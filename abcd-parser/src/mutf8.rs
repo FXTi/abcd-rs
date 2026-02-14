@@ -81,3 +81,136 @@ pub fn decode_mutf8(data: &[u8], offset: usize) -> Result<String, ParseError> {
 
     Ok(result)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Tests migrated from arkcompiler runtime_core/libpandabase/tests/utf_test.cpp
+
+    use super::*;
+
+    // --- ConvertMUtf8ToUtf16_1 ---
+
+    #[test]
+    fn mutf8_null_char_two_byte() {
+        // 2-byte mutf-8 U+0000: {0xc0, 0x80, 0x00} → "\0"
+        let data = [0xc0, 0x80, 0x00];
+        assert_eq!(decode_mutf8(&data, 0).unwrap(), "\0");
+    }
+
+    #[test]
+    fn mutf8_single_byte_0x7f() {
+        // 1-byte mutf-8: 0xxxxxxx → U+007F (DEL)
+        let data = [0x7f, 0x00];
+        assert_eq!(decode_mutf8(&data, 0).unwrap(), "\x7f");
+    }
+
+    #[test]
+    fn mutf8_two_byte_section_sign() {
+        // 2-byte mutf-8: 110xxxxx 10xxxxxx → U+00A7 (§) + U+0033 ('3')
+        let data = [0xc2, 0xa7, 0x33, 0x00];
+        assert_eq!(decode_mutf8(&data, 0).unwrap(), "§3");
+    }
+
+    #[test]
+    fn mutf8_three_byte_u_ffc3() {
+        // 3-byte mutf-8: 1110xxxx 10xxxxxx 10xxxxxx → U+FFC3 + U+0033
+        let data = [0xef, 0xbf, 0x83, 0x33, 0x00];
+        let result = decode_mutf8(&data, 0).unwrap();
+        assert_eq!(result.chars().nth(0).unwrap() as u32, 0xffc3);
+        assert_eq!(result.chars().nth(1).unwrap(), '3');
+    }
+
+    // --- ConvertMUtf8ToUtf16_2 (surrogate pairs) ---
+
+    #[test]
+    fn mutf8_surrogate_pair_u10437() {
+        // double 3-byte mutf-8: high surrogate D801 + low surrogate DC37 → U+10437
+        let data = [0xed, 0xa0, 0x81, 0xed, 0xb0, 0xb7, 0x00];
+        let result = decode_mutf8(&data, 0).unwrap();
+        assert_eq!(result.chars().next().unwrap() as u32, 0x10437);
+    }
+
+    #[test]
+    fn mutf8_mixed_ascii_and_lone_high_surrogate() {
+        // [abc + high surrogate D8D2 + ]
+        let data = [0x5b, 0x61, 0x62, 0x63, 0xed, 0xa3, 0x92, 0x5d, 0x00];
+        let result = decode_mutf8(&data, 0).unwrap();
+        // Starts with "[abc"
+        assert!(result.starts_with("[abc"));
+        // Ends with "]"
+        assert!(result.ends_with(']'));
+    }
+
+    #[test]
+    fn mutf8_4byte_utf8_person_emoji() {
+        // 4-byte UTF-8 (standard, not MUTF-8 surrogate): F0 9F 91 B3 → U+1F473 (👳)
+        // Our decoder handles this as an error (4-byte sequences are not valid MUTF-8)
+        let data = [0xF0, 0x9F, 0x91, 0xB3, 0x00];
+        assert!(decode_mutf8(&data, 0).is_err());
+    }
+
+    // --- IsMUtf8OnlySingleBytes / IsValidModifiedUTF8 equivalents ---
+
+    #[test]
+    fn mutf8_valid_single_byte_only() {
+        // {0x02, 0x00} — valid single-byte
+        let data = [0x02, 0x00];
+        assert!(decode_mutf8(&data, 0).is_ok());
+    }
+
+    #[test]
+    fn mutf8_invalid_continuation_start() {
+        // {0x9f, 0x00} — 0x9f is a continuation byte, not a valid start
+        let data = [0x9f, 0x00];
+        assert!(decode_mutf8(&data, 0).is_err());
+    }
+
+    #[test]
+    fn mutf8_invalid_4byte_start() {
+        // {0xf7, 0x00} — 4-byte start without continuation
+        let data = [0xf7, 0x00];
+        assert!(decode_mutf8(&data, 0).is_err());
+    }
+
+    #[test]
+    fn mutf8_invalid_3byte_truncated() {
+        // {0xe0, 0x00} — 3-byte start but null terminator immediately
+        let data = [0xe0, 0x00];
+        assert!(decode_mutf8(&data, 0).is_err());
+    }
+
+    #[test]
+    fn mutf8_invalid_2byte_truncated() {
+        // {0xd4, 0x00} — 2-byte start but null terminator (0x00 is not 10xxxxxx)
+        let data = [0xd4, 0x00];
+        assert!(decode_mutf8(&data, 0).is_err());
+    }
+
+    #[test]
+    fn mutf8_valid_multi_single_bytes() {
+        // {0x11, 0x31, 0x00} — two valid single-byte chars
+        let data = [0x11, 0x31, 0x00];
+        assert_eq!(decode_mutf8(&data, 0).unwrap(), "\x11\x31");
+    }
+
+    #[test]
+    fn mutf8_invalid_0xf8_start() {
+        // {0xf8, 0x00} — 5-byte start, not valid in MUTF-8
+        let data = [0xf8, 0x00];
+        assert!(decode_mutf8(&data, 0).is_err());
+    }
+
+    // --- Additional coverage ---
+
+    #[test]
+    fn mutf8_empty_string() {
+        let data = [0x00];
+        assert_eq!(decode_mutf8(&data, 0).unwrap(), "");
+    }
+
+    #[test]
+    fn mutf8_offset_into_data() {
+        let data = b"XXXhello\0";
+        assert_eq!(decode_mutf8(data, 3).unwrap(), "hello");
+    }
+}

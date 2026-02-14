@@ -68,22 +68,13 @@ struct OperandPart {
 }
 
 fn main() {
-    let isa_path = env::var("ABC_ISA_YAML").unwrap_or_else(|_| {
-        let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-        let p = PathBuf::from(&manifest_dir)
-            .join("../..")
-            .join("arkcompiler/runtime_core/isa/isa.yaml");
-        if p.exists() {
-            return p.to_string_lossy().to_string();
-        }
-        PathBuf::from(&manifest_dir)
-            .join("../../arkcompiler/runtime_core/isa/isa.yaml")
-            .to_string_lossy()
-            .to_string()
-    });
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+
+    // Resolve isa.yaml path: env var > local cache > download from gitcode
+    let isa_path = resolve_isa_yaml(&manifest_dir, &out_dir);
 
     println!("cargo:rerun-if-changed={isa_path}");
-    println!("cargo:rerun-if-env-changed=ABC_ISA_YAML");
 
     let yaml_content = fs::read_to_string(&isa_path)
         .unwrap_or_else(|e| panic!("Failed to read ISA YAML at {isa_path}: {e}"));
@@ -745,4 +736,31 @@ fn generate_decode_function(
     .unwrap();
     writeln!(code, "    Some((opcode, info))").unwrap();
     writeln!(code, "}}").unwrap();
+}
+
+const ISA_YAML_URL: &str =
+    "https://raw.gitcode.com/openharmony/arkcompiler_runtime_core/raw/master/isa/isa.yaml";
+
+/// Resolve the path to isa.yaml:
+/// 1. Cached download in OUT_DIR
+/// 2. Fresh download from gitcode
+fn resolve_isa_yaml(_manifest_dir: &str, out_dir: &str) -> String {
+    let cached = PathBuf::from(out_dir).join("isa.yaml");
+    if cached.exists() {
+        return cached.to_string_lossy().to_string();
+    }
+
+    eprintln!("Downloading isa.yaml from {ISA_YAML_URL}...");
+    let output = std::process::Command::new("curl")
+        .args(["-fsSL", "-o", &cached.to_string_lossy(), ISA_YAML_URL])
+        .output()
+        .expect("Failed to run curl — is curl installed?");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("Failed to download isa.yaml: {stderr}");
+    }
+
+    eprintln!("Downloaded isa.yaml to {}", cached.display());
+    cached.to_string_lossy().to_string()
 }

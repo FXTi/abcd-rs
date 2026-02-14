@@ -32,6 +32,7 @@ pub enum LiteralTag {
     BuiltinTypeIndex = 0x19,
     Getter = 0x1a,
     Setter = 0x1b,
+    EtsImplements = 0x1c,
     NullValue = 0xff,
 }
 
@@ -66,6 +67,7 @@ impl LiteralTag {
             0x19 => Some(Self::BuiltinTypeIndex),
             0x1a => Some(Self::Getter),
             0x1b => Some(Self::Setter),
+            0x1c => Some(Self::EtsImplements),
             0xff => Some(Self::NullValue),
             _ => None,
         }
@@ -190,7 +192,8 @@ impl LiteralArray {
                     pos += 4;
                     LiteralValue::Method(val)
                 }
-                // Typed array tags — rest of data is the array, stop parsing
+                // Typed array tags — the preceding Integer value gives the element count,
+                // and the remaining bytes are the array data. Parse them.
                 LiteralTag::ArrayU1
                 | LiteralTag::ArrayU8
                 | LiteralTag::ArrayI8
@@ -202,7 +205,30 @@ impl LiteralArray {
                 | LiteralTag::ArrayI64
                 | LiteralTag::ArrayF32
                 | LiteralTag::ArrayF64 => {
-                    break;
+                    // The element count was the previous Integer entry's value
+                    let elem_count = match entries.last() {
+                        Some((_, LiteralValue::Integer(n))) => *n as usize,
+                        _ => 0,
+                    };
+                    let elem_size = match tag {
+                        LiteralTag::ArrayU1 | LiteralTag::ArrayU8 | LiteralTag::ArrayI8 => 1,
+                        LiteralTag::ArrayU16 | LiteralTag::ArrayI16 => 2,
+                        LiteralTag::ArrayU32 | LiteralTag::ArrayI32 | LiteralTag::ArrayF32 => 4,
+                        LiteralTag::ArrayU64 | LiteralTag::ArrayI64 | LiteralTag::ArrayF64 => 8,
+                        _ => 1,
+                    };
+                    let total = elem_count * elem_size;
+                    // Skip the array data
+                    pos += total;
+                    LiteralValue::TagValue(0)
+                }
+                LiteralTag::EtsImplements => {
+                    if pos + 4 > data.len() {
+                        break;
+                    }
+                    let val = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                    pos += 4;
+                    LiteralValue::Integer(val as i32)
                 }
             };
 
@@ -210,5 +236,164 @@ impl LiteralArray {
         }
 
         Ok(Self { entries })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests based on arkcompiler runtime_core/libpandafile literal_data_accessor.h
+    //! and abc2program/tests/cpp_sources/hello_world_test.cpp literal array tests.
+
+    use super::*;
+
+    /// Build a literal array binary: [num_values: u32] [tag, value]...
+    fn build_literal_array(items: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let count = items.len() as u32;
+        data.extend_from_slice(&count.to_le_bytes());
+        for (tag, value) in items {
+            data.push(*tag);
+            data.extend_from_slice(value);
+        }
+        data
+    }
+
+    #[test]
+    fn parse_bool_literal() {
+        let data = build_literal_array(&[(0x01, &[1])]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries.len(), 1);
+        assert_eq!(arr.entries[0].0, LiteralTag::Bool);
+        assert!(matches!(arr.entries[0].1, LiteralValue::Bool(true)));
+    }
+
+    #[test]
+    fn parse_integer_literal() {
+        let data = build_literal_array(&[(0x02, &42i32.to_le_bytes())]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries[0].0, LiteralTag::Integer);
+        assert!(matches!(arr.entries[0].1, LiteralValue::Integer(42)));
+    }
+
+    #[test]
+    fn parse_float_literal() {
+        let val = 3.14f32;
+        let data = build_literal_array(&[(0x03, &val.to_le_bytes())]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries[0].0, LiteralTag::Float);
+        if let LiteralValue::Float(f) = arr.entries[0].1 {
+            assert!((f - 3.14).abs() < 0.001);
+        } else {
+            panic!("expected Float");
+        }
+    }
+
+    #[test]
+    fn parse_double_literal() {
+        let val = 2.718281828f64;
+        let data = build_literal_array(&[(0x04, &val.to_le_bytes())]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries[0].0, LiteralTag::Double);
+        if let LiteralValue::Double(d) = arr.entries[0].1 {
+            assert!((d - 2.718281828).abs() < 1e-6);
+        } else {
+            panic!("expected Double");
+        }
+    }
+
+    #[test]
+    fn parse_string_literal() {
+        let off = 0x1234u32;
+        let data = build_literal_array(&[(0x05, &off.to_le_bytes())]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries[0].0, LiteralTag::String);
+        assert!(matches!(arr.entries[0].1, LiteralValue::String(0x1234)));
+    }
+
+    #[test]
+    fn parse_method_literal() {
+        let off = 0xABCDu32;
+        let data = build_literal_array(&[(0x06, &off.to_le_bytes())]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries[0].0, LiteralTag::Method);
+        assert!(matches!(arr.entries[0].1, LiteralValue::Method(0xABCD)));
+    }
+
+    #[test]
+    fn parse_method_affiliate() {
+        let val = 5u16;
+        let data = build_literal_array(&[(0x09, &val.to_le_bytes())]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries[0].0, LiteralTag::MethodAffiliate);
+        assert!(matches!(arr.entries[0].1, LiteralValue::MethodAffiliate(5)));
+    }
+
+    #[test]
+    fn parse_null_literal() {
+        let data = build_literal_array(&[(0xff, &[0])]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries[0].0, LiteralTag::NullValue);
+        assert!(matches!(arr.entries[0].1, LiteralValue::Null));
+    }
+
+    #[test]
+    fn parse_multiple_entries() {
+        let data = build_literal_array(&[
+            (0x05, &100u32.to_le_bytes()), // String key
+            (0x02, &42i32.to_le_bytes()),  // Integer value
+            (0x05, &200u32.to_le_bytes()), // String key
+            (0x01, &[0]),                  // Bool value
+        ]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries.len(), 4);
+    }
+
+    #[test]
+    fn parse_ets_implements_tag() {
+        let data = build_literal_array(&[(0x1c, &99u32.to_le_bytes())]);
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries[0].0, LiteralTag::EtsImplements);
+    }
+
+    #[test]
+    fn parse_typed_array_skips_data() {
+        // Integer count entry, then ArrayU8 with 3 bytes of data, then another Integer
+        let mut data = Vec::new();
+        let count = 3u32; // 3 items total
+        data.extend_from_slice(&count.to_le_bytes());
+        // Item 1: Integer(3) — element count for the array
+        data.push(0x02);
+        data.extend_from_slice(&3i32.to_le_bytes());
+        // Item 2: ArrayU8 with 3 bytes
+        data.push(0x0b);
+        data.extend_from_slice(&[10, 20, 30]);
+        // Item 3: Integer(99)
+        data.push(0x02);
+        data.extend_from_slice(&99i32.to_le_bytes());
+
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert_eq!(arr.entries.len(), 3);
+        // Last entry should be Integer(99)
+        assert!(matches!(arr.entries[2].1, LiteralValue::Integer(99)));
+    }
+
+    #[test]
+    fn all_literal_tags_recognized() {
+        for tag_val in 0x00..=0x1c {
+            assert!(
+                LiteralTag::from_u8(tag_val).is_some(),
+                "tag {tag_val:#x} not recognized"
+            );
+        }
+        assert!(LiteralTag::from_u8(0xff).is_some());
+        // 0x1d should not be recognized
+        assert!(LiteralTag::from_u8(0x1d).is_none());
+    }
+
+    #[test]
+    fn empty_literal_array() {
+        let data = 0u32.to_le_bytes().to_vec();
+        let arr = LiteralArray::parse(&data, 0).unwrap();
+        assert!(arr.entries.is_empty());
     }
 }

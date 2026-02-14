@@ -1,5 +1,5 @@
 use crate::error::ParseError;
-use crate::leb128::decode_uleb128;
+use crate::leb128::{decode_sleb128, decode_uleb128};
 use crate::string_table::read_string;
 
 /// Parsed class definition from an ABC file.
@@ -141,7 +141,7 @@ impl ClassData {
                 match tag {
                     0x01 => {
                         // INT_VALUE: sleb128
-                        let (val, consumed) = decode_uleb128(data, pos)?;
+                        let (val, consumed) = decode_sleb128(data, pos)?;
                         field_u32_value = Some(val as u32);
                         pos += consumed;
                     }
