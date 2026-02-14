@@ -1,0 +1,10 @@
+[package]
+name = "abcd-parser"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+abcd-isa = { workspace = true }
+thiserror = { workspace = true }
+memmap2 = { workspace = true }
+log = { workspace = true }

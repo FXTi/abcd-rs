@@ -1,0 +1,10 @@
+[package]
+name = "abcd-decompiler"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+abcd-isa = { workspace = true }
+abcd-parser = { workspace = true }
+abcd-ir = { workspace = true }
+log = { workspace = true }

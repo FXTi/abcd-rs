@@ -1,0 +1,16 @@
+[package]
+name = "abcd-cli"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "abcd"
+path = "src/main.rs"
+
+[dependencies]
+abcd-parser = { workspace = true }
+abcd-decompiler = { workspace = true }
+abcd-ir = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }

@@ -1,0 +1,28 @@
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ParseError {
+    #[error("File too small: {0} bytes")]
+    FileTooSmall(usize),
+
+    #[error("Invalid magic: expected PANDA\\0\\0\\0")]
+    InvalidMagic,
+
+    #[error("Unsupported version: {0:?}")]
+    UnsupportedVersion([u8; 4]),
+
+    #[error("Offset {0:#x} out of bounds (file size: {1:#x})")]
+    OffsetOutOfBounds(usize, usize),
+
+    #[error("Invalid LEB128 encoding at offset {0:#x}")]
+    InvalidLeb128(usize),
+
+    #[error("Invalid MUTF-8 encoding at offset {0:#x}")]
+    InvalidMutf8(usize),
+
+    #[error("Invalid tagged value tag {0:#x} at offset {1:#x}")]
+    InvalidTag(u8, usize),
+
+    #[error("I/O error: {0}")]
+    Io(String),
+}
