@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use abcd_ir::expr::{BinOp, Expr, PropKey, UnOp};
 use abcd_ir::instruction::{Instruction, Operand};
 use abcd_ir::stmt::Stmt;
-use abcd_isa::Opcode;
 use abcd_parser::literal::{LiteralArray, LiteralTag, LiteralValue};
 
 /// Resolves entity IDs to strings/names and literal arrays.
@@ -11,15 +10,15 @@ pub trait StringResolver {
     fn resolve_string(&self, method_off: u32, entity_id: u32) -> Option<String>;
     fn resolve_offset(&self, method_off: u32, entity_id: u32) -> Option<u32>;
     /// Resolve a literal array by its entity ID.
-    fn resolve_literal_array(&self, method_off: u32, entity_id: u32) -> Option<LiteralArray> {
+    fn resolve_literal_array(&self, _method_off: u32, _entity_id: u32) -> Option<LiteralArray> {
         None
     }
     /// Read a string at a raw file offset.
-    fn get_string_at_offset(&self, offset: u32) -> Option<String> {
+    fn get_string_at_offset(&self, _offset: u32) -> Option<String> {
         None
     }
     /// Resolve a method entity ID to its name.
-    fn resolve_method_name(&self, method_off: u32, entity_id: u32) -> Option<String> {
+    fn resolve_method_name(&self, _method_off: u32, _entity_id: u32) -> Option<String> {
         None
     }
 }
@@ -118,7 +117,7 @@ pub fn recover_block_with_state(
     }
 }
 
-fn arg_or_var(r: u16, num_vregs: u32, num_args: u32) -> Expr {
+fn arg_or_var(r: u16, num_vregs: u32, _num_args: u32) -> Expr {
     // ArkCompiler register layout:
     // [v0..v(num_vregs-1)] [funcObj] [newTarget] [this] [arg0, arg1, ...]
     let r32 = r as u32;
@@ -499,8 +498,8 @@ fn process_insn(
         }
         "callthis0" => {
             // callthis0 ic_slot, v_this
-            let this_reg = get_reg(&ops[1]);
-            let this_val = state.get_reg(this_reg);
+            let _this_reg = get_reg(&ops[1]);
+            let _this_val = state.get_reg(_this_reg);
             // acc holds the method reference (from ldobjbyname)
             let method = state.acc.clone();
             state.acc = Expr::Call {
@@ -509,7 +508,7 @@ fn process_insn(
             };
         }
         "callthis1" => {
-            let this_reg = get_reg(&ops[1]);
+            let _this_reg = get_reg(&ops[1]);
             let a0 = state.get_reg(get_reg(&ops[2]));
             let method = state.acc.clone();
             state.acc = Expr::Call {
@@ -734,7 +733,7 @@ fn process_insn(
         }
         "createobjectwithexcludedkeys" | "wide.createobjectwithexcludedkeys" => {
             // Create object from source excluding certain keys
-            let count = get_imm(&ops[0]) as u16;
+            let _count = get_imm(&ops[0]) as u16;
             let start = get_reg(&ops[1]);
             let src = state.get_reg(start);
             state.acc = Expr::Call {
@@ -913,14 +912,14 @@ fn process_insn(
             let level = get_imm(&ops[0]);
             let slot = get_imm(&ops[1]);
             stmts.push(Stmt::Assign {
-                target: Expr::Var(format!("lex_{level}_{slot}")),
+                target: Expr::Var(format!("x_{}_{}", level + 1, slot + 1)),
                 value: state.acc.clone(),
             });
         }
         "wide.ldlexvar" => {
             let level = get_imm(&ops[0]);
             let slot = get_imm(&ops[1]);
-            state.acc = Expr::Var(format!("lex_{level}_{slot}"));
+            state.acc = Expr::Var(format!("x_{}_{}", level + 1, slot + 1));
         }
         "wide.newlexenv" | "wide.newlexenvwithname" => {}
         "ldinfinity" => {
@@ -1017,7 +1016,7 @@ fn resolve_array_buffer(lit: &LiteralArray, resolver: &dyn StringResolver) -> Ex
 }
 
 fn literal_value_to_expr(
-    tag: &LiteralTag,
+    _tag: &LiteralTag,
     val: &LiteralValue,
     resolver: &dyn StringResolver,
 ) -> Expr {

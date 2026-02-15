@@ -1,7 +1,9 @@
 //! ABC binary file format parser for ArkCompiler bytecode files.
 
+pub mod annotation;
 pub mod class;
 pub mod code;
+pub mod debug_info;
 pub mod error;
 pub mod header;
 pub mod index;

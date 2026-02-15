@@ -20,6 +20,7 @@ struct PrefixDef {
 
 #[derive(Debug, Deserialize)]
 struct GroupDef {
+    #[allow(dead_code)]
     title: String,
     #[serde(default)]
     properties: Vec<String>,
@@ -57,6 +58,7 @@ struct ResolvedInsn {
 }
 
 struct OperandPart {
+    #[allow(dead_code)]
     name: String,
     kind: &'static str, // "Reg", "Imm", "Id"
     bit_width: usize,
@@ -684,12 +686,10 @@ fn generate_opcode_table(resolved: &[ResolvedInsn], code: &mut String) {
 }
 
 fn generate_decode_function(
-    resolved: &[ResolvedInsn],
+    _resolved: &[ResolvedInsn],
     prefix_map: &HashMap<String, u8>,
     code: &mut String,
 ) {
-    let prefix_bytes: Vec<u8> = prefix_map.values().copied().collect();
-
     writeln!(code, "/// Decode an opcode from a byte stream.").unwrap();
     writeln!(code, "///").unwrap();
     writeln!(

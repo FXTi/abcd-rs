@@ -516,15 +516,35 @@ fn decompile_method_to_string(
         code.num_args,
     );
 
+    // Detect rest parameters by scanning for copyrestargs instruction
+    let decoded = abcd_decompiler::decode_method(&code.instructions);
+    let rest_param_idx = decoded.iter().find_map(|insn| {
+        if insn.opcode.mnemonic() == "copyrestargs" {
+            Some(insn.operands.first().map_or(0, |op| match op {
+                abcd_ir::instruction::Operand::Imm(v) => *v as u32,
+                _ => 0,
+            }))
+        } else {
+            None
+        }
+    });
+
     // Generate parameter list: num_args includes funcObj, newTarget, this (3 implicit)
-    let user_params = if code.num_args > 3 {
-        (1..=(code.num_args - 3))
-            .map(|i| format!("p{i}"))
-            .collect::<Vec<_>>()
-            .join(", ")
+    let user_param_count = if code.num_args > 3 {
+        code.num_args - 3
     } else {
-        String::new()
+        0
     };
+    let user_params = (1..=user_param_count)
+        .map(|i| {
+            if rest_param_idx == Some(i - 1) {
+                format!("...p{i}")
+            } else {
+                format!("p{i}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
 
     output.push_str(&format!(
         "function {}({user_params}) {{\n",
