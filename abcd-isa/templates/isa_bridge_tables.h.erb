@@ -1,0 +1,154 @@
+/**
+ * isa_bridge_tables.h.erb - Generate static metadata tables for the ISA bridge.
+ *
+ * Generated using: ruby gen.rb -t isa_bridge_tables.h.erb -d isa.yaml -r isapi.rb,pandafile_isapi.rb
+ */
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* === Opcode → Mnemonic string table === */
+
+struct IsaMnemonicEntry {
+    uint16_t opcode;
+    const char* mnemonic;
+};
+
+static const struct IsaMnemonicEntry ISA_MNEMONIC_TABLE[] = {
+<% Panda.instructions.each do |insn| -%>
+    { <%= "0x%04x" % insn.opcode_idx %>, "<%= insn.mnemonic %>" },
+<% end -%>
+};
+static const size_t ISA_MNEMONIC_TABLE_SIZE = <%= Panda.instructions.size %>;
+
+/* === Opcode → Flags bitmask table === */
+/*
+ * We use well-known property names as flag bits.
+ * Each instruction's properties are OR'd into a bitmask.
+ */
+<%
+  # Build a stable mapping from property tag to bit index
+  all_props = {}
+  Panda.instructions.each do |insn|
+    insn.properties.each { |p| all_props[p] = true unless p.nil? || p.empty? }
+  end
+  prop_list = all_props.keys.sort
+  prop_to_bit = {}
+  prop_list.each_with_index { |p, i| prop_to_bit[p] = i }
+-%>
+<% prop_list.each_with_index do |tag, i| -%>
+#define ISA_FLAG_<%= tag.upcase %> (1u << <%= i %>)
+<% end -%>
+
+struct IsaFlagsEntry {
+    uint16_t opcode;
+    uint32_t flags;
+};
+
+static const struct IsaFlagsEntry ISA_FLAGS_TABLE[] = {
+<% Panda.instructions.each do |insn| -%>
+<%   bits = insn.properties.select { |p| !p.nil? && !p.empty? }.map { |p| "ISA_FLAG_#{p.upcase}" } -%>
+<%   flags_str = bits.empty? ? "0" : bits.join(" | ") -%>
+    { <%= "0x%04x" % insn.opcode_idx %>, <%= flags_str %> },
+<% end -%>
+};
+static const size_t ISA_FLAGS_TABLE_SIZE = <%= Panda.instructions.size %>;
+
+/* === Opcode → Exceptions bitmask table === */
+<%
+  all_excs = {}
+  Panda.instructions.each do |insn|
+    next unless insn.respond_to?(:exceptions) && insn.exceptions
+    insn.exceptions.each { |e| all_excs[e] = true unless e.nil? || e.empty? }
+  end
+  exc_list = all_excs.keys.sort
+  exc_to_bit = {}
+  exc_list.each_with_index { |e, i| exc_to_bit[e] = i }
+-%>
+<% exc_list.each_with_index do |tag, i| -%>
+#define ISA_EXC_<%= tag.upcase %> (1u << <%= i %>)
+<% end -%>
+
+struct IsaExceptionsEntry {
+    uint16_t opcode;
+    uint32_t exceptions;
+};
+
+static const struct IsaExceptionsEntry ISA_EXCEPTIONS_TABLE[] = {
+<% Panda.instructions.each do |insn| -%>
+<%   if insn.respond_to?(:exceptions) && insn.exceptions -%>
+<%     bits = insn.exceptions.select { |e| !e.nil? && !e.empty? }.map { |e| "ISA_EXC_#{e.upcase}" } -%>
+<%     exc_str = bits.empty? ? "0" : bits.join(" | ") -%>
+<%   else -%>
+<%     exc_str = "0" -%>
+<%   end -%>
+    { <%= "0x%04x" % insn.opcode_idx %>, <%= exc_str %> },
+<% end -%>
+};
+static const size_t ISA_EXCEPTIONS_TABLE_SIZE = <%= Panda.instructions.size %>;
+
+/* === Opcode → Namespace table === */
+
+struct IsaNamespaceEntry {
+    uint16_t opcode;
+    const char* ns;
+};
+
+static const struct IsaNamespaceEntry ISA_NAMESPACE_TABLE[] = {
+<% Panda.instructions.each do |insn| -%>
+    { <%= "0x%04x" % insn.opcode_idx %>, "<%= insn.namespace %>" },
+<% end -%>
+};
+static const size_t ISA_NAMESPACE_TABLE_SIZE = <%= Panda.instructions.size %>;
+
+/* === Opcode → Operand info table === */
+
+struct IsaOperandInfo {
+    uint8_t kind;      /* 0=reg, 1=imm, 2=id */
+    uint8_t op_type;   /* encoded type index */
+    uint8_t bit_width;
+    uint8_t is_src;
+    uint8_t is_dst;
+};
+
+struct IsaOpcodeOperands {
+    uint16_t opcode;
+    uint8_t num_operands;
+    uint8_t acc_read;
+    uint8_t acc_write;
+    struct IsaOperandInfo operands[8]; /* max 8 operands per instruction */
+};
+
+<%
+  type_map = {
+    'none' => 0, 'u1' => 1, 'i8' => 2, 'u8' => 3, 'i16' => 4, 'u16' => 5,
+    'i32' => 6, 'u32' => 7, 'i64' => 8, 'u64' => 9, 'f32' => 10, 'f64' => 11,
+    'ref' => 12, 'top' => 13, 'any' => 14, 'b32' => 15, 'b64' => 16
+  }
+-%>
+static const struct IsaOpcodeOperands ISA_OPERANDS_TABLE[] = {
+<% Panda.instructions.each do |insn| -%>
+<%   ops = insn.operands.select { |o| !o.acc? } -%>
+    { <%= "0x%04x" % insn.opcode_idx %>, <%= ops.size %>, <%= insn.acc_read? ? 1 : 0 %>, <%= insn.acc_write? ? 1 : 0 %>, {
+<%   ops.each do |op| -%>
+<%     kind = op.reg? ? 0 : (op.imm? ? 1 : 2) -%>
+<%     tp = type_map[op.type] || 0 -%>
+        { <%= kind %>, <%= tp %>, <%= op.width %>, <%= op.src? ? 1 : 0 %>, <%= op.dst? ? 1 : 0 %> },
+<%   end -%>
+    } },
+<% end -%>
+};
+static const size_t ISA_OPERANDS_TABLE_SIZE = <%= Panda.instructions.size %>;
+
+/* === Total counts === */
+static const size_t ISA_TOTAL_OPCODES = <%= Panda.instructions.size %>;
+static const size_t ISA_TOTAL_FORMATS = <%= Panda.formats.size %>;
+static const size_t ISA_TOTAL_PREFIXES = <%= Panda.prefixes.size %>;
+
+#ifdef __cplusplus
+}
+#endif

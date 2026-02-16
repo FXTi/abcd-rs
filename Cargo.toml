@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "abcd-isa",
-    "abcd-parser",
+    "abcd-file",
     "abcd-ir",
     "abcd-decompiler",
     "abcd-cli",
@@ -23,6 +23,6 @@ log = "0.4"
 env_logger = "0.11"
 
 abcd-isa = { path = "abcd-isa" }
-abcd-parser = { path = "abcd-parser" }
+abcd-file = { path = "abcd-file" }
 abcd-ir = { path = "abcd-ir" }
 abcd-decompiler = { path = "abcd-decompiler" }

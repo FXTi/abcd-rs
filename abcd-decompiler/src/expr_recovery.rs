@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
+use abcd_file::literal::{LiteralArray, LiteralTag, LiteralValue};
 use abcd_ir::expr::{BinOp, Expr, PropKey, UnOp};
 use abcd_ir::instruction::{Instruction, Operand};
 use abcd_ir::stmt::Stmt;
-use abcd_parser::literal::{LiteralArray, LiteralTag, LiteralValue};
 
 /// Resolves entity IDs to strings/names and literal arrays.
 pub trait StringResolver {

@@ -455,8 +455,7 @@ mod tests {
         let min_opcode = ((line_min_inc - LINE_BASE) + (0 * LINE_RANGE) + OPCODE_BASE as i32) as u8;
         assert_eq!(min_opcode, OPCODE_BASE); // 0x0c
 
-        let max_opcode =
-            ((line_max_inc - LINE_BASE) + (0 * LINE_RANGE) + OPCODE_BASE as i32) as u8;
+        let max_opcode = ((line_max_inc - LINE_BASE) + (0 * LINE_RANGE) + OPCODE_BASE as i32) as u8;
         assert_eq!(max_opcode, OPCODE_BASE + 14); // 0x1a
     }
 
@@ -483,13 +482,13 @@ mod tests {
             0x7b, // line advance = -5 (sleb128: 0x7b = -5)
         ];
         let lnp = vec![
-            LNP_SET_SOURCE_CODE,  // 0x0a — reads from CP
-            LNP_SET_FILE,         // 0x09 — reads from CP
-            LNP_SET_PROLOGUE_END, // 0x07 — no args
-            LNP_ADVANCE_PC,       // 0x01 — reads pc=10 from CP
-            LNP_ADVANCE_LINE,     // 0x02 — reads line=-5 from CP
+            LNP_SET_SOURCE_CODE,    // 0x0a — reads from CP
+            LNP_SET_FILE,           // 0x09 — reads from CP
+            LNP_SET_PROLOGUE_END,   // 0x07 — no args
+            LNP_ADVANCE_PC,         // 0x01 — reads pc=10 from CP
+            LNP_ADVANCE_LINE,       // 0x02 — reads line=-5 from CP
             LNP_SET_EPILOGUE_BEGIN, // 0x08 — no args
-            LNP_END_SEQUENCE,     // 0x00
+            LNP_END_SEQUENCE,       // 0x00
         ];
         let result = execute_line_program(&lnp, &cp, &[], 5, 100);
         // No special opcodes emitted, so no line table entries
@@ -509,7 +508,13 @@ mod tests {
         // After opcode1: address=1, line=10+(-4)=6
         assert_eq!(result.line_table[0], LineEntry { offset: 1, line: 6 });
         // After opcode2: address=1+2=3, line=6+10=16
-        assert_eq!(result.line_table[1], LineEntry { offset: 3, line: 16 });
+        assert_eq!(
+            result.line_table[1],
+            LineEntry {
+                offset: 3,
+                line: 16
+            }
+        );
     }
 
     /// Migrated from: runtime_core/static_core/libarkfile/tests/debug_info_extractor_test.cpp
@@ -542,9 +547,27 @@ mod tests {
         ];
         let result = execute_line_program(&lnp, &cp, &[], 3, 100);
         assert_eq!(result.column_table.len(), 3);
-        assert_eq!(result.column_table[0], ColumnEntry { offset: 0, column: 7 });
-        assert_eq!(result.column_table[1], ColumnEntry { offset: 0, column: 8 });
-        assert_eq!(result.column_table[2], ColumnEntry { offset: 1, column: 9 });
+        assert_eq!(
+            result.column_table[0],
+            ColumnEntry {
+                offset: 0,
+                column: 7
+            }
+        );
+        assert_eq!(
+            result.column_table[1],
+            ColumnEntry {
+                offset: 0,
+                column: 8
+            }
+        );
+        assert_eq!(
+            result.column_table[2],
+            ColumnEntry {
+                offset: 1,
+                column: 9
+            }
+        );
     }
 
     /// Migrated from: runtime_core/static_core/libarkfile/tests/debug_info_extractor_test.cpp
@@ -587,12 +610,12 @@ mod tests {
 
         let lnp = vec![
             LNP_START_LOCAL,
-            1, // reg=1 (sleb128)
+            1,    // reg=1 (sleb128)
             0x20, // special opcode: pc_inc=1, line_inc=1
             LNP_START_LOCAL_EXTENDED,
             2, // reg=2 (sleb128)
             LNP_END_LOCAL,
-            1, // reg=1 ends here (address=1)
+            1,    // reg=1 ends here (address=1)
             0x20, // special opcode: pc_inc=1, line_inc=1 → address=2
             LNP_START_LOCAL,
             3, // reg=3 (sleb128)

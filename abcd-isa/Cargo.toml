@@ -4,8 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-bitflags = "2"
 
 [build-dependencies]
-serde = { workspace = true }
-serde_yaml = { workspace = true }
+cc = "1"
+bindgen = "0.71"

@@ -8,7 +8,7 @@ name = "abcd"
 path = "src/main.rs"
 
 [dependencies]
-abcd-parser = { workspace = true }
+abcd-file = { workspace = true }
 abcd-decompiler = { workspace = true }
 abcd-ir = { workspace = true }
 clap = { workspace = true }

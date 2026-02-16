@@ -167,7 +167,10 @@ impl AnnotationData {
         let total_size = 4 + count * 8 + count;
 
         if tags_start + count > data.len() {
-            return Err(ParseError::OffsetOutOfBounds(tags_start + count, data.len()));
+            return Err(ParseError::OffsetOutOfBounds(
+                tags_start + count,
+                data.len(),
+            ));
         }
 
         let mut elements = Vec::with_capacity(count);
@@ -211,7 +214,10 @@ mod tests {
     fn tag_from_byte_arrays() {
         assert_eq!(AnnotationTag::from_byte(b'K'), AnnotationTag::ArrayU1);
         assert_eq!(AnnotationTag::from_byte(b'V'), AnnotationTag::ArrayString);
-        assert_eq!(AnnotationTag::from_byte(b'@'), AnnotationTag::ArrayMethodHandle);
+        assert_eq!(
+            AnnotationTag::from_byte(b'@'),
+            AnnotationTag::ArrayMethodHandle
+        );
         assert!(AnnotationTag::from_byte(b'K').is_array());
         assert!(!AnnotationTag::from_byte(b'6').is_array());
     }

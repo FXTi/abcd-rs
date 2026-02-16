@@ -45,7 +45,7 @@ fn main() {
 // === StringResolver implementation for AbcFile ===
 
 struct AbcResolver<'a> {
-    abc: &'a abcd_parser::AbcFile,
+    abc: &'a abcd_file::AbcFile,
 }
 
 impl<'a> abcd_decompiler::expr_recovery::StringResolver for AbcResolver<'a> {
@@ -70,13 +70,13 @@ impl<'a> abcd_decompiler::expr_recovery::StringResolver for AbcResolver<'a> {
         &self,
         method_off: u32,
         entity_id: u32,
-    ) -> Option<abcd_parser::literal::LiteralArray> {
+    ) -> Option<abcd_file::literal::LiteralArray> {
         let off = self.abc.index_section().resolve_offset_by_index(
             self.abc.data(),
             method_off,
             entity_id as u16,
         )?;
-        abcd_parser::literal::LiteralArray::parse(self.abc.data(), off).ok()
+        abcd_file::literal::LiteralArray::parse(self.abc.data(), off).ok()
     }
 
     fn get_string_at_offset(&self, offset: u32) -> Option<String> {
@@ -89,7 +89,7 @@ impl<'a> abcd_decompiler::expr_recovery::StringResolver for AbcResolver<'a> {
             method_off,
             entity_id as u16,
         )?;
-        let method = abcd_parser::method::MethodData::parse(self.abc.data(), off).ok()?;
+        let method = abcd_file::method::MethodData::parse(self.abc.data(), off).ok()?;
         if method.name.is_empty() {
             None
         } else {
@@ -99,7 +99,7 @@ impl<'a> abcd_decompiler::expr_recovery::StringResolver for AbcResolver<'a> {
 }
 
 fn cmd_info(path: &PathBuf) {
-    let abc = match abcd_parser::AbcFile::open(path.as_path()) {
+    let abc = match abcd_file::AbcFile::open(path.as_path()) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -127,7 +127,7 @@ fn cmd_info(path: &PathBuf) {
 }
 
 fn cmd_disasm(path: &PathBuf) {
-    let abc = match abcd_parser::AbcFile::open(path.as_path()) {
+    let abc = match abcd_file::AbcFile::open(path.as_path()) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -152,7 +152,7 @@ fn cmd_disasm(path: &PathBuf) {
             continue;
         }
 
-        let class = match abcd_parser::class::ClassData::parse(abc.data(), class_off) {
+        let class = match abcd_file::class::ClassData::parse(abc.data(), class_off) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("# Error parsing class at {class_off:#x}: {e}");
@@ -177,8 +177,8 @@ fn cmd_disasm(path: &PathBuf) {
     }
 }
 
-fn disasm_method(abc: &abcd_parser::AbcFile, method_off: u32) {
-    let method = match abcd_parser::method::MethodData::parse(abc.data(), method_off) {
+fn disasm_method(abc: &abcd_file::AbcFile, method_off: u32) {
+    let method = match abcd_file::method::MethodData::parse(abc.data(), method_off) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("# Error parsing method at {method_off:#x}: {e}");
@@ -195,7 +195,7 @@ fn disasm_method(abc: &abcd_parser::AbcFile, method_off: u32) {
         return;
     };
 
-    let code = match abcd_parser::code::CodeData::parse(abc.data(), code_off) {
+    let code = match abcd_file::code::CodeData::parse(abc.data(), code_off) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("    # Error parsing code at {code_off:#x}: {e}");
@@ -249,7 +249,7 @@ fn disasm_method(abc: &abcd_parser::AbcFile, method_off: u32) {
 }
 
 fn format_operand(
-    abc: &abcd_parser::AbcFile,
+    abc: &abcd_file::AbcFile,
     method_off: u32,
     insn_offset: u32,
     op: &abcd_ir::instruction::Operand,
@@ -280,7 +280,7 @@ fn format_operand(
 }
 
 fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
-    let abc = match abcd_parser::AbcFile::open(path.as_path()) {
+    let abc = match abcd_file::AbcFile::open(path.as_path()) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -302,7 +302,7 @@ fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
             continue;
         }
 
-        let class = match abcd_parser::class::ClassData::parse(abc.data(), class_off) {
+        let class = match abcd_file::class::ClassData::parse(abc.data(), class_off) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("// Error parsing class at {class_off:#x}: {e}");
@@ -319,7 +319,7 @@ fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
             .iter()
             .find(|(name, _)| name == "moduleRecordIdx")
             .and_then(|(_, offset)| {
-                abcd_parser::module_record::ModuleRecord::parse(abc.data(), *offset).ok()
+                abcd_file::module_record::ModuleRecord::parse(abc.data(), *offset).ok()
             });
 
         // Generate import statements
@@ -461,12 +461,12 @@ fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
 }
 
 fn decompile_method_to_string(
-    abc: &abcd_parser::AbcFile,
+    abc: &abcd_file::AbcFile,
     resolver: &AbcResolver,
     method_off: u32,
     output: &mut String,
 ) {
-    let method = match abcd_parser::method::MethodData::parse(abc.data(), method_off) {
+    let method = match abcd_file::method::MethodData::parse(abc.data(), method_off) {
         Ok(m) => m,
         Err(e) => {
             output.push_str(&format!(
@@ -480,7 +480,7 @@ fn decompile_method_to_string(
         return; // Skip native/abstract methods
     };
 
-    let code = match abcd_parser::code::CodeData::parse(abc.data(), code_off) {
+    let code = match abcd_file::code::CodeData::parse(abc.data(), code_off) {
         Ok(c) => c,
         Err(e) => {
             output.push_str(&format!("// Error parsing code at {code_off:#x}: {e}\n"));

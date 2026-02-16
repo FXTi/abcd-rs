@@ -1,5 +1,5 @@
 [package]
-name = "abcd-parser"
+name = "abcd-file"
 edition.workspace = true
 version.workspace = true
 
