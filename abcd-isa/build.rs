@@ -5,13 +5,18 @@ use std::path::Path;
 
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
-    let bindings_path = env::var("DEP_ISA_BRIDGE_BINDINGS_RS")
-        .expect("DEP_ISA_BRIDGE_BINDINGS_RS not set — abcd-isa-sys must have links = \"isa_bridge\"");
+    let bindings_path = env::var("DEP_ISA_BRIDGE_BINDINGS_RS").expect(
+        "DEP_ISA_BRIDGE_BINDINGS_RS not set — abcd-isa-sys must have links = \"isa_bridge\"",
+    );
 
     let bindings = fs::read_to_string(&bindings_path).expect("failed to read bindings.rs");
 
     let mut out = Vec::new();
-    writeln!(out, "// Auto-generated safe Emitter methods from abcd-isa-sys bindings.").unwrap();
+    writeln!(
+        out,
+        "// Auto-generated safe Emitter methods from abcd-isa-sys bindings."
+    )
+    .unwrap();
     writeln!(out, "// Do not edit manually.").unwrap();
     writeln!(out).unwrap();
     writeln!(out, "impl Emitter {{").unwrap();
@@ -23,9 +28,15 @@ fn main() {
             continue;
         }
         // Extract: isa_emit_xxx(params)
-        let Some(fn_start) = trimmed.find("isa_emit_") else { continue };
-        let Some(paren_open) = trimmed.find('(') else { continue };
-        let Some(paren_close) = trimmed.rfind(')') else { continue };
+        let Some(fn_start) = trimmed.find("isa_emit_") else {
+            continue;
+        };
+        let Some(paren_open) = trimmed.find('(') else {
+            continue;
+        };
+        let Some(paren_close) = trimmed.rfind(')') else {
+            continue;
+        };
 
         let ffi_name = &trimmed[fn_start..paren_open];
         let rust_name_raw = &ffi_name["isa_emit_".len()..];
@@ -89,7 +100,11 @@ fn main() {
         // Emit doc comment with mnemonic
         let mnemonic = rust_name.replace('_', ".");
         if has_label {
-            writeln!(out, "/// Emit `{mnemonic}` instruction (jump target: [`Label`]).").unwrap();
+            writeln!(
+                out,
+                "/// Emit `{mnemonic}` instruction (jump target: [`Label`])."
+            )
+            .unwrap();
         } else {
             writeln!(out, "/// Emit `{mnemonic}` instruction.").unwrap();
         }

@@ -97,7 +97,9 @@ fn main() {
         .include(&format!("{manifest}/vendor/libpandafile"))
         .include(&format!("{manifest}/vendor/libpandabase"))
         .file(&format!("{manifest}/bridge/isa_bridge.cpp"))
-        .file(&format!("{manifest}/vendor/libpandafile/bytecode_emitter.cpp"))
+        .file(&format!(
+            "{manifest}/vendor/libpandafile/bytecode_emitter.cpp"
+        ))
         .compile("isa_bridge");
 
     // Phase 3: Generate Rust FFI bindings

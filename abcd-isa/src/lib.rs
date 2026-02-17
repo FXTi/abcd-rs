@@ -74,10 +74,18 @@ impl OpcodeFlags {
     pub const THROW: Self = Self(ffi::ISA_FLAG_THROW);
     pub const TWO_SLOT: Self = Self(ffi::ISA_FLAG_TWO_SLOT);
 
-    pub const fn raw(self) -> u32 { self.0 }
-    pub const fn empty() -> Self { Self(0) }
-    pub const fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
-    pub const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
 }
 
 /// Exception type flags.
@@ -89,8 +97,12 @@ impl Exceptions {
     pub const OOM: Self = Self(ffi::ISA_EXC_X_OOM);
     pub const THROW: Self = Self(ffi::ISA_EXC_X_THROW);
 
-    pub const fn raw(self) -> u32 { self.0 }
-    pub const fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
 }
 
 /// Kind of operand in an instruction format.
@@ -320,13 +332,24 @@ impl<'a> Inst<'a> {
         if bytes.len() < size {
             return None;
         }
-        Some(Inst { bytes: &bytes[..size], info })
+        Some(Inst {
+            bytes: &bytes[..size],
+            info,
+        })
     }
 
-    pub fn opcode(&self) -> Opcode { self.info.opcode() }
-    pub fn info(&self) -> OpcodeInfo { self.info }
-    pub fn size(&self) -> usize { self.bytes.len() }
-    pub fn bytes(&self) -> &[u8] { self.bytes }
+    pub fn opcode(&self) -> Opcode {
+        self.info.opcode()
+    }
+    pub fn info(&self) -> OpcodeInfo {
+        self.info
+    }
+    pub fn size(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes
+    }
 
     // Operand extraction
     pub fn vreg(&self, idx: usize) -> u16 {
@@ -476,7 +499,9 @@ pub struct Emitter {
 
 impl Emitter {
     pub fn new() -> Self {
-        Emitter { ptr: unsafe { ffi::isa_emitter_create() } }
+        Emitter {
+            ptr: unsafe { ffi::isa_emitter_create() },
+        }
     }
 
     /// Create a new label for branch targets.
@@ -511,7 +536,9 @@ impl Emitter {
 include!(concat!(env!("OUT_DIR"), "/emitter_methods.rs"));
 
 impl Default for Emitter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Drop for Emitter {
@@ -570,7 +597,12 @@ mod tests {
     fn non_prefixed_opcodes_fit_in_u8() {
         for info in opcode_table() {
             if !info.is_prefixed() {
-                assert!(info.opcode().0 <= 0xFF, "{} has value {:#x} > 0xFF", info.mnemonic(), info.opcode().0);
+                assert!(
+                    info.opcode().0 <= 0xFF,
+                    "{} has value {:#x} > 0xFF",
+                    info.mnemonic(),
+                    info.opcode().0
+                );
             }
         }
     }
@@ -581,7 +613,13 @@ mod tests {
         for info in opcode_table() {
             if info.is_prefixed() {
                 let lo = (info.opcode().0 & 0xFF) as u8;
-                assert!(lo >= min_prefix, "{} has low byte {:#x} < min prefix {:#x}", info.mnemonic(), lo, min_prefix);
+                assert!(
+                    lo >= min_prefix,
+                    "{} has low byte {:#x} < min prefix {:#x}",
+                    info.mnemonic(),
+                    lo,
+                    min_prefix
+                );
             }
         }
     }
@@ -621,7 +659,10 @@ mod tests {
     fn version_by_api_returns_some_for_current() {
         let ver = current_version();
         let result = version_by_api(ver.0[0]);
-        assert!(result.is_some(), "current API level should map to a version");
+        assert!(
+            result.is_some(),
+            "current API level should map to a version"
+        );
     }
 
     #[test]
@@ -726,7 +767,11 @@ mod tests {
     #[test]
     fn namespace_is_nonempty() {
         for info in opcode_table() {
-            assert!(!info.namespace().is_empty(), "{} has empty namespace", info.mnemonic());
+            assert!(
+                !info.namespace().is_empty(),
+                "{} has empty namespace",
+                info.mnemonic()
+            );
         }
     }
 
