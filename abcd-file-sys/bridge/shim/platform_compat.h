@@ -27,7 +27,7 @@
 
 inline constexpr int __builtin_clz(unsigned int x) {
     int n = 32;
-    unsigned int y;
+    unsigned int y = 0;
     y = x >> 16; if (y != 0) { n -= 16; x = y; }
     y = x >> 8;  if (y != 0) { n -= 8;  x = y; }
     y = x >> 4;  if (y != 0) { n -= 4;  x = y; }
