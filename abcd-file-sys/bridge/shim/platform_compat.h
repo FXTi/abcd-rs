@@ -11,6 +11,10 @@
 #if defined(_MSC_VER) && !defined(__clang__)
 
 #include <intrin.h>
+#include <cstdint>
+
+// POSIX ssize_t — not defined by MSVC
+typedef intptr_t ssize_t;
 
 // GCC/Clang branch-prediction hints — no-op on MSVC
 #define __builtin_expect(expr, val) (expr)
