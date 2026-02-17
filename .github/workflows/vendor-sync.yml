@@ -7,6 +7,11 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   sync:
@@ -19,6 +24,7 @@ jobs:
           ruby-version: '3.2'
 
       - name: Run vendor sync
+        id: sync
         run: ruby abcd-isa-sys/vendor-sync.rb -v --force
 
       - name: Check for changes
@@ -29,6 +35,18 @@ jobs:
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Install Rust toolchain
+        if: steps.diff.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo build
+        if: steps.diff.outputs.changed == 'true'
+        run: cargo build
+
+      - name: cargo test
+        if: steps.diff.outputs.changed == 'true'
+        run: cargo test
 
       - name: Create PR
         if: steps.diff.outputs.changed == 'true'
@@ -44,5 +62,34 @@ jobs:
           git push -u origin "$branch"
           gh pr create \
             --title "chore: sync vendor files from upstream" \
-            --body "Automated daily sync from arkcompiler_runtime_core master branch." \
+            --body "Automated daily sync from arkcompiler_runtime_core master branch. Build & test passed on ubuntu-latest." \
             --label "vendor-sync"
+
+      - name: Create issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Skip if a matching open issue already exists
+          existing=$(gh issue list --label "vendor-sync" --state open --limit 1 --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" \
+              --body "Still failing as of $(date -u +%Y-%m-%dT%H:%M:%SZ). [Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            exit 0
+          fi
+          gh issue create \
+            --title "vendor-sync: upstream sync failed" \
+            --label "vendor-sync" \
+            --body "$(cat <<'BODY'
+          Automated vendor sync encountered an error.
+
+          **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Possible causes:
+          - Upstream repo unreachable or files moved/deleted
+          - Upstream changes break the build
+          - Upstream changes break tests
+
+          Please investigate the run log above.
+          BODY
+          )"
