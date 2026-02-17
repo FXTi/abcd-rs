@@ -46,34 +46,14 @@ impl Format {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpcodeFlags(u32);
 
-impl OpcodeFlags {
-    pub const ACC_NONE: Self = Self(ffi::ISA_FLAG_ACC_NONE);
-    pub const ACC_READ: Self = Self(ffi::ISA_FLAG_ACC_READ);
-    pub const ACC_WRITE: Self = Self(ffi::ISA_FLAG_ACC_WRITE);
-    pub const CONDITIONAL: Self = Self(ffi::ISA_FLAG_CONDITIONAL);
-    pub const CONDITIONAL_THROW: Self = Self(ffi::ISA_FLAG_CONDITIONAL_THROW);
-    pub const DYNAMIC: Self = Self(ffi::ISA_FLAG_DYNAMIC);
-    pub const EIGHT_BIT_IC: Self = Self(ffi::ISA_FLAG_EIGHT_BIT_IC);
-    pub const EIGHT_SIXTEEN_BIT_IC: Self = Self(ffi::ISA_FLAG_EIGHT_SIXTEEN_BIT_IC);
-    pub const FLOAT: Self = Self(ffi::ISA_FLAG_FLOAT);
-    pub const IC_SLOT: Self = Self(ffi::ISA_FLAG_IC_SLOT);
-    pub const JIT_IC_SLOT: Self = Self(ffi::ISA_FLAG_JIT_IC_SLOT);
-    pub const JUMP: Self = Self(ffi::ISA_FLAG_JUMP);
-    pub const LANGUAGE_TYPE: Self = Self(ffi::ISA_FLAG_LANGUAGE_TYPE);
-    pub const LITERALARRAY_ID: Self = Self(ffi::ISA_FLAG_LITERALARRAY_ID);
-    pub const MAYBE_DYNAMIC: Self = Self(ffi::ISA_FLAG_MAYBE_DYNAMIC);
-    pub const METHOD_ID: Self = Self(ffi::ISA_FLAG_METHOD_ID);
-    pub const NO_SIDE_EFFECT: Self = Self(ffi::ISA_FLAG_NO_SIDE_EFFECT);
-    pub const ONE_SLOT: Self = Self(ffi::ISA_FLAG_ONE_SLOT);
-    pub const RANGE_0: Self = Self(ffi::ISA_FLAG_RANGE_0);
-    pub const RANGE_1: Self = Self(ffi::ISA_FLAG_RANGE_1);
-    pub const RETURN: Self = Self(ffi::ISA_FLAG_RETURN);
-    pub const SIXTEEN_BIT_IC: Self = Self(ffi::ISA_FLAG_SIXTEEN_BIT_IC);
-    pub const STRING_ID: Self = Self(ffi::ISA_FLAG_STRING_ID);
-    /// Synthetic flag: instruction's primary role is to throw (bit 31).
-    pub const THROW: Self = Self(ffi::ISA_FLAG_THROW);
-    pub const TWO_SLOT: Self = Self(ffi::ISA_FLAG_TWO_SLOT);
+/// Exception type flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exceptions(u32);
 
+// Generated OpcodeFlags and Exceptions constants from ISA bindings.
+include!(concat!(env!("OUT_DIR"), "/flag_constants.rs"));
+
+impl OpcodeFlags {
     pub const fn raw(self) -> u32 {
         self.0
     }
@@ -88,15 +68,7 @@ impl OpcodeFlags {
     }
 }
 
-/// Exception type flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Exceptions(u32);
-
 impl Exceptions {
-    pub const NONE: Self = Self(ffi::ISA_EXC_X_NONE);
-    pub const OOM: Self = Self(ffi::ISA_EXC_X_OOM);
-    pub const THROW: Self = Self(ffi::ISA_EXC_X_THROW);
-
     pub const fn raw(self) -> u32 {
         self.0
     }

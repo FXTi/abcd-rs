@@ -121,6 +121,70 @@ fn main() {
     let out_path = Path::new(&out_dir).join("emitter_methods.rs");
     fs::write(&out_path, out).expect("failed to write emitter_methods.rs");
 
+    // --- Generate flag_constants.rs (OpcodeFlags + Exceptions constants) ---
+    let mut flags: Vec<(String, String)> = Vec::new(); // (rust_name, ffi_const_name)
+    let mut exceptions: Vec<(String, String)> = Vec::new();
+
+    for line in bindings.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("pub const ISA_FLAG_") {
+            if let Some(colon) = rest.find(':') {
+                let suffix = &rest[..colon];
+                let ffi_name = format!("ISA_FLAG_{suffix}");
+                flags.push((suffix.to_string(), ffi_name));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("pub const ISA_EXC_") {
+            if let Some(colon) = rest.find(':') {
+                let suffix = &rest[..colon];
+                let ffi_name = format!("ISA_EXC_{suffix}");
+                let rust_name = suffix.strip_prefix("X_").unwrap_or(suffix);
+                exceptions.push((rust_name.to_string(), ffi_name));
+            }
+        }
+    }
+
+    flags.sort_by(|a, b| a.0.cmp(&b.0));
+    flags.dedup_by(|a, b| a.0 == b.0);
+    exceptions.sort_by(|a, b| a.0.cmp(&b.0));
+    exceptions.dedup_by(|a, b| a.0 == b.0);
+
+    let mut fc = Vec::new();
+    writeln!(
+        fc,
+        "// Auto-generated from abcd-isa-sys bindings. Do not edit."
+    )
+    .unwrap();
+    writeln!(fc).unwrap();
+    writeln!(fc, "impl OpcodeFlags {{").unwrap();
+    for (rust_name, ffi_name) in &flags {
+        if rust_name == "THROW" {
+            writeln!(
+                fc,
+                "    /// Synthetic flag: instruction's primary role is to throw (bit 31)."
+            )
+            .unwrap();
+        }
+        writeln!(
+            fc,
+            "    pub const {rust_name}: Self = Self(ffi::{ffi_name});"
+        )
+        .unwrap();
+    }
+    writeln!(fc, "}}").unwrap();
+    writeln!(fc).unwrap();
+    writeln!(fc, "impl Exceptions {{").unwrap();
+    for (rust_name, ffi_name) in &exceptions {
+        writeln!(
+            fc,
+            "    pub const {rust_name}: Self = Self(ffi::{ffi_name});"
+        )
+        .unwrap();
+    }
+    writeln!(fc, "}}").unwrap();
+
+    let fc_path = Path::new(&out_dir).join("flag_constants.rs");
+    fs::write(&fc_path, fc).expect("failed to write flag_constants.rs");
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={bindings_path}");
     println!("cargo:rerun-if-env-changed=DEP_ISA_BRIDGE_BINDINGS_RS");
