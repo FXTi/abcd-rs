@@ -17,6 +17,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn open_close() {
         let data = load_test_abc();
         unsafe {
@@ -27,6 +28,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn header_info() {
         let data = load_test_abc();
         unsafe {
@@ -47,6 +49,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn class_accessor() {
         let data = load_test_abc();
         unsafe {
@@ -72,6 +75,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn method_and_code_accessor() {
         let data = load_test_abc();
         unsafe {
@@ -136,6 +140,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn string_access() {
         let data = load_test_abc();
         unsafe {
@@ -189,6 +194,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn field_accessor() {
         let data = load_test_abc();
         unsafe {
@@ -241,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn literal_accessor() {
         let data = load_test_abc();
         unsafe {
@@ -262,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn debug_info_extractor() {
         let data = load_test_abc();
         unsafe {
@@ -327,6 +335,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn module_accessor() {
         let data = load_test_abc();
         unsafe {

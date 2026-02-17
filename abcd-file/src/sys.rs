@@ -539,6 +539,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn sys_file_open_and_header() {
         let data = test_abc_data();
         let f = SysFile::open(data).unwrap();
@@ -550,6 +551,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn sys_class_accessor() {
         let data = test_abc_data();
         let f = SysFile::open(data).unwrap();
@@ -565,6 +567,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn sys_method_accessor() {
         let data = test_abc_data();
         let f = SysFile::open(data).unwrap();
@@ -588,6 +591,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn sys_cross_validate_class_count() {
         let data = test_abc_data();
         let abc = crate::AbcFile::parse(data.clone()).unwrap();
@@ -597,6 +601,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires proprietary modules.abc"]
     fn sys_cross_validate_method_names() {
         let data = test_abc_data();
         let abc = crate::AbcFile::parse(data.clone()).unwrap();
