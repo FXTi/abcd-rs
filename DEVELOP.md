@@ -11,15 +11,25 @@ ArkCompiler ABC 字节码工具链的 Rust 实现。
 
 ## Crate 分工
 
+### abcd-isa-sys — C FFI 绑定
+
+底层 `-sys` crate，通过 Ruby 代码生成 + C++ bridge + bindgen 暴露原始 C 函数和静态表：
+
+- Ruby 管线从 `isa.yaml` 生成 8 个 C/C++ 头文件
+- C bridge (`isa_bridge.h/cpp`) 封装 vendor `BytecodeInst` 和 `BytecodeEmitter`
+- bindgen 生成 Rust FFI 绑定
+- 暴露 40+ 静态函数 + 326 个 per-mnemonic emit 函数 + 5 个元数据静态表
+
 ### abcd-isa — 指令集架构
 
-单条指令粒度的一切：
+单条指令粒度的一切（安全 Rust API，基于 abcd-isa-sys）：
 
-- Opcode 定义、格式、操作数类型（从 vendor isa.yaml 生成）
-- 字节码解码：`decode_opcode()`、operand 提取（`get_vreg`/`get_imm64`/`get_id`）
-- 字节码编码：`Emitter`（封装 vendor BytecodeEmitter）
-- 反汇编：`format_instruction()`
-- ISA 版本元数据：`current_version()`、`min_version()`、`version_by_api()`、`is_version_compatible()`
+- `OpcodeInfo` — 零分配 `Copy` 句柄，O(1) 元数据查询
+- `Inst` — 已解码指令引用，bounds-checked 操作数提取
+- `decode()` / `lookup()` — 字节码解码和 opcode 查找
+- `Emitter` — 字节码汇编器（per-mnemonic 安全 emit 方法）
+- `OpcodeFlags` / `Exceptions` — 位掩码类型，支持 `BitOr`/`BitAnd`/`Not`
+- `AbcVersion` — 版本管理：`current_version()`、`min_version()`、`version_by_api()`、`is_version_compatible()`
 
 不负责决定"该用哪个 opcode"——只忠实编码调用者给它的任何 opcode。
 
@@ -63,6 +73,8 @@ IR → 源码的完整管线：
 ## 依赖图
 
 ```
+abcd-isa-sys
+  ↑
 abcd-isa
   ↑
   ├── abcd-file
@@ -89,7 +101,8 @@ arkcompiler ISA 的 opcode 没有 per-opcode 版本标注。es2panda 在编译�
 
 | Crate | 读/解码 | 写/编码 |
 |---|---|---|
-| abcd-isa | ✅ 解码 + 反汇编 | ✅ Emitter + 版本 API |
+| abcd-isa-sys | ✅ C FFI 绑定 | ✅ Emitter FFI |
+| abcd-isa | ✅ 解码 + 元数据 + 反汇编 | ✅ Emitter + 版本 API |
 | abcd-file | ✅ 完整解析 | ❌ AbcFileBuilder 待实现 |
 | abcd-ir | ✅ 指令/表达式/语句/CFG | ❌ IR lowering 待实现 |
 | abcd-decompiler | ✅ 部分反编译 | — |

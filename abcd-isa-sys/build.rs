@@ -129,6 +129,9 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header(&wrapper_h)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .allowlist_function("isa_.*")
+        .allowlist_type("Isa.*")
+        .allowlist_var("ISA_.*")
         .generate()
         .expect("bindgen failed");
 
@@ -142,27 +145,41 @@ fn main() {
 
     // rerun-if-changed
     for path in &[
+        // Bridge sources
         "bridge/isa_bridge.h",
         "bridge/isa_bridge.cpp",
         "bridge/shim/securec.h",
         "bridge/shim/file.h",
         "bridge/shim/platform_compat.h",
-        "vendor/isa/isa.yaml",
-        "vendor/libpandafile/bytecode_instruction.h",
-        "vendor/libpandafile/bytecode_instruction-inl.h",
-        "vendor/libpandafile/bytecode_emitter.h",
-        "vendor/libpandafile/bytecode_emitter.cpp",
-        "vendor/libpandabase/macros.h",
-        "vendor/libpandabase/utils/span.h",
-        "vendor/libpandabase/utils/bit_utils.h",
+        // Our ERB templates
         "templates/isa_bridge_tables.h.erb",
         "templates/isa_bridge_emitter.h.erb",
         "templates/isa_bridge_emitter_decl.h.erb",
+        // Vendor: Ruby codegen scripts
+        "vendor/isa/gen.rb",
+        "vendor/isa/isapi.rb",
+        "vendor/isa/combine.rb",
+        "vendor/isa/isa.yaml",
+        "vendor/libpandafile/pandafile_isapi.rb",
+        // Vendor: ERB templates
         "vendor/libpandafile/templates/bytecode_instruction_enum_gen.h.erb",
         "vendor/libpandafile/templates/bytecode_instruction-inl_gen.h.erb",
         "vendor/libpandafile/templates/bytecode_emitter_def_gen.h.erb",
         "vendor/libpandafile/templates/bytecode_emitter_gen.h.erb",
         "vendor/libpandafile/templates/file_format_version.h.erb",
+        // Vendor: C/C++ sources
+        "vendor/libpandafile/bytecode_instruction.h",
+        "vendor/libpandafile/bytecode_instruction-inl.h",
+        "vendor/libpandafile/bytecode_emitter.h",
+        "vendor/libpandafile/bytecode_emitter.cpp",
+        "vendor/libpandabase/macros.h",
+        "vendor/libpandabase/globals.h",
+        "vendor/libpandabase/panda_visibility.h",
+        "vendor/libpandabase/utils/debug.h",
+        "vendor/libpandabase/utils/bit_helpers.h",
+        "vendor/libpandabase/utils/bit_utils.h",
+        "vendor/libpandabase/utils/span.h",
+        "vendor/libpandabase/os/stacktrace.h",
     ] {
         println!("cargo:rerun-if-changed={manifest}/{path}");
     }

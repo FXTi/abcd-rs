@@ -8,7 +8,7 @@ pub fn decode_method(code: &[u8]) -> Vec<Instruction> {
 
     while (offset as usize) < code.len() {
         let bytes = &code[offset as usize..];
-        let Some((opcode, info)) = abcd_isa::decode(bytes) else {
+        let Ok((opcode, info)) = abcd_isa::decode(bytes) else {
             // Unknown opcode - skip one byte
             log::warn!("Unknown opcode at offset {offset:#x}: {:#04x}", bytes[0]);
             offset += 1;
@@ -35,33 +35,61 @@ fn decode_operands(bytes: &[u8], info: OpcodeInfo) -> Vec<Operand> {
     let mut operands = Vec::new();
 
     for part in info.operands() {
-        let byte_offset = part.byte_offset;
-        match part.kind {
+        let byte_offset = part.byte_offset();
+        match part.kind() {
             abcd_isa::OperandKind::Reg => {
-                let val = read_uint(bytes, byte_offset, part.bit_width, part.bit_offset_in_byte);
+                let val = read_uint(
+                    bytes,
+                    byte_offset,
+                    part.bit_width(),
+                    part.bit_offset_in_byte(),
+                );
                 operands.push(Operand::Reg(val as u16));
             }
             abcd_isa::OperandKind::Imm => {
-                if part.is_jump {
-                    let val = read_int(bytes, byte_offset, part.bit_width, part.bit_offset_in_byte);
+                if part.is_jump() {
+                    let val = read_int(
+                        bytes,
+                        byte_offset,
+                        part.bit_width(),
+                        part.bit_offset_in_byte(),
+                    );
                     operands.push(Operand::JumpOffset(val as i32));
-                } else if part.is_float {
-                    let bits =
-                        read_uint(bytes, byte_offset, part.bit_width, part.bit_offset_in_byte);
+                } else if part.is_float() {
+                    let bits = read_uint(
+                        bytes,
+                        byte_offset,
+                        part.bit_width(),
+                        part.bit_offset_in_byte(),
+                    );
                     operands.push(Operand::FloatImm(f64::from_bits(bits)));
-                } else if part.bit_width >= 32 {
+                } else if part.bit_width() >= 32 {
                     // 32-bit+ immediates may be signed (e.g. ldai)
-                    let val = read_int(bytes, byte_offset, part.bit_width, part.bit_offset_in_byte);
+                    let val = read_int(
+                        bytes,
+                        byte_offset,
+                        part.bit_width(),
+                        part.bit_offset_in_byte(),
+                    );
                     operands.push(Operand::Imm(val));
                 } else {
                     // 4/8/16-bit immediates are unsigned (IC slots, counts, indices)
-                    let val =
-                        read_uint(bytes, byte_offset, part.bit_width, part.bit_offset_in_byte);
+                    let val = read_uint(
+                        bytes,
+                        byte_offset,
+                        part.bit_width(),
+                        part.bit_offset_in_byte(),
+                    );
                     operands.push(Operand::Imm(val as i64));
                 }
             }
             abcd_isa::OperandKind::Id => {
-                let val = read_uint(bytes, byte_offset, part.bit_width, part.bit_offset_in_byte);
+                let val = read_uint(
+                    bytes,
+                    byte_offset,
+                    part.bit_width(),
+                    part.bit_offset_in_byte(),
+                );
                 operands.push(Operand::EntityId(val as u32));
             }
         }

@@ -10,7 +10,7 @@
 using Inst = panda::BytecodeInst<panda::BytecodeInstMode::FAST>;
 
 /* Helper: construct a BytecodeInst from an opcode value (for opcode-only queries) */
-static Inst make_inst(IsaOpcode opcode, uint8_t buf[2]) {
+static Inst make_inst(uint16_t opcode, uint8_t buf[2]) {
     uint8_t lo = opcode & 0xFF;
     if (lo >= Inst::GetMinPrefixOpcodeIndex()) {
         buf[0] = lo;
@@ -69,26 +69,27 @@ static size_t find_opcode_index(uint16_t opcode) {
 
 extern "C" {
 
-IsaOpcode isa_decode_opcode(const uint8_t* bytes, size_t len) {
-    if (len == 0) return 0xFFFF;
+size_t isa_decode_index(const uint8_t* bytes, size_t len) {
+    if (len == 0) return SIZE_MAX;
     if (bytes[0] >= Inst::GetMinPrefixOpcodeIndex() && len < 2) {
-        return 0xFFFF;
+        return SIZE_MAX;
     }
     Inst inst(bytes);
-    auto opcode = inst.GetOpcode();
-    return static_cast<IsaOpcode>(opcode);
+    auto opcode = static_cast<uint16_t>(inst.GetOpcode());
+    size_t idx = find_opcode_index(opcode);
+    return idx < ISA_MNEMONIC_TABLE_SIZE ? idx : SIZE_MAX;
 }
 
-IsaFormat isa_get_format(IsaOpcode opcode) {
+uint8_t isa_get_format(uint16_t opcode) {
     auto fmt = Inst::GetFormat(static_cast<Inst::Opcode>(opcode));
-    return static_cast<IsaFormat>(fmt);
+    return static_cast<uint8_t>(fmt);
 }
 
-size_t isa_get_size(IsaFormat format) {
+size_t isa_get_size(uint8_t format) {
     return Inst::Size(static_cast<Inst::Format>(format));
 }
 
-int isa_is_prefixed(IsaOpcode opcode) {
+int isa_is_prefixed(uint16_t opcode) {
     return (opcode & 0xFF) >= Inst::GetMinPrefixOpcodeIndex() ? 1 : 0;
 }
 
@@ -107,95 +108,25 @@ uint32_t isa_get_id(const uint8_t* bytes, size_t idx) {
     return inst.GetId(idx).AsRawValue();
 }
 
-int isa_has_vreg(IsaFormat format, size_t idx) {
+int isa_has_vreg(uint8_t format, size_t idx) {
     return Inst::HasVReg(static_cast<Inst::Format>(format), idx) ? 1 : 0;
 }
 
-int isa_has_imm(IsaFormat format, size_t idx) {
+int isa_has_imm(uint8_t format, size_t idx) {
     return Inst::HasImm(static_cast<Inst::Format>(format), idx) ? 1 : 0;
 }
 
-int isa_has_id(IsaFormat format, size_t idx) {
+int isa_has_id(uint8_t format, size_t idx) {
     return Inst::HasId(static_cast<Inst::Format>(format), idx) ? 1 : 0;
 }
 
-const char* isa_get_mnemonic(IsaOpcode opcode) {
-    size_t idx = find_opcode_index(opcode);
-    if (idx >= ISA_MNEMONIC_TABLE_SIZE) return nullptr;
-    return ISA_MNEMONIC_TABLE[idx].mnemonic;
-}
-
-uint32_t isa_get_flags(IsaOpcode opcode) {
-    size_t idx = find_opcode_index(opcode);
-    if (idx >= ISA_FLAGS_TABLE_SIZE) return 0;
-    return ISA_FLAGS_TABLE[idx].flags;
-}
-
-uint32_t isa_get_exceptions(IsaOpcode opcode) {
-    size_t idx = find_opcode_index(opcode);
-    if (idx >= ISA_EXCEPTIONS_TABLE_SIZE) return 0;
-    return ISA_EXCEPTIONS_TABLE[idx].exceptions;
-}
-
-const char* isa_get_namespace(IsaOpcode opcode) {
-    size_t idx = find_opcode_index(opcode);
-    if (idx >= ISA_NAMESPACE_TABLE_SIZE) return nullptr;
-    return ISA_NAMESPACE_TABLE[idx].ns;
-}
-
-int isa_is_jump(IsaOpcode opcode) {
-    return (isa_get_flags(opcode) & ISA_FLAG_JUMP) ? 1 : 0;
-}
-
-int isa_is_conditional(IsaOpcode opcode) {
-    return (isa_get_flags(opcode) & ISA_FLAG_CONDITIONAL) ? 1 : 0;
-}
-
-int isa_is_return(IsaOpcode opcode) {
-    return (isa_get_flags(opcode) & ISA_FLAG_RETURN) ? 1 : 0;
-}
-
-int isa_is_throw(IsaOpcode opcode) {
-    uint8_t buf[2];
-    auto inst = make_inst(opcode, buf);
-    return inst.IsThrow(Inst::Exceptions::X_THROW) ? 1 : 0;
-}
-
-int isa_is_range(IsaOpcode opcode) {
+int isa_is_range(uint16_t opcode) {
     uint8_t buf[2];
     auto inst = make_inst(opcode, buf);
     return inst.IsRangeInstruction() ? 1 : 0;
 }
 
-struct IsaOperandBrief isa_get_operand_info(IsaOpcode opcode) {
-    struct IsaOperandBrief result = {0, 0, 0};
-    size_t idx = find_opcode_index(opcode);
-    if (idx < ISA_OPERANDS_TABLE_SIZE) {
-        result.num_operands = ISA_OPERANDS_TABLE[idx].num_operands;
-        result.acc_read = ISA_OPERANDS_TABLE[idx].acc_read;
-        result.acc_write = ISA_OPERANDS_TABLE[idx].acc_write;
-    }
-    return result;
-}
-
-size_t isa_opcode_count(void) {
-    return ISA_TOTAL_OPCODES;
-}
-
-size_t isa_format_instruction(const uint8_t* bytes, size_t len,
-                               char* buf, size_t buf_len) {
-    if (len == 0 || buf_len == 0) return 0;
-    Inst inst(bytes);
-    std::ostringstream oss;
-    oss << inst;
-    std::string s = oss.str();
-    size_t copy_len = s.size() < buf_len - 1 ? s.size() : buf_len - 1;
-    std::memcpy(buf, s.c_str(), copy_len);
-    buf[copy_len] = '\0';
-    return copy_len;
-}
-
-int isa_is_suspend(IsaOpcode opcode) {
+int isa_is_suspend(uint16_t opcode) {
     uint8_t buf[2];
     auto inst = make_inst(opcode, buf);
     return inst.HasFlag(Inst::Flags::SUSPEND) ? 1 : 0;
@@ -214,6 +145,19 @@ int isa_is_terminator(const uint8_t* bytes) {
 int isa_is_return_or_throw(const uint8_t* bytes) {
     Inst inst(bytes);
     return inst.IsReturnOrThrowInstruction() ? 1 : 0;
+}
+
+size_t isa_format_instruction(const uint8_t* bytes, size_t len,
+                               char* buf, size_t buf_len) {
+    if (len == 0 || buf_len == 0) return 0;
+    Inst inst(bytes);
+    std::ostringstream oss;
+    oss << inst;
+    std::string s = oss.str();
+    size_t copy_len = s.size() < buf_len - 1 ? s.size() : buf_len - 1;
+    std::memcpy(buf, s.c_str(), copy_len);
+    buf[copy_len] = '\0';
+    return copy_len;
 }
 
 /* === Constants and prefix queries === */

@@ -6,24 +6,15 @@
 extern "C" {
 #endif
 
-/* === Types === */
-typedef uint16_t IsaOpcode;
-typedef uint8_t  IsaFormat;
-
 /* === Constants === */
-
-/* Sentinel returned by isa_decode_opcode on failure. */
-#define ISA_INVALID_OPCODE 0xFFFFU
 
 /* Operand kind values (matches IsaOperandInfo.kind in generated tables). */
 #define ISA_OPERAND_KIND_REG 0U
 #define ISA_OPERAND_KIND_IMM 1U
-#define ISA_OPERAND_KIND_ID  2U
 
 /* Emitter build result codes. */
 #define ISA_EMITTER_OK             0U
 #define ISA_EMITTER_INTERNAL_ERROR 1U
-#define ISA_EMITTER_UNBOUND_LABELS 2U
 
 /* Synthetic flag: instruction's primary role is to throw.
  * Not part of the generated ISA_FLAG_* set; occupies bit 31. */
@@ -31,17 +22,18 @@ typedef uint8_t  IsaFormat;
 
 /* === Decoding === */
 
-/* Decode opcode from byte stream. Returns ISA_INVALID_OPCODE on failure. */
-IsaOpcode isa_decode_opcode(const uint8_t* bytes, size_t len);
+/* Decode opcode and return its index in ISA_MNEMONIC_TABLE.
+ * Returns SIZE_MAX on failure. */
+size_t isa_decode_index(const uint8_t* bytes, size_t len);
 
 /* Get instruction format for an opcode. */
-IsaFormat isa_get_format(IsaOpcode opcode);
+uint8_t isa_get_format(uint16_t opcode);
 
 /* Get instruction size in bytes. */
-size_t isa_get_size(IsaFormat format);
+size_t isa_get_size(uint8_t format);
 
 /* Check if opcode is prefixed (2-byte opcode). */
-int isa_is_prefixed(IsaOpcode opcode);
+int isa_is_prefixed(uint16_t opcode);
 
 /* === Operand extraction === */
 
@@ -55,47 +47,18 @@ int64_t isa_get_imm64(const uint8_t* bytes, size_t idx);
 uint32_t isa_get_id(const uint8_t* bytes, size_t idx);
 
 /* Query if format has vreg/imm/id at index. */
-int isa_has_vreg(IsaFormat format, size_t idx);
-int isa_has_imm(IsaFormat format, size_t idx);
-int isa_has_id(IsaFormat format, size_t idx);
+int isa_has_vreg(uint8_t format, size_t idx);
+int isa_has_imm(uint8_t format, size_t idx);
+int isa_has_id(uint8_t format, size_t idx);
 
-/* === Metadata (from generated tables) === */
-
-/* Get mnemonic string for opcode. Returns NULL if unknown. */
-const char* isa_get_mnemonic(IsaOpcode opcode);
-
-/* Get flags bitmask for opcode. */
-uint32_t isa_get_flags(IsaOpcode opcode);
-
-/* Get exceptions bitmask for opcode. */
-uint32_t isa_get_exceptions(IsaOpcode opcode);
-
-/* Get namespace string for opcode. */
-const char* isa_get_namespace(IsaOpcode opcode);
-
-/* Classification helpers */
-int isa_is_jump(IsaOpcode opcode);
-int isa_is_conditional(IsaOpcode opcode);
-int isa_is_return(IsaOpcode opcode);
-int isa_is_throw(IsaOpcode opcode);
-int isa_is_range(IsaOpcode opcode);
-int isa_is_suspend(IsaOpcode opcode);
+/* === Classification === */
+int isa_is_range(uint16_t opcode);
+int isa_is_suspend(uint16_t opcode);
 
 /* Classification from bytecode (delegates to upstream generated methods) */
 int isa_can_throw(const uint8_t* bytes);
 int isa_is_terminator(const uint8_t* bytes);
 int isa_is_return_or_throw(const uint8_t* bytes);
-
-/* Get operand info for opcode */
-struct IsaOperandBrief {
-    uint8_t num_operands;
-    uint8_t acc_read;
-    uint8_t acc_write;
-};
-struct IsaOperandBrief isa_get_operand_info(IsaOpcode opcode);
-
-/* === Counts === */
-size_t isa_opcode_count(void);
 
 /* === Constants and prefix queries === */
 uint8_t isa_min_prefix_opcode(void);

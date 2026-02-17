@@ -52,11 +52,13 @@ struct IsaFlagsEntry {
 extern const struct IsaFlagsEntry ISA_FLAGS_TABLE[] = {
 <% Panda.instructions.each do |insn| -%>
 <%   bits = insn.properties.select { |p| !p.nil? && !p.empty? }.map { |p| "ISA_FLAG_#{p.upcase}" } -%>
+<%   if insn.respond_to?(:exceptions) && insn.exceptions&.include?('x_throw') -%>
+<%     bits << "ISA_FLAG_THROW" -%>
+<%   end -%>
 <%   flags_str = bits.empty? ? "0" : bits.join(" | ") -%>
     { <%= "0x%04x" % insn.opcode_idx %>, <%= flags_str %> },
 <% end -%>
 };
-static const size_t ISA_FLAGS_TABLE_SIZE = <%= Panda.instructions.size %>;
 
 /* === Opcode → Exceptions bitmask table === */
 <%
@@ -89,7 +91,6 @@ extern const struct IsaExceptionsEntry ISA_EXCEPTIONS_TABLE[] = {
     { <%= "0x%04x" % insn.opcode_idx %>, <%= exc_str %> },
 <% end -%>
 };
-static const size_t ISA_EXCEPTIONS_TABLE_SIZE = <%= Panda.instructions.size %>;
 
 /* === Opcode → Namespace table === */
 
@@ -103,7 +104,6 @@ extern const struct IsaNamespaceEntry ISA_NAMESPACE_TABLE[] = {
     { <%= "0x%04x" % insn.opcode_idx %>, "<%= insn.namespace %>" },
 <% end -%>
 };
-static const size_t ISA_NAMESPACE_TABLE_SIZE = <%= Panda.instructions.size %>;
 
 /* === Opcode → Operand info table === */
 
@@ -142,13 +142,8 @@ extern const struct IsaOpcodeOperands ISA_OPERANDS_TABLE[] = {
     } },
 <% end -%>
 };
-static const size_t ISA_OPERANDS_TABLE_SIZE = <%= Panda.instructions.size %>;
 
-/* === Total counts and prefix metadata === */
-#define ISA_TOTAL_OPCODES       <%= Panda.instructions.size %>U
-#define ISA_TOTAL_FORMATS       <%= Panda.formats.size %>U
-#define ISA_TOTAL_PREFIXES      <%= Panda.prefixes.size %>U
-#define ISA_MIN_PREFIX_OPCODE   <%= Panda.prefixes.map(&:opcode_idx).min %>U
+/* === Prefix metadata === */
 #define ISA_PREFIX_COUNT        <%= Panda.prefixes.size %>U
 
 struct IsaPrefixEntry {

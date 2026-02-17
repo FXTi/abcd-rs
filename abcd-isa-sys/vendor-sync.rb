@@ -3,7 +3,12 @@
 
 # abcd-isa-sys/vendor-sync.rb — Sync vendored arkcompiler files from upstream
 #
-# Usage: ruby abcd-isa-sys/vendor-sync.rb [--dry-run] [--force] [--verbose]
+# Usage: ruby abcd-isa-sys/vendor-sync.rb [options]
+#   -n, --dry-run       Show changes without writing files
+#   -f, --force         Overwrite locally modified vendor files
+#       --check-local   Check for local modifications only (no network)
+#   -v, --verbose       Verbose output
+#   -h, --help          Show help
 
 require 'optparse'
 require 'fileutils'
