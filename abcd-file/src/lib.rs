@@ -1,4 +1,4 @@
-//! ABC binary file format parser for ArkCompiler bytecode files.
+//! ABC binary file format parser and writer for ArkCompiler bytecode files.
 
 pub mod annotation;
 pub mod class;
@@ -13,6 +13,8 @@ pub mod method;
 pub mod module_record;
 pub mod mutf8;
 pub mod string_table;
+pub mod sys;
+pub mod writer;
 
 use error::ParseError;
 use header::Header;

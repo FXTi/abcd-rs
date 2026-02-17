@@ -1,0 +1,11 @@
+[package]
+name = "abcd-file-sys"
+edition.workspace = true
+version.workspace = true
+links = "file_bridge"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+bindgen = "0.71"

@@ -28,10 +28,19 @@ dependencies = [
 name = "abcd-file"
 version = "0.1.0"
 dependencies = [
+ "abcd-file-sys",
  "abcd-isa",
  "log",
  "memmap2",
  "thiserror",
+]
+
+[[package]]
+name = "abcd-file-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+ "cc",
 ]
 
 [[package]]

@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 abcd-isa = { workspace = true }
+abcd-file-sys = { workspace = true }
 thiserror = { workspace = true }
 memmap2 = { workspace = true }
 log = { workspace = true }
