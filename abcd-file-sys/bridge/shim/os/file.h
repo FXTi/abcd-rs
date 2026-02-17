@@ -5,6 +5,7 @@
 #ifndef LIBPANDABASE_OS_FILE_H
 #define LIBPANDABASE_OS_FILE_H
 
+#include <cstdint>
 #include <cstdio>
 #include <string>
 
