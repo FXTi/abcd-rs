@@ -185,6 +185,118 @@ fn main() {
     let fc_path = Path::new(&out_dir).join("flag_constants.rs");
     fs::write(&fc_path, fc).expect("failed to write flag_constants.rs");
 
+    // --- Generate roundtrip_tests.rs (test dispatch for every emitter method) ---
+    let mut rt = Vec::new();
+    writeln!(
+        rt,
+        "// Auto-generated roundtrip test dispatch from abcd-isa-sys bindings."
+    )
+    .unwrap();
+    writeln!(rt, "// Do not edit manually.").unwrap();
+    writeln!(rt).unwrap();
+    writeln!(
+        rt,
+        "/// Emit one instruction via the named mnemonic with zero/default operands,"
+    )
+    .unwrap();
+    writeln!(
+        rt,
+        "/// build, decode, and return the decoded mnemonic string."
+    )
+    .unwrap();
+    writeln!(rt, "fn roundtrip_one(mnemonic: &str) -> Option<String> {{").unwrap();
+    writeln!(rt, "    use abcd_isa::{{Emitter, Inst}};").unwrap();
+    writeln!(rt, "    let mut e = Emitter::new();").unwrap();
+    writeln!(rt, "    match mnemonic {{").unwrap();
+
+    for line in bindings.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("pub fn isa_emit_") {
+            continue;
+        }
+        let Some(fn_start) = trimmed.find("isa_emit_") else {
+            continue;
+        };
+        let Some(paren_open) = trimmed.find('(') else {
+            continue;
+        };
+        let Some(paren_close) = trimmed.rfind(')') else {
+            continue;
+        };
+
+        let ffi_name = &trimmed[fn_start..paren_open];
+        let rust_name_raw = &ffi_name["isa_emit_".len()..];
+
+        // Mnemonic: underscores become dots (matching the ISA convention)
+        let mnemonic = rust_name_raw.replace('_', ".");
+
+        let rust_name = match rust_name_raw {
+            "return" | "typeof" | "throw" | "try" | "yield" | "async" | "await" | "move"
+            | "type" | "mod" | "in" | "if" | "else" | "loop" | "while" | "for" | "match"
+            | "break" | "continue" | "fn" | "let" | "const" | "static" | "struct" | "enum"
+            | "trait" | "impl" | "self" | "super" | "crate" | "pub" | "use" | "as" | "ref"
+            | "mut" | "where" | "unsafe" | "extern" | "true" | "false" | "abstract" | "become"
+            | "box" | "do" | "final" | "macro" | "override" | "priv" | "virtual" => {
+                format!("r#{rust_name_raw}")
+            }
+            _ => rust_name_raw.to_string(),
+        };
+
+        let params_str = &trimmed[paren_open + 1..paren_close];
+        let params: Vec<&str> = params_str.split(',').map(|s| s.trim()).collect();
+
+        // Build call arguments with default values (skip first param which is the emitter ptr)
+        let mut call_args = Vec::new();
+        let mut has_label = false;
+        for param in params.iter().skip(1) {
+            let parts: Vec<&str> = param.splitn(2, ':').map(|s| s.trim()).collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let name = parts[0];
+            let ty = parts[1];
+            if name == "label_id" {
+                has_label = true;
+                call_args.push("label".to_string());
+            } else {
+                // Default value: 0 cast to the appropriate type
+                call_args.push(format!("0{ty}"));
+            }
+        }
+
+        // For label instructions, we need to create and bind a label
+        if has_label {
+            let args_str = call_args.join(", ");
+            writeln!(
+                rt,
+                "        \"{mnemonic}\" => {{ let label = e.label(); e.{rust_name}({args_str}); e.bind(label); }},"
+            )
+            .unwrap();
+        } else if call_args.is_empty() {
+            writeln!(rt, "        \"{mnemonic}\" => {{ e.{rust_name}(); }},").unwrap();
+        } else {
+            let args_str = call_args.join(", ");
+            writeln!(
+                rt,
+                "        \"{mnemonic}\" => {{ e.{rust_name}({args_str}); }},"
+            )
+            .unwrap();
+        }
+    }
+
+    writeln!(rt, "        _ => return None,").unwrap();
+    writeln!(rt, "    }}").unwrap();
+    writeln!(rt, "    // Append a terminator so the emitter can finalize").unwrap();
+    writeln!(rt, "    e.returnundefined();").unwrap();
+    writeln!(rt, "    let bytecode = e.build().ok()?;").unwrap();
+    writeln!(rt, "    let inst = Inst::decode(&bytecode)?;").unwrap();
+    writeln!(rt, "    Some(inst.info().mnemonic().to_string())").unwrap();
+    writeln!(rt, "}}").unwrap();
+    writeln!(rt).unwrap();
+
+    let rt_path = Path::new(&out_dir).join("roundtrip_tests.rs");
+    fs::write(&rt_path, rt).expect("failed to write roundtrip_tests.rs");
+
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={bindings_path}");
     println!("cargo:rerun-if-env-changed=DEP_ISA_BRIDGE_BINDINGS_RS");
