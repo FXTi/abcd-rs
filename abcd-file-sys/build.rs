@@ -38,8 +38,10 @@ fn main() {
     if target.contains("windows") {
         build
             .define("PANDA_TARGET_WINDOWS", None)
-            .flag("/FI")
-            .flag("bridge/shim/platform_compat.h")
+            .flag(&format!(
+                "/FI{}",
+                manifest_dir.join("bridge/shim/platform_compat.h").display()
+            ))
             .flag("/EHsc");
     }
 
@@ -56,8 +58,7 @@ fn main() {
 
     build.compile("file_bridge");
 
-    // Link zlib (needed by file_writer.cpp for adler32 checksum)
-    println!("cargo:rustc-link-lib=z");
+    // No need to link system zlib — bridge/shim/zlib.h provides inline adler32
 
     // Generate Rust bindings via bindgen
     let bindings = bindgen::Builder::default()
