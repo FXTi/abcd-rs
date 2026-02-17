@@ -1,0 +1,48 @@
+---
+synced_at: '2026-02-17T11:30:35+00:00'
+base_url: https://raw.gitcode.com/openharmony/arkcompiler_runtime_core/raw/master
+files:
+  isa/gen.rb:
+    sha256: 43c2ab419deb1090a8a897a1b50ec48d42f0a7a5bcd6a5a6e5b210be1f7902fb
+  isa/isapi.rb:
+    sha256: d45122d4ab8697812f21eac101ac10f04b314560ec0723bfb44f676206f729ce
+  isa/combine.rb:
+    sha256: 296129bf6a9d5e8d21e05e5946220d6084a13c48a87014bcafe14181742e2409
+  isa/isa.yaml:
+    sha256: b8b69da3b2a458c0dd21e788d52fc1c95ee0619a2510145ea80784c59e4c2918
+  libpandafile/pandafile_isapi.rb:
+    sha256: 50ae41167624c3fce6f6817d89a356bed01482f949f09da436585afa4bc77925
+  libpandafile/templates/bytecode_instruction_enum_gen.h.erb:
+    sha256: aaa52414a03e68974621001f4628f39caf306ceb1ba1b62a982869a68ec6723f
+  libpandafile/templates/bytecode_instruction-inl_gen.h.erb:
+    sha256: 13b9d41d21d3f2471e4308632a63fe1d55acae69b278aa79ef4d6de646ea2dfb
+  libpandafile/bytecode_instruction.h:
+    sha256: 8f8516df8324aa365f2d4d85563a32bd52f7cf8d9aaf4b19376f01fe8dd84597
+  libpandafile/bytecode_instruction-inl.h:
+    sha256: ad6194db031582d8f1db813443c9906a245fc297e945b1c7dd1fc52afa766ed8
+  libpandafile/bytecode_emitter.h:
+    sha256: 246a08beebed2591877e1fd955cfdec9e7068660ce4b58ee6f477ba6bd0918ae
+  libpandafile/bytecode_emitter.cpp:
+    sha256: e02f5e2564706f17a1a904c2a6e00a0383b1c60152f10c931226d647a00a7081
+  libpandafile/templates/bytecode_emitter_def_gen.h.erb:
+    sha256: e88b2957e93eb9234b6c24d54d975adf4876636c9ba8237a851fbf4c6ecce681
+  libpandafile/templates/bytecode_emitter_gen.h.erb:
+    sha256: a879657f3016d6842c1a4c059d3961af2f5564a5183d06119ecfd5efb6fbb1ae
+  libpandafile/templates/file_format_version.h.erb:
+    sha256: d88cb497121c7dc31b92254ae422fe8426eb93e046cd34cd14a05d81ed8f8c3e
+  libpandabase/macros.h:
+    sha256: e01a9a32a7e0f2f46363e6fa194556e1708d592c3cc7bccfba5811804de1f402
+  libpandabase/globals.h:
+    sha256: c628871f36bf5aec6c0d5d478a9695efc2a81391a744e32a9add9da26c6480d4
+  libpandabase/panda_visibility.h:
+    sha256: e994cc899cc0f887ed0f20431e8b167e0ce0930589eac754f780cc872ffbecd3
+  libpandabase/utils/debug.h:
+    sha256: 01ecc2f817f0a0ec49cd64a831ae99ff003f41c9b4af24143eef7d23362420cd
+  libpandabase/utils/bit_helpers.h:
+    sha256: 3aa26c5cfcf34e1cb31b430b90ec23754b081dbd146584e9d86a68346553095b
+  libpandabase/utils/bit_utils.h:
+    sha256: 032ae42c1916ac227c0d99901f76ad2c5a34190c146f62bab71a90cd834337aa
+  libpandabase/utils/span.h:
+    sha256: c68043daf1de2ee7bb111a29d274c671779eac70e1eb9d421f9c2f4ca214ab63
+  libpandabase/os/stacktrace.h:
+    sha256: 831c9d8762b21d5a3aba5a1810cfd3c2e363c9927093802bc3db830536bcd9f1
