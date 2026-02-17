@@ -86,7 +86,8 @@ fn main() {
     );
 
     // Phase 2: Compile C++ bridge
-    cc::Build::new()
+    let mut cc_build = cc::Build::new();
+    cc_build
         .cpp(true)
         .std("c++17")
         .warnings(false)
@@ -99,8 +100,16 @@ fn main() {
         .file(&format!("{manifest}/bridge/isa_bridge.cpp"))
         .file(&format!(
             "{manifest}/vendor/libpandafile/bytecode_emitter.cpp"
-        ))
-        .compile("isa_bridge");
+        ));
+
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("windows") {
+        cc_build.define("PANDA_TARGET_WINDOWS", None);
+        // Force-include MSVC compat header before all source files
+        cc_build.flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"));
+    }
+
+    cc_build.compile("isa_bridge");
 
     // Phase 3: Generate Rust FFI bindings
     // Write a wrapper header that includes both the static header and generated declarations
@@ -135,6 +144,7 @@ fn main() {
         "bridge/isa_bridge.cpp",
         "bridge/shim/securec.h",
         "bridge/shim/file.h",
+        "bridge/shim/platform_compat.h",
         "vendor/isa/isa.yaml",
         "vendor/libpandafile/bytecode_instruction.h",
         "vendor/libpandafile/bytecode_instruction-inl.h",

@@ -18,6 +18,7 @@
 #include <iostream>
 #include <optional>
 #include <array>
+#include <map>
 
 // Transitive dependencies that the original file.h provides through helpers.h.
 // bytecode_emitter.cpp needs Span<T> and MinimumBitsToStore.
