@@ -111,6 +111,13 @@ fn main() {
         cc_build.flag("/EHsc");
     }
 
+    // Coverage: instrument C++ when running under cargo-llvm-cov
+    if env::var("CARGO_LLVM_COV").is_ok() {
+        cc_build
+            .flag("-fprofile-instr-generate")
+            .flag("-fcoverage-mapping");
+    }
+
     cc_build.compile("isa_bridge");
 
     // Phase 3: Generate Rust FFI bindings
