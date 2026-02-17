@@ -18,7 +18,7 @@ struct IsaMnemonicEntry {
     const char* mnemonic;
 };
 
-static const struct IsaMnemonicEntry ISA_MNEMONIC_TABLE[] = {
+extern const struct IsaMnemonicEntry ISA_MNEMONIC_TABLE[] = {
 <% Panda.instructions.each do |insn| -%>
     { <%= "0x%04x" % insn.opcode_idx %>, "<%= insn.mnemonic %>" },
 <% end -%>
@@ -40,16 +40,18 @@ static const size_t ISA_MNEMONIC_TABLE_SIZE = <%= Panda.instructions.size %>;
   prop_to_bit = {}
   prop_list.each_with_index { |p, i| prop_to_bit[p] = i }
 -%>
+enum {
 <% prop_list.each_with_index do |tag, i| -%>
-#define ISA_FLAG_<%= tag.upcase %> (1u << <%= i %>)
+    ISA_FLAG_<%= tag.upcase %> = (1u << <%= i %>),
 <% end -%>
+};
 
 struct IsaFlagsEntry {
     uint16_t opcode;
     uint32_t flags;
 };
 
-static const struct IsaFlagsEntry ISA_FLAGS_TABLE[] = {
+extern const struct IsaFlagsEntry ISA_FLAGS_TABLE[] = {
 <% Panda.instructions.each do |insn| -%>
 <%   bits = insn.properties.select { |p| !p.nil? && !p.empty? }.map { |p| "ISA_FLAG_#{p.upcase}" } -%>
 <%   flags_str = bits.empty? ? "0" : bits.join(" | ") -%>
@@ -69,16 +71,18 @@ static const size_t ISA_FLAGS_TABLE_SIZE = <%= Panda.instructions.size %>;
   exc_to_bit = {}
   exc_list.each_with_index { |e, i| exc_to_bit[e] = i }
 -%>
+enum {
 <% exc_list.each_with_index do |tag, i| -%>
-#define ISA_EXC_<%= tag.upcase %> (1u << <%= i %>)
+    ISA_EXC_<%= tag.upcase %> = (1u << <%= i %>),
 <% end -%>
+};
 
 struct IsaExceptionsEntry {
     uint16_t opcode;
     uint32_t exceptions;
 };
 
-static const struct IsaExceptionsEntry ISA_EXCEPTIONS_TABLE[] = {
+extern const struct IsaExceptionsEntry ISA_EXCEPTIONS_TABLE[] = {
 <% Panda.instructions.each do |insn| -%>
 <%   if insn.respond_to?(:exceptions) && insn.exceptions -%>
 <%     bits = insn.exceptions.select { |e| !e.nil? && !e.empty? }.map { |e| "ISA_EXC_#{e.upcase}" } -%>
@@ -98,7 +102,7 @@ struct IsaNamespaceEntry {
     const char* ns;
 };
 
-static const struct IsaNamespaceEntry ISA_NAMESPACE_TABLE[] = {
+extern const struct IsaNamespaceEntry ISA_NAMESPACE_TABLE[] = {
 <% Panda.instructions.each do |insn| -%>
     { <%= "0x%04x" % insn.opcode_idx %>, "<%= insn.namespace %>" },
 <% end -%>
@@ -130,7 +134,7 @@ struct IsaOpcodeOperands {
     'ref' => 12, 'top' => 13, 'any' => 14, 'b32' => 15, 'b64' => 16
   }
 -%>
-static const struct IsaOpcodeOperands ISA_OPERANDS_TABLE[] = {
+extern const struct IsaOpcodeOperands ISA_OPERANDS_TABLE[] = {
 <% Panda.instructions.each do |insn| -%>
 <%   ops = insn.operands.select { |o| !o.acc? } -%>
     { <%= "0x%04x" % insn.opcode_idx %>, <%= ops.size %>, <%= insn.acc_read? ? 1 : 0 %>, <%= insn.acc_write? ? 1 : 0 %>, {
@@ -144,10 +148,25 @@ static const struct IsaOpcodeOperands ISA_OPERANDS_TABLE[] = {
 };
 static const size_t ISA_OPERANDS_TABLE_SIZE = <%= Panda.instructions.size %>;
 
-/* === Total counts === */
-static const size_t ISA_TOTAL_OPCODES = <%= Panda.instructions.size %>;
-static const size_t ISA_TOTAL_FORMATS = <%= Panda.formats.size %>;
-static const size_t ISA_TOTAL_PREFIXES = <%= Panda.prefixes.size %>;
+/* === Total counts and prefix metadata === */
+enum {
+    ISA_TOTAL_OPCODES = <%= Panda.instructions.size %>,
+    ISA_TOTAL_FORMATS = <%= Panda.formats.size %>,
+    ISA_TOTAL_PREFIXES = <%= Panda.prefixes.size %>,
+    ISA_MIN_PREFIX_OPCODE = <%= Panda.prefixes.map(&:opcode_idx).min %>,
+    ISA_PREFIX_COUNT = <%= Panda.prefixes.size %>,
+};
+
+struct IsaPrefixEntry {
+    uint8_t opcode_idx;
+    const char* name;
+};
+
+extern const struct IsaPrefixEntry ISA_PREFIX_TABLE[] = {
+<% Panda.prefixes.sort_by(&:opcode_idx).each do |p| -%>
+    { <%= p.opcode_idx %>, "<%= p.name %>" },
+<% end -%>
+};
 
 #ifdef __cplusplus
 }

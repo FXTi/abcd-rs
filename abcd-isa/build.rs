@@ -1,161 +1,112 @@
 use std::env;
-use std::path::PathBuf;
-use std::process::Command;
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 
 fn main() {
-    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir = env::var("OUT_DIR").unwrap();
+    let bindings_path = env::var("DEP_ISA_BRIDGE_BINDINGS_RS")
+        .expect("DEP_ISA_BRIDGE_BINDINGS_RS not set — abcd-isa-sys must have links = \"isa_bridge\"");
 
-    // Phase 1: Ruby code generation
-    let gen_rb = format!("{manifest}/vendor/isa/gen.rb");
-    let isa_yaml = format!("{manifest}/vendor/isa/isa.yaml");
-    let isapi = format!("{manifest}/vendor/isa/isapi.rb");
-    let pf_isapi = format!("{manifest}/vendor/libpandafile/pandafile_isapi.rb");
-    let requires = format!("{isapi},{pf_isapi}");
+    let bindings = fs::read_to_string(&bindings_path).expect("failed to read bindings.rs");
 
-    // Generate bytecode_instruction_enum_gen.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/bytecode_instruction_enum_gen.h.erb"),
-        &format!("{out_dir}/bytecode_instruction_enum_gen.h"),
-    );
+    let mut out = Vec::new();
+    writeln!(out, "// Auto-generated safe Emitter methods from abcd-isa-sys bindings.").unwrap();
+    writeln!(out, "// Do not edit manually.").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "impl Emitter {{").unwrap();
 
-    // Generate bytecode_instruction-inl_gen.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/bytecode_instruction-inl_gen.h.erb"),
-        &format!("{out_dir}/bytecode_instruction-inl_gen.h"),
-    );
+    for line in bindings.lines() {
+        let trimmed = line.trim();
+        // Match: pub fn isa_emit_xxx(...)
+        if !trimmed.starts_with("pub fn isa_emit_") {
+            continue;
+        }
+        // Extract: isa_emit_xxx(params)
+        let Some(fn_start) = trimmed.find("isa_emit_") else { continue };
+        let Some(paren_open) = trimmed.find('(') else { continue };
+        let Some(paren_close) = trimmed.rfind(')') else { continue };
 
-    // Generate isa_bridge_tables.h (our custom metadata tables)
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/templates/isa_bridge_tables.h.erb"),
-        &format!("{out_dir}/isa_bridge_tables.h"),
-    );
+        let ffi_name = &trimmed[fn_start..paren_open];
+        let rust_name_raw = &ffi_name["isa_emit_".len()..];
 
-    // Generate bytecode_emitter_def_gen.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/bytecode_emitter_def_gen.h.erb"),
-        &format!("{out_dir}/bytecode_emitter_def_gen.h"),
-    );
+        // Escape Rust reserved keywords
+        let rust_name = match rust_name_raw {
+            "return" | "typeof" | "throw" | "try" | "yield" | "async" | "await" | "move"
+            | "type" | "mod" | "in" | "if" | "else" | "loop" | "while" | "for" | "match"
+            | "break" | "continue" | "fn" | "let" | "const" | "static" | "struct" | "enum"
+            | "trait" | "impl" | "self" | "super" | "crate" | "pub" | "use" | "as" | "ref"
+            | "mut" | "where" | "unsafe" | "extern" | "true" | "false" | "abstract" | "become"
+            | "box" | "do" | "final" | "macro" | "override" | "priv" | "virtual" => {
+                format!("r#{rust_name_raw}")
+            }
+            _ => rust_name_raw.to_string(),
+        };
+        let params_str = &trimmed[paren_open + 1..paren_close];
 
-    // Generate bytecode_emitter_gen.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/bytecode_emitter_gen.h.erb"),
-        &format!("{out_dir}/bytecode_emitter_gen.h"),
-    );
+        // Parse parameters, skip the first one (e: *mut IsaEmitter)
+        let params: Vec<&str> = params_str.split(',').map(|s| s.trim()).collect();
+        if params.is_empty() {
+            continue;
+        }
 
-    // Generate file_format_version.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/file_format_version.h.erb"),
-        &format!("{out_dir}/file_format_version.h"),
-    );
+        // Build method signature and call args
+        let mut method_params = Vec::new();
+        let mut call_args = Vec::new();
+        let mut has_label = false;
 
-    // Generate isa_bridge_emitter.h (C bridge for emitter — implementations)
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/templates/isa_bridge_emitter.h.erb"),
-        &format!("{out_dir}/isa_bridge_emitter.h"),
-    );
+        for param in params.iter().skip(1) {
+            // param looks like "imm: u8" or "label_id: u32" or "v1: u8"
+            let parts: Vec<&str> = param.splitn(2, ':').map(|s| s.trim()).collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let name = parts[0];
+            let ty = parts[1];
 
-    // Generate isa_bridge_emitter_decl.h (declarations only, for bindgen)
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/templates/isa_bridge_emitter_decl.h.erb"),
-        &format!("{out_dir}/isa_bridge_emitter_decl.h"),
-    );
+            if name == "label_id" {
+                method_params.push("label: Label".to_string());
+                call_args.push("label.0".to_string());
+                has_label = true;
+            } else {
+                method_params.push(format!("{name}: {ty}"));
+                call_args.push(name.to_string());
+            }
+        }
 
-    // Phase 2: Compile C++ bridge
-    cc::Build::new()
-        .cpp(true)
-        .std("c++17")
-        .warnings(false)
-        .include(&out_dir)
-        .include(&format!("{manifest}/bridge/shim"))
-        .include(&format!("{manifest}/bridge"))
-        .include(&format!("{manifest}/vendor/libpandafile"))
-        .file(&format!("{manifest}/bridge/isa_bridge.cpp"))
-        .file(&format!("{manifest}/bridge/bytecode_emitter_wrapper.cpp"))
-        .compile("isa_bridge");
+        let method_params_str = if method_params.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", method_params.join(", "))
+        };
 
-    // Phase 3: Generate Rust FFI bindings
-    // Write a wrapper header that includes both the static header and generated declarations
-    let wrapper_h = format!("{out_dir}/isa_bridge_bindgen.h");
-    std::fs::write(
-        &wrapper_h,
-        format!(
-            "#include \"{manifest}/bridge/isa_bridge.h\"\n\
-             #include \"{out_dir}/isa_bridge_emitter_decl.h\"\n"
-        ),
-    )
-    .expect("failed to write bindgen wrapper header");
+        let call_args_str = if call_args.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", call_args.join(", "))
+        };
 
-    let bindings = bindgen::Builder::default()
-        .header(&wrapper_h)
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .generate()
-        .expect("bindgen failed");
-
-    let out_path = PathBuf::from(&out_dir).join("bindings.rs");
-    bindings
-        .write_to_file(&out_path)
-        .expect("failed to write bindings");
-
-    // rerun-if-changed
-    for path in &[
-        "bridge/isa_bridge.h",
-        "bridge/isa_bridge.cpp",
-        "bridge/bytecode_emitter_wrapper.cpp",
-        "vendor/isa/isa.yaml",
-        "bridge/shim/bytecode_instruction.h",
-        "bridge/shim/bytecode_instruction-inl.h",
-        "bridge/shim/bytecode_emitter_shim.h",
-        "bridge/shim/file_shim.h",
-        "vendor/libpandafile/bytecode_emitter.h",
-        "vendor/libpandafile/bytecode_emitter.cpp",
-        "templates/isa_bridge_tables.h.erb",
-        "templates/isa_bridge_emitter.h.erb",
-        "templates/isa_bridge_emitter_decl.h.erb",
-        "vendor/libpandafile/templates/bytecode_instruction_enum_gen.h.erb",
-        "vendor/libpandafile/templates/bytecode_instruction-inl_gen.h.erb",
-        "vendor/libpandafile/templates/bytecode_emitter_def_gen.h.erb",
-        "vendor/libpandafile/templates/bytecode_emitter_gen.h.erb",
-        "vendor/libpandafile/templates/file_format_version.h.erb",
-    ] {
-        println!("cargo:rerun-if-changed={manifest}/{path}");
+        // Emit doc comment with mnemonic
+        let mnemonic = rust_name.replace('_', ".");
+        if has_label {
+            writeln!(out, "/// Emit `{mnemonic}` instruction (jump target: [`Label`]).").unwrap();
+        } else {
+            writeln!(out, "/// Emit `{mnemonic}` instruction.").unwrap();
+        }
+        writeln!(
+            out,
+            "pub fn {rust_name}(&mut self{method_params_str}) {{ unsafe {{ ffi::{ffi_name}(self.ptr{call_args_str}) }} }}"
+        )
+        .unwrap();
+        writeln!(out).unwrap();
     }
-}
 
-fn run_ruby(gen_rb: &str, data: &str, requires: &str, template: &str, output: &str) {
-    let status = Command::new("ruby")
-        .args([
-            gen_rb, "-t", template, "-d", data, "-r", requires, "-o", output,
-        ])
-        .status()
-        .unwrap_or_else(|e| panic!("Failed to run ruby: {e}. Is ruby installed?"));
+    writeln!(out, "}}").unwrap();
 
-    assert!(
-        status.success(),
-        "Ruby code generation failed for template: {template}"
-    );
+    let out_path = Path::new(&out_dir).join("emitter_methods.rs");
+    fs::write(&out_path, out).expect("failed to write emitter_methods.rs");
+
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={bindings_path}");
+    println!("cargo:rerun-if-env-changed=DEP_ISA_BRIDGE_BINDINGS_RS");
 }

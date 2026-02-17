@@ -1,7 +1,5 @@
 #include "isa_bridge.h"
-#include "bytecode_instruction.h"
 #include "bytecode_instruction-inl.h"
-#include "bytecode_emitter_shim.h"
 #include "bytecode_emitter.h"
 #include <isa_bridge_tables.h>
 #include <file_format_version.h>
@@ -10,6 +8,19 @@
 #include <vector>
 
 using Inst = panda::BytecodeInst<panda::BytecodeInstMode::FAST>;
+
+/* Helper: construct a BytecodeInst from an opcode value (for opcode-only queries) */
+static Inst make_inst(IsaOpcode opcode, uint8_t buf[2]) {
+    uint8_t lo = opcode & 0xFF;
+    if (lo >= Inst::GetMinPrefixOpcodeIndex()) {
+        buf[0] = lo;
+        buf[1] = static_cast<uint8_t>(opcode >> 8);
+    } else {
+        buf[0] = static_cast<uint8_t>(opcode);
+        buf[1] = 0;
+    }
+    return Inst(buf);
+}
 
 /* IsaEmitter wraps the C++ BytecodeEmitter + label storage */
 struct IsaEmitter {
@@ -60,8 +71,7 @@ extern "C" {
 
 IsaOpcode isa_decode_opcode(const uint8_t* bytes, size_t len) {
     if (len == 0) return 0xFFFF;
-    uint8_t first = bytes[0];
-    if ((first == 0xFB || first == 0xFC || first == 0xFD || first == 0xFE) && len < 2) {
+    if (bytes[0] >= Inst::GetMinPrefixOpcodeIndex() && len < 2) {
         return 0xFFFF;
     }
     Inst inst(bytes);
@@ -79,24 +89,20 @@ size_t isa_get_size(IsaFormat format) {
 }
 
 int isa_is_prefixed(IsaOpcode opcode) {
-    uint8_t lo = opcode & 0xFF;
-    return (lo == 0xFB || lo == 0xFC || lo == 0xFD || lo == 0xFE) ? 1 : 0;
+    return (opcode & 0xFF) >= Inst::GetMinPrefixOpcodeIndex() ? 1 : 0;
 }
 
-uint16_t isa_get_vreg(const uint8_t* bytes, size_t len, size_t idx) {
-    (void)len;
+uint16_t isa_get_vreg(const uint8_t* bytes, size_t idx) {
     Inst inst(bytes);
     return inst.GetVReg(idx);
 }
 
-int64_t isa_get_imm64(const uint8_t* bytes, size_t len, size_t idx) {
-    (void)len;
+int64_t isa_get_imm64(const uint8_t* bytes, size_t idx) {
     Inst inst(bytes);
     return inst.GetImm64(idx);
 }
 
-uint32_t isa_get_id(const uint8_t* bytes, size_t len, size_t idx) {
-    (void)len;
+uint32_t isa_get_id(const uint8_t* bytes, size_t idx) {
     Inst inst(bytes);
     return inst.GetId(idx).AsRawValue();
 }
@@ -150,20 +156,14 @@ int isa_is_return(IsaOpcode opcode) {
 }
 
 int isa_is_throw(IsaOpcode opcode) {
-    return (opcode & 0xFF) == 0xFE ? 1 : 0;
+    uint8_t buf[2];
+    auto inst = make_inst(opcode, buf);
+    return inst.IsThrow(Inst::Exceptions::X_THROW) ? 1 : 0;
 }
 
 int isa_is_range(IsaOpcode opcode) {
-    uint8_t bytes[2];
-    uint8_t lo = opcode & 0xFF;
-    if (lo == 0xFB || lo == 0xFC || lo == 0xFD || lo == 0xFE) {
-        bytes[0] = lo;                                    /* prefix byte first */
-        bytes[1] = static_cast<uint8_t>(opcode >> 8);    /* sub-opcode second */
-    } else {
-        bytes[0] = static_cast<uint8_t>(opcode);
-        bytes[1] = 0;
-    }
-    Inst inst(bytes);
+    uint8_t buf[2];
+    auto inst = make_inst(opcode, buf);
     return inst.IsRangeInstruction() ? 1 : 0;
 }
 
@@ -193,6 +193,88 @@ size_t isa_format_instruction(const uint8_t* bytes, size_t len,
     std::memcpy(buf, s.c_str(), copy_len);
     buf[copy_len] = '\0';
     return copy_len;
+}
+
+int isa_is_suspend(IsaOpcode opcode) {
+    uint8_t buf[2];
+    auto inst = make_inst(opcode, buf);
+    return inst.HasFlag(Inst::Flags::SUSPEND) ? 1 : 0;
+}
+
+int isa_can_throw(const uint8_t* bytes) {
+    Inst inst(bytes);
+    return inst.CanThrow() ? 1 : 0;
+}
+
+int isa_is_terminator(const uint8_t* bytes) {
+    Inst inst(bytes);
+    return inst.IsTerminator() ? 1 : 0;
+}
+
+int isa_is_return_or_throw(const uint8_t* bytes) {
+    Inst inst(bytes);
+    return inst.IsReturnOrThrowInstruction() ? 1 : 0;
+}
+
+/* === Constants and prefix queries === */
+
+uint8_t isa_min_prefix_opcode(void) {
+    return Inst::GetMinPrefixOpcodeIndex();
+}
+
+size_t isa_prefix_count(void) {
+    return ISA_PREFIX_COUNT;
+}
+
+uint8_t isa_prefix_opcode_at(size_t idx) {
+    if (idx >= ISA_PREFIX_COUNT) return 0;
+    return ISA_PREFIX_TABLE[idx].opcode_idx;
+}
+
+int isa_is_primary_opcode_valid(uint8_t primary) {
+    uint8_t buf[1] = { primary };
+    Inst inst(buf);
+    return inst.IsPrimaryOpcodeValid() ? 1 : 0;
+}
+
+/* === Additional operand methods === */
+
+int64_t isa_get_imm_data(const uint8_t* bytes, size_t idx) {
+    Inst inst(bytes);
+    return inst.GetImmData(idx);
+}
+
+size_t isa_get_imm_count(const uint8_t* bytes) {
+    Inst inst(bytes);
+    return inst.GetImmCount();
+}
+
+size_t isa_get_literal_index(const uint8_t* bytes) {
+    Inst inst(bytes);
+    return inst.GetLiteralIndex();
+}
+
+void isa_update_id(uint8_t* bytes, uint32_t new_id, uint32_t idx) {
+    using InstMut = panda::BytecodeInst<panda::BytecodeInstMode::FAST>;
+    InstMut inst(const_cast<const uint8_t*>(bytes));
+    const_cast<InstMut&>(inst).UpdateId(panda::BytecodeId(new_id), idx);
+}
+
+int64_t isa_get_last_vreg(const uint8_t* bytes) {
+    Inst inst(bytes);
+    auto result = inst.GetLastVReg();
+    return result.has_value() ? static_cast<int64_t>(result.value()) : -1;
+}
+
+int64_t isa_get_range_last_reg_idx(const uint8_t* bytes) {
+    Inst inst(bytes);
+    auto result = inst.GetRangeInsLastRegIdx();
+    return result.has_value() ? static_cast<int64_t>(result.value()) : -1;
+}
+
+int isa_is_id_match_flag(const uint8_t* bytes, size_t idx, uint32_t flag) {
+    Inst inst(bytes);
+    return inst.IsIdMatchFlag(idx, static_cast<Inst::Flags>(flag)) ? 1 : 0;
 }
 
 /* === Version API === */

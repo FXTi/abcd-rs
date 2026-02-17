@@ -1,0 +1,48 @@
+name: vendor-sync
+on:
+  schedule:
+    - cron: '0 2 * * *'   # Daily at UTC 02:00 (Beijing 10:00)
+  workflow_dispatch:        # Manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Run vendor sync
+        run: ruby abcd-isa-sys/vendor-sync.rb -v
+
+      - name: Check for changes
+        id: diff
+        run: |
+          if git diff --quiet abcd-isa-sys/vendor/; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="vendor-sync/$(date +%Y%m%d-%H%M)"
+          git checkout -b "$branch"
+          git add abcd-isa-sys/vendor/
+          git commit -m "chore: sync vendor files from upstream arkcompiler"
+          git push -u origin "$branch"
+          gh pr create \
+            --title "chore: sync vendor files from upstream" \
+            --body "Automated daily sync from arkcompiler_runtime_core master branch." \
+            --label "vendor-sync"

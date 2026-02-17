@@ -1,12 +1,23 @@
 /**
- * Simplified bytecode_instruction-inl.h for abcd-rs ISA bridge.
- * Provides ReadHelper/Read/Read64/GetSize, then includes generated methods.
+ * Copyright (c) 2021-2022 Huawei Device Co., Ltd.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #ifndef LIBPANDAFILE_BYTECODE_INSTRUCTION_INL_H
 #define LIBPANDAFILE_BYTECODE_INSTRUCTION_INL_H
 
 #include "bytecode_instruction.h"
+#include "macros.h"
 
 namespace panda {
 
@@ -15,6 +26,7 @@ template <class R, class S>
 inline auto BytecodeInst<Mode>::ReadHelper(size_t byteoffset, size_t bytecount, size_t offset, size_t width) const
 {
     constexpr size_t BYTE_WIDTH = 8;
+
     size_t right_shift = offset % BYTE_WIDTH;
 
     S v = 0;
@@ -26,8 +38,12 @@ inline auto BytecodeInst<Mode>::ReadHelper(size_t byteoffset, size_t bytecount, 
     v >>= right_shift;
     size_t left_shift = sizeof(R) * BYTE_WIDTH - width;
 
-    static_assert((-1 >> 1) == -1, "arithmetic right shift required");
+    // Do sign extension using arithmetic shift. It's implementation defined
+    // so we check such behavior using static assert
+    // NOLINTNEXTLINE(hicpp-signed-bitwise)
+    static_assert((-1 >> 1) == -1);
 
+    // NOLINTNEXTLINE(hicpp-signed-bitwise)
     return static_cast<R>(v << left_shift) >> left_shift;
 }
 

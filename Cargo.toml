@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "abcd-isa-sys",
     "abcd-isa",
     "abcd-file",
     "abcd-ir",
@@ -22,6 +23,7 @@ memmap2 = "0.9"
 log = "0.4"
 env_logger = "0.11"
 
+abcd-isa-sys = { path = "abcd-isa-sys" }
 abcd-isa = { path = "abcd-isa" }
 abcd-file = { path = "abcd-file" }
 abcd-ir = { path = "abcd-ir" }

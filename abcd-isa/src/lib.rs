@@ -1,31 +1,26 @@
-//! ArkCompiler ISA definitions, generated via arkcompiler's Ruby pipeline + C++ bridge.
+//! ArkCompiler ISA definitions — opcode metadata, instruction decoding, version
+//! management, and bytecode assembly.
 //!
-//! This crate provides opcode definitions, instruction formats, and decoding
-//! functions for the ArkCompiler bytecode instruction set.
+//! Built on top of `abcd-isa-sys` (raw C FFI bindings). All public types are safe;
+//! the `ffi` module is internal.
 
-#![allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
-
-use std::sync::LazyLock;
-
-// --- FFI bindings from bindgen ---
-#[allow(dead_code)]
-pub mod ffi {
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+mod ffi {
+    pub use abcd_isa_sys::*;
 }
 
-// --- Public types (API-compatible with old generated code) ---
+// ---------------------------------------------------------------------------
+// Core types
+// ---------------------------------------------------------------------------
 
-/// Opcode value (u16). Non-prefixed opcodes fit in u8; prefixed = prefix_byte << 8 | sub.
+/// Opcode value (u16). Non-prefixed opcodes fit in u8; prefixed = (sub << 8) | prefix_byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Opcode(pub u16);
 
 impl Opcode {
-    /// Get the mnemonic string for this opcode.
+    /// Mnemonic string for this opcode, or `"unknown"`.
     pub fn mnemonic(self) -> &'static str {
-        lookup_opcode(self.0)
-            .map(|info| info.mnemonic)
-            .unwrap_or("unknown")
+        lookup(self.0).map(|i| i.mnemonic()).unwrap_or("unknown")
     }
 }
 
@@ -47,47 +42,62 @@ impl Format {
     }
 }
 
-/// Instruction property flags.
+/// Instruction property flags (bit positions from generated ISA_FLAG_* constants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpcodeFlags(u32);
 
 impl OpcodeFlags {
-    pub const JUMP: OpcodeFlags = OpcodeFlags(1 << 0);
-    pub const CONDITIONAL: OpcodeFlags = OpcodeFlags(1 << 1);
-    pub const CALL: OpcodeFlags = OpcodeFlags(1 << 2);
-    pub const RETURN: OpcodeFlags = OpcodeFlags(1 << 3);
-    pub const THROW: OpcodeFlags = OpcodeFlags(1 << 4);
-    pub const SUSPEND: OpcodeFlags = OpcodeFlags(1 << 5);
-    pub const FLOAT: OpcodeFlags = OpcodeFlags(1 << 6);
-    pub const ACC_READ: OpcodeFlags = OpcodeFlags(1 << 7);
-    pub const ACC_WRITE: OpcodeFlags = OpcodeFlags(1 << 8);
-    pub const STRING_ID: OpcodeFlags = OpcodeFlags(1 << 9);
-    pub const METHOD_ID: OpcodeFlags = OpcodeFlags(1 << 10);
-    pub const LITERALARRAY_ID: OpcodeFlags = OpcodeFlags(1 << 11);
-    pub const IC_SLOT: OpcodeFlags = OpcodeFlags(1 << 12);
-    pub const NO_SIDE_EFFECT: OpcodeFlags = OpcodeFlags(1 << 13);
+    pub const ACC_NONE: Self = Self(ffi::ISA_FLAG_ACC_NONE);
+    pub const ACC_READ: Self = Self(ffi::ISA_FLAG_ACC_READ);
+    pub const ACC_WRITE: Self = Self(ffi::ISA_FLAG_ACC_WRITE);
+    pub const CONDITIONAL: Self = Self(ffi::ISA_FLAG_CONDITIONAL);
+    pub const CONDITIONAL_THROW: Self = Self(ffi::ISA_FLAG_CONDITIONAL_THROW);
+    pub const DYNAMIC: Self = Self(ffi::ISA_FLAG_DYNAMIC);
+    pub const EIGHT_BIT_IC: Self = Self(ffi::ISA_FLAG_EIGHT_BIT_IC);
+    pub const EIGHT_SIXTEEN_BIT_IC: Self = Self(ffi::ISA_FLAG_EIGHT_SIXTEEN_BIT_IC);
+    pub const FLOAT: Self = Self(ffi::ISA_FLAG_FLOAT);
+    pub const IC_SLOT: Self = Self(ffi::ISA_FLAG_IC_SLOT);
+    pub const JIT_IC_SLOT: Self = Self(ffi::ISA_FLAG_JIT_IC_SLOT);
+    pub const JUMP: Self = Self(ffi::ISA_FLAG_JUMP);
+    pub const LANGUAGE_TYPE: Self = Self(ffi::ISA_FLAG_LANGUAGE_TYPE);
+    pub const LITERALARRAY_ID: Self = Self(ffi::ISA_FLAG_LITERALARRAY_ID);
+    pub const MAYBE_DYNAMIC: Self = Self(ffi::ISA_FLAG_MAYBE_DYNAMIC);
+    pub const METHOD_ID: Self = Self(ffi::ISA_FLAG_METHOD_ID);
+    pub const NO_SIDE_EFFECT: Self = Self(ffi::ISA_FLAG_NO_SIDE_EFFECT);
+    pub const ONE_SLOT: Self = Self(ffi::ISA_FLAG_ONE_SLOT);
+    pub const RANGE_0: Self = Self(ffi::ISA_FLAG_RANGE_0);
+    pub const RANGE_1: Self = Self(ffi::ISA_FLAG_RANGE_1);
+    pub const RETURN: Self = Self(ffi::ISA_FLAG_RETURN);
+    pub const SIXTEEN_BIT_IC: Self = Self(ffi::ISA_FLAG_SIXTEEN_BIT_IC);
+    pub const STRING_ID: Self = Self(ffi::ISA_FLAG_STRING_ID);
+    /// Synthetic flag: instruction's primary role is to throw (bit 31).
+    pub const THROW: Self = Self(ffi::ISA_FLAG_THROW);
+    pub const TWO_SLOT: Self = Self(ffi::ISA_FLAG_TWO_SLOT);
 
-    pub const fn empty() -> Self {
-        OpcodeFlags(0)
-    }
+    pub const fn raw(self) -> u32 { self.0 }
+    pub const fn empty() -> Self { Self(0) }
+    pub const fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
+    pub const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
+}
 
-    pub const fn contains(self, other: OpcodeFlags) -> bool {
-        (self.0 & other.0) == other.0
-    }
+/// Exception type flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exceptions(u32);
 
-    pub const fn union(self, other: OpcodeFlags) -> Self {
-        OpcodeFlags(self.0 | other.0)
-    }
+impl Exceptions {
+    pub const NONE: Self = Self(ffi::ISA_EXC_X_NONE);
+    pub const OOM: Self = Self(ffi::ISA_EXC_X_OOM);
+    pub const THROW: Self = Self(ffi::ISA_EXC_X_THROW);
+
+    pub const fn raw(self) -> u32 { self.0 }
+    pub const fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
 }
 
 /// Kind of operand in an instruction format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperandKind {
-    /// Virtual register.
     Reg,
-    /// Immediate value.
     Imm,
-    /// Entity ID (string, method, literalarray, etc.).
     Id,
 }
 
@@ -100,250 +110,301 @@ pub struct OperandDesc {
     pub bit_offset_in_byte: usize,
     pub is_jump: bool,
     pub is_float: bool,
+    pub is_src: bool,
+    pub is_dst: bool,
 }
 
-/// Metadata for a single opcode.
-#[derive(Debug, Clone)]
-pub struct OpcodeInfo {
-    pub mnemonic: &'static str,
-    pub format: Format,
-    pub flags: OpcodeFlags,
-    pub is_prefixed: bool,
-    pub operand_parts: &'static [OperandDesc],
-}
+// ---------------------------------------------------------------------------
+// OpcodeInfo — zero-allocation index into C static tables
+// ---------------------------------------------------------------------------
 
-// --- Static table (built once from C bridge) ---
+/// Metadata for a single opcode. This is a lightweight `Copy` handle that reads
+/// from the C static tables on demand (O(1) per accessor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpcodeInfo(u16); // index into ISA_*_TABLE arrays
 
-struct IsaTable {
-    entries: Vec<(u16, OpcodeInfo)>,
-    /// Leaked operand slices for 'static lifetime
-    _operand_storage: Vec<Box<[OperandDesc]>>,
-    /// Leaked mnemonic strings for 'static lifetime
-    _mnemonic_storage: Vec<Box<str>>,
-}
+impl OpcodeInfo {
+    pub fn opcode(&self) -> Opcode {
+        Opcode(unsafe { ffi::ISA_MNEMONIC_TABLE[self.0 as usize].opcode })
+    }
 
-static ISA: LazyLock<IsaTable> = LazyLock::new(|| {
-    let count = unsafe { ffi::isa_opcode_count() };
-    let mut entries = Vec::with_capacity(count);
-    let mut operand_storage = Vec::with_capacity(count);
-    let mut mnemonic_storage = Vec::with_capacity(count);
+    pub fn mnemonic(&self) -> &'static str {
+        let ptr = unsafe { ffi::ISA_MNEMONIC_TABLE[self.0 as usize].mnemonic };
+        unsafe { core::ffi::CStr::from_ptr(ptr).to_str().unwrap_unchecked() }
+    }
 
-    // Iterate all opcodes: non-prefixed (0x00..0xFF) + prefixed ((sub<<8)|prefix)
-    let mut opcodes_to_check: Vec<u16> = (0..=0xFFu16).collect();
-    for prefix in [0xFBu16, 0xFC, 0xFD, 0xFE] {
-        for sub in 1..=0xFFu16 {
-            opcodes_to_check.push((sub << 8) | prefix);
+    pub fn format(&self) -> Format {
+        Format(unsafe { ffi::isa_get_format(self.raw_opcode()) })
+    }
+
+    pub fn size(&self) -> usize {
+        self.format().size()
+    }
+
+    pub fn flags(&self) -> OpcodeFlags {
+        let mut raw = unsafe { ffi::ISA_FLAGS_TABLE[self.0 as usize].flags };
+        if unsafe { ffi::isa_is_throw(self.raw_opcode()) } != 0 {
+            raw |= OpcodeFlags::THROW.0;
+        }
+        OpcodeFlags(raw)
+    }
+
+    pub fn exceptions(&self) -> Exceptions {
+        Exceptions(unsafe { ffi::ISA_EXCEPTIONS_TABLE[self.0 as usize].exceptions })
+    }
+
+    pub fn namespace(&self) -> &'static str {
+        let ptr = unsafe { ffi::ISA_NAMESPACE_TABLE[self.0 as usize].ns };
+        unsafe { core::ffi::CStr::from_ptr(ptr).to_str().unwrap_unchecked() }
+    }
+
+    pub fn is_prefixed(&self) -> bool {
+        unsafe { ffi::isa_is_prefixed(self.raw_opcode()) != 0 }
+    }
+
+    pub fn is_range(&self) -> bool {
+        unsafe { ffi::isa_is_range(self.raw_opcode()) != 0 }
+    }
+
+    pub fn is_suspend(&self) -> bool {
+        unsafe { ffi::isa_is_suspend(self.raw_opcode()) != 0 }
+    }
+
+    pub fn acc_read(&self) -> bool {
+        unsafe { ffi::ISA_OPERANDS_TABLE[self.0 as usize].acc_read != 0 }
+    }
+
+    pub fn acc_write(&self) -> bool {
+        unsafe { ffi::ISA_OPERANDS_TABLE[self.0 as usize].acc_write != 0 }
+    }
+
+    pub fn operands(&self) -> OperandIter {
+        let entry = unsafe { &ffi::ISA_OPERANDS_TABLE[self.0 as usize] };
+        let flags = self.flags();
+        let opcode_bytes = if self.is_prefixed() { 2 } else { 1 };
+        OperandIter {
+            entry,
+            idx: 0,
+            count: entry.num_operands as usize,
+            bit_cursor: opcode_bytes * 8,
+            is_jump: flags.contains(OpcodeFlags::JUMP),
+            is_float: flags.contains(OpcodeFlags::FLOAT),
         }
     }
 
-    for opcode_val in opcodes_to_check {
-        let mnemonic_ptr = unsafe { ffi::isa_get_mnemonic(opcode_val) };
-        if mnemonic_ptr.is_null() {
-            continue;
-        }
-
-        let mnemonic_cstr = unsafe { std::ffi::CStr::from_ptr(mnemonic_ptr) };
-        let mnemonic_str = mnemonic_cstr.to_str().unwrap_or("unknown");
-
-        // Leak the mnemonic string to get 'static lifetime
-        let mnemonic_box: Box<str> = mnemonic_str.into();
-        let mnemonic_static: &'static str = unsafe { &*(mnemonic_box.as_ref() as *const str) };
-        mnemonic_storage.push(mnemonic_box);
-
-        let format_val = unsafe { ffi::isa_get_format(opcode_val) };
-        let format = Format(format_val);
-        let is_prefixed = unsafe { ffi::isa_is_prefixed(opcode_val) } != 0;
-
-        // Build flags from C bridge
-        let raw_flags = unsafe { ffi::isa_get_flags(opcode_val) };
-        let flags = map_flags(raw_flags, opcode_val);
-
-        // Build operand descriptors from format
-        let mut ops = Vec::new();
-        let fmt_size = format.size();
-        let opcode_bytes = if is_prefixed { 2usize } else { 1 };
-
-        for idx in 0..8usize {
-            let has_vreg = unsafe { ffi::isa_has_vreg(format_val, idx) } != 0;
-            let has_imm = unsafe { ffi::isa_has_imm(format_val, idx) } != 0;
-            let has_id = unsafe { ffi::isa_has_id(format_val, idx) } != 0;
-
-            if has_vreg {
-                ops.push(OperandDesc {
-                    kind: OperandKind::Reg,
-                    bit_width: 0, // will be refined
-                    byte_offset: 0,
-                    bit_offset_in_byte: 0,
-                    is_jump: false,
-                    is_float: false,
-                });
-            } else if has_imm {
-                ops.push(OperandDesc {
-                    kind: OperandKind::Imm,
-                    bit_width: 0,
-                    byte_offset: 0,
-                    bit_offset_in_byte: 0,
-                    is_jump: flags.contains(OpcodeFlags::JUMP),
-                    is_float: flags.contains(OpcodeFlags::FLOAT),
-                });
-            } else if has_id {
-                ops.push(OperandDesc {
-                    kind: OperandKind::Id,
-                    bit_width: 0,
-                    byte_offset: 0,
-                    bit_offset_in_byte: 0,
-                    is_jump: false,
-                    is_float: false,
-                });
-            } else {
-                break;
-            }
-        }
-
-        // Compute byte offsets from format size and operand count
-        if !ops.is_empty() {
-            let operand_bytes = fmt_size - opcode_bytes;
-            let bits_per_op = if ops.len() > 0 {
-                operand_bytes * 8 / ops.len()
-            } else {
-                0
-            };
-            let mut bit_offset = 0usize;
-            for op in &mut ops {
-                op.bit_width = bits_per_op;
-                op.byte_offset = opcode_bytes + bit_offset / 8;
-                op.bit_offset_in_byte = bit_offset % 8;
-                bit_offset += bits_per_op;
-            }
-        }
-
-        // Leak operand slice for 'static lifetime
-        let ops_box: Box<[OperandDesc]> = ops.into_boxed_slice();
-        let ops_static: &'static [OperandDesc] =
-            unsafe { &*(ops_box.as_ref() as *const [OperandDesc]) };
-        operand_storage.push(ops_box);
-
-        entries.push((
-            opcode_val,
-            OpcodeInfo {
-                mnemonic: mnemonic_static,
-                format,
-                flags,
-                is_prefixed,
-                operand_parts: ops_static,
-            },
-        ));
+    fn raw_opcode(&self) -> u16 {
+        unsafe { ffi::ISA_MNEMONIC_TABLE[self.0 as usize].opcode }
     }
-
-    entries.sort_by_key(|(v, _)| *v);
-
-    IsaTable {
-        entries,
-        _operand_storage: operand_storage,
-        _mnemonic_storage: mnemonic_storage,
-    }
-});
-
-/// Map raw C flags to our OpcodeFlags.
-fn map_flags(raw: u32, opcode: u16) -> OpcodeFlags {
-    let mut flags = OpcodeFlags::empty();
-
-    // The C bridge flags come from instruction properties.
-    // We check known property names via the C bridge helpers.
-    if unsafe { ffi::isa_is_jump(opcode) } != 0 {
-        flags = flags.union(OpcodeFlags::JUMP);
-    }
-    if unsafe { ffi::isa_is_conditional(opcode) } != 0 {
-        flags = flags.union(OpcodeFlags::CONDITIONAL);
-    }
-    if unsafe { ffi::isa_is_return(opcode) } != 0 {
-        flags = flags.union(OpcodeFlags::RETURN);
-    }
-    if unsafe { ffi::isa_is_throw(opcode) } != 0 {
-        flags = flags.union(OpcodeFlags::THROW);
-    }
-
-    let info = unsafe { ffi::isa_get_operand_info(opcode) };
-    if info.acc_read != 0 {
-        flags = flags.union(OpcodeFlags::ACC_READ);
-    }
-    if info.acc_write != 0 {
-        flags = flags.union(OpcodeFlags::ACC_WRITE);
-    }
-
-    // Check raw flags for other properties (from the generated tables)
-    // The bit positions depend on the sorted property list from the ERB template.
-    // We pass through the raw value for properties we can't easily query via C helpers.
-    let _ = raw; // raw flags available for future use
-
-    flags
 }
 
-// --- Public API (compatible with old generated code) ---
-
-/// Lookup table: maps opcode u16 value to OpcodeInfo.
-pub fn opcode_table() -> &'static [(u16, OpcodeInfo)] {
-    &ISA.entries
+/// Iterator over operand descriptors for an opcode.
+pub struct OperandIter {
+    entry: &'static ffi::IsaOpcodeOperands,
+    idx: usize,
+    count: usize,
+    bit_cursor: usize,
+    is_jump: bool,
+    is_float: bool,
 }
 
-/// For backward compatibility: OPCODE_TABLE as a function-like accessor.
-/// Old code used `OPCODE_TABLE` as a static; now it's a lazy-initialized slice.
-pub static OPCODE_TABLE: LazyLock<&'static [(u16, OpcodeInfo)]> = LazyLock::new(|| &ISA.entries);
+impl Iterator for OperandIter {
+    type Item = OperandDesc;
 
-/// Find OpcodeInfo by opcode u16 value.
-pub fn lookup_opcode(value: u16) -> Option<&'static OpcodeInfo> {
-    ISA.entries
-        .binary_search_by_key(&value, |(v, _)| *v)
+    fn next(&mut self) -> Option<OperandDesc> {
+        if self.idx >= self.count {
+            return None;
+        }
+        let op = &self.entry.operands[self.idx];
+        let kind = match op.kind as u32 {
+            ffi::ISA_OPERAND_KIND_REG => OperandKind::Reg,
+            ffi::ISA_OPERAND_KIND_IMM => OperandKind::Imm,
+            _ => OperandKind::Id,
+        };
+        let bit_width = op.bit_width as usize;
+        let byte_offset = self.bit_cursor / 8;
+        let bit_offset_in_byte = self.bit_cursor % 8;
+        self.bit_cursor += bit_width;
+        self.idx += 1;
+
+        Some(OperandDesc {
+            kind,
+            bit_width,
+            byte_offset,
+            bit_offset_in_byte,
+            is_jump: kind == OperandKind::Imm && self.is_jump,
+            is_float: kind == OperandKind::Imm && self.is_float,
+            is_src: op.is_src != 0,
+            is_dst: op.is_dst != 0,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let rem = self.count - self.idx;
+        (rem, Some(rem))
+    }
+}
+
+impl ExactSizeIterator for OperandIter {}
+
+// ---------------------------------------------------------------------------
+// Lookup & decode
+// ---------------------------------------------------------------------------
+
+/// Find opcode metadata by raw opcode value. Binary search on the static table.
+pub fn lookup(value: u16) -> Option<OpcodeInfo> {
+    let table = unsafe { &ffi::ISA_MNEMONIC_TABLE };
+    table
+        .binary_search_by_key(&value, |e| e.opcode)
         .ok()
-        .map(|idx| &ISA.entries[idx].1)
+        .map(|idx| OpcodeInfo(idx as u16))
 }
 
 /// Decode an opcode from a byte stream.
-pub fn decode_opcode(bytes: &[u8]) -> Option<(Opcode, &'static OpcodeInfo)> {
+pub fn decode(bytes: &[u8]) -> Option<(Opcode, OpcodeInfo)> {
     if bytes.is_empty() {
         return None;
     }
     let raw = unsafe { ffi::isa_decode_opcode(bytes.as_ptr(), bytes.len()) };
-    if raw == 0xFFFF {
+    if raw == ffi::ISA_INVALID_OPCODE as u16 {
         return None;
     }
-    let info = lookup_opcode(raw)?;
+    let info = lookup(raw)?;
     Some((Opcode(raw), info))
 }
 
-// --- Operand extraction (delegated to C bridge) ---
-
-/// Extract a virtual register operand from instruction bytes.
-pub fn get_vreg(bytes: &[u8], idx: usize) -> u16 {
-    unsafe { ffi::isa_get_vreg(bytes.as_ptr(), bytes.len(), idx) }
+/// Total number of opcodes in the ISA.
+pub fn opcode_count() -> usize {
+    ffi::ISA_MNEMONIC_TABLE_SIZE
 }
 
-/// Extract a signed 64-bit immediate operand from instruction bytes.
-pub fn get_imm64(bytes: &[u8], idx: usize) -> i64 {
-    unsafe { ffi::isa_get_imm64(bytes.as_ptr(), bytes.len(), idx) }
+/// Iterator over all opcode metadata entries.
+pub fn opcode_table() -> impl Iterator<Item = OpcodeInfo> {
+    (0..ffi::ISA_MNEMONIC_TABLE_SIZE).map(|i| OpcodeInfo(i as u16))
 }
 
-/// Extract an entity ID operand from instruction bytes.
-pub fn get_id(bytes: &[u8], idx: usize) -> u32 {
-    unsafe { ffi::isa_get_id(bytes.as_ptr(), bytes.len(), idx) }
+/// Minimum prefix opcode byte value.
+pub fn min_prefix_opcode() -> u8 {
+    unsafe { ffi::isa_min_prefix_opcode() }
 }
 
-/// Format an instruction as a human-readable string.
-pub fn format_instruction(bytes: &[u8]) -> String {
-    let mut buf = vec![0u8; 256];
-    let len = unsafe {
-        ffi::isa_format_instruction(
-            bytes.as_ptr(),
-            bytes.len(),
-            buf.as_mut_ptr() as *mut i8,
-            buf.len(),
-        )
-    };
-    buf.truncate(len);
-    String::from_utf8_lossy(&buf).into_owned()
+/// Number of prefix groups.
+pub fn prefix_count() -> usize {
+    unsafe { ffi::isa_prefix_count() }
 }
 
-// --- Version API ---
+/// Opcode byte for the i-th prefix group.
+pub fn prefix_opcode_at(idx: usize) -> u8 {
+    unsafe { ffi::isa_prefix_opcode_at(idx) }
+}
+
+/// Check if a primary (non-prefixed) opcode byte is valid.
+pub fn is_primary_opcode_valid(primary: u8) -> bool {
+    unsafe { ffi::isa_is_primary_opcode_valid(primary) != 0 }
+}
+
+// ---------------------------------------------------------------------------
+// Inst — decoded instruction reference
+// ---------------------------------------------------------------------------
+
+/// A reference to a decoded instruction in a byte stream.
+pub struct Inst<'a> {
+    bytes: &'a [u8],
+    info: OpcodeInfo,
+}
+
+impl<'a> Inst<'a> {
+    /// Decode one instruction from the start of `bytes`.
+    pub fn decode(bytes: &'a [u8]) -> Option<Self> {
+        let (_, info) = decode(bytes)?;
+        let size = info.size();
+        if bytes.len() < size {
+            return None;
+        }
+        Some(Inst { bytes: &bytes[..size], info })
+    }
+
+    pub fn opcode(&self) -> Opcode { self.info.opcode() }
+    pub fn info(&self) -> OpcodeInfo { self.info }
+    pub fn size(&self) -> usize { self.bytes.len() }
+    pub fn bytes(&self) -> &[u8] { self.bytes }
+
+    // Operand extraction
+    pub fn vreg(&self, idx: usize) -> u16 {
+        unsafe { ffi::isa_get_vreg(self.bytes.as_ptr(), idx) }
+    }
+    pub fn imm64(&self, idx: usize) -> i64 {
+        unsafe { ffi::isa_get_imm64(self.bytes.as_ptr(), idx) }
+    }
+    pub fn id(&self, idx: usize) -> u32 {
+        unsafe { ffi::isa_get_id(self.bytes.as_ptr(), idx) }
+    }
+    pub fn imm_data(&self, idx: usize) -> i64 {
+        unsafe { ffi::isa_get_imm_data(self.bytes.as_ptr(), idx) }
+    }
+    pub fn imm_count(&self) -> usize {
+        unsafe { ffi::isa_get_imm_count(self.bytes.as_ptr()) }
+    }
+    pub fn literal_index(&self) -> Option<usize> {
+        let idx = unsafe { ffi::isa_get_literal_index(self.bytes.as_ptr()) };
+        // C bridge returns (size_t)-1 when no literal index exists
+        if idx == usize::MAX { None } else { Some(idx) }
+    }
+    pub fn last_vreg(&self) -> Option<u64> {
+        let v = unsafe { ffi::isa_get_last_vreg(self.bytes.as_ptr()) };
+        if v < 0 { None } else { Some(v as u64) }
+    }
+    pub fn range_last_reg_idx(&self) -> Option<u64> {
+        let v = unsafe { ffi::isa_get_range_last_reg_idx(self.bytes.as_ptr()) };
+        if v < 0 { None } else { Some(v as u64) }
+    }
+
+    // Classification
+    pub fn can_throw(&self) -> bool {
+        unsafe { ffi::isa_can_throw(self.bytes.as_ptr()) != 0 }
+    }
+    pub fn is_terminator(&self) -> bool {
+        unsafe { ffi::isa_is_terminator(self.bytes.as_ptr()) != 0 }
+    }
+    pub fn is_return_or_throw(&self) -> bool {
+        unsafe { ffi::isa_is_return_or_throw(self.bytes.as_ptr()) != 0 }
+    }
+
+    /// Check if the `idx`-th ID operand matches a specific flag
+    /// (e.g. `OpcodeFlags::STRING_ID`, `OpcodeFlags::METHOD_ID`, `OpcodeFlags::LITERALARRAY_ID`).
+    pub fn is_id_match_flag(&self, idx: usize, flag: OpcodeFlags) -> bool {
+        unsafe { ffi::isa_is_id_match_flag(self.bytes.as_ptr(), idx, flag.0) != 0 }
+    }
+
+    // Formatting
+    pub fn format_string(&self) -> String {
+        // Buffer of 512 bytes is sufficient for any instruction.
+        // isa_format_instruction truncates silently if the buffer is too small.
+        let mut buf = vec![0u8; 512];
+        let len = unsafe {
+            ffi::isa_format_instruction(
+                self.bytes.as_ptr(),
+                self.bytes.len(),
+                buf.as_mut_ptr() as *mut i8,
+                buf.len(),
+            )
+        };
+        buf.truncate(len);
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bytecode patching
+// ---------------------------------------------------------------------------
+
+/// Write a new entity ID at the given operand index (bytecode patching).
+pub fn update_id(bytes: &mut [u8], new_id: u32, idx: u32) {
+    unsafe { ffi::isa_update_id(bytes.as_mut_ptr(), new_id, idx) }
+}
+
+// ---------------------------------------------------------------------------
+// Version API
+// ---------------------------------------------------------------------------
 
 /// .abc file version (4 bytes: major.minor.patch.build).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -355,33 +416,36 @@ impl core::fmt::Display for AbcVersion {
     }
 }
 
-/// Current .abc file version from the ISA definition.
 pub fn current_version() -> AbcVersion {
     let mut v = [0u8; 4];
     unsafe { ffi::isa_get_version(v.as_mut_ptr()) };
     AbcVersion(v)
 }
 
-/// Minimum supported .abc file version.
 pub fn min_version() -> AbcVersion {
     let mut v = [0u8; 4];
     unsafe { ffi::isa_get_min_version(v.as_mut_ptr()) };
     AbcVersion(v)
 }
 
-/// Lookup the file version corresponding to an API level.
 pub fn version_by_api(api_level: u8) -> Option<AbcVersion> {
     let mut v = [0u8; 4];
     let rc = unsafe { ffi::isa_get_version_by_api(api_level, v.as_mut_ptr()) };
     if rc == 0 { Some(AbcVersion(v)) } else { None }
 }
 
-/// Check if a version is compatible with the current ISA (>= min, <= current).
 pub fn is_version_compatible(ver: &AbcVersion) -> bool {
     unsafe { ffi::isa_is_version_compatible(ver.0.as_ptr()) != 0 }
 }
 
-// --- Emitter API ---
+/// Number of entries in the API version map.
+pub fn api_version_count() -> usize {
+    unsafe { ffi::isa_get_api_version_count() }
+}
+
+// ---------------------------------------------------------------------------
+// Emitter
+// ---------------------------------------------------------------------------
 
 /// Error from emitter build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,35 +467,25 @@ impl std::error::Error for EmitterError {}
 
 /// Opaque label handle for branch targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct EmitterLabel(pub u32);
+pub struct Label(pub u32);
 
 /// Bytecode emitter — encodes instructions, manages labels, patches branches.
-///
-/// Per-mnemonic emit functions are available through the raw FFI pointer
-/// returned by [`Emitter::as_ptr`]. Call `ffi::isa_emit_*` functions directly.
 pub struct Emitter {
     ptr: *mut ffi::IsaEmitter,
 }
 
 impl Emitter {
     pub fn new() -> Self {
-        Emitter {
-            ptr: unsafe { ffi::isa_emitter_create() },
-        }
-    }
-
-    /// Raw pointer for calling per-mnemonic `ffi::isa_emit_*` functions.
-    pub fn as_ptr(&mut self) -> *mut ffi::IsaEmitter {
-        self.ptr
+        Emitter { ptr: unsafe { ffi::isa_emitter_create() } }
     }
 
     /// Create a new label for branch targets.
-    pub fn create_label(&mut self) -> EmitterLabel {
-        EmitterLabel(unsafe { ffi::isa_emitter_create_label(self.ptr) })
+    pub fn label(&mut self) -> Label {
+        Label(unsafe { ffi::isa_emitter_create_label(self.ptr) })
     }
 
     /// Bind a label to the current position in the bytecode stream.
-    pub fn bind(&mut self, label: EmitterLabel) {
+    pub fn bind(&mut self, label: Label) {
         unsafe { ffi::isa_emitter_bind(self.ptr, label.0) };
     }
 
@@ -440,22 +494,24 @@ impl Emitter {
         let mut buf: *mut u8 = std::ptr::null_mut();
         let mut len: usize = 0;
         let rc = unsafe { ffi::isa_emitter_build(self.ptr, &mut buf, &mut len) };
-        match rc {
-            0 => {
+        match rc as u32 {
+            ffi::ISA_EMITTER_OK => {
                 let result = unsafe { std::slice::from_raw_parts(buf, len) }.to_vec();
                 unsafe { ffi::isa_emitter_free_buf(buf) };
                 Ok(result)
             }
-            1 => Err(EmitterError::InternalError),
+            ffi::ISA_EMITTER_INTERNAL_ERROR => Err(EmitterError::InternalError),
             _ => Err(EmitterError::UnboundLabels),
         }
     }
+
+    // Per-mnemonic safe emit methods are in a separate impl block (auto-generated)
 }
 
+include!(concat!(env!("OUT_DIR"), "/emitter_methods.rs"));
+
 impl Default for Emitter {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
 impl Drop for Emitter {
@@ -464,6 +520,10 @@ impl Drop for Emitter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,94 +531,72 @@ mod tests {
     #[test]
     fn decode_ldundefined() {
         let bytecode = [0x00u8];
-        let result = decode_opcode(&bytecode);
+        let result = decode(&bytecode);
         assert!(result.is_some(), "opcode 0x00 should decode");
         let (op, info) = result.unwrap();
         assert_eq!(op.mnemonic(), "ldundefined");
-        assert_eq!(info.mnemonic, "ldundefined");
+        assert_eq!(info.mnemonic(), "ldundefined");
     }
 
     #[test]
     fn decode_empty_bytecode() {
         let bytecode: [u8; 0] = [];
-        assert!(decode_opcode(&bytecode).is_none());
+        assert!(decode(&bytecode).is_none());
     }
 
     #[test]
     fn decode_prefixed_opcode() {
         let bytecode = [0xfbu8, 0x00];
-        let result = decode_opcode(&bytecode);
+        let result = decode(&bytecode);
         assert!(result.is_some(), "prefixed opcode 0xfb00 should decode");
         let (_, info) = result.unwrap();
-        assert!(info.is_prefixed);
+        assert!(info.is_prefixed());
     }
 
     #[test]
     fn decode_prefixed_needs_two_bytes() {
         let bytecode = [0xfbu8];
-        assert!(decode_opcode(&bytecode).is_none());
+        assert!(decode(&bytecode).is_none());
     }
 
     #[test]
     fn format_sizes_are_positive() {
-        for &(_, ref info) in opcode_table() {
-            assert!(
-                info.format.size() >= 1,
-                "format {:?} has size 0",
-                info.format
-            );
+        for info in opcode_table() {
+            assert!(info.size() >= 1, "format {:?} has size 0", info.format());
         }
     }
 
     #[test]
     fn non_prefixed_opcodes_fit_in_u8() {
-        for &(value, ref info) in opcode_table() {
-            if !info.is_prefixed {
-                assert!(
-                    value <= 0xFF,
-                    "{} has value {:#x} > 0xFF",
-                    info.mnemonic,
-                    value
-                );
+        for info in opcode_table() {
+            if !info.is_prefixed() {
+                assert!(info.opcode().0 <= 0xFF, "{} has value {:#x} > 0xFF", info.mnemonic(), info.opcode().0);
             }
         }
     }
 
     #[test]
     fn prefixed_opcodes_have_prefix_low_byte() {
-        for &(value, ref info) in opcode_table() {
-            if info.is_prefixed {
-                let lo = (value & 0xFF) as u8;
-                assert!(
-                    lo == 0xFB || lo == 0xFC || lo == 0xFD || lo == 0xFE,
-                    "{} has value {:#x} with unexpected low byte {:#x}",
-                    info.mnemonic,
-                    value,
-                    lo
-                );
+        let min_prefix = min_prefix_opcode();
+        for info in opcode_table() {
+            if info.is_prefixed() {
+                let lo = (info.opcode().0 & 0xFF) as u8;
+                assert!(lo >= min_prefix, "{} has low byte {:#x} < min prefix {:#x}", info.mnemonic(), lo, min_prefix);
             }
         }
     }
 
     #[test]
     fn decode_returnundefined() {
-        let info = lookup_opcode_by_mnemonic("returnundefined");
+        let info = opcode_table().find(|i| i.mnemonic() == "returnundefined");
         assert!(info.is_some(), "returnundefined should exist in ISA");
         let info = info.unwrap();
-        assert!(info.flags.contains(OpcodeFlags::RETURN));
+        assert!(info.flags().contains(OpcodeFlags::RETURN));
     }
 
     #[test]
     fn opcode_count_matches() {
-        let count = unsafe { ffi::isa_opcode_count() };
-        assert_eq!(opcode_table().len(), count);
-    }
-
-    fn lookup_opcode_by_mnemonic(mnemonic: &str) -> Option<&'static OpcodeInfo> {
-        opcode_table()
-            .iter()
-            .find(|(_, info)| info.mnemonic == mnemonic)
-            .map(|(_, info)| info)
+        assert_eq!(opcode_table().count(), opcode_count());
     }
 
     #[test]
@@ -571,54 +609,43 @@ mod tests {
 
     #[test]
     fn current_version_is_compatible() {
-        let ver = current_version();
-        assert!(is_version_compatible(&ver));
+        assert!(is_version_compatible(&current_version()));
     }
 
     #[test]
     fn min_version_is_compatible() {
-        let ver = min_version();
-        assert!(is_version_compatible(&ver));
+        assert!(is_version_compatible(&min_version()));
     }
 
     #[test]
     fn version_by_api_returns_some_for_current() {
         let ver = current_version();
-        // API level = first byte of version
         let result = version_by_api(ver.0[0]);
-        assert!(
-            result.is_some(),
-            "current API level should map to a version"
-        );
+        assert!(result.is_some(), "current API level should map to a version");
     }
 
     #[test]
     fn emitter_create_and_drop() {
         let _e = Emitter::new();
-        // Just test that create/destroy doesn't crash
     }
 
     #[test]
     fn emitter_roundtrip() {
-        // Encode ldundefined (opcode 0x00, NONE format, 1 byte) then decode it
         let mut e = Emitter::new();
-        unsafe { ffi::isa_emit_ldundefined(e.as_ptr()) };
+        e.ldundefined();
         let bytecode = e.build().expect("build should succeed");
         assert!(!bytecode.is_empty());
-        let (op, _) = decode_opcode(&bytecode).expect("should decode");
+        let (op, _) = decode(&bytecode).expect("should decode");
         assert_eq!(op.mnemonic(), "ldundefined");
     }
 
     #[test]
     fn emitter_with_label() {
         let mut e = Emitter::new();
-        let label = e.create_label();
-        // Emit a jump to the label
-        unsafe { ffi::isa_emit_jmp(e.as_ptr(), label.0) };
-        // Bind the label here
+        let label = e.label();
+        e.jmp(label);
         e.bind(label);
-        // Emit something after the label
-        unsafe { ffi::isa_emit_ldundefined(e.as_ptr()) };
+        e.ldundefined();
         let bytecode = e.build().expect("build should succeed");
         assert!(!bytecode.is_empty());
     }
@@ -626,10 +653,90 @@ mod tests {
     #[test]
     fn emitter_unbound_label_fails() {
         let mut e = Emitter::new();
-        let label = e.create_label();
-        unsafe { ffi::isa_emit_jmp(e.as_ptr(), label.0) };
-        // Don't bind the label
+        let label = e.label();
+        e.jmp(label);
         let result = e.build();
         assert_eq!(result, Err(EmitterError::UnboundLabels));
+    }
+
+    #[test]
+    fn flags_raw_passthrough() {
+        assert_eq!(OpcodeFlags::JUMP.raw(), ffi::ISA_FLAG_JUMP);
+        assert_eq!(OpcodeFlags::RETURN.raw(), ffi::ISA_FLAG_RETURN);
+        assert_eq!(OpcodeFlags::CONDITIONAL.raw(), ffi::ISA_FLAG_CONDITIONAL);
+        assert_eq!(OpcodeFlags::ACC_READ.raw(), ffi::ISA_FLAG_ACC_READ);
+        assert_eq!(OpcodeFlags::ACC_WRITE.raw(), ffi::ISA_FLAG_ACC_WRITE);
+    }
+
+    #[test]
+    fn min_prefix_opcode_value() {
+        let min = min_prefix_opcode();
+        assert!(min > 0 && min < 0xFF, "min prefix should be in valid range");
+        for info in opcode_table() {
+            if info.is_prefixed() {
+                assert!((info.opcode().0 & 0xFF) as u8 >= min);
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_count_matches() {
+        let count = prefix_count();
+        assert!(count > 0, "should have at least one prefix");
+        let min = min_prefix_opcode();
+        for i in 0..count {
+            assert!(prefix_opcode_at(i) >= min);
+        }
+    }
+
+    #[test]
+    fn can_throw_for_throw_instruction() {
+        let info = opcode_table().find(|i| i.mnemonic() == "throw");
+        if let Some(info) = info {
+            let _ = info; // just verify it exists
+            let mut e = Emitter::new();
+            e.throw();
+            let bytecode = e.build().expect("build");
+            let inst = Inst::decode(&bytecode).expect("decode");
+            assert!(inst.can_throw(), "throw instruction should can_throw");
+        }
+    }
+
+    #[test]
+    fn is_terminator_for_return() {
+        let info = opcode_table().find(|i| i.mnemonic() == "returnundefined");
+        assert!(info.is_some());
+        let mut e = Emitter::new();
+        e.returnundefined();
+        let bytecode = e.build().expect("build");
+        let inst = Inst::decode(&bytecode).expect("decode");
+        assert!(inst.is_terminator(), "returnundefined should be terminator");
+    }
+
+    #[test]
+    fn operand_info_from_table() {
+        // mov has 2 register operands
+        let info = opcode_table().find(|i| i.mnemonic() == "mov").unwrap();
+        let ops: Vec<_> = info.operands().collect();
+        assert!(ops.len() >= 2, "mov should have at least 2 operands");
+        assert_eq!(ops[0].kind, OperandKind::Reg);
+        assert_eq!(ops[1].kind, OperandKind::Reg);
+    }
+
+    #[test]
+    fn namespace_is_nonempty() {
+        for info in opcode_table() {
+            assert!(!info.namespace().is_empty(), "{} has empty namespace", info.mnemonic());
+        }
+    }
+
+    #[test]
+    fn inst_decode_and_access() {
+        let mut e = Emitter::new();
+        e.ldundefined();
+        let bytecode = e.build().expect("build");
+        let inst = Inst::decode(&bytecode).expect("decode");
+        assert_eq!(inst.opcode().mnemonic(), "ldundefined");
+        assert_eq!(inst.size(), inst.info().size());
     }
 }

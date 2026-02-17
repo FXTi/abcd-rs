@@ -78,8 +78,8 @@ impl CFG {
         leaders.insert(0u32); // First instruction is always a leader
 
         for (i, insn) in instructions.iter().enumerate() {
-            let flags = abcd_isa::lookup_opcode(insn.opcode.0)
-                .map(|info| info.flags)
+            let flags = abcd_isa::lookup(insn.opcode.0)
+                .map(|info| info.flags())
                 .unwrap_or(abcd_isa::OpcodeFlags::empty());
 
             // Jump targets are leaders
@@ -176,8 +176,8 @@ impl CFG {
             }
             let last_idx = block.last_insn - 1;
             let last_insn = &instructions[last_idx];
-            let flags = abcd_isa::lookup_opcode(last_insn.opcode.0)
-                .map(|info| info.flags)
+            let flags = abcd_isa::lookup(last_insn.opcode.0)
+                .map(|info| info.flags())
                 .unwrap_or(abcd_isa::OpcodeFlags::empty());
 
             let is_jump = flags.contains(abcd_isa::OpcodeFlags::JUMP);

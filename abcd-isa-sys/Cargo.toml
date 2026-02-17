@@ -1,0 +1,11 @@
+[package]
+name = "abcd-isa-sys"
+edition.workspace = true
+version.workspace = true
+links = "isa_bridge"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+bindgen = "0.71"

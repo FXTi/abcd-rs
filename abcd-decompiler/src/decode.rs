@@ -1,5 +1,5 @@
 use abcd_ir::instruction::{Instruction, Operand};
-use abcd_isa::{OpcodeInfo, decode_opcode};
+use abcd_isa::OpcodeInfo;
 
 /// Decode a raw bytecode byte slice into a list of instructions.
 pub fn decode_method(code: &[u8]) -> Vec<Instruction> {
@@ -8,14 +8,14 @@ pub fn decode_method(code: &[u8]) -> Vec<Instruction> {
 
     while (offset as usize) < code.len() {
         let bytes = &code[offset as usize..];
-        let Some((opcode, info)) = decode_opcode(bytes) else {
+        let Some((opcode, info)) = abcd_isa::decode(bytes) else {
             // Unknown opcode - skip one byte
             log::warn!("Unknown opcode at offset {offset:#x}: {:#04x}", bytes[0]);
             offset += 1;
             continue;
         };
 
-        let size = info.format.size() as u8;
+        let size = info.size() as u8;
         let operands = decode_operands(bytes, info);
 
         instructions.push(Instruction {
@@ -31,10 +31,10 @@ pub fn decode_method(code: &[u8]) -> Vec<Instruction> {
     instructions
 }
 
-fn decode_operands(bytes: &[u8], info: &OpcodeInfo) -> Vec<Operand> {
+fn decode_operands(bytes: &[u8], info: OpcodeInfo) -> Vec<Operand> {
     let mut operands = Vec::new();
 
-    for part in info.operand_parts {
+    for part in info.operands() {
         let byte_offset = part.byte_offset;
         match part.kind {
             abcd_isa::OperandKind::Reg => {

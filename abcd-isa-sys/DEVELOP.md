@@ -4,32 +4,40 @@
 
 本 crate 通过 arkcompiler 的 Ruby 代码生成管线 + C++ 桥接层，为 Rust 提供完整的 ArkCompiler 字节码指令集定义、解码、元数据查询、版本管理和字节码汇编能力。
 
-原样拷贝（12 个）：
+原样拷贝（22 个）：
+```
+vendor/isa/gen.rb                                          — runtime_core/isa/gen.rb
+vendor/isa/isapi.rb                                        — runtime_core/isa/isapi.rb
+vendor/isa/combine.rb                                      — runtime_core/isa/combine.rb
+vendor/isa/isa.yaml                                        — runtime_core/isa/isa.yaml
+vendor/libpandafile/pandafile_isapi.rb                     — runtime_core/libpandafile/pandafile_isapi.rb
+vendor/libpandafile/templates/bytecode_instruction_enum_gen.h.erb — runtime_core/libpandafile/templates/bytecode_instruction_enum_gen.h.erb
+vendor/libpandafile/templates/bytecode_instruction-inl_gen.h.erb  — runtime_core/libpandafile/templates/bytecode_instruction-inl_gen.h.erb
+vendor/libpandafile/bytecode_instruction.h                 — runtime_core/libpandafile/bytecode_instruction.h
+vendor/libpandafile/bytecode_instruction-inl.h             — runtime_core/libpandafile/bytecode_instruction-inl.h
+vendor/libpandafile/bytecode_emitter.h                     — runtime_core/libpandafile/bytecode_emitter.h
+vendor/libpandafile/bytecode_emitter.cpp                   — runtime_core/libpandafile/bytecode_emitter.cpp
+vendor/libpandafile/templates/bytecode_emitter_def_gen.h.erb — runtime_core/libpandafile/templates/bytecode_emitter_def_gen.h.erb
+vendor/libpandafile/templates/bytecode_emitter_gen.h.erb   — runtime_core/libpandafile/templates/bytecode_emitter_gen.h.erb
+vendor/libpandafile/templates/file_format_version.h.erb    — runtime_core/libpandafile/templates/file_format_version.h.erb
+vendor/libpandabase/macros.h                               — runtime_core/libpandabase/include/libpandabase/macros.h
+vendor/libpandabase/globals.h                              — runtime_core/libpandabase/include/libpandabase/globals.h
+vendor/libpandabase/panda_visibility.h                     — runtime_core/libpandabase/include/libpandabase/panda_visibility.h
+vendor/libpandabase/utils/debug.h                          — runtime_core/libpandabase/include/libpandabase/utils/debug.h
+vendor/libpandabase/utils/bit_helpers.h                    — runtime_core/libpandabase/include/libpandabase/utils/bit_helpers.h
+vendor/libpandabase/utils/bit_utils.h                      — runtime_core/libpandabase/include/libpandabase/utils/bit_utils.h
+vendor/libpandabase/utils/span.h                           — runtime_core/libpandabase/include/libpandabase/utils/span.h
+vendor/libpandabase/os/stacktrace.h                        — runtime_core/libpandabase/include/libpandabase/os/stacktrace.h
+```
 
-vendor/isa/gen.rb — runtime_core/isa/gen.rb
-vendor/isa/isapi.rb — runtime_core/isa/isapi.rb
-vendor/isa/combine.rb — runtime_core/isa/combine.rb
-vendor/isa/isa.yaml — runtime_core/isa/isa.yaml
-vendor/libpandafile/pandafile_isapi.rb — runtime_core/libpandafile/pandafile_isapi.rb
-vendor/libpandafile/templates/bytecode_instruction_enum_gen.h.erb — 原始模板
-vendor/libpandafile/templates/bytecode_instruction-inl_gen.h.erb — 原始模板
-vendor/libpandafile/bytecode_emitter.h — 字节码汇编器基类（~132 行）
-vendor/libpandafile/bytecode_emitter.cpp — 字节码汇编器实现（~293 行）
-vendor/libpandafile/templates/bytecode_emitter_def_gen.h.erb — emitter 方法声明模板
-vendor/libpandafile/templates/bytecode_emitter_gen.h.erb — emitter 方法实现模板
-vendor/libpandafile/templates/file_format_version.h.erb — 版本常量模板
-
-我们写的 shim / bridge 文件（9 个）：
-
-bridge/shim/bytecode_instruction.h（~300 行 vs 原始 439 行）— 简化版，去掉了对 file.h、bit_helpers.h、securec.h、macros.h 的依赖，内联了 shim 宏（ASSERT、UNREACHABLE 等）、TypeHelperT 类型特征、panda_file::File 最小 stub（含 VERSION_SIZE），砍掉了 SAFE 模式的完整实现
-bridge/shim/bytecode_instruction-inl.h（81 行 vs 原始 94 行）— 去掉了 #include "macros.h" 和一些 NOLINT 注释，功能上等价
-bridge/shim/bytecode_emitter_shim.h — 提供 Span<T> 和 MinimumBitsToStore（emitter 依赖，原始来自 libpandabase）
-bridge/shim/file_shim.h — 定义 PANDA_PUBLIC_API 宏（file_format_version.h 依赖）
-bridge/shim/file.h — 重定向头文件，include bytecode_instruction.h + file_shim.h
+我们写的 shim / bridge 文件（5 个）：
+```
+bridge/shim/securec.h — 华为安全 C 库 shim，实现 memcpy_s 为标准 memcpy 包装（~20 行）
+bridge/shim/file.h — libpandafile/file.h 最小 shim，提供 File::EntityId + LOG 宏 + 传递依赖（~65 行）
 bridge/shim/utils/const_value.h — 空 stub（file_format_version.h 的 include 依赖）
-bridge/bytecode_emitter_wrapper.cpp — shim 注入 wrapper（先 include shim 再 include vendor .cpp，避免修改 vendor 文件）
 templates/isa_bridge_emitter.h.erb — 自定义模板，生成 per-mnemonic C bridge emit 函数实现
 templates/isa_bridge_emitter_decl.h.erb — 自定义模板，生成 per-mnemonic C bridge emit 函数声明（bindgen 用）
+```
 
 ## 流水线总览
 
@@ -49,8 +57,8 @@ gen.rb + isapi.rb + pandafile_isapi.rb (Ruby 管线)
     └──► isa_bridge_emitter_decl.h         (per-mnemonic C bridge emit 函数声明, bindgen 用)
             │
             ▼
-    bytecode_instruction.h / -inl.h (简化版手写 C++ 基类, 含 shim)
-    bytecode_emitter.h / .cpp (vendor 汇编器, 通过 wrapper.cpp 注入 shim)
+    bytecode_instruction.h / -inl.h (vendor 原版, 通过 shim 满足依赖)
+    bytecode_emitter.h / .cpp (vendor 汇编器, 直接编译)
             │
             ▼
     isa_bridge.h / isa_bridge.cpp (thin C wrapper, extern "C")
@@ -86,7 +94,7 @@ gen.rb + isapi.rb + pandafile_isapi.rb        ← TemplateBasedGen.cmake:98-119 
     直接在 C++ 项目中使用 (无需 C wrapper)
 ```
 
-我们的差异：不走 CMake，用 Rust `build.rs` 驱动 Ruby；不用原始 C++ 头文件（依赖链太深），用简化版 + shim；额外写了 `isa_bridge_tables.h.erb` 模板导出 mnemonic/flags/exceptions 等元数据（原始管线中这些信息嵌在 `HasFlag` 的 switch 里，没有独立的静态表）。现在我们也生成 bytecode_emitter 和 file_format_version，与原始管线的差距进一步缩小——主要差异仅在于 shim 层和 C bridge 层。
+我们的差异：不走 CMake，用 Rust `build.rs` 驱动 Ruby；用 vendor 原版 C++ 头文件 + 最小 shim（securec.h、file.h、const_value.h）替代重型依赖；额外写了 `isa_bridge_tables.h.erb` 模板导出 mnemonic/flags/exceptions 等元数据（原始管线中这些信息嵌在 `HasFlag` 的 switch 里，没有独立的静态表）。编译时加 `-DNDEBUG` 消除 C++ debug 断言的运行时依赖（AssertionFail、PrintStack）。isa_bridge.cpp 中所有前缀检测通过 `Inst::GetMinPrefixOpcodeIndex()` 获取阈值，所有分类函数委托上游生成方法，零硬编码常量。ISA_FLAG_* 和 ISA_EXC_* 常量以匿名 enum 形式生成，bindgen 可直接导出到 Rust。
 
 ---
 
@@ -629,76 +637,27 @@ inline BytecodeId BytecodeInst<Mode>::GetId(size_t idx) const { ... }
 ## 第六步：C++ 基类 — bytecode_instruction.h
 
 arkcompiler 原始文件: `runtime_core/libpandafile/bytecode_instruction.h` (439 行)
-我们的简化版: `bridge/shim/bytecode_instruction.h` (295 行)
+我们直接使用 vendor 拷贝: `vendor/libpandafile/bytecode_instruction.h`
 
-### 原始依赖链
+### 依赖链与 shim 策略
 
-原始文件依赖：
+原始文件的依赖通过 include 路径优先级解析：
 
-- `libpandabase/macros.h` → `ASSERT`, `UNREACHABLE`, `DEFAULT_COPY_SEMANTIC` 等宏
-- `libpandabase/utils/bit_helpers.h` → `helpers::TypeHelperT` 类型特征
-- `libpandafile/file.h` → `panda_file::File::EntityId`, `panda_file::File::Index`
-- `securec.h` → `memcpy_s`（华为安全 C 库）
-- `utils/logger.h` → `LOG` 宏
+```
+bytecode_instruction.h
+  → "file.h"              → bridge/shim/file.h (shim: File::EntityId + LOG + 传递依赖)
+  → "utils/bit_helpers.h"  → vendor/libpandabase/utils/bit_helpers.h (原版拷贝)
+  → "securec.h"            → bridge/shim/securec.h (shim: memcpy_s 包装)
 
-### 我们的 shim 替代
-
-在简化版头文件顶部 (`bridge/shim/bytecode_instruction.h:20-39`)：
-
-```cpp
-// Shim macros replacing arkcompiler internals
-#include <cassert>
-#define ASSERT(x) assert(x)
-#define ASSERT_PRINT(x, msg) assert(x)
-#define UNREACHABLE() __builtin_unreachable()
-#define UNREACHABLE_CONSTEXPR() __builtin_unreachable()
-#define ALWAYS_INLINE __attribute__((always_inline))
-#define DEFAULT_COPY_SEMANTIC(T) T(const T&) = default; T& operator=(const T&) = default
-#define NO_MOVE_SEMANTIC(T) T(T&&) = delete; T& operator=(T&&) = delete
-#define LOG(level, component) std::cerr
-
-// C++20 bit_cast shim (generated code uses it)
-template <typename To, typename From>
-inline To bit_cast(const From& src) {
-    static_assert(sizeof(To) == sizeof(From));
-    To dst;
-    std::memcpy(&dst, &src, sizeof(To));
-    return dst;
-}
+bytecode_instruction-inl.h
+  → "macros.h"             → vendor/libpandabase/macros.h (原版拷贝, 加 -DNDEBUG)
+    → "os/stacktrace.h"    → vendor/libpandabase/os/stacktrace.h (原版拷贝, 仅声明)
+    → "utils/debug.h"      → vendor/libpandabase/utils/debug.h (原版拷贝, 仅声明)
+    → "panda_visibility.h" → vendor/libpandabase/panda_visibility.h (原版拷贝)
 ```
 
-`panda_file::File` 最小 stub (`bridge/shim/bytecode_instruction.h:43-53`)：
-
-```cpp
-namespace panda::panda_file {
-class File {
-public:
-    using Index = uint16_t;
-    struct EntityId {
-        uint32_t offset;
-        explicit constexpr EntityId(uint32_t v) : offset(v) {}
-        uint32_t GetOffset() const { return offset; }
-    };
-};
-}
-```
-
-`helpers::TypeHelperT` 内联 (`bridge/shim/bytecode_instruction.h:59-83`) — 从 `libpandabase/utils/bit_helpers.h` 提取：
-
-```cpp
-namespace panda::helpers {
-template <size_t width>
-struct UnsignedTypeHelper {
-    using type = std::conditional_t<
-        width <= 8, uint8_t,
-        std::conditional_t<width <= 16, uint16_t,
-            std::conditional_t<width <= 32, uint32_t,
-                std::conditional_t<width <= 64, uint64_t, void>>>>;
-};
-template <size_t width, bool is_signed>
-using TypeHelperT = ...;
-}
-```
+只有 3 个 shim 文件（securec.h、file.h、utils/const_value.h），其余全部使用 arkcompiler 原版。
+编译时加 `-DNDEBUG` 使 ASSERT 变为 no-op，UNREACHABLE 变为 `std::abort()`，消除对 AssertionFail/PrintStack 实现的依赖。
 
 ### 核心类结构
 
@@ -870,54 +829,44 @@ public:
 - `bytecode_emitter_def_gen.h.erb` — 方法声明（注入到类定义内）
 - `bytecode_emitter_gen.h.erb` — 方法实现（编码逻辑，选择最优指令格式）
 
-### Wrapper .cpp 模式
+### Vendor 源文件直接编译
 
-vendor 的 `bytecode_emitter.cpp` 依赖 `Span<T>` 和 `MinimumBitsToStore`（来自 libpandabase），但我们不想修改 vendor 文件。解决方案是 `bridge/bytecode_emitter_wrapper.cpp`：
+vendor 的 `bytecode_emitter.cpp` 通过 include 路径获取所有依赖：
+- `Span<T>` — 通过 bytecode_instruction.h → file.h (shim) → span.h (vendor)
+- `MinimumBitsToStore` — 通过 file.h (shim) → bit_utils.h (vendor)
 
-```cpp
-// 先 include shim，再 include 原始 cpp
-#include "bytecode_emitter_shim.h"
-#include "bytecode_emitter.cpp"  // 直接 include .cpp
-```
-
-这样 shim 中的 `Span<T>` 和 `MinimumBitsToStore` 在 vendor 代码编译前就已定义。
+不再需要 wrapper .cpp，build.rs 直接编译 `vendor/libpandafile/bytecode_emitter.cpp`。
 
 ---
 
-## 第九步：Emitter Shim 文件
+## 第九步：Shim 文件
 
-### bytecode_emitter_shim.h
+只有 3 个 shim 文件，替代 3 个无法直接拷贝的重型依赖：
 
-提供 emitter 依赖的两个 libpandabase 组件的最小实现：
+### securec.h (bridge/shim/securec.h)
+
+华为安全 C 库 shim，实现 `memcpy_s` 为标准 `memcpy` 包装：
 
 ```cpp
-namespace panda {
-template <typename T>
-class Span {
-public:
-    Span(T* data, size_t size);
-    template <typename U, size_t N> Span(std::array<U, N>& arr);
-    template <typename U, size_t N> Span(const std::array<U, N>& arr);
-    template <typename It> Span(It it, size_t size);  // 迭代器构造
-    T& operator[](size_t idx);
-    size_t size() const;
-    Span SubSpan(size_t offset) const;
-};
+inline int memcpy_s(void *dest, size_t destMax, const void *src, size_t count) {
+    if (dest == nullptr || src == nullptr) return EINVAL;
+    if (count > destMax) return ERANGE;
+    std::memcpy(dest, src, count);
+    return EOK;
 }
-
-template <typename T>
-constexpr size_t MinimumBitsToStore(T value);  // 计算存储 value 所需的最少位数
 ```
 
-`Span<T>` 的迭代器构造函数是关键——emitter 内部用 `bytecode_.begin() + offset` 构造 Span。
+### file.h (bridge/shim/file.h)
 
-### file_shim.h + file.h
+替代原始 `libpandafile/file.h`（564 行 + os/mem.h + logger.h），提供：
+- `panda::panda_file::File::EntityId` — bytecode_instruction.h 的 BytecodeId 依赖
+- `panda::panda_file::File::Index` / `Index32` — 类型别名
+- `LOG(level, component)` 宏 — 替代 logger.h（541 行）
+- 传递 include `utils/span.h` + `utils/bit_utils.h` — bytecode_emitter.cpp 依赖
 
-`file_format_version.h` 依赖 `#include "file.h"` 和 `PANDA_PUBLIC_API` 宏。我们的策略：
+### utils/const_value.h (bridge/shim/utils/const_value.h)
 
-- `bridge/shim/file_shim.h` — 只定义 `#define PANDA_PUBLIC_API`
-- `bridge/shim/file.h` — 重定向，include `bytecode_instruction.h`（提供 `File::VERSION_SIZE`）+ `file_shim.h`
-- `bridge/shim/utils/const_value.h` — 空 stub（`file_format_version.h` 的另一个 include 依赖）
+空 stub，满足 `file_format_version.h` 的 `#include "utils/const_value.h"` 依赖。
 
 `File::VERSION_SIZE = 4` 定义在 `bytecode_instruction.h` 的 `panda::panda_file::File` stub 中，与 `EntityId`、`Index` 共存。
 
@@ -1007,14 +956,41 @@ const char* isa_get_namespace(IsaOpcode opcode);     // ISA_NAMESPACE_TABLE
 struct IsaOperandBrief isa_get_operand_info(IsaOpcode opcode);  // ISA_OPERANDS_TABLE
 ```
 
-**分类辅助** — 基于 flags 或 opcode 编码的快捷查询：
+**分类辅助** — 全部委托上游生成方法，零硬编码：
 
 ```c
 int isa_is_jump(IsaOpcode opcode);         // ISA_FLAG_JUMP
 int isa_is_conditional(IsaOpcode opcode);  // ISA_FLAG_CONDITIONAL
 int isa_is_return(IsaOpcode opcode);       // ISA_FLAG_RETURN
-int isa_is_throw(IsaOpcode opcode);        // (opcode & 0xFF) == 0xFE (throw 是前缀)
-int isa_is_range(IsaOpcode opcode);        // 委托 IsRangeInstruction()
+int isa_is_throw(IsaOpcode opcode);        // IsThrow(Exceptions::X_THROW) — 委托上游
+int isa_is_range(IsaOpcode opcode);        // IsRangeInstruction() — 委托上游
+int isa_is_suspend(IsaOpcode opcode);      // HasFlag(SUSPEND) — 委托上游
+
+// 从字节流查询（需要构造 BytecodeInst）
+int isa_can_throw(const uint8_t* bytes, size_t len);          // CanThrow()
+int isa_is_terminator(const uint8_t* bytes, size_t len);      // IsTerminator()
+int isa_is_return_or_throw(const uint8_t* bytes, size_t len); // IsReturnOrThrowInstruction()
+```
+
+**常量与前缀查询** — 从生成数据获取：
+
+```c
+uint8_t isa_min_prefix_opcode(void);           // GetMinPrefixOpcodeIndex() — 当前 251
+size_t isa_prefix_count(void);                 // ISA_PREFIX_COUNT — 当前 4
+uint8_t isa_prefix_opcode_at(size_t idx);      // ISA_PREFIX_TABLE[idx].opcode_idx
+int isa_is_primary_opcode_valid(uint8_t primary); // IsPrimaryOpcodeValid()
+```
+
+**额外操作数方法** — 补齐上游 BytecodeInst 的完整能力：
+
+```c
+int64_t isa_get_imm_data(const uint8_t* bytes, size_t len, size_t idx);  // GetImmData (正确符号)
+size_t isa_get_imm_count(const uint8_t* bytes, size_t len);              // GetImmCount
+size_t isa_get_literal_index(const uint8_t* bytes, size_t len);          // GetLiteralIndex
+void isa_update_id(uint8_t* bytes, size_t len, uint32_t new_id, uint32_t idx); // UpdateId
+int64_t isa_get_last_vreg(const uint8_t* bytes, size_t len);             // GetLastVReg
+int64_t isa_get_range_last_reg_idx(const uint8_t* bytes, size_t len);    // GetRangeInsLastRegIdx
+int isa_is_id_match_flag(const uint8_t* bytes, size_t len, size_t idx, uint32_t flag); // IsIdMatchFlag
 ```
 
 ### Opcode 编码注意事项
@@ -1022,9 +998,9 @@ int isa_is_range(IsaOpcode opcode);        // 委托 IsRangeInstruction()
 opcode 值的编码为 `(sub_opcode << 8) | prefix_byte`：
 
 - 非前缀指令：值 = 第一个字节（0x00-0xDC），高 8 位为 0
-- 前缀指令：低 8 位 = prefix byte（0xFB/FC/FD/FE），高 8 位 = sub-opcode
+- 前缀指令：低 8 位 = prefix byte（>= `GetMinPrefixOpcodeIndex()`），高 8 位 = sub-opcode
 
-`isa_is_prefixed` 检查低字节而非高字节。`isa_is_throw` 直接检查 `(opcode & 0xFF) == 0xFE`，因为 throw 是一个前缀组（0xFE），不是 flags 中的属性。`isa_is_range` 需要重建字节序列后委托给 C++ 的 `IsRangeInstruction()`。
+所有前缀检测通过 `Inst::GetMinPrefixOpcodeIndex()` 获取阈值，不硬编码具体字节值。`isa_is_throw` 委托上游 `IsThrow(Exceptions::X_THROW)` 检查异常表。`isa_is_range` 委托上游 `IsRangeInstruction()`。
 
 ### 版本 API
 
@@ -1231,15 +1207,11 @@ abcd-isa/
 ├── bridge/
 │   ├── isa_bridge.h            # C wrapper 头文件（extern "C"）
 │   ├── isa_bridge.cpp          # C wrapper 实现
-│   ├── bytecode_emitter_wrapper.cpp  # shim 注入 wrapper
-│   └── shim/
-│       ├── bytecode_instruction.h      # 简化版 C++ 基类（含 shim 宏 + File stub）
-│       ├── bytecode_instruction-inl.h  # 简化版内联方法
-│       ├── bytecode_emitter_shim.h     # Span<T> + MinimumBitsToStore
-│       ├── file_shim.h                 # PANDA_PUBLIC_API 宏
-│       ├── file.h                      # 重定向头文件
+│   └── shim/                   # 最小 shim（仅 3 个文件，替代重型依赖）
+│       ├── securec.h                  # 华为安全 C 库 shim（memcpy_s 包装）
+│       ├── file.h                     # libpandafile/file.h shim（File::EntityId + LOG 宏）
 │       └── utils/
-│           └── const_value.h           # 空 stub
+│           └── const_value.h          # 空 stub
 ├── templates/
 │   ├── isa_bridge_tables.h.erb         # 自定义 ERB 模板（元数据静态表）
 │   ├── isa_bridge_emitter.h.erb        # 自定义 ERB 模板（emitter C bridge 实现）
@@ -1250,16 +1222,29 @@ abcd-isa/
 │   │   ├── isapi.rb            # arkcompiler: runtime_core/isa/isapi.rb
 │   │   ├── combine.rb          # arkcompiler: runtime_core/isa/combine.rb
 │   │   └── isa.yaml            # arkcompiler: runtime_core/isa/isa.yaml (已合并 ecmascript plugin)
-│   └── libpandafile/
-│       ├── pandafile_isapi.rb           # arkcompiler: pandafile_isapi.rb
-│       ├── bytecode_emitter.h           # arkcompiler: 汇编器基类
-│       ├── bytecode_emitter.cpp         # arkcompiler: 汇编器实现
-│       └── templates/
-│           ├── bytecode_instruction_enum_gen.h.erb   # arkcompiler 原始模板
-│           ├── bytecode_instruction-inl_gen.h.erb    # arkcompiler 原始模板
-│           ├── bytecode_emitter_def_gen.h.erb        # arkcompiler 原始模板
-│           ├── bytecode_emitter_gen.h.erb            # arkcompiler 原始模板
-│           └── file_format_version.h.erb             # arkcompiler 原始模板
+│   ├── libpandafile/
+│   │   ├── bytecode_instruction.h     # arkcompiler: 字节码指令基类
+│   │   ├── bytecode_instruction-inl.h # arkcompiler: 字节码指令内联实现
+│   │   ├── bytecode_emitter.h         # arkcompiler: 汇编器基类
+│   │   ├── bytecode_emitter.cpp       # arkcompiler: 汇编器实现
+│   │   ├── pandafile_isapi.rb         # arkcompiler: pandafile_isapi.rb
+│   │   └── templates/
+│   │       ├── bytecode_instruction_enum_gen.h.erb
+│   │       ├── bytecode_instruction-inl_gen.h.erb
+│   │       ├── bytecode_emitter_def_gen.h.erb
+│   │       ├── bytecode_emitter_gen.h.erb
+│   │       └── file_format_version.h.erb
+│   └── libpandabase/
+│       ├── macros.h                   # ASSERT/UNREACHABLE/copy semantics 宏
+│       ├── globals.h                  # 基础常量
+│       ├── panda_visibility.h         # PANDA_PUBLIC_API 宏
+│       ├── utils/
+│       │   ├── debug.h                # debug 函数声明
+│       │   ├── bit_helpers.h          # 类型辅助模板
+│       │   ├── bit_utils.h            # 位操作工具 + MinimumBitsToStore
+│       │   └── span.h                 # Span<T> 容器
+│       └── os/
+│           └── stacktrace.h           # 栈追踪声明（仅声明不调用）
 └── DEVELOP.md
 ```
 
@@ -1276,6 +1261,8 @@ abcd-isa/
 - ~80 种指令格式
 - 4 个前缀：`callruntime` (0xFB), `deprecated` (0xFC), `wide` (0xFD), `throw` (0xFE)
 - Ruby 生成 8 个头文件：enum_gen, inl_gen, bridge_tables, emitter_def_gen, emitter_gen, file_format_version, bridge_emitter, bridge_emitter_decl
-- C++ 编译 2 个源文件：isa_bridge.cpp + bytecode_emitter_wrapper.cpp
-- C bridge 导出 30+ 静态函数 + 326 个 per-mnemonic emit 函数
-- Rust API：解码/元数据/版本/汇编器，17 个测试
+- C++ 编译 2 个源文件：isa_bridge.cpp + vendor/bytecode_emitter.cpp（加 -DNDEBUG）
+- Vendor 文件 22 个（直接拷贝，更新时覆盖即可），Shim 文件 3 个（~55 行自写代码）
+- C bridge 导出 40+ 静态函数 + 326 个 per-mnemonic emit 函数（零硬编码常量，全部委托上游）
+- Rust API：解码/元数据/版本/汇编器/分类/操作数，22 个测试
+- ISA_FLAG_* 24 个属性标志 + ISA_EXC_* 异常标志，bindgen 直接导出

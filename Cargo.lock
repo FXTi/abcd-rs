@@ -45,6 +45,13 @@ dependencies = [
 name = "abcd-isa"
 version = "0.1.0"
 dependencies = [
+ "abcd-isa-sys",
+]
+
+[[package]]
+name = "abcd-isa-sys"
+version = "0.1.0"
+dependencies = [
  "bindgen",
  "cc",
 ]
