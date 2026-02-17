@@ -47,32 +47,32 @@ impl Format {
 pub struct OpcodeFlags(u32);
 
 impl OpcodeFlags {
-    pub const ACC_NONE: Self = Self(ffi::ISA_FLAG_ACC_NONE as u32);
-    pub const ACC_READ: Self = Self(ffi::ISA_FLAG_ACC_READ as u32);
-    pub const ACC_WRITE: Self = Self(ffi::ISA_FLAG_ACC_WRITE as u32);
-    pub const CONDITIONAL: Self = Self(ffi::ISA_FLAG_CONDITIONAL as u32);
-    pub const CONDITIONAL_THROW: Self = Self(ffi::ISA_FLAG_CONDITIONAL_THROW as u32);
-    pub const DYNAMIC: Self = Self(ffi::ISA_FLAG_DYNAMIC as u32);
-    pub const EIGHT_BIT_IC: Self = Self(ffi::ISA_FLAG_EIGHT_BIT_IC as u32);
-    pub const EIGHT_SIXTEEN_BIT_IC: Self = Self(ffi::ISA_FLAG_EIGHT_SIXTEEN_BIT_IC as u32);
-    pub const FLOAT: Self = Self(ffi::ISA_FLAG_FLOAT as u32);
-    pub const IC_SLOT: Self = Self(ffi::ISA_FLAG_IC_SLOT as u32);
-    pub const JIT_IC_SLOT: Self = Self(ffi::ISA_FLAG_JIT_IC_SLOT as u32);
-    pub const JUMP: Self = Self(ffi::ISA_FLAG_JUMP as u32);
-    pub const LANGUAGE_TYPE: Self = Self(ffi::ISA_FLAG_LANGUAGE_TYPE as u32);
-    pub const LITERALARRAY_ID: Self = Self(ffi::ISA_FLAG_LITERALARRAY_ID as u32);
-    pub const MAYBE_DYNAMIC: Self = Self(ffi::ISA_FLAG_MAYBE_DYNAMIC as u32);
-    pub const METHOD_ID: Self = Self(ffi::ISA_FLAG_METHOD_ID as u32);
-    pub const NO_SIDE_EFFECT: Self = Self(ffi::ISA_FLAG_NO_SIDE_EFFECT as u32);
-    pub const ONE_SLOT: Self = Self(ffi::ISA_FLAG_ONE_SLOT as u32);
-    pub const RANGE_0: Self = Self(ffi::ISA_FLAG_RANGE_0 as u32);
-    pub const RANGE_1: Self = Self(ffi::ISA_FLAG_RANGE_1 as u32);
-    pub const RETURN: Self = Self(ffi::ISA_FLAG_RETURN as u32);
-    pub const SIXTEEN_BIT_IC: Self = Self(ffi::ISA_FLAG_SIXTEEN_BIT_IC as u32);
-    pub const STRING_ID: Self = Self(ffi::ISA_FLAG_STRING_ID as u32);
+    pub const ACC_NONE: Self = Self(ffi::ISA_FLAG_ACC_NONE);
+    pub const ACC_READ: Self = Self(ffi::ISA_FLAG_ACC_READ);
+    pub const ACC_WRITE: Self = Self(ffi::ISA_FLAG_ACC_WRITE);
+    pub const CONDITIONAL: Self = Self(ffi::ISA_FLAG_CONDITIONAL);
+    pub const CONDITIONAL_THROW: Self = Self(ffi::ISA_FLAG_CONDITIONAL_THROW);
+    pub const DYNAMIC: Self = Self(ffi::ISA_FLAG_DYNAMIC);
+    pub const EIGHT_BIT_IC: Self = Self(ffi::ISA_FLAG_EIGHT_BIT_IC);
+    pub const EIGHT_SIXTEEN_BIT_IC: Self = Self(ffi::ISA_FLAG_EIGHT_SIXTEEN_BIT_IC);
+    pub const FLOAT: Self = Self(ffi::ISA_FLAG_FLOAT);
+    pub const IC_SLOT: Self = Self(ffi::ISA_FLAG_IC_SLOT);
+    pub const JIT_IC_SLOT: Self = Self(ffi::ISA_FLAG_JIT_IC_SLOT);
+    pub const JUMP: Self = Self(ffi::ISA_FLAG_JUMP);
+    pub const LANGUAGE_TYPE: Self = Self(ffi::ISA_FLAG_LANGUAGE_TYPE);
+    pub const LITERALARRAY_ID: Self = Self(ffi::ISA_FLAG_LITERALARRAY_ID);
+    pub const MAYBE_DYNAMIC: Self = Self(ffi::ISA_FLAG_MAYBE_DYNAMIC);
+    pub const METHOD_ID: Self = Self(ffi::ISA_FLAG_METHOD_ID);
+    pub const NO_SIDE_EFFECT: Self = Self(ffi::ISA_FLAG_NO_SIDE_EFFECT);
+    pub const ONE_SLOT: Self = Self(ffi::ISA_FLAG_ONE_SLOT);
+    pub const RANGE_0: Self = Self(ffi::ISA_FLAG_RANGE_0);
+    pub const RANGE_1: Self = Self(ffi::ISA_FLAG_RANGE_1);
+    pub const RETURN: Self = Self(ffi::ISA_FLAG_RETURN);
+    pub const SIXTEEN_BIT_IC: Self = Self(ffi::ISA_FLAG_SIXTEEN_BIT_IC);
+    pub const STRING_ID: Self = Self(ffi::ISA_FLAG_STRING_ID);
     /// Synthetic flag: instruction's primary role is to throw (bit 31).
-    pub const THROW: Self = Self(ffi::ISA_FLAG_THROW as u32);
-    pub const TWO_SLOT: Self = Self(ffi::ISA_FLAG_TWO_SLOT as u32);
+    pub const THROW: Self = Self(ffi::ISA_FLAG_THROW);
+    pub const TWO_SLOT: Self = Self(ffi::ISA_FLAG_TWO_SLOT);
 
     pub const fn raw(self) -> u32 {
         self.0
@@ -93,9 +93,9 @@ impl OpcodeFlags {
 pub struct Exceptions(u32);
 
 impl Exceptions {
-    pub const NONE: Self = Self(ffi::ISA_EXC_X_NONE as u32);
-    pub const OOM: Self = Self(ffi::ISA_EXC_X_OOM as u32);
-    pub const THROW: Self = Self(ffi::ISA_EXC_X_THROW as u32);
+    pub const NONE: Self = Self(ffi::ISA_EXC_X_NONE);
+    pub const OOM: Self = Self(ffi::ISA_EXC_X_OOM);
+    pub const THROW: Self = Self(ffi::ISA_EXC_X_THROW);
 
     pub const fn raw(self) -> u32 {
         self.0
@@ -227,13 +227,10 @@ impl Iterator for OperandIter {
             return None;
         }
         let op = &self.entry.operands[self.idx];
-        let kind_raw = op.kind as u32;
-        let kind = if kind_raw == ffi::ISA_OPERAND_KIND_REG as u32 {
-            OperandKind::Reg
-        } else if kind_raw == ffi::ISA_OPERAND_KIND_IMM as u32 {
-            OperandKind::Imm
-        } else {
-            OperandKind::Id
+        let kind = match op.kind as u32 {
+            ffi::ISA_OPERAND_KIND_REG => OperandKind::Reg,
+            ffi::ISA_OPERAND_KIND_IMM => OperandKind::Imm,
+            _ => OperandKind::Id,
         };
         let bit_width = op.bit_width as usize;
         let byte_offset = self.bit_cursor / 8;
@@ -522,15 +519,14 @@ impl Emitter {
         let mut buf: *mut u8 = std::ptr::null_mut();
         let mut len: usize = 0;
         let rc = unsafe { ffi::isa_emitter_build(self.ptr, &mut buf, &mut len) };
-        let rc = rc as u32;
-        if rc == ffi::ISA_EMITTER_OK as u32 {
-            let result = unsafe { std::slice::from_raw_parts(buf, len) }.to_vec();
-            unsafe { ffi::isa_emitter_free_buf(buf) };
-            Ok(result)
-        } else if rc == ffi::ISA_EMITTER_INTERNAL_ERROR as u32 {
-            Err(EmitterError::InternalError)
-        } else {
-            Err(EmitterError::UnboundLabels)
+        match rc as u32 {
+            ffi::ISA_EMITTER_OK => {
+                let result = unsafe { std::slice::from_raw_parts(buf, len) }.to_vec();
+                unsafe { ffi::isa_emitter_free_buf(buf) };
+                Ok(result)
+            }
+            ffi::ISA_EMITTER_INTERNAL_ERROR => Err(EmitterError::InternalError),
+            _ => Err(EmitterError::UnboundLabels),
         }
     }
 
@@ -706,14 +702,11 @@ mod tests {
 
     #[test]
     fn flags_raw_passthrough() {
-        assert_eq!(OpcodeFlags::JUMP.raw(), ffi::ISA_FLAG_JUMP as u32);
-        assert_eq!(OpcodeFlags::RETURN.raw(), ffi::ISA_FLAG_RETURN as u32);
-        assert_eq!(
-            OpcodeFlags::CONDITIONAL.raw(),
-            ffi::ISA_FLAG_CONDITIONAL as u32
-        );
-        assert_eq!(OpcodeFlags::ACC_READ.raw(), ffi::ISA_FLAG_ACC_READ as u32);
-        assert_eq!(OpcodeFlags::ACC_WRITE.raw(), ffi::ISA_FLAG_ACC_WRITE as u32);
+        assert_eq!(OpcodeFlags::JUMP.raw(), ffi::ISA_FLAG_JUMP);
+        assert_eq!(OpcodeFlags::RETURN.raw(), ffi::ISA_FLAG_RETURN);
+        assert_eq!(OpcodeFlags::CONDITIONAL.raw(), ffi::ISA_FLAG_CONDITIONAL);
+        assert_eq!(OpcodeFlags::ACC_READ.raw(), ffi::ISA_FLAG_ACC_READ);
+        assert_eq!(OpcodeFlags::ACC_WRITE.raw(), ffi::ISA_FLAG_ACC_WRITE);
     }
 
     #[test]

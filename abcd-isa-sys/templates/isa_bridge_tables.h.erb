@@ -40,11 +40,9 @@ static const size_t ISA_MNEMONIC_TABLE_SIZE = <%= Panda.instructions.size %>;
   prop_to_bit = {}
   prop_list.each_with_index { |p, i| prop_to_bit[p] = i }
 -%>
-enum {
 <% prop_list.each_with_index do |tag, i| -%>
-    ISA_FLAG_<%= tag.upcase %> = (1u << <%= i %>),
+#define ISA_FLAG_<%= tag.upcase %> (1U << <%= i %>)
 <% end -%>
-};
 
 struct IsaFlagsEntry {
     uint16_t opcode;
@@ -71,11 +69,9 @@ static const size_t ISA_FLAGS_TABLE_SIZE = <%= Panda.instructions.size %>;
   exc_to_bit = {}
   exc_list.each_with_index { |e, i| exc_to_bit[e] = i }
 -%>
-enum {
 <% exc_list.each_with_index do |tag, i| -%>
-    ISA_EXC_<%= tag.upcase %> = (1u << <%= i %>),
+#define ISA_EXC_<%= tag.upcase %> (1U << <%= i %>)
 <% end -%>
-};
 
 struct IsaExceptionsEntry {
     uint16_t opcode;
@@ -149,13 +145,11 @@ extern const struct IsaOpcodeOperands ISA_OPERANDS_TABLE[] = {
 static const size_t ISA_OPERANDS_TABLE_SIZE = <%= Panda.instructions.size %>;
 
 /* === Total counts and prefix metadata === */
-enum {
-    ISA_TOTAL_OPCODES = <%= Panda.instructions.size %>,
-    ISA_TOTAL_FORMATS = <%= Panda.formats.size %>,
-    ISA_TOTAL_PREFIXES = <%= Panda.prefixes.size %>,
-    ISA_MIN_PREFIX_OPCODE = <%= Panda.prefixes.map(&:opcode_idx).min %>,
-    ISA_PREFIX_COUNT = <%= Panda.prefixes.size %>,
-};
+#define ISA_TOTAL_OPCODES       <%= Panda.instructions.size %>U
+#define ISA_TOTAL_FORMATS       <%= Panda.formats.size %>U
+#define ISA_TOTAL_PREFIXES      <%= Panda.prefixes.size %>U
+#define ISA_MIN_PREFIX_OPCODE   <%= Panda.prefixes.map(&:opcode_idx).min %>U
+#define ISA_PREFIX_COUNT        <%= Panda.prefixes.size %>U
 
 struct IsaPrefixEntry {
     uint8_t opcode_idx;

@@ -13,21 +13,17 @@ typedef uint8_t  IsaFormat;
 /* === Constants === */
 
 /* Sentinel returned by isa_decode_opcode on failure. */
-enum { ISA_INVALID_OPCODE = 0xFFFF };
+#define ISA_INVALID_OPCODE 0xFFFFU
 
 /* Operand kind values (matches IsaOperandInfo.kind in generated tables). */
-enum {
-    ISA_OPERAND_KIND_REG = 0,
-    ISA_OPERAND_KIND_IMM = 1,
-    ISA_OPERAND_KIND_ID  = 2,
-};
+#define ISA_OPERAND_KIND_REG 0U
+#define ISA_OPERAND_KIND_IMM 1U
+#define ISA_OPERAND_KIND_ID  2U
 
 /* Emitter build result codes. */
-enum {
-    ISA_EMITTER_OK             = 0,
-    ISA_EMITTER_INTERNAL_ERROR = 1,
-    ISA_EMITTER_UNBOUND_LABELS = 2,
-};
+#define ISA_EMITTER_OK             0U
+#define ISA_EMITTER_INTERNAL_ERROR 1U
+#define ISA_EMITTER_UNBOUND_LABELS 2U
 
 /* Synthetic flag: instruction's primary role is to throw.
  * Not part of the generated ISA_FLAG_* set; occupies bit 31. */
