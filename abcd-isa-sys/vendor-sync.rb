@@ -9,6 +9,7 @@ require 'optparse'
 require 'fileutils'
 require 'digest'
 require 'yaml'
+require 'time'
 require 'net/http'
 require 'uri'
 
