@@ -107,6 +107,8 @@ fn main() {
         cc_build.define("PANDA_TARGET_WINDOWS", None);
         // Force-include MSVC compat header before all source files
         cc_build.flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"));
+        // Enable C++ exception handling (vendor code uses <iostream>)
+        cc_build.flag("/EHsc");
     }
 
     cc_build.compile("isa_bridge");
