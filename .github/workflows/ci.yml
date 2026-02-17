@@ -21,16 +21,30 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  vendor-check:
+    name: Vendor integrity
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - run: ruby abcd-isa-sys/vendor-sync.rb --check-local
+
   build:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: fmt
+    needs: [fmt, vendor-check]
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
       - uses: actions/cache@v4
         with:
           path: |
@@ -63,6 +77,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
       - run: cargo build --release --target ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:

@@ -19,7 +19,7 @@ jobs:
           ruby-version: '3.2'
 
       - name: Run vendor sync
-        run: ruby abcd-isa-sys/vendor-sync.rb -v
+        run: ruby abcd-isa-sys/vendor-sync.rb -v --force
 
       - name: Check for changes
         id: diff

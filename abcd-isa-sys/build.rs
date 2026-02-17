@@ -159,7 +159,16 @@ fn main() {
 fn run_ruby(gen_rb: &str, data: &str, requires: &str, template: &str, output: &str) {
     let status = Command::new("ruby")
         .args([
-            gen_rb, "-t", template, "-d", data, "-r", requires, "-o", output,
+            "-rostruct",
+            gen_rb,
+            "-t",
+            template,
+            "-d",
+            data,
+            "-r",
+            requires,
+            "-o",
+            output,
         ])
         .status()
         .unwrap_or_else(|e| panic!("Failed to run ruby: {e}. Is ruby installed?"));

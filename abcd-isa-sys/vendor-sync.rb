@@ -3,7 +3,7 @@
 
 # abcd-isa-sys/vendor-sync.rb — Sync vendored arkcompiler files from upstream
 #
-# Usage: ruby abcd-isa-sys/vendor-sync.rb [--dry-run] [--verbose]
+# Usage: ruby abcd-isa-sys/vendor-sync.rb [--dry-run] [--force] [--verbose]
 
 require 'optparse'
 require 'fileutils'
@@ -92,12 +92,22 @@ end
 class VendorSync
   Result = Struct.new(:local_path, :status, :content, :detail, keyword_init: true)
 
-  def initialize(dry_run: false, verbose: false)
+  def initialize(dry_run: false, verbose: false, force: false)
     @dry_run = dry_run
     @verbose = verbose
+    @force   = force
   end
 
   def run
+    # Pre-flight: check for local modifications before touching anything
+    dirty = check_local_modifications
+    if dirty.any? && !@force
+      $stderr.puts "\nERROR: #{dirty.size} vendor file(s) have local modifications."
+      $stderr.puts "Run with --force to overwrite, or revert the changes first."
+      dirty.each { |path| $stderr.puts "  #{path}" }
+      exit 3
+    end
+
     puts "Fetching #{FILE_MAP.size} files from upstream..."
     results = fetch_all
     report(results)
@@ -124,26 +134,29 @@ class VendorSync
     exit 0
   end
 
+  def check_local_modifications
+    meta = load_metadata
+    meta_files = meta['files'] || {}
+    dirty = []
+    FILE_MAP.each_key do |local_path|
+      local_file = File.join(VENDOR_DIR, local_path)
+      next unless File.exist?(local_file) && meta_files[local_path]
+      expected = meta_files[local_path]['sha256']
+      next unless expected
+      dirty << local_path if sha256(File.binread(local_file)) != expected
+    end
+    dirty
+  end
+
   private
 
   def fetch_all
-    meta = load_metadata
-    meta_files = meta['files'] || {}
-
     FILE_MAP.each_with_index.map do |(local_path, upstream_path), idx|
       prefix = "  [#{idx + 1}/#{FILE_MAP.size}]"
       label  = local_path.ljust(52)
 
       local_file = File.join(VENDOR_DIR, local_path)
       local_content = File.exist?(local_file) ? File.binread(local_file) : nil
-
-      # Check for local modifications vs last sync
-      if local_content && meta_files[local_path]
-        expected = meta_files[local_path]['sha256']
-        if expected && sha256(local_content) != expected
-          $stderr.puts "#{prefix} WARNING: #{local_path} has local modifications"
-        end
-      end
 
       # Fetch upstream
       url = "#{BASE_URL}/#{upstream_path}"
@@ -213,9 +226,24 @@ end
 options = {}
 OptionParser.new do |opts|
   opts.banner = "Usage: ruby #{$PROGRAM_NAME} [options]"
-  opts.on('-n', '--dry-run', 'Show changes without writing files')  { options[:dry_run] = true }
-  opts.on('-v', '--verbose', 'Verbose output')                      { options[:verbose] = true }
-  opts.on('-h', '--help',    'Show this help')                      { puts opts; exit }
+  opts.on('-n', '--dry-run',      'Show changes without writing files')    { options[:dry_run] = true }
+  opts.on('-f', '--force',        'Overwrite locally modified vendor files') { options[:force] = true }
+  opts.on(      '--check-local',  'Check for local modifications only (no network)') { options[:check_local] = true }
+  opts.on('-v', '--verbose',      'Verbose output')                        { options[:verbose] = true }
+  opts.on('-h', '--help',         'Show this help')                        { puts opts; exit }
 end.parse!
+
+if options.delete(:check_local)
+  sync = VendorSync.new(**options)
+  dirty = sync.check_local_modifications
+  if dirty.empty?
+    puts "Vendor files OK — no local modifications detected."
+    exit 0
+  else
+    $stderr.puts "ERROR: #{dirty.size} vendor file(s) have local modifications:"
+    dirty.each { |path| $stderr.puts "  #{path}" }
+    exit 3
+  end
+end
 
 VendorSync.new(**options).run
