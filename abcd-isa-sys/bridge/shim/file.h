@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <iostream>
+#include <optional>
+#include <array>
 
 // Transitive dependencies that the original file.h provides through helpers.h.
 // bytecode_emitter.cpp needs Span<T> and MinimumBitsToStore.
