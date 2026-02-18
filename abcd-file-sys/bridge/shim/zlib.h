@@ -5,10 +5,10 @@
 #include <cstddef>
 
 typedef unsigned long uLong;
-typedef const unsigned char* Bytef;
+typedef unsigned char Bytef;
 typedef unsigned int uInt;
 
-inline uLong adler32(uLong adler, const Bytef buf, uInt len) {
+inline uLong adler32(uLong adler, const Bytef *buf, uInt len) {
     constexpr uLong MOD = 65521;
     if (buf == nullptr) return 1;
     uLong a = adler & 0xffff;
