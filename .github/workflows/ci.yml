@@ -79,11 +79,11 @@ jobs:
         run: |
           echo '## Coverage Report' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov --workspace --no-run --summary-only 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --workspace --summary-only 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v5
         with:
           files: lcov.info
           fail_ci_if_error: false
