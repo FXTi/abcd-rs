@@ -15,6 +15,107 @@
 extern "C" {
 #endif
 
+/* ========== Constants: Access Modifiers (modifiers.h) ========== */
+
+#define ABC_ACC_PUBLIC       0x0001
+#define ABC_ACC_PRIVATE      0x0002
+#define ABC_ACC_PROTECTED    0x0004
+#define ABC_ACC_STATIC       0x0008
+#define ABC_ACC_FINAL        0x0010
+#define ABC_ACC_SUPER        0x0020
+#define ABC_ACC_SYNCHRONIZED 0x0020
+#define ABC_ACC_BRIDGE       0x0040
+#define ABC_ACC_VOLATILE     0x0040
+#define ABC_ACC_TRANSIENT    0x0080
+#define ABC_ACC_VARARGS      0x0080
+#define ABC_ACC_NATIVE       0x0100
+#define ABC_ACC_INTERFACE    0x0200
+#define ABC_ACC_ABSTRACT     0x0400
+#define ABC_ACC_STRICT       0x0800
+#define ABC_ACC_SYNTHETIC    0x1000
+#define ABC_ACC_ANNOTATION   0x2000
+#define ABC_ACC_ENUM         0x4000
+#define ABC_ACC_FILE_MASK    0xFFFF
+
+/* ========== Constants: LiteralTag (literal_data_accessor.h) ========== */
+
+#define ABC_LITERAL_TAG_TAGVALUE            0x00
+#define ABC_LITERAL_TAG_BOOL                0x01
+#define ABC_LITERAL_TAG_INTEGER             0x02
+#define ABC_LITERAL_TAG_FLOAT               0x03
+#define ABC_LITERAL_TAG_DOUBLE              0x04
+#define ABC_LITERAL_TAG_STRING              0x05
+#define ABC_LITERAL_TAG_METHOD              0x06
+#define ABC_LITERAL_TAG_GENERATORMETHOD     0x07
+#define ABC_LITERAL_TAG_ACCESSOR            0x08
+#define ABC_LITERAL_TAG_METHODAFFILIATE     0x09
+#define ABC_LITERAL_TAG_ARRAY_U1            0x0a
+#define ABC_LITERAL_TAG_ARRAY_U8            0x0b
+#define ABC_LITERAL_TAG_ARRAY_I8            0x0c
+#define ABC_LITERAL_TAG_ARRAY_U16           0x0d
+#define ABC_LITERAL_TAG_ARRAY_I16           0x0e
+#define ABC_LITERAL_TAG_ARRAY_U32           0x0f
+#define ABC_LITERAL_TAG_ARRAY_I32           0x10
+#define ABC_LITERAL_TAG_ARRAY_U64           0x11
+#define ABC_LITERAL_TAG_ARRAY_I64           0x12
+#define ABC_LITERAL_TAG_ARRAY_F32           0x13
+#define ABC_LITERAL_TAG_ARRAY_F64           0x14
+#define ABC_LITERAL_TAG_ARRAY_STRING        0x15
+#define ABC_LITERAL_TAG_ASYNCGENERATORMETHOD 0x16
+#define ABC_LITERAL_TAG_LITERALBUFFERINDEX  0x17
+#define ABC_LITERAL_TAG_LITERALARRAY        0x18
+#define ABC_LITERAL_TAG_BUILTINTYPEINDEX    0x19
+#define ABC_LITERAL_TAG_GETTER              0x1a
+#define ABC_LITERAL_TAG_SETTER              0x1b
+#define ABC_LITERAL_TAG_ETS_IMPLEMENTS      0x1c
+#define ABC_LITERAL_TAG_NULLVALUE           0xff
+
+/* ========== Constants: ModuleTag (module_data_accessor.h) ========== */
+
+#define ABC_MODULE_TAG_REGULAR_IMPORT   0x00
+#define ABC_MODULE_TAG_NAMESPACE_IMPORT 0x01
+#define ABC_MODULE_TAG_LOCAL_EXPORT     0x02
+#define ABC_MODULE_TAG_INDIRECT_EXPORT  0x03
+#define ABC_MODULE_TAG_STAR_EXPORT      0x04
+
+/* ========== Constants: SourceLang (source_lang_enum.h) ========== */
+
+#define ABC_SOURCE_LANG_ECMASCRIPT     0
+#define ABC_SOURCE_LANG_PANDA_ASSEMBLY 1
+#define ABC_SOURCE_LANG_JAVASCRIPT     2
+#define ABC_SOURCE_LANG_TYPESCRIPT     3
+#define ABC_SOURCE_LANG_ARKTS          4
+
+/* ========== Constants: Type::TypeId (type.h) ========== */
+
+#define ABC_TYPE_INVALID   0x00
+#define ABC_TYPE_VOID      0x01
+#define ABC_TYPE_U1        0x02
+#define ABC_TYPE_I8        0x03
+#define ABC_TYPE_U8        0x04
+#define ABC_TYPE_I16       0x05
+#define ABC_TYPE_U16       0x06
+#define ABC_TYPE_I32       0x07
+#define ABC_TYPE_U32       0x08
+#define ABC_TYPE_F32       0x09
+#define ABC_TYPE_F64       0x0a
+#define ABC_TYPE_I64       0x0b
+#define ABC_TYPE_U64       0x0c
+#define ABC_TYPE_REFERENCE 0x0d
+#define ABC_TYPE_TAGGED    0x0e
+
+/* ========== Constants: FunctionKind (file_items.h) ========== */
+
+#define ABC_FUNCTION_KIND_NONE                     0x0
+#define ABC_FUNCTION_KIND_FUNCTION                 0x1
+#define ABC_FUNCTION_KIND_NC_FUNCTION              0x2
+#define ABC_FUNCTION_KIND_GENERATOR_FUNCTION        0x3
+#define ABC_FUNCTION_KIND_ASYNC_FUNCTION            0x4
+#define ABC_FUNCTION_KIND_ASYNC_GENERATOR_FUNCTION  0x5
+#define ABC_FUNCTION_KIND_ASYNC_NC_FUNCTION         0x6
+#define ABC_FUNCTION_KIND_CONCURRENT_FUNCTION       0x7
+#define ABC_FUNCTION_KIND_SENDABLE_FUNCTION         0x8
+
 /* Common callback types */
 typedef int (*AbcAnnotationCb)(uint32_t annotation_off, void *ctx);
 typedef int (*AbcEntityIdCb)(uint32_t entity_off, void *ctx);
@@ -57,6 +158,34 @@ int abc_file_get_string_is_ascii(const AbcFileHandle *f, uint32_t offset);
 /* Checksum validation: 1 = valid */
 int abc_file_validate_checksum(const AbcFileHandle *f);
 
+/* File type: -1 = invalid, 0 = dynamic, 1 = static */
+int8_t abc_file_get_type(const uint8_t *data, int32_t size);
+
+/* Raw data pointer (File::GetBase) */
+const uint8_t *abc_file_get_raw_data(const AbcFileHandle *f);
+
+/* Index headers */
+struct AbcIndexHeader {
+    uint32_t start;
+    uint32_t end;
+    uint32_t class_idx_size;
+    uint32_t class_idx_off;
+    uint32_t method_idx_size;
+    uint32_t method_idx_off;
+    uint32_t field_idx_size;
+    uint32_t field_idx_off;
+    uint32_t proto_idx_size;
+    uint32_t proto_idx_off;
+};
+uint32_t abc_file_num_index_headers(const AbcFileHandle *f);
+void abc_file_get_index_header(const AbcFileHandle *f, uint32_t idx,
+                               struct AbcIndexHeader *out);
+
+/* Resolve by generic index: returns offset, UINT32_MAX on error */
+uint32_t abc_resolve_offset_by_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx);
+/* Resolve line number program index: returns offset, UINT32_MAX on error */
+uint32_t abc_resolve_lnp_index(const AbcFileHandle *f, uint32_t idx);
+
 /* ========== Version Utilities ========== */
 
 /* Get compile-time version / minVersion constants */
@@ -83,6 +212,8 @@ typedef int (*AbcProtoTypeCb)(uint8_t type_id, void *ctx);
 void abc_proto_enumerate_types(AbcProtoAccessor *a, AbcProtoTypeCb cb, void *ctx);
 /* Shorty descriptor: returns length, sets *out_data to internal buffer */
 uint32_t abc_proto_get_shorty(AbcProtoAccessor *a, const uint8_t **out_data);
+uint32_t abc_proto_get_size(AbcProtoAccessor *a);
+int abc_proto_is_equal(AbcProtoAccessor *a, AbcProtoAccessor *b);
 
 /* ========== Class Data Accessor ========== */
 
@@ -122,6 +253,11 @@ void abc_class_enumerate_runtime_annotations(AbcClassAccessor *a, AbcAnnotationC
 void abc_class_enumerate_type_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
 void abc_class_enumerate_runtime_type_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx);
 
+/* Class annotation counts and ID */
+uint32_t abc_class_get_annotations_number(AbcClassAccessor *a);
+uint32_t abc_class_get_runtime_annotations_number(AbcClassAccessor *a);
+uint32_t abc_class_get_class_id(const AbcClassAccessor *a);
+
 /* ========== Method Data Accessor ========== */
 
 typedef struct AbcMethodAccessor AbcMethodAccessor;
@@ -160,6 +296,21 @@ void abc_method_enumerate_types_in_proto(AbcMethodAccessor *a, AbcProtoTypeExCb 
 void abc_method_enumerate_type_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
 void abc_method_enumerate_runtime_type_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx);
 
+/* Method annotation counts, size, ID, and misc */
+uint32_t abc_method_get_annotations_number(AbcMethodAccessor *a);
+uint32_t abc_method_get_runtime_annotations_number(AbcMethodAccessor *a);
+uint32_t abc_method_get_type_annotations_number(AbcMethodAccessor *a);
+uint32_t abc_method_get_runtime_type_annotations_number(AbcMethodAccessor *a);
+uint32_t abc_method_get_size(AbcMethodAccessor *a);
+uint32_t abc_method_get_method_id(const AbcMethodAccessor *a);
+int abc_method_has_valid_proto(const AbcMethodAccessor *a);
+uint32_t abc_method_get_numerical_annotation(AbcMethodAccessor *a, uint32_t field_id);
+
+/* Method static quick-access (no accessor needed) */
+uint32_t abc_method_get_name_off_static(const AbcFileHandle *f, uint32_t method_off);
+uint32_t abc_method_get_class_id_static(const AbcFileHandle *f, uint32_t method_off);
+uint32_t abc_method_get_proto_id_static(const AbcFileHandle *f, uint32_t method_off);
+
 /* ========== Code Data Accessor ========== */
 
 typedef struct AbcCodeAccessor AbcCodeAccessor;
@@ -187,6 +338,14 @@ typedef int (*AbcTryBlockFullCb)(const struct AbcTryBlockInfo *try_info,
                                   const struct AbcCatchBlockInfo *catches, void *ctx);
 void abc_code_enumerate_try_blocks_full(AbcCodeAccessor *a, AbcTryBlockFullCb cb, void *ctx);
 
+/* Code accessor size and ID */
+uint32_t abc_code_get_size(AbcCodeAccessor *a);
+uint32_t abc_code_get_code_id(const AbcCodeAccessor *a);
+
+/* Code static quick-access (no accessor needed) */
+uint32_t abc_code_get_num_vregs_static(const AbcFileHandle *f, uint32_t code_off);
+const uint8_t *abc_code_get_instructions_static(const AbcFileHandle *f, uint32_t code_off);
+
 /* ========== Field Data Accessor ========== */
 
 typedef struct AbcFieldAccessor AbcFieldAccessor;
@@ -213,6 +372,17 @@ int abc_field_get_value_f64(AbcFieldAccessor *a, double *out);
 /* Field type annotations */
 void abc_field_enumerate_type_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
 void abc_field_enumerate_runtime_type_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx);
+
+/* Field annotation counts and ID */
+uint32_t abc_field_get_annotations_number(AbcFieldAccessor *a);
+uint32_t abc_field_get_runtime_annotations_number(AbcFieldAccessor *a);
+uint32_t abc_field_get_type_annotations_number(AbcFieldAccessor *a);
+uint32_t abc_field_get_runtime_type_annotations_number(AbcFieldAccessor *a);
+uint32_t abc_field_get_field_id(const AbcFieldAccessor *a);
+
+/* Field static quick-access (no accessor needed) */
+uint32_t abc_field_get_name_off_static(const AbcFileHandle *f, uint32_t field_off);
+uint32_t abc_field_get_type_static(const AbcFileHandle *f, uint32_t field_off);
 
 /* ========== Literal Data Accessor ========== */
 
@@ -247,6 +417,9 @@ uint32_t abc_literal_get_vals_num(const AbcLiteralAccessor *a, uint32_t array_of
 uint32_t abc_literal_get_vals_num_by_index(const AbcLiteralAccessor *a, uint32_t index);
 void abc_literal_enumerate_vals_by_index(AbcLiteralAccessor *a, uint32_t index,
                                           AbcLiteralValCb cb, void *ctx);
+
+/* Resolve literal array index from entity offset: returns index, UINT32_MAX if not found */
+uint32_t abc_literal_resolve_index(const AbcLiteralAccessor *a, uint32_t entity_off);
 
 /* ========== Module Data Accessor ========== */
 
@@ -293,6 +466,9 @@ struct AbcAnnotationArrayVal {
 };
 int abc_annotation_get_array_element(const AbcAnnotationAccessor *a, uint32_t idx,
                                       struct AbcAnnotationArrayVal *out);
+
+/* Annotation entity ID */
+uint32_t abc_annotation_get_annotation_id(const AbcAnnotationAccessor *a);
 
 /* ========== Debug Info Extractor ========== */
 
@@ -467,6 +643,8 @@ uint32_t abc_builder_add_foreign_method(AbcBuilder *b, uint32_t class_handle,
 
 /* --- Deduplication --- */
 void abc_builder_deduplicate(AbcBuilder *b);
+void abc_builder_deduplicate_code_and_debug_info(AbcBuilder *b);
+void abc_builder_deduplicate_annotations(AbcBuilder *b);
 
 #ifdef __cplusplus
 }

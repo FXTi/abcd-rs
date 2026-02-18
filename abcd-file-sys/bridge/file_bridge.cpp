@@ -364,6 +364,48 @@ int abc_file_validate_checksum(const AbcFileHandle *f) {
     return f->file->ValidateChecksum() ? 1 : 0;
 }
 
+int8_t abc_file_get_type(const uint8_t *data, int32_t size) {
+    return static_cast<int8_t>(panda::panda_file::GetFileType(data, size));
+}
+
+const uint8_t *abc_file_get_raw_data(const AbcFileHandle *f) {
+    return f->file->GetBase();
+}
+
+uint32_t abc_file_num_index_headers(const AbcFileHandle *f) {
+    return f->file->GetHeader()->num_indexes;
+}
+
+void abc_file_get_index_header(const AbcFileHandle *f, uint32_t idx,
+                               struct AbcIndexHeader *out) {
+    auto headers = f->file->GetIndexHeaders();
+    if (idx >= headers.Size()) {
+        std::memset(out, 0, sizeof(*out));
+        return;
+    }
+    auto &ih = headers[idx];
+    out->start = ih.start;
+    out->end = ih.end;
+    out->class_idx_size = ih.class_idx_size;
+    out->class_idx_off = ih.class_idx_off;
+    out->method_idx_size = ih.method_idx_size;
+    out->method_idx_off = ih.method_idx_off;
+    out->field_idx_size = ih.field_idx_size;
+    out->field_idx_off = ih.field_idx_off;
+    out->proto_idx_size = ih.proto_idx_size;
+    out->proto_idx_off = ih.proto_idx_off;
+}
+
+uint32_t abc_resolve_offset_by_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx) {
+    auto id = f->file->ResolveOffsetByIndex(File::EntityId(entity_off), idx);
+    return id.GetOffset();
+}
+
+uint32_t abc_resolve_lnp_index(const AbcFileHandle *f, uint32_t idx) {
+    auto id = f->file->ResolveLineNumberProgramIndex(idx);
+    return id.GetOffset();
+}
+
 /* ========== Version Utilities ========== */
 
 void abc_get_current_version(uint8_t out[4]) {
@@ -427,6 +469,14 @@ uint32_t abc_proto_get_shorty(AbcProtoAccessor *a, const uint8_t **out_data) {
     auto shorty = a->accessor.GetShorty();
     *out_data = shorty.data();
     return static_cast<uint32_t>(shorty.size());
+}
+
+uint32_t abc_proto_get_size(AbcProtoAccessor *a) {
+    return static_cast<uint32_t>(a->accessor.GetSize());
+}
+
+int abc_proto_is_equal(AbcProtoAccessor *a, AbcProtoAccessor *b) {
+    return a->accessor.IsEqual(&b->accessor) ? 1 : 0;
 }
 
 /* ========== Class Data Accessor ========== */
@@ -523,6 +573,18 @@ void abc_class_enumerate_runtime_type_annotations(AbcClassAccessor *a, AbcAnnota
     a->accessor.EnumerateRuntimeTypeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+}
+
+uint32_t abc_class_get_annotations_number(AbcClassAccessor *a) {
+    return a->accessor.GetAnnotationsNumber();
+}
+
+uint32_t abc_class_get_runtime_annotations_number(AbcClassAccessor *a) {
+    return a->accessor.GetRuntimeAnnotationsNumber();
+}
+
+uint32_t abc_class_get_class_id(const AbcClassAccessor *a) {
+    return a->accessor.GetClassId().GetOffset();
 }
 
 /* ========== Method Data Accessor ========== */
@@ -623,6 +685,50 @@ void abc_method_enumerate_runtime_type_annotations(AbcMethodAccessor *a, AbcAnno
     });
 }
 
+uint32_t abc_method_get_annotations_number(AbcMethodAccessor *a) {
+    return a->accessor.GetAnnotationsNumber();
+}
+
+uint32_t abc_method_get_runtime_annotations_number(AbcMethodAccessor *a) {
+    return a->accessor.GetRuntimeAnnotationsNumber();
+}
+
+uint32_t abc_method_get_type_annotations_number(AbcMethodAccessor *a) {
+    return a->accessor.GetTypeAnnotationsNumber();
+}
+
+uint32_t abc_method_get_runtime_type_annotations_number(AbcMethodAccessor *a) {
+    return a->accessor.GetRuntimeTypeAnnotationsNumber();
+}
+
+uint32_t abc_method_get_size(AbcMethodAccessor *a) {
+    return static_cast<uint32_t>(a->accessor.GetSize());
+}
+
+uint32_t abc_method_get_method_id(const AbcMethodAccessor *a) {
+    return a->accessor.GetMethodId().GetOffset();
+}
+
+int abc_method_has_valid_proto(const AbcMethodAccessor *a) {
+    return a->accessor.HasValidProto() ? 1 : 0;
+}
+
+uint32_t abc_method_get_numerical_annotation(AbcMethodAccessor *a, uint32_t field_id) {
+    return a->accessor.GetNumericalAnnotation(field_id);
+}
+
+uint32_t abc_method_get_name_off_static(const AbcFileHandle *f, uint32_t method_off) {
+    return MethodDA::GetNameId(*f->file, File::EntityId(method_off)).GetOffset();
+}
+
+uint32_t abc_method_get_class_id_static(const AbcFileHandle *f, uint32_t method_off) {
+    return MethodDA::GetClassId(*f->file, File::EntityId(method_off)).GetOffset();
+}
+
+uint32_t abc_method_get_proto_id_static(const AbcFileHandle *f, uint32_t method_off) {
+    return MethodDA::GetProtoId(*f->file, File::EntityId(method_off)).GetOffset();
+}
+
 /* ========== Code Data Accessor ========== */
 
 AbcCodeAccessor *abc_code_open(const AbcFileHandle *f, uint32_t offset) {
@@ -674,6 +780,22 @@ void abc_code_enumerate_try_blocks_full(AbcCodeAccessor *a, AbcTryBlockFullCb cb
         cb(&ti, catches.data(), ctx);
         return true;  // continue
     });
+}
+
+uint32_t abc_code_get_size(AbcCodeAccessor *a) {
+    return static_cast<uint32_t>(a->accessor.GetSize());
+}
+
+uint32_t abc_code_get_code_id(const AbcCodeAccessor *a) {
+    return const_cast<CodeDA &>(a->accessor).GetCodeId().GetOffset();
+}
+
+uint32_t abc_code_get_num_vregs_static(const AbcFileHandle *f, uint32_t code_off) {
+    return CodeDA::GetNumVregs(*f->file, File::EntityId(code_off));
+}
+
+const uint8_t *abc_code_get_instructions_static(const AbcFileHandle *f, uint32_t code_off) {
+    return CodeDA::GetInstructions(*f->file, File::EntityId(code_off));
 }
 
 /* ========== Field Data Accessor ========== */
@@ -762,6 +884,34 @@ void abc_field_enumerate_runtime_type_annotations(AbcFieldAccessor *a, AbcAnnota
     });
 }
 
+uint32_t abc_field_get_annotations_number(AbcFieldAccessor *a) {
+    return a->accessor.GetAnnotationsNumber();
+}
+
+uint32_t abc_field_get_runtime_annotations_number(AbcFieldAccessor *a) {
+    return a->accessor.GetRuntimeAnnotationsNumber();
+}
+
+uint32_t abc_field_get_type_annotations_number(AbcFieldAccessor *a) {
+    return a->accessor.GetTypeAnnotationsNumber();
+}
+
+uint32_t abc_field_get_runtime_type_annotations_number(AbcFieldAccessor *a) {
+    return a->accessor.GetRuntimeTypeAnnotationsNumber();
+}
+
+uint32_t abc_field_get_field_id(const AbcFieldAccessor *a) {
+    return a->accessor.GetFieldId().GetOffset();
+}
+
+uint32_t abc_field_get_name_off_static(const AbcFileHandle *f, uint32_t field_off) {
+    return FieldDA::GetNameId(*f->file, File::EntityId(field_off)).GetOffset();
+}
+
+uint32_t abc_field_get_type_static(const AbcFileHandle *f, uint32_t field_off) {
+    return FieldDA::GetTypeId(*f->file, File::EntityId(field_off)).GetOffset();
+}
+
 /* ========== Literal Data Accessor ========== */
 
 AbcLiteralAccessor *abc_literal_open(const AbcFileHandle *f, uint32_t literal_data_off) {
@@ -824,6 +974,12 @@ void abc_literal_enumerate_vals_by_index(AbcLiteralAccessor *a, uint32_t index,
         [&](const LiteralDA::LiteralValue &val, LiteralTag tag) {
             literal_val_to_c(val, tag, cb, ctx);
         });
+}
+
+uint32_t abc_literal_resolve_index(const AbcLiteralAccessor *a, uint32_t entity_off) {
+    size_t idx = a->accessor.ResolveLiteralArrayIndex(File::EntityId(entity_off));
+    if (idx >= a->accessor.GetLiteralNum()) return UINT32_MAX;
+    return static_cast<uint32_t>(idx);
 }
 
 /* ========== Module Data Accessor ========== */
@@ -896,6 +1052,10 @@ int abc_annotation_get_array_element(const AbcAnnotationAccessor *a, uint32_t id
     out->count = arr.GetCount();
     out->entity_off = arr.GetId().GetOffset();
     return 0;
+}
+
+uint32_t abc_annotation_get_annotation_id(const AbcAnnotationAccessor *a) {
+    return a->accessor.GetAnnotationId().GetOffset();
 }
 
 /* ========== Debug Info Extractor ========== */
@@ -1454,6 +1614,14 @@ uint32_t abc_builder_add_foreign_method(AbcBuilder *b, uint32_t class_handle,
 
 void abc_builder_deduplicate(AbcBuilder *b) {
     b->container.DeduplicateItems(false);
+}
+
+void abc_builder_deduplicate_code_and_debug_info(AbcBuilder *b) {
+    b->container.DeduplicateCodeAndDebugInfo();
+}
+
+void abc_builder_deduplicate_annotations(AbcBuilder *b) {
+    b->container.DeduplicateAnnotations();
 }
 
 const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len) {
