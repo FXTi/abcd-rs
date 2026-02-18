@@ -14,7 +14,6 @@ require 'optparse'
 require 'fileutils'
 require 'digest'
 require 'yaml'
-require 'time'
 require 'net/http'
 require 'uri'
 
@@ -218,7 +217,6 @@ class VendorSync
     end
 
     data = {
-      'synced_at' => Time.now.iso8601,
       'base_url'  => BASE_URL,
       'files'     => files,
     }
