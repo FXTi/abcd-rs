@@ -170,11 +170,6 @@ uint32_t abc_code_code_size(const AbcCodeAccessor *a);
 const uint8_t *abc_code_instructions(const AbcCodeAccessor *a);
 uint32_t abc_code_tries_size(const AbcCodeAccessor *a);
 
-/* Enumerate try blocks */
-typedef int (*AbcTryBlockCb)(uint32_t start_pc, uint32_t length,
-                              uint32_t num_catches, void *ctx);
-void abc_code_enumerate_try_blocks(AbcCodeAccessor *a, AbcTryBlockCb cb, void *ctx);
-
 /* Enumerate try blocks with full catch block info */
 struct AbcTryBlockInfo {
     uint32_t start_pc;
@@ -366,20 +361,16 @@ uint32_t abc_builder_add_class(AbcBuilder *b, const char *descriptor);
 uint32_t abc_builder_add_foreign_class(AbcBuilder *b, const char *descriptor);
 uint32_t abc_builder_add_literal_array(AbcBuilder *b, const char *id);
 
-/* Add method to a class: returns method handle index, UINT32_MAX on error */
-uint32_t abc_builder_class_add_method(AbcBuilder *b, uint32_t class_handle,
-                                       const char *name, uint32_t access_flags,
-                                       const uint8_t *code, uint32_t code_size,
-                                       uint32_t num_vregs, uint32_t num_args);
-
 /* Add field to a class */
 uint32_t abc_builder_class_add_field(AbcBuilder *b, uint32_t class_handle,
                                       const char *name, uint8_t type_id,
                                       uint32_t access_flags);
 
-/* Set literal array data (tag-value pairs already serialized) */
-void abc_builder_set_literal_array_data(AbcBuilder *b, uint32_t lit_handle,
-                                         const uint8_t *data, uint32_t len);
+/* Add typed items to a literal array (call once per item, in order) */
+void abc_builder_literal_array_add_u8(AbcBuilder *b, uint32_t lit_handle, uint8_t val);
+void abc_builder_literal_array_add_u16(AbcBuilder *b, uint32_t lit_handle, uint16_t val);
+void abc_builder_literal_array_add_u32(AbcBuilder *b, uint32_t lit_handle, uint32_t val);
+void abc_builder_literal_array_add_u64(AbcBuilder *b, uint32_t lit_handle, uint64_t val);
 
 /* Finalize: compute layout, write to memory buffer.
  * Returns pointer to buffer (owned by builder), sets *out_len.

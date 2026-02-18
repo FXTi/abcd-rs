@@ -1,59 +1,50 @@
+use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").unwrap();
 
     // Phase 1: Ruby code generation (source_lang_enum.h, type.h, file_format_version.h)
-    let vendor_isa = manifest_dir.join("vendor/isa");
-    let vendor_pf = manifest_dir.join("vendor/libpandafile");
-    let gen_rb = vendor_isa.join("gen.rb");
-    let isa_yaml = vendor_isa.join("isa.yaml");
-    let isapi = vendor_isa.join("isapi.rb");
-    let pf_isapi = vendor_pf.join("pandafile_isapi.rb");
-    let plugin_opts = vendor_pf.join("plugin_options.rb");
-    let types_rb = vendor_pf.join("types.rb");
-    let codegen_init = manifest_dir.join("bridge/codegen_init.rb");
-    let requires = format!(
-        "{},{},{},{},{}",
-        isapi.display(),
-        pf_isapi.display(),
-        plugin_opts.display(),
-        types_rb.display(),
-        codegen_init.display()
-    );
-    let templates = vendor_pf.join("templates");
-    let types_yaml = vendor_pf.join("types.yaml");
+    let gen_rb = format!("{manifest}/vendor/isa/gen.rb");
+    let isa_yaml = format!("{manifest}/vendor/isa/isa.yaml");
+    let tpl = format!("{manifest}/vendor/libpandafile/templates");
 
+    // Each template gets only the requires it needs (matching upstream).
+    // Ruby's `def` is last-writer-wins, so the final Gen.on_require must
+    // match the module the template actually uses.
     run_ruby(
         &gen_rb,
         &isa_yaml,
-        &requires,
-        &templates.join("source_lang_enum.h.erb"),
-        &out_dir.join("source_lang_enum.h"),
+        &format!("{manifest}/vendor/libpandafile/plugin_options.rb"),
+        &format!("{tpl}/source_lang_enum.h.erb"),
+        &format!("{out_dir}/source_lang_enum.h"),
     );
     run_ruby(
         &gen_rb,
-        &types_yaml,
-        &requires,
-        &templates.join("type.h.erb"),
-        &out_dir.join("type.h"),
+        &format!("{manifest}/vendor/libpandafile/types.yaml"),
+        &format!("{manifest}/vendor/libpandafile/types.rb"),
+        &format!("{tpl}/type.h.erb"),
+        &format!("{out_dir}/type.h"),
     );
     run_ruby(
         &gen_rb,
         &isa_yaml,
-        &requires,
-        &templates.join("file_format_version.h.erb"),
-        &out_dir.join("file_format_version.h"),
+        &format!(
+            "{manifest}/vendor/isa/isapi.rb,\
+             {manifest}/vendor/libpandafile/pandafile_isapi.rb"
+        ),
+        &format!("{tpl}/file_format_version.h.erb"),
+        &format!("{out_dir}/file_format_version.h"),
     );
 
     // Phase 2: Compile C++ library
-    let vendor_dir = manifest_dir.join("vendor/libpandafile");
+    let vendor_pf = format!("{manifest}/vendor/libpandafile");
     let mut cpp_files: Vec<PathBuf> = Vec::new();
 
     // Collect vendor libpandafile .cpp files
-    for entry in std::fs::read_dir(&vendor_dir).expect("read vendor/libpandafile") {
+    for entry in std::fs::read_dir(&vendor_pf).expect("read vendor/libpandafile") {
         let entry = entry.unwrap();
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "cpp") {
@@ -62,11 +53,10 @@ fn main() {
     }
 
     // Vendor libpandabase .cpp files
-    cpp_files.push(manifest_dir.join("vendor/libpandabase/utils/utf.cpp"));
+    cpp_files.push(format!("{manifest}/vendor/libpandabase/utils/utf.cpp").into());
 
     // Our bridge files
-    cpp_files.push(manifest_dir.join("bridge/file_bridge.cpp"));
-    cpp_files.push(manifest_dir.join("bridge/file_impl.cpp"));
+    cpp_files.push(format!("{manifest}/bridge/file_bridge.cpp").into());
 
     let mut build = cc::Build::new();
     build
@@ -76,27 +66,30 @@ fn main() {
         .define("NDEBUG", None)
         .define("SUPPORT_KNOWN_EXCEPTION", None)
         // Include path priority: shim > shim/utils (for bare "logger.h") > OUT_DIR > bridge > vendor
-        .include(manifest_dir.join("bridge/shim"))
-        .include(manifest_dir.join("bridge/shim/utils"))
+        .include(&format!("{manifest}/bridge/shim"))
+        .include(&format!("{manifest}/bridge/shim/utils"))
         .include(&out_dir)
-        .include(manifest_dir.join("bridge"))
-        .include(&vendor_dir)
-        .include(manifest_dir.join("vendor/libpandabase"));
+        .include(&format!("{manifest}/bridge"))
+        .include(&vendor_pf)
+        .include(&format!("{manifest}/vendor/libpandabase"));
+
+    // Force-include missing transitive headers that the upstream build provides
+    let fixups = format!("{manifest}/bridge/shim/vendor_fixups.h");
 
     // Platform-specific flags
-    let target = std::env::var("TARGET").unwrap_or_default();
+    let target = env::var("TARGET").unwrap_or_default();
     if target.contains("windows") {
         build
             .define("PANDA_TARGET_WINDOWS", None)
-            .flag(&format!(
-                "/FI{}",
-                manifest_dir.join("bridge/shim/platform_compat.h").display()
-            ))
+            .flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"))
+            .flag(&format!("/FI{fixups}"))
             .flag("/EHsc");
+    } else {
+        build.flag("-include").flag(&fixups);
     }
 
     // Coverage: instrument C++ when running under cargo-llvm-cov
-    if std::env::var("CARGO_LLVM_COV").is_ok() {
+    if env::var("CARGO_LLVM_COV").is_ok() {
         build
             .flag("-fprofile-instr-generate")
             .flag("-fcoverage-mapping");
@@ -111,24 +104,18 @@ fn main() {
     // No need to link system zlib — bridge/shim/zlib.h provides inline adler32
 
     // Phase 3: Generate Rust bindings via bindgen
+    // file_bridge.h is a pure C header (only <stddef.h> + <stdint.h>, opaque types),
+    // so no extra include paths are needed.
     let bindings = bindgen::Builder::default()
-        .header(manifest_dir.join("bridge/file_bridge.h").to_str().unwrap())
-        .allowlist_function("abc_.*")
-        .allowlist_type("Abc.*")
-        .allowlist_var("ABC_.*")
-        .clang_args([
-            &format!("-I{}", manifest_dir.join("bridge/shim").display()),
-            &format!("-I{}", out_dir.display()),
-            &format!("-I{}", manifest_dir.join("bridge").display()),
-            &format!("-I{}", vendor_dir.display()),
-            &format!("-I{}", manifest_dir.join("vendor/libpandabase").display()),
-        ])
+        .header(&format!("{manifest}/bridge/file_bridge.h"))
+        // .allowlist_function("abc_.*")
+        // .allowlist_type("Abc.*")
+        // .allowlist_var("ABC_.*")
         .generate()
         .expect("bindgen failed");
 
-    let bindings_path = out_dir.join("bindings.rs");
     bindings
-        .write_to_file(&bindings_path)
+        .write_to_file(format!("{out_dir}/bindings.rs"))
         .expect("failed to write bindings.rs");
 
     // Rerun triggers
@@ -136,32 +123,25 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/");
 }
 
-fn run_ruby(
-    gen_rb: &PathBuf,
-    data: &PathBuf,
-    requires: &str,
-    template: &PathBuf,
-    output: &PathBuf,
-) {
+fn run_ruby(gen_rb: &str, data: &str, requires: &str, template: &str, output: &str) {
     let status = Command::new("ruby")
         .args([
             "-rostruct",
-            gen_rb.to_str().unwrap(),
+            gen_rb,
             "-t",
-            template.to_str().unwrap(),
+            template,
             "-d",
-            data.to_str().unwrap(),
+            data,
             "-r",
             requires,
             "-o",
-            output.to_str().unwrap(),
+            output,
         ])
         .status()
         .unwrap_or_else(|e| panic!("Failed to run ruby: {e}. Is ruby installed?"));
 
     assert!(
         status.success(),
-        "Ruby code generation failed for template: {}",
-        template.display()
+        "Ruby code generation failed for template: {template}"
     );
 }

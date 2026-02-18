@@ -58,6 +58,7 @@ libpandafile/file_item_container.h: libpandafile/file_item_container.h
 libpandafile/file_item_container.cpp: libpandafile/file_item_container.cpp
 libpandafile/file_items.h: libpandafile/file_items.h
 libpandafile/file_items.cpp: libpandafile/file_items.cpp
+libpandafile/file_format_version.cpp: libpandafile/file_format_version.cpp
 libpandafile/file_writer.h: libpandafile/file_writer.h
 libpandafile/file_writer.cpp: libpandafile/file_writer.cpp
 libpandafile/helpers.h: libpandafile/helpers.h
@@ -73,7 +74,6 @@ libpandafile/modifiers.h: libpandafile/modifiers.h
 libpandafile/module_data_accessor-inl.h: libpandafile/module_data_accessor-inl.h
 libpandafile/module_data_accessor.h: libpandafile/module_data_accessor.h
 libpandafile/module_data_accessor.cpp: libpandafile/module_data_accessor.cpp
-libpandafile/pgo.h: libpandafile/pgo.h
 libpandafile/proto_data_accessor-inl.h: libpandafile/proto_data_accessor-inl.h
 libpandafile/proto_data_accessor.h: libpandafile/proto_data_accessor.h
 libpandafile/shorty_iterator.h: libpandafile/shorty_iterator.h

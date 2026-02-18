@@ -151,45 +151,9 @@ fn main() {
     println!("cargo:bindings_rs={}", out_path.display());
 
     // rerun-if-changed
-    for path in &[
-        // Bridge sources
-        "bridge/isa_bridge.h",
-        "bridge/isa_bridge.cpp",
-        "bridge/shim/securec.h",
-        "bridge/shim/file.h",
-        "bridge/shim/platform_compat.h",
-        // Our ERB templates
-        "templates/isa_bridge_tables.h.erb",
-        "templates/isa_bridge_emitter.h.erb",
-        "templates/isa_bridge_emitter_decl.h.erb",
-        // Vendor: Ruby codegen scripts
-        "vendor/isa/gen.rb",
-        "vendor/isa/isapi.rb",
-        "vendor/isa/combine.rb",
-        "vendor/isa/isa.yaml",
-        "vendor/libpandafile/pandafile_isapi.rb",
-        // Vendor: ERB templates
-        "vendor/libpandafile/templates/bytecode_instruction_enum_gen.h.erb",
-        "vendor/libpandafile/templates/bytecode_instruction-inl_gen.h.erb",
-        "vendor/libpandafile/templates/bytecode_emitter_def_gen.h.erb",
-        "vendor/libpandafile/templates/bytecode_emitter_gen.h.erb",
-        "vendor/libpandafile/templates/file_format_version.h.erb",
-        // Vendor: C/C++ sources
-        "vendor/libpandafile/bytecode_instruction.h",
-        "vendor/libpandafile/bytecode_instruction-inl.h",
-        "vendor/libpandafile/bytecode_emitter.h",
-        "vendor/libpandafile/bytecode_emitter.cpp",
-        "vendor/libpandabase/macros.h",
-        "vendor/libpandabase/globals.h",
-        "vendor/libpandabase/panda_visibility.h",
-        "vendor/libpandabase/utils/debug.h",
-        "vendor/libpandabase/utils/bit_helpers.h",
-        "vendor/libpandabase/utils/bit_utils.h",
-        "vendor/libpandabase/utils/span.h",
-        "vendor/libpandabase/os/stacktrace.h",
-    ] {
-        println!("cargo:rerun-if-changed={manifest}/{path}");
-    }
+    println!("cargo:rerun-if-changed=bridge/");
+    println!("cargo:rerun-if-changed=templates/");
+    println!("cargo:rerun-if-changed=vendor/");
 }
 
 fn run_ruby(gen_rb: &str, data: &str, requires: &str, template: &str, output: &str) {

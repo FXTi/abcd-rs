@@ -23,6 +23,9 @@
 #include <cstring>
 #include <new>
 #include <vector>
+#include <iostream>
+#include <stdexcept>
+#include "zlib.h"
 
 using File = panda::panda_file::File;
 using ClassDA = panda::panda_file::ClassDataAccessor;
@@ -57,6 +60,150 @@ using ScalarValueItem = panda::panda_file::ScalarValueItem;
 using SourceLang = panda::panda_file::SourceLang;
 using FunctionKind = panda::panda_file::FunctionKind;
 using BaseClassItem = panda::panda_file::BaseClassItem;
+
+/* ========== File method implementations (merged from file_impl.cpp) ========== */
+namespace panda::panda_file {
+
+// Static member definitions
+const std::array<uint8_t, File::MAGIC_SIZE> File::MAGIC {'P', 'A', 'N', 'D', 'A', '\0', '\0', '\0'};
+
+// Constructor
+File::File(std::string filename, os::mem::ConstBytePtr &&base)
+    : base_(std::move(base)),
+      FILENAME(std::move(filename)),
+      FILENAME_HASH(0),
+      UNIQ_ID(0) {}
+
+// Destructor
+File::~File() = default;
+
+// ThrowIfWithCheck — error handling used by inline accessor methods
+void File::ThrowIfWithCheck(bool cond, const std::string_view &msg,
+                            const std::string_view & /*tag*/) const {
+#ifdef SUPPORT_KNOWN_EXCEPTION
+    if (cond) {
+        throw helpers::FileAccessException(msg);
+    }
+#else
+    if (cond) {
+        std::cerr << "FATAL: " << msg << std::endl;
+        std::abort();
+    }
+#endif
+}
+
+// GetLiteralArraysId
+File::EntityId File::GetLiteralArraysId() const {
+    return EntityId(GetHeader()->literalarray_idx_off);
+}
+
+// GetClassId — linear scan (sufficient for our use case)
+File::EntityId File::GetClassId(const uint8_t *mutf8_name) const {
+    auto classes = GetClasses();
+    for (size_t i = 0; i < classes.Size(); i++) {
+        auto id = EntityId(classes[i]);
+        auto sd = GetStringData(id);
+        if (sd.data && std::strcmp(reinterpret_cast<const char *>(sd.data),
+                                   reinterpret_cast<const char *>(mutf8_name)) == 0) {
+            return id;
+        }
+    }
+    return EntityId();
+}
+
+// GetClassIdFromClassHashTable — stub (we don't use hash table acceleration)
+File::EntityId File::GetClassIdFromClassHashTable(const uint8_t *mutf8_name) const {
+    return GetClassId(mutf8_name);
+}
+
+// CalcFilenameHash — stub
+uint32_t File::CalcFilenameHash(const std::string & /*filename*/) {
+    return 0;
+}
+
+// ValidateChecksum — real implementation using adler32
+bool File::ValidateChecksum(uint32_t *cal_checksum_out) const {
+    constexpr uint32_t CHECKSUM_SIZE = 4U;
+    constexpr uint32_t FILE_CONTENT_OFFSET = File::MAGIC_SIZE + CHECKSUM_SIZE;
+    uint32_t file_size = GetHeader()->file_size;
+    uint32_t cal_checksum = adler32(1, GetBase() + FILE_CONTENT_OFFSET,
+                                     file_size - FILE_CONTENT_OFFSET);
+    if (cal_checksum_out != nullptr) {
+        *cal_checksum_out = cal_checksum;
+    }
+    return GetHeader()->checksum == cal_checksum;
+}
+
+// Factory methods
+std::unique_ptr<const File> File::OpenFromMemory(os::mem::ConstBytePtr &&ptr) {
+    return std::unique_ptr<const File>(new File("", std::move(ptr)));
+}
+
+std::unique_ptr<const File> File::OpenFromMemory(os::mem::ConstBytePtr &&ptr,
+                                                  std::string_view filename) {
+    return std::unique_ptr<const File>(new File(std::string(filename), std::move(ptr)));
+}
+
+// Open — not supported (no filesystem access)
+std::unique_ptr<const File> File::Open(std::string_view /*filename*/, OpenMode /*open_mode*/) {
+    return nullptr;
+}
+
+// OpenUncompressedArchive — not supported
+std::unique_ptr<const File> File::OpenUncompressedArchive(int /*fd*/,
+    const std::string_view & /*filename*/, size_t /*size*/,
+    uint32_t /*offset*/, OpenMode /*open_mode*/) {
+    return nullptr;
+}
+
+// ContainsLiteralArrayInHeader — delegates to IsVersionLessOrEqual
+bool ContainsLiteralArrayInHeader(const std::array<uint8_t, File::VERSION_SIZE> &version) {
+    return IsVersionLessOrEqual(version, LAST_CONTAINS_LITERAL_IN_HEADER_VERSION);
+}
+
+// Free functions — stubs
+bool CheckSecureMem(uintptr_t, size_t) { return true; }
+
+bool CheckHeader(const os::mem::ConstBytePtr & /*ptr*/, const std::string_view & /*filename*/) {
+    return true;
+}
+
+void CheckFileVersion(const std::array<uint8_t, File::VERSION_SIZE> & /*file_version*/,
+                      const std::string_view & /*filename*/) {}
+
+PandaFileType GetFileType(const uint8_t * /*data*/, int32_t /*size*/) {
+    return PandaFileType::FILE_DYNAMIC;
+}
+
+std::unique_ptr<const File> OpenPandaFileOrZip(std::string_view /*location*/,
+                                                File::OpenMode /*open_mode*/) {
+    return nullptr;
+}
+
+std::unique_ptr<const File> OpenPandaFileFromMemory(const void *buffer, size_t size,
+                                                     std::string tag) {
+    auto *bytes = reinterpret_cast<std::byte *>(const_cast<void *>(buffer));
+    os::mem::ConstBytePtr ptr(bytes, size, nullptr);
+    return File::OpenFromMemory(std::move(ptr), tag);
+}
+
+std::unique_ptr<const File> OpenPandaFileFromSecureMemory(uint8_t *buffer, size_t size) {
+    auto *bytes = reinterpret_cast<std::byte *>(buffer);
+    os::mem::ConstBytePtr ptr(bytes, size, nullptr);
+    return File::OpenFromMemory(std::move(ptr));
+}
+
+std::unique_ptr<const File> OpenPandaFile(std::string_view /*location*/,
+                                           std::string_view /*archive_filename*/,
+                                           File::OpenMode /*open_mode*/) {
+    return nullptr;
+}
+
+const char *ARCHIVE_FILENAME = "";
+
+}  // namespace panda::panda_file
+
+/* ========== Bridge API ========== */
 
 struct AbcFileHandle {
     std::unique_ptr<const File> file;
@@ -230,11 +377,9 @@ void abc_get_min_version(uint8_t out[4]) {
 }
 
 int abc_is_version_less_or_equal(const uint8_t current[4], const uint8_t target[4]) {
-    for (int i = 0; i < 4; i++) {
-        if (current[i] < target[i]) return 1;
-        if (current[i] > target[i]) return 0;
-    }
-    return 1;  // equal
+    std::array<uint8_t, File::VERSION_SIZE> c = {current[0], current[1], current[2], current[3]};
+    std::array<uint8_t, File::VERSION_SIZE> t = {target[0], target[1], target[2], target[3]};
+    return panda::panda_file::IsVersionLessOrEqual(c, t) ? 1 : 0;
 }
 
 int abc_contains_literal_array_in_header(const uint8_t ver[4]) {
@@ -502,14 +647,6 @@ uint32_t abc_code_tries_size(const AbcCodeAccessor *a) {
     return a->accessor.GetTriesSize();
 }
 
-void abc_code_enumerate_try_blocks(AbcCodeAccessor *a, AbcTryBlockCb cb, void *ctx) {
-    a->accessor.EnumerateTryBlocks([&](CodeDA::TryBlock &try_block) {
-        cb(try_block.GetStartPc(), try_block.GetLength(),
-           try_block.GetNumCatches(), ctx);
-        return true;  // continue
-    });
-}
-
 void abc_code_enumerate_try_blocks_full(AbcCodeAccessor *a, AbcTryBlockFullCb cb, void *ctx) {
     a->accessor.EnumerateTryBlocks([&](CodeDA::TryBlock &try_block) {
         AbcTryBlockInfo ti;
@@ -633,61 +770,33 @@ uint32_t abc_literal_count(const AbcLiteralAccessor *a) {
     return a->accessor.GetLiteralNum();
 }
 
+// Convert a C++ std::variant LiteralValue to our C union.
+// Dispatches on the variant's active type, not on LiteralTag — so adding
+// new tags upstream (with existing types) requires zero changes here.
+static void literal_val_to_c(const LiteralDA::LiteralValue &val, LiteralTag tag,
+                              AbcLiteralValCb cb, void *ctx) {
+    AbcLiteralVal out;
+    out.tag = static_cast<uint8_t>(tag);
+    out.u64_val = 0;
+    std::visit([&out](auto &&arg) {
+        using T = std::decay_t<decltype(arg)>;
+        if constexpr (std::is_same_v<T, bool>)          out.bool_val = arg ? 1 : 0;
+        else if constexpr (std::is_same_v<T, uint8_t>)  out.u8_val = arg;
+        else if constexpr (std::is_same_v<T, uint16_t>) out.u16_val = arg;
+        else if constexpr (std::is_same_v<T, uint32_t>) out.u32_val = arg;
+        else if constexpr (std::is_same_v<T, uint64_t>) out.u64_val = arg;
+        else if constexpr (std::is_same_v<T, float>)    out.f32_val = arg;
+        else if constexpr (std::is_same_v<T, double>)   out.f64_val = arg;
+        // void*, StringData: not representable in our C union — skip
+    }, val);
+    cb(&out, ctx);
+}
+
 void abc_literal_enumerate_vals(AbcLiteralAccessor *a, uint32_t array_off,
                                 AbcLiteralValCb cb, void *ctx) {
     a->accessor.EnumerateLiteralVals(File::EntityId(array_off),
         [&](const LiteralDA::LiteralValue &val, LiteralTag tag) {
-            AbcLiteralVal out;
-            out.tag = static_cast<uint8_t>(tag);
-            out.u64_val = 0;
-            switch (tag) {
-            case LiteralTag::BOOL:
-                out.bool_val = std::get<bool>(val) ? 1 : 0;
-                break;
-            case LiteralTag::BUILTINTYPEINDEX:
-            case LiteralTag::ACCESSOR:
-            case LiteralTag::NULLVALUE:
-                out.u8_val = std::get<uint8_t>(val);
-                break;
-            case LiteralTag::METHODAFFILIATE:
-                out.u16_val = std::get<uint16_t>(val);
-                break;
-            case LiteralTag::INTEGER:
-            case LiteralTag::LITERALBUFFERINDEX:
-            case LiteralTag::STRING:
-            case LiteralTag::METHOD:
-            case LiteralTag::GETTER:
-            case LiteralTag::SETTER:
-            case LiteralTag::GENERATORMETHOD:
-            case LiteralTag::ASYNCGENERATORMETHOD:
-            case LiteralTag::LITERALARRAY:
-            case LiteralTag::ETS_IMPLEMENTS:
-                out.u32_val = std::get<uint32_t>(val);
-                break;
-            case LiteralTag::FLOAT:
-                out.f32_val = std::get<float>(val);
-                break;
-            case LiteralTag::DOUBLE:
-                out.f64_val = std::get<double>(val);
-                break;
-            case LiteralTag::ARRAY_U1:
-            case LiteralTag::ARRAY_U8:
-            case LiteralTag::ARRAY_I8:
-            case LiteralTag::ARRAY_U16:
-            case LiteralTag::ARRAY_I16:
-            case LiteralTag::ARRAY_U32:
-            case LiteralTag::ARRAY_I32:
-            case LiteralTag::ARRAY_U64:
-            case LiteralTag::ARRAY_I64:
-            case LiteralTag::ARRAY_F32:
-            case LiteralTag::ARRAY_F64:
-            case LiteralTag::ARRAY_STRING:
-                out.u32_val = std::get<uint32_t>(val);
-                break;
-            default:
-                break;
-            }
-            cb(&out, ctx);
+            literal_val_to_c(val, tag, cb, ctx);
         });
 }
 
@@ -703,57 +812,7 @@ void abc_literal_enumerate_vals_by_index(AbcLiteralAccessor *a, uint32_t index,
                                           AbcLiteralValCb cb, void *ctx) {
     a->accessor.EnumerateLiteralVals(static_cast<size_t>(index),
         [&](const LiteralDA::LiteralValue &val, LiteralTag tag) {
-            AbcLiteralVal out;
-            out.tag = static_cast<uint8_t>(tag);
-            out.u64_val = 0;
-            switch (tag) {
-            case LiteralTag::BOOL:
-                out.bool_val = std::get<bool>(val) ? 1 : 0;
-                break;
-            case LiteralTag::BUILTINTYPEINDEX:
-            case LiteralTag::ACCESSOR:
-            case LiteralTag::NULLVALUE:
-                out.u8_val = std::get<uint8_t>(val);
-                break;
-            case LiteralTag::METHODAFFILIATE:
-                out.u16_val = std::get<uint16_t>(val);
-                break;
-            case LiteralTag::INTEGER:
-            case LiteralTag::LITERALBUFFERINDEX:
-            case LiteralTag::STRING:
-            case LiteralTag::METHOD:
-            case LiteralTag::GETTER:
-            case LiteralTag::SETTER:
-            case LiteralTag::GENERATORMETHOD:
-            case LiteralTag::ASYNCGENERATORMETHOD:
-            case LiteralTag::LITERALARRAY:
-            case LiteralTag::ETS_IMPLEMENTS:
-                out.u32_val = std::get<uint32_t>(val);
-                break;
-            case LiteralTag::FLOAT:
-                out.f32_val = std::get<float>(val);
-                break;
-            case LiteralTag::DOUBLE:
-                out.f64_val = std::get<double>(val);
-                break;
-            case LiteralTag::ARRAY_U1:
-            case LiteralTag::ARRAY_U8:
-            case LiteralTag::ARRAY_I8:
-            case LiteralTag::ARRAY_U16:
-            case LiteralTag::ARRAY_I16:
-            case LiteralTag::ARRAY_U32:
-            case LiteralTag::ARRAY_I32:
-            case LiteralTag::ARRAY_U64:
-            case LiteralTag::ARRAY_I64:
-            case LiteralTag::ARRAY_F32:
-            case LiteralTag::ARRAY_F64:
-            case LiteralTag::ARRAY_STRING:
-                out.u32_val = std::get<uint32_t>(val);
-                break;
-            default:
-                break;
-            }
-            cb(&out, ctx);
+            literal_val_to_c(val, tag, cb, ctx);
         });
 }
 
@@ -921,6 +980,8 @@ struct AbcBuilder {
     std::vector<ProtoItem *> protos;
     std::vector<ForeignFieldItem *> foreign_fields;
     std::vector<ForeignMethodItem *> foreign_methods;
+    // Staged literal items: flushed to LiteralArrayItem in finalize
+    std::vector<std::vector<panda::panda_file::LiteralItem>> literal_items_staging;
 
     // Resolve tagged class handle: high bit = foreign class
     BaseClassItem *ResolveClassHandle(uint32_t handle) {
@@ -972,32 +1033,7 @@ uint32_t abc_builder_add_literal_array(AbcBuilder *b, const char *id) {
     auto *item = b->container.GetOrCreateLiteralArrayItem(id);
     uint32_t idx = static_cast<uint32_t>(b->literal_arrays.size());
     b->literal_arrays.push_back(item);
-    return idx;
-}
-
-uint32_t abc_builder_class_add_method(AbcBuilder *b, uint32_t class_handle,
-                                       const char *name, uint32_t access_flags,
-                                       const uint8_t *code, uint32_t code_size,
-                                       uint32_t num_vregs, uint32_t num_args) {
-    if (class_handle >= b->classes.size()) return UINT32_MAX;
-    auto *cls = b->classes[class_handle];
-
-    auto *name_item = b->container.GetOrCreateStringItem(name);
-    // Use TAGGED as default return type for ECMAScript
-    auto *ret_type = b->container.GetOrCreatePrimitiveTypeItem(Type::TypeId::TAGGED);
-    auto *proto = b->container.GetOrCreateProtoItem(ret_type, {});
-
-    auto *method = cls->AddMethod(name_item, proto, access_flags,
-                                   std::vector<panda::panda_file::MethodParamItem>{});
-
-    if (code && code_size > 0) {
-        std::vector<uint8_t> insns(code, code + code_size);
-        auto *code_item = b->container.CreateItem<CodeItem>(num_vregs, num_args, std::move(insns));
-        method->SetCode(code_item);
-    }
-
-    uint32_t idx = static_cast<uint32_t>(b->methods.size());
-    b->methods.push_back(method);
+    b->literal_items_staging.emplace_back();
     return idx;
 }
 
@@ -1018,18 +1054,24 @@ uint32_t abc_builder_class_add_field(AbcBuilder *b, uint32_t class_handle,
     return idx;
 }
 
-void abc_builder_set_literal_array_data(AbcBuilder *b, uint32_t lit_handle,
-                                         const uint8_t *data, uint32_t len) {
-    if (lit_handle >= b->literal_arrays.size()) return;
-    auto *item = b->literal_arrays[lit_handle];
-    // Build LiteralItems from raw tag-value pairs
-    std::vector<panda::panda_file::LiteralItem> items;
-    // For now, store as raw uint8_t values — the caller is responsible for
-    // providing properly serialized literal array data
-    for (uint32_t i = 0; i < len; i++) {
-        items.emplace_back(static_cast<uint8_t>(data[i]));
-    }
-    item->AddItems(items);
+void abc_builder_literal_array_add_u8(AbcBuilder *b, uint32_t lit_handle, uint8_t val) {
+    if (lit_handle >= b->literal_items_staging.size()) return;
+    b->literal_items_staging[lit_handle].emplace_back(val);
+}
+
+void abc_builder_literal_array_add_u16(AbcBuilder *b, uint32_t lit_handle, uint16_t val) {
+    if (lit_handle >= b->literal_items_staging.size()) return;
+    b->literal_items_staging[lit_handle].emplace_back(val);
+}
+
+void abc_builder_literal_array_add_u32(AbcBuilder *b, uint32_t lit_handle, uint32_t val) {
+    if (lit_handle >= b->literal_items_staging.size()) return;
+    b->literal_items_staging[lit_handle].emplace_back(val);
+}
+
+void abc_builder_literal_array_add_u64(AbcBuilder *b, uint32_t lit_handle, uint64_t val) {
+    if (lit_handle >= b->literal_items_staging.size()) return;
+    b->literal_items_staging[lit_handle].emplace_back(val);
 }
 
 /* --- 3.1 Proto --- */
@@ -1370,6 +1412,12 @@ void abc_builder_deduplicate(AbcBuilder *b) {
 
 const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len) {
     try {
+        // Flush staged literal items to their LiteralArrayItems
+        for (size_t i = 0; i < b->literal_items_staging.size(); i++) {
+            if (!b->literal_items_staging[i].empty()) {
+                b->literal_arrays[i]->AddItems(b->literal_items_staging[i]);
+            }
+        }
         b->container.ComputeLayout();
         MemoryWriter writer;
         if (!b->container.Write(&writer)) {

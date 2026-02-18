@@ -32,7 +32,6 @@
 #include <string>
 #include <variant>
 #include <vector>
-#include <functional>
 #include <list>
 #include <set>
 

@@ -15,7 +15,6 @@
 
 #include "file_items.h"
 #include "file_item_container.h"
-#include <iomanip>
 
 namespace panda::panda_file {
 

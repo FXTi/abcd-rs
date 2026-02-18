@@ -14,7 +14,6 @@
  */
 
 #include "file_item_container.h"
-#include "utils/hash.h"
 
 namespace panda::panda_file {
 

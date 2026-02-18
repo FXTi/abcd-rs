@@ -79,6 +79,9 @@ impl AbcWriter {
 
     /// Add a method to a class.
     ///
+    /// Uses a default TAGGED return type proto (ECMAScript convention).
+    /// For custom protos, use `create_proto` + `add_method_with_proto`.
+    ///
     /// - `class_handle`: handle from `add_class`
     /// - `name`: method name
     /// - `access_flags`: ACC_PUBLIC, ACC_STATIC, etc.
@@ -94,6 +97,32 @@ impl AbcWriter {
         num_vregs: u32,
         num_args: u32,
     ) -> Result<MethodHandle, ParseError> {
+        // TAGGED = 0x0d
+        let proto = unsafe {
+            abcd_file_sys::abc_builder_create_proto(self.inner, 0x0d, std::ptr::null(), 0)
+        };
+        self.add_method_with_proto(
+            class_handle,
+            name,
+            proto,
+            access_flags,
+            code,
+            num_vregs,
+            num_args,
+        )
+    }
+
+    /// Add a method to a class with an explicit proto handle.
+    pub fn add_method_with_proto(
+        &mut self,
+        class_handle: ClassHandle,
+        name: &str,
+        proto_handle: u32,
+        access_flags: u32,
+        code: &[u8],
+        num_vregs: u32,
+        num_args: u32,
+    ) -> Result<MethodHandle, ParseError> {
         let c_name = CString::new(name).expect("name contains null byte");
         let (code_ptr, code_len) = if code.is_empty() {
             (std::ptr::null(), 0)
@@ -101,10 +130,11 @@ impl AbcWriter {
             (code.as_ptr(), code.len() as u32)
         };
         let idx = unsafe {
-            abcd_file_sys::abc_builder_class_add_method(
+            abcd_file_sys::abc_builder_class_add_method_with_proto(
                 self.inner,
                 class_handle.0,
                 c_name.as_ptr(),
+                proto_handle,
                 access_flags,
                 code_ptr,
                 code_len,
@@ -144,15 +174,31 @@ impl AbcWriter {
         Ok(FieldHandle(idx))
     }
 
-    /// Set raw literal array data (pre-serialized tag-value pairs).
-    pub fn set_literal_array_data(&mut self, handle: LiteralArrayHandle, data: &[u8]) {
+    /// Add a u8 item to a literal array (used for tags and small values).
+    pub fn literal_array_add_u8(&mut self, handle: LiteralArrayHandle, val: u8) {
         unsafe {
-            abcd_file_sys::abc_builder_set_literal_array_data(
-                self.inner,
-                handle.0,
-                data.as_ptr(),
-                data.len() as u32,
-            );
+            abcd_file_sys::abc_builder_literal_array_add_u8(self.inner, handle.0, val);
+        }
+    }
+
+    /// Add a u16 item to a literal array.
+    pub fn literal_array_add_u16(&mut self, handle: LiteralArrayHandle, val: u16) {
+        unsafe {
+            abcd_file_sys::abc_builder_literal_array_add_u16(self.inner, handle.0, val);
+        }
+    }
+
+    /// Add a u32 item to a literal array.
+    pub fn literal_array_add_u32(&mut self, handle: LiteralArrayHandle, val: u32) {
+        unsafe {
+            abcd_file_sys::abc_builder_literal_array_add_u32(self.inner, handle.0, val);
+        }
+    }
+
+    /// Add a u64 item to a literal array.
+    pub fn literal_array_add_u64(&mut self, handle: LiteralArrayHandle, val: u64) {
+        unsafe {
+            abcd_file_sys::abc_builder_literal_array_add_u64(self.inner, handle.0, val);
         }
     }
 
@@ -279,9 +325,8 @@ mod tests {
         w.add_method(cls, "func_main_0", 0x0001, &code, 1, 0)
             .unwrap();
 
-        let la = w.add_literal_array("0");
-        // Empty literal array data (just count = 0)
-        w.set_literal_array_data(la, &[0x00]);
+        let _la = w.add_literal_array("0");
+        // Empty literal array — no items added
 
         let data = w.finalize().unwrap();
         let abc = AbcFile::parse(data).unwrap();
