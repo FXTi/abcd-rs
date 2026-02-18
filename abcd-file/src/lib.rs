@@ -10,6 +10,7 @@ pub mod index;
 pub mod leb128;
 pub mod literal;
 pub mod method;
+pub mod modifiers;
 pub mod module_record;
 pub mod mutf8;
 pub mod string_table;

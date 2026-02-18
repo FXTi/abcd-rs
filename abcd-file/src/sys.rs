@@ -7,6 +7,30 @@
 use crate::error::ParseError;
 use std::ffi::CStr;
 
+/// Shared callback for collecting u32 IDs from enumerate-style C APIs.
+unsafe extern "C" fn entity_id_cb(id: u32, ctx: *mut std::ffi::c_void) -> i32 {
+    unsafe {
+        let v = &mut *(ctx as *mut Vec<u32>);
+        v.push(id);
+    }
+    0
+}
+
+/// Helper: call an enumerate function and collect all u32 IDs.
+fn collect_entity_ids(
+    enumerate: impl FnOnce(
+        unsafe extern "C" fn(u32, *mut std::ffi::c_void) -> i32,
+        *mut std::ffi::c_void,
+    ),
+) -> Vec<u32> {
+    let mut ids = Vec::new();
+    enumerate(
+        entity_id_cb,
+        &mut ids as *mut Vec<u32> as *mut std::ffi::c_void,
+    );
+    ids
+}
+
 /// A file handle backed by the C++ File shim.
 ///
 /// Owns a copy of the data and the native AbcFileHandle.
@@ -101,6 +125,27 @@ impl SysFile {
         if off == u32::MAX { None } else { Some(off) }
     }
 
+    /// Resolve a 16-bit proto index to a file offset.
+    pub fn resolve_proto_index(&self, entity_off: u32, idx: u16) -> Option<u32> {
+        let off = unsafe { abcd_file_sys::abc_resolve_proto_index(self.handle, entity_off, idx) };
+        if off == u32::MAX { None } else { Some(off) }
+    }
+
+    /// Validate the file checksum.
+    pub fn validate_checksum(&self) -> bool {
+        unsafe { abcd_file_sys::abc_file_validate_checksum(self.handle) != 0 }
+    }
+
+    /// Check if an entity offset is in the foreign section.
+    pub fn is_external(&self, entity_off: u32) -> bool {
+        unsafe { abcd_file_sys::abc_file_is_external(self.handle, entity_off) != 0 }
+    }
+
+    /// Get the UTF-16 length of a string at the given offset.
+    pub fn get_string_utf16_len(&self, offset: u32) -> u32 {
+        unsafe { abcd_file_sys::abc_file_get_string_utf16_len(self.handle, offset) }
+    }
+
     /// Open a class accessor at the given offset.
     pub fn class_accessor(&self, offset: u32) -> Result<SysClassAccessor<'_>, ParseError> {
         SysClassAccessor::open(self, offset)
@@ -119,6 +164,32 @@ impl SysFile {
     /// Open a field accessor at the given offset.
     pub fn field_accessor(&self, offset: u32) -> Result<SysFieldAccessor<'_>, ParseError> {
         SysFieldAccessor::open(self, offset)
+    }
+
+    /// Open a proto accessor at the given offset.
+    pub fn proto_accessor(&self, offset: u32) -> Result<SysProtoAccessor<'_>, ParseError> {
+        SysProtoAccessor::open(self, offset)
+    }
+
+    /// Open an annotation accessor at the given offset.
+    pub fn annotation_accessor(
+        &self,
+        offset: u32,
+    ) -> Result<SysAnnotationAccessor<'_>, ParseError> {
+        SysAnnotationAccessor::open(self, offset)
+    }
+
+    /// Open a literal data accessor.
+    pub fn literal_accessor(
+        &self,
+        literal_data_off: u32,
+    ) -> Result<SysLiteralAccessor<'_>, ParseError> {
+        SysLiteralAccessor::open(self, literal_data_off)
+    }
+
+    /// Open a module accessor at the given offset.
+    pub fn module_accessor(&self, offset: u32) -> Result<SysModuleAccessor<'_>, ParseError> {
+        SysModuleAccessor::open(self, offset)
     }
 
     pub(crate) fn handle(&self) -> *mut abcd_file_sys::AbcFileHandle {
@@ -218,6 +289,57 @@ impl<'f> SysClassAccessor<'f> {
         offsets
     }
 
+    /// Source language, or `None` if absent.
+    pub fn source_lang(&self) -> Option<u8> {
+        let v = unsafe { abcd_file_sys::abc_class_get_source_lang(self.handle) };
+        if v == u8::MAX { None } else { Some(v) }
+    }
+
+    /// Number of interfaces.
+    pub fn ifaces_number(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_class_get_ifaces_number(self.handle) }
+    }
+
+    /// Get interface entity ID by index.
+    pub fn interface_id(&self, idx: u32) -> u32 {
+        unsafe { abcd_file_sys::abc_class_get_interface_id(self.handle, idx) }
+    }
+
+    /// Collect all interface entity IDs.
+    pub fn interface_ids(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_class_enumerate_interfaces(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect annotation offsets.
+    pub fn annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_class_enumerate_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect runtime annotation offsets.
+    pub fn runtime_annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_class_enumerate_runtime_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect type annotation offsets.
+    pub fn type_annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_class_enumerate_type_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect runtime type annotation offsets.
+    pub fn runtime_type_annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_class_enumerate_runtime_type_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
     /// Get the file reference.
     pub fn file(&self) -> &'f SysFile {
         self.file
@@ -278,6 +400,71 @@ impl<'f> SysMethodAccessor<'f> {
     pub fn debug_info_off(&self) -> Option<u32> {
         let off = unsafe { abcd_file_sys::abc_method_debug_info_off(self.handle) };
         if off == u32::MAX { None } else { Some(off) }
+    }
+
+    /// Whether this method is in the foreign section.
+    pub fn is_external(&self) -> bool {
+        unsafe { abcd_file_sys::abc_method_is_external(self.handle) != 0 }
+    }
+
+    /// Resolved class entity ID.
+    pub fn get_class_id(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_method_get_class_id(self.handle) }
+    }
+
+    /// Resolved proto entity ID.
+    pub fn get_proto_id(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_method_get_proto_id(self.handle) }
+    }
+
+    /// Source language, or `None` if absent.
+    pub fn source_lang(&self) -> Option<u8> {
+        let v = unsafe { abcd_file_sys::abc_method_get_source_lang(self.handle) };
+        if v == u8::MAX { None } else { Some(v) }
+    }
+
+    /// Collect annotation offsets.
+    pub fn annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_method_enumerate_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect runtime annotation offsets.
+    pub fn runtime_annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_method_enumerate_runtime_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect type annotation offsets.
+    pub fn type_annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_method_enumerate_type_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect runtime type annotation offsets.
+    pub fn runtime_type_annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_method_enumerate_runtime_type_annotations(
+                self.handle,
+                Some(cb),
+                ctx,
+            );
+        })
+    }
+
+    /// Parameter annotation ID, or `None` if absent.
+    pub fn param_annotation_id(&self) -> Option<u32> {
+        let v = unsafe { abcd_file_sys::abc_method_get_param_annotation_id(self.handle) };
+        if v == u32::MAX { None } else { Some(v) }
+    }
+
+    /// Runtime parameter annotation ID, or `None` if absent.
+    pub fn runtime_param_annotation_id(&self) -> Option<u32> {
+        let v = unsafe { abcd_file_sys::abc_method_get_runtime_param_annotation_id(self.handle) };
+        if v == u32::MAX { None } else { Some(v) }
     }
 }
 
@@ -391,12 +578,473 @@ impl<'f> SysFieldAccessor<'f> {
     pub fn size(&self) -> u32 {
         unsafe { abcd_file_sys::abc_field_size(self.handle) }
     }
+
+    /// Get i32 initial value, if present.
+    pub fn get_value_i32(&self) -> Option<i32> {
+        let mut out = 0i32;
+        let ok = unsafe { abcd_file_sys::abc_field_get_value_i32(self.handle, &mut out) };
+        if ok != 0 { Some(out) } else { None }
+    }
+
+    /// Get i64 initial value, if present.
+    pub fn get_value_i64(&self) -> Option<i64> {
+        let mut out = 0i64;
+        let ok = unsafe { abcd_file_sys::abc_field_get_value_i64(self.handle, &mut out) };
+        if ok != 0 { Some(out) } else { None }
+    }
+
+    /// Get f32 initial value, if present.
+    pub fn get_value_f32(&self) -> Option<f32> {
+        let mut out = 0f32;
+        let ok = unsafe { abcd_file_sys::abc_field_get_value_f32(self.handle, &mut out) };
+        if ok != 0 { Some(out) } else { None }
+    }
+
+    /// Get f64 initial value, if present.
+    pub fn get_value_f64(&self) -> Option<f64> {
+        let mut out = 0f64;
+        let ok = unsafe { abcd_file_sys::abc_field_get_value_f64(self.handle, &mut out) };
+        if ok != 0 { Some(out) } else { None }
+    }
+
+    /// Collect annotation offsets.
+    pub fn annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_field_enumerate_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect runtime annotation offsets.
+    pub fn runtime_annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_field_enumerate_runtime_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect type annotation offsets.
+    pub fn type_annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_field_enumerate_type_annotations(self.handle, Some(cb), ctx);
+        })
+    }
+
+    /// Collect runtime type annotation offsets.
+    pub fn runtime_type_annotation_offsets(&self) -> Vec<u32> {
+        collect_entity_ids(|cb, ctx| unsafe {
+            abcd_file_sys::abc_field_enumerate_runtime_type_annotations(self.handle, Some(cb), ctx);
+        })
+    }
 }
 
 impl Drop for SysFieldAccessor<'_> {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             unsafe { abcd_file_sys::abc_field_close(self.handle) };
+        }
+    }
+}
+
+// ========== Proto Accessor ==========
+
+/// Safe wrapper around C++ ProtoDataAccessor.
+pub struct SysProtoAccessor<'f> {
+    handle: *mut abcd_file_sys::AbcProtoAccessor,
+    _file: &'f SysFile,
+}
+
+impl<'f> SysProtoAccessor<'f> {
+    fn open(file: &'f SysFile, offset: u32) -> Result<Self, ParseError> {
+        let handle = unsafe { abcd_file_sys::abc_proto_open(file.handle(), offset) };
+        if handle.is_null() {
+            return Err(ParseError::Io(format!(
+                "abc_proto_open failed at offset {offset}"
+            )));
+        }
+        Ok(Self {
+            handle,
+            _file: file,
+        })
+    }
+
+    /// Return type ID.
+    pub fn return_type(&self) -> u8 {
+        unsafe { abcd_file_sys::abc_proto_get_return_type(self.handle) }
+    }
+
+    /// Number of arguments.
+    pub fn num_args(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_proto_num_args(self.handle) }
+    }
+
+    /// Argument type ID by index.
+    pub fn arg_type(&self, idx: u32) -> u8 {
+        unsafe { abcd_file_sys::abc_proto_get_arg_type(self.handle, idx) }
+    }
+
+    /// Number of reference types.
+    pub fn ref_num(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_proto_get_ref_num(self.handle) }
+    }
+
+    /// Reference type entity offset by index.
+    pub fn reference_type(&self, idx: u32) -> u32 {
+        unsafe { abcd_file_sys::abc_proto_get_reference_type(self.handle, idx) }
+    }
+
+    /// Collect all type IDs via enumerate.
+    pub fn types(&self) -> Vec<u8> {
+        let mut types = Vec::new();
+        unsafe extern "C" fn cb(type_id: u8, ctx: *mut std::ffi::c_void) -> i32 {
+            unsafe {
+                let v = &mut *(ctx as *mut Vec<u8>);
+                v.push(type_id);
+            }
+            0
+        }
+        unsafe {
+            abcd_file_sys::abc_proto_enumerate_types(
+                self.handle,
+                Some(cb),
+                &mut types as *mut Vec<u8> as *mut std::ffi::c_void,
+            );
+        }
+        types
+    }
+
+    /// Get the raw shorty descriptor bytes.
+    pub fn shorty(&self) -> &[u8] {
+        let mut ptr = std::ptr::null();
+        let len = unsafe { abcd_file_sys::abc_proto_get_shorty(self.handle, &mut ptr) };
+        if ptr.is_null() || len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+    }
+}
+
+impl Drop for SysProtoAccessor<'_> {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { abcd_file_sys::abc_proto_close(self.handle) };
+        }
+    }
+}
+
+// ========== Annotation Accessor ==========
+
+/// A single annotation element.
+#[derive(Debug, Clone)]
+pub struct AnnotationElem {
+    pub name_off: u32,
+    pub tag: u8,
+    pub value: u32,
+}
+
+/// An annotation array value.
+#[derive(Debug, Clone)]
+pub struct AnnotationArrayVal {
+    pub count: u32,
+    pub entity_off: u32,
+}
+
+/// Safe wrapper around C++ AnnotationDataAccessor.
+pub struct SysAnnotationAccessor<'f> {
+    handle: *mut abcd_file_sys::AbcAnnotationAccessor,
+    _file: &'f SysFile,
+}
+
+impl<'f> SysAnnotationAccessor<'f> {
+    fn open(file: &'f SysFile, offset: u32) -> Result<Self, ParseError> {
+        let handle = unsafe { abcd_file_sys::abc_annotation_open(file.handle(), offset) };
+        if handle.is_null() {
+            return Err(ParseError::Io(format!(
+                "abc_annotation_open failed at offset {offset}"
+            )));
+        }
+        Ok(Self {
+            handle,
+            _file: file,
+        })
+    }
+
+    /// Class entity offset for this annotation.
+    pub fn class_off(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_annotation_class_off(self.handle) }
+    }
+
+    /// Number of elements.
+    pub fn count(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_annotation_count(self.handle) }
+    }
+
+    /// Size in bytes.
+    pub fn size(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_annotation_size(self.handle) }
+    }
+
+    /// Get a scalar element by index.
+    pub fn element(&self, idx: u32) -> Option<AnnotationElem> {
+        let mut out = abcd_file_sys::AbcAnnotationElem {
+            name_off: 0,
+            tag: 0,
+            value: 0,
+        };
+        let rc = unsafe { abcd_file_sys::abc_annotation_get_element(self.handle, idx, &mut out) };
+        if rc != 0 {
+            return None;
+        }
+        Some(AnnotationElem {
+            name_off: out.name_off,
+            tag: out.tag,
+            value: out.value,
+        })
+    }
+
+    /// Get an array element by index.
+    pub fn array_element(&self, idx: u32) -> Option<AnnotationArrayVal> {
+        let mut out = abcd_file_sys::AbcAnnotationArrayVal {
+            count: 0,
+            entity_off: 0,
+        };
+        let rc =
+            unsafe { abcd_file_sys::abc_annotation_get_array_element(self.handle, idx, &mut out) };
+        if rc != 0 {
+            return None;
+        }
+        Some(AnnotationArrayVal {
+            count: out.count,
+            entity_off: out.entity_off,
+        })
+    }
+}
+
+impl Drop for SysAnnotationAccessor<'_> {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { abcd_file_sys::abc_annotation_close(self.handle) };
+        }
+    }
+}
+
+// ========== Literal Accessor ==========
+
+/// A literal value from a literal array.
+#[derive(Debug, Clone, Copy)]
+pub struct LiteralVal {
+    pub tag: u8,
+    pub u64_val: u64,
+}
+
+impl LiteralVal {
+    pub fn as_u8(&self) -> u8 {
+        self.u64_val as u8
+    }
+    pub fn as_u16(&self) -> u16 {
+        self.u64_val as u16
+    }
+    pub fn as_u32(&self) -> u32 {
+        self.u64_val as u32
+    }
+    pub fn as_u64(&self) -> u64 {
+        self.u64_val
+    }
+    pub fn as_f32(&self) -> f32 {
+        f32::from_bits(self.u64_val as u32)
+    }
+    pub fn as_f64(&self) -> f64 {
+        f64::from_bits(self.u64_val)
+    }
+    pub fn as_bool(&self) -> bool {
+        self.u64_val != 0
+    }
+}
+
+/// Safe wrapper around C++ LiteralDataAccessor.
+pub struct SysLiteralAccessor<'f> {
+    handle: *mut abcd_file_sys::AbcLiteralAccessor,
+    _file: &'f SysFile,
+}
+
+impl<'f> SysLiteralAccessor<'f> {
+    fn open(file: &'f SysFile, literal_data_off: u32) -> Result<Self, ParseError> {
+        let handle = unsafe { abcd_file_sys::abc_literal_open(file.handle(), literal_data_off) };
+        if handle.is_null() {
+            return Err(ParseError::Io(format!(
+                "abc_literal_open failed at offset {literal_data_off}"
+            )));
+        }
+        Ok(Self {
+            handle,
+            _file: file,
+        })
+    }
+
+    /// Total number of literal arrays.
+    pub fn count(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_literal_count(self.handle) }
+    }
+
+    /// Number of values in a literal array (by entity offset).
+    pub fn vals_num(&self, array_off: u32) -> u32 {
+        unsafe { abcd_file_sys::abc_literal_get_vals_num(self.handle, array_off) }
+    }
+
+    /// Number of values in a literal array (by index).
+    pub fn vals_num_by_index(&self, index: u32) -> u32 {
+        unsafe { abcd_file_sys::abc_literal_get_vals_num_by_index(self.handle, index) }
+    }
+
+    /// Get literal array entity ID by index.
+    pub fn array_id(&self, index: u32) -> u32 {
+        unsafe { abcd_file_sys::abc_literal_get_array_id(self.handle, index) }
+    }
+
+    /// Enumerate literal values by entity offset.
+    pub fn enumerate_vals(&self, array_off: u32) -> Vec<LiteralVal> {
+        let mut vals = Vec::new();
+        unsafe extern "C" fn cb(
+            val: *const abcd_file_sys::AbcLiteralVal,
+            ctx: *mut std::ffi::c_void,
+        ) -> i32 {
+            unsafe {
+                let v = &mut *(ctx as *mut Vec<LiteralVal>);
+                let lv = &*val;
+                v.push(LiteralVal {
+                    tag: lv.tag,
+                    u64_val: lv.__bindgen_anon_1.u64_val,
+                });
+            }
+            0
+        }
+        unsafe {
+            abcd_file_sys::abc_literal_enumerate_vals(
+                self.handle,
+                array_off,
+                Some(cb),
+                &mut vals as *mut Vec<LiteralVal> as *mut std::ffi::c_void,
+            );
+        }
+        vals
+    }
+
+    /// Enumerate literal values by index.
+    pub fn enumerate_vals_by_index(&self, index: u32) -> Vec<LiteralVal> {
+        let mut vals = Vec::new();
+        unsafe extern "C" fn cb(
+            val: *const abcd_file_sys::AbcLiteralVal,
+            ctx: *mut std::ffi::c_void,
+        ) -> i32 {
+            unsafe {
+                let v = &mut *(ctx as *mut Vec<LiteralVal>);
+                let lv = &*val;
+                v.push(LiteralVal {
+                    tag: lv.tag,
+                    u64_val: lv.__bindgen_anon_1.u64_val,
+                });
+            }
+            0
+        }
+        unsafe {
+            abcd_file_sys::abc_literal_enumerate_vals_by_index(
+                self.handle,
+                index,
+                Some(cb),
+                &mut vals as *mut Vec<LiteralVal> as *mut std::ffi::c_void,
+            );
+        }
+        vals
+    }
+}
+
+impl Drop for SysLiteralAccessor<'_> {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { abcd_file_sys::abc_literal_close(self.handle) };
+        }
+    }
+}
+
+// ========== Module Accessor ==========
+
+/// A module record entry.
+#[derive(Debug, Clone)]
+pub struct ModuleRecord {
+    pub tag: u8,
+    pub export_name_off: u32,
+    pub module_request_idx: u32,
+    pub import_name_off: u32,
+    pub local_name_off: u32,
+}
+
+/// Safe wrapper around C++ ModuleDataAccessor.
+pub struct SysModuleAccessor<'f> {
+    handle: *mut abcd_file_sys::AbcModuleAccessor,
+    _file: &'f SysFile,
+}
+
+impl<'f> SysModuleAccessor<'f> {
+    fn open(file: &'f SysFile, offset: u32) -> Result<Self, ParseError> {
+        let handle = unsafe { abcd_file_sys::abc_module_open(file.handle(), offset) };
+        if handle.is_null() {
+            return Err(ParseError::Io(format!(
+                "abc_module_open failed at offset {offset}"
+            )));
+        }
+        Ok(Self {
+            handle,
+            _file: file,
+        })
+    }
+
+    /// Number of request modules.
+    pub fn num_requests(&self) -> u32 {
+        unsafe { abcd_file_sys::abc_module_num_requests(self.handle) }
+    }
+
+    /// Get request module string offset by index.
+    pub fn request_off(&self, idx: u32) -> Option<u32> {
+        let off = unsafe { abcd_file_sys::abc_module_request_off(self.handle, idx) };
+        if off == u32::MAX { None } else { Some(off) }
+    }
+
+    /// Collect all module records.
+    pub fn records(&self) -> Vec<ModuleRecord> {
+        let mut records = Vec::new();
+        unsafe extern "C" fn cb(
+            tag: u8,
+            export_name_off: u32,
+            module_request_idx: u32,
+            import_name_off: u32,
+            local_name_off: u32,
+            ctx: *mut std::ffi::c_void,
+        ) -> i32 {
+            unsafe {
+                let v = &mut *(ctx as *mut Vec<ModuleRecord>);
+                v.push(ModuleRecord {
+                    tag,
+                    export_name_off,
+                    module_request_idx,
+                    import_name_off,
+                    local_name_off,
+                });
+            }
+            0
+        }
+        unsafe {
+            abcd_file_sys::abc_module_enumerate_records(
+                self.handle,
+                Some(cb),
+                &mut records as *mut Vec<ModuleRecord> as *mut std::ffi::c_void,
+            );
+        }
+        records
+    }
+}
+
+impl Drop for SysModuleAccessor<'_> {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { abcd_file_sys::abc_module_close(self.handle) };
         }
     }
 }

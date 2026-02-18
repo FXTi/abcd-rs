@@ -81,6 +81,8 @@ uint32_t abc_proto_get_ref_num(AbcProtoAccessor *a);
 
 typedef int (*AbcProtoTypeCb)(uint8_t type_id, void *ctx);
 void abc_proto_enumerate_types(AbcProtoAccessor *a, AbcProtoTypeCb cb, void *ctx);
+/* Shorty descriptor: returns length, sets *out_data to internal buffer */
+uint32_t abc_proto_get_shorty(AbcProtoAccessor *a, const uint8_t **out_data);
 
 /* ========== Class Data Accessor ========== */
 
@@ -242,6 +244,7 @@ void abc_literal_enumerate_vals(AbcLiteralAccessor *a, uint32_t array_off,
 /* Literal array by index */
 uint32_t abc_literal_get_array_id(const AbcLiteralAccessor *a, uint32_t index);
 uint32_t abc_literal_get_vals_num(const AbcLiteralAccessor *a, uint32_t array_off);
+uint32_t abc_literal_get_vals_num_by_index(const AbcLiteralAccessor *a, uint32_t index);
 void abc_literal_enumerate_vals_by_index(AbcLiteralAccessor *a, uint32_t index,
                                           AbcLiteralValCb cb, void *ctx);
 
@@ -445,10 +448,16 @@ uint32_t abc_builder_create_annotation(AbcBuilder *b, uint32_t class_handle,
     const struct AbcAnnotationElemDef *elements, uint32_t num_elements);
 void abc_builder_class_add_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle);
 void abc_builder_class_add_runtime_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle);
+void abc_builder_class_add_type_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle);
+void abc_builder_class_add_runtime_type_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle);
 void abc_builder_method_add_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle);
 void abc_builder_method_add_runtime_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle);
+void abc_builder_method_add_type_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle);
+void abc_builder_method_add_runtime_type_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle);
 void abc_builder_field_add_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle);
 void abc_builder_field_add_runtime_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle);
+void abc_builder_field_add_type_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle);
+void abc_builder_field_add_runtime_type_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle);
 
 /* --- Foreign items --- */
 uint32_t abc_builder_add_foreign_field(AbcBuilder *b, uint32_t class_handle,

@@ -423,6 +423,12 @@ void abc_proto_enumerate_types(AbcProtoAccessor *a, AbcProtoTypeCb cb, void *ctx
     });
 }
 
+uint32_t abc_proto_get_shorty(AbcProtoAccessor *a, const uint8_t **out_data) {
+    auto shorty = a->accessor.GetShorty();
+    *out_data = shorty.data();
+    return static_cast<uint32_t>(shorty.size());
+}
+
 /* ========== Class Data Accessor ========== */
 
 AbcClassAccessor *abc_class_open(const AbcFileHandle *f, uint32_t offset) {
@@ -806,6 +812,10 @@ uint32_t abc_literal_get_array_id(const AbcLiteralAccessor *a, uint32_t index) {
 
 uint32_t abc_literal_get_vals_num(const AbcLiteralAccessor *a, uint32_t array_off) {
     return static_cast<uint32_t>(a->accessor.GetLiteralValsNum(File::EntityId(array_off)));
+}
+
+uint32_t abc_literal_get_vals_num_by_index(const AbcLiteralAccessor *a, uint32_t index) {
+    return static_cast<uint32_t>(a->accessor.GetLiteralValsNum(static_cast<size_t>(index)));
 }
 
 void abc_literal_enumerate_vals_by_index(AbcLiteralAccessor *a, uint32_t index,
@@ -1352,6 +1362,18 @@ void abc_builder_class_add_runtime_annotation(AbcBuilder *b, uint32_t class_hand
     b->classes[class_handle]->AddRuntimeAnnotation(b->annotations[ann_handle]);
 }
 
+void abc_builder_class_add_type_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle) {
+    if (class_handle >= b->classes.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    b->classes[class_handle]->AddTypeAnnotation(b->annotations[ann_handle]);
+}
+
+void abc_builder_class_add_runtime_type_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle) {
+    if (class_handle >= b->classes.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    b->classes[class_handle]->AddRuntimeTypeAnnotation(b->annotations[ann_handle]);
+}
+
 void abc_builder_method_add_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
@@ -1364,6 +1386,18 @@ void abc_builder_method_add_runtime_annotation(AbcBuilder *b, uint32_t method_ha
     b->methods[method_handle]->AddRuntimeAnnotation(b->annotations[ann_handle]);
 }
 
+void abc_builder_method_add_type_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
+    if (method_handle >= b->methods.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    b->methods[method_handle]->AddTypeAnnotation(b->annotations[ann_handle]);
+}
+
+void abc_builder_method_add_runtime_type_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
+    if (method_handle >= b->methods.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    b->methods[method_handle]->AddRuntimeTypeAnnotation(b->annotations[ann_handle]);
+}
+
 void abc_builder_field_add_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
@@ -1374,6 +1408,18 @@ void abc_builder_field_add_runtime_annotation(AbcBuilder *b, uint32_t field_hand
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->fields[field_handle]->AddRuntimeAnnotation(b->annotations[ann_handle]);
+}
+
+void abc_builder_field_add_type_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
+    if (field_handle >= b->fields.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    b->fields[field_handle]->AddTypeAnnotation(b->annotations[ann_handle]);
+}
+
+void abc_builder_field_add_runtime_type_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
+    if (field_handle >= b->fields.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    b->fields[field_handle]->AddRuntimeTypeAnnotation(b->annotations[ann_handle]);
 }
 
 /* --- 3.8 Foreign items --- */

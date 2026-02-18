@@ -108,9 +108,9 @@ fn main() {
     // so no extra include paths are needed.
     let bindings = bindgen::Builder::default()
         .header(&format!("{manifest}/bridge/file_bridge.h"))
-        // .allowlist_function("abc_.*")
-        // .allowlist_type("Abc.*")
-        // .allowlist_var("ABC_.*")
+        .allowlist_function("abc_.*")
+        .allowlist_type("Abc.*")
+        .allowlist_var("ABC_.*")
         .generate()
         .expect("bindgen failed");
 
