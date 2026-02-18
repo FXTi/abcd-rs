@@ -145,9 +145,17 @@ jobs:
         if: ${{ matrix.use_cross }}
         run: cross build --release --target ${{ matrix.target }}
 
+      - name: Test (cross)
+        if: ${{ matrix.use_cross }}
+        run: cross test --release --target ${{ matrix.target }}
+
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Test (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo test --release --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
