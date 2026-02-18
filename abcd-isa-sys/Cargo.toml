@@ -2,6 +2,7 @@
 name = "abcd-isa-sys"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 links = "isa_bridge"
 
 [dependencies]

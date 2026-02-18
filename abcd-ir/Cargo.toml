@@ -2,6 +2,7 @@
 name = "abcd-ir"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 abcd-isa = { workspace = true }
