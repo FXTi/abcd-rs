@@ -70,7 +70,7 @@ impl SysFile {
             abcd_file_sys::abc_file_get_string(
                 self.handle,
                 offset,
-                buf.as_mut_ptr() as *mut i8,
+                buf.as_mut_ptr() as *mut std::ffi::c_char,
                 buf.len(),
             )
         };
