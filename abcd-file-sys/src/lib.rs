@@ -176,7 +176,7 @@ mod tests {
                         let n = abc_file_get_string(
                             f,
                             name_off,
-                            buf.as_mut_ptr() as *mut i8,
+                            buf.as_mut_ptr() as *mut std::ffi::c_char,
                             buf.len(),
                         );
                         assert!(n > 0, "should read a method name string");
@@ -348,7 +348,12 @@ mod tests {
                 let class_off = abc_file_class_offset(f, i);
                 // Read the class name to check if it's a module descriptor
                 let mut buf = [0u8; 256];
-                let n = abc_file_get_string(f, class_off, buf.as_mut_ptr() as *mut i8, buf.len());
+                let n = abc_file_get_string(
+                    f,
+                    class_off,
+                    buf.as_mut_ptr() as *mut std::ffi::c_char,
+                    buf.len(),
+                );
                 if n == 0 {
                     continue;
                 }
@@ -381,11 +386,11 @@ mod tests {
 
             // Set API version
             let sub_api = b"beta1\0";
-            abc_builder_set_api(b, 12, sub_api.as_ptr() as *const i8);
+            abc_builder_set_api(b, 12, sub_api.as_ptr() as *const std::ffi::c_char);
 
             // Create a class with one method
             let cls_desc = b"L_GLOBAL;\0";
-            let cls = abc_builder_add_class(b, cls_desc.as_ptr() as *const i8);
+            let cls = abc_builder_add_class(b, cls_desc.as_ptr() as *const std::ffi::c_char);
             assert_ne!(cls, u32::MAX);
 
             let method_name = b"func_main_0\0";
@@ -394,7 +399,7 @@ mod tests {
             let m = abc_builder_class_add_method(
                 b,
                 cls,
-                method_name.as_ptr() as *const i8,
+                method_name.as_ptr() as *const std::ffi::c_char,
                 0x0001, // ACC_PUBLIC
                 code.as_ptr(),
                 code.len() as u32,
