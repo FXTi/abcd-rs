@@ -7,7 +7,7 @@
  *   - panda::panda_file::File::EntityId
  *   - panda::panda_file::File::Index / Index32
  *   - Transitive includes (span.h, bit_utils.h) for bytecode_emitter.cpp
- *   - LOG macro (replacing logger.h)
+ *   - LOG macro (via utils/logger.h)
  */
 
 #ifndef LIBPANDAFILE_FILE_H
@@ -25,9 +25,8 @@
 #include "utils/span.h"
 #include "utils/bit_utils.h"
 
-// LOG macro stub — original comes through file.h → helpers.h → logger.h (541 lines).
-// We only need the stream interface for error messages.
-#define LOG(level, component) std::cerr
+// LOG macro — shim replacing the 541-line upstream logger.h
+#include "utils/logger.h"
 
 namespace panda::panda_file {
 

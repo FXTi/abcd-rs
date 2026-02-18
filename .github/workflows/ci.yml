@@ -49,7 +49,14 @@ jobs:
               diff -q "$first" "$f" || { diff -u "$first" "$f"; fail=1; }
             done
           fi
-          # Add more cross-crate file checks here as needed
+          # Common shim files must be identical across crates
+          for f in platform_compat.h securec.h utils/logger.h; do
+            a="abcd-file-sys/bridge/shim/$f"
+            b="abcd-isa-sys/bridge/shim/$f"
+            if [ ! -f "$a" ]; then echo "MISSING: $a"; fail=1; continue; fi
+            if [ ! -f "$b" ]; then echo "MISSING: $b"; fail=1; continue; fi
+            diff -q "$a" "$b" || { echo "MISMATCH: $f"; diff -u "$a" "$b"; fail=1; }
+          done
           [ "$fail" -eq 0 ] && echo "All common files are consistent." || exit 1
 
   build:
