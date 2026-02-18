@@ -179,7 +179,7 @@ class VendorSync
 
   def update_metadata(results)
     files = {}
-    FILE_MAP.each_key do |local_path|
+    FILE_MAP.keys.sort.each do |local_path|
       local_file = File.join(VENDOR_DIR, local_path)
       next unless File.exist?(local_file)
       files[local_path] = { 'sha256' => sha256(File.binread(local_file)) }
