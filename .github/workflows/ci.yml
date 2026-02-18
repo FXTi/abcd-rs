@@ -24,18 +24,38 @@ jobs:
   vendor-check:
     name: Vendor integrity
     runs-on: ubuntu-latest
-    needs: fmt
     steps:
       - uses: actions/checkout@v4
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
       - run: ruby abcd-isa-sys/vendor-sync.rb --check-local
+      - run: ruby abcd-file-sys/vendor-sync.rb --check-local
+
+  common-files-consistency:
+    name: Common files consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify cross-crate common files are identical
+        run: |
+          fail=0
+          # vendor-sync.rb must be identical across crates
+          scripts=$(ls */vendor-sync.rb 2>/dev/null)
+          if [ -n "$scripts" ]; then
+            first=$(echo "$scripts" | head -1)
+            for f in $scripts; do
+              [ "$f" = "$first" ] && continue
+              diff -q "$first" "$f" || { diff -u "$first" "$f"; fail=1; }
+            done
+          fi
+          # Add more cross-crate file checks here as needed
+          [ "$fail" -eq 0 ] && echo "All common files are consistent." || exit 1
 
   build:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: [fmt, vendor-check]
+    needs: [fmt, vendor-check, common-files-consistency]
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -54,7 +74,7 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
-    needs: [fmt, vendor-check]
+    needs: [fmt, vendor-check, common-files-consistency]
     env:
       CXX: clang++
     steps:

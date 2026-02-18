@@ -1,0 +1,33 @@
+# vendor-sync-files.yml — local vendor path => upstream path within runtime_core/
+
+# --- Ruby ISA scripts & data ---
+isa/gen.rb: isa/gen.rb
+isa/isapi.rb: isa/isapi.rb
+isa/combine.rb: isa/combine.rb
+isa/isa.yaml: isa/isa.yaml
+
+# --- Ruby pandafile scripts ---
+libpandafile/pandafile_isapi.rb: libpandafile/pandafile_isapi.rb
+
+# --- ERB templates ---
+libpandafile/templates/bytecode_instruction_enum_gen.h.erb: libpandafile/templates/bytecode_instruction_enum_gen.h.erb
+libpandafile/templates/bytecode_instruction-inl_gen.h.erb: libpandafile/templates/bytecode_instruction-inl_gen.h.erb
+libpandafile/templates/bytecode_emitter_def_gen.h.erb: libpandafile/templates/bytecode_emitter_def_gen.h.erb
+libpandafile/templates/bytecode_emitter_gen.h.erb: libpandafile/templates/bytecode_emitter_gen.h.erb
+libpandafile/templates/file_format_version.h.erb: libpandafile/templates/file_format_version.h.erb
+
+# --- libpandafile headers & source ---
+libpandafile/bytecode_instruction.h: libpandafile/bytecode_instruction.h
+libpandafile/bytecode_instruction-inl.h: libpandafile/bytecode_instruction-inl.h
+libpandafile/bytecode_emitter.h: libpandafile/bytecode_emitter.h
+libpandafile/bytecode_emitter.cpp: libpandafile/bytecode_emitter.cpp
+
+# --- libpandabase headers ---
+libpandabase/macros.h: libpandabase/include/libpandabase/macros.h
+libpandabase/globals.h: libpandabase/include/libpandabase/globals.h
+libpandabase/panda_visibility.h: libpandabase/include/libpandabase/panda_visibility.h
+libpandabase/utils/debug.h: libpandabase/include/libpandabase/utils/debug.h
+libpandabase/utils/bit_helpers.h: libpandabase/include/libpandabase/utils/bit_helpers.h
+libpandabase/utils/bit_utils.h: libpandabase/include/libpandabase/utils/bit_utils.h
+libpandabase/utils/span.h: libpandabase/include/libpandabase/utils/span.h
+libpandabase/os/stacktrace.h: libpandabase/include/libpandabase/os/stacktrace.h

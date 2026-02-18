@@ -6,6 +6,7 @@
 
 #include "file.h"
 #include "file-inl.h"
+#include "os/mem.h"
 #include "class_data_accessor-inl.h"
 #include "method_data_accessor-inl.h"
 #include "code_data_accessor-inl.h"
@@ -45,8 +46,8 @@ using Type = panda::panda_file::Type;
 using PrimitiveTypeItem = panda::panda_file::PrimitiveTypeItem;
 
 struct AbcFileHandle {
-    File file;
-    AbcFileHandle(const uint8_t *data, size_t len) : file(data, len) {}
+    std::unique_ptr<const File> file;
+    AbcFileHandle(std::unique_ptr<const File> f) : file(std::move(f)) {}
 };
 
 struct AbcClassAccessor {
@@ -95,7 +96,11 @@ extern "C" {
 
 AbcFileHandle *abc_file_open(const uint8_t *data, size_t len) {
     if (!data || len < sizeof(File::Header)) return nullptr;
-    return new (std::nothrow) AbcFileHandle(data, len);
+    auto *bytes = reinterpret_cast<std::byte *>(const_cast<uint8_t *>(data));
+    panda::os::mem::ConstBytePtr ptr(bytes, len, nullptr);
+    auto file = File::OpenFromMemory(std::move(ptr));
+    if (!file) return nullptr;
+    return new (std::nothrow) AbcFileHandle(std::move(file));
 }
 
 void abc_file_close(AbcFileHandle *f) {
@@ -103,41 +108,41 @@ void abc_file_close(AbcFileHandle *f) {
 }
 
 uint32_t abc_file_num_classes(const AbcFileHandle *f) {
-    return f->file.GetHeader()->num_classes;
+    return f->file->GetHeader()->num_classes;
 }
 
 uint32_t abc_file_class_offset(const AbcFileHandle *f, uint32_t idx) {
-    auto classes = f->file.GetClasses();
+    auto classes = f->file->GetClasses();
     if (idx >= classes.Size()) return UINT32_MAX;
     return classes[idx];
 }
 
 uint32_t abc_file_num_literalarrays(const AbcFileHandle *f) {
-    return f->file.GetHeader()->num_literalarrays;
+    return f->file->GetHeader()->num_literalarrays;
 }
 
 uint32_t abc_file_literalarray_offset(const AbcFileHandle *f, uint32_t idx) {
-    auto arrays = f->file.GetLiteralArrays();
+    auto arrays = f->file->GetLiteralArrays();
     if (idx >= arrays.Size()) return UINT32_MAX;
     return arrays[idx];
 }
 
 uint32_t abc_file_literalarray_idx_off(const AbcFileHandle *f) {
-    return f->file.GetHeader()->literalarray_idx_off;
+    return f->file->GetHeader()->literalarray_idx_off;
 }
 
 uint32_t abc_file_size(const AbcFileHandle *f) {
-    return f->file.GetHeader()->file_size;
+    return f->file->GetHeader()->file_size;
 }
 
 void abc_file_version(const AbcFileHandle *f, uint8_t out[4]) {
-    auto &ver = f->file.GetHeader()->version;
+    auto &ver = f->file->GetHeader()->version;
     out[0] = ver[0]; out[1] = ver[1]; out[2] = ver[2]; out[3] = ver[3];
 }
 
 size_t abc_file_get_string(const AbcFileHandle *f, uint32_t offset,
                            char *buf, size_t buf_len) {
-    auto sd = f->file.GetStringData(File::EntityId(offset));
+    auto sd = f->file->GetStringData(File::EntityId(offset));
     if (!sd.data) return 0;
     // Find null terminator
     size_t len = std::strlen(reinterpret_cast<const char *>(sd.data));
@@ -151,24 +156,24 @@ size_t abc_file_get_string(const AbcFileHandle *f, uint32_t offset,
 }
 
 uint32_t abc_resolve_method_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx) {
-    auto id = f->file.ResolveMethodIndex(File::EntityId(entity_off), idx);
+    auto id = f->file->ResolveMethodIndex(File::EntityId(entity_off), idx);
     return id.GetOffset();
 }
 
 uint32_t abc_resolve_class_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx) {
-    auto id = f->file.ResolveClassIndex(File::EntityId(entity_off), idx);
+    auto id = f->file->ResolveClassIndex(File::EntityId(entity_off), idx);
     return id.GetOffset();
 }
 
 uint32_t abc_resolve_field_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx) {
-    auto id = f->file.ResolveFieldIndex(File::EntityId(entity_off), idx);
+    auto id = f->file->ResolveFieldIndex(File::EntityId(entity_off), idx);
     return id.GetOffset();
 }
 
 /* ========== Class Data Accessor ========== */
 
 AbcClassAccessor *abc_class_open(const AbcFileHandle *f, uint32_t offset) {
-    return new (std::nothrow) AbcClassAccessor(f->file, File::EntityId(offset));
+    return new (std::nothrow) AbcClassAccessor(*f->file, File::EntityId(offset));
 }
 
 void abc_class_close(AbcClassAccessor *a) {
@@ -220,7 +225,7 @@ void abc_class_enumerate_fields(AbcClassAccessor *a, AbcFieldOffsetCb cb, void *
 /* ========== Method Data Accessor ========== */
 
 AbcMethodAccessor *abc_method_open(const AbcFileHandle *f, uint32_t offset) {
-    return new (std::nothrow) AbcMethodAccessor(f->file, File::EntityId(offset));
+    return new (std::nothrow) AbcMethodAccessor(*f->file, File::EntityId(offset));
 }
 
 void abc_method_close(AbcMethodAccessor *a) {
@@ -258,7 +263,7 @@ uint32_t abc_method_debug_info_off(AbcMethodAccessor *a) {
 /* ========== Code Data Accessor ========== */
 
 AbcCodeAccessor *abc_code_open(const AbcFileHandle *f, uint32_t offset) {
-    return new (std::nothrow) AbcCodeAccessor(f->file, File::EntityId(offset));
+    return new (std::nothrow) AbcCodeAccessor(*f->file, File::EntityId(offset));
 }
 
 void abc_code_close(AbcCodeAccessor *a) {
@@ -296,7 +301,7 @@ void abc_code_enumerate_try_blocks(AbcCodeAccessor *a, AbcTryBlockCb cb, void *c
 /* ========== Field Data Accessor ========== */
 
 AbcFieldAccessor *abc_field_open(const AbcFileHandle *f, uint32_t offset) {
-    return new (std::nothrow) AbcFieldAccessor(f->file, File::EntityId(offset));
+    return new (std::nothrow) AbcFieldAccessor(*f->file, File::EntityId(offset));
 }
 
 void abc_field_close(AbcFieldAccessor *a) {
@@ -342,7 +347,7 @@ void abc_field_enumerate_runtime_annotations(AbcFieldAccessor *a, AbcAnnotationC
 /* ========== Literal Data Accessor ========== */
 
 AbcLiteralAccessor *abc_literal_open(const AbcFileHandle *f, uint32_t literal_data_off) {
-    return new (std::nothrow) AbcLiteralAccessor(f->file, File::EntityId(literal_data_off));
+    return new (std::nothrow) AbcLiteralAccessor(*f->file, File::EntityId(literal_data_off));
 }
 
 void abc_literal_close(AbcLiteralAccessor *a) {
@@ -414,7 +419,7 @@ void abc_literal_enumerate_vals(AbcLiteralAccessor *a, uint32_t array_off,
 /* ========== Module Data Accessor ========== */
 
 AbcModuleAccessor *abc_module_open(const AbcFileHandle *f, uint32_t offset) {
-    return new (std::nothrow) AbcModuleAccessor(f->file, File::EntityId(offset));
+    return new (std::nothrow) AbcModuleAccessor(*f->file, File::EntityId(offset));
 }
 
 void abc_module_close(AbcModuleAccessor *a) {
@@ -443,7 +448,7 @@ void abc_module_enumerate_records(AbcModuleAccessor *a, AbcModuleRecordCb cb, vo
 /* ========== Annotation Data Accessor ========== */
 
 AbcAnnotationAccessor *abc_annotation_open(const AbcFileHandle *f, uint32_t offset) {
-    return new (std::nothrow) AbcAnnotationAccessor(f->file, File::EntityId(offset));
+    return new (std::nothrow) AbcAnnotationAccessor(*f->file, File::EntityId(offset));
 }
 
 void abc_annotation_close(AbcAnnotationAccessor *a) {
@@ -476,7 +481,7 @@ int abc_annotation_get_element(const AbcAnnotationAccessor *a, uint32_t idx,
 /* ========== Debug Info Extractor ========== */
 
 AbcDebugInfo *abc_debug_info_open(const AbcFileHandle *f) {
-    return new (std::nothrow) AbcDebugInfo(&f->file);
+    return new (std::nothrow) AbcDebugInfo(f->file.get());
 }
 
 void abc_debug_info_close(AbcDebugInfo *d) {

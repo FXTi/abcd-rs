@@ -1,7 +1,7 @@
 name: vendor-sync
 on:
   schedule:
-    - cron: '0 2 * * *'   # Daily at UTC 02:00 (Beijing 10:00)
+    - cron: '0 0 * * *'   # Daily at UTC 00:00 (Beijing 8:00)
   workflow_dispatch:        # Manual trigger
 
 permissions:
@@ -16,6 +16,10 @@ env:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [abcd-isa-sys, abcd-file-sys]
     steps:
       - uses: actions/checkout@v4
 
@@ -24,13 +28,12 @@ jobs:
           ruby-version: '3.2'
 
       - name: Run vendor sync
-        id: sync
-        run: ruby abcd-isa-sys/vendor-sync.rb -v --force
+        run: ruby ${{ matrix.crate }}/vendor-sync.rb -v --force
 
       - name: Check for changes
         id: diff
         run: |
-          if git diff --quiet abcd-isa-sys/vendor/; then
+          if git diff --quiet ${{ matrix.crate }}/vendor/; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -55,14 +58,14 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          branch="vendor-sync/$(date +%Y%m%d-%H%M)"
+          branch="vendor-sync/${{ matrix.crate }}/$(date +%Y%m%d-%H%M)"
           git checkout -b "$branch"
-          git add abcd-isa-sys/vendor/
-          git commit -m "chore: sync vendor files from upstream arkcompiler"
+          git add ${{ matrix.crate }}/vendor/
+          git commit -m "chore(${{ matrix.crate }}): sync vendor files from upstream"
           git push -u origin "$branch"
           gh pr create \
-            --title "chore: sync vendor files from upstream" \
-            --body "Automated daily sync from arkcompiler_runtime_core master branch. Build & test passed on ubuntu-latest." \
+            --title "chore(${{ matrix.crate }}): sync vendor files from upstream" \
+            --body "Automated daily sync of **${{ matrix.crate }}** vendor files from arkcompiler_runtime_core master. Build & test passed on ubuntu-latest." \
             --label "vendor-sync"
 
       - name: Create issue on failure
@@ -74,14 +77,14 @@ jobs:
           existing=$(gh issue list --label "vendor-sync" --state open --limit 1 --json number -q '.[0].number')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" \
-              --body "Still failing as of $(date -u +%Y-%m-%dT%H:%M:%SZ). [Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+              --body "**${{ matrix.crate }}** still failing as of $(date -u +%Y-%m-%dT%H:%M:%SZ). [Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
             exit 0
           fi
           gh issue create \
-            --title "vendor-sync: upstream sync failed" \
+            --title "vendor-sync: ${{ matrix.crate }} upstream sync failed" \
             --label "vendor-sync" \
             --body "$(cat <<'BODY'
-          Automated vendor sync encountered an error.
+          Automated vendor sync for **${{ matrix.crate }}** encountered an error.
 
           **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 

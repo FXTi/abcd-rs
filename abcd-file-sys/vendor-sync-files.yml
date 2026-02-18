@@ -1,0 +1,80 @@
+# vendor-sync-files.yml — local vendor path => upstream path within runtime_core/
+
+# --- Ruby codegen scripts & data ---
+isa/gen.rb: isa/gen.rb
+isa/isapi.rb: isa/isapi.rb
+isa/isa.yaml: isa/isa.yaml
+libpandafile/pandafile_isapi.rb: libpandafile/pandafile_isapi.rb
+libpandafile/plugin_options.rb: templates/plugin_options.rb
+libpandafile/types.rb: libpandafile/types.rb
+libpandafile/types.yaml: libpandafile/types.yaml
+
+# --- ERB templates ---
+libpandafile/templates/source_lang_enum.h.erb: libpandafile/templates/source_lang_enum.h.erb
+libpandafile/templates/type.h.erb: libpandafile/templates/type.h.erb
+libpandafile/templates/file_format_version.h.erb: libpandafile/templates/file_format_version.h.erb
+
+# --- libpandabase headers ---
+libpandabase/macros.h: libpandabase/include/libpandabase/macros.h
+libpandabase/globals.h: libpandabase/include/libpandabase/globals.h
+libpandabase/panda_visibility.h: libpandabase/include/libpandabase/panda_visibility.h
+libpandabase/os/stacktrace.h: libpandabase/include/libpandabase/os/stacktrace.h
+libpandabase/utils/bit_helpers.h: libpandabase/include/libpandabase/utils/bit_helpers.h
+libpandabase/utils/bit_utils.h: libpandabase/include/libpandabase/utils/bit_utils.h
+libpandabase/utils/const_value.h: libpandabase/include/libpandabase/utils/const_value.h
+libpandabase/utils/debug.h: libpandabase/include/libpandabase/utils/debug.h
+libpandabase/utils/hash.h: libpandabase/include/libpandabase/utils/hash.h
+libpandabase/utils/hash_base.h: libpandabase/include/libpandabase/utils/hash_base.h
+libpandabase/utils/leb128.h: libpandabase/include/libpandabase/utils/leb128.h
+libpandabase/utils/murmur3_hash.h: libpandabase/include/libpandabase/utils/murmur3_hash.h
+libpandabase/utils/span.h: libpandabase/include/libpandabase/utils/span.h
+libpandabase/utils/type_helpers.h: libpandabase/include/libpandabase/utils/type_helpers.h
+libpandabase/utils/utf.h: libpandabase/include/libpandabase/utils/utf.h
+
+# --- libpandabase source ---
+libpandabase/utils/utf.cpp: libpandabase/utils/utf.cpp
+
+# --- libpandafile headers & source ---
+libpandafile/annotation_data_accessor.h: libpandafile/annotation_data_accessor.h
+libpandafile/annotation_data_accessor.cpp: libpandafile/annotation_data_accessor.cpp
+libpandafile/class_data_accessor-inl.h: libpandafile/class_data_accessor-inl.h
+libpandafile/class_data_accessor.h: libpandafile/class_data_accessor.h
+libpandafile/class_data_accessor.cpp: libpandafile/class_data_accessor.cpp
+libpandafile/code_data_accessor-inl.h: libpandafile/code_data_accessor-inl.h
+libpandafile/code_data_accessor.h: libpandafile/code_data_accessor.h
+libpandafile/code_data_accessor.cpp: libpandafile/code_data_accessor.cpp
+libpandafile/debug_data_accessor-inl.h: libpandafile/debug_data_accessor-inl.h
+libpandafile/debug_data_accessor.h: libpandafile/debug_data_accessor.h
+libpandafile/debug_data_accessor.cpp: libpandafile/debug_data_accessor.cpp
+libpandafile/debug_helpers.h: libpandafile/debug_helpers.h
+libpandafile/debug_info_extractor.h: libpandafile/debug_info_extractor.h
+libpandafile/debug_info_extractor.cpp: libpandafile/debug_info_extractor.cpp
+libpandafile/field_data_accessor-inl.h: libpandafile/field_data_accessor-inl.h
+libpandafile/field_data_accessor.h: libpandafile/field_data_accessor.h
+libpandafile/field_data_accessor.cpp: libpandafile/field_data_accessor.cpp
+libpandafile/file-inl.h: libpandafile/file-inl.h
+libpandafile/file.h: libpandafile/file.h
+libpandafile/file_item_container.h: libpandafile/file_item_container.h
+libpandafile/file_item_container.cpp: libpandafile/file_item_container.cpp
+libpandafile/file_items.h: libpandafile/file_items.h
+libpandafile/file_items.cpp: libpandafile/file_items.cpp
+libpandafile/file_writer.h: libpandafile/file_writer.h
+libpandafile/file_writer.cpp: libpandafile/file_writer.cpp
+libpandafile/helpers.h: libpandafile/helpers.h
+libpandafile/index_accessor.h: libpandafile/index_accessor.h
+libpandafile/line_number_program.h: libpandafile/line_number_program.h
+libpandafile/literal_data_accessor-inl.h: libpandafile/literal_data_accessor-inl.h
+libpandafile/literal_data_accessor.h: libpandafile/literal_data_accessor.h
+libpandafile/literal_data_accessor.cpp: libpandafile/literal_data_accessor.cpp
+libpandafile/method_data_accessor-inl.h: libpandafile/method_data_accessor-inl.h
+libpandafile/method_data_accessor.h: libpandafile/method_data_accessor.h
+libpandafile/method_data_accessor.cpp: libpandafile/method_data_accessor.cpp
+libpandafile/modifiers.h: libpandafile/modifiers.h
+libpandafile/module_data_accessor-inl.h: libpandafile/module_data_accessor-inl.h
+libpandafile/module_data_accessor.h: libpandafile/module_data_accessor.h
+libpandafile/module_data_accessor.cpp: libpandafile/module_data_accessor.cpp
+libpandafile/pgo.h: libpandafile/pgo.h
+libpandafile/proto_data_accessor-inl.h: libpandafile/proto_data_accessor-inl.h
+libpandafile/proto_data_accessor.h: libpandafile/proto_data_accessor.h
+libpandafile/shorty_iterator.h: libpandafile/shorty_iterator.h
+libpandafile/value.h: libpandafile/value.h
