@@ -2,6 +2,10 @@ use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser)]
 #[command(name = "abcd-rs", about = "ArkCompiler ABC bytecode decompiler")]
 struct Cli {
