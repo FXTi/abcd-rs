@@ -722,7 +722,7 @@ impl<'a> Inst<'a> {
             ffi::isa_format_instruction(
                 self.bytes.as_ptr(),
                 self.bytes.len(),
-                buf.as_mut_ptr() as *mut i8,
+                buf.as_mut_ptr() as *mut std::ffi::c_char,
                 buf.len(),
             )
         };
@@ -737,7 +737,7 @@ impl core::fmt::Display for Inst<'_> {
             ffi::isa_format_instruction(
                 self.bytes.as_ptr(),
                 self.bytes.len(),
-                buf.as_mut_ptr() as *mut i8,
+                buf.as_mut_ptr() as *mut std::ffi::c_char,
                 buf.len(),
             )
         };
