@@ -4,6 +4,7 @@ use abcd_ir::cfg::{BlockId, CFG};
 use abcd_ir::expr::{BinOp, Expr, UnOp};
 use abcd_ir::instruction::{Instruction, TryBlockInfo};
 use abcd_ir::stmt::Stmt;
+use abcd_isa::EntityId;
 
 use crate::expr_recovery::{self, BlockRecovery, StringResolver};
 
@@ -13,7 +14,7 @@ pub fn structure_method(
     cfg: &CFG,
     try_blocks: &[TryBlockInfo],
     resolver: &dyn StringResolver,
-    method_off: u32,
+    method_off: EntityId,
     num_vregs: u32,
     num_args: u32,
 ) -> Vec<Stmt> {
@@ -52,7 +53,7 @@ struct StructCtx<'a> {
     loop_headers: HashSet<BlockId>,
     visited: Vec<bool>,
     resolver: &'a dyn StringResolver,
-    method_off: u32,
+    method_off: EntityId,
     num_vregs: u32,
     num_args: u32,
 }

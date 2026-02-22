@@ -7,13 +7,14 @@ pub use decode::decode_method;
 
 use abcd_ir::cfg::CFG;
 use abcd_ir::instruction::TryBlockInfo;
+use abcd_isa::EntityId;
 
 /// Decompile a method's bytecode into JavaScript source.
 pub fn decompile_method(
     code_bytes: &[u8],
     try_blocks: &[TryBlockInfo],
     resolver: &dyn expr_recovery::StringResolver,
-    method_off: u32,
+    method_off: EntityId,
     num_vregs: u32,
     num_args: u32,
 ) -> String {

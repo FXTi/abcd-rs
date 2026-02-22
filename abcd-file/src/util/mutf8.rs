@@ -1,4 +1,4 @@
-use crate::error::ParseError;
+use crate::error::Error as ParseError;
 
 /// Decode a Modified UTF-8 (MUTF-8) byte sequence into a Rust String.
 ///
@@ -53,7 +53,11 @@ pub fn decode_mutf8(data: &[u8], offset: usize) -> Result<String, ParseError> {
             // Check for surrogate pair (MUTF-8 encodes supplementary chars this way)
             if (0xD800..=0xDBFF).contains(&cp) {
                 // High surrogate - look for low surrogate
-                if pos + 5 < data.len() && data[pos + 3] & 0xf0 == 0xe0 {
+                if pos + 5 < data.len()
+                    && data[pos + 3] & 0xf0 == 0xe0
+                    && data[pos + 4] & 0xc0 == 0x80
+                    && data[pos + 5] & 0xc0 == 0x80
+                {
                     let b4 = data[pos + 3];
                     let b5 = data[pos + 4];
                     let b6 = data[pos + 5];
@@ -212,5 +216,22 @@ mod tests {
     fn mutf8_offset_into_data() {
         let data = b"XXXhello\0";
         assert_eq!(decode_mutf8(data, 3).unwrap(), "hello");
+    }
+
+    #[test]
+    fn mutf8_surrogate_pair_bad_continuation_bytes() {
+        // High surrogate D801 (ed a0 81) followed by what looks like a 3-byte
+        // low surrogate but with invalid continuation bytes (ed 00 b7 instead
+        // of ed b0 b7). The second byte 0x00 is not 10xxxxxx, so the surrogate
+        // pair check should fail and produce a lone high surrogate (U+FFFD).
+        // After that, pos advances by 3 and hits the null terminator at data[3].
+        //
+        // Before the fix, the code only checked the first byte of the potential
+        // low surrogate (0xed & 0xf0 == 0xe0) without validating continuation
+        // bytes, which could accept malformed sequences.
+        let data = [0xed, 0xa0, 0x81, 0x00]; // high surrogate + null terminator
+        let result = decode_mutf8(&data, 0).unwrap();
+        // Lone high surrogate → replacement char
+        assert_eq!(result, "\u{FFFD}");
     }
 }

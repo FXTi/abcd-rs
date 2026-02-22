@@ -1,3 +1,4 @@
+use abcd_file::EntityId;
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
@@ -46,64 +47,65 @@ fn main() {
     }
 }
 
-// === StringResolver implementation for AbcFile ===
+// === StringResolver implementation for File ===
 
 struct AbcResolver<'a> {
-    abc: &'a abcd_file::AbcFile,
+    abc: &'a abcd_file::File,
 }
 
 impl<'a> abcd_decompiler::expr_recovery::StringResolver for AbcResolver<'a> {
-    fn resolve_string(&self, method_off: u32, entity_id: u32) -> Option<String> {
-        let off = self.abc.index_section().resolve_offset_by_index(
-            self.abc.data(),
-            method_off,
-            entity_id as u16,
-        )?;
+    fn resolve_string(&self, method_off: EntityId, entity_id: EntityId) -> Option<String> {
+        let off = self
+            .abc
+            .resolve_offset_by_index(method_off, entity_id.0 as u16)?;
         self.abc.get_string(off).ok()
     }
 
-    fn resolve_offset(&self, method_off: u32, entity_id: u32) -> Option<u32> {
-        self.abc.index_section().resolve_offset_by_index(
-            self.abc.data(),
-            method_off,
-            entity_id as u16,
-        )
+    fn resolve_offset(&self, method_off: EntityId, entity_id: EntityId) -> Option<EntityId> {
+        self.abc
+            .resolve_offset_by_index(method_off, entity_id.0 as u16)
     }
 
     fn resolve_literal_array(
         &self,
-        method_off: u32,
-        entity_id: u32,
+        method_off: EntityId,
+        entity_id: EntityId,
     ) -> Option<abcd_file::literal::LiteralArray> {
-        let off = self.abc.index_section().resolve_offset_by_index(
-            self.abc.data(),
-            method_off,
-            entity_id as u16,
-        )?;
-        abcd_file::literal::LiteralArray::parse(self.abc.data(), off).ok()
+        let off = self
+            .abc
+            .resolve_offset_by_index(method_off, entity_id.0 as u16)?;
+        let literal = self
+            .abc
+            .literal(EntityId(self.abc.literal_array_idx_off()))
+            .ok()?;
+        let vals = literal.enumerate_vals(off);
+        let entries = vals
+            .iter()
+            .map(|v| {
+                let tag = v.tag.unwrap_or(abcd_file::literal::LiteralTag::TagValue);
+                let value = v.to_value();
+                (tag, value)
+            })
+            .collect();
+        Some(abcd_file::literal::LiteralArray { entries })
     }
 
-    fn get_string_at_offset(&self, offset: u32) -> Option<String> {
+    fn get_string_at_offset(&self, offset: EntityId) -> Option<String> {
         self.abc.get_string(offset).ok()
     }
 
-    fn resolve_method_name(&self, method_off: u32, entity_id: u32) -> Option<String> {
-        let off = self.abc.index_section().resolve_offset_by_index(
-            self.abc.data(),
-            method_off,
-            entity_id as u16,
-        )?;
-        let method = abcd_file::method::MethodData::parse(self.abc.data(), off).ok()?;
-        if method.name.is_empty() {
-            None
-        } else {
-            Some(method.name)
-        }
+    fn resolve_method_name(&self, method_off: EntityId, entity_id: EntityId) -> Option<String> {
+        let off = self
+            .abc
+            .resolve_offset_by_index(method_off, entity_id.0 as u16)?;
+        let method = self.abc.method(off).ok()?;
+        let name = self.abc.get_string(method.name_off()).ok()?;
+        if name.is_empty() { None } else { Some(name) }
     }
 }
 
 fn cmd_info(path: &PathBuf) {
-    let abc = match abcd_file::AbcFile::open(path.as_path()) {
+    let abc = match abcd_file::File::open_path(path.as_path()) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -111,27 +113,28 @@ fn cmd_info(path: &PathBuf) {
         }
     };
 
-    let h = &abc.header;
+    let ver = abc.version();
+    let checksum = abc.checksum();
+    let foreign_off = abc.foreign_off();
+    let foreign_size = abc.foreign_size();
+    let num_lnps = abc.num_lnps();
+
     println!("=== ABC File Info ===");
+    println!("Version:          {ver}",);
+    println!("File size:        {} bytes", abc.file_size());
+    println!("Checksum:         {checksum:#010x}");
+    println!("Classes:          {}", abc.num_classes());
+    println!("Literal arrays:   {}", abc.num_literal_arrays());
+    println!("Line num progs:   {num_lnps}");
+    println!("Index regions:    {}", abc.num_index_headers());
     println!(
-        "Version:          {}.{}.{}.{}",
-        h.version[0], h.version[1], h.version[2], h.version[3]
-    );
-    println!("File size:        {} bytes", h.file_size);
-    println!("Checksum:         {:#010x}", h.checksum);
-    println!("Classes:          {}", h.num_classes);
-    println!("Literal arrays:   {}", h.num_literalarrays);
-    println!("Line num progs:   {}", h.num_lnps);
-    println!("Index regions:    {}", h.num_indexes);
-    println!(
-        "Foreign region:   {:#x}..{:#x}",
-        h.foreign_off,
-        h.foreign_off + h.foreign_size
+        "Foreign region:   {foreign_off:#x}..{:#x}",
+        foreign_off + foreign_size
     );
 }
 
 fn cmd_disasm(path: &PathBuf) {
-    let abc = match abcd_file::AbcFile::open(path.as_path()) {
+    let abc = match abcd_file::File::open_path(path.as_path()) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -139,107 +142,105 @@ fn cmd_disasm(path: &PathBuf) {
         }
     };
 
-    let h = &abc.header;
+    let ver = abc.version();
     println!("# ABC Disassembly");
-    println!(
-        "# Version: {}.{}.{}.{}",
-        h.version[0], h.version[1], h.version[2], h.version[3]
-    );
+    println!("# Version: {ver}",);
     println!(
         "# Classes: {}, Literal arrays: {}",
-        h.num_classes, h.num_literalarrays
+        abc.num_classes(),
+        abc.num_literal_arrays()
     );
     println!();
 
     for class_off in abc.class_offsets() {
-        if abc.is_foreign(class_off) {
+        if abc.is_external(class_off) {
             continue;
         }
 
-        let class = match abcd_file::class::ClassData::parse(abc.data(), class_off) {
+        let class = match abc.class(class_off) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("# Error parsing class at {class_off:#x}: {e}");
+                eprintln!("# Error parsing class at {class_off}: {e}");
                 continue;
             }
         };
 
+        let class_name = abc
+            .get_string(class_off)
+            .unwrap_or_else(|_| format!("<{class_off}>"));
+        let source_file = class
+            .source_file_off()
+            .and_then(|off| abc.get_string(off).ok());
+
         println!("# ============================================");
-        println!("# Class: {}", class.name);
-        if let Some(ref sf) = class.source_file {
+        println!("# Class: {class_name}");
+        if let Some(ref sf) = source_file {
             println!("# Source: {sf}");
         }
         println!(
             "# Methods: {}, Fields: {}",
-            class.num_methods, class.num_fields
+            class.num_methods(),
+            class.num_fields()
         );
         println!();
 
-        for &method_off in &class.method_offsets {
-            disasm_method(&abc, method_off as u32);
+        for method_off in class.method_offsets() {
+            disasm_method(&abc, method_off);
         }
     }
 }
 
-fn disasm_method(abc: &abcd_file::AbcFile, method_off: u32) {
-    let method = match abcd_file::method::MethodData::parse(abc.data(), method_off) {
+fn disasm_method(abc: &abcd_file::File, method_off: EntityId) {
+    let method = match abc.method(method_off) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!("# Error parsing method at {method_off:#x}: {e}");
+            eprintln!("# Error parsing method at {method_off}: {e}");
             return;
         }
     };
 
-    println!(".function {} {{", method.name);
+    let method_name = abc
+        .get_string(method.name_off())
+        .unwrap_or_else(|_| format!("<{method_off}>"));
+    println!(".function {method_name} {{");
 
-    let Some(code_off) = method.code_off else {
+    let Some(code_off) = method.code_off() else {
         println!("    # (no code - native or abstract)");
         println!("}}");
         println!();
         return;
     };
 
-    let code = match abcd_file::code::CodeData::parse(abc.data(), code_off) {
+    let code = match abc.code(code_off) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("    # Error parsing code at {code_off:#x}: {e}");
+            eprintln!("    # Error parsing code at {code_off}: {e}");
             println!("}}");
             println!();
             return;
         }
     };
 
+    let instructions = code.instructions();
     println!(
         "    # vregs: {}, args: {}, code_size: {}",
-        code.num_vregs,
-        code.num_args,
-        code.instructions.len()
+        code.num_vregs(),
+        code.num_args(),
+        instructions.len()
     );
 
-    let instructions = abcd_decompiler::decode_method(&code.instructions);
-    for insn in &instructions {
-        let operands_str: Vec<String> = insn
-            .operands
-            .iter()
-            .map(|op| format_operand(abc, method_off, insn.offset, op))
-            .collect();
-
-        let ops = if operands_str.is_empty() {
-            String::new()
-        } else {
-            format!(" {}", operands_str.join(", "))
-        };
-
-        println!("    {:#06x}  {}{ops}", insn.offset, insn.opcode);
+    let decoded = abcd_decompiler::decode_method(instructions);
+    for insn in &decoded {
+        println!("    {:#06x}  {}", insn.offset, insn.opcode);
     }
 
-    for tb in &code.try_blocks {
+    for tb in &code.try_blocks() {
         println!(
             "    # try [{:#x}..{:#x}]",
             tb.start_pc,
             tb.start_pc + tb.length
         );
-        for cb in &tb.catch_blocks {
+        for cb in &tb.catches {
             if cb.type_idx == 0 {
                 println!("    #   catch_all -> {:#x}", cb.handler_pc);
             } else {
@@ -252,39 +253,124 @@ fn disasm_method(abc: &abcd_file::AbcFile, method_off: u32) {
     println!();
 }
 
-fn format_operand(
-    abc: &abcd_file::AbcFile,
-    method_off: u32,
-    insn_offset: u32,
-    op: &abcd_ir::instruction::Operand,
-) -> String {
-    match op {
-        abcd_ir::instruction::Operand::Reg(r) => format!("v{r}"),
-        abcd_ir::instruction::Operand::Imm(i) => format!("{i}"),
-        abcd_ir::instruction::Operand::FloatImm(f) => format!("{f}"),
-        abcd_ir::instruction::Operand::EntityId(id) => {
-            let resolved_off =
-                abc.index_section()
-                    .resolve_offset_by_index(abc.data(), method_off, *id as u16);
+// === Module record helpers ===
 
-            if let Some(off) = resolved_off {
-                match abc.get_string(off) {
-                    Ok(s) if !s.is_empty() => format!("\"{s}\""),
-                    _ => format!("@{off:#x}"),
-                }
-            } else {
-                format!("#{id}")
+struct RegularImport {
+    local_name: String,
+    import_name: String,
+    module_request_idx: u32,
+}
+struct NamespaceImport {
+    local_name: String,
+    module_request_idx: u32,
+}
+struct LocalExport {
+    local_name: String,
+    export_name: String,
+}
+struct IndirectExport {
+    export_name: String,
+    import_name: String,
+    module_request_idx: u32,
+}
+struct StarExport {
+    module_request_idx: u32,
+}
+
+struct ResolvedModuleRecord {
+    module_requests: Vec<String>,
+    regular_imports: Vec<RegularImport>,
+    namespace_imports: Vec<NamespaceImport>,
+    local_exports: Vec<LocalExport>,
+    indirect_exports: Vec<IndirectExport>,
+    star_exports: Vec<StarExport>,
+}
+
+fn resolve_module_record(
+    abc: &abcd_file::File,
+    module: &abcd_file::module::Module,
+) -> ResolvedModuleRecord {
+    let module_requests: Vec<String> = (0..module.num_requests())
+        .map(|i| {
+            module
+                .request_off(i)
+                .and_then(|off| abc.get_string(off).ok())
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let records = module.records();
+    let mut regular_imports = Vec::new();
+    let mut namespace_imports = Vec::new();
+    let mut local_exports = Vec::new();
+    let mut indirect_exports = Vec::new();
+    let mut star_exports = Vec::new();
+
+    for r in &records {
+        let s = |off: EntityId| abc.get_string(off).unwrap_or_default();
+        match r.tag {
+            abcd_file::ModuleTag::RegularImport => {
+                regular_imports.push(RegularImport {
+                    local_name: s(r.local_name_off),
+                    import_name: s(r.import_name_off),
+                    module_request_idx: r.module_request_idx,
+                });
             }
+            abcd_file::ModuleTag::NamespaceImport => {
+                namespace_imports.push(NamespaceImport {
+                    local_name: s(r.local_name_off),
+                    module_request_idx: r.module_request_idx,
+                });
+            }
+            abcd_file::ModuleTag::LocalExport => {
+                local_exports.push(LocalExport {
+                    local_name: s(r.local_name_off),
+                    export_name: s(r.export_name_off),
+                });
+            }
+            abcd_file::ModuleTag::IndirectExport => {
+                indirect_exports.push(IndirectExport {
+                    export_name: s(r.export_name_off),
+                    import_name: s(r.import_name_off),
+                    module_request_idx: r.module_request_idx,
+                });
+            }
+            abcd_file::ModuleTag::StarExport => {
+                star_exports.push(StarExport {
+                    module_request_idx: r.module_request_idx,
+                });
+            }
+            abcd_file::ModuleTag::Unknown(_) => {}
         }
-        abcd_ir::instruction::Operand::JumpOffset(off) => {
-            let target = insn_offset as i64 + *off as i64;
-            format!("-> {target:#x}")
-        }
+    }
+
+    ResolvedModuleRecord {
+        module_requests,
+        regular_imports,
+        namespace_imports,
+        local_exports,
+        indirect_exports,
+        star_exports,
     }
 }
 
+/// Try to find the "moduleRecordIdx" field value from a class.
+fn find_module_record_offset(
+    abc: &abcd_file::File,
+    class: &abcd_file::class::Class,
+) -> Option<EntityId> {
+    for field_off in class.field_offsets() {
+        let field = abc.field(field_off).ok()?;
+        let name = abc.get_string(field.name_off()).ok()?;
+        if name == "moduleRecordIdx" {
+            return field.value_i32().map(|v| EntityId(v as u32));
+        }
+    }
+    None
+}
+
 fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
-    let abc = match abcd_file::AbcFile::open(path.as_path()) {
+    let abc = match abcd_file::File::open_path(path.as_path()) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -302,29 +388,32 @@ fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
     }
 
     for class_off in abc.class_offsets() {
-        if abc.is_foreign(class_off) {
+        if abc.is_external(class_off) {
             continue;
         }
 
-        let class = match abcd_file::class::ClassData::parse(abc.data(), class_off) {
+        let class = match abc.class(class_off) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("// Error parsing class at {class_off:#x}: {e}");
+                eprintln!("// Error parsing class at {class_off}: {e}");
                 continue;
             }
         };
 
+        let class_name = abc
+            .get_string(class_off)
+            .unwrap_or_else(|_| format!("<{class_off}>"));
+        let source_file = class
+            .source_file_off()
+            .and_then(|off| abc.get_string(off).ok())
+            .unwrap_or_else(|| class_name.clone());
+
         let mut class_output = String::new();
-        let source_file = class.source_file.as_deref().unwrap_or(&class.name);
 
         // Try to parse module record from class fields
-        let module_record = class
-            .field_values
-            .iter()
-            .find(|(name, _)| name == "moduleRecordIdx")
-            .and_then(|(_, offset)| {
-                abcd_file::module_record::ModuleRecord::parse(abc.data(), *offset).ok()
-            });
+        let module_record = find_module_record_offset(&abc, &class)
+            .and_then(|off| abc.module(off).ok())
+            .map(|m| resolve_module_record(&abc, &m));
 
         // Generate import statements
         if let Some(ref mr) = module_record {
@@ -397,8 +486,8 @@ fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
             }
         }
 
-        for &method_off in &class.method_offsets {
-            decompile_method_to_string(&abc, &resolver, method_off as u32, &mut class_output);
+        for method_off in class.method_offsets() {
+            decompile_method_to_string(&abc, &resolver, method_off, &mut class_output);
         }
 
         // Generate local export statements
@@ -421,23 +510,19 @@ fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
 
         // Replace __module_N and __export_N placeholders with actual names
         if let Some(ref mr) = module_record {
-            // Build import name mapping: __module_N → local_name from regular_imports
             for (i, imp) in mr.regular_imports.iter().enumerate() {
                 let placeholder = format!("__module_{i}");
                 class_output = class_output.replace(&placeholder, &imp.local_name);
             }
-            // Namespace imports come after regular imports in the index
             let ns_offset = mr.regular_imports.len();
             for (i, imp) in mr.namespace_imports.iter().enumerate() {
                 let placeholder = format!("__module_{}", ns_offset + i);
                 class_output = class_output.replace(&placeholder, &imp.local_name);
             }
-            // Local module vars: __local_module_N → local_name from local_exports
             for (i, exp) in mr.local_exports.iter().enumerate() {
                 let placeholder = format!("__local_module_{i}");
                 class_output = class_output.replace(&placeholder, &exp.local_name);
             }
-            // Export vars: __export_N → export_name from local_exports
             for (i, exp) in mr.local_exports.iter().enumerate() {
                 let placeholder = format!("__export_{i}");
                 class_output = class_output.replace(&placeholder, &exp.export_name);
@@ -445,14 +530,13 @@ fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
         }
 
         if let Some(dir) = output_dir {
-            let rel_path = class_name_to_path(source_file);
+            let rel_path = class_name_to_path(&source_file);
             let out_path = dir.join(&rel_path);
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent).unwrap_or_else(|e| {
                     eprintln!("Error creating directory {}: {e}", parent.display());
                 });
             }
-            // Append if file exists (multiple classes may share a source file)
             let mut existing = fs::read_to_string(&out_path).unwrap_or_default();
             existing.push_str(&class_output);
             fs::write(&out_path, existing).unwrap_or_else(|e| {
@@ -465,42 +549,46 @@ fn cmd_decompile(path: &PathBuf, output_dir: Option<&std::path::Path>) {
 }
 
 fn decompile_method_to_string(
-    abc: &abcd_file::AbcFile,
+    abc: &abcd_file::File,
     resolver: &AbcResolver,
-    method_off: u32,
+    method_off: EntityId,
     output: &mut String,
 ) {
-    let method = match abcd_file::method::MethodData::parse(abc.data(), method_off) {
+    let method = match abc.method(method_off) {
         Ok(m) => m,
         Err(e) => {
-            output.push_str(&format!(
-                "// Error parsing method at {method_off:#x}: {e}\n"
-            ));
+            output.push_str(&format!("// Error parsing method at {method_off}: {e}\n"));
             return;
         }
     };
 
-    let Some(code_off) = method.code_off else {
+    let Some(code_off) = method.code_off() else {
         return; // Skip native/abstract methods
     };
 
-    let code = match abcd_file::code::CodeData::parse(abc.data(), code_off) {
+    let code = match abc.code(code_off) {
         Ok(c) => c,
         Err(e) => {
-            output.push_str(&format!("// Error parsing code at {code_off:#x}: {e}\n"));
+            output.push_str(&format!("// Error parsing code at {code_off}: {e}\n"));
             return;
         }
     };
 
-    // Convert parser try blocks to IR try blocks
+    let method_name = abc
+        .get_string(method.name_off())
+        .unwrap_or_else(|_| format!("<{method_off}>"));
+
+    let instructions = code.instructions();
+
+    // Convert try blocks to IR try blocks
     let try_blocks: Vec<abcd_ir::instruction::TryBlockInfo> = code
-        .try_blocks
+        .try_blocks()
         .iter()
         .map(|tb| abcd_ir::instruction::TryBlockInfo {
             start_pc: tb.start_pc,
             length: tb.length,
             catch_blocks: tb
-                .catch_blocks
+                .catches
                 .iter()
                 .map(|cb| abcd_ir::instruction::CatchBlockInfo {
                     type_idx: cb.type_idx,
@@ -512,30 +600,28 @@ fn decompile_method_to_string(
         .collect();
 
     let js = abcd_decompiler::decompile_method(
-        &code.instructions,
+        instructions,
         &try_blocks,
         resolver,
         method_off,
-        code.num_vregs,
-        code.num_args,
+        code.num_vregs(),
+        code.num_args(),
     );
 
     // Detect rest parameters by scanning for copyrestargs instruction
-    let decoded = abcd_decompiler::decode_method(&code.instructions);
+    let decoded = abcd_decompiler::decode_method(instructions);
     let rest_param_idx = decoded.iter().find_map(|insn| {
         if insn.opcode.mnemonic() == "copyrestargs" {
-            Some(insn.operands.first().map_or(0, |op| match op {
-                abcd_ir::instruction::Operand::Imm(v) => *v as u32,
-                _ => 0,
-            }))
+            let (_, args, n) = insn.opcode.emit_args();
+            Some(if n > 0 { args[0] as u32 } else { 0 })
         } else {
             None
         }
     });
 
     // Generate parameter list: num_args includes funcObj, newTarget, this (3 implicit)
-    let user_param_count = if code.num_args > 3 {
-        code.num_args - 3
+    let user_param_count = if code.num_args() > 3 {
+        code.num_args() - 3
     } else {
         0
     };
@@ -552,7 +638,7 @@ fn decompile_method_to_string(
 
     output.push_str(&format!(
         "function {}({user_params}) {{\n",
-        clean_method_name(&method.name)
+        clean_method_name(&method_name)
     ));
     for line in js.lines() {
         output.push_str(&format!("    {line}\n"));
@@ -561,14 +647,6 @@ fn decompile_method_to_string(
 }
 
 /// Parse ABC internal method names into readable names.
-///
-/// ABC method name patterns:
-/// - `func_main_0` → module initializer
-/// - `#~@0=#ClassName` → constructor
-/// - `#~@0>#methodName` → instance method
-/// - `#~@0>@1*#` → anonymous function (numbered)
-/// - `#*#` → anonymous function
-/// - `#*#^1` → anonymous function variant
 fn clean_method_name(name: &str) -> String {
     // Constructor: contains `=#Name`
     if let Some(pos) = name.rfind("=#") {
@@ -595,7 +673,6 @@ fn clean_method_name(name: &str) -> String {
 
     // Numbered anonymous: `>@hex*#` pattern
     if name.contains("*#") {
-        // Extract the last @hex part
         if let Some(at_pos) = name.rfind('@') {
             let after_at = &name[at_pos + 1..];
             if let Some(star_pos) = after_at.find("*#") {
@@ -610,8 +687,6 @@ fn clean_method_name(name: &str) -> String {
         }
     }
 
-    // Keep as-is for func_main_0 and other recognizable names
-    // Final cleanup: strip remaining prefixes and sanitize
     let cleaned = name
         .strip_prefix("#%#")
         .or_else(|| name.strip_prefix("#"))

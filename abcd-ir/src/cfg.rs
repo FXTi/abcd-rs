@@ -34,20 +34,19 @@ pub struct CFG {
     offset_to_block: BTreeMap<u32, BlockId>,
 }
 
-/// Check if a throw instruction is a conditional/runtime check that falls through
-/// in normal execution (TDZ checks, type checks, etc.)
-fn is_conditional_throw(mnemonic: &str) -> bool {
-    matches!(
-        mnemonic,
-        "throw.undefinedifholewithname"
-            | "throw.undefinedifhole"
-            | "throw.ifsupernotcorrectcall"
-            | "throw.ifnotobject"
-            | "throw.constassignment"
-            | "throw.notexists"
-            | "throw.patternnoncoercible"
-            | "throw.deletesuperproperty"
-    )
+/// Extract the jump target byte offset from a jump instruction.
+///
+/// The `Bytecode` stores jump targets as `Label(instruction_index)`.
+/// We resolve the index through the `instructions` array to get the byte offset.
+fn jump_target_offset(
+    insn: &crate::instruction::Instruction,
+    instructions: &[crate::instruction::Instruction],
+) -> Option<u32> {
+    let (_, args, _) = insn.opcode.emit_args();
+    insn.opcode.jump_label_arg_index().and_then(|idx| {
+        let target_insn = args[idx] as usize;
+        instructions.get(target_insn).map(|t| t.offset)
+    })
 }
 
 impl CFG {
@@ -78,17 +77,10 @@ impl CFG {
         leaders.insert(0u32); // First instruction is always a leader
 
         for (i, insn) in instructions.iter().enumerate() {
-            let flags = abcd_isa::lookup(insn.opcode.raw())
-                .map(|info| info.flags())
-                .unwrap_or(abcd_isa::OpcodeFlags::empty());
-
             // Jump targets are leaders
-            if flags.contains(abcd_isa::OpcodeFlags::JUMP) {
-                for op in &insn.operands {
-                    if let crate::instruction::Operand::JumpOffset(off) = op {
-                        let target = (insn.offset as i64 + *off as i64) as u32;
-                        leaders.insert(target);
-                    }
+            if insn.opcode.is_jump() {
+                if let Some(target) = jump_target_offset(insn, instructions) {
+                    leaders.insert(target);
                 }
                 // Instruction after a jump is also a leader
                 if i + 1 < instructions.len() {
@@ -96,12 +88,12 @@ impl CFG {
                 }
             }
 
-            // Returns and throws end a block
-            // But NOT conditional throws like throw.undefinedifhole* and throw.if*
-            // which are TDZ/runtime checks that fall through in normal execution
-            if flags.contains(abcd_isa::OpcodeFlags::RETURN)
-                || (flags.contains(abcd_isa::OpcodeFlags::THROW)
-                    && !is_conditional_throw(insn.opcode.mnemonic()))
+            // Returns and unconditional throws end a block.
+            // Conditional throws (TDZ/runtime checks) fall through.
+            if insn.opcode.is_return_or_throw()
+                && !insn
+                    .opcode
+                    .has_flag(abcd_isa::BytecodeFlag::CONDITIONAL_THROW)
             {
                 if i + 1 < instructions.len() {
                     leaders.insert(instructions[i + 1].offset);
@@ -176,27 +168,26 @@ impl CFG {
             }
             let last_idx = block.last_insn - 1;
             let last_insn = &instructions[last_idx];
-            let flags = abcd_isa::lookup(last_insn.opcode.raw())
-                .map(|info| info.flags())
-                .unwrap_or(abcd_isa::OpcodeFlags::empty());
 
-            let is_jump = flags.contains(abcd_isa::OpcodeFlags::JUMP);
-            let is_cond = flags.contains(abcd_isa::OpcodeFlags::CONDITIONAL);
-            let is_return = flags.contains(abcd_isa::OpcodeFlags::RETURN);
-            let is_throw = flags.contains(abcd_isa::OpcodeFlags::THROW)
-                && !is_conditional_throw(last_insn.opcode.mnemonic());
+            let is_jump = last_insn.opcode.is_jump();
+            let is_cond = last_insn
+                .opcode
+                .has_flag(abcd_isa::BytecodeFlag::CONDITIONAL);
+            let is_return = last_insn.opcode.has_flag(abcd_isa::BytecodeFlag::RETURN);
+            let is_throw = last_insn.opcode.is_return_or_throw()
+                && !is_return
+                && !last_insn
+                    .opcode
+                    .has_flag(abcd_isa::BytecodeFlag::CONDITIONAL_THROW);
             let is_unconditional_jump = is_jump && !is_cond;
 
             if is_return || is_throw {
                 // No successors
             } else if is_unconditional_jump {
                 // Only the jump target
-                for op in &last_insn.operands {
-                    if let crate::instruction::Operand::JumpOffset(off) = op {
-                        let target = (last_insn.offset as i64 + *off as i64) as u32;
-                        if let Some(&target_id) = offset_to_block.get(&target) {
-                            blocks[bi].succs.push(target_id);
-                        }
+                if let Some(target) = jump_target_offset(last_insn, instructions) {
+                    if let Some(&target_id) = offset_to_block.get(&target) {
+                        blocks[bi].succs.push(target_id);
                     }
                 }
             } else if is_cond {
@@ -209,13 +200,10 @@ impl CFG {
                 if let Some(ft) = fallthrough_id {
                     blocks[bi].succs.push(ft);
                 }
-                for op in &last_insn.operands {
-                    if let crate::instruction::Operand::JumpOffset(off) = op {
-                        let target = (last_insn.offset as i64 + *off as i64) as u32;
-                        if let Some(&target_id) = offset_to_block.get(&target) {
-                            if !blocks[bi].succs.contains(&target_id) {
-                                blocks[bi].succs.push(target_id);
-                            }
+                if let Some(target) = jump_target_offset(last_insn, instructions) {
+                    if let Some(&target_id) = offset_to_block.get(&target) {
+                        if !blocks[bi].succs.contains(&target_id) {
+                            blocks[bi].succs.push(target_id);
                         }
                     }
                 }

@@ -1,29 +1,12 @@
-use abcd_isa::Opcode;
+use abcd_isa::Bytecode;
 
-/// A decoded operand from a bytecode instruction.
-#[derive(Debug, Clone)]
-pub enum Operand {
-    /// Virtual register index.
-    Reg(u16),
-    /// Signed immediate value.
-    Imm(i64),
-    /// Float immediate value.
-    FloatImm(f64),
-    /// Entity ID (resolved from 16-bit index): string, method, literalarray, etc.
-    EntityId(u32),
-    /// Relative jump offset in bytes.
-    JumpOffset(i32),
-}
-
-/// A single decoded bytecode instruction with resolved operands.
+/// A single decoded bytecode instruction.
 #[derive(Debug, Clone)]
 pub struct Instruction {
     /// Byte offset within the method's code.
     pub offset: u32,
-    /// The opcode.
-    pub opcode: Opcode,
-    /// Decoded operands.
-    pub operands: Vec<Operand>,
+    /// The decoded bytecode instruction.
+    pub opcode: Bytecode,
     /// Total instruction size in bytes.
     pub size: u8,
 }

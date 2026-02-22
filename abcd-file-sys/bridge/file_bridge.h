@@ -37,6 +37,18 @@ extern "C" {
 #define ABC_ACC_ENUM         0x4000
 #define ABC_ACC_FILE_MASK    0xFFFF
 
+/* Runtime-internal modifiers (above ACC_FILE_MASK) */
+#define ABC_ACC_TYPE                    0x00FF0000
+#define ABC_ACC_TYPE_SHIFT              16
+#define ABC_ACC_HAS_DEFAULT_METHODS     0x00010000  /* class */
+#define ABC_ACC_CONSTRUCTOR             0x00010000  /* method */
+#define ABC_ACC_DEFAULT_INTERFACE_METHOD 0x00020000 /* method */
+#define ABC_ACC_SINGLE_IMPL            0x00040000   /* method */
+#define ABC_ACC_INTRINSIC              0x00200000   /* method */
+#define ABC_ACC_PROXY                  0x00020000   /* class (java) */
+#define ABC_ACC_FAST_NATIVE            0x00080000   /* method (java) */
+#define ABC_ACC_CRITICAL_NATIVE        0x00100000   /* method (java) */
+
 /* ========== Constants: LiteralTag (literal_data_accessor.h) ========== */
 
 #define ABC_LITERAL_TAG_TAGVALUE            0x00
@@ -186,6 +198,15 @@ uint32_t abc_resolve_offset_by_index(const AbcFileHandle *f, uint32_t entity_off
 /* Resolve line number program index: returns offset, UINT32_MAX on error */
 uint32_t abc_resolve_lnp_index(const AbcFileHandle *f, uint32_t idx);
 
+/* Additional header fields */
+uint32_t abc_file_checksum(const AbcFileHandle *f);
+uint32_t abc_file_foreign_off(const AbcFileHandle *f);
+uint32_t abc_file_foreign_size(const AbcFileHandle *f);
+uint32_t abc_file_class_idx_off(const AbcFileHandle *f);
+uint32_t abc_file_num_lnps(const AbcFileHandle *f);
+uint32_t abc_file_lnp_idx_off(const AbcFileHandle *f);
+uint32_t abc_file_index_section_off(const AbcFileHandle *f);
+
 /* ========== Version Utilities ========== */
 
 /* Get compile-time version / minVersion constants */
@@ -208,12 +229,14 @@ uint8_t abc_proto_get_arg_type(const AbcProtoAccessor *a, uint32_t idx);
 uint32_t abc_proto_get_reference_type(AbcProtoAccessor *a, uint32_t idx);
 uint32_t abc_proto_get_ref_num(AbcProtoAccessor *a);
 
-typedef int (*AbcProtoTypeCb)(uint8_t type_id, void *ctx);
+typedef void (*AbcProtoTypeCb)(uint8_t type_id, void *ctx);
 void abc_proto_enumerate_types(AbcProtoAccessor *a, AbcProtoTypeCb cb, void *ctx);
 /* Shorty descriptor: returns length, sets *out_data to internal buffer */
 uint32_t abc_proto_get_shorty(AbcProtoAccessor *a, const uint8_t **out_data);
 uint32_t abc_proto_get_size(AbcProtoAccessor *a);
 int abc_proto_is_equal(AbcProtoAccessor *a, AbcProtoAccessor *b);
+/* Proto entity ID */
+uint32_t abc_proto_get_proto_id(const AbcProtoAccessor *a);
 
 /* ========== Class Data Accessor ========== */
 
@@ -229,12 +252,12 @@ uint32_t abc_class_size(AbcClassAccessor *a);
 /* Returns source file entity offset, UINT32_MAX if absent */
 uint32_t abc_class_source_file_off(AbcClassAccessor *a);
 
-/* Enumerate methods: callback receives method offset, returns 0 to continue, non-zero to stop */
-typedef int (*AbcMethodOffsetCb)(uint32_t method_offset, void *ctx);
+/* Enumerate methods: callback receives method offset (no early-stop) */
+typedef void (*AbcMethodOffsetCb)(uint32_t method_offset, void *ctx);
 void abc_class_enumerate_methods(AbcClassAccessor *a, AbcMethodOffsetCb cb, void *ctx);
 
-/* Enumerate fields: callback receives field offset */
-typedef int (*AbcFieldOffsetCb)(uint32_t field_offset, void *ctx);
+/* Enumerate fields: callback receives field offset (no early-stop) */
+typedef void (*AbcFieldOffsetCb)(uint32_t field_offset, void *ctx);
 void abc_class_enumerate_fields(AbcClassAccessor *a, AbcFieldOffsetCb cb, void *ctx);
 
 /* Interfaces */
@@ -257,6 +280,10 @@ void abc_class_enumerate_runtime_type_annotations(AbcClassAccessor *a, AbcAnnota
 uint32_t abc_class_get_annotations_number(AbcClassAccessor *a);
 uint32_t abc_class_get_runtime_annotations_number(AbcClassAccessor *a);
 uint32_t abc_class_get_class_id(const AbcClassAccessor *a);
+
+/* Class descriptor (raw MUTF-8 bytes, null-terminated) and name */
+const uint8_t *abc_class_get_descriptor(const AbcClassAccessor *a);
+size_t abc_class_get_name(const AbcClassAccessor *a, char *buf, size_t buf_len);
 
 /* ========== Method Data Accessor ========== */
 
@@ -310,6 +337,11 @@ uint32_t abc_method_get_numerical_annotation(AbcMethodAccessor *a, uint32_t fiel
 uint32_t abc_method_get_name_off_static(const AbcFileHandle *f, uint32_t method_off);
 uint32_t abc_method_get_class_id_static(const AbcFileHandle *f, uint32_t method_off);
 uint32_t abc_method_get_proto_id_static(const AbcFileHandle *f, uint32_t method_off);
+
+/* Method name as string (copies into buf, returns byte count; 0 on error) */
+size_t abc_method_get_name(const AbcMethodAccessor *a, char *buf, size_t buf_len);
+size_t abc_method_get_name_static(const AbcFileHandle *f, uint32_t method_off,
+                                   char *buf, size_t buf_len);
 
 /* ========== Code Data Accessor ========== */
 
@@ -404,10 +436,14 @@ struct AbcLiteralVal {
         double   f64_val;
         uint8_t  bool_val;
     };
+    /* String data — valid when tag is STRING or ARRAY_STRING.
+     * str_data points into the file buffer; NULL for non-string tags. */
+    const uint8_t *str_data;
+    uint32_t str_utf16_len;
 };
 
-/* Enumerate literal values by index into the literal array table */
-typedef int (*AbcLiteralValCb)(const struct AbcLiteralVal *val, void *ctx);
+/* Enumerate literal values by index into the literal array table (no early-stop) */
+typedef void (*AbcLiteralValCb)(const struct AbcLiteralVal *val, void *ctx);
 void abc_literal_enumerate_vals(AbcLiteralAccessor *a, uint32_t array_off,
                                 AbcLiteralValCb cb, void *ctx);
 
@@ -420,6 +456,8 @@ void abc_literal_enumerate_vals_by_index(AbcLiteralAccessor *a, uint32_t index,
 
 /* Resolve literal array index from entity offset: returns index, UINT32_MAX if not found */
 uint32_t abc_literal_resolve_index(const AbcLiteralAccessor *a, uint32_t entity_off);
+/* Literal data entity ID */
+uint32_t abc_literal_get_data_id(const AbcLiteralAccessor *a);
 
 /* ========== Module Data Accessor ========== */
 
@@ -433,12 +471,14 @@ uint32_t abc_module_num_requests(const AbcModuleAccessor *a);
 /* Get request module string offset by index */
 uint32_t abc_module_request_off(const AbcModuleAccessor *a, uint32_t idx);
 
-/* Module record callback: tag, export_name_off, module_request_idx, import_name_off, local_name_off */
-typedef int (*AbcModuleRecordCb)(uint8_t tag, uint32_t export_name_off,
+/* Module record callback: tag, export_name_off, module_request_idx, import_name_off, local_name_off (no early-stop) */
+typedef void (*AbcModuleRecordCb)(uint8_t tag, uint32_t export_name_off,
                                   uint32_t module_request_idx,
                                   uint32_t import_name_off,
                                   uint32_t local_name_off, void *ctx);
 void abc_module_enumerate_records(AbcModuleAccessor *a, AbcModuleRecordCb cb, void *ctx);
+/* Module data entity ID */
+uint32_t abc_module_get_data_id(const AbcModuleAccessor *a);
 
 /* ========== Annotation Data Accessor ========== */
 
@@ -524,6 +564,19 @@ void abc_debug_get_parameter_info(const AbcDebugInfo *d, uint32_t method_off,
 /* List of all methods with debug info */
 void abc_debug_get_method_list(const AbcDebugInfo *d, AbcEntityIdCb cb, void *ctx);
 
+/* ========== Index Accessor ========== */
+
+typedef struct AbcIndexAccessor AbcIndexAccessor;
+
+AbcIndexAccessor *abc_index_open(const AbcFileHandle *f, uint32_t method_off);
+void abc_index_close(AbcIndexAccessor *a);
+/* Resolve 16-bit instruction index to entity offset */
+uint32_t abc_index_get_offset_by_id(const AbcIndexAccessor *a, uint16_t idx);
+/* FunctionKind encoded in access flags */
+uint8_t abc_index_get_function_kind(const AbcIndexAccessor *a);
+uint16_t abc_index_get_header_index(const AbcIndexAccessor *a);
+uint32_t abc_index_get_num_headers(const AbcIndexAccessor *a);
+
 /* ========== ABC Builder (ItemContainer + MemoryWriter) ========== */
 
 typedef struct AbcBuilder AbcBuilder;
@@ -538,18 +591,33 @@ void abc_builder_set_api(AbcBuilder *b, uint8_t api, const char *sub_api);
 uint32_t abc_builder_add_string(AbcBuilder *b, const char *str);
 uint32_t abc_builder_add_class(AbcBuilder *b, const char *descriptor);
 uint32_t abc_builder_add_foreign_class(AbcBuilder *b, const char *descriptor);
+/* Convenience: add the global class ("L_GLOBAL;") */
+uint32_t abc_builder_add_global_class(AbcBuilder *b);
 uint32_t abc_builder_add_literal_array(AbcBuilder *b, const char *id);
 
 /* Add field to a class */
 uint32_t abc_builder_class_add_field(AbcBuilder *b, uint32_t class_handle,
                                       const char *name, uint8_t type_id,
                                       uint32_t access_flags);
+/* Extended: add field with reference type support */
+uint32_t abc_builder_class_add_field_ex(AbcBuilder *b, uint32_t class_handle,
+                                         const char *name, uint8_t type_id,
+                                         uint32_t ref_class_handle, uint32_t access_flags);
 
 /* Add typed items to a literal array (call once per item, in order) */
 void abc_builder_literal_array_add_u8(AbcBuilder *b, uint32_t lit_handle, uint8_t val);
 void abc_builder_literal_array_add_u16(AbcBuilder *b, uint32_t lit_handle, uint16_t val);
 void abc_builder_literal_array_add_u32(AbcBuilder *b, uint32_t lit_handle, uint32_t val);
 void abc_builder_literal_array_add_u64(AbcBuilder *b, uint32_t lit_handle, uint64_t val);
+void abc_builder_literal_array_add_bool(AbcBuilder *b, uint32_t lit_handle, uint8_t val);
+void abc_builder_literal_array_add_f32(AbcBuilder *b, uint32_t lit_handle, float val);
+void abc_builder_literal_array_add_f64(AbcBuilder *b, uint32_t lit_handle, double val);
+/* String literal: string_handle is an index returned by abc_builder_add_string */
+void abc_builder_literal_array_add_string(AbcBuilder *b, uint32_t lit_handle, uint32_t string_handle);
+/* Method literal: method_handle is an index returned by abc_builder_class_add_method_with_proto */
+void abc_builder_literal_array_add_method(AbcBuilder *b, uint32_t lit_handle, uint32_t method_handle);
+/* Literal array reference: ref_handle is an index returned by abc_builder_add_literal_array */
+void abc_builder_literal_array_add_literalarray(AbcBuilder *b, uint32_t lit_handle, uint32_t ref_handle);
 
 /* Finalize: compute layout, write to memory buffer.
  * Returns pointer to buffer (owned by builder), sets *out_len.
@@ -557,8 +625,16 @@ void abc_builder_literal_array_add_u64(AbcBuilder *b, uint32_t lit_handle, uint6
 const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len);
 
 /* --- Proto --- */
+/* Proto parameter descriptor for reference type support */
+struct AbcProtoParam {
+    uint8_t type_id;          /* ABC_TYPE_* constant */
+    uint32_t class_handle;    /* tagged class handle when type_id == ABC_TYPE_REFERENCE, else ignored */
+};
 uint32_t abc_builder_create_proto(AbcBuilder *b, uint8_t ret_type_id,
                                    const uint8_t *param_type_ids, uint32_t num_params);
+/* Extended proto creation with reference type support */
+uint32_t abc_builder_create_proto_ex(AbcBuilder *b, uint8_t ret_type_id, uint32_t ret_class_handle,
+                                      const struct AbcProtoParam *params, uint32_t num_params);
 uint32_t abc_builder_class_add_method_with_proto(AbcBuilder *b, uint32_t class_handle,
     const char *name, uint32_t proto_handle, uint32_t access_flags,
     const uint8_t *code, uint32_t code_size, uint32_t num_vregs, uint32_t num_args);
@@ -622,6 +698,18 @@ struct AbcAnnotationElemDef {
 };
 uint32_t abc_builder_create_annotation(AbcBuilder *b, uint32_t class_handle,
     const struct AbcAnnotationElemDef *elements, uint32_t num_elements);
+
+/* Extended annotation element definition supporting array values */
+struct AbcAnnotationElemDefEx {
+    uint32_t name_string_handle;
+    char     tag;
+    uint8_t  is_array;            /* 0 = scalar, 1 = array */
+    uint32_t scalar_value;        /* used when is_array == 0 */
+    const uint32_t *array_values; /* used when is_array == 1 */
+    uint32_t array_count;         /* used when is_array == 1 */
+};
+uint32_t abc_builder_create_annotation_ex(AbcBuilder *b, uint32_t class_handle,
+    const struct AbcAnnotationElemDefEx *elements, uint32_t num_elements);
 void abc_builder_class_add_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle);
 void abc_builder_class_add_runtime_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle);
 void abc_builder_class_add_type_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle);

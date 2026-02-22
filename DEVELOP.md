@@ -29,7 +29,7 @@ ArkCompiler ABC 字节码工具链的 Rust 实现。
 - `decode()` / `lookup()` — 字节码解码和 opcode 查找
 - `Emitter` — 字节码汇编器（per-mnemonic 安全 emit 方法）
 - `OpcodeFlags` / `Exceptions` — 位掩码类型，支持 `BitOr`/`BitAnd`/`Not`
-- `AbcVersion` — 版本管理：`current_version()`、`min_version()`、`version_by_api()`、`is_version_compatible()`
+- `Version` — 版本管理：`current_version()`、`min_version()`、`version_by_api()`、`is_version_compatible()`
 
 不负责决定"该用哪个 opcode"——只忠实编码调用者给它的任何 opcode。
 

@@ -1,4 +1,4 @@
-use crate::error::ParseError;
+use crate::error::Error as ParseError;
 
 /// Decode an unsigned LEB128 value from `data` starting at `offset`.
 /// Returns (value, bytes_consumed).
@@ -14,6 +14,11 @@ pub fn decode_uleb128(data: &[u8], offset: usize) -> Result<(u64, usize), ParseE
         let byte = data[pos];
         pos += 1;
 
+        // On the last possible byte (shift == 63), only bit 0 is valid for u64.
+        // Bits 1-6 would be shifted beyond 64 bits and silently lost.
+        if shift == 63 && (byte & 0x7e) != 0 {
+            return Err(ParseError::InvalidLeb128(offset));
+        }
         result |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
             return Ok((result, pos - offset));
@@ -40,6 +45,13 @@ pub fn decode_sleb128(data: &[u8], offset: usize) -> Result<(i64, usize), ParseE
         byte = data[pos];
         pos += 1;
 
+        // On the last possible byte (shift == 63), only bit 0 (value) and bit 6
+        // (sign) are meaningful. The valid patterns are 0x00 (positive, bit 63 = 0)
+        // and 0x7f (negative, bit 63 = 1 with sign extension). Any other value
+        // would silently lose bits shifted beyond 64.
+        if shift == 63 && byte != 0x00 && byte != 0x7f {
+            return Err(ParseError::InvalidLeb128(offset));
+        }
         result |= ((byte & 0x7f) as i64) << shift;
         shift += 7;
         if byte & 0x80 == 0 {
@@ -236,5 +248,55 @@ mod tests {
     #[test]
     fn sleb128_truncated_data() {
         assert!(decode_sleb128(&[0x80], 0).is_err());
+    }
+
+    // --- Overflow validation on 10th byte ---
+
+    #[test]
+    fn uleb128_10th_byte_valid_bit0() {
+        // u64::MAX = 0xFFFF_FFFF_FFFF_FFFF
+        // Encoded: 9 bytes of 0xFF + final byte 0x01
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        assert_eq!(decode_uleb128(&data, 0).unwrap(), (u64::MAX, 10));
+    }
+
+    #[test]
+    fn uleb128_10th_byte_overflow_rejected() {
+        // 10th byte = 0x03 has bit 1 set, which would overflow u64
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x03];
+        assert!(decode_uleb128(&data, 0).is_err());
+    }
+
+    #[test]
+    fn uleb128_10th_byte_all_bits_rejected() {
+        // 10th byte = 0x7F has bits 1-6 set, all would overflow
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F];
+        assert!(decode_uleb128(&data, 0).is_err());
+    }
+
+    #[test]
+    fn sleb128_10th_byte_positive_zero() {
+        // Large positive: bit 63 = 0, 10th byte must be 0x00
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+        let (val, len) = decode_sleb128(&data, 0).unwrap();
+        assert_eq!(len, 10);
+        assert_eq!(val, 0x7FFF_FFFF_FFFF_FFFF_i64);
+    }
+
+    #[test]
+    fn sleb128_10th_byte_negative_7f() {
+        // i64::MIN = -9223372036854775808
+        // Encoded: 9 bytes of 0x80 + final byte 0x7F (sign-extended)
+        let data = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7F];
+        let (val, len) = decode_sleb128(&data, 0).unwrap();
+        assert_eq!(len, 10);
+        assert_eq!(val, i64::MIN);
+    }
+
+    #[test]
+    fn sleb128_10th_byte_overflow_rejected() {
+        // 10th byte = 0x03 is neither 0x00 nor 0x7F → overflow
+        let data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x03];
+        assert!(decode_sleb128(&data, 0).is_err());
     }
 }
