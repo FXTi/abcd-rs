@@ -21,6 +21,7 @@ libpandafile/bytecode_instruction.h: libpandafile/bytecode_instruction.h
 libpandafile/bytecode_instruction-inl.h: libpandafile/bytecode_instruction-inl.h
 libpandafile/bytecode_emitter.h: libpandafile/bytecode_emitter.h
 libpandafile/bytecode_emitter.cpp: libpandafile/bytecode_emitter.cpp
+libpandafile/file_format_version.cpp: libpandafile/file_format_version.cpp
 
 # --- libpandabase headers ---
 libpandabase/macros.h: libpandabase/include/libpandabase/macros.h

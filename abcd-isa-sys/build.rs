@@ -1,3 +1,13 @@
+// Build script for abcd-isa-sys.
+//
+// Three phases:
+//   1. Ruby code generation — runs gen.rb against isa.yaml to produce C++ headers
+//      and the Rust `bytecode.rs` source.
+//   2. C++ compilation — compiles the bridge (`isa_bridge.cpp`) and vendor sources
+//      into a static library via the `cc` crate.
+//   3. Rust FFI bindings — runs `bindgen` on the bridge header to produce
+//      `bindings.rs`.
+
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -31,15 +41,6 @@ fn main() {
         &format!("{out_dir}/bytecode_instruction-inl_gen.h"),
     );
 
-    // Generate isa_bridge_tables.h (our custom metadata tables)
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/templates/isa_bridge_tables.h.erb"),
-        &format!("{out_dir}/isa_bridge_tables.h"),
-    );
-
     // Generate bytecode_emitter_def_gen.h
     run_ruby(
         &gen_rb,
@@ -67,22 +68,22 @@ fn main() {
         &format!("{out_dir}/file_format_version.h"),
     );
 
-    // Generate isa_bridge_emitter.h (C bridge for emitter — implementations)
+    // Generate isa_bridge_emit_dispatch.h (C++ emitter dispatch switch)
     run_ruby(
         &gen_rb,
         &isa_yaml,
         &requires,
-        &format!("{manifest}/templates/isa_bridge_emitter.h.erb"),
-        &format!("{out_dir}/isa_bridge_emitter.h"),
+        &format!("{manifest}/templates/isa_bridge_emit_dispatch.h.erb"),
+        &format!("{out_dir}/isa_bridge_emit_dispatch.h"),
     );
 
-    // Generate isa_bridge_emitter_decl.h (declarations only, for bindgen)
+    // Generate bytecode.rs (Rust Bytecode enum + Operands + insn constructors)
     run_ruby(
         &gen_rb,
         &isa_yaml,
         &requires,
-        &format!("{manifest}/templates/isa_bridge_emitter_decl.h.erb"),
-        &format!("{out_dir}/isa_bridge_emitter_decl.h"),
+        &format!("{manifest}/templates/bytecode.rs.erb"),
+        &format!("{out_dir}/bytecode.rs"),
     );
 
     // Phase 2: Compile C++ bridge
@@ -98,6 +99,9 @@ fn main() {
         .include(&format!("{manifest}/vendor/libpandafile"))
         .include(&format!("{manifest}/vendor/libpandabase"))
         .file(&format!("{manifest}/bridge/isa_bridge.cpp"))
+        .file(&format!(
+            "{manifest}/vendor/libpandafile/file_format_version.cpp"
+        ))
         .file(&format!(
             "{manifest}/vendor/libpandafile/bytecode_emitter.cpp"
         ));
@@ -125,11 +129,7 @@ fn main() {
     let wrapper_h = format!("{out_dir}/isa_bridge_bindgen.h");
     std::fs::write(
         &wrapper_h,
-        format!(
-            "#include \"{manifest}/bridge/isa_bridge.h\"\n\
-             #include \"{out_dir}/isa_bridge_emitter_decl.h\"\n\
-             #include \"{out_dir}/isa_bridge_tables.h\"\n"
-        ),
+        format!("#include \"{manifest}/bridge/isa_bridge.h\"\n"),
     )
     .expect("failed to write bindgen wrapper header");
 
@@ -147,15 +147,16 @@ fn main() {
         .write_to_file(&out_path)
         .expect("failed to write bindings");
 
-    // Export bindings path for dependent crates via links metadata
-    println!("cargo:bindings_rs={}", out_path.display());
-
     // rerun-if-changed
     println!("cargo:rerun-if-changed=bridge/");
     println!("cargo:rerun-if-changed=templates/");
     println!("cargo:rerun-if-changed=vendor/");
 }
 
+/// Run a Ruby ERB code-generation step.
+///
+/// Invokes `gen.rb` with the given ISA data file, require paths, template, and
+/// output path.  Panics if Ruby is not installed or the template fails.
 fn run_ruby(gen_rb: &str, data: &str, requires: &str, template: &str, output: &str) {
     let status = Command::new("ruby")
         .args([

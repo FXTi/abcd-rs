@@ -1,11 +1,15 @@
 [package]
 name = "abcd-isa-sys"
+description = "Low-level FFI bindings for the ArkCompiler bytecode ISA"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-links = "isa_bridge"
+readme = "README.md"
+keywords = ["arkcompiler", "bytecode", "ffi", "isa"]
+categories = ["api-bindings", "compilers"]
 
 [dependencies]
+bitflags.workspace = true
 
 [build-dependencies]
 cc = "1"
