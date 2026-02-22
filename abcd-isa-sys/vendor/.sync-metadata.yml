@@ -33,6 +33,8 @@ files:
     sha256: ad6194db031582d8f1db813443c9906a245fc297e945b1c7dd1fc52afa766ed8
   libpandafile/bytecode_instruction.h:
     sha256: 8f8516df8324aa365f2d4d85563a32bd52f7cf8d9aaf4b19376f01fe8dd84597
+  libpandafile/file_format_version.cpp:
+    sha256: c36a8688527d8f1b1c9660b200436979018eebf15584915b57f5be5394762776
   libpandafile/pandafile_isapi.rb:
     sha256: 50ae41167624c3fce6f6817d89a356bed01482f949f09da436585afa4bc77925
   libpandafile/templates/bytecode_emitter_def_gen.h.erb:
