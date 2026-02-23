@@ -3,7 +3,6 @@ name = "abcd-file-sys"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
-links = "file_bridge"
 
 [dependencies]
 
