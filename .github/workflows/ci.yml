@@ -168,6 +168,11 @@ jobs:
         if: ${{ matrix.use_cross }}
         uses: taiki-e/install-action@cross
 
+      - name: Enable CRT static linking (Windows)
+        if: contains(matrix.target, 'windows')
+        shell: bash
+        run: echo "RUSTFLAGS=${RUSTFLAGS} -C target-feature=+crt-static" >> "$GITHUB_ENV"
+
       - name: Build (cross)
         if: ${{ matrix.use_cross }}
         run: cross build --release --target ${{ matrix.target }}

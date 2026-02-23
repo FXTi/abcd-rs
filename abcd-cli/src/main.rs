@@ -7,6 +7,10 @@ use std::path::PathBuf;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(target_env = "msvc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "abcd-rs", about = "ArkCompiler ABC bytecode decompiler")]
 struct Cli {
