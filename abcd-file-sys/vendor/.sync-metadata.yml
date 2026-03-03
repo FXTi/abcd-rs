@@ -4,7 +4,7 @@ files:
   isa/gen.rb:
     sha256: 43c2ab419deb1090a8a897a1b50ec48d42f0a7a5bcd6a5a6e5b210be1f7902fb
   isa/isa.yaml:
-    sha256: b8b69da3b2a458c0dd21e788d52fc1c95ee0619a2510145ea80784c59e4c2918
+    sha256: 690d960793e07d18c94d81a644e916592bb29962c48c7e2f5f48376989f530f9
   isa/isapi.rb:
     sha256: d45122d4ab8697812f21eac101ac10f04b314560ec0723bfb44f676206f729ce
   libpandabase/globals.h:
