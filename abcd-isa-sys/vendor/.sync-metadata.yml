@@ -1,5 +1,5 @@
 ---
-base_url: https://raw.gitcode.com/openharmony/arkcompiler_runtime_core/raw/master
+base_url: https://raw.githubusercontent.com/openharmony/arkcompiler_runtime_core/master
 files:
   isa/combine.rb:
     sha256: 296129bf6a9d5e8d21e05e5946220d6084a13c48a87014bcafe14181742e2409

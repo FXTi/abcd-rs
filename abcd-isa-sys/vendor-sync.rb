@@ -17,7 +17,10 @@ require 'yaml'
 require 'net/http'
 require 'uri'
 
-BASE_URL = 'https://raw.gitcode.com/openharmony/arkcompiler_runtime_core/raw/master'
+# 上游拉取源：openharmony 的 GitHub 官方镜像。
+# 曾使用 raw.gitcode.com，但其 WAF 对 GitHub Actions 的境外 IP 一律返回
+# HTTP 418，导致 CI 每日同步全部失败；该镜像内容与上游 master 同步。
+BASE_URL = 'https://raw.githubusercontent.com/openharmony/arkcompiler_runtime_core/master'
 
 VENDOR_DIR  = File.expand_path('vendor', __dir__)
 METADATA    = File.join(VENDOR_DIR, '.sync-metadata.yml')
@@ -36,7 +39,9 @@ def fetch(url, limit = 5)
   http.open_timeout = 10
   http.read_timeout = 30
 
-  resp = http.get(uri.request_uri)
+  req = Net::HTTP::Get.new(uri)
+  req['User-Agent'] = 'abcd-rs-vendor-sync (Ruby Net::HTTP)'
+  resp = http.request(req)
   case resp
   when Net::HTTPSuccess     then resp.body
   when Net::HTTPRedirection then fetch(resp['location'], limit - 1)

@@ -2,7 +2,7 @@
 
 ## 原则
 
-1. **vendor 文件与上游零 diff**。`*/vendor/` 下的文件是 arkcompiler `runtime_core` master 的逐字节副本（来源 `raw.gitcode.com/openharmony/arkcompiler_runtime_core`）。任何上游改动通过同步脚本整体拉取，**绝不在 vendor 文件上打本地补丁**。
+1. **vendor 文件与上游零 diff**。`*/vendor/` 下的文件是 arkcompiler `runtime_core` master 的逐字节副本，拉取源是 `raw.githubusercontent.com/openharmony/arkcompiler_runtime_core`（OpenHarmony 的 GitHub 官方镜像）。曾使用 `raw.gitcode.com`，但其 WAF 对 GitHub Actions 的境外 IP 一律返回 HTTP 418，导致每日同步全部失败，故切换为镜像源。任何上游改动通过同步脚本整体拉取，**绝不在 vendor 文件上打本地补丁**。
 2. **本地适配用 shim / 编译选项，不碰 vendor**。缺失的传递头用 `-include vendor_fixups.h` 注入；重型依赖（logger/securec/zlib/os 抽象/pgo）用独立 shim 头 + include 路径优先级覆盖；行为差异用宏（`-DNDEBUG`、`-DSUPPORT_KNOWN_EXCEPTION`）。
 3. **元数据锁定**。每个 vendor 文件的 sha256 记录在 `vendor/.sync-metadata.yml`；`--check-local` 比对实际文件与元数据，任何本地改动都会被 CI 抓到。
 

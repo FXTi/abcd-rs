@@ -1,6 +1,12 @@
 ---
-base_url: https://raw.gitcode.com/openharmony/arkcompiler_runtime_core/raw/master
+base_url: https://raw.githubusercontent.com/openharmony/arkcompiler_runtime_core/master
 files:
+  assembler/annotation.h:
+    sha256: 70403e1ccfcc34fa4fc659ec5f99bf87cda65b2bc51b725b33f1788a55da5aad
+  assembler/assembly-type.h:
+    sha256: e221cf5c8bef1c63463be2dbb838ae9604fc3906f8407b4e15334c880bf4a150
+  assembler/define.h:
+    sha256: 7652244d5715fce10016c6d1b52f97bfd844a1d23437ae17e77612298e62cb3a
   isa/gen.rb:
     sha256: 43c2ab419deb1090a8a897a1b50ec48d42f0a7a5bcd6a5a6e5b210be1f7902fb
   isa/isa.yaml:
