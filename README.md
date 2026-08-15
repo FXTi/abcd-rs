@@ -42,7 +42,18 @@ for (desc, class) in &file.classes {
 - **Optimize**: peephole → SCCP → ADCE → copy propagation
 - **Lower**: chordal-graph register allocation (MCS coloring + Boissinot out-of-SSA) → instruction selection → layout
 
-See [`abcd-ir/README.md`](abcd-ir/README.md) for the design document and references.
+See [`abcd-ir/README.md`](abcd-ir/README.md) for the IR user guide.
+
+## Design
+
+Architecture and design decisions are documented in [`design/`](design/README.md):
+
+- [Overview](design/overview.md) — layering, data flow, version-aware design
+- [ISA](design/isa.md) — code generation pipeline, bytecode decode/encode
+- [File format](design/file-format.md) — ABC container, FFI bridge, builder
+- [IR](design/ir.md) — SSA lift/optimize/lower, register allocation, references
+- [Vendor sync](design/vendor-sync.md) — upstream consistency system
+- [CI/CD](design/ci.md) — jobs rationale, release policy
 
 ## License
 
