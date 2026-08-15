@@ -20,6 +20,7 @@
 #include "index_accessor.h"
 #include "file_item_container.h"
 #include "file_writer.h"
+#include "utils/leb128.h"
 
 #include <cstring>
 #include <new>
@@ -27,6 +28,59 @@
 #include <iostream>
 #include <stdexcept>
 #include "zlib.h"
+#include "annotation.h"  // pandasm::Value — for annotation value type validation
+
+// ---------------------------------------------------------------------------
+// Compile-time checks: Rust enum values must match C++ definitions.
+// ---------------------------------------------------------------------------
+
+// FileType ↔ PandaFileType (file.h)
+static_assert(static_cast<int8_t>(panda::panda_file::PandaFileType::FILE_FORMAT_INVALID) == -1);
+static_assert(static_cast<int8_t>(panda::panda_file::PandaFileType::FILE_DYNAMIC) == 0);
+static_assert(static_cast<int8_t>(panda::panda_file::PandaFileType::FILE_STATIC) == 1);
+
+// AnnotationValueType ↔ pandasm::Value (annotation.h)
+// Scalar (GetTypeAsChar)
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::U1) == '1');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::I8) == '2');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::U8) == '3');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::I16) == '4');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::U16) == '5');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::I32) == '6');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::U32) == '7');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::I64) == '8');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::U64) == '9');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::F32) == 'A');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::F64) == 'B');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::STRING) == 'C');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::RECORD) == 'D');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::METHOD) == 'E');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::ENUM) == 'F');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::ANNOTATION) == 'G');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::ARRAY) == 'H');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::VOID) == 'I');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::METHOD_HANDLE) == 'J');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::STRING_NULLPTR) == '*');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::LITERALARRAY) == '#');
+static_assert(panda::pandasm::Value::GetTypeAsChar(panda::pandasm::Value::Type::UNKNOWN) == '0');
+// Array (GetArrayTypeAsChar)
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::U1) == 'K');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::I8) == 'L');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::U8) == 'M');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::I16) == 'N');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::U16) == 'O');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::I32) == 'P');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::U32) == 'Q');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::I64) == 'R');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::U64) == 'S');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::F32) == 'T');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::F64) == 'U');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::STRING) == 'V');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::RECORD) == 'W');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::METHOD) == 'X');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::ENUM) == 'Y');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::ANNOTATION) == 'Z');
+static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::Type::METHOD_HANDLE) == '@');
 
 using File = panda::panda_file::File;
 using ClassDA = panda::panda_file::ClassDataAccessor;
@@ -64,6 +118,15 @@ using SourceLang = panda::panda_file::SourceLang;
 using FunctionKind = panda::panda_file::FunctionKind;
 using BaseClassItem = panda::panda_file::BaseClassItem;
 using TypeItem = panda::panda_file::TypeItem;
+using BaseItem = panda::panda_file::BaseItem;
+using MethodHandleItem = panda::panda_file::MethodHandleItem;
+using MethodHandleType = panda::panda_file::MethodHandleType;
+
+/* ========== Compile-time guards for vendor assumptions ========== */
+static_assert(File::MAGIC_SIZE == 8, "MAGIC_SIZE changed upstream");
+static_assert(sizeof(float) == sizeof(uint32_t), "float size assumption for LiteralItem");
+static_assert(sizeof(double) == sizeof(uint64_t), "double size assumption for LiteralItem");
+static_assert(static_cast<uint8_t>(Type::TypeId::U32) == 0x08, "U32 type id changed upstream");
 
 /* ========== File method implementations (merged from file_impl.cpp) ========== */
 namespace panda::panda_file {
@@ -1022,19 +1085,19 @@ static void literal_val_to_c(const LiteralDA::LiteralValue &val, LiteralTag tag,
                               AbcLiteralValCb cb, void *ctx) {
     AbcLiteralVal out;
     out.tag = static_cast<uint8_t>(tag);
-    out.u64_val = 0;
+    out.data.u64_val = 0;
     out.str_data = nullptr;
     out.str_utf16_len = 0;
     std::visit([&out](auto &&arg) {
         using T = std::decay_t<decltype(arg)>;
-        if constexpr (std::is_same_v<T, bool>)          out.bool_val = arg ? 1 : 0;
-        else if constexpr (std::is_same_v<T, uint8_t>)  out.u8_val = arg;
-        else if constexpr (std::is_same_v<T, uint16_t>) out.u16_val = arg;
-        else if constexpr (std::is_same_v<T, uint32_t>) out.u32_val = arg;
-        else if constexpr (std::is_same_v<T, uint64_t>) out.u64_val = arg;
-        else if constexpr (std::is_same_v<T, float>)    out.f32_val = arg;
-        else if constexpr (std::is_same_v<T, double>)   out.f64_val = arg;
-        else if constexpr (std::is_same_v<T, void *>)   out.u64_val = reinterpret_cast<uintptr_t>(arg);
+        if constexpr (std::is_same_v<T, bool>)          out.data.bool_val = arg ? 1 : 0;
+        else if constexpr (std::is_same_v<T, uint8_t>)  out.data.u8_val = arg;
+        else if constexpr (std::is_same_v<T, uint16_t>) out.data.u16_val = arg;
+        else if constexpr (std::is_same_v<T, uint32_t>) out.data.u32_val = arg;
+        else if constexpr (std::is_same_v<T, uint64_t>) out.data.u64_val = arg;
+        else if constexpr (std::is_same_v<T, float>)    out.data.f32_val = arg;
+        else if constexpr (std::is_same_v<T, double>)   out.data.f64_val = arg;
+        else if constexpr (std::is_same_v<T, void *>)   out.data.u64_val = reinterpret_cast<uintptr_t>(arg);
         else if constexpr (std::is_same_v<T, File::StringData>) {
             out.str_data = arg.data;
             out.str_utf16_len = arg.utf16_length;
@@ -1161,6 +1224,66 @@ uint32_t abc_annotation_get_annotation_id(const AbcAnnotationAccessor *a) {
     return a->accessor.GetAnnotationId().GetOffset();
 }
 
+int abc_annotation_get_value_i64(const AbcAnnotationAccessor *a, uint32_t idx, int64_t *out) {
+    if (idx >= a->accessor.GetCount()) return -1;
+    auto elem = a->accessor.GetElement(idx);
+    *out = elem.GetScalarValue().Get<int64_t>();
+    return 0;
+}
+
+int abc_annotation_get_value_u64(const AbcAnnotationAccessor *a, uint32_t idx, uint64_t *out) {
+    if (idx >= a->accessor.GetCount()) return -1;
+    auto elem = a->accessor.GetElement(idx);
+    *out = elem.GetScalarValue().Get<uint64_t>();
+    return 0;
+}
+
+int abc_annotation_get_value_f64(const AbcAnnotationAccessor *a, uint32_t idx, double *out) {
+    if (idx >= a->accessor.GetCount()) return -1;
+    auto elem = a->accessor.GetElement(idx);
+    *out = elem.GetScalarValue().Get<double>();
+    return 0;
+}
+
+int abc_annotation_array_read(const AbcFileHandle *f, uint32_t entity_off,
+                               uint32_t element_size, uint32_t count,
+                               uint64_t *out_values, uint32_t max_count) {
+    auto sp = f->file->GetSpanFromId(File::EntityId(entity_off));
+    if (sp.empty()) return -1;
+
+    // Skip the ULEB128 count prefix.
+    auto [cnt, bytes_read, ok] = panda::leb128::DecodeUnsigned<uint32_t>(sp.data());
+    if (!ok) return -1;
+    auto data = sp.SubSpan(bytes_read);
+
+    uint32_t n = std::min(count, max_count);
+    for (uint32_t i = 0; i < n; ++i) {
+        auto elem = data.SubSpan(element_size * i);
+        if (elem.Size() < element_size) return static_cast<int>(i);
+        uint64_t val = 0;
+        std::memcpy(&val, elem.data(), element_size);
+        out_values[i] = val;
+    }
+    return static_cast<int>(n);
+}
+
+/* ========== MethodHandle ========== */
+
+int abc_method_handle_read(const AbcFileHandle *f, uint32_t offset,
+                           uint8_t *out_type, uint32_t *out_entity_off) {
+    auto sp = f->file->GetSpanFromId(File::EntityId(offset));
+    if (sp.empty()) return -1;
+
+    // First byte is MethodHandleType (0-8).
+    *out_type = sp[0];
+
+    // Next comes ULEB128-encoded entity offset.
+    auto [entity_off, n, ok] = panda::leb128::DecodeUnsigned<uint32_t>(sp.data() + 1);
+    if (!ok) return -1;
+    *out_entity_off = entity_off;
+    return 0;
+}
+
 /* ========== Debug Info Extractor ========== */
 
 AbcDebugInfo *abc_debug_info_open(const AbcFileHandle *f) {
@@ -1279,6 +1402,7 @@ struct AbcBuilder {
     std::vector<ProtoItem *> protos;
     std::vector<ForeignFieldItem *> foreign_fields;
     std::vector<ForeignMethodItem *> foreign_methods;
+    std::vector<MethodHandleItem *> method_handle_items;
     // Staged literal items: flushed to LiteralArrayItem in finalize
     std::vector<std::vector<panda::panda_file::LiteralItem>> literal_items_staging;
 
@@ -1313,7 +1437,7 @@ static TypeItem *resolve_type(AbcBuilder *b, uint8_t type_id, uint32_t class_han
 
 void abc_builder_set_api(AbcBuilder *b, uint8_t api, const char *sub_api) {
     ItemContainer::SetApi(api);
-    ItemContainer::SetSubApi(sub_api ? sub_api : "beta1");
+    ItemContainer::SetSubApi(sub_api ? sub_api : panda::panda_file::DEFAULT_SUB_API_VERSION.c_str());
 }
 
 uint32_t abc_builder_add_string(AbcBuilder *b, const char *str) {
@@ -1338,7 +1462,10 @@ uint32_t abc_builder_add_foreign_class(AbcBuilder *b, const char *descriptor) {
 }
 
 uint32_t abc_builder_add_global_class(AbcBuilder *b) {
-    return abc_builder_add_class(b, "L_GLOBAL;");
+    auto *item = b->container.GetOrCreateGlobalClassItem();
+    uint32_t idx = static_cast<uint32_t>(b->classes.size());
+    b->classes.push_back(item);
+    return idx;
 }
 
 uint32_t abc_builder_add_literal_array(AbcBuilder *b, const char *id) {
@@ -1656,6 +1783,18 @@ void abc_builder_lnp_emit_start_local(AbcBuilder *b, uint32_t lnp_handle,
         b->debug_infos[debug_handle]->GetConstantPool(), reg, name_item, type_item);
 }
 
+void abc_builder_lnp_emit_start_local_extended(AbcBuilder *b, uint32_t lnp_handle,
+    uint32_t debug_handle, int32_t reg,
+    uint32_t name_handle, uint32_t type_handle, uint32_t type_sig_handle) {
+    if (lnp_handle >= b->lnps.size()) return;
+    if (debug_handle >= b->debug_infos.size()) return;
+    StringItem *name_item = (name_handle < b->strings.size()) ? b->strings[name_handle] : nullptr;
+    StringItem *type_item = (type_handle < b->strings.size()) ? b->strings[type_handle] : nullptr;
+    StringItem *sig_item = (type_sig_handle < b->strings.size()) ? b->strings[type_sig_handle] : nullptr;
+    b->lnps[lnp_handle]->EmitStartLocalExtended(
+        b->debug_infos[debug_handle]->GetConstantPool(), reg, name_item, type_item, sig_item);
+}
+
 void abc_builder_lnp_emit_end_local(AbcBuilder *b, uint32_t lnp_handle, int32_t reg) {
     if (lnp_handle >= b->lnps.size()) return;
     b->lnps[lnp_handle]->EmitEndLocal(reg);
@@ -1719,6 +1858,62 @@ uint32_t abc_builder_create_annotation(AbcBuilder *b, uint32_t class_handle,
     return idx;
 }
 
+// Resolve an entity handle to a BaseItem* based on annotation tag character.
+static BaseItem *resolve_entity_by_tag(AbcBuilder *b, char tag, uint32_t handle) {
+    switch (tag) {
+        case 'C': // String
+            if (handle < b->strings.size()) return b->strings[handle];
+            break;
+        case 'D': // Record (class)
+            return b->ResolveClassHandle(handle);
+        case 'E': // Method
+            if (handle & 0x80000000u) {
+                uint32_t idx = handle & 0x7FFFFFFFu;
+                if (idx < b->foreign_methods.size()) return b->foreign_methods[idx];
+            } else if (handle < b->methods.size()) {
+                return b->methods[handle];
+            }
+            break;
+        case 'F': // Enum (field)
+            if (handle & 0x80000000u) {
+                uint32_t idx = handle & 0x7FFFFFFFu;
+                if (idx < b->foreign_fields.size()) return b->foreign_fields[idx];
+            } else if (handle < b->fields.size()) {
+                return b->fields[handle];
+            }
+            break;
+        case 'G': // Annotation
+            if (handle < b->annotations.size()) return b->annotations[handle];
+            break;
+        case 'J': // MethodHandle
+            if (handle < b->method_handle_items.size()) return b->method_handle_items[handle];
+            break;
+        case '#': // LiteralArray
+            if (handle < b->literal_arrays.size()) return b->literal_arrays[handle];
+            break;
+        default: break;
+    }
+    return nullptr;
+}
+
+// Map annotation array tag to panda Type::TypeId for ArrayValueItem component type.
+static Type::TypeId component_type_from_tag(char tag) {
+    switch (tag) {
+        case 'K': return Type::TypeId::U1;   // ArrayU1
+        case 'L': return Type::TypeId::I8;   // ArrayI8
+        case 'M': return Type::TypeId::U8;   // ArrayU8
+        case 'N': return Type::TypeId::I16;  // ArrayI16
+        case 'O': return Type::TypeId::U16;  // ArrayU16
+        case 'P': return Type::TypeId::I32;  // ArrayI32
+        case 'Q': return Type::TypeId::U32;  // ArrayU32
+        case 'R': return Type::TypeId::I64;  // ArrayI64
+        case 'S': return Type::TypeId::U64;  // ArrayU64
+        case 'W': return Type::TypeId::F32;  // ArrayF32
+        case 'X': return Type::TypeId::F64;  // ArrayF64
+        default:  return Type::TypeId::U32;  // Fallback
+    }
+}
+
 uint32_t abc_builder_create_annotation_ex(AbcBuilder *b, uint32_t class_handle,
     const struct AbcAnnotationElemDefEx *elements, uint32_t num_elements) {
     auto *cls = b->ResolveClassHandle(class_handle);
@@ -1731,13 +1926,55 @@ uint32_t abc_builder_create_annotation_ex(AbcBuilder *b, uint32_t class_handle,
         if (elements[i].name_string_handle < b->strings.size()) {
             name = b->strings[elements[i].name_string_handle];
         }
-        if (elements[i].is_array) {
+        if (elements[i].is_array == 1) {
+            // Scalar array
             std::vector<ScalarValueItem> items;
             for (uint32_t j = 0; j < elements[i].array_count; j++) {
                 items.emplace_back(elements[i].array_values[j], &b->container);
             }
+            auto comp_type = component_type_from_tag(elements[i].tag);
             auto *arr_val = b->container.CreateItem<ArrayValueItem>(
-                Type(Type::TypeId::U32), std::move(items));
+                Type(comp_type), std::move(items));
+            elems.emplace_back(name, arr_val);
+        } else if (elements[i].is_array == 2) {
+            // 64-bit scalar: use tag to pick the right ScalarValueItem constructor.
+            char t = elements[i].tag;
+            if (t == 'B') {
+                // F64: reinterpret bits as double.
+                double dv;
+                std::memcpy(&dv, &elements[i].scalar_value_64, sizeof(double));
+                auto *val = b->container.CreateItem<ScalarValueItem>(dv);
+                elems.emplace_back(name, val);
+            } else {
+                // I64 / U64: store as uint64_t.
+                auto *val = b->container.CreateItem<ScalarValueItem>(elements[i].scalar_value_64);
+                elems.emplace_back(name, val);
+            }
+        } else if (elements[i].is_array == 3) {
+            // Entity reference: scalar_value is a handle index, resolve by tag.
+            BaseItem *entity = resolve_entity_by_tag(b, elements[i].tag, elements[i].scalar_value);
+            if (entity) {
+                auto *val = b->container.CreateItem<ScalarValueItem>(entity);
+                elems.emplace_back(name, val);
+            } else {
+                // Fallback: raw scalar
+                auto *val = b->container.CreateItem<ScalarValueItem>(elements[i].scalar_value);
+                elems.emplace_back(name, val);
+            }
+        } else if (elements[i].is_array == 4) {
+            // Array of entity references
+            std::vector<ScalarValueItem> items;
+            for (uint32_t j = 0; j < elements[i].array_count; j++) {
+                BaseItem *entity = resolve_entity_by_tag(b, elements[i].tag, elements[i].array_values[j]);
+                if (entity) {
+                    items.emplace_back(entity, &b->container);
+                } else {
+                    items.emplace_back(elements[i].array_values[j], &b->container);
+                }
+            }
+            auto comp_type = component_type_from_tag(elements[i].tag);
+            auto *arr_val = b->container.CreateItem<ArrayValueItem>(
+                Type(comp_type), std::move(items));
             elems.emplace_back(name, arr_val);
         } else {
             auto *val = b->container.CreateItem<ScalarValueItem>(elements[i].scalar_value);
@@ -1800,6 +2037,54 @@ void abc_builder_method_add_runtime_type_annotation(AbcBuilder *b, uint32_t meth
     b->methods[method_handle]->AddRuntimeTypeAnnotation(b->annotations[ann_handle]);
 }
 
+/* --- Method parameter annotations --- */
+
+uint32_t abc_builder_method_add_param(AbcBuilder *b, uint32_t method_handle, uint8_t type_id) {
+    if (method_handle >= b->methods.size()) return UINT32_MAX;
+    auto *type_item = b->container.GetOrCreatePrimitiveTypeItem(
+        static_cast<Type::TypeId>(type_id));
+    auto &params = b->methods[method_handle]->GetParams();
+    uint32_t idx = static_cast<uint32_t>(params.size());
+    params.emplace_back(type_item);
+    return idx;
+}
+
+void abc_builder_method_param_add_annotation(AbcBuilder *b, uint32_t method_handle,
+    uint32_t param_idx, uint32_t ann_handle) {
+    if (method_handle >= b->methods.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    auto &params = b->methods[method_handle]->GetParams();
+    if (param_idx >= params.size()) return;
+    params[param_idx].AddAnnotation(b->annotations[ann_handle]);
+}
+
+void abc_builder_method_param_add_runtime_annotation(AbcBuilder *b, uint32_t method_handle,
+    uint32_t param_idx, uint32_t ann_handle) {
+    if (method_handle >= b->methods.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    auto &params = b->methods[method_handle]->GetParams();
+    if (param_idx >= params.size()) return;
+    params[param_idx].AddRuntimeAnnotation(b->annotations[ann_handle]);
+}
+
+void abc_builder_method_param_add_type_annotation(AbcBuilder *b, uint32_t method_handle,
+    uint32_t param_idx, uint32_t ann_handle) {
+    if (method_handle >= b->methods.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    auto &params = b->methods[method_handle]->GetParams();
+    if (param_idx >= params.size()) return;
+    params[param_idx].AddTypeAnnotation(b->annotations[ann_handle]);
+}
+
+void abc_builder_method_param_add_runtime_type_annotation(AbcBuilder *b, uint32_t method_handle,
+    uint32_t param_idx, uint32_t ann_handle) {
+    if (method_handle >= b->methods.size()) return;
+    if (ann_handle >= b->annotations.size()) return;
+    auto &params = b->methods[method_handle]->GetParams();
+    if (param_idx >= params.size()) return;
+    params[param_idx].AddRuntimeTypeAnnotation(b->annotations[ann_handle]);
+}
+
 void abc_builder_field_add_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
@@ -1849,6 +2134,35 @@ uint32_t abc_builder_add_foreign_method(AbcBuilder *b, uint32_t class_handle,
         cls, name_item, b->protos[proto_handle], access_flags);
     uint32_t idx = static_cast<uint32_t>(b->foreign_methods.size());
     b->foreign_methods.push_back(item);
+    return idx;
+}
+
+/* --- 3.8b MethodHandle items --- */
+
+uint32_t abc_builder_create_method_handle(AbcBuilder *b, uint8_t type, uint32_t entity_handle) {
+    BaseItem *entity = nullptr;
+    auto mh_type = static_cast<MethodHandleType>(type);
+    if (type <= 3) {
+        // field op (PutStatic, GetStatic, PutInstance, GetInstance)
+        if (entity_handle & 0x80000000u) {
+            uint32_t idx = entity_handle & 0x7FFFFFFFu;
+            if (idx < b->foreign_fields.size()) entity = b->foreign_fields[idx];
+        } else if (entity_handle < b->fields.size()) {
+            entity = b->fields[entity_handle];
+        }
+    } else {
+        // method op (InvokeStatic..InvokeInterface)
+        if (entity_handle & 0x80000000u) {
+            uint32_t idx = entity_handle & 0x7FFFFFFFu;
+            if (idx < b->foreign_methods.size()) entity = b->foreign_methods[idx];
+        } else if (entity_handle < b->methods.size()) {
+            entity = b->methods[entity_handle];
+        }
+    }
+    if (!entity) return UINT32_MAX;
+    auto *item = b->container.CreateItem<MethodHandleItem>(mh_type, entity);
+    uint32_t idx = static_cast<uint32_t>(b->method_handle_items.size());
+    b->method_handle_items.push_back(item);
     return idx;
 }
 

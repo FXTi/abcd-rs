@@ -59,7 +59,7 @@ bitflags::bitflags! {
     ///
     /// Values match the C++ `BytecodeInstruction::Flags` enum generated from `isa.yaml`.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub struct BytecodeFlag: u32 {
+    pub struct BytecodeFlags: u32 {
 % Panda::properties.each_with_index do |f, i|
         const <%= f.tag.upcase %> = <%= format("0x%x", 1 << i) %>;
 % end
@@ -186,10 +186,10 @@ impl Bytecode {
     /// Check if this instruction has a specific property flag.
     ///
     /// ```ignore
-    /// use abcd_isa_sys::BytecodeFlag;
-    /// if bc.has_flag(BytecodeFlag::CALL | BytecodeFlag::DYNAMIC) { /* ... */ }
+    /// use abcd_isa_sys::BytecodeFlags;
+    /// if bc.has_flag(BytecodeFlags::CALL | BytecodeFlags::DYNAMIC) { /* ... */ }
     /// ```
-    pub fn has_flag(&self, flag: BytecodeFlag) -> bool {
+    pub fn has_flag(&self, flag: BytecodeFlags) -> bool {
         unsafe { crate::isa_has_flag_opcode(self.representative_opcode(), flag.bits()) != 0 }
     }
 

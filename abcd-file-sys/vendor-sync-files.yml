@@ -78,3 +78,8 @@ libpandafile/proto_data_accessor-inl.h: libpandafile/proto_data_accessor-inl.h
 libpandafile/proto_data_accessor.h: libpandafile/proto_data_accessor.h
 libpandafile/shorty_iterator.h: libpandafile/shorty_iterator.h
 libpandafile/value.h: libpandafile/value.h
+
+# --- assembler headers (annotation value type validation) ---
+assembler/annotation.h: assembler/annotation.h
+assembler/assembly-type.h: assembler/assembly-type.h
+assembler/define.h: assembler/define.h

@@ -86,18 +86,18 @@ fn can_throw_extended() {
 
 #[test]
 fn has_flag_jump() {
-    assert!(insn::Jmp::new(Label(0)).has_flag(BytecodeFlag::JUMP));
+    assert!(insn::Jmp::new(Label(0)).has_flag(BytecodeFlags::JUMP));
 }
 
 #[test]
 fn has_flag_return() {
-    assert!(insn::Return::new().has_flag(BytecodeFlag::RETURN));
+    assert!(insn::Return::new().has_flag(BytecodeFlags::RETURN));
 }
 
 #[test]
 fn has_flag_negative() {
-    assert!(!insn::Ldundefined::new().has_flag(BytecodeFlag::RETURN));
-    assert!(!insn::Ldundefined::new().has_flag(BytecodeFlag::JUMP));
+    assert!(!insn::Ldundefined::new().has_flag(BytecodeFlags::RETURN));
+    assert!(!insn::Ldundefined::new().has_flag(BytecodeFlags::JUMP));
 }
 
 // --- mnemonic ---
@@ -212,49 +212,51 @@ fn has_flag_call_not_assigned() {
     // Regression: the CALL flag exists in the ISA schema but is never assigned
     // to any instruction. If the ISA definition changes to assign it, this test
     // should be updated to reflect the new assignment rather than removed.
-    assert!(!insn::Callarg0::new(Imm(0)).has_flag(BytecodeFlag::CALL));
-    assert!(!insn::Callthis0::new(Imm(0), Reg(0)).has_flag(BytecodeFlag::CALL));
+    assert!(!insn::Callarg0::new(Imm(0)).has_flag(BytecodeFlags::CALL));
+    assert!(!insn::Callthis0::new(Imm(0), Reg(0)).has_flag(BytecodeFlags::CALL));
 }
 
 #[test]
 fn has_flag_suspend_not_assigned() {
     // Regression: same as CALL — SUSPEND flag exists but is never assigned.
     // This also explains why is_suspend() returns false for all instructions.
-    assert!(!insn::Suspendgenerator::new(Reg(0)).has_flag(BytecodeFlag::SUSPEND));
+    assert!(!insn::Suspendgenerator::new(Reg(0)).has_flag(BytecodeFlags::SUSPEND));
 }
 
 #[test]
 fn has_flag_string_id() {
-    assert!(insn::LdaStr::new(EntityId(0)).has_flag(BytecodeFlag::STRING_ID));
-    assert!(insn::Ldobjbyname::new(Imm(0), EntityId(0)).has_flag(BytecodeFlag::STRING_ID));
-    assert!(insn::Tryldglobalbyname::new(Imm(0), EntityId(0)).has_flag(BytecodeFlag::STRING_ID));
+    assert!(insn::LdaStr::new(EntityId(0)).has_flag(BytecodeFlags::STRING_ID));
+    assert!(insn::Ldobjbyname::new(Imm(0), EntityId(0)).has_flag(BytecodeFlags::STRING_ID));
+    assert!(insn::Tryldglobalbyname::new(Imm(0), EntityId(0)).has_flag(BytecodeFlags::STRING_ID));
 }
 
 #[test]
 fn has_flag_method_id() {
-    assert!(insn::Definefunc::new(Imm(0), EntityId(0), Imm(0)).has_flag(BytecodeFlag::METHOD_ID));
-    assert!(insn::Definemethod::new(Imm(0), EntityId(0), Imm(0)).has_flag(BytecodeFlag::METHOD_ID));
+    assert!(insn::Definefunc::new(Imm(0), EntityId(0), Imm(0)).has_flag(BytecodeFlags::METHOD_ID));
+    assert!(
+        insn::Definemethod::new(Imm(0), EntityId(0), Imm(0)).has_flag(BytecodeFlags::METHOD_ID)
+    );
 }
 
 #[test]
 fn has_flag_literalarray_id() {
     assert!(
         insn::Createarraywithbuffer::new(Imm(0), EntityId(0))
-            .has_flag(BytecodeFlag::LITERALARRAY_ID)
+            .has_flag(BytecodeFlags::LITERALARRAY_ID)
     );
     assert!(
         insn::Createobjectwithbuffer::new(Imm(0), EntityId(0))
-            .has_flag(BytecodeFlag::LITERALARRAY_ID)
+            .has_flag(BytecodeFlags::LITERALARRAY_ID)
     );
 }
 
 #[test]
 fn has_flag_conditional() {
-    assert!(insn::Jeqz::new(Label(0)).has_flag(BytecodeFlag::CONDITIONAL));
-    assert!(insn::Jnez::new(Label(0)).has_flag(BytecodeFlag::CONDITIONAL));
-    assert!(insn::Jeq::new(Reg(0), Label(0)).has_flag(BytecodeFlag::CONDITIONAL));
-    assert!(insn::Jne::new(Reg(0), Label(0)).has_flag(BytecodeFlag::CONDITIONAL));
-    assert!(!insn::Jmp::new(Label(0)).has_flag(BytecodeFlag::CONDITIONAL));
+    assert!(insn::Jeqz::new(Label(0)).has_flag(BytecodeFlags::CONDITIONAL));
+    assert!(insn::Jnez::new(Label(0)).has_flag(BytecodeFlags::CONDITIONAL));
+    assert!(insn::Jeq::new(Reg(0), Label(0)).has_flag(BytecodeFlags::CONDITIONAL));
+    assert!(insn::Jne::new(Reg(0), Label(0)).has_flag(BytecodeFlags::CONDITIONAL));
+    assert!(!insn::Jmp::new(Label(0)).has_flag(BytecodeFlags::CONDITIONAL));
 }
 
 #[test]

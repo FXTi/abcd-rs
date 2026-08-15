@@ -1,12 +1,15 @@
 [package]
 name = "abcd-file"
+description = "Safe Rust API for ArkCompiler bytecode file format (read, write, inspect)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+keywords = ["arkcompiler", "bytecode", "abc", "panda"]
+categories = ["compilers", "parser-implementations"]
 
 [dependencies]
-abcd-isa = { workspace = true }
-abcd-file-sys = { workspace = true }
-thiserror = { workspace = true }
-memmap2 = { workspace = true }
-log = { workspace = true }
+abcd-file-sys.workspace = true
+abcd-isa.workspace = true
+thiserror.workspace = true
+bitflags.workspace = true
+string-interner.workspace = true

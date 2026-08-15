@@ -54,4 +54,4 @@ if let Some(v) = Version::for_api(12) {
 
 ## Re-exported Types
 
-From `abcd-isa-sys`: `Bytecode`, `Reg`, `Imm`, `EntityId`, `Label`, `insn` (per-mnemonic constructors), `BytecodeFlag`, `ExceptionType`.
+From `abcd-isa-sys`: `Bytecode`, `Reg`, `Imm`, `EntityId`, `Label`, `insn` (per-mnemonic constructors), `BytecodeFlags`, `ExceptionType`.

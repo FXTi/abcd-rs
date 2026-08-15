@@ -1,5 +1,6 @@
 [package]
 name = "abcd-file-sys"
+description = "C FFI bindings for ArkCompiler .abc file format (libpandafile)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

@@ -7,7 +7,7 @@
 //! - A safe [`Bytecode`] enum with per-instruction variants and operand accessors
 //! - Per-mnemonic constructor types in the [`insn`] module
 //! - Operand newtypes: [`Reg`], [`Imm`], [`EntityId`], [`Label`]
-//! - Classification flags: [`BytecodeFlag`], [`ExceptionType`]
+//! - Classification flags: [`BytecodeFlags`], [`ExceptionType`]
 //!
 //! Most users should depend on
 //! [`abcd-isa`](https://crates.io/crates/abcd-isa) instead, which wraps

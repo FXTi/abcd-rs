@@ -1,33 +1,40 @@
-use thiserror::Error;
-
-#[derive(Debug, Error)]
+/// Errors from ABC file operations.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    #[error("File too small: {0} bytes")]
-    FileTooSmall(usize),
-
-    #[error("Invalid magic: expected PANDA\\0\\0\\0")]
-    InvalidMagic,
-
-    #[error("Unsupported version: {0}")]
-    UnsupportedVersion(abcd_isa::Version),
-
-    #[error("Offset {0:#x} out of bounds (file size: {1:#x})")]
-    OffsetOutOfBounds(usize, usize),
-
-    #[error("Invalid LEB128 encoding at offset {0:#x}")]
-    InvalidLeb128(usize),
-
-    #[error("Invalid MUTF-8 encoding at offset {0:#x}")]
-    InvalidMutf8(usize),
-
-    #[error("Invalid tagged value tag {0:#x} at offset {1:#x}")]
-    InvalidTag(u8, usize),
-
-    #[error("FFI call failed: {0}")]
-    Ffi(String),
-
-    #[error("I/O error: {0}")]
-    Io(String),
+    /// Failed to open or parse an ABC file.
+    #[error("failed to open ABC file")]
+    Open,
+    /// An entity offset does not point to a valid entity.
+    #[error("invalid entity offset {0:#x}")]
+    InvalidOffset(u32),
+    /// String at the given offset could not be read.
+    #[error("string at offset {0:#x} is invalid")]
+    InvalidString(u32),
+    /// Annotation element index is out of range.
+    #[error("annotation element index {0} out of range")]
+    AnnotationIndex(u32),
+    /// Builder finalize failed.
+    #[error("builder finalize failed")]
+    Finalize,
+    /// Bytecode encoding failed during encode.
+    #[error("bytecode encode error: {0}")]
+    BytecodeEncode(String),
+    /// Unknown source language discriminant.
+    #[error("unknown source language {0}")]
+    UnknownSourceLang(u8),
+    /// Unknown type id discriminant.
+    #[error("unknown type id {0}")]
+    UnknownTypeId(u8),
+    /// Unknown function kind discriminant.
+    #[error("unknown function kind {0}")]
+    UnknownFunctionKind(u8),
+    /// Unknown literal tag discriminant.
+    #[error("unknown literal tag {0}")]
+    UnknownLiteralTag(u8),
+    /// A required field is missing (malformed ABC file).
+    #[error("missing required {field} in {context}")]
+    Malformed {
+        field: &'static str,
+        context: String,
+    },
 }
-
-pub type Result<T> = std::result::Result<T, Error>;

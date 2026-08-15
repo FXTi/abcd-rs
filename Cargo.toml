@@ -6,8 +6,6 @@ members = [
     "abcd-file-sys",
     "abcd-file",
     "abcd-ir",
-    "abcd-decompiler",
-    "abcd-cli",
 ]
 
 [workspace.package]
@@ -24,10 +22,10 @@ memmap2 = "0.9"
 log = "0.4"
 env_logger = "0.11"
 bitflags = "2"
+string-interner = "0.19"
 
 abcd-isa-sys = { path = "abcd-isa-sys" }
 abcd-isa = { path = "abcd-isa" }
 abcd-file-sys = { path = "abcd-file-sys" }
 abcd-file = { path = "abcd-file" }
 abcd-ir = { path = "abcd-ir" }
-abcd-decompiler = { path = "abcd-decompiler" }

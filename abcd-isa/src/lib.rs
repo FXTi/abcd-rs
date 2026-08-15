@@ -29,10 +29,10 @@
 //!
 //! The following types are re-exported from [`abcd_isa_sys`] for convenience:
 //! [`Bytecode`], [`Reg`], [`Imm`], [`EntityId`], [`Label`],
-//! [`insn`], [`BytecodeFlag`], [`ExceptionType`].
+//! [`insn`], [`BytecodeFlags`], [`ExceptionType`].
 
 pub use abcd_isa_sys::{Bytecode, EntityId, Imm, Label, Reg};
-pub use abcd_isa_sys::{BytecodeFlag, ExceptionType, insn};
+pub use abcd_isa_sys::{BytecodeFlags, ExceptionType, insn};
 
 mod decoder;
 pub use decoder::{DecodeError, decode};

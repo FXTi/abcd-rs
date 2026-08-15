@@ -1,8 +1,12 @@
 [package]
 name = "abcd-ir"
+description = "SSA-form intermediate representation for ArkCompiler bytecode"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 
 [dependencies]
-abcd-isa = { workspace = true }
+abcd-isa.workspace = true
+abcd-file.workspace = true
+thiserror.workspace = true
+string-interner.workspace = true

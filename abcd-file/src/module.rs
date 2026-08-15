@@ -1,107 +1,169 @@
-//! Module data accessor.
+use crate::error::Error;
+use crate::literal::LiteralValue;
 
-use crate::{EntityId, File, error::Error, types::ModuleTag};
-
-/// A module record entry.
-#[derive(Debug, Clone)]
-pub struct ModuleRecord {
-    pub tag: ModuleTag,
-    pub export_name_off: EntityId,
-    pub module_request_idx: u32,
-    pub import_name_off: EntityId,
-    pub local_name_off: EntityId,
+/// A single module record entry with interned strings.
+///
+/// Each variant carries only the fields present for that record kind.
+#[derive(Clone, Debug)]
+pub enum ModuleRecord {
+    RegularImport {
+        local_name: crate::StringId,
+        import_name: crate::StringId,
+        module_request_idx: u32,
+    },
+    NamespaceImport {
+        local_name: crate::StringId,
+        module_request_idx: u32,
+    },
+    LocalExport {
+        local_name: crate::StringId,
+        export_name: crate::StringId,
+    },
+    IndirectExport {
+        export_name: crate::StringId,
+        import_name: crate::StringId,
+        module_request_idx: u32,
+    },
+    StarExport {
+        module_request_idx: u32,
+    },
 }
 
-/// A module data accessor. Borrows from a [`File`].
-pub struct Module<'f> {
-    handle: *mut abcd_file_sys::AbcModuleAccessor,
-    file: &'f File,
-    off: EntityId,
+/// Decoded module data (import/export declarations for an ES module).
+///
+/// Module data is stored as a special literal array in the ABC file.
+/// Use [`ModuleData::from_literal_values`] or [`File::decode_module`](crate::File::decode_module)
+/// to decode it from an already-decoded literal array.
+#[derive(Clone, Debug)]
+pub struct ModuleData {
+    /// Module request strings (paths of imported modules).
+    pub requests: Vec<crate::StringId>,
+    /// Import/export records.
+    pub records: Vec<ModuleRecord>,
 }
 
-impl<'f> Module<'f> {
-    pub(crate) fn open(file: &'f File, offset: EntityId) -> Result<Self, Error> {
-        let handle = unsafe { abcd_file_sys::abc_module_open(file.handle(), offset.0) };
-        if handle.is_null() {
-            return Err(Error::Ffi(format!(
-                "abc_module_open failed at offset {offset:?}"
-            )));
+impl ModuleData {
+    /// Parse module data from a flat slice of decoded literal values.
+    ///
+    /// The expected layout matches the ArkCompiler module literal array format:
+    /// counts as `Integer`, strings as `String`, module indices as `MethodAffiliate`.
+    pub fn from_literal_values(values: &[LiteralValue]) -> Result<Self, Error> {
+        let mut cur = Cursor { values, pos: 0 };
+
+        // Module requests.
+        let n = cur.read_u32("module_requests_count")?;
+        let mut requests = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            requests.push(cur.read_string_id("module_request")?);
         }
-        Ok(Self {
-            handle,
-            file,
-            off: offset,
-        })
-    }
 
-    /// The offset in the ABC file where this module was opened.
-    pub fn offset(&self) -> EntityId {
-        self.off
-    }
-
-    pub fn data_id(&self) -> EntityId {
-        EntityId(unsafe { abcd_file_sys::abc_module_get_data_id(self.handle) })
-    }
-
-    pub fn num_requests(&self) -> u32 {
-        unsafe { abcd_file_sys::abc_module_num_requests(self.handle) }
-    }
-
-    pub fn request_off(&self, idx: u32) -> Option<EntityId> {
-        let off = unsafe { abcd_file_sys::abc_module_request_off(self.handle, idx) };
-        if off == u32::MAX {
-            None
-        } else {
-            Some(EntityId(off))
-        }
-    }
-
-    pub fn records(&self) -> Vec<ModuleRecord> {
         let mut records = Vec::new();
-        unsafe extern "C" fn cb(
-            tag: u8,
-            export_name_off: u32,
-            module_request_idx: u32,
-            import_name_off: u32,
-            local_name_off: u32,
-            ctx: *mut std::ffi::c_void,
-        ) {
-            unsafe {
-                let v = &mut *(ctx as *mut Vec<ModuleRecord>);
-                v.push(ModuleRecord {
-                    tag: ModuleTag::from_u8(tag),
-                    export_name_off: EntityId(export_name_off),
-                    module_request_idx,
-                    import_name_off: EntityId(import_name_off),
-                    local_name_off: EntityId(local_name_off),
-                });
-            }
-        }
-        unsafe {
-            abcd_file_sys::abc_module_enumerate_records(
-                self.handle,
-                Some(cb),
-                &mut records as *mut Vec<ModuleRecord> as *mut std::ffi::c_void,
-            );
-        }
-        records
-    }
 
-    pub fn file(&self) -> &'f File {
-        self.file
+        // Regular imports: [local_name, import_name, module_idx] × N
+        let n = cur.read_u32("regular_import_count")?;
+        for _ in 0..n {
+            let local_name = cur.read_string_id("regular_import.local_name")?;
+            let import_name = cur.read_string_id("regular_import.import_name")?;
+            let module_request_idx = cur.read_u16("regular_import.module_idx")? as u32;
+            records.push(ModuleRecord::RegularImport {
+                local_name,
+                import_name,
+                module_request_idx,
+            });
+        }
+
+        // Namespace imports: [local_name, module_idx] × N
+        let n = cur.read_u32("namespace_import_count")?;
+        for _ in 0..n {
+            let local_name = cur.read_string_id("namespace_import.local_name")?;
+            let module_request_idx = cur.read_u16("namespace_import.module_idx")? as u32;
+            records.push(ModuleRecord::NamespaceImport {
+                local_name,
+                module_request_idx,
+            });
+        }
+
+        // Local exports: [local_name, export_name] × N
+        let n = cur.read_u32("local_export_count")?;
+        for _ in 0..n {
+            let local_name = cur.read_string_id("local_export.local_name")?;
+            let export_name = cur.read_string_id("local_export.export_name")?;
+            records.push(ModuleRecord::LocalExport {
+                local_name,
+                export_name,
+            });
+        }
+
+        // Indirect exports: [export_name, import_name, module_idx] × N
+        let n = cur.read_u32("indirect_export_count")?;
+        for _ in 0..n {
+            let export_name = cur.read_string_id("indirect_export.export_name")?;
+            let import_name = cur.read_string_id("indirect_export.import_name")?;
+            let module_request_idx = cur.read_u16("indirect_export.module_idx")? as u32;
+            records.push(ModuleRecord::IndirectExport {
+                export_name,
+                import_name,
+                module_request_idx,
+            });
+        }
+
+        // Star exports: [module_idx] × N
+        let n = cur.read_u32("star_export_count")?;
+        for _ in 0..n {
+            let module_request_idx = cur.read_u16("star_export.module_idx")? as u32;
+            records.push(ModuleRecord::StarExport { module_request_idx });
+        }
+
+        Ok(ModuleData { requests, records })
     }
 }
 
-impl Drop for Module<'_> {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { abcd_file_sys::abc_module_close(self.handle) };
-        }
-    }
+// ---------------------------------------------------------------------------
+// Internal cursor for walking a &[LiteralValue] sequentially
+// ---------------------------------------------------------------------------
+
+struct Cursor<'a> {
+    values: &'a [LiteralValue],
+    pos: usize,
 }
 
-impl std::fmt::Debug for Module<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Module").field("offset", &self.off).finish()
+impl<'a> Cursor<'a> {
+    fn next(&mut self, ctx: &str) -> Result<&'a LiteralValue, Error> {
+        let v = self.values.get(self.pos).ok_or_else(|| Error::Malformed {
+            field: "module_data",
+            context: format!("unexpected end at {ctx}"),
+        })?;
+        self.pos += 1;
+        Ok(v)
+    }
+
+    fn read_u32(&mut self, ctx: &str) -> Result<u32, Error> {
+        match self.next(ctx)? {
+            LiteralValue::Integer(n) => Ok(*n),
+            other => Err(Error::Malformed {
+                field: "module_data",
+                context: format!("expected Integer for {ctx}, got {other:?}"),
+            }),
+        }
+    }
+
+    fn read_string_id(&mut self, ctx: &str) -> Result<crate::StringId, Error> {
+        match self.next(ctx)? {
+            LiteralValue::String(sid) => Ok(*sid),
+            other => Err(Error::Malformed {
+                field: "module_data",
+                context: format!("expected String for {ctx}, got {other:?}"),
+            }),
+        }
+    }
+
+    fn read_u16(&mut self, ctx: &str) -> Result<u16, Error> {
+        match self.next(ctx)? {
+            LiteralValue::MethodAffiliate(n) => Ok(*n),
+            other => Err(Error::Malformed {
+                field: "module_data",
+                context: format!("expected MethodAffiliate for {ctx}, got {other:?}"),
+            }),
+        }
     }
 }

@@ -1,323 +1,219 @@
-//! Literal data accessor.
+use std::ffi::c_void;
 
-use crate::{EntityId, File, error::Error};
-use std::ffi::CStr;
-use std::fmt;
+use abcd_file_sys as sys;
 
-/// Literal tag values from the ABC file format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::Error;
+use crate::file::read_string;
+
+/// Tag identifying the type of a literal array element (internal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub enum LiteralTag {
-    TagValue = 0x00,
-    Bool = 0x01,
-    Integer = 0x02,
-    Float = 0x03,
-    Double = 0x04,
-    String = 0x05,
-    Method = 0x06,
-    GeneratorMethod = 0x07,
-    Accessor = 0x08,
-    MethodAffiliate = 0x09,
-    ArrayU1 = 0x0a,
-    ArrayU8 = 0x0b,
-    ArrayI8 = 0x0c,
-    ArrayU16 = 0x0d,
-    ArrayI16 = 0x0e,
-    ArrayU32 = 0x0f,
-    ArrayI32 = 0x10,
-    ArrayU64 = 0x11,
-    ArrayI64 = 0x12,
-    ArrayF32 = 0x13,
-    ArrayF64 = 0x14,
-    ArrayString = 0x15,
-    AsyncGeneratorMethod = 0x16,
-    LiteralBufferIndex = 0x17,
-    LiteralArray = 0x18,
-    BuiltinTypeIndex = 0x19,
-    Getter = 0x1a,
-    Setter = 0x1b,
-    EtsImplements = 0x1c,
-    NullValue = 0xff,
+pub(crate) enum LiteralTag {
+    TagValue = sys::LiteralTag_TAGVALUE,
+    Bool = sys::LiteralTag_BOOL,
+    Integer = sys::LiteralTag_INTEGER,
+    Float = sys::LiteralTag_FLOAT,
+    Double = sys::LiteralTag_DOUBLE,
+    String = sys::LiteralTag_STRING,
+    Method = sys::LiteralTag_METHOD,
+    GeneratorMethod = sys::LiteralTag_GENERATORMETHOD,
+    Accessor = sys::LiteralTag_ACCESSOR,
+    MethodAffiliate = sys::LiteralTag_METHODAFFILIATE,
+    ArrayU1 = sys::LiteralTag_ARRAY_U1,
+    ArrayU8 = sys::LiteralTag_ARRAY_U8,
+    ArrayI8 = sys::LiteralTag_ARRAY_I8,
+    ArrayU16 = sys::LiteralTag_ARRAY_U16,
+    ArrayI16 = sys::LiteralTag_ARRAY_I16,
+    ArrayU32 = sys::LiteralTag_ARRAY_U32,
+    ArrayI32 = sys::LiteralTag_ARRAY_I32,
+    ArrayU64 = sys::LiteralTag_ARRAY_U64,
+    ArrayI64 = sys::LiteralTag_ARRAY_I64,
+    ArrayF32 = sys::LiteralTag_ARRAY_F32,
+    ArrayF64 = sys::LiteralTag_ARRAY_F64,
+    ArrayString = sys::LiteralTag_ARRAY_STRING,
+    AsyncGeneratorMethod = sys::LiteralTag_ASYNCGENERATORMETHOD,
+    LiteralBufferIndex = sys::LiteralTag_LITERALBUFFERINDEX,
+    LiteralArray = sys::LiteralTag_LITERALARRAY,
+    BuiltinTypeIndex = sys::LiteralTag_BUILTINTYPEINDEX,
+    Getter = sys::LiteralTag_GETTER,
+    Setter = sys::LiteralTag_SETTER,
+    EtsImplements = sys::LiteralTag_ETS_IMPLEMENTS,
+    NullValue = sys::LiteralTag_NULLVALUE,
 }
 
-impl LiteralTag {
-    pub fn from_u8(val: u8) -> Option<Self> {
-        match val {
-            0x00 => Some(Self::TagValue),
-            0x01 => Some(Self::Bool),
-            0x02 => Some(Self::Integer),
-            0x03 => Some(Self::Float),
-            0x04 => Some(Self::Double),
-            0x05 => Some(Self::String),
-            0x06 => Some(Self::Method),
-            0x07 => Some(Self::GeneratorMethod),
-            0x08 => Some(Self::Accessor),
-            0x09 => Some(Self::MethodAffiliate),
-            0x0a => Some(Self::ArrayU1),
-            0x0b => Some(Self::ArrayU8),
-            0x0c => Some(Self::ArrayI8),
-            0x0d => Some(Self::ArrayU16),
-            0x0e => Some(Self::ArrayI16),
-            0x0f => Some(Self::ArrayU32),
-            0x10 => Some(Self::ArrayI32),
-            0x11 => Some(Self::ArrayU64),
-            0x12 => Some(Self::ArrayI64),
-            0x13 => Some(Self::ArrayF32),
-            0x14 => Some(Self::ArrayF64),
-            0x15 => Some(Self::ArrayString),
-            0x16 => Some(Self::AsyncGeneratorMethod),
-            0x17 => Some(Self::LiteralBufferIndex),
-            0x18 => Some(Self::LiteralArray),
-            0x19 => Some(Self::BuiltinTypeIndex),
-            0x1a => Some(Self::Getter),
-            0x1b => Some(Self::Setter),
-            0x1c => Some(Self::EtsImplements),
-            0xff => Some(Self::NullValue),
-            _ => None,
+impl TryFrom<u8> for LiteralTag {
+    type Error = Error;
+    fn try_from(v: u8) -> Result<Self, Error> {
+        match v {
+            x if x == sys::LiteralTag_TAGVALUE => Ok(Self::TagValue),
+            x if x == sys::LiteralTag_BOOL => Ok(Self::Bool),
+            x if x == sys::LiteralTag_INTEGER => Ok(Self::Integer),
+            x if x == sys::LiteralTag_FLOAT => Ok(Self::Float),
+            x if x == sys::LiteralTag_DOUBLE => Ok(Self::Double),
+            x if x == sys::LiteralTag_STRING => Ok(Self::String),
+            x if x == sys::LiteralTag_METHOD => Ok(Self::Method),
+            x if x == sys::LiteralTag_GENERATORMETHOD => Ok(Self::GeneratorMethod),
+            x if x == sys::LiteralTag_ACCESSOR => Ok(Self::Accessor),
+            x if x == sys::LiteralTag_METHODAFFILIATE => Ok(Self::MethodAffiliate),
+            x if x == sys::LiteralTag_ARRAY_U1 => Ok(Self::ArrayU1),
+            x if x == sys::LiteralTag_ARRAY_U8 => Ok(Self::ArrayU8),
+            x if x == sys::LiteralTag_ARRAY_I8 => Ok(Self::ArrayI8),
+            x if x == sys::LiteralTag_ARRAY_U16 => Ok(Self::ArrayU16),
+            x if x == sys::LiteralTag_ARRAY_I16 => Ok(Self::ArrayI16),
+            x if x == sys::LiteralTag_ARRAY_U32 => Ok(Self::ArrayU32),
+            x if x == sys::LiteralTag_ARRAY_I32 => Ok(Self::ArrayI32),
+            x if x == sys::LiteralTag_ARRAY_U64 => Ok(Self::ArrayU64),
+            x if x == sys::LiteralTag_ARRAY_I64 => Ok(Self::ArrayI64),
+            x if x == sys::LiteralTag_ARRAY_F32 => Ok(Self::ArrayF32),
+            x if x == sys::LiteralTag_ARRAY_F64 => Ok(Self::ArrayF64),
+            x if x == sys::LiteralTag_ARRAY_STRING => Ok(Self::ArrayString),
+            x if x == sys::LiteralTag_ASYNCGENERATORMETHOD => Ok(Self::AsyncGeneratorMethod),
+            x if x == sys::LiteralTag_LITERALBUFFERINDEX => Ok(Self::LiteralBufferIndex),
+            x if x == sys::LiteralTag_LITERALARRAY => Ok(Self::LiteralArray),
+            x if x == sys::LiteralTag_BUILTINTYPEINDEX => Ok(Self::BuiltinTypeIndex),
+            x if x == sys::LiteralTag_GETTER => Ok(Self::Getter),
+            x if x == sys::LiteralTag_SETTER => Ok(Self::Setter),
+            x if x == sys::LiteralTag_ETS_IMPLEMENTS => Ok(Self::EtsImplements),
+            x if x == sys::LiteralTag_NULLVALUE => Ok(Self::NullValue),
+            _ => Err(Error::UnknownLiteralTag(v)),
         }
     }
 }
 
-impl fmt::Display for LiteralTag {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
+/// Index into [`File::literal_arrays`](crate::File::literal_arrays).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LiteralArrayIdx(pub u32);
 
-/// A literal value from a literal array.
-#[derive(Debug, Clone)]
-pub struct LiteralVal {
-    pub tag: Option<LiteralTag>,
-    pub u64_val: u64,
-    /// String data (decoded from MUTF-8). Present when tag is STRING or ARRAY_STRING.
-    pub str_data: Option<String>,
-    /// UTF-16 length of the string. 0 for non-string tags.
-    pub str_utf16_len: u32,
-}
-
-impl LiteralVal {
-    pub fn as_u8(&self) -> u8 {
-        self.u64_val as u8
-    }
-    pub fn as_u16(&self) -> u16 {
-        self.u64_val as u16
-    }
-    pub fn as_u32(&self) -> u32 {
-        self.u64_val as u32
-    }
-    pub fn as_u64(&self) -> u64 {
-        self.u64_val
-    }
-    pub fn as_i32(&self) -> i32 {
-        self.u64_val as i32
-    }
-    pub fn as_i64(&self) -> i64 {
-        self.u64_val as i64
-    }
-    pub fn as_f32(&self) -> f32 {
-        f32::from_bits(self.u64_val as u32)
-    }
-    pub fn as_f64(&self) -> f64 {
-        f64::from_bits(self.u64_val)
-    }
-    pub fn as_bool(&self) -> bool {
-        self.u64_val != 0
-    }
-
-    /// Checked conversion to `u8`. Returns `None` if the value doesn't fit.
-    pub fn try_as_u8(&self) -> Option<u8> {
-        u8::try_from(self.u64_val).ok()
-    }
-    /// Checked conversion to `u16`. Returns `None` if the value doesn't fit.
-    pub fn try_as_u16(&self) -> Option<u16> {
-        u16::try_from(self.u64_val).ok()
-    }
-    /// Checked conversion to `u32`. Returns `None` if the value doesn't fit.
-    pub fn try_as_u32(&self) -> Option<u32> {
-        u32::try_from(self.u64_val).ok()
-    }
-    /// Checked conversion to `i8`. Returns `None` if the value doesn't fit.
-    pub fn try_as_i8(&self) -> Option<i8> {
-        i8::try_from(self.u64_val as i64).ok()
-    }
-    /// Checked conversion to `i16`. Returns `None` if the value doesn't fit.
-    pub fn try_as_i16(&self) -> Option<i16> {
-        i16::try_from(self.u64_val as i64).ok()
-    }
-    /// Checked conversion to `i32`. Returns `None` if the value doesn't fit.
-    pub fn try_as_i32(&self) -> Option<i32> {
-        i32::try_from(self.u64_val as i64).ok()
-    }
-    /// Checked conversion to `i64`. Returns `None` if the value doesn't fit in `i64`.
-    pub fn try_as_i64(&self) -> Option<i64> {
-        i64::try_from(self.u64_val).ok()
-    }
-
-    /// Convert to a typed `LiteralValue` using the tag.
-    pub fn to_value(&self) -> LiteralValue {
-        match self.tag {
-            Some(LiteralTag::Bool) => LiteralValue::Bool(self.as_bool()),
-            Some(LiteralTag::Integer) => LiteralValue::Integer(self.u64_val as i64),
-            Some(LiteralTag::Float) => LiteralValue::Float(self.as_f32()),
-            Some(LiteralTag::Double) => LiteralValue::Double(self.as_f64()),
-            Some(LiteralTag::String | LiteralTag::ArrayString) => {
-                LiteralValue::String(EntityId(self.as_u32()))
-            }
-            Some(
-                LiteralTag::Method
-                | LiteralTag::GeneratorMethod
-                | LiteralTag::AsyncGeneratorMethod
-                | LiteralTag::Getter
-                | LiteralTag::Setter
-                | LiteralTag::Accessor,
-            ) => LiteralValue::Method(EntityId(self.as_u32())),
-            Some(LiteralTag::MethodAffiliate) => LiteralValue::MethodAffiliate(self.as_u16()),
-            Some(LiteralTag::NullValue) => LiteralValue::Null,
-            Some(LiteralTag::TagValue) => LiteralValue::TagValue(self.as_u32()),
-            _ => LiteralValue::TagValue(self.as_u32()),
-        }
-    }
-}
-
-/// A typed literal value (high-level interpretation of [`LiteralVal`]).
-#[derive(Debug, Clone)]
+/// A single literal value from a literal array.
+///
+/// Each variant corresponds to a `LiteralTag` and carries the correctly-typed
+/// data for that tag.
+///
+/// Entity offsets (e.g. in `Method`, `Getter`, `Setter`) can be resolved via
+/// [`File::resolve_entity()`](crate::File::resolve_entity).
+#[derive(Clone, Debug, PartialEq)]
 pub enum LiteralValue {
     Bool(bool),
-    Integer(i64),
+    Integer(u32),
     Float(f32),
     Double(f64),
-    String(EntityId),
-    Method(EntityId),
-    Null,
+    /// Interned string content.
+    String(crate::StringId),
+    /// Method entity offset — resolve via `File::resolve_entity()`.
+    Method(u32),
+    /// Generator method entity offset — resolve via `File::resolve_entity()`.
+    GeneratorMethod(u32),
+    /// Async generator method entity offset — resolve via `File::resolve_entity()`.
+    AsyncGeneratorMethod(u32),
+    /// Getter method entity offset — resolve via `File::resolve_entity()`.
+    Getter(u32),
+    /// Setter method entity offset — resolve via `File::resolve_entity()`.
+    Setter(u32),
+    /// Accessor kind tag (0 = getter, 1 = setter, 2 = getter+setter).
+    Accessor(u8),
+    /// Method affiliate data (index into auxiliary tables).
     MethodAffiliate(u16),
-    TagValue(u32),
+    /// Index into [`File::literal_arrays`](crate::File::literal_arrays).
+    LiteralArray(LiteralArrayIdx),
+    /// Index into the literal buffer table.
+    LiteralBufferIndex(LiteralArrayIdx),
+    /// Builtin type index for ArkTS static typing.
+    BuiltinTypeIndex(u8),
+    /// Interned string content (ArkTS `implements` clause).
+    EtsImplements(crate::StringId),
+    /// Null sentinel value.
+    NullValue(u8),
+    /// Typed `bool[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayU1(LiteralArrayIdx),
+    /// Typed `u8[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayU8(LiteralArrayIdx),
+    /// Typed `i8[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayI8(LiteralArrayIdx),
+    /// Typed `u16[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayU16(LiteralArrayIdx),
+    /// Typed `i16[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayI16(LiteralArrayIdx),
+    /// Typed `u32[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayU32(LiteralArrayIdx),
+    /// Typed `i32[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayI32(LiteralArrayIdx),
+    /// Typed `u64[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayU64(LiteralArrayIdx),
+    /// Typed `i64[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayI64(LiteralArrayIdx),
+    /// Typed `f32[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayF32(LiteralArrayIdx),
+    /// Typed `f64[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayF64(LiteralArrayIdx),
+    /// Typed `string[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ArrayString(LiteralArrayIdx),
 }
 
-/// A parsed literal array (collection of tag-value pairs).
-#[derive(Debug, Clone)]
-pub struct LiteralArray {
-    pub entries: Vec<(LiteralTag, LiteralValue)>,
+/// Context passed through the C callback for collecting literal values.
+pub(crate) struct LiteralCollectCtx {
+    pub file: *const sys::AbcFileHandle,
+    pub strings: *mut crate::StringPool,
+    pub values: Vec<LiteralValue>,
 }
 
-/// A literal data accessor. Borrows from a [`File`].
-pub struct Literal<'f> {
-    handle: *mut abcd_file_sys::AbcLiteralAccessor,
-    file: &'f File,
-    off: EntityId,
-}
-
-unsafe extern "C" fn literal_val_cb(
-    val: *const abcd_file_sys::AbcLiteralVal,
-    ctx: *mut std::ffi::c_void,
+/// Callback for collecting literal values from the C API.
+pub(crate) unsafe extern "C" fn collect_literal_val_cb(
+    val: *const sys::AbcLiteralVal,
+    ctx: *mut c_void,
 ) {
-    unsafe {
-        let v = &mut *(ctx as *mut Vec<LiteralVal>);
-        let lv = &*val;
-        let str_data = if !lv.str_data.is_null() {
-            // SAFETY: The C++ side returns a null-terminated MUTF-8 string.
-            let cstr = CStr::from_ptr(lv.str_data as *const std::ffi::c_char);
-            let bytes = cstr.to_bytes();
-            String::from_utf8_lossy(bytes).into_owned().into()
-        } else {
-            None
-        };
-        v.push(LiteralVal {
-            tag: LiteralTag::from_u8(lv.tag),
-            u64_val: lv.__bindgen_anon_1.u64_val,
-            str_data,
-            str_utf16_len: lv.str_utf16_len,
-        });
-    }
-}
-
-impl<'f> Literal<'f> {
-    pub(crate) fn open(file: &'f File, literal_data_off: EntityId) -> Result<Self, Error> {
-        let handle = unsafe { abcd_file_sys::abc_literal_open(file.handle(), literal_data_off.0) };
-        if handle.is_null() {
-            return Err(Error::Ffi(format!(
-                "abc_literal_open failed at offset {literal_data_off:?}"
-            )));
+    let ctx = unsafe { &mut *(ctx as *mut LiteralCollectCtx) };
+    let v = unsafe { &*val };
+    let Ok(tag) = LiteralTag::try_from(v.tag) else {
+        return;
+    };
+    let lit = match tag {
+        LiteralTag::Bool => LiteralValue::Bool(unsafe { v.data.bool_val } != 0),
+        LiteralTag::Integer => LiteralValue::Integer(unsafe { v.data.u32_val }),
+        LiteralTag::Float => LiteralValue::Float(unsafe { v.data.f32_val }),
+        LiteralTag::Double => LiteralValue::Double(unsafe { v.data.f64_val }),
+        LiteralTag::String => {
+            let s = read_string(ctx.file, unsafe { v.data.u32_val }).unwrap_or_default();
+            let sid = unsafe { &mut *ctx.strings }.get_or_intern(&s);
+            LiteralValue::String(sid)
         }
-        Ok(Self {
-            handle,
-            file,
-            off: literal_data_off,
-        })
-    }
-
-    /// The offset in the ABC file where this literal was opened.
-    pub fn offset(&self) -> EntityId {
-        self.off
-    }
-
-    pub fn count(&self) -> u32 {
-        unsafe { abcd_file_sys::abc_literal_count(self.handle) }
-    }
-
-    pub fn vals_num(&self, array_off: EntityId) -> u32 {
-        unsafe { abcd_file_sys::abc_literal_get_vals_num(self.handle, array_off.0) }
-    }
-
-    pub fn vals_num_by_index(&self, index: u32) -> u32 {
-        unsafe { abcd_file_sys::abc_literal_get_vals_num_by_index(self.handle, index) }
-    }
-
-    pub fn array_id(&self, index: u32) -> EntityId {
-        EntityId(unsafe { abcd_file_sys::abc_literal_get_array_id(self.handle, index) })
-    }
-
-    pub fn enumerate_vals(&self, array_off: EntityId) -> Vec<LiteralVal> {
-        let mut vals = Vec::new();
-        unsafe {
-            abcd_file_sys::abc_literal_enumerate_vals(
-                self.handle,
-                array_off.0,
-                Some(literal_val_cb),
-                &mut vals as *mut Vec<LiteralVal> as *mut std::ffi::c_void,
-            );
+        LiteralTag::EtsImplements => {
+            let s = read_string(ctx.file, unsafe { v.data.u32_val }).unwrap_or_default();
+            let sid = unsafe { &mut *ctx.strings }.get_or_intern(&s);
+            LiteralValue::EtsImplements(sid)
         }
-        vals
-    }
-
-    pub fn enumerate_vals_by_index(&self, index: u32) -> Vec<LiteralVal> {
-        let mut vals = Vec::new();
-        unsafe {
-            abcd_file_sys::abc_literal_enumerate_vals_by_index(
-                self.handle,
-                index,
-                Some(literal_val_cb),
-                &mut vals as *mut Vec<LiteralVal> as *mut std::ffi::c_void,
-            );
+        LiteralTag::Method => LiteralValue::Method(unsafe { v.data.u32_val }),
+        LiteralTag::GeneratorMethod => LiteralValue::GeneratorMethod(unsafe { v.data.u32_val }),
+        LiteralTag::AsyncGeneratorMethod => {
+            LiteralValue::AsyncGeneratorMethod(unsafe { v.data.u32_val })
         }
-        vals
-    }
-
-    pub fn resolve_index(&self, entity_off: EntityId) -> Option<u32> {
-        let idx = unsafe { abcd_file_sys::abc_literal_resolve_index(self.handle, entity_off.0) };
-        if idx == u32::MAX { None } else { Some(idx) }
-    }
-
-    pub fn data_id(&self) -> EntityId {
-        EntityId(unsafe { abcd_file_sys::abc_literal_get_data_id(self.handle) })
-    }
-
-    pub fn file(&self) -> &'f File {
-        self.file
-    }
-}
-
-impl Drop for Literal<'_> {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { abcd_file_sys::abc_literal_close(self.handle) };
+        LiteralTag::Accessor => LiteralValue::Accessor(unsafe { v.data.u8_val }),
+        LiteralTag::MethodAffiliate => LiteralValue::MethodAffiliate(unsafe { v.data.u16_val }),
+        LiteralTag::Getter => LiteralValue::Getter(unsafe { v.data.u32_val }),
+        LiteralTag::Setter => LiteralValue::Setter(unsafe { v.data.u32_val }),
+        LiteralTag::LiteralArray => {
+            LiteralValue::LiteralArray(LiteralArrayIdx(unsafe { v.data.u32_val }))
         }
-    }
-}
-
-impl std::fmt::Debug for Literal<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Literal")
-            .field("offset", &self.off)
-            .finish()
-    }
+        LiteralTag::LiteralBufferIndex => {
+            LiteralValue::LiteralBufferIndex(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::BuiltinTypeIndex => LiteralValue::BuiltinTypeIndex(unsafe { v.data.u8_val }),
+        LiteralTag::NullValue => LiteralValue::NullValue(unsafe { v.data.u8_val }),
+        LiteralTag::ArrayU1 => LiteralValue::ArrayU1(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayU8 => LiteralValue::ArrayU8(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayI8 => LiteralValue::ArrayI8(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayU16 => LiteralValue::ArrayU16(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayI16 => LiteralValue::ArrayI16(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayU32 => LiteralValue::ArrayU32(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayI32 => LiteralValue::ArrayI32(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayU64 => LiteralValue::ArrayU64(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayI64 => LiteralValue::ArrayI64(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayF32 => LiteralValue::ArrayF32(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayF64 => LiteralValue::ArrayF64(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::ArrayString => {
+            LiteralValue::ArrayString(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        // TagValue (= INTEGER_8) is UNREACHABLE in C++
+        LiteralTag::TagValue => return,
+    };
+    ctx.values.push(lit);
 }

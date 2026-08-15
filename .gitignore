@@ -2,3 +2,13 @@
 *.abc
 /output
 .DS_Store
+
+# 上游参考源码树（仅本地研究用，不入库）
+/arkcompiler
+/hermes-main
+
+# 反编译产物（含第三方闭源代码，严禁入库）
+/decompiled
+
+# 本地工具配置
+.claude
