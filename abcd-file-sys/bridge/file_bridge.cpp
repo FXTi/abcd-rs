@@ -28,6 +28,8 @@
 #include <iostream>
 #include <stdexcept>
 #include "zlib.h"
+// 上游 file_item_container 使用计时埋点；vendor 根 include 路径解析此头。
+#include "libpandabase/utils/timers.h"
 #include "annotation.h"  // pandasm::Value — for annotation value type validation
 
 // ---------------------------------------------------------------------------
@@ -269,6 +271,14 @@ std::unique_ptr<const File> OpenPandaFile(std::string_view /*location*/,
 const char *ARCHIVE_FILENAME = "";
 
 }  // namespace panda::panda_file
+
+// 上游 timers.cpp 依赖 nlohmann/json 与 os::file::File 写盘能力，我们不引入。
+// 这里只补两个静态成员的定义，初始值与上游 timers.cpp 一致（no-op 函数指针），
+// 因此 file_item_container.cpp 里的 ScopeTimer 是零开销占位测量。
+namespace panda {
+TimeStartFunc Timer::timerStart = [](const std::string_view, std::string) {};
+TimeEndFunc Timer::timerEnd = [](const std::string_view, std::string) {};
+}  // namespace panda
 
 /* ========== Bridge API ========== */
 
@@ -1930,7 +1940,7 @@ uint32_t abc_builder_create_annotation_ex(AbcBuilder *b, uint32_t class_handle,
             // Scalar array
             std::vector<ScalarValueItem> items;
             for (uint32_t j = 0; j < elements[i].array_count; j++) {
-                items.emplace_back(elements[i].array_values[j], &b->container);
+                items.emplace_back(elements[i].array_values[j]);
             }
             auto comp_type = component_type_from_tag(elements[i].tag);
             auto *arr_val = b->container.CreateItem<ArrayValueItem>(
@@ -1967,9 +1977,9 @@ uint32_t abc_builder_create_annotation_ex(AbcBuilder *b, uint32_t class_handle,
             for (uint32_t j = 0; j < elements[i].array_count; j++) {
                 BaseItem *entity = resolve_entity_by_tag(b, elements[i].tag, elements[i].array_values[j]);
                 if (entity) {
-                    items.emplace_back(entity, &b->container);
+                    items.emplace_back(entity);
                 } else {
-                    items.emplace_back(elements[i].array_values[j], &b->container);
+                    items.emplace_back(elements[i].array_values[j]);
                 }
             }
             auto comp_type = component_type_from_tag(elements[i].tag);
@@ -1998,19 +2008,19 @@ void abc_builder_class_add_annotation(AbcBuilder *b, uint32_t class_handle, uint
 void abc_builder_class_add_runtime_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle) {
     if (class_handle >= b->classes.size()) return;
     if (ann_handle >= b->annotations.size()) return;
-    b->classes[class_handle]->AddRuntimeAnnotation(b->annotations[ann_handle]);
+    b->classes[class_handle]->AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_class_add_type_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle) {
     if (class_handle >= b->classes.size()) return;
     if (ann_handle >= b->annotations.size()) return;
-    b->classes[class_handle]->AddTypeAnnotation(b->annotations[ann_handle]);
+    b->classes[class_handle]->AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_class_add_runtime_type_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle) {
     if (class_handle >= b->classes.size()) return;
     if (ann_handle >= b->annotations.size()) return;
-    b->classes[class_handle]->AddRuntimeTypeAnnotation(b->annotations[ann_handle]);
+    b->classes[class_handle]->AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_method_add_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
@@ -2022,19 +2032,19 @@ void abc_builder_method_add_annotation(AbcBuilder *b, uint32_t method_handle, ui
 void abc_builder_method_add_runtime_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
-    b->methods[method_handle]->AddRuntimeAnnotation(b->annotations[ann_handle]);
+    b->methods[method_handle]->AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_method_add_type_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
-    b->methods[method_handle]->AddTypeAnnotation(b->annotations[ann_handle]);
+    b->methods[method_handle]->AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_method_add_runtime_type_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
-    b->methods[method_handle]->AddRuntimeTypeAnnotation(b->annotations[ann_handle]);
+    b->methods[method_handle]->AddAnnotation(b->annotations[ann_handle]);
 }
 
 /* --- Method parameter annotations --- */
@@ -2064,7 +2074,7 @@ void abc_builder_method_param_add_runtime_annotation(AbcBuilder *b, uint32_t met
     if (ann_handle >= b->annotations.size()) return;
     auto &params = b->methods[method_handle]->GetParams();
     if (param_idx >= params.size()) return;
-    params[param_idx].AddRuntimeAnnotation(b->annotations[ann_handle]);
+    params[param_idx].AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_method_param_add_type_annotation(AbcBuilder *b, uint32_t method_handle,
@@ -2073,7 +2083,7 @@ void abc_builder_method_param_add_type_annotation(AbcBuilder *b, uint32_t method
     if (ann_handle >= b->annotations.size()) return;
     auto &params = b->methods[method_handle]->GetParams();
     if (param_idx >= params.size()) return;
-    params[param_idx].AddTypeAnnotation(b->annotations[ann_handle]);
+    params[param_idx].AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_method_param_add_runtime_type_annotation(AbcBuilder *b, uint32_t method_handle,
@@ -2082,7 +2092,7 @@ void abc_builder_method_param_add_runtime_type_annotation(AbcBuilder *b, uint32_
     if (ann_handle >= b->annotations.size()) return;
     auto &params = b->methods[method_handle]->GetParams();
     if (param_idx >= params.size()) return;
-    params[param_idx].AddRuntimeTypeAnnotation(b->annotations[ann_handle]);
+    params[param_idx].AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_field_add_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
@@ -2094,19 +2104,19 @@ void abc_builder_field_add_annotation(AbcBuilder *b, uint32_t field_handle, uint
 void abc_builder_field_add_runtime_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
-    b->fields[field_handle]->AddRuntimeAnnotation(b->annotations[ann_handle]);
+    b->fields[field_handle]->AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_field_add_type_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
-    b->fields[field_handle]->AddTypeAnnotation(b->annotations[ann_handle]);
+    b->fields[field_handle]->AddAnnotation(b->annotations[ann_handle]);
 }
 
 void abc_builder_field_add_runtime_type_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
-    b->fields[field_handle]->AddRuntimeTypeAnnotation(b->annotations[ann_handle]);
+    b->fields[field_handle]->AddAnnotation(b->annotations[ann_handle]);
 }
 
 /* --- 3.8 Foreign items --- */

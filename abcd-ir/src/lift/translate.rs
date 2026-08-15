@@ -895,6 +895,104 @@ pub(super) fn translate_bytecode(
             );
             write_acc(ssa, block, v);
         }
+        // callthis*withname：方法名（string_id）只是 JIT IC 提示，IR 层与
+        // 对应 callthis* 等价（IC 槽与名字提示一律丢弃，与既有设计一致）。
+        Bytecode::Callthis0withname(_ic, _eid, this_reg) => {
+            let callee = read_acc(ssa, block, module);
+            let this = read_reg(ssa, *this_reg, block, module);
+            let v = emit_val(
+                module,
+                block,
+                InstData::Call {
+                    kind: CallKind::CallThis,
+                    callee,
+                    args: vec![this],
+                },
+                loc,
+            );
+            write_acc(ssa, block, v);
+        }
+        Bytecode::Callthis1withname(_ic, _eid, this_reg, a0) => {
+            let callee = read_acc(ssa, block, module);
+            let this = read_reg(ssa, *this_reg, block, module);
+            let arg0 = read_reg(ssa, *a0, block, module);
+            let v = emit_val(
+                module,
+                block,
+                InstData::Call {
+                    kind: CallKind::CallThis,
+                    callee,
+                    args: vec![this, arg0],
+                },
+                loc,
+            );
+            write_acc(ssa, block, v);
+        }
+        Bytecode::Callthis2withname(_ic, _eid, this_reg, a0, a1) => {
+            let callee = read_acc(ssa, block, module);
+            let this = read_reg(ssa, *this_reg, block, module);
+            let arg0 = read_reg(ssa, *a0, block, module);
+            let arg1 = read_reg(ssa, *a1, block, module);
+            let v = emit_val(
+                module,
+                block,
+                InstData::Call {
+                    kind: CallKind::CallThis,
+                    callee,
+                    args: vec![this, arg0, arg1],
+                },
+                loc,
+            );
+            write_acc(ssa, block, v);
+        }
+        Bytecode::Callthis3withname(_ic, _eid, this_reg, a0, a1, a2) => {
+            let callee = read_acc(ssa, block, module);
+            let this = read_reg(ssa, *this_reg, block, module);
+            let arg0 = read_reg(ssa, *a0, block, module);
+            let arg1 = read_reg(ssa, *a1, block, module);
+            let arg2 = read_reg(ssa, *a2, block, module);
+            let v = emit_val(
+                module,
+                block,
+                InstData::Call {
+                    kind: CallKind::CallThis,
+                    callee,
+                    args: vec![this, arg0, arg1, arg2],
+                },
+                loc,
+            );
+            write_acc(ssa, block, v);
+        }
+        Bytecode::Callthisrangewithname(_ic, argc, _eid, start) => {
+            let callee = read_acc(ssa, block, module);
+            let args = read_reg_range(ssa, start.0, argc.0 as u16, block, module);
+            let v = emit_val(
+                module,
+                block,
+                InstData::Call {
+                    kind: CallKind::CallThis,
+                    callee,
+                    args,
+                },
+                loc,
+            );
+            write_acc(ssa, block, v);
+        }
+        Bytecode::WideCallthisrangewithname(argc, _eid, start) => {
+            let callee = read_acc(ssa, block, module);
+            let args = read_reg_range(ssa, start.0, argc.0 as u16, block, module);
+            let v = emit_val(
+                module,
+                block,
+                InstData::Call {
+                    kind: CallKind::CallThis,
+                    callee,
+                    args,
+                },
+                loc,
+            );
+            write_acc(ssa, block, v);
+        }
         Bytecode::Supercallthisrange(_, argc, start)
         | Bytecode::WideSupercallthisrange(argc, start) => {
             let callee = read_acc(ssa, block, module);

@@ -16,6 +16,8 @@
 
 `vendor-sync.rb` 是这套机制**脚本本体**，与上游保持一致的契约由 CI 保证（见下）。它要求 Ruby ≥ 3.1（Psych 4 的 `YAML.safe_load_file`）；本地若 Ruby 过老，`--check-local` 会不可用——这是预期行为，一致性检查以 CI 的 Ruby 3.2 环境为准，本地构建管线（gen.rb）仍只需 Ruby 2.5+。
 
+注意：映射文件（`vendor-sync-files.yml`）不自动发现上游**新增**的文件——上游引入新依赖头时（如 2026-08 的 `timers.h`），需要人工把新文件加入映射（内容同步后由每日任务自动跟进）。
+
 ## CI 中的一致性检查
 
 两条 job 守护契约：

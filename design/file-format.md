@@ -47,20 +47,22 @@
 
 ## vendor 与 shim 策略
 
-vendor（69 文件，与上游零 diff）+ 9 个 shim 替换重型依赖：
+vendor（73 文件，与上游零 diff）+ 10 个 shim 替换重型依赖：
 
 - `zlib.h`：内联 adler32（NMAX=5552 分批取模），免链接系统 zlib；
 - `os/mem.h`：非拥有 `MapPtr`（调用方持有内存）；
 - `pgo.h`：`ProfileOptimizer` 空实现（file_item_container 仅需类型）；
 - `platform_compat.h`：MSVC 的 clz/ctz/popcount 等 constexpr 位运算内建；
-- `vendor_fixups.h`：以 `-include` 强制注入上游构建系统提供的 4 个传递头，**不改 vendor 文件本身**。
+- `vendor_fixups.h`：以 `-include` 强制注入上游构建系统提供的 4 个传递头，**不改 vendor 文件本身**；
+- `libpandabase/utils/timers.h`：**vendored 零 diff**（EVENT 常量 + inline `ScopeTimer`）；上游 `timers.cpp` 依赖 `nlohmann/json` 与 `os::file::File` 写盘，不引入——bridge 里补两个静态成员的定义（no-op 函数指针，与上游 `TimerStartDoNothing` 初始值等价）。
 
 构建管线：Ruby（gen.rb，需 Ruby ≥ 2.5）生成 `type.h` / `source_lang_enum.h` / `file_format_version.h` → cc 编译 14 个 vendor `.cpp` + bridge → bindgen。
 
 ## 已知限制
 
 1. **`encode()` 语义 round-trip 被禁用**：`abc_builder_deduplicate` 在重编码已解码文件时于 C++ 侧崩溃（`abcd-file/tests/roundtrip.rs` 的 `encode_roundtrip` 标 `#[ignore]`）。修复方向：在 bridge 的 finalize 前自行实现等价去重，或绕开 `DeduplicateCodeAndDebugInfo`。
-2. 字符串池不可直接枚举（需遍历实体间接收集）。
-3. Builder 无法设置文件类型（dynamic/static），厂商代码缺失，默认 dynamic。
-4. 字节级 round-trip 不可能（builder 自行决定布局），语义等价即可。
-5. `ParamInfo::signature` 在 encode 时不保留（C++ 写侧限制）。
+2. **注解类别在上游 API 24 写入侧合并**：上游 writer 现在只产出 `ANNOTATION` 类别（tag 枚举与读侧仍保留 4 类以兼容旧文件）。bridge 的 4 类注解 API 全部映射到单一向量——encode 会把 runtime/type 注解折叠进 compile-time 桶，这是与上游 es2panda 一致的行为。
+3. 字符串池不可直接枚举（需遍历实体间接收集）。
+4. Builder 无法设置文件类型（dynamic/static），厂商代码缺失，默认 dynamic。
+5. 字节级 round-trip 不可能（builder 自行决定布局），语义等价即可。
+6. `ParamInfo::signature` 在 encode 时不保留（C++ 写侧限制）。

@@ -180,7 +180,7 @@ We use the pre-merged `isa.yaml` directly and do not need to run combine.rb.
 Injected into the `BytecodeInst` class body via `#include <bytecode_instruction_enum_gen.h>`, generating 4 enums:
 
 - `Format` — ~80 formats: `NONE`, `V4_V4`, `V8`, `IMM8`, `PREF_IMM16_V8`, ...
-- `Opcode` — 326 opcodes, value range: non-prefixed 0-220, prefixed 251-11772
+- `Opcode` — 332 opcodes, value range: non-prefixed 0-225, prefixed 251-11772
 - `Flags` — Property bitmask (JUMP, CONDITIONAL, RETURN, etc.)
 - `Exceptions` — Exception type bitmask
 
@@ -357,11 +357,11 @@ Opcode values are encoded as `(sub_opcode << 8) | prefix_byte`:
 
 ## Statistics
 
-- 326 opcodes: 225 non-prefixed (0x00-0xDC) + 101 prefixed (4 prefix groups)
+- 332 opcodes: 230 non-prefixed (0x00-0xE1) + 102 prefixed (4 prefix groups)
 - ~80 instruction formats
 - 4 prefixes: `callruntime` (0xFB), `deprecated` (0xFC), `wide` (0xFD), `throw` (0xFE)
 - Ruby generates 8 header files
 - C++ compiles 2 source files: isa_bridge.cpp + vendor/bytecode_emitter.cpp
 - 22 vendor files, 3 shim files (~55 lines of custom code)
 - C bridge exports 40+ static functions + 326 per-mnemonic emit functions
-- ISA_FLAG_* 24 property flags + ISA_EXC_* exception flags
+- BytecodeFlags 30 property flags + ExceptionType 14 exception flags（由 bytecode.rs.erb 从 isa.yaml 生成）

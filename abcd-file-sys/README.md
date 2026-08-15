@@ -38,7 +38,7 @@ abcd-file-sys/
 
 ### Vendor File Origins
 
-69 files copied verbatim from arkcompiler runtime_core. All vendor files are kept identical to upstream (zero diff) to minimize sync burden.
+73 files copied verbatim from arkcompiler runtime_core. All vendor files are kept identical to upstream (zero diff) to minimize sync burden.
 
 4 missing transitive includes that the upstream build provides are injected via `vendor_fixups.h` (force-included with `-include` / `/FI`), avoiding any vendor file modifications.
 
@@ -60,7 +60,7 @@ gen.rb + per-template requires (Ruby pipeline)
             │
             ▼
     vendor/libpandafile/*.cpp + vendor/libpandabase/utils/utf.cpp
-    (14 vendor .cpp files, compiled directly)
+    (13 vendor libpandafile .cpp files + libpandabase/utils/utf.cpp, compiled directly)
             │
             ▼
     file_bridge.h / file_bridge.cpp (thin C wrapper, extern "C")
@@ -165,8 +165,8 @@ The bridge converts C++ `std::variant<bool, void*, uint8_t, uint16_t, uint32_t, 
 
 ## Statistics
 
-- 69 vendor files (all identical to upstream)
-- 9 shim files
-- 14 vendor `.cpp` files + 1 bridge `.cpp` compiled
+- 73 vendor files (all identical to upstream)
+- 10 shim files
+- 13 vendor libpandafile `.cpp` + libpandabase `utf.cpp` + 1 bridge `.cpp` compiled
 - Ruby generates 3 header files
 - C bridge exports ~170 functions across 10 accessor types + builder

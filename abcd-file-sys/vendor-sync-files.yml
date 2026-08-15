@@ -83,3 +83,4 @@ libpandafile/value.h: libpandafile/value.h
 assembler/annotation.h: assembler/annotation.h
 assembler/assembly-type.h: assembler/assembly-type.h
 assembler/define.h: assembler/define.h
+libpandabase/utils/timers.h: libpandabase/include/libpandabase/utils/timers.h

@@ -3,7 +3,7 @@
 ## 三层结构
 
 ```
-isa.yaml（262 条指令 / 326 个 opcode / 4 个前缀组，vendor 自上游）
+isa.yaml（268 条指令 / 332 个 opcode / 4 个前缀组，vendor 自上游）
         │  Ruby 代码生成（gen.rb + isapi.rb + pandafile_isapi.rb，ERB）
         ▼
 生成的 C++ 头（opcode/format/flags 枚举、操作数解码内联、emitter 声明）
@@ -54,7 +54,7 @@ abcd-isa（decode / encode / Version）
 ## 分类与版本
 
 - 分类：`is_jump / can_throw / is_terminator / is_return_or_throw / is_suspend / is_range / is_throw_ex / has_flag`。opcode 级查询用零填充缓冲构造指令，避免依赖操作数字节。
-- 版本：`Version`（四元组）提供 `current()`（13.0.1.0）、`min_supported()`、`for_api()`、`is_in_supported_range()`、`is_blocked()`（incompatible 黑名单），底层委托 vendor `file_format_version` 实现，不手工复制数据。
+- 版本：`Version`（四元组）提供 `current()`（24.0.0.0）、`min_supported()`、`for_api()`、`is_in_supported_range()`、`is_blocked()`（incompatible 黑名单），底层委托 vendor `file_format_version` 实现，不手工复制数据。
 
 ## 设计原则
 

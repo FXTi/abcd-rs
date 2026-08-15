@@ -68,10 +68,10 @@ fn clone_copy() {
 #[test]
 fn current_returns_valid() {
     let v = Version::current();
-    // The ISA version is 13.0.1.0 as of the current build.
+    // The ISA version is 24.0.0.0 as of the current build.
     assert_eq!(
         v,
-        Version::new(13, 0, 1, 0),
+        Version::new(24, 0, 0, 0),
         "ISA version changed; update this test"
     );
 }

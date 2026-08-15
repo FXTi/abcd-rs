@@ -78,7 +78,10 @@ fn main() {
         .include(&vendor_pf)
         .include(&format!("{manifest}/vendor/libpandabase"))
         // assembler headers for annotation value type validation
-        .include(&format!("{manifest}/vendor/assembler"));
+        .include(&format!("{manifest}/vendor/assembler"))
+        // vendor 根目录：上游代码使用 "libpandabase/utils/timers.h" 这类
+        // 以仓库根为前缀的 include，flat 布局下由本路径解析
+        .include(&format!("{manifest}/vendor"));
 
     // Force-include missing transitive headers that the upstream build provides
     let fixups = format!("{manifest}/bridge/shim/vendor_fixups.h");
