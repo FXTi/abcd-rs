@@ -79,8 +79,8 @@ fn main() {
         .include(&format!("{manifest}/vendor/libpandabase"))
         // assembler headers for annotation value type validation
         .include(&format!("{manifest}/vendor/assembler"))
-        // vendor 根目录：上游代码使用 "libpandabase/utils/timers.h" 这类
-        // 以仓库根为前缀的 include，flat 布局下由本路径解析
+        // vendor root: upstream code uses repo-root-prefixed includes such as
+        // "libpandabase/utils/timers.h", resolved by this path in our flat layout
         .include(&format!("{manifest}/vendor"));
 
     // Force-include missing transitive headers that the upstream build provides

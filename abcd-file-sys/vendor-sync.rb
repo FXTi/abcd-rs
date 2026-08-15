@@ -17,9 +17,10 @@ require 'yaml'
 require 'net/http'
 require 'uri'
 
-# 上游拉取源：openharmony 的 GitHub 官方镜像。
-# 曾使用 raw.gitcode.com，但其 WAF 对 GitHub Actions 的境外 IP 一律返回
-# HTTP 418，导致 CI 每日同步全部失败；该镜像内容与上游 master 同步。
+# Upstream fetch source: OpenHarmony's official GitHub mirror.
+# Previously raw.gitcode.com was used, but its WAF rejects GitHub Actions
+# IPs with HTTP 418, breaking the daily CI sync; the mirror tracks
+# upstream master.
 BASE_URL = 'https://raw.githubusercontent.com/openharmony/arkcompiler_runtime_core/master'
 
 VENDOR_DIR  = File.expand_path('vendor', __dir__)

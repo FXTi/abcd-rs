@@ -4,23 +4,23 @@
 #include <cstdint>
 #include <cstddef>
 
-typedef uint32_t      uLong;  // 明确 32 位，跨平台一致
+typedef uint32_t      uLong;  // explicitly 32-bit for cross-platform consistency
 typedef unsigned char Bytef;
 typedef unsigned int  uInt;
 
 inline uLong adler32(uLong adler, const Bytef *buf, uInt len) {
     constexpr uLong MOD  = 65521;
-    constexpr uInt  NMAX = 5552; // 每批最多处理字节数（见下方溢出证明）
+    constexpr uInt  NMAX = 5552; // max bytes per batch (see overflow proof below)
 
     if (buf == nullptr) return 1UL;
 
     uLong a = adler & 0xffff;
     uLong b = (adler >> 16) & 0xffff;
 
-    // 整批处理：每批 NMAX 字节，批末才取模
+    // Process full batches of NMAX bytes; take the modulus at batch end
     while (len >= NMAX) {
         len -= NMAX;
-        uInt n = NMAX / 16; // 5552 / 16 = 347，整除
+        uInt n = NMAX / 16; // 5552 / 16 = 347, exact division
         do {
             a += buf[ 0]; b += a;
             a += buf[ 1]; b += a;
@@ -44,7 +44,7 @@ inline uLong adler32(uLong adler, const Bytef *buf, uInt len) {
         b %= MOD;
     }
 
-    // 处理尾部剩余字节（< NMAX，不必展开）
+    // Handle the remaining tail bytes (< NMAX, no unrolling needed)
     if (len > 0) {
         while (len--) { a += *buf++; b += a; }
         a %= MOD;

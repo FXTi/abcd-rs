@@ -28,7 +28,7 @@
 #include <iostream>
 #include <stdexcept>
 #include "zlib.h"
-// 上游 file_item_container 使用计时埋点；vendor 根 include 路径解析此头。
+// file_item_container uses Timer instrumentation upstream; the vendor/ include root resolves this header.
 #include "libpandabase/utils/timers.h"
 #include "annotation.h"  // pandasm::Value — for annotation value type validation
 
@@ -272,9 +272,11 @@ const char *ARCHIVE_FILENAME = "";
 
 }  // namespace panda::panda_file
 
-// 上游 timers.cpp 依赖 nlohmann/json 与 os::file::File 写盘能力，我们不引入。
-// 这里只补两个静态成员的定义，初始值与上游 timers.cpp 一致（no-op 函数指针），
-// 因此 file_item_container.cpp 里的 ScopeTimer 是零开销占位测量。
+// Upstream timers.cpp depends on nlohmann/json and os::file::File write
+// support, which we do not bring in. We only provide definitions for the
+// two static members, initialized to the same no-op function pointers as
+// upstream timers.cpp, so ScopeTimer in file_item_container.cpp is a
+// zero-cost placeholder measurement.
 namespace panda {
 TimeStartFunc Timer::timerStart = [](const std::string_view, std::string) {};
 TimeEndFunc Timer::timerEnd = [](const std::string_view, std::string) {};

@@ -1,15 +1,13 @@
-# ABC 容器层设计（abcd-file-sys / abcd-file）
+# ABC Container Layer Design (abcd-file-sys / abcd-file)
 
-> 本文档取代原根目录的 `abcd-file.md`（内容已并入并更新）。
+## File layout
 
-## 文件布局
+The first 8 bytes are the magic `PANDA\0\0\0`, followed by a little-endian field sequence. Using the development baseline `modules.abc` as an example:
 
-头 8 字节 magic `PANDA\0\0\0`，之后是小端字段序列。以开发基准 `modules.abc` 为例：
-
-| 偏移 | 字段 | 实例值 |
-|------|------|--------|
+| Offset | Field | Sample value |
+|--------|-------|--------------|
 | 0x00 | magic | `PANDA\0\0\0` |
-| 0x08 | checksum（adler32，从 version 字段起算） | `0xC30BD6FF` |
+| 0x08 | checksum (adler32, computed from the version field onward) | `0xC30BD6FF` |
 | 0x0C | version | `12.0.6.0` |
 | 0x10 | file_size | 21.6MB |
 | 0x14/0x18 | foreign_off / foreign_size | 0 / 0 |
@@ -22,47 +20,47 @@
 | 0x34 | num_indexes | 2 |
 | 0x38 | index_section_off | … |
 
-版本条件化：`12.0.6.0` 是 `LAST_CONTAINS_LITERAL_IN_HEADER_VERSION`，即此版本前 header 里携带字面量数组索引，之后移入其他区段——读写两侧都按版本分支（vendor `ContainsLiteralArrayInHeader`）。
+Version conditioning: `12.0.6.0` is `LAST_CONTAINS_LITERAL_IN_HEADER_VERSION` — before that version the header carries the literal-array index, after it the index moves elsewhere. Both sides branch on the version (vendored `ContainsLiteralArrayInHeader`).
 
-## 实体模型
+## Entity model
 
-- 所有实体以 32-bit offset 定位；方法内引用用 16-bit index，经 `IndexHeader`（class/method/field/proto 四张索引表）解析为 offset。
-- 类/方法/字段/代码都是"ULEB128 前缀字段 + tag 序列"的紧凑编码；注解四类（compile-time / runtime / type / runtime-type）、debug info（行号程序 + 常量池）、模块数据（LiteralArray 编码的 import/export 记录）全部覆盖。
+- All entities are located by 32-bit offsets; references inside methods use 16-bit indices resolved through `IndexHeader` (class/method/field/proto index tables) to offsets.
+- Classes/methods/fields/code are "ULEB128 prefix fields + tag sequences"; four annotation categories (compile-time / runtime / type / runtime-type), debug info (line-number program + constant pool), and module data (import/export records encoded as a literal array) are all covered.
 
-## FFI 设计（file_bridge.h / file_bridge.cpp）
+## FFI design (file_bridge.h / file_bridge.cpp)
 
-- 纯 C 接口（opaque handle），每个 accessor 走 `open → use → close` 生命周期。
-- 枚举一律回调（`int (*cb)(..., void *ctx)`，返回非 0 提前终止）。
-- 错误用 sentinel：`UINT32_MAX` = 不存在、`0` = size_t 失败。
-- 编译期防线：`static_assert` 锁死 vendor 假设（MAGIC_SIZE=8、LiteralTag/AnnotationValueType 字符编码、`Type::TypeId::U32 == 0x08`），vendor 变动在编译期爆炸而非运行时。
-- 两遍 bindgen：`bindings.rs`（桥 API）+ `enum_bindings.rs`（vendor 枚举）。ACC_* 访问标志由 build.rs **从 vendor `modifiers.h` 自动提取名称**、值引用 vendor constexpr——名称可列、数值永远来自 vendor，杜绝手写镜像漂移。
+- Pure C interface (opaque handles); each accessor follows an `open → use → close` lifecycle.
+- Enumeration is callback-based (`int (*cb)(..., void *ctx)`, non-zero stops early).
+- Errors use sentinels: `UINT32_MAX` = absent, `0` = size_t failure.
+- Compile-time guardrails: `static_assert`s pin vendor assumptions (MAGIC_SIZE=8, LiteralTag/AnnotationValueType char encodings, `Type::TypeId::U32 == 0x08`) so vendor changes explode at compile time instead of runtime.
+- Two bindgen passes: `bindings.rs` (bridge API) + `enum_bindings.rs` (vendor enums). The ACC_* access flags are extracted by build.rs **by name from the vendored `modifiers.h`** with values referencing vendor constexprs — names are listed, values always come from vendor code, eliminating hand-written mirror drift.
 
 ## Builder
 
-`AbcBuilder`（`ItemContainer` + `MemoryWriter`）按"添加各项 → finalize → 释放"组织：
+`AbcBuilder` (`ItemContainer` + `MemoryWriter`) follows "add items → finalize → free":
 
-- handle 表按类型分列（class/foreign_class/string/literal_array/method/field/code/debug/lnp/annotation/proto/…），tagged class handle 高位 `0x80000000` 区分 foreign。
-- literal array 先 staging（平铺 `(tag, value)` 对），`finalize` 时 flush 进 `LiteralArrayItem`。
-- `ItemContainer::ComputeLayout()` 决定布局：header → 类索引 → 索引区 → foreign → 主体 → 行号程序索引；checksum 在写出后回填。
+- Handle tables per item kind (class/foreign_class/string/literal_array/method/field/code/debug/lnp/annotation/proto/…); tagged class handles use the high bit `0x80000000` for foreign classes.
+- Literal arrays stage flat `(tag, value)` pairs, flushed into `LiteralArrayItem` at finalize.
+- `ItemContainer::ComputeLayout()` decides the layout: header → class index → index section → foreign → body → line-number-program index; the checksum is back-filled after writing.
 
-## vendor 与 shim 策略
+## Vendor and shim strategy
 
-vendor（73 文件，与上游零 diff）+ 10 个 shim 替换重型依赖：
+Vendor (73 files, zero diff against upstream) + 10 shims replacing heavy dependencies:
 
-- `zlib.h`：内联 adler32（NMAX=5552 分批取模），免链接系统 zlib；
-- `os/mem.h`：非拥有 `MapPtr`（调用方持有内存）；
-- `pgo.h`：`ProfileOptimizer` 空实现（file_item_container 仅需类型）；
-- `platform_compat.h`：MSVC 的 clz/ctz/popcount 等 constexpr 位运算内建；
-- `vendor_fixups.h`：以 `-include` 强制注入上游构建系统提供的 4 个传递头，**不改 vendor 文件本身**；
-- `libpandabase/utils/timers.h`：**vendored 零 diff**（EVENT 常量 + inline `ScopeTimer`）；上游 `timers.cpp` 依赖 `nlohmann/json` 与 `os::file::File` 写盘，不引入——bridge 里补两个静态成员的定义（no-op 函数指针，与上游 `TimerStartDoNothing` 初始值等价）。
+- `zlib.h`: inline adler32 (NMAX=5552 batch modulus), no system zlib link;
+- `os/mem.h`: non-owning `MapPtr` (the caller owns the memory);
+- `pgo.h`: no-op `ProfileOptimizer` (file_item_container only needs the type);
+- `platform_compat.h`: constexpr clz/ctz/popcount etc. bit builtins for MSVC;
+- `vendor_fixups.h`: force-injected (`-include`) transitive headers that the upstream build system provides — **vendor files themselves are never modified**;
+- `libpandabase/utils/timers.h`: **vendored zero-diff** (EVENT constants + inline `ScopeTimer`); upstream `timers.cpp` depends on `nlohmann/json` and `os::file::File` write support, which we do not bring in — the bridge provides definitions for the two static members instead (no-op function pointers, equivalent to upstream's `TimerStartDoNothing` defaults).
 
-构建管线：Ruby（gen.rb，需 Ruby ≥ 2.5）生成 `type.h` / `source_lang_enum.h` / `file_format_version.h` → cc 编译 14 个 vendor `.cpp` + bridge → bindgen。
+Build pipeline: Ruby (gen.rb, needs Ruby ≥ 2.5) generates `type.h` / `source_lang_enum.h` / `file_format_version.h` → cc compiles the 13 vendored libpandafile `.cpp` files + `utf.cpp` + the bridge → bindgen.
 
-## 已知限制
+## Known limitations
 
-1. **`encode()` 语义 round-trip 被禁用**：`abc_builder_deduplicate` 在重编码已解码文件时于 C++ 侧崩溃（`abcd-file/tests/roundtrip.rs` 的 `encode_roundtrip` 标 `#[ignore]`）。修复方向：在 bridge 的 finalize 前自行实现等价去重，或绕开 `DeduplicateCodeAndDebugInfo`。
-2. **注解类别在上游 API 24 写入侧合并**：上游 writer 现在只产出 `ANNOTATION` 类别（tag 枚举与读侧仍保留 4 类以兼容旧文件）。bridge 的 4 类注解 API 全部映射到单一向量——encode 会把 runtime/type 注解折叠进 compile-time 桶，这是与上游 es2panda 一致的行为。
-3. 字符串池不可直接枚举（需遍历实体间接收集）。
-4. Builder 无法设置文件类型（dynamic/static），厂商代码缺失，默认 dynamic。
-5. 字节级 round-trip 不可能（builder 自行决定布局），语义等价即可。
-6. `ParamInfo::signature` 在 encode 时不保留（C++ 写侧限制）。
+1. **`encode()` semantic round-trip is disabled**: `abc_builder_deduplicate` crashes on the C++ side when re-encoding decoded files (`encode_roundtrip` in `abcd-file/tests/roundtrip.rs` is `#[ignore]`d). Fix directions: implement equivalent dedup before finalize in the bridge, or bypass `DeduplicateCodeAndDebugInfo`.
+2. **Annotation categories were consolidated upstream at API 24**: the upstream writer now only emits the `ANNOTATION` category (the tag enum and the reader keep all four categories for legacy files). The bridge maps its four annotation APIs onto the single vector — encode folds runtime/type annotations into the compile-time bucket, matching upstream es2panda behavior.
+3. The string pool cannot be enumerated directly (collected indirectly by walking entities).
+4. The builder cannot set the file type (dynamic/static); the vendor code is missing it, defaults to dynamic.
+5. Byte-level round-trip is impossible (the builder decides its own layout); semantic equivalence is the goal.
+6. `ParamInfo::signature` is not preserved during encode (C++ writer limitation).

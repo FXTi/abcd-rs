@@ -1,19 +1,19 @@
-# abcd-rs 设计文档
+# abcd-rs Design Docs
 
-ArkCompiler ABC 字节码 Rust 工具链（第二代）的设计文档。全部为 Markdown，与代码同仓库维护。
+Design documentation for the ArkCompiler ABC bytecode Rust toolkit (second generation). All documents are Markdown and live with the code.
 
-## 索引
+## Index
 
-| 文档 | 内容 |
-|------|------|
-| [overview.md](overview.md) | 总体架构：定位、crate 分层、数据流、版本分层、当前状态 |
-| [isa.md](isa.md) | ISA 层：代码生成管线、Bytecode 枚举、解码/编码、分类与版本 API |
-| [file-format.md](file-format.md) | ABC 容器层：文件布局、accessor/bridge 设计、builder、shim 策略 |
-| [ir.md](ir.md) | SSA IR：lift / opt / lower 全链路设计、寄存器分配、论文依据 |
-| [vendor-sync.md](vendor-sync.md) | vendor 同步体系：零 diff 原则、元数据锁定、一致性检查 |
-| [ci.md](ci.md) | CI/CD：job 设计理由、发布形态 |
+| Doc | Contents |
+|-----|----------|
+| [overview.md](overview.md) | Architecture: positioning, crate layering, data flow, version-aware design, current status |
+| [isa.md](isa.md) | ISA layer: code generation pipeline, Bytecode enum, decode/encode, classification and version APIs |
+| [file-format.md](file-format.md) | ABC container layer: file layout, accessor/bridge design, builder, shim strategy |
+| [ir.md](ir.md) | SSA IR: lift / opt / lower end-to-end design, register allocation, paper references |
+| [vendor-sync.md](vendor-sync.md) | Vendor sync system: zero-diff principle, metadata locking, consistency checks |
+| [ci.md](ci.md) | CI/CD: job rationale, release policy |
 
-## 一句话管线
+## The pipeline in one line
 
 ```
 .abc ──decode──▶ abcd-isa ──▶ abcd-file ──lift──▶ abcd-ir (SSA) ──opt──▶ ──lower──▶ abcd-file ──encode──▶ .abc

@@ -3,12 +3,12 @@
 /output
 .DS_Store
 
-# 上游参考源码树（仅本地研究用，不入库）
+# Upstream reference source trees (local research only, not committed)
 /arkcompiler
 /hermes-main
 
-# 反编译产物（含第三方闭源代码，严禁入库）
+# Decompilation output (contains third-party closed source; never commit)
 /decompiled
 
-# 本地工具配置
+# Local tooling config
 .claude
