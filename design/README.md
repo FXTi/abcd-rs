@@ -2,6 +2,8 @@
 
 Design documentation for the ArkCompiler ABC bytecode Rust toolkit (second generation). All documents are Markdown and live with the code.
 
+These are internal working documents — the knowledge deposit of the project. They will be deleted and rewritten from the stabilized state at v0.1 (see roadmap.md).
+
 ## Index
 
 | Doc | Contents |
@@ -12,6 +14,8 @@ Design documentation for the ArkCompiler ABC bytecode Rust toolkit (second gener
 | [ir.md](ir.md) | SSA IR: lift / opt / lower end-to-end design, register allocation, paper references |
 | [vendor-sync.md](vendor-sync.md) | Vendor sync system: zero-diff principle, metadata locking, consistency checks |
 | [ci.md](ci.md) | CI/CD: job rationale, release policy |
+| [roadmap.md](roadmap.md) | Two-phase plan, IR positioning, acceptance criteria, working agreements |
+| [review-isa-file.md](review-isa-file.md) | Quality review of the isa/file layers: findings, severity, fix plan |
 
 ## The pipeline in one line
 
