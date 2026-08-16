@@ -17,15 +17,15 @@ Status: `open` = reported, awaiting triage · `fixed` = landed with a regression
 | 4 | P1 | `abc_file_get_type` is stubbed to always return Dynamic; static files are misreported. | open |
 | 5 | P1 | MUTF-8 → `String` uses `to_string_lossy`; NUL/surrogate/astral characters corrupt to U+FFFD. | open |
 | 6 | P1 | `encode()` keys `method_handles`/`field_handles` by name; same-named methods across classes collide (common in real JS). | open |
-| 7 | P1 | `abc_file_open` never validates magic/checksum; garbage input reaches accessors. | open |
-| 8 | P1 | Bridge `extern "C"` functions have no exception guards; any `FileAccessException` crosses the FFI → SIGABRT. | open |
+| 7 | P1 | `abc_file_open` never validates magic/checksum; garbage input reaches accessors. | fixed |
+| 8 | P1 | Bridge `extern "C"` functions have no exception guards; any `FileAccessException` crosses the FFI → SIGABRT. | fixed |
 | 9 | P1 | Annotation categories collapse to ANNOTATION on write (upstream API-24 behavior) — accepted, but must be the documented round-trip contract. | open |
 | 10 | P2 | `File::GetClassId` is a linear scan; class hash table APIs are stubs. | open |
 | 11 | P2 | `decode()` eagerly extracts all debug info even when the caller does not need it. | open |
 | 12 | P2 | Unused workspace dependencies (clap/serde/serde_yaml/memmap2/env_logger/log) left over from the removed CLI. | open |
 | 13 | P2 | Stale README claims: both `-sys` READMEs reference the removed `links` key; isa-sys README documents a dead `DEP_ISA_BRIDGE_BINDINGS_RS` mechanism. | open |
 | 14 | P2 | C API footguns: `abc_builder_class_add_field` with REFERENCE type hits a C++ assert; `abc_builder_literal_array_add_method` requires prior method registration. | open |
-| 15 | P2 | `Error::Open` carries no C++-side reason. | open |
+| 15 | P2 | `Error::Open` carries no C++-side reason. | fixed |
 
 ## Findings with evidence
 

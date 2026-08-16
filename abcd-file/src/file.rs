@@ -26,7 +26,12 @@ impl<'data> AbcFile<'data> {
     pub fn open(data: &'data [u8]) -> Result<Self, Error> {
         let raw = unsafe { sys::abc_file_open(data.as_ptr(), data.len()) };
         if raw.is_null() {
-            return Err(Error::Open);
+            // SAFETY: abc_file_open_error returns a thread-local NUL-terminated
+            // string set by the failed open call.
+            let reason = unsafe { CStr::from_ptr(sys::abc_file_open_error()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::Open(reason));
         }
         Ok(Self {
             raw,

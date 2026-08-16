@@ -1,9 +1,9 @@
 /// Errors from ABC file operations.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    /// Failed to open or parse an ABC file.
-    #[error("failed to open ABC file")]
-    Open,
+    /// Failed to open or parse an ABC file (reason from the C++ side).
+    #[error("failed to open ABC file: {0}")]
+    Open(String),
     /// An entity offset does not point to a valid entity.
     #[error("invalid entity offset {0:#x}")]
     InvalidOffset(u32),

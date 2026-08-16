@@ -343,54 +343,117 @@ extern "C" {
 
 /* ========== File handle ========== */
 
+static thread_local std::string g_open_error;
+
+const char *abc_file_open_error(void) {
+try {
+    return g_open_error.c_str();
+} catch (...) {
+    return nullptr;
+}
+}
+
 AbcFileHandle *abc_file_open(const uint8_t *data, size_t len) {
-    if (!data || len < sizeof(File::Header)) return nullptr;
-    auto *bytes = reinterpret_cast<std::byte *>(const_cast<uint8_t *>(data));
-    panda::os::mem::ConstBytePtr ptr(bytes, len, nullptr);
-    auto file = File::OpenFromMemory(std::move(ptr));
-    if (!file) return nullptr;
-    return new (std::nothrow) AbcFileHandle(std::move(file));
+try {
+    g_open_error.clear();
+    if (!data || len < sizeof(File::Header)) {
+        g_open_error = "buffer too small for file header";
+        return nullptr;
+    }
+    if (std::memcmp(data, File::MAGIC.data(), File::MAGIC_SIZE) != 0) {
+        g_open_error = "bad magic";
+        return nullptr;
+    }
+    try {
+        auto *bytes = reinterpret_cast<std::byte *>(const_cast<uint8_t *>(data));
+        panda::os::mem::ConstBytePtr ptr(bytes, len, nullptr);
+        auto file = File::OpenFromMemory(std::move(ptr));
+        if (!file) {
+            g_open_error = "OpenFromMemory failed";
+            return nullptr;
+        }
+        return new (std::nothrow) AbcFileHandle(std::move(file));
+    } catch (const std::exception &e) {
+        g_open_error = e.what();
+        return nullptr;
+    }
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_file_close(AbcFileHandle *f) {
+try {
     delete f;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_file_num_classes(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->num_classes;
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_file_class_offset(const AbcFileHandle *f, uint32_t idx) {
+try {
     auto classes = f->file->GetClasses();
     if (idx >= classes.Size()) return UINT32_MAX;
     return classes[idx];
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_file_num_literalarrays(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->num_literalarrays;
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_file_literalarray_offset(const AbcFileHandle *f, uint32_t idx) {
+try {
     auto arrays = f->file->GetLiteralArrays();
     if (idx >= arrays.Size()) return UINT32_MAX;
     return arrays[idx];
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_file_literalarray_idx_off(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->literalarray_idx_off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_file_size(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->file_size;
+} catch (...) {
+    return 0;
+}
 }
 
 void abc_file_version(const AbcFileHandle *f, uint8_t out[4]) {
+try {
     auto &ver = f->file->GetHeader()->version;
     out[0] = ver[0]; out[1] = ver[1]; out[2] = ver[2]; out[3] = ver[3];
+} catch (...) {
+    return;
+}
 }
 
 size_t abc_file_get_string(const AbcFileHandle *f, uint32_t offset,
                            char *buf, size_t buf_len) {
+try {
     auto sd = f->file->GetStringData(File::EntityId(offset));
     if (!sd.data) return 0;
     // Find null terminator
@@ -402,70 +465,122 @@ size_t abc_file_get_string(const AbcFileHandle *f, uint32_t offset,
         return copy;
     }
     return len;
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_resolve_method_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx) {
+try {
     auto id = f->file->ResolveMethodIndex(File::EntityId(entity_off), idx);
     uint32_t off = id.GetOffset();
     return off == 0 ? UINT32_MAX : off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_resolve_class_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx) {
+try {
     auto id = f->file->ResolveClassIndex(File::EntityId(entity_off), idx);
     uint32_t off = id.GetOffset();
     return off == 0 ? UINT32_MAX : off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_resolve_field_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx) {
+try {
     auto id = f->file->ResolveFieldIndex(File::EntityId(entity_off), idx);
     uint32_t off = id.GetOffset();
     return off == 0 ? UINT32_MAX : off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_resolve_proto_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx) {
+try {
     auto id = f->file->ResolveProtoIndex(File::EntityId(entity_off), idx);
     uint32_t off = id.GetOffset();
     return off == 0 ? UINT32_MAX : off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_file_get_class_id(const AbcFileHandle *f, const char *mutf8_name) {
+try {
     auto id = f->file->GetClassId(reinterpret_cast<const uint8_t *>(mutf8_name));
     uint32_t off = id.GetOffset();
     return off == 0 ? UINT32_MAX : off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 int abc_file_is_external(const AbcFileHandle *f, uint32_t entity_off) {
+try {
     return f->file->IsExternal(File::EntityId(entity_off)) ? 1 : 0;
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_file_get_string_utf16_len(const AbcFileHandle *f, uint32_t offset) {
+try {
     auto sd = f->file->GetStringData(File::EntityId(offset));
     return sd.utf16_length;
+} catch (...) {
+    return 0;
+}
 }
 
 int abc_file_get_string_is_ascii(const AbcFileHandle *f, uint32_t offset) {
+try {
     auto sd = f->file->GetStringData(File::EntityId(offset));
     return sd.is_ascii ? 1 : 0;
+} catch (...) {
+    return 0;
+}
 }
 
 int abc_file_validate_checksum(const AbcFileHandle *f) {
+try {
     return f->file->ValidateChecksum() ? 1 : 0;
+} catch (...) {
+    return 0;
+}
 }
 
 int8_t abc_file_get_type(const uint8_t *data, int32_t size) {
+try {
     return static_cast<int8_t>(panda::panda_file::GetFileType(data, size));
+} catch (...) {
+    return -1;
+}
 }
 
 const uint8_t *abc_file_get_raw_data(const AbcFileHandle *f) {
+try {
     return f->file->GetBase();
+} catch (...) {
+    return nullptr;
+}
 }
 
 uint32_t abc_file_num_index_headers(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->num_indexes;
+} catch (...) {
+    return 0;
+}
 }
 
 void abc_file_get_index_header(const AbcFileHandle *f, uint32_t idx,
                                struct AbcIndexHeader *out) {
+try {
     auto headers = f->file->GetIndexHeaders();
     if (idx >= headers.Size()) {
         std::memset(out, 0, sizeof(*out));
@@ -482,236 +597,428 @@ void abc_file_get_index_header(const AbcFileHandle *f, uint32_t idx,
     out->field_idx_off = ih.field_idx_off;
     out->proto_idx_size = ih.proto_idx_size;
     out->proto_idx_off = ih.proto_idx_off;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_resolve_offset_by_index(const AbcFileHandle *f, uint32_t entity_off, uint16_t idx) {
+try {
     auto id = f->file->ResolveOffsetByIndex(File::EntityId(entity_off), idx);
     uint32_t off = id.GetOffset();
     return off == 0 ? UINT32_MAX : off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_resolve_lnp_index(const AbcFileHandle *f, uint32_t idx) {
+try {
     auto id = f->file->ResolveLineNumberProgramIndex(idx);
     uint32_t off = id.GetOffset();
     return off == 0 ? UINT32_MAX : off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 /* ========== Additional Header Fields ========== */
 
 uint32_t abc_file_checksum(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->checksum;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_file_foreign_off(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->foreign_off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_file_foreign_size(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->foreign_size;
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_file_class_idx_off(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->class_idx_off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_file_num_lnps(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->num_lnps;
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_file_lnp_idx_off(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->lnp_idx_off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_file_index_section_off(const AbcFileHandle *f) {
+try {
     return f->file->GetHeader()->index_section_off;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 /* ========== Version Utilities ========== */
 
 void abc_get_current_version(uint8_t out[4]) {
+try {
     auto &v = panda::panda_file::version;
     out[0] = v[0]; out[1] = v[1]; out[2] = v[2]; out[3] = v[3];
+} catch (...) {
+    return;
+}
 }
 
 void abc_get_min_version(uint8_t out[4]) {
+try {
     auto &v = panda::panda_file::minVersion;
     out[0] = v[0]; out[1] = v[1]; out[2] = v[2]; out[3] = v[3];
+} catch (...) {
+    return;
+}
 }
 
 int abc_is_version_less_or_equal(const uint8_t current[4], const uint8_t target[4]) {
+try {
     std::array<uint8_t, File::VERSION_SIZE> c = {current[0], current[1], current[2], current[3]};
     std::array<uint8_t, File::VERSION_SIZE> t = {target[0], target[1], target[2], target[3]};
     return panda::panda_file::IsVersionLessOrEqual(c, t) ? 1 : 0;
+} catch (...) {
+    return -1;
+}
 }
 
 int abc_contains_literal_array_in_header(const uint8_t ver[4]) {
+try {
     std::array<uint8_t, File::VERSION_SIZE> v = {ver[0], ver[1], ver[2], ver[3]};
     return panda::panda_file::ContainsLiteralArrayInHeader(v) ? 1 : 0;
+} catch (...) {
+    return -1;
+}
 }
 
 /* ========== Proto Data Accessor ========== */
 
 AbcProtoAccessor *abc_proto_open(const AbcFileHandle *f, uint32_t proto_off) {
+try {
     return new (std::nothrow) AbcProtoAccessor(*f->file, File::EntityId(proto_off));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_proto_close(AbcProtoAccessor *a) {
+try {
     delete a;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_proto_num_args(AbcProtoAccessor *a) {
+try {
     return a->accessor.GetNumArgs();
+} catch (...) {
+    return 0;
+}
 }
 
 uint8_t abc_proto_get_return_type(const AbcProtoAccessor *a) {
+try {
     return static_cast<uint8_t>(a->accessor.GetReturnType().GetId());
+} catch (...) {
+    return UINT8_MAX;
+}
 }
 
 uint8_t abc_proto_get_arg_type(const AbcProtoAccessor *a, uint32_t idx) {
+try {
     return static_cast<uint8_t>(a->accessor.GetArgType(idx).GetId());
+} catch (...) {
+    return UINT8_MAX;
+}
 }
 
 uint32_t abc_proto_get_reference_type(AbcProtoAccessor *a, uint32_t idx) {
+try {
     return a->accessor.GetReferenceType(idx).GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_proto_get_ref_num(AbcProtoAccessor *a) {
+try {
     return static_cast<uint32_t>(a->accessor.GetRefNum());
+} catch (...) {
+    return 0;
+}
 }
 
 void abc_proto_enumerate_types(AbcProtoAccessor *a, AbcProtoTypeCb cb, void *ctx) {
+try {
     a->accessor.EnumerateTypes([&](Type t) {
         cb(static_cast<uint8_t>(t.GetId()), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_proto_get_shorty(AbcProtoAccessor *a, const uint8_t **out_data) {
+try {
     auto shorty = a->accessor.GetShorty();
     *out_data = shorty.data();
     return static_cast<uint32_t>(shorty.size());
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_proto_get_size(AbcProtoAccessor *a) {
+try {
     return static_cast<uint32_t>(a->accessor.GetSize());
+} catch (...) {
+    return 0;
+}
 }
 
 int abc_proto_is_equal(AbcProtoAccessor *a, AbcProtoAccessor *b) {
+try {
     return a->accessor.IsEqual(&b->accessor) ? 1 : 0;
+} catch (...) {
+    return -1;
+}
 }
 
 uint32_t abc_proto_get_proto_id(const AbcProtoAccessor *a) {
+try {
     return a->accessor.GetProtoId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 /* ========== Class Data Accessor ========== */
 
 AbcClassAccessor *abc_class_open(const AbcFileHandle *f, uint32_t offset) {
+try {
     return new (std::nothrow) AbcClassAccessor(*f->file, File::EntityId(offset));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_class_close(AbcClassAccessor *a) {
+try {
     delete a;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_class_super_class_off(AbcClassAccessor *a) {
+try {
     return a->accessor.GetSuperClassId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_class_access_flags(AbcClassAccessor *a) {
+try {
     return a->accessor.GetAccessFlags();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_class_num_fields(AbcClassAccessor *a) {
+try {
     return a->accessor.GetFieldsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_class_num_methods(AbcClassAccessor *a) {
+try {
     return a->accessor.GetMethodsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_class_size(AbcClassAccessor *a) {
+try {
     return a->accessor.GetSize();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_class_source_file_off(AbcClassAccessor *a) {
+try {
     auto id = a->accessor.GetSourceFileId();
     if (!id) return UINT32_MAX;
     return id->GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_class_enumerate_methods(AbcClassAccessor *a, AbcMethodOffsetCb cb, void *ctx) {
+try {
     a->accessor.EnumerateMethods([&](panda::panda_file::MethodDataAccessor &mda) {
         cb(mda.GetMethodId().GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 void abc_class_enumerate_fields(AbcClassAccessor *a, AbcFieldOffsetCb cb, void *ctx) {
+try {
     a->accessor.EnumerateFields([&](panda::panda_file::FieldDataAccessor &fda) {
         cb(fda.GetFieldId().GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_class_get_ifaces_number(AbcClassAccessor *a) {
+try {
     return a->accessor.GetIfacesNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_class_get_interface_id(AbcClassAccessor *a, uint32_t idx) {
+try {
     return a->accessor.GetInterfaceId(idx).GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_class_enumerate_interfaces(AbcClassAccessor *a, AbcEntityIdCb cb, void *ctx) {
+try {
     a->accessor.EnumerateInterfaces([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 uint8_t abc_class_get_source_lang(AbcClassAccessor *a) {
+try {
     auto lang = a->accessor.GetSourceLang();
     if (!lang) return UINT8_MAX;
     return static_cast<uint8_t>(*lang);
+} catch (...) {
+    return UINT8_MAX;
+}
 }
 
 void abc_class_enumerate_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 void abc_class_enumerate_runtime_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateRuntimeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 void abc_class_enumerate_type_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateTypeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 void abc_class_enumerate_runtime_type_annotations(AbcClassAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateRuntimeTypeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_class_get_annotations_number(AbcClassAccessor *a) {
+try {
     return a->accessor.GetAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_class_get_runtime_annotations_number(AbcClassAccessor *a) {
+try {
     return a->accessor.GetRuntimeAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_class_get_class_id(const AbcClassAccessor *a) {
+try {
     return a->accessor.GetClassId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 const uint8_t *abc_class_get_descriptor(const AbcClassAccessor *a) {
+try {
     return a->accessor.GetDescriptor();
+} catch (...) {
+    return nullptr;
+}
 }
 
 size_t abc_class_get_name(const AbcClassAccessor *a, char *buf, size_t buf_len) {
+try {
     auto sd = a->accessor.GetName();
     if (!sd.data) return 0;
     size_t len = std::strlen(reinterpret_cast<const char *>(sd.data));
@@ -722,151 +1029,275 @@ size_t abc_class_get_name(const AbcClassAccessor *a, char *buf, size_t buf_len) 
         return copy;
     }
     return len;
+} catch (...) {
+    return 0;
+}
 }
 
 /* ========== Method Data Accessor ========== */
 
 AbcMethodAccessor *abc_method_open(const AbcFileHandle *f, uint32_t offset) {
+try {
     return new (std::nothrow) AbcMethodAccessor(*f->file, File::EntityId(offset));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_method_close(AbcMethodAccessor *a) {
+try {
     delete a;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_method_name_off(const AbcMethodAccessor *a) {
+try {
     return a->accessor.GetNameId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint16_t abc_method_class_idx(const AbcMethodAccessor *a) {
+try {
     return a->accessor.GetClassIdx();
+} catch (...) {
+    return 0xFFFF;
+}
 }
 
 uint16_t abc_method_proto_idx(const AbcMethodAccessor *a) {
+try {
     return a->accessor.GetProtoIdx();
+} catch (...) {
+    return 0xFFFF;
+}
 }
 
 uint32_t abc_method_access_flags(AbcMethodAccessor *a) {
+try {
     return a->accessor.GetAccessFlags();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_method_code_off(AbcMethodAccessor *a) {
+try {
     auto id = a->accessor.GetCodeId();
     if (!id) return UINT32_MAX;
     return id->GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_method_debug_info_off(AbcMethodAccessor *a) {
+try {
     auto id = a->accessor.GetDebugInfoId();
     if (!id) return UINT32_MAX;
     return id->GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_method_get_class_id(const AbcMethodAccessor *a) {
+try {
     return a->accessor.GetClassId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_method_get_proto_id(const AbcMethodAccessor *a) {
+try {
     return a->accessor.GetProtoId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 int abc_method_is_external(const AbcMethodAccessor *a) {
+try {
     return a->accessor.IsExternal() ? 1 : 0;
+} catch (...) {
+    return 0;
+}
 }
 
 uint8_t abc_method_get_source_lang(AbcMethodAccessor *a) {
+try {
     auto lang = a->accessor.GetSourceLang();
     if (!lang) return UINT8_MAX;
     return static_cast<uint8_t>(*lang);
+} catch (...) {
+    return UINT8_MAX;
+}
 }
 
 void abc_method_enumerate_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 void abc_method_enumerate_runtime_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateRuntimeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_method_get_param_annotation_id(AbcMethodAccessor *a) {
+try {
     auto id = a->accessor.GetParamAnnotationId();
     if (!id) return UINT32_MAX;
     return id->GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_method_get_runtime_param_annotation_id(AbcMethodAccessor *a) {
+try {
     auto id = a->accessor.GetRuntimeParamAnnotationId();
     if (!id) return UINT32_MAX;
     return id->GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_method_enumerate_types_in_proto(AbcMethodAccessor *a, AbcProtoTypeExCb cb, void *ctx) {
+try {
     a->accessor.EnumerateTypesInProto([&](Type t, File::EntityId class_id) {
         cb(static_cast<uint8_t>(t.GetId()), class_id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 void abc_method_enumerate_type_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateTypeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 void abc_method_enumerate_runtime_type_annotations(AbcMethodAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateRuntimeTypeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_method_get_annotations_number(AbcMethodAccessor *a) {
+try {
     return a->accessor.GetAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_method_get_runtime_annotations_number(AbcMethodAccessor *a) {
+try {
     return a->accessor.GetRuntimeAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_method_get_type_annotations_number(AbcMethodAccessor *a) {
+try {
     return a->accessor.GetTypeAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_method_get_runtime_type_annotations_number(AbcMethodAccessor *a) {
+try {
     return a->accessor.GetRuntimeTypeAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_method_get_size(AbcMethodAccessor *a) {
+try {
     return static_cast<uint32_t>(a->accessor.GetSize());
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_method_get_method_id(const AbcMethodAccessor *a) {
+try {
     return a->accessor.GetMethodId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 int abc_method_has_valid_proto(const AbcMethodAccessor *a) {
+try {
     return a->accessor.HasValidProto() ? 1 : 0;
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_method_get_numerical_annotation(AbcMethodAccessor *a, uint32_t field_id) {
+try {
     return a->accessor.GetNumericalAnnotation(field_id);
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_method_get_name_off_static(const AbcFileHandle *f, uint32_t method_off) {
+try {
     return MethodDA::GetNameId(*f->file, File::EntityId(method_off)).GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_method_get_class_id_static(const AbcFileHandle *f, uint32_t method_off) {
+try {
     return MethodDA::GetClassId(*f->file, File::EntityId(method_off)).GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_method_get_proto_id_static(const AbcFileHandle *f, uint32_t method_off) {
+try {
     return MethodDA::GetProtoId(*f->file, File::EntityId(method_off)).GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 size_t abc_method_get_name(const AbcMethodAccessor *a, char *buf, size_t buf_len) {
+try {
     auto sd = a->accessor.GetName();
     if (!sd.data) return 0;
     size_t len = std::strlen(reinterpret_cast<const char *>(sd.data));
@@ -877,10 +1308,14 @@ size_t abc_method_get_name(const AbcMethodAccessor *a, char *buf, size_t buf_len
         return copy;
     }
     return len;
+} catch (...) {
+    return 0;
+}
 }
 
 size_t abc_method_get_name_static(const AbcFileHandle *f, uint32_t method_off,
                                    char *buf, size_t buf_len) {
+try {
     auto sd = MethodDA::GetName(*f->file, File::EntityId(method_off));
     if (!sd.data) return 0;
     size_t len = std::strlen(reinterpret_cast<const char *>(sd.data));
@@ -891,39 +1326,71 @@ size_t abc_method_get_name_static(const AbcFileHandle *f, uint32_t method_off,
         return copy;
     }
     return len;
+} catch (...) {
+    return 0;
+}
 }
 
 /* ========== Code Data Accessor ========== */
 
 AbcCodeAccessor *abc_code_open(const AbcFileHandle *f, uint32_t offset) {
+try {
     return new (std::nothrow) AbcCodeAccessor(*f->file, File::EntityId(offset));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_code_close(AbcCodeAccessor *a) {
+try {
     delete a;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_code_num_vregs(const AbcCodeAccessor *a) {
+try {
     return a->accessor.GetNumVregs();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_code_num_args(const AbcCodeAccessor *a) {
+try {
     return a->accessor.GetNumArgs();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_code_code_size(const AbcCodeAccessor *a) {
+try {
     return a->accessor.GetCodeSize();
+} catch (...) {
+    return 0;
+}
 }
 
 const uint8_t *abc_code_instructions(const AbcCodeAccessor *a) {
+try {
     return a->accessor.GetInstructions();
+} catch (...) {
+    return nullptr;
+}
 }
 
 uint32_t abc_code_tries_size(const AbcCodeAccessor *a) {
+try {
     return a->accessor.GetTriesSize();
+} catch (...) {
+    return 0;
+}
 }
 
 void abc_code_enumerate_try_blocks_full(AbcCodeAccessor *a, AbcTryBlockFullCb cb, void *ctx) {
+try {
     a->accessor.EnumerateTryBlocks([&](CodeDA::TryBlock &try_block) {
         AbcTryBlockInfo ti;
         ti.start_pc = try_block.GetStartPc();
@@ -944,155 +1411,282 @@ void abc_code_enumerate_try_blocks_full(AbcCodeAccessor *a, AbcTryBlockFullCb cb
         cb(&ti, catches.data(), ctx);
         return true;  // continue
     });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_code_get_size(AbcCodeAccessor *a) {
+try {
     return static_cast<uint32_t>(a->accessor.GetSize());
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_code_get_code_id(const AbcCodeAccessor *a) {
+try {
     return const_cast<CodeDA &>(a->accessor).GetCodeId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_code_get_num_vregs_static(const AbcFileHandle *f, uint32_t code_off) {
+try {
     return CodeDA::GetNumVregs(*f->file, File::EntityId(code_off));
+} catch (...) {
+    return 0;
+}
 }
 
 const uint8_t *abc_code_get_instructions_static(const AbcFileHandle *f, uint32_t code_off) {
+try {
     return CodeDA::GetInstructions(*f->file, File::EntityId(code_off));
+} catch (...) {
+    return nullptr;
+}
 }
 
 /* ========== Field Data Accessor ========== */
 
 AbcFieldAccessor *abc_field_open(const AbcFileHandle *f, uint32_t offset) {
+try {
     return new (std::nothrow) AbcFieldAccessor(*f->file, File::EntityId(offset));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_field_close(AbcFieldAccessor *a) {
+try {
     delete a;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_field_name_off(const AbcFieldAccessor *a) {
+try {
     return a->accessor.GetNameId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_field_type(AbcFieldAccessor *a) {
+try {
     return a->accessor.GetType();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint8_t abc_field_type_id(AbcFieldAccessor *a) {
+try {
     uint32_t enc = a->accessor.GetType();
     return static_cast<uint8_t>(Type::GetTypeFromFieldEncoding(enc).GetId());
+} catch (...) {
+    return UINT8_MAX;
+}
 }
 
 uint32_t abc_field_access_flags(AbcFieldAccessor *a) {
+try {
     return a->accessor.GetAccessFlags();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 int abc_field_is_external(const AbcFieldAccessor *a) {
+try {
     return a->accessor.IsExternal() ? 1 : 0;
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_field_class_off(const AbcFieldAccessor *a) {
+try {
     return a->accessor.GetClassId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_field_size(AbcFieldAccessor *a) {
+try {
     return static_cast<uint32_t>(a->accessor.GetSize());
+} catch (...) {
+    return 0;
+}
 }
 
 void abc_field_enumerate_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 void abc_field_enumerate_runtime_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateRuntimeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 int abc_field_get_value_i32(AbcFieldAccessor *a, int32_t *out) {
+try {
     auto val = a->accessor.GetValue<int32_t>();
     if (!val) return 0;
     *out = *val;
     return 1;
+} catch (...) {
+    return 0;
+}
 }
 
 int abc_field_get_value_i64(AbcFieldAccessor *a, int64_t *out) {
+try {
     auto val = a->accessor.GetValue<int64_t>();
     if (!val) return 0;
     *out = *val;
     return 1;
+} catch (...) {
+    return 0;
+}
 }
 
 int abc_field_get_value_f32(AbcFieldAccessor *a, float *out) {
+try {
     auto val = a->accessor.GetValue<float>();
     if (!val) return 0;
     *out = *val;
     return 1;
+} catch (...) {
+    return 0;
+}
 }
 
 int abc_field_get_value_f64(AbcFieldAccessor *a, double *out) {
+try {
     auto val = a->accessor.GetValue<double>();
     if (!val) return 0;
     *out = *val;
     return 1;
+} catch (...) {
+    return 0;
+}
 }
 
 void abc_field_enumerate_type_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateTypeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 void abc_field_enumerate_runtime_type_annotations(AbcFieldAccessor *a, AbcAnnotationCb cb, void *ctx) {
+try {
     a->accessor.EnumerateRuntimeTypeAnnotations([&](File::EntityId id) {
         cb(id.GetOffset(), ctx);
     });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_field_get_annotations_number(AbcFieldAccessor *a) {
+try {
     return a->accessor.GetAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_field_get_runtime_annotations_number(AbcFieldAccessor *a) {
+try {
     return a->accessor.GetRuntimeAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_field_get_type_annotations_number(AbcFieldAccessor *a) {
+try {
     return a->accessor.GetTypeAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_field_get_runtime_type_annotations_number(AbcFieldAccessor *a) {
+try {
     return a->accessor.GetRuntimeTypeAnnotationsNumber();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_field_get_field_id(const AbcFieldAccessor *a) {
+try {
     return a->accessor.GetFieldId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_field_get_name_off_static(const AbcFileHandle *f, uint32_t field_off) {
+try {
     return FieldDA::GetNameId(*f->file, File::EntityId(field_off)).GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_field_get_type_static(const AbcFileHandle *f, uint32_t field_off) {
+try {
     return FieldDA::GetTypeId(*f->file, File::EntityId(field_off)).GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 /* ========== Literal Data Accessor ========== */
 
 AbcLiteralAccessor *abc_literal_open(const AbcFileHandle *f, uint32_t literal_data_off) {
+try {
     return new (std::nothrow) AbcLiteralAccessor(*f->file, File::EntityId(literal_data_off));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_literal_close(AbcLiteralAccessor *a) {
+try {
     delete a;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_literal_count(const AbcLiteralAccessor *a) {
+try {
     return a->accessor.GetLiteralNum();
+} catch (...) {
+    return 0;
+}
 }
 
 // Convert a C++ std::variant LiteralValue to our C union.
@@ -1125,99 +1719,172 @@ static void literal_val_to_c(const LiteralDA::LiteralValue &val, LiteralTag tag,
 
 void abc_literal_enumerate_vals(AbcLiteralAccessor *a, uint32_t array_off,
                                 AbcLiteralValCb cb, void *ctx) {
+try {
     a->accessor.EnumerateLiteralVals(File::EntityId(array_off),
         [&](const LiteralDA::LiteralValue &val, LiteralTag tag) {
             literal_val_to_c(val, tag, cb, ctx);
         });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_literal_get_array_id(const AbcLiteralAccessor *a, uint32_t index) {
+try {
     return a->accessor.GetLiteralArrayId(static_cast<size_t>(index)).GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_literal_get_vals_num(const AbcLiteralAccessor *a, uint32_t array_off) {
+try {
     return static_cast<uint32_t>(a->accessor.GetLiteralValsNum(File::EntityId(array_off)));
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_literal_get_vals_num_by_index(const AbcLiteralAccessor *a, uint32_t index) {
+try {
     return static_cast<uint32_t>(a->accessor.GetLiteralValsNum(static_cast<size_t>(index)));
+} catch (...) {
+    return 0;
+}
 }
 
 void abc_literal_enumerate_vals_by_index(AbcLiteralAccessor *a, uint32_t index,
                                           AbcLiteralValCb cb, void *ctx) {
+try {
     a->accessor.EnumerateLiteralVals(static_cast<size_t>(index),
         [&](const LiteralDA::LiteralValue &val, LiteralTag tag) {
             literal_val_to_c(val, tag, cb, ctx);
         });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_literal_resolve_index(const AbcLiteralAccessor *a, uint32_t entity_off) {
+try {
     size_t idx = a->accessor.ResolveLiteralArrayIndex(File::EntityId(entity_off));
     if (idx >= a->accessor.GetLiteralNum()) return UINT32_MAX;
     return static_cast<uint32_t>(idx);
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_literal_get_data_id(const AbcLiteralAccessor *a) {
+try {
     return a->accessor.GetLiteralDataId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 /* ========== Module Data Accessor ========== */
 
 AbcModuleAccessor *abc_module_open(const AbcFileHandle *f, uint32_t offset) {
+try {
     return new (std::nothrow) AbcModuleAccessor(*f->file, File::EntityId(offset));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_module_close(AbcModuleAccessor *a) {
+try {
     delete a;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_module_num_requests(const AbcModuleAccessor *a) {
+try {
     return static_cast<uint32_t>(a->accessor.getRequestModules().size());
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_module_request_off(const AbcModuleAccessor *a, uint32_t idx) {
+try {
     auto &reqs = a->accessor.getRequestModules();
     if (idx >= reqs.size()) return UINT32_MAX;
     return reqs[idx];
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_module_enumerate_records(AbcModuleAccessor *a, AbcModuleRecordCb cb, void *ctx) {
+try {
     a->accessor.EnumerateModuleRecord(
         [&](ModuleTag tag, uint32_t export_name_off, uint32_t module_request_idx,
             uint32_t import_name_off, uint32_t local_name_off) {
             cb(static_cast<uint8_t>(tag), export_name_off, module_request_idx,
                import_name_off, local_name_off, ctx);
         });
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_module_get_data_id(const AbcModuleAccessor *a) {
+try {
     return a->accessor.GetModuleDataId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 /* ========== Annotation Data Accessor ========== */
 
 AbcAnnotationAccessor *abc_annotation_open(const AbcFileHandle *f, uint32_t offset) {
+try {
     return new (std::nothrow) AbcAnnotationAccessor(*f->file, File::EntityId(offset));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_annotation_close(AbcAnnotationAccessor *a) {
+try {
     delete a;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_annotation_class_off(const AbcAnnotationAccessor *a) {
+try {
     return a->accessor.GetClassId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_annotation_count(const AbcAnnotationAccessor *a) {
+try {
     return a->accessor.GetCount();
+} catch (...) {
+    return 0;
+}
 }
 
 uint32_t abc_annotation_size(const AbcAnnotationAccessor *a) {
+try {
     return static_cast<uint32_t>(a->accessor.GetSize());
+} catch (...) {
+    return 0;
+}
 }
 
 int abc_annotation_get_element(const AbcAnnotationAccessor *a, uint32_t idx,
                                struct AbcAnnotationElem *out) {
+try {
     if (idx >= a->accessor.GetCount()) return -1;
     auto elem = a->accessor.GetElement(idx);
     auto tag = a->accessor.GetTag(idx);
@@ -1225,46 +1892,70 @@ int abc_annotation_get_element(const AbcAnnotationAccessor *a, uint32_t idx,
     out->tag = static_cast<uint8_t>(tag.GetItem());
     out->value = elem.GetScalarValue().GetValue();
     return 0;
+} catch (...) {
+    return -1;
+}
 }
 
 int abc_annotation_get_array_element(const AbcAnnotationAccessor *a, uint32_t idx,
                                       struct AbcAnnotationArrayVal *out) {
+try {
     if (idx >= a->accessor.GetCount()) return -1;
     auto elem = a->accessor.GetElement(idx);
     auto arr = elem.GetArrayValue();
     out->count = arr.GetCount();
     out->entity_off = arr.GetId().GetOffset();
     return 0;
+} catch (...) {
+    return -1;
+}
 }
 
 uint32_t abc_annotation_get_annotation_id(const AbcAnnotationAccessor *a) {
+try {
     return a->accessor.GetAnnotationId().GetOffset();
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 int abc_annotation_get_value_i64(const AbcAnnotationAccessor *a, uint32_t idx, int64_t *out) {
+try {
     if (idx >= a->accessor.GetCount()) return -1;
     auto elem = a->accessor.GetElement(idx);
     *out = elem.GetScalarValue().Get<int64_t>();
     return 0;
+} catch (...) {
+    return -1;
+}
 }
 
 int abc_annotation_get_value_u64(const AbcAnnotationAccessor *a, uint32_t idx, uint64_t *out) {
+try {
     if (idx >= a->accessor.GetCount()) return -1;
     auto elem = a->accessor.GetElement(idx);
     *out = elem.GetScalarValue().Get<uint64_t>();
     return 0;
+} catch (...) {
+    return -1;
+}
 }
 
 int abc_annotation_get_value_f64(const AbcAnnotationAccessor *a, uint32_t idx, double *out) {
+try {
     if (idx >= a->accessor.GetCount()) return -1;
     auto elem = a->accessor.GetElement(idx);
     *out = elem.GetScalarValue().Get<double>();
     return 0;
+} catch (...) {
+    return -1;
+}
 }
 
 int abc_annotation_array_read(const AbcFileHandle *f, uint32_t entity_off,
                                uint32_t element_size, uint32_t count,
                                uint64_t *out_values, uint32_t max_count) {
+try {
     auto sp = f->file->GetSpanFromId(File::EntityId(entity_off));
     if (sp.empty()) return -1;
 
@@ -1282,12 +1973,16 @@ int abc_annotation_array_read(const AbcFileHandle *f, uint32_t entity_off,
         out_values[i] = val;
     }
     return static_cast<int>(n);
+} catch (...) {
+    return -1;
+}
 }
 
 /* ========== MethodHandle ========== */
 
 int abc_method_handle_read(const AbcFileHandle *f, uint32_t offset,
                            uint8_t *out_type, uint32_t *out_entity_off) {
+try {
     auto sp = f->file->GetSpanFromId(File::EntityId(offset));
     if (sp.empty()) return -1;
 
@@ -1299,20 +1994,32 @@ int abc_method_handle_read(const AbcFileHandle *f, uint32_t offset,
     if (!ok) return -1;
     *out_entity_off = entity_off;
     return 0;
+} catch (...) {
+    return -1;
+}
 }
 
 /* ========== Debug Info Extractor ========== */
 
 AbcDebugInfo *abc_debug_info_open(const AbcFileHandle *f) {
+try {
     return new (std::nothrow) AbcDebugInfo(f->file.get());
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_debug_info_close(AbcDebugInfo *d) {
+try {
     delete d;
+} catch (...) {
+    return;
+}
 }
 
 void abc_debug_get_line_table(const AbcDebugInfo *d, uint32_t method_off,
                               AbcLineEntryCb cb, void *ctx) {
+try {
     auto &table = d->extractor.GetLineNumberTable(File::EntityId(method_off));
     for (auto &entry : table) {
         AbcLineEntry e;
@@ -1320,10 +2027,14 @@ void abc_debug_get_line_table(const AbcDebugInfo *d, uint32_t method_off,
         e.line = static_cast<uint32_t>(entry.line);
         if (cb(&e, ctx) != 0) break;
     }
+} catch (...) {
+    return;
+}
 }
 
 void abc_debug_get_column_table(const AbcDebugInfo *d, uint32_t method_off,
                                 AbcColumnEntryCb cb, void *ctx) {
+try {
     auto &table = d->extractor.GetColumnNumberTable(File::EntityId(method_off));
     for (auto &entry : table) {
         AbcColumnEntry e;
@@ -1331,10 +2042,14 @@ void abc_debug_get_column_table(const AbcDebugInfo *d, uint32_t method_off,
         e.column = static_cast<uint32_t>(entry.column);
         if (cb(&e, ctx) != 0) break;
     }
+} catch (...) {
+    return;
+}
 }
 
 void abc_debug_get_local_vars(const AbcDebugInfo *d, uint32_t method_off,
                               AbcLocalVarCb cb, void *ctx) {
+try {
     auto &table = d->extractor.GetLocalVariableTable(File::EntityId(method_off));
     for (auto &info : table) {
         AbcLocalVarInfo v;
@@ -1346,18 +2061,30 @@ void abc_debug_get_local_vars(const AbcDebugInfo *d, uint32_t method_off,
         v.end_offset = info.end_offset;
         if (cb(&v, ctx) != 0) break;
     }
+} catch (...) {
+    return;
+}
 }
 
 const char *abc_debug_get_source_file(const AbcDebugInfo *d, uint32_t method_off) {
+try {
     return d->extractor.GetSourceFile(File::EntityId(method_off));
+} catch (...) {
+    return nullptr;
+}
 }
 
 const char *abc_debug_get_source_code(const AbcDebugInfo *d, uint32_t method_off) {
+try {
     return d->extractor.GetSourceCode(File::EntityId(method_off));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_debug_get_parameter_info(const AbcDebugInfo *d, uint32_t method_off,
                                    AbcParamInfoCb cb, void *ctx) {
+try {
     auto &params = d->extractor.GetParameterInfo(File::EntityId(method_off));
     for (auto &p : params) {
         AbcParamInfo info;
@@ -1365,39 +2092,70 @@ void abc_debug_get_parameter_info(const AbcDebugInfo *d, uint32_t method_off,
         info.signature = p.signature.c_str();
         if (cb(&info, ctx) != 0) break;
     }
+} catch (...) {
+    return;
+}
 }
 
 void abc_debug_get_method_list(const AbcDebugInfo *d, AbcEntityIdCb cb, void *ctx) {
+try {
     auto methods = d->extractor.GetMethodIdList();
     for (auto &id : methods) {
         if (cb(id.GetOffset(), ctx) != 0) break;
     }
+} catch (...) {
+    return;
+}
 }
 
 /* ========== Index Accessor ========== */
 
 AbcIndexAccessor *abc_index_open(const AbcFileHandle *f, uint32_t method_off) {
+try {
     return new (std::nothrow) AbcIndexAccessor(*f->file, File::EntityId(method_off));
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_index_close(AbcIndexAccessor *a) {
+try {
     delete a;
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_index_get_offset_by_id(const AbcIndexAccessor *a, uint16_t idx) {
+try {
     return a->accessor.GetOffsetById(idx);
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint8_t abc_index_get_function_kind(const AbcIndexAccessor *a) {
+try {
     return static_cast<uint8_t>(a->accessor.GetFunctionKind());
+} catch (...) {
+    return UINT8_MAX;
+}
 }
 
 uint16_t abc_index_get_header_index(const AbcIndexAccessor *a) {
+try {
     return a->accessor.GetHeaderIndex();
+} catch (...) {
+    return 0xFFFF;
+}
 }
 
 uint32_t abc_index_get_num_headers(const AbcIndexAccessor *a) {
+try {
     return a->accessor.GetNumHeaders();
+} catch (...) {
+    return 0;
+}
 }
 
 /* ========== ABC Builder ========== */

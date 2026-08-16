@@ -29,6 +29,8 @@ typedef struct AbcFileHandle AbcFileHandle;
 
 AbcFileHandle *abc_file_open(const uint8_t *data, size_t len);
 void abc_file_close(AbcFileHandle *f);
+/* Reason for the last failed abc_file_open (thread-local; empty on success). */
+const char *abc_file_open_error(void);
 
 /* Header access */
 uint32_t abc_file_num_classes(const AbcFileHandle *f);
