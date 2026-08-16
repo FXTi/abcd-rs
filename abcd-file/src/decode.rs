@@ -844,8 +844,31 @@ fn decode_annotation_list(
                             }
                         }
                         AVT::LiteralArray => {
-                            let values = decode_literal_array_at(f, out.value, strings);
-                            AnnotationValue::LiteralArray(values)
+                            // '#' is both a scalar and an array component
+                            // tag: try the array interpretation first, fall
+                            // back to a scalar literal-array reference.
+                            let mut arr = sys::AbcAnnotationArrayVal {
+                                count: 0,
+                                entity_off: 0,
+                            };
+                            if unsafe { sys::abc_annotation_get_array_element(ar, idx, &mut arr) }
+                                == 0
+                            {
+                                AnnotationValue::Array {
+                                    tag: b'#',
+                                    values: decode_annotation_array_elements(
+                                        f,
+                                        b'#',
+                                        arr.count,
+                                        arr.entity_off,
+                                        entity_map,
+                                        strings,
+                                    ),
+                                }
+                            } else {
+                                let values = decode_literal_array_at(f, out.value, strings);
+                                AnnotationValue::LiteralArray(values)
+                            }
                         }
                         AVT::Void => AnnotationValue::Void,
                         AVT::StringNullptr => AnnotationValue::StringNullptr,
@@ -935,7 +958,8 @@ fn decode_annotation_array_elements(
             | AVT::ArrayMethod
             | AVT::ArrayEnum
             | AVT::ArrayAnnotation
-            | AVT::ArrayMethodHandle,
+            | AVT::ArrayMethodHandle
+            | AVT::LiteralArray,
         ) => 4,
         Ok(AVT::ArrayI64 | AVT::ArrayU64 | AVT::ArrayF64) => 8,
         _ => return Vec::new(),
@@ -1004,6 +1028,9 @@ fn decode_annotation_array_elements(
                     }
                     _ => AnnotationValue::Void,
                 }
+            }
+            Ok(AVT::LiteralArray) => {
+                AnnotationValue::LiteralArray(decode_literal_array_at(f, raw as u32, strings))
             }
             Ok(AVT::ArrayMethodHandle) => {
                 let mut handle_type_raw = 0u8;

@@ -1359,7 +1359,7 @@ fn annotation_value_to_raw(
 /// K..U are scalar arrays (K=U1 … T=F32, U=F64), V=String, W=Record,
 /// X=Method, Y=Enum, Z=Annotation, @=MethodHandle (audit finding #B1).
 fn is_entity_array_tag(tag: u8) -> bool {
-    matches!(tag, b'V' | b'W' | b'X' | b'Y' | b'Z' | b'@')
+    matches!(tag, b'V' | b'W' | b'X' | b'Y' | b'Z' | b'@' | b'#')
 }
 
 /// Convert a single annotation array element to a u32 handle/value for the builder.
