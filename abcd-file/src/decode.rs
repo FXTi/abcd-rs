@@ -480,6 +480,50 @@ fn decode_field_at(
     })
 }
 
+/// Resolve the interned name of an entity offset. Falls back to reading the
+/// name directly from a foreign field/method item (both store name_off as
+/// the u32 at item+4) when the offset is in the file's foreign region and
+/// the entity_map has no entry — foreign members are not class members and
+/// never enter the entity_map (test group A).
+fn resolve_foreign_entity_name(
+    f: *const sys::AbcFileHandle,
+    entity_map: &HashMap<u32, StringId>,
+    strings: &mut StringPool,
+    off: u32,
+) -> StringId {
+    if let Some(&sid) = entity_map.get(&off) {
+        return sid;
+    }
+    let foreign_off = unsafe { sys::abc_file_foreign_off(f) };
+    let foreign_size = unsafe { sys::abc_file_foreign_size(f) };
+    if foreign_size == 0 || off < foreign_off || off >= foreign_off.saturating_add(foreign_size) {
+        return strings.get_or_intern("");
+    }
+    let name_off = read_u32_at(f, off + 4).unwrap_or(ABSENT);
+    if name_off == ABSENT {
+        return strings.get_or_intern("");
+    }
+    match read_string(f, name_off) {
+        Some(name) => strings.get_or_intern(&name),
+        None => strings.get_or_intern(""),
+    }
+}
+
+/// Read a little-endian u32 at an arbitrary file offset with bounds checks.
+fn read_u32_at(f: *const sys::AbcFileHandle, off: u32) -> Option<u32> {
+    let base = unsafe { sys::abc_file_get_raw_data(f) };
+    if base.is_null() {
+        return None;
+    }
+    let size = unsafe { sys::abc_file_size(f) };
+    if off.checked_add(4)? > size {
+        return None;
+    }
+    // SAFETY: base..base+size is the padded file buffer; off..off+4 in bounds.
+    let bytes = unsafe { std::slice::from_raw_parts(base.add(off as usize), 4) };
+    Some(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
 /// Returns `(MethodBody, byte_offsets)` where `byte_offsets[i]` is the byte
 /// offset of instruction `i` in the raw bytecode.  The table is needed by
 /// `read_debug_info` to convert debug byte-offsets to instruction indices.
@@ -739,20 +783,16 @@ fn decode_annotation_list(
                             AnnotationValue::Record(sid)
                         }
                         AVT::Method => {
-                            let sid = entity_map
-                                .get(&out.value)
-                                .copied()
-                                .unwrap_or_else(|| strings.get_or_intern(""));
+                            let sid =
+                                resolve_foreign_entity_name(f, entity_map, strings, out.value);
                             AnnotationValue::Method {
                                 name: sid,
                                 offset: out.value,
                             }
                         }
                         AVT::Enum => {
-                            let sid = entity_map
-                                .get(&out.value)
-                                .copied()
-                                .unwrap_or_else(|| strings.get_or_intern(""));
+                            let sid =
+                                resolve_foreign_entity_name(f, entity_map, strings, out.value);
                             AnnotationValue::Enum {
                                 name: sid,
                                 offset: out.value,
@@ -940,20 +980,14 @@ fn decode_annotation_array_elements(
                 AnnotationValue::Record(sid)
             }
             Ok(AVT::ArrayMethod) => {
-                let sid = entity_map
-                    .get(&(raw as u32))
-                    .copied()
-                    .unwrap_or_else(|| strings.get_or_intern(""));
+                let sid = resolve_foreign_entity_name(f, entity_map, strings, raw as u32);
                 AnnotationValue::Method {
                     name: sid,
                     offset: raw as u32,
                 }
             }
             Ok(AVT::ArrayEnum) => {
-                let sid = entity_map
-                    .get(&(raw as u32))
-                    .copied()
-                    .unwrap_or_else(|| strings.get_or_intern(""));
+                let sid = resolve_foreign_entity_name(f, entity_map, strings, raw as u32);
                 AnnotationValue::Enum {
                     name: sid,
                     offset: raw as u32,
