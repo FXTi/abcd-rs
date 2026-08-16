@@ -274,7 +274,7 @@ fn decode_method_at(
         if code_off == ABSENT {
             (None, Vec::new())
         } else {
-            let (b, bo) = decode_code_at(f, code_off);
+            let (b, bo) = decode_code_at(f, method_off, code_off);
             (Some(b), bo)
         }
     };
@@ -527,7 +527,11 @@ fn read_u32_at(f: *const sys::AbcFileHandle, off: u32) -> Option<u32> {
 /// Returns `(MethodBody, byte_offsets)` where `byte_offsets[i]` is the byte
 /// offset of instruction `i` in the raw bytecode.  The table is needed by
 /// `read_debug_info` to convert debug byte-offsets to instruction indices.
-fn decode_code_at(f: *const sys::AbcFileHandle, code_off: u32) -> (MethodBody, Vec<u32>) {
+fn decode_code_at(
+    f: *const sys::AbcFileHandle,
+    method_off: u32,
+    code_off: u32,
+) -> (MethodBody, Vec<u32>) {
     let cr = unsafe { sys::abc_code_open(f as *mut _, code_off) };
     if cr.is_null() {
         return (
@@ -567,7 +571,7 @@ fn decode_code_at(f: *const sys::AbcFileHandle, code_off: u32) -> (MethodBody, V
         }
     };
 
-    let try_blocks = collect_try_blocks(cr)
+    let try_blocks = collect_try_blocks(f, method_off, cr)
         .into_iter()
         .map(|tb| {
             let start = offset_to_index(tb.start);
@@ -1415,28 +1419,49 @@ fn collect_offsets_int<T>(
     result
 }
 
-/// Collect try-blocks from a code accessor.
-fn collect_try_blocks(cr: *mut sys::AbcCodeAccessor) -> Vec<TryBlock> {
-    let mut result = Vec::new();
+/// Collect try-blocks from a code accessor. Typed catch entries store a
+/// region class *index* in the file; decode resolves it to the class entity
+/// offset so the model carries entity identity (catch-all stays UINT32_MAX).
+fn collect_try_blocks(
+    f: *const sys::AbcFileHandle,
+    method_off: u32,
+    cr: *mut sys::AbcCodeAccessor,
+) -> Vec<TryBlock> {
+    struct Ctx {
+        f: *const sys::AbcFileHandle,
+        method_off: u32,
+        blocks: Vec<TryBlock>,
+    }
+    let mut ctx = Ctx {
+        f,
+        method_off,
+        blocks: Vec::new(),
+    };
     unsafe extern "C" fn cb(
         try_info: *const sys::AbcTryBlockInfo,
         catches: *const sys::AbcCatchBlockInfo,
-        ctx: *mut c_void,
+        ctx_raw: *mut c_void,
     ) -> i32 {
-        let vec = unsafe { &mut *(ctx as *mut Vec<TryBlock>) };
+        let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
         let info = unsafe { &*try_info };
         let catch_slice = if info.num_catches > 0 {
             unsafe { std::slice::from_raw_parts(catches, info.num_catches as usize) }
         } else {
             &[]
         };
-        vec.push(TryBlock {
+        ctx.blocks.push(TryBlock {
             start: info.start_pc,
             len: info.length,
             catches: catch_slice
                 .iter()
                 .map(|c| CatchBlock {
-                    type_idx: c.type_idx,
+                    type_idx: if c.type_idx == u32::MAX {
+                        u32::MAX
+                    } else {
+                        unsafe {
+                            sys::abc_resolve_class_index(ctx.f, ctx.method_off, c.type_idx as u16)
+                        }
+                    },
                     handler: c.handler_pc,
                     len: c.code_size,
                 })
@@ -1445,11 +1470,7 @@ fn collect_try_blocks(cr: *mut sys::AbcCodeAccessor) -> Vec<TryBlock> {
         0
     }
     unsafe {
-        sys::abc_code_enumerate_try_blocks_full(
-            cr,
-            Some(cb),
-            &mut result as *mut Vec<TryBlock> as *mut c_void,
-        );
+        sys::abc_code_enumerate_try_blocks_full(cr, Some(cb), &mut ctx as *mut Ctx as *mut c_void);
     }
-    result
+    ctx.blocks
 }

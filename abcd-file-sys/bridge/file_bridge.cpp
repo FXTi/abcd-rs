@@ -121,6 +121,7 @@ using SourceLang = panda::panda_file::SourceLang;
 using FunctionKind = panda::panda_file::FunctionKind;
 using BaseClassItem = panda::panda_file::BaseClassItem;
 using TypeItem = panda::panda_file::TypeItem;
+using BaseMethodItem = panda::panda_file::BaseMethodItem;
 using BaseItem = panda::panda_file::BaseItem;
 using MethodHandleItem = panda::panda_file::MethodHandleItem;
 using MethodHandleType = panda::panda_file::MethodHandleType;
@@ -2371,6 +2372,22 @@ struct AbcBuilder {
     std::vector<MethodItem *> methods;
     std::vector<FieldItem *> fields;
     std::vector<CodeItem *> code_items;
+    // Owner method per code item (upstream keeps this in CodeItem::methods_;
+    // we keep a parallel table because the bridge needs it before the method
+    // is attached — CatchBlock stores the MethodItem for region-index lookup).
+    std::vector<MethodItem *> code_owners;
+    struct PendingCatch {
+        uint32_t type_class_handle;  // UINT32_MAX = catch-all
+        uint32_t handler_pc;
+        uint32_t code_size;
+    };
+    struct PendingTryBlock {
+        uint32_t code_handle;
+        uint32_t start_pc;
+        uint32_t length;
+        std::vector<PendingCatch> catches;
+    };
+    std::vector<PendingTryBlock> pending_try_blocks;
     std::vector<DebugInfoItem *> debug_infos;
     std::vector<LineNumberProgramItem *> lnps;
     std::vector<AnnotationItem *> annotations;
@@ -2688,6 +2705,7 @@ uint32_t abc_builder_create_code(AbcBuilder *b, uint32_t num_vregs, uint32_t num
         static_cast<size_t>(num_vregs), static_cast<size_t>(num_args), std::move(insns));
     uint32_t idx = static_cast<uint32_t>(b->code_items.size());
     b->code_items.push_back(item);
+    b->code_owners.push_back(nullptr);
     return idx;
 }
 
@@ -2695,13 +2713,35 @@ void abc_builder_code_add_try_block(AbcBuilder *b, uint32_t code_handle,
     uint32_t start_pc, uint32_t length,
     const struct AbcCatchBlockDef *catches, uint32_t num_catches) {
     if (code_handle >= b->code_items.size()) return;
+    // CatchBlock stores the owner MethodItem (region-index lookup); when the
+    // method is not attached yet (try block added before method_set_code),
+    // defer construction until the owner is known.
+    if (b->code_owners[code_handle] == nullptr) {
+        AbcBuilder::PendingTryBlock pending;
+        pending.code_handle = code_handle;
+        pending.start_pc = start_pc;
+        pending.length = length;
+        for (uint32_t i = 0; i < num_catches; i++) {
+            pending.catches.push_back({catches[i].type_class_handle,
+                                       catches[i].handler_pc, catches[i].code_size});
+        }
+        b->pending_try_blocks.push_back(std::move(pending));
+        return;
+    }
     std::vector<CodeItem::CatchBlock> catch_blocks;
     for (uint32_t i = 0; i < num_catches; i++) {
         BaseClassItem *type_cls = nullptr;
         if (catches[i].type_class_handle != UINT32_MAX) {
             type_cls = b->ResolveClassHandle(catches[i].type_class_handle);
+            // The catch type must sit in the owner method's region class
+            // index table (upstream registers bytecode id dependencies the
+            // same way); without this, CatchBlock::CalculateSize dereferences
+            // a missing index at layout time.
+            if (type_cls != nullptr) {
+                b->code_owners[code_handle]->AddIndexDependency(type_cls);
+            }
         }
-        catch_blocks.emplace_back(nullptr, type_cls,
+        catch_blocks.emplace_back(b->code_owners[code_handle], type_cls,
                                    static_cast<size_t>(catches[i].handler_pc),
                                    static_cast<size_t>(catches[i].code_size));
     }
@@ -2715,6 +2755,35 @@ void abc_builder_method_set_code(AbcBuilder *b, uint32_t method_handle, uint32_t
     if (method_handle >= b->methods.size()) return;
     if (code_handle >= b->code_items.size()) return;
     b->methods[method_handle]->SetCode(b->code_items[code_handle]);
+    // Mirror upstream SetCodeAndDebugInfo (code->AddMethod(method)) and
+    // record the owner for CatchBlock region-index lookups.
+    b->code_items[code_handle]->AddMethod(b->methods[method_handle]);
+    b->code_owners[code_handle] = b->methods[method_handle];
+    // Flush try blocks that were staged before the method was attached.
+    for (auto it = b->pending_try_blocks.begin(); it != b->pending_try_blocks.end();) {
+        if (it->code_handle != code_handle) {
+            ++it;
+            continue;
+        }
+        std::vector<CodeItem::CatchBlock> catch_blocks;
+        for (auto &cb : it->catches) {
+            BaseClassItem *type_cls = nullptr;
+            if (cb.type_class_handle != UINT32_MAX) {
+                type_cls = b->ResolveClassHandle(cb.type_class_handle);
+                if (type_cls != nullptr) {
+                    b->methods[method_handle]->AddIndexDependency(type_cls);
+                }
+            }
+            catch_blocks.emplace_back(b->methods[method_handle], type_cls,
+                                      static_cast<size_t>(cb.handler_pc),
+                                      static_cast<size_t>(cb.code_size));
+        }
+        CodeItem::TryBlock try_block(static_cast<size_t>(it->start_pc),
+                                      static_cast<size_t>(it->length),
+                                      std::move(catch_blocks));
+        b->code_items[code_handle]->AddTryBlock(try_block);
+        it = b->pending_try_blocks.erase(it);
+    }
 }
 
 /* --- 3.6 Debug Info --- */
