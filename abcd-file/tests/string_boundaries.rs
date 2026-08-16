@@ -77,7 +77,7 @@ fn embedded_nul_decodes_via_c0_80() {
         let is_ascii = tag & 1;
         if is_ascii == 1 && utf16_len == 1 && data[i + 1] == b'f' && data[i + 2] == 0 {
             // rewrite: 'a' C0 80 'b' — utf16 len 3, not ascii: tag = 3<<1 = 6
-            let mut new_item = vec![6u8, b'a', 0xC0, 0x80, b'b', 0x00];
+            let new_item = vec![6u8, b'a', 0xC0, 0x80, b'b', 0x00];
             let mut tmp: Vec<u8> = Vec::new();
             tmp.extend_from_slice(&data[..i]);
             tmp.extend_from_slice(&new_item);
