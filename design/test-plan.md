@@ -54,15 +54,15 @@ compatibility matrix) and design/ir.md (v0.2 boundary).
 | I | protos/signatures | 9/11 shorty read + reference types; 12+/24 assert absence (format fact #A7) | corpus |
 | J | isa opcode coverage | every opcode decodes on a 12.0.6.0 corpus (modules.abc full-method disassembly + per-opcode counter assertions) | 12.0.6.0 |
 
-## isa compatibility facts (prerequisite)
+## isa compatibility facts (delivered)
 
-- Diff `isa.yaml` 24.0.0.0 against the 4.0/4.1 release copies:
-  opcodes added/removed/renumbered, format changes, prefix layout.
-  Deliverable: `design/isa-compat.md` with the fact table, and a
-  generated "12 file opcodes ⊆ 24 table?" assertion.
-- Known so far: 24 added `callthis*withname` (0xdd–0xe1) and the wide
-  variants (0x14 prefix); 12 files never contain them. Whether 12 has
-  opcodes absent from 24 is unverified.
+- Diffed `isa.yaml` 24.0.0.0 against the OpenHarmony 4.0/4.1/5.0 release
+  copies. Result: 9.0.0.0, 11.0.2.0, and 12.0.6.0 are all strict subsets
+  of 24.0.0.0 with zero opcode renumbering and identical prefixes; 24 only
+  adds 9 instructions (callthis*withname, supercallforwardallargs, 2
+  sendable). Full table: `design/isa-compat.md`.
+- Empirical confirmation: Group J decodes stock modules.abc (12.0.6.0)
+  fully with the 24 table — 2,946,777 instructions, zero unknown opcodes.
 
 ## Order of execution
 
