@@ -188,6 +188,76 @@ mod tests {
         }
     }
 
+    /// Regression test for audit findings #A8 (checksum backfill) and
+    /// #B3 (empty-proto arg count). Builds a file, checks the checksum is
+    /// real and validates, and probes an empty shorty proto.
+    #[test]
+    fn output_checksum_and_empty_proto() {
+        unsafe {
+            let b = abc_builder_new();
+            let sub_api = b"beta1\0";
+            abc_builder_set_api(b, 12, sub_api.as_ptr() as *const std::ffi::c_char);
+            let cls_desc = b"L_GLOBAL;\0";
+            let cls = abc_builder_add_class(b, cls_desc.as_ptr() as *const std::ffi::c_char);
+            let code: [u8; 1] = [0x65];
+            let proto = abc_builder_create_proto(b, 0x0d, std::ptr::null(), 0);
+            let m = abc_builder_class_add_method_with_proto(
+                b,
+                cls,
+                b"f\0".as_ptr() as *const std::ffi::c_char,
+                proto,
+                0x1,
+                code.as_ptr(),
+                1,
+                1,
+                0,
+            );
+            assert_ne!(m, u32::MAX);
+            let mut out_len: u32 = 0;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null());
+            let data = std::slice::from_raw_parts(ptr, out_len as usize);
+            // #A8: checksum must be non-zero and validate.
+            let checksum = u32::from_le_bytes(data[8..12].try_into().unwrap());
+            assert_ne!(checksum, 0, "finalize must backfill a real checksum");
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null());
+            assert_eq!(abc_file_validate_checksum(f), 1, "checksum must validate");
+            abc_file_close(f);
+            abc_builder_free(b);
+        }
+    }
+
+    /// Regression test for audit finding #B3: an empty shorty proto (a
+    /// single 0x0000 halfword) must report zero args, not a huge
+    /// underflowed count.
+    #[test]
+    fn empty_proto_reports_zero_args() {
+        unsafe {
+            // header (60) + 4 filler + proto item at 64: shorty = [0x0000]
+            let mut data: Vec<u8> = Vec::new();
+            data.extend_from_slice(b"PANDA\0\0\0");
+            data.extend_from_slice(&0u32.to_le_bytes());
+            data.extend_from_slice(&[12, 0, 2, 0]);
+            data.extend_from_slice(&0u32.to_le_bytes());
+            for _ in 0..10 {
+                data.extend_from_slice(&0u32.to_le_bytes());
+            }
+            data.extend_from_slice(&[0u8; 4]); // filler so proto offset > 60
+            data.extend_from_slice(&0u16.to_le_bytes()); // empty shorty
+            let file_size = data.len() as u32;
+            data[16..20].copy_from_slice(&file_size.to_le_bytes());
+
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null());
+            let a = abc_proto_open(f, 64);
+            assert!(!a.is_null(), "proto open should succeed");
+            assert_eq!(abc_proto_num_args(a), 0, "empty proto must have zero args");
+            abc_proto_close(a);
+            abc_file_close(f);
+        }
+    }
+
     /// Regression test for audit finding #A3: vendor code reads fixed-size
     /// blocks past string data (murmur3/PseudoFnv 4-byte blocks, NUL
     /// scans), so abc_file_open must give the File a padded copy — the

@@ -107,7 +107,7 @@ and the compatibility/architecture decisions derived from the audit.
   signatures cannot be recovered from 12+/24 files; the Rust model keeps
   them `Option` and encode cannot restore them. (Decision B includes
   verifying 9/11 files, which do carry protos.)
-- **#A8 (P2)**: MemoryWriter does no checksum counting → our output files
+- **#A8 (P2, fixed)**: MemoryWriter does no checksum counting → our output files
   have checksum 0 (upstream FileWriter computes adler32). Fix plan:
   patch the checksum after write in the bridge finalize.
 - **#A9 (P2)**: upstream copy-paste defects (GetAnnotationsNumber counts
@@ -125,9 +125,9 @@ and the compatibility/architecture decisions derived from the audit.
   regression test.
 - **#B2 (P1, fixed)**: `abc_index_get_offset_by_id` exposes the unbounded vendor
   accessor. Add a bounds check against the index header size.
-- **#B3 (P2)**: `abc_proto_num_args`/`abc_proto_get_arg_type` forward the
+- **#B3 (P2, fixed)**: `abc_proto_num_args`/`abc_proto_get_arg_type` forward the
   vendor `GetNumArgs` underflow. Clamp in the bridge.
-- **#B4 (P2)**: `abc_method_handle_read` decodes ULEB with no 5-byte bound.
+- **#B4 (P2, fixed)**: `abc_method_handle_read` decodes ULEB with no 5-byte bound.
 - **#B5 (informational)**: class descriptors read through
   `abc_file_get_string_utf16` rely on the class-item name ULEB having no
   ascii bit — utf16 length decodes correctly by coincidence; strlen drives
@@ -198,5 +198,5 @@ Hermes (reference tree `hermes-main/`) confirms the same two-layer shape:
 2. ~~#A3 padded copy in abc_file_open~~ — done.
 3. ~~#A2~~ — fixed (INVALID count → 0; v24 decode covered by tests/format_v24.rs). #A7 signature handling remains a documented format fact.
 4. ~~#B1 annotation array tag fix~~ — done (both sides + round-trip test; also added `Handle::as_raw`).
-5. #A8 checksum backfill; #B2/#B3/#B4 bridge bounds; #A6 note.
+5. ~~#A8 checksum backfill; #B2/#B3/#B4 bridge bounds~~ — done (one commit). #A6 documented as accepted residual risk.
 6. Update design/review-isa-file.md and close out.

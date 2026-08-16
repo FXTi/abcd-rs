@@ -794,7 +794,12 @@ try {
 
 uint32_t abc_proto_num_args(AbcProtoAccessor *a) {
 try {
-    return a->accessor.GetNumArgs();
+    // Re-count the shorty instead of calling GetNumArgs(): the vendor
+    // implementation computes elem_num_ - 1 and underflows on an empty
+    // shorty (audit #B3).
+    uint32_t elems = 0;
+    a->accessor.EnumerateTypes([&elems](Type /*t*/) { elems++; });
+    return elems == 0 ? 0 : elems - 1;
 } catch (...) {
     return 0;
 }
@@ -2142,7 +2147,8 @@ int abc_method_handle_read(const AbcFileHandle *f, uint32_t offset,
                            uint8_t *out_type, uint32_t *out_entity_off) {
 try {
     auto sp = f->file->GetSpanFromId(File::EntityId(offset));
-    if (sp.empty()) return -1;
+    // type byte + up to 5 ULEB bytes (audit #B4).
+    if (sp.Size() < 6) return -1;
 
     // First byte is MethodHandleType (0-8).
     *out_type = sp[0];
@@ -3259,6 +3265,14 @@ const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len) {
         }
         b->output = writer.GetData();
         *out_len = static_cast<uint32_t>(b->output.size());
+        // MemoryWriter performs no checksum counting (upstream FileWriter
+        // does); backfill adler32 over [version..end] — audit finding #A8.
+        if (b->output.size() > File::MAGIC_SIZE + sizeof(uint32_t)) {
+            uint32_t checksum = adler32(1, b->output.data() + File::MAGIC_SIZE + sizeof(uint32_t),
+                                        static_cast<uint32_t>(b->output.size()) -
+                                            (File::MAGIC_SIZE + sizeof(uint32_t)));
+            std::memcpy(b->output.data() + File::MAGIC_SIZE, &checksum, sizeof(checksum));
+        }
         return b->output.data();
     } catch (...) {
         return nullptr;
