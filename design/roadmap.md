@@ -25,6 +25,34 @@ One IR serves three downstream consumers:
 
 Therefore Phase 1 is not "make it run"; every node must hold up to all three uses.
 
+## Format compatibility (decision B, locked)
+
+Phase 1 covers the **entire second generation** of the ABC format, per the
+upstream `api_version_map` (see design/vendor-audit.md §4):
+
+| file version | read | write |
+|--------------|------|-------|
+| 9.0.0.0 / 11.0.2.0 (api 9/10/11) | target (legacy) | no |
+| 12.0.6.0 (api 12/13, device stock) | **must** — modules.abc regression | no |
+| 12.0.2.0 (api 12 beta1) | yes | current default |
+| 24.0.0.0 (api 24, second-gen final) | **must** | target |
+| static marker {0,1,0,7} | detect only | no |
+
+Third generation (`static_core`, file version 0.1.x) is **out of scope for
+Phase 1**; the architecture leaves a slot (see below). Compatibility work
+lives in a **FormatProfile** layer — never in the core model:
+
+- **Single core model** (`abcd_file` Rust types + `abcd-ir`): no version
+  branches; `File.version` is metadata only.
+- **Upstream definitions referenced, not copied**: enum values via bindgen,
+  `Bytecode`/formats generated from isa.yaml, version tables via the bridge.
+- **FormatProfile** absorbs every version difference (literal-array table
+  vs index path, proto presence, tag-stream quirks) and legacy reader bugs
+  are fixed at the bridge (see vendor-audit.md §3, all A/B findings closed
+  except #A4/#A5/#A6/#A7/#A9 which are documented format facts).
+- A future 0.1.x backend = a second vendor subset + a second profile,
+  same IR.
+
 ## Why vendor code for isa and file
 
 The ground truth of the ISA lives in `isa.yaml`; the ground truth of the container format lives in libpandafile. Rewriting either means permanently maintaining a mirror that chases upstream. The chosen trade-off:
