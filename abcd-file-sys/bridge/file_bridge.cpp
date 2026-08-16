@@ -240,7 +240,25 @@ bool CheckHeader(const os::mem::ConstBytePtr & /*ptr*/, const std::string_view &
 void CheckFileVersion(const std::array<uint8_t, File::VERSION_SIZE> & /*file_version*/,
                       const std::string_view & /*filename*/) {}
 
-PandaFileType GetFileType(const uint8_t * /*data*/, int32_t /*size*/) {
+PandaFileType GetFileType(const uint8_t *data, int32_t size) {
+    // Ported from upstream file.cpp (merged here; see review finding #4).
+    if (data == nullptr || size < 0 || static_cast<uint32_t>(size) < sizeof(File::Header)) {
+        return PandaFileType::FILE_FORMAT_INVALID;
+    }
+
+    auto *header = reinterpret_cast<const File::Header *>(data);
+    uint32_t actual_size = static_cast<uint32_t>(size);
+    if (actual_size != header->file_size) {
+        return PandaFileType::FILE_FORMAT_INVALID;
+    }
+
+    if (File::MAGIC != header->magic) {
+        return PandaFileType::FILE_FORMAT_INVALID;
+    }
+
+    if (header->version == File::STATIC_VERSION) {
+        return PandaFileType::FILE_STATIC;
+    }
     return PandaFileType::FILE_DYNAMIC;
 }
 
