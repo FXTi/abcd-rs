@@ -64,8 +64,17 @@ fn build_rich() -> Vec<u8> {
     );
     b.method_set_source_lang(m, SourceLang::EcmaScript);
 
-    // Note: debug info is intentionally absent — its emission order is a
-    // separate issue (design/review-isa-file.md #16) with its own test.
+    // Debug info with a source file and a line table. Regression test for
+    // design/review-isa-file.md #16 (line-number programs were emitted
+    // before layout, recording string offsets of 0).
+    let lnp = b.create_lnp();
+    let debug = b.create_debug_info(lnp, 1);
+    let src_file = b.add_string("main.js");
+    b.lnp_emit_set_file(lnp, debug, src_file);
+    b.lnp_emit_advance_pc(lnp, debug, 1);
+    b.lnp_emit_advance_line(lnp, debug, 2);
+    b.lnp_emit_end(lnp);
+    b.method_set_debug_info(m, debug);
 
     let la = b.add_literal_array("lit");
     let hello = b.add_string("hello");
@@ -251,8 +260,22 @@ fn encode_roundtrip_rich() {
         "annotation element count must round-trip"
     );
 
+    // Debug info round-trips: the original file extracts it, and so does
+    // the re-encoded one (see #16).
+    let d1 = g1.methods[0]
+        .debug
+        .as_ref()
+        .expect("debug info must decode from the original file");
+    let src1 = d1.source_file.map(|s| file1.strings.resolve(s).unwrap());
+    assert_eq!(src1, Some("main.js"), "source file must decode correctly");
+    assert!(!d1.line_table.is_empty(), "line table must decode");
+
     let m2 = &g2.methods[0];
     assert!(m2.body.is_some(), "method body must round-trip");
+    let d2 = m2.debug.as_ref().expect("debug info must round-trip");
+    let src2 = d2.source_file.map(|s| file2.strings.resolve(s).unwrap());
+    assert_eq!(src2, Some("main.js"), "source file must round-trip");
+    assert!(!d2.line_table.is_empty(), "line table must round-trip");
 
     assert_eq!(
         file1.literal_arrays.len(),

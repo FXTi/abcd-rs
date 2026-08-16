@@ -26,7 +26,7 @@ Status: `open` = reported, awaiting triage · `fixed` = landed with a regression
 | 13 | P2 | Stale README claims: both `-sys` READMEs reference the removed `links` key; isa-sys README documents a dead `DEP_ISA_BRIDGE_BINDINGS_RS` mechanism. | open |
 | 14 | P2 | C API footguns: `abc_builder_class_add_field` with REFERENCE type hits a C++ assert; `abc_builder_literal_array_add_method` requires prior method registration. | open |
 | 15 | P2 | `Error::Open` carries no C++-side reason. | fixed |
-| 16 | P1 | Line-number programs are emitted before `ComputeLayout`, so `EmitSetFile`-style operands record string offsets of 0; files with debug info fail extraction (or decode garbage). Needs staged emission flushed after the first layout pass. | open |
+| 16 | P1 | Line-number programs are emitted before `ComputeLayout`, so `EmitSetFile`-style operands record string offsets of 0; files with debug info fail extraction (or decode garbage). Needs staged emission flushed after the first layout pass. | fixed |
 
 ## Findings with evidence
 

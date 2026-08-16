@@ -2194,6 +2194,33 @@ try {
 
 /* ========== ABC Builder ========== */
 
+/* Line-number-program ops are staged and flushed after the first
+ * ComputeLayout: operands such as EmitSetFile encode string item offsets,
+ * which do not exist before layout. Flushing happens in finalize and in
+ * every dedup entry point (dedup must hash fully-built programs). */
+
+enum AbcLnpOp : uint8_t {
+    ABC_LNP_OP_END = 0,
+    ABC_LNP_OP_ADVANCE_PC,
+    ABC_LNP_OP_ADVANCE_LINE,
+    ABC_LNP_OP_COLUMN,
+    ABC_LNP_OP_START_LOCAL,
+    ABC_LNP_OP_START_LOCAL_EXTENDED,
+    ABC_LNP_OP_END_LOCAL,
+    ABC_LNP_OP_SET_FILE,
+    ABC_LNP_OP_SET_SOURCE_CODE,
+};
+
+struct AbcStagedLnpOp {
+    uint8_t op;
+    uint32_t lnp;
+    uint32_t debug;
+    uint32_t a;  // u32 payload / first string handle
+    int32_t b;   // i32 payload (register numbers, line deltas)
+    uint32_t c;  // second string handle (start_local type)
+    uint32_t d;  // third string handle (start_local_extended signature)
+};
+
 struct AbcBuilder {
     ItemContainer container;
     std::vector<uint8_t> output;
@@ -2214,6 +2241,8 @@ struct AbcBuilder {
     std::vector<MethodHandleItem *> method_handle_items;
     // Staged literal items: flushed to LiteralArrayItem in finalize
     std::vector<std::vector<panda::panda_file::LiteralItem>> literal_items_staging;
+    // Staged line-number-program ops: flushed after the first ComputeLayout
+    std::vector<AbcStagedLnpOp> lnp_staging;
 
     // Resolve tagged class handle: high bit = foreign class
     BaseClassItem *ResolveClassHandle(uint32_t handle) {
@@ -2551,6 +2580,74 @@ void abc_builder_method_set_code(AbcBuilder *b, uint32_t method_handle, uint32_t
 
 /* --- 3.6 Debug Info --- */
 
+/* Line-number-program ops are staged and flushed after the first
+ * ComputeLayout: operands such as EmitSetFile encode string item offsets,
+ * which do not exist before layout. Flushing happens in finalize and in
+ * every dedup entry point (dedup must hash fully-built programs). */
+
+static void abc_builder_flush_lnp_staging(AbcBuilder *b) {
+    if (b->lnp_staging.empty()) {
+        return;
+    }
+    b->container.ComputeLayout();
+    for (const auto &op : b->lnp_staging) {
+        if (op.lnp >= b->lnps.size()) continue;
+        auto *lnp = b->lnps[op.lnp];
+        switch (op.op) {
+            case ABC_LNP_OP_END:
+                lnp->EmitEnd();
+                break;
+            case ABC_LNP_OP_ADVANCE_PC:
+                if (op.debug >= b->debug_infos.size()) continue;
+                lnp->EmitAdvancePc(b->debug_infos[op.debug]->GetConstantPool(), op.a);
+                break;
+            case ABC_LNP_OP_ADVANCE_LINE:
+                if (op.debug >= b->debug_infos.size()) continue;
+                lnp->EmitAdvanceLine(b->debug_infos[op.debug]->GetConstantPool(), op.b);
+                break;
+            case ABC_LNP_OP_COLUMN:
+                if (op.debug >= b->debug_infos.size()) continue;
+                lnp->EmitColumn(b->debug_infos[op.debug]->GetConstantPool(), op.a, op.c);
+                break;
+            case ABC_LNP_OP_START_LOCAL: {
+                if (op.debug >= b->debug_infos.size()) continue;
+                StringItem *name = (op.a < b->strings.size()) ? b->strings[op.a] : nullptr;
+                StringItem *type = (op.c < b->strings.size()) ? b->strings[op.c] : nullptr;
+                lnp->EmitStartLocal(b->debug_infos[op.debug]->GetConstantPool(), op.b, name, type);
+                break;
+            }
+            case ABC_LNP_OP_START_LOCAL_EXTENDED: {
+                if (op.debug >= b->debug_infos.size()) continue;
+                StringItem *name = (op.a < b->strings.size()) ? b->strings[op.a] : nullptr;
+                StringItem *type = (op.c < b->strings.size()) ? b->strings[op.c] : nullptr;
+                StringItem *sig = (op.d < b->strings.size()) ? b->strings[op.d] : nullptr;
+                lnp->EmitStartLocalExtended(b->debug_infos[op.debug]->GetConstantPool(), op.b,
+                                            name, type, sig);
+                break;
+            }
+            case ABC_LNP_OP_END_LOCAL:
+                lnp->EmitEndLocal(op.b);
+                break;
+            case ABC_LNP_OP_SET_FILE: {
+                if (op.debug >= b->debug_infos.size()) continue;
+                StringItem *file = (op.a < b->strings.size()) ? b->strings[op.a] : nullptr;
+                lnp->EmitSetFile(b->debug_infos[op.debug]->GetConstantPool(), file);
+                break;
+            }
+            case ABC_LNP_OP_SET_SOURCE_CODE: {
+                if (op.debug >= b->debug_infos.size()) continue;
+                StringItem *code = (op.a < b->strings.size()) ? b->strings[op.a] : nullptr;
+                lnp->EmitSetSourceCode(b->debug_infos[op.debug]->GetConstantPool(), code);
+                break;
+            }
+            default:
+                continue;
+        }
+    }
+    b->lnp_staging.clear();
+    b->container.InvalidateComputeLayout();
+}
+
 uint32_t abc_builder_create_lnp(AbcBuilder *b) {
     auto *item = b->container.CreateLineNumberProgramItem();
     uint32_t idx = static_cast<uint32_t>(b->lnps.size());
@@ -2560,38 +2657,36 @@ uint32_t abc_builder_create_lnp(AbcBuilder *b) {
 
 void abc_builder_lnp_emit_end(AbcBuilder *b, uint32_t lnp_handle) {
     if (lnp_handle >= b->lnps.size()) return;
-    b->lnps[lnp_handle]->EmitEnd();
+    b->lnp_staging.push_back({ABC_LNP_OP_END, lnp_handle, 0, 0, 0, 0, 0});
 }
 
 void abc_builder_lnp_emit_advance_pc(AbcBuilder *b, uint32_t lnp_handle,
                                       uint32_t debug_handle, uint32_t value) {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
-    b->lnps[lnp_handle]->EmitAdvancePc(b->debug_infos[debug_handle]->GetConstantPool(), value);
+    b->lnp_staging.push_back({ABC_LNP_OP_ADVANCE_PC, lnp_handle, debug_handle, value, 0, 0, 0});
 }
 
 void abc_builder_lnp_emit_advance_line(AbcBuilder *b, uint32_t lnp_handle,
                                         uint32_t debug_handle, int32_t value) {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
-    b->lnps[lnp_handle]->EmitAdvanceLine(b->debug_infos[debug_handle]->GetConstantPool(), value);
+    b->lnp_staging.push_back({ABC_LNP_OP_ADVANCE_LINE, lnp_handle, debug_handle, 0, value, 0, 0});
 }
 
 void abc_builder_lnp_emit_column(AbcBuilder *b, uint32_t lnp_handle,
                                   uint32_t debug_handle, uint32_t pc_inc, uint32_t column) {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
-    b->lnps[lnp_handle]->EmitColumn(b->debug_infos[debug_handle]->GetConstantPool(), pc_inc, column);
+    b->lnp_staging.push_back({ABC_LNP_OP_COLUMN, lnp_handle, debug_handle, pc_inc, 0, column, 0});
 }
 
 void abc_builder_lnp_emit_start_local(AbcBuilder *b, uint32_t lnp_handle,
     uint32_t debug_handle, int32_t reg, uint32_t name_handle, uint32_t type_handle) {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
-    StringItem *name_item = (name_handle < b->strings.size()) ? b->strings[name_handle] : nullptr;
-    StringItem *type_item = (type_handle < b->strings.size()) ? b->strings[type_handle] : nullptr;
-    b->lnps[lnp_handle]->EmitStartLocal(
-        b->debug_infos[debug_handle]->GetConstantPool(), reg, name_item, type_item);
+    b->lnp_staging.push_back(
+        {ABC_LNP_OP_START_LOCAL, lnp_handle, debug_handle, name_handle, reg, type_handle, 0});
 }
 
 void abc_builder_lnp_emit_start_local_extended(AbcBuilder *b, uint32_t lnp_handle,
@@ -2599,16 +2694,13 @@ void abc_builder_lnp_emit_start_local_extended(AbcBuilder *b, uint32_t lnp_handl
     uint32_t name_handle, uint32_t type_handle, uint32_t type_sig_handle) {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
-    StringItem *name_item = (name_handle < b->strings.size()) ? b->strings[name_handle] : nullptr;
-    StringItem *type_item = (type_handle < b->strings.size()) ? b->strings[type_handle] : nullptr;
-    StringItem *sig_item = (type_sig_handle < b->strings.size()) ? b->strings[type_sig_handle] : nullptr;
-    b->lnps[lnp_handle]->EmitStartLocalExtended(
-        b->debug_infos[debug_handle]->GetConstantPool(), reg, name_item, type_item, sig_item);
+    b->lnp_staging.push_back({ABC_LNP_OP_START_LOCAL_EXTENDED, lnp_handle, debug_handle,
+                              name_handle, reg, type_handle, type_sig_handle});
 }
 
 void abc_builder_lnp_emit_end_local(AbcBuilder *b, uint32_t lnp_handle, int32_t reg) {
     if (lnp_handle >= b->lnps.size()) return;
-    b->lnps[lnp_handle]->EmitEndLocal(reg);
+    b->lnp_staging.push_back({ABC_LNP_OP_END_LOCAL, lnp_handle, 0, 0, reg, 0, 0});
 }
 
 void abc_builder_lnp_emit_set_file(AbcBuilder *b, uint32_t lnp_handle,
@@ -2616,8 +2708,8 @@ void abc_builder_lnp_emit_set_file(AbcBuilder *b, uint32_t lnp_handle,
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     if (source_file_handle >= b->strings.size()) return;
-    b->lnps[lnp_handle]->EmitSetFile(
-        b->debug_infos[debug_handle]->GetConstantPool(), b->strings[source_file_handle]);
+    b->lnp_staging.push_back(
+        {ABC_LNP_OP_SET_FILE, lnp_handle, debug_handle, source_file_handle, 0, 0, 0});
 }
 
 void abc_builder_lnp_emit_set_source_code(AbcBuilder *b, uint32_t lnp_handle,
@@ -2625,8 +2717,8 @@ void abc_builder_lnp_emit_set_source_code(AbcBuilder *b, uint32_t lnp_handle,
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     if (source_code_handle >= b->strings.size()) return;
-    b->lnps[lnp_handle]->EmitSetSourceCode(
-        b->debug_infos[debug_handle]->GetConstantPool(), b->strings[source_code_handle]);
+    b->lnp_staging.push_back(
+        {ABC_LNP_OP_SET_SOURCE_CODE, lnp_handle, debug_handle, source_code_handle, 0, 0, 0});
 }
 
 uint32_t abc_builder_create_debug_info(AbcBuilder *b, uint32_t lnp_handle, uint32_t line_number) {
@@ -2987,16 +3079,19 @@ uint32_t abc_builder_create_method_handle(AbcBuilder *b, uint8_t type, uint32_t 
 // InvalidateComputeLayout); the finalize step recomputes the layout.
 
 void abc_builder_deduplicate(AbcBuilder *b) {
+    abc_builder_flush_lnp_staging(b);
     b->container.DeduplicateItems(true);
 }
 
 void abc_builder_deduplicate_code_and_debug_info(AbcBuilder *b) {
+    abc_builder_flush_lnp_staging(b);
     b->container.ComputeLayout();
     b->container.DeduplicateCodeAndDebugInfo();
     b->container.InvalidateComputeLayout();
 }
 
 void abc_builder_deduplicate_annotations(AbcBuilder *b) {
+    abc_builder_flush_lnp_staging(b);
     b->container.ComputeLayout();
     b->container.DeduplicateAnnotations();
     b->container.InvalidateComputeLayout();
@@ -3004,6 +3099,9 @@ void abc_builder_deduplicate_annotations(AbcBuilder *b) {
 
 const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len) {
     try {
+        // Flush staged line-number-program ops (their operands encode item
+        // offsets, so the flush runs its own layout pass first)
+        abc_builder_flush_lnp_staging(b);
         // Flush staged literal items to their LiteralArrayItems
         for (size_t i = 0; i < b->literal_items_staging.size(); i++) {
             if (!b->literal_items_staging[i].empty()) {
