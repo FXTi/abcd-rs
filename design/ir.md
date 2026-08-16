@@ -1,4 +1,7 @@
-# SSA IR Design (abcd-ir)
+# SSA IR Design (abcd-ir) — v0.1 (as built)
+
+> The v0.2 redesign proposal is appended below ("IR Design v0.2"); this
+> v0.1 section documents the implementation as it stands.
 
 ## Goals and principles
 
@@ -98,4 +101,211 @@ Note: the Lengauer-Tarjan / Georgiadis dominator papers are deliberately **not**
 3. `try_remove_trivial_phi` updates only the defs maps and does not actually remove the phi instruction from the module.
 4. `isel` approximations: `BitNot → Not`, `Void → Ldundefined`, `ThrowConstAssignment` uses a dummy Reg(0).
 5. Out-of-SSA cycle breaking allocates no real temporary register (swap cycles of ≥2 nodes are wrong).
-6. `encode()` round-trip is disabled by the C++ dedup crash (see file-format.md).
+6. ~~`encode()` round-trip is disabled by the C++ dedup crash~~ — fixed in review #3 (dedup now runs with a layout pass); `encode_roundtrip` is un-ignored and green.
+
+---
+
+# IR Design v0.2 (redesign proposal)
+
+Status: proposal agreed with the maintainer; supersedes the v0.1 shape
+above. The v0.1 section stays as the "as built" record.
+
+## 1. Boundary and dependency direction
+
+`abcd-ir` is **format-independent by construction**: its `Cargo.toml`
+declares no dependency on `abcd-file` or `abcd-isa`. Lifting and lowering
+are separate conversion layers (own crates, e.g. `abcd-lift` /
+`abcd-lower`) and are the only components that import both sides.
+
+```
+File (encoding) ──lift──▶ IR (semantics) ──lower──▶ File (encoding)
+```
+
+The IR describes a **program** (classes, functions, value flow, types,
+annotations, modules, debug info) — never a **file**. Everything
+container-specific stays in `abcd-file` + FormatProfile; everything
+instruction-encoding-specific stays in the lift/lower layers.
+
+## 2. What must not leak (format concepts banned from the IR)
+
+| Leaked concept (v0.1) | Why it leaks | Semantic replacement |
+|---|---|---|
+| `Module.version` / `file_type` | file identity, not program semantics | removed; callers read `File.version` if they need it |
+| `Value.origin` (source register / accumulator) | register numbering is an encoding-layout decision | removed; variable naming quality comes from `DebugData.local_vars` (the LNP table, which *is* semantics) |
+| `LiteralArrayIdx` / `ModuleData` encodings | literal-array table & module-record byte layout are container shapes | `Const` pool (`Str/Num/Bool/Null/Array/TypedArray`) and `ImportDecl`/`ExportDecl` |
+| four annotation buckets (compile_time/runtime/type/runtime_type) | tag-stream classification; the #9 contract folds them to one bucket on 12+/24 write-back | a single `Vec<Annotation>` per attach site; lift merges, lower folds per FormatProfile. The 9/11 four-bucket distinction stays documented in the File layer as read-only legacy |
+| `Tagged` type id, `ACC_*` bit values, `FunctionKind` encodings | format-layer type codes and bit layouts | semantic `Modifiers` set, semantic `FunctionKind` enum, `Ty::Any` for tagged |
+| `SourceLoc` instruction offset | code-layout detail | line/column/statement only |
+| `num_vregs` / `num_args` | frame layout | removed (SSA has no registers) |
+
+## 3. Object model (arena indices, no lifetimes)
+
+```rust
+struct Module {
+    sym: SymbolTable,                // symbol identity (names); not a "string pool"
+    classes: Vec<ClassData>,
+    functions: Vec<FunctionData>,
+    consts: Vec<Const>,              // numbers, strings, array literals, typed arrays
+    imports: Vec<ImportDecl>,        // module semantics, not record encodings
+    exports: Vec<ExportDecl>,
+}
+
+struct ClassData {
+    descriptor: Sym, name: Sym,
+    modifiers: Modifiers,            // public/static/final/abstract/interface/enum/annotation
+    source_lang: SourceLang,         // ECMAScript / TypeScript / ArkTS (semantic)
+    super_class: Option<ClassId>, interfaces: Vec<ClassId>,
+    fields: Vec<FieldId>, methods: Vec<FuncId>,
+    annotations: Vec<Annotation>,    // single list, see §6
+    source_file: Option<Sym>,
+}
+
+struct FunctionData {
+    class_id: ClassId, name: Sym,
+    sig: Option<Signature>,          // absent in 12+/24 files (format fact #A7); the IR reflects reality
+    kind: FunctionKind,              // Function/Constructor/Generator/Async/... (semantic enum)
+    modifiers: Modifiers,
+    params: Vec<ValueId>,            // `this` + all formals as SSA parameters
+    entry: BlockId, blocks: Vec<BlockId>,
+    try_regions: Vec<TryRegion>,     // protected ranges + catch edges (control-flow semantics)
+    debug: Option<DebugData>,        // line/column tables, locals, param names, source file/code
+    annotations: Vec<Annotation>,
+}
+
+struct Block { insts: Vec<InstId>, preds: Vec<BlockId> }   // successors derived from the terminator
+struct Value { def: ValueDef, ty: Ty }
+enum ValueDef { Param(ParamId), Inst(InstId), Const(ConstId) }
+struct Inst { op: Op, operands: Vec<ValueId>, result: Option<ValueId>,
+              block: BlockId, loc: Loc }                    // Loc = line/column/statement
+
+struct Annotation { class: ClassId, elements: Vec<(Sym, AnnValue)> }
+```
+
+Single-point interfaces on `Op`, mirroring the Hermes discipline:
+`operands_mut()` / `has_result()` / `is_terminator()` — every pass and
+the verifier depend only on these three.
+
+## 4. Op taxonomy: ~40 semantic variants, zero opcode concepts
+
+All 268 opcodes (width variants, typed/dynamic twins, call family) fold
+into a small semantic set; encoding selection is a lowering concern.
+
+- **Compute**: `BinaryOp` / `UnaryOp` / `Compare` by operator semantics
+  (`add_i32` vs `add_f64` are `BinaryOp::Add` + `ty`, not two ops).
+- **Value flow**: `Mov` (pure value copy; sign extension is `Mov` + `ty`).
+- **Constants**: `LoadConst(ConstId)`.
+- **Objects / arrays**: `AllocObject { shape: ConstId }`, `AllocArray`,
+  `LoadProp/StoreProp { name: Sym, ty }`, `LoadPropByIndex/StorePropByIndex`,
+  `DefineMethod`, `GetPropIterator/IteratorNext/IteratorReturn/IteratorThrow`.
+- **Lexical / global / module**: `GetLexEnv/GetLexVar/PutLexVar`,
+  `TryGetGlobal { name, default_path }`, `StoreGlobal`,
+  `GetModuleNamespace/LoadModuleVar/StoreModuleVar`.
+- **Calls**: `Call { target, args, kind: Direct|Virtual|Super|New, sig: Option<Signature> }`,
+  `DefineFunc { captured: Vec<ValueId>, body: FuncId }` — one semantic
+  call op replaces the whole callthis/callshort/callrange family.
+- **Exceptions**: `Throw`; protected ranges live in `TryRegion`, catch
+  entry via CFG edges.
+- **Generators / async**: `CreateGenerator/Suspend/Resume`, `Await`
+  (protocol details annotate lowering, not the Op).
+- **Control flow**: `Branch / CondBranch / Switch(const table) / Return / Phi`.
+
+Result: analyzers face ~40 semantic ops instead of 268 encodings, with no
+fidelity loss — width/variant choice carries no semantic difference.
+
+## 5. Types: dynamic lattice + static precise layer
+
+JS/TS files lift to `Any` everywhere; ArkTS static constructs annotate the
+same instruction stream. The IR is **dynamic-first, static-as-annotation**
+(es2panda is a JS compiler — modules.abc is JS — so the dynamic layer is
+the core, never a corner case).
+
+```rust
+enum Ty {
+    Any,
+    DynPrim(Undefined | Null | Bool | Number | String | Symbol | BigInt | Object),
+    Static(StaticTy),
+    Union(SmallVec<Ty, 4>),
+    Unknown,
+}
+enum StaticTy { U1, I8, U8, I16, U16, I32, U32, I64, U64, F32, F64,
+                Reference(ClassId), Void }        // no Tagged: that is Ty::Any
+```
+
+Join: `Any ⊔ x = Any`; equal static types keep, unequal fall back along
+the numeric tower to `DynPrim(Number)` / `Any`. `Signature` (declaration)
+is kept separate from `Ty` (analysis value).
+
+## 6. Metadata fidelity contract
+
+- **Annotations**: one semantic list per attach site; elements reference
+  `Const` / `ClassId` / `FieldId` / `Sym`. Lifting merges the four file
+  buckets; lowering folds per FormatProfile (#9: 12+/24 emit ANNOTATION
+  only). The 9/11 four-bucket read distinction is File-layer legacy.
+- **Debug**: `DebugData` on the function (line/column tables, locals,
+  param names, source file/code); lifted from the LNP dual stream,
+  replayed as advance_pc/line pairs with the #16 rule (emit after layout).
+- **Try regions**: structured per-block metadata *and* catch edges — CFG
+  passes need edges, decompilation needs structure.
+- **Modules**: import/export declarations preserved (decompiling JS
+  modules depends on them).
+- **Constant pool**: literal arrays become typed `Const`s; the module
+  record becomes `ImportDecl`/`ExportDecl`.
+
+## 7. Lift / lower responsibilities
+
+```
+lift (decode → semantics)              lower (semantics → encode)
+─────────────────────────             ─────────────────────────
+tag streams / indexes / offsets       phi exit + register/acc allocation
+four annotation buckets → one list    annotation fold per FormatProfile
+module record → Import/ExportDecl     Import/ExportDecl → record layout
+LNP dual stream → tables              tables → advance_pc/line replay
+literal arrays → Const pool           Const pool → literal-array layout
+registers+acc → Braun SSA             SSA values → interference graph → regs/acc
+opcode/format → Op + ty               Op + ty → instruction selection (typed/dynamic, widths)
+```
+
+## 8. Invariants
+
+1. **Zero format dependency** — enforced at compile time by the crate
+   graph; no pass may know whether the input was a 12 or a 24 file.
+2. **Round-trip fixed point** — `lift(decode(encode(lower(y)))) ≅ y`
+   (structural equivalence) is a CI invariant.
+3. **Information conservation table** — every encoding construct consumed
+   by lift has exactly one semantic home in the IR, or is listed in the
+   FormatProfile's "deliberate loss" ledger (12+/24 protos, 9/11
+   annotation classification).
+4. **Analysis is format-agnostic** — pass inputs/outputs are IR only.
+
+## 9. Analysis roadmap on this IR
+
+1. Graph/structure: RPO, dominators (Semi-NCA), dominance frontiers,
+   natural loops, CFG simplify, structured control-flow recovery
+   (if/switch/while patterns for decompilation).
+2. Classical dataflow: use-def/def-use, liveness, reaching definitions,
+   available expressions, SCCP, value ranges.
+3. SSA optimizations: GVN, LICM, ADCE, copy propagation, branch folding,
+   jump threading, scalar replacement (object-field SROA).
+4. JS/semantic layer (the point of this project): call-graph construction
+   with CHA/RTA convergence on `Call { kind: Dynamic }`; type inference
+   converging `Ty` from typed ops, literal shapes, and prototype chains;
+   property/prototype shape analysis; escape analysis over `DefineFunc`
+   capture tables; exception-flow pollution through catch edges;
+   accumulator flow reconstruction into expression stacks (decompilation);
+   switch-pattern and iterator-protocol recognition.
+5. Verification: IRVerifier (SSA dominance, single terminator, operand
+   types, metadata completeness) plus the round-trip fixed point in CI.
+
+## 10. Delta vs v0.1 (the concrete redesign decisions)
+
+1. Instruction set organized as "dynamic layer + static annotation layer"
+   instead of a flat opcode enumeration.
+2. `Ty` double lattice introduced; static types become annotations on the
+   dynamic core (v0.1 `types.rs` is static-biased).
+3. domtree / natural loops / alias / type inference promoted to core
+   wired-in analyses (v0.1 keeps domtree as an unwired stub).
+4. Accumulator modeled as an SSA value without register origin; out-of-SSA
+   unifies register/acc allocation (v0.1 unifies as RegOrAcc but keeps
+   numbering inside the IR).
+5. Metadata contract written as pass constraints + verifier checks
+   (v0.1 has the data but not the hard contract).

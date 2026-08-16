@@ -172,6 +172,14 @@ definitions referenced, upstream churn does not affect us" goal:
    metadata; local adaptation only in bridge/shim; generated code in
    OUT_DIR; the C ABI surface is the stable contract. A future 0.1.x
    backend = a second vendor subset + a second profile, same IR.
+5. **IR boundary decision (see design/ir.md v0.2)**: `abcd-ir` is
+   format-independent by construction — no dependency on `abcd-file` or
+   `abcd-isa`; lift/lower are the only layers that see both sides. Format
+   concepts banned from the IR: file version/type, register origins,
+   literal-array/module-record encodings, the four annotation buckets
+   (merged to one semantic list; fold-back per #9), Tagged/ACC bit values,
+   instruction offsets, frame sizes. The IR holds program semantics; the
+   File layer holds container semantics.
 
 ## 6. Hermes comparison
 
