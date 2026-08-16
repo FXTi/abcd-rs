@@ -94,6 +94,9 @@ pub struct LiteralArrayIdx(pub u32);
 #[derive(Clone, Debug, PartialEq)]
 pub enum LiteralValue {
     Bool(bool),
+    /// 8-bit integer literal (`TAGVALUE`/`INTEGER_8` tag 0x00; present in
+    /// real 12.x files — audit finding #A1).
+    Integer8(u8),
     Integer(u32),
     Float(f32),
     Double(f64),
@@ -212,8 +215,9 @@ pub(crate) unsafe extern "C" fn collect_literal_val_cb(
         LiteralTag::ArrayString => {
             LiteralValue::ArrayString(LiteralArrayIdx(unsafe { v.data.u32_val }))
         }
-        // TagValue (= INTEGER_8) is UNREACHABLE in C++
-        LiteralTag::TagValue => return,
+        // TagValue (= INTEGER_8): a legal one-byte integer literal in
+        // real 12.x files (audit finding #A1).
+        LiteralTag::TagValue => LiteralValue::Integer8(unsafe { v.data.u8_val }),
     };
     ctx.values.push(lit);
 }

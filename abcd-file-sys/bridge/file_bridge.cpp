@@ -1751,13 +1751,117 @@ static void literal_val_to_c(const LiteralDA::LiteralValue &val, LiteralTag tag,
     cb(&out, ctx);
 }
 
+// Tolerant literal-array enumerator. The vendor
+// LiteralDataAccessor::EnumerateLiteralVals aborts on LiteralTag 0x00
+// (TAGVALUE / INTEGER_8 — a legal 1-byte integer literal in real 12.x
+// files, audit finding #A1) and on any unknown tag. This walk keeps the
+// vendor [tag][value] pair semantics (count = 2N) but:
+//   - treats tag 0x00 as a 1-byte INTEGER_8,
+//   - bounds-checks every read,
+//   - stops (never aborts) on unknown tags or truncated items.
+static constexpr size_t TAG_SIZE_BC = 1;
+
+static void abc_literal_enumerate_vals_tolerant(const File *file, uint32_t array_off,
+                                                AbcLiteralValCb cb, void *ctx) {
+    auto sp = file->GetSpanFromId(File::EntityId(array_off));
+    if (sp.Size() < sizeof(uint32_t)) {
+        return;
+    }
+    uint32_t count = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+    AbcLiteralVal out;
+    for (uint32_t i = 0; i < count; i += 2U) {
+        out.data.u64_val = 0;
+        out.str_data = nullptr;
+        out.str_utf16_len = 0;
+        if (sp.Size() < TAG_SIZE_BC) {
+            return;
+        }
+        uint8_t tag = sp[0];
+        sp = sp.SubSpan(TAG_SIZE_BC);
+        auto read_u8 = [&sp]() -> bool {
+            if (sp.Size() < 1) return false;
+            return true;
+        };
+        switch (tag) {
+            case 0x00:  // TAGVALUE / INTEGER_8: one-byte integer
+                if (!read_u8()) return;
+                out.tag = 0x00;
+                out.data.u8_val = sp[0];
+                sp = sp.SubSpan(1);
+                break;
+            case 0x01:  // BOOL
+                if (!read_u8()) return;
+                out.tag = 0x01;
+                out.data.bool_val = sp[0];
+                sp = sp.SubSpan(1);
+                break;
+            case 0x02:  // INTEGER
+            case 0x17:  // LITERALBUFFERINDEX
+                if (sp.Size() < 4) return;
+                out.tag = tag;
+                out.data.u32_val = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+                break;
+            case 0x03:  // FLOAT
+                if (sp.Size() < 4) return;
+                out.tag = tag;
+                out.data.u32_val = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+                break;
+            case 0x04:  // DOUBLE
+                if (sp.Size() < 8) return;
+                out.tag = tag;
+                out.data.u64_val = panda::panda_file::helpers::Read<sizeof(uint64_t)>(&sp);
+                break;
+            case 0x05:  // STRING
+            case 0x06:  // METHOD
+            case 0x07:  // GENERATORMETHOD
+            case 0x16:  // ASYNCGENERATORMETHOD
+            case 0x18:  // LITERALARRAY
+            case 0x1a:  // GETTER
+            case 0x1b:  // SETTER
+            case 0x1c:  // ETS_IMPLEMENTS
+                if (sp.Size() < 4) return;
+                out.tag = tag;
+                out.data.u32_val = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+                break;
+            case 0x08:  // ACCESSOR
+            case 0x19:  // BUILTINTYPEINDEX
+            case 0xff:  // NULLVALUE
+                if (!read_u8()) return;
+                out.tag = tag;
+                out.data.u8_val = sp[0];
+                sp = sp.SubSpan(1);
+                break;
+            case 0x09:  // METHODAFFILIATE
+                if (sp.Size() < 2) return;
+                out.tag = tag;
+                out.data.u16_val = panda::panda_file::helpers::Read<sizeof(uint16_t)>(&sp);
+                break;
+            case 0x0a:  // ARRAY_U1
+            case 0x0b:  // ARRAY_U8
+            case 0x0c:  // ARRAY_I8
+            case 0x0d:  // ARRAY_U16
+            case 0x0e:  // ARRAY_I16
+            case 0x0f:  // ARRAY_U32
+            case 0x10:  // ARRAY_I32
+            case 0x11:  // ARRAY_U64
+            case 0x12:  // ARRAY_I64
+            case 0x13:  // ARRAY_F32
+            case 0x14:  // ARRAY_F64
+            case 0x15:  // ARRAY_STRING: value = offset of the typed array data
+                out.tag = tag;
+                out.data.u32_val = file->GetIdFromPointer(sp.data()).GetOffset();
+                return;  // the rest of the item is the array payload
+            default:
+                return;  // unknown tag: stop, never abort
+        }
+        cb(&out, ctx);
+    }
+}
+
 void abc_literal_enumerate_vals(AbcLiteralAccessor *a, uint32_t array_off,
                                 AbcLiteralValCb cb, void *ctx) {
 try {
-    a->accessor.EnumerateLiteralVals(File::EntityId(array_off),
-        [&](const LiteralDA::LiteralValue &val, LiteralTag tag) {
-            literal_val_to_c(val, tag, cb, ctx);
-        });
+    abc_literal_enumerate_vals_tolerant(&a->accessor.GetPandaFile(), array_off, cb, ctx);
 } catch (...) {
     return;
 }
@@ -1790,10 +1894,9 @@ try {
 void abc_literal_enumerate_vals_by_index(AbcLiteralAccessor *a, uint32_t index,
                                           AbcLiteralValCb cb, void *ctx) {
 try {
-    a->accessor.EnumerateLiteralVals(static_cast<size_t>(index),
-        [&](const LiteralDA::LiteralValue &val, LiteralTag tag) {
-            literal_val_to_c(val, tag, cb, ctx);
-        });
+    auto id = a->accessor.GetLiteralArrayId(static_cast<size_t>(index));
+    if (!id.IsValid()) return;
+    abc_literal_enumerate_vals_tolerant(&a->accessor.GetPandaFile(), id.GetOffset(), cb, ctx);
 } catch (...) {
     return;
 }

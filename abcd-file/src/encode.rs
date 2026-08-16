@@ -1410,6 +1410,10 @@ fn encode_literal_value_simple(
             b.literal_array_add_u8(la, LiteralTag::Bool as u8);
             b.literal_array_add_u8(la, *v as u8);
         }
+        LiteralValue::Integer8(v) => {
+            b.literal_array_add_u8(la, LiteralTag::TagValue as u8);
+            b.literal_array_add_u8(la, *v);
+        }
         LiteralValue::Integer(v) => {
             b.literal_array_add_u8(la, LiteralTag::Integer as u8);
             b.literal_array_add_u32(la, *v);
@@ -1623,6 +1627,10 @@ fn encode_literal_value(
         LiteralValue::Bool(v) => {
             b.literal_array_add_u8(la, LiteralTag::Bool as u8);
             b.literal_array_add_u8(la, *v as u8);
+        }
+        LiteralValue::Integer8(v) => {
+            b.literal_array_add_u8(la, LiteralTag::TagValue as u8);
+            b.literal_array_add_u8(la, *v);
         }
         LiteralValue::Integer(v) => {
             b.literal_array_add_u8(la, LiteralTag::Integer as u8);
