@@ -1155,9 +1155,9 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     }
 
     // --- Deduplicate and finalize ---
-    // NOTE: b.deduplicate() (specifically deduplicate_code_and_debug_info)
-    // crashes in the C++ library when re-encoding decoded files.
-    // Skipped until the underlying C++ issue is fixed.
+    // DeduplicateItems computes a layout pass first: its hash computation
+    // reads per-item index ranges that only ComputeLayout populates.
+    b.deduplicate();
     b.finalize()
 }
 

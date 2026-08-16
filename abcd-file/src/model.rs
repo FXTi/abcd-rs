@@ -92,7 +92,7 @@ pub struct Field {
 }
 
 /// Initial value of a field.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FieldValue {
     I32(i32),
     I64(i64),

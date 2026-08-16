@@ -2981,16 +2981,25 @@ uint32_t abc_builder_create_method_handle(AbcBuilder *b, uint8_t type, uint32_t 
 
 /* --- 3.9 Deduplication --- */
 
+// Deduplication hashes items through IndexedItem::GetIndex, which requires
+// the per-item index ranges populated by ComputeLayout. DeduplicateItems
+// therefore runs with computeLayout=true (ComputeLayout -> dedup ->
+// InvalidateComputeLayout); the finalize step recomputes the layout.
+
 void abc_builder_deduplicate(AbcBuilder *b) {
-    b->container.DeduplicateItems(false);
+    b->container.DeduplicateItems(true);
 }
 
 void abc_builder_deduplicate_code_and_debug_info(AbcBuilder *b) {
+    b->container.ComputeLayout();
     b->container.DeduplicateCodeAndDebugInfo();
+    b->container.InvalidateComputeLayout();
 }
 
 void abc_builder_deduplicate_annotations(AbcBuilder *b) {
+    b->container.ComputeLayout();
     b->container.DeduplicateAnnotations();
+    b->container.InvalidateComputeLayout();
 }
 
 const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len) {

@@ -1,4 +1,6 @@
-use abcd_file::{AccessFlags, Builder, Bytecode, SourceLang, Type, decode, encode};
+use abcd_file::{
+    AccessFlags, AnnotationElemDef, Builder, Bytecode, SourceLang, Type, decode, encode,
+};
 
 /// Build a minimal ABC file with one global class and one method.
 fn build_minimal() -> Vec<u8> {
@@ -21,6 +23,53 @@ fn build_minimal() -> Vec<u8> {
     );
     b.method_set_source_lang(m, SourceLang::EcmaScript);
     b.method_set_function_kind(m, abcd_file::FunctionKind::Function);
+
+    b.finalize().expect("finalize should succeed")
+}
+
+/// Build a richer file covering the item kinds the dedup passes walk:
+/// a field with an initial value, a class annotation, debug info with a
+/// line table, and a literal array.
+fn build_rich() -> Vec<u8> {
+    let mut b = Builder::new();
+    b.set_api(12, "beta1");
+
+    let cls = b.add_global_class();
+    b.class_set_source_lang(cls, SourceLang::EcmaScript);
+
+    let f = b.class_add_field(cls, "count", Type::I32, AccessFlags::PUBLIC);
+    b.field_set_value_i32(f, 42);
+
+    // Class annotation with one U32 element (tag b'7').
+    let ann_name = b.add_string("level");
+    let ann = b.create_annotation(
+        cls,
+        &[AnnotationElemDef {
+            name: ann_name,
+            tag: b'7',
+            value: 9,
+        }],
+    );
+    b.class_add_runtime_annotation(cls, ann);
+
+    let proto = b.create_proto(Type::Tagged, &[]);
+    let m = b.class_add_method(
+        cls,
+        "func_main_0",
+        proto,
+        AccessFlags::PUBLIC,
+        &[0x65],
+        1,
+        0,
+    );
+    b.method_set_source_lang(m, SourceLang::EcmaScript);
+
+    // Note: debug info is intentionally absent — its emission order is a
+    // separate issue (design/review-isa-file.md #16) with its own test.
+
+    let la = b.add_literal_array("lit");
+    let hello = b.add_string("hello");
+    b.literal_array_add_string(la, hello);
 
     b.finalize().expect("finalize should succeed")
 }
@@ -73,9 +122,11 @@ fn file_type_detection() {
 }
 
 #[test]
-#[ignore = "C++ abc_builder_deduplicate crashes on re-encoded files; without dedup the output has invalid offsets"]
 fn encode_roundtrip() {
-    // Build → decode → encode → decode again, compare.
+    // Build → decode → encode → decode again, compare. Regression test for
+    // review finding #3: encode() round-trip was disabled because
+    // DeduplicateItems was invoked without a layout pass, so its hash
+    // computation dereferenced unset index ranges.
     let original_data = build_minimal();
     let file1 = decode(&original_data).expect("first decode");
 
@@ -159,4 +210,72 @@ fn encode_roundtrip() {
             assert_eq!(f1.access_flags, f2.access_flags, "field flags mismatch");
         }
     }
+}
+
+#[test]
+fn encode_roundtrip_rich() {
+    // Same as encode_roundtrip but through the item kinds the dedup passes
+    // walk: field initial value, class annotation, debug info, literal array.
+    let data = build_rich();
+    let file1 = decode(&data).expect("first decode");
+    let encoded = encode(&file1).expect("encode should succeed");
+    let file2 = decode(&encoded).expect("second decode");
+
+    let g1 = file1
+        .classes
+        .values()
+        .find(|c| !c.is_external)
+        .expect("global class (original)");
+    let g2 = file2
+        .classes
+        .values()
+        .find(|c| !c.is_external)
+        .expect("global class (re-encoded)");
+
+    assert_eq!(g1.fields.len(), g2.fields.len());
+    assert_eq!(
+        g1.fields[0].initial_value, g2.fields[0].initial_value,
+        "field initial value must round-trip"
+    );
+
+    // Annotation categories collapse to the ANNOTATION section on write
+    // (upstream API-24 behavior, review finding #9); decode surfaces it as
+    // compile_time, so assert on that bucket.
+    assert_eq!(
+        g1.annotations.compile_time.len(),
+        g2.annotations.compile_time.len()
+    );
+    assert_eq!(
+        g1.annotations.compile_time[0].elements.len(),
+        g2.annotations.compile_time[0].elements.len(),
+        "annotation element count must round-trip"
+    );
+
+    let m2 = &g2.methods[0];
+    assert!(m2.body.is_some(), "method body must round-trip");
+
+    assert_eq!(
+        file1.literal_arrays.len(),
+        file2.literal_arrays.len(),
+        "literal array count must round-trip"
+    );
+    let resolve = |f: &abcd_file::File, v: &abcd_file::LiteralValue| -> String {
+        match v {
+            abcd_file::LiteralValue::String(sid) => f.strings.resolve(*sid).unwrap().to_string(),
+            other => format!("{other:?}"),
+        }
+    };
+    assert_eq!(
+        file1.literal_arrays[0]
+            .values
+            .iter()
+            .map(|v| resolve(&file1, v))
+            .collect::<Vec<_>>(),
+        file2.literal_arrays[0]
+            .values
+            .iter()
+            .map(|v| resolve(&file2, v))
+            .collect::<Vec<_>>(),
+        "literal array values must round-trip"
+    );
 }
