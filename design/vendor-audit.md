@@ -117,7 +117,7 @@ and the compatibility/architecture decisions derived from the audit.
 
 ### B — defects in our bridge/Rust adaptation (found by this audit)
 
-- **#B1 (P1)**: `component_type_from_tag` (bridge) maps 'W'/'X' to F32/F64
+- **#B1 (P1, fixed)**: `component_type_from_tag` (bridge) maps 'W'/'X' to F32/F64
   — wrong; upstream is 'T'=F32, 'U'=F64. Simultaneously
   `encode.rs::is_entity_array_tag` treats 'T'/'U' as entity arrays —
   wrong; entity arrays are 'V'/'W'/'X'/'Y'/'Z'/'@'. Both bugs are masked
@@ -197,6 +197,6 @@ Hermes (reference tree `hermes-main/`) confirms the same two-layer shape:
 1. ~~#A1 tolerant literal enumerator~~ — done (modules.abc decodes: 2035 classes, 29147 literal arrays).
 2. ~~#A3 padded copy in abc_file_open~~ — done.
 3. ~~#A2~~ — fixed (INVALID count → 0; v24 decode covered by tests/format_v24.rs). #A7 signature handling remains a documented format fact.
-4. #B1 annotation array tag fix (both sides) + round-trip test.
+4. ~~#B1 annotation array tag fix~~ — done (both sides + round-trip test; also added `Handle::as_raw`).
 5. #A8 checksum backfill; #B2/#B3/#B4 bridge bounds; #A6 note.
 6. Update design/review-isa-file.md and close out.

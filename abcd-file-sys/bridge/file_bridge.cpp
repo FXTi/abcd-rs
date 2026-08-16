@@ -2880,15 +2880,23 @@ uint32_t abc_builder_create_annotation(AbcBuilder *b, uint32_t class_handle,
     return idx;
 }
 
-// Resolve an entity handle to a BaseItem* based on annotation tag character.
+// Resolve an entity handle to a BaseItem* based on the annotation tag
+// character. Scalar chars: C=String, D=Record, E=Method, F=Enum,
+// G=Annotation, J=MethodHandle, #=LiteralArray. Array chars:
+// V=String, W=Record, X=Method, Y=Enum, Z=Annotation, @=MethodHandle
+// (audit finding #B1: entity array elements must resolve to item offsets,
+// never fall back to raw handle indices).
 static BaseItem *resolve_entity_by_tag(AbcBuilder *b, char tag, uint32_t handle) {
     switch (tag) {
-        case 'C': // String
+        case 'C':  // String (scalar)
+        case 'V':  // String (array element)
             if (handle < b->strings.size()) return b->strings[handle];
             break;
-        case 'D': // Record (class)
+        case 'D':  // Record (scalar)
+        case 'W':  // Record (array element)
             return b->ResolveClassHandle(handle);
-        case 'E': // Method
+        case 'E':  // Method (scalar)
+        case 'X':  // Method (array element)
             if (handle & 0x80000000u) {
                 uint32_t idx = handle & 0x7FFFFFFFu;
                 if (idx < b->foreign_methods.size()) return b->foreign_methods[idx];
@@ -2896,7 +2904,8 @@ static BaseItem *resolve_entity_by_tag(AbcBuilder *b, char tag, uint32_t handle)
                 return b->methods[handle];
             }
             break;
-        case 'F': // Enum (field)
+        case 'F':  // Enum (scalar)
+        case 'Y':  // Enum (array element)
             if (handle & 0x80000000u) {
                 uint32_t idx = handle & 0x7FFFFFFFu;
                 if (idx < b->foreign_fields.size()) return b->foreign_fields[idx];
@@ -2904,13 +2913,15 @@ static BaseItem *resolve_entity_by_tag(AbcBuilder *b, char tag, uint32_t handle)
                 return b->fields[handle];
             }
             break;
-        case 'G': // Annotation
+        case 'G':  // Annotation (scalar)
+        case 'Z':  // Annotation (array element)
             if (handle < b->annotations.size()) return b->annotations[handle];
             break;
-        case 'J': // MethodHandle
+        case 'J':  // MethodHandle (scalar)
+        case '@':  // MethodHandle (array element)
             if (handle < b->method_handle_items.size()) return b->method_handle_items[handle];
             break;
-        case '#': // LiteralArray
+        case '#':  // LiteralArray
             if (handle < b->literal_arrays.size()) return b->literal_arrays[handle];
             break;
         default: break;
@@ -2930,8 +2941,8 @@ static Type::TypeId component_type_from_tag(char tag) {
         case 'Q': return Type::TypeId::U32;  // ArrayU32
         case 'R': return Type::TypeId::I64;  // ArrayI64
         case 'S': return Type::TypeId::U64;  // ArrayU64
-        case 'W': return Type::TypeId::F32;  // ArrayF32
-        case 'X': return Type::TypeId::F64;  // ArrayF64
+        case 'T': return Type::TypeId::F32;  // ArrayF32
+        case 'U': return Type::TypeId::F64;  // ArrayF64
         default:  return Type::TypeId::U32;  // Fallback
     }
 }
