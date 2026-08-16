@@ -980,6 +980,11 @@ uint32_t abc_field_type(AbcFieldAccessor *a) {
     return a->accessor.GetType();
 }
 
+uint8_t abc_field_type_id(AbcFieldAccessor *a) {
+    uint32_t enc = a->accessor.GetType();
+    return static_cast<uint8_t>(Type::GetTypeFromFieldEncoding(enc).GetId());
+}
+
 uint32_t abc_field_access_flags(AbcFieldAccessor *a) {
     return a->accessor.GetAccessFlags();
 }
@@ -1470,7 +1475,9 @@ uint32_t abc_builder_add_foreign_class(AbcBuilder *b, const char *descriptor) {
     auto *item = b->container.GetOrCreateForeignClassItem(descriptor);
     uint32_t idx = static_cast<uint32_t>(b->foreign_classes.size());
     b->foreign_classes.push_back(item);
-    return idx;
+    // Return the tagged handle (high bit = foreign) so it can be passed
+    // directly to APIs that resolve class handles.
+    return idx | 0x80000000u;
 }
 
 uint32_t abc_builder_add_global_class(AbcBuilder *b) {
@@ -2133,7 +2140,8 @@ uint32_t abc_builder_add_foreign_field(AbcBuilder *b, uint32_t class_handle,
     auto *item = b->container.CreateItem<ForeignFieldItem>(cls, name_item, type_item);
     uint32_t idx = static_cast<uint32_t>(b->foreign_fields.size());
     b->foreign_fields.push_back(item);
-    return idx;
+    // Tagged handle (high bit = foreign), matching the class-handle convention.
+    return idx | 0x80000000u;
 }
 
 uint32_t abc_builder_add_foreign_method(AbcBuilder *b, uint32_t class_handle,
@@ -2146,7 +2154,8 @@ uint32_t abc_builder_add_foreign_method(AbcBuilder *b, uint32_t class_handle,
         cls, name_item, b->protos[proto_handle], access_flags);
     uint32_t idx = static_cast<uint32_t>(b->foreign_methods.size());
     b->foreign_methods.push_back(item);
-    return idx;
+    // Tagged handle (high bit = foreign), matching the class-handle convention.
+    return idx | 0x80000000u;
 }
 
 /* --- 3.8b MethodHandle items --- */

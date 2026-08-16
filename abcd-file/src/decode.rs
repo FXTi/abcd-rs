@@ -65,6 +65,16 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         if class_off == ABSENT {
             continue;
         }
+        if is_external(f, class_off) {
+            // A foreign-class item is just a string item (no methods/fields):
+            // read its descriptor directly instead of building an accessor,
+            // which upstream only supports for non-external classes.
+            if let Some(desc) = read_string(f, class_off) {
+                let sid = strings.get_or_intern(&desc);
+                entity_map.insert(class_off, sid);
+            }
+            continue;
+        }
         let cr = unsafe { sys::abc_class_open(f, class_off) };
         if cr.is_null() {
             continue;
@@ -107,6 +117,30 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     for i in 0..num_classes {
         let class_off = unsafe { sys::abc_file_class_offset(f, i) };
         if class_off == ABSENT {
+            continue;
+        }
+        if is_external(f, class_off) {
+            // Foreign classes carry only a descriptor: surface them as
+            // minimal Class entries so super_class references resolve.
+            if let Some(desc_str) = read_string(f, class_off) {
+                let descriptor = strings.get_or_intern(&desc_str);
+                classes.insert(
+                    descriptor,
+                    Class {
+                        descriptor,
+                        name: descriptor,
+                        access_flags: AccessFlags::empty(),
+                        source_lang: SourceLang::PandaAssembly,
+                        source_file: None,
+                        is_external: true,
+                        super_class: None,
+                        interfaces: Vec::new(),
+                        methods: Vec::new(),
+                        fields: Vec::new(),
+                        annotations: Annotations::default(),
+                    },
+                );
+            }
             continue;
         }
         let cr = unsafe { sys::abc_class_open(f, class_off) };
@@ -341,33 +375,71 @@ fn decode_field_at(
         strings.get_or_intern(&s)
     };
 
-    let initial_value = {
-        let mut vi32 = 0i32;
-        let mut vi64 = 0i64;
-        let mut vf32 = 0.0f32;
-        let mut vf64 = 0.0f64;
-        if unsafe { sys::abc_field_get_value_i32(fr, &mut vi32) } != 0 {
-            Some(FieldValue::I32(vi32))
-        } else if unsafe { sys::abc_field_get_value_i64(fr, &mut vi64) } != 0 {
-            Some(FieldValue::I64(vi64))
-        } else if unsafe { sys::abc_field_get_value_f32(fr, &mut vf32) } != 0 {
-            Some(FieldValue::F32(vf32))
-        } else if unsafe { sys::abc_field_get_value_f64(fr, &mut vf64) } != 0 {
-            Some(FieldValue::F64(vf64))
-        } else {
-            None
-        }
+    // `abc_field_type` returns the type entity offset. For primitive types the
+    // vendor class-index entry is a PrimitiveTypeItem whose "offset" is the
+    // field encoding (a small integer), not a file offset — classify via the
+    // vendored GetTypeFromFieldEncoding instead of the entity_map.
+    let type_raw = unsafe { sys::abc_field_type(fr) };
+    let type_id = TypeId::try_from(unsafe { sys::abc_field_type_id(fr) })?;
+    let field_type = if type_id == TypeId::Reference {
+        let type_sid = entity_map
+            .get(&type_raw)
+            .copied()
+            .ok_or_else(|| Error::Malformed {
+                field: "field_type",
+                context: format!("field {:?}", strings.resolve(name).unwrap_or("?")),
+            })?;
+        Type::Reference(type_sid)
+    } else {
+        Type::from_raw(type_id, None)?
     };
 
-    let type_raw = unsafe { sys::abc_field_type(fr) };
-    let type_sid = entity_map
-        .get(&type_raw)
-        .copied()
-        .ok_or_else(|| Error::Malformed {
-            field: "field_type",
-            context: format!("field {:?}", strings.resolve(name).unwrap_or("?")),
-        })?;
-    let field_type = Type::from_descriptor(strings.resolve(type_sid).unwrap_or(""), type_sid);
+    // The vendor GetValue<T> does std::get<T-width> on the variant, so probing
+    // getters in the wrong width throws std::bad_variant_access across the FFI
+    // (and silently misreads float bit patterns as ints). Dispatch on the
+    // field's type id instead.
+    let initial_value = match type_id {
+        TypeId::U1
+        | TypeId::I8
+        | TypeId::U8
+        | TypeId::I16
+        | TypeId::U16
+        | TypeId::I32
+        | TypeId::U32
+        | TypeId::Tagged => {
+            let mut v = 0i32;
+            if unsafe { sys::abc_field_get_value_i32(fr, &mut v) } != 0 {
+                Some(FieldValue::I32(v))
+            } else {
+                None
+            }
+        }
+        TypeId::I64 | TypeId::U64 => {
+            let mut v = 0i64;
+            if unsafe { sys::abc_field_get_value_i64(fr, &mut v) } != 0 {
+                Some(FieldValue::I64(v))
+            } else {
+                None
+            }
+        }
+        TypeId::F32 => {
+            let mut v = 0.0f32;
+            if unsafe { sys::abc_field_get_value_f32(fr, &mut v) } != 0 {
+                Some(FieldValue::F32(v))
+            } else {
+                None
+            }
+        }
+        TypeId::F64 => {
+            let mut v = 0.0f64;
+            if unsafe { sys::abc_field_get_value_f64(fr, &mut v) } != 0 {
+                Some(FieldValue::F64(v))
+            } else {
+                None
+            }
+        }
+        TypeId::Void | TypeId::Reference => None,
+    };
 
     let annotations = Annotations {
         compile_time: decode_annotation_list(

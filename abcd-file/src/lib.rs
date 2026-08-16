@@ -63,4 +63,8 @@ mod literal;
 mod module;
 
 mod encode;
-pub use encode::{Builder, encode};
+pub use encode::{
+    AnnotationHandle, Builder, ClassHandle, CodeHandle, DebugInfoHandle, FieldHandle,
+    LiteralArrayHandle, LnpHandle, MethodHandle, MethodHandleItemHandle, ParamHandle, ProtoHandle,
+    StringHandle, encode,
+};

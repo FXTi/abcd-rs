@@ -277,6 +277,9 @@ AbcFieldAccessor *abc_field_open(const AbcFileHandle *f, uint32_t offset);
 void abc_field_close(AbcFieldAccessor *a);
 uint32_t abc_field_name_off(const AbcFieldAccessor *a);
 uint32_t abc_field_type(AbcFieldAccessor *a);
+/* TypeId of the field's type, classified via Type::GetTypeFromFieldEncoding:
+   primitives/tagged map to their TypeId, class offsets map to REFERENCE. */
+uint8_t abc_field_type_id(AbcFieldAccessor *a);
 uint32_t abc_field_access_flags(AbcFieldAccessor *a);
 int abc_field_is_external(const AbcFieldAccessor *a);
 uint32_t abc_field_class_off(const AbcFieldAccessor *a);
