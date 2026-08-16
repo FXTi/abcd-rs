@@ -76,8 +76,27 @@ pub fn file_type(data: &[u8]) -> sys::FileType {
 
 // --- Internal helpers ---
 
-/// Read a MUTF-8 string from the file, converting to a Rust String.
+/// Read a string from the file, converting to a Rust String.
+///
+/// Uses the bridge's MUTF-8 → UTF-16 conversion (lossless for the whole
+/// Unicode range: NUL, surrogate pairs, astral characters) and falls back
+/// to the raw-byte view if the conversion is unavailable or malformed.
 pub(crate) fn read_string(file: *const sys::AbcFileHandle, offset: u32) -> Option<String> {
+    // SAFETY: null buffer queries the UTF-16 unit count; 0 means the offset
+    // does not hold a string.
+    let units = unsafe { sys::abc_file_get_string_utf16(file, offset, std::ptr::null_mut(), 0) };
+    if units > 0 {
+        let mut buf = vec![0u16; units as usize];
+        // SAFETY: buf holds exactly `units` UTF-16 units.
+        unsafe {
+            sys::abc_file_get_string_utf16(file, offset, buf.as_mut_ptr(), buf.len());
+        }
+        if let Ok(s) = String::from_utf16(&buf) {
+            return Some(s);
+        }
+    }
+
+    // Fallback: raw bytes (lossy — only reached for malformed strings).
     let len = unsafe { sys::abc_file_get_string(file, offset, std::ptr::null_mut(), 0) };
     if len == 0 {
         return None;

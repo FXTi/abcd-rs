@@ -81,7 +81,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         }
         let _cg = HandleGuard(Some(|| unsafe { sys::abc_class_close(cr) }));
 
-        if let Some(desc) = read_class_descriptor(cr) {
+        if let Some(desc) = read_class_descriptor(f, cr) {
             let sid = strings.get_or_intern(&desc);
             entity_map.insert(unsafe { sys::abc_class_get_class_id(cr) }, sid);
         }
@@ -149,7 +149,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         }
         let _cg = HandleGuard(Some(|| unsafe { sys::abc_class_close(cr) }));
 
-        let descriptor_str = match read_class_descriptor(cr) {
+        let descriptor_str = match read_class_descriptor(f, cr) {
             Some(d) => d,
             None => continue,
         };
@@ -1281,13 +1281,21 @@ fn read_debug_info(
 // FFI helper: read strings from C accessors
 // ---------------------------------------------------------------------------
 
-fn read_class_descriptor(cr: *const sys::AbcClassAccessor) -> Option<String> {
-    let ptr = unsafe { sys::abc_class_get_descriptor(cr) };
-    if ptr.is_null() {
-        return None;
-    }
-    let cstr = unsafe { CStr::from_ptr(ptr as *const _) };
-    Some(cstr.to_string_lossy().into_owned())
+fn read_class_descriptor(
+    f: *const sys::AbcFileHandle,
+    cr: *const sys::AbcClassAccessor,
+) -> Option<String> {
+    let class_id = unsafe { sys::abc_class_get_class_id(cr) };
+    // The class item starts with its descriptor string; go through the
+    // lossless string reader instead of the raw MUTF-8 pointer.
+    read_string(f, class_id).or_else(|| {
+        let ptr = unsafe { sys::abc_class_get_descriptor(cr) };
+        if ptr.is_null() {
+            return None;
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr as *const _) };
+        Some(cstr.to_string_lossy().into_owned())
+    })
 }
 
 fn read_class_name(cr: *const sys::AbcClassAccessor) -> Option<String> {

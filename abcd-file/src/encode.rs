@@ -367,43 +367,95 @@ impl Builder {
         LiteralArrayHandle(unsafe { sys::abc_builder_add_literal_array(self.raw, c_id.as_ptr()) })
     }
 
+    // The literal-array section stores pairs of items: a one-byte tag followed
+    // by the encoded value, and the section count is the total number of
+    // items (2 per logical literal). The typed conveniences below therefore
+    // emit a complete `[tag][value]` pair; the `add_u*` methods are the raw
+    // single-item primitives used to build those pairs.
+
+    /// Append a raw one-byte item. Combine with a preceding tag item (e.g.
+    /// `literal_array_add_u8(la, LiteralTag::Accessor as u8)`) to form a
+    /// complete literal.
     pub fn literal_array_add_u8(&mut self, la: LiteralArrayHandle, val: u8) {
         unsafe { sys::abc_builder_literal_array_add_u8(self.raw, la.0, val) };
     }
 
+    /// Append a raw two-byte item; see [`Self::literal_array_add_u8`].
     pub fn literal_array_add_u16(&mut self, la: LiteralArrayHandle, val: u16) {
         unsafe { sys::abc_builder_literal_array_add_u16(self.raw, la.0, val) };
     }
 
+    /// Append a raw four-byte item; see [`Self::literal_array_add_u8`].
     pub fn literal_array_add_u32(&mut self, la: LiteralArrayHandle, val: u32) {
         unsafe { sys::abc_builder_literal_array_add_u32(self.raw, la.0, val) };
     }
 
+    /// Append a raw eight-byte item; see [`Self::literal_array_add_u8`].
     pub fn literal_array_add_u64(&mut self, la: LiteralArrayHandle, val: u64) {
         unsafe { sys::abc_builder_literal_array_add_u64(self.raw, la.0, val) };
     }
 
+    /// Append a complete `BOOL` literal (`[tag][value]` pair).
     pub fn literal_array_add_bool(&mut self, la: LiteralArrayHandle, val: bool) {
+        self.literal_array_add_u8(la, LiteralTag::Bool as u8);
+        self.literal_array_add_raw_bool(la, val);
+    }
+
+    /// Append a complete `FLOAT` literal (`[tag][value]` pair).
+    pub fn literal_array_add_f32(&mut self, la: LiteralArrayHandle, val: f32) {
+        self.literal_array_add_u8(la, LiteralTag::Float as u8);
+        self.literal_array_add_u32(la, val.to_bits());
+    }
+
+    /// Append a complete `INTEGER` literal (`[tag][value]` pair).
+    pub fn literal_array_add_integer(&mut self, la: LiteralArrayHandle, val: u32) {
+        self.literal_array_add_u8(la, LiteralTag::Integer as u8);
+        self.literal_array_add_u32(la, val);
+    }
+
+    /// Append a complete `DOUBLE` literal (`[tag][value]` pair).
+    pub fn literal_array_add_f64(&mut self, la: LiteralArrayHandle, val: f64) {
+        self.literal_array_add_u8(la, LiteralTag::Double as u8);
+        self.literal_array_add_u64(la, val.to_bits());
+    }
+
+    /// Append a complete `STRING` literal (`[tag][value]` pair).
+    pub fn literal_array_add_string(&mut self, la: LiteralArrayHandle, s: StringHandle) {
+        self.literal_array_add_u8(la, LiteralTag::String as u8);
+        self.literal_array_add_raw_string(la, s);
+    }
+
+    /// Append a complete `METHOD` literal (`[tag][value]` pair).
+    pub fn literal_array_add_method(&mut self, la: LiteralArrayHandle, m: MethodHandle) {
+        self.literal_array_add_u8(la, LiteralTag::Method as u8);
+        self.literal_array_add_raw_method(la, m);
+    }
+
+    /// Append a complete `LITERALARRAY` literal (`[tag][value]` pair).
+    pub fn literal_array_add_literalarray(
+        &mut self,
+        la: LiteralArrayHandle,
+        ref_la: LiteralArrayHandle,
+    ) {
+        self.literal_array_add_u8(la, LiteralTag::LiteralArray as u8);
+        self.literal_array_add_raw_literalarray(la, ref_la);
+    }
+
+    // Raw value items without a tag. Callers that already emitted the tag
+    // item (e.g. the model-driven literal encoder) use these directly.
+    pub(crate) fn literal_array_add_raw_bool(&mut self, la: LiteralArrayHandle, val: bool) {
         unsafe { sys::abc_builder_literal_array_add_bool(self.raw, la.0, val as u8) };
     }
 
-    pub fn literal_array_add_f32(&mut self, la: LiteralArrayHandle, val: f32) {
-        unsafe { sys::abc_builder_literal_array_add_f32(self.raw, la.0, val) };
-    }
-
-    pub fn literal_array_add_f64(&mut self, la: LiteralArrayHandle, val: f64) {
-        unsafe { sys::abc_builder_literal_array_add_f64(self.raw, la.0, val) };
-    }
-
-    pub fn literal_array_add_string(&mut self, la: LiteralArrayHandle, s: StringHandle) {
+    pub(crate) fn literal_array_add_raw_string(&mut self, la: LiteralArrayHandle, s: StringHandle) {
         unsafe { sys::abc_builder_literal_array_add_string(self.raw, la.0, s.0) };
     }
 
-    pub fn literal_array_add_method(&mut self, la: LiteralArrayHandle, m: MethodHandle) {
+    pub(crate) fn literal_array_add_raw_method(&mut self, la: LiteralArrayHandle, m: MethodHandle) {
         unsafe { sys::abc_builder_literal_array_add_method(self.raw, la.0, m.0) };
     }
 
-    pub fn literal_array_add_literalarray(
+    pub(crate) fn literal_array_add_raw_literalarray(
         &mut self,
         la: LiteralArrayHandle,
         ref_la: LiteralArrayHandle,
@@ -1325,7 +1377,7 @@ fn encode_literal_value_simple(
         LiteralValue::String(sid) => {
             b.literal_array_add_u8(la, LiteralTag::String as u8);
             let sh = get_or_add_string_id(b, string_handles, pool, *sid);
-            b.literal_array_add_string(la, sh);
+            b.literal_array_add_raw_string(la, sh);
         }
         LiteralValue::Method(off)
         | LiteralValue::GeneratorMethod(off)
@@ -1366,7 +1418,7 @@ fn encode_literal_value_simple(
         LiteralValue::EtsImplements(sid) => {
             b.literal_array_add_u8(la, LiteralTag::EtsImplements as u8);
             let sh = get_or_add_string_id(b, string_handles, pool, *sid);
-            b.literal_array_add_string(la, sh);
+            b.literal_array_add_raw_string(la, sh);
         }
         LiteralValue::NullValue(v) => {
             b.literal_array_add_u8(la, LiteralTag::NullValue as u8);
@@ -1532,12 +1584,12 @@ fn encode_literal_value(
         LiteralValue::String(sid) => {
             b.literal_array_add_u8(la, LiteralTag::String as u8);
             let sh = get_or_add_string_id(b, string_handles, pool, *sid);
-            b.literal_array_add_string(la, sh);
+            b.literal_array_add_raw_string(la, sh);
         }
         LiteralValue::Method(off) => {
             if let Some(mh) = resolve_method(*off) {
                 b.literal_array_add_u8(la, LiteralTag::Method as u8);
-                b.literal_array_add_method(la, mh);
+                b.literal_array_add_raw_method(la, mh);
             } else {
                 b.literal_array_add_u8(la, LiteralTag::Method as u8);
                 b.literal_array_add_u32(la, *off);
@@ -1546,7 +1598,7 @@ fn encode_literal_value(
         LiteralValue::GeneratorMethod(off) => {
             if let Some(mh) = resolve_method(*off) {
                 b.literal_array_add_u8(la, LiteralTag::GeneratorMethod as u8);
-                b.literal_array_add_method(la, mh);
+                b.literal_array_add_raw_method(la, mh);
             } else {
                 b.literal_array_add_u8(la, LiteralTag::GeneratorMethod as u8);
                 b.literal_array_add_u32(la, *off);
@@ -1555,7 +1607,7 @@ fn encode_literal_value(
         LiteralValue::AsyncGeneratorMethod(off) => {
             if let Some(mh) = resolve_method(*off) {
                 b.literal_array_add_u8(la, LiteralTag::AsyncGeneratorMethod as u8);
-                b.literal_array_add_method(la, mh);
+                b.literal_array_add_raw_method(la, mh);
             } else {
                 b.literal_array_add_u8(la, LiteralTag::AsyncGeneratorMethod as u8);
                 b.literal_array_add_u32(la, *off);
@@ -1564,7 +1616,7 @@ fn encode_literal_value(
         LiteralValue::Getter(off) => {
             if let Some(mh) = resolve_method(*off) {
                 b.literal_array_add_u8(la, LiteralTag::Getter as u8);
-                b.literal_array_add_method(la, mh);
+                b.literal_array_add_raw_method(la, mh);
             } else {
                 b.literal_array_add_u8(la, LiteralTag::Getter as u8);
                 b.literal_array_add_u32(la, *off);
@@ -1573,7 +1625,7 @@ fn encode_literal_value(
         LiteralValue::Setter(off) => {
             if let Some(mh) = resolve_method(*off) {
                 b.literal_array_add_u8(la, LiteralTag::Setter as u8);
-                b.literal_array_add_method(la, mh);
+                b.literal_array_add_raw_method(la, mh);
             } else {
                 b.literal_array_add_u8(la, LiteralTag::Setter as u8);
                 b.literal_array_add_u32(la, *off);
@@ -1602,7 +1654,7 @@ fn encode_literal_value(
         LiteralValue::EtsImplements(sid) => {
             b.literal_array_add_u8(la, LiteralTag::EtsImplements as u8);
             let sh = get_or_add_string_id(b, string_handles, pool, *sid);
-            b.literal_array_add_string(la, sh);
+            b.literal_array_add_raw_string(la, sh);
         }
         LiteralValue::NullValue(v) => {
             b.literal_array_add_u8(la, LiteralTag::NullValue as u8);
