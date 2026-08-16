@@ -3,7 +3,7 @@
 //! moved out of the header); the bridge must report zero arrays instead of
 //! 0xFFFFFFFF so decode never iterates a bogus table.
 
-use abcd_file::{AccessFlags, Builder, LiteralValue, SourceLang, Type, decode};
+use abcd_file::{AccessFlags, Builder, SourceLang, Type, decode};
 
 #[test]
 fn v24_file_decodes_without_bogus_literal_table() {
