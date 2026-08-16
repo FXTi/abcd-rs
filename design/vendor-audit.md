@@ -123,7 +123,7 @@ and the compatibility/architecture decisions derived from the audit.
   wrong; entity arrays are 'V'/'W'/'X'/'Y'/'Z'/'@'. Both bugs are masked
   today only because every involved element is 4 bytes wide. Fix both +
   regression test.
-- **#B2 (P1)**: `abc_index_get_offset_by_id` exposes the unbounded vendor
+- **#B2 (P1, fixed)**: `abc_index_get_offset_by_id` exposes the unbounded vendor
   accessor. Add a bounds check against the index header size.
 - **#B3 (P2)**: `abc_proto_num_args`/`abc_proto_get_arg_type` forward the
   vendor `GetNumArgs` underflow. Clamp in the bridge.

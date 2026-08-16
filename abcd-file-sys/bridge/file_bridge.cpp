@@ -361,9 +361,14 @@ struct AbcProtoAccessor {
     AbcProtoAccessor(const File &f, File::EntityId id) : accessor(f, id) {}
 };
 
+// Does NOT wrap the vendor IndexAccessor: its constructor indexes
+// GetIndexHeaders()[header_index] with an unchecked header_index read
+// from the method's access flags (UB on malformed input, audit #B2).
+// All queries below re-derive the same values through bounded paths.
 struct AbcIndexAccessor {
-    IndexAcc accessor;
-    AbcIndexAccessor(const File &f, File::EntityId id) : accessor(f, id) {}
+    const File *file;
+    File::EntityId method_id;
+    AbcIndexAccessor(const File &f, File::EntityId id) : file(&f), method_id(id) {}
 };
 
 extern "C" {
@@ -2281,7 +2286,10 @@ try {
 
 uint32_t abc_index_get_offset_by_id(const AbcIndexAccessor *a, uint16_t idx) {
 try {
-    return a->accessor.GetOffsetById(idx);
+    // ResolveOffsetByIndex bounds-checks idx against the method index.
+    auto id = a->file->ResolveOffsetByIndex(a->method_id, idx);
+    uint32_t off = id.GetOffset();
+    return off == 0 ? UINT32_MAX : off;
 } catch (...) {
     return UINT32_MAX;
 }
@@ -2289,7 +2297,10 @@ try {
 
 uint8_t abc_index_get_function_kind(const AbcIndexAccessor *a) {
 try {
-    return static_cast<uint8_t>(a->accessor.GetFunctionKind());
+    MethodDA mda(*a->file, a->method_id);
+    uint32_t flags = mda.GetAccessFlags();
+    return static_cast<uint8_t>((flags & panda::panda_file::FUNCTION_KIND_MASK) >>
+                               panda::panda_file::FLAG_WIDTH);
 } catch (...) {
     return UINT8_MAX;
 }
@@ -2297,7 +2308,10 @@ try {
 
 uint16_t abc_index_get_header_index(const AbcIndexAccessor *a) {
 try {
-    return a->accessor.GetHeaderIndex();
+    MethodDA mda(*a->file, a->method_id);
+    uint32_t flags = mda.GetAccessFlags();
+    return static_cast<uint16_t>(flags >> (panda::panda_file::FUNTION_KIND_WIDTH +
+                                          panda::panda_file::FLAG_WIDTH));
 } catch (...) {
     return 0xFFFF;
 }
@@ -2305,7 +2319,7 @@ try {
 
 uint32_t abc_index_get_num_headers(const AbcIndexAccessor *a) {
 try {
-    return a->accessor.GetNumHeaders();
+    return a->file->GetHeader()->num_indexes;
 } catch (...) {
     return 0;
 }
