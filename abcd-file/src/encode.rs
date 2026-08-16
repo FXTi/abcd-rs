@@ -420,6 +420,13 @@ impl Builder {
         self.literal_array_add_u32(la, val);
     }
 
+    /// Append a complete `METHODAFFILIATE` literal (`[tag][value]` pair) —
+    /// used by the module-record encoding for module request indices.
+    pub fn literal_array_add_method_affiliate(&mut self, la: LiteralArrayHandle, val: u16) {
+        self.literal_array_add_u8(la, LiteralTag::MethodAffiliate as u8);
+        self.literal_array_add_u16(la, val);
+    }
+
     /// Append a complete `DOUBLE` literal (`[tag][value]` pair).
     pub fn literal_array_add_f64(&mut self, la: LiteralArrayHandle, val: f64) {
         self.literal_array_add_u8(la, LiteralTag::Double as u8);
