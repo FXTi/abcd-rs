@@ -58,9 +58,8 @@ Build pipeline: Ruby (gen.rb, needs Ruby ≥ 2.5) generates `type.h` / `source_l
 
 ## Known limitations
 
-1. **`encode()` semantic round-trip is disabled**: `abc_builder_deduplicate` crashes on the C++ side when re-encoding decoded files (`encode_roundtrip` in `abcd-file/tests/roundtrip.rs` is `#[ignore]`d). Fix directions: implement equivalent dedup before finalize in the bridge, or bypass `DeduplicateCodeAndDebugInfo`.
-2. **Annotation categories were consolidated upstream at API 24**: the upstream writer now only emits the `ANNOTATION` category (the tag enum and the reader keep all four categories for legacy files). The bridge maps its four annotation APIs onto the single vector — encode folds runtime/type annotations into the compile-time bucket, matching upstream es2panda behavior.
-3. The string pool cannot be enumerated directly (collected indirectly by walking entities).
-4. The builder cannot set the file type (dynamic/static); the vendor code is missing it, defaults to dynamic.
-5. Byte-level round-trip is impossible (the builder decides its own layout); semantic equivalence is the goal.
-6. `ParamInfo::signature` is not preserved during encode (C++ writer limitation).
+1. **Annotation categories were consolidated upstream at API 24**: the upstream writer only emits the `ANNOTATION` category (the tag enum and the reader keep all four categories for legacy files). The bridge maps its four annotation APIs onto the single vector — encode folds runtime/type annotations into the compile-time bucket, matching upstream es2panda behavior. This is the documented round-trip contract, pinned by `abcd-file/tests/annotation_categories.rs`: all four buckets decode into `compile_time`, the legacy buckets stay empty, and the collapsed bucket survives an encode round-trip.
+2. The string pool cannot be enumerated directly (collected indirectly by walking entities).
+3. The builder cannot set the file type (dynamic/static); the vendor code is missing it, defaults to dynamic.
+4. Byte-level round-trip is impossible (the builder decides its own layout); semantic equivalence is the goal.
+5. `ParamInfo::signature` is not preserved during encode (C++ writer limitation).

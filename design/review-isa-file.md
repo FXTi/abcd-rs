@@ -19,7 +19,7 @@ Status: `open` = reported, awaiting triage · `fixed` = landed with a regression
 | 6 | P1 | `encode()` keys `method_handles`/`field_handles` by name; same-named methods across classes collide (common in real JS). | fixed |
 | 7 | P1 | `abc_file_open` never validates magic/checksum; garbage input reaches accessors. | fixed |
 | 8 | P1 | Bridge `extern "C"` functions have no exception guards; any `FileAccessException` crosses the FFI → SIGABRT. | fixed |
-| 9 | P1 | Annotation categories collapse to ANNOTATION on write (upstream API-24 behavior) — accepted, but must be the documented round-trip contract. | open |
+| 9 | P1 | Annotation categories collapse to ANNOTATION on write (upstream API-24 behavior) — accepted, but must be the documented round-trip contract. | fixed |
 | 10 | P2 | `File::GetClassId` is a linear scan; class hash table APIs are stubs. | open |
 | 11 | P2 | `decode()` eagerly extracts all debug info even when the caller does not need it. | open |
 | 12 | P2 | Unused workspace dependencies (clap/serde/serde_yaml/memmap2/env_logger/log) left over from the removed CLI. | open |
