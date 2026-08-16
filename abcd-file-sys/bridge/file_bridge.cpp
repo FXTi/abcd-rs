@@ -440,7 +440,12 @@ try {
 
 uint32_t abc_file_num_literalarrays(const AbcFileHandle *f) {
 try {
-    return f->file->GetHeader()->num_literalarrays;
+    // Versions > 12.0.6.0 (24.0.0.0) store INVALID_INDEX here; their
+    // literal arrays are reachable only through instruction id indexes
+    // (audit finding #A2). Return 0 so callers never iterate a bogus
+    // 4-billion-element table.
+    uint32_t n = f->file->GetHeader()->num_literalarrays;
+    return n == panda::panda_file::INVALID_INDEX ? 0 : n;
 } catch (...) {
     return 0;
 }

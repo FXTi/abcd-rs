@@ -74,7 +74,7 @@ and the compatibility/architecture decisions derived from the audit.
   1-byte INTEGER_8. Fix: replace the bridge's vendor call with our own
   bounded, tolerant enumerator (TAGVALUE → 1-byte value, unknown tag →
   stop) — no vendor patch.
-- **#A2 (P1)**: For versions > 12.0.6.0 (24.0.0.0) the header's
+- **#A2 (P1, fixed)**: For versions > 12.0.6.0 (24.0.0.0) the header's
   `num_literalarrays`/`literalarray_idx_off` are INVALID and the array
   table lives elsewhere (upstream `GetLiteralArraysId` in file.cpp, which
   we do not compile). Our bridge returns 0xFFFFFFFF for the count → a
@@ -196,7 +196,7 @@ Hermes (reference tree `hermes-main/`) confirms the same two-layer shape:
 
 1. ~~#A1 tolerant literal enumerator~~ — done (modules.abc decodes: 2035 classes, 29147 literal arrays).
 2. ~~#A3 padded copy in abc_file_open~~ — done.
-3. #A2 / #A7 version-gated literal-array & signature handling (FormatProfile v1).
+3. ~~#A2~~ — fixed (INVALID count → 0; v24 decode covered by tests/format_v24.rs). #A7 signature handling remains a documented format fact.
 4. #B1 annotation array tag fix (both sides) + round-trip test.
 5. #A8 checksum backfill; #B2/#B3/#B4 bridge bounds; #A6 note.
 6. Update design/review-isa-file.md and close out.
