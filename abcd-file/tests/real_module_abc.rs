@@ -36,15 +36,23 @@ fn modules_abc_decodes_fully_with_v24_table() {
     let mut classes = 0usize;
     let mut methods = 0usize;
     let mut instructions = 0usize;
+    let mut proto_shorty = 0usize;
     for c in file.classes.values() {
         classes += 1;
         for m in &c.methods {
             methods += 1;
+            // Format fact #A7: 12.0.6.0 protos carry no shorty signature —
+            // return types are absent from every method item.
+            if m.return_type.is_some() {
+                proto_shorty += 1;
+            }
             if let Some(body) = &m.body {
                 instructions += body.bytecodes.len();
             }
         }
     }
+
+    assert_eq!(proto_shorty, 0, "12.0.6.0 protos must have no return types");
 
     // Snapshot floors recorded at 12.0.6.0 stock (2,946,777 instructions):
     // they exist to catch table regressions, not to track exact builds.
