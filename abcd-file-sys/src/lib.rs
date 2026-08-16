@@ -187,4 +187,54 @@ mod tests {
             abc_builder_free(b);
         }
     }
+
+    /// Regression test for audit finding #A3: vendor code reads fixed-size
+    /// blocks past string data (murmur3/PseudoFnv 4-byte blocks, NUL
+    /// scans), so abc_file_open must give the File a padded copy — the
+    /// caller's Rust buffer has no trailing slack. This test places a
+    /// string item whose bytes run to the very end of the buffer (no NUL),
+    /// then reads it through the bridge.
+    #[test]
+    fn string_at_buffer_end_reads_safely() {
+        unsafe {
+            // Minimal header (magic + size), then a string item at the end:
+            // ULEB tag (4 utf16 units, not ascii => 4<<1|0 = 8) + "ta" with
+            // no NUL terminator inside the buffer.
+            let mut data: Vec<u8> = Vec::new();
+            data.extend_from_slice(b"PANDA\0\0\0"); // magic (8)
+            data.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            data.extend_from_slice(&[12, 0, 2, 0]); // version
+            let mut file_size = 60usize + 3; // header + [tag + 2 bytes]
+            data.extend_from_slice(&(file_size as u32).to_le_bytes());
+            for _ in 0..10 {
+                data.extend_from_slice(&0u32.to_le_bytes()); // foreign..index fields
+            }
+            // 4 filler bytes so the string item offset is > sizeof(Header).
+            data.extend_from_slice(&[0u8; 4]);
+            let str_off = 64u32;
+            // string item: ULEB(8) + 't' + 'a' (deliberately no NUL)
+            data.push(8);
+            data.push(b't');
+            data.push(b'a');
+            file_size = data.len();
+            data[16..20].copy_from_slice(&(file_size as u32).to_le_bytes());
+
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null(), "open should succeed");
+
+            // Reading the string at the end scans for the NUL past the
+            // buffer; the padded copy keeps the scan in bounds.
+            let n = abc_file_get_string_utf16(f, str_off, std::ptr::null_mut(), 0);
+            assert_eq!(n, 4, "utf16 length from the tag");
+            let mut buf = [0u16; 4];
+            let written = abc_file_get_string_utf16(f, str_off, buf.as_mut_ptr(), buf.len());
+            assert_eq!(written, 4);
+            // The scan hits the padding NULs, so the string is "ta"; the
+            // tag claims 4 units but the data only holds 2 (deliberately
+            // inconsistent) — the trailing units are the padding NULs.
+            assert_eq!(String::from_utf16_lossy(&buf).trim_end_matches('\0'), "ta");
+
+            abc_file_close(f);
+        }
+    }
 }

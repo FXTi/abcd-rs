@@ -304,8 +304,16 @@ TimeEndFunc Timer::timerEnd = [](const std::string_view, std::string) {};
 /* ========== Bridge API ========== */
 
 struct AbcFileHandle {
+    // Padded copy of the caller's buffer (audit finding #A3): several
+    // vendor code paths read fixed-size blocks past the data they were
+    // given (murmur3/PseudoFnv hash 4-byte blocks, LEB128 5-byte reads,
+    // NUL scans). The caller's Rust buffer has no trailing slack, so we
+    // copy into a buffer with 16 zero bytes of padding. The File still
+    // reports the true file_size; the padding is only readable slack.
+    std::vector<uint8_t> buffer;
     std::unique_ptr<const File> file;
-    AbcFileHandle(std::unique_ptr<const File> f) : file(std::move(f)) {}
+    AbcFileHandle(std::vector<uint8_t> padded, std::unique_ptr<const File> f)
+        : buffer(std::move(padded)), file(std::move(f)) {}
 };
 
 struct AbcClassAccessor {
@@ -384,14 +392,17 @@ try {
         return nullptr;
     }
     try {
-        auto *bytes = reinterpret_cast<std::byte *>(const_cast<uint8_t *>(data));
+        constexpr size_t PADDING = 16;  // slack for 4/5-byte block reads (#A3)
+        std::vector<uint8_t> padded(data, data + len);
+        padded.resize(len + PADDING, 0);
+        auto *bytes = reinterpret_cast<std::byte *>(padded.data());
         panda::os::mem::ConstBytePtr ptr(bytes, len, nullptr);
         auto file = File::OpenFromMemory(std::move(ptr));
         if (!file) {
             g_open_error = "OpenFromMemory failed";
             return nullptr;
         }
-        return new (std::nothrow) AbcFileHandle(std::move(file));
+        return new (std::nothrow) AbcFileHandle(std::move(padded), std::move(file));
     } catch (const std::exception &e) {
         g_open_error = e.what();
         return nullptr;

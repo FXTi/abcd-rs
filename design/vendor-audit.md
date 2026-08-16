@@ -81,7 +81,7 @@ and the compatibility/architecture decisions derived from the audit.
   naive Rust loop would run 4 billion iterations. Fix: return 0 for
   INVALID_INDEX and implement the 24-entry path (or explicitly reject
   until implemented — must be deterministic, never a huge loop).
-- **#A3 (P1)**: murmur3 / PseudoFnv hash 4-byte blocks and
+- **#A3 (P1, fixed)**: murmur3 / PseudoFnv hash 4-byte blocks and
   `ReadULeb128`/`ReadLeb128` 5-byte reads are unbounded; `abc_file_open`
   maps the caller's Rust buffer directly with no trailing padding, so a
   string item ending at the file end can read past the heap buffer. Fix:
@@ -195,7 +195,7 @@ Hermes (reference tree `hermes-main/`) confirms the same two-layer shape:
 ## 7. Remediation order (each = one commit + regression test)
 
 1. ~~#A1 tolerant literal enumerator~~ — done (modules.abc decodes: 2035 classes, 29147 literal arrays).
-2. #A3 padded copy in abc_file_open (heap-safety).
+2. ~~#A3 padded copy in abc_file_open~~ — done.
 3. #A2 / #A7 version-gated literal-array & signature handling (FormatProfile v1).
 4. #B1 annotation array tag fix (both sides) + round-trip test.
 5. #A8 checksum backfill; #B2/#B3/#B4 bridge bounds; #A6 note.
