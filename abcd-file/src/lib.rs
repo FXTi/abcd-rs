@@ -59,6 +59,7 @@ mod annotation;
 mod code;
 mod debug;
 pub(crate) mod file;
+pub use file::file_type;
 mod literal;
 mod module;
 
