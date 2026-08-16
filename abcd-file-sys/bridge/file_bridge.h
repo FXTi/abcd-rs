@@ -240,6 +240,8 @@ uint32_t abc_method_get_proto_id_static(const AbcFileHandle *f, uint32_t method_
 
 /* Method name as string (copies into buf, returns byte count; 0 on error) */
 size_t abc_method_get_name(const AbcMethodAccessor *a, char *buf, size_t buf_len);
+/* Method name via MUTF-8 -> UTF-16 (lossless; query with buf=null) */
+size_t abc_method_get_name_utf16(const AbcMethodAccessor *a, uint16_t *buf, size_t buf_len);
 size_t abc_method_get_name_static(const AbcFileHandle *f, uint32_t method_off,
                                    char *buf, size_t buf_len);
 

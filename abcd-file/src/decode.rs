@@ -1413,16 +1413,17 @@ fn read_class_name(cr: *const sys::AbcClassAccessor) -> Option<String> {
 }
 
 fn read_method_name(mr: *const sys::AbcMethodAccessor) -> Option<String> {
-    let len = unsafe { sys::abc_method_get_name(mr, std::ptr::null_mut(), 0) };
-    if len == 0 {
+    // Lossless: MUTF-8 -> UTF-16 via the bridge (the raw C-string view
+    // corrupts embedded NULs encoded as C0 80 — test group G).
+    let units = unsafe { sys::abc_method_get_name_utf16(mr, std::ptr::null_mut(), 0) };
+    if units == 0 {
         return None;
     }
-    let mut buf = vec![0u8; len + 1];
+    let mut buf = vec![0u16; units as usize];
     unsafe {
-        sys::abc_method_get_name(mr, buf.as_mut_ptr() as *mut _, buf.len());
+        sys::abc_method_get_name_utf16(mr, buf.as_mut_ptr(), buf.len());
     }
-    let cstr = CStr::from_bytes_until_nul(&buf).ok()?;
-    Some(cstr.to_string_lossy().into_owned())
+    String::from_utf16(&buf).ok()
 }
 
 // ---------------------------------------------------------------------------
