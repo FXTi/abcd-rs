@@ -49,6 +49,9 @@ pub struct ResolvedMethodHandle {
     pub handle_type: MethodHandleType,
     /// Interned name of the referenced field or method.
     pub entity: crate::StringId,
+    /// Offset of the referenced field/method item in the source file;
+    /// 0 when the reference could not be resolved to an entity.
+    pub entity_offset: u32,
 }
 
 /// Fully-typed annotation element value.
@@ -76,10 +79,18 @@ pub enum AnnotationValue {
     String(crate::StringId),
     /// Interned class descriptor.
     Record(crate::StringId),
-    /// Interned method name.
-    Method(crate::StringId),
-    /// Interned enum descriptor.
-    Enum(crate::StringId),
+    /// Referenced method: interned name plus the method item offset in the
+    /// source file (the unique entity identity; names repeat across classes).
+    Method {
+        name: crate::StringId,
+        offset: u32,
+    },
+    /// Referenced enum field: interned name plus the field item offset in
+    /// the source file.
+    Enum {
+        name: crate::StringId,
+        offset: u32,
+    },
     /// Recursively resolved nested annotation.
     Annotation(Box<crate::model::Annotation>),
     /// Resolved method handle with type and entity reference.

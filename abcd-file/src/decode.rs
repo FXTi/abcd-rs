@@ -334,6 +334,7 @@ fn decode_method_at(
 
     Ok(Method {
         name,
+        offset: method_off,
         access_flags: AccessFlags::from_bits_truncate(unsafe { sys::abc_method_access_flags(mr) }),
         function_kind,
         source_lang: SourceLang::try_from(unsafe { sys::abc_method_get_source_lang(mr) })
@@ -470,6 +471,7 @@ fn decode_field_at(
 
     Ok(Field {
         name,
+        offset: field_off,
         field_type,
         access_flags: AccessFlags::from_bits_truncate(unsafe { sys::abc_field_access_flags(fr) }),
         is_external: is_external(f, field_id),
@@ -741,14 +743,20 @@ fn decode_annotation_list(
                                 .get(&out.value)
                                 .copied()
                                 .unwrap_or_else(|| strings.get_or_intern(""));
-                            AnnotationValue::Method(sid)
+                            AnnotationValue::Method {
+                                name: sid,
+                                offset: out.value,
+                            }
                         }
                         AVT::Enum => {
                             let sid = entity_map
                                 .get(&out.value)
                                 .copied()
                                 .unwrap_or_else(|| strings.get_or_intern(""));
-                            AnnotationValue::Enum(sid)
+                            AnnotationValue::Enum {
+                                name: sid,
+                                offset: out.value,
+                            }
                         }
                         AVT::Annotation => {
                             // Recursively resolve nested annotation.
@@ -782,6 +790,7 @@ fn decode_annotation_list(
                                     AnnotationValue::MethodHandle(ResolvedMethodHandle {
                                         handle_type: ht,
                                         entity,
+                                        entity_offset: entity_off,
                                     })
                                 } else {
                                     AnnotationValue::Void
@@ -935,14 +944,20 @@ fn decode_annotation_array_elements(
                     .get(&(raw as u32))
                     .copied()
                     .unwrap_or_else(|| strings.get_or_intern(""));
-                AnnotationValue::Method(sid)
+                AnnotationValue::Method {
+                    name: sid,
+                    offset: raw as u32,
+                }
             }
             Ok(AVT::ArrayEnum) => {
                 let sid = entity_map
                     .get(&(raw as u32))
                     .copied()
                     .unwrap_or_else(|| strings.get_or_intern(""));
-                AnnotationValue::Enum(sid)
+                AnnotationValue::Enum {
+                    name: sid,
+                    offset: raw as u32,
+                }
             }
             Ok(AVT::ArrayAnnotation) => {
                 match decode_annotation_list(f, &[raw as u32], entity_map, strings) {
@@ -972,6 +987,7 @@ fn decode_annotation_array_elements(
                         AnnotationValue::MethodHandle(ResolvedMethodHandle {
                             handle_type: ht,
                             entity,
+                            entity_offset: entity_off,
                         })
                     } else {
                         AnnotationValue::Void

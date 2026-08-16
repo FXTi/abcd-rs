@@ -61,6 +61,10 @@ pub struct Class {
 #[derive(Clone, Debug)]
 pub struct Method {
     pub name: StringId,
+    /// Offset of the method item in the source file; 0 for hand-built
+    /// models. This is the file's unique method identity — names are not
+    /// unique across classes.
+    pub offset: u32,
     pub access_flags: AccessFlags,
     pub function_kind: FunctionKind,
     pub source_lang: SourceLang,
@@ -76,6 +80,10 @@ pub struct Method {
 #[derive(Clone, Debug)]
 pub struct Field {
     pub name: StringId,
+    /// Offset of the field item in the source file; 0 for hand-built
+    /// models. This is the file's unique field identity — names are not
+    /// unique across classes.
+    pub offset: u32,
     pub field_type: Type,
     pub access_flags: AccessFlags,
     pub is_external: bool,

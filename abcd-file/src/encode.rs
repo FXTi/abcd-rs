@@ -805,6 +805,59 @@ impl Drop for Builder {
 
 use crate::{StringId, StringPool};
 
+/// Handles of encoded methods/fields, resolvable from decoded reference
+/// payloads.
+///
+/// References inside a decoded file carry entity offsets (method/field item
+/// offsets) or interned names. Names are not unique — two classes routinely
+/// define a method of the same name — so the offset map is authoritative and
+/// the name map only serves hand-built models whose entities all carry
+/// offset 0.
+#[derive(Default)]
+struct EntityHandles {
+    methods_by_offset: HashMap<u32, MethodHandle>,
+    methods_by_name: HashMap<StringId, MethodHandle>,
+    fields_by_offset: HashMap<u32, FieldHandle>,
+    fields_by_name: HashMap<StringId, FieldHandle>,
+}
+
+impl EntityHandles {
+    fn insert_method(&mut self, m: &Method, h: MethodHandle) {
+        self.methods_by_name.insert(m.name, h);
+        if m.offset != 0 {
+            self.methods_by_offset.insert(m.offset, h);
+        }
+    }
+
+    fn insert_field(&mut self, f: &Field, h: FieldHandle) {
+        self.fields_by_name.insert(f.name, h);
+        if f.offset != 0 {
+            self.fields_by_offset.insert(f.offset, h);
+        }
+    }
+
+    /// Resolve a method reference. A non-zero offset is the entity's unique
+    /// identity; the name map is only a fallback for hand-built models.
+    fn resolve_method(&self, name: StringId, offset: u32) -> Option<MethodHandle> {
+        if offset != 0
+            && let Some(&h) = self.methods_by_offset.get(&offset)
+        {
+            return Some(h);
+        }
+        self.methods_by_name.get(&name).copied()
+    }
+
+    /// Resolve a field reference (see [`Self::resolve_method`]).
+    fn resolve_field(&self, name: StringId, offset: u32) -> Option<FieldHandle> {
+        if offset != 0
+            && let Some(&h) = self.fields_by_offset.get(&offset)
+        {
+            return Some(h);
+        }
+        self.fields_by_name.get(&name).copied()
+    }
+}
+
 /// Encode a decoded [`File`] back to ABC bytes.
 ///
 /// The output is a valid ABC file that can be decoded again. Checksums will
@@ -823,8 +876,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
 
     // --- Create classes (foreign first, then normal) ---
     let mut class_handles: HashMap<StringId, ClassHandle> = HashMap::new();
-    let mut method_handles: HashMap<StringId, MethodHandle> = HashMap::new();
-    let mut field_handles: HashMap<StringId, FieldHandle> = HashMap::new();
+    let mut entities = EntityHandles::default();
     let mut ann_la_counter: u32 = 0;
 
     // First pass: foreign classes
@@ -1004,15 +1056,14 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
             b.method_set_function_kind(method_h, method.function_kind);
 
             // Track method handle for literal array method references.
-            method_handles.insert(method.name, method_h);
+            entities.insert_method(method, method_h);
 
             // Method annotations
             {
                 let mut ctx = AnnotationEncodeCtx {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
-                    method_handles: &method_handles,
-                    field_handles: &field_handles,
+                    entities: &entities,
                     ann_la_counter: &mut ann_la_counter,
                     pool,
                 };
@@ -1039,7 +1090,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
             };
 
             // Track field handle for annotation references.
-            field_handles.insert(field.name, field_h);
+            entities.insert_field(field, field_h);
 
             // Initial value
             match field.initial_value {
@@ -1055,8 +1106,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 let mut ctx = AnnotationEncodeCtx {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
-                    method_handles: &method_handles,
-                    field_handles: &field_handles,
+                    entities: &entities,
                     ann_la_counter: &mut ann_la_counter,
                     pool,
                 };
@@ -1074,8 +1124,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
             let mut ctx = AnnotationEncodeCtx {
                 string_handles: &mut string_handles,
                 class_handles: &mut class_handles,
-                method_handles: &method_handles,
-                field_handles: &field_handles,
+                entities: &entities,
                 ann_la_counter: &mut ann_la_counter,
                 pool,
             };
@@ -1100,7 +1149,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 la_h,
                 val,
                 &file.entity_map,
-                &method_handles,
+                &entities,
             );
         }
     }
@@ -1126,8 +1175,7 @@ enum AnnotationTarget {
 struct AnnotationEncodeCtx<'a> {
     string_handles: &'a mut HashMap<StringId, StringHandle>,
     class_handles: &'a mut HashMap<StringId, ClassHandle>,
-    method_handles: &'a HashMap<StringId, MethodHandle>,
-    field_handles: &'a HashMap<StringId, FieldHandle>,
+    entities: &'a EntityHandles,
     ann_la_counter: &'a mut u32,
     pool: &'a StringPool,
 }
@@ -1211,15 +1259,15 @@ fn annotation_value_to_raw(
             let h = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, *sid);
             (b'D', AnnotationElemValue::EntityRef(h.0))
         }
-        AnnotationValue::Method(sid) => {
-            if let Some(&mh) = ctx.method_handles.get(sid) {
+        AnnotationValue::Method { name, offset } => {
+            if let Some(mh) = ctx.entities.resolve_method(*name, *offset) {
                 (b'E', AnnotationElemValue::EntityRef(mh.0))
             } else {
                 (b'E', AnnotationElemValue::Scalar(0))
             }
         }
-        AnnotationValue::Enum(sid) => {
-            if let Some(&fh) = ctx.field_handles.get(sid) {
+        AnnotationValue::Enum { name, offset } => {
+            if let Some(fh) = ctx.entities.resolve_field(*name, *offset) {
                 (b'F', AnnotationElemValue::EntityRef(fh.0))
             } else {
                 (b'F', AnnotationElemValue::Scalar(0))
@@ -1242,13 +1290,13 @@ fn annotation_value_to_raw(
         }
         AnnotationValue::MethodHandle(mh) => {
             let entity_handle = if mh.handle_type.is_field_op() {
-                ctx.field_handles
-                    .get(&mh.entity)
+                ctx.entities
+                    .resolve_field(mh.entity, mh.entity_offset)
                     .map(|h| h.0)
                     .unwrap_or(u32::MAX)
             } else {
-                ctx.method_handles
-                    .get(&mh.entity)
+                ctx.entities
+                    .resolve_method(mh.entity, mh.entity_offset)
                     .map(|h| h.0)
                     .unwrap_or(u32::MAX)
             };
@@ -1555,12 +1603,19 @@ fn encode_literal_value(
     la: LiteralArrayHandle,
     val: &LiteralValue,
     entity_map: &HashMap<u32, StringId>,
-    method_handles: &HashMap<StringId, MethodHandle>,
+    entities: &EntityHandles,
 ) {
-    // Helper: resolve a method entity offset to a MethodHandle via entity_map.
+    // Helper: resolve a method entity offset to a MethodHandle. The offset
+    // is the unique entity identity; the name lookup via entity_map is only
+    // a fallback for hand-built models (offset 0).
     let resolve_method = |off: u32| -> Option<MethodHandle> {
+        if off != 0
+            && let Some(&mh) = entities.methods_by_offset.get(&off)
+        {
+            return Some(mh);
+        }
         let sid = entity_map.get(&off)?;
-        method_handles.get(sid).copied()
+        entities.methods_by_name.get(sid).copied()
     };
 
     // Literal arrays are stored as flat (tag_u8, value) pairs.
@@ -1733,4 +1788,73 @@ fn get_or_add_string_id(
     let h = b.add_string(s);
     string_handles.insert(sid, h);
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::AccessFlags;
+
+    fn method(pool: &mut StringPool, name: &str, offset: u32) -> Method {
+        Method {
+            name: pool.get_or_intern(name),
+            offset,
+            access_flags: AccessFlags::empty(),
+            function_kind: FunctionKind::None,
+            source_lang: SourceLang::EcmaScript,
+            is_external: false,
+            return_type: None,
+            arg_types: Vec::new(),
+            body: None,
+            annotations: Annotations::default(),
+            debug: None,
+        }
+    }
+
+    fn field(pool: &mut StringPool, name: &str, offset: u32) -> Field {
+        Field {
+            name: pool.get_or_intern(name),
+            offset,
+            field_type: Type::Tagged,
+            access_flags: AccessFlags::empty(),
+            is_external: false,
+            initial_value: None,
+            annotations: Annotations::default(),
+        }
+    }
+
+    #[test]
+    fn handles_resolve_by_offset_when_names_collide() {
+        // Same name in two classes; only the offset disambiguates.
+        let mut pool = StringPool::default();
+        let name = pool.get_or_intern("foo");
+        let mut entities = EntityHandles::default();
+
+        entities.insert_method(&method(&mut pool, "foo", 100), MethodHandle(1));
+        entities.insert_method(&method(&mut pool, "foo", 200), MethodHandle(2));
+        entities.insert_field(&field(&mut pool, "foo", 300), FieldHandle(3));
+        entities.insert_field(&field(&mut pool, "foo", 400), FieldHandle(4));
+
+        assert_eq!(entities.resolve_method(name, 100), Some(MethodHandle(1)));
+        assert_eq!(entities.resolve_method(name, 200), Some(MethodHandle(2)));
+        assert_eq!(entities.resolve_field(name, 300), Some(FieldHandle(3)));
+        assert_eq!(entities.resolve_field(name, 400), Some(FieldHandle(4)));
+    }
+
+    #[test]
+    fn handles_fall_back_to_name_for_offsetless_models() {
+        // Hand-built models carry offset 0; name lookup (last insert wins)
+        // must still work, preserving pre-#6 behavior.
+        let mut pool = StringPool::default();
+        let name = pool.get_or_intern("bar");
+        let mut entities = EntityHandles::default();
+
+        entities.insert_method(&method(&mut pool, "bar", 0), MethodHandle(10));
+        entities.insert_field(&field(&mut pool, "bar", 0), FieldHandle(20));
+
+        assert_eq!(entities.resolve_method(name, 0), Some(MethodHandle(10)));
+        assert_eq!(entities.resolve_field(name, 0), Some(FieldHandle(20)));
+        // Unknown offsets on an offset-carrying resolver do not resolve.
+        assert_eq!(entities.resolve_method(name, 999), Some(MethodHandle(10)));
+    }
 }
