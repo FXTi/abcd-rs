@@ -35,7 +35,7 @@ fn static_version_header_is_static() {
     // consistent file_size — the rest of the file is irrelevant for typing.
     let mut data = vec![0u8; 60];
     data[..8].copy_from_slice(b"PANDA\0\0\0");
-    data[12..16].copy_from_slice(&[0, 0, 0, 6]);
+    data[12..16].copy_from_slice(&[0, 1, 0, 7]);
     data[16..20].copy_from_slice(&60u32.to_le_bytes());
     assert_eq!(file_type(&data), FileType::Static);
 }
