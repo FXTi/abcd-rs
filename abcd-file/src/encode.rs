@@ -1471,8 +1471,10 @@ fn encode_literal_value_simple(
             b.literal_array_add_u16(la, *v);
         }
         LiteralValue::LiteralArray(idx) => {
-            b.literal_array_add_u8(la, LiteralTag::LiteralArray as u8);
-            b.literal_array_add_u32(la, idx.0);
+            // idx is the table index into File::literal_arrays; route it
+            // through the reference API so the writer stores the array's
+            // final file offset.
+            b.literal_array_add_literalarray(la, LiteralArrayHandle(idx.0));
         }
         LiteralValue::LiteralBufferIndex(idx) => {
             b.literal_array_add_u8(la, LiteralTag::LiteralBufferIndex as u8);
@@ -1718,8 +1720,10 @@ fn encode_literal_value(
             b.literal_array_add_u16(la, *v);
         }
         LiteralValue::LiteralArray(idx) => {
-            b.literal_array_add_u8(la, LiteralTag::LiteralArray as u8);
-            b.literal_array_add_u32(la, idx.0);
+            // idx is the table index into File::literal_arrays; route it
+            // through the reference API so the writer stores the array's
+            // final file offset.
+            b.literal_array_add_literalarray(la, LiteralArrayHandle(idx.0));
         }
         LiteralValue::LiteralBufferIndex(idx) => {
             b.literal_array_add_u8(la, LiteralTag::LiteralBufferIndex as u8);

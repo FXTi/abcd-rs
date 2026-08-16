@@ -1105,9 +1105,17 @@ fn decode_literal_arrays(
         return Vec::new();
     }
 
-    // Open one accessor — the EntityId-based EnumerateLiteralVals overload
-    // reads directly from the given offset, so the accessor's literal_data_sp_
-    // is irrelevant.  We just need a valid handle for the panda_file reference.
+    // Collect file offsets first so nested LiteralArray references (which
+    // store the referenced array's file offset) can be rewritten to table
+    // indices — the model's documented semantic.
+    let mut offset_to_index: HashMap<u32, u32> = HashMap::new();
+    for i in 0..n {
+        let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
+        if off != ABSENT {
+            offset_to_index.insert(off, i);
+        }
+    }
+
     let first_off = unsafe { sys::abc_file_literalarray_offset(f, 0) };
     if first_off == ABSENT {
         return Vec::new();
@@ -1118,7 +1126,7 @@ fn decode_literal_arrays(
     }
     let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
 
-    (0..n)
+    let mut arrays: Vec<LiteralArray> = (0..n)
         .filter_map(|i| {
             let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
             if off == ABSENT {
@@ -1140,7 +1148,19 @@ fn decode_literal_arrays(
             }
             Some(LiteralArray { values: ctx.values })
         })
-        .collect()
+        .collect();
+
+    // Rewrite nested references (file offset → table index).
+    for arr in &mut arrays {
+        for v in &mut arr.values {
+            if let LiteralValue::LiteralArray(idx) = v {
+                if let Some(&table_idx) = offset_to_index.get(&idx.0) {
+                    idx.0 = table_idx;
+                }
+            }
+        }
+    }
+    arrays
 }
 
 /// Intermediate struct for collecting debug info strings before interning.
