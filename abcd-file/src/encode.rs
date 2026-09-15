@@ -1378,10 +1378,16 @@ fn annotation_array_elem_to_handle(
         AnnotationValue::U16(v) => *v as u32,
         AnnotationValue::I32(v) => *v as u32,
         AnnotationValue::U32(v) => *v,
-        AnnotationValue::I64(v) => *v as u32,
-        AnnotationValue::U64(v) => *v as u32,
+        // The C bridge's array ABI currently accepts only 32-bit elements.
+        // Silently truncating these values produces a different annotation;
+        // fail explicitly until a 64-bit array ABI is available.
+        AnnotationValue::I64(_) | AnnotationValue::U64(_) => {
+            panic!("64-bit annotation array elements are not supported by the builder ABI")
+        }
         AnnotationValue::F32(v) => v.to_bits(),
-        AnnotationValue::F64(v) => v.to_bits() as u32,
+        AnnotationValue::F64(_) => {
+            panic!("F64 annotation array elements are not supported by the builder ABI")
+        }
         AnnotationValue::String(sid) => {
             let h = get_or_add_string_id(b, string_handles, pool, *sid);
             h.0

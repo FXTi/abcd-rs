@@ -13,7 +13,7 @@ use std::fmt;
 use crate::analysis;
 use crate::entity::{Block, FuncId, Inst, Value};
 use crate::inst::InstData;
-use crate::module::Module;
+use crate::module::{Module, ValueDef};
 
 /// A verification error with location context.
 #[derive(Debug)]
@@ -44,30 +44,40 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
     let mut errors = Vec::new();
     let func = module.func(func_id);
     let func_blocks: HashSet<Block> = func.blocks.iter().copied().collect();
-
-    // Collect all values defined in this function.
-    let mut defined_values: HashSet<Value> = HashSet::new();
-    for &bb in &func.blocks {
-        let block = module.block(bb);
-        for &inst_id in block.phis.iter().chain(block.insts.iter()) {
-            if let Some(val) = module.inst(inst_id).result {
-                defined_values.insert(val);
-            }
-        }
-    }
-    // Function parameters are also defined values.
-    for (vi, vd) in module.values.iter().enumerate() {
-        if let crate::module::ValueDef::FuncParam(_) = vd.def {
-            defined_values.insert(Value::from_index(vi));
-        }
-    }
-
     let err = |block: Option<Block>, inst: Option<Inst>, msg: String| VerifyError {
         func: func_id,
         block,
         inst,
         message: msg,
     };
+
+    // Collect values defined in this function and validate their ownership.
+    let mut defined_values: HashSet<Value> = HashSet::new();
+    for &bb in &func.blocks {
+        let block = module.block(bb);
+        for &inst_id in block.phis.iter().chain(block.insts.iter()) {
+            if module.inst(inst_id).block != bb {
+                errors.push(err(
+                    Some(bb),
+                    Some(inst_id),
+                    "instruction is stored in a different block".into(),
+                ));
+            }
+            if let Some(val) = module.inst(inst_id).result {
+                defined_values.insert(val);
+            }
+        }
+    }
+    // Function parameters are also defined values, but only parameters of
+    // this function.  A global scan would incorrectly permit cross-function
+    // value references.
+    for (vi, vd) in module.values.iter().enumerate() {
+        if let ValueDef::FuncParam(index) = vd.def {
+            if index < func.param_count {
+                defined_values.insert(Value::from_index(vi));
+            }
+        }
+    }
 
     // Entry block has no predecessors.
     let entry = func.entry_block;
@@ -81,6 +91,31 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
 
     for &bb in &func.blocks {
         let block = module.block(bb);
+
+        // Predecessor lists are sets and must agree with terminator edges.
+        let pred_set: HashSet<Block> = block.preds.iter().copied().collect();
+        if pred_set.len() != block.preds.len() {
+            errors.push(err(
+                Some(bb),
+                None,
+                "block has duplicate predecessors".into(),
+            ));
+        }
+        for &pred in &block.preds {
+            if !func_blocks.contains(&pred) {
+                errors.push(err(
+                    Some(bb),
+                    None,
+                    format!("predecessor {pred} is not in this function"),
+                ));
+            } else if !analysis::block_succs(module, pred).contains(&bb) {
+                errors.push(err(
+                    Some(bb),
+                    None,
+                    format!("predecessor {pred} does not target block"),
+                ));
+            }
+        }
 
         // Block must have at least one instruction (the terminator).
         if block.insts.is_empty() {
@@ -182,6 +217,12 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
                     Some(last),
                     format!("successor {succ} is not in this function"),
                 ));
+            } else if !module.block(succ).preds.contains(&bb) {
+                errors.push(err(
+                    Some(bb),
+                    Some(last),
+                    format!("successor {succ} is missing this block from predecessors"),
+                ));
             }
         }
 
@@ -194,6 +235,26 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
                         Some(inst_id),
                         format!("uses undefined value {val}"),
                     ));
+                }
+            }
+        }
+
+        // Every value definition must belong to this function and point back
+        // to the instruction that defines it.
+        for &inst_id in block.phis.iter().chain(block.insts.iter()) {
+            if let Some(result) = module.inst(inst_id).result {
+                match module.values.get(result.index()).map(|v| v.def) {
+                    Some(ValueDef::Inst(def)) if def == inst_id => {}
+                    Some(_) => errors.push(err(
+                        Some(bb),
+                        Some(inst_id),
+                        format!("result {result} has mismatched definition"),
+                    )),
+                    None => errors.push(err(
+                        Some(bb),
+                        Some(inst_id),
+                        format!("result {result} is outside value arena"),
+                    )),
                 }
             }
         }
