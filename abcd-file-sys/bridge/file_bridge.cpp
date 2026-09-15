@@ -258,16 +258,7 @@ PandaFileType GetFileType(const uint8_t *data, int32_t size) {
         return PandaFileType::FILE_FORMAT_INVALID;
     }
 
-    // Upstream renamed STATIC_VERSION to OLD_STATIC_VERSION and added a
-    // static marker in version byte 1. Keep the bridge independent of that
-    // member name so vendor syncs do not break compilation. The older
-    // second-generation marker remains accepted for existing fixtures.
-    constexpr std::array<uint8_t, File::VERSION_SIZE> OLD_STATIC_VERSION = {0, 0, 0, 6};
-    constexpr std::array<uint8_t, File::VERSION_SIZE> LEGACY_STATIC_VERSION = {0, 1, 0, 7};
-    const bool static_marker = header->version[1] == 1 ||
-                               header->version == OLD_STATIC_VERSION ||
-                               header->version == LEGACY_STATIC_VERSION;
-    if (static_marker) {
+    if (header->version == File::STATIC_VERSION) {
         return PandaFileType::FILE_STATIC;
     }
     return PandaFileType::FILE_DYNAMIC;
