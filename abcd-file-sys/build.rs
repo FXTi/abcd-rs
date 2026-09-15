@@ -262,6 +262,13 @@ fn generate_format_compat_header(manifest: &str, out_dir: &str) {
                 .collect::<Vec<_>>();
             (values.len() == 4).then(|| values.join(", "))
         });
+    let parse_const = |name: &str| -> Option<usize> {
+        let marker = format!("{name} =");
+        let start = file_h.find(&marker)? + marker.len();
+        file_h[start..].split(';').next()?.trim().parse().ok()
+    };
+    let static_flag_offset = parse_const("FILE_TYPE_OFFSET").unwrap_or(0);
+    let static_flag_value = parse_const("FILE_TYPE_STATIC_FLAG").unwrap_or(0);
     let has_flag = file_h.contains("FILE_TYPE_OFFSET") && file_h.contains("FILE_TYPE_STATIC_FLAG");
     let marker = marker.unwrap_or_else(|| "0, 0, 0, 0".to_string());
     let out = format!(
@@ -272,8 +279,8 @@ fn generate_format_compat_header(manifest: &str, out_dir: &str) {
          #include <cstdint>\n\
          namespace abcd_format_compat {{\n\
          inline constexpr bool HAS_STATIC_FLAG = {has_flag};\n\
-         inline constexpr std::size_t STATIC_FLAG_OFFSET = 1;\n\
-         inline constexpr std::uint8_t STATIC_FLAG_VALUE = 1;\n\
+         inline constexpr std::size_t STATIC_FLAG_OFFSET = {static_flag_offset};\n\
+         inline constexpr std::uint8_t STATIC_FLAG_VALUE = {static_flag_value};\n\
          inline constexpr std::array<std::uint8_t, 4> LEGACY_STATIC_VERSION = {{{marker}}};\n\
          }}  // namespace abcd_format_compat\n"
     );
