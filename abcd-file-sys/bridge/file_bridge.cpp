@@ -17,7 +17,6 @@
 #include "annotation_data_accessor.h"
 #include "proto_data_accessor-inl.h"
 #include "file_format_version.h"
-#include "abcd_format_compat.h"
 #include "debug_info_extractor.h"
 #include "index_accessor.h"
 #include "file_item_container.h"
@@ -245,10 +244,13 @@ void CheckFileVersion(const std::array<uint8_t, File::VERSION_SIZE> & /*file_ver
 
 namespace {
 
+// Static-file recognition is an abcd-rs format rule.  Keep it at the file
+// format boundary instead of depending on names from a particular vendor
+// header revision (the upstream member was renamed in 2026).
 bool IsStaticFileVersion(const std::array<uint8_t, File::VERSION_SIZE> &version) {
-    using namespace abcd_format_compat;
-    return (HAS_STATIC_FLAG && version[STATIC_FLAG_OFFSET] == STATIC_FLAG_VALUE) ||
-           version == LEGACY_STATIC_VERSION;
+    constexpr std::array<uint8_t, File::VERSION_SIZE> LEGACY_STATIC_VERSION = {0, 1, 0, 7};
+    constexpr std::array<uint8_t, File::VERSION_SIZE> OLD_STATIC_VERSION = {0, 0, 0, 6};
+    return version[1] == 1 || version == LEGACY_STATIC_VERSION || version == OLD_STATIC_VERSION;
 }
 
 }  // namespace
