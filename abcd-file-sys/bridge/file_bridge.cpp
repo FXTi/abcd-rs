@@ -242,6 +242,19 @@ bool CheckHeader(const os::mem::ConstBytePtr & /*ptr*/, const std::string_view &
 void CheckFileVersion(const std::array<uint8_t, File::VERSION_SIZE> & /*file_version*/,
                       const std::string_view & /*filename*/) {}
 
+namespace {
+
+// Static-file recognition is an abcd-rs format rule.  Keep it at the file
+// format boundary instead of depending on names from a particular vendor
+// header revision (the upstream member was renamed in 2026).
+bool IsStaticFileVersion(const std::array<uint8_t, File::VERSION_SIZE> &version) {
+    constexpr std::array<uint8_t, File::VERSION_SIZE> LEGACY_STATIC_VERSION = {0, 1, 0, 7};
+    constexpr std::array<uint8_t, File::VERSION_SIZE> OLD_STATIC_VERSION = {0, 0, 0, 6};
+    return version[1] == 1 || version == LEGACY_STATIC_VERSION || version == OLD_STATIC_VERSION;
+}
+
+}  // namespace
+
 PandaFileType GetFileType(const uint8_t *data, int32_t size) {
     // Ported from upstream file.cpp (merged here; see review finding #4).
     if (data == nullptr || size < 0 || static_cast<uint32_t>(size) < sizeof(File::Header)) {
@@ -258,16 +271,7 @@ PandaFileType GetFileType(const uint8_t *data, int32_t size) {
         return PandaFileType::FILE_FORMAT_INVALID;
     }
 
-    // Upstream renamed STATIC_VERSION to OLD_STATIC_VERSION and added a
-    // static marker in version byte 1. Keep the bridge independent of that
-    // member name so vendor syncs do not break compilation. The older
-    // second-generation marker remains accepted for existing fixtures.
-    constexpr std::array<uint8_t, File::VERSION_SIZE> OLD_STATIC_VERSION = {0, 0, 0, 6};
-    constexpr std::array<uint8_t, File::VERSION_SIZE> LEGACY_STATIC_VERSION = {0, 1, 0, 7};
-    const bool static_marker = header->version[1] == 1 ||
-                               header->version == OLD_STATIC_VERSION ||
-                               header->version == LEGACY_STATIC_VERSION;
-    if (static_marker) {
+    if (IsStaticFileVersion(header->version)) {
         return PandaFileType::FILE_STATIC;
     }
     return PandaFileType::FILE_DYNAMIC;
