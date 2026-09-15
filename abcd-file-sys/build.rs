@@ -43,6 +43,7 @@ fn main() {
     // Parses modifiers.h to extract ACC_* names, then writes a C++ header
     // that references vendor constexpr/enum values directly.
     generate_enums_header(&manifest, &out_dir);
+    generate_format_compat_header(&manifest, &out_dir);
 
     // Phase 2: Compile C++ library
     let vendor_pf = format!("{manifest}/vendor/libpandafile");
@@ -238,5 +239,53 @@ fn generate_enums_header(manifest: &str, out_dir: &str) {
     let path = format!("{out_dir}/file_bridge_enums.h");
     if std::fs::read_to_string(&path).ok().as_deref() != Some(out.as_str()) {
         std::fs::write(&path, &out).expect("write file_bridge_enums.h");
+    }
+}
+
+/// Generate the small format-compatibility surface consumed by the bridge.
+///
+/// Static-file markers have changed names and representation upstream.  Read
+/// the vendor declarations here so the bridge never hard-codes an upstream
+/// member name or version tuple.
+fn generate_format_compat_header(manifest: &str, out_dir: &str) {
+    let file_h = std::fs::read_to_string(format!("{manifest}/vendor/libpandafile/file.h"))
+        .expect("read file.h");
+    let marker = ["OLD_STATIC_VERSION", "STATIC_VERSION"]
+        .iter()
+        .find_map(|name| {
+            let needle = format!("{name} = {{");
+            let start = file_h.find(&needle)? + needle.len();
+            let end = file_h[start..].find('}')? + start;
+            let values = file_h[start..end]
+                .split(',')
+                .map(str::trim)
+                .collect::<Vec<_>>();
+            (values.len() == 4).then(|| values.join(", "))
+        });
+    let parse_const = |name: &str| -> Option<usize> {
+        let marker = format!("{name} =");
+        let start = file_h.find(&marker)? + marker.len();
+        file_h[start..].split(';').next()?.trim().parse().ok()
+    };
+    let static_flag_offset = parse_const("FILE_TYPE_OFFSET").unwrap_or(0);
+    let static_flag_value = parse_const("FILE_TYPE_STATIC_FLAG").unwrap_or(0);
+    let has_flag = file_h.contains("FILE_TYPE_OFFSET") && file_h.contains("FILE_TYPE_STATIC_FLAG");
+    let marker = marker.unwrap_or_else(|| "0, 0, 0, 0".to_string());
+    let out = format!(
+        "/* Generated from vendor/libpandafile/file.h; do not edit. */\n\
+         #pragma once\n\
+         #include <array>\n\
+         #include <cstddef>\n\
+         #include <cstdint>\n\
+         namespace abcd_format_compat {{\n\
+         inline constexpr bool HAS_STATIC_FLAG = {has_flag};\n\
+         inline constexpr std::size_t STATIC_FLAG_OFFSET = {static_flag_offset};\n\
+         inline constexpr std::uint8_t STATIC_FLAG_VALUE = {static_flag_value};\n\
+         inline constexpr std::array<std::uint8_t, 4> LEGACY_STATIC_VERSION = {{{marker}}};\n\
+         }}  // namespace abcd_format_compat\n"
+    );
+    let path = format!("{out_dir}/abcd_format_compat.h");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(out.as_str()) {
+        std::fs::write(path, out).expect("write abcd_format_compat.h");
     }
 }
