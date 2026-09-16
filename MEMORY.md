@@ -80,6 +80,12 @@
 - `isa.yaml` has no super-by-index opcode. Lowering now returns an explicit
   unsupported-instruction error for `LoadSuperProperty`/`StoreSuperProperty`
   with `ByIndex` instead of silently emitting nothing.
+- VM oracle attempt: original corpus candidate compares successfully, but an
+  ABC rebuilt by `abcd_file::encode` fails `ark_disasm` with invalid entity
+  offset. The bridge's `AbcBuilder` writes code bytes verbatim and has no
+  post-finalize entity relocation. Do not map source offsets to builder
+  handles in generic encode; a dedicated code relocation/emitter bridge is
+  still required.
 - Annotation array preflight rejects 64-bit arrays rather than supporting
   them. The underlying panic and unsupported-element zero fallbacks remain.
 
