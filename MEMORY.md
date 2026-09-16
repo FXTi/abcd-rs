@@ -86,6 +86,9 @@
   post-finalize entity relocation. Do not map source offsets to builder
   handles in generic encode; a dedicated code relocation/emitter bridge is
   still required.
+- `abcd_file::encode` now configures the builder API from the source ABC
+  version (including API12 beta subversions and API18/API24 mappings). This
+  fixes version policy selection but does not solve code entity relocation.
 - Annotation array preflight rejects 64-bit arrays rather than supporting
   them. The underlying panic and unsupported-element zero fallbacks remain.
 

@@ -881,6 +881,15 @@ impl EntityHandles {
 pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     validate_annotation_arrays(file)?;
     let mut b = Builder::new();
+    match file.version.as_bytes() {
+        [9, _, _, _] => b.set_api(9, ""),
+        [11, _, _, _] => b.set_api(11, ""),
+        [12, 0, 2, 0] => b.set_api(12, "beta1"),
+        [12, _, _, _] => b.set_api(12, "beta3"),
+        [13, _, _, _] => b.set_api(18, ""),
+        [24, _, _, _] => b.set_api(24, ""),
+        _ => {}
+    }
     let pool = &file.strings;
 
     // Helper: resolve a StringId to &str, panicking on invalid ids.
