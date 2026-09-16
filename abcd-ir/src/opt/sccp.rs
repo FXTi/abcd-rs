@@ -198,7 +198,12 @@ impl FuncPass for Sccp {
                     if let Some(LatticeVal::Constant(c)) = lattice.get(&result) {
                         let new_data = const_to_inst(c);
                         if !matches_inst_data(&module.inst(inst_id).data, &new_data) {
+                            let was_phi = module.inst(inst_id).data.is_phi();
                             module.inst_mut(inst_id).data = new_data;
+                            if was_phi {
+                                module.block_mut(bb).phis.retain(|&id| id != inst_id);
+                                module.block_mut(bb).insts.insert(0, inst_id);
+                            }
                             changed = true;
                         }
                     }

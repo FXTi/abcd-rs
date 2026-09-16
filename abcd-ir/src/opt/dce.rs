@@ -176,13 +176,32 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
             // succ must have no phis (single pred).
             let succ_phis = module.block(succ).phis.clone();
             let succ_insts = module.block(succ).insts.clone();
+            let bb_preds = module.block(bb).preds.clone();
+            for &phi_id in &succ_phis {
+                if let InstData::Phi { entries } = &mut module.inst_mut(phi_id).data {
+                    let incoming = entries
+                        .iter()
+                        .find(|(pred, _)| *pred == bb)
+                        .map(|(_, v)| *v);
+                    if let Some(value) = incoming {
+                        entries.clear();
+                        entries.extend(bb_preds.iter().copied().map(|pred| (pred, value)));
+                    }
+                }
+            }
 
             // Remove the terminator from bb.
             module.block_mut(bb).insts.pop();
 
             // Move succ's phis (should be empty for single-pred) and insts.
-            module.block_mut(bb).phis.extend(succ_phis);
-            module.block_mut(bb).insts.extend(succ_insts);
+            module.block_mut(bb).phis.extend(succ_phis.iter().copied());
+            module
+                .block_mut(bb)
+                .insts
+                .extend(succ_insts.iter().copied());
+            for &inst_id in succ_phis.iter().chain(succ_insts.iter()) {
+                module.inst_mut(inst_id).block = bb;
+            }
 
             // Update block references in successors of succ.
             let new_succs = block_succs(module, bb);
@@ -206,7 +225,10 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
             }
 
             // Remove succ from function's block list.
+            rewrite_all_terminators(module, func, succ, bb);
             module.func_mut(func).blocks.retain(|b| *b != succ);
+            rewrite_try_regions(module, func, succ, &[bb]);
+            rebuild_predecessors(module, func);
 
             merged_any = true;
             changed = true;
@@ -290,7 +312,10 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
         }
 
         // Remove bb from function.
+        rewrite_all_terminators(module, func, bb, target);
         module.func_mut(func).blocks.retain(|b| *b != bb);
+        rewrite_try_regions(module, func, bb, &preds);
+        rebuild_predecessors(module, func);
         changed = true;
     }
 
@@ -320,6 +345,63 @@ fn redirect_terminator(module: &mut Module, block: Block, old_target: Block, new
                 }
             }
             _ => {}
+        }
+    }
+}
+
+fn rewrite_all_terminators(module: &mut Module, func: FuncId, old: Block, new: Block) {
+    let blocks = module.func(func).blocks.clone();
+    for block in blocks {
+        redirect_terminator(module, block, old, new);
+    }
+}
+
+fn rebuild_predecessors(module: &mut Module, func: FuncId) {
+    let blocks = module.func(func).blocks.clone();
+    for &block in &blocks {
+        module.block_mut(block).preds.clear();
+    }
+    for &block in &blocks {
+        for succ in block_succs(module, block) {
+            if !module.block(succ).preds.contains(&block) {
+                module.block_mut(succ).preds.push(block);
+            }
+        }
+    }
+    let regions = module.func(func).try_regions.clone();
+    for region in regions {
+        for &protected in &region.try_blocks {
+            for catch in &region.catches {
+                if module.func(func).blocks.contains(&catch.handler_block)
+                    && !module.block(catch.handler_block).preds.contains(&protected)
+                {
+                    module.block_mut(catch.handler_block).preds.push(protected);
+                }
+            }
+        }
+    }
+}
+
+/// Rewrite exception metadata when a CFG block is replaced by other blocks.
+fn rewrite_try_regions(module: &mut Module, func: FuncId, removed: Block, replacements: &[Block]) {
+    for region in &mut module.func_mut(func).try_regions {
+        let mut protected = Vec::new();
+        for block in region.try_blocks.drain(..) {
+            if block == removed {
+                protected.extend_from_slice(replacements);
+            } else {
+                protected.push(block);
+            }
+        }
+        protected.sort_by_key(|b| b.0);
+        protected.dedup();
+        region.try_blocks = protected;
+        for catch in &mut region.catches {
+            if catch.handler_block == removed {
+                if let Some(&replacement) = replacements.first() {
+                    catch.handler_block = replacement;
+                }
+            }
         }
     }
 }
@@ -365,5 +447,11 @@ fn remove_unreachable_blocks(module: &mut Module, func: FuncId) -> bool {
         .func_mut(func)
         .blocks
         .retain(|b| reachable.contains(b));
+    for region in &mut module.func_mut(func).try_regions {
+        region.try_blocks.retain(|b| reachable.contains(b));
+        region
+            .catches
+            .retain(|c| reachable.contains(&c.handler_block));
+    }
     true
 }
