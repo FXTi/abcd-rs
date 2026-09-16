@@ -10,7 +10,7 @@
 //! ```
 
 use abcd_file::decode;
-use abcd_isa::Version;
+use abcd_isa::{decode as decode_isa, encode as encode_isa, Version};
 
 fn exported_corpus_root() -> std::path::PathBuf {
     std::env::var_os("ABCD_CORPUS_ROOT")
@@ -110,4 +110,31 @@ fn exported_corpus_index_decodes_every_fixture() {
         count += 1;
     }
     assert_eq!(count, 2757, "unexpected exported corpus size");
+}
+
+/// Exercise the ISA encode/decode layer for every decoded method body.
+#[test]
+#[ignore = "requires exported GHCR corpus"]
+fn exported_corpus_method_bytecodes_roundtrip_through_isa() {
+    let root = exported_corpus_root();
+    let manifest = root.join("index.jsonl");
+    let text = std::fs::read_to_string(&manifest).expect("corpus manifest");
+    let mut methods = 0usize;
+    for line in text.lines() {
+        let prefix = "\"abc\": \"";
+        let start = line.find(prefix).expect("abc path") + prefix.len();
+        let end = start + line[start..].find('"').expect("abc path terminator");
+        let data = std::fs::read(root.join(&line[start..end])).expect("fixture");
+        let file = decode(&data).expect("decode fixture");
+        for class in file.classes.values() {
+            for method in &class.methods {
+                let Some(body) = &method.body else { continue };
+                let encoded = encode_isa(&body.bytecodes).expect("encode method bytecodes");
+                let decoded = decode_isa(&encoded.0).expect("decode encoded method bytecodes");
+                assert_eq!(decoded.len(), body.bytecodes.len());
+                methods += 1;
+            }
+        }
+    }
+    assert!(methods > 10_000, "unexpected method count: {methods}");
 }
