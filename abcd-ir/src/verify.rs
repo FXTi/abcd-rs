@@ -260,6 +260,41 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
         }
     }
 
+    // Try/catch metadata must only reference blocks owned by this function.
+    // Keep the region lists consistent with the CFG so lowering cannot emit
+    // handlers or protected ranges from another function.
+    for (ri, region) in func.try_regions.iter().enumerate() {
+        let mut seen = HashSet::new();
+        for &try_block in &region.try_blocks {
+            if !func_blocks.contains(&try_block) {
+                errors.push(err(
+                    None,
+                    None,
+                    format!("try region {ri} references foreign block {try_block}"),
+                ));
+            }
+            if !seen.insert(try_block) {
+                errors.push(err(
+                    Some(try_block),
+                    None,
+                    format!("try region {ri} contains duplicate protected block"),
+                ));
+            }
+        }
+        for catch in &region.catches {
+            if !func_blocks.contains(&catch.handler_block) {
+                errors.push(err(
+                    None,
+                    None,
+                    format!(
+                        "try region {ri} references foreign handler {}",
+                        catch.handler_block
+                    ),
+                ));
+            }
+        }
+    }
+
     errors
 }
 
@@ -277,7 +312,7 @@ mod tests {
     use super::*;
     use crate::builder::IRBuilder;
     use crate::inst::{BinOp, InstData};
-    use crate::module::Module;
+    use crate::module::{CatchHandler, Module, TryRegion};
     use crate::types::IrType;
     use abcd_file::{FileType, FunctionKind, Version};
 
@@ -345,6 +380,24 @@ mod tests {
             errs.iter()
                 .any(|e| e.message.contains("phi has 2 entries but block has 1"))
         );
+    }
+
+    #[test]
+    fn rejects_foreign_try_region_blocks() {
+        let mut m = make_module();
+        let func = IRBuilder::create_function(&mut m, "f", FunctionKind::Function, 0);
+        let foreign = Block::from_index(m.blocks.len());
+        m.blocks.push(crate::module::BasicBlockData::new());
+        m.func_mut(func).try_regions.push(TryRegion {
+            try_blocks: vec![foreign],
+            catches: vec![CatchHandler {
+                type_idx: u32::MAX,
+                handler_block: foreign,
+            }],
+        });
+        let errs = verify_func(&m, func);
+        assert!(errs.iter().any(|e| e.message.contains("foreign block")));
+        assert!(errs.iter().any(|e| e.message.contains("foreign handler")));
     }
 
     #[test]
