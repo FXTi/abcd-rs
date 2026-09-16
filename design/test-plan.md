@@ -1,7 +1,8 @@
 # Test plan — isa & file foundation (tests first)
 
-Status: scattered groups A–J delivered and green; corpus pipeline **deferred
-by decision** (2026-08) — see "Corpus status" below. Complements
+Status (2026-09-17): local GHCR corpus tests are enabled as opt-in tests;
+full IR/VM equivalence remains outstanding. The older generator plan below
+is historical. Complements
 design/vendor-audit.md (§3 findings, §4 compatibility matrix) and
 design/ir.md (v0.2 boundary).
 
@@ -19,15 +20,43 @@ design/ir.md (v0.2 boundary).
    them locally. **Never dump hap/app binaries into the repo** (Huawei
    distribution restrictions); record their origin in the ledger instead.
 
-## Corpus pipeline (`scripts/gen-corpus.sh`)
+## Current GHCR corpus validation
 
-**Corpus status: deferred.** The upstream source set is identified
+The local `exports/corpus` export contains 2757 fixtures across six ABC
+versions and three compile profiles, including 1119 runtime-oracle cases.
+Exported data is ignored by Git. The image remains a black-box reference.
+
+```sh
+cargo test -p abcd-file --test real_module_abc exported_corpus -- --ignored
+cargo test -p abcd-ir --test corpus_entities -- --ignored
+```
+
+Both commands accept `ABCD_CORPUS_ROOT`; the default is `exports/corpus`.
+The IR regression uses Python 3 to select rows from `index.jsonl` and reads
+each row's official pandasm reference for the expected function name.
+
+Verified locally:
+
+- Manifest-listed ABC files decode and report the expected version.
+- ISA re-encoding/re-decoding retains instruction counts for decoded bodies.
+  This is not an instruction-by-instruction semantic comparison.
+- All 18 arithmetic fixtures resolve `definefunc` and global-name operands
+  using the owning method's index context, then lift with matching names.
+
+Not yet established: complete bytecode parsing (`decode_code_at` still has
+an error-to-empty fallback), full-corpus IR validity, optimizer/lowering
+equivalence, complete literal-array resolution, and rewritten-ABC VM oracle.
+Passing these opt-in tests must not be reported as those stronger guarantees.
+
+## Historical corpus pipeline (`scripts/gen-corpus.sh`)
+
+**Historical generator status: deferred.** The upstream source set was identified
 (ets_frontend `es2panda/test`: 3252 js/ts files; runtime_core
 `libabckit/tests` 242, `static_core/plugins` 134, `disassembler/tests` 74,
 `abc2program/tests` 14; upstream also ships a test262 harness with
 skiplists), but toolchain availability and source-set choice need a
-separate discussion. Until then the repo carries a placeholder pipeline
-and the scattered tests carry the load:
+separate discussion at that time. This script remains a placeholder; current
+local validation uses the GHCR export described above:
 
 - Sources: `scripts/corpus-src/*.js|ts` — 11 small ES6 programs covering
   classes/inheritance, closures/rest/arrows, generators/async, modules,

@@ -430,9 +430,10 @@ mod tests {
         let entry = m.func(func).entry_block;
         m.func_mut(func).blocks.push(entry);
         let errs = verify_func(&m, func);
-        assert!(errs
-            .iter()
-            .any(|e| e.message.contains("block list contains duplicates")));
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("block list contains duplicates"))
+        );
     }
 
     #[test]
@@ -452,9 +453,10 @@ mod tests {
         );
         b.emit_void(InstData::Return { value: None });
         let errs = verify_func(&m, func);
-        assert!(errs
-            .iter()
-            .any(|e| e.message.contains("duplicate predecessor")));
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("duplicate predecessor"))
+        );
     }
 
     #[test]

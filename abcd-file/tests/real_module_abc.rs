@@ -10,7 +10,7 @@
 //! ```
 
 use abcd_file::decode;
-use abcd_isa::{decode as decode_isa, encode as encode_isa, Version};
+use abcd_isa::{Version, decode as decode_isa, encode as encode_isa};
 
 fn exported_corpus_root() -> std::path::PathBuf {
     std::env::var_os("ABCD_CORPUS_ROOT")
@@ -98,15 +98,24 @@ fn exported_corpus_index_decodes_every_fixture() {
         let path = root.join(rel);
         let data = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("fixture missing at {}: {e}", path.display()));
-        let file = decode(&data)
-            .unwrap_or_else(|e| panic!("decode failed at {}: {e:?}", path.display()));
+        let file =
+            decode(&data).unwrap_or_else(|e| panic!("decode failed at {}: {e:?}", path.display()));
         let version = rel
             .split('/')
             .next()
-            .and_then(|v| v.split('.').map(|n| n.parse::<u8>().ok()).collect::<Option<Vec<_>>>())
+            .and_then(|v| {
+                v.split('.')
+                    .map(|n| n.parse::<u8>().ok())
+                    .collect::<Option<Vec<_>>>()
+            })
             .and_then(|v| (v.len() == 4).then(|| Version::new(v[0], v[1], v[2], v[3])))
             .unwrap_or_else(|| panic!("invalid version path in manifest line {}", line_no + 1));
-        assert_eq!(file.version, version, "version mismatch at {}", path.display());
+        assert_eq!(
+            file.version,
+            version,
+            "version mismatch at {}",
+            path.display()
+        );
         count += 1;
     }
     assert_eq!(count, 2757, "unexpected exported corpus size");
