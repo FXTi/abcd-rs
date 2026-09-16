@@ -11,7 +11,7 @@ use crate::entity::{Block, FuncId, Inst, StringId, Value};
 use crate::inst::{BinOp, CallKind, InstData, PropKind, UnOp};
 use crate::module::Module;
 
-use super::regalloc::{RegAlloc, RegSlot};
+use super::regalloc::{RegAlloc, RegSlot, TEMP_REG_BASE, TEMP_REG_COUNT};
 
 /// Result of instruction selection for one function.
 #[derive(Debug)]
@@ -120,10 +120,11 @@ fn val_reg(val: Value, alloc: &RegAlloc, codes: &mut Vec<Bytecode>) -> Reg {
     match alloc.allocation.get(&val).copied().unwrap_or(RegSlot::Acc) {
         RegSlot::Reg(r) => Reg(r),
         RegSlot::Acc => {
-            // Value is in acc — need to sta to a temp. This shouldn't happen often
-            // because the allocator tries to keep multi-use values in registers.
-            // For now, use reg 0xFFFE as a spill slot.
-            let spill = Reg(0xFFFE);
+            // Value is in acc — spill it to a reserved short-lived register.
+            // The sequence length gives two accumulator operands in one
+            // instruction distinct slots; the allocator never assigns this
+            // high register range to long-lived SSA values.
+            let spill = Reg(TEMP_REG_BASE + (codes.len() as u16 % TEMP_REG_COUNT));
             codes.push(Bytecode::Sta(spill));
             spill
         }
@@ -146,6 +147,30 @@ fn ensure_acc(val: Value, alloc: &RegAlloc, codes: &mut Vec<Bytecode>) {
 fn store_result(result_slot: Option<RegSlot>, codes: &mut Vec<Bytecode>) {
     if let Some(RegSlot::Reg(r)) = result_slot {
         codes.push(Bytecode::Sta(Reg(r)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RegAlloc, val_reg};
+    use crate::entity::Value;
+    use abcd_isa::Bytecode;
+    use std::collections::HashMap;
+
+    #[test]
+    fn accumulator_spills_use_distinct_reserved_registers() {
+        let alloc = RegAlloc {
+            allocation: HashMap::new(),
+            phi_copies: HashMap::new(),
+            num_regs: 0,
+        };
+        let mut codes = Vec::new();
+        let first = val_reg(Value::from_index(1), &alloc, &mut codes);
+        let second = val_reg(Value::from_index(2), &alloc, &mut codes);
+        assert_ne!(first, second);
+        assert!(matches!(codes[0], Bytecode::Sta(_)));
+        assert!(matches!(codes[1], Bytecode::Sta(_)));
+        assert_eq!(first.0 + 1, second.0);
     }
 }
 

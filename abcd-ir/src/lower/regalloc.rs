@@ -39,6 +39,10 @@ pub enum RegSlot {
     Acc,
 }
 
+/// Registers reserved for short-lived accumulator spills emitted by isel.
+pub const TEMP_REG_BASE: u16 = 0xfff0;
+pub const TEMP_REG_COUNT: u16 = 16;
+
 /// Re-export compute_rpo for backward compatibility.
 pub fn compute_rpo(module: &Module, func_id: FuncId) -> Vec<Block> {
     analysis::compute_rpo(module, func_id)
@@ -416,6 +420,9 @@ fn mcs_color(
                     return Err(RegAllocError::RegisterOverflow);
                 }
                 reg += 1;
+            }
+            if reg >= TEMP_REG_BASE {
+                return Err(RegAllocError::RegisterOverflow);
             }
             if reg >= next_reg {
                 next_reg = reg + 1;
