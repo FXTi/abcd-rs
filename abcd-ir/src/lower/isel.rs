@@ -22,6 +22,7 @@ pub struct IselResult {
     pub string_map: HashMap<StringId, EntityId>,
     /// Total number of IC slots allocated for this function.
     pub ic_size: u32,
+    pub unsupported: Option<String>,
 }
 
 /// Per-function IC slot allocator.
@@ -62,6 +63,7 @@ pub fn select(
 ) -> IselResult {
     let mut block_codes: Vec<(Block, Vec<Bytecode>)> = Vec::new();
     let mut ic = IcAllocator::new();
+    let mut unsupported = None;
 
     for &bb in rpo {
         let mut codes = Vec::new();
@@ -72,6 +74,17 @@ pub fn select(
 
         for &inst in &block.insts {
             let node = module.inst(inst);
+            if matches!(
+                &node.data,
+                InstData::LoadSuperProperty {
+                    key: PropKind::ByIndex(_)
+                } | InstData::StoreSuperProperty {
+                    key: PropKind::ByIndex(_),
+                    ..
+                }
+            ) {
+                unsupported = Some("super property access by index".to_string());
+            }
             let result_slot = node
                 .result
                 .map(|v| alloc.allocation.get(&v).copied().unwrap_or(RegSlot::Acc));
@@ -95,6 +108,7 @@ pub fn select(
         block_codes,
         string_map: string_map.clone(),
         ic_size: ic.counter,
+        unsupported,
     }
 }
 

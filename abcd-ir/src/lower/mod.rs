@@ -24,6 +24,8 @@ pub enum LowerError {
     EmptyFunction(FuncId),
     #[error("register allocation overflow in function {0:?}")]
     RegisterOverflow(FuncId),
+    #[error("unsupported instruction in function {func:?}: {message}")]
+    UnsupportedInstruction { func: FuncId, message: String },
 }
 
 /// Lower a single IR function back to bytecodes.
@@ -45,6 +47,12 @@ pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, 
 
     // Step 3: Instruction selection.
     let isel_result = isel::select(module, func_id, &alloc, &rpo, &string_map);
+    if let Some(message) = isel_result.unsupported.clone() {
+        return Err(LowerError::UnsupportedInstruction {
+            func: func_id,
+            message,
+        });
+    }
 
     // Step 4: Layout and jump resolution.
     let result = layout::layout(module, func_id, &isel_result, &alloc, &rpo);

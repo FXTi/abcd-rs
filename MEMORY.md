@@ -77,6 +77,9 @@
   string-pool ownership, and exception CFG semantics need review.
 - Lowering still has approximate semantics, fixed spill registers, missing
   output entity relocation, and incomplete literal-array handling.
+- `isa.yaml` has no super-by-index opcode. Lowering now returns an explicit
+  unsupported-instruction error for `LoadSuperProperty`/`StoreSuperProperty`
+  with `ByIndex` instead of silently emitting nothing.
 - Annotation array preflight rejects 64-bit arrays rather than supporting
   them. The underlying panic and unsupported-element zero fallbacks remain.
 
