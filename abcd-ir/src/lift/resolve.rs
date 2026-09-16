@@ -26,6 +26,13 @@ pub fn resolve_entity(
     Some(module.strings.intern(name))
 }
 
+pub fn resolve_literal_array(file: &File, body: &MethodBody, id: EntityId) -> Option<u32> {
+    let offset = *body
+        .entity_offsets
+        .get(&(EntityKind::LiteralarrayId, id.0))?;
+    file.literal_array_offsets.get(&offset).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -42,6 +49,7 @@ mod tests {
             classes: Default::default(),
             literal_arrays: vec![],
             entity_map: Default::default(),
+            literal_array_offsets: Default::default(),
         };
         for (offset, name) in [
             (100, "first"),

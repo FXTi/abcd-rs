@@ -20,7 +20,7 @@ use crate::module::{
 use crate::types::IrType;
 
 use self::cfg::build_cfg;
-use self::resolve::resolve_entity;
+use self::resolve::{resolve_entity, resolve_literal_array};
 use self::ssa::{RegOrAcc, SsaBuilder};
 use self::translate::translate_bytecode;
 
@@ -413,6 +413,14 @@ fn resolve(
     kind: abcd_isa::EntityKind,
 ) -> Result<StringId, LiftError> {
     resolve_entity(file, body, module, id, kind).ok_or(LiftError::UnresolvedEntity(id.0))
+}
+
+fn resolve_literal(
+    file: &File,
+    body: &abcd_file::MethodBody,
+    id: abcd_isa::EntityId,
+) -> Result<u32, LiftError> {
+    resolve_literal_array(file, body, id).ok_or(LiftError::UnresolvedEntity(id.0))
 }
 
 /// Look up the IR Block for a jump target label.

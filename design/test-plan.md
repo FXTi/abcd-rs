@@ -44,7 +44,7 @@ Verified locally:
   using the owning method's index context, then lift with matching names.
 
 Not yet established: full-corpus IR validity, optimizer/lowering equivalence,
-complete literal-array resolution, and rewritten-ABC VM oracle.
+legacy closure/literal-array IR semantics, and rewritten-ABC VM oracle.
 Passing these opt-in tests must not be reported as those stronger guarantees.
 
 ## Historical corpus pipeline (`scripts/gen-corpus.sh`)

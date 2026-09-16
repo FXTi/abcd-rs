@@ -160,21 +160,21 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Createarraywithbuffer(_ic, eid) => {
-            let s = resolve(file, body, module, *eid, EntityKind::LiteralarrayId)?;
+            let s = super::resolve_literal(file, body, *eid)?;
             let v = emit_val(
                 module,
                 block,
-                InstData::CreateArrayWithBuffer { literal_array: s.0 },
+                InstData::CreateArrayWithBuffer { literal_array: s },
                 loc,
             );
             write_acc(ssa, block, v);
         }
         Bytecode::Createobjectwithbuffer(_ic, eid) => {
-            let s = resolve(file, body, module, *eid, EntityKind::LiteralarrayId)?;
+            let s = super::resolve_literal(file, body, *eid)?;
             let v = emit_val(
                 module,
                 block,
-                InstData::CreateObjectWithBuffer { literal_array: s.0 },
+                InstData::CreateObjectWithBuffer { literal_array: s },
                 loc,
             );
             write_acc(ssa, block, v);

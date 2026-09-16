@@ -37,6 +37,8 @@ pub struct File {
     pub classes: BTreeMap<StringId, Class>,
     /// Literal arrays (indexed by position in the file).
     pub literal_arrays: Vec<LiteralArray>,
+    /// Source-file literal-array offset → decoded table index.
+    pub literal_array_offsets: HashMap<u32, u32>,
     /// offset → interned name/descriptor, for resolving bytecode `EntityId` operands.
     pub entity_map: HashMap<u32, StringId>,
 }

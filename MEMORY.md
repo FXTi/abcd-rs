@@ -43,7 +43,9 @@
   for string/method operands; bytecodes keep raw values. `File::entity_map`
   remains offset -> name. Entity roles come from the vendored ISA generator.
 - Lift resolves through the owning body's map, without raw-offset fallback.
-  Literal-array/type/field operand handling is not completed by this change.
+  Literal-array offsets now map to decoded table indices for buffer-creation
+  operands. `NewLexEnvWithName` still uses a legacy string-shaped IR field and
+  must be typed before closure lift can claim semantic fidelity.
 - Empty strings previously looked like read failures. UTF-16 bridge queries
   now use `SIZE_MAX` for failure and zero for a valid empty string.
 

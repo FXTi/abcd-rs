@@ -228,7 +228,10 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         for bytecode in &body.bytecodes {
             for (kind, id) in bytecode.entity_operands() {
                 use abcd_isa::EntityKind;
-                if !matches!(kind, EntityKind::StringId | EntityKind::MethodId) {
+                if !matches!(
+                    kind,
+                    EntityKind::StringId | EntityKind::MethodId | EntityKind::LiteralarrayId
+                ) {
                     continue;
                 }
                 let invalid = || Error::Malformed {
@@ -247,6 +250,9 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                     return Err(invalid());
                 }
                 body.entity_offsets.insert((kind, id.0), offset);
+                if kind == EntityKind::LiteralarrayId {
+                    continue;
+                }
                 if entity_map.contains_key(&offset) {
                     continue;
                 }
@@ -267,7 +273,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     }
 
     // --- literal arrays ---
-    let literal_arrays = decode_literal_arrays(f, &mut strings);
+    let (literal_arrays, literal_array_offsets) = decode_literal_arrays(f, &mut strings);
 
     Ok(File {
         version,
@@ -277,6 +283,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         strings,
         classes,
         literal_arrays,
+        literal_array_offsets,
         entity_map,
     })
 }
@@ -1143,10 +1150,10 @@ fn decode_literal_array_at(
 fn decode_literal_arrays(
     f: *const sys::AbcFileHandle,
     strings: &mut StringPool,
-) -> Vec<LiteralArray> {
+) -> (Vec<LiteralArray>, HashMap<u32, u32>) {
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     }
 
     // Collect file offsets first so nested LiteralArray references (which
@@ -1162,11 +1169,11 @@ fn decode_literal_arrays(
 
     let first_off = unsafe { sys::abc_file_literalarray_offset(f, 0) };
     if first_off == ABSENT {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     }
     let lr = unsafe { sys::abc_literal_open(f, first_off) };
     if lr.is_null() {
-        return Vec::new();
+        return (Vec::new(), offset_to_index);
     }
     let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
 
@@ -1204,7 +1211,7 @@ fn decode_literal_arrays(
             }
         }
     }
-    arrays
+    (arrays, offset_to_index)
 }
 
 /// Intermediate struct for collecting debug info strings before interning.
