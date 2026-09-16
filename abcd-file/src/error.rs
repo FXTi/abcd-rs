@@ -19,6 +19,10 @@ pub enum Error {
     /// Bytecode encoding failed during encode.
     #[error("bytecode encode error: {0}")]
     BytecodeEncode(String),
+    /// Annotation arrays whose element width cannot be represented by the
+    /// current builder ABI.
+    #[error("unsupported annotation array element type for tag {tag:#x}")]
+    UnsupportedAnnotationArrayType { tag: u8 },
     /// Unknown source language discriminant.
     #[error("unknown source language {0}")]
     UnknownSourceLang(u8),

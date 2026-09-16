@@ -879,6 +879,7 @@ impl EntityHandles {
 ///
 /// Note: `ParamInfo::signature` is not preserved (C++ writer limitation).
 pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
+    validate_annotation_arrays(file)?;
     let mut b = Builder::new();
     let pool = &file.strings;
 
@@ -1173,6 +1174,46 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     // reads per-item index ranges that only ComputeLayout populates.
     b.deduplicate();
     b.finalize()
+}
+
+fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
+    fn annotations(a: &Annotations) -> impl Iterator<Item = &Annotation> {
+        a.compile_time
+            .iter()
+            .chain(a.runtime.iter())
+            .chain(a.compile_time_type.iter())
+            .chain(a.runtime_type.iter())
+    }
+    fn value(v: &AnnotationValue) -> Result<(), Error> {
+        match v {
+            AnnotationValue::Array { tag, values } => {
+                if values.iter().any(|item| matches!(item, AnnotationValue::I64(_) | AnnotationValue::U64(_) | AnnotationValue::F64(_))) {
+                    return Err(Error::UnsupportedAnnotationArrayType { tag: *tag });
+                }
+                for item in values { value(item)?; }
+                Ok(())
+            }
+            AnnotationValue::Annotation(a) => {
+                for e in &a.elements { value(&e.value)?; }
+                Ok(())
+            }
+            AnnotationValue::LiteralArray(values) => {
+                let _ = values;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    for class in file.classes.values() {
+        for ann in annotations(&class.annotations) { for e in &ann.elements { value(&e.value)?; } }
+        for method in &class.methods {
+            for ann in annotations(&method.annotations) { for e in &ann.elements { value(&e.value)?; } }
+        }
+        for field in &class.fields {
+            for ann in annotations(&field.annotations) { for e in &ann.elements { value(&e.value)?; } }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
