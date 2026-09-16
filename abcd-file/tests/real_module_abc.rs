@@ -12,6 +12,17 @@
 use abcd_file::decode;
 use abcd_isa::Version;
 
+fn exported_corpus_root() -> std::path::PathBuf {
+    std::env::var_os("ABCD_CORPUS_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("exports")
+                .join("corpus")
+        })
+}
+
 fn corpus_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -62,4 +73,41 @@ fn modules_abc_decodes_fully_with_v24_table() {
         instructions > 2_000_000,
         "expected >2,000,000 decoded instructions, got {instructions}"
     );
+}
+
+/// Decode every fixture listed by the exported corpus manifest.
+#[test]
+#[ignore = "requires exported GHCR corpus"]
+fn exported_corpus_index_decodes_every_fixture() {
+    let root = exported_corpus_root();
+    let manifest = root.join("index.jsonl");
+    let text = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("corpus manifest missing at {}: {e}", manifest.display()));
+    let mut count = 0usize;
+    for (line_no, line) in text.lines().enumerate() {
+        let prefix = "\"abc\": \"";
+        let start = line
+            .find(prefix)
+            .unwrap_or_else(|| panic!("manifest line {} has no abc path", line_no + 1))
+            + prefix.len();
+        let end = line[start..]
+            .find('"')
+            .map(|i| start + i)
+            .unwrap_or_else(|| panic!("manifest line {} has unterminated abc path", line_no + 1));
+        let rel = &line[start..end];
+        let path = root.join(rel);
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("fixture missing at {}: {e}", path.display()));
+        let file = decode(&data)
+            .unwrap_or_else(|e| panic!("decode failed at {}: {e:?}", path.display()));
+        let version = rel
+            .split('/')
+            .next()
+            .and_then(|v| v.split('.').map(|n| n.parse::<u8>().ok()).collect::<Option<Vec<_>>>())
+            .and_then(|v| (v.len() == 4).then(|| Version::new(v[0], v[1], v[2], v[3])))
+            .unwrap_or_else(|| panic!("invalid version path in manifest line {}", line_no + 1));
+        assert_eq!(file.version, version, "version mismatch at {}", path.display());
+        count += 1;
+    }
+    assert_eq!(count, 2757, "unexpected exported corpus size");
 }
