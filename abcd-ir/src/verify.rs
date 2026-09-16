@@ -200,12 +200,20 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
                     ));
                 }
                 let pred_set: HashSet<Block> = block.preds.iter().copied().collect();
+                let mut entry_preds = HashSet::new();
                 for (entry_bb, _) in entries {
                     if !pred_set.contains(entry_bb) {
                         errors.push(err(
                             Some(bb),
                             Some(inst_id),
                             format!("phi references {entry_bb} which is not a predecessor"),
+                        ));
+                    }
+                    if !entry_preds.insert(*entry_bb) {
+                        errors.push(err(
+                            Some(bb),
+                            Some(inst_id),
+                            format!("phi contains duplicate predecessor {entry_bb}"),
                         ));
                     }
                 }
@@ -425,6 +433,28 @@ mod tests {
         assert!(errs
             .iter()
             .any(|e| e.message.contains("block list contains duplicates")));
+    }
+
+    #[test]
+    fn rejects_duplicate_phi_predecessors() {
+        let mut m = make_module();
+        let func = IRBuilder::create_function(&mut m, "f", FunctionKind::Function, 0);
+        let mut b = IRBuilder::new(&mut m, func);
+        let entry = b.current_block();
+        let target = b.create_block();
+        b.emit_void(InstData::Branch { dest: target });
+        b.set_insert_block(target);
+        b.emit_val(
+            InstData::Phi {
+                entries: vec![(entry, Value::from_index(0)), (entry, Value::from_index(0))],
+            },
+            IrType::default(),
+        );
+        b.emit_void(InstData::Return { value: None });
+        let errs = verify_func(&m, func);
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("duplicate predecessor")));
     }
 
     #[test]
