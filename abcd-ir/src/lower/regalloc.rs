@@ -84,11 +84,11 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     let acc_score = compute_acc_scores(module, &rpo);
 
     // Step 4: MCS ordering + greedy coloring.
-    let (allocation, num_regs) =
+    let (mut allocation, mut num_regs) =
         mcs_color(&all_values, &interference, &acc_score, func.param_count)?;
 
     // Step 5: Boissinot SSA destruction.
-    let phi_copies = boissinot_destruction(module, &rpo, &allocation);
+    let phi_copies = boissinot_destruction(module, &rpo, &mut allocation, &mut num_regs);
 
     Ok(RegAlloc {
         allocation,
@@ -436,7 +436,8 @@ fn mcs_color(
 fn boissinot_destruction(
     module: &Module,
     rpo: &[Block],
-    allocation: &HashMap<Value, RegSlot>,
+    allocation: &mut HashMap<Value, RegSlot>,
+    num_regs: &mut u16,
 ) -> HashMap<(Block, Block), Vec<(Value, Value)>> {
     let mut copies: HashMap<(Block, Block), Vec<(Value, Value)>> = HashMap::new();
 
@@ -464,7 +465,17 @@ fn boissinot_destruction(
 
     // Resolve parallel copies: topological sort with cycle breaking.
     for (_, copy_list) in copies.iter_mut() {
-        *copy_list = resolve_parallel_copies(copy_list, allocation);
+        *copy_list = resolve_parallel_copies(copy_list);
+        if copy_list
+            .iter()
+            .any(|(src, dst)| *src == Value::INVALID || *dst == Value::INVALID)
+        {
+            allocation.entry(Value::INVALID).or_insert_with(|| {
+                let slot = RegSlot::Reg(*num_regs);
+                *num_regs = (*num_regs).saturating_add(1);
+                slot
+            });
+        }
     }
 
     copies
@@ -472,10 +483,7 @@ fn boissinot_destruction(
 
 /// Resolve parallel copies into a sequential order.
 /// Handles cycles by introducing a temporary swap.
-fn resolve_parallel_copies(
-    copies: &[(Value, Value)],
-    _allocation: &HashMap<Value, RegSlot>,
-) -> Vec<(Value, Value)> {
+fn resolve_parallel_copies(copies: &[(Value, Value)]) -> Vec<(Value, Value)> {
     if copies.len() <= 1 {
         return copies.to_vec();
     }
@@ -505,22 +513,48 @@ fn resolve_parallel_copies(
         pending = next_pending;
     }
 
-    // Remaining copies form cycles. Break each cycle with a swap pattern.
-    // For a cycle a→b→c→a, emit: tmp=a, a=c, c=b, b=tmp
+    // Remaining copies form cycles. Break each cycle with INVALID as a
+    // temporary pseudo-value. Layout maps that pseudo-value to a spare reg.
     while !pending.is_empty() {
-        // Pick first copy to start the cycle.
         let (first_src, first_dst) = pending[0];
-        result.push((first_src, first_dst)); // will be overwritten, but sequencing handles it
         pending.remove(0);
+        result.push((first_src, Value::INVALID));
 
-        // Follow the cycle.
-        let mut cur = first_dst;
-        while let Some(pos) = pending.iter().position(|(s, _)| *s == cur) {
+        let mut cur = first_src;
+        while let Some(pos) = pending.iter().position(|(_, d)| *d == cur) {
             let (s, d) = pending.remove(pos);
             result.push((s, d));
-            cur = d;
+            cur = s;
         }
+        result.push((Value::INVALID, first_dst));
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_parallel_copies;
+    use crate::entity::Value;
+
+    #[test]
+    fn breaks_two_value_copy_cycle_with_temp() {
+        let a = Value::from_index(1);
+        let b = Value::from_index(2);
+        assert_eq!(
+            resolve_parallel_copies(&[(a, b), (b, a)]),
+            vec![(a, Value::INVALID), (b, a), (Value::INVALID, b)]
+        );
+    }
+
+    #[test]
+    fn breaks_three_value_copy_cycle_with_temp() {
+        let a = Value::from_index(1);
+        let b = Value::from_index(2);
+        let c = Value::from_index(3);
+        assert_eq!(
+            resolve_parallel_copies(&[(a, b), (b, c), (c, a)]),
+            vec![(a, Value::INVALID), (c, a), (b, c), (Value::INVALID, b)]
+        );
+    }
 }
