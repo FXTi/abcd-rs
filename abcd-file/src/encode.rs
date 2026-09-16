@@ -1182,7 +1182,9 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     // DeduplicateItems computes a layout pass first: its hash computation
     // reads per-item index ranges that only ComputeLayout populates.
     b.deduplicate();
-    b.finalize()
+    let output = b.finalize()?;
+    crate::decode(&output).map_err(|e| Error::FinalizeValidation(e.to_string()))?;
+    Ok(output)
 }
 
 fn validate_annotation_arrays(file: &File) -> Result<(), Error> {

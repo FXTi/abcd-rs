@@ -16,6 +16,9 @@ pub enum Error {
     /// Builder finalize failed.
     #[error("builder finalize failed")]
     Finalize,
+    /// The builder produced bytes that the reader cannot decode.
+    #[error("finalized ABC failed validation: {0}")]
+    FinalizeValidation(String),
     /// Bytecode encoding failed during encode.
     #[error("bytecode encode error: {0}")]
     BytecodeEncode(String),

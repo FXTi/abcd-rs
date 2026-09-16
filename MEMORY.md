@@ -86,6 +86,10 @@
   post-finalize entity relocation. Do not map source offsets to builder
   handles in generic encode; a dedicated code relocation/emitter bridge is
   still required.
+- `abcd_file::encode` now re-decodes finalized bytes and returns
+  `Error::FinalizeValidation` if builder output is not readable. This turns
+  the unresolved entity-relocation problem into an explicit error instead of
+  returning invalid ABC bytes.
 - `abcd_file::encode` now configures the builder API from the source ABC
   version (including API12 beta subversions and API18/API24 mappings). This
   fixes version policy selection but does not solve code entity relocation.
