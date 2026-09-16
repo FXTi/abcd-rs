@@ -193,6 +193,16 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
                         *p = bb;
                     }
                 }
+                let phi_ids = module.block(s).phis.clone();
+                for phi_id in phi_ids {
+                    if let InstData::Phi { entries } = &mut module.inst_mut(phi_id).data {
+                        for (pred, _) in entries.iter_mut() {
+                            if *pred == succ {
+                                *pred = bb;
+                            }
+                        }
+                    }
+                }
             }
 
             // Remove succ from function's block list.
