@@ -271,6 +271,24 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
         // Remove bb from target's preds (it's been replaced by bb's preds).
         module.block_mut(target).preds.retain(|p| *p != bb);
 
+        // Preserve phi semantics when the removed block had predecessors:
+        // every predecessor now reaches `target` with the value that used to
+        // arrive through `bb`.
+        let phi_ids = module.block(target).phis.clone();
+        for phi_id in phi_ids {
+            if let InstData::Phi { entries } = &mut module.inst_mut(phi_id).data {
+                let incoming = entries.iter().find(|(p, _)| *p == bb).map(|(_, v)| *v);
+                entries.retain(|(p, _)| *p != bb);
+                if let Some(value) = incoming {
+                    for &pred in &preds {
+                        if !entries.iter().any(|(p, _)| *p == pred) {
+                            entries.push((pred, value));
+                        }
+                    }
+                }
+            }
+        }
+
         // Remove bb from function.
         module.func_mut(func).blocks.retain(|b| *b != bb);
         changed = true;
