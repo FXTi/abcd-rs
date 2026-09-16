@@ -9,7 +9,7 @@
 //! cargo test --test real_module_abc -- --ignored
 //! ```
 
-use abcd_file::decode;
+use abcd_file::{Error, decode, encode};
 use abcd_isa::{Version, decode as decode_isa, encode as encode_isa};
 
 fn exported_corpus_root() -> std::path::PathBuf {
@@ -146,4 +146,14 @@ fn exported_corpus_method_bytecodes_roundtrip_through_isa() {
         }
     }
     assert!(methods > 10_000, "unexpected method count: {methods}");
+}
+
+#[test]
+#[ignore = "requires exported GHCR corpus"]
+fn rewritten_corpus_candidate_reports_relocation_gap() {
+    let root = exported_corpus_root();
+    let path = root.join("24.0.0.0/local/arithmetic/baseline/input.abc");
+    let file = decode(&std::fs::read(&path).expect("fixture")).expect("decode fixture");
+    let error = encode(&file).expect_err("current builder cannot relocate code entities yet");
+    assert!(matches!(error, Error::FinalizeValidation(_)), "{error}");
 }
