@@ -51,6 +51,21 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
         message: msg,
     };
 
+    if func.blocks.first().copied() != Some(func.entry_block) {
+        errors.push(err(
+            None,
+            None,
+            "entry block must be the first block in the function".into(),
+        ));
+    }
+    if func_blocks.len() != func.blocks.len() {
+        errors.push(err(
+            None,
+            None,
+            "function block list contains duplicates".into(),
+        ));
+    }
+
     // Collect values defined in this function and validate their ownership.
     let mut defined_values: HashSet<Value> = HashSet::new();
     for &bb in &func.blocks {
@@ -398,6 +413,18 @@ mod tests {
         let errs = verify_func(&m, func);
         assert!(errs.iter().any(|e| e.message.contains("foreign block")));
         assert!(errs.iter().any(|e| e.message.contains("foreign handler")));
+    }
+
+    #[test]
+    fn rejects_duplicate_function_blocks() {
+        let mut m = make_module();
+        let func = IRBuilder::create_function(&mut m, "f", FunctionKind::Function, 0);
+        let entry = m.func(func).entry_block;
+        m.func_mut(func).blocks.push(entry);
+        let errs = verify_func(&m, func);
+        assert!(errs
+            .iter()
+            .any(|e| e.message.contains("block list contains duplicates")));
     }
 
     #[test]
