@@ -176,6 +176,13 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
             // succ must have no phis (single pred).
             let succ_phis = module.block(succ).phis.clone();
             let succ_insts = module.block(succ).insts.clone();
+            let phi_inputs_match = succ_phis.iter().all(|&phi_id| {
+                matches!(&module.inst(phi_id).data, InstData::Phi { entries }
+                    if entries.len() == 1 && entries[0].0 == bb)
+            });
+            if !phi_inputs_match {
+                continue;
+            }
             let bb_preds = module.block(bb).preds.clone();
             for &phi_id in &succ_phis {
                 if let InstData::Phi { entries } = &mut module.inst_mut(phi_id).data {
@@ -380,6 +387,17 @@ fn rebuild_predecessors(module: &mut Module, func: FuncId) {
             }
         }
     }
+    for &block in &blocks {
+        let preds = module.block(block).preds.clone();
+        let phis = module.block(block).phis.clone();
+        for phi_id in phis {
+            if let InstData::Phi { entries } = &mut module.inst_mut(phi_id).data {
+                entries.retain(|(pred, _)| preds.contains(pred));
+                let mut seen = HashSet::new();
+                entries.retain(|(pred, _)| seen.insert(*pred));
+            }
+        }
+    }
 }
 
 /// Rewrite exception metadata when a CFG block is replaced by other blocks.
@@ -453,5 +471,6 @@ fn remove_unreachable_blocks(module: &mut Module, func: FuncId) -> bool {
             .catches
             .retain(|c| reachable.contains(&c.handler_block));
     }
+    rebuild_predecessors(module, func);
     true
 }

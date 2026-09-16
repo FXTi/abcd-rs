@@ -50,11 +50,14 @@
 - The opt-in `abcd-ir/tests/corpus_verify.rs` now lifts and verifies all 2757
   fixtures. This proves the current structural verifier accepts them; it does
   not prove optimizer/lowering or runtime semantics.
+- The opt-in `abcd-ir/tests/corpus_opt_verify.rs` now runs lift → verify →
+  optimize → verify for all 2757 fixtures. It passes structurally; this is
+  not a semantic or VM equivalence test.
 - An optimizer corpus probe found and fixed SCCP phi-list corruption,
   instruction ownership left stale by CFG merges, and dangling branch/pred
-  metadata after block deletion. The probe still fails on complex exception
-  and loop CFGs where merged phi IDs/incoming edges are not fully rewritten;
-  do not claim corpus-wide optimize verification yet.
+  metadata after block deletion, plus stale/duplicate phi predecessors. The
+  remaining optimizer risks are semantic, not current structural verifier
+  failures.
 
 ## Remaining correctness issues to revalidate
 
