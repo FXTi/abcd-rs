@@ -58,6 +58,9 @@
   metadata after block deletion, plus stale/duplicate phi predecessors. The
   remaining optimizer risks are semantic, not current structural verifier
   failures.
+- The wide-register lower regression reaches 32776 SSA values and now lowers
+  in under a second after MCS switched from O(n²) rescanning to a heap. IC slot
+  allocation also uses a wider counter, so it no longer overflows at u16.
 
 ## Remaining correctness issues to revalidate
 

@@ -22,6 +22,8 @@ pub use self::regalloc::RegAlloc;
 pub enum LowerError {
     #[error("function {0:?} has no blocks")]
     EmptyFunction(FuncId),
+    #[error("register allocation overflow in function {0:?}")]
+    RegisterOverflow(FuncId),
 }
 
 /// Lower a single IR function back to bytecodes.
@@ -35,7 +37,8 @@ pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, 
     let string_map = build_string_map(module);
 
     // Step 1: Register allocation.
-    let alloc = regalloc::allocate(module, func_id);
+    let alloc =
+        regalloc::allocate(module, func_id).map_err(|_| LowerError::RegisterOverflow(func_id))?;
 
     // Step 2: Compute RPO (reuse from regalloc).
     let rpo = regalloc::compute_rpo(module, func_id);

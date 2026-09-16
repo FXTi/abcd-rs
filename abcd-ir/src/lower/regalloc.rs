@@ -7,7 +7,7 @@
 //! 4. Boissinot SSA destruction: coalesce same-color phi operands,
 //!    insert copies for different colors, topological sort parallel copies.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use crate::analysis::{self, block_succs, inst_operands};
 use crate::entity::{Block, FuncId, Value};
@@ -26,6 +26,12 @@ pub struct RegAlloc {
     pub num_regs: u16,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RegAllocError {
+    #[error("function requires more than 65535 registers")]
+    RegisterOverflow,
+}
+
 /// Where a value lives after allocation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RegSlot {
@@ -39,7 +45,7 @@ pub fn compute_rpo(module: &Module, func_id: FuncId) -> Vec<Block> {
 }
 
 /// Allocate registers for a function using SSA-based chordal coloring.
-pub fn allocate(module: &Module, func_id: FuncId) -> RegAlloc {
+pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocError> {
     let func = module.func(func_id);
     let rpo = analysis::compute_rpo(module, func_id);
 
@@ -62,13 +68,12 @@ pub fn allocate(module: &Module, func_id: FuncId) -> RegAlloc {
     }
 
     if all_values.is_empty() {
-        return RegAlloc {
+        return Ok(RegAlloc {
             allocation: HashMap::new(),
             phi_copies: HashMap::new(),
             num_regs: 0,
-        };
+        });
     }
-
     // Step 1: Exact backward dataflow liveness.
     let (_live_in, live_out) = compute_liveness(module, func_id, &rpo);
 
@@ -80,16 +85,16 @@ pub fn allocate(module: &Module, func_id: FuncId) -> RegAlloc {
 
     // Step 4: MCS ordering + greedy coloring.
     let (allocation, num_regs) =
-        mcs_color(&all_values, &interference, &acc_score, func.param_count);
+        mcs_color(&all_values, &interference, &acc_score, func.param_count)?;
 
     // Step 5: Boissinot SSA destruction.
     let phi_copies = boissinot_destruction(module, &rpo, &allocation);
 
-    RegAlloc {
+    Ok(RegAlloc {
         allocation,
         phi_copies,
         num_regs,
-    }
+    })
 }
 
 // ─── Step 1: Exact backward dataflow liveness ────────────────────────────────
@@ -332,30 +337,30 @@ fn mcs_color(
     interference: &InterferenceGraph,
     acc_score: &HashMap<Value, i32>,
     param_count: u16,
-) -> (HashMap<Value, RegSlot>, u16) {
+) -> Result<(HashMap<Value, RegSlot>, u16), RegAllocError> {
     let n = all_values.len();
     let val_set: HashSet<Value> = all_values.iter().copied().collect();
 
-    // MCS: repeatedly pick the unvisited vertex with the most visited neighbors.
+    // MCS: repeatedly pick the unvisited vertex with the most visited
+    // neighbors. A heap avoids rescanning the complete value set for every
+    // vertex on high-register-pressure methods.
     let mut weight: HashMap<Value, u32> = HashMap::new();
     let mut visited = HashSet::new();
     let mut mcs_order: Vec<Value> = Vec::with_capacity(n);
+    let mut heap: BinaryHeap<(u32, i32, Value)> = BinaryHeap::new();
+    for &value in all_values {
+        heap.push((0, acc_score.get(&value).copied().unwrap_or(0), value));
+    }
 
     for _ in 0..n {
-        // Pick vertex with max weight (ties broken by acc_score descending).
-        let best = all_values
-            .iter()
-            .filter(|v| !visited.contains(*v))
-            .max_by_key(|v| {
-                let w = weight.get(*v).copied().unwrap_or(0);
-                let s = acc_score.get(*v).copied().unwrap_or(0);
-                (w, s)
-            })
-            .copied();
-
-        let v = match best {
-            Some(v) => v,
-            None => break,
+        let v = loop {
+            let Some((w, _score, value)) = heap.pop() else {
+                return Err(RegAllocError::RegisterOverflow);
+            };
+            if visited.contains(&value) || weight.get(&value).copied().unwrap_or(0) != w {
+                continue;
+            }
+            break value;
         };
 
         visited.insert(v);
@@ -365,7 +370,9 @@ fn mcs_color(
         if let Some(neighbors) = interference.get(&v) {
             for &nb in neighbors {
                 if !visited.contains(&nb) && val_set.contains(&nb) {
-                    *weight.entry(nb).or_default() += 1;
+                    let new_weight = weight.entry(nb).or_default();
+                    *new_weight += 1;
+                    heap.push((*new_weight, acc_score.get(&nb).copied().unwrap_or(0), nb));
                 }
             }
         }
@@ -405,6 +412,9 @@ fn mcs_color(
             // Find smallest available register.
             let mut reg = 0u16;
             while used_colors.contains(&RegSlot::Reg(reg)) {
+                if reg == u16::MAX {
+                    return Err(RegAllocError::RegisterOverflow);
+                }
                 reg += 1;
             }
             if reg >= next_reg {
@@ -414,7 +424,7 @@ fn mcs_color(
         }
     }
 
-    (allocation, next_reg)
+    Ok((allocation, next_reg))
 }
 
 // ─── Step 5: Boissinot SSA destruction ───────────────────────────────────────

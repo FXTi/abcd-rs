@@ -21,12 +21,12 @@ pub struct IselResult {
     /// String pool reverse map: StringId → EntityId for the output file.
     pub string_map: HashMap<StringId, EntityId>,
     /// Total number of IC slots allocated for this function.
-    pub ic_size: u16,
+    pub ic_size: u32,
 }
 
 /// Per-function IC slot allocator.
 struct IcAllocator {
-    counter: u16,
+    counter: u32,
 }
 
 impl IcAllocator {
@@ -37,7 +37,7 @@ impl IcAllocator {
     /// Allocate `slot_count` consecutive IC slots, returning the first slot's Imm.
     fn alloc(&mut self, slot_count: u16) -> Imm {
         let id = self.counter;
-        self.counter += slot_count;
+        self.counter = self.counter.saturating_add(slot_count as u32);
         Imm(id as i64)
     }
 
