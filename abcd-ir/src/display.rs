@@ -222,12 +222,11 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
         InstData::NewLexEnv { num_vars } => write!(f, "NewLexEnv {num_vars}"),
         InstData::NewLexEnvWithName {
             num_vars,
-            scope_name,
+            scope_literal_array,
         } => {
             write!(
                 f,
-                "NewLexEnvWithName {num_vars}, \"{}\"",
-                m.strings.get(*scope_name)
+                "NewLexEnvWithName {num_vars}, literal_array {scope_literal_array}"
             )
         }
         InstData::PopLexEnv => write!(f, "PopLexEnv"),

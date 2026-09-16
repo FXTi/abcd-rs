@@ -604,13 +604,13 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Newlexenvwithname(num, eid) | Bytecode::WideNewlexenvwithname(num, eid) => {
-            let scope_name = resolve(file, body, module, *eid, EntityKind::LiteralarrayId)?;
+            let scope_literal_array = super::resolve_literal(file, body, *eid)?;
             let v = emit_val(
                 module,
                 block,
                 InstData::NewLexEnvWithName {
                     num_vars: num.0 as u32,
-                    scope_name,
+                    scope_literal_array,
                 },
                 loc,
             );

@@ -192,7 +192,7 @@ pub enum InstData {
     },
     NewLexEnvWithName {
         num_vars: u32,
-        scope_name: StringId,
+        scope_literal_array: u32,
     },
     PopLexEnv,
 

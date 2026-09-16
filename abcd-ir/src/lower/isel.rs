@@ -433,11 +433,11 @@ fn select_inst(
         }
         InstData::NewLexEnvWithName {
             num_vars,
-            scope_name,
+            scope_literal_array,
         } => {
             codes.push(Bytecode::Newlexenvwithname(
                 Imm(*num_vars as i64),
-                eid(*scope_name, string_map),
+                EntityId(*scope_literal_array),
             ));
             store_result(result_slot, codes);
         }
