@@ -2,7 +2,7 @@
 //!
 //! Call [`decode`] to parse raw bytes into a [`File`] struct.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CStr, c_void};
 
 use abcd_file_sys as sys;
@@ -273,7 +273,20 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     }
 
     // --- literal arrays ---
-    let (literal_arrays, literal_array_offsets) = decode_literal_arrays(f, &mut strings);
+    // API13/24 no longer expose a usable header count. Collect literal-array
+    // offsets reached through method index regions so they can be decoded on
+    // demand alongside legacy table entries.
+    let referenced_literal_offsets: HashSet<u32> = classes
+        .values()
+        .flat_map(|class| class.methods.iter())
+        .flat_map(|method| method.body.iter())
+        .flat_map(|body| body.entity_offsets.iter())
+        .filter_map(|((kind, _), offset)| {
+            (kind == &abcd_isa::EntityKind::LiteralarrayId).then_some(*offset)
+        })
+        .collect();
+    let (literal_arrays, literal_array_offsets) =
+        decode_literal_arrays(f, &mut strings, &referenced_literal_offsets);
 
     Ok(File {
         version,
@@ -1150,9 +1163,24 @@ fn decode_literal_array_at(
 fn decode_literal_arrays(
     f: *const sys::AbcFileHandle,
     strings: &mut StringPool,
+    referenced_offsets: &HashSet<u32>,
 ) -> (Vec<LiteralArray>, HashMap<u32, u32>) {
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
-    if n == 0 {
+    let mut offsets = Vec::new();
+    if n != 0 {
+        for i in 0..n {
+            let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
+            if off != ABSENT {
+                offsets.push(off);
+            }
+        }
+    }
+    for &off in referenced_offsets {
+        if off != ABSENT && !offsets.contains(&off) {
+            offsets.push(off);
+        }
+    }
+    if offsets.is_empty() {
         return (Vec::new(), HashMap::new());
     }
 
@@ -1160,30 +1188,20 @@ fn decode_literal_arrays(
     // store the referenced array's file offset) can be rewritten to table
     // indices — the model's documented semantic.
     let mut offset_to_index: HashMap<u32, u32> = HashMap::new();
-    for i in 0..n {
-        let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
-        if off != ABSENT {
-            offset_to_index.insert(off, i);
-        }
+    for (i, &off) in offsets.iter().enumerate() {
+        offset_to_index.insert(off, i as u32);
     }
 
-    let first_off = unsafe { sys::abc_file_literalarray_offset(f, 0) };
-    if first_off == ABSENT {
-        return (Vec::new(), HashMap::new());
-    }
+    let first_off = offsets[0];
     let lr = unsafe { sys::abc_literal_open(f, first_off) };
     if lr.is_null() {
         return (Vec::new(), offset_to_index);
     }
     let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
 
-    let mut arrays: Vec<LiteralArray> = (0..n)
-        .filter_map(|i| {
-            let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
-            if off == ABSENT {
-                return None;
-            }
-
+    let mut arrays: Vec<LiteralArray> = offsets
+        .iter()
+        .filter_map(|&off| {
             let mut ctx = crate::literal::LiteralCollectCtx {
                 file: f,
                 strings: strings as *mut StringPool,

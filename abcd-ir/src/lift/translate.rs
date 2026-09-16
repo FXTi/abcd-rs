@@ -703,14 +703,14 @@ pub(super) fn translate_bytecode(
         }
         Bytecode::Defineclasswithbuffer(_ic, method_eid, lit_eid, _count, base_reg) => {
             let method_id = resolve(file, body, module, *method_eid, EntityKind::MethodId)?;
-            let lit_s = resolve(file, body, module, *lit_eid, EntityKind::LiteralarrayId)?;
+            let lit_s = super::resolve_literal(file, body, *lit_eid)?;
             let base = read_reg(ssa, *base_reg, block, module);
             let v = emit_val(
                 module,
                 block,
                 InstData::DefineClassWithBuffer {
                     method_id,
-                    literal_array: lit_s.0,
+                    literal_array: lit_s,
                     base,
                 },
                 loc,
@@ -1572,7 +1572,7 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::CallruntimeCreateprivateproperty(_count, eid) => {
-            let _name = resolve(file, body, module, *eid, EntityKind::LiteralarrayId)?;
+            let _literal_array = super::resolve_literal(file, body, *eid)?;
             // Private property creation — bookkeeping, no IR side effect
         }
         Bytecode::CallruntimeDefineprivateproperty(_ic, level, slot, val_reg) => {
@@ -1607,14 +1607,14 @@ pub(super) fn translate_bytecode(
         }
         Bytecode::CallruntimeDefinesendableclass(_ic, method_eid, lit_eid, _count, base_reg) => {
             let method_id = resolve(file, body, module, *method_eid, EntityKind::MethodId)?;
-            let lit_s = resolve(file, body, module, *lit_eid, EntityKind::LiteralarrayId)?;
+            let lit_s = super::resolve_literal(file, body, *lit_eid)?;
             let base = read_reg(ssa, *base_reg, block, module);
             let v = emit_val(
                 module,
                 block,
                 InstData::DefineClassWithBuffer {
                     method_id,
-                    literal_array: lit_s.0,
+                    literal_array: lit_s,
                     base,
                 },
                 loc,
