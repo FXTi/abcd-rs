@@ -198,6 +198,11 @@ impl SsaBuilder {
             }
         }
 
+        // The phi has no remaining uses. Remove it from the owning block so
+        // subsequent lowering cannot emit a node that was already replaced.
+        let block = module.inst(phi_inst).block;
+        module.block_mut(block).phis.retain(|&id| id != phi_inst);
+
         replacement
     }
 }

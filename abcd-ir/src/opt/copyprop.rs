@@ -68,6 +68,10 @@ fn eliminate_trivial_phis(module: &mut Module, func: FuncId) -> bool {
                 if let Some(replacement) = unique {
                     // Replace all uses of `result` with `replacement`.
                     analysis::replace_uses_in_func(module, func, result, replacement);
+                    // Keep the block structure in sync with the use-def rewrite.
+                    // Leaving the eliminated phi in `phis` would make later
+                    // lowering visit a dead instruction.
+                    module.block_mut(bb).phis.retain(|&id| id != phi_id);
                     changed = true;
                 }
                 // If unique is None, all entries are self-references (dead phi).
