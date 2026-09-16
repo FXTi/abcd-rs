@@ -190,8 +190,13 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
         source_lang: method.source_lang,
         is_external: method.is_external,
         param_count: method.arg_types.len() as u16,
-        return_type: None, // TODO: convert abcd_file::Type → IrType
-        param_types: Vec::new(),
+        return_type: method.return_type.clone().map(IrType::Static),
+        param_types: method
+            .arg_types
+            .iter()
+            .cloned()
+            .map(IrType::Static)
+            .collect(),
         entry_block,
         blocks: vec![entry_block],
         annotations,
