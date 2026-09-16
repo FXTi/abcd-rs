@@ -7,6 +7,8 @@ use abcd_file::{FieldValue, LiteralArray, ModuleData};
 use crate::entity::{Block, ClassId, FuncId, Inst, StringId, Value};
 use crate::inst::InstData;
 use crate::types::IrType;
+use abcd_isa::EntityId;
+use std::collections::HashMap;
 
 // ─── String pool ─────────────────────────────────────────────────────────────
 
@@ -230,6 +232,8 @@ pub struct Module {
 
     // ── Shared resources ──
     pub strings: StringPool,
+    /// Source ABC entity identity for strings resolved from bytecode.
+    pub string_entities: HashMap<StringId, EntityId>,
 }
 
 impl Module {
@@ -245,6 +249,7 @@ impl Module {
             blocks: Vec::new(),
             values: Vec::new(),
             strings: StringPool::new(),
+            string_entities: HashMap::new(),
         }
     }
 

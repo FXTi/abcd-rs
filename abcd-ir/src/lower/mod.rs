@@ -58,7 +58,14 @@ fn build_string_map(module: &Module) -> HashMap<StringId, EntityId> {
     let mut map = HashMap::new();
     for i in 0..module.strings.len() {
         let sid = StringId::from_index(i);
-        map.insert(sid, EntityId(sid.0));
+        map.insert(
+            sid,
+            module
+                .string_entities
+                .get(&sid)
+                .copied()
+                .unwrap_or(EntityId(sid.0)),
+        );
     }
     map
 }

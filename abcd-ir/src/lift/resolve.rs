@@ -23,7 +23,12 @@ pub fn resolve_entity(
     let offset = body.entity_offsets.get(&(kind, id.0))?;
     let file_sid = file.resolve_entity(*offset)?;
     let name = file.strings.resolve(file_sid)?;
-    Some(module.strings.intern(name))
+    let string_id = module.strings.intern(name);
+    module
+        .string_entities
+        .entry(string_id)
+        .or_insert(EntityId(*offset));
+    Some(string_id)
 }
 
 pub fn resolve_literal_array(file: &File, body: &MethodBody, id: EntityId) -> Option<u32> {
@@ -70,6 +75,7 @@ mod tests {
         let first =
             resolve_entity(&file, &body, &mut module, EntityId(0), EntityKind::MethodId).unwrap();
         assert_eq!(module.strings.get(first), "first");
+        assert_eq!(module.string_entities.get(&first), Some(&EntityId(100)));
         body.entity_offsets.insert((EntityKind::MethodId, 0), 200);
         let second =
             resolve_entity(&file, &body, &mut module, EntityId(0), EntityKind::MethodId).unwrap();
