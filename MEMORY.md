@@ -40,14 +40,15 @@
   region. That shared table also contains strings; opening every entry as a
   method is wrong. The unfinished global-method enumeration patch was removed.
 - `MethodBody::entity_offsets` retains `(EntityKind, raw index) -> file offset`
-  for string/method operands; bytecodes keep raw values. `File::entity_map`
+  for string/method/literal-array operands; bytecodes keep raw values. `File::entity_map`
   remains offset -> name. Entity roles come from the vendored ISA generator.
 - Lift resolves through the owning body's map, without raw-offset fallback.
   Literal-array offsets now map to decoded table indices for buffer-creation
-  operands. `NewLexEnvWithName` still uses a legacy string-shaped IR field and
-  must be typed before closure lift can claim semantic fidelity.
+  operands, and `NewLexEnvWithName` stores a numeric literal-array index.
 - Empty strings previously looked like read failures. UTF-16 bridge queries
   now use `SIZE_MAX` for failure and zero for a valid empty string.
+- The opt-in `abcd-ir/tests/corpus_lift.rs` lifts all 2757 exported fixtures.
+  This is a construction smoke test, not an IR semantic equivalence proof.
 
 ## Remaining correctness issues to revalidate
 
