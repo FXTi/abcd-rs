@@ -198,10 +198,10 @@ impl SsaBuilder {
             }
         }
 
-        // The phi has no remaining uses. Remove it from the owning block so
-        // subsequent lowering cannot emit a node that was already replaced.
-        let block = module.inst(phi_inst).block;
-        module.block_mut(block).phis.retain(|&id| id != phi_inst);
+        // Keep the phi in the block during SSA construction. Earlier
+        // instructions may already refer to its value; removing it here
+        // without a function-wide use rewrite would create an undefined SSA
+        // value. CopyProp performs that rewrite before removing dead phis.
 
         replacement
     }

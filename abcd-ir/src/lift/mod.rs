@@ -257,6 +257,39 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
             )?;
         }
 
+        // CFG construction records implicit fall-through edges, but the IR
+        // requires every block to end in an explicit terminator. Bytecode
+        // instructions such as lda/sta may disappear during SSA lifting, so
+        // inspect the emitted IR rather than the last source instruction.
+        if module
+            .block(ir_block)
+            .insts
+            .last()
+            .map(|&inst| module.inst(inst).data.is_terminator())
+            != Some(true)
+        {
+            match raw_block.succs.as_slice() {
+                [succ_bi] => {
+                    emit_void(
+                        module,
+                        ir_block,
+                        InstData::Branch {
+                            dest: block_map[succ_bi],
+                        },
+                        None,
+                    );
+                }
+                [] => emit_void(module, ir_block, InstData::Unreachable, None),
+                _ => {
+                    // A conditional successor set must have been emitted by
+                    // its jump bytecode. Keep malformed/unsupported cases
+                    // explicit instead of silently creating an unterminated
+                    // block.
+                    emit_void(module, ir_block, InstData::Unreachable, None);
+                }
+            }
+        }
+
         // Seal successor blocks if all their predecessors have been processed.
         // (Simple heuristic: seal after processing each block.)
         for &succ_bi in raw_block.succs.iter().chain(raw_block.catch_succs.iter()) {

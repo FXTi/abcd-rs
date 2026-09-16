@@ -94,13 +94,14 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
         }
     }
 
-    // Entry block has no predecessors.
+    // Entry normally has no predecessors. A loop may legally branch back to
+    // itself, so only predecessors from a different block are invalid.
     let entry = func.entry_block;
-    if !module.block(entry).preds.is_empty() {
+    if module.block(entry).preds.iter().any(|pred| *pred != entry) {
         errors.push(err(
             Some(entry),
             None,
-            "entry block must have no predecessors".into(),
+            "entry block has a predecessor from another block".into(),
         ));
     }
 
@@ -123,7 +124,12 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
                     None,
                     format!("predecessor {pred} is not in this function"),
                 ));
-            } else if !analysis::block_succs(module, pred).contains(&bb) {
+            } else if !analysis::block_succs(module, pred).contains(&bb)
+                && !func.try_regions.iter().any(|region| {
+                    region.try_blocks.contains(&pred)
+                        && region.catches.iter().any(|catch| catch.handler_block == bb)
+                })
+            {
                 errors.push(err(
                     Some(bb),
                     None,

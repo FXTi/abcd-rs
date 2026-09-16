@@ -42,6 +42,8 @@ Verified locally:
   This is not an instruction-by-instruction semantic comparison.
 - All 18 arithmetic fixtures resolve `definefunc` and global-name operands
   using the owning method's index context, then lift with matching names.
+- All 2757 fixtures pass the opt-in IR lift plus structural verifier test. This
+  checks current invariants only; it is not an IR semantic comparison.
 
 Not yet established: full-corpus IR validity, optimizer/lowering equivalence,
 complete optimizer/lowering use of API13/24 literal arrays, and rewritten-ABC

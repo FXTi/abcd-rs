@@ -47,8 +47,9 @@
   operands, and `NewLexEnvWithName` stores a numeric literal-array index.
 - Empty strings previously looked like read failures. UTF-16 bridge queries
   now use `SIZE_MAX` for failure and zero for a valid empty string.
-- The opt-in `abcd-ir/tests/corpus_lift.rs` lifts all 2757 exported fixtures.
-  This is a construction smoke test, not an IR semantic equivalence proof.
+- The opt-in `abcd-ir/tests/corpus_verify.rs` now lifts and verifies all 2757
+  fixtures. This proves the current structural verifier accepts them; it does
+  not prove optimizer/lowering or runtime semantics.
 
 ## Remaining correctness issues to revalidate
 
