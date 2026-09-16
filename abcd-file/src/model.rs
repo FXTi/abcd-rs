@@ -108,6 +108,10 @@ pub struct MethodBody {
     /// Number of arguments (including `this` for instance methods).
     pub num_args: u32,
     pub bytecodes: Vec<Bytecode>,
+    /// (Operand role, index) → source-file entity offset, resolved in
+    /// this method's index region. Bytecodes retain their raw operands.
+    /// Literal-array operands require separate version-dependent handling.
+    pub entity_offsets: HashMap<(abcd_isa::EntityKind, u32), u32>,
     pub try_blocks: Vec<TryBlock>,
 }
 

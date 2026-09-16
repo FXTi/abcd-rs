@@ -218,6 +218,54 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         );
     }
 
+    // Resolve encoded string/method indices while the source file is open.
+    // An index only has meaning in its owning method's index region; it must
+    // never be used directly as a key in the file-wide offset/name map.
+    for method in classes.values_mut().flat_map(|class| &mut class.methods) {
+        let Some(body) = &mut method.body else {
+            continue;
+        };
+        for bytecode in &body.bytecodes {
+            for (kind, id) in bytecode.entity_operands() {
+                use abcd_isa::EntityKind;
+                if !matches!(kind, EntityKind::StringId | EntityKind::MethodId) {
+                    continue;
+                }
+                let invalid = || Error::Malformed {
+                    field: "bytecode entity reference",
+                    context: format!(
+                        "{} in method {:#x}: {:?} index {}",
+                        bytecode.mnemonic(),
+                        method.offset,
+                        kind,
+                        id.0
+                    ),
+                };
+                let index = u16::try_from(id.0).map_err(|_| invalid())?;
+                let offset = unsafe { sys::abc_resolve_offset_by_index(f, method.offset, index) };
+                if offset == ABSENT {
+                    return Err(invalid());
+                }
+                body.entity_offsets.insert((kind, id.0), offset);
+                if entity_map.contains_key(&offset) {
+                    continue;
+                }
+                let name = if kind == EntityKind::StringId {
+                    read_string(f, offset)
+                } else {
+                    let accessor = unsafe { sys::abc_method_open(f, offset) };
+                    if accessor.is_null() {
+                        return Err(invalid());
+                    }
+                    let _guard = HandleGuard(Some(|| unsafe { sys::abc_method_close(accessor) }));
+                    read_method_name(accessor)
+                }
+                .ok_or_else(invalid)?;
+                entity_map.insert(offset, strings.get_or_intern(&name));
+            }
+        }
+    }
+
     // --- literal arrays ---
     let literal_arrays = decode_literal_arrays(f, &mut strings);
 
@@ -539,6 +587,7 @@ fn decode_code_at(
                 num_vregs: 0,
                 num_args: 0,
                 bytecodes: Vec::new(),
+                entity_offsets: HashMap::new(),
                 try_blocks: Vec::new(),
             },
             Vec::new(),
@@ -604,6 +653,7 @@ fn decode_code_at(
             num_vregs,
             num_args,
             bytecodes,
+            entity_offsets: HashMap::new(),
             try_blocks,
         },
         byte_offsets,

@@ -1,7 +1,7 @@
 //! Bytecode → IR translation for each instruction variant.
 
 use abcd_file::File;
-use abcd_isa::{Bytecode, Reg};
+use abcd_isa::{Bytecode, EntityKind, Reg};
 
 use crate::entity::{Block, Value};
 use crate::inst::{BinOp, CallKind, InstData, PropKind, UnOp};
@@ -21,6 +21,7 @@ pub(super) fn translate_bytecode(
     idx: usize,
     block: Block,
     file: &File,
+    body: &abcd_file::MethodBody,
     module: &mut Module,
     ssa: &mut SsaBuilder,
     block_map: &HashMap<usize, Block>,
@@ -74,12 +75,12 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::LdaStr(eid) => {
-            let s = resolve(file, module, *eid)?;
+            let s = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let v = emit_val(module, block, InstData::LiteralString(s), loc);
             write_acc(ssa, block, v);
         }
         Bytecode::Ldbigint(eid) => {
-            let s = resolve(file, module, *eid)?;
+            let s = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let v = emit_val(module, block, InstData::LiteralString(s), loc);
             write_acc(ssa, block, v);
         }
@@ -159,7 +160,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Createarraywithbuffer(_ic, eid) => {
-            let s = resolve(file, module, *eid)?;
+            let s = resolve(file, body, module, *eid, EntityKind::LiteralarrayId)?;
             let v = emit_val(
                 module,
                 block,
@@ -169,7 +170,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Createobjectwithbuffer(_ic, eid) => {
-            let s = resolve(file, module, *eid)?;
+            let s = resolve(file, body, module, *eid, EntityKind::LiteralarrayId)?;
             let v = emit_val(
                 module,
                 block,
@@ -179,7 +180,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Createregexpwithliteral(_ic, eid, flags_imm) => {
-            let pattern = resolve(file, module, *eid)?;
+            let pattern = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let flags_str = format!("{}", flags_imm.0);
             let flags = module.strings.intern(&flags_str);
             let v = emit_val(
@@ -206,7 +207,7 @@ pub(super) fn translate_bytecode(
 
         // ── Property access ──────────────────────────────────────────
         Bytecode::Ldobjbyname(_ic, eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let obj = read_acc(ssa, block, module);
             let v = emit_val(
                 module,
@@ -220,7 +221,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Stobjbyname(_ic, eid, obj_reg) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_acc(ssa, block, module);
             let obj = read_reg(ssa, *obj_reg, block, module);
             emit_void(
@@ -306,7 +307,7 @@ pub(super) fn translate_bytecode(
         }
         Bytecode::Stownbyname(_ic, eid, obj_reg)
         | Bytecode::Stownbynamewithnameset(_ic, eid, obj_reg) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_acc(ssa, block, module);
             let obj = read_reg(ssa, *obj_reg, block, module);
             emit_void(
@@ -351,7 +352,7 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::Ldthisbyname(_ic, eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let this = emit_val(module, block, InstData::LoadThis, loc);
             let v = emit_val(
                 module,
@@ -365,7 +366,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Stthisbyname(_ic, eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_acc(ssa, block, module);
             let this = emit_val(module, block, InstData::LoadThis, loc);
             emit_void(
@@ -409,7 +410,7 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::Ldsuperbyname(_ic, eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let v = emit_val(
                 module,
                 block,
@@ -421,7 +422,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Stsuperbyname(_ic, eid, val_reg) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_reg(ssa, *val_reg, block, module);
             emit_void(
                 module,
@@ -518,7 +519,7 @@ pub(super) fn translate_bytecode(
         // ── Define field/property by name ────────────────────────────
         Bytecode::Definefieldbyname(_ic, eid, obj_reg)
         | Bytecode::Definepropertybyname(_ic, eid, obj_reg) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_acc(ssa, block, module);
             let obj = read_reg(ssa, *obj_reg, block, module);
             emit_void(
@@ -535,22 +536,22 @@ pub(super) fn translate_bytecode(
 
         // ── Global variables ─────────────────────────────────────────
         Bytecode::Ldglobalvar(_ic, eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let v = emit_val(module, block, InstData::LoadGlobalVar { name }, loc);
             write_acc(ssa, block, v);
         }
         Bytecode::Stglobalvar(_ic, eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_acc(ssa, block, module);
             emit_void(module, block, InstData::StoreGlobalVar { name, value }, loc);
         }
         Bytecode::Tryldglobalbyname(_ic, eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let v = emit_val(module, block, InstData::TryLoadGlobalByName { name }, loc);
             write_acc(ssa, block, v);
         }
         Bytecode::Trystglobalbyname(_ic, eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_acc(ssa, block, module);
             emit_void(
                 module,
@@ -560,7 +561,7 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::Stconsttoglobalrecord(_ic, eid) | Bytecode::Sttoglobalrecord(_ic, eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_acc(ssa, block, module);
             emit_void(module, block, InstData::StoreGlobalVar { name, value }, loc);
         }
@@ -603,7 +604,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Newlexenvwithname(num, eid) | Bytecode::WideNewlexenvwithname(num, eid) => {
-            let scope_name = resolve(file, module, *eid)?;
+            let scope_name = resolve(file, body, module, *eid, EntityKind::LiteralarrayId)?;
             let v = emit_val(
                 module,
                 block,
@@ -673,7 +674,7 @@ pub(super) fn translate_bytecode(
 
         // ── Function / Class definition ──────────────────────────────
         Bytecode::Definefunc(_ic, eid, length) => {
-            let method_id = resolve(file, module, *eid)?;
+            let method_id = resolve(file, body, module, *eid, EntityKind::MethodId)?;
             let v = emit_val(
                 module,
                 block,
@@ -686,7 +687,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Definemethod(_ic, eid, length) => {
-            let method_id = resolve(file, module, *eid)?;
+            let method_id = resolve(file, body, module, *eid, EntityKind::MethodId)?;
             let home_object = read_acc(ssa, block, module);
             let v = emit_val(
                 module,
@@ -701,8 +702,8 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Defineclasswithbuffer(_ic, method_eid, lit_eid, _count, base_reg) => {
-            let method_id = resolve(file, module, *method_eid)?;
-            let lit_s = resolve(file, module, *lit_eid)?;
+            let method_id = resolve(file, body, module, *method_eid, EntityKind::MethodId)?;
+            let lit_s = resolve(file, body, module, *lit_eid, EntityKind::LiteralarrayId)?;
             let base = read_reg(ssa, *base_reg, block, module);
             let v = emit_val(
                 module,
@@ -1510,7 +1511,7 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::ThrowUndefinedifholewithname(eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let acc = read_acc(ssa, block, module);
             emit_void(
                 module,
@@ -1571,7 +1572,7 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::CallruntimeCreateprivateproperty(_count, eid) => {
-            let _name = resolve(file, module, *eid)?;
+            let _name = resolve(file, body, module, *eid, EntityKind::LiteralarrayId)?;
             // Private property creation — bookkeeping, no IR side effect
         }
         Bytecode::CallruntimeDefineprivateproperty(_ic, level, slot, val_reg) => {
@@ -1605,8 +1606,8 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::CallruntimeDefinesendableclass(_ic, method_eid, lit_eid, _count, base_reg) => {
-            let method_id = resolve(file, module, *method_eid)?;
-            let lit_s = resolve(file, module, *lit_eid)?;
+            let method_id = resolve(file, body, module, *method_eid, EntityKind::MethodId)?;
+            let lit_s = resolve(file, body, module, *lit_eid, EntityKind::LiteralarrayId)?;
             let base = read_reg(ssa, *base_reg, block, module);
             let v = emit_val(
                 module,
@@ -1946,7 +1947,7 @@ pub(super) fn translate_bytecode(
             base_reg,
             _env_reg,
         ) => {
-            let method_id = resolve(file, module, *method_eid)?;
+            let method_id = resolve(file, body, module, *method_eid, EntityKind::MethodId)?;
             let base = read_reg(ssa, *base_reg, block, module);
             let v = emit_val(
                 module,
@@ -2107,7 +2108,7 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::DeprecatedGetmodulenamespace(eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let v = emit_val(
                 module,
                 block,
@@ -2117,7 +2118,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedStmodulevar(eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_acc(ssa, block, module);
             emit_void(
                 module,
@@ -2130,7 +2131,7 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::DeprecatedLdobjbyname(eid, obj_reg) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let obj = read_reg(ssa, *obj_reg, block, module);
             let v = emit_val(
                 module,
@@ -2144,7 +2145,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedLdsuperbyname(eid, _obj_reg) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let v = emit_val(
                 module,
                 block,
@@ -2156,7 +2157,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedLdmodulevar(eid, _flag) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let v = emit_val(
                 module,
                 block,
@@ -2168,7 +2169,7 @@ pub(super) fn translate_bytecode(
         Bytecode::DeprecatedStconsttoglobalrecord(eid)
         | Bytecode::DeprecatedStlettoglobalrecord(eid)
         | Bytecode::DeprecatedStclasstoglobalrecord(eid) => {
-            let name = resolve(file, module, *eid)?;
+            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let value = read_acc(ssa, block, module);
             emit_void(module, block, InstData::StoreGlobalVar { name, value }, loc);
         }

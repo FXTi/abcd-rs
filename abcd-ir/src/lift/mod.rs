@@ -253,7 +253,7 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
         for idx in raw_block.start..raw_block.end {
             let bc = &bytecodes[idx];
             translate_bytecode(
-                bc, idx, ir_block, file, module, &mut ssa, &block_map, &raw_cfg,
+                bc, idx, ir_block, file, body, module, &mut ssa, &block_map, &raw_cfg,
             )?;
         }
 
@@ -407,10 +407,12 @@ fn write_reg(ssa: &mut SsaBuilder, reg: abcd_isa::Reg, block: Block, val: Value)
 /// Resolve an EntityId to StringId, or return LiftError.
 fn resolve(
     file: &File,
+    body: &abcd_file::MethodBody,
     module: &mut Module,
     id: abcd_isa::EntityId,
+    kind: abcd_isa::EntityKind,
 ) -> Result<StringId, LiftError> {
-    resolve_entity(file, module, id).ok_or(LiftError::UnresolvedEntity(id.0))
+    resolve_entity(file, body, module, id, kind).ok_or(LiftError::UnresolvedEntity(id.0))
 }
 
 /// Look up the IR Block for a jump target label.

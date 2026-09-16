@@ -212,6 +212,7 @@ mod tests {
 
     fn make_body(bytecodes: Vec<Bytecode>) -> MethodBody {
         MethodBody {
+            entity_offsets: Default::default(),
             num_vregs: 0,
             num_args: 0,
             bytecodes,
@@ -263,6 +264,7 @@ mod tests {
     fn try_catch_edges() {
         use abcd_file::{CatchBlock, TryBlock};
         let body = MethodBody {
+            entity_offsets: Default::default(),
             num_vregs: 0,
             num_args: 0,
             bytecodes: vec![

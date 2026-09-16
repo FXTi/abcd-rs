@@ -31,7 +31,7 @@
 //! [`Bytecode`], [`Reg`], [`Imm`], [`EntityId`], [`Label`],
 //! [`insn`], [`BytecodeFlags`], [`ExceptionType`].
 
-pub use abcd_isa_sys::{Bytecode, EntityId, Imm, Label, Reg};
+pub use abcd_isa_sys::{Bytecode, EntityId, EntityKind, Imm, Label, Reg};
 pub use abcd_isa_sys::{BytecodeFlags, ExceptionType, insn};
 
 mod decoder;
