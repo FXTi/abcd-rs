@@ -81,9 +81,12 @@ pub fn select(
                 } | InstData::StoreSuperProperty {
                     key: PropKind::ByIndex(_),
                     ..
-                }
+                } | InstData::ThrowConstAssignment { .. }
             ) {
-                unsupported = Some("super property access by index".to_string());
+                unsupported = Some(match &node.data {
+                    InstData::ThrowConstAssignment { .. } => "throw const assignment".to_string(),
+                    _ => "super property access by index".to_string(),
+                });
             }
             let result_slot = node
                 .result

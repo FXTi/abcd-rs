@@ -77,3 +77,26 @@ fn build_string_map(module: &Module) -> HashMap<StringId, EntityId> {
     }
     map
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::IRBuilder;
+    use crate::inst::InstData;
+    use crate::module::Module;
+    use abcd_file::{FileType, FunctionKind, Version};
+
+    #[test]
+    fn rejects_dummy_register_lowering() {
+        let mut module = Module::new(Version::new(12, 0, 6, 0), FileType::Dynamic);
+        let func = IRBuilder::create_function(&mut module, "f", FunctionKind::Function, 0);
+        let mut builder = IRBuilder::new(&mut module, func);
+        let name = builder.intern("constant");
+        builder.emit_void(InstData::ThrowConstAssignment { name });
+        builder.emit_void(InstData::Return { value: None });
+        assert!(matches!(
+            lower_function(&module, func),
+            Err(LowerError::UnsupportedInstruction { .. })
+        ));
+    }
+}
