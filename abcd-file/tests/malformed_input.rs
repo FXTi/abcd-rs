@@ -60,3 +60,18 @@ fn corrupted_body_does_not_abort() {
     // Must terminate with a Rust result, not a signal.
     let _ = decode(&data);
 }
+
+#[test]
+fn invalid_instruction_bytes_are_reported() {
+    let mut b = Builder::new();
+    b.set_api(12, "beta1");
+    let cls = b.add_global_class();
+    b.class_set_source_lang(cls, SourceLang::EcmaScript);
+    let proto = b.create_proto(Type::Tagged, &[]);
+    b.class_add_method(cls, "bad", proto, AccessFlags::PUBLIC, &[0xff], 1, 0);
+    let err = decode(&b.finalize().expect("finalize")).expect_err("invalid opcode must fail");
+    assert!(
+        matches!(err, abcd_file::Error::BytecodeDecode { .. }),
+        "{err}"
+    );
+}

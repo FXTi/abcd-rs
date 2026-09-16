@@ -19,6 +19,13 @@ pub enum Error {
     /// Bytecode encoding failed during encode.
     #[error("bytecode encode error: {0}")]
     BytecodeEncode(String),
+    /// A method body contains bytes that the vendored ISA cannot decode.
+    #[error("bytecode decode error in method {method_offset:#x}: {source}")]
+    BytecodeDecode {
+        method_offset: u32,
+        #[source]
+        source: abcd_isa::DecodeError,
+    },
     /// Annotation arrays whose element width cannot be represented by the
     /// current builder ABI.
     #[error("unsupported annotation array element type for tag {tag:#x}")]

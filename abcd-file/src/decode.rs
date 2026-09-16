@@ -322,7 +322,7 @@ fn decode_method_at(
         if code_off == ABSENT {
             (None, Vec::new())
         } else {
-            let (b, bo) = decode_code_at(f, method_off, code_off);
+            let (b, bo) = decode_code_at(f, method_off, code_off)?;
             (Some(b), bo)
         }
     };
@@ -579,19 +579,10 @@ fn decode_code_at(
     f: *const sys::AbcFileHandle,
     method_off: u32,
     code_off: u32,
-) -> (MethodBody, Vec<u32>) {
+) -> Result<(MethodBody, Vec<u32>), Error> {
     let cr = unsafe { sys::abc_code_open(f as *mut _, code_off) };
     if cr.is_null() {
-        return (
-            MethodBody {
-                num_vregs: 0,
-                num_args: 0,
-                bytecodes: Vec::new(),
-                entity_offsets: HashMap::new(),
-                try_blocks: Vec::new(),
-            },
-            Vec::new(),
-        );
+        return Err(Error::InvalidOffset(code_off));
     }
     let _cg = HandleGuard(Some(|| unsafe { sys::abc_code_close(cr) }));
 
@@ -604,7 +595,10 @@ fn decode_code_at(
             unsafe { std::slice::from_raw_parts(ptr, len) }
         }
     };
-    let decoded = abcd_isa::decode(raw_insns).unwrap_or_default();
+    let decoded = abcd_isa::decode(raw_insns).map_err(|source| Error::BytecodeDecode {
+        method_offset: method_off,
+        source,
+    })?;
 
     // Split into instructions and a byte-offset table for try-block conversion.
     let (bytecodes, byte_offsets): (Vec<_>, Vec<_>) = decoded.into_iter().unzip();
@@ -648,7 +642,7 @@ fn decode_code_at(
     let num_vregs = unsafe { sys::abc_code_num_vregs(cr) };
     let num_args = unsafe { sys::abc_code_num_args(cr) };
 
-    (
+    Ok((
         MethodBody {
             num_vregs,
             num_args,
@@ -657,7 +651,7 @@ fn decode_code_at(
             try_blocks,
         },
         byte_offsets,
-    )
+    ))
 }
 
 fn decode_proto_types(
