@@ -82,14 +82,22 @@ pub fn file_type(data: &[u8]) -> sys::FileType {
 /// Unicode range: NUL, surrogate pairs, astral characters) and falls back
 /// to the raw-byte view if the conversion is unavailable or malformed.
 pub(crate) fn read_string(file: *const sys::AbcFileHandle, offset: u32) -> Option<String> {
-    // SAFETY: null buffer queries the UTF-16 unit count; 0 means the offset
-    // does not hold a string.
+    // SAFETY: null buffer queries the UTF-16 unit count. SIZE_MAX denotes
+    // failure; zero denotes a valid empty string.
     let units = unsafe { sys::abc_file_get_string_utf16(file, offset, std::ptr::null_mut(), 0) };
+    if units == usize::MAX {
+        return None;
+    }
+    if units == 0 {
+        return Some(String::new());
+    }
     if units > 0 {
         let mut buf = vec![0u16; units as usize];
         // SAFETY: buf holds exactly `units` UTF-16 units.
-        unsafe {
-            sys::abc_file_get_string_utf16(file, offset, buf.as_mut_ptr(), buf.len());
+        let written =
+            unsafe { sys::abc_file_get_string_utf16(file, offset, buf.as_mut_ptr(), buf.len()) };
+        if written != units {
+            return None;
         }
         if let Ok(s) = String::from_utf16(&buf) {
             return Some(s);
@@ -112,4 +120,22 @@ pub(crate) fn read_string(file: *const sys::AbcFileHandle, offset: u32) -> Optio
 /// Whether the entity at the given offset is in the foreign section.
 pub(crate) fn is_external(file: *const sys::AbcFileHandle, offset: u32) -> bool {
     unsafe { sys::abc_file_is_external(file, offset) != 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_string_is_distinct_from_invalid_offset() {
+        let mut builder = crate::Builder::new();
+        builder.add_foreign_class(""); // A foreign class item is a string.
+        let data = builder.finalize().unwrap();
+        let file = AbcFile::open(&data).unwrap();
+        let offset = unsafe { sys::abc_file_class_offset(file.raw, 0) };
+        assert_ne!(offset, ABSENT);
+        assert_eq!(read_string(file.raw, offset), Some(String::new()));
+        assert_eq!(read_string(file.raw, data.len() as u32), None);
+        assert_eq!(read_string(file.raw, ABSENT), None);
+    }
 }

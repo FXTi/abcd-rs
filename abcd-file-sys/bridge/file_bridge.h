@@ -49,7 +49,8 @@ size_t abc_file_get_string(const AbcFileHandle *f, uint32_t offset,
 
 /* String access via MUTF-8 → UTF-16 conversion (lossless for the whole
  * Unicode range, unlike the raw-byte view). Returns the number of UTF-16
- * units (excluding any terminator); 0 on error. Query with buf=null.
+ * units (excluding any terminator); SIZE_MAX on error. Zero is a valid
+ * empty string. Query with buf=null.
  * buf must hold at least the returned unit count. */
 size_t abc_file_get_string_utf16(const AbcFileHandle *f, uint32_t offset,
                                  uint16_t *buf, size_t buf_len);

@@ -516,14 +516,14 @@ size_t abc_file_get_string_utf16(const AbcFileHandle *f, uint32_t offset,
                                  uint16_t *buf, size_t buf_len) {
 try {
     auto sd = f->file->GetStringData(File::EntityId(offset));
-    if (!sd.data) return 0;
+    if (!sd.data) return SIZE_MAX;
     if (!buf || buf_len == 0) return sd.utf16_length;
-    if (buf_len < sd.utf16_length) return 0;  // caller must size the buffer
+    if (buf_len < sd.utf16_length) return SIZE_MAX;  // caller must size the buffer
     size_t mutf8_len = std::strlen(reinterpret_cast<const char *>(sd.data));
     panda::utf::ConvertMUtf8ToUtf16(sd.data, mutf8_len, buf);
     return sd.utf16_length;
 } catch (...) {
-    return 0;
+    return SIZE_MAX;
 }
 }
 
