@@ -49,9 +49,9 @@
 
 ## Remaining correctness issues to revalidate
 
-- `decode_code_at` still uses `abcd_isa::decode(...).unwrap_or_default()`;
-  malformed instructions can disappear into an empty body. Propagate errors
-  and re-run the corpus before making stronger coverage claims.
+- `decode_code_at` now propagates `Error::BytecodeDecode` with method offset;
+  malformed instructions do not disappear into an empty body. The corpus
+  decode regression was re-run after this change.
 - SSA trivial-phi removal rewrites definition maps but not all existing uses;
   deleting the phi from a block alone does not prove correctness.
 - Empty-jump elimination must preserve distinct values when a predecessor

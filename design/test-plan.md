@@ -43,9 +43,8 @@ Verified locally:
 - All 18 arithmetic fixtures resolve `definefunc` and global-name operands
   using the owning method's index context, then lift with matching names.
 
-Not yet established: complete bytecode parsing (`decode_code_at` still has
-an error-to-empty fallback), full-corpus IR validity, optimizer/lowering
-equivalence, complete literal-array resolution, and rewritten-ABC VM oracle.
+Not yet established: full-corpus IR validity, optimizer/lowering equivalence,
+complete literal-array resolution, and rewritten-ABC VM oracle.
 Passing these opt-in tests must not be reported as those stronger guarantees.
 
 ## Historical corpus pipeline (`scripts/gen-corpus.sh`)
