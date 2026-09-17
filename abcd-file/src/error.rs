@@ -19,6 +19,8 @@ pub enum Error {
     /// The builder produced bytes that the reader cannot decode.
     #[error("finalized ABC failed validation: {0}")]
     FinalizeValidation(String),
+    #[error("cannot relocate code entity: {0}")]
+    CodeRelocation(String),
     /// Bytecode encoding failed during encode.
     #[error("bytecode encode error: {0}")]
     BytecodeEncode(String),

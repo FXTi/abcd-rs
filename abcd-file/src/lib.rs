@@ -66,7 +66,7 @@ mod module;
 mod encode;
 pub use encode::{
     AnnotationElemDef, AnnotationElemDefEx, AnnotationElemValue, AnnotationHandle, Builder,
-    CatchBlockDef, ClassHandle, CodeHandle, DebugInfoHandle, FieldHandle, LiteralArrayHandle,
-    LnpHandle, MethodHandle, MethodHandleItemHandle, ParamHandle, ProtoHandle, StringHandle,
-    encode,
+    CatchBlockDef, ClassHandle, CodeEntity, CodeHandle, DebugInfoHandle, FieldHandle,
+    LiteralArrayHandle, LnpHandle, MethodHandle, MethodHandleItemHandle, ParamHandle, ProtoHandle,
+    StringHandle, encode,
 };

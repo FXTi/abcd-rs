@@ -2385,6 +2385,13 @@ struct AbcBuilder {
     std::vector<StringItem *> strings;
     std::vector<LiteralArrayItem *> literal_arrays;
     std::vector<MethodItem *> methods;
+    struct CodeIdRelocation {
+        MethodItem *owner;
+        uint32_t byte_offset;
+        uint32_t operand;
+        panda::panda_file::IndexedItem *target;
+    };
+    std::vector<CodeIdRelocation> code_id_relocations;
     std::vector<FieldItem *> fields;
     std::vector<CodeItem *> code_items;
     // Owner method per code item (upstream keeps this in CodeItem::methods_;
@@ -3331,7 +3338,49 @@ void abc_builder_deduplicate_annotations(AbcBuilder *b) {
     b->container.InvalidateComputeLayout();
 }
 
-const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len) {
+int abc_builder_relocate_code_id(AbcBuilder *b, uint32_t method_handle,
+    uint32_t byte_offset, uint32_t operand, enum AbcCodeEntityKind kind, uint32_t target_handle) {
+    try {
+        if (method_handle >= b->methods.size()) return 0;
+        auto *owner = b->methods[method_handle];
+        auto *code = owner->GetCode();
+        if (!code || byte_offset >= code->GetCodeSize()) return 0;
+        panda::panda_file::IndexedItem *target = nullptr;
+        // Foreign method/field handles follow the existing builder tagging.
+        bool foreign = (target_handle & 0x80000000u) != 0;
+        auto index = target_handle & 0x7fffffffu;
+        switch (kind) {
+            case ABC_CODE_STRING:
+                if (target_handle < b->strings.size()) target = b->strings[target_handle];
+                break;
+            case ABC_CODE_METHOD:
+                if (foreign) {
+                    if (index < b->foreign_methods.size()) target = b->foreign_methods[index];
+                } else if (index < b->methods.size()) target = b->methods[index];
+                break;
+            case ABC_CODE_LITERAL_ARRAY:
+                if (target_handle < b->literal_arrays.size()) target = b->literal_arrays[target_handle];
+                break;
+            case ABC_CODE_CLASS:
+                target = b->ResolveClassHandle(target_handle);
+                break;
+            case ABC_CODE_FIELD:
+                if (foreign) {
+                    if (index < b->foreign_fields.size()) target = b->foreign_fields[index];
+                } else if (index < b->fields.size()) target = b->fields[index];
+                break;
+            default: return 0;
+        }
+        if (!target) return 0;
+        owner->AddIndexDependency(target);
+        b->code_id_relocations.push_back({owner, byte_offset, operand, target});
+        b->container.InvalidateComputeLayout();
+        return 1;
+    } catch (...) { return 0; }
+}
+
+const uint8_t *abc_builder_finalize_with_code_ids(AbcBuilder *b, uint32_t *out_len,
+    AbcCodeIdUpdater updater) {
     try {
         // Flush staged line-number-program ops (their operands encode item
         // offsets, so the flush runs its own layout pass first)
@@ -3343,6 +3392,14 @@ const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len) {
             }
         }
         b->container.ComputeLayout();
+        for (const auto &reloc : b->code_id_relocations) {
+            if (!updater || !reloc.target->HasIndex(reloc.owner)) return nullptr;
+            auto *code = reloc.owner->GetCode();
+            if (!code) return nullptr;
+            auto *instructions = code->GetInstructions();
+            if (!updater(instructions->data(), instructions->size(), reloc.byte_offset,
+                         reloc.operand, reloc.target->GetIndex(reloc.owner))) return nullptr;
+        }
         MemoryWriter writer;
         if (!b->container.Write(&writer)) {
             return nullptr;
@@ -3361,6 +3418,10 @@ const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len) {
     } catch (...) {
         return nullptr;
     }
+}
+
+const uint8_t *abc_builder_finalize(AbcBuilder *b, uint32_t *out_len) {
+    return abc_builder_finalize_with_code_ids(b, out_len, nullptr);
 }
 
 } /* extern "C" */

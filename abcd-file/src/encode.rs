@@ -36,6 +36,36 @@ handle_type!(AnnotationHandle);
 handle_type!(ParamHandle);
 handle_type!(MethodHandleItemHandle);
 
+/// A symbolic builder target for a bytecode entity operand.
+pub enum CodeEntity {
+    String(StringHandle),
+    Method(MethodHandle),
+    LiteralArray(LiteralArrayHandle),
+    Class(ClassHandle),
+    Field(FieldHandle),
+}
+
+unsafe extern "C" fn update_code_id(
+    code: *mut u8,
+    size: usize,
+    byte_offset: u32,
+    operand: u32,
+    new_id: u32,
+) -> std::ffi::c_int {
+    if code.is_null() || byte_offset as usize >= size {
+        return 0;
+    }
+    // SAFETY: the builder owns this buffer and grants exclusive access for
+    // this synchronous callback. No Rust reference into it survives the call.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(code, size) };
+    abcd_isa::relocate_entity_id(
+        &mut bytes[byte_offset as usize..],
+        operand,
+        abcd_isa::EntityId(new_id),
+    )
+    .is_ok() as std::ffi::c_int
+}
+
 /// Safe catch block definition for the builder.
 pub struct CatchBlockDef {
     /// Class handle for the exception type, or `None` for catch-all.
@@ -786,11 +816,56 @@ impl Builder {
 
     // --- Finalize ---
 
+    /// Resolve an instruction's ID operand after the upstream writer assigns
+    /// method-local indices. `byte_offset` is an instruction start and
+    /// `operand` is its ID ordinal (excluding register/immediate operands).
+    pub fn relocate_code_id(
+        &mut self,
+        method: MethodHandle,
+        byte_offset: u32,
+        operand: u32,
+        target: CodeEntity,
+    ) -> Result<(), Error> {
+        use sys::{
+            AbcCodeEntityKind_ABC_CODE_CLASS as CLASS, AbcCodeEntityKind_ABC_CODE_FIELD as FIELD,
+            AbcCodeEntityKind_ABC_CODE_LITERAL_ARRAY as LITERAL,
+            AbcCodeEntityKind_ABC_CODE_METHOD as METHOD,
+            AbcCodeEntityKind_ABC_CODE_STRING as STRING,
+        };
+        let (kind, handle) = match target {
+            CodeEntity::String(h) => (STRING, h.0),
+            CodeEntity::Method(h) => (METHOD, h.0),
+            CodeEntity::LiteralArray(h) => (LITERAL, h.0),
+            CodeEntity::Class(h) => (CLASS, h.0),
+            CodeEntity::Field(h) => (FIELD, h.0),
+        };
+        // SAFETY: builder handle lives for the duration of this call. C++
+        // validates ownership and stores only pointers owned by the builder.
+        let ok = unsafe {
+            sys::abc_builder_relocate_code_id(
+                self.raw,
+                method.0,
+                byte_offset,
+                operand,
+                kind,
+                handle,
+            )
+        };
+        if ok == 0 {
+            return Err(Error::CodeRelocation(format!(
+                "invalid builder target or code location at {byte_offset:#x}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Finalize the builder and return the serialized ABC file bytes.
     pub fn finalize(&mut self) -> Result<Vec<u8>, Error> {
         let mut out_len: u32 = 0;
         // SAFETY: raw is valid; out_len is stack-allocated.
-        let ptr = unsafe { sys::abc_builder_finalize(self.raw, &mut out_len) };
+        let ptr = unsafe {
+            sys::abc_builder_finalize_with_code_ids(self.raw, &mut out_len, Some(update_code_id))
+        };
         if ptr.is_null() {
             return Err(Error::Finalize);
         }
@@ -874,8 +949,10 @@ impl EntityHandles {
 
 /// Encode a decoded [`File`] back to ABC bytes.
 ///
-/// The output is a valid ABC file that can be decoded again. Checksums will
-/// differ from the original but all semantic content is preserved.
+/// Source entity operands are resolved through each method body's index map
+/// and relocated after the upstream writer assigns new indices. The output
+/// is checked by this crate's decoder before being returned. This readback
+/// check does not prove runtime equivalence or complete metadata preservation.
 ///
 /// Note: `ParamInfo::signature` is not preserved (C++ writer limitation).
 pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
@@ -901,6 +978,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     // --- Create classes (foreign first, then normal) ---
     let mut class_handles: HashMap<StringId, ClassHandle> = HashMap::new();
     let mut entities = EntityHandles::default();
+    let mut code_references = Vec::new();
     let mut ann_la_counter: u32 = 0;
 
     // First pass: foreign classes
@@ -1073,6 +1151,10 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     );
                 }
 
+                if let Some(body) = &method.body {
+                    code_references.push((m_h, byte_offsets, body));
+                }
+
                 m_h
             };
 
@@ -1162,9 +1244,10 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     }
 
     // --- Literal arrays ---
-    for (i, la) in file.literal_arrays.iter().enumerate() {
-        let id = format!("{i}");
-        let la_h = b.add_literal_array(&id);
+    let literal_handles: Vec<_> = (0..file.literal_arrays.len())
+        .map(|index| b.add_literal_array(&index.to_string()))
+        .collect();
+    for (la, &la_h) in file.literal_arrays.iter().zip(&literal_handles) {
         for val in &la.values {
             encode_literal_value(
                 &mut b,
@@ -1175,6 +1258,54 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 &file.entity_map,
                 &entities,
             );
+        }
+    }
+
+    // All entities now have handles, including forward method/literal refs.
+    // Register dependencies AND deferred operand updates; upstream owns the
+    // final method-local index ordering, which may differ from the input.
+    for (owner, offsets, body) in code_references {
+        for (instruction, &byte_offset) in body.bytecodes.iter().zip(&offsets) {
+            for (ordinal, (kind, id)) in instruction.entity_operands().into_iter().enumerate() {
+                use abcd_isa::EntityKind;
+                let unresolved = || {
+                    Error::CodeRelocation(format!(
+                        "{:?} index {} at byte {byte_offset:#x}",
+                        kind, id.0
+                    ))
+                };
+                let offset = *body
+                    .entity_offsets
+                    .get(&(kind, id.0))
+                    .ok_or_else(unresolved)?;
+                let target = match kind {
+                    EntityKind::StringId => {
+                        let sid = *file.entity_map.get(&offset).ok_or_else(unresolved)?;
+                        CodeEntity::String(get_or_add_string_id(
+                            &mut b,
+                            &mut string_handles,
+                            pool,
+                            sid,
+                        ))
+                    }
+                    EntityKind::MethodId => CodeEntity::Method(
+                        *entities
+                            .methods_by_offset
+                            .get(&offset)
+                            .ok_or_else(unresolved)?,
+                    ),
+                    EntityKind::LiteralarrayId => {
+                        let index = *file
+                            .literal_array_offsets
+                            .get(&offset)
+                            .ok_or_else(unresolved)?;
+                        CodeEntity::LiteralArray(
+                            *literal_handles.get(index as usize).ok_or_else(unresolved)?,
+                        )
+                    }
+                };
+                b.relocate_code_id(owner, byte_offset, ordinal as u32, target)?;
+            }
         }
     }
 

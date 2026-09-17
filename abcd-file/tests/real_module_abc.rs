@@ -9,7 +9,7 @@
 //! cargo test --test real_module_abc -- --ignored
 //! ```
 
-use abcd_file::{Error, decode, encode};
+use abcd_file::{decode, encode};
 use abcd_isa::{Version, decode as decode_isa, encode as encode_isa};
 
 fn exported_corpus_root() -> std::path::PathBuf {
@@ -150,10 +150,51 @@ fn exported_corpus_method_bytecodes_roundtrip_through_isa() {
 
 #[test]
 #[ignore = "requires exported GHCR corpus"]
-fn rewritten_corpus_candidate_reports_relocation_gap() {
+fn rewritten_corpus_preserves_arithmetic_entities() {
     let root = exported_corpus_root();
-    let path = root.join("24.0.0.0/local/arithmetic/baseline/input.abc");
-    let file = decode(&std::fs::read(&path).expect("fixture")).expect("decode fixture");
-    let error = encode(&file).expect_err("current builder cannot relocate code entities yet");
-    assert!(matches!(error, Error::FinalizeValidation(_)), "{error}");
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(root.join("index.jsonl"))
+        .expect("corpus index")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid index JSON"))
+        .collect();
+    let mut checked = 0;
+    for row in rows.iter().filter(|row| row["case"] == "local/arithmetic") {
+        let relative = row["abc"].as_str().expect("abc path");
+        let file = decode(&std::fs::read(root.join(relative)).expect("fixture"))
+            .unwrap_or_else(|error| panic!("decode {relative}: {error}"));
+        let output = encode(&file).unwrap_or_else(|error| panic!("encode {relative}: {error}"));
+        let rewritten = decode(&output).expect("decode rewritten fixture");
+        let snapshot = |f: &abcd_file::File| {
+            f.all_methods()
+                .map(|(_, method)| {
+                    let name = f.strings.resolve(method.name).unwrap().to_owned();
+                    let body = method.body.as_ref().unwrap();
+                    let operands = body
+                        .bytecodes
+                        .iter()
+                        .flat_map(|bc| {
+                            bc.entity_operands().into_iter().map(|(kind, id)| {
+                                let offset = body.entity_offsets[&(kind, id.0)];
+                                (
+                                    bc.mnemonic(),
+                                    kind,
+                                    f.resolve_entity_str(offset).unwrap().to_owned(),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    (name, body.bytecodes.len(), operands)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rewritten.version, file.version, "{relative}");
+        assert_eq!(snapshot(&rewritten), snapshot(&file), "{relative}");
+        if let Some(directory) = std::env::var_os("ABCD_REWRITTEN_DIR") {
+            let target = std::path::PathBuf::from(directory).join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, output).expect("write oracle candidate");
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 18, "arithmetic version/profile matrix");
 }

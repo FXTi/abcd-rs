@@ -583,6 +583,23 @@ void abc_builder_method_set_source_lang(AbcBuilder *b, uint32_t method_handle, u
 void abc_builder_method_set_function_kind(AbcBuilder *b, uint32_t method_handle, uint8_t kind);
 void abc_builder_method_set_debug_info(AbcBuilder *b, uint32_t method_handle, uint32_t debug_handle);
 
+/* Bridge handle categories (not ABC on-disk values). */
+enum AbcCodeEntityKind {
+    ABC_CODE_STRING, ABC_CODE_METHOD, ABC_CODE_LITERAL_ARRAY,
+    ABC_CODE_CLASS, ABC_CODE_FIELD
+};
+/* Register a target and defer patching until upstream assigns its index.
+ * byte_offset is the start of an instruction; operand counts only ID fields.
+ * Returns 1 on success, 0 for an invalid handle/code location. */
+int abc_builder_relocate_code_id(AbcBuilder *b, uint32_t method_handle,
+    uint32_t byte_offset, uint32_t operand, enum AbcCodeEntityKind kind, uint32_t target_handle);
+/* The caller supplies the ISA updater so file-sys does not duplicate ISA
+ * encoding rules. Return 1 on success, 0 on invalid operands/overflow. */
+typedef int (*AbcCodeIdUpdater)(uint8_t *code, size_t code_size,
+    uint32_t byte_offset, uint32_t operand, uint32_t new_id);
+const uint8_t *abc_builder_finalize_with_code_ids(AbcBuilder *b, uint32_t *out_len,
+    AbcCodeIdUpdater updater);
+
 /* --- Field initial values --- */
 void abc_builder_field_set_value_i32(AbcBuilder *b, uint32_t field_handle, int32_t value);
 void abc_builder_field_set_value_i64(AbcBuilder *b, uint32_t field_handle, int64_t value);
