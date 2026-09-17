@@ -40,5 +40,8 @@ pub use decoder::{DecodeError, decode};
 mod emitter;
 pub use emitter::{EncodeError, encode};
 
+mod relocation;
+pub use relocation::{RelocationError, relocate_entity_id};
+
 mod version;
 pub use version::Version;
