@@ -515,8 +515,11 @@ typedef struct AbcBuilder AbcBuilder;
 AbcBuilder *abc_builder_new(void);
 void abc_builder_free(AbcBuilder *b);
 
-/* Set API version (default: 12, "beta1") */
+/* Set API policy before creating items (default: upstream current API). */
 void abc_builder_set_api(AbcBuilder *b, uint8_t api, const char *sub_api);
+/* Select an exact file version through the upstream API/version map.
+ * Returns 1 on success; 0 leaves the builder policy unchanged. */
+int abc_builder_set_file_version(AbcBuilder *b, const uint8_t version[4]);
 
 /* Create / get items */
 uint32_t abc_builder_add_string(AbcBuilder *b, const char *str);

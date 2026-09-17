@@ -21,6 +21,8 @@ pub enum Error {
     FinalizeValidation(String),
     #[error("cannot relocate code entity: {0}")]
     CodeRelocation(String),
+    #[error("unsupported ABC output version {0}")]
+    UnsupportedOutputVersion(crate::Version),
     /// Bytecode encoding failed during encode.
     #[error("bytecode encode error: {0}")]
     BytecodeEncode(String),

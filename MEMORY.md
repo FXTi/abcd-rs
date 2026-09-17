@@ -97,9 +97,18 @@
   This is an original-ABC rewrite result, NOT an IR optimize/lower VM result.
 - `abcd_file::encode` retains readback validation (`FinalizeValidation`), but
   passing our reader alone is not equivalent to passing the upstream oracle.
-- Version selection currently contains a hard-coded API reverse mapping in
-  Rust introduced in 74f1534. It needs replacement with upstream-owned version
-  policy; do not expand these downstream magic tuples.
+- High-level encode selects exact versions through `Builder::set_file_version`.
+  The bridge queries the vendored `api_version_map` and `GetVersionByApi` with
+  the upstream default subversion and unqualified table policy. Rust contains
+  no API/tuple/beta mapping; unrecognized tuples return `UnsupportedOutputVersion`.
+- Each builder stores its own API policy. A bridge mutex scopes upstream's
+  process-global settings during proto creation, layout, dedup, and write.
+  Interleaved/concurrent builders do not inherit another builder's settings.
+  Select a policy before creating items.
+- Proto shorty enumeration mutates the upstream accessor. Re-counting or
+  enumerating types now uses a fresh accessor, so a preceding reference-count
+  query cannot erase API9/11 argument types. Repeated/query-order tests and
+  full corpus structural checks passed after this correction.
 - Annotation array preflight rejects 64-bit arrays rather than supporting
   them. The underlying panic and unsupported-element zero fallbacks remain.
 

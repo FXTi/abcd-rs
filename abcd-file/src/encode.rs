@@ -113,10 +113,22 @@ impl Builder {
         Self { raw }
     }
 
-    /// Set the API version.
+    /// Set the API policy before adding items.
     pub fn set_api(&mut self, version: u8, sub_api: &str) {
         let c_sub = CString::new(sub_api).expect("sub_api contains NUL");
         unsafe { sys::abc_builder_set_api(self.raw, version, c_sub.as_ptr()) };
+    }
+
+    /// Select an exact output version using the vendored writer's version
+    /// policy. Call before adding items. An unsupported version leaves the
+    /// existing selection unchanged.
+    pub fn set_file_version(&mut self, version: crate::Version) -> Result<(), Error> {
+        // SAFETY: the builder is live and as_bytes provides all four bytes.
+        if unsafe { sys::abc_builder_set_file_version(self.raw, version.as_bytes().as_ptr()) } == 0
+        {
+            return Err(Error::UnsupportedOutputVersion(version));
+        }
+        Ok(())
     }
 
     // --- Strings ---
@@ -958,15 +970,7 @@ impl EntityHandles {
 pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     validate_annotation_arrays(file)?;
     let mut b = Builder::new();
-    match file.version.as_bytes() {
-        [9, _, _, _] => b.set_api(9, ""),
-        [11, _, _, _] => b.set_api(11, ""),
-        [12, 0, 2, 0] => b.set_api(12, "beta1"),
-        [12, _, _, _] => b.set_api(12, "beta3"),
-        [13, _, _, _] => b.set_api(18, ""),
-        [24, _, _, _] => b.set_api(24, ""),
-        _ => {}
-    }
+    b.set_file_version(file.version)?;
     let pool = &file.strings;
 
     // Helper: resolve a StringId to &str, panicking on invalid ids.

@@ -45,6 +45,11 @@ Verified locally:
 - All 2757 fixtures pass the opt-in IR lift plus structural verifier test. This
   checks current invariants only; it is not an IR semantic comparison.
 
+Builder version selection is exact and uses the vendored version policy.
+Tests cover unsupported patch versions, interleaved and concurrent builders,
+and repeated proto queries after reading reference counts. No tuple/API
+reverse mapping is maintained in the Rust encoder.
+
 Rewritten arithmetic ABC has also passed the upstream oracle for all 18
 version/profile combinations. This path decodes and re-encodes the original
 file; it does not run IR optimization or lowering. Symbolic code references

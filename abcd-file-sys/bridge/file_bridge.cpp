@@ -24,6 +24,7 @@
 #include "utils/leb128.h"
 
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <vector>
 #include <iostream>
@@ -2381,6 +2382,10 @@ struct AbcStagedLnpOp {
 };
 
 struct AbcBuilder {
+    // Upstream uses process-global API settings. Keep each builder's policy
+    // here and activate it only while calling version-sensitive writer code.
+    uint8_t api = 0;
+    std::string sub_api = panda::panda_file::DEFAULT_SUB_API_VERSION;
     ItemContainer container;
     std::vector<uint8_t> output;
     // Handle tables: index → raw pointer (owned by container)
@@ -2438,6 +2443,26 @@ struct AbcBuilder {
     }
 };
 
+static std::mutex g_builder_version_mutex;
+
+class BuilderVersionScope {
+public:
+    explicit BuilderVersionScope(const AbcBuilder *b)
+        : lock_(g_builder_version_mutex), previous_api_(ItemContainer::GetApi()),
+          previous_sub_api_(ItemContainer::GetSubApi()) {
+        ItemContainer::SetApi(b->api);
+        ItemContainer::SetSubApi(b->sub_api);
+    }
+    ~BuilderVersionScope() {
+        ItemContainer::SetApi(previous_api_);
+        ItemContainer::SetSubApi(previous_sub_api_);
+    }
+private:
+    std::unique_lock<std::mutex> lock_;
+    uint8_t previous_api_;
+    std::string previous_sub_api_;
+};
+
 AbcBuilder *abc_builder_new(void) {
     return new (std::nothrow) AbcBuilder();
 }
@@ -2456,8 +2481,33 @@ static TypeItem *resolve_type(AbcBuilder *b, uint8_t type_id, uint32_t class_han
 }
 
 void abc_builder_set_api(AbcBuilder *b, uint8_t api, const char *sub_api) {
-    ItemContainer::SetApi(api);
-    ItemContainer::SetSubApi(sub_api ? sub_api : panda::panda_file::DEFAULT_SUB_API_VERSION.c_str());
+    b->api = api;
+    b->sub_api = sub_api ? sub_api : panda::panda_file::DEFAULT_SUB_API_VERSION;
+    b->container.InvalidateComputeLayout();
+}
+
+int abc_builder_set_file_version(AbcBuilder *b, const uint8_t version[4]) {
+    try {
+        if (!b || !version) return 0;
+        std::array<uint8_t, File::VERSION_SIZE> requested;
+        std::memcpy(requested.data(), version, requested.size());
+        // Try the upstream default subversion and the unqualified table entry.
+        // No ABC tuples, API-level correspondences, or beta names are repeated
+        // here. Unknown tuples must not use GetVersionByApi's fallback.
+        const std::array<std::string, 2> sub_apis {
+            panda::panda_file::DEFAULT_SUB_API_VERSION, std::string {}
+        };
+        for (const auto &entry : panda::panda_file::api_version_map) {
+            for (const auto &sub_api : sub_apis) {
+                auto mapped = panda::panda_file::GetVersionByApi(entry.first, sub_api);
+                if (mapped && *mapped == requested) {
+                    abc_builder_set_api(b, entry.first, sub_api.c_str());
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    } catch (...) { return 0; }
 }
 
 uint32_t abc_builder_add_string(AbcBuilder *b, const char *str) {
@@ -2590,6 +2640,7 @@ void abc_builder_literal_array_add_literalarray(AbcBuilder *b, uint32_t lit_hand
 
 uint32_t abc_builder_create_proto(AbcBuilder *b, uint8_t ret_type_id,
                                    const uint8_t *param_type_ids, uint32_t num_params) {
+    BuilderVersionScope version_scope(b);
     auto *ret_type = b->container.GetOrCreatePrimitiveTypeItem(
         static_cast<Type::TypeId>(ret_type_id));
     std::vector<panda::panda_file::MethodParamItem> params;
@@ -2606,6 +2657,7 @@ uint32_t abc_builder_create_proto(AbcBuilder *b, uint8_t ret_type_id,
 
 uint32_t abc_builder_create_proto_ex(AbcBuilder *b, uint8_t ret_type_id, uint32_t ret_class_handle,
                                       const struct AbcProtoParam *params_def, uint32_t num_params) {
+    BuilderVersionScope version_scope(b);
     auto *ret_type = resolve_type(b, ret_type_id, ret_class_handle);
     if (!ret_type) return UINT32_MAX;
     std::vector<panda::panda_file::MethodParamItem> params;
@@ -3324,11 +3376,13 @@ uint32_t abc_builder_create_method_handle(AbcBuilder *b, uint8_t type, uint32_t 
 // InvalidateComputeLayout); the finalize step recomputes the layout.
 
 void abc_builder_deduplicate(AbcBuilder *b) {
+    BuilderVersionScope version_scope(b);
     abc_builder_flush_lnp_staging(b);
     b->container.DeduplicateItems(true);
 }
 
 void abc_builder_deduplicate_code_and_debug_info(AbcBuilder *b) {
+    BuilderVersionScope version_scope(b);
     abc_builder_flush_lnp_staging(b);
     b->container.ComputeLayout();
     b->container.DeduplicateCodeAndDebugInfo();
@@ -3336,6 +3390,7 @@ void abc_builder_deduplicate_code_and_debug_info(AbcBuilder *b) {
 }
 
 void abc_builder_deduplicate_annotations(AbcBuilder *b) {
+    BuilderVersionScope version_scope(b);
     abc_builder_flush_lnp_staging(b);
     b->container.ComputeLayout();
     b->container.DeduplicateAnnotations();
@@ -3386,6 +3441,7 @@ int abc_builder_relocate_code_id(AbcBuilder *b, uint32_t method_handle,
 const uint8_t *abc_builder_finalize_with_code_ids(AbcBuilder *b, uint32_t *out_len,
     AbcCodeIdUpdater updater) {
     try {
+        BuilderVersionScope version_scope(b);
         // Flush staged line-number-program ops (their operands encode item
         // offsets, so the flush runs its own layout pass first)
         abc_builder_flush_lnp_staging(b);
