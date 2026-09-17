@@ -80,19 +80,26 @@
 - `isa.yaml` has no super-by-index opcode. Lowering now returns an explicit
   unsupported-instruction error for `LoadSuperProperty`/`StoreSuperProperty`
   with `ByIndex` instead of silently emitting nothing.
-- VM oracle attempt: original corpus candidate compares successfully, but an
-  ABC rebuilt by `abcd_file::encode` fails `ark_disasm` with invalid entity
-  offset. The bridge's `AbcBuilder` writes code bytes verbatim and has no
-  post-finalize entity relocation. Do not map source offsets to builder
-  handles in generic encode; a dedicated code relocation/emitter bridge is
-  still required.
-- `abcd_file::encode` now re-decodes finalized bytes and returns
-  `Error::FinalizeValidation` if builder output is not readable. This turns
-  the unresolved entity-relocation problem into an explicit error instead of
-  returning invalid ABC bytes.
-- `abcd_file::encode` now configures the builder API from the source ABC
-  version (including API12 beta subversions and API18/API24 mappings). This
-  fixes version policy selection but does not solve code entity relocation.
+- The previous `GetProtoIndex`/invalid-offset oracle failures were caused by
+  stale instruction operands, not proven broken method-header ranges. Merely
+  adding dependencies does not preserve the old index ordering.
+- Code relocation is now staged in the builder. It registers the target
+  `IndexedItem` with the owner, calls upstream `ComputeLayout`, then reads
+  `target->GetIndex(owner)` and patches that exact ID operand via the checked
+  `abcd_isa::relocate_entity_id` wrapper over upstream `UpdateId`. No hand-coded
+  opcode layout or post-write checksum patching is used for relocation.
+- High-level encode resolves `(role, original index)` through the owning
+  `MethodBody::entity_offsets`, waits until all target handles exist (forward
+  references), and registers string/method/literal-array relocations. Missing
+  mappings return `Error::CodeRelocation`; they never fall back to raw offsets.
+- Arithmetic decode → encode → Ark compare passes all 18 manifest fixtures
+  (six versions × three profiles): stdout `42\n`, no stderr, exit 0, no timeout.
+  This is an original-ABC rewrite result, NOT an IR optimize/lower VM result.
+- `abcd_file::encode` retains readback validation (`FinalizeValidation`), but
+  passing our reader alone is not equivalent to passing the upstream oracle.
+- Version selection currently contains a hard-coded API reverse mapping in
+  Rust introduced in 74f1534. It needs replacement with upstream-owned version
+  policy; do not expand these downstream magic tuples.
 - Annotation array preflight rejects 64-bit arrays rather than supporting
   them. The underlying panic and unsupported-element zero fallbacks remain.
 
@@ -103,4 +110,6 @@ cargo fmt --all -- --check
 cargo test --workspace --offline
 cargo test -p abcd-file --test real_module_abc exported_corpus -- --ignored
 cargo test -p abcd-ir --test corpus_entities -- --ignored
+ABCD_REWRITTEN_DIR=/tmp/abcd-relocation-matrix cargo test -p abcd-file --test real_module_abc rewritten_corpus_preserves_arithmetic_entities -- --ignored
+python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd-relocation-matrix --case local/arithmetic
 ```

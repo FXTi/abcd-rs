@@ -45,10 +45,25 @@ Verified locally:
 - All 2757 fixtures pass the opt-in IR lift plus structural verifier test. This
   checks current invariants only; it is not an IR semantic comparison.
 
-Not yet established: full-corpus IR validity, optimizer/lowering equivalence,
-complete optimizer/lowering use of API13/24 literal arrays, and rewritten-ABC
-VM oracle.
-Passing these opt-in tests must not be reported as those stronger guarantees.
+Rewritten arithmetic ABC has also passed the upstream oracle for all 18
+version/profile combinations. This path decodes and re-encodes the original
+file; it does not run IR optimization or lowering. Symbolic code references
+are resolved to new method-local indices after upstream `ComputeLayout`.
+
+Reproduce the candidate and oracle matrix (Python 3 and Docker required):
+
+```sh
+ABCD_REWRITTEN_DIR=/tmp/abcd-relocation-matrix cargo test -p abcd-file --test real_module_abc rewritten_corpus_preserves_arithmetic_entities -- --ignored
+python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd-relocation-matrix --case local/arithmetic
+```
+
+The driver reads cases, versions, profiles, paths, and runtime applicability
+from `index.jsonl`, fails on missing rewritten candidates, and reports
+structure-only rows separately. Its JSON output records the actual image ID.
+
+Not yet established: optimizer/lowering semantic equivalence, full-corpus
+rewritten-ABC VM results, and complete metadata preservation. Passing our
+reader/verifier alone does not establish these properties.
 
 ## Historical corpus pipeline (`scripts/gen-corpus.sh`)
 
