@@ -800,7 +800,10 @@ try {
     // implementation computes elem_num_ - 1 and underflows on an empty
     // shorty (audit #B3).
     uint32_t elems = 0;
-    a->accessor.EnumerateTypes([&elems](Type /*t*/) { elems++; });
+    // Enumeration advances internal state. Other queries may already have
+    // consumed it, so count with a fresh upstream accessor each time.
+    ProtoDA cursor(a->accessor.GetPandaFile(), a->accessor.GetProtoId());
+    cursor.EnumerateTypes([&elems](Type /*t*/) { elems++; });
     return elems == 0 ? 0 : elems - 1;
 } catch (...) {
     return 0;
@@ -841,7 +844,8 @@ try {
 
 void abc_proto_enumerate_types(AbcProtoAccessor *a, AbcProtoTypeCb cb, void *ctx) {
 try {
-    a->accessor.EnumerateTypes([&](Type t) {
+    ProtoDA cursor(a->accessor.GetPandaFile(), a->accessor.GetProtoId());
+    cursor.EnumerateTypes([&](Type t) {
         cb(static_cast<uint8_t>(t.GetId()), ctx);
     });
 } catch (...) {
