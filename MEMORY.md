@@ -138,7 +138,47 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   0 bridge/wrapper audit → 0.5 audit fixes → 1 lower correctness → 2 VM
   oracle chain → 3 P1 correctness → 4 evidence upgrades → 5 sweep + v0.2
   decision.
-- Phase 0 (active): audit of bridge/wrapper layers of the four lower crates
-  (completeness / cleanliness / design quality). Output:
-  `design/review-bridge-wrapper.md` for maintainer triage before any fix.
-  The four crates are frozen for functional changes during the audit.
+- Goal-tool usage: pause goals while waiting on subagents (rounds would
+  otherwise spin the orchestrator); complete/resume needs a direct human turn.
+
+## Phase 0 / 0.5 outcome (done, 2026-09-18)
+
+- Phase 0 audit report: `design/review-bridge-wrapper.md` (10 P0 / 22 P1 /
+  ~40 P2 + verified-good list + fix log). Runtime probe kept at
+  `abcd-isa/examples/audit_probe.rs`.
+- Phase 0.5 fixed everything in scope across 13 commits
+  (`ff092bb`…`514146c`): invalid-opcode abort → error (#1), operand
+  truncation → OperandOutOfRange (#2), file_size check (#3), ARRAY_* cb
+  delivery (#4), debug local-var scopes (#5), annotation silent zeros →
+  hard errors (#6/#7), nested literal-array handle mapping (#8), MUTF-8
+  embedded-NUL strings (#9), element_size whitelist (#10), 134 FFI guards
+  (#11/#12), LiteralTag static_asserts (#13), foreign-name bridge API +
+  layering (#16), param annotations model incl. runtime→compile-time fold
+  contract (#17, same precedent as the #9 annotation category fold),
+  panic→Error paths (#18), hand mirrors → sys references (#19).
+- Verification at closeout: fmt clean, 51 workspace suites green, corpus
+  4/4 green (modules.abc, 2757 fixtures, ISA roundtrip, 18 arithmetic
+  rewrites). Every fix has a regression test; reachable bugs were proven
+  red before fixing.
+- Contracts/rulings to remember: vendor `MethodParamItem` has ONE annotation
+  vector → param-annotation runtime bucket folds into compile-time on write
+  (decode keeps both). `ISA_EMIT_INTERNAL_ERROR = -5` added (never reuse
+  -1: that is ISA_EMIT_INVALID_LABEL). 12+ files carry no proto signatures
+  (format fact #A7) — do not re-report as a bug.
+- Follow-up register (not yet scheduled): F-new-1 vendored writer is
+  creation-order sensitive (literal arrays before classes corrupts SET_FILE
+  debug string offsets — needs bridge-side investigation); F-new-2
+  annotation-embedded literal arrays write raw source offsets for method
+  references (encode_literal_value_simple lacks entity context); dead FFI
+  surface policy (108/324 in-repo-unused exports — publish-shaped crates,
+  needs maintainer decision, NOT a delete list); 12.x builder
+  `abc_method_has_valid_proto` behavior matches #A7 (no action).
+- Deferred to Phase 5 sweep: dead `literal_val_to_c`, builder second-finalize
+  staging not cleared, -sys README rewrites (#20/#21), callback early-stop
+  docs (#15), abcd-file README drift (6 items), P2 test-gap list, CI
+  duplicate-vendor-file protection (#22 — maintainer chose "leave as is",
+  revisit only if drift ever appears).
+- Next: Phase 1 lower correctness (out-of-SSA cycle breaking with a real
+  temp register, val_reg spill-slot conflict management, lower entity
+  relocation channel reusing Builder::relocate_code_id). Test-first: failing
+  swap-cycle regression before the fix.
