@@ -107,7 +107,7 @@ VM 语义簇（需逐簇拆根因）：
 | 3.2 | S6 修复：异常边活性 + handler live-in 禁染 Acc + fusion 三前提门禁 | worker P3-T2 (k3) | **完成**（9dad2cb；worker 探针纠正 orchestrator 根因——真身是异常边活性洞，fusion 为潜伏不健全；orchestrator 独立复现红色 4 失败 1 钉住、直方图 lift 1011→1029/lower-other 18→0） |
 | 3.3 | S3 修复：copydataproperties 专属 InstData + lift/isel 臂（含 deprecated 形） | worker P3-T3 (k3) | **完成**（86f810a；附纠正：旧 lift 臂操作数角色与 vendor 相反，已对 sig+pandasm 实证修正；orchestrator 干净 worktree 独立复验：61 套件绿、直方图 untraceable 18→0、object-spread VM 18/18） |
 | 3.4 | S4+S5 修复：abcd-file 建模 module record（blob 保留 + 字段值重定位；含 N1 _ESScopeNamesRecord 同类）；identity 证据面扩到 module 用例（N6） | worker P3-T4 (k3) | **进行中**（与 3.3 并行——crate 不相交） |
-| 3.5 | S1+N2 修复：实体身份按 kind 区分（kind 键映射；消灭静默错方法引用） | 待定 | 未开始 |
+| 3.5 | S1+N2 修复：方法引用携带源 offset（名字不是身份，offset 才是）；EntityTrace 按 kind 限定 | worker P3-T5 (k3) | **进行中**（与 3.4 并行——crate 不相交） |
 | 3.6 | S2 修复：wide.callrange 选择 + 高位寄存器经低位 scratch 中转（含 N4 起始寄存器 u8 约束） | 待定 | 未开始 |
 
 ## 审计纪律
