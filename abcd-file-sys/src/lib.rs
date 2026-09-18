@@ -508,4 +508,217 @@ mod tests {
             abc_builder_free(b);
         }
     }
+
+    /// Round-trip for method parameter annotations through the bridge:
+    /// stage per-param annotations, seal them into ParamAnnotationsItems
+    /// (compile-time and runtime), finalize, then read both items back via
+    /// abc_param_annotations_enumerate.
+    #[test]
+    fn param_annotations_roundtrip_through_bridge() {
+        unsafe extern "C" fn collect_method(method_offset: u32, ctx: *mut std::ffi::c_void) {
+            unsafe {
+                (*(ctx as *mut Vec<u32>)).push(method_offset);
+            }
+        }
+        unsafe extern "C" fn collect_entry(
+            param_idx: u32,
+            annotation_off: u32,
+            ctx: *mut std::ffi::c_void,
+        ) -> i32 {
+            unsafe {
+                (*(ctx as *mut Vec<(u32, u32)>)).push((param_idx, annotation_off));
+            }
+            0
+        }
+
+        unsafe {
+            let b = abc_builder_new();
+            assert!(!b.is_null());
+            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as *const std::ffi::c_char);
+
+            let cls = abc_builder_add_global_class(b);
+            assert_ne!(cls, u32::MAX);
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
+            let code: [u8; 1] = [0xa0];
+            let m = abc_builder_class_add_method_with_proto(
+                b,
+                cls,
+                b"func\0".as_ptr() as *const std::ffi::c_char,
+                proto,
+                0x1, // ACC_PUBLIC
+                code.as_ptr(),
+                1,
+                1,
+                0,
+            );
+            assert_ne!(m, u32::MAX);
+
+            // Two typed parameters.
+            assert_eq!(abc_builder_method_add_param(b, m, Type_TypeId_TAGGED), 0);
+            assert_eq!(abc_builder_method_add_param(b, m, Type_TypeId_TAGGED), 1);
+
+            // Two annotations, one U32 ('6') element each.
+            let ann_cls = abc_builder_add_class(b, b"LParamAnn;\0".as_ptr() as *const _);
+            assert_ne!(ann_cls, u32::MAX);
+            let name = abc_builder_add_string(b, b"value\0".as_ptr() as *const _);
+            assert_ne!(name, u32::MAX);
+            let mk_ann = |value: u32| {
+                let elems = [AbcAnnotationElemDef {
+                    name_string_handle: name,
+                    tag: b'6' as std::ffi::c_char,
+                    value,
+                }];
+                abc_builder_create_annotation(b, ann_cls, elems.as_ptr(), 1)
+            };
+            let ann_a = mk_ann(1111);
+            let ann_b = mk_ann(2222);
+            assert_ne!(ann_a, u32::MAX);
+            assert_ne!(ann_b, u32::MAX);
+
+            // Compile-time bucket on param 0; seal BEFORE staging runtime so
+            // the compile-time item snapshots only its own annotation.
+            abc_builder_method_param_add_annotation(b, m, 0, ann_a);
+            assert_eq!(abc_builder_method_seal_param_annotations(b, m, 0), 1);
+            abc_builder_method_param_add_runtime_annotation(b, m, 1, ann_b);
+            assert_eq!(abc_builder_method_seal_param_annotations(b, m, 1), 1);
+            // Invalid method handle is rejected.
+            assert_eq!(abc_builder_method_seal_param_annotations(b, u32::MAX, 0), 0);
+
+            let mut out_len: u32 = 0;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null(), "builder finalize should succeed");
+            let data = std::slice::from_raw_parts(ptr, out_len as usize);
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null(), "should open the built ABC file");
+
+            // Locate the method and its two ParamAnnotationsItems.
+            let class_off = abc_file_get_class_id(f, b"L_GLOBAL;\0".as_ptr() as *const _);
+            assert_ne!(class_off, u32::MAX);
+            let ca = abc_class_open(f, class_off);
+            assert!(!ca.is_null());
+            let mut methods: Vec<u32> = Vec::new();
+            abc_class_enumerate_methods(
+                ca,
+                Some(collect_method),
+                &mut methods as *mut _ as *mut std::ffi::c_void,
+            );
+            abc_class_close(ca);
+            assert_eq!(methods.len(), 1);
+            let ma = abc_method_open(f, methods[0]);
+            assert!(!ma.is_null());
+            let compile_id = abc_method_get_param_annotation_id(ma);
+            let runtime_id = abc_method_get_runtime_param_annotation_id(ma);
+            abc_method_close(ma);
+            assert_ne!(
+                compile_id,
+                u32::MAX,
+                "compile-time param annotations absent"
+            );
+            assert_ne!(runtime_id, u32::MAX, "runtime param annotations absent");
+            assert_ne!(compile_id, runtime_id);
+
+            // Compile-time item: exactly one entry, on param 0.
+            let mut compile_entries: Vec<(u32, u32)> = Vec::new();
+            assert_eq!(
+                abc_param_annotations_enumerate(
+                    f,
+                    compile_id,
+                    Some(collect_entry),
+                    &mut compile_entries as *mut _ as *mut std::ffi::c_void,
+                ),
+                0
+            );
+            assert_eq!(compile_entries.len(), 1);
+            assert_eq!(compile_entries[0].0, 0);
+
+            // Runtime item: vendor MethodParamItem keeps a SINGLE annotation
+            // vector per param (file_items.h:828-845; HasRuntimeAnnotations
+            // unconditionally returns false), and ParamAnnotationsItem's
+            // constructor snapshots whatever is staged at seal time. The
+            // runtime seal happened after both buckets were staged, so it
+            // contains param 0's compile-time annotation as well.
+            let mut runtime_entries: Vec<(u32, u32)> = Vec::new();
+            assert_eq!(
+                abc_param_annotations_enumerate(
+                    f,
+                    runtime_id,
+                    Some(collect_entry),
+                    &mut runtime_entries as *mut _ as *mut std::ffi::c_void,
+                ),
+                0
+            );
+            assert_eq!(runtime_entries.len(), 2);
+            assert_eq!(runtime_entries[0].0, 0);
+            assert_eq!(runtime_entries[1].0, 1);
+            assert_eq!(runtime_entries[0].1, compile_entries[0].1);
+
+            // The referenced annotation items carry the expected values.
+            for (off, want) in [
+                (compile_entries[0].1, 1111u32),
+                (runtime_entries[1].1, 2222u32),
+            ] {
+                let a = abc_annotation_open(f, off);
+                assert!(!a.is_null(), "annotation at {off} must open");
+                assert_eq!(abc_annotation_count(a), 1);
+                let mut elem = AbcAnnotationElem {
+                    name_off: 0,
+                    tag: 0,
+                    value: 0,
+                };
+                assert_eq!(abc_annotation_get_element(a, 0, &mut elem), 0);
+                assert_eq!(elem.tag, b'6');
+                assert_eq!(elem.value, want);
+                abc_annotation_close(a);
+            }
+
+            abc_file_close(f);
+            abc_builder_free(b);
+        }
+    }
+
+    /// Boundary: enumerating a ParamAnnotationsItem at an offset inside the
+    /// file header must fail with -1, not crash or escape the exception
+    /// guard.
+    #[test]
+    fn param_annotations_enumerate_rejects_header_offset() {
+        unsafe extern "C" fn noop(_p: u32, _o: u32, _c: *mut std::ffi::c_void) -> i32 {
+            0
+        }
+
+        unsafe {
+            let b = abc_builder_new();
+            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as *const std::ffi::c_char);
+            let cls = abc_builder_add_global_class(b);
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
+            let code: [u8; 1] = [0xa0];
+            abc_builder_class_add_method_with_proto(
+                b,
+                cls,
+                b"f\0".as_ptr() as *const std::ffi::c_char,
+                proto,
+                0x1,
+                code.as_ptr(),
+                1,
+                1,
+                0,
+            );
+            let mut out_len: u32 = 0;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null());
+            let data = std::slice::from_raw_parts(ptr, out_len as usize);
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null());
+
+            // Offset 4 lands inside the header; the "item" parsed from
+            // header bytes runs off the end of the span and the guard
+            // converts the throw into -1.
+            assert_eq!(
+                abc_param_annotations_enumerate(f, 4, Some(noop), std::ptr::null_mut()),
+                -1
+            );
+
+            abc_file_close(f);
+            abc_builder_free(b);
+        }
+    }
 }

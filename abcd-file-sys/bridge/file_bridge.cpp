@@ -126,6 +126,7 @@ using BaseMethodItem = panda::panda_file::BaseMethodItem;
 using BaseItem = panda::panda_file::BaseItem;
 using MethodHandleItem = panda::panda_file::MethodHandleItem;
 using MethodHandleType = panda::panda_file::MethodHandleType;
+using ParamAnnotationsItem = panda::panda_file::ParamAnnotationsItem;
 
 /* ========== Compile-time guards for vendor assumptions ========== */
 static_assert(File::MAGIC_SIZE == 8, "MAGIC_SIZE changed upstream");
@@ -1278,6 +1279,30 @@ try {
     return id->GetOffset();
 } catch (...) {
     return UINT32_MAX;
+}
+}
+
+int abc_param_annotations_enumerate(const AbcFileHandle *f, uint32_t item_off,
+                                    AbcParamAnnotationCb cb, void *ctx) {
+try {
+    // Layout (vendor ParamAnnotationsItem::Write, file_items.cpp:449):
+    // u32 num_params, then per param: u32 annotation count followed by
+    // count * ID_SIZE (4-byte) annotation item offsets.
+    auto sp = f->file->GetSpanFromId(File::EntityId(item_off));
+    if (sp.Size() < sizeof(uint32_t)) return -1;
+    uint32_t num_params = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+    for (uint32_t param_idx = 0; param_idx < num_params; ++param_idx) {
+        // A short span makes helpers::Read throw INVALID_SPAN_OFFSET; the
+        // catch guard below maps that to -1.
+        uint32_t count = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t annotation_off = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+            if (cb(param_idx, annotation_off, ctx) != 0) return 0;
+        }
+    }
+    return 0;
+} catch (...) {
+    return -1;
 }
 }
 
@@ -3619,6 +3644,20 @@ try {
     params[param_idx].AddAnnotation(b->annotations[ann_handle]);
 } catch (...) {
     return;
+}
+}
+
+int abc_builder_method_seal_param_annotations(AbcBuilder *b, uint32_t method_handle, int is_runtime) {
+try {
+    if (method_handle >= b->methods.size()) return 0;
+    // The ParamAnnotationsItem constructor copies each param's annotation
+    // vector and links the item into the method's tagged data
+    // (MethodTag::PARAM_ANNOTATION or RUNTIME_PARAM_ANNOTATION) — vendor
+    // file_items.cpp:424.
+    b->container.CreateItem<ParamAnnotationsItem>(b->methods[method_handle], is_runtime != 0);
+    return 1;
+} catch (...) {
+    return 0;
 }
 }
 

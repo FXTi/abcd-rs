@@ -220,6 +220,12 @@ void abc_method_enumerate_runtime_annotations(AbcMethodAccessor *a, AbcAnnotatio
 uint32_t abc_method_get_param_annotation_id(AbcMethodAccessor *a);
 uint32_t abc_method_get_runtime_param_annotation_id(AbcMethodAccessor *a);
 
+/* Enumerate a ParamAnnotationsItem's entries: cb(param_idx, annotation_off).
+ * Returns 0 on success, -1 on malformed/out-of-bounds data. */
+typedef int (*AbcParamAnnotationCb)(uint32_t param_idx, uint32_t annotation_off, void *ctx);
+int abc_param_annotations_enumerate(const AbcFileHandle *f, uint32_t item_off,
+                                    AbcParamAnnotationCb cb, void *ctx);
+
 /* Enumerate types in proto inline (type_id + class_off for reference types, 0 otherwise) */
 typedef int (*AbcProtoTypeExCb)(uint8_t type_id, uint32_t class_off, void *ctx);
 void abc_method_enumerate_types_in_proto(AbcMethodAccessor *a, AbcProtoTypeExCb cb, void *ctx);
@@ -694,6 +700,13 @@ void abc_builder_method_param_add_type_annotation(AbcBuilder *b, uint32_t method
     uint32_t param_idx, uint32_t ann_handle);
 void abc_builder_method_param_add_runtime_type_annotation(AbcBuilder *b, uint32_t method_handle,
     uint32_t param_idx, uint32_t ann_handle);
+
+/* Seal staged param annotations into a ParamAnnotationsItem and link it
+ * into the method's tagged data. is_runtime: 0 = compile-time
+ * (MethodTag::PARAM_ANNOTATION), 1 = runtime (RUNTIME_PARAM_ANNOTATION).
+ * Call after method_add_param + method_param_add_* for that bucket.
+ * Returns 1 on success, 0 on invalid handle. */
+int abc_builder_method_seal_param_annotations(AbcBuilder *b, uint32_t method_handle, int is_runtime);
 
 void abc_builder_field_add_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle);
 void abc_builder_field_add_runtime_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle);
