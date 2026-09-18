@@ -5,6 +5,7 @@ use abcd_isa_sys::Bytecode;
 
 // C bridge error codes (from isa_bridge.h).
 const ISA_EMIT_UNKNOWN_OPCODE: i32 = -3;
+const ISA_EMIT_OPERAND_OUT_OF_RANGE: i32 = -4;
 
 /// Errors from [`encode`].
 #[derive(Debug, thiserror::Error)]
@@ -15,6 +16,10 @@ pub enum EncodeError {
     /// The opcode is not recognized by the emitter.
     #[error("emit failed: unknown opcode")]
     UnknownOpcode,
+    /// An operand does not fit the instruction's storage width; encoding it
+    /// would silently truncate the value.
+    #[error("operand out of range for the instruction encoding")]
+    OperandOutOfRange,
     /// A jump instruction references instruction index `{0}` which is
     /// beyond the program length `{1}`.
     #[error("label index {0} is out of bounds (program length: {1})")]
@@ -107,6 +112,7 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
         match rc {
             0 => {}
             ISA_EMIT_UNKNOWN_OPCODE => return Err(EncodeError::UnknownOpcode),
+            ISA_EMIT_OPERAND_OUT_OF_RANGE => return Err(EncodeError::OperandOutOfRange),
             _ => return Err(EncodeError::Internal),
         }
     }
@@ -138,6 +144,12 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
                     break;
                 }
                 pos += size;
+            }
+
+            // The C++ emitter owns format selection and never drops an
+            // instruction; a shorter offset table means one was lost.
+            if offsets.len() != instructions.len() {
+                return Err(EncodeError::Internal);
             }
 
             Ok((vec, offsets))

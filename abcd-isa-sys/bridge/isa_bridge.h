@@ -10,6 +10,7 @@
 #define ISA_EMIT_INVALID_LABEL     -1
 #define ISA_EMIT_TOO_FEW_ARGS     -2
 #define ISA_EMIT_UNKNOWN_OPCODE   -3
+#define ISA_EMIT_OPERAND_OUT_OF_RANGE -4
 
 /* isa_emitter_build return codes */
 #define ISA_BUILD_OK                0
