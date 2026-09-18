@@ -10,8 +10,8 @@
 |------|------|------|
 | Phase 0 | Bridge/封装层全面审计（完整性/清爽/漂亮） | **完成（2026-09-18，报告 design/review-bridge-wrapper.md）** |
 | Phase 0.5 | 审计 findings 的 P0/P1 修复批 | **完成（12 commits：ff092bb…81d3b71）** |
-| Phase 1 | Lower 正确性旧账（out-of-SSA 破环、val_reg 溢出槽、lower 实体重定位通道） | **进行中（2026-09-18 开工）** |
-| Phase 2 | VM oracle 证据链（corpus_lower_oracle → 1119 passed fixture 全量） | 未开始 |
+| Phase 1 | Lower 正确性旧账（out-of-SSA 破环、val_reg 溢出槽、lower 实体重定位通道） | **完成（2026-09-19，4 commits：30d254a/0620a12/99e5a52/793e234）** |
+| Phase 2 | VM oracle 证据链（corpus_lower_oracle → 1119 passed fixture 全量） | **进行中** |
 | Phase 3 | P1 漏洞（参数所有权三连修、encode_debug_info 作用域、SSA trivial-phi） | 未开始 |
 | Phase 4 | 证据升级（真实 9/11 读验证、pandasm 逐指令对照） | 未开始 |
 | Phase 5 | 清扫（死依赖、-sys README、panic 路径）+ FormatProfile 评估 + IR v0.2 决策点 | 未开始 |
@@ -57,11 +57,17 @@ orchestrator 静态分析确认的三个 bug 机制（worker 需在代码中复�
 | 1.1 | B1+B2+B3 红色回归测试（手工构造 RegAlloc/IselResult 驱动 layout/isel + 迷你字节码模拟器断言语义；`#[ignore]` 保持主线绿） | worker P1-T1 (k3) | **完成**（30d254a；orchestrator 逐行复审 + 独立复验 4 条断言红色输出一致；Mov 操作数序对 vendor isa.yaml 签名核验无误） |
 | 1.2 | B1+B2 修复：槽位级并行拷贝解析 + 每函数显式预留临时寄存器（溢出报错，禁 saturating）+ 条件边 trampoline 插入 | worker P1-T2 (k3) | **完成**（0620a12；orchestrator 逐行复审 + 独立复验：55 套件绿、3 条红转绿、e2e 循环交换测试绿、INVALID/saturating 清除 grep 实证、sub2/greater 语义对 vendor sig 核验） |
 | 1.3 | B3 修复：溢出槽移入声明帧（spill-before-ensure_acc）；未分配 value 改硬错误 | worker P1-T3 (k3) | **完成**（99e5a52；orchestrator 复审：materialize_operands 顺序正确、ThrowUndefinedIfHole 顺手修复对 vendor sig `acc: in:top` 核验属实并批准、55 套件绿、3 条 B3 测试绿、grep 证据干净） |
-| 1.4 | lower 实体重定位通道：LayoutResult 携带实体操作数元数据，产出 `abcd_file::MethodBody`（entity_offsets + num_vregs），复用 `Builder::relocate_code_id` 的 decode→encode 路径 | worker P1-T4 (k3) | **进行中**（encode 契约已确认：bytecode 操作数=源 offset + entity_offsets 恒等映射即可复用现有循环） |
+| 1.4 | lower 实体重定位通道：`to_method_body` 产出 `abcd_file::MethodBody`（EntityTrace 溯源 + entity_offsets 恒等映射 + LA 索引反查），复用 `Builder::relocate_code_id` 零改动 | worker P1-T4 (k3) | **完成**（793e234；orchestrator 复审 + 独立复验：57 套件绿、in-suite 4 测试绿、语料 opt-in 18/18 真实 encode+重定位路径通过） |
 
 Phase 1 复审中新登记（不进本期范围）：
 
 - B4：acc-as-color 模型不跟踪物理 acc 被 `Lda` 覆盖——Acc 色的 live-through value 若跨越一条发射 `Lda` 的指令，其物理内容被杀，后续 `ensure_acc` 无操作假设即失效。属寄存器分配建模缺口（修复≈在 liveness 上叠加 acc-clobber 约束，或 IR v0.2 重新建模 acc），登记进 Phase 3 或 v0.2 决策点，由维护者定夺。
+
+## Phase 2 任务登记（2026-09-19 开工）
+
+| # | 任务 | 执行者 | 状态 |
+|---|------|--------|------|
+| 2.1 | corpus_lower_oracle：decode→lift→(optimize)→lower→to_method_body→encode 全链路重写 passed fixture，写盘 + `compare-rewritten-corpus.py` VM 对照；算术用例先行，lift-only 与 lift+optimize 分开报告 | 待定 | 未开始 |
 
 ## 审计纪律
 

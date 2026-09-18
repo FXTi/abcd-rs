@@ -75,8 +75,11 @@
   sufficient.
 - IR parameter ownership, dominance, input parameter seeding, reference-type
   string-pool ownership, and exception CFG semantics need review.
-- Lowering still has approximate semantics, fixed spill registers, missing
-  output entity relocation, and incomplete literal-array handling.
+- Lowering after Phase 1: slot-level copy resolution, edge-correct phi
+  placement, in-frame spills, and the encode relocation channel are done.
+  Remaining: approximate semantics (B4 acc-clobber modeling), parameter
+  ABI/seeding (args must live in top-of-frame slots), incomplete
+  literal-array handling.
 - `isa.yaml` has no super-by-index opcode. Lowering now returns an explicit
   unsupported-instruction error for `LoadSuperProperty`/`StoreSuperProperty`
   with `ByIndex` instead of silently emitting nothing.
@@ -140,6 +143,46 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   decision.
 - Goal-tool usage: pause goals while waiting on subagents (rounds would
   otherwise spin the orchestrator); complete/resume needs a direct human turn.
+
+## Phase 1 outcome (done, 2026-09-19)
+
+- Four commits: 30d254a (red tests) → 0620a12 (B1/B2 fix) → 99e5a52 (B3 fix)
+  → 793e234 (relocation channel). Every fix reviewed line-by-line and
+  independently re-verified by the orchestrator.
+- B1: phi copies of a conditional predecessor no longer execute on both
+  edges — per-edge trampolines (copy sequence + Jmp succ) appended after all
+  real blocks; they cannot extend try/handler ranges (offsets sort last) and
+  contain no throwing instructions.
+- B2: parallel copies are now sequentialized in SLOT space at the emission
+  point (lower/copy_resolve.rs); regalloc reserves one real `copy_temp`
+  register when phi copies exist (hard RegisterOverflow at TEMP_REG_BASE).
+  `Value::INVALID` pseudo-temp and `saturating_add` deleted.
+- B3: isel spills the (at most one, by the interference invariant)
+  Acc-colored register operand into a reserved in-frame `spill_slot` BEFORE
+  any `ensure_acc` Lda of the same instruction; the 0xfff0 rotation is gone.
+  Unallocated operands are now a hard `LowerError::UnallocatedOperand`
+  (reachable via lower_function on unverified IR). Incidental, approved:
+  ThrowUndefinedIfHole now loads its value into acc (vendor `acc: in:top`).
+- Relocation channel: `abcd_ir::lower::to_method_body(module, func, result,
+  file)` builds an `abcd_file::MethodBody` reusing the decode→encode channel
+  (entity_offsets + Builder::relocate_code_id) unchanged. String/method
+  operands carry source offsets (identity entries, validated against
+  module.string_entities + File.entity_map via isel's EntityTrace records);
+  literal-array operands carry decoded table indices, inverted through
+  File::literal_array_offsets. Untraceable operands are hard errors.
+- KNOWN LIMITATION (Phase 3): regalloc pins params to Reg(0..param_count),
+  i.e. the BOTTOM of the frame, but the Ark ABI passes args in the TOP
+  slots (frame = num_vregs + num_args). Lowered bodies that READ arguments
+  are therefore not runtime-correct yet; to_method_body writes
+  num_vregs = num_regs (includes params — oversized frame, harmless).
+- B4 registered for Phase 3 / IR v0.2: the acc-as-color model does not track
+  physical acc clobbering across instructions (an Acc-colored value live
+  across an Lda-emitting instruction loses its content).
+- Closeout verification: fmt clean; 57 workspace suites green; abcd-file
+  corpus 4/4; abcd-ir opt-in suites all green (entities, lift 2757, verify,
+  opt-verify, lower ISA roundtrip, lower→encode roundtrip 18/18); VM oracle
+  on rewritten (decode→encode) arithmetic 18/18 (stdout 42\n, image
+  sha256:5e7627…). NOTE: the VM oracle has NOT yet run on LOWERED bodies.
 
 ## Phase 0 / 0.5 outcome (done, 2026-09-18)
 
