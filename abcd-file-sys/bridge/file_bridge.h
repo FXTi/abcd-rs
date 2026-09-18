@@ -563,6 +563,35 @@ void abc_builder_literal_array_add_method(AbcBuilder *b, uint32_t lit_handle, ui
 /* Literal array reference: ref_handle is an index returned by abc_builder_add_literal_array */
 void abc_builder_literal_array_add_literalarray(AbcBuilder *b, uint32_t lit_handle, uint32_t ref_handle);
 
+/* --- Module-record blob write support (ModuleDataAccessor layout) --- */
+
+/* One module record entry. String handles are indices returned by
+ * abc_builder_add_string; UINT32_MAX marks an absent name. `tag` is a
+ * panda::panda_file::ModuleTag value (bindgen: ModuleTag_*). */
+typedef struct AbcModuleRecordDef {
+    uint8_t tag;
+    uint32_t export_name_handle;
+    uint32_t module_request_idx;
+    uint32_t import_name_handle;
+    uint32_t local_name_handle;
+} AbcModuleRecordDef;
+
+/* Stage a complete module-record blob into a literal array created by
+ * abc_builder_add_literal_array. The blob follows the vendored UNTAGGED
+ * ModuleDataAccessor layout (module_data_accessor.cpp ctor +
+ * module_data_accessor-inl.h EnumerateModuleRecord): request count,
+ * request string references, then per-tag section counts and entries in
+ * vendored section order (regular/namespace/local/indirect/star). The
+ * LiteralArrayItem itself writes the u32 item-count header. Nothing is
+ * staged unless every input validates.
+ * Returns 0 on success, -1 on error (bad handle, unknown tag, missing
+ * required name, module_request_idx wider than the vendored u16 slot). */
+int32_t abc_builder_literal_array_add_module_data(AbcBuilder *b, uint32_t lit_handle,
+                                                  const uint32_t *request_handles,
+                                                  uint32_t num_requests,
+                                                  const AbcModuleRecordDef *records,
+                                                  uint32_t num_records);
+
 /* Finalize: compute layout, write to memory buffer.
  * Returns pointer to buffer (owned by builder), sets *out_len.
  * Returns NULL on error. Buffer valid until builder is freed. */
@@ -618,6 +647,14 @@ void abc_builder_field_set_value_i32(AbcBuilder *b, uint32_t field_handle, int32
 void abc_builder_field_set_value_i64(AbcBuilder *b, uint32_t field_handle, int64_t value);
 void abc_builder_field_set_value_f32(AbcBuilder *b, uint32_t field_handle, float value);
 void abc_builder_field_set_value_f64(AbcBuilder *b, uint32_t field_handle, double value);
+/* Set a field's initial value to a literal-array item reference. The value
+ * item is the vendored ScalarValueItem Type::ID, so the writer stores the
+ * item's LAYOUT offset inline (FieldTag::VALUE + u32) — this is how es2abc
+ * stores _ESModuleRecord/_ESScopeNamesRecord field values, and it relocates
+ * automatically with the target item.
+ * Returns 0 on success, -1 on an invalid field or literal-array handle. */
+int32_t abc_builder_field_set_value_literalarray(AbcBuilder *b, uint32_t field_handle,
+                                                 uint32_t lit_handle);
 
 /* --- Try-Catch blocks --- */
 struct AbcCatchBlockDef {

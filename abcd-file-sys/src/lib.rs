@@ -845,4 +845,321 @@ mod tests {
             abc_builder_free(b);
         }
     }
+
+    /// Module-record blob write path (Phase 3 S4/S5 fix). A module-record
+    /// blob is a literal-array item whose items follow the UNTAGGED
+    /// ModuleDataAccessor layout (vendored module_data_accessor-inl.h:
+    /// request count + request strings, then per-tag section counts and
+    /// entries in vendored section order). The record field value must be
+    /// an item reference (vendored ScalarValueItem Type::ID) so the writer
+    /// relocates it to the blob's layout offset, matching how es2abc stores
+    /// `_ESModuleRecord` field values (FieldTag::VALUE + inline u32).
+    #[test]
+    fn module_data_blob_write_and_field_reference() {
+        unsafe {
+            let b = abc_builder_new();
+            assert!(!b.is_null());
+            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as *const std::ffi::c_char);
+
+            let rec_cls = abc_builder_add_class(b, b"L_ESModuleRecord;\0".as_ptr() as _);
+            assert_ne!(rec_cls, u32::MAX);
+            let field = abc_builder_class_add_field(
+                b,
+                rec_cls,
+                b"test.js\0".as_ptr() as _,
+                Type_TypeId_U32 as u8,
+                1, // ACC_PUBLIC
+            );
+            assert_ne!(field, u32::MAX);
+
+            // A global class with an entry method so the file is well-formed.
+            let global = abc_builder_add_class(b, b"L_GLOBAL;\0".as_ptr() as _);
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED as u8, std::ptr::null(), 0);
+            let m = abc_builder_class_add_method_with_proto(
+                b,
+                global,
+                b"func_main_0\0".as_ptr() as _,
+                proto,
+                1,
+                [0x65u8].as_ptr(),
+                1,
+                1,
+                0,
+            );
+            assert_ne!(m, u32::MAX);
+
+            // Strings referenced by the blob.
+            let s_dep = abc_builder_add_string(b, b"dep1\0".as_ptr() as _);
+            let s_local1 = abc_builder_add_string(b, b"local1\0".as_ptr() as _);
+            let s_imp1 = abc_builder_add_string(b, b"imp1\0".as_ptr() as _);
+            let s_ns1 = abc_builder_add_string(b, b"ns1\0".as_ptr() as _);
+            let s_local2 = abc_builder_add_string(b, b"local2\0".as_ptr() as _);
+            let s_exp2 = abc_builder_add_string(b, b"export2\0".as_ptr() as _);
+            let s_exp3 = abc_builder_add_string(b, b"export3\0".as_ptr() as _);
+            let s_imp3 = abc_builder_add_string(b, b"imp3\0".as_ptr() as _);
+            for h in [
+                s_dep, s_local1, s_imp1, s_ns1, s_local2, s_exp2, s_exp3, s_imp3,
+            ] {
+                assert_ne!(h, u32::MAX);
+            }
+
+            let la = abc_builder_add_literal_array(b, b"module\0".as_ptr() as _);
+            assert_ne!(la, u32::MAX);
+
+            let records = [
+                AbcModuleRecordDef {
+                    tag: ModuleTag_REGULAR_IMPORT,
+                    export_name_handle: u32::MAX,
+                    module_request_idx: 0,
+                    import_name_handle: s_imp1,
+                    local_name_handle: s_local1,
+                },
+                AbcModuleRecordDef {
+                    tag: ModuleTag_NAMESPACE_IMPORT,
+                    export_name_handle: u32::MAX,
+                    module_request_idx: 0,
+                    import_name_handle: u32::MAX,
+                    local_name_handle: s_ns1,
+                },
+                AbcModuleRecordDef {
+                    tag: ModuleTag_LOCAL_EXPORT,
+                    export_name_handle: s_exp2,
+                    module_request_idx: 0,
+                    import_name_handle: u32::MAX,
+                    local_name_handle: s_local2,
+                },
+                AbcModuleRecordDef {
+                    tag: ModuleTag_INDIRECT_EXPORT,
+                    export_name_handle: s_exp3,
+                    module_request_idx: 0,
+                    import_name_handle: s_imp3,
+                    local_name_handle: u32::MAX,
+                },
+                AbcModuleRecordDef {
+                    tag: ModuleTag_STAR_EXPORT,
+                    export_name_handle: u32::MAX,
+                    module_request_idx: 0,
+                    import_name_handle: u32::MAX,
+                    local_name_handle: u32::MAX,
+                },
+            ];
+            assert_eq!(
+                abc_builder_literal_array_add_module_data(
+                    b,
+                    la,
+                    [s_dep].as_ptr(),
+                    1,
+                    records.as_ptr(),
+                    records.len() as u32,
+                ),
+                0,
+                "module data staging must succeed"
+            );
+            assert_eq!(
+                abc_builder_field_set_value_literalarray(b, field, la),
+                0,
+                "field value wiring must succeed"
+            );
+
+            let mut out_len: u32 = 0;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null(), "finalize");
+            let data = std::slice::from_raw_parts(ptr, out_len as usize);
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null(), "open built file");
+
+            // Find the record class field; its value must be the blob's NEW
+            // layout offset (non-zero, valid in this file).
+            let n_cls = abc_file_num_classes(f);
+            let mut field_off = u32::MAX;
+            for i in 0..n_cls {
+                let cls_off = abc_file_class_offset(f, i);
+                let ca = abc_class_open(f, cls_off);
+                if ca.is_null() {
+                    continue;
+                }
+                unsafe extern "C" fn collect_field(off: u32, ctx: *mut std::ffi::c_void) {
+                    unsafe { *(ctx as *mut u32) = off };
+                }
+                let mut found = u32::MAX;
+                abc_class_enumerate_fields(
+                    ca,
+                    Some(collect_field),
+                    &mut found as *mut u32 as *mut std::ffi::c_void,
+                );
+                abc_class_close(ca);
+                if found != u32::MAX {
+                    field_off = found;
+                    break;
+                }
+            }
+            assert_ne!(field_off, u32::MAX, "record field must exist");
+            let fa = abc_field_open(f, field_off);
+            assert!(!fa.is_null());
+            let mut blob_off: i32 = 0;
+            assert_eq!(abc_field_get_value_i32(fa, &mut blob_off), 1);
+            abc_field_close(fa);
+            assert!(blob_off > 0, "blob offset must be a valid file offset");
+
+            // Parse the blob through the vendored ModuleDataAccessor.
+            let ma = abc_module_open(f, blob_off as u32);
+            assert!(!ma.is_null(), "module blob must parse");
+            assert_eq!(abc_module_num_requests(ma), 1);
+            let req_off = abc_module_request_off(ma, 0);
+            assert_ne!(req_off, u32::MAX);
+            let read_str = |off: u32| -> String {
+                let units = abc_file_get_string_utf16(f, off, std::ptr::null_mut(), 0);
+                assert_ne!(units, usize::MAX, "string at {off:#x} must read");
+                let mut buf = vec![0u16; units];
+                let written = abc_file_get_string_utf16(f, off, buf.as_mut_ptr(), buf.len());
+                assert_eq!(written, units);
+                String::from_utf16(&buf).expect("utf16")
+            };
+            assert_eq!(read_str(req_off), "dep1");
+
+            let mut records_out: Vec<(u8, u32, u32, u32, u32)> = Vec::new();
+            unsafe extern "C" fn collect_record(
+                tag: u8,
+                export_off: u32,
+                req_idx: u32,
+                import_off: u32,
+                local_off: u32,
+                ctx: *mut std::ffi::c_void,
+            ) {
+                unsafe {
+                    (*(ctx as *mut Vec<(u8, u32, u32, u32, u32)>))
+                        .push((tag, export_off, req_idx, import_off, local_off))
+                };
+            }
+            abc_module_enumerate_records(
+                ma,
+                Some(collect_record),
+                &mut records_out as *mut _ as *mut std::ffi::c_void,
+            );
+            abc_module_close(ma);
+            assert_eq!(records_out.len(), 5, "all five record kinds");
+            // Vendored section order: regular, namespace, local, indirect, star.
+            assert_eq!(records_out[0].0, ModuleTag_REGULAR_IMPORT);
+            assert_eq!(read_str(records_out[0].4), "local1");
+            assert_eq!(read_str(records_out[0].3), "imp1");
+            assert_eq!(records_out[0].2, 0);
+            assert_eq!(records_out[1].0, ModuleTag_NAMESPACE_IMPORT);
+            assert_eq!(read_str(records_out[1].4), "ns1");
+            assert_eq!(records_out[2].0, ModuleTag_LOCAL_EXPORT);
+            assert_eq!(read_str(records_out[2].4), "local2");
+            assert_eq!(read_str(records_out[2].1), "export2");
+            assert_eq!(records_out[3].0, ModuleTag_INDIRECT_EXPORT);
+            assert_eq!(read_str(records_out[3].1), "export3");
+            assert_eq!(read_str(records_out[3].3), "imp3");
+            assert_eq!(records_out[4].0, ModuleTag_STAR_EXPORT);
+            assert_eq!(records_out[4].2, 0);
+
+            abc_file_close(f);
+            abc_builder_free(b);
+        }
+    }
+
+    /// Guard/sentinel conformance for the module-data write path: invalid
+    /// handles, unknown tags, missing required names, and out-of-range
+    /// request indices must return -1 (never abort, never silently write).
+    #[test]
+    fn module_data_write_rejects_invalid_input() {
+        unsafe {
+            let b = abc_builder_new();
+            assert!(!b.is_null());
+            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as _);
+            let s = abc_builder_add_string(b, b"dep\0".as_ptr() as _);
+            let la = abc_builder_add_literal_array(b, b"module\0".as_ptr() as _);
+            let ok_record = AbcModuleRecordDef {
+                tag: ModuleTag_STAR_EXPORT,
+                export_name_handle: u32::MAX,
+                module_request_idx: 0,
+                import_name_handle: u32::MAX,
+                local_name_handle: u32::MAX,
+            };
+            // Bad literal-array handle.
+            assert_eq!(
+                abc_builder_literal_array_add_module_data(
+                    b,
+                    u32::MAX,
+                    [s].as_ptr(),
+                    1,
+                    [ok_record].as_ptr(),
+                    1
+                ),
+                -1
+            );
+            // Bad request string handle.
+            assert_eq!(
+                abc_builder_literal_array_add_module_data(
+                    b,
+                    la,
+                    [u32::MAX].as_ptr(),
+                    1,
+                    [ok_record].as_ptr(),
+                    1
+                ),
+                -1
+            );
+            // Unknown tag.
+            let bad_tag = AbcModuleRecordDef {
+                tag: 0x7f,
+                ..ok_record
+            };
+            assert_eq!(
+                abc_builder_literal_array_add_module_data(
+                    b,
+                    la,
+                    [s].as_ptr(),
+                    1,
+                    [bad_tag].as_ptr(),
+                    1
+                ),
+                -1
+            );
+            // Missing required local name on a regular import.
+            let missing_name = AbcModuleRecordDef {
+                tag: ModuleTag_REGULAR_IMPORT,
+                ..ok_record
+            };
+            assert_eq!(
+                abc_builder_literal_array_add_module_data(
+                    b,
+                    la,
+                    [s].as_ptr(),
+                    1,
+                    [missing_name].as_ptr(),
+                    1
+                ),
+                -1
+            );
+            // module_request_idx wider than the vendored u16 slot.
+            let wide_idx = AbcModuleRecordDef {
+                module_request_idx: 0x1_0000,
+                ..ok_record
+            };
+            assert_eq!(
+                abc_builder_literal_array_add_module_data(
+                    b,
+                    la,
+                    [s].as_ptr(),
+                    1,
+                    [wide_idx].as_ptr(),
+                    1
+                ),
+                -1
+            );
+            // field_set_value_literalarray handle validation.
+            assert_eq!(
+                abc_builder_field_set_value_literalarray(b, u32::MAX, la),
+                -1
+            );
+            assert_eq!(abc_builder_field_set_value_literalarray(b, 0, u32::MAX), -1);
+            // Nothing was staged on the failure paths above.
+            let mut out_len: u32 = 0;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null(), "finalize after rejected staging");
+            abc_builder_free(b);
+        }
+    }
 }

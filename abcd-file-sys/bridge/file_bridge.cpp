@@ -2818,6 +2818,109 @@ try {
 }
 }
 
+int32_t abc_builder_literal_array_add_module_data(AbcBuilder *b, uint32_t lit_handle,
+                                                  const uint32_t *request_handles,
+                                                  uint32_t num_requests,
+                                                  const AbcModuleRecordDef *records,
+                                                  uint32_t num_records) {
+try {
+    if (lit_handle >= b->literal_items_staging.size()) return -1;
+    if (num_requests > 0 && request_handles == nullptr) return -1;
+    if (num_records > 0 && records == nullptr) return -1;
+    auto string_item = [&](uint32_t handle) -> StringItem * {
+        if (handle >= b->strings.size()) return nullptr;
+        return b->strings[handle];
+    };
+    // Validate everything BEFORE staging so a failure leaves no partial blob.
+    for (uint32_t i = 0; i < num_requests; i++) {
+        if (string_item(request_handles[i]) == nullptr) return -1;
+    }
+    for (uint32_t i = 0; i < num_records; i++) {
+        const auto &rec = records[i];
+        if (rec.module_request_idx > UINT16_MAX) return -1;
+        // Required names per vendored layout (module_data_accessor-inl.h).
+        switch (static_cast<ModuleTag>(rec.tag)) {
+            case ModuleTag::REGULAR_IMPORT:
+                if (string_item(rec.local_name_handle) == nullptr) return -1;
+                if (string_item(rec.import_name_handle) == nullptr) return -1;
+                break;
+            case ModuleTag::NAMESPACE_IMPORT:
+                if (string_item(rec.local_name_handle) == nullptr) return -1;
+                break;
+            case ModuleTag::LOCAL_EXPORT:
+                if (string_item(rec.local_name_handle) == nullptr) return -1;
+                if (string_item(rec.export_name_handle) == nullptr) return -1;
+                break;
+            case ModuleTag::INDIRECT_EXPORT:
+                if (string_item(rec.export_name_handle) == nullptr) return -1;
+                if (string_item(rec.import_name_handle) == nullptr) return -1;
+                break;
+            case ModuleTag::STAR_EXPORT:
+                break;
+            default:
+                return -1;  // unknown ModuleTag
+        }
+    }
+
+    auto &staging = b->literal_items_staging[lit_handle];
+    // Blob layout (module_data_accessor.cpp ctor): after the u32 item-count
+    // header written by LiteralArrayItem itself come the module requests...
+    staging.emplace_back(num_requests);
+    for (uint32_t i = 0; i < num_requests; i++) {
+        staging.emplace_back(string_item(request_handles[i]));
+    }
+    // ...then per-tag sections in vendored enumeration order
+    // (module_data_accessor-inl.h EnumerateModuleRecord).
+    static constexpr ModuleTag SECTION_ORDER[] = {
+        ModuleTag::REGULAR_IMPORT,
+        ModuleTag::NAMESPACE_IMPORT,
+        ModuleTag::LOCAL_EXPORT,
+        ModuleTag::INDIRECT_EXPORT,
+        ModuleTag::STAR_EXPORT,
+    };
+    for (auto section : SECTION_ORDER) {
+        uint32_t count = 0;
+        for (uint32_t i = 0; i < num_records; i++) {
+            if (records[i].tag == static_cast<uint8_t>(section)) count++;
+        }
+        staging.emplace_back(count);
+        for (uint32_t i = 0; i < num_records; i++) {
+            const auto &rec = records[i];
+            if (rec.tag != static_cast<uint8_t>(section)) continue;
+            const auto idx = static_cast<uint16_t>(rec.module_request_idx);
+            switch (section) {
+                case ModuleTag::REGULAR_IMPORT:
+                    staging.emplace_back(string_item(rec.local_name_handle));
+                    staging.emplace_back(string_item(rec.import_name_handle));
+                    staging.emplace_back(idx);
+                    break;
+                case ModuleTag::NAMESPACE_IMPORT:
+                    staging.emplace_back(string_item(rec.local_name_handle));
+                    staging.emplace_back(idx);
+                    break;
+                case ModuleTag::LOCAL_EXPORT:
+                    staging.emplace_back(string_item(rec.local_name_handle));
+                    staging.emplace_back(string_item(rec.export_name_handle));
+                    break;
+                case ModuleTag::INDIRECT_EXPORT:
+                    staging.emplace_back(string_item(rec.export_name_handle));
+                    staging.emplace_back(string_item(rec.import_name_handle));
+                    staging.emplace_back(idx);
+                    break;
+                case ModuleTag::STAR_EXPORT:
+                    staging.emplace_back(idx);
+                    break;
+                default:
+                    return -1;  // unreachable: tags pre-validated above
+            }
+        }
+    }
+    return 0;
+} catch (...) {
+    return -1;
+}
+}
+
 /* --- 3.1 Proto --- */
 
 uint32_t abc_builder_create_proto(AbcBuilder *b, uint8_t ret_type_id,
@@ -3010,6 +3113,22 @@ try {
     b->fields[field_handle]->SetValue(val);
 } catch (...) {
     return;
+}
+}
+
+int32_t abc_builder_field_set_value_literalarray(AbcBuilder *b, uint32_t field_handle,
+                                                 uint32_t lit_handle) {
+try {
+    if (field_handle >= b->fields.size()) return -1;
+    if (lit_handle >= b->literal_arrays.size()) return -1;
+    // ScalarValueItem Type::ID: FieldItem writes FieldTag::VALUE + the item's
+    // layout offset inline (vendor file_items.cpp FieldItem::WriteValue), so
+    // the reference relocates with the literal-array item automatically.
+    auto *val = b->container.GetOrCreateIdValueItem(b->literal_arrays[lit_handle]);
+    b->fields[field_handle]->SetValue(val);
+    return 0;
+} catch (...) {
+    return -1;
 }
 }
 
