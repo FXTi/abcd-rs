@@ -595,6 +595,33 @@ try {
 }
 }
 
+uint32_t abc_foreign_item_name_off(const AbcFileHandle *f, uint32_t entity_off) {
+try {
+    const auto *header = f->file->GetHeader();
+    // Read only inside the header-declared foreign region (same membership
+    // test as abc_file_is_external, written in subtraction form so a
+    // foreign_off + foreign_size overflow in a hostile header cannot wrap).
+    if (entity_off < header->foreign_off ||
+        entity_off - header->foreign_off >= header->foreign_size) {
+        return UINT32_MAX;
+    }
+    // checked_add(4) semantics: the name field lives at item+4; reject
+    // offsets whose addition would overflow or run past the declared
+    // file_size before touching raw data.
+    if (entity_off > UINT32_MAX - 4) return UINT32_MAX;
+    const uint32_t name_field_off = entity_off + 4;
+    if (name_field_off > header->file_size ||
+        header->file_size - name_field_off < sizeof(uint32_t)) {
+        return UINT32_MAX;
+    }
+    uint32_t name_off;
+    std::memcpy(&name_off, f->file->GetBase() + name_field_off, sizeof(name_off));
+    return name_off;
+} catch (...) {
+    return UINT32_MAX;
+}
+}
+
 uint32_t abc_file_get_string_utf16_len(const AbcFileHandle *f, uint32_t offset) {
 try {
     auto sd = f->file->GetStringData(File::EntityId(offset));
@@ -2514,11 +2541,19 @@ private:
 };
 
 AbcBuilder *abc_builder_new(void) {
+try {
     return new (std::nothrow) AbcBuilder();
+} catch (...) {
+    return nullptr;
+}
 }
 
 void abc_builder_free(AbcBuilder *b) {
+try {
     delete b;
+} catch (...) {
+    return;
+}
 }
 
 // Helper: resolve type_id to TypeItem*, using class_handle for reference types
@@ -2531,9 +2566,13 @@ static TypeItem *resolve_type(AbcBuilder *b, uint8_t type_id, uint32_t class_han
 }
 
 void abc_builder_set_api(AbcBuilder *b, uint8_t api, const char *sub_api) {
+try {
     b->api = api;
     b->sub_api = sub_api ? sub_api : panda::panda_file::DEFAULT_SUB_API_VERSION;
     b->container.InvalidateComputeLayout();
+} catch (...) {
+    return;
+}
 }
 
 int abc_builder_set_file_version(AbcBuilder *b, const uint8_t version[4]) {
@@ -2561,46 +2600,67 @@ int abc_builder_set_file_version(AbcBuilder *b, const uint8_t version[4]) {
 }
 
 uint32_t abc_builder_add_string(AbcBuilder *b, const char *str) {
+try {
     auto *item = b->container.GetOrCreateStringItem(str);
     uint32_t idx = static_cast<uint32_t>(b->strings.size());
     b->strings.push_back(item);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_builder_add_class(AbcBuilder *b, const char *descriptor) {
+try {
     auto *item = b->container.GetOrCreateClassItem(descriptor);
     uint32_t idx = static_cast<uint32_t>(b->classes.size());
     b->classes.push_back(item);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_builder_add_foreign_class(AbcBuilder *b, const char *descriptor) {
+try {
     auto *item = b->container.GetOrCreateForeignClassItem(descriptor);
     uint32_t idx = static_cast<uint32_t>(b->foreign_classes.size());
     b->foreign_classes.push_back(item);
     // Return the tagged handle (high bit = foreign) so it can be passed
     // directly to APIs that resolve class handles.
     return idx | 0x80000000u;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_builder_add_global_class(AbcBuilder *b) {
+try {
     auto *item = b->container.GetOrCreateGlobalClassItem();
     uint32_t idx = static_cast<uint32_t>(b->classes.size());
     b->classes.push_back(item);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_builder_add_literal_array(AbcBuilder *b, const char *id) {
+try {
     auto *item = b->container.GetOrCreateLiteralArrayItem(id);
     uint32_t idx = static_cast<uint32_t>(b->literal_arrays.size());
     b->literal_arrays.push_back(item);
     b->literal_items_staging.emplace_back();
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_builder_class_add_field(AbcBuilder *b, uint32_t class_handle,
                                       const char *name, uint8_t type_id,
                                       uint32_t access_flags) {
+try {
     if (class_handle >= b->classes.size()) return UINT32_MAX;
     auto *cls = b->classes[class_handle];
 
@@ -2613,11 +2673,15 @@ uint32_t abc_builder_class_add_field(AbcBuilder *b, uint32_t class_handle,
     uint32_t idx = static_cast<uint32_t>(b->fields.size());
     b->fields.push_back(field);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_builder_class_add_field_ex(AbcBuilder *b, uint32_t class_handle,
                                          const char *name, uint8_t type_id,
                                          uint32_t ref_class_handle, uint32_t access_flags) {
+try {
     if (class_handle >= b->classes.size()) return UINT32_MAX;
     auto *cls = b->classes[class_handle];
     auto *name_item = b->container.GetOrCreateStringItem(name);
@@ -2627,69 +2691,113 @@ uint32_t abc_builder_class_add_field_ex(AbcBuilder *b, uint32_t class_handle,
     uint32_t idx = static_cast<uint32_t>(b->fields.size());
     b->fields.push_back(field);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_builder_literal_array_add_u8(AbcBuilder *b, uint32_t lit_handle, uint8_t val) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     b->literal_items_staging[lit_handle].emplace_back(val);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_literal_array_add_u16(AbcBuilder *b, uint32_t lit_handle, uint16_t val) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     b->literal_items_staging[lit_handle].emplace_back(val);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_literal_array_add_u32(AbcBuilder *b, uint32_t lit_handle, uint32_t val) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     b->literal_items_staging[lit_handle].emplace_back(val);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_literal_array_add_u64(AbcBuilder *b, uint32_t lit_handle, uint64_t val) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     b->literal_items_staging[lit_handle].emplace_back(val);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_literal_array_add_bool(AbcBuilder *b, uint32_t lit_handle, uint8_t val) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     b->literal_items_staging[lit_handle].emplace_back(static_cast<uint8_t>(val ? 1 : 0));
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_literal_array_add_f32(AbcBuilder *b, uint32_t lit_handle, float val) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     uint32_t bits;
     std::memcpy(&bits, &val, sizeof(bits));
     b->literal_items_staging[lit_handle].emplace_back(bits);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_literal_array_add_f64(AbcBuilder *b, uint32_t lit_handle, double val) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     uint64_t bits;
     std::memcpy(&bits, &val, sizeof(bits));
     b->literal_items_staging[lit_handle].emplace_back(bits);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_literal_array_add_string(AbcBuilder *b, uint32_t lit_handle, uint32_t string_handle) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     if (string_handle >= b->strings.size()) return;
     b->literal_items_staging[lit_handle].emplace_back(b->strings[string_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_literal_array_add_method(AbcBuilder *b, uint32_t lit_handle, uint32_t method_handle) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     if (method_handle >= b->methods.size()) return;
     b->literal_items_staging[lit_handle].emplace_back(b->methods[method_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_literal_array_add_literalarray(AbcBuilder *b, uint32_t lit_handle, uint32_t ref_handle) {
+try {
     if (lit_handle >= b->literal_items_staging.size()) return;
     if (ref_handle >= b->literal_arrays.size()) return;
     b->literal_items_staging[lit_handle].emplace_back(b->literal_arrays[ref_handle]);
+} catch (...) {
+    return;
+}
 }
 
 /* --- 3.1 Proto --- */
 
 uint32_t abc_builder_create_proto(AbcBuilder *b, uint8_t ret_type_id,
                                    const uint8_t *param_type_ids, uint32_t num_params) {
+try {
     BuilderVersionScope version_scope(b);
     auto *ret_type = b->container.GetOrCreatePrimitiveTypeItem(
         static_cast<Type::TypeId>(ret_type_id));
@@ -2703,10 +2811,14 @@ uint32_t abc_builder_create_proto(AbcBuilder *b, uint8_t ret_type_id,
     uint32_t idx = static_cast<uint32_t>(b->protos.size());
     b->protos.push_back(proto);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_builder_create_proto_ex(AbcBuilder *b, uint8_t ret_type_id, uint32_t ret_class_handle,
                                       const struct AbcProtoParam *params_def, uint32_t num_params) {
+try {
     BuilderVersionScope version_scope(b);
     auto *ret_type = resolve_type(b, ret_type_id, ret_class_handle);
     if (!ret_type) return UINT32_MAX;
@@ -2720,11 +2832,15 @@ uint32_t abc_builder_create_proto_ex(AbcBuilder *b, uint8_t ret_type_id, uint32_
     uint32_t idx = static_cast<uint32_t>(b->protos.size());
     b->protos.push_back(proto);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_builder_class_add_method_with_proto(AbcBuilder *b, uint32_t class_handle,
     const char *name, uint32_t proto_handle, uint32_t access_flags,
     const uint8_t *code, uint32_t code_size, uint32_t num_vregs, uint32_t num_args) {
+try {
     if (class_handle >= b->classes.size()) return UINT32_MAX;
     if (proto_handle >= b->protos.size()) return UINT32_MAX;
     auto *cls = b->classes[class_handle];
@@ -2743,88 +2859,140 @@ uint32_t abc_builder_class_add_method_with_proto(AbcBuilder *b, uint32_t class_h
     uint32_t idx = static_cast<uint32_t>(b->methods.size());
     b->methods.push_back(method);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 /* --- 3.2 Class configuration --- */
 
 void abc_builder_class_set_access_flags(AbcBuilder *b, uint32_t class_handle, uint32_t flags) {
+try {
     if (class_handle >= b->classes.size()) return;
     b->classes[class_handle]->SetAccessFlags(flags);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_class_set_source_lang(AbcBuilder *b, uint32_t class_handle, uint8_t lang) {
+try {
     if (class_handle >= b->classes.size()) return;
     b->classes[class_handle]->SetSourceLang(static_cast<SourceLang>(lang));
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_class_set_super_class(AbcBuilder *b, uint32_t class_handle, uint32_t super_handle) {
+try {
     if (class_handle >= b->classes.size()) return;
     auto *super_cls = b->ResolveClassHandle(super_handle);
     if (!super_cls) return;
     b->classes[class_handle]->SetSuperClass(super_cls);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_class_add_interface(AbcBuilder *b, uint32_t class_handle, uint32_t iface_handle) {
+try {
     if (class_handle >= b->classes.size()) return;
     auto *iface = b->ResolveClassHandle(iface_handle);
     if (!iface) return;
     b->classes[class_handle]->AddInterface(iface);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_class_set_source_file(AbcBuilder *b, uint32_t class_handle, uint32_t string_handle) {
+try {
     if (class_handle >= b->classes.size()) return;
     if (string_handle >= b->strings.size()) return;
     b->classes[class_handle]->SetSourceFile(b->strings[string_handle]);
+} catch (...) {
+    return;
+}
 }
 
 /* --- 3.3 Method configuration --- */
 
 void abc_builder_method_set_source_lang(AbcBuilder *b, uint32_t method_handle, uint8_t lang) {
+try {
     if (method_handle >= b->methods.size()) return;
     b->methods[method_handle]->SetSourceLang(static_cast<SourceLang>(lang));
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_set_function_kind(AbcBuilder *b, uint32_t method_handle, uint8_t kind) {
+try {
     if (method_handle >= b->methods.size()) return;
     b->methods[method_handle]->SetFunctionKind(static_cast<FunctionKind>(kind));
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_set_debug_info(AbcBuilder *b, uint32_t method_handle, uint32_t debug_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     b->methods[method_handle]->SetDebugInfo(b->debug_infos[debug_handle]);
+} catch (...) {
+    return;
+}
 }
 
 /* --- 3.4 Field initial values --- */
 
 void abc_builder_field_set_value_i32(AbcBuilder *b, uint32_t field_handle, int32_t value) {
+try {
     if (field_handle >= b->fields.size()) return;
     auto *val = b->container.CreateItem<ScalarValueItem>(static_cast<uint32_t>(value));
     b->fields[field_handle]->SetValue(val);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_field_set_value_i64(AbcBuilder *b, uint32_t field_handle, int64_t value) {
+try {
     if (field_handle >= b->fields.size()) return;
     auto *val = b->container.CreateItem<ScalarValueItem>(static_cast<uint64_t>(value));
     b->fields[field_handle]->SetValue(val);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_field_set_value_f32(AbcBuilder *b, uint32_t field_handle, float value) {
+try {
     if (field_handle >= b->fields.size()) return;
     auto *val = b->container.CreateItem<ScalarValueItem>(value);
     b->fields[field_handle]->SetValue(val);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_field_set_value_f64(AbcBuilder *b, uint32_t field_handle, double value) {
+try {
     if (field_handle >= b->fields.size()) return;
     auto *val = b->container.CreateItem<ScalarValueItem>(value);
     b->fields[field_handle]->SetValue(val);
+} catch (...) {
+    return;
+}
 }
 
 /* --- 3.5 Try-Catch blocks --- */
 
 uint32_t abc_builder_create_code(AbcBuilder *b, uint32_t num_vregs, uint32_t num_args,
                                   const uint8_t *instructions, uint32_t code_size) {
+try {
     std::vector<uint8_t> insns;
     if (instructions && code_size > 0) {
         insns.assign(instructions, instructions + code_size);
@@ -2835,11 +3003,15 @@ uint32_t abc_builder_create_code(AbcBuilder *b, uint32_t num_vregs, uint32_t num
     b->code_items.push_back(item);
     b->code_owners.push_back(nullptr);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_builder_code_add_try_block(AbcBuilder *b, uint32_t code_handle,
     uint32_t start_pc, uint32_t length,
     const struct AbcCatchBlockDef *catches, uint32_t num_catches) {
+try {
     if (code_handle >= b->code_items.size()) return;
     // CatchBlock stores the owner MethodItem (region-index lookup); when the
     // method is not attached yet (try block added before method_set_code),
@@ -2877,9 +3049,13 @@ void abc_builder_code_add_try_block(AbcBuilder *b, uint32_t code_handle,
                                   static_cast<size_t>(length),
                                   std::move(catch_blocks));
     b->code_items[code_handle]->AddTryBlock(try_block);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_set_code(AbcBuilder *b, uint32_t method_handle, uint32_t code_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (code_handle >= b->code_items.size()) return;
     b->methods[method_handle]->SetCode(b->code_items[code_handle]);
@@ -2912,6 +3088,9 @@ void abc_builder_method_set_code(AbcBuilder *b, uint32_t method_handle, uint32_t
         b->code_items[code_handle]->AddTryBlock(try_block);
         it = b->pending_try_blocks.erase(it);
     }
+} catch (...) {
+    return;
+}
 }
 
 /* --- 3.6 Debug Info --- */
@@ -2985,97 +3164,146 @@ static void abc_builder_flush_lnp_staging(AbcBuilder *b) {
 }
 
 uint32_t abc_builder_create_lnp(AbcBuilder *b) {
+try {
     auto *item = b->container.CreateLineNumberProgramItem();
     uint32_t idx = static_cast<uint32_t>(b->lnps.size());
     b->lnps.push_back(item);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_builder_lnp_emit_end(AbcBuilder *b, uint32_t lnp_handle) {
+try {
     if (lnp_handle >= b->lnps.size()) return;
     b->lnp_staging.push_back({ABC_LNP_OP_END, lnp_handle, 0, 0, 0, 0, 0});
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_lnp_emit_advance_pc(AbcBuilder *b, uint32_t lnp_handle,
                                       uint32_t debug_handle, uint32_t value) {
+try {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     b->lnp_staging.push_back({ABC_LNP_OP_ADVANCE_PC, lnp_handle, debug_handle, value, 0, 0, 0});
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_lnp_emit_advance_line(AbcBuilder *b, uint32_t lnp_handle,
                                         uint32_t debug_handle, int32_t value) {
+try {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     b->lnp_staging.push_back({ABC_LNP_OP_ADVANCE_LINE, lnp_handle, debug_handle, 0, value, 0, 0});
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_lnp_emit_column(AbcBuilder *b, uint32_t lnp_handle,
                                   uint32_t debug_handle, uint32_t pc_inc, uint32_t column) {
+try {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     b->lnp_staging.push_back({ABC_LNP_OP_COLUMN, lnp_handle, debug_handle, pc_inc, 0, column, 0});
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_lnp_emit_start_local(AbcBuilder *b, uint32_t lnp_handle,
     uint32_t debug_handle, int32_t reg, uint32_t name_handle, uint32_t type_handle) {
+try {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     b->lnp_staging.push_back(
         {ABC_LNP_OP_START_LOCAL, lnp_handle, debug_handle, name_handle, reg, type_handle, 0});
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_lnp_emit_start_local_extended(AbcBuilder *b, uint32_t lnp_handle,
     uint32_t debug_handle, int32_t reg,
     uint32_t name_handle, uint32_t type_handle, uint32_t type_sig_handle) {
+try {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     b->lnp_staging.push_back({ABC_LNP_OP_START_LOCAL_EXTENDED, lnp_handle, debug_handle,
                               name_handle, reg, type_handle, type_sig_handle});
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_lnp_emit_end_local(AbcBuilder *b, uint32_t lnp_handle, int32_t reg) {
+try {
     if (lnp_handle >= b->lnps.size()) return;
     b->lnp_staging.push_back({ABC_LNP_OP_END_LOCAL, lnp_handle, 0, 0, reg, 0, 0});
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_lnp_emit_set_file(AbcBuilder *b, uint32_t lnp_handle,
                                     uint32_t debug_handle, uint32_t source_file_handle) {
+try {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     if (source_file_handle >= b->strings.size()) return;
     b->lnp_staging.push_back(
         {ABC_LNP_OP_SET_FILE, lnp_handle, debug_handle, source_file_handle, 0, 0, 0});
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_lnp_emit_set_source_code(AbcBuilder *b, uint32_t lnp_handle,
                                            uint32_t debug_handle, uint32_t source_code_handle) {
+try {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     if (source_code_handle >= b->strings.size()) return;
     b->lnp_staging.push_back(
         {ABC_LNP_OP_SET_SOURCE_CODE, lnp_handle, debug_handle, source_code_handle, 0, 0, 0});
+} catch (...) {
+    return;
+}
 }
 
 uint32_t abc_builder_create_debug_info(AbcBuilder *b, uint32_t lnp_handle, uint32_t line_number) {
+try {
     if (lnp_handle >= b->lnps.size()) return UINT32_MAX;
     auto *item = b->container.CreateItem<DebugInfoItem>(b->lnps[lnp_handle]);
     item->SetLineNumber(static_cast<size_t>(line_number));
     uint32_t idx = static_cast<uint32_t>(b->debug_infos.size());
     b->debug_infos.push_back(item);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_builder_debug_add_param(AbcBuilder *b, uint32_t debug_handle, uint32_t name_string_handle) {
+try {
     if (debug_handle >= b->debug_infos.size()) return;
     if (name_string_handle >= b->strings.size()) return;
     b->debug_infos[debug_handle]->AddParameter(b->strings[name_string_handle]);
+} catch (...) {
+    return;
+}
 }
 
 /* --- 3.7 Annotations --- */
 
 uint32_t abc_builder_create_annotation(AbcBuilder *b, uint32_t class_handle,
     const struct AbcAnnotationElemDef *elements, uint32_t num_elements) {
+try {
     auto *cls = b->ResolveClassHandle(class_handle);
     if (!cls) return UINT32_MAX;
 
@@ -3095,6 +3323,9 @@ uint32_t abc_builder_create_annotation(AbcBuilder *b, uint32_t class_handle,
     uint32_t idx = static_cast<uint32_t>(b->annotations.size());
     b->annotations.push_back(ann);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 // Resolve an entity handle to a BaseItem* based on the annotation tag
@@ -3166,6 +3397,7 @@ static Type::TypeId component_type_from_tag(char tag) {
 
 uint32_t abc_builder_create_annotation_ex(AbcBuilder *b, uint32_t class_handle,
     const struct AbcAnnotationElemDefEx *elements, uint32_t num_elements) {
+try {
     auto *cls = b->ResolveClassHandle(class_handle);
     if (!cls) return UINT32_MAX;
 
@@ -3237,59 +3469,95 @@ uint32_t abc_builder_create_annotation_ex(AbcBuilder *b, uint32_t class_handle,
     uint32_t idx = static_cast<uint32_t>(b->annotations.size());
     b->annotations.push_back(ann);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_builder_class_add_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle) {
+try {
     if (class_handle >= b->classes.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->classes[class_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_class_add_runtime_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle) {
+try {
     if (class_handle >= b->classes.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->classes[class_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_class_add_type_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle) {
+try {
     if (class_handle >= b->classes.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->classes[class_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_class_add_runtime_type_annotation(AbcBuilder *b, uint32_t class_handle, uint32_t ann_handle) {
+try {
     if (class_handle >= b->classes.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->classes[class_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_add_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->methods[method_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_add_runtime_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->methods[method_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_add_type_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->methods[method_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_add_runtime_type_annotation(AbcBuilder *b, uint32_t method_handle, uint32_t ann_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->methods[method_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 /* --- Method parameter annotations --- */
 
 uint32_t abc_builder_method_add_param(AbcBuilder *b, uint32_t method_handle, uint8_t type_id) {
+try {
     if (method_handle >= b->methods.size()) return UINT32_MAX;
     auto *type_item = b->container.GetOrCreatePrimitiveTypeItem(
         static_cast<Type::TypeId>(type_id));
@@ -3297,72 +3565,108 @@ uint32_t abc_builder_method_add_param(AbcBuilder *b, uint32_t method_handle, uin
     uint32_t idx = static_cast<uint32_t>(params.size());
     params.emplace_back(type_item);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 void abc_builder_method_param_add_annotation(AbcBuilder *b, uint32_t method_handle,
     uint32_t param_idx, uint32_t ann_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     auto &params = b->methods[method_handle]->GetParams();
     if (param_idx >= params.size()) return;
     params[param_idx].AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_param_add_runtime_annotation(AbcBuilder *b, uint32_t method_handle,
     uint32_t param_idx, uint32_t ann_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     auto &params = b->methods[method_handle]->GetParams();
     if (param_idx >= params.size()) return;
     params[param_idx].AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_param_add_type_annotation(AbcBuilder *b, uint32_t method_handle,
     uint32_t param_idx, uint32_t ann_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     auto &params = b->methods[method_handle]->GetParams();
     if (param_idx >= params.size()) return;
     params[param_idx].AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_method_param_add_runtime_type_annotation(AbcBuilder *b, uint32_t method_handle,
     uint32_t param_idx, uint32_t ann_handle) {
+try {
     if (method_handle >= b->methods.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     auto &params = b->methods[method_handle]->GetParams();
     if (param_idx >= params.size()) return;
     params[param_idx].AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_field_add_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
+try {
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->fields[field_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_field_add_runtime_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
+try {
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->fields[field_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_field_add_type_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
+try {
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->fields[field_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_field_add_runtime_type_annotation(AbcBuilder *b, uint32_t field_handle, uint32_t ann_handle) {
+try {
     if (field_handle >= b->fields.size()) return;
     if (ann_handle >= b->annotations.size()) return;
     b->fields[field_handle]->AddAnnotation(b->annotations[ann_handle]);
+} catch (...) {
+    return;
+}
 }
 
 /* --- 3.8 Foreign items --- */
 
 uint32_t abc_builder_add_foreign_field(AbcBuilder *b, uint32_t class_handle,
                                         const char *name, uint8_t type_id) {
+try {
     auto *cls = b->ResolveClassHandle(class_handle);
     if (!cls) return UINT32_MAX;
     auto *name_item = b->container.GetOrCreateStringItem(name);
@@ -3373,10 +3677,14 @@ uint32_t abc_builder_add_foreign_field(AbcBuilder *b, uint32_t class_handle,
     b->foreign_fields.push_back(item);
     // Tagged handle (high bit = foreign), matching the class-handle convention.
     return idx | 0x80000000u;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 uint32_t abc_builder_add_foreign_method(AbcBuilder *b, uint32_t class_handle,
                                          const char *name, uint32_t proto_handle, uint32_t access_flags) {
+try {
     auto *cls = b->ResolveClassHandle(class_handle);
     if (!cls) return UINT32_MAX;
     if (proto_handle >= b->protos.size()) return UINT32_MAX;
@@ -3387,11 +3695,15 @@ uint32_t abc_builder_add_foreign_method(AbcBuilder *b, uint32_t class_handle,
     b->foreign_methods.push_back(item);
     // Tagged handle (high bit = foreign), matching the class-handle convention.
     return idx | 0x80000000u;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 /* --- 3.8b MethodHandle items --- */
 
 uint32_t abc_builder_create_method_handle(AbcBuilder *b, uint8_t type, uint32_t entity_handle) {
+try {
     BaseItem *entity = nullptr;
     auto mh_type = static_cast<MethodHandleType>(type);
     if (type <= 3) {
@@ -3416,6 +3728,9 @@ uint32_t abc_builder_create_method_handle(AbcBuilder *b, uint8_t type, uint32_t 
     uint32_t idx = static_cast<uint32_t>(b->method_handle_items.size());
     b->method_handle_items.push_back(item);
     return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
 }
 
 /* --- 3.9 Deduplication --- */
@@ -3426,25 +3741,37 @@ uint32_t abc_builder_create_method_handle(AbcBuilder *b, uint8_t type, uint32_t 
 // InvalidateComputeLayout); the finalize step recomputes the layout.
 
 void abc_builder_deduplicate(AbcBuilder *b) {
+try {
     BuilderVersionScope version_scope(b);
     abc_builder_flush_lnp_staging(b);
     b->container.DeduplicateItems(true);
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_deduplicate_code_and_debug_info(AbcBuilder *b) {
+try {
     BuilderVersionScope version_scope(b);
     abc_builder_flush_lnp_staging(b);
     b->container.ComputeLayout();
     b->container.DeduplicateCodeAndDebugInfo();
     b->container.InvalidateComputeLayout();
+} catch (...) {
+    return;
+}
 }
 
 void abc_builder_deduplicate_annotations(AbcBuilder *b) {
+try {
     BuilderVersionScope version_scope(b);
     abc_builder_flush_lnp_staging(b);
     b->container.ComputeLayout();
     b->container.DeduplicateAnnotations();
     b->container.InvalidateComputeLayout();
+} catch (...) {
+    return;
+}
 }
 
 int abc_builder_relocate_code_id(AbcBuilder *b, uint32_t method_handle,

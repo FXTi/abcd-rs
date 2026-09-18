@@ -65,6 +65,10 @@ uint32_t abc_resolve_proto_index(const AbcFileHandle *f, uint32_t entity_off, ui
 uint32_t abc_file_get_class_id(const AbcFileHandle *f, const char *mutf8_name);
 /* Check if entity is in the foreign section */
 int abc_file_is_external(const AbcFileHandle *f, uint32_t entity_off);
+/* Read the name offset of a foreign field/method item (stored as the u32
+ * at item+4). Returns UINT32_MAX if out of bounds or not in the foreign
+ * region. */
+uint32_t abc_foreign_item_name_off(const AbcFileHandle *f, uint32_t entity_off);
 /* String metadata */
 uint32_t abc_file_get_string_utf16_len(const AbcFileHandle *f, uint32_t offset);
 int abc_file_get_string_is_ascii(const AbcFileHandle *f, uint32_t offset);

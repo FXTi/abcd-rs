@@ -447,4 +447,65 @@ mod tests {
             abc_file_close(f);
         }
     }
+
+    /// Regression test for review finding #16 (foreign-name layering):
+    /// the bridge exposes a foreign field/method item's name offset via
+    /// abc_foreign_item_name_off with bounds checks, instead of the safe
+    /// wrapper reading raw bytes at item+4 with an unchecked add.
+    #[test]
+    fn foreign_item_name_off_reads_name() {
+        unsafe {
+            let b = abc_builder_new();
+            assert!(!b.is_null());
+            let sub_api = b"beta1\0";
+            abc_builder_set_api(b, 12, sub_api.as_ptr() as *const std::ffi::c_char);
+
+            // One foreign field ("fx") hanging off the global class.
+            let cls = abc_builder_add_global_class(b);
+            assert_ne!(cls, u32::MAX);
+            let ff = abc_builder_add_foreign_field(
+                b,
+                cls,
+                b"fx\0".as_ptr() as *const std::ffi::c_char,
+                Type_TypeId_I32 as u8,
+            );
+            assert_ne!(ff, u32::MAX);
+
+            let mut out_len: u32 = 0;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null(), "builder finalize should succeed");
+            let data = std::slice::from_raw_parts(ptr, out_len as usize);
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null(), "should open the built ABC file");
+
+            let foreign_off = abc_file_foreign_off(f);
+            let foreign_size = abc_file_foreign_size(f);
+            assert_ne!(foreign_off, u32::MAX);
+            assert!(
+                foreign_size >= 8,
+                "foreign region must hold the 8-byte field item"
+            );
+
+            // The only foreign item is the field at the region start.
+            let name_off = abc_foreign_item_name_off(f, foreign_off);
+            assert_ne!(name_off, u32::MAX, "name offset must be readable");
+            let n = abc_file_get_string_utf16(f, name_off, std::ptr::null_mut(), 0);
+            let mut buf = vec![0u16; n];
+            let written = abc_file_get_string_utf16(f, name_off, buf.as_mut_ptr(), buf.len());
+            assert_eq!(written, n);
+            assert_eq!(String::from_utf16_lossy(&buf), "fx");
+
+            // Offsets outside the foreign region are rejected: inside the
+            // header (4) and at the region end boundary.
+            assert_eq!(abc_foreign_item_name_off(f, 4), u32::MAX);
+            assert_eq!(
+                abc_foreign_item_name_off(f, foreign_off + foreign_size),
+                u32::MAX,
+                "region end boundary must be rejected"
+            );
+
+            abc_file_close(f);
+            abc_builder_free(b);
+        }
+    }
 }
