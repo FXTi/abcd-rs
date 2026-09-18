@@ -1436,9 +1436,8 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
 
 /// Count the literal arrays that annotation encoding will create: exactly
 /// one `ann_la_*` builder array per `AnnotationValue::LiteralArray` element,
-/// recursing into nested annotations. Array elements are converted by
-/// `annotation_array_elem_to_handle`, which never creates arrays, so they
-/// are not counted.
+/// recursing into nested annotations and array elements (both are handled by
+/// paths that create such arrays).
 ///
 /// The count determines the builder handle of every model literal array
 /// (created after class configuration): `handle(i) = count + i`.
@@ -1447,6 +1446,7 @@ fn count_annotation_literal_arrays(file: &File) -> u32 {
         match v {
             AnnotationValue::LiteralArray(_) => 1,
             AnnotationValue::Annotation(a) => a.elements.iter().map(|e| in_value(&e.value)).sum(),
+            AnnotationValue::Array { values, .. } => values.iter().map(in_value).sum(),
             _ => 0,
         }
     }
@@ -1563,39 +1563,51 @@ fn annotation_value_to_raw(
     b: &mut Builder,
     ctx: &mut AnnotationEncodeCtx<'_>,
 ) -> Result<(u8, AnnotationElemValue), Error> {
+    use sys::AnnotationValueType as AVT;
+
+    // Unresolvable entity references (e.g. foreign members, which never
+    // enter EntityHandles) must fail loudly — writing Scalar(0) would
+    // silently produce a different annotation (audit findings #6/#7).
+    let unresolved = |kind: &str, name: StringId, offset: u32| {
+        Error::CodeRelocation(format!(
+            "annotation {kind} reference '{}' at offset {offset:#x} cannot be resolved",
+            ctx.pool.resolve(name).unwrap_or("<unknown>")
+        ))
+    };
+
     let raw = match val {
-        AnnotationValue::Bool(v) => (b'1', AnnotationElemValue::Scalar(*v as u32)),
-        AnnotationValue::I8(v) => (b'2', AnnotationElemValue::Scalar(*v as u32)),
-        AnnotationValue::U8(v) => (b'3', AnnotationElemValue::Scalar(*v as u32)),
-        AnnotationValue::I16(v) => (b'4', AnnotationElemValue::Scalar(*v as u32)),
-        AnnotationValue::U16(v) => (b'5', AnnotationElemValue::Scalar(*v as u32)),
-        AnnotationValue::I32(v) => (b'6', AnnotationElemValue::Scalar(*v as u32)),
-        AnnotationValue::U32(v) => (b'7', AnnotationElemValue::Scalar(*v)),
-        AnnotationValue::I64(v) => (b'8', AnnotationElemValue::Scalar64(*v as u64)),
-        AnnotationValue::U64(v) => (b'9', AnnotationElemValue::Scalar64(*v)),
-        AnnotationValue::F32(v) => (b'A', AnnotationElemValue::Scalar(v.to_bits())),
-        AnnotationValue::F64(v) => (b'B', AnnotationElemValue::Scalar64(v.to_bits())),
+        AnnotationValue::Bool(v) => (AVT::U1 as u8, AnnotationElemValue::Scalar(*v as u32)),
+        AnnotationValue::I8(v) => (AVT::I8 as u8, AnnotationElemValue::Scalar(*v as u32)),
+        AnnotationValue::U8(v) => (AVT::U8 as u8, AnnotationElemValue::Scalar(*v as u32)),
+        AnnotationValue::I16(v) => (AVT::I16 as u8, AnnotationElemValue::Scalar(*v as u32)),
+        AnnotationValue::U16(v) => (AVT::U16 as u8, AnnotationElemValue::Scalar(*v as u32)),
+        AnnotationValue::I32(v) => (AVT::I32 as u8, AnnotationElemValue::Scalar(*v as u32)),
+        AnnotationValue::U32(v) => (AVT::U32 as u8, AnnotationElemValue::Scalar(*v)),
+        AnnotationValue::I64(v) => (AVT::I64 as u8, AnnotationElemValue::Scalar64(*v as u64)),
+        AnnotationValue::U64(v) => (AVT::U64 as u8, AnnotationElemValue::Scalar64(*v)),
+        AnnotationValue::F32(v) => (AVT::F32 as u8, AnnotationElemValue::Scalar(v.to_bits())),
+        AnnotationValue::F64(v) => (AVT::F64 as u8, AnnotationElemValue::Scalar64(v.to_bits())),
         AnnotationValue::String(sid) => {
             let h = get_or_add_string_id(b, ctx.string_handles, ctx.pool, *sid)?;
-            (b'C', AnnotationElemValue::EntityRef(h.0))
+            (AVT::String as u8, AnnotationElemValue::EntityRef(h.0))
         }
         AnnotationValue::Record(sid) => {
             let h = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, *sid)?;
-            (b'D', AnnotationElemValue::EntityRef(h.0))
+            (AVT::Record as u8, AnnotationElemValue::EntityRef(h.0))
         }
         AnnotationValue::Method { name, offset } => {
-            if let Some(mh) = ctx.entities.resolve_method(*name, *offset) {
-                (b'E', AnnotationElemValue::EntityRef(mh.0))
-            } else {
-                (b'E', AnnotationElemValue::Scalar(0))
-            }
+            let mh = ctx
+                .entities
+                .resolve_method(*name, *offset)
+                .ok_or_else(|| unresolved("method", *name, *offset))?;
+            (AVT::Method as u8, AnnotationElemValue::EntityRef(mh.0))
         }
         AnnotationValue::Enum { name, offset } => {
-            if let Some(fh) = ctx.entities.resolve_field(*name, *offset) {
-                (b'F', AnnotationElemValue::EntityRef(fh.0))
-            } else {
-                (b'F', AnnotationElemValue::Scalar(0))
-            }
+            let fh = ctx
+                .entities
+                .resolve_field(*name, *offset)
+                .ok_or_else(|| unresolved("enum", *name, *offset))?;
+            (AVT::Enum as u8, AnnotationElemValue::EntityRef(fh.0))
         }
         AnnotationValue::Annotation(nested) => {
             let ann_cls =
@@ -1610,26 +1622,27 @@ fn annotation_value_to_raw(
                 })
                 .collect::<Result<_, Error>>()?;
             let ann_h = b.create_annotation_ex(ann_cls, &elems);
-            (b'G', AnnotationElemValue::EntityRef(ann_h.0))
+            (
+                AVT::Annotation as u8,
+                AnnotationElemValue::EntityRef(ann_h.0),
+            )
         }
         AnnotationValue::MethodHandle(mh) => {
             let entity_handle = if mh.handle_type.is_field_op() {
                 ctx.entities
                     .resolve_field(mh.entity, mh.entity_offset)
                     .map(|h| h.0)
-                    .unwrap_or(u32::MAX)
             } else {
                 ctx.entities
                     .resolve_method(mh.entity, mh.entity_offset)
                     .map(|h| h.0)
-                    .unwrap_or(u32::MAX)
-            };
-            if entity_handle != u32::MAX {
-                let mh_item = b.create_method_handle(mh.handle_type as u8, entity_handle);
-                (b'J', AnnotationElemValue::EntityRef(mh_item.0))
-            } else {
-                (b'J', AnnotationElemValue::Scalar(0))
             }
+            .ok_or_else(|| unresolved("method-handle", mh.entity, mh.entity_offset))?;
+            let mh_item = b.create_method_handle(mh.handle_type as u8, entity_handle);
+            (
+                AVT::MethodHandle as u8,
+                AnnotationElemValue::EntityRef(mh_item.0),
+            )
         }
         AnnotationValue::LiteralArray(values) => {
             let id = format!("ann_la_{}", *ctx.ann_la_counter);
@@ -1646,23 +1659,19 @@ fn annotation_value_to_raw(
                     ctx.literal_array_count,
                 )?;
             }
-            (b'#', AnnotationElemValue::EntityRef(la_h.0))
+            (
+                AVT::LiteralArray as u8,
+                AnnotationElemValue::EntityRef(la_h.0),
+            )
         }
-        AnnotationValue::Void => (b'I', AnnotationElemValue::Scalar(0)),
-        AnnotationValue::StringNullptr => (b'*', AnnotationElemValue::Scalar(0)),
+        AnnotationValue::Void => (AVT::Void as u8, AnnotationElemValue::Scalar(0)),
+        AnnotationValue::StringNullptr => {
+            (AVT::StringNullptr as u8, AnnotationElemValue::Scalar(0))
+        }
         AnnotationValue::Array { tag, values } => {
             let handles: Vec<u32> = values
                 .iter()
-                .map(|v| {
-                    annotation_array_elem_to_handle(
-                        v,
-                        *tag,
-                        b,
-                        ctx.string_handles,
-                        ctx.class_handles,
-                        ctx.pool,
-                    )
-                })
+                .map(|v| annotation_array_elem_to_handle(v, *tag, b, ctx))
                 .collect::<Result<_, Error>>()?;
             if is_entity_array_tag(*tag) {
                 (*tag, AnnotationElemValue::EntityArray(handles))
@@ -1675,23 +1684,35 @@ fn annotation_value_to_raw(
 }
 
 /// Returns true if the annotation array tag refers to entity-reference
-/// elements. Tag chars follow upstream pandasm::Value::GetArrayTypeAsChar:
-/// K..U are scalar arrays (K=U1 … T=F32, U=F64), V=String, W=Record,
-/// X=Method, Y=Enum, Z=Annotation, @=MethodHandle (audit finding #B1).
+/// elements. Tag chars follow upstream pandasm::Value::GetArrayTypeAsChar
+/// (audit finding #B1): K..U are scalar arrays (K=U1 … T=F32, U=F64),
+/// V=String, W=Record, X=Method, Y=Enum, Z=Annotation, @=MethodHandle;
+/// '#' (LiteralArray) is also an entity reference.
 fn is_entity_array_tag(tag: u8) -> bool {
-    matches!(tag, b'V' | b'W' | b'X' | b'Y' | b'Z' | b'@' | b'#')
+    use sys::AnnotationValueType as AVT;
+    matches!(
+        AVT::try_from(tag),
+        Ok(AVT::ArrayString
+            | AVT::ArrayRecord
+            | AVT::ArrayMethod
+            | AVT::ArrayEnum
+            | AVT::ArrayAnnotation
+            | AVT::ArrayMethodHandle
+            | AVT::LiteralArray)
+    )
 }
 
 /// Convert a single annotation array element to a u32 handle/value for the builder.
 ///
 /// `tag` is the enclosing array's element tag, used only for error reporting.
+/// Entity elements (Method/Enum/Annotation/MethodHandle/LiteralArray) are
+/// resolved to real builder handles; unresolvable references fail instead of
+/// writing 0 (audit finding #7).
 fn annotation_array_elem_to_handle(
     val: &AnnotationValue,
     tag: u8,
     b: &mut Builder,
-    string_handles: &mut HashMap<StringId, StringHandle>,
-    class_handles: &mut HashMap<StringId, ClassHandle>,
-    pool: &StringPool,
+    ctx: &mut AnnotationEncodeCtx<'_>,
 ) -> Result<u32, Error> {
     let raw = match val {
         AnnotationValue::Bool(v) => *v as u32,
@@ -1709,14 +1730,68 @@ fn annotation_array_elem_to_handle(
         }
         AnnotationValue::F32(v) => v.to_bits(),
         AnnotationValue::String(sid) => {
-            let h = get_or_add_string_id(b, string_handles, pool, *sid)?;
+            let h = get_or_add_string_id(b, ctx.string_handles, ctx.pool, *sid)?;
             h.0
         }
         AnnotationValue::Record(sid) => {
-            let h = resolve_class_for_ann(b, class_handles, pool, *sid)?;
+            let h = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, *sid)?;
             h.0
         }
-        _ => 0,
+        AnnotationValue::Method { name, offset } => {
+            ctx.entities
+                .resolve_method(*name, *offset)
+                .ok_or_else(|| {
+                    Error::CodeRelocation(format!(
+                        "annotation array method reference '{}' at offset {offset:#x} cannot be resolved",
+                        ctx.pool.resolve(*name).unwrap_or("<unknown>")
+                    ))
+                })?
+                .0
+        }
+        AnnotationValue::Enum { name, offset } => {
+            ctx.entities
+                .resolve_field(*name, *offset)
+                .ok_or_else(|| {
+                    Error::CodeRelocation(format!(
+                        "annotation array enum reference '{}' at offset {offset:#x} cannot be resolved",
+                        ctx.pool.resolve(*name).unwrap_or("<unknown>")
+                    ))
+                })?
+                .0
+        }
+        AnnotationValue::MethodHandle(mh) => {
+            let entity_handle = if mh.handle_type.is_field_op() {
+                ctx.entities
+                    .resolve_field(mh.entity, mh.entity_offset)
+                    .map(|h| h.0)
+            } else {
+                ctx.entities
+                    .resolve_method(mh.entity, mh.entity_offset)
+                    .map(|h| h.0)
+            }
+            .ok_or_else(|| {
+                Error::CodeRelocation(format!(
+                    "annotation array method-handle reference '{}' at offset {:#x} cannot be resolved",
+                    ctx.pool.resolve(mh.entity).unwrap_or("<unknown>"),
+                    mh.entity_offset
+                ))
+            })?;
+            b.create_method_handle(mh.handle_type as u8, entity_handle).0
+        }
+        // Nested annotations and literal arrays encode as entity references;
+        // reuse the scalar conversion path.
+        AnnotationValue::Annotation(_) | AnnotationValue::LiteralArray(_) => {
+            match annotation_value_to_raw(val, b, ctx)? {
+                (_, AnnotationElemValue::EntityRef(h)) => h,
+                _ => unreachable!("annotation/literal-array values encode as entity refs"),
+            }
+        }
+        AnnotationValue::Void | AnnotationValue::StringNullptr => 0,
+        AnnotationValue::Array { .. } => {
+            return Err(Error::CodeRelocation(
+                "nested annotation arrays are not supported by the builder ABI".into(),
+            ));
+        }
     };
     Ok(raw)
 }
@@ -2033,50 +2108,53 @@ fn encode_literal_value(
             let sh = get_or_add_string_id(b, string_handles, pool, *sid)?;
             b.literal_array_add_raw_string(la, sh);
         }
+        // Method references: an unresolvable offset must fail loudly —
+        // falling back to writing the source-file offset into the new
+        // file's different layout silently corrupts the array (#6).
         LiteralValue::Method(off) => {
-            if let Some(mh) = resolve_method(*off) {
-                b.literal_array_add_u8(la, LiteralTag::Method as u8);
-                b.literal_array_add_raw_method(la, mh);
-            } else {
-                b.literal_array_add_u8(la, LiteralTag::Method as u8);
-                b.literal_array_add_u32(la, *off);
-            }
+            let mh = resolve_method(*off).ok_or_else(|| {
+                Error::CodeRelocation(format!(
+                    "literal array method reference at offset {off:#x} cannot be resolved"
+                ))
+            })?;
+            b.literal_array_add_u8(la, LiteralTag::Method as u8);
+            b.literal_array_add_raw_method(la, mh);
         }
         LiteralValue::GeneratorMethod(off) => {
-            if let Some(mh) = resolve_method(*off) {
-                b.literal_array_add_u8(la, LiteralTag::GeneratorMethod as u8);
-                b.literal_array_add_raw_method(la, mh);
-            } else {
-                b.literal_array_add_u8(la, LiteralTag::GeneratorMethod as u8);
-                b.literal_array_add_u32(la, *off);
-            }
+            let mh = resolve_method(*off).ok_or_else(|| {
+                Error::CodeRelocation(format!(
+                    "literal array generator-method reference at offset {off:#x} cannot be resolved"
+                ))
+            })?;
+            b.literal_array_add_u8(la, LiteralTag::GeneratorMethod as u8);
+            b.literal_array_add_raw_method(la, mh);
         }
         LiteralValue::AsyncGeneratorMethod(off) => {
-            if let Some(mh) = resolve_method(*off) {
-                b.literal_array_add_u8(la, LiteralTag::AsyncGeneratorMethod as u8);
-                b.literal_array_add_raw_method(la, mh);
-            } else {
-                b.literal_array_add_u8(la, LiteralTag::AsyncGeneratorMethod as u8);
-                b.literal_array_add_u32(la, *off);
-            }
+            let mh = resolve_method(*off).ok_or_else(|| {
+                Error::CodeRelocation(format!(
+                    "literal array async-generator-method reference at offset {off:#x} cannot be resolved"
+                ))
+            })?;
+            b.literal_array_add_u8(la, LiteralTag::AsyncGeneratorMethod as u8);
+            b.literal_array_add_raw_method(la, mh);
         }
         LiteralValue::Getter(off) => {
-            if let Some(mh) = resolve_method(*off) {
-                b.literal_array_add_u8(la, LiteralTag::Getter as u8);
-                b.literal_array_add_raw_method(la, mh);
-            } else {
-                b.literal_array_add_u8(la, LiteralTag::Getter as u8);
-                b.literal_array_add_u32(la, *off);
-            }
+            let mh = resolve_method(*off).ok_or_else(|| {
+                Error::CodeRelocation(format!(
+                    "literal array getter reference at offset {off:#x} cannot be resolved"
+                ))
+            })?;
+            b.literal_array_add_u8(la, LiteralTag::Getter as u8);
+            b.literal_array_add_raw_method(la, mh);
         }
         LiteralValue::Setter(off) => {
-            if let Some(mh) = resolve_method(*off) {
-                b.literal_array_add_u8(la, LiteralTag::Setter as u8);
-                b.literal_array_add_raw_method(la, mh);
-            } else {
-                b.literal_array_add_u8(la, LiteralTag::Setter as u8);
-                b.literal_array_add_u32(la, *off);
-            }
+            let mh = resolve_method(*off).ok_or_else(|| {
+                Error::CodeRelocation(format!(
+                    "literal array setter reference at offset {off:#x} cannot be resolved"
+                ))
+            })?;
+            b.literal_array_add_u8(la, LiteralTag::Setter as u8);
+            b.literal_array_add_raw_method(la, mh);
         }
         LiteralValue::Accessor(v) => {
             b.literal_array_add_u8(la, LiteralTag::Accessor as u8);

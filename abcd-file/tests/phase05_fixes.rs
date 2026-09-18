@@ -1,12 +1,15 @@
 //! Regression tests for Phase 0.5 worker F fixes (design/review-bridge-wrapper.md):
 //! - #5  local-variable scopes must survive an encode roundtrip
+//! - #6  unresolvable annotation references must fail, not encode as 0
+//! - #7  entity annotation array elements resolve to real handles
 //! - #8  nested literal-array references resolve through the handle table
 //! - #9  embedded-NUL strings encode as MUTF-8 (C0 80) instead of panicking
 //! - #18 64-bit annotation array elements return an error instead of panicking
 
 use abcd_file::{
-    AccessFlags, Annotation, AnnotationElem, AnnotationValue, Annotations, Builder, Error,
-    LiteralArray, LiteralArrayIdx, LiteralValue, SourceLang, Type, decode, encode,
+    AccessFlags, Annotation, AnnotationElem, AnnotationElemDefEx, AnnotationElemValue,
+    AnnotationValue, Annotations, Builder, Error, LiteralArray, LiteralArrayIdx, LiteralValue,
+    SourceLang, Type, decode, encode,
 };
 
 /// Build a method carrying debug info with a local variable whose scope
@@ -201,4 +204,133 @@ fn i64_annotation_array_element_returns_error_not_panic() {
 
     let err = encode(&file).expect_err("encode must fail, not panic");
     assert_eq!(err, Error::UnsupportedAnnotationArrayType { tag: b'S' });
+}
+
+/// Finding #6: an annotation referencing a foreign method cannot be resolved
+/// to a builder handle on encode (foreign members are never class members,
+/// so they never enter EntityHandles). encode must fail loudly instead of
+/// silently writing `(b'E', Scalar(0))`.
+#[test]
+fn foreign_member_annotation_encode_fails() {
+    // Same construction as tests/foreign_items.rs.
+    let mut b = Builder::new();
+    b.set_api(12, "beta1");
+    let cls = b.add_global_class();
+    b.class_set_source_lang(cls, SourceLang::EcmaScript);
+    let proto = b.create_proto(Type::Tagged, &[]);
+    let fm = b.add_foreign_method(cls, "fm", proto, AccessFlags::PUBLIC);
+
+    let name = b.add_string("m");
+    let ann = b.create_annotation_ex(
+        cls,
+        &[AnnotationElemDefEx {
+            name,
+            tag: b'E', // Method reference
+            value: AnnotationElemValue::EntityRef(fm.as_raw()),
+        }],
+    );
+    b.class_add_runtime_annotation(cls, ann);
+
+    let m = b.class_add_method(
+        cls,
+        "func_main_0",
+        proto,
+        AccessFlags::PUBLIC,
+        &[0x65],
+        1,
+        0,
+    );
+    b.method_set_source_lang(m, SourceLang::EcmaScript);
+    let data = b.finalize().expect("finalize");
+
+    let file = decode(&data).expect("decode");
+    let g = file.classes.values().find(|c| !c.is_external).unwrap();
+    assert!(
+        matches!(
+            g.annotations.compile_time[0].elements[0].value,
+            AnnotationValue::Method { .. }
+        ),
+        "sanity: the element decoded as a Method reference"
+    );
+
+    let err = encode(&file).expect_err("encode must fail for foreign member references");
+    assert!(
+        matches!(err, Error::CodeRelocation(_)),
+        "expected CodeRelocation, got {err:?}"
+    );
+}
+
+/// Finding #7: entity annotation array elements (X=Method, Y=Enum) that
+/// reference real class members must resolve to builder handles and survive
+/// a roundtrip (previously the `_ => 0` arm wrote 0 for each).
+#[test]
+fn entity_array_annotation_roundtrips() {
+    let mut b = Builder::new();
+    b.set_api(12, "beta1");
+    let cls = b.add_global_class();
+    b.class_set_source_lang(cls, SourceLang::EcmaScript);
+    // Decoys occupy handle 0 in the field/method tables so that a pre-fix
+    // `_ => 0` element points at the decoy, not the referenced target.
+    let _decoy_f = b.class_add_field(cls, "decoy_f", Type::I32, AccessFlags::PUBLIC);
+    let f = b.class_add_field(cls, "target_f", Type::I32, AccessFlags::PUBLIC);
+    let proto = b.create_proto(Type::Tagged, &[]);
+    let _decoy_m = b.class_add_method(cls, "decoy_m", proto, AccessFlags::PUBLIC, &[0x65], 1, 0);
+    let m = b.class_add_method(cls, "target_m", proto, AccessFlags::PUBLIC, &[0x65], 1, 0);
+    b.method_set_source_lang(m, SourceLang::EcmaScript);
+
+    let nx = b.add_string("ameth");
+    let ny = b.add_string("aenum");
+    let ann = b.create_annotation_ex(
+        cls,
+        &[
+            AnnotationElemDefEx {
+                name: nx,
+                tag: b'X', // ArrayMethod
+                value: AnnotationElemValue::EntityArray(vec![m.as_raw()]),
+            },
+            AnnotationElemDefEx {
+                name: ny,
+                tag: b'Y', // ArrayEnum
+                value: AnnotationElemValue::EntityArray(vec![f.as_raw()]),
+            },
+        ],
+    );
+    b.class_add_runtime_annotation(cls, ann);
+    let data = b.finalize().expect("finalize");
+
+    let file1 = decode(&data).expect("decode #1");
+    let bytes2 = encode(&file1).expect("encode must resolve member entity arrays");
+    let file2 = decode(&bytes2).expect("decode #2");
+    let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
+
+    let mut saw_method = false;
+    let mut saw_enum = false;
+    for ann in &g2.annotations.compile_time {
+        for e in &ann.elements {
+            match (&e.value, file2.strings.resolve(e.name)) {
+                (AnnotationValue::Array { tag, values }, Some("ameth")) => {
+                    assert_eq!(*tag, b'X');
+                    match &values[0] {
+                        AnnotationValue::Method { name, .. } => {
+                            assert_eq!(file2.strings.resolve(*name), Some("target_m"));
+                            saw_method = true;
+                        }
+                        other => panic!("expected Method element, got {other:?}"),
+                    }
+                }
+                (AnnotationValue::Array { tag, values }, Some("aenum")) => {
+                    assert_eq!(*tag, b'Y');
+                    match &values[0] {
+                        AnnotationValue::Enum { name, .. } => {
+                            assert_eq!(file2.strings.resolve(*name), Some("target_f"));
+                            saw_enum = true;
+                        }
+                        other => panic!("expected Enum element, got {other:?}"),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_method && saw_enum, "both entity arrays must roundtrip");
 }
