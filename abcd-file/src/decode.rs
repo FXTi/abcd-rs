@@ -400,6 +400,8 @@ fn decode_method_at(
         ))
     };
 
+    let param_annotations = decode_param_annotations(f, mr, arg_types.len(), entity_map, strings)?;
+
     Ok(Method {
         name,
         offset: method_off,
@@ -412,8 +414,80 @@ fn decode_method_at(
         arg_types,
         body,
         annotations,
+        param_annotations,
         debug,
     })
+}
+
+/// Decode per-parameter annotations for a method.
+///
+/// Each ParamAnnotationsItem enumerates (param_idx, annotation_off) pairs;
+/// the annotations are decoded individually and grouped by parameter index.
+/// Buckets are sized to the method's parameter count (or the highest seen
+/// index + 1 when that exceeds the proto's arity), with empty Vecs for
+/// unannotated parameters. A method without the item leaves its bucket
+/// empty.
+fn decode_param_annotations(
+    f: *const sys::AbcFileHandle,
+    mr: *mut sys::AbcMethodAccessor,
+    num_params: usize,
+    entity_map: &HashMap<u32, StringId>,
+    strings: &mut StringPool,
+) -> Result<ParamAnnotations, Error> {
+    let mut result = ParamAnnotations::default();
+    for (is_runtime, item_off) in [
+        (false, unsafe {
+            sys::abc_method_get_param_annotation_id(mr)
+        }),
+        (true, unsafe {
+            sys::abc_method_get_runtime_param_annotation_id(mr)
+        }),
+    ] {
+        if item_off == ABSENT {
+            continue;
+        }
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        unsafe extern "C" fn cb(param_idx: u32, annotation_off: u32, ctx: *mut c_void) -> i32 {
+            let pairs = unsafe { &mut *(ctx as *mut Vec<(u32, u32)>) };
+            pairs.push((param_idx, annotation_off));
+            0
+        }
+        let rc = unsafe {
+            sys::abc_param_annotations_enumerate(
+                f,
+                item_off,
+                Some(cb),
+                &mut pairs as *mut Vec<(u32, u32)> as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Malformed {
+                field: "param_annotations",
+                context: format!("param annotations item at offset {item_off:#x}"),
+            });
+        }
+        if pairs.is_empty() {
+            continue;
+        }
+        let bucket = if is_runtime {
+            &mut result.runtime
+        } else {
+            &mut result.compile_time
+        };
+        let len = num_params.max(
+            pairs
+                .iter()
+                .map(|&(i, _)| i as usize + 1)
+                .max()
+                .unwrap_or(0),
+        );
+        bucket.resize(len, Vec::new());
+        for (idx, off) in pairs {
+            let anns = decode_annotation_list(f, &[off], entity_map, strings)?;
+            bucket[idx as usize].extend(anns);
+        }
+    }
+    Ok(result)
 }
 
 fn decode_field_at(

@@ -75,7 +75,21 @@ pub struct Method {
     pub arg_types: Vec<Type>,
     pub body: Option<MethodBody>,
     pub annotations: Annotations,
+    /// Per-parameter annotations, indexed by parameter position.
+    pub param_annotations: ParamAnnotations,
     pub debug: Option<MethodDebugInfo>,
+}
+
+/// Per-parameter annotations, indexed by parameter position.
+///
+/// Decode fills both buckets; encode folds them (see the contract at the
+/// encode site): when the compile-time bucket carries any annotation, the
+/// runtime bucket is folded into it and only a compile-time item is written
+/// (same precedent as the annotation-category collapse, review finding #9).
+#[derive(Clone, Debug, Default)]
+pub struct ParamAnnotations {
+    pub compile_time: Vec<Vec<Annotation>>,
+    pub runtime: Vec<Vec<Annotation>>,
 }
 
 /// A decoded field.

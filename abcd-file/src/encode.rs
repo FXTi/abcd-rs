@@ -317,6 +317,31 @@ impl Builder {
         ParamHandle(unsafe { sys::abc_builder_method_add_param(self.raw, m.0, ty.as_raw_u8()) })
     }
 
+    /// Add a typed parameter with reference-type support.
+    pub fn method_add_param_ex(
+        &mut self,
+        m: MethodHandle,
+        ty: Type,
+        class: Option<ClassHandle>,
+    ) -> ParamHandle {
+        ParamHandle(unsafe {
+            sys::abc_builder_method_add_param_ex(
+                self.raw,
+                m.0,
+                ty.as_raw_u8(),
+                class.map_or(0, |h| h.0),
+            )
+        })
+    }
+
+    /// Seal staged param annotations into a ParamAnnotationsItem
+    /// (`is_runtime`: false = compile-time, true = runtime). The vendored
+    /// MethodParamItem keeps a single annotation vector per param; sealing
+    /// snapshots whatever is staged at that moment.
+    pub fn method_seal_param_annotations(&mut self, m: MethodHandle, is_runtime: bool) {
+        unsafe { sys::abc_builder_method_seal_param_annotations(self.raw, m.0, is_runtime as i32) };
+    }
+
     // --- Fields ---
 
     /// Add a field to a class.
@@ -1222,6 +1247,74 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     AnnotationTarget::Method(method_h),
                 )?;
             }
+
+            // --- Parameter annotations ---
+            // Contract (maintainer ruling, same precedent as the annotation
+            // category fold, review finding #9): decode keeps both buckets;
+            // encode folds them. The vendored MethodParamItem has a single
+            // annotation vector per param and sealing snapshots it
+            // (ParamAnnotationsItem ctor, vendor file_items.cpp:424), so the
+            // fold stages the per-param union of both buckets through the
+            // compile-time adder and seals ONCE as compile-time — unless the
+            // compile-time bucket is empty, in which case the runtime bucket
+            // is staged alone and sealed as runtime.
+            let pa = &method.param_annotations;
+            let has_compile = pa.compile_time.iter().any(|v| !v.is_empty());
+            let has_runtime = pa.runtime.iter().any(|v| !v.is_empty());
+            if !method.is_external && (has_compile || has_runtime) {
+                // Params must exist before annotations can attach to them
+                // (the bridge drops out-of-range param indices). Hand-built
+                // models may carry param annotations without arg_types; pad
+                // with TAGGED params.
+                let num_params = method
+                    .arg_types
+                    .len()
+                    .max(pa.compile_time.len())
+                    .max(pa.runtime.len());
+                let mut param_handles = Vec::with_capacity(num_params);
+                for i in 0..num_params {
+                    let ty = method.arg_types.get(i).copied().unwrap_or(Type::Tagged);
+                    let ref_cls = if let Type::Reference(d) = ty {
+                        Some(resolve_class_id(&mut b, &mut class_handles, pool, d)?)
+                    } else {
+                        None
+                    };
+                    param_handles.push(b.method_add_param_ex(method_h, ty, ref_cls));
+                }
+
+                let seal_as_runtime = !has_compile;
+                let mut ctx = AnnotationEncodeCtx {
+                    string_handles: &mut string_handles,
+                    class_handles: &mut class_handles,
+                    entities: &entities,
+                    ann_la_counter: &mut ann_la_counter,
+                    ann_la_base,
+                    literal_array_count: file.literal_arrays.len(),
+                    pool,
+                };
+                for (idx, param_h) in param_handles.iter().enumerate() {
+                    // Per-param union of both buckets; the runtime bucket may
+                    // already contain compile-time annotations (vendor seal
+                    // snapshots the shared vector), so dedup by value.
+                    let staged: Vec<&Annotation> = if seal_as_runtime {
+                        pa.runtime.get(idx).into_iter().flatten().collect()
+                    } else {
+                        pa.compile_time
+                            .get(idx)
+                            .into_iter()
+                            .flatten()
+                            .chain(pa.runtime.get(idx).into_iter().flatten().filter(|ra| {
+                                !pa.compile_time.get(idx).is_some_and(|c| c.contains(*ra))
+                            }))
+                            .collect()
+                    };
+                    for ann in staged {
+                        let ann_h = encode_single_annotation(&mut b, &mut ctx, ann)?;
+                        b.method_param_add_annotation(method_h, *param_h, ann_h);
+                    }
+                }
+                b.method_seal_param_annotations(method_h, seal_as_runtime);
+            }
         }
 
         // --- Fields ---
@@ -1538,24 +1631,32 @@ fn encode_annotations_on(
 
     for (ann_list, attach_fn) in &groups {
         for ann in *ann_list {
-            let ann_cls =
-                resolve_class_for_ann(b, ctx.class_handles, ctx.pool, ann.class_descriptor)?;
-
-            let elems: Vec<AnnotationElemDefEx> = ann
-                .elements
-                .iter()
-                .map(|e| {
-                    let name = get_or_add_string_id(b, ctx.string_handles, ctx.pool, e.name)?;
-                    let (tag, value) = annotation_value_to_raw(&e.value, b, ctx)?;
-                    Ok(AnnotationElemDefEx { name, tag, value })
-                })
-                .collect::<Result<_, Error>>()?;
-
-            let ann_h = b.create_annotation_ex(ann_cls, &elems);
+            let ann_h = encode_single_annotation(b, ctx, ann)?;
             attach_fn(b, &target, ann_h);
         }
     }
     Ok(())
+}
+
+/// Encode one annotation (class reference + elements) into a builder handle.
+fn encode_single_annotation(
+    b: &mut Builder,
+    ctx: &mut AnnotationEncodeCtx<'_>,
+    ann: &Annotation,
+) -> Result<AnnotationHandle, Error> {
+    let ann_cls = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, ann.class_descriptor)?;
+
+    let elems: Vec<AnnotationElemDefEx> = ann
+        .elements
+        .iter()
+        .map(|e| {
+            let name = get_or_add_string_id(b, ctx.string_handles, ctx.pool, e.name)?;
+            let (tag, value) = annotation_value_to_raw(&e.value, b, ctx)?;
+            Ok(AnnotationElemDefEx { name, tag, value })
+        })
+        .collect::<Result<_, Error>>()?;
+
+    Ok(b.create_annotation_ex(ann_cls, &elems))
 }
 
 fn annotation_value_to_raw(
@@ -2291,6 +2392,7 @@ mod tests {
             arg_types: Vec::new(),
             body: None,
             annotations: Annotations::default(),
+            param_annotations: ParamAnnotations::default(),
             debug: None,
         }
     }
