@@ -96,6 +96,8 @@ fn phi_copies_for_untaken_successor_clobber_taken_path() {
         phi_copies,
         num_regs: 6,
         copy_temp: Some(RegSlot::Reg(15)),
+        // No Acc-colored values in this fixture.
+        spill_slot: None,
     };
 
     let rpo = regalloc::compute_rpo(&module, func);

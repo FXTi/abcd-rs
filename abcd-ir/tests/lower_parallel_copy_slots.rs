@@ -74,6 +74,8 @@ fn run_edge_copies(
         phi_copies,
         num_regs: 16,
         copy_temp: Some(RegSlot::Reg(15)),
+        // No Acc-colored values in this fixture.
+        spill_slot: None,
     };
 
     let rpo = regalloc::compute_rpo(&module, func);

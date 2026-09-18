@@ -11,7 +11,8 @@ use crate::entity::{Block, FuncId, Inst, StringId, Value};
 use crate::inst::{BinOp, CallKind, InstData, PropKind, UnOp};
 use crate::module::Module;
 
-use super::regalloc::{RegAlloc, RegSlot, TEMP_REG_BASE, TEMP_REG_COUNT};
+use super::LowerError;
+use super::regalloc::{RegAlloc, RegSlot};
 
 /// Result of instruction selection for one function.
 #[derive(Debug)]
@@ -56,11 +57,11 @@ impl IcAllocator {
 /// Select instructions for a function.
 pub fn select(
     module: &Module,
-    _func_id: FuncId,
+    func_id: FuncId,
     alloc: &RegAlloc,
     rpo: &[Block],
     string_map: &HashMap<StringId, EntityId>,
-) -> IselResult {
+) -> Result<IselResult, LowerError> {
     let mut block_codes: Vec<(Block, Vec<Bytecode>)> = Vec::new();
     let mut ic = IcAllocator::new();
     let mut unsupported = None;
@@ -88,52 +89,84 @@ pub fn select(
                     _ => "super property access by index".to_string(),
                 });
             }
-            let result_slot = node
-                .result
-                .map(|v| alloc.allocation.get(&v).copied().unwrap_or(RegSlot::Acc));
+            let result_slot = match node.result {
+                Some(v) => Some(slot_of(func_id, v, alloc)?),
+                None => None,
+            };
 
             select_inst(
                 &node.data,
                 result_slot,
                 inst,
+                func_id,
                 module,
                 alloc,
                 string_map,
                 &mut codes,
                 &mut ic,
-            );
+            )?;
         }
 
         block_codes.push((bb, codes));
     }
 
-    IselResult {
+    Ok(IselResult {
         block_codes,
         string_map: string_map.clone(),
         ic_size: ic.counter,
         unsupported,
-    }
+    })
 }
 
-/// Get the Reg for a value, inserting lda/sta as needed.
-fn val_reg(val: Value, alloc: &RegAlloc, codes: &mut Vec<Bytecode>) -> Reg {
-    match alloc.allocation.get(&val).copied().unwrap_or(RegSlot::Acc) {
-        RegSlot::Reg(r) => Reg(r),
+/// Look up the slot register allocation assigned to a value. A missing entry
+/// means the operand was never colored (e.g. a dangling value reference in
+/// unverified IR), which the old code silently treated as acc-resident.
+fn slot_of(func_id: FuncId, val: Value, alloc: &RegAlloc) -> Result<RegSlot, LowerError> {
+    alloc
+        .allocation
+        .get(&val)
+        .copied()
+        .ok_or(LowerError::UnallocatedOperand {
+            func: func_id,
+            value: val,
+        })
+}
+
+/// Get the Reg for a value, spilling an acc-resident value into the reserved
+/// in-frame spill slot (`Sta`) when needed.
+fn val_reg(
+    func_id: FuncId,
+    val: Value,
+    alloc: &RegAlloc,
+    codes: &mut Vec<Bytecode>,
+) -> Result<Reg, LowerError> {
+    match slot_of(func_id, val, alloc)? {
+        RegSlot::Reg(r) => Ok(Reg(r)),
         RegSlot::Acc => {
-            // Value is in acc — spill it to a reserved short-lived register.
-            // The sequence length gives two accumulator operands in one
-            // instruction distinct slots; the allocator never assigns this
-            // high register range to long-lived SSA values.
-            let spill = Reg(TEMP_REG_BASE + (codes.len() as u16 % TEMP_REG_COUNT));
-            codes.push(Bytecode::Sta(spill));
-            spill
+            // Value is in acc — spill it to the reserved in-frame register.
+            // The register allocator reserves exactly one such slot whenever
+            // any value is Acc-colored; at most one operand per instruction
+            // is Acc-colored (interference invariant, see
+            // `materialize_operands`), so one slot suffices.
+            match alloc.spill_slot {
+                Some(RegSlot::Reg(r)) => {
+                    codes.push(Bytecode::Sta(Reg(r)));
+                    Ok(Reg(r))
+                }
+                _ => Err(LowerError::MissingSpillSlot(func_id)),
+            }
         }
     }
 }
 
 /// Ensure a value is in the accumulator. If it's in a register, emit lda.
-fn ensure_acc(val: Value, alloc: &RegAlloc, codes: &mut Vec<Bytecode>) {
-    match alloc.allocation.get(&val).copied().unwrap_or(RegSlot::Acc) {
+fn ensure_acc(
+    func_id: FuncId,
+    val: Value,
+    alloc: &RegAlloc,
+    codes: &mut Vec<Bytecode>,
+) -> Result<(), LowerError> {
+    match slot_of(func_id, val, alloc)? {
         RegSlot::Reg(r) => {
             codes.push(Bytecode::Lda(Reg(r)));
         }
@@ -141,6 +174,57 @@ fn ensure_acc(val: Value, alloc: &RegAlloc, codes: &mut Vec<Bytecode>) {
             // Already in acc, nothing to do.
         }
     }
+    Ok(())
+}
+
+/// Materialize one instruction's operands in spill-before-load order.
+///
+/// (a) Resolve every register operand first: the — at most one —
+///     Acc-colored register operand is spilled into the reserved in-frame
+///     spill slot via `Sta`, which reads but never clobbers the acc.
+/// (b) Only then bring the acc operand into the accumulator (`Lda` unless
+///     it is the acc-resident value itself).
+///
+/// The invariant that makes a single spill slot sufficient comes from the
+/// interference construction in `regalloc::build_interference`: all operands
+/// of one instruction are simultaneously live at that instruction, hence
+/// pairwise interfere (the later-defined operand's definition point sees the
+/// other operand live), hence the greedy coloring can assign `RegSlot::Acc`
+/// to at most one of them. A hand-crafted allocation may violate it; rather
+/// than emitting a spill sequence that would overwrite the first spill,
+/// selection fails hard.
+fn materialize_operands(
+    func_id: FuncId,
+    reg_operands: &[Value],
+    acc_operand: Option<Value>,
+    alloc: &RegAlloc,
+    codes: &mut Vec<Bytecode>,
+) -> Result<Vec<Reg>, LowerError> {
+    let mut acc_colored: Option<Value> = None;
+    for &v in reg_operands.iter().chain(acc_operand.iter()) {
+        if matches!(alloc.allocation.get(&v), Some(RegSlot::Acc)) {
+            match acc_colored {
+                None => acc_colored = Some(v),
+                Some(prev) if prev != v => {
+                    return Err(LowerError::MultipleAccOperands {
+                        func: func_id,
+                        a: prev,
+                        b: v,
+                    });
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    let mut regs = Vec::with_capacity(reg_operands.len());
+    for &v in reg_operands {
+        regs.push(val_reg(func_id, v, alloc, codes)?);
+    }
+    if let Some(acc_val) = acc_operand {
+        ensure_acc(func_id, acc_val, alloc, codes)?;
+    }
+    Ok(regs)
 }
 
 /// If the result should go to a register (not acc), emit sta.
@@ -152,26 +236,147 @@ fn store_result(result_slot: Option<RegSlot>, codes: &mut Vec<Bytecode>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{RegAlloc, val_reg};
-    use crate::entity::Value;
-    use abcd_isa::Bytecode;
+    use super::{LowerError, RegAlloc, RegSlot, ensure_acc, materialize_operands, val_reg};
+    use crate::entity::{FuncId, Value};
+    use abcd_isa::{Bytecode, Reg};
     use std::collections::HashMap;
 
-    #[test]
-    fn accumulator_spills_use_distinct_reserved_registers() {
-        let alloc = RegAlloc {
-            allocation: HashMap::new(),
+    const F: FuncId = FuncId(0);
+
+    fn alloc_with(slots: &[(Value, RegSlot)], spill_slot: Option<RegSlot>) -> RegAlloc {
+        RegAlloc {
+            allocation: slots.iter().copied().collect(),
             phi_copies: HashMap::new(),
-            num_regs: 0,
+            num_regs: 8,
             copy_temp: None,
-        };
+            spill_slot,
+        }
+    }
+
+    #[test]
+    fn acc_operand_spills_into_the_reserved_in_frame_slot() {
+        let v = Value::from_index(1);
+        let alloc = alloc_with(&[(v, RegSlot::Acc)], Some(RegSlot::Reg(7)));
         let mut codes = Vec::new();
-        let first = val_reg(Value::from_index(1), &alloc, &mut codes);
-        let second = val_reg(Value::from_index(2), &alloc, &mut codes);
-        assert_ne!(first, second);
-        assert!(matches!(codes[0], Bytecode::Sta(_)));
-        assert!(matches!(codes[1], Bytecode::Sta(_)));
-        assert_eq!(first.0 + 1, second.0);
+        let r = val_reg(F, v, &alloc, &mut codes).expect("spill must succeed");
+        assert_eq!(r, Reg(7));
+        assert!(
+            matches!(codes.as_slice(), [Bytecode::Sta(Reg(7))]),
+            "expected a single Sta into the reserved slot, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn reg_colored_operand_passes_through_without_emission() {
+        let v = Value::from_index(1);
+        let alloc = alloc_with(&[(v, RegSlot::Reg(2))], None);
+        let mut codes = Vec::new();
+        let r = val_reg(F, v, &alloc, &mut codes).expect("reg operand must resolve");
+        assert_eq!(r, Reg(2));
+        assert!(codes.is_empty(), "no lda/sta expected, got {codes:?}");
+    }
+
+    #[test]
+    fn acc_spill_without_reserved_slot_is_a_hard_error() {
+        let v = Value::from_index(1);
+        let alloc = alloc_with(&[(v, RegSlot::Acc)], None);
+        let mut codes = Vec::new();
+        assert!(
+            matches!(
+                val_reg(F, v, &alloc, &mut codes),
+                Err(LowerError::MissingSpillSlot(_))
+            ),
+            "an Acc-colored register operand with no reserved spill slot must fail"
+        );
+    }
+
+    #[test]
+    fn unallocated_operand_is_a_hard_error_not_silent_acc() {
+        let alloc = alloc_with(&[], None);
+        let mut codes = Vec::new();
+        let dangling = Value::from_index(42);
+        assert!(matches!(
+            val_reg(F, dangling, &alloc, &mut codes),
+            Err(LowerError::UnallocatedOperand { value, .. }) if value == dangling
+        ));
+        assert!(matches!(
+            ensure_acc(F, dangling, &alloc, &mut codes),
+            Err(LowerError::UnallocatedOperand { value, .. }) if value == dangling
+        ));
+    }
+
+    #[test]
+    fn spill_is_emitted_before_the_acc_load() {
+        // obj is Acc-colored and needed as a register operand; key is
+        // Reg-colored and needed in acc. The Sta must precede the Lda, or
+        // the spill would capture the key (B3).
+        let obj = Value::from_index(1);
+        let key = Value::from_index(2);
+        let alloc = alloc_with(
+            &[(obj, RegSlot::Acc), (key, RegSlot::Reg(0))],
+            Some(RegSlot::Reg(7)),
+        );
+        let mut codes = Vec::new();
+        let regs = materialize_operands(F, &[obj], Some(key), &alloc, &mut codes)
+            .expect("materialization must succeed");
+        assert_eq!(regs, vec![Reg(7)]);
+        assert!(
+            matches!(
+                codes.as_slice(),
+                [Bytecode::Sta(Reg(7)), Bytecode::Lda(Reg(0))]
+            ),
+            "expected Sta(spill) then Lda(key), got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn acc_resident_acc_operand_emits_no_load() {
+        // The unique Acc-colored value is the acc operand: nothing to spill,
+        // nothing to load.
+        let k = Value::from_index(1);
+        let o = Value::from_index(2);
+        let alloc = alloc_with(
+            &[(k, RegSlot::Acc), (o, RegSlot::Reg(0))],
+            Some(RegSlot::Reg(7)),
+        );
+        let mut codes = Vec::new();
+        let regs = materialize_operands(F, &[o], Some(k), &alloc, &mut codes)
+            .expect("materialization must succeed");
+        assert_eq!(regs, vec![Reg(0)]);
+        assert!(codes.is_empty(), "no lda/sta expected, got {codes:?}");
+    }
+
+    #[test]
+    fn the_same_acc_value_as_reg_and_acc_operand_spills_once() {
+        let v = Value::from_index(1);
+        let alloc = alloc_with(&[(v, RegSlot::Acc)], Some(RegSlot::Reg(7)));
+        let mut codes = Vec::new();
+        let regs = materialize_operands(F, &[v], Some(v), &alloc, &mut codes)
+            .expect("one value in both roles is not a conflict");
+        assert_eq!(regs, vec![Reg(7)]);
+        assert!(matches!(codes.as_slice(), [Bytecode::Sta(Reg(7))]));
+    }
+
+    #[test]
+    fn two_distinct_acc_colored_operands_are_rejected() {
+        // Violates the interference invariant (possible only with a
+        // hand-crafted allocation); must fail instead of overwriting the
+        // first spill with the second.
+        let a = Value::from_index(1);
+        let b = Value::from_index(2);
+        let alloc = alloc_with(
+            &[(a, RegSlot::Acc), (b, RegSlot::Acc)],
+            Some(RegSlot::Reg(7)),
+        );
+        let mut codes = Vec::new();
+        assert!(matches!(
+            materialize_operands(F, &[a], Some(b), &alloc, &mut codes),
+            Err(LowerError::MultipleAccOperands { .. })
+        ));
+        assert!(matches!(
+            materialize_operands(F, &[a, b], None, &alloc, &mut codes),
+            Err(LowerError::MultipleAccOperands { .. })
+        ));
     }
 }
 
@@ -185,12 +390,13 @@ fn select_inst(
     data: &InstData,
     result_slot: Option<RegSlot>,
     _inst: Inst,
+    func_id: FuncId,
     module: &Module,
     alloc: &RegAlloc,
     string_map: &HashMap<StringId, EntityId>,
     codes: &mut Vec<Bytecode>,
     ic: &mut IcAllocator,
-) {
+) -> Result<(), LowerError> {
     match data {
         // ── Literals ─────────────────────────────────────────────────
         InstData::LiteralUndefined => {
@@ -237,8 +443,8 @@ fn select_inst(
 
         // ── Binary operations ────────────────────────────────────────
         InstData::BinaryOp { op, left, right } => {
-            ensure_acc(*left, alloc, codes);
-            let r = val_reg(*right, alloc, codes);
+            let regs = materialize_operands(func_id, &[*right], Some(*left), alloc, codes)?;
+            let r = regs[0];
             let bc = match op {
                 BinOp::Add => Bytecode::Add2(ic.one(), r),
                 BinOp::Sub => Bytecode::Sub2(ic.one(), r),
@@ -269,7 +475,7 @@ fn select_inst(
 
         // ── Unary operations ─────────────────────────────────────────
         InstData::UnaryOp { op, operand } => {
-            ensure_acc(*operand, alloc, codes);
+            ensure_acc(func_id, *operand, alloc, codes)?;
             let bc = match op {
                 UnOp::Minus => Bytecode::Neg(ic.one()),
                 UnOp::LogicalNot => Bytecode::Not(ic.one()),
@@ -285,12 +491,12 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::IsTrue { operand } => {
-            ensure_acc(*operand, alloc, codes);
+            ensure_acc(func_id, *operand, alloc, codes)?;
             codes.push(Bytecode::Istrue);
             store_result(result_slot, codes);
         }
         InstData::IsFalse { operand } => {
-            ensure_acc(*operand, alloc, codes);
+            ensure_acc(func_id, *operand, alloc, codes)?;
             codes.push(Bytecode::Isfalse);
             store_result(result_slot, codes);
         }
@@ -322,12 +528,16 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::CreateObjectWithExcludedKeys { obj, keys } => {
-            let obj_r = val_reg(*obj, alloc, codes);
-            let start_r = if let Some(first) = keys.first() {
-                val_reg(*first, alloc, codes)
-            } else {
-                Reg(0)
-            };
+            // Only the object and the first key are register operands that
+            // need materialization; the remaining keys are assumed to occupy
+            // consecutive registers (approximate, pre-existing).
+            let mut reg_operands = vec![*obj];
+            if let Some(first) = keys.first() {
+                reg_operands.push(*first);
+            }
+            let regs = materialize_operands(func_id, &reg_operands, None, alloc, codes)?;
+            let obj_r = regs[0];
+            let start_r = if keys.is_empty() { Reg(0) } else { regs[1] };
             codes.push(Bytecode::Createobjectwithexcludedkeys(
                 Imm(keys.len() as i64),
                 obj_r,
@@ -340,16 +550,15 @@ fn select_inst(
         InstData::LoadProperty { object, key } => {
             match key {
                 PropKind::ByName(name) => {
-                    ensure_acc(*object, alloc, codes);
+                    ensure_acc(func_id, *object, alloc, codes)?;
                     codes.push(Bytecode::Ldobjbyname(ic.two(), eid(*name, string_map)));
                 }
                 PropKind::ByValue(k) => {
-                    ensure_acc(*k, alloc, codes);
-                    let obj_r = val_reg(*object, alloc, codes);
-                    codes.push(Bytecode::Ldobjbyvalue(ic.two(), obj_r));
+                    let regs = materialize_operands(func_id, &[*object], Some(*k), alloc, codes)?;
+                    codes.push(Bytecode::Ldobjbyvalue(ic.two(), regs[0]));
                 }
                 PropKind::ByIndex(idx) => {
-                    ensure_acc(*object, alloc, codes);
+                    ensure_acc(func_id, *object, alloc, codes)?;
                     codes.push(Bytecode::Ldobjbyindex(ic.two(), Imm(*idx as i64)));
                 }
             }
@@ -357,52 +566,45 @@ fn select_inst(
         }
         InstData::StoreProperty { object, key, value } => match key {
             PropKind::ByName(name) => {
-                ensure_acc(*value, alloc, codes);
-                let obj_r = val_reg(*object, alloc, codes);
+                let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
                 codes.push(Bytecode::Stobjbyname(
                     ic.two(),
                     eid(*name, string_map),
-                    obj_r,
+                    regs[0],
                 ));
             }
             PropKind::ByValue(k) => {
-                ensure_acc(*k, alloc, codes);
-                let obj_r = val_reg(*object, alloc, codes);
-                let val_r = val_reg(*value, alloc, codes);
-                codes.push(Bytecode::Stobjbyvalue(ic.two(), obj_r, val_r));
+                let regs =
+                    materialize_operands(func_id, &[*object, *value], Some(*k), alloc, codes)?;
+                codes.push(Bytecode::Stobjbyvalue(ic.two(), regs[0], regs[1]));
             }
             PropKind::ByIndex(idx) => {
-                ensure_acc(*value, alloc, codes);
-                let obj_r = val_reg(*object, alloc, codes);
-                codes.push(Bytecode::Stobjbyindex(ic.two(), obj_r, Imm(*idx as i64)));
+                let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
+                codes.push(Bytecode::Stobjbyindex(ic.two(), regs[0], Imm(*idx as i64)));
             }
         },
         InstData::StoreOwnProperty { object, key, value } => match key {
             PropKind::ByName(name) => {
-                ensure_acc(*value, alloc, codes);
-                let obj_r = val_reg(*object, alloc, codes);
+                let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
                 codes.push(Bytecode::Stownbyname(
                     ic.two(),
                     eid(*name, string_map),
-                    obj_r,
+                    regs[0],
                 ));
             }
             PropKind::ByValue(k) => {
-                ensure_acc(*value, alloc, codes);
-                let obj_r = val_reg(*object, alloc, codes);
-                let key_r = val_reg(*k, alloc, codes);
-                codes.push(Bytecode::Stownbyvalue(ic.two(), obj_r, key_r));
+                let regs =
+                    materialize_operands(func_id, &[*object, *k], Some(*value), alloc, codes)?;
+                codes.push(Bytecode::Stownbyvalue(ic.two(), regs[0], regs[1]));
             }
             PropKind::ByIndex(idx) => {
-                ensure_acc(*value, alloc, codes);
-                let obj_r = val_reg(*object, alloc, codes);
-                codes.push(Bytecode::Stownbyindex(ic.two(), obj_r, Imm(*idx as i64)));
+                let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
+                codes.push(Bytecode::Stownbyindex(ic.two(), regs[0], Imm(*idx as i64)));
             }
         },
         InstData::DeleteProperty { object, key } => {
-            ensure_acc(*object, alloc, codes);
-            let key_r = val_reg(*key, alloc, codes);
-            codes.push(Bytecode::Delobjprop(key_r));
+            let regs = materialize_operands(func_id, &[*key], Some(*object), alloc, codes)?;
+            codes.push(Bytecode::Delobjprop(regs[0]));
             store_result(result_slot, codes);
         }
         InstData::LoadSuperProperty { key } => {
@@ -411,7 +613,7 @@ fn select_inst(
                     codes.push(Bytecode::Ldsuperbyname(ic.two(), eid(*name, string_map)));
                 }
                 PropKind::ByValue(k) => {
-                    let key_r = val_reg(*k, alloc, codes);
+                    let key_r = val_reg(func_id, *k, alloc, codes)?;
                     codes.push(Bytecode::Ldsuperbyvalue(ic.two(), key_r));
                 }
                 PropKind::ByIndex(_) => {
@@ -422,7 +624,7 @@ fn select_inst(
         }
         InstData::StoreSuperProperty { key, value } => match key {
             PropKind::ByName(name) => {
-                let val_r = val_reg(*value, alloc, codes);
+                let val_r = val_reg(func_id, *value, alloc, codes)?;
                 codes.push(Bytecode::Stsuperbyname(
                     ic.two(),
                     eid(*name, string_map),
@@ -430,9 +632,8 @@ fn select_inst(
                 ));
             }
             PropKind::ByValue(k) => {
-                let key_r = val_reg(*k, alloc, codes);
-                let val_r = val_reg(*value, alloc, codes);
-                codes.push(Bytecode::Stsuperbyvalue(ic.two(), key_r, val_r));
+                let regs = materialize_operands(func_id, &[*k, *value], None, alloc, codes)?;
+                codes.push(Bytecode::Stsuperbyvalue(ic.two(), regs[0], regs[1]));
             }
             PropKind::ByIndex(_) => {}
         },
@@ -443,7 +644,7 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::StoreGlobalVar { name, value } => {
-            ensure_acc(*value, alloc, codes);
+            ensure_acc(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Stglobalvar(ic.one(), eid(*name, string_map)));
         }
         InstData::TryLoadGlobalByName { name } => {
@@ -454,7 +655,7 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::TryStoreGlobalByName { name, value } => {
-            ensure_acc(*value, alloc, codes);
+            ensure_acc(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Trystglobalbyname(
                 ic.one(),
                 eid(*name, string_map),
@@ -467,7 +668,7 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::StoreLexVar { level, slot, value } => {
-            ensure_acc(*value, alloc, codes);
+            ensure_acc(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Stlexvar(Imm(*level as i64), Imm(*slot as i64)));
         }
         InstData::NewLexEnv { num_vars } => {
@@ -498,7 +699,7 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::StoreModuleVar { index, value } => {
-            ensure_acc(*value, alloc, codes);
+            ensure_acc(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Stmodulevar(Imm(*index as i64)));
         }
         InstData::GetModuleNamespace { index } => {
@@ -506,7 +707,7 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::DynamicImport { specifier } => {
-            ensure_acc(*specifier, alloc, codes);
+            ensure_acc(func_id, *specifier, alloc, codes)?;
             codes.push(Bytecode::Dynamicimport);
             store_result(result_slot, codes);
         }
@@ -525,7 +726,7 @@ fn select_inst(
             length,
             home_object,
         } => {
-            ensure_acc(*home_object, alloc, codes);
+            ensure_acc(func_id, *home_object, alloc, codes)?;
             codes.push(Bytecode::Definemethod(
                 ic.one(),
                 eid(*method_id, string_map),
@@ -538,7 +739,7 @@ fn select_inst(
             literal_array,
             base,
         } => {
-            let base_r = val_reg(*base, alloc, codes);
+            let base_r = val_reg(func_id, *base, alloc, codes)?;
             codes.push(Bytecode::Defineclasswithbuffer(
                 ic.one(),
                 eid(*method_id, string_map),
@@ -554,19 +755,17 @@ fn select_inst(
             getter,
             setter,
         } => {
-            let obj_r = val_reg(*obj, alloc, codes);
-            let key_r = val_reg(*key, alloc, codes);
-            let getter_r = val_reg(*getter, alloc, codes);
-            let setter_r = val_reg(*setter, alloc, codes);
+            let regs =
+                materialize_operands(func_id, &[*obj, *key, *getter, *setter], None, alloc, codes)?;
             codes.push(Bytecode::Definegettersetterbyvalue(
-                obj_r, key_r, getter_r, setter_r,
+                regs[0], regs[1], regs[2], regs[3],
             ));
             store_result(result_slot, codes);
         }
 
         // ── Calls ────────────────────────────────────────────────────
         InstData::Call { kind, callee, args } => {
-            select_call(*kind, *callee, args, alloc, codes, ic);
+            select_call(*kind, *callee, args, func_id, alloc, codes, ic)?;
             store_result(result_slot, codes);
         }
 
@@ -598,34 +797,34 @@ fn select_inst(
 
         // ── Iterators ────────────────────────────────────────────────
         InstData::GetIterator { obj } => {
-            ensure_acc(*obj, alloc, codes);
+            ensure_acc(func_id, *obj, alloc, codes)?;
             codes.push(Bytecode::Getiterator(ic.two()));
             store_result(result_slot, codes);
         }
         InstData::GetAsyncIterator { obj } => {
-            ensure_acc(*obj, alloc, codes);
+            ensure_acc(func_id, *obj, alloc, codes)?;
             codes.push(Bytecode::Getasynciterator(ic.two()));
             store_result(result_slot, codes);
         }
         InstData::GetPropIterator { obj } => {
-            ensure_acc(*obj, alloc, codes);
+            ensure_acc(func_id, *obj, alloc, codes)?;
             codes.push(Bytecode::Getpropiterator);
             store_result(result_slot, codes);
         }
         InstData::CloseIterator { iterator } => {
-            let iter_r = val_reg(*iterator, alloc, codes);
+            let iter_r = val_reg(func_id, *iterator, alloc, codes)?;
             codes.push(Bytecode::Closeiterator(ic.two(), iter_r));
             store_result(result_slot, codes);
         }
 
         // ── Generator / Async ────────────────────────────────────────
         InstData::CreateGeneratorObj { func } => {
-            let func_r = val_reg(*func, alloc, codes);
+            let func_r = val_reg(func_id, *func, alloc, codes)?;
             codes.push(Bytecode::Creategeneratorobj(func_r));
             store_result(result_slot, codes);
         }
         InstData::SuspendGenerator { value } => {
-            let val_r = val_reg(*value, alloc, codes);
+            let val_r = val_reg(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Suspendgenerator(val_r));
             store_result(result_slot, codes);
         }
@@ -638,34 +837,33 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::AsyncFunctionAwaitUncaught { value } => {
-            let val_r = val_reg(*value, alloc, codes);
+            let val_r = val_reg(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Asyncfunctionawaituncaught(val_r));
             store_result(result_slot, codes);
         }
         InstData::AsyncFunctionResolve { value } => {
-            let val_r = val_reg(*value, alloc, codes);
+            let val_r = val_reg(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Asyncfunctionresolve(val_r));
             store_result(result_slot, codes);
         }
         InstData::AsyncFunctionReject { value } => {
-            let val_r = val_reg(*value, alloc, codes);
+            let val_r = val_reg(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Asyncfunctionreject(val_r));
             store_result(result_slot, codes);
         }
         InstData::CreateIterResultObj { value, done } => {
-            let val_r = val_reg(*value, alloc, codes);
-            let done_r = val_reg(*done, alloc, codes);
-            codes.push(Bytecode::Createiterresultobj(val_r, done_r));
+            let regs = materialize_operands(func_id, &[*value, *done], None, alloc, codes)?;
+            codes.push(Bytecode::Createiterresultobj(regs[0], regs[1]));
             store_result(result_slot, codes);
         }
 
         // ── Exception handling ───────────────────────────────────────
         InstData::Throw { value } => {
-            ensure_acc(*value, alloc, codes);
+            ensure_acc(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Throw);
         }
         InstData::ThrowIfNotObject { value } => {
-            let val_r = val_reg(*value, alloc, codes);
+            let val_r = val_reg(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::ThrowIfnotobject(val_r));
         }
         InstData::ThrowConstAssignment { .. } => {
@@ -673,15 +871,14 @@ fn select_inst(
             codes.push(Bytecode::ThrowConstassignment(Reg(0)));
         }
         InstData::ThrowUndefinedIfHole { name, value } => {
-            let val_r = val_reg(*value, alloc, codes);
-            // ThrowUndefinedifholewithname is simpler
+            // ThrowUndefinedifholewithname reads the value from the acc.
+            ensure_acc(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::ThrowUndefinedifholewithname(eid(
                 *name, string_map,
             )));
-            let _ = val_r;
         }
         InstData::ThrowIfSuperNotCorrectCall { value } => {
-            ensure_acc(*value, alloc, codes);
+            ensure_acc(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::ThrowIfsupernotcorrectcall(Imm(0)));
         }
         InstData::ThrowNotExists => {
@@ -707,10 +904,12 @@ fn select_inst(
         } => {
             // Try compare-branch fusion: if cond is IsTrue(CmpOp(a, b)),
             // emit a fused Jeq/Jne/Jstricteq/Jnstricteq instead of Jnez.
-            if let Some(fused) = try_fuse_cmp_branch(*cond, *true_dest, module, alloc, codes) {
+            if let Some(fused) =
+                try_fuse_cmp_branch(*cond, *true_dest, func_id, module, alloc, codes)?
+            {
                 codes.push(fused);
             } else {
-                ensure_acc(*cond, alloc, codes);
+                ensure_acc(func_id, *cond, alloc, codes)?;
                 // Emit: if acc truthy → jump to true_dest, fall through to false_dest
                 codes.push(Bytecode::Jnez(Label(true_dest.0)));
             }
@@ -720,7 +919,7 @@ fn select_inst(
         }
         InstData::Return { value } => {
             if let Some(val) = value {
-                ensure_acc(*val, alloc, codes);
+                ensure_acc(func_id, *val, alloc, codes)?;
                 codes.push(Bytecode::Return);
             } else {
                 codes.push(Bytecode::Returnundefined);
@@ -738,86 +937,80 @@ fn select_inst(
             codes.push(Bytecode::Debugger);
         }
     }
+    Ok(())
 }
 
 /// Select call bytecodes based on kind and argument count.
+///
+/// Every arm materializes operands in spill-before-load order: the argument
+/// registers are resolved first (spilling the at-most-one Acc-colored
+/// register operand), then the callee is brought into the acc.
 fn select_call(
     kind: CallKind,
     callee: Value,
     args: &[Value],
+    func_id: FuncId,
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
     ic: &mut IcAllocator,
-) {
+) -> Result<(), LowerError> {
     match kind {
-        CallKind::Call => {
-            ensure_acc(callee, alloc, codes);
-            match args.len() {
-                0 => codes.push(Bytecode::Callarg0(ic.two())),
-                1 => {
-                    let a0 = val_reg(args[0], alloc, codes);
-                    codes.push(Bytecode::Callarg1(ic.two(), a0));
-                }
-                2 => {
-                    let a0 = val_reg(args[0], alloc, codes);
-                    let a1 = val_reg(args[1], alloc, codes);
-                    codes.push(Bytecode::Callargs2(ic.two(), a0, a1));
-                }
-                3 => {
-                    let a0 = val_reg(args[0], alloc, codes);
-                    let a1 = val_reg(args[1], alloc, codes);
-                    let a2 = val_reg(args[2], alloc, codes);
-                    codes.push(Bytecode::Callargs3(ic.two(), a0, a1, a2));
-                }
-                n => {
-                    let start = val_reg(args[0], alloc, codes);
-                    codes.push(Bytecode::Callrange(ic.two(), Imm(n as i64), start));
-                }
+        CallKind::Call => match args.len() {
+            0 => {
+                materialize_operands(func_id, &[], Some(callee), alloc, codes)?;
+                codes.push(Bytecode::Callarg0(ic.two()));
             }
-        }
+            n @ (1..=3) => {
+                let regs = materialize_operands(func_id, args, Some(callee), alloc, codes)?;
+                let bc = match n {
+                    1 => Bytecode::Callarg1(ic.two(), regs[0]),
+                    2 => Bytecode::Callargs2(ic.two(), regs[0], regs[1]),
+                    _ => Bytecode::Callargs3(ic.two(), regs[0], regs[1], regs[2]),
+                };
+                codes.push(bc);
+            }
+            n => {
+                // Range calls pass only the first register; the rest are
+                // assumed to occupy consecutive registers (approximate,
+                // pre-existing).
+                let regs = materialize_operands(func_id, &args[..1], Some(callee), alloc, codes)?;
+                codes.push(Bytecode::Callrange(ic.two(), Imm(n as i64), regs[0]));
+            }
+        },
         CallKind::CallThis => {
-            ensure_acc(callee, alloc, codes);
             // args[0] = this, args[1..] = actual args
             match args.len() {
                 0 => {
                     // No this — shouldn't happen, but handle gracefully
+                    materialize_operands(func_id, &[], Some(callee), alloc, codes)?;
                     codes.push(Bytecode::Callarg0(ic.two()));
                 }
-                1 => {
-                    let this_r = val_reg(args[0], alloc, codes);
-                    codes.push(Bytecode::Callthis0(ic.two(), this_r));
-                }
-                2 => {
-                    let this_r = val_reg(args[0], alloc, codes);
-                    let a0 = val_reg(args[1], alloc, codes);
-                    codes.push(Bytecode::Callthis1(ic.two(), this_r, a0));
-                }
-                3 => {
-                    let this_r = val_reg(args[0], alloc, codes);
-                    let a0 = val_reg(args[1], alloc, codes);
-                    let a1 = val_reg(args[2], alloc, codes);
-                    codes.push(Bytecode::Callthis2(ic.two(), this_r, a0, a1));
-                }
-                4 => {
-                    let this_r = val_reg(args[0], alloc, codes);
-                    let a0 = val_reg(args[1], alloc, codes);
-                    let a1 = val_reg(args[2], alloc, codes);
-                    let a2 = val_reg(args[3], alloc, codes);
-                    codes.push(Bytecode::Callthis3(ic.two(), this_r, a0, a1, a2));
+                n @ (1..=4) => {
+                    let regs = materialize_operands(func_id, args, Some(callee), alloc, codes)?;
+                    let bc = match n {
+                        1 => Bytecode::Callthis0(ic.two(), regs[0]),
+                        2 => Bytecode::Callthis1(ic.two(), regs[0], regs[1]),
+                        3 => Bytecode::Callthis2(ic.two(), regs[0], regs[1], regs[2]),
+                        _ => Bytecode::Callthis3(ic.two(), regs[0], regs[1], regs[2], regs[3]),
+                    };
+                    codes.push(bc);
                 }
                 n => {
-                    let start = val_reg(args[0], alloc, codes);
-                    codes.push(Bytecode::Callthisrange(ic.two(), Imm(n as i64), start));
+                    let regs =
+                        materialize_operands(func_id, &args[..1], Some(callee), alloc, codes)?;
+                    codes.push(Bytecode::Callthisrange(ic.two(), Imm(n as i64), regs[0]));
                 }
             }
         }
         CallKind::SuperCall => {
-            ensure_acc(callee, alloc, codes);
-            let start = if args.is_empty() {
-                Reg(0)
-            } else {
-                val_reg(args[0], alloc, codes)
-            };
+            let regs = materialize_operands(
+                func_id,
+                &args[..1.min(args.len())],
+                Some(callee),
+                alloc,
+                codes,
+            )?;
+            let start = if args.is_empty() { Reg(0) } else { regs[0] };
             codes.push(Bytecode::Supercallthisrange(
                 ic.two(),
                 Imm(args.len() as i64),
@@ -825,12 +1018,14 @@ fn select_call(
             ));
         }
         CallKind::SuperCallArrow => {
-            ensure_acc(callee, alloc, codes);
-            let start = if args.is_empty() {
-                Reg(0)
-            } else {
-                val_reg(args[0], alloc, codes)
-            };
+            let regs = materialize_operands(
+                func_id,
+                &args[..1.min(args.len())],
+                Some(callee),
+                alloc,
+                codes,
+            )?;
+            let start = if args.is_empty() { Reg(0) } else { regs[0] };
             codes.push(Bytecode::Supercallarrowrange(
                 ic.two(),
                 Imm(args.len() as i64),
@@ -838,28 +1033,30 @@ fn select_call(
             ));
         }
         CallKind::SuperCallSpread => {
-            ensure_acc(callee, alloc, codes);
-            let arg_r = if args.is_empty() {
-                Reg(0)
-            } else {
-                val_reg(args[0], alloc, codes)
-            };
+            let regs = materialize_operands(
+                func_id,
+                &args[..1.min(args.len())],
+                Some(callee),
+                alloc,
+                codes,
+            )?;
+            let arg_r = if args.is_empty() { Reg(0) } else { regs[0] };
             codes.push(Bytecode::Supercallspread(ic.two(), arg_r));
         }
         CallKind::Apply => {
-            ensure_acc(callee, alloc, codes);
             if args.len() >= 2 {
-                let this_r = val_reg(args[0], alloc, codes);
-                let args_r = val_reg(args[1], alloc, codes);
-                codes.push(Bytecode::Apply(ic.two(), this_r, args_r));
+                let regs = materialize_operands(func_id, &args[..2], Some(callee), alloc, codes)?;
+                codes.push(Bytecode::Apply(ic.two(), regs[0], regs[1]));
             } else if args.len() == 1 {
-                let arg_r = val_reg(args[0], alloc, codes);
-                codes.push(Bytecode::Newobjapply(ic.two(), arg_r));
+                let regs = materialize_operands(func_id, &args[..1], Some(callee), alloc, codes)?;
+                codes.push(Bytecode::Newobjapply(ic.two(), regs[0]));
             } else {
+                materialize_operands(func_id, &[], Some(callee), alloc, codes)?;
                 codes.push(Bytecode::Callarg0(ic.two()));
             }
         }
     }
+    Ok(())
 }
 
 /// Try to fuse a compare + branch into a single bytecode.
@@ -867,18 +1064,20 @@ fn select_call(
 /// Pattern: `CondBranch(cond: IsTrue(BinaryOp { op: Eq|StrictEq|..., left, right }), true_dest)`
 /// → `Jeq(right_reg, true_dest)` with left in acc.
 ///
-/// Returns `Some(fused_bytecode)` if fusion succeeded, `None` otherwise.
+/// Returns `Ok(Some(fused_bytecode))` if fusion succeeded, `Ok(None)`
+/// otherwise.
 fn try_fuse_cmp_branch(
     cond: Value,
     true_dest: Block,
+    func_id: FuncId,
     module: &Module,
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
-) -> Option<Bytecode> {
+) -> Result<Option<Bytecode>, LowerError> {
     let cond_def = module.value(cond);
     let cond_inst = match cond_def.def {
         crate::module::ValueDef::Inst(i) => i,
-        _ => return None,
+        _ => return Ok(None),
     };
 
     // Check if cond is IsTrue { operand }
@@ -886,58 +1085,56 @@ fn try_fuse_cmp_branch(
         InstData::IsTrue { operand } => *operand,
         // If cond is directly a comparison (without IsTrue wrapper), also fuse.
         InstData::BinaryOp { op, left, right } => {
-            return fuse_binop_branch(*op, *left, *right, true_dest, alloc, codes);
+            return fuse_binop_branch(*op, *left, *right, true_dest, func_id, alloc, codes);
         }
-        _ => return None,
+        _ => return Ok(None),
     };
 
     // Check if inner_val is BinaryOp { op: comparison, left, right }
     let inner_def = module.value(inner_val);
     let inner_inst = match inner_def.def {
         crate::module::ValueDef::Inst(i) => i,
-        _ => return None,
+        _ => return Ok(None),
     };
 
     match &module.inst(inner_inst).data {
         InstData::BinaryOp { op, left, right } => {
-            fuse_binop_branch(*op, *left, *right, true_dest, alloc, codes)
+            fuse_binop_branch(*op, *left, *right, true_dest, func_id, alloc, codes)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 /// Emit a fused compare-branch for a BinOp comparison.
+///
+/// The comparison's operands follow the same spill-before-load ordering as
+/// any two-operand instruction: spill the register operand first, then load
+/// the acc operand.
 fn fuse_binop_branch(
     op: BinOp,
     left: Value,
     right: Value,
     true_dest: Block,
+    func_id: FuncId,
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
-) -> Option<Bytecode> {
-    let label = Label(true_dest.0);
-    match op {
-        BinOp::Eq => {
-            ensure_acc(left, alloc, codes);
-            let r = val_reg(right, alloc, codes);
-            Some(Bytecode::Jeq(r, label))
-        }
-        BinOp::NotEq => {
-            ensure_acc(left, alloc, codes);
-            let r = val_reg(right, alloc, codes);
-            Some(Bytecode::Jne(r, label))
-        }
-        BinOp::StrictEq => {
-            ensure_acc(left, alloc, codes);
-            let r = val_reg(right, alloc, codes);
-            Some(Bytecode::Jstricteq(r, label))
-        }
-        BinOp::StrictNotEq => {
-            ensure_acc(left, alloc, codes);
-            let r = val_reg(right, alloc, codes);
-            Some(Bytecode::Jnstricteq(r, label))
-        }
-        // No fused bytecodes for Less/Greater/etc in ABC ISA.
-        _ => None,
+) -> Result<Option<Bytecode>, LowerError> {
+    // Only the Eq family has fused branch bytecodes in the ABC ISA; for
+    // Less/Greater/etc there is nothing to fuse.
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::StrictEq | BinOp::StrictNotEq
+    ) {
+        return Ok(None);
     }
+    let label = Label(true_dest.0);
+    let regs = materialize_operands(func_id, &[right], Some(left), alloc, codes)?;
+    let r = regs[0];
+    Ok(Some(match op {
+        BinOp::Eq => Bytecode::Jeq(r, label),
+        BinOp::NotEq => Bytecode::Jne(r, label),
+        BinOp::StrictEq => Bytecode::Jstricteq(r, label),
+        // Only StrictNotEq remains (guarded above).
+        _ => Bytecode::Jnstricteq(r, label),
+    }))
 }

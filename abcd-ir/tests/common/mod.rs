@@ -2,7 +2,7 @@
 //! regression tests.
 //!
 //! It supports only the opcodes the crafted sequences use
-//! (`Lda`/`Sta`/`Mov`/`Ldai`/`Sub2`/`Greater`/`Jmp`/`Jnez`/`Return`/
+//! (`Lda`/`Sta`/`Mov`/`Ldai`/`Add2`/`Sub2`/`Greater`/`Jmp`/`Jnez`/`Return`/
 //! `Returnundefined`, no-op `Stobjbyname`, plus record-and-stop for
 //! `Stobjbyvalue`). Labels in `layout` output are already resolved to
 //! absolute instruction indices by `resolve_labels`, so jumps use the label
@@ -80,6 +80,13 @@ impl Machine {
                 }
                 Bytecode::Ldai(imm) => {
                     self.acc = imm.0;
+                    pc += 1;
+                }
+                // `add2 imm:u8, v:in:top` with `acc: inout:top`
+                // (vendor arkcompiler_runtime_core-master/isa/isa.yaml line 590):
+                // acc = acc + v0 (ic slot operand ignored).
+                Bytecode::Add2(_, r) => {
+                    self.acc += self.reg(r.0);
                     pc += 1;
                 }
                 // `sub2 imm, v0` — acc = acc - v0 (ic slot operand ignored).

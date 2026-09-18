@@ -25,11 +25,16 @@ pub struct RegAlloc {
     /// Key: (predecessor, successor). Value: (src, dst) copies.
     pub phi_copies: HashMap<(Block, Block), Vec<(Value, Value)>>,
     /// Total registers used (excluding accumulator), including the reserved
-    /// `copy_temp` register when present.
+    /// `copy_temp` and `spill_slot` registers when present.
     pub num_regs: u16,
     /// Reserved real register for breaking slot-level copy cycles in layout.
     /// `Some` iff the function has any phi copies; never assigned to a value.
     pub copy_temp: Option<RegSlot>,
+    /// Reserved real register for isel's intra-instruction accumulator spills
+    /// (an Acc-colored value needed as a register operand). `Some` iff any
+    /// allocated value is `RegSlot::Acc`; always a `RegSlot::Reg`; never
+    /// assigned to a value.
+    pub spill_slot: Option<RegSlot>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,9 +50,9 @@ pub enum RegSlot {
     Acc,
 }
 
-/// Registers reserved for short-lived accumulator spills emitted by isel.
+/// Ceiling for allocated (and reserved) registers. Slots at or above this
+/// base are outside the declared frame; nothing may be assigned there.
 pub const TEMP_REG_BASE: u16 = 0xfff0;
-pub const TEMP_REG_COUNT: u16 = 16;
 
 /// Re-export compute_rpo for backward compatibility.
 pub fn compute_rpo(module: &Module, func_id: FuncId) -> Vec<Block> {
@@ -83,6 +88,7 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
             phi_copies: HashMap::new(),
             num_regs: 0,
             copy_temp: None,
+            spill_slot: None,
         });
     }
     // Step 1: Exact backward dataflow liveness.
@@ -117,11 +123,28 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
         None
     };
 
+    // Step 7: When any value lives in the accumulator, reserve exactly one
+    // real register as isel's intra-instruction spill slot. The reservation
+    // order is deterministic: `copy_temp` (step 6) first, then `spill_slot`,
+    // each taking the current `num_regs` and incrementing it. Both registers
+    // are therefore distinct, in-frame, and disjoint from every colored slot.
+    let spill_slot = if allocation.values().any(|&slot| slot == RegSlot::Acc) {
+        let spill = num_regs;
+        if spill >= TEMP_REG_BASE {
+            return Err(RegAllocError::RegisterOverflow);
+        }
+        num_regs += 1;
+        Some(RegSlot::Reg(spill))
+    } else {
+        None
+    };
+
     Ok(RegAlloc {
         allocation,
         phi_copies,
         num_regs,
         copy_temp,
+        spill_slot,
     })
 }
 

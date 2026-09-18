@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use abcd_isa::EntityId;
 
-use crate::entity::{FuncId, StringId};
+use crate::entity::{FuncId, StringId, Value};
 use crate::module::Module;
 
 pub use self::layout::LayoutResult;
@@ -31,6 +31,17 @@ pub enum LowerError {
         "function {0:?} has a slot-level phi copy cycle but no reserved copy temporary register"
     )]
     MissingCopyTemp(FuncId),
+    #[error("function {func:?} uses value {value:?} that register allocation never colored")]
+    UnallocatedOperand { func: FuncId, value: Value },
+    #[error(
+        "function {0:?} has an accumulator-colored register operand but no reserved spill register"
+    )]
+    MissingSpillSlot(FuncId),
+    #[error(
+        "function {func:?} has an instruction with two distinct accumulator-colored operands \
+         ({a:?} and {b:?}); the interference invariant guarantees at most one"
+    )]
+    MultipleAccOperands { func: FuncId, a: Value, b: Value },
 }
 
 /// Lower a single IR function back to bytecodes.
@@ -51,7 +62,7 @@ pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, 
     let rpo = regalloc::compute_rpo(module, func_id);
 
     // Step 3: Instruction selection.
-    let isel_result = isel::select(module, func_id, &alloc, &rpo, &string_map);
+    let isel_result = isel::select(module, func_id, &alloc, &rpo, &string_map)?;
     if let Some(message) = isel_result.unsupported.clone() {
         return Err(LowerError::UnsupportedInstruction {
             func: func_id,
