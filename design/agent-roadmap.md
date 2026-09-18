@@ -73,7 +73,7 @@ Phase 2 新发现（worker P2-T1，orchestrator 已核实 lift/mod.rs:192）：
 
 - B5：`lift/mod.rs` 用 `method.arg_types.len()` 播种 `param_count`，但 12.0.x+ 文件无 proto shorty（格式事实 #A7）→ arg_types 为空 → IR param_count=0 → lowered 帧 num_args=0，而调用方仍按原 num_args 压参 → VM 越帧读写 → SIGSEGV。修复方向：param_count 改从 code header 的 num_args 播种（arg_types 仅在有 shorty 的版本提供类型信息）。**B5 + 参数 ABI 顶槽问题是 VM oracle 通过的前置条件，Phase 3 参数所有权三连修需提前。**
 
-| 2.2 | 参数 ABI 修复（提前自 Phase 3）：param_count 从 code header num_args 播种（B5）+ 参数钉到帧顶槽位（num_vregs..num_vregs+num_args）+ num_vregs 不再含参数 | 待定 | 未开始 |
+| 2.2 | 参数 ABI 修复（提前自 Phase 3）：param_count 从 code header num_args 播种（B5）+ entry 参数播种（空 phi 洞）+ lower 拷贝式 prologue（ABI 顶槽→参数宿主）| worker P2-T2 (k3) | **进行中** |
 
 ## 审计纪律
 
