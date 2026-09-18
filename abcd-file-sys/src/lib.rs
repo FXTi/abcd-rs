@@ -307,4 +307,140 @@ mod tests {
             abc_file_close(f);
         }
     }
+
+    /// Regression test for review finding #3: a header whose declared
+    /// file_size exceeds the supplied buffer must be rejected at open.
+    /// Vendor Spans are sized from file_size and bounds-check only via
+    /// ASSERT (gone under NDEBUG), so opening such a file would allow
+    /// heap OOB reads later.
+    #[test]
+    fn open_rejects_inflated_file_size() {
+        unsafe {
+            let mut data: Vec<u8> = Vec::new();
+            data.extend_from_slice(b"PANDA\0\0\0"); // magic (8)
+            data.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            data.extend_from_slice(&[12, 0, 2, 0]); // version
+            data.extend_from_slice(&0xFFFFFF00u32.to_le_bytes()); // file_size (inflated)
+            for _ in 0..10 {
+                data.extend_from_slice(&0u32.to_le_bytes()); // remaining header fields
+            }
+            assert_eq!(data.len(), 60);
+
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(f.is_null(), "inflated file_size must fail open");
+            let err = abc_file_open_error();
+            assert!(!err.is_null(), "open error must be set");
+            let msg = std::ffi::CStr::from_ptr(err).to_string_lossy();
+            assert!(msg.contains("file_size"), "unexpected error: {msg}");
+        }
+    }
+
+    /// Regression test for review finding #4: the tolerant literal
+    /// enumerator must deliver a typed-array (ARRAY_*) literal exactly
+    /// once — the value is the offset of the array data — then stop,
+    /// matching vendor EnumerateLiteralVals semantics.
+    #[test]
+    fn literal_array_tag_value_is_delivered() {
+        unsafe extern "C" fn collect(val: *const AbcLiteralVal, ctx: *mut std::ffi::c_void) {
+            unsafe {
+                let v = &*val;
+                let out = &mut *(ctx as *mut Vec<(u8, u32)>);
+                out.push((v.tag, v.data.u32_val));
+            }
+        }
+
+        unsafe {
+            let mut data: Vec<u8> = Vec::new();
+            data.extend_from_slice(b"PANDA\0\0\0"); // magic (8)
+            data.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            data.extend_from_slice(&[12, 0, 2, 0]); // version
+            data.extend_from_slice(&0u32.to_le_bytes()); // file_size (patched below)
+            data.extend_from_slice(&0u32.to_le_bytes()); // foreign_off
+            data.extend_from_slice(&0u32.to_le_bytes()); // foreign_size
+            data.extend_from_slice(&0u32.to_le_bytes()); // num_classes
+            data.extend_from_slice(&0u32.to_le_bytes()); // class_idx_off
+            data.extend_from_slice(&0u32.to_le_bytes()); // num_lnps
+            data.extend_from_slice(&0u32.to_le_bytes()); // lnp_idx_off
+            data.extend_from_slice(&1u32.to_le_bytes()); // num_literalarrays
+            data.extend_from_slice(&64u32.to_le_bytes()); // literalarray_idx_off
+            data.extend_from_slice(&0u32.to_le_bytes()); // num_indexes
+            data.extend_from_slice(&0u32.to_le_bytes()); // index_section_off
+            assert_eq!(data.len(), 60);
+            data.extend_from_slice(&[0u8; 4]); // filler to offset 64
+            // Literal array index table at 64: one entry -> array at 68.
+            data.extend_from_slice(&68u32.to_le_bytes());
+            // Literal array at 68: count=2 (one [tag][value] pair),
+            // tag = ARRAY_U8 (0x0b), then the 4-byte array payload.
+            data.extend_from_slice(&2u32.to_le_bytes());
+            data.push(0x0b);
+            data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+            let file_size = data.len() as u32;
+            data[16..20].copy_from_slice(&file_size.to_le_bytes());
+
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null(), "open should succeed");
+            let a = abc_literal_open(f, 64);
+            assert!(!a.is_null(), "literal open should succeed");
+
+            let mut seen: Vec<(u8, u32)> = Vec::new();
+            abc_literal_enumerate_vals(
+                a,
+                68,
+                Some(collect),
+                &mut seen as *mut Vec<(u8, u32)> as *mut std::ffi::c_void,
+            );
+            assert_eq!(
+                seen.len(),
+                1,
+                "ARRAY_* value must be delivered exactly once"
+            );
+            assert_eq!(seen[0].0, 0x0b, "tag must be ARRAY_U8");
+            // The value is the file offset of the array payload:
+            // 68 (array) + 4 (count) + 1 (tag).
+            assert_eq!(seen[0].1, 73, "value must be the array data offset");
+
+            abc_literal_close(a);
+            abc_file_close(f);
+        }
+    }
+
+    /// Regression test for review finding #10: abc_annotation_array_read
+    /// must reject an element_size outside {1, 2, 4, 8} instead of
+    /// memcpy-ing past its 8-byte stack value.
+    #[test]
+    fn annotation_array_read_rejects_bad_element_size() {
+        unsafe {
+            // Minimal openable file: header only, all sections empty.
+            let mut data: Vec<u8> = Vec::new();
+            data.extend_from_slice(b"PANDA\0\0\0"); // magic (8)
+            data.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            data.extend_from_slice(&[12, 0, 2, 0]); // version
+            data.extend_from_slice(&0u32.to_le_bytes()); // file_size (patched below)
+            for _ in 0..10 {
+                data.extend_from_slice(&0u32.to_le_bytes()); // remaining header fields
+            }
+            data.extend_from_slice(&[0u8; 4]); // filler so offset 64 is valid
+            let file_size = data.len() as u32;
+            data[16..20].copy_from_slice(&file_size.to_le_bytes());
+
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null(), "open should succeed");
+
+            let mut buf = [0u64; 1];
+            assert_eq!(
+                abc_annotation_array_read(f, 64, 16, 1, buf.as_mut_ptr(), 1),
+                -1
+            );
+            assert_eq!(
+                abc_annotation_array_read(f, 64, 0, 1, buf.as_mut_ptr(), 1),
+                -1
+            );
+            assert_eq!(
+                abc_annotation_array_read(f, 64, 3, 1, buf.as_mut_ptr(), 1),
+                -1
+            );
+
+            abc_file_close(f);
+        }
+    }
 }

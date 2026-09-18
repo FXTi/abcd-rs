@@ -399,6 +399,15 @@ try {
         g_open_error = "bad magic";
         return nullptr;
     }
+    // #3: reject a header whose declared file_size exceeds the buffer before
+    // allocating the padded copy. Vendor Spans are sized from file_size and
+    // bounds-check only via ASSERT (compiled out under NDEBUG), so an
+    // inflated file_size would turn later reads into heap OOB.
+    auto *header = reinterpret_cast<const File::Header *>(data);
+    if (header->file_size > len) {
+        g_open_error = "declared file_size exceeds buffer";
+        return nullptr;
+    }
     try {
         constexpr size_t PADDING = 16;  // slack for 4/5-byte block reads (#A3)
         std::vector<uint8_t> padded(data, data + len);
@@ -1808,6 +1817,41 @@ static void literal_val_to_c(const LiteralDA::LiteralValue &val, LiteralTag tag,
 //   - stops (never aborts) on unknown tags or truncated items.
 static constexpr size_t TAG_SIZE_BC = 1;
 
+// #13: pin every tag literal used in the switch below to the vendored
+// LiteralTag enum, so an upstream renumber fails to compile instead of
+// silently corrupting decode. TAGVALUE and INTEGER_8 are the same value
+// (0x00) upstream; we pin TAGVALUE only.
+static_assert(static_cast<uint8_t>(LiteralTag::TAGVALUE) == 0x00);  // INTEGER_8 aliases TAGVALUE
+static_assert(static_cast<uint8_t>(LiteralTag::BOOL) == 0x01);
+static_assert(static_cast<uint8_t>(LiteralTag::INTEGER) == 0x02);
+static_assert(static_cast<uint8_t>(LiteralTag::FLOAT) == 0x03);
+static_assert(static_cast<uint8_t>(LiteralTag::DOUBLE) == 0x04);
+static_assert(static_cast<uint8_t>(LiteralTag::STRING) == 0x05);
+static_assert(static_cast<uint8_t>(LiteralTag::METHOD) == 0x06);
+static_assert(static_cast<uint8_t>(LiteralTag::GENERATORMETHOD) == 0x07);
+static_assert(static_cast<uint8_t>(LiteralTag::ACCESSOR) == 0x08);
+static_assert(static_cast<uint8_t>(LiteralTag::METHODAFFILIATE) == 0x09);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_U1) == 0x0a);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_U8) == 0x0b);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_I8) == 0x0c);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_U16) == 0x0d);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_I16) == 0x0e);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_U32) == 0x0f);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_I32) == 0x10);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_U64) == 0x11);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_I64) == 0x12);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_F32) == 0x13);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_F64) == 0x14);
+static_assert(static_cast<uint8_t>(LiteralTag::ARRAY_STRING) == 0x15);
+static_assert(static_cast<uint8_t>(LiteralTag::ASYNCGENERATORMETHOD) == 0x16);
+static_assert(static_cast<uint8_t>(LiteralTag::LITERALBUFFERINDEX) == 0x17);
+static_assert(static_cast<uint8_t>(LiteralTag::LITERALARRAY) == 0x18);
+static_assert(static_cast<uint8_t>(LiteralTag::BUILTINTYPEINDEX) == 0x19);
+static_assert(static_cast<uint8_t>(LiteralTag::GETTER) == 0x1a);
+static_assert(static_cast<uint8_t>(LiteralTag::SETTER) == 0x1b);
+static_assert(static_cast<uint8_t>(LiteralTag::ETS_IMPLEMENTS) == 0x1c);
+static_assert(static_cast<uint8_t>(LiteralTag::NULLVALUE) == 0xff);
+
 static void abc_literal_enumerate_vals_tolerant(const File *file, uint32_t array_off,
                                                 AbcLiteralValCb cb, void *ctx) {
     auto sp = file->GetSpanFromId(File::EntityId(array_off));
@@ -1897,7 +1941,11 @@ static void abc_literal_enumerate_vals_tolerant(const File *file, uint32_t array
             case 0x15:  // ARRAY_STRING: value = offset of the typed array data
                 out.tag = tag;
                 out.data.u32_val = file->GetIdFromPointer(sp.data()).GetOffset();
-                return;  // the rest of the item is the array payload
+                // Vendor semantics (literal_data_accessor-inl.h:94-115):
+                // deliver the array-data offset once, then stop — the rest
+                // of the item is the array payload.
+                cb(&out, ctx);
+                return;
             default:
                 return;  // unknown tag: stop, never abort
         }
@@ -2140,6 +2188,8 @@ int abc_annotation_array_read(const AbcFileHandle *f, uint32_t entity_off,
                                uint32_t element_size, uint32_t count,
                                uint64_t *out_values, uint32_t max_count) {
 try {
+    // #10: element_size feeds memcpy into an 8-byte uint64_t — whitelist it.
+    if (element_size != 1 && element_size != 2 && element_size != 4 && element_size != 8) return -1;
     auto sp = f->file->GetSpanFromId(File::EntityId(entity_off));
     if (sp.empty()) return -1;
 
