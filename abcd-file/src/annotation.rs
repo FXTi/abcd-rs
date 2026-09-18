@@ -1,3 +1,5 @@
+use abcd_file_sys as sys;
+
 /// Annotation element with resolved name.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnnotationElem {
@@ -9,37 +11,37 @@ pub struct AnnotationElem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum MethodHandleType {
-    PutStatic = 0,
-    GetStatic = 1,
-    PutInstance = 2,
-    GetInstance = 3,
-    InvokeStatic = 4,
-    InvokeInstance = 5,
-    InvokeConstructor = 6,
-    InvokeDirect = 7,
-    InvokeInterface = 8,
+    PutStatic = sys::MethodHandleType_PUT_STATIC,
+    GetStatic = sys::MethodHandleType_GET_STATIC,
+    PutInstance = sys::MethodHandleType_PUT_INSTANCE,
+    GetInstance = sys::MethodHandleType_GET_INSTANCE,
+    InvokeStatic = sys::MethodHandleType_INVOKE_STATIC,
+    InvokeInstance = sys::MethodHandleType_INVOKE_INSTANCE,
+    InvokeConstructor = sys::MethodHandleType_INVOKE_CONSTRUCTOR,
+    InvokeDirect = sys::MethodHandleType_INVOKE_DIRECT,
+    InvokeInterface = sys::MethodHandleType_INVOKE_INTERFACE,
 }
 
 impl MethodHandleType {
     /// Convert a raw byte to a `MethodHandleType`.
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0 => Some(Self::PutStatic),
-            1 => Some(Self::GetStatic),
-            2 => Some(Self::PutInstance),
-            3 => Some(Self::GetInstance),
-            4 => Some(Self::InvokeStatic),
-            5 => Some(Self::InvokeInstance),
-            6 => Some(Self::InvokeConstructor),
-            7 => Some(Self::InvokeDirect),
-            8 => Some(Self::InvokeInterface),
+            x if x == sys::MethodHandleType_PUT_STATIC => Some(Self::PutStatic),
+            x if x == sys::MethodHandleType_GET_STATIC => Some(Self::GetStatic),
+            x if x == sys::MethodHandleType_PUT_INSTANCE => Some(Self::PutInstance),
+            x if x == sys::MethodHandleType_GET_INSTANCE => Some(Self::GetInstance),
+            x if x == sys::MethodHandleType_INVOKE_STATIC => Some(Self::InvokeStatic),
+            x if x == sys::MethodHandleType_INVOKE_INSTANCE => Some(Self::InvokeInstance),
+            x if x == sys::MethodHandleType_INVOKE_CONSTRUCTOR => Some(Self::InvokeConstructor),
+            x if x == sys::MethodHandleType_INVOKE_DIRECT => Some(Self::InvokeDirect),
+            x if x == sys::MethodHandleType_INVOKE_INTERFACE => Some(Self::InvokeInterface),
             _ => None,
         }
     }
 
     /// Returns `true` for field operations (Put/Get Static/Instance).
     pub fn is_field_op(self) -> bool {
-        (self as u8) <= 3
+        (self as u8) <= sys::MethodHandleType_GET_INSTANCE
     }
 }
 

@@ -37,6 +37,10 @@ impl TryFrom<i8> for FileType {
 ///
 /// Stored in the binary as a char via `GetTypeAsChar` (scalar) and
 /// `GetArrayTypeAsChar` (array). Both encodings are merged here.
+///
+/// The C++ static_asserts in `file_bridge.cpp` pin the char encodings
+/// against `pandasm::Value`; if upstream changes them the C++ build fails
+/// before this table can drift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum AnnotationValueType {

@@ -151,6 +151,7 @@ fn main() {
         .allowlist_type("panda::panda_file::FunctionKind")
         .allowlist_type("panda::panda_file::SourceLang")
         .allowlist_type("panda::panda_file::Type_TypeId")
+        .allowlist_type("panda::panda_file::MethodHandleType")
         .constified_enum(".*")
         .disable_name_namespacing()
         .generate()

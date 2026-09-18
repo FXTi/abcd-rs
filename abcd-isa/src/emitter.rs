@@ -3,10 +3,6 @@ use std::ptr;
 
 use abcd_isa_sys::Bytecode;
 
-// C bridge error codes (from isa_bridge.h).
-const ISA_EMIT_UNKNOWN_OPCODE: i32 = -3;
-const ISA_EMIT_OPERAND_OUT_OF_RANGE: i32 = -4;
-
 /// Errors from [`encode`].
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
@@ -95,7 +91,11 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
         if let Some(&cpp_id) = targets.get(&(i as u32)) {
             // SAFETY: raw is non-null; cpp_id was returned by create_label.
             let rc = unsafe { abcd_isa_sys::isa_emitter_bind(raw, cpp_id) };
-            debug_assert_eq!(rc, 0, "isa_emitter_bind failed for label {cpp_id}");
+            debug_assert_eq!(
+                rc,
+                abcd_isa_sys::ISA_EMIT_OK as i32,
+                "isa_emitter_bind failed for label {cpp_id}"
+            );
         }
 
         let (opcode, mut args, num_args) = bc.emit_args();
@@ -110,9 +110,11 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
         // with at least num_args elements.
         let rc = unsafe { abcd_isa_sys::isa_emitter_emit(raw, opcode, args.as_ptr(), num_args) };
         match rc {
-            0 => {}
-            ISA_EMIT_UNKNOWN_OPCODE => return Err(EncodeError::UnknownOpcode),
-            ISA_EMIT_OPERAND_OUT_OF_RANGE => return Err(EncodeError::OperandOutOfRange),
+            x if x == abcd_isa_sys::ISA_EMIT_OK as i32 => {}
+            abcd_isa_sys::ISA_EMIT_UNKNOWN_OPCODE => return Err(EncodeError::UnknownOpcode),
+            abcd_isa_sys::ISA_EMIT_OPERAND_OUT_OF_RANGE => {
+                return Err(EncodeError::OperandOutOfRange);
+            }
             _ => return Err(EncodeError::Internal),
         }
     }
@@ -123,7 +125,7 @@ pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeEr
     // SAFETY: raw is non-null; buf and len are valid mutable references.
     let rc = unsafe { abcd_isa_sys::isa_emitter_build(raw, &mut buf, &mut len) };
     match rc {
-        0 if !buf.is_null() => {
+        x if x == abcd_isa_sys::ISA_BUILD_OK as i32 && !buf.is_null() => {
             // SAFETY: buf is non-null (match guard) and points to `len` bytes
             // allocated by isa_emitter_build.
             let vec = unsafe { std::slice::from_raw_parts(buf, len) }.to_vec();
