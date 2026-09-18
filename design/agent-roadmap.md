@@ -67,7 +67,13 @@ Phase 1 复审中新登记（不进本期范围）：
 
 | # | 任务 | 执行者 | 状态 |
 |---|------|--------|------|
-| 2.1 | corpus_lower_oracle：decode→lift→(optimize)→lower→to_method_body→encode 全链路重写 passed fixture，写盘 + `compare-rewritten-corpus.py` VM 对照；算术用例先行，lift-only 与 lift+optimize 分开报告 | worker P2-T1 (k3) | **进行中** |
+| 2.1 | corpus_lower_oracle：decode→lift→(optimize)→lower→to_method_body→encode 全链路重写 passed fixture，写盘 + `compare-rewritten-corpus.py` VM 对照；算术用例先行，lift-only 与 lift+optimize 分开报告 | worker P2-T1 (k3) | **完成**（f4c68f1；36/36 重写成功 0 skip；VM oracle 0/18——失败签名两种：9/11 NaN（参数 ABI 已知限制），12+ SIGSEGV（新发现 B5）） |
+
+Phase 2 新发现（worker P2-T1，orchestrator 已核实 lift/mod.rs:192）：
+
+- B5：`lift/mod.rs` 用 `method.arg_types.len()` 播种 `param_count`，但 12.0.x+ 文件无 proto shorty（格式事实 #A7）→ arg_types 为空 → IR param_count=0 → lowered 帧 num_args=0，而调用方仍按原 num_args 压参 → VM 越帧读写 → SIGSEGV。修复方向：param_count 改从 code header 的 num_args 播种（arg_types 仅在有 shorty 的版本提供类型信息）。**B5 + 参数 ABI 顶槽问题是 VM oracle 通过的前置条件，Phase 3 参数所有权三连修需提前。**
+
+| 2.2 | 参数 ABI 修复（提前自 Phase 3）：param_count 从 code header num_args 播种（B5）+ 参数钉到帧顶槽位（num_vregs..num_vregs+num_args）+ num_vregs 不再含参数 | 待定 | 未开始 |
 
 ## 审计纪律
 

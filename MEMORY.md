@@ -175,6 +175,17 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   slots (frame = num_vregs + num_args). Lowered bodies that READ arguments
   are therefore not runtime-correct yet; to_method_body writes
   num_vregs = num_regs (includes params — oversized frame, harmless).
+- Phase 2.1 (corpus lower oracle, f4c68f1): lowered bodies now reach the VM
+  oracle — `abcd-ir/tests/corpus_lower_oracle.rs` writes
+  `$ABCD_LOWERED_DIR/{lift,opt}/...` (all-or-nothing per fixture), compared
+  by scripts/compare-rewritten-corpus.py. First arithmetic run: 36/36
+  rewrites succeeded, VM 0/18 in both variants. Signatures: 9/11 → NaN
+  (param ABI above); 12+ → SIGSEGV — NEW BUG B5: lift seeds `param_count`
+  from `method.arg_types.len()` (lift/mod.rs:192), but 12.0.x+ protos carry
+  no shorty (#A7), so arg_types is empty and the lowered frame declares
+  num_args=0 while call sites push real args → out-of-frame VM crash.
+  B5 fix + top-of-frame param pinning are the gate for VM-oracle progress
+  (Phase 3 param work pulled forward as Phase 2.2).
 - B4 registered for Phase 3 / IR v0.2: the acc-as-color model does not track
   physical acc clobbering across instructions (an Acc-colored value live
   across an Lda-emitting instruction loses its content).
