@@ -160,6 +160,19 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   test-branch-elimination 18/18→0/18 and infinite-loops for-in (V6).
   Optimizer is net-positive overall (+72 passes) but V6 blocks widening
   opt coverage.
+- S6 RESOLVED (9dad2cb) with a root-cause correction: the corpus trigger
+  was NOT fusion but a regalloc liveness hole — block_succs follows only
+  terminators, so try bodies ending in Throw/Unreachable had empty
+  live-out; handler-read values never interfered and were all Acc-colored
+  until the handler's own materialize_operands errored. Fix: liveness
+  augments try-region→handler edges, and handler live-in values are never
+  Acc-colored (exception dispatch physically clobbers acc). The fusion
+  unsoundness (liveness extension + acc clobber + slot-reuse window) was
+  real but latent — now gated on same-block adjacency + Reg-colored
+  operands + no result-slot sharing, else unfused fallback. Corpus delta:
+  lift 1011→1029 written, lower-other 18→0 (orchestrator-verified). The
+  unskipped try-catch fixtures still fail the VM on V1-family wrong values
+  (0/18) — expected, tracked there.
 
 ## Phase 1 outcome (done, 2026-09-19)
 

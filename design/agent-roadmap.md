@@ -89,7 +89,7 @@ Phase 2 新发现（worker P2-T1，orchestrator 已核实 lift/mod.rs:192）：
 | S3 | object-spread lower-untraceable:StringId（func_main_0 raw 0x7-0x9 不在 entity_offsets） | 18 skip | 待诊断 |
 | S4 | ark_disasm 'This line should be unreachable' abort——我们 encode 出的字节码让上游反汇编器崩溃（module-exports×12 + test-namespace×12 + test-constant-propagation×12） | 36 VM 失败 | 待诊断（严重：输出畸形） |
 | S5 | 13.0.1.0-only abort 'F/pandafile: Invalid span offset'（module-exports/test-namespace/test-constant-propagation×6） | 18 VM 失败 | 待诊断（疑似 debug LNP span，版本特定） |
-| S6 | MultipleAccOperands 不变式被真实输入打破（testTryWithRegAccAlloc×18，仅 lift）——fused-branch 在 CondBranch 点物化的是**另一条指令**（比较）的操作数，两值可同染 Acc。T3 不变式证明只覆盖单指令操作数 | 18 skip | 根因已明，待修 |
+| S6 | ~~MultipleAccOperands（fusion 路径）~~ **根因已纠正**：regalloc 活性分析漏 try→handler 异常边（try 体以 Throw/Unreachable 结尾时 live-out 为空）→ handler 读取的值互不干涉 → 全染 Acc → handler 自己的 Add 触发硬错误；失败函数里根本没有 CondBranch。fusion 三重不健全是潜伏问题（非语料触发器）一并修复 | 18 skip | **已修（9dad2cb，见 3.2）** |
 
 VM 语义簇（需逐簇拆根因）：
 
@@ -104,7 +104,7 @@ VM 语义簇（需逐簇拆根因）：
 | V7 | template/tagged-template 'Cannot convert UNDEFINED to JSObject' / 'Cannot load property of null' | 36 | 疑似 tagged-template 字面量数组 strings 缓存 |
 
 | 3.1 | 结构性簇诊断（S1-S5 根因到 file:line + 修复方案 + 红色测试草图；只诊断不改码） | worker P3-T1 (k3) | **进行中**（只读任务，不落盘不提交） |
-| 3.2 | S6 修复：fusion 仅在槽位有效时启用（同块紧邻 + 两操作数皆 Reg 色），否则回退 Jnez | worker P3-T2 (k3) | **进行中**（orchestrator 根因分析已随卡下发：活性外延 + acc 被比较指令覆盖 + 槽位重用窗口三重不健全） |
+| 3.2 | S6 修复：异常边活性 + handler live-in 禁染 Acc + fusion 三前提门禁 | worker P3-T2 (k3) | **完成**（9dad2cb；worker 探针纠正 orchestrator 根因——真身是异常边活性洞，fusion 为潜伏不健全；orchestrator 独立复现红色 4 失败 1 钉住、直方图 lift 1011→1029/lower-other 18→0） |
 
 ## 审计纪律
 
