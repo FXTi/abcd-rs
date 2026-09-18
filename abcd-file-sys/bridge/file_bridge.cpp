@@ -3595,6 +3595,21 @@ try {
 }
 }
 
+uint32_t abc_builder_method_add_param_ex(AbcBuilder *b, uint32_t method_handle,
+    uint8_t type_id, uint32_t class_handle) {
+try {
+    if (method_handle >= b->methods.size()) return UINT32_MAX;
+    auto *type_item = resolve_type(b, type_id, class_handle);
+    if (!type_item) return UINT32_MAX;
+    auto &params = b->methods[method_handle]->GetParams();
+    uint32_t idx = static_cast<uint32_t>(params.size());
+    params.emplace_back(type_item);
+    return idx;
+} catch (...) {
+    return UINT32_MAX;
+}
+}
+
 void abc_builder_method_param_add_annotation(AbcBuilder *b, uint32_t method_handle,
     uint32_t param_idx, uint32_t ann_handle) {
 try {

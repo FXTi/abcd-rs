@@ -721,4 +721,128 @@ mod tests {
             abc_builder_free(b);
         }
     }
+
+    /// abc_builder_method_add_param_ex must accept reference types (via
+    /// resolve_type) so param annotations can hang off reference-typed
+    /// params, and must reject invalid class handles.
+    #[test]
+    fn method_add_param_ex_supports_reference_params() {
+        unsafe extern "C" fn collect_method(method_offset: u32, ctx: *mut std::ffi::c_void) {
+            unsafe {
+                (*(ctx as *mut Vec<u32>)).push(method_offset);
+            }
+        }
+        unsafe extern "C" fn collect_entry(
+            param_idx: u32,
+            annotation_off: u32,
+            ctx: *mut std::ffi::c_void,
+        ) -> i32 {
+            unsafe {
+                (*(ctx as *mut Vec<(u32, u32)>)).push((param_idx, annotation_off));
+            }
+            0
+        }
+
+        unsafe {
+            let b = abc_builder_new();
+            assert!(!b.is_null());
+            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as *const std::ffi::c_char);
+
+            let cls = abc_builder_add_global_class(b);
+            assert_ne!(cls, u32::MAX);
+            let rec = abc_builder_add_foreign_class(b, b"LRec;\0".as_ptr() as *const _);
+            assert_ne!(rec, u32::MAX);
+            assert_ne!(rec & 0x8000_0000, 0, "foreign class handle must be tagged");
+
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
+            let code: [u8; 1] = [0xa0];
+            let m = abc_builder_class_add_method_with_proto(
+                b,
+                cls,
+                b"func\0".as_ptr() as *const std::ffi::c_char,
+                proto,
+                0x1, // ACC_PUBLIC
+                code.as_ptr(),
+                1,
+                1,
+                0,
+            );
+            assert_ne!(m, u32::MAX);
+
+            // One reference-typed param, one primitive param.
+            assert_eq!(
+                abc_builder_method_add_param_ex(b, m, Type_TypeId_REFERENCE, rec),
+                0
+            );
+            assert_eq!(abc_builder_method_add_param_ex(b, m, Type_TypeId_I32, 0), 1);
+            // Invalid class handles are rejected (tagged foreign index out of
+            // range; unregistered regular class index).
+            assert_eq!(
+                abc_builder_method_add_param_ex(b, m, Type_TypeId_REFERENCE, 0xFFFF_FFFF),
+                u32::MAX
+            );
+            assert_eq!(
+                abc_builder_method_add_param_ex(b, m, Type_TypeId_REFERENCE, 0x7FFF_FFFF),
+                u32::MAX
+            );
+            assert_eq!(
+                abc_builder_method_add_param_ex(b, u32::MAX, Type_TypeId_I32, 0),
+                u32::MAX
+            );
+
+            // Annotate the reference-typed param and seal compile-time.
+            let ann_cls = abc_builder_add_class(b, b"LRefParamAnn;\0".as_ptr() as *const _);
+            let name = abc_builder_add_string(b, b"value\0".as_ptr() as *const _);
+            let elems = [AbcAnnotationElemDef {
+                name_string_handle: name,
+                tag: b'6' as std::ffi::c_char,
+                value: 7,
+            }];
+            let ann = abc_builder_create_annotation(b, ann_cls, elems.as_ptr(), 1);
+            assert_ne!(ann, u32::MAX);
+            abc_builder_method_param_add_annotation(b, m, 0, ann);
+            assert_eq!(abc_builder_method_seal_param_annotations(b, m, 0), 1);
+
+            let mut out_len: u32 = 0;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null(), "builder finalize should succeed");
+            let data = std::slice::from_raw_parts(ptr, out_len as usize);
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null(), "should open the built ABC file");
+
+            let class_off = abc_file_get_class_id(f, b"L_GLOBAL;\0".as_ptr() as *const _);
+            assert_ne!(class_off, u32::MAX);
+            let ca = abc_class_open(f, class_off);
+            assert!(!ca.is_null());
+            let mut methods: Vec<u32> = Vec::new();
+            abc_class_enumerate_methods(
+                ca,
+                Some(collect_method),
+                &mut methods as *mut _ as *mut std::ffi::c_void,
+            );
+            abc_class_close(ca);
+            assert_eq!(methods.len(), 1);
+            let ma = abc_method_open(f, methods[0]);
+            assert!(!ma.is_null());
+            let compile_id = abc_method_get_param_annotation_id(ma);
+            abc_method_close(ma);
+            assert_ne!(compile_id, u32::MAX);
+
+            let mut entries: Vec<(u32, u32)> = Vec::new();
+            assert_eq!(
+                abc_param_annotations_enumerate(
+                    f,
+                    compile_id,
+                    Some(collect_entry),
+                    &mut entries as *mut _ as *mut std::ffi::c_void,
+                ),
+                0
+            );
+            assert_eq!(entries.len(), 1, "exactly one annotated param");
+            assert_eq!(entries[0].0, 0, "annotation hangs off the reference param");
+
+            abc_file_close(f);
+            abc_builder_free(b);
+        }
+    }
 }

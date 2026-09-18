@@ -691,6 +691,12 @@ void abc_builder_method_add_runtime_type_annotation(AbcBuilder *b, uint32_t meth
    type_id: ABC_TYPE_* constant */
 uint32_t abc_builder_method_add_param(AbcBuilder *b, uint32_t method_handle, uint8_t type_id);
 
+/* Add a typed parameter with reference type support.
+ * class_handle: tagged class handle when type_id == ABC_TYPE_REFERENCE, else ignored.
+ * Returns param index (0-based), or UINT32_MAX on error. */
+uint32_t abc_builder_method_add_param_ex(AbcBuilder *b, uint32_t method_handle,
+    uint8_t type_id, uint32_t class_handle);
+
 /* Add annotation to a specific method parameter */
 void abc_builder_method_param_add_annotation(AbcBuilder *b, uint32_t method_handle,
     uint32_t param_idx, uint32_t ann_handle);
