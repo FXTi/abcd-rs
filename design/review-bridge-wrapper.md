@@ -17,7 +17,7 @@ data-path panic) · **P1** rule violation (hand mirrors, layering, missing
 guards, sentinel contract) or material doc-vs-code mismatch · **P2** design
 quality / dead code / test gaps.
 
-Status: `open` = reported, awaiting maintainer triage.
+Status: **all findings triaged and fixed in Phase 0.5** (commits listed below), except items explicitly deferred to the Phase 5 sweep (dead-surface policy, README rewrites #20/#21, callback-contract docs #15, CI duplicate-file protection #22) and the follow-up register below.
 
 ## Summary
 
@@ -458,6 +458,28 @@ callback slice is null-safe.
 8. P1 sweep (#15 callback docs, #17 param annotations decision, #18 panics,
    #19 mirrors, #20/#21 README rewrites, #22 CI).
 9. P2 sweep (dead `literal_val_to_c`, staging clears, docs, test gaps).
+
+
+## Phase 0.5 fix log (commit -> findings)
+
+| Commit | Findings |
+|--------|----------|
+| `ff092bb` | #1 (probe-verified) |
+| `99120c6` | #2 (probe-verified) |
+| `ce9c25e` | #3, #4, #10, #13 |
+| `333268a` | #19 (emitter constants, MethodHandleType, AVT comment) |
+| `1134bba` | #11, #12, #16 (guards + abc_foreign_item_name_off) |
+| `9f10556` | #5, #8, #9, #16 (read_class_name, Send/Sync), #18 |
+| `f20d7e0` | #6, #7, #16 (foreign name API switch), #19 (AVT tags) |
+| `9139631` | #17 (bridge: enumerate + seal) |
+| `9e5ec81` | #17 (bridge: add_param_ex) |
+| `81d3b71` | #17 (model + decode + encode fold contract) |
+
+Verification matrix: `cargo fmt --all -- --check` clean; full workspace
+suites green (51 suites); `real_module_abc` opt-in corpus green (21.6MB
+device stock, 2757 exported fixtures decode, 10k+ method ISA roundtrip,
+18 arithmetic rewrite snapshots); every fix carries a regression test
+verified red before the fix where the bug was reachable.
 
 ## Follow-up findings registered during Phase 0.5
 

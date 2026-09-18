@@ -9,7 +9,7 @@
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | Phase 0 | Bridge/封装层全面审计（完整性/清爽/漂亮） | **进行中** |
-| Phase 0.5 | 审计 findings 的 P0/P1 修复批 | 未开始 |
+| Phase 0.5 | 审计 findings 的 P0/P1 修复批 | **完成（12 commits：ff092bb…81d3b71）** |
 | Phase 1 | Lower 正确性旧账（out-of-SSA 破环、val_reg 溢出槽、lower 实体重定位通道） | 未开始 |
 | Phase 2 | VM oracle 证据链（corpus_lower_oracle → 1119 passed fixture 全量） | 未开始 |
 | Phase 3 | P1 漏洞（参数所有权三连修、encode_debug_info 作用域、SSA trivial-phi） | 未开始 |
@@ -39,10 +39,10 @@ P0 全 10 条；P1 的 ⑪⑫⑬⑭⑯⑱⑲；⑰ 参数注解扩模型；CI（
 | 0.5.3 | #3 file_size>len 拒绝 + #10 element_size 白名单 + #4 ARRAY_* cb + ⑬ LiteralTag static_assert | worker E (k3) | **完成**（ce9c25e；orchestrator 逐行复审 diff 通过，7/7 测试绿） |
 | 0.5.4 | #5 debug 作用域 + #8 嵌套 LA 句柄 + #9 MUTF-8 字符串 + ⑯ class_name 无损/删 SendSync + ⑱ panic 改错误 | worker F (k3) | **完成**（9f10556；orchestrator 复审 + 全 workspace 复验绿；新发现 F-new-1 已登记 review 文档） |
 | 0.5.5 | ⑪⑫ FFI 护栏（isa_bridge 59 + builder 75）+ ⑯ abc_foreign_item_name_off | worker H (k3) | **完成**（1134bba；orchestrator 抽查 + 复验通过；裁决：新增 ISA_EMIT_INTERNAL_ERROR(-5)） |
-| 0.5.6 | #6/#7 注解静默写 0 改错误 + ⑲ tag 字符/is_entity_array_tag 走 AVT + ⑯c decode.rs 换 abc_foreign_item_name_off | worker F 延续 | 进行中 |
+| 0.5.6 | #6/#7 注解静默写 0 改错误 + ⑲ tag 字符/is_entity_array_tag 走 AVT + ⑯c decode.rs 换 abc_foreign_item_name_off | worker F 延续 | **完成**（f20d7e0；含 decoy 防 handle-0 误通过的回归设计；F-new-2 登记） |
 | 0.5.7 | ⑲ emitter.rs 常量走 sys、MethodHandleType bindgen 导出 + annotation.rs 引用、AVT 弱钉注释 | worker G (k3) | **完成**（333268a；orchestrator 复审 + 独立复验通过） |
-| 0.5.8 | ⑰ 参数注解扩模型：bridge 部分（abc_param_annotations_enumerate + seal API） | worker G 延续 | 进行中（模型/encode 部分待 0.5.6 落盘后派发） |
-| 0.5.9 | 全量验证 + 报告状态列更新 + 逐 commit | orchestrator | 待全部 |
+| 0.5.8 | ⑰ 参数注解扩模型 | worker G + worker F | **完成**（9139631、9e5ec81、81d3b71；契约：runtime 折叠进 compile-time，与 #9 先例一致） |
+| 0.5.9 | 全量验证 + 报告状态列更新 + 逐 commit | orchestrator | **完成**（51 套件绿 + 语料 4/4 绿；review 文档 fix log 已更新） |
 
 ## 审计纪律
 
