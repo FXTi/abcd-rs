@@ -6,16 +6,19 @@
 pub mod copy_resolve;
 pub mod isel;
 pub mod layout;
+pub mod method_body;
 pub mod regalloc;
 
 use std::collections::HashMap;
 
-use abcd_isa::EntityId;
+use abcd_isa::{EntityId, EntityKind};
 
 use crate::entity::{FuncId, StringId, Value};
 use crate::module::Module;
 
+pub use self::isel::EntityTrace;
 pub use self::layout::LayoutResult;
+pub use self::method_body::to_method_body;
 pub use self::regalloc::RegAlloc;
 
 /// Errors that can occur during lowering.
@@ -42,6 +45,15 @@ pub enum LowerError {
          ({a:?} and {b:?}); the interference invariant guarantees at most one"
     )]
     MultipleAccOperands { func: FuncId, a: Value, b: Value },
+    #[error(
+        "function {func:?} has a {kind:?} entity operand with raw value {raw:#x} that cannot \
+         be traced to a source-file offset recorded by lift"
+    )]
+    UntraceableEntity {
+        func: FuncId,
+        kind: EntityKind,
+        raw: u32,
+    },
 }
 
 /// Lower a single IR function back to bytecodes.

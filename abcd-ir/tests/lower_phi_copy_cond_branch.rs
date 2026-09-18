@@ -72,6 +72,7 @@ fn phi_copies_for_untaken_successor_clobber_taken_path() {
             (s2, vec![Bytecode::Returnundefined]),
         ],
         string_map: HashMap::new(),
+        entity_traces: HashMap::new(),
         ic_size: 0,
         unsupported: None,
     };

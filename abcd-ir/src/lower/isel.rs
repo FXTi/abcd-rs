@@ -21,9 +21,66 @@ pub struct IselResult {
     pub block_codes: Vec<(Block, Vec<Bytecode>)>,
     /// String pool reverse map: StringId → EntityId for the output file.
     pub string_map: HashMap<StringId, EntityId>,
+    /// Trace of every entity operand emitted through the string map, keyed by
+    /// the emitted raw operand value. [`EntityTrace::Traced`] means the value
+    /// is the source-file offset recorded in `module.string_entities`;
+    /// [`EntityTrace::Untraced`] means at least one use of the value fell
+    /// back to the identity `EntityId(sid.0)` for an unmapped string (a
+    /// hand-built module has no source file). An untraced use poisons the
+    /// raw value: identity relocation entries are only meaningful when every
+    /// use of the value carries a real source offset.
+    pub entity_traces: HashMap<u32, EntityTrace>,
     /// Total number of IC slots allocated for this function.
     pub ic_size: u32,
     pub unsupported: Option<String>,
+}
+
+/// Whether an emitted entity operand value is traceable to a source-file
+/// offset recorded by lift (`module.string_entities`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntityTrace {
+    /// The operand value is the source-file offset recorded for the StringId.
+    Traced,
+    /// At least one use of this operand value had no recorded source offset
+    /// and fell back to the identity `EntityId(sid.0)`.
+    Untraced,
+}
+
+/// Resolves StringIds to emitted entity operand values and records whether
+/// each emitted value is traceable to a source-file offset.
+struct EntityTracer<'a> {
+    /// The caller-provided output map (may carry identity fallbacks).
+    string_map: &'a HashMap<StringId, EntityId>,
+    /// The module's own recorded source mappings (StringId → source offset).
+    module_entities: &'a HashMap<StringId, EntityId>,
+    traces: HashMap<u32, EntityTrace>,
+}
+
+impl EntityTracer<'_> {
+    /// Resolve `sid` exactly as the legacy `eid` helper did (string_map value,
+    /// identity fallback), recording whether the emitted value is the
+    /// module-recorded source offset.
+    fn eid(&mut self, sid: StringId) -> EntityId {
+        let e = self
+            .string_map
+            .get(&sid)
+            .copied()
+            .unwrap_or(EntityId(sid.0));
+        let traced = self.module_entities.get(&sid).copied() == Some(e);
+        self.traces
+            .entry(e.0)
+            .and_modify(|t| {
+                if !traced {
+                    *t = EntityTrace::Untraced;
+                }
+            })
+            .or_insert(if traced {
+                EntityTrace::Traced
+            } else {
+                EntityTrace::Untraced
+            });
+        e
+    }
 }
 
 /// Per-function IC slot allocator.
@@ -65,6 +122,11 @@ pub fn select(
     let mut block_codes: Vec<(Block, Vec<Bytecode>)> = Vec::new();
     let mut ic = IcAllocator::new();
     let mut unsupported = None;
+    let mut tracer = EntityTracer {
+        string_map,
+        module_entities: &module.string_entities,
+        traces: HashMap::new(),
+    };
 
     for &bb in rpo {
         let mut codes = Vec::new();
@@ -101,7 +163,7 @@ pub fn select(
                 func_id,
                 module,
                 alloc,
-                string_map,
+                &mut tracer,
                 &mut codes,
                 &mut ic,
             )?;
@@ -113,6 +175,7 @@ pub fn select(
     Ok(IselResult {
         block_codes,
         string_map: string_map.clone(),
+        entity_traces: tracer.traces,
         ic_size: ic.counter,
         unsupported,
     })
@@ -380,10 +443,6 @@ mod tests {
     }
 }
 
-fn eid(sid: StringId, string_map: &HashMap<StringId, EntityId>) -> EntityId {
-    string_map.get(&sid).copied().unwrap_or(EntityId(sid.0))
-}
-
 /// Select bytecodes for a single IR instruction.
 #[allow(clippy::too_many_arguments)]
 fn select_inst(
@@ -393,7 +452,7 @@ fn select_inst(
     func_id: FuncId,
     module: &Module,
     alloc: &RegAlloc,
-    string_map: &HashMap<StringId, EntityId>,
+    tracer: &mut EntityTracer,
     codes: &mut Vec<Bytecode>,
     ic: &mut IcAllocator,
 ) -> Result<(), LowerError> {
@@ -425,7 +484,7 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::LiteralString(s) => {
-            codes.push(Bytecode::LdaStr(eid(*s, string_map)));
+            codes.push(Bytecode::LdaStr(tracer.eid(*s)));
             store_result(result_slot, codes);
         }
         InstData::LiteralNaN => {
@@ -521,7 +580,7 @@ fn select_inst(
             store_result(result_slot, codes);
         }
         InstData::CreateRegExp { pattern, flags } => {
-            let p = eid(*pattern, string_map);
+            let p = tracer.eid(*pattern);
             let f_str = module.strings.get(*flags);
             let f_val: i64 = f_str.parse().unwrap_or(0);
             codes.push(Bytecode::Createregexpwithliteral(ic.one(), p, Imm(f_val)));
@@ -551,7 +610,7 @@ fn select_inst(
             match key {
                 PropKind::ByName(name) => {
                     ensure_acc(func_id, *object, alloc, codes)?;
-                    codes.push(Bytecode::Ldobjbyname(ic.two(), eid(*name, string_map)));
+                    codes.push(Bytecode::Ldobjbyname(ic.two(), tracer.eid(*name)));
                 }
                 PropKind::ByValue(k) => {
                     let regs = materialize_operands(func_id, &[*object], Some(*k), alloc, codes)?;
@@ -567,11 +626,7 @@ fn select_inst(
         InstData::StoreProperty { object, key, value } => match key {
             PropKind::ByName(name) => {
                 let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
-                codes.push(Bytecode::Stobjbyname(
-                    ic.two(),
-                    eid(*name, string_map),
-                    regs[0],
-                ));
+                codes.push(Bytecode::Stobjbyname(ic.two(), tracer.eid(*name), regs[0]));
             }
             PropKind::ByValue(k) => {
                 let regs =
@@ -586,11 +641,7 @@ fn select_inst(
         InstData::StoreOwnProperty { object, key, value } => match key {
             PropKind::ByName(name) => {
                 let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
-                codes.push(Bytecode::Stownbyname(
-                    ic.two(),
-                    eid(*name, string_map),
-                    regs[0],
-                ));
+                codes.push(Bytecode::Stownbyname(ic.two(), tracer.eid(*name), regs[0]));
             }
             PropKind::ByValue(k) => {
                 let regs =
@@ -610,7 +661,7 @@ fn select_inst(
         InstData::LoadSuperProperty { key } => {
             match key {
                 PropKind::ByName(name) => {
-                    codes.push(Bytecode::Ldsuperbyname(ic.two(), eid(*name, string_map)));
+                    codes.push(Bytecode::Ldsuperbyname(ic.two(), tracer.eid(*name)));
                 }
                 PropKind::ByValue(k) => {
                     let key_r = val_reg(func_id, *k, alloc, codes)?;
@@ -625,11 +676,7 @@ fn select_inst(
         InstData::StoreSuperProperty { key, value } => match key {
             PropKind::ByName(name) => {
                 let val_r = val_reg(func_id, *value, alloc, codes)?;
-                codes.push(Bytecode::Stsuperbyname(
-                    ic.two(),
-                    eid(*name, string_map),
-                    val_r,
-                ));
+                codes.push(Bytecode::Stsuperbyname(ic.two(), tracer.eid(*name), val_r));
             }
             PropKind::ByValue(k) => {
                 let regs = materialize_operands(func_id, &[*k, *value], None, alloc, codes)?;
@@ -640,26 +687,20 @@ fn select_inst(
 
         // ── Global variables ─────────────────────────────────────────
         InstData::LoadGlobalVar { name } => {
-            codes.push(Bytecode::Ldglobalvar(ic.one(), eid(*name, string_map)));
+            codes.push(Bytecode::Ldglobalvar(ic.one(), tracer.eid(*name)));
             store_result(result_slot, codes);
         }
         InstData::StoreGlobalVar { name, value } => {
             ensure_acc(func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::Stglobalvar(ic.one(), eid(*name, string_map)));
+            codes.push(Bytecode::Stglobalvar(ic.one(), tracer.eid(*name)));
         }
         InstData::TryLoadGlobalByName { name } => {
-            codes.push(Bytecode::Tryldglobalbyname(
-                ic.one(),
-                eid(*name, string_map),
-            ));
+            codes.push(Bytecode::Tryldglobalbyname(ic.one(), tracer.eid(*name)));
             store_result(result_slot, codes);
         }
         InstData::TryStoreGlobalByName { name, value } => {
             ensure_acc(func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::Trystglobalbyname(
-                ic.one(),
-                eid(*name, string_map),
-            ));
+            codes.push(Bytecode::Trystglobalbyname(ic.one(), tracer.eid(*name)));
         }
 
         // ── Lexical variables ────────────────────────────────────────
@@ -716,7 +757,7 @@ fn select_inst(
         InstData::DefineFunc { method_id, length } => {
             codes.push(Bytecode::Definefunc(
                 ic.one(),
-                eid(*method_id, string_map),
+                tracer.eid(*method_id),
                 Imm(*length as i64),
             ));
             store_result(result_slot, codes);
@@ -729,7 +770,7 @@ fn select_inst(
             ensure_acc(func_id, *home_object, alloc, codes)?;
             codes.push(Bytecode::Definemethod(
                 ic.one(),
-                eid(*method_id, string_map),
+                tracer.eid(*method_id),
                 Imm(*length as i64),
             ));
             store_result(result_slot, codes);
@@ -742,7 +783,7 @@ fn select_inst(
             let base_r = val_reg(func_id, *base, alloc, codes)?;
             codes.push(Bytecode::Defineclasswithbuffer(
                 ic.one(),
-                eid(*method_id, string_map),
+                tracer.eid(*method_id),
                 EntityId(*literal_array),
                 Imm(0),
                 base_r,
@@ -873,9 +914,7 @@ fn select_inst(
         InstData::ThrowUndefinedIfHole { name, value } => {
             // ThrowUndefinedifholewithname reads the value from the acc.
             ensure_acc(func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::ThrowUndefinedifholewithname(eid(
-                *name, string_map,
-            )));
+            codes.push(Bytecode::ThrowUndefinedifholewithname(tracer.eid(*name)));
         }
         InstData::ThrowIfSuperNotCorrectCall { value } => {
             ensure_acc(func_id, *value, alloc, codes)?;

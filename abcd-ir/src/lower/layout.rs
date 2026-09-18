@@ -34,6 +34,11 @@ pub struct LayoutResult {
     /// Final register count for the function frame, including the reserved
     /// phi-copy temporary register (if any).
     pub num_regs: u16,
+    /// Entity operand traceability inherited from instruction selection.
+    /// Layout only inserts `Mov`/`Lda`/`Sta` copies and `Jmp` trampolines —
+    /// none of which carry entity operands — so the selection-time records
+    /// stay valid for the flattened sequence.
+    pub entity_traces: HashMap<u32, super::isel::EntityTrace>,
 }
 
 /// Lay out blocks and resolve jump targets.
@@ -192,6 +197,7 @@ pub fn layout(
         bytecodes: flat,
         try_blocks,
         num_regs: alloc.num_regs,
+        entity_traces: isel.entity_traces.clone(),
     })
 }
 

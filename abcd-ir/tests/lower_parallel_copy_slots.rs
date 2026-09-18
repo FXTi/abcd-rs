@@ -61,6 +61,7 @@ fn run_edge_copies(
             (succ, succ_codes),
         ],
         string_map: HashMap::new(),
+        entity_traces: HashMap::new(),
         ic_size: 0,
         unsupported: None,
     };
