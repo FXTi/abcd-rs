@@ -128,9 +128,18 @@ pub fn select(
         traces: HashMap::new(),
     };
 
+    let entry_block = module.func(func_id).entry_block;
+
     for &bb in rpo {
         let mut codes = Vec::new();
         let block = module.block(bb);
+
+        // Copy-in prologue: arguments arrive in the ABI top slots and are
+        // moved into the parameters' vreg homes at the very start of the
+        // entry block.
+        if bb == entry_block {
+            emit_param_copy_in(func_id, module, alloc, &mut codes)?;
+        }
 
         // Phi copies from predecessors are handled in layout (inserted before terminators).
         // Skip phi instructions — they don't produce bytecodes directly.
@@ -179,6 +188,57 @@ pub fn select(
         ic_size: ic.counter,
         unsupported,
     })
+}
+
+/// Emit the copy-in prologue at the very start of the entry block: for each
+/// parameter `i`, `Mov(home_i, Reg(num_regs + i))` moves the ABI top slot
+/// into the parameter's vreg home. The vendor frame is
+/// `num_vregs + num_args` with arguments in the top slots
+/// (static_core/runtime/include/method.h); `to_method_body` declares
+/// `num_vregs = num_regs`, so the arg slots of the lowered frame start
+/// exactly at `Reg(num_regs)`. `alloc.num_regs` is final here — it already
+/// includes the `copy_temp`/`spill_slot` reservations.
+///
+/// `mcs_color` pre-assigns every parameter a register home, so an
+/// Acc-colored parameter can only come from a hand-crafted allocation;
+/// both that and an uncolored parameter are hard errors, never a silent
+/// path.
+///
+/// Emission-point safety: `layout` inserts phi copies before predecessor
+/// TERMINATORS (or into trampolines appended after all real blocks), never
+/// at the start of a block, and the entry block has no predecessors in
+/// practice — so code prepended at `codes[0..]` of the entry block cannot
+/// interleave with phi-copy sequences.
+fn emit_param_copy_in(
+    func_id: FuncId,
+    module: &Module,
+    alloc: &RegAlloc,
+    codes: &mut Vec<Bytecode>,
+) -> Result<(), LowerError> {
+    let func = module.func(func_id);
+    for (i, &val) in func.param_values.iter().enumerate() {
+        let home = match alloc.allocation.get(&val).copied() {
+            Some(RegSlot::Reg(r)) => r,
+            Some(RegSlot::Acc) => {
+                return Err(LowerError::AccColoredParam {
+                    func: func_id,
+                    value: val,
+                });
+            }
+            None => {
+                return Err(LowerError::UnallocatedOperand {
+                    func: func_id,
+                    value: val,
+                });
+            }
+        };
+        let arg_slot = u32::from(alloc.num_regs) + i as u32;
+        if arg_slot > u32::from(u16::MAX) {
+            return Err(LowerError::RegisterOverflow(func_id));
+        }
+        codes.push(Bytecode::Mov(Reg(home), Reg(arg_slot as u16)));
+    }
+    Ok(())
 }
 
 /// Look up the slot register allocation assigned to a value. A missing entry

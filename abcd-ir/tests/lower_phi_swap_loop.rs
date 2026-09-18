@@ -159,13 +159,17 @@ fn phi_swap_across_loop_back_edge_executes_correctly() {
         result.num_regs
     );
 
-    // Params are pinned to R0..R3 by the allocator's param pre-assignment.
+    // Params are pinned to the R0..R3 vreg homes by the allocator's param
+    // pre-assignment; the copy-in prologue moves the ABI top slots
+    // (v[num_regs + i]) into those homes at entry, so the simulator seeds
+    // the arguments at the top of the frame.
+    let base = result.num_regs;
     let run = |n: i64| {
         let mut machine = Machine::new()
-            .with_reg(0, A)
-            .with_reg(1, B)
-            .with_reg(2, n)
-            .with_reg(3, ONE);
+            .with_reg(base, A)
+            .with_reg(base + 1, B)
+            .with_reg(base + 2, n)
+            .with_reg(base + 3, ONE);
         machine.run(&result.bytecodes)
     };
 

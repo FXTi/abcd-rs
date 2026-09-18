@@ -74,9 +74,11 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
             }
         }
     }
-    // Add function parameters.
-    for i in 0..func.param_count {
-        let val = Value::from_index(i as usize);
+    // Add function parameters. `param_values` is the authoritative
+    // parameter identity (lift entry seeding / IRBuilder::create_func_param);
+    // an arena-index convention (`Value::from_index(i)`) would name values
+    // of OTHER functions in a multi-function module.
+    for &val in &func.param_values {
         if !all_values.contains(&val) {
             all_values.push(val);
         }
@@ -101,8 +103,13 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     let acc_score = compute_acc_scores(module, &rpo);
 
     // Step 4: MCS ordering + greedy coloring.
-    let (allocation, mut num_regs) =
-        mcs_color(&all_values, &interference, &acc_score, func.param_count)?;
+    let (allocation, mut num_regs) = mcs_color(
+        &all_values,
+        &interference,
+        &acc_score,
+        func.param_count,
+        &func.param_values,
+    )?;
 
     // Step 5: Boissinot SSA destruction — collect the per-edge value-level
     // copy sets. Slot-level resolution happens at the emission point in
@@ -383,11 +390,19 @@ fn compute_acc_scores(module: &Module, rpo: &[Block]) -> HashMap<Value, i32> {
 
 /// MCS ordering followed by reverse greedy coloring.
 /// Returns (allocation, num_regs).
+///
+/// Parameters are pre-assigned to their vreg homes: `params[i]` (the
+/// function's own `param_values`, NOT an arena index) gets `Reg(i)`, the
+/// bottom of the frame. isel's copy-in prologue moves the ABI top slots
+/// into these homes. `param_count` still seeds `next_reg` so a hand-built
+/// function that declares more args than it created values for keeps the
+/// bottom slots reserved, preserving the historical frame size.
 fn mcs_color(
     all_values: &[Value],
     interference: &InterferenceGraph,
     acc_score: &HashMap<Value, i32>,
     param_count: u16,
+    params: &[Value],
 ) -> Result<(HashMap<Value, RegSlot>, u16), RegAllocError> {
     let n = all_values.len();
     let val_set: HashSet<Value> = all_values.iter().copied().collect();
@@ -433,10 +448,9 @@ fn mcs_color(
     let mut allocation: HashMap<Value, RegSlot> = HashMap::new();
     let mut next_reg = param_count;
 
-    // Pre-assign params.
-    for i in 0..param_count {
-        let val = Value::from_index(i as usize);
-        allocation.insert(val, RegSlot::Reg(i));
+    // Pre-assign params to their vreg homes at the bottom of the frame.
+    for (i, &val) in params.iter().enumerate() {
+        allocation.insert(val, RegSlot::Reg(i as u16));
     }
 
     for &v in mcs_order.iter().rev() {

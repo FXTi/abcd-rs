@@ -149,7 +149,19 @@ pub struct FunctionData {
     pub is_external: bool,
     pub param_count: u16,
     pub return_type: Option<IrType>,
+    /// Advisory parameter types, from the proto shorty when the file
+    /// version carries one. May be shorter than `param_count` (12.0.x+
+    /// files have no shorty — format fact #A7); `param_count` is the
+    /// authoritative arity.
     pub param_types: Vec<IrType>,
+    /// SSA values for the function parameters, in argument order:
+    /// `param_values[i]` is the value for argument `i`. Populated by lift
+    /// (entry seeding) and by [`crate::builder::IRBuilder::create_func_param`].
+    /// This is the authoritative parameter identity — register allocation
+    /// pins these values to the vreg homes `Reg(0..n)`; an arena-index
+    /// convention (`Value::from_index(i)`) is meaningless in a
+    /// multi-function module.
+    pub param_values: Vec<Value>,
     pub entry_block: Block,
     /// All blocks owned by this function (entry_block is always blocks[0]).
     pub blocks: Vec<Block>,

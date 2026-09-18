@@ -99,9 +99,13 @@ pub fn to_method_body(
         // Convention (abcd-file/src/decode.rs:717-723): num_vregs counts the
         // method's own registers only, num_args the arguments; the runtime
         // frame is num_vregs + num_args with args in the top slots
-        // (vendor static_core/runtime/include/method.h:514). The lowering
-        // frame numbers every used register from 0 (params included), so
-        // num_regs is the vreg count and param_count the arg count.
+        // (vendor static_core/runtime/include/method.h:514). Under the
+        // copy-in prologue this split is EXACT: parameter values are pinned
+        // to vreg homes at the bottom of the lowering frame (inside
+        // num_regs, alongside the reserved copy-temp/spill slots), and the
+        // prologue Moves the ABI top slots Reg(num_regs + i) into those
+        // homes at entry. Args live above the declared vregs, never
+        // aliasing a local slot.
         num_vregs: u32::from(result.num_regs),
         num_args: u32::from(func.param_count),
         bytecodes: result.bytecodes.clone(),

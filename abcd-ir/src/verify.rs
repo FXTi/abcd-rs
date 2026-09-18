@@ -84,14 +84,11 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
         }
     }
     // Function parameters are also defined values, but only parameters of
-    // this function.  A global scan would incorrectly permit cross-function
-    // value references.
-    for (vi, vd) in module.values.iter().enumerate() {
-        if let ValueDef::FuncParam(index) = vd.def {
-            if index < func.param_count {
-                defined_values.insert(Value::from_index(vi));
-            }
-        }
+    // this function. `param_values` records per-function ownership; a
+    // global scan of FuncParam defs would incorrectly permit cross-function
+    // value references (two functions can both have a FuncParam(0)).
+    for &val in &func.param_values {
+        defined_values.insert(val);
     }
 
     // Entry normally has no predecessors. A loop may legally branch back to

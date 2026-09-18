@@ -40,9 +40,12 @@ impl FuncPass for Sccp {
         // Initialize lattice: all values start at Top.
         let mut lattice: HashMap<Value, LatticeVal> = HashMap::new();
 
-        // Function params are Bottom (unknown input).
-        for i in 0..module.func(func).param_count {
-            let val = Value::from_index(i as usize);
+        // Function params are Bottom (unknown input). `param_values` is the
+        // authoritative parameter identity; an arena-index convention would
+        // mark values of OTHER functions in a multi-function module and —
+        // worse — leave this function's real parameters at Top, letting a
+        // phi(param, const) fold to the constant.
+        for &val in &module.func(func).param_values {
             lattice.insert(val, LatticeVal::Bottom);
         }
 

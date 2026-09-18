@@ -49,6 +49,7 @@ impl<'m> IRBuilder<'m> {
             param_count,
             return_type: None,
             param_types: Vec::new(),
+            param_values: Vec::new(),
             entry_block: entry,
             blocks: vec![entry],
             annotations: IrAnnotations::default(),
@@ -94,9 +95,17 @@ impl<'m> IRBuilder<'m> {
         id
     }
 
-    /// Create a function parameter value.
+    /// Create a function parameter value. Parameters must be created in
+    /// argument order (index 0, 1, 2, …): the value is registered as the
+    /// owning function's `param_values[index]`, which register allocation
+    /// pins to the vreg home `Reg(index)`.
     pub fn create_func_param(&mut self, index: u16, ty: IrType) -> Value {
-        self.alloc_value(ValueDef::FuncParam(index), ty)
+        let val = self.alloc_value(ValueDef::FuncParam(index), ty);
+        self.module
+            .func_mut(self.current_func)
+            .param_values
+            .push(val);
+        val
     }
 
     // ── Instruction emission ─────────────────────────────────────────

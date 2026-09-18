@@ -41,6 +41,12 @@ pub enum LiftError {
     NoBody,
     #[error("empty bytecode")]
     EmptyBytecode,
+    #[error("method declares num_args {0}, which exceeds the u16 parameter-count limit")]
+    ParamCountOverflow(u32),
+    #[error(
+        "method frame num_vregs {num_vregs} + num_args {num_args} exceeds the u16 register limit"
+    )]
+    FrameTooLarge { num_vregs: u32, num_args: u32 },
 }
 
 /// Lift an entire ABC file into a [`Module`].
@@ -169,6 +175,22 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
         return Err(LiftError::EmptyBytecode);
     }
 
+    // Arity and arg-slot base come from the decoded code header (B5). The
+    // u32 → u16 conversions are checked: overflow is a hard error, never a
+    // truncation.
+    let param_count =
+        u16::try_from(body.num_args).map_err(|_| LiftError::ParamCountOverflow(body.num_args))?;
+    let arg_base = u16::try_from(body.num_vregs).map_err(|_| LiftError::FrameTooLarge {
+        num_vregs: body.num_vregs,
+        num_args: body.num_args,
+    })?;
+    if arg_base.checked_add(param_count).is_none() {
+        return Err(LiftError::FrameTooLarge {
+            num_vregs: body.num_vregs,
+            num_args: body.num_args,
+        });
+    }
+
     let raw_cfg = build_cfg(body).ok_or(LiftError::EmptyBytecode)?;
 
     // Create the function entry.
@@ -189,14 +211,21 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
         access_flags: method.access_flags,
         source_lang: method.source_lang,
         is_external: method.is_external,
-        param_count: method.arg_types.len() as u16,
+        // Arity comes from the decoded code header (B5): on 12.0.x+ files
+        // protos carry no shorty (format fact #A7), so `arg_types` is empty
+        // even when callers push real arguments. On 9/11 files the two
+        // agree (shorty present), so this preserves their behavior.
+        // Overflow is a hard error, never a truncation.
+        param_count,
         return_type: method.return_type.clone().map(IrType::Static),
+        // Advisory only: may be shorter than `param_count` on 12+ files.
         param_types: method
             .arg_types
             .iter()
             .cloned()
             .map(IrType::Static)
             .collect(),
+        param_values: Vec::new(), // populated by entry seeding below
         entry_block,
         blocks: vec![entry_block],
         annotations,
@@ -239,6 +268,33 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
 
     // SSA construction.
     let mut ssa = SsaBuilder::new();
+
+    // Entry seeding: arguments arrive in the ABI top slots
+    // `Reg(num_vregs + i)` (frame = num_vregs + num_args, args at the top;
+    // vendor static_core/runtime/include/method.h). Bind each arg slot to
+    // a fresh FuncParam value so a bytecode read of an arg slot at entry
+    // resolves to the parameter instead of an empty phi. `param_values[i]`
+    // is the authoritative identity of parameter i: register allocation
+    // pins these values to the vreg homes Reg(0..n) and isel emits the
+    // copy-in prologue from the ABI top slots.
+    //
+    // Out of scope (follow-up): reads of never-written VREG slots
+    // (< num_vregs) at entry still produce empty phis; Ark initializes
+    // vregs to hole.
+    for i in 0..param_count {
+        let val = Value::from_index(module.values.len());
+        module.values.push(ValueData {
+            def: ValueDef::FuncParam(i),
+            ty: method
+                .arg_types
+                .get(i as usize)
+                .cloned()
+                .map(IrType::Static)
+                .unwrap_or_default(),
+        });
+        ssa.write_variable(RegOrAcc::Reg(arg_base + i), entry_block, val);
+        module.func_mut(func_id).param_values.push(val);
+    }
 
     // Seal blocks that have all predecessors known (in RPO, all blocks are
     // sealable after we've set up edges — we process in order).
