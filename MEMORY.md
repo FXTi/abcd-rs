@@ -145,6 +145,22 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
 - Goal-tool usage: pause goals while waiting on subagents (rounds would
   otherwise spin the orchestrator); complete/resume needs a direct human turn.
 
+- Phase 2.3 (full-corpus lower oracle, cae3712): corpus_lower_oracle now
+  covers all 1119 passed fixtures (ABCD_LOWERED_CASE filters), both
+  variants; compare-rewritten-corpus.py gained additive --allow-missing /
+  --jobs (default byte-identical, verified). Result: rewrite lift 1011/108
+  skips, opt 1029/90; VM oracle lift 390/1011, opt 462/1029 (image
+  sha256:5e7627…). Failure clusters registered with sizes in
+  design/agent-roadmap.md Phase 3 (S1-S6 structural, V1-V7 semantic).
+  Headline new findings: our encoded bytes abort ark_disasm on
+  module-exports/test-namespace/test-constant-propagation (S4); 13.0.1.0
+  'Invalid span offset' (S5); MultipleAccOperands fired on real input via
+  the compare-branch fusion reading ANOTHER instruction's operands (S6 —
+  the T3 single-instruction invariant does not cover fusion); opt regresses
+  test-branch-elimination 18/18→0/18 and infinite-loops for-in (V6).
+  Optimizer is net-positive overall (+72 passes) but V6 blocks widening
+  opt coverage.
+
 ## Phase 1 outcome (done, 2026-09-19)
 
 - Four commits: 30d254a (red tests) → 0620a12 (B1/B2 fix) → 99e5a52 (B3 fix)

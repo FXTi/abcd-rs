@@ -74,7 +74,37 @@ Phase 2 新发现（worker P2-T1，orchestrator 已核实 lift/mod.rs:192）：
 - B5：`lift/mod.rs` 用 `method.arg_types.len()` 播种 `param_count`，但 12.0.x+ 文件无 proto shorty（格式事实 #A7）→ arg_types 为空 → IR param_count=0 → lowered 帧 num_args=0，而调用方仍按原 num_args 压参 → VM 越帧读写 → SIGSEGV。修复方向：param_count 改从 code header 的 num_args 播种（arg_types 仅在有 shorty 的版本提供类型信息）。**B5 + 参数 ABI 顶槽问题是 VM oracle 通过的前置条件，Phase 3 参数所有权三连修需提前。**
 
 | 2.2 | 参数 ABI 端到端修复（B5 num_args 播种 + entry 参数播种消空 phi + copy-in prologue + param_values 权威身份）| worker P2-T2 (k3) | **完成**（900a39c；VM oracle 0/18→lift 18/18 + opt 18/18；orchestrator 复审 12 文件 diff + 独立复现红色（3 失败签名一致）+ 独立 oracle 复跑全绿） |
-| 2.3 | 全量 VM oracle：1119 个 passed fixture 的 lift/opt 双变体重写 + 对照；SKIP 分类直方图（Phase 3 输入）；脚本加 --allow-missing（additive）| worker P2-T3 (k3) | **进行中** |
+| 2.3 | 全量 VM oracle：1119 个 passed fixture 双变体重写 + 对照 | worker P2-T3 (k3) | **完成**（cae3712；重写 lift 1011/108skip、opt 1029/90skip；VM lift 390/1011、opt 462/1029；orchestrator 独立抽验：默认模式 18/18 兼容、disasm abort/wide-call/object-spread 三簇首验一致） |
+
+## Phase 3 任务登记（由 P2-T3 全量 oracle 数据重排，2026-09-19）
+
+原 Phase 3 范围（参数所有权三连修）已在 2.2 提前消化大半；剩余 SSA trivial-phi、dominance、string-pool 所有权、exception CFG。以下按 P2-T3 数据登记失败簇（lift 390/1011、opt 462/1029）：
+
+结构性（encode/lower skip 或输出畸形，确定性高、根因少，优先）：
+
+| # | 簇 | 规模 | 现状 |
+|---|----|------|------|
+| S1 | MethodId 重定位失败 "cannot relocate code entity: MethodId index N"（class-accessors×9 + newtarget-this×9 + lexicalEnv×36） | 54/变体 skip | 待诊断 |
+| S2 | wide-call encode "operand out of range for the instruction encoding" | 18 skip | 待诊断 |
+| S3 | object-spread lower-untraceable:StringId（func_main_0 raw 0x7-0x9 不在 entity_offsets） | 18 skip | 待诊断 |
+| S4 | ark_disasm 'This line should be unreachable' abort——我们 encode 出的字节码让上游反汇编器崩溃（module-exports×12 + test-namespace×12 + test-constant-propagation×12） | 36 VM 失败 | 待诊断（严重：输出畸形） |
+| S5 | 13.0.1.0-only abort 'F/pandafile: Invalid span offset'（module-exports/test-namespace/test-constant-propagation×6） | 18 VM 失败 | 待诊断（疑似 debug LNP span，版本特定） |
+| S6 | MultipleAccOperands 不变式被真实输入打破（testTryWithRegAccAlloc×18，仅 lift）——fused-branch 在 CondBranch 点物化的是**另一条指令**（比较）的操作数，两值可同染 Acc。T3 不变式证明只覆盖单指令操作数 | 18 skip | 根因已明，待修 |
+
+VM 语义簇（需逐簇拆根因）：
+
+| # | 簇 | 规模（lift/opt） | 现状 |
+|---|----|------|------|
+| V1 | 错值 stdout-diff 大簇（array-index/bitwise/numeric/bigint/property-ops/call-shapes/control-flow/decrement/literals/symbol/exception-finally/for-in 等） | 268/204 | 混合族：B4 acc-clobber + vreg-hole 空 phi + 字面量数组缺口 + call-shapes NaN（新触发点） |
+| V2 | iterator/generator/destructuring exit 255 'undefined' 抛出 | 128/? | 疑似 vreg-hole + 迭代器/生成器语义缺口 |
+| V3 | NewTarget undefined 族（proxy×18、typed-array×18） | 36 | NewTarget 未穿透 lowered 构造调用 |
+| V4 | optional-chain SIGSEGV | 18/12+6 | 新崩溃签名（不同于已修的参数 ABI SIGSEGV） |
+| V5 | class heritage 'TypeError: parent class is not constructor'（super-properties、test-deault/explicit-constructor） | 54/0 | opt 变体全绿→lift 的 class 定义路径缺陷 |
+| V6 | opt 回归：test-branch-elimination 18/18→0/18（stdout 'bad'，疑似 SCCP 过折叠）；for-in 0→timeout 死循环 | 各 18 | 优化器语义 bug，优先于继续扩 opt 覆盖 |
+| V7 | template/tagged-template 'Cannot convert UNDEFINED to JSObject' / 'Cannot load property of null' | 36 | 疑似 tagged-template 字面量数组 strings 缓存 |
+
+| 3.1 | 结构性簇诊断（S1-S5 根因到 file:line + 修复方案 + 红色测试草图；只诊断不改码） | 待定 | 未开始 |
+| 3.2 | S6 MultipleAccOperands 修复（fusion 路径的 slot 物化违反单 acc 不变式） | 待定 | 未开始 |
 
 ## 审计纪律
 
