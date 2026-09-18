@@ -114,6 +114,12 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
 
     // --- classes ---
     let mut classes = BTreeMap::new();
+    // Source offsets of module-record blobs (`_ESModuleRecord` field values)
+    // and scope-names literal arrays (`_ESScopeNamesRecord` field values).
+    // The former must be excluded from tagged literal-array decoding; the
+    // latter must be included even when no header table lists them (13.x+).
+    let mut module_data_offsets: HashSet<u32> = HashSet::new();
+    let mut scope_names_offsets: HashSet<u32> = HashSet::new();
     for i in 0..num_classes {
         let class_off = unsafe { sys::abc_file_class_offset(f, i) };
         if class_off == ABSENT {
@@ -169,7 +175,17 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
 
         let fields: Result<Vec<_>, _> = collect_offsets_void(cr, sys::abc_class_enumerate_fields)
             .into_iter()
-            .map(|off| decode_field_at(f, off, &entity_map, &mut strings))
+            .map(|off| {
+                decode_field_at(
+                    f,
+                    off,
+                    &entity_map,
+                    &mut strings,
+                    &descriptor_str,
+                    &mut module_data_offsets,
+                    &mut scope_names_offsets,
+                )
+            })
             .collect();
         let fields = fields?;
 
@@ -275,7 +291,9 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     // --- literal arrays ---
     // API13/24 no longer expose a usable header count. Collect literal-array
     // offsets reached through method index regions so they can be decoded on
-    // demand alongside legacy table entries.
+    // demand alongside legacy table entries. Scope-names blobs
+    // (`_ESScopeNamesRecord` field values) are ordinary tagged literal arrays
+    // reachable only through those fields on 13.x+, so collect them too.
     let referenced_literal_offsets: HashSet<u32> = classes
         .values()
         .flat_map(|class| class.methods.iter())
@@ -284,9 +302,14 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         .filter_map(|((kind, _), offset)| {
             (kind == &abcd_isa::EntityKind::LiteralarrayId).then_some(*offset)
         })
+        .chain(scope_names_offsets.iter().copied())
         .collect();
-    let (literal_arrays, literal_array_offsets) =
-        decode_literal_arrays(f, &mut strings, &referenced_literal_offsets);
+    let (literal_arrays, literal_array_offsets) = decode_literal_arrays(
+        f,
+        &mut strings,
+        &referenced_literal_offsets,
+        &module_data_offsets,
+    );
 
     Ok(File {
         version,
@@ -490,11 +513,136 @@ fn decode_param_annotations(
     Ok(result)
 }
 
+/// Descriptor of the record class whose u32 fields reference module-record
+/// blobs (upstream name `_ESModuleRecord`: abc2program/common/
+/// abc_file_utils.h `ES_MODULE_RECORD`; collection policy:
+/// libpandafile/util/collect_util.h `ES_MODULE_RECORD`).
+const ES_MODULE_RECORD_DESCRIPTOR: &str = "L_ESModuleRecord;";
+/// Descriptor of the record class whose u32 fields reference scope-names
+/// literal arrays (upstream `_ESScopeNamesRecord`, same sources).
+const ES_SCOPE_NAMES_RECORD_DESCRIPTOR: &str = "L_ESScopeNamesRecord;";
+
+/// Decode a module-record blob through the vendored ModuleDataAccessor.
+///
+/// Layout (module_data_accessor.cpp ctor + module_data_accessor-inl.h
+/// `EnumerateModuleRecord`): `[u32 item count]` (skipped by the accessor),
+/// `[u32 num_module_requests][u32 request string offset]*`, then per-tag
+/// sections (count + entries) in vendored order REGULAR_IMPORT,
+/// NAMESPACE_IMPORT, LOCAL_EXPORT, INDIRECT_EXPORT, STAR_EXPORT. All name
+/// fields are string entity offsets. Unreadable strings and unknown tags
+/// are hard errors — module data is never silently dropped.
+fn decode_module_data_at(
+    f: *const sys::AbcFileHandle,
+    offset: u32,
+    strings: &mut StringPool,
+) -> Result<ModuleData, Error> {
+    fn intern_string_at(
+        f: *const sys::AbcFileHandle,
+        off: u32,
+        strings: &mut StringPool,
+    ) -> Result<StringId, Error> {
+        let s = read_string(f, off).ok_or(Error::InvalidString(off))?;
+        Ok(strings.get_or_intern(&s))
+    }
+
+    let mr = unsafe { sys::abc_module_open(f, offset) };
+    if mr.is_null() {
+        return Err(Error::InvalidOffset(offset));
+    }
+    let _mg = HandleGuard(Some(|| unsafe { sys::abc_module_close(mr) }));
+
+    let num_requests = unsafe { sys::abc_module_num_requests(mr) };
+    let mut requests = Vec::with_capacity(num_requests as usize);
+    for i in 0..num_requests {
+        let off = unsafe { sys::abc_module_request_off(mr, i) };
+        if off == ABSENT {
+            return Err(Error::InvalidString(off));
+        }
+        requests.push(intern_string_at(f, off, strings)?);
+    }
+
+    // The bridge callback cannot fail (no early stop), so collect raw
+    // offsets first and resolve strings afterwards, where `?` works.
+    struct RawRecord {
+        tag: u8,
+        export_off: u32,
+        request_idx: u32,
+        import_off: u32,
+        local_off: u32,
+    }
+    unsafe extern "C" fn collect_record(
+        tag: u8,
+        export_off: u32,
+        request_idx: u32,
+        import_off: u32,
+        local_off: u32,
+        ctx: *mut c_void,
+    ) {
+        unsafe { &mut *(ctx as *mut Vec<RawRecord>) }.push(RawRecord {
+            tag,
+            export_off,
+            request_idx,
+            import_off,
+            local_off,
+        });
+    }
+    let mut raw: Vec<RawRecord> = Vec::new();
+    unsafe {
+        sys::abc_module_enumerate_records(
+            mr,
+            Some(collect_record),
+            &mut raw as *mut Vec<RawRecord> as *mut c_void,
+        )
+    };
+
+    let mut records = Vec::with_capacity(raw.len());
+    for rec in raw {
+        let record = match rec.tag {
+            t if t == sys::ModuleTag_REGULAR_IMPORT => ModuleRecord::RegularImport {
+                local_name: intern_string_at(f, rec.local_off, strings)?,
+                import_name: intern_string_at(f, rec.import_off, strings)?,
+                module_request_idx: rec.request_idx,
+            },
+            t if t == sys::ModuleTag_NAMESPACE_IMPORT => ModuleRecord::NamespaceImport {
+                local_name: intern_string_at(f, rec.local_off, strings)?,
+                module_request_idx: rec.request_idx,
+            },
+            t if t == sys::ModuleTag_LOCAL_EXPORT => ModuleRecord::LocalExport {
+                local_name: intern_string_at(f, rec.local_off, strings)?,
+                export_name: intern_string_at(f, rec.export_off, strings)?,
+            },
+            t if t == sys::ModuleTag_INDIRECT_EXPORT => ModuleRecord::IndirectExport {
+                export_name: intern_string_at(f, rec.export_off, strings)?,
+                import_name: intern_string_at(f, rec.import_off, strings)?,
+                module_request_idx: rec.request_idx,
+            },
+            t if t == sys::ModuleTag_STAR_EXPORT => ModuleRecord::StarExport {
+                module_request_idx: rec.request_idx,
+            },
+            other => {
+                return Err(Error::ModuleData(format!(
+                    "unknown module record tag {other:#x} in blob at {offset:#x}"
+                )));
+            }
+        };
+        records.push(record);
+    }
+
+    Ok(ModuleData {
+        source_offset: offset,
+        requests,
+        records,
+    })
+}
+
 fn decode_field_at(
     f: *const sys::AbcFileHandle,
     field_off: u32,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    class_descriptor: &str,
+    module_data_offsets: &mut HashSet<u32>,
+    scope_names_offsets: &mut HashSet<u32>,
 ) -> Result<Field, Error> {
     let fr = unsafe { sys::abc_field_open(f as *mut _, field_off) };
     if fr.is_null() {
@@ -582,6 +730,40 @@ fn decode_field_at(
             }
         }
         TypeId::Void | TypeId::Reference => None,
+    };
+
+    // Module-record classes (upstream names: abc2program/common/
+    // abc_file_utils.h ES_MODULE_RECORD / ES_SCOPE_NAMES_RECORD). Their u32
+    // field values are SOURCE-FILE OFFSETS, not scalars:
+    // - `_ESModuleRecord` → untagged ModuleDataAccessor blob; decode it
+    //   structurally so encode can re-emit and relocate it.
+    // - `_ESScopeNamesRecord` → ordinary tagged literal array; keep a
+    //   reference so encode rewires the field to the re-emitted array, and
+    //   collect the offset for literal-array decoding (13.x+ has no header
+    //   table entry for it).
+    let initial_value = match (class_descriptor, type_id, initial_value) {
+        (ES_MODULE_RECORD_DESCRIPTOR, TypeId::U32, Some(FieldValue::I32(off))) => {
+            let offset = u32::try_from(off).map_err(|_| {
+                Error::ModuleData(format!(
+                    "{class_descriptor} field at {field_off:#x}: negative blob offset {off}"
+                ))
+            })?;
+            let data = decode_module_data_at(f, offset, strings).map_err(|e| {
+                Error::ModuleData(format!("{class_descriptor} field at {field_off:#x}: {e}"))
+            })?;
+            module_data_offsets.insert(offset);
+            Some(FieldValue::ModuleData(data))
+        }
+        (ES_SCOPE_NAMES_RECORD_DESCRIPTOR, TypeId::U32, Some(FieldValue::I32(off))) => {
+            let offset = u32::try_from(off).map_err(|_| {
+                Error::ModuleData(format!(
+                    "{class_descriptor} field at {field_off:#x}: negative blob offset {off}"
+                ))
+            })?;
+            scope_names_offsets.insert(offset);
+            Some(FieldValue::LiteralArrayRef(offset))
+        }
+        (_, _, value) => value,
     };
 
     let annotations = Annotations {
@@ -1219,19 +1401,23 @@ fn decode_literal_arrays(
     f: *const sys::AbcFileHandle,
     strings: &mut StringPool,
     referenced_offsets: &HashSet<u32>,
+    module_data_offsets: &HashSet<u32>,
 ) -> (Vec<LiteralArray>, HashMap<u32, u32>) {
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
     let mut offsets = Vec::new();
     if n != 0 {
         for i in 0..n {
             let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
-            if off != ABSENT {
+            // Module-record blobs ride the legacy header table on <=12.x but
+            // are NOT tagged literal arrays; they are modeled structurally
+            // via FieldValue::ModuleData and must never be decoded here.
+            if off != ABSENT && !module_data_offsets.contains(&off) {
                 offsets.push(off);
             }
         }
     }
     for &off in referenced_offsets {
-        if off != ABSENT && !offsets.contains(&off) {
+        if off != ABSENT && !offsets.contains(&off) && !module_data_offsets.contains(&off) {
             offsets.push(off);
         }
     }

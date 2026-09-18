@@ -119,6 +119,94 @@ pub enum AnnotationElemValue {
     EntityArray(Vec<u32>),
 }
 
+/// Handle-based module record for [`Builder::literal_array_add_module_data`].
+///
+/// Variants correspond to the vendored `panda_file::ModuleTag` kinds; the
+/// wire tag values come from bindgen (`ModuleTag_*`), not hand mirrors.
+#[derive(Clone, Copy, Debug)]
+pub enum ModuleRecordDef {
+    RegularImport {
+        local_name: StringHandle,
+        import_name: StringHandle,
+        module_request_idx: u16,
+    },
+    NamespaceImport {
+        local_name: StringHandle,
+        module_request_idx: u16,
+    },
+    LocalExport {
+        local_name: StringHandle,
+        export_name: StringHandle,
+    },
+    IndirectExport {
+        export_name: StringHandle,
+        import_name: StringHandle,
+        module_request_idx: u16,
+    },
+    StarExport {
+        module_request_idx: u16,
+    },
+}
+
+impl ModuleRecordDef {
+    /// Convert to the FFI record; `u32::MAX` marks an absent name handle
+    /// (bridge sentinel convention).
+    fn as_raw(&self) -> sys::AbcModuleRecordDef {
+        use ModuleRecordDef::*;
+        match *self {
+            RegularImport {
+                local_name,
+                import_name,
+                module_request_idx,
+            } => sys::AbcModuleRecordDef {
+                tag: sys::ModuleTag_REGULAR_IMPORT,
+                export_name_handle: u32::MAX,
+                module_request_idx: module_request_idx as u32,
+                import_name_handle: import_name.as_raw(),
+                local_name_handle: local_name.as_raw(),
+            },
+            NamespaceImport {
+                local_name,
+                module_request_idx,
+            } => sys::AbcModuleRecordDef {
+                tag: sys::ModuleTag_NAMESPACE_IMPORT,
+                export_name_handle: u32::MAX,
+                module_request_idx: module_request_idx as u32,
+                import_name_handle: u32::MAX,
+                local_name_handle: local_name.as_raw(),
+            },
+            LocalExport {
+                local_name,
+                export_name,
+            } => sys::AbcModuleRecordDef {
+                tag: sys::ModuleTag_LOCAL_EXPORT,
+                export_name_handle: export_name.as_raw(),
+                module_request_idx: 0,
+                import_name_handle: u32::MAX,
+                local_name_handle: local_name.as_raw(),
+            },
+            IndirectExport {
+                export_name,
+                import_name,
+                module_request_idx,
+            } => sys::AbcModuleRecordDef {
+                tag: sys::ModuleTag_INDIRECT_EXPORT,
+                export_name_handle: export_name.as_raw(),
+                module_request_idx: module_request_idx as u32,
+                import_name_handle: import_name.as_raw(),
+                local_name_handle: u32::MAX,
+            },
+            StarExport { module_request_idx } => sys::AbcModuleRecordDef {
+                tag: sys::ModuleTag_STAR_EXPORT,
+                export_name_handle: u32::MAX,
+                module_request_idx: module_request_idx as u32,
+                import_name_handle: u32::MAX,
+                local_name_handle: u32::MAX,
+            },
+        }
+    }
+}
+
 /// ABC file builder.
 pub struct Builder {
     raw: *mut sys::AbcBuilder,
@@ -410,6 +498,26 @@ impl Builder {
         unsafe { sys::abc_builder_field_set_value_f64(self.raw, f.0, value) };
     }
 
+    /// Set a field's initial value to a literal-array item reference.
+    ///
+    /// The vendored writer stores the item's LAYOUT offset inline
+    /// (`ScalarValueItem` Type::ID → `FieldTag::VALUE` + u32), so the
+    /// reference relocates with the item automatically. This is how es2abc
+    /// stores `_ESModuleRecord` / `_ESScopeNamesRecord` field values.
+    pub fn field_set_value_literalarray(
+        &mut self,
+        f: FieldHandle,
+        la: LiteralArrayHandle,
+    ) -> Result<(), Error> {
+        // SAFETY: the builder is live; the bridge validates both handles.
+        if unsafe { sys::abc_builder_field_set_value_literalarray(self.raw, f.0, la.0) } != 0 {
+            return Err(Error::ModuleData(
+                "field_set_value_literalarray: invalid field or literal-array handle".into(),
+            ));
+        }
+        Ok(())
+    }
+
     // --- Code ---
 
     /// Create a standalone code item.
@@ -562,6 +670,41 @@ impl Builder {
         ref_la: LiteralArrayHandle,
     ) {
         unsafe { sys::abc_builder_literal_array_add_literalarray(self.raw, la.0, ref_la.0) };
+    }
+
+    /// Stage a complete module-record blob (the UNTAGGED vendored
+    /// `ModuleDataAccessor` layout: request count + request strings, then
+    /// per-tag section counts and entries) into a literal array created by
+    /// [`Self::add_literal_array`]. The vendored writer emits the u32
+    /// item-count header itself. Nothing is staged if any input is invalid.
+    pub fn literal_array_add_module_data(
+        &mut self,
+        la: LiteralArrayHandle,
+        requests: &[StringHandle],
+        records: &[ModuleRecordDef],
+    ) -> Result<(), Error> {
+        let raw_requests: Vec<u32> = requests.iter().map(|h| h.as_raw()).collect();
+        let raw_records: Vec<sys::AbcModuleRecordDef> =
+            records.iter().map(ModuleRecordDef::as_raw).collect();
+        // SAFETY: the builder is live; both slices outlive the call; the
+        // bridge validates all handles and record fields before staging.
+        let rc = unsafe {
+            sys::abc_builder_literal_array_add_module_data(
+                self.raw,
+                la.0,
+                raw_requests.as_ptr(),
+                raw_requests.len() as u32,
+                raw_records.as_ptr(),
+                raw_records.len() as u32,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::ModuleData(format!(
+                "module-record blob staging rejected ({records} records)",
+                records = records.len()
+            )));
+        }
+        Ok(())
     }
 
     // --- MethodHandle items ---
@@ -1033,6 +1176,9 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     let mut class_handles: HashMap<StringId, ClassHandle> = HashMap::new();
     let mut entities = EntityHandles::default();
     let mut code_references = Vec::new();
+    // Field values that reference literal-array items (module-record blobs,
+    // scope-names arrays), wired up after the literal-array section exists.
+    let mut deferred_field_values: Vec<(FieldHandle, &FieldValue)> = Vec::new();
     let mut ann_la_counter: u32 = 0;
     // Number of annotation-embedded literal arrays that will be created
     // while classes are configured. Model literal arrays are only created
@@ -1333,12 +1479,22 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
             // Track field handle for annotation references.
             entities.insert_field(field, field_h);
 
-            // Initial value
-            match field.initial_value {
-                Some(FieldValue::I32(v)) => b.field_set_value_i32(field_h, v),
-                Some(FieldValue::I64(v)) => b.field_set_value_i64(field_h, v),
-                Some(FieldValue::F32(v)) => b.field_set_value_f32(field_h, v),
-                Some(FieldValue::F64(v)) => b.field_set_value_f64(field_h, v),
+            // Initial value. Offset-reference values (module-record and
+            // scope-names blobs) are deferred: their literal-array items are
+            // only created after class configuration (creation order is
+            // significant to the vendored writer), and the field value must
+            // reference the item so the writer relocates it at layout time.
+            match &field.initial_value {
+                Some(FieldValue::I32(v)) => b.field_set_value_i32(field_h, *v),
+                Some(FieldValue::I64(v)) => b.field_set_value_i64(field_h, *v),
+                Some(FieldValue::F32(v)) => b.field_set_value_f32(field_h, *v),
+                Some(FieldValue::F64(v)) => b.field_set_value_f64(field_h, *v),
+                Some(FieldValue::ModuleData(_)) | Some(FieldValue::LiteralArrayRef(_)) => {
+                    deferred_field_values.push((
+                        field_h,
+                        field.initial_value.as_ref().expect("deferred value"),
+                    ))
+                }
                 None => {}
             }
 
@@ -1406,6 +1562,51 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 &entities,
                 &literal_handles,
             )?;
+        }
+    }
+
+    // --- Module-record blobs and scope-names field references ---
+    // These literal arrays are created at the same point as model literal
+    // arrays (after all class configuration; creation order is significant
+    // to the vendored writer — F-new-1), so their handles follow the model
+    // arrays and never disturb the `ann_la_base` handle arithmetic above.
+    let mut module_la_counter: u32 = 0;
+    for (field_h, value) in deferred_field_values {
+        match value {
+            FieldValue::ModuleData(md) => {
+                let la_h = b.add_literal_array(&format!("module_la_{module_la_counter}"));
+                module_la_counter += 1;
+                let requests: Vec<StringHandle> = md
+                    .requests
+                    .iter()
+                    .map(|&sid| get_or_add_string_id(&mut b, &mut string_handles, pool, sid))
+                    .collect::<Result<_, _>>()?;
+                let records: Vec<ModuleRecordDef> = md
+                    .records
+                    .iter()
+                    .map(|rec| module_record_def(rec, &mut b, &mut string_handles, pool))
+                    .collect::<Result<_, _>>()?;
+                b.literal_array_add_module_data(la_h, &requests, &records)?;
+                b.field_set_value_literalarray(field_h, la_h)?;
+            }
+            FieldValue::LiteralArrayRef(source_offset) => {
+                let index =
+                    *file
+                        .literal_array_offsets
+                        .get(source_offset)
+                        .ok_or_else(|| {
+                            Error::ModuleData(format!(
+                                "scope-names literal array at source offset {source_offset:#x} was not decoded"
+                            ))
+                        })?;
+                let la_h = *literal_handles.get(index as usize).ok_or_else(|| {
+                    Error::ModuleData(format!(
+                        "scope-names literal array index {index} out of range"
+                    ))
+                })?;
+                b.field_set_value_literalarray(field_h, la_h)?;
+            }
+            _ => unreachable!("only offset-reference field values are deferred"),
         }
     }
 
@@ -2373,6 +2574,62 @@ fn get_or_add_string_id(
     let h = b.add_string(s);
     string_handles.insert(sid, h);
     Ok(h)
+}
+
+/// Convert a decoded module record into the handle-based builder form,
+/// interning its name strings into the output file.
+fn module_record_def(
+    rec: &ModuleRecord,
+    b: &mut Builder,
+    string_handles: &mut HashMap<StringId, StringHandle>,
+    pool: &StringPool,
+) -> Result<ModuleRecordDef, Error> {
+    let mut gs =
+        |b: &mut Builder, sid: StringId| get_or_add_string_id(b, string_handles, pool, sid);
+    let idx = |v: u32| -> Result<u16, Error> {
+        u16::try_from(v).map_err(|_| {
+            Error::ModuleData(format!(
+                "module request index {v} exceeds the vendored u16 slot"
+            ))
+        })
+    };
+    Ok(match rec {
+        ModuleRecord::RegularImport {
+            local_name,
+            import_name,
+            module_request_idx,
+        } => ModuleRecordDef::RegularImport {
+            local_name: gs(b, *local_name)?,
+            import_name: gs(b, *import_name)?,
+            module_request_idx: idx(*module_request_idx)?,
+        },
+        ModuleRecord::NamespaceImport {
+            local_name,
+            module_request_idx,
+        } => ModuleRecordDef::NamespaceImport {
+            local_name: gs(b, *local_name)?,
+            module_request_idx: idx(*module_request_idx)?,
+        },
+        ModuleRecord::LocalExport {
+            local_name,
+            export_name,
+        } => ModuleRecordDef::LocalExport {
+            local_name: gs(b, *local_name)?,
+            export_name: gs(b, *export_name)?,
+        },
+        ModuleRecord::IndirectExport {
+            export_name,
+            import_name,
+            module_request_idx,
+        } => ModuleRecordDef::IndirectExport {
+            export_name: gs(b, *export_name)?,
+            import_name: gs(b, *import_name)?,
+            module_request_idx: idx(*module_request_idx)?,
+        },
+        ModuleRecord::StarExport { module_request_idx } => ModuleRecordDef::StarExport {
+            module_request_idx: idx(*module_request_idx)?,
+        },
+    })
 }
 
 #[cfg(test)]

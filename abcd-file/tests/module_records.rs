@@ -1,6 +1,11 @@
 //! Test group C — module records: all five ModuleRecord kinds decoded from
-//! the module literal-array encoding (requests + regular/namespace/local/
-//! indirect/star records), as es2abc writes them.
+//! the TAGGED pandasm-level literal-array representation via
+//! `ModuleData::from_literal_values`.
+//!
+//! Note: real on-disk module blobs are UNTAGGED (ModuleDataAccessor format)
+//! and are referenced by `_ESModuleRecord` field offsets; those surface as
+//! `FieldValue::ModuleData` (see module_record_fields.rs). This group covers
+//! the tagged representation only.
 
 use abcd_file::{AccessFlags, Builder, ModuleRecord, SourceLang, Type, decode};
 
@@ -10,7 +15,8 @@ fn build_module_array() -> Vec<u8> {
     let cls = b.add_global_class();
     b.class_set_source_lang(cls, SourceLang::EcmaScript);
 
-    // Module record literal array (the layout es2abc emits):
+    // Module record literal array in the tagged pandasm-level layout
+    // (tag + value item pairs):
     //   requests: count, then string offsets
     //   regular imports: count, [local, import, request_idx]*
     //   namespace imports: count, [local, request_idx]*

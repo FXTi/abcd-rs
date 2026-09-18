@@ -4,7 +4,9 @@ use crate::literal::LiteralValue;
 /// A single module record entry with interned strings.
 ///
 /// Each variant carries only the fields present for that record kind.
-#[derive(Clone, Debug)]
+/// Variants correspond to the vendored `panda_file::ModuleTag` values
+/// (vendor `module_data_accessor.h`); the raw tag never crosses into Rust.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModuleRecord {
     RegularImport {
         local_name: crate::StringId,
@@ -31,14 +33,19 @@ pub enum ModuleRecord {
 
 /// Decoded module data (import/export declarations for an ES module).
 ///
-/// Module data is stored as a special literal array in the ABC file.
-/// Use [`ModuleData::from_literal_values`] or [`File::decode_module`](crate::File::decode_module)
-/// to decode it from an already-decoded literal array.
-#[derive(Clone, Debug)]
+/// On disk the module data is an UNTAGGED literal-array item read through
+/// the vendored `ModuleDataAccessor` (request count + request strings, then
+/// per-tag section counts and entries; vendor `module_data_accessor-inl.h`).
+/// `_ESModuleRecord` record fields reference the blob by file offset; decode
+/// surfaces them as [`crate::FieldValue::ModuleData`].
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleData {
+    /// Offset of the module blob in the source file; 0 for hand-built
+    /// models. Re-emission relocates the blob, so this is informational.
+    pub source_offset: u32,
     /// Module request strings (paths of imported modules).
     pub requests: Vec<crate::StringId>,
-    /// Import/export records.
+    /// Import/export records in vendored section order.
     pub records: Vec<ModuleRecord>,
 }
 
@@ -47,6 +54,10 @@ impl ModuleData {
     ///
     /// The expected layout matches the ArkCompiler module literal array format:
     /// counts as `Integer`, strings as `String`, module indices as `MethodAffiliate`.
+    ///
+    /// Note: this parses the *tagged* pandasm-level representation. Real
+    /// on-disk module blobs are untagged and surface through
+    /// [`crate::FieldValue::ModuleData`] instead.
     pub fn from_literal_values(values: &[LiteralValue]) -> Result<Self, Error> {
         let mut cur = Cursor { values, pos: 0 };
 
@@ -114,7 +125,11 @@ impl ModuleData {
             records.push(ModuleRecord::StarExport { module_request_idx });
         }
 
-        Ok(ModuleData { requests, records })
+        Ok(ModuleData {
+            source_offset: 0,
+            requests,
+            records,
+        })
     }
 }
 

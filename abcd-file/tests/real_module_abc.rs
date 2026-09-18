@@ -198,3 +198,147 @@ fn rewritten_corpus_preserves_arithmetic_entities() {
     }
     assert_eq!(checked, 18, "arithmetic version/profile matrix");
 }
+
+/// Render a module/scope record field value into comparable strings.
+///
+/// Module blobs carry string-offset references, so equality across a
+/// rewrite must be checked through the string pool, not raw offsets.
+fn module_field_snapshots(f: &abcd_file::File) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (desc, cls) in &f.classes {
+        for field in &cls.fields {
+            let key = format!(
+                "{}.{}",
+                f.strings.resolve(*desc).unwrap_or("?"),
+                f.strings.resolve(field.name).unwrap_or("?")
+            );
+            let value = match &field.initial_value {
+                Some(abcd_file::FieldValue::ModuleData(md)) => {
+                    let requests: Vec<&str> = md
+                        .requests
+                        .iter()
+                        .map(|&sid| f.strings.resolve(sid).expect("request string"))
+                        .collect();
+                    let records: Vec<String> = md
+                        .records
+                        .iter()
+                        .map(|rec| {
+                            use abcd_file::ModuleRecord::*;
+                            let r = |sid: abcd_file::StringId| {
+                                f.strings.resolve(sid).unwrap_or("?").to_owned()
+                            };
+                            match rec {
+                                RegularImport {
+                                    local_name,
+                                    import_name,
+                                    module_request_idx,
+                                } => format!(
+                                    "regular({},{},{module_request_idx})",
+                                    r(*local_name),
+                                    r(*import_name)
+                                ),
+                                NamespaceImport {
+                                    local_name,
+                                    module_request_idx,
+                                } => format!("namespace({},{module_request_idx})", r(*local_name)),
+                                LocalExport {
+                                    local_name,
+                                    export_name,
+                                } => format!("local({},{})", r(*local_name), r(*export_name)),
+                                IndirectExport {
+                                    export_name,
+                                    import_name,
+                                    module_request_idx,
+                                } => format!(
+                                    "indirect({},{},{module_request_idx})",
+                                    r(*export_name),
+                                    r(*import_name)
+                                ),
+                                StarExport { module_request_idx } => {
+                                    format!("star({module_request_idx})")
+                                }
+                            }
+                        })
+                        .collect();
+                    format!("module({requests:?};{})", records.join(","))
+                }
+                Some(abcd_file::FieldValue::LiteralArrayRef(off)) => {
+                    let idx = f
+                        .literal_array_offsets
+                        .get(off)
+                        .unwrap_or_else(|| panic!("scope blob offset {off:#x} must decode"));
+                    let values: Vec<String> = f.literal_arrays[*idx as usize]
+                        .values
+                        .iter()
+                        .map(|v| match v {
+                            abcd_file::LiteralValue::String(sid) => {
+                                f.strings.resolve(*sid).unwrap_or("?").to_owned()
+                            }
+                            other => format!("{other:?}"),
+                        })
+                        .collect();
+                    format!("scope({})", values.join(","))
+                }
+                other => format!("{other:?}"),
+            };
+            out.push((key, value));
+        }
+    }
+    out
+}
+
+/// Identity rewrite of module-record-bearing corpus fixtures (S4/S5/N1/N6
+/// evidence): decode -> encode must succeed, and the rewritten file's module
+/// and scope-names data must be equivalent to the source.
+///
+/// Before the module-record modeling fix, the rewritten bytes aborted
+/// ark_disasm ('This line should be unreachable') and FATALed the VM
+/// ('Invalid span offset'): the field value was written back as a dangling
+/// source offset and (<=12.x) the module blob was misparsed as a tagged
+/// literal array of zeros.
+#[test]
+#[ignore = "requires exported GHCR corpus"]
+fn rewritten_corpus_module_cases() {
+    const CASES: &[&str] = &[
+        "local/module-exports",
+        "local/module-imports",
+        "upstream/bytecode/ts/cases/test-namespace",
+        "upstream/optimizer/js/branch-elimination/test-constant-propagation",
+    ];
+    let root = exported_corpus_root();
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(root.join("index.jsonl"))
+        .expect("corpus index")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid index JSON"))
+        .collect();
+    let mut checked = 0;
+    for row in rows.iter().filter(|row| {
+        row["case"]
+            .as_str()
+            .is_some_and(|case| CASES.contains(&case))
+    }) {
+        let relative = row["abc"].as_str().expect("abc path");
+        let file = decode(&std::fs::read(root.join(relative)).expect("fixture"))
+            .unwrap_or_else(|error| panic!("decode {relative}: {error}"));
+        let expected = module_field_snapshots(&file);
+        assert!(
+            expected.iter().any(|(_, v)| v.starts_with("module(")),
+            "{relative}: fixture must carry module-record data"
+        );
+        let output = encode(&file).unwrap_or_else(|error| panic!("encode {relative}: {error}"));
+        let rewritten =
+            decode(&output).unwrap_or_else(|error| panic!("decode rewritten {relative}: {error}"));
+        assert_eq!(
+            module_field_snapshots(&rewritten),
+            expected,
+            "{relative}: module/scope data must survive the identity rewrite"
+        );
+        if let Some(directory) = std::env::var_os("ABCD_REWRITTEN_DIR") {
+            let target = std::path::PathBuf::from(directory).join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, output).expect("write oracle candidate");
+        }
+        checked += 1;
+    }
+    assert_eq!(checked, 72, "4 module cases x 6 versions x 3 profiles");
+}

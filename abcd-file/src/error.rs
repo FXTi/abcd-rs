@@ -55,4 +55,7 @@ pub enum Error {
         field: &'static str,
         context: String,
     },
+    /// Module-record blob decode/encode failure (never a silent fallback).
+    #[error("module data error: {0}")]
+    ModuleData(String),
 }

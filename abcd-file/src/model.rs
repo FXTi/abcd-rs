@@ -114,6 +114,18 @@ pub enum FieldValue {
     I64(i64),
     F32(f32),
     F64(f64),
+    /// `_ESModuleRecord` record field: the u32 wire value is the source-file
+    /// offset of an untagged ModuleDataAccessor-format blob (vendored
+    /// `module_data_accessor-inl.h`). Decode reads the blob through the
+    /// vendored accessor into this structural model; encode re-emits it as a
+    /// fresh literal-array item and writes the field value as the item's NEW
+    /// layout offset (never the stale source offset).
+    ModuleData(ModuleData),
+    /// `_ESScopeNamesRecord` record field: the u32 wire value is the
+    /// source-file offset of a normal tagged literal array. The offset is
+    /// resolved through [`File::literal_array_offsets`] at encode time, so
+    /// the rewritten field points at the re-emitted literal array.
+    LiteralArrayRef(u32),
 }
 
 /// Decoded method body (bytecodes + exception handlers).
