@@ -67,7 +67,7 @@ Phase 1 复审中新登记（不进本期范围）：
 
 | # | 任务 | 执行者 | 状态 |
 |---|------|--------|------|
-| 2.1 | corpus_lower_oracle：decode→lift→(optimize)→lower→to_method_body→encode 全链路重写 passed fixture，写盘 + `compare-rewritten-corpus.py` VM 对照；算术用例先行，lift-only 与 lift+optimize 分开报告 | 待定 | 未开始 |
+| 2.1 | corpus_lower_oracle：decode→lift→(optimize)→lower→to_method_body→encode 全链路重写 passed fixture，写盘 + `compare-rewritten-corpus.py` VM 对照；算术用例先行，lift-only 与 lift+optimize 分开报告 | worker P2-T1 (k3) | **进行中** |
 
 ## 审计纪律
 
