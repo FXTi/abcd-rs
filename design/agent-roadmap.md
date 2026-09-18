@@ -56,8 +56,8 @@ orchestrator 静态分析确认的三个 bug 机制（worker 需在代码中复�
 |---|------|--------|------|
 | 1.1 | B1+B2+B3 红色回归测试（手工构造 RegAlloc/IselResult 驱动 layout/isel + 迷你字节码模拟器断言语义；`#[ignore]` 保持主线绿） | worker P1-T1 (k3) | **完成**（30d254a；orchestrator 逐行复审 + 独立复验 4 条断言红色输出一致；Mov 操作数序对 vendor isa.yaml 签名核验无误） |
 | 1.2 | B1+B2 修复：槽位级并行拷贝解析 + 每函数显式预留临时寄存器（溢出报错，禁 saturating）+ 条件边 trampoline 插入 | worker P1-T2 (k3) | **完成**（0620a12；orchestrator 逐行复审 + 独立复验：55 套件绿、3 条红转绿、e2e 循环交换测试绿、INVALID/saturating 清除 grep 实证、sub2/greater 语义对 vendor sig 核验） |
-| 1.3 | B3 修复：溢出槽移入声明帧（isel 前 spill 所有 acc 色寄存器操作数再 ensure_acc）；未分配 value 改硬错误（若可达） | worker P1-T3 (k3) | **进行中**（num_regs 贯通 LayoutResult 已由 1.2 完成；新登记 B4 见下） |
-| 1.4 | lower 实体重定位通道：LayoutResult 携带实体操作数元数据，产出 `abcd_file::MethodBody`（entity_offsets + num_vregs），复用 `Builder::relocate_code_id` 的 decode→encode 路径 | 待定 | 未开始 |
+| 1.3 | B3 修复：溢出槽移入声明帧（spill-before-ensure_acc）；未分配 value 改硬错误 | worker P1-T3 (k3) | **完成**（99e5a52；orchestrator 复审：materialize_operands 顺序正确、ThrowUndefinedIfHole 顺手修复对 vendor sig `acc: in:top` 核验属实并批准、55 套件绿、3 条 B3 测试绿、grep 证据干净） |
+| 1.4 | lower 实体重定位通道：LayoutResult 携带实体操作数元数据，产出 `abcd_file::MethodBody`（entity_offsets + num_vregs），复用 `Builder::relocate_code_id` 的 decode→encode 路径 | worker P1-T4 (k3) | **进行中**（encode 契约已确认：bytecode 操作数=源 offset + entity_offsets 恒等映射即可复用现有循环） |
 
 Phase 1 复审中新登记（不进本期范围）：
 
