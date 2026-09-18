@@ -169,6 +169,7 @@ pub fn select(
                 &node.data,
                 result_slot,
                 inst,
+                &block.insts,
                 func_id,
                 module,
                 alloc,
@@ -504,11 +505,17 @@ mod tests {
 }
 
 /// Select bytecodes for a single IR instruction.
+///
+/// `inst` and `block_insts` (the owning block's instruction list) are
+/// needed by the CondBranch compare-fusion soundness checks: fusion
+/// re-reads another instruction's operands, which is only valid when the
+/// comparison chain sits immediately before the branch in the same block.
 #[allow(clippy::too_many_arguments)]
 fn select_inst(
     data: &InstData,
     result_slot: Option<RegSlot>,
-    _inst: Inst,
+    inst: Inst,
+    block_insts: &[Inst],
     func_id: FuncId,
     module: &Module,
     alloc: &RegAlloc,
@@ -1003,9 +1010,22 @@ fn select_inst(
         } => {
             // Try compare-branch fusion: if cond is IsTrue(CmpOp(a, b)),
             // emit a fused Jeq/Jne/Jstricteq/Jnstricteq instead of Jnez.
-            if let Some(fused) =
-                try_fuse_cmp_branch(*cond, *true_dest, func_id, module, alloc, codes)?
-            {
+            // Fusion re-reads the COMPARISON's operands at this branch, so
+            // it fires only when that re-read is provably sound (S6; see
+            // try_fuse_cmp_branch). Otherwise fall back to the unfused
+            // path, which is sound: `cond` is the branch's own operand —
+            // physically in acc right after its definition (Acc-colored)
+            // or reloaded from its register (Reg-colored).
+            if let Some(fused) = try_fuse_cmp_branch(
+                *cond,
+                *true_dest,
+                inst,
+                block_insts,
+                func_id,
+                module,
+                alloc,
+                codes,
+            )? {
                 codes.push(fused);
             } else {
                 ensure_acc(func_id, *cond, alloc, codes)?;
@@ -1163,52 +1183,105 @@ fn select_call(
 /// Pattern: `CondBranch(cond: IsTrue(BinaryOp { op: Eq|StrictEq|..., left, right }), true_dest)`
 /// → `Jeq(right_reg, true_dest)` with left in acc.
 ///
+/// Fusion re-reads the COMPARISON's operands (`left`, `right`) at the
+/// branch site, extending their live ranges beyond what register
+/// allocation computed: allocation lets them die at the comparison, and
+/// the comparison plus the `IsTrue` wrapper both write the accumulator.
+/// Fusing is therefore only sound when ALL of the following hold (S6):
+///
+/// 1. The comparison — and the `IsTrue` wrapper, if present — are the
+///    instructions immediately preceding this branch IN THE SAME BLOCK.
+///    Any instruction in between could reuse an operand slot whose live
+///    range ended at the comparison.
+/// 2. Both `left` and `right` are Reg-colored. At the branch the physical
+///    acc holds `cond`, not `left`: `ensure_acc(left)` on an Acc-colored
+///    `left` would no-op with the wrong value, and `val_reg(right)` on an
+///    Acc-colored `right` would spill `cond`. (A hand-crafted allocation
+///    can also color both operands Acc — they are operands of the
+///    comparison, not of this branch, so the single-acc-per-instruction
+///    interference invariant does not apply at this materialization
+///    point.)
+/// 3. Neither the comparison result nor the `IsTrue` result reuses an
+///    operand's slot. An operand that dies at the comparison does not
+///    interfere with those results, so the allocator may co-locate them;
+///    the fused re-read would then observe the result, not the operand.
+///
 /// Returns `Ok(Some(fused_bytecode))` if fusion succeeded, `Ok(None)`
-/// otherwise.
+/// when any precondition fails — the caller then emits the unfused
+/// `ensure_acc(cond)` + `Jnez` sequence.
+#[allow(clippy::too_many_arguments)]
 fn try_fuse_cmp_branch(
     cond: Value,
     true_dest: Block,
+    branch_inst: Inst,
+    block_insts: &[Inst],
     func_id: FuncId,
     module: &Module,
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
 ) -> Result<Option<Bytecode>, LowerError> {
-    let cond_def = module.value(cond);
-    let cond_inst = match cond_def.def {
+    let cond_inst = match module.value(cond).def {
         crate::module::ValueDef::Inst(i) => i,
         _ => return Ok(None),
     };
 
-    // Check if cond is IsTrue { operand }
-    let inner_val = match &module.inst(cond_inst).data {
-        InstData::IsTrue { operand } => *operand,
+    // Unwrap the IsTrue wrapper: the comparison is the instruction whose
+    // result feeds the branch, directly or through the wrapper.
+    let (cmp_inst, wrapper) = match &module.inst(cond_inst).data {
+        InstData::IsTrue { operand } => match module.value(*operand).def {
+            crate::module::ValueDef::Inst(i) => (i, Some(cond_inst)),
+            _ => return Ok(None),
+        },
         // If cond is directly a comparison (without IsTrue wrapper), also fuse.
-        InstData::BinaryOp { op, left, right } => {
-            return fuse_binop_branch(*op, *left, *right, true_dest, func_id, alloc, codes);
-        }
+        InstData::BinaryOp { .. } => (cond_inst, None),
         _ => return Ok(None),
     };
-
-    // Check if inner_val is BinaryOp { op: comparison, left, right }
-    let inner_def = module.value(inner_val);
-    let inner_inst = match inner_def.def {
-        crate::module::ValueDef::Inst(i) => i,
-        _ => return Ok(None),
+    let InstData::BinaryOp { op, left, right } = &module.inst(cmp_inst).data else {
+        return Ok(None);
     };
 
-    match &module.inst(inner_inst).data {
-        InstData::BinaryOp { op, left, right } => {
-            fuse_binop_branch(*op, *left, *right, true_dest, func_id, alloc, codes)
-        }
-        _ => Ok(None),
+    // Precondition 1: same-block adjacency — the block's instruction tail
+    // must be exactly [comparison, (IsTrue,) branch].
+    let tail: &[Inst] = match wrapper {
+        Some(w) => &[cmp_inst, w, branch_inst],
+        None => &[cmp_inst, branch_inst],
+    };
+    if !block_insts.ends_with(tail) {
+        return Ok(None);
     }
+
+    // Precondition 2: both comparison operands Reg-colored.
+    let (Some(RegSlot::Reg(left_r)), Some(RegSlot::Reg(right_r))) = (
+        alloc.allocation.get(left).copied(),
+        alloc.allocation.get(right).copied(),
+    ) else {
+        return Ok(None);
+    };
+
+    // Precondition 3: the comparison/IsTrue results (the only stores
+    // between the comparison and the branch, by precondition 1) must not
+    // occupy an operand slot.
+    for result in [module.inst(cmp_inst).result, module.inst(cond_inst).result]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(RegSlot::Reg(r)) = alloc.allocation.get(&result).copied() {
+            if r == left_r || r == right_r {
+                return Ok(None);
+            }
+        }
+    }
+
+    fuse_binop_branch(*op, *left, *right, true_dest, func_id, alloc, codes)
 }
 
 /// Emit a fused compare-branch for a BinOp comparison.
 ///
 /// The comparison's operands follow the same spill-before-load ordering as
 /// any two-operand instruction: spill the register operand first, then load
-/// the acc operand.
+/// the acc operand. Soundness preconditions (adjacency, Reg-colored
+/// operands, no result-slot sharing) are enforced by the caller,
+/// `try_fuse_cmp_branch`.
 fn fuse_binop_branch(
     op: BinOp,
     left: Value,

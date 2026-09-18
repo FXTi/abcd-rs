@@ -93,8 +93,21 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
             spill_slot: None,
         });
     }
-    // Step 1: Exact backward dataflow liveness.
-    let (_live_in, live_out) = compute_liveness(module, func_id, &rpo);
+    // Step 1: Exact backward dataflow liveness (exception edges included).
+    let (live_in, live_out) = compute_liveness(module, func_id, &rpo);
+
+    // Values live into a catch handler must not be Acc-colored: exception
+    // dispatch physically delivers the thrown object in the accumulator,
+    // so the acc content of any value live across an exception edge is
+    // dead at handler entry. They must keep a real register home.
+    let handler_live_in: HashSet<Value> = func
+        .try_regions
+        .iter()
+        .flat_map(|region| region.catches.iter())
+        .filter_map(|catch| live_in.get(&catch.handler_block))
+        .flatten()
+        .copied()
+        .collect();
 
     // Step 2: Build interference graph.
     let interference = build_interference(module, &rpo, &live_out);
@@ -109,6 +122,7 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
         &acc_score,
         func.param_count,
         &func.param_values,
+        &handler_live_in,
     )?;
 
     // Step 5: Boissinot SSA destruction — collect the per-edge value-level
@@ -159,14 +173,43 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
 
 /// Compute live_in and live_out sets for each block.
 /// Phi operands are treated as uses in the predecessor block.
+///
+/// Exception edges participate: a catch handler is a control-flow
+/// successor of every block in its try region — an exception can transfer
+/// control from any protected instruction to the handler, so values the
+/// handler uses are live out of every try block. Terminator-only
+/// successors (`block_succs`) miss this: a try body may end in
+/// `Throw`/`Unreachable` while the handler still reads values defined
+/// there (S6 — without these edges such values look dead past their
+/// definition, never interfere, and can all be colored Acc).
 fn compute_liveness(
     module: &Module,
-    _func_id: FuncId,
+    func_id: FuncId,
     rpo: &[Block],
 ) -> (
     HashMap<Block, HashSet<Value>>,
     HashMap<Block, HashSet<Value>>,
 ) {
+    let func = module.func(func_id);
+
+    // Augmented successor map: terminator successors plus, for every try
+    // region, an edge from each protected block to each of its handlers.
+    let mut succs: HashMap<Block, Vec<Block>> = rpo
+        .iter()
+        .map(|&bb| (bb, block_succs(module, bb)))
+        .collect();
+    for region in &func.try_regions {
+        for &try_block in &region.try_blocks {
+            if let Some(edges) = succs.get_mut(&try_block) {
+                for catch in &region.catches {
+                    if !edges.contains(&catch.handler_block) {
+                        edges.push(catch.handler_block);
+                    }
+                }
+            }
+        }
+    }
+
     // Compute use and def sets per block.
     let mut block_use: HashMap<Block, HashSet<Value>> = HashMap::new();
     let mut block_def: HashMap<Block, HashSet<Value>> = HashMap::new();
@@ -232,15 +275,17 @@ fn compute_liveness(
         changed = false;
         // Process in reverse RPO for faster convergence.
         for &bb in rpo.iter().rev() {
+            let empty: Vec<Block> = Vec::new();
+            let bb_succs = succs.get(&bb).unwrap_or(&empty);
             // live_out = union of live_in of successors
             let mut new_out = HashSet::new();
-            for succ in block_succs(module, bb) {
+            for &succ in bb_succs {
                 if let Some(succ_in) = live_in.get(&succ) {
                     new_out.extend(succ_in);
                 }
             }
             // Also add phi operands from successors that come from this block.
-            for succ in block_succs(module, bb) {
+            for &succ in bb_succs {
                 let succ_block = module.block(succ);
                 for &phi_id in &succ_block.phis {
                     if let InstData::Phi { entries } = &module.inst(phi_id).data {
@@ -397,12 +442,16 @@ fn compute_acc_scores(module: &Module, rpo: &[Block]) -> HashMap<Value, i32> {
 /// into these homes. `param_count` still seeds `next_reg` so a hand-built
 /// function that declares more args than it created values for keeps the
 /// bottom slots reserved, preserving the historical frame size.
+///
+/// `acc_forbidden` values (live into a catch handler) are never colored
+/// Acc: exception dispatch physically clobbers the accumulator.
 fn mcs_color(
     all_values: &[Value],
     interference: &InterferenceGraph,
     acc_score: &HashMap<Value, i32>,
     param_count: u16,
     params: &[Value],
+    acc_forbidden: &HashSet<Value>,
 ) -> Result<(HashMap<Value, RegSlot>, u16), RegAllocError> {
     let n = all_values.len();
     let val_set: HashSet<Value> = all_values.iter().copied().collect();
@@ -470,8 +519,10 @@ fn mcs_color(
 
         let score = acc_score.get(&v).copied().unwrap_or(0);
 
-        // Try accumulator first if score is positive and acc is available.
-        if score > 0 && !used_colors.contains(&RegSlot::Acc) {
+        // Try accumulator first if score is positive, acc is available, and
+        // the value is not live into a catch handler (exception dispatch
+        // clobbers the physical acc).
+        if score > 0 && !acc_forbidden.contains(&v) && !used_colors.contains(&RegSlot::Acc) {
             allocation.insert(v, RegSlot::Acc);
         } else {
             // Find smallest available register.

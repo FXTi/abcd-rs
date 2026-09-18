@@ -2,11 +2,11 @@
 //! regression tests.
 //!
 //! It supports only the opcodes the crafted sequences use
-//! (`Lda`/`Sta`/`Mov`/`Ldai`/`Add2`/`Sub2`/`Greater`/`Jmp`/`Jnez`/`Return`/
-//! `Returnundefined`, no-op `Stobjbyname`, plus record-and-stop for
-//! `Stobjbyvalue`). Labels in `layout` output are already resolved to
-//! absolute instruction indices by `resolve_labels`, so jumps use the label
-//! operand directly as a program counter.
+//! (`Lda`/`Sta`/`Mov`/`Ldai`/`Add2`/`Sub2`/`Greater`/`Eq`/`Istrue`/`Jmp`/
+//! `Jnez`/`Jeq`/`Return`/`Returnundefined`, no-op `Stobjbyname`, plus
+//! record-and-stop for `Stobjbyvalue`). Labels in `layout` output are
+//! already resolved to absolute instruction indices by `resolve_labels`,
+//! so jumps use the label operand directly as a program counter.
 
 use std::collections::HashMap;
 
@@ -99,11 +99,36 @@ impl Machine {
                     self.acc = i64::from(self.acc > self.reg(r.0));
                     pc += 1;
                 }
+                // `eq imm:u8, v:in:top` with `acc: inout:top`
+                // (vendor arkcompiler_runtime_core-master/isa/isa.yaml line 615):
+                // acc = (acc == v0) (ic slot operand ignored).
+                Bytecode::Eq(_, r) => {
+                    self.acc = i64::from(self.acc == self.reg(r.0));
+                    pc += 1;
+                }
+                // `istrue` with `acc: inout:top`
+                // (vendor arkcompiler_runtime_core-master/isa/isa.yaml line 761):
+                // acc = ToBoolean(acc); the machine's i64 values model
+                // truthiness as != 0.
+                Bytecode::Istrue => {
+                    self.acc = i64::from(self.acc != 0);
+                    pc += 1;
+                }
                 Bytecode::Jmp(label) => {
                     pc = label.0 as usize;
                 }
                 Bytecode::Jnez(label) => {
                     if self.acc != 0 {
+                        pc = label.0 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+                // `jeq v:in:top, imm:i16` with `acc: in:top`
+                // (vendor arkcompiler_runtime_core-master/isa/isa.yaml line 1746):
+                // jump if acc == v0.
+                Bytecode::Jeq(r, label) => {
+                    if self.acc == self.reg(r.0) {
                         pc = label.0 as usize;
                     } else {
                         pc += 1;
