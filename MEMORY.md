@@ -73,13 +73,14 @@
   already has a direct edge to the target. CFG merge also needs instruction
   ownership and try-region maintenance; partial predecessor rewrites are not
   sufficient.
-- IR parameter ownership, dominance, input parameter seeding, reference-type
-  string-pool ownership, and exception CFG semantics need review.
-- Lowering after Phase 1: slot-level copy resolution, edge-correct phi
-  placement, in-frame spills, and the encode relocation channel are done.
-  Remaining: approximate semantics (B4 acc-clobber modeling), parameter
-  ABI/seeding (args must live in top-of-frame slots), incomplete
-  literal-array handling.
+- IR parameter ownership and input parameter seeding were fixed in 900a39c
+  (param_values per-function identity + entry seeding + copy-in prologue).
+  Still needing review: dominance, reference-type string-pool ownership,
+  and exception CFG semantics.
+- Lowering after Phase 1+2.2: slot-level copy resolution, edge-correct phi
+  placement, in-frame spills, the encode relocation channel, and the
+  parameter ABI are done. Remaining: approximate semantics (B4 acc-clobber
+  modeling), incomplete literal-array handling.
 - `isa.yaml` has no super-by-index opcode. Lowering now returns an explicit
   unsupported-instruction error for `LoadSuperProperty`/`StoreSuperProperty`
   with `ByIndex` instead of silently emitting nothing.
@@ -170,11 +171,22 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   module.string_entities + File.entity_map via isel's EntityTrace records);
   literal-array operands carry decoded table indices, inverted through
   File::literal_array_offsets. Untraceable operands are hard errors.
-- KNOWN LIMITATION (Phase 3): regalloc pins params to Reg(0..param_count),
-  i.e. the BOTTOM of the frame, but the Ark ABI passes args in the TOP
-  slots (frame = num_vregs + num_args). Lowered bodies that READ arguments
-  are therefore not runtime-correct yet; to_method_body writes
-  num_vregs = num_regs (includes params — oversized frame, harmless).
+- RESOLVED (900a39c, Phase 2.2): the parameter ABI is now correct
+  end-to-end — lift seeds param_count from the code header num_args (B5
+  fixed; 12+ SIGSEGV gone), entry seeding binds arg-slot registers
+  Reg(num_vregs + i) to per-function FuncParam values
+  (FunctionData.param_values is authoritative; the Value::from_index(i)
+  arena convention is gone from regalloc/SCCP/verify), and isel emits a
+  copy-in prologue Mov(home_i, Reg(num_regs + i)). to_method_body's
+  num_vregs = num_regs / num_args = param_count split is now EXACT.
+  VM oracle on lowered arithmetic bodies: 0/18 → 18/18 (lift) + 18/18
+  (opt), stdout 42\n, image sha256:5e7627… (independently re-run by the
+  orchestrator).
+- Follow-up (registered, not scheduled): reads of never-written VREG slots
+  (< num_vregs) at entry still produce empty phis; Ark initializes vregs to
+  hole. Deliberately deferred (scope discipline) — a LiteralHole seeding
+  would perturb liveness; revisit if a corpus fixture reads an
+  uninitialized vreg.
 - Phase 2.1 (corpus lower oracle, f4c68f1): lowered bodies now reach the VM
   oracle — `abcd-ir/tests/corpus_lower_oracle.rs` writes
   `$ABCD_LOWERED_DIR/{lift,opt}/...` (all-or-nothing per fixture), compared
