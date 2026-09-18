@@ -17,10 +17,6 @@ pub struct AbcFile<'data> {
     _data: PhantomData<&'data [u8]>,
 }
 
-// SAFETY: AbcFileHandle is internally thread-safe (read-only after open).
-unsafe impl Send for AbcFile<'_> {}
-unsafe impl Sync for AbcFile<'_> {}
-
 impl<'data> AbcFile<'data> {
     /// Open an ABC file from a byte slice.
     pub fn open(data: &'data [u8]) -> Result<Self, Error> {

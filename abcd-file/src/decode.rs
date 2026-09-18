@@ -155,7 +155,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         };
         let descriptor = strings.get_or_intern(&descriptor_str);
 
-        let name_str = read_class_name(cr).ok_or_else(|| Error::Malformed {
+        let name_str = read_class_name(f, cr).ok_or_else(|| Error::Malformed {
             field: "name",
             context: format!("class {descriptor_str}"),
         })?;
@@ -1468,17 +1468,16 @@ fn read_class_descriptor(
     })
 }
 
-fn read_class_name(cr: *const sys::AbcClassAccessor) -> Option<String> {
-    let len = unsafe { sys::abc_class_get_name(cr, std::ptr::null_mut(), 0) };
-    if len == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; len + 1];
-    unsafe {
-        sys::abc_class_get_name(cr, buf.as_mut_ptr() as *mut _, buf.len());
-    }
-    let cstr = CStr::from_bytes_until_nul(&buf).ok()?;
-    Some(cstr.to_string_lossy().into_owned())
+fn read_class_name(
+    f: *const sys::AbcFileHandle,
+    cr: *const sys::AbcClassAccessor,
+) -> Option<String> {
+    // The class item's name is its descriptor string; read it through the
+    // lossless MUTF-8 path (same source as read_class_descriptor) instead of
+    // the raw-byte abc_class_get_name view, which corrupts embedded NULs
+    // (C0 80) and astral characters.
+    let class_id = unsafe { sys::abc_class_get_class_id(cr) };
+    read_string(f, class_id)
 }
 
 fn read_method_name(mr: *const sys::AbcMethodAccessor) -> Option<String> {

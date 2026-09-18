@@ -23,6 +23,26 @@ macro_rules! handle_type {
     };
 }
 
+/// Convert a Rust UTF-8 string to MUTF-8 (modified UTF-8) bytes in a CString.
+///
+/// MUTF-8 encodes U+0000 as the two-byte overlong sequence `C0 80`, so the
+/// result never contains a `0x00` byte regardless of the input; astral
+/// characters keep their standard 4-byte UTF-8 encoding (panda's MUTF-8
+/// differs from UTF-8 only in the NUL rule — upstream utf.cpp:131-138).
+fn c_mutf8(s: &str) -> CString {
+    let mut bytes = Vec::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch == '\0' {
+            bytes.extend_from_slice(&[0xC0, 0x80]);
+        } else {
+            let mut buf = [0u8; 4];
+            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    // Unreachable: MUTF-8 output contains no 0x00 byte by construction.
+    CString::new(bytes).expect("MUTF-8 contains no NUL")
+}
+
 handle_type!(StringHandle);
 handle_type!(ClassHandle);
 handle_type!(MethodHandle);
@@ -115,7 +135,7 @@ impl Builder {
 
     /// Set the API policy before adding items.
     pub fn set_api(&mut self, version: u8, sub_api: &str) {
-        let c_sub = CString::new(sub_api).expect("sub_api contains NUL");
+        let c_sub = c_mutf8(sub_api);
         unsafe { sys::abc_builder_set_api(self.raw, version, c_sub.as_ptr()) };
     }
 
@@ -135,7 +155,7 @@ impl Builder {
 
     /// Add a string, returning its handle.
     pub fn add_string(&mut self, s: &str) -> StringHandle {
-        let c_str = CString::new(s).expect("string contains NUL");
+        let c_str = c_mutf8(s);
         StringHandle(unsafe { sys::abc_builder_add_string(self.raw, c_str.as_ptr()) })
     }
 
@@ -143,13 +163,13 @@ impl Builder {
 
     /// Add a class with the given descriptor (e.g. `"LMyClass;"`).
     pub fn add_class(&mut self, descriptor: &str) -> ClassHandle {
-        let c_desc = CString::new(descriptor).expect("descriptor contains NUL");
+        let c_desc = c_mutf8(descriptor);
         ClassHandle(unsafe { sys::abc_builder_add_class(self.raw, c_desc.as_ptr()) })
     }
 
     /// Add a foreign (external) class.
     pub fn add_foreign_class(&mut self, descriptor: &str) -> ClassHandle {
-        let c_desc = CString::new(descriptor).expect("descriptor contains NUL");
+        let c_desc = c_mutf8(descriptor);
         ClassHandle(unsafe { sys::abc_builder_add_foreign_class(self.raw, c_desc.as_ptr()) })
     }
 
@@ -241,7 +261,7 @@ impl Builder {
         num_vregs: u32,
         num_args: u32,
     ) -> MethodHandle {
-        let c_name = CString::new(name).expect("name contains NUL");
+        let c_name = c_mutf8(name);
         MethodHandle(unsafe {
             sys::abc_builder_class_add_method_with_proto(
                 self.raw,
@@ -265,7 +285,7 @@ impl Builder {
         proto: ProtoHandle,
         flags: AccessFlags,
     ) -> MethodHandle {
-        let c_name = CString::new(name).expect("name contains NUL");
+        let c_name = c_mutf8(name);
         MethodHandle(unsafe {
             sys::abc_builder_add_foreign_method(
                 self.raw,
@@ -307,7 +327,7 @@ impl Builder {
         ty: Type,
         flags: AccessFlags,
     ) -> FieldHandle {
-        let c_name = CString::new(name).expect("name contains NUL");
+        let c_name = c_mutf8(name);
         FieldHandle(unsafe {
             sys::abc_builder_class_add_field(
                 self.raw,
@@ -328,7 +348,7 @@ impl Builder {
         ref_class: ClassHandle,
         flags: AccessFlags,
     ) -> FieldHandle {
-        let c_name = CString::new(name).expect("name contains NUL");
+        let c_name = c_mutf8(name);
         FieldHandle(unsafe {
             sys::abc_builder_class_add_field_ex(
                 self.raw,
@@ -343,7 +363,7 @@ impl Builder {
 
     /// Add a foreign field.
     pub fn add_foreign_field(&mut self, cls: ClassHandle, name: &str, ty: Type) -> FieldHandle {
-        let c_name = CString::new(name).expect("name contains NUL");
+        let c_name = c_mutf8(name);
         FieldHandle(unsafe {
             sys::abc_builder_add_foreign_field(self.raw, cls.0, c_name.as_ptr(), ty.as_raw_u8())
         })
@@ -412,7 +432,7 @@ impl Builder {
 
     /// Create a literal array with the given ID string.
     pub fn add_literal_array(&mut self, id: &str) -> LiteralArrayHandle {
-        let c_id = CString::new(id).expect("id contains NUL");
+        let c_id = c_mutf8(id);
         LiteralArrayHandle(unsafe { sys::abc_builder_add_literal_array(self.raw, c_id.as_ptr()) })
     }
 
@@ -973,8 +993,13 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     b.set_file_version(file.version)?;
     let pool = &file.strings;
 
-    // Helper: resolve a StringId to &str, panicking on invalid ids.
-    let rs = |id: StringId| -> &str { pool.resolve(id).expect("dangling StringId in file") };
+    // Helper: resolve a StringId to &str, erroring on invalid ids.
+    let rs = |id: StringId| -> Result<&str, Error> {
+        pool.resolve(id).ok_or_else(|| Error::Malformed {
+            field: "string_id",
+            context: format!("dangling StringId {id:?} in file"),
+        })
+    };
 
     // --- Collect all strings and build handle map ---
     let mut string_handles: HashMap<StringId, StringHandle> = HashMap::new();
@@ -984,18 +1009,24 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     let mut entities = EntityHandles::default();
     let mut code_references = Vec::new();
     let mut ann_la_counter: u32 = 0;
+    // Number of annotation-embedded literal arrays that will be created
+    // while classes are configured. Model literal arrays are only created
+    // afterwards (creation order is significant to the vendored writer), so
+    // their builder handles start at this offset — used to resolve nested
+    // `LiteralValue::LiteralArray` references on the annotation path (#8).
+    let ann_la_base = count_annotation_literal_arrays(file);
 
     // First pass: foreign classes
     for (&desc, cls) in &file.classes {
         if cls.is_external {
-            let h = b.add_foreign_class(rs(desc));
+            let h = b.add_foreign_class(rs(desc)?);
             class_handles.insert(desc, h);
         }
     }
     // Second pass: normal classes
     for (&desc, cls) in &file.classes {
         if !cls.is_external {
-            let desc_str = rs(desc);
+            let desc_str = rs(desc)?;
             let h = if desc_str == "L_GLOBAL;" {
                 b.add_global_class()
             } else {
@@ -1010,14 +1041,17 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                             map: &mut HashMap<StringId, ClassHandle>,
                             pool: &StringPool,
                             desc: StringId|
-     -> ClassHandle {
+     -> Result<ClassHandle, Error> {
         if let Some(&h) = map.get(&desc) {
-            return h;
+            return Ok(h);
         }
-        let desc_str = pool.resolve(desc).expect("dangling StringId");
+        let desc_str = pool.resolve(desc).ok_or_else(|| Error::Malformed {
+            field: "string_id",
+            context: format!("dangling StringId {desc:?} for class descriptor"),
+        })?;
         let h = b.add_foreign_class(desc_str);
         map.insert(desc, h);
-        h
+        Ok(h)
     };
 
     // --- Configure each class ---
@@ -1028,24 +1062,24 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
         b.class_set_source_lang(cls_h, cls.source_lang);
 
         if let Some(sf) = cls.source_file {
-            let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, sf);
+            let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, sf)?;
             b.class_set_source_file(cls_h, sh);
         }
         if let Some(sup) = cls.super_class {
-            let sup_h = resolve_class_id(&mut b, &mut class_handles, pool, sup);
+            let sup_h = resolve_class_id(&mut b, &mut class_handles, pool, sup)?;
             b.class_set_super_class(cls_h, sup_h);
         }
         for &iface in &cls.interfaces {
-            let iface_h = resolve_class_id(&mut b, &mut class_handles, pool, iface);
+            let iface_h = resolve_class_id(&mut b, &mut class_handles, pool, iface)?;
             b.class_add_interface(cls_h, iface_h);
         }
 
         // --- Methods ---
         for method in &cls.methods {
-            let method_name_str = rs(method.name);
+            let method_name_str = rs(method.name)?;
             let ret_type = method.return_type.unwrap_or(Type::Void);
             let ret_class = if let Type::Reference(d) = ret_type {
-                Some(resolve_class_id(&mut b, &mut class_handles, pool, d))
+                Some(resolve_class_id(&mut b, &mut class_handles, pool, d)?)
             } else {
                 None
             };
@@ -1054,12 +1088,12 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 .iter()
                 .map(|t| {
                     if let Type::Reference(d) = t {
-                        Some(resolve_class_id(&mut b, &mut class_handles, pool, *d))
+                        resolve_class_id(&mut b, &mut class_handles, pool, *d).map(Some)
                     } else {
-                        None
+                        Ok(None)
                     }
                 })
-                .collect();
+                .collect::<Result<_, Error>>()?;
 
             let proto = b.create_proto_ex(&ret_type, ret_class, &method.arg_types, &arg_classes);
 
@@ -1113,9 +1147,11 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                                 let type_class = if cb.type_idx == u32::MAX {
                                     None
                                 } else {
-                                    file.resolve_entity(cb.type_idx).map(|d| {
-                                        resolve_class_id(&mut b, &mut class_handles, pool, d)
-                                    })
+                                    file.resolve_entity(cb.type_idx)
+                                        .map(|d| {
+                                            resolve_class_id(&mut b, &mut class_handles, pool, d)
+                                        })
+                                        .transpose()?
                                 };
                                 let handler_pc =
                                     byte_offsets.get(cb.handler as usize).copied().unwrap_or(0);
@@ -1124,13 +1160,13 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                                     .get(end as usize)
                                     .copied()
                                     .unwrap_or(code_bytes.len() as u32);
-                                CatchBlockDef {
+                                Ok(CatchBlockDef {
                                     type_class,
                                     handler_pc,
                                     code_size: end_pc - handler_pc,
-                                }
+                                })
                             })
-                            .collect();
+                            .collect::<Result<_, Error>>()?;
                         let start_pc = byte_offsets.get(tb.start as usize).copied().unwrap_or(0);
                         let end = tb.start + tb.len;
                         let end_pc = byte_offsets
@@ -1152,7 +1188,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                         dbg,
                         &byte_offsets,
                         code_bytes.len() as u32,
-                    );
+                    )?;
                 }
 
                 if let Some(body) = &method.body {
@@ -1175,6 +1211,8 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     class_handles: &mut class_handles,
                     entities: &entities,
                     ann_la_counter: &mut ann_la_counter,
+                    ann_la_base,
+                    literal_array_count: file.literal_arrays.len(),
                     pool,
                 };
                 encode_annotations_on(
@@ -1182,18 +1220,18 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     &mut ctx,
                     &method.annotations,
                     AnnotationTarget::Method(method_h),
-                );
+                )?;
             }
         }
 
         // --- Fields ---
         for field in &cls.fields {
-            let field_name_str = rs(field.name);
+            let field_name_str = rs(field.name)?;
             let ty = field.field_type;
             let field_h = if field.is_external {
                 b.add_foreign_field(cls_h, field_name_str, ty)
             } else if let Type::Reference(d) = ty {
-                let ref_cls = resolve_class_id(&mut b, &mut class_handles, pool, d);
+                let ref_cls = resolve_class_id(&mut b, &mut class_handles, pool, d)?;
                 b.class_add_field_ex(cls_h, field_name_str, ty, ref_cls, field.access_flags)
             } else {
                 b.class_add_field(cls_h, field_name_str, ty, field.access_flags)
@@ -1218,6 +1256,8 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     class_handles: &mut class_handles,
                     entities: &entities,
                     ann_la_counter: &mut ann_la_counter,
+                    ann_la_base,
+                    literal_array_count: file.literal_arrays.len(),
                     pool,
                 };
                 encode_annotations_on(
@@ -1225,7 +1265,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     &mut ctx,
                     &field.annotations,
                     AnnotationTarget::Field(field_h),
-                );
+                )?;
             }
         }
 
@@ -1236,6 +1276,8 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 class_handles: &mut class_handles,
                 entities: &entities,
                 ann_la_counter: &mut ann_la_counter,
+                ann_la_base,
+                literal_array_count: file.literal_arrays.len(),
                 pool,
             };
             encode_annotations_on(
@@ -1243,15 +1285,23 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 &mut ctx,
                 &cls.annotations,
                 AnnotationTarget::Class(cls_h),
-            );
+            )?;
         }
     }
 
-    // --- Literal arrays ---
+    // --- Literal array contents ---
+    // Model literal arrays are created after class configuration, so their
+    // builder handles start after every annotation-embedded (`ann_la_*`)
+    // array: handle(i) = ann_la_base + i.
     let literal_handles: Vec<_> = (0..file.literal_arrays.len())
         .map(|index| b.add_literal_array(&index.to_string()))
         .collect();
-    for (la, &la_h) in file.literal_arrays.iter().zip(&literal_handles) {
+    for (i, (la, &la_h)) in file.literal_arrays.iter().zip(&literal_handles).enumerate() {
+        debug_assert_eq!(
+            la_h.as_raw(),
+            ann_la_base + i as u32,
+            "model literal-array handles must follow annotation-embedded ones"
+        );
         for val in &la.values {
             encode_literal_value(
                 &mut b,
@@ -1261,7 +1311,8 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 val,
                 &file.entity_map,
                 &entities,
-            );
+                &literal_handles,
+            )?;
         }
     }
 
@@ -1290,7 +1341,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                             &mut string_handles,
                             pool,
                             sid,
-                        ))
+                        )?)
                     }
                     EntityKind::MethodId => CodeEntity::Method(
                         *entities
@@ -1383,6 +1434,50 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
     Ok(())
 }
 
+/// Count the literal arrays that annotation encoding will create: exactly
+/// one `ann_la_*` builder array per `AnnotationValue::LiteralArray` element,
+/// recursing into nested annotations. Array elements are converted by
+/// `annotation_array_elem_to_handle`, which never creates arrays, so they
+/// are not counted.
+///
+/// The count determines the builder handle of every model literal array
+/// (created after class configuration): `handle(i) = count + i`.
+fn count_annotation_literal_arrays(file: &File) -> u32 {
+    fn in_value(v: &AnnotationValue) -> u32 {
+        match v {
+            AnnotationValue::LiteralArray(_) => 1,
+            AnnotationValue::Annotation(a) => a.elements.iter().map(|e| in_value(&e.value)).sum(),
+            _ => 0,
+        }
+    }
+    fn in_annotations(a: &Annotations) -> u32 {
+        a.compile_time
+            .iter()
+            .chain(a.runtime.iter())
+            .chain(a.compile_time_type.iter())
+            .chain(a.runtime_type.iter())
+            .flat_map(|ann| ann.elements.iter())
+            .map(|e| in_value(&e.value))
+            .sum()
+    }
+    file.classes
+        .values()
+        .map(|class| {
+            in_annotations(&class.annotations)
+                + class
+                    .methods
+                    .iter()
+                    .map(|m| in_annotations(&m.annotations))
+                    .sum::<u32>()
+                + class
+                    .fields
+                    .iter()
+                    .map(|f| in_annotations(&f.annotations))
+                    .sum::<u32>()
+        })
+        .sum()
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1399,6 +1494,12 @@ struct AnnotationEncodeCtx<'a> {
     class_handles: &'a mut HashMap<StringId, ClassHandle>,
     entities: &'a EntityHandles,
     ann_la_counter: &'a mut u32,
+    /// Handle of the first model literal array (= number of
+    /// annotation-embedded arrays, which are created first), plus the model
+    /// table length. Nested `LiteralValue::LiteralArray` references resolve
+    /// to `LiteralArrayHandle(ann_la_base + idx)`.
+    ann_la_base: u32,
+    literal_array_count: usize,
     pool: &'a StringPool,
 }
 
@@ -1408,7 +1509,7 @@ fn encode_annotations_on(
     ctx: &mut AnnotationEncodeCtx<'_>,
     anns: &Annotations,
     target: AnnotationTarget,
-) {
+) -> Result<(), Error> {
     let groups: [(
         &[Annotation],
         fn(&mut Builder, &AnnotationTarget, AnnotationHandle),
@@ -1438,30 +1539,31 @@ fn encode_annotations_on(
     for (ann_list, attach_fn) in &groups {
         for ann in *ann_list {
             let ann_cls =
-                resolve_class_for_ann(b, ctx.class_handles, ctx.pool, ann.class_descriptor);
+                resolve_class_for_ann(b, ctx.class_handles, ctx.pool, ann.class_descriptor)?;
 
             let elems: Vec<AnnotationElemDefEx> = ann
                 .elements
                 .iter()
                 .map(|e| {
-                    let name = get_or_add_string_id(b, ctx.string_handles, ctx.pool, e.name);
-                    let (tag, value) = annotation_value_to_raw(&e.value, b, ctx);
-                    AnnotationElemDefEx { name, tag, value }
+                    let name = get_or_add_string_id(b, ctx.string_handles, ctx.pool, e.name)?;
+                    let (tag, value) = annotation_value_to_raw(&e.value, b, ctx)?;
+                    Ok(AnnotationElemDefEx { name, tag, value })
                 })
-                .collect();
+                .collect::<Result<_, Error>>()?;
 
             let ann_h = b.create_annotation_ex(ann_cls, &elems);
             attach_fn(b, &target, ann_h);
         }
     }
+    Ok(())
 }
 
 fn annotation_value_to_raw(
     val: &AnnotationValue,
     b: &mut Builder,
     ctx: &mut AnnotationEncodeCtx<'_>,
-) -> (u8, AnnotationElemValue) {
-    match val {
+) -> Result<(u8, AnnotationElemValue), Error> {
+    let raw = match val {
         AnnotationValue::Bool(v) => (b'1', AnnotationElemValue::Scalar(*v as u32)),
         AnnotationValue::I8(v) => (b'2', AnnotationElemValue::Scalar(*v as u32)),
         AnnotationValue::U8(v) => (b'3', AnnotationElemValue::Scalar(*v as u32)),
@@ -1474,11 +1576,11 @@ fn annotation_value_to_raw(
         AnnotationValue::F32(v) => (b'A', AnnotationElemValue::Scalar(v.to_bits())),
         AnnotationValue::F64(v) => (b'B', AnnotationElemValue::Scalar64(v.to_bits())),
         AnnotationValue::String(sid) => {
-            let h = get_or_add_string_id(b, ctx.string_handles, ctx.pool, *sid);
+            let h = get_or_add_string_id(b, ctx.string_handles, ctx.pool, *sid)?;
             (b'C', AnnotationElemValue::EntityRef(h.0))
         }
         AnnotationValue::Record(sid) => {
-            let h = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, *sid);
+            let h = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, *sid)?;
             (b'D', AnnotationElemValue::EntityRef(h.0))
         }
         AnnotationValue::Method { name, offset } => {
@@ -1497,16 +1599,16 @@ fn annotation_value_to_raw(
         }
         AnnotationValue::Annotation(nested) => {
             let ann_cls =
-                resolve_class_for_ann(b, ctx.class_handles, ctx.pool, nested.class_descriptor);
+                resolve_class_for_ann(b, ctx.class_handles, ctx.pool, nested.class_descriptor)?;
             let elems: Vec<AnnotationElemDefEx> = nested
                 .elements
                 .iter()
                 .map(|e| {
-                    let name = get_or_add_string_id(b, ctx.string_handles, ctx.pool, e.name);
-                    let (tag, value) = annotation_value_to_raw(&e.value, b, ctx);
-                    AnnotationElemDefEx { name, tag, value }
+                    let name = get_or_add_string_id(b, ctx.string_handles, ctx.pool, e.name)?;
+                    let (tag, value) = annotation_value_to_raw(&e.value, b, ctx)?;
+                    Ok(AnnotationElemDefEx { name, tag, value })
                 })
-                .collect();
+                .collect::<Result<_, Error>>()?;
             let ann_h = b.create_annotation_ex(ann_cls, &elems);
             (b'G', AnnotationElemValue::EntityRef(ann_h.0))
         }
@@ -1534,7 +1636,15 @@ fn annotation_value_to_raw(
             *ctx.ann_la_counter += 1;
             let la_h = b.add_literal_array(&id);
             for val in values {
-                encode_literal_value_simple(b, ctx.string_handles, ctx.pool, la_h, val);
+                encode_literal_value_simple(
+                    b,
+                    ctx.string_handles,
+                    ctx.pool,
+                    la_h,
+                    val,
+                    ctx.ann_la_base,
+                    ctx.literal_array_count,
+                )?;
             }
             (b'#', AnnotationElemValue::EntityRef(la_h.0))
         }
@@ -1546,20 +1656,22 @@ fn annotation_value_to_raw(
                 .map(|v| {
                     annotation_array_elem_to_handle(
                         v,
+                        *tag,
                         b,
                         ctx.string_handles,
                         ctx.class_handles,
                         ctx.pool,
                     )
                 })
-                .collect();
+                .collect::<Result<_, Error>>()?;
             if is_entity_array_tag(*tag) {
                 (*tag, AnnotationElemValue::EntityArray(handles))
             } else {
                 (*tag, AnnotationElemValue::Array(handles))
             }
         }
-    }
+    };
+    Ok(raw)
 }
 
 /// Returns true if the annotation array tag refers to entity-reference
@@ -1571,14 +1683,17 @@ fn is_entity_array_tag(tag: u8) -> bool {
 }
 
 /// Convert a single annotation array element to a u32 handle/value for the builder.
+///
+/// `tag` is the enclosing array's element tag, used only for error reporting.
 fn annotation_array_elem_to_handle(
     val: &AnnotationValue,
+    tag: u8,
     b: &mut Builder,
     string_handles: &mut HashMap<StringId, StringHandle>,
     class_handles: &mut HashMap<StringId, ClassHandle>,
     pool: &StringPool,
-) -> u32 {
-    match val {
+) -> Result<u32, Error> {
+    let raw = match val {
         AnnotationValue::Bool(v) => *v as u32,
         AnnotationValue::I8(v) => *v as u32,
         AnnotationValue::U8(v) => *v as u32,
@@ -1589,23 +1704,21 @@ fn annotation_array_elem_to_handle(
         // The C bridge's array ABI currently accepts only 32-bit elements.
         // Silently truncating these values produces a different annotation;
         // fail explicitly until a 64-bit array ABI is available.
-        AnnotationValue::I64(_) | AnnotationValue::U64(_) => {
-            panic!("64-bit annotation array elements are not supported by the builder ABI")
+        AnnotationValue::I64(_) | AnnotationValue::U64(_) | AnnotationValue::F64(_) => {
+            return Err(Error::UnsupportedAnnotationArrayType { tag });
         }
         AnnotationValue::F32(v) => v.to_bits(),
-        AnnotationValue::F64(_) => {
-            panic!("F64 annotation array elements are not supported by the builder ABI")
-        }
         AnnotationValue::String(sid) => {
-            let h = get_or_add_string_id(b, string_handles, pool, *sid);
+            let h = get_or_add_string_id(b, string_handles, pool, *sid)?;
             h.0
         }
         AnnotationValue::Record(sid) => {
-            let h = resolve_class_for_ann(b, class_handles, pool, *sid);
+            let h = resolve_class_for_ann(b, class_handles, pool, *sid)?;
             h.0
         }
         _ => 0,
-    }
+    };
+    Ok(raw)
 }
 
 /// Resolve a class descriptor for annotation encoding.
@@ -1614,25 +1727,35 @@ fn resolve_class_for_ann(
     class_handles: &mut HashMap<StringId, ClassHandle>,
     pool: &StringPool,
     desc: StringId,
-) -> ClassHandle {
+) -> Result<ClassHandle, Error> {
     if let Some(&h) = class_handles.get(&desc) {
-        return h;
+        return Ok(h);
     }
-    let desc_str = pool.resolve(desc).expect("dangling StringId");
+    let desc_str = pool.resolve(desc).ok_or_else(|| Error::Malformed {
+        field: "string_id",
+        context: format!("dangling StringId {desc:?} for annotation class descriptor"),
+    })?;
     let h = b.add_foreign_class(desc_str);
     class_handles.insert(desc, h);
-    h
+    Ok(h)
 }
 
 /// Simplified literal value encoding for annotation-embedded literal arrays.
 /// Does not resolve method entity offsets (no entity_map available).
+///
+/// Nested `LiteralValue::LiteralArray` references carry a model table index
+/// into `File::literal_arrays`. Model arrays are created after all
+/// annotation-embedded ones, so the builder handle is
+/// `ann_la_base + idx` (`literal_array_count` bounds-checks `idx`).
 fn encode_literal_value_simple(
     b: &mut Builder,
     string_handles: &mut HashMap<StringId, StringHandle>,
     pool: &StringPool,
     la: LiteralArrayHandle,
     val: &LiteralValue,
-) {
+    ann_la_base: u32,
+    literal_array_count: usize,
+) -> Result<(), Error> {
     use crate::literal::LiteralTag;
     match val {
         LiteralValue::Bool(v) => {
@@ -1657,7 +1780,7 @@ fn encode_literal_value_simple(
         }
         LiteralValue::String(sid) => {
             b.literal_array_add_u8(la, LiteralTag::String as u8);
-            let sh = get_or_add_string_id(b, string_handles, pool, *sid);
+            let sh = get_or_add_string_id(b, string_handles, pool, *sid)?;
             b.literal_array_add_raw_string(la, sh);
         }
         LiteralValue::Method(off)
@@ -1685,10 +1808,20 @@ fn encode_literal_value_simple(
             b.literal_array_add_u16(la, *v);
         }
         LiteralValue::LiteralArray(idx) => {
-            // idx is the table index into File::literal_arrays; route it
-            // through the reference API so the writer stores the array's
-            // final file offset.
-            b.literal_array_add_literalarray(la, LiteralArrayHandle(idx.0));
+            // idx is a model table index into File::literal_arrays, NOT a
+            // builder handle: annotation-embedded arrays occupy the low
+            // handle slots. Model arrays are created right after them, so
+            // the target handle is ann_la_base + idx. Route it through the
+            // reference API so the writer stores the array's final file
+            // offset.
+            if idx.0 as usize >= literal_array_count {
+                return Err(Error::CodeRelocation(format!(
+                    "nested literal array index {} out of bounds",
+                    idx.0
+                )));
+            }
+            let target = LiteralArrayHandle(ann_la_base + idx.0);
+            b.literal_array_add_literalarray(la, target);
         }
         LiteralValue::LiteralBufferIndex(idx) => {
             b.literal_array_add_u8(la, LiteralTag::LiteralBufferIndex as u8);
@@ -1700,7 +1833,7 @@ fn encode_literal_value_simple(
         }
         LiteralValue::EtsImplements(sid) => {
             b.literal_array_add_u8(la, LiteralTag::EtsImplements as u8);
-            let sh = get_or_add_string_id(b, string_handles, pool, *sid);
+            let sh = get_or_add_string_id(b, string_handles, pool, *sid)?;
             b.literal_array_add_raw_string(la, sh);
         }
         LiteralValue::NullValue(v) => {
@@ -1738,6 +1871,7 @@ fn encode_literal_value_simple(
             b.literal_array_add_u32(la, idx.0);
         }
     }
+    Ok(())
 }
 
 fn encode_debug_info(
@@ -1748,7 +1882,7 @@ fn encode_debug_info(
     dbg: &MethodDebugInfo,
     byte_offsets: &[u32],
     code_len: u32,
-) {
+) -> Result<(), Error> {
     // Skip if debug info is completely empty (no meaningful content).
     let has_content = !dbg.line_table.is_empty()
         || !dbg.column_table.is_empty()
@@ -1757,7 +1891,7 @@ fn encode_debug_info(
         || dbg.source_file.is_some()
         || dbg.source_code.is_some();
     if !has_content {
-        return;
+        return Ok(());
     }
 
     let lnp = b.create_lnp();
@@ -1768,69 +1902,87 @@ fn encode_debug_info(
     if let Some(sf) = dbg.source_file {
         let sf_str = pool.resolve(sf).unwrap_or("");
         if !sf_str.is_empty() {
-            let sh = get_or_add_string_id(b, string_handles, pool, sf);
+            let sh = get_or_add_string_id(b, string_handles, pool, sf)?;
             b.lnp_emit_set_file(lnp, debug_h, sh);
         }
     }
     if let Some(sc) = dbg.source_code {
         let sc_str = pool.resolve(sc).unwrap_or("");
         if !sc_str.is_empty() {
-            let sh = get_or_add_string_id(b, string_handles, pool, sc);
+            let sh = get_or_add_string_id(b, string_handles, pool, sc)?;
             b.lnp_emit_set_source_code(lnp, debug_h, sh);
         }
     }
 
     // Params (signature not preserved — C++ writer limitation)
     for p in &dbg.params {
-        let nh = get_or_add_string_id(b, string_handles, pool, p.name);
+        let nh = get_or_add_string_id(b, string_handles, pool, p.name)?;
         b.debug_add_param(debug_h, nh);
     }
 
-    // Line table — emit as (advance_pc, advance_line) deltas
-    let mut prev_pc: u32 = 0;
+    // Line table — emit as (advance_pc, advance_line) deltas.
+    // `cur_pc` tracks the LNP program counter across the whole program;
+    // the line table, column table, and local variables share one stream.
+    let mut cur_pc: u32 = 0;
     let mut prev_line: u32 = first_line;
     for entry in &dbg.line_table {
         let pc = index_to_offset(byte_offsets, entry.index, code_len);
-        let pc_delta = pc.saturating_sub(prev_pc);
+        let pc_delta = pc.saturating_sub(cur_pc);
         let line_delta = entry.line as i32 - prev_line as i32;
         if pc_delta > 0 {
             b.lnp_emit_advance_pc(lnp, debug_h, pc_delta);
+            cur_pc = pc;
         }
         if line_delta != 0 {
             b.lnp_emit_advance_line(lnp, debug_h, line_delta);
         }
-        prev_pc = pc;
         prev_line = entry.line;
     }
 
     // Column table
-    let mut prev_pc: u32 = 0;
+    let mut prev_col_pc: u32 = 0;
     for entry in &dbg.column_table {
         let pc = index_to_offset(byte_offsets, entry.index, code_len);
-        let pc_delta = pc.saturating_sub(prev_pc);
+        let pc_delta = pc.saturating_sub(prev_col_pc);
         b.lnp_emit_column(lnp, debug_h, pc_delta, entry.column);
-        prev_pc = pc;
+        prev_col_pc = pc;
+        cur_pc = cur_pc.saturating_add(pc_delta);
     }
 
-    // Local variables
+    // Local variables — advance the program counter to each scope boundary
+    // so start_local/end_local span the variable's live range (the line and
+    // column tables above have already moved the pc past zero).
     for lv in &dbg.local_vars {
-        let name_h = get_or_add_string_id(b, string_handles, pool, lv.name);
-        let type_h = get_or_add_string_id(b, string_handles, pool, lv.type_name);
+        let name_h = get_or_add_string_id(b, string_handles, pool, lv.name)?;
+        let type_h = get_or_add_string_id(b, string_handles, pool, lv.type_name)?;
+        let start_pc = index_to_offset(byte_offsets, lv.start, code_len);
+        let start_delta = start_pc.saturating_sub(cur_pc);
+        if start_delta > 0 {
+            b.lnp_emit_advance_pc(lnp, debug_h, start_delta);
+            cur_pc = start_pc;
+        }
         let sig_str = pool.resolve(lv.type_signature).unwrap_or("");
         if !sig_str.is_empty() {
-            let sig_h = get_or_add_string_id(b, string_handles, pool, lv.type_signature);
+            let sig_h = get_or_add_string_id(b, string_handles, pool, lv.type_signature)?;
             b.lnp_emit_start_local_extended(lnp, debug_h, lv.reg_number, name_h, type_h, sig_h);
         } else {
             b.lnp_emit_start_local(lnp, debug_h, lv.reg_number, name_h, type_h);
         }
-        // Emit end_local at the end offset
+        let end_pc = index_to_offset(byte_offsets, lv.end, code_len);
+        let end_delta = end_pc.saturating_sub(cur_pc);
+        if end_delta > 0 {
+            b.lnp_emit_advance_pc(lnp, debug_h, end_delta);
+            cur_pc = end_pc;
+        }
         b.lnp_emit_end_local(lnp, lv.reg_number);
     }
 
     b.lnp_emit_end(lnp);
     b.method_set_debug_info(method_h, debug_h);
+    Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_literal_value(
     b: &mut Builder,
     string_handles: &mut HashMap<StringId, StringHandle>,
@@ -1839,7 +1991,8 @@ fn encode_literal_value(
     val: &LiteralValue,
     entity_map: &HashMap<u32, StringId>,
     entities: &EntityHandles,
-) {
+    literal_handles: &[LiteralArrayHandle],
+) -> Result<(), Error> {
     // Helper: resolve a method entity offset to a MethodHandle. The offset
     // is the unique entity identity; the name lookup via entity_map is only
     // a fallback for hand-built models (offset 0).
@@ -1877,7 +2030,7 @@ fn encode_literal_value(
         }
         LiteralValue::String(sid) => {
             b.literal_array_add_u8(la, LiteralTag::String as u8);
-            let sh = get_or_add_string_id(b, string_handles, pool, *sid);
+            let sh = get_or_add_string_id(b, string_handles, pool, *sid)?;
             b.literal_array_add_raw_string(la, sh);
         }
         LiteralValue::Method(off) => {
@@ -1934,10 +2087,18 @@ fn encode_literal_value(
             b.literal_array_add_u16(la, *v);
         }
         LiteralValue::LiteralArray(idx) => {
-            // idx is the table index into File::literal_arrays; route it
+            // idx is a model table index into File::literal_arrays, NOT a
+            // builder handle: annotation-embedded arrays occupy other handle
+            // slots. Resolve through the handle table and route the result
             // through the reference API so the writer stores the array's
             // final file offset.
-            b.literal_array_add_literalarray(la, LiteralArrayHandle(idx.0));
+            let target = literal_handles.get(idx.0 as usize).ok_or_else(|| {
+                Error::CodeRelocation(format!(
+                    "nested literal array index {} out of bounds",
+                    idx.0
+                ))
+            })?;
+            b.literal_array_add_literalarray(la, *target);
         }
         LiteralValue::LiteralBufferIndex(idx) => {
             b.literal_array_add_u8(la, LiteralTag::LiteralBufferIndex as u8);
@@ -1949,7 +2110,7 @@ fn encode_literal_value(
         }
         LiteralValue::EtsImplements(sid) => {
             b.literal_array_add_u8(la, LiteralTag::EtsImplements as u8);
-            let sh = get_or_add_string_id(b, string_handles, pool, *sid);
+            let sh = get_or_add_string_id(b, string_handles, pool, *sid)?;
             b.literal_array_add_raw_string(la, sh);
         }
         LiteralValue::NullValue(v) => {
@@ -2005,6 +2166,7 @@ fn encode_literal_value(
             b.literal_array_add_u32(la, idx.0);
         }
     }
+    Ok(())
 }
 
 /// Convert an instruction index to a byte offset using the offset table.
@@ -2021,14 +2183,17 @@ fn get_or_add_string_id(
     string_handles: &mut HashMap<StringId, StringHandle>,
     pool: &StringPool,
     sid: StringId,
-) -> StringHandle {
+) -> Result<StringHandle, Error> {
     if let Some(&h) = string_handles.get(&sid) {
-        return h;
+        return Ok(h);
     }
-    let s = pool.resolve(sid).expect("dangling StringId");
+    let s = pool.resolve(sid).ok_or_else(|| Error::Malformed {
+        field: "string_id",
+        context: format!("dangling StringId {sid:?} in string table"),
+    })?;
     let h = b.add_string(s);
     string_handles.insert(sid, h);
-    h
+    Ok(h)
 }
 
 #[cfg(test)]
