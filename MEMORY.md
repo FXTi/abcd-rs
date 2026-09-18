@@ -185,6 +185,7 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   channel reusing Builder::relocate_code_id). Test-first: red regressions
   land ignored, fixes unignore them. Task register: design/agent-roadmap.md
   Phase 1 section (bugs B1/B2/B3 mechanisms recorded there).
-- MAINTAINER GATE: when Phase 1 (tasks 1.1-1.4) is fully landed and
-  verified, STOP and hand the code back for maintainer review. Do not start
-  Phase 2 until the maintainer has looked (instruction of 2026-09-19).
+- MAINTAINER GATE LIFTED (2026-09-19): the maintainer first asked to pause
+  for code review after Phase 1, then withdrew it ("Phase 1 完成后不用停了，
+  继续吧"). Continue directly into Phase 2+ when Phase 1 lands; no stop
+  between phases.
