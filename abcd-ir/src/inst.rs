@@ -214,16 +214,29 @@ pub enum InstData {
 
     // ── Function operations ──────────────────────────────────────────
     DefineFunc {
+        /// Method name (display/debugging only — NOT the entity identity:
+        /// distinct methods can share a name, and a name can collide with a
+        /// string entity).
         method_id: StringId,
+        /// Source-file offset of the referenced method. This is the entity
+        /// identity: encode resolves MethodId operands by offset
+        /// (`methods_by_offset`), so lowering keys on this, never the name.
+        method_offset: u32,
         length: u16,
     },
     DefineMethod {
+        /// Display name only; see `DefineFunc::method_id`.
         method_id: StringId,
+        /// Source-file offset of the referenced method (the identity).
+        method_offset: u32,
         length: u16,
         home_object: Value,
     },
     DefineClassWithBuffer {
+        /// Display name only; see `DefineFunc::method_id`.
         method_id: StringId,
+        /// Source-file offset of the constructor method (the identity).
+        method_offset: u32,
         literal_array: u32,
         base: Value,
     },

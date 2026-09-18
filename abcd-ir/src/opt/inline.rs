@@ -105,8 +105,13 @@ fn find_inline_candidates(module: &Module, func: FuncId, max_inst_count: usize) 
 
 /// Try to resolve a callee Value to a FuncId.
 ///
-/// Looks for the pattern: callee is defined by DefineFunc { method_id, .. }
-/// and method_id maps to a function in the module.
+/// Looks for the pattern: callee is defined by DefineFunc { method_offset, .. }
+/// and method_offset is the source offset of a function in the module.
+/// Identity is keyed on the source offset, never the name: two lifted
+/// methods can share one name, so a name match could inline the WRONG
+/// function (the N2-class silent misreference). A DefineFunc whose offset
+/// matches no lifted function (hand-built module, external method) is
+/// simply not inlined.
 fn resolve_callee(module: &Module, callee: Value) -> Option<FuncId> {
     let vd = module.value(callee);
     let inst = match vd.def {
@@ -114,11 +119,9 @@ fn resolve_callee(module: &Module, callee: Value) -> Option<FuncId> {
         _ => return None,
     };
 
-    if let InstData::DefineFunc { method_id, .. } = &module.inst(inst).data {
-        let name = module.strings.get(*method_id);
-        // Search for a function with this name.
+    if let InstData::DefineFunc { method_offset, .. } = &module.inst(inst).data {
         for (i, f) in module.functions.iter().enumerate() {
-            if module.strings.get(f.name) == name {
+            if f.source_offset == Some(*method_offset) {
                 return Some(FuncId::from_index(i));
             }
         }

@@ -9,14 +9,22 @@
 //! from the module's recorded source mappings and the selection-time
 //! [`EntityTrace`] records:
 //!
-//! - `StringId` / `MethodId` operands carry the source-file offset itself
-//!   (isel resolves them through `module.string_entities`, populated by
-//!   lift's `resolve_entity`). The relocation entry is the identity
-//!   `(kind, offset) → offset`, valid because `abcd_file::encode` treats the
-//!   raw operand purely as a lookup key and overwrites the operand bytes
-//!   with the relocated index. An operand that is not a recorded source
-//!   offset of the given file (identity fallback for hand-built modules, or
-//!   a stale offset from a different file) is a hard error.
+//! - `StringId` operands carry the source-file offset of a STRING entity
+//!   (isel resolves them through `module.string_entities`, which lift
+//!   populates for `EntityKind::StringId` resolutions only). The relocation
+//!   entry is the identity `(kind, offset) → offset`, valid because
+//!   `abcd_file::encode` treats the raw operand purely as a lookup key and
+//!   overwrites the operand bytes with the relocated index.
+//! - `MethodId` operands carry the source-file offset of the referenced
+//!   METHOD, recorded per use-site by lift onto the IR instruction itself
+//!   (`InstData::DefineFunc::method_offset` etc.) — the name is not the
+//!   identity (two methods can share a name; a method name can collide with
+//!   a string of the same content). The offset must be a selection-time
+//!   MethodId trace AND a member of the file's method set
+//!   (`File::all_methods()`), matching encode's `methods_by_offset` lookup.
+//! - A string/method operand that is not traceable (identity fallback for
+//!   hand-built modules, or a stale offset from a different file) is a hard
+//!   error.
 //! - `LiteralarrayId` operands carry the decoded literal-array table index
 //!   (lift's `resolve_literal_array` maps source offset → index). The
 //!   relocation entry `(kind, index) → offset` is recovered by inverting
@@ -24,6 +32,7 @@
 //!   error.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use abcd_file::{File, MethodBody};
 use abcd_isa::EntityKind;
@@ -37,8 +46,9 @@ use super::{EntityTrace, LowerError};
 /// Build an encodable [`MethodBody`] for a lowered function.
 ///
 /// `file` is the source file the module was lifted from: it provides the
-/// entity-offset table (string/method offset → name) and the literal-array
-/// offset ↔ index mapping the relocation entries must agree with.
+/// entity-offset table (string/method offset → name), the method set, and
+/// the literal-array offset ↔ index mapping the relocation entries must
+/// agree with.
 ///
 /// Every entity operand of every emitted bytecode must be traceable to a
 /// source-file offset recorded in `module` and resolvable in `file`;
@@ -59,18 +69,39 @@ pub fn to_method_body(
         la_index_to_offset.insert(index, offset);
     }
 
+    // The file's method offsets: encode resolves MethodId operands through
+    // `methods_by_offset`, so a MethodId operand must name a real method of
+    // this file — a string offset or a stale foreign offset is a hard error.
+    let method_offsets: HashSet<u32> = file.all_methods().map(|(_, m)| m.offset).collect();
+
     let mut entity_offsets: HashMap<(EntityKind, u32), u32> = HashMap::new();
     for bc in &result.bytecodes {
         for (kind, id) in bc.entity_operands() {
             let offset = match kind {
-                EntityKind::StringId | EntityKind::MethodId => {
+                EntityKind::StringId => {
                     // The raw operand must be a selection-time-traced source
                     // offset that resolves in this file's entity map. Decode
                     // guarantees entity_map coverage for every offset a
                     // method body's string/method operands reference
                     // (abcd-file/src/decode.rs:256-270).
-                    match result.entity_traces.get(&id.0) {
+                    match result.entity_traces.get(&(kind, id.0)) {
                         Some(EntityTrace::Traced) if file.entity_map.contains_key(&id.0) => id.0,
+                        _ => {
+                            return Err(LowerError::UntraceableEntity {
+                                func: func_id,
+                                kind,
+                                raw: id.0,
+                            });
+                        }
+                    }
+                }
+                EntityKind::MethodId => {
+                    // Method identity is the source offset carried on the IR
+                    // instruction (traced as MethodId at selection time);
+                    // membership in the file's method set is the exact
+                    // precondition of encode's methods_by_offset lookup.
+                    match result.entity_traces.get(&(kind, id.0)) {
+                        Some(EntityTrace::Traced) if method_offsets.contains(&id.0) => id.0,
                         _ => {
                             return Err(LowerError::UntraceableEntity {
                                 func: func_id,

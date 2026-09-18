@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use abcd_isa::{Bytecode, EntityId, Imm, Label, Reg};
+use abcd_isa::{Bytecode, EntityId, EntityKind, Imm, Label, Reg};
 
 use crate::entity::{Block, FuncId, Inst, StringId, Value};
 use crate::inst::{BinOp, CallKind, InstData, PropKind, UnOp};
@@ -21,15 +21,19 @@ pub struct IselResult {
     pub block_codes: Vec<(Block, Vec<Bytecode>)>,
     /// String pool reverse map: StringId → EntityId for the output file.
     pub string_map: HashMap<StringId, EntityId>,
-    /// Trace of every entity operand emitted through the string map, keyed by
-    /// the emitted raw operand value. [`EntityTrace::Traced`] means the value
-    /// is the source-file offset recorded in `module.string_entities`;
-    /// [`EntityTrace::Untraced`] means at least one use of the value fell
-    /// back to the identity `EntityId(sid.0)` for an unmapped string (a
-    /// hand-built module has no source file). An untraced use poisons the
-    /// raw value: identity relocation entries are only meaningful when every
-    /// use of the value carries a real source offset.
-    pub entity_traces: HashMap<u32, EntityTrace>,
+    /// Trace of every emitted entity operand, keyed by (entity kind, raw
+    /// operand value). [`EntityTrace::Traced`] means the value is a
+    /// source-file offset recorded by lift (string: via
+    /// `module.string_entities`; method: carried on the defining IR
+    /// instruction). [`EntityTrace::Untraced`] means at least one STRING use
+    /// of the value fell back to the identity `EntityId(sid.0)` for an
+    /// unmapped string (a hand-built module has no source file). An untraced
+    /// use poisons the (kind, value) pair: identity relocation entries are
+    /// only meaningful when every use of the value carries a real source
+    /// offset. The key is kind-qualified so that an untraced StringId use of
+    /// a raw value cannot poison a MethodId trace of the same number, and
+    /// vice versa.
+    pub entity_traces: HashMap<(EntityKind, u32), EntityTrace>,
     /// Total number of IC slots allocated for this function.
     pub ic_size: u32,
     pub unsupported: Option<String>,
@@ -47,19 +51,19 @@ pub enum EntityTrace {
 }
 
 /// Resolves StringIds to emitted entity operand values and records whether
-/// each emitted value is traceable to a source-file offset.
+/// each emitted (kind, value) pair is traceable to a source-file offset.
 struct EntityTracer<'a> {
     /// The caller-provided output map (may carry identity fallbacks).
     string_map: &'a HashMap<StringId, EntityId>,
     /// The module's own recorded source mappings (StringId → source offset).
     module_entities: &'a HashMap<StringId, EntityId>,
-    traces: HashMap<u32, EntityTrace>,
+    traces: HashMap<(EntityKind, u32), EntityTrace>,
 }
 
 impl EntityTracer<'_> {
     /// Resolve `sid` exactly as the legacy `eid` helper did (string_map value,
     /// identity fallback), recording whether the emitted value is the
-    /// module-recorded source offset.
+    /// module-recorded source offset. String operands only.
     fn eid(&mut self, sid: StringId) -> EntityId {
         let e = self
             .string_map
@@ -68,7 +72,7 @@ impl EntityTracer<'_> {
             .unwrap_or(EntityId(sid.0));
         let traced = self.module_entities.get(&sid).copied() == Some(e);
         self.traces
-            .entry(e.0)
+            .entry((EntityKind::StringId, e.0))
             .and_modify(|t| {
                 if !traced {
                     *t = EntityTrace::Untraced;
@@ -80,6 +84,18 @@ impl EntityTracer<'_> {
                 EntityTrace::Untraced
             });
         e
+    }
+
+    /// Emit a method-reference operand: the IR instruction carries the
+    /// precise source-file offset of the referenced method (recorded by lift
+    /// from the use-site's own `entity_offsets` entry), so the emitted value
+    /// IS the source offset — by construction traced, never name-derived.
+    /// `to_method_body` still validates the offset against the file's method
+    /// set, so a hand-built module with a bogus offset is a hard error there.
+    fn method_eid(&mut self, method_offset: u32) -> EntityId {
+        self.traces
+            .insert((EntityKind::MethodId, method_offset), EntityTrace::Traced);
+        EntityId(method_offset)
     }
 }
 
@@ -833,36 +849,42 @@ fn select_inst(
         }
 
         // ── Function / Class definition ──────────────────────────────
-        InstData::DefineFunc { method_id, length } => {
+        InstData::DefineFunc {
+            method_offset,
+            length,
+            ..
+        } => {
             codes.push(Bytecode::Definefunc(
                 ic.one(),
-                tracer.eid(*method_id),
+                tracer.method_eid(*method_offset),
                 Imm(*length as i64),
             ));
             store_result(result_slot, codes);
         }
         InstData::DefineMethod {
-            method_id,
+            method_offset,
             length,
             home_object,
+            ..
         } => {
             ensure_acc(func_id, *home_object, alloc, codes)?;
             codes.push(Bytecode::Definemethod(
                 ic.one(),
-                tracer.eid(*method_id),
+                tracer.method_eid(*method_offset),
                 Imm(*length as i64),
             ));
             store_result(result_slot, codes);
         }
         InstData::DefineClassWithBuffer {
-            method_id,
+            method_offset,
             literal_array,
             base,
+            ..
         } => {
             let base_r = val_reg(func_id, *base, alloc, codes)?;
             codes.push(Bytecode::Defineclasswithbuffer(
                 ic.one(),
-                tracer.eid(*method_id),
+                tracer.method_eid(*method_offset),
                 EntityId(*literal_array),
                 Imm(0),
                 base_r,

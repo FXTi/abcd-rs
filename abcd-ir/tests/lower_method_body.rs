@@ -121,6 +121,303 @@ fn method_by_name<'a>(file: &'a File, name: &str) -> &'a abcd_file::Method {
         .1
 }
 
+fn method_in_class<'a>(file: &'a File, descriptor: &str, name: &str) -> &'a abcd_file::Method {
+    file.all_methods()
+        .find(|(desc, m)| {
+            file.strings.resolve(*desc) == Some(descriptor)
+                && file.strings.resolve(m.name) == Some(name)
+        })
+        .unwrap_or_else(|| panic!("method {name} in {descriptor}"))
+        .1
+}
+
+fn func_id_by_name(module: &Module, name: &str) -> FuncId {
+    (0..module.functions.len())
+        .map(FuncId::from_index)
+        .find(|&f| module.strings.get(module.func(f).name) == name)
+        .unwrap_or_else(|| panic!("function {name}"))
+}
+
+/// Replace `target_offset`'s body in a clone of `file` with `body`.
+fn splice_body(file: &File, target_offset: u32, body: &abcd_file::MethodBody) -> File {
+    let mut rebuilt = file.clone();
+    for class in rebuilt.classes.values_mut() {
+        for method in &mut class.methods {
+            if method.offset == target_offset {
+                method.body = Some(body.clone());
+            }
+        }
+    }
+    rebuilt
+}
+
+/// S1 input file: a `caller` body that references the string "A" (lda.str)
+/// BEFORE the method "A" (definefunc). Both names intern to the same
+/// StringId, so the name-keyed `Module::string_entities` first-wins map
+/// records the STRING's offset for the name; lowering then emits the string
+/// offset as the definefunc MethodId operand and encode cannot relocate it.
+fn build_string_first_collision_file() -> (File, u32) {
+    let mut builder = Builder::new();
+    builder.set_api(24, "");
+    let global = builder.add_global_class();
+    let class_a = builder.add_class("LA;");
+    let proto = builder.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+    let (code, offsets) = encode_bytecodes(&[
+        Bytecode::LdaStr(placeholder),
+        Bytecode::Definefunc(Imm(0), placeholder, Imm(0)),
+        Bytecode::Returnundefined,
+    ])
+    .unwrap();
+    let caller =
+        builder.class_add_method(global, "caller", proto, AccessFlags::STATIC, &code, 1, 0);
+    let (ret, _) = encode_bytecodes(&[Bytecode::Returnundefined]).unwrap();
+    let ctor = builder.class_add_method(class_a, "A", proto, AccessFlags::STATIC, &ret, 0, 0);
+    let name = builder.add_string("A");
+    builder
+        .relocate_code_id(caller, offsets[0], 0, CodeEntity::String(name))
+        .unwrap();
+    builder
+        .relocate_code_id(caller, offsets[1], 0, CodeEntity::Method(ctor))
+        .unwrap();
+    builder.deduplicate();
+    let file = abcd_file::decode(&builder.finalize().unwrap()).unwrap();
+    let caller_offset = method_by_name(&file, "caller").offset;
+    (file, caller_offset)
+}
+
+/// S1 regression: a string/method name collision with the string lifted
+/// first must still encode, and the definefunc MethodId operand must
+/// relocate to the METHOD's offset, not the string's.
+///
+/// Red state: `Module::string_entities` is name-keyed first-wins, so the
+/// name "A" maps to the string offset; isel emits it as the MethodId
+/// operand and `abcd_file::encode` fails with `Error::CodeRelocation`
+/// (the 54 class-accessors/newtarget-this/lexicalEnv corpus skips).
+#[test]
+fn string_first_name_collision_relocates_method_operand_to_the_method() {
+    let (file, caller_offset) = build_string_first_collision_file();
+    let module = lift_file(&file).expect("lift");
+    assert!(verify_module(&module).is_empty());
+    let caller_id = func_id_by_name(&module, "caller");
+
+    // IR identity: the DefineFunc carries the METHOD's source offset even
+    // though the string "A" claimed the name first in the string entity map.
+    let ctor_offset = method_in_class(&file, "LA;", "A").offset;
+    let define_offsets: Vec<u32> = module
+        .func(caller_id)
+        .blocks
+        .iter()
+        .flat_map(|&bb| module.block(bb).insts.iter())
+        .filter_map(|&inst| match &module.inst(inst).data {
+            InstData::DefineFunc { method_offset, .. } => Some(*method_offset),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(define_offsets, vec![ctor_offset]);
+
+    let result = lower_function(&module, caller_id).expect("lower caller");
+    let body = to_method_body(&module, caller_id, &result, &file).expect("method body");
+
+    let rebuilt = splice_body(&file, caller_offset, &body);
+    let encoded = abcd_file::encode(&rebuilt).expect("encode rebuilt file");
+    let output = abcd_file::decode(&encoded).expect("decode rebuilt file");
+
+    let out_ctor = method_in_class(&output, "LA;", "A");
+    let out_body = method_by_name(&output, "caller").body.clone().unwrap();
+    let mut saw_method = false;
+    let mut saw_string = false;
+    for bc in &out_body.bytecodes {
+        for (kind, id) in bc.entity_operands() {
+            let offset = out_body.entity_offsets[&(kind, id.0)];
+            match kind {
+                EntityKind::MethodId => {
+                    assert_eq!(
+                        offset, out_ctor.offset,
+                        "definefunc must relocate to the method \"A\", not the string \"A\""
+                    );
+                    saw_method = true;
+                }
+                EntityKind::StringId => {
+                    assert_eq!(output.resolve_entity_str(offset), Some("A"));
+                    saw_string = true;
+                }
+                EntityKind::LiteralarrayId => {}
+            }
+        }
+    }
+    assert!(saw_method && saw_string);
+}
+
+/// N2 input file: a `caller` body that references two DIFFERENT methods both
+/// named "f" (in classes LA; and LB;) plus the string "f", method reference
+/// first. The name-keyed first-wins map records the FIRST method's offset
+/// for "f", so the second definefunc silently encodes a reference to the
+/// first method.
+fn build_same_named_methods_file() -> (File, u32) {
+    let mut builder = Builder::new();
+    builder.set_api(24, "");
+    let global = builder.add_global_class();
+    let class_a = builder.add_class("LA;");
+    let class_b = builder.add_class("LB;");
+    let proto = builder.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+    let (code, offsets) = encode_bytecodes(&[
+        Bytecode::Definefunc(Imm(0), placeholder, Imm(0)),
+        Bytecode::LdaStr(placeholder),
+        Bytecode::Definefunc(Imm(1), placeholder, Imm(0)),
+        Bytecode::Returnundefined,
+    ])
+    .unwrap();
+    let caller =
+        builder.class_add_method(global, "caller", proto, AccessFlags::STATIC, &code, 1, 0);
+    let (ret1, _) = encode_bytecodes(&[Bytecode::Returnundefined]).unwrap();
+    let m1 = builder.class_add_method(class_a, "f", proto, AccessFlags::STATIC, &ret1, 0, 0);
+    let (ret2, _) = encode_bytecodes(&[Bytecode::Ldai(Imm(7)), Bytecode::Returnundefined]).unwrap();
+    let m2 = builder.class_add_method(class_b, "f", proto, AccessFlags::STATIC, &ret2, 0, 0);
+    let name = builder.add_string("f");
+    builder
+        .relocate_code_id(caller, offsets[0], 0, CodeEntity::Method(m1))
+        .unwrap();
+    builder
+        .relocate_code_id(caller, offsets[1], 0, CodeEntity::String(name))
+        .unwrap();
+    builder
+        .relocate_code_id(caller, offsets[2], 0, CodeEntity::Method(m2))
+        .unwrap();
+    builder.deduplicate();
+    let file = abcd_file::decode(&builder.finalize().unwrap()).unwrap();
+    let caller_offset = method_by_name(&file, "caller").offset;
+    (file, caller_offset)
+}
+
+/// N2 regression: two same-named methods referenced from one body must each
+/// resolve to their own source offset. Red state: both definefunc operands
+/// encode to the FIRST method's offset — encode succeeds, silently calling
+/// the wrong method at runtime.
+#[test]
+fn same_named_method_references_keep_their_own_offsets() {
+    let (file, caller_offset) = build_same_named_methods_file();
+    let module = lift_file(&file).expect("lift");
+    assert!(verify_module(&module).is_empty());
+    let caller_id = func_id_by_name(&module, "caller");
+
+    // IR identity: each DefineFunc carries its own method's source offset.
+    let m1_offset = method_in_class(&file, "LA;", "f").offset;
+    let m2_offset = method_in_class(&file, "LB;", "f").offset;
+    let define_offsets: Vec<u32> = module
+        .func(caller_id)
+        .blocks
+        .iter()
+        .flat_map(|&bb| module.block(bb).insts.iter())
+        .filter_map(|&inst| match &module.inst(inst).data {
+            InstData::DefineFunc { method_offset, .. } => Some(*method_offset),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(define_offsets, vec![m1_offset, m2_offset]);
+
+    let result = lower_function(&module, caller_id).expect("lower caller");
+    let body = to_method_body(&module, caller_id, &result, &file).expect("method body");
+
+    let rebuilt = splice_body(&file, caller_offset, &body);
+    let encoded = abcd_file::encode(&rebuilt).expect("encode rebuilt file");
+    let output = abcd_file::decode(&encoded).expect("decode rebuilt file");
+
+    let m1_out = method_in_class(&output, "LA;", "f").offset;
+    let m2_out = method_in_class(&output, "LB;", "f").offset;
+    assert_ne!(m1_out, m2_out, "the two methods are distinct entities");
+
+    let out_body = method_by_name(&output, "caller").body.clone().unwrap();
+    let method_offsets: Vec<u32> = out_body
+        .bytecodes
+        .iter()
+        .flat_map(|bc| bc.entity_operands())
+        .filter(|(kind, _)| *kind == EntityKind::MethodId)
+        .map(|(kind, id)| out_body.entity_offsets[&(kind, id.0)])
+        .collect();
+    assert_eq!(
+        method_offsets,
+        vec![m1_out, m2_out],
+        "each definefunc must relocate to its own method"
+    );
+    // The string operand still resolves to the string "f".
+    let saw_string = out_body.bytecodes.iter().any(|bc| {
+        bc.entity_operands().iter().any(|(kind, id)| {
+            *kind == EntityKind::StringId
+                && output.resolve_entity_str(out_body.entity_offsets[&(*kind, id.0)]) == Some("f")
+        })
+    });
+    assert!(saw_string, "lda.str operand must survive relocation");
+}
+
+/// N2 guard: with the method reference lifted FIRST and the string use
+/// later (single method named "A" + string "A"), the method operand was
+/// already correct by first-wins luck; the string must remain correct too.
+/// String references are content-addressed at encode, so a stray method
+/// offset recorded under the same name cannot corrupt the emitted string —
+/// pin that property.
+#[test]
+fn method_first_name_collision_preserves_method_and_string() {
+    let mut builder = Builder::new();
+    builder.set_api(24, "");
+    let global = builder.add_global_class();
+    let class_a = builder.add_class("LA;");
+    let proto = builder.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+    let (code, offsets) = encode_bytecodes(&[
+        Bytecode::Definefunc(Imm(0), placeholder, Imm(0)),
+        Bytecode::LdaStr(placeholder),
+        Bytecode::Returnundefined,
+    ])
+    .unwrap();
+    let caller =
+        builder.class_add_method(global, "caller", proto, AccessFlags::STATIC, &code, 1, 0);
+    let (ret, _) = encode_bytecodes(&[Bytecode::Returnundefined]).unwrap();
+    let ctor = builder.class_add_method(class_a, "A", proto, AccessFlags::STATIC, &ret, 0, 0);
+    let name = builder.add_string("A");
+    builder
+        .relocate_code_id(caller, offsets[0], 0, CodeEntity::Method(ctor))
+        .unwrap();
+    builder
+        .relocate_code_id(caller, offsets[1], 0, CodeEntity::String(name))
+        .unwrap();
+    builder.deduplicate();
+    let file = abcd_file::decode(&builder.finalize().unwrap()).unwrap();
+    let caller_offset = method_by_name(&file, "caller").offset;
+
+    let module = lift_file(&file).expect("lift");
+    let caller_id = func_id_by_name(&module, "caller");
+    let result = lower_function(&module, caller_id).expect("lower caller");
+    let body = to_method_body(&module, caller_id, &result, &file).expect("method body");
+
+    let rebuilt = splice_body(&file, caller_offset, &body);
+    let encoded = abcd_file::encode(&rebuilt).expect("encode rebuilt file");
+    let output = abcd_file::decode(&encoded).expect("decode rebuilt file");
+
+    let out_ctor = method_in_class(&output, "LA;", "A");
+    let out_body = method_by_name(&output, "caller").body.clone().unwrap();
+    let mut saw_method = false;
+    let mut saw_string = false;
+    for bc in &out_body.bytecodes {
+        for (kind, id) in bc.entity_operands() {
+            let offset = out_body.entity_offsets[&(kind, id.0)];
+            match kind {
+                EntityKind::MethodId => {
+                    assert_eq!(offset, out_ctor.offset);
+                    saw_method = true;
+                }
+                EntityKind::StringId => {
+                    assert_eq!(output.resolve_entity_str(offset), Some("A"));
+                    saw_string = true;
+                }
+                EntityKind::LiteralarrayId => {}
+            }
+        }
+    }
+    assert!(saw_method && saw_string);
+}
+
 #[test]
 fn lowered_method_body_roundtrips_through_encode_relocation() {
     let (file, entities) = build_input_file();
@@ -152,11 +449,14 @@ fn lowered_method_body_roundtrips_through_encode_relocation() {
         body.entity_offsets[&(EntityKind::LiteralarrayId, array_index)],
         entities.array_offset
     );
-    // Every string/method operand must be selection-time traced.
+    // Every string/method operand must be selection-time traced (kind-keyed).
     for bc in &body.bytecodes {
         for (kind, id) in bc.entity_operands() {
             if kind != EntityKind::LiteralarrayId {
-                assert_eq!(result.entity_traces.get(&id.0), Some(&EntityTrace::Traced));
+                assert_eq!(
+                    result.entity_traces.get(&(kind, id.0)),
+                    Some(&EntityTrace::Traced)
+                );
             }
         }
     }

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use abcd_file::TryBlock;
-use abcd_isa::{Bytecode, Label};
+use abcd_isa::{Bytecode, EntityKind, Label};
 
 use crate::entity::{Block, FuncId};
 use crate::inst::InstData;
@@ -34,11 +34,12 @@ pub struct LayoutResult {
     /// Final register count for the function frame, including the reserved
     /// phi-copy temporary register (if any).
     pub num_regs: u16,
-    /// Entity operand traceability inherited from instruction selection.
+    /// Entity operand traceability inherited from instruction selection,
+    /// keyed by (entity kind, raw operand value).
     /// Layout only inserts `Mov`/`Lda`/`Sta` copies and `Jmp` trampolines —
     /// none of which carry entity operands — so the selection-time records
     /// stay valid for the flattened sequence.
-    pub entity_traces: HashMap<u32, super::isel::EntityTrace>,
+    pub entity_traces: HashMap<(EntityKind, u32), super::isel::EntityTrace>,
 }
 
 /// Lay out blocks and resolve jump targets.

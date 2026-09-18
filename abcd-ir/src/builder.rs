@@ -42,6 +42,8 @@ impl<'m> IRBuilder<'m> {
         let func_id = FuncId::from_index(module.functions.len());
         module.functions.push(FunctionData {
             name: name_id,
+            // Hand-built function: no source file, hence no source offset.
+            source_offset: None,
             kind,
             access_flags: AccessFlags::empty(),
             source_lang: SourceLang::EcmaScript,

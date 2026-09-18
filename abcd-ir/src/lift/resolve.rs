@@ -13,6 +13,14 @@ use crate::module::Module;
 /// then look up the offset in the file's name map.
 ///
 /// Returns `None` if the entity cannot be resolved.
+///
+/// Only `EntityKind::StringId` resolutions are recorded into
+/// `module.string_entities`: that map is name-keyed first-wins, which is
+/// safe for strings (encode resolves string operands content-addressed, so
+/// two offsets with equal content yield the same pool entry) but wrong for
+/// methods — a method name can collide with a string of the same content,
+/// and two distinct methods can share one name. Method identity is the
+/// source offset; use [`resolve_method_entity`] for method references.
 pub fn resolve_entity(
     file: &File,
     body: &MethodBody,
@@ -24,11 +32,33 @@ pub fn resolve_entity(
     let file_sid = file.resolve_entity(*offset)?;
     let name = file.strings.resolve(file_sid)?;
     let string_id = module.strings.intern(name);
-    module
-        .string_entities
-        .entry(string_id)
-        .or_insert(EntityId(*offset));
+    if kind == EntityKind::StringId {
+        module
+            .string_entities
+            .entry(string_id)
+            .or_insert(EntityId(*offset));
+    }
     Some(string_id)
+}
+
+/// Resolve a method-reference [`EntityId`] to its display name AND its
+/// precise source-file offset.
+///
+/// `body.entity_offsets[(MethodId, raw)]` gives the exact offset for THIS
+/// use-site (decode records it per operand), so two same-named methods
+/// referenced from one body resolve to their own offsets. The offset is the
+/// identity the lowering/encode path keys on; the name is display-only.
+pub fn resolve_method_entity(
+    file: &File,
+    body: &MethodBody,
+    module: &mut Module,
+    id: EntityId,
+) -> Option<(StringId, u32)> {
+    let offset = *body.entity_offsets.get(&(EntityKind::MethodId, id.0))?;
+    let file_sid = file.resolve_entity(offset)?;
+    let name = file.strings.resolve(file_sid)?;
+    let string_id = module.strings.intern(name);
+    Some((string_id, offset))
 }
 
 pub fn resolve_literal_array(file: &File, body: &MethodBody, id: EntityId) -> Option<u32> {
@@ -75,7 +105,19 @@ mod tests {
         let first =
             resolve_entity(&file, &body, &mut module, EntityId(0), EntityKind::MethodId).unwrap();
         assert_eq!(module.strings.get(first), "first");
-        assert_eq!(module.string_entities.get(&first), Some(&EntityId(100)));
+        assert_eq!(
+            module.string_entities.get(&first),
+            None,
+            "method-kind resolutions must not enter the string entity map"
+        );
+        let (method_name, method_offset) =
+            resolve_method_entity(&file, &body, &mut module, EntityId(0)).unwrap();
+        assert_eq!(module.strings.get(method_name), "first");
+        assert_eq!(method_offset, 100);
+        body.entity_offsets.insert((EntityKind::StringId, 0), 100);
+        let as_string =
+            resolve_entity(&file, &body, &mut module, EntityId(0), EntityKind::StringId).unwrap();
+        assert_eq!(module.string_entities.get(&as_string), Some(&EntityId(100)));
         body.entity_offsets.insert((EntityKind::MethodId, 0), 200);
         let second =
             resolve_entity(&file, &body, &mut module, EntityId(0), EntityKind::MethodId).unwrap();

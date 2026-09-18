@@ -143,6 +143,10 @@ impl Default for BasicBlockData {
 #[derive(Clone, Debug)]
 pub struct FunctionData {
     pub name: StringId,
+    /// Source-file offset of the method this function was lifted from
+    /// (`None` for hand-built functions). This is the function's entity
+    /// identity — names are not (two lifted methods can share one name).
+    pub source_offset: Option<u32>,
     pub kind: FunctionKind,
     pub access_flags: AccessFlags,
     pub source_lang: SourceLang,
@@ -244,7 +248,15 @@ pub struct Module {
 
     // ── Shared resources ──
     pub strings: StringPool,
-    /// Source ABC entity identity for strings resolved from bytecode.
+    /// Source ABC entity identity for STRING entities resolved from
+    /// bytecode (name → source offset, first-wins). Strings only: method
+    /// references are NOT recorded here — their identity is the source
+    /// offset carried on the instruction (`InstData::DefineFunc::method_offset`
+    /// etc.), because a method name can collide with a string of the same
+    /// content and two distinct methods can share one name. For strings the
+    /// name-keyed first-wins policy is safe: encode resolves string operands
+    /// content-addressed through `File::entity_map`, so two different string
+    /// offsets with equal content produce the same output string pool entry.
     pub string_entities: HashMap<StringId, EntityId>,
 }
 

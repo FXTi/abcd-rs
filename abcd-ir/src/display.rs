@@ -235,28 +235,38 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
         InstData::PopLexEnv => write!(f, "PopLexEnv"),
 
         // Function operations
-        InstData::DefineFunc { method_id, length } => {
-            write!(f, "DefineFunc \"{}\", {length}", m.strings.get(*method_id))
+        InstData::DefineFunc {
+            method_id,
+            method_offset,
+            length,
+        } => {
+            write!(
+                f,
+                "DefineFunc \"{}\"@{method_offset:#x}, {length}",
+                m.strings.get(*method_id)
+            )
         }
         InstData::DefineMethod {
             method_id,
+            method_offset,
             length,
             home_object,
         } => {
             write!(
                 f,
-                "DefineMethod \"{}\", {length}, {home_object}",
+                "DefineMethod \"{}\"@{method_offset:#x}, {length}, {home_object}",
                 m.strings.get(*method_id)
             )
         }
         InstData::DefineClassWithBuffer {
             method_id,
+            method_offset,
             literal_array,
             base,
         } => {
             write!(
                 f,
-                "DefineClassWithBuffer \"{}\", #{literal_array}, {base}",
+                "DefineClassWithBuffer \"{}\"@{method_offset:#x}, #{literal_array}, {base}",
                 m.strings.get(*method_id)
             )
         }

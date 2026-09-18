@@ -10,7 +10,8 @@ use crate::module::Module;
 use super::cfg;
 use super::ssa::SsaBuilder;
 use super::{
-    LiftError, emit_val, emit_void, label_block, read_acc, read_reg, resolve, write_acc, write_reg,
+    LiftError, emit_val, emit_void, label_block, read_acc, read_reg, resolve, resolve_method,
+    write_acc, write_reg,
 };
 use std::collections::HashMap;
 
@@ -674,12 +675,13 @@ pub(super) fn translate_bytecode(
 
         // ── Function / Class definition ──────────────────────────────
         Bytecode::Definefunc(_ic, eid, length) => {
-            let method_id = resolve(file, body, module, *eid, EntityKind::MethodId)?;
+            let (method_id, method_offset) = resolve_method(file, body, module, *eid)?;
             let v = emit_val(
                 module,
                 block,
                 InstData::DefineFunc {
                     method_id,
+                    method_offset,
                     length: length.0 as u16,
                 },
                 loc,
@@ -687,13 +689,14 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Definemethod(_ic, eid, length) => {
-            let method_id = resolve(file, body, module, *eid, EntityKind::MethodId)?;
+            let (method_id, method_offset) = resolve_method(file, body, module, *eid)?;
             let home_object = read_acc(ssa, block, module);
             let v = emit_val(
                 module,
                 block,
                 InstData::DefineMethod {
                     method_id,
+                    method_offset,
                     length: length.0 as u16,
                     home_object,
                 },
@@ -702,7 +705,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Defineclasswithbuffer(_ic, method_eid, lit_eid, _count, base_reg) => {
-            let method_id = resolve(file, body, module, *method_eid, EntityKind::MethodId)?;
+            let (method_id, method_offset) = resolve_method(file, body, module, *method_eid)?;
             let lit_s = super::resolve_literal(file, body, *lit_eid)?;
             let base = read_reg(ssa, *base_reg, block, module);
             let v = emit_val(
@@ -710,6 +713,7 @@ pub(super) fn translate_bytecode(
                 block,
                 InstData::DefineClassWithBuffer {
                     method_id,
+                    method_offset,
                     literal_array: lit_s,
                     base,
                 },
@@ -1609,7 +1613,7 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::CallruntimeDefinesendableclass(_ic, method_eid, lit_eid, _count, base_reg) => {
-            let method_id = resolve(file, body, module, *method_eid, EntityKind::MethodId)?;
+            let (method_id, method_offset) = resolve_method(file, body, module, *method_eid)?;
             let lit_s = super::resolve_literal(file, body, *lit_eid)?;
             let base = read_reg(ssa, *base_reg, block, module);
             let v = emit_val(
@@ -1617,6 +1621,7 @@ pub(super) fn translate_bytecode(
                 block,
                 InstData::DefineClassWithBuffer {
                     method_id,
+                    method_offset,
                     literal_array: lit_s,
                     base,
                 },
@@ -1950,13 +1955,14 @@ pub(super) fn translate_bytecode(
             base_reg,
             _env_reg,
         ) => {
-            let method_id = resolve(file, body, module, *method_eid, EntityKind::MethodId)?;
+            let (method_id, method_offset) = resolve_method(file, body, module, *method_eid)?;
             let base = read_reg(ssa, *base_reg, block, module);
             let v = emit_val(
                 module,
                 block,
                 InstData::DefineClassWithBuffer {
                     method_id,
+                    method_offset,
                     literal_array: lit_idx.0 as u32,
                     base,
                 },

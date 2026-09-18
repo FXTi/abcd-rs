@@ -20,7 +20,7 @@ use crate::module::{
 use crate::types::IrType;
 
 use self::cfg::build_cfg;
-use self::resolve::{resolve_entity, resolve_literal_array};
+use self::resolve::{resolve_entity, resolve_literal_array, resolve_method_entity};
 use self::ssa::{RegOrAcc, SsaBuilder};
 use self::translate::translate_bytecode;
 
@@ -207,6 +207,7 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
 
     module.functions.push(FunctionData {
         name,
+        source_offset: Some(method.offset),
         kind: method.function_kind,
         access_flags: method.access_flags,
         source_lang: method.source_lang,
@@ -502,6 +503,17 @@ fn resolve(
     kind: abcd_isa::EntityKind,
 ) -> Result<StringId, LiftError> {
     resolve_entity(file, body, module, id, kind).ok_or(LiftError::UnresolvedEntity(id.0))
+}
+
+/// Resolve a method-reference EntityId to its display name and its precise
+/// source-file offset (the entity identity), or return LiftError.
+fn resolve_method(
+    file: &File,
+    body: &abcd_file::MethodBody,
+    module: &mut Module,
+    id: abcd_isa::EntityId,
+) -> Result<(StringId, u32), LiftError> {
+    resolve_method_entity(file, body, module, id).ok_or(LiftError::UnresolvedEntity(id.0))
 }
 
 fn resolve_literal(
