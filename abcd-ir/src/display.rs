@@ -175,6 +175,9 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
         InstData::DeleteProperty { object, key } => {
             write!(f, "DeleteProperty {object}, {key}")
         }
+        InstData::CopyDataProperties { dst, src } => {
+            write!(f, "CopyDataProperties {dst}, {src}")
+        }
         InstData::LoadSuperProperty { key } => {
             write!(f, "LoadSuperProperty")?;
             write_prop(f, m, key)

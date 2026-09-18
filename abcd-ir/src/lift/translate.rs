@@ -1290,21 +1290,24 @@ pub(super) fn translate_bytecode(
                 loc,
             );
         }
-        Bytecode::Copydataproperties(src_reg) => {
-            let dst = read_acc(ssa, block, module);
-            let src = read_reg(ssa, *src_reg, block, module);
-            // Model as a call-like operation; dst stays in acc
-            let name = module.strings.intern("[[CopyDataProperties]]");
+        Bytecode::Copydataproperties(dst_reg) => {
+            // Vendor `copydataproperties v:in:top, acc: inout:top`: the
+            // register operand is the TARGET object, the accumulator
+            // carries the SOURCE and receives the result (the target
+            // object). Real es2abc output confirms the roles:
+            // `createemptyobject; sta v8; tryldglobalbyname "a";
+            // copydataproperties v8` spreads "a" (acc) into the new object
+            // (v8).
+            let src = read_acc(ssa, block, module);
+            let dst = read_reg(ssa, *dst_reg, block, module);
             emit_void(
                 module,
                 block,
-                InstData::StoreProperty {
-                    object: dst,
-                    key: PropKind::ByName(name),
-                    value: src,
-                },
+                InstData::CopyDataProperties { dst, src },
                 loc,
             );
+            // acc: inout — after the instruction acc holds the target.
+            write_acc(ssa, block, dst);
         }
 
         // ── Control flow — jumps ─────────────────────────────────────
@@ -2013,19 +2016,20 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedCopydataproperties(dst_reg, src_reg) => {
+            // Vendor `deprecated.copydataproperties v1:in:top, v2:in:top,
+            // acc: out:top`: v1 = target, v2 = source (ECMAScript
+            // CopyDataProperties(target, source) argument order, matching
+            // the modern form's register-is-target role); the result (the
+            // target) is written to acc.
             let dst = read_reg(ssa, *dst_reg, block, module);
             let src = read_reg(ssa, *src_reg, block, module);
-            let name = module.strings.intern("[[CopyDataProperties]]");
             emit_void(
                 module,
                 block,
-                InstData::StoreProperty {
-                    object: dst,
-                    key: PropKind::ByName(name),
-                    value: src,
-                },
+                InstData::CopyDataProperties { dst, src },
                 loc,
             );
+            write_acc(ssa, block, dst);
         }
         Bytecode::DeprecatedSetobjectwithproto(proto_reg, obj_reg) => {
             let proto = read_reg(ssa, *proto_reg, block, module);

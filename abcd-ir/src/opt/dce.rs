@@ -97,6 +97,7 @@ fn is_essential(data: &InstData) -> bool {
         StoreProperty { .. }
         | StoreOwnProperty { .. }
         | StoreSuperProperty { .. }
+        | CopyDataProperties { .. }
         | StoreGlobalVar { .. }
         | TryStoreGlobalByName { .. }
         | StoreLexVar { .. }

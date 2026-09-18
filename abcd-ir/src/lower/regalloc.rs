@@ -407,6 +407,13 @@ fn compute_acc_scores(module: &Module, rpo: &[Block]) -> HashMap<Value, i32> {
                     *scores.entry(*object).or_default() -= 3;
                     *scores.entry(*value).or_default() -= 3;
                 }
+                // copydataproperties: dst is a register operand (-3), src
+                // rides the accumulator (+2) — vendor
+                // `copydataproperties v:in:top, acc: inout:top`.
+                InstData::CopyDataProperties { dst, src } => {
+                    *scores.entry(*dst).or_default() -= 3;
+                    *scores.entry(*src).or_default() += 2;
+                }
                 _ => {}
             }
         }

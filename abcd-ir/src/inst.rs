@@ -140,6 +140,22 @@ pub enum InstData {
         key: PropKind,
         value: Value,
     },
+    /// ECMAScript CopyDataProperties (object spread): copy all own
+    /// enumerable properties of `src` into `dst`. Side-effecting,
+    /// store-like, no IR result — the runtime result is the mutated `dst`
+    /// object itself, which lift re-binds to the accumulator.
+    ///
+    /// Both vendor forms map here (the codebase folds deprecated opcodes
+    /// into the modern IR variant, cf. `DeprecatedDelobjprop` →
+    /// `DeleteProperty`):
+    /// - `copydataproperties v:in:top, acc: inout:top` — `dst` from the
+    ///   register operand, `src` from the accumulator;
+    /// - `deprecated.copydataproperties v1:in:top, v2:in:top, acc: out:top`
+    ///   — `dst` from v1, `src` from v2.
+    CopyDataProperties {
+        dst: Value,
+        src: Value,
+    },
 
     // ── Global variables ─────────────────────────────────────────────
     LoadGlobalVar {
@@ -386,6 +402,7 @@ impl InstData {
                 v
             }
             DeleteProperty { object, key } => vec![object, key],
+            CopyDataProperties { dst, src } => vec![dst, src],
             LoadSuperProperty { key } => {
                 if let PropKind::ByValue(k) = key {
                     vec![k]
@@ -468,6 +485,7 @@ impl InstData {
             InstData::StoreProperty { .. }
                 | InstData::StoreOwnProperty { .. }
                 | InstData::StoreSuperProperty { .. }
+                | InstData::CopyDataProperties { .. }
                 | InstData::StoreGlobalVar { .. }
                 | InstData::TryStoreGlobalByName { .. }
                 | InstData::StoreLexVar { .. }

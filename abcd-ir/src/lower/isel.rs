@@ -725,6 +725,18 @@ fn select_inst(
             codes.push(Bytecode::Delobjprop(regs[0]));
             store_result(result_slot, codes);
         }
+        InstData::CopyDataProperties { dst, src } => {
+            // Vendor `copydataproperties v:in:top, acc: inout:top`: the
+            // register operand is the target, the accumulator carries the
+            // source (and receives the result). Spill-before-load order
+            // via materialize_operands: dst is resolved first (an
+            // Acc-colored dst spills through the reserved slot), then src
+            // is brought into acc. No entity operands — nothing for the
+            // tracer/relocation channel. Both vendor forms lower to the
+            // modern opcode (the codebase's deprecated-opcode convention).
+            let regs = materialize_operands(func_id, &[*dst], Some(*src), alloc, codes)?;
+            codes.push(Bytecode::Copydataproperties(regs[0]));
+        }
         InstData::LoadSuperProperty { key } => {
             match key {
                 PropKind::ByName(name) => {

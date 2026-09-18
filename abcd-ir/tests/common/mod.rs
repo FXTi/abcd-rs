@@ -23,6 +23,11 @@ pub enum Halt {
     /// `Stobjbyvalue` (record-and-inspect): `key` is the accumulator
     /// (the ByValue key), `obj`/`value` are the operand register contents.
     StObjByValue { key: i64, obj: i64, value: i64 },
+    /// `Copydataproperties` (record-and-inspect): `dst` is the operand
+    /// register's contents (the target object), `src` the accumulator
+    /// (the source object) — vendor `copydataproperties v:in:top,
+    /// acc: inout:top`.
+    CopyDataProperties { dst: i64, src: i64 },
 }
 
 /// A tiny register machine: `HashMap<u16, i64>` registers plus one
@@ -147,6 +152,12 @@ impl Machine {
                 // regressions only use to pin register-resident values.
                 Bytecode::Stobjbyname(..) => {
                     pc += 1;
+                }
+                Bytecode::Copydataproperties(dst_r) => {
+                    return Halt::CopyDataProperties {
+                        dst: self.reg(dst_r.0),
+                        src: self.acc,
+                    };
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),
             }

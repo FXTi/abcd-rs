@@ -14,7 +14,7 @@ use abcd_ir::lower::{EntityTrace, LowerError, lower_function, to_method_body};
 use abcd_ir::module::Module;
 use abcd_ir::types::IrType;
 use abcd_ir::verify::verify_module;
-use abcd_isa::{Bytecode, EntityId, EntityKind, Imm, encode as encode_bytecodes};
+use abcd_isa::{Bytecode, EntityId, EntityKind, Imm, Reg, encode as encode_bytecodes};
 
 /// Offsets of the entities the caller body references, as assigned by the
 /// builder-produced input file.
@@ -302,5 +302,216 @@ fn unknown_literal_array_index_is_a_hard_error() {
             }
         ),
         "expected UntraceableEntity for an unknown literal-array index, got {err:?}"
+    );
+}
+
+/// Build the S3 input file: a global-class `spread` method whose body
+/// creates an empty object into v0, loads a string into the accumulator,
+/// and runs the real `copydataproperties v0` (vendor
+/// `copydataproperties v:in:top, acc: inout:top`: the register operand is
+/// the target object, the accumulator carries the source and receives the
+/// result).
+fn build_spread_input_file() -> File {
+    let mut builder = Builder::new();
+    builder.set_api(24, "");
+    let class = builder.add_global_class();
+    let proto = builder.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+    let (code, offsets) = encode_bytecodes(&[
+        Bytecode::Createemptyobject,
+        Bytecode::Sta(Reg(0)),
+        Bytecode::LdaStr(placeholder),
+        Bytecode::Copydataproperties(Reg(0)),
+        Bytecode::Returnundefined,
+    ])
+    .unwrap();
+    let spread = builder.class_add_method(class, "spread", proto, AccessFlags::STATIC, &code, 1, 0);
+    let name = builder.add_string("payload");
+    builder
+        .relocate_code_id(spread, offsets[2], 0, CodeEntity::String(name))
+        .unwrap();
+    builder.deduplicate();
+    abcd_file::decode(&builder.finalize().unwrap()).unwrap()
+}
+
+/// S3 regression: `copydataproperties` must round-trip as the real opcode.
+///
+/// Red state: lift models the instruction as
+/// `StoreProperty { key: ByName("[[CopyDataProperties]]") }` with a
+/// synthetic interned name that exists in no source file; isel lowers that
+/// to `stobjbyname` with an identity-fallback StringId operand, and
+/// `to_method_body` hard-errors with `UntraceableEntity` (the 18
+/// object-spread corpus skips).
+#[test]
+fn copydataproperties_survives_lift_lower_encode_as_the_real_opcode() {
+    let file = build_spread_input_file();
+    let module = lift_file(&file).expect("lift");
+
+    let spread_id = (0..module.functions.len())
+        .map(FuncId::from_index)
+        .find(|&f| module.strings.get(module.func(f).name) == "spread")
+        .expect("spread function");
+
+    // Lift must not synthesize the fake "[[CopyDataProperties]]" property
+    // name: no StoreProperty keyed by it may exist anywhere in the module.
+    for &bb in &module.func(spread_id).blocks {
+        for &inst_id in &module.block(bb).insts {
+            if let InstData::StoreProperty {
+                key: abcd_ir::inst::PropKind::ByName(name),
+                ..
+            } = &module.inst(inst_id).data
+            {
+                assert_ne!(
+                    module.strings.get(*name),
+                    "[[CopyDataProperties]]",
+                    "lift must not model copydataproperties as a synthetic-name store"
+                );
+            }
+        }
+    }
+
+    let result = lower_function(&module, spread_id).expect("lower spread");
+    let body = to_method_body(&module, spread_id, &result, &file)
+        .expect("copydataproperties has no entity operands and must relocate cleanly");
+
+    // The lowered body must contain the real opcode and no stobjbyname
+    // impersonating it.
+    assert!(
+        body.bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Copydataproperties(_))),
+        "lowered body must contain Copydataproperties, got {:?}",
+        body.bytecodes
+    );
+    assert!(
+        !body
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Stobjbyname(..))),
+        "lowered body must not contain Stobjbyname, got {:?}",
+        body.bytecodes
+    );
+
+    // Full encode → decode roundtrip: the opcode must survive relocation.
+    let spread_offset = method_by_name(&file, "spread").offset;
+    let mut rebuilt = file.clone();
+    for class in rebuilt.classes.values_mut() {
+        for method in &mut class.methods {
+            if method.offset == spread_offset {
+                method.body = Some(body.clone());
+            }
+        }
+    }
+    let encoded = abcd_file::encode(&rebuilt).expect("encode rebuilt file");
+    let output = abcd_file::decode(&encoded).expect("decode rebuilt file");
+    let out_body = method_by_name(&output, "spread")
+        .body
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(
+        out_body
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Copydataproperties(_))),
+        "re-encoded body must still contain Copydataproperties, got {:?}",
+        out_body.bytecodes
+    );
+    // The string operand of lda.str must still resolve to "payload".
+    let saw_payload = out_body.bytecodes.iter().any(|bc| {
+        bc.entity_operands().iter().any(|(kind, id)| {
+            *kind == EntityKind::StringId
+                && output.resolve_entity_str(out_body.entity_offsets[&(*kind, id.0)])
+                    == Some("payload")
+        })
+    });
+    assert!(saw_payload, "lda.str operand must survive relocation");
+}
+
+/// S3, deprecated form: `deprecated.copydataproperties v1, v2` (v1 = target,
+/// v2 = source, `acc: out:top`) lifts to the same IR variant and lowers to
+/// the modern opcode — the codebase's deprecated-opcode convention (cf.
+/// `DeprecatedDelobjprop` → `DeleteProperty` → `Delobjprop`). No corpus
+/// fixture uses this form, so this builder-driven body is its only
+/// end-to-end coverage.
+#[test]
+fn deprecated_copydataproperties_lifts_and_lowers_to_the_modern_opcode() {
+    let mut builder = Builder::new();
+    builder.set_api(24, "");
+    let class = builder.add_global_class();
+    let proto = builder.create_proto(Type::Void, &[]);
+    let (code, _) = encode_bytecodes(&[
+        Bytecode::Createemptyobject,
+        Bytecode::Sta(Reg(0)),
+        Bytecode::Createemptyobject,
+        Bytecode::Sta(Reg(1)),
+        Bytecode::DeprecatedCopydataproperties(Reg(0), Reg(1)),
+        Bytecode::Returnundefined,
+    ])
+    .unwrap();
+    builder.class_add_method(class, "spread", proto, AccessFlags::STATIC, &code, 2, 0);
+    builder.deduplicate();
+    let file = abcd_file::decode(&builder.finalize().unwrap()).unwrap();
+
+    let module = lift_file(&file).expect("lift");
+    assert!(verify_module(&module).is_empty());
+    let spread_id = (0..module.functions.len())
+        .map(FuncId::from_index)
+        .find(|&f| module.strings.get(module.func(f).name) == "spread")
+        .expect("spread function");
+
+    // Exactly one CopyDataProperties, no synthetic-name StoreProperty.
+    let mut saw_copy = false;
+    for &bb in &module.func(spread_id).blocks {
+        for &inst_id in &module.block(bb).insts {
+            match &module.inst(inst_id).data {
+                InstData::CopyDataProperties { .. } => saw_copy = true,
+                InstData::StoreProperty {
+                    key: abcd_ir::inst::PropKind::ByName(name),
+                    ..
+                } => assert_ne!(module.strings.get(*name), "[[CopyDataProperties]]"),
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_copy, "deprecated form must lift to CopyDataProperties");
+
+    let result = lower_function(&module, spread_id).expect("lower");
+    let body = to_method_body(&module, spread_id, &result, &file).expect("method body");
+    assert!(
+        body.bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Copydataproperties(_))),
+        "deprecated form must lower to the modern Copydataproperties, got {:?}",
+        body.bytecodes
+    );
+    assert!(
+        !body
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Stobjbyname(..))),
+        "no Stobjbyname impersonation, got {:?}",
+        body.bytecodes
+    );
+
+    let spread_offset = method_by_name(&file, "spread").offset;
+    let mut rebuilt = file.clone();
+    for class in rebuilt.classes.values_mut() {
+        for method in &mut class.methods {
+            if method.offset == spread_offset {
+                method.body = Some(body.clone());
+            }
+        }
+    }
+    let encoded = abcd_file::encode(&rebuilt).expect("encode rebuilt file");
+    let output = abcd_file::decode(&encoded).expect("decode rebuilt file");
+    let out_body = method_by_name(&output, "spread").body.clone().unwrap();
+    assert!(
+        out_body
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Copydataproperties(_))),
+        "re-encoded body must still contain Copydataproperties, got {:?}",
+        out_body.bytecodes
     );
 }
