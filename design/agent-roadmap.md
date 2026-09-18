@@ -8,9 +8,9 @@
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| Phase 0 | Bridge/封装层全面审计（完整性/清爽/漂亮） | **进行中** |
+| Phase 0 | Bridge/封装层全面审计（完整性/清爽/漂亮） | **完成（2026-09-18，报告 design/review-bridge-wrapper.md）** |
 | Phase 0.5 | 审计 findings 的 P0/P1 修复批 | **完成（12 commits：ff092bb…81d3b71）** |
-| Phase 1 | Lower 正确性旧账（out-of-SSA 破环、val_reg 溢出槽、lower 实体重定位通道） | 未开始 |
+| Phase 1 | Lower 正确性旧账（out-of-SSA 破环、val_reg 溢出槽、lower 实体重定位通道） | **进行中（2026-09-18 开工）** |
 | Phase 2 | VM oracle 证据链（corpus_lower_oracle → 1119 passed fixture 全量） | 未开始 |
 | Phase 3 | P1 漏洞（参数所有权三连修、encode_debug_info 作用域、SSA trivial-phi） | 未开始 |
 | Phase 4 | 证据升级（真实 9/11 读验证、pandasm 逐指令对照） | 未开始 |
@@ -43,6 +43,21 @@ P0 全 10 条；P1 的 ⑪⑫⑬⑭⑯⑱⑲；⑰ 参数注解扩模型；CI（
 | 0.5.7 | ⑲ emitter.rs 常量走 sys、MethodHandleType bindgen 导出 + annotation.rs 引用、AVT 弱钉注释 | worker G (k3) | **完成**（333268a；orchestrator 复审 + 独立复验通过） |
 | 0.5.8 | ⑰ 参数注解扩模型 | worker G + worker F | **完成**（9139631、9e5ec81、81d3b71；契约：runtime 折叠进 compile-time，与 #9 先例一致） |
 | 0.5.9 | 全量验证 + 报告状态列更新 + 逐 commit | orchestrator | **完成**（51 套件绿 + 语料 4/4 绿；review 文档 fix log 已更新） |
+
+## Phase 1 任务登记（2026-09-18 开工）
+
+orchestrator 静态分析确认的三个 bug 机制（worker 需在代码中复核）：
+
+- B1 条件前驱 phi 拷贝：`layout.rs` 把 `(pred, succ)` 拷贝插到 pred 终结指令前，对该前驱的所有后继一视同仁——CondBranch 前驱的两条边拷贝在两条路径上都执行。
+- B2 槽位级并行拷贝：`regalloc.rs` 的 `resolve_parallel_copies` 在 Value 空间排序/破环，但 coalescing 后不同 value 可共享寄存器，槽位级 hazard/cycle 被漏检（值层无环 ≠ 槽位层无环）。
+- B3 isel acc 溢出读错：`isel.rs` 的 `val_reg` 在 `ensure_acc` 的 `Lda` 之后才 `Sta` 溢出 Acc 色寄存器操作数，溢出的已是被覆盖的 acc；且溢出槽在 0xfff0 高位区，超出任何合理帧声明。
+
+| # | 任务 | 执行者 | 状态 |
+|---|------|--------|------|
+| 1.1 | B1+B2+B3 红色回归测试（手工构造 RegAlloc/IselResult 驱动 layout/isel + 迷你字节码模拟器断言语义；`#[ignore]` 保持主线绿） | worker P1-T1 (k3) | **进行中** |
+| 1.2 | B1+B2 修复：槽位级并行拷贝解析 + 每函数显式预留临时寄存器（溢出报错，禁 saturating）+ 条件边 trampoline 插入 | 待定 | 未开始 |
+| 1.3 | B3 修复：溢出槽移入声明帧（isel 前 spill 所有 acc 色寄存器操作数再 ensure_acc）；num_regs 贯通到 LayoutResult；未分配 value 改硬错误（若可达） | 待定 | 未开始 |
+| 1.4 | lower 实体重定位通道：LayoutResult 携带实体操作数元数据，产出 `abcd_file::MethodBody`（entity_offsets + num_vregs），复用 `Builder::relocate_code_id` 的 decode→encode 路径 | 待定 | 未开始 |
 
 ## 审计纪律
 

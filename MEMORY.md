@@ -178,7 +178,10 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   docs (#15), abcd-file README drift (6 items), P2 test-gap list, CI
   duplicate-vendor-file protection (#22 — maintainer chose "leave as is",
   revisit only if drift ever appears).
-- Next: Phase 1 lower correctness (out-of-SSA cycle breaking with a real
-  temp register, val_reg spill-slot conflict management, lower entity
-  relocation channel reusing Builder::relocate_code_id). Test-first: failing
-  swap-cycle regression before the fix.
+- Phase 1 started 2026-09-18: lower correctness (out-of-SSA cycle breaking at
+  SLOT level with a reserved real temp register, edge-correct phi-copy
+  placement for conditional predecessors, val_reg spill slots moved into the
+  declared frame + spill-before-ensure_acc ordering, lower entity relocation
+  channel reusing Builder::relocate_code_id). Test-first: red regressions
+  land ignored, fixes unignore them. Task register: design/agent-roadmap.md
+  Phase 1 section (bugs B1/B2/B3 mechanisms recorded there).
