@@ -34,14 +34,14 @@ P0 全 10 条；P1 的 ⑪⑫⑬⑭⑯⑱⑲；⑰ 参数注解扩模型；CI（
 
 | # | 任务 | 执行者 | 状态 |
 |---|------|--------|------|
-| 0.5.1 | #1 decode 无效 opcode abort → 生成 isa_is_valid_opcode + bridge 预检 + 回归测试 | orchestrator | 进行中 |
-| 0.5.2 | #2 encode 操作数越界静默截断 → dispatch 范围检查 + EncodeError + 回归测试 | orchestrator | 排队（随 0.5.1 同批） |
-| 0.5.3 | #3 file_size>len 拒绝 + #10 element_size 白名单 + #4 ARRAY_* cb + ⑬ LiteralTag static_assert | worker E (k3) | 进行中 |
-| 0.5.4 | #5 debug 作用域 + #8 嵌套 LA 句柄 + #9 MUTF-8 字符串 + ⑯ class_name 无损/删 SendSync + ⑱ panic 改错误 | worker F (k3) | 进行中 |
-| 0.5.5 | ⑪⑫ FFI 护栏（isa_bridge + builder 家族）+ ⑯ foreign name bridge API | worker H (k3) | 待 batch 1 |
-| 0.5.6 | #6/#7 注解静默写 0 改错误 + ⑲ encode.rs tag 字符走 sys AVT | worker F 延续 | 待 batch 1 |
-| 0.5.7 | ⑲ 其余：emitter.rs 常量、MethodHandleType bindgen 导出、is_entity_array_tag 走 AVT | worker G (k3) | 待 batch 1 |
-| 0.5.8 | ⑰ 参数注解扩模型（模型+bridge 读取+builder 封装+encode+测试） | orchestrator + worker | 待 batch 2 |
+| 0.5.1 | #1 decode 无效 opcode abort → 生成 isa_is_valid_opcode + bridge 预检 + 回归测试 | orchestrator | **完成**（ff092bb；探针实证 exit 134→Err(InvalidOpcode(0))） |
+| 0.5.2 | #2 encode 操作数越界静默截断 → dispatch 范围检查 + EncodeError + 回归测试 | orchestrator | **完成**（99120c6；探针实证 Imm(300) 不再截断为 44，改报 OperandOutOfRange） |
+| 0.5.3 | #3 file_size>len 拒绝 + #10 element_size 白名单 + #4 ARRAY_* cb + ⑬ LiteralTag static_assert | worker E (k3) | **完成**（ce9c25e；orchestrator 逐行复审 diff 通过，7/7 测试绿） |
+| 0.5.4 | #5 debug 作用域 + #8 嵌套 LA 句柄 + #9 MUTF-8 字符串 + ⑯ class_name 无损/删 SendSync + ⑱ panic 改错误 | worker F (k3) | **完成**（9f10556；orchestrator 复审 + 全 workspace 复验绿；新发现 F-new-1 已登记 review 文档） |
+| 0.5.5 | ⑪⑫ FFI 护栏（isa_bridge 59 + builder 75）+ ⑯ abc_foreign_item_name_off | worker H (k3) | **完成**（1134bba；orchestrator 抽查 + 复验通过；裁决：新增 ISA_EMIT_INTERNAL_ERROR(-5)） |
+| 0.5.6 | #6/#7 注解静默写 0 改错误 + ⑲ tag 字符/is_entity_array_tag 走 AVT + ⑯c decode.rs 换 abc_foreign_item_name_off | worker F 延续 | 进行中 |
+| 0.5.7 | ⑲ emitter.rs 常量走 sys、MethodHandleType bindgen 导出 + annotation.rs 引用、AVT 弱钉注释 | worker G (k3) | **完成**（333268a；orchestrator 复审 + 独立复验通过） |
+| 0.5.8 | ⑰ 参数注解扩模型：bridge 部分（abc_param_annotations_enumerate + seal API） | worker G 延续 | 进行中（模型/encode 部分待 0.5.6 落盘后派发） |
 | 0.5.9 | 全量验证 + 报告状态列更新 + 逐 commit | orchestrator | 待全部 |
 
 ## 审计纪律

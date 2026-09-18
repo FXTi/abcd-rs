@@ -458,3 +458,18 @@ callback slice is null-safe.
 8. P1 sweep (#15 callback docs, #17 param annotations decision, #18 panics,
    #19 mirrors, #20/#21 README rewrites, #22 CI).
 9. P2 sweep (dead `literal_val_to_c`, staging clears, docs, test gaps).
+
+## Follow-up findings registered during Phase 0.5
+
+- **F-new-1 (open, bridge/vendor)**: the vendored writer is sensitive to
+  item *creation order*. Moving literal-array creation before class
+  creation corrupts SET_FILE debug string offsets (source_file decoded as
+  a stale offset into "func_main_0" — observed as "n_0"). The #8 fix keeps
+  the original creation order (classes first) as a workaround. Root cause
+  needs a bridge-side investigation (likely stale string offsets captured
+  before ComputeLayout somewhere in the LNP staging flush), tracked here
+  until filed into a fix batch.
+- **F-note-1 (accepted)**: the `annotation_value_to_raw` error arm for
+  64-bit annotation arrays is unreachable through `encode()` because
+  `validate_annotation_arrays` preflight rejects them first; kept as a
+  defense layer.
