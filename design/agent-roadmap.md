@@ -105,7 +105,7 @@ VM 语义簇（需逐簇拆根因）：
 
 | 3.1 | 结构性簇诊断（S1-S5） | worker P3-T1 (k3) | **完成**（只读；S4/S5 同根因=abcd-file 不建模 module record（_ESModuleRecord 字段写回悬挂偏移 + ≤12.x 伪 LA），lowering 洗清——orchestrator 已独立实证恒等重写即损坏；S1=string_entities 名字键撞名（首录者胜）+ 静默错方法双胞胎 N2；S2=wide.callrange 未选择 + sta/lda 无 wide 形需低位 scratch；S3=copydataproperties 被建模成合成名 StoreProperty；新登记 N1-N6） |
 | 3.2 | S6 修复：异常边活性 + handler live-in 禁染 Acc + fusion 三前提门禁 | worker P3-T2 (k3) | **完成**（9dad2cb；worker 探针纠正 orchestrator 根因——真身是异常边活性洞，fusion 为潜伏不健全；orchestrator 独立复现红色 4 失败 1 钉住、直方图 lift 1011→1029/lower-other 18→0） |
-| 3.3 | S3 修复：copydataproperties 专属 InstData + lift/isel 臂（含 deprecated 形） | worker P3-T3 (k3) | **进行中** |
+| 3.3 | S3 修复：copydataproperties 专属 InstData + lift/isel 臂（含 deprecated 形） | worker P3-T3 (k3) | **完成**（86f810a；附纠正：旧 lift 臂操作数角色与 vendor 相反，已对 sig+pandasm 实证修正；orchestrator 干净 worktree 独立复验：61 套件绿、直方图 untraceable 18→0、object-spread VM 18/18） |
 | 3.4 | S4+S5 修复：abcd-file 建模 module record（blob 保留 + 字段值重定位；含 N1 _ESScopeNamesRecord 同类）；identity 证据面扩到 module 用例（N6） | worker P3-T4 (k3) | **进行中**（与 3.3 并行——crate 不相交） |
 | 3.5 | S1+N2 修复：实体身份按 kind 区分（kind 键映射；消灭静默错方法引用） | 待定 | 未开始 |
 | 3.6 | S2 修复：wide.callrange 选择 + 高位寄存器经低位 scratch 中转（含 N4 起始寄存器 u8 约束） | 待定 | 未开始 |
