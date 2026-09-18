@@ -173,6 +173,21 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   lift 1011→1029 written, lower-other 18→0 (orchestrator-verified). The
   unskipped try-catch fixtures still fail the VM on V1-family wrong values
   (0/18) — expected, tracked there.
+- P3-T1 structural diagnosis (read-only, accepted): S4+S5 share ONE root
+  cause OUTSIDE lowering — abcd-file never modeled module records:
+  `_ESModuleRecord` field values are raw source offsets written back
+  dangling, and ≤12.x additionally parses the module blob as a garbage
+  Integer8(0) literal array. Orchestrator verified first-hand: identity
+  decode→encode of module-exports 9.0.0.0 aborts ark_disasm ('This line
+  should be unreachable') while the original disasms clean. The identity
+  path had only ever been VM-checked on arithmetic (evidence gap N6).
+  S1 = name-keyed Module::string_entities collision (first-wins), with a
+  silent wrong-method-reference twin (N2). S2 = wide.callrange never
+  selected + sta/lda have no wide form (regs ≥256 unencodable; upstream
+  routes via mov + low scratch). S3 = copydataproperties modeled as a
+  synthetic-name StoreProperty. New issues N1-N6 registered in
+  design/agent-roadmap.md Phase 3. Fix order: S3 → (S4+S5 parallel, file
+  layer) → S1+N2 → S2.
 
 ## Phase 1 outcome (done, 2026-09-19)
 
