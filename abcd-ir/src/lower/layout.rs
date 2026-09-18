@@ -3,24 +3,37 @@
 //! Arranges basic blocks in reverse post-order, flattens them into a linear
 //! bytecode sequence, and resolves Block references in jump instructions
 //! to concrete instruction indices (Labels).
+//!
+//! Phi copies execute ONLY on their own CFG edge: copies for an
+//! unconditional predecessor are inserted before its terminator; for a
+//! `CondBranch` predecessor a trampoline per successor edge (copy sequence +
+//! `Jmp succ`) is appended after all regular blocks and the corresponding
+//! branch target is rewritten to it. Trampolines belong to no IR block and
+//! sort after every real block offset, so `reconstruct_try_blocks` never
+//! extends a try/handler range over them.
 
 use std::collections::HashMap;
 
 use abcd_file::TryBlock;
-use abcd_isa::{Bytecode, Label, Reg};
+use abcd_isa::{Bytecode, Label};
 
 use crate::entity::{Block, FuncId};
 use crate::inst::InstData;
 use crate::module::Module;
 
+use super::LowerError;
+use super::copy_resolve::{emit_copy, resolve_slot_copies};
 use super::isel::IselResult;
-use super::regalloc::RegAlloc;
+use super::regalloc::{RegAlloc, RegSlot};
 
-/// Result of layout: a flat bytecode sequence + try blocks.
+/// Result of layout: a flat bytecode sequence + try blocks + frame size.
 #[derive(Debug)]
 pub struct LayoutResult {
     pub bytecodes: Vec<Bytecode>,
     pub try_blocks: Vec<TryBlock>,
+    /// Final register count for the function frame, including the reserved
+    /// phi-copy temporary register (if any).
+    pub num_regs: u16,
 }
 
 /// Lay out blocks and resolve jump targets.
@@ -30,123 +43,196 @@ pub fn layout(
     isel: &IselResult,
     alloc: &RegAlloc,
     rpo: &[Block],
-) -> LayoutResult {
-    // Step 1: Insert phi copies before terminators.
+) -> Result<LayoutResult, LowerError> {
+    // Step 1: Resolve each edge's phi copies at SLOT level. Coalescing lets
+    // distinct values share a slot, so the value-level list must be re-mapped
+    // and re-ordered here, at the emission point.
+    let mut edge_codes: HashMap<(Block, Block), Vec<Bytecode>> = HashMap::new();
+    for (&edge, copies) in &alloc.phi_copies {
+        if copies.is_empty() {
+            continue;
+        }
+        // Values without an allocation are skipped, preserving the previous
+        // (both endpoints known) filtering behavior.
+        let slot_pairs: Vec<(RegSlot, RegSlot)> = copies
+            .iter()
+            .filter_map(|&(src, dst)| {
+                let s = alloc.allocation.get(&src).copied()?;
+                let d = alloc.allocation.get(&dst).copied()?;
+                Some((s, d))
+            })
+            .collect();
+        let resolved = resolve_slot_copies(&slot_pairs, alloc.copy_temp)
+            .map_err(|_| LowerError::MissingCopyTemp(func_id))?;
+        let codes: Vec<Bytecode> = resolved
+            .into_iter()
+            .filter_map(|(s, d)| emit_copy(s, d))
+            .collect();
+        if !codes.is_empty() {
+            edge_codes.insert(edge, codes);
+        }
+    }
+
+    // Step 2: Place copies on their edges.
     let mut block_codes: HashMap<Block, Vec<Bytecode>> = HashMap::new();
     for (bb, codes) in &isel.block_codes {
         block_codes.insert(*bb, codes.clone());
     }
 
-    // Insert parallel copies for phi elimination.
-    for (&(pred, succ), copies) in &alloc.phi_copies {
-        if let Some(codes) = block_codes.get_mut(&pred) {
-            // Insert copies before the last instruction (terminator).
-            let insert_pos = if codes.is_empty() { 0 } else { codes.len() - 1 };
-            let mut copy_codes = Vec::new();
-            for &(src, dst) in copies {
-                let src_slot = alloc.allocation.get(&src).copied();
-                let dst_slot = alloc.allocation.get(&dst).copied();
-                match (src_slot, dst_slot) {
-                    (
-                        Some(super::regalloc::RegSlot::Reg(sr)),
-                        Some(super::regalloc::RegSlot::Reg(dr)),
-                    ) => {
-                        if sr != dr {
-                            copy_codes.push(Bytecode::Mov(Reg(dr), Reg(sr)));
-                        }
-                    }
-                    (
-                        Some(super::regalloc::RegSlot::Acc),
-                        Some(super::regalloc::RegSlot::Reg(dr)),
-                    ) => {
-                        copy_codes.push(Bytecode::Sta(Reg(dr)));
-                    }
-                    (
-                        Some(super::regalloc::RegSlot::Reg(sr)),
-                        Some(super::regalloc::RegSlot::Acc),
-                    ) => {
-                        copy_codes.push(Bytecode::Lda(Reg(sr)));
-                    }
-                    _ => {
-                        // acc→acc or unknown — skip
+    // Synthetic trampoline blocks (copy sequence + `Jmp succ`), appended
+    // after all real blocks. Keys are synthetic Block ids counting down from
+    // `u32::MAX - 1`; real Block ids are module block-vector indices and
+    // cannot reach that range (`Block(u32::MAX)` itself is `Block::INVALID`).
+    let mut trampolines: Vec<(Block, Vec<Bytecode>)> = Vec::new();
+
+    for (i, &bb) in rpo.iter().enumerate() {
+        let next_bb = rpo.get(i + 1).copied();
+        let block_data = module.block(bb);
+        let term = block_data.insts.last().map(|&inst| &module.inst(inst).data);
+
+        if let Some(InstData::CondBranch {
+            true_dest,
+            false_dest,
+            ..
+        }) = term
+        {
+            let (true_dest, false_dest) = (*true_dest, *false_dest);
+
+            // Copies keyed to a successor that is neither branch target are
+            // inconsistent input; keep the legacy in-block placement rather
+            // than dropping them.
+            let legacy: Vec<Bytecode> = edge_codes
+                .iter()
+                .filter(|&(&(pred, succ), _)| pred == bb && succ != true_dest && succ != false_dest)
+                .flat_map(|(_, c)| c.iter().cloned())
+                .collect();
+
+            // True edge: redirect the conditional branch (always the last
+            // bytecode of the block) to the trampoline when the edge has copies.
+            let true_target = match edge_codes.get(&(bb, true_dest)) {
+                Some(copies) => add_trampoline(&mut trampolines, copies, true_dest),
+                None => true_dest,
+            };
+            // False edge: route to its trampoline when it has copies;
+            // otherwise keep the fall-through / explicit-Jmp behavior.
+            let false_target = match edge_codes.get(&(bb, false_dest)) {
+                Some(copies) => Some(add_trampoline(&mut trampolines, copies, false_dest)),
+                None => None,
+            };
+
+            let Some(codes) = block_codes.get_mut(&bb) else {
+                continue;
+            };
+            if !legacy.is_empty() {
+                let insert_pos = codes.len().saturating_sub(1);
+                for (j, bc) in legacy.into_iter().enumerate() {
+                    codes.insert(insert_pos + j, bc);
+                }
+            }
+            if let Some(last) = codes.last_mut() {
+                rewrite_branch_target(last, true_target);
+            }
+            match false_target {
+                Some(tramp) => codes.push(Bytecode::Jmp(Label(tramp.0))),
+                None => {
+                    if next_bb != Some(false_dest) {
+                        codes.push(Bytecode::Jmp(Label(false_dest.0)));
                     }
                 }
             }
-            for (i, bc) in copy_codes.into_iter().enumerate() {
-                codes.insert(insert_pos + i, bc);
+        } else {
+            // Unconditional (or no) terminator: copies inserted before the
+            // terminator run on exactly the outgoing edge(s).
+            let mut copy_codes: Vec<Bytecode> = Vec::new();
+            for (&(pred, _), codes) in &edge_codes {
+                if pred == bb {
+                    copy_codes.extend(codes.iter().cloned());
+                }
             }
-            let _ = succ; // used only as key
+            if copy_codes.is_empty() {
+                continue;
+            }
+            let Some(codes) = block_codes.get_mut(&bb) else {
+                continue;
+            };
+            let insert_pos = codes.len().saturating_sub(1);
+            for (j, bc) in copy_codes.into_iter().enumerate() {
+                codes.insert(insert_pos + j, bc);
+            }
         }
     }
 
-    // Step 2: Flatten blocks in RPO order, recording block start offsets.
+    // Step 3: Flatten blocks in RPO order, then trampolines, recording offsets.
     let mut flat: Vec<Bytecode> = Vec::new();
-    let mut block_offsets: HashMap<Block, usize> = HashMap::new();
+    let mut final_offsets: HashMap<Block, usize> = HashMap::new();
 
     for &bb in rpo {
-        block_offsets.insert(bb, flat.len());
+        final_offsets.insert(bb, flat.len());
         if let Some(codes) = block_codes.get(&bb) {
             flat.extend(codes.iter().cloned());
         }
     }
-
-    // Check if fall-through is needed: if a block's last instruction is a
-    // conditional branch and the false_dest is NOT the next block, insert Jmp.
-    let mut insertions: Vec<(usize, Bytecode)> = Vec::new();
-    for (i, &bb) in rpo.iter().enumerate() {
-        let next_bb = rpo.get(i + 1).copied();
-        let block_data = module.block(bb);
-        if let Some(&last_inst) = block_data.insts.last() {
-            if let InstData::CondBranch { false_dest, .. } = &module.inst(last_inst).data {
-                if next_bb != Some(*false_dest) {
-                    // Need explicit jump to false_dest.
-                    let offset = block_offsets[&bb] + block_codes.get(&bb).map_or(0, |c| c.len());
-                    insertions.push((offset, Bytecode::Jmp(Label(false_dest.0))));
-                }
-            }
-        }
+    for (key, codes) in &trampolines {
+        final_offsets.insert(*key, flat.len());
+        flat.extend(codes.iter().cloned());
     }
 
-    // Apply insertions (in reverse to preserve offsets).
-    for (offset, bc) in insertions.into_iter().rev() {
-        flat.insert(offset, bc);
-    }
-
-    // Recompute block offsets after insertions.
-    let mut final_offsets: HashMap<Block, usize> = HashMap::new();
-    let mut pos = 0;
-    for &bb in rpo {
-        final_offsets.insert(bb, pos);
-        if let Some(codes) = block_codes.get(&bb) {
-            pos += codes.len();
-        }
-        // Account for any inserted Jmp
-        let block_data = module.block(bb);
-        if let Some(&last_inst) = block_data.insts.last() {
-            if let InstData::CondBranch { false_dest, .. } = &module.inst(last_inst).data {
-                let next_idx = rpo
-                    .iter()
-                    .position(|&b| b == bb)
-                    .map(|i| rpo.get(i + 1).copied());
-                if next_idx != Some(Some(*false_dest)) {
-                    pos += 1;
-                }
-            }
-        }
-    }
-
-    // Step 3: Resolve jump targets (Block references → instruction indices).
+    // Step 4: Resolve jump targets (Block references → instruction indices).
+    // Synthetic trampoline keys resolve through the same map.
     for bc in &mut flat {
         resolve_labels(bc, &final_offsets);
     }
 
-    // Step 4: Reconstruct try blocks from IR try_regions.
+    // Step 5: Reconstruct try blocks from IR try_regions. Trampoline offsets
+    // sort after every real block, so try/handler ranges computed as
+    // "distance to the next greater offset" exclude them.
     let try_blocks = reconstruct_try_blocks(module, func_id, &final_offsets, flat.len());
 
-    LayoutResult {
+    Ok(LayoutResult {
         bytecodes: flat,
         try_blocks,
-    }
+        num_regs: alloc.num_regs,
+    })
+}
+
+/// Append a trampoline (copy sequence + `Jmp succ`) and return its synthetic
+/// Block key.
+fn add_trampoline(
+    trampolines: &mut Vec<(Block, Vec<Bytecode>)>,
+    copies: &[Bytecode],
+    succ: Block,
+) -> Block {
+    let key = Block(u32::MAX - 1 - trampolines.len() as u32);
+    let mut codes = copies.to_vec();
+    codes.push(Bytecode::Jmp(Label(succ.0)));
+    trampolines.push((key, codes));
+    key
+}
+
+/// Rewrite the target of a (conditional or unconditional) branch bytecode.
+/// No-op for non-branch bytecodes.
+fn rewrite_branch_target(bc: &mut Bytecode, target: Block) {
+    let label = match bc {
+        Bytecode::Jmp(l)
+        | Bytecode::Jeqz(l)
+        | Bytecode::Jnez(l)
+        | Bytecode::Jstricteqz(l)
+        | Bytecode::Jnstricteqz(l)
+        | Bytecode::Jeqnull(l)
+        | Bytecode::Jnenull(l)
+        | Bytecode::Jstricteqnull(l)
+        | Bytecode::Jnstricteqnull(l)
+        | Bytecode::Jequndefined(l)
+        | Bytecode::Jneundefined(l)
+        | Bytecode::Jstrictequndefined(l)
+        | Bytecode::Jnstrictequndefined(l) => l,
+        Bytecode::Jeq(_, l)
+        | Bytecode::Jne(_, l)
+        | Bytecode::Jstricteq(_, l)
+        | Bytecode::Jnstricteq(_, l) => l,
+        _ => return,
+    };
+    *label = Label(target.0);
 }
 
 /// Reconstruct TryBlock entries from the function's try_regions using final block offsets.

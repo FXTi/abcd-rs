@@ -2,10 +2,11 @@
 //! regression tests.
 //!
 //! It supports only the opcodes the crafted sequences use
-//! (`Lda`/`Sta`/`Mov`/`Ldai`/`Jmp`/`Jnez`/`Return`/`Returnundefined`, plus
-//! record-and-stop for `Stobjbyvalue`). Labels in `layout` output are already
-//! resolved to absolute instruction indices by `resolve_labels`, so jumps use
-//! the label operand directly as a program counter.
+//! (`Lda`/`Sta`/`Mov`/`Ldai`/`Sub2`/`Greater`/`Jmp`/`Jnez`/`Return`/
+//! `Returnundefined`, no-op `Stobjbyname`, plus record-and-stop for
+//! `Stobjbyvalue`). Labels in `layout` output are already resolved to
+//! absolute instruction indices by `resolve_labels`, so jumps use the label
+//! operand directly as a program counter.
 
 use std::collections::HashMap;
 
@@ -81,6 +82,16 @@ impl Machine {
                     self.acc = imm.0;
                     pc += 1;
                 }
+                // `sub2 imm, v0` — acc = acc - v0 (ic slot operand ignored).
+                Bytecode::Sub2(_, r) => {
+                    self.acc -= self.reg(r.0);
+                    pc += 1;
+                }
+                // `greater imm, v0` — acc = (acc > v0) (ic slot operand ignored).
+                Bytecode::Greater(_, r) => {
+                    self.acc = i64::from(self.acc > self.reg(r.0));
+                    pc += 1;
+                }
                 Bytecode::Jmp(label) => {
                     pc = label.0 as usize;
                 }
@@ -99,6 +110,11 @@ impl Machine {
                         obj: self.reg(obj_r.0),
                         value: self.reg(val_r.0),
                     };
+                }
+                // Store to a named property: a side effect the lowering
+                // regressions only use to pin register-resident values.
+                Bytecode::Stobjbyname(..) => {
+                    pc += 1;
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),
             }

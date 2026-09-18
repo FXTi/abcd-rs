@@ -1,10 +1,12 @@
-//! P1 red regression (B1): phi copies of a conditional predecessor execute on
-//! BOTH outgoing edges.
+//! P1 regression (B1): phi copies of a conditional predecessor must execute
+//! ONLY on their own edge.
 //!
-//! `lower::layout` inserts the copy sequence keyed `(pred, succ)` into `pred`
-//! immediately before its terminator — for every successor key. When `pred`
-//! ends in `InstData::CondBranch`, the copies belonging to the *not-taken*
-//! successor run as well, clobbering registers the taken path still reads.
+//! `lower::layout` used to insert the copy sequence keyed `(pred, succ)`
+//! into `pred` immediately before its terminator — for every successor key.
+//! When `pred` ends in `InstData::CondBranch`, the copies belonging to the
+//! *not-taken* successor ran as well, clobbering registers the taken path
+//! still reads. The fix routes each copy-bearing edge through a synthetic
+//! trampoline (copy sequence + `Jmp succ`) and rewrites the branch target.
 //!
 //! The module below is real IR built with `IRBuilder` (entry ends in
 //! `CondBranch`, successors s1/s2 end in `Return`). The `RegAlloc` and
@@ -37,7 +39,6 @@ const LIVE_INTO_S1: i64 = 5555;
 const S2_EDGE_PAYLOAD: i64 = 3333;
 
 #[test]
-#[ignore = "P1 red: cond-branch phi copies run on both edges"]
 fn phi_copies_for_untaken_successor_clobber_taken_path() {
     let mut module = Module::new(Version::new(12, 0, 6, 0), FileType::Dynamic);
     let func = IRBuilder::create_function(&mut module, "f", FunctionKind::Function, 0);
@@ -94,10 +95,11 @@ fn phi_copies_for_untaken_successor_clobber_taken_path() {
         allocation,
         phi_copies,
         num_regs: 6,
+        copy_temp: Some(RegSlot::Reg(15)),
     };
 
     let rpo = regalloc::compute_rpo(&module, func);
-    let laid_out = layout::layout(&module, func, &isel, &alloc, &rpo);
+    let laid_out = layout::layout(&module, func, &isel, &alloc, &rpo).unwrap();
 
     // Simulate taking the s1 edge (acc = 1 from Ldai). Correct semantics:
     // only the (entry, s1) copy runs, R5 survives, s1 returns LIVE_INTO_S1.

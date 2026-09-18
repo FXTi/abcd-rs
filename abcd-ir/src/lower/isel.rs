@@ -163,6 +163,7 @@ mod tests {
             allocation: HashMap::new(),
             phi_copies: HashMap::new(),
             num_regs: 0,
+            copy_temp: None,
         };
         let mut codes = Vec::new();
         let first = val_reg(Value::from_index(1), &alloc, &mut codes);

@@ -4,8 +4,10 @@
 //! 2. Interference graph construction (SSA guarantees chordal graph).
 //! 3. MCS (Maximum Cardinality Search) ordering + greedy coloring with
 //!    accumulator preference heuristic.
-//! 4. Boissinot SSA destruction: coalesce same-color phi operands,
-//!    insert copies for different colors, topological sort parallel copies.
+//! 4. Boissinot SSA destruction: coalesce same-color phi operands, collect
+//!    the per-edge parallel copy sets for different colors. The copies are
+//!    resolved (sequentialized) at slot level at the emission point in
+//!    `layout`, because coalescing can make distinct values share a slot.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -22,8 +24,12 @@ pub struct RegAlloc {
     /// Parallel copies for phi elimination.
     /// Key: (predecessor, successor). Value: (src, dst) copies.
     pub phi_copies: HashMap<(Block, Block), Vec<(Value, Value)>>,
-    /// Total registers used (excluding accumulator).
+    /// Total registers used (excluding accumulator), including the reserved
+    /// `copy_temp` register when present.
     pub num_regs: u16,
+    /// Reserved real register for breaking slot-level copy cycles in layout.
+    /// `Some` iff the function has any phi copies; never assigned to a value.
+    pub copy_temp: Option<RegSlot>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -76,6 +82,7 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
             allocation: HashMap::new(),
             phi_copies: HashMap::new(),
             num_regs: 0,
+            copy_temp: None,
         });
     }
     // Step 1: Exact backward dataflow liveness.
@@ -88,16 +95,33 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     let acc_score = compute_acc_scores(module, &rpo);
 
     // Step 4: MCS ordering + greedy coloring.
-    let (mut allocation, mut num_regs) =
+    let (allocation, mut num_regs) =
         mcs_color(&all_values, &interference, &acc_score, func.param_count)?;
 
-    // Step 5: Boissinot SSA destruction.
-    let phi_copies = boissinot_destruction(module, &rpo, &mut allocation, &mut num_regs);
+    // Step 5: Boissinot SSA destruction — collect the per-edge value-level
+    // copy sets. Slot-level resolution happens at the emission point in
+    // `layout`, so no value-level cycle breaking (or pseudo-temp) is done here.
+    let phi_copies = boissinot_destruction(module, &rpo, &allocation);
+
+    // Step 6: When any edge carries phi copies, reserve exactly one real temp
+    // register for slot-level cycle breaking. Overflow is a hard error, not
+    // a silent saturation.
+    let copy_temp = if phi_copies.values().any(|copies| !copies.is_empty()) {
+        let temp = num_regs;
+        if temp >= TEMP_REG_BASE {
+            return Err(RegAllocError::RegisterOverflow);
+        }
+        num_regs += 1;
+        Some(RegSlot::Reg(temp))
+    } else {
+        None
+    };
 
     Ok(RegAlloc {
         allocation,
         phi_copies,
         num_regs,
+        copy_temp,
     })
 }
 
@@ -438,13 +462,16 @@ fn mcs_color(
 
 /// Boissinot-style SSA destruction:
 /// - Same-color phi operands: coalesce (no copy needed).
-/// - Different-color: insert copy.
-/// - Parallel copies resolved via topological sort + cycle breaking.
+/// - Different-color: record a copy on the (pred, block) edge.
+///
+/// The returned per-edge lists are parallel copy *sets* in value space.
+/// They are NOT sequentialized here: coalescing lets distinct values share
+/// a slot, so the safe emission order (and any cycle breaking through the
+/// reserved `copy_temp` register) is computed at slot level in `layout`.
 fn boissinot_destruction(
     module: &Module,
     rpo: &[Block],
-    allocation: &mut HashMap<Value, RegSlot>,
-    num_regs: &mut u16,
+    allocation: &HashMap<Value, RegSlot>,
 ) -> HashMap<(Block, Block), Vec<(Value, Value)>> {
     let mut copies: HashMap<(Block, Block), Vec<(Value, Value)>> = HashMap::new();
 
@@ -470,98 +497,5 @@ fn boissinot_destruction(
         }
     }
 
-    // Resolve parallel copies: topological sort with cycle breaking.
-    for (_, copy_list) in copies.iter_mut() {
-        *copy_list = resolve_parallel_copies(copy_list);
-        if copy_list
-            .iter()
-            .any(|(src, dst)| *src == Value::INVALID || *dst == Value::INVALID)
-        {
-            allocation.entry(Value::INVALID).or_insert_with(|| {
-                let slot = RegSlot::Reg(*num_regs);
-                *num_regs = (*num_regs).saturating_add(1);
-                slot
-            });
-        }
-    }
-
     copies
-}
-
-/// Resolve parallel copies into a sequential order.
-/// Handles cycles by introducing a temporary swap.
-fn resolve_parallel_copies(copies: &[(Value, Value)]) -> Vec<(Value, Value)> {
-    if copies.len() <= 1 {
-        return copies.to_vec();
-    }
-
-    // Build dependency graph: dst → src.
-    let mut pending: Vec<(Value, Value)> = copies.to_vec();
-    let mut result: Vec<(Value, Value)> = Vec::new();
-
-    // Topological sort: emit copies whose dst is not a src of any other pending copy.
-    let mut progress = true;
-    while progress && !pending.is_empty() {
-        progress = false;
-        let srcs: HashSet<Value> = pending.iter().map(|(s, _)| *s).collect();
-        let mut next_pending = Vec::new();
-
-        for &(src, dst) in &pending {
-            if !srcs.contains(&dst) || src == dst {
-                // Safe to emit: no other copy reads from dst.
-                if src != dst {
-                    result.push((src, dst));
-                }
-                progress = true;
-            } else {
-                next_pending.push((src, dst));
-            }
-        }
-        pending = next_pending;
-    }
-
-    // Remaining copies form cycles. Break each cycle with INVALID as a
-    // temporary pseudo-value. Layout maps that pseudo-value to a spare reg.
-    while !pending.is_empty() {
-        let (first_src, first_dst) = pending[0];
-        pending.remove(0);
-        result.push((first_src, Value::INVALID));
-
-        let mut cur = first_src;
-        while let Some(pos) = pending.iter().position(|(_, d)| *d == cur) {
-            let (s, d) = pending.remove(pos);
-            result.push((s, d));
-            cur = s;
-        }
-        result.push((Value::INVALID, first_dst));
-    }
-
-    result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_parallel_copies;
-    use crate::entity::Value;
-
-    #[test]
-    fn breaks_two_value_copy_cycle_with_temp() {
-        let a = Value::from_index(1);
-        let b = Value::from_index(2);
-        assert_eq!(
-            resolve_parallel_copies(&[(a, b), (b, a)]),
-            vec![(a, Value::INVALID), (b, a), (Value::INVALID, b)]
-        );
-    }
-
-    #[test]
-    fn breaks_three_value_copy_cycle_with_temp() {
-        let a = Value::from_index(1);
-        let b = Value::from_index(2);
-        let c = Value::from_index(3);
-        assert_eq!(
-            resolve_parallel_copies(&[(a, b), (b, c), (c, a)]),
-            vec![(a, Value::INVALID), (c, a), (b, c), (Value::INVALID, b)]
-        );
-    }
 }

@@ -1,12 +1,13 @@
-//! P1 red regressions (B2): value-level parallel-copy resolution misses
+//! P1 regressions (B2): value-level parallel-copy resolution misses
 //! slot-level hazards.
 //!
-//! `lower::regalloc::resolve_parallel_copies` computes a safe sequential
-//! emission order over SSA *Values* (topological sort + cycle breaking with a
-//! temp). But coalescing lets distinct values share one register slot, so an
-//! order that is safe in value space can be unsafe in slot space, and a slot
-//! space cycle can exist where value space has none (so no temp is ever
-//! allocated). `lower::layout` then emits the copies in that order as `Mov`s.
+//! `lower::regalloc` used to compute the sequential emission order over SSA
+//! *Values* (topological sort + cycle breaking with a temp). But coalescing
+//! lets distinct values share one register slot, so an order that is safe in
+//! value space can be unsafe in slot space, and a slot space cycle can exist
+//! where value space has none (so no temp was ever allocated). The fix
+//! re-resolves the copies in SLOT space at the emission point in
+//! `lower::layout`, using the per-function reserved `copy_temp` register.
 //!
 //! Both tests use a single unconditional edge pred -> succ (pred ends in
 //! `InstData::Branch`). The copy lists are written in the exact order the
@@ -72,10 +73,11 @@ fn run_edge_copies(
         allocation,
         phi_copies,
         num_regs: 16,
+        copy_temp: Some(RegSlot::Reg(15)),
     };
 
     let rpo = regalloc::compute_rpo(&module, func);
-    let laid_out = layout::layout(&module, func, &isel, &alloc, &rpo);
+    let laid_out = layout::layout(&module, func, &isel, &alloc, &rpo).unwrap();
 
     let mut machine = Machine::new();
     for &(reg, val) in init_regs {
@@ -92,7 +94,6 @@ fn run_edge_copies(
 /// i.e. `Mov(R2, R1)` — but R2 still holds c's value, which `(c, d)` must
 /// read: correct parallel semantics give d := old c, i.e. R3 = old R2.
 #[test]
-#[ignore = "P1 red: parallel-copy slot hazard"]
 fn value_order_overwrites_shared_source_slot() {
     let (a, b, c, d) = (
         Value::from_index(100),
@@ -128,7 +129,6 @@ fn value_order_overwrites_shared_source_slot() {
 /// so the resolver allocates no temp and layout emits
 /// `Mov(R2, R1); Mov(R1, R2)` — sequential emission corrupts the swap.
 #[test]
-#[ignore = "P1 red: parallel-copy slot cycle"]
 fn slot_cycle_without_value_cycle_needs_temp() {
     let (a, b, c, d) = (
         Value::from_index(100),

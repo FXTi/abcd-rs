@@ -60,6 +60,7 @@ fn acc_spill_after_ensure_acc_captures_key_not_object() {
         ]),
         phi_copies: HashMap::new(),
         num_regs: 2,
+        copy_temp: None,
     };
 
     let rpo = regalloc::compute_rpo(&module, func);

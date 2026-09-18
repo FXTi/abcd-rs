@@ -3,6 +3,7 @@
 //! Entry point: [`lower_function`] takes a Module + FuncId and produces
 //! a flat bytecode sequence with try blocks.
 
+pub mod copy_resolve;
 pub mod isel;
 pub mod layout;
 pub mod regalloc;
@@ -26,6 +27,10 @@ pub enum LowerError {
     RegisterOverflow(FuncId),
     #[error("unsupported instruction in function {func:?}: {message}")]
     UnsupportedInstruction { func: FuncId, message: String },
+    #[error(
+        "function {0:?} has a slot-level phi copy cycle but no reserved copy temporary register"
+    )]
+    MissingCopyTemp(FuncId),
 }
 
 /// Lower a single IR function back to bytecodes.
@@ -55,7 +60,7 @@ pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, 
     }
 
     // Step 4: Layout and jump resolution.
-    let result = layout::layout(module, func_id, &isel_result, &alloc, &rpo);
+    let result = layout::layout(module, func_id, &isel_result, &alloc, &rpo)?;
 
     Ok(result)
 }
