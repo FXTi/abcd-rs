@@ -103,8 +103,8 @@ VM 语义簇（需逐簇拆根因）：
 | V6 | opt 回归：test-branch-elimination 18/18→0/18（stdout 'bad'，疑似 SCCP 过折叠）；for-in 0→timeout 死循环 | 各 18 | 优化器语义 bug，优先于继续扩 opt 覆盖 |
 | V7 | template/tagged-template 'Cannot convert UNDEFINED to JSObject' / 'Cannot load property of null' | 36 | 疑似 tagged-template 字面量数组 strings 缓存 |
 
-| 3.1 | 结构性簇诊断（S1-S5 根因到 file:line + 修复方案 + 红色测试草图；只诊断不改码） | 待定 | 未开始 |
-| 3.2 | S6 MultipleAccOperands 修复（fusion 路径的 slot 物化违反单 acc 不变式） | 待定 | 未开始 |
+| 3.1 | 结构性簇诊断（S1-S5 根因到 file:line + 修复方案 + 红色测试草图；只诊断不改码） | worker P3-T1 (k3) | **进行中**（只读任务，不落盘不提交） |
+| 3.2 | S6 修复：fusion 仅在槽位有效时启用（同块紧邻 + 两操作数皆 Reg 色），否则回退 Jnez | worker P3-T2 (k3) | **进行中**（orchestrator 根因分析已随卡下发：活性外延 + acc 被比较指令覆盖 + 槽位重用窗口三重不健全） |
 
 ## 审计纪律
 
