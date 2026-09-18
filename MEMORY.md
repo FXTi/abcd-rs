@@ -122,3 +122,23 @@ cargo test -p abcd-ir --test corpus_entities -- --ignored
 ABCD_REWRITTEN_DIR=/tmp/abcd-relocation-matrix cargo test -p abcd-file --test real_module_abc rewritten_corpus_preserves_arithmetic_entities -- --ignored
 python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd-relocation-matrix --case local/arithmetic
 ```
+
+## Agent collaboration (locked, 2026-09-18)
+
+- Orchestrator (kimi-coding/k3) dispatches bounded, machine-verifiable tasks to
+  subagents (kimi-coding/k3). Agent output requires direct review before
+  landing. Task cards: goal / in-scope files / forbidden files / invariants /
+  acceptance command / evidence format (commands run, diff list, evidence
+  layer: structural vs semantic vs VM oracle).
+- Gates per task: `cargo fmt --all -- --check` → `cargo test --workspace
+  --offline` → targeted tests → line-by-line diff review. Small commits, one
+  fix + one regression test each. Test-first for bug fixes (failing probe
+  reviewed before the fix).
+- Roadmap and per-task status live in `design/agent-roadmap.md`. Phase order:
+  0 bridge/wrapper audit → 0.5 audit fixes → 1 lower correctness → 2 VM
+  oracle chain → 3 P1 correctness → 4 evidence upgrades → 5 sweep + v0.2
+  decision.
+- Phase 0 (active): audit of bridge/wrapper layers of the four lower crates
+  (completeness / cleanliness / design quality). Output:
+  `design/review-bridge-wrapper.md` for maintainer triage before any fix.
+  The four crates are frozen for functional changes during the audit.
