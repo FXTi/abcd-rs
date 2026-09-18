@@ -101,13 +101,14 @@ VM 语义簇（需逐簇拆根因）：
 | V4 | optional-chain SIGSEGV | 18/12+6 | 新崩溃签名（不同于已修的参数 ABI SIGSEGV） |
 | V5 | class heritage 'TypeError: parent class is not constructor'（super-properties、test-deault/explicit-constructor） | 54/0 | opt 变体全绿→lift 的 class 定义路径缺陷 |
 | V6 | opt 回归：test-branch-elimination 18/18→0/18（stdout 'bad'，疑似 SCCP 过折叠）；for-in 0→timeout 死循环 | 各 18 | 优化器语义 bug，优先于继续扩 opt 覆盖 |
+| V8 | 新暴露（S1 解封后达 VM）：class-accessors lift 'Object is not callable'、opt 'class constructor cannot called without new'；newtarget-this 同类 | 36×2 | 类/构造器语义簇，待诊断 |
 | V7 | template/tagged-template 'Cannot convert UNDEFINED to JSObject' / 'Cannot load property of null' | 36 | 疑似 tagged-template 字面量数组 strings 缓存 |
 
 | 3.1 | 结构性簇诊断（S1-S5） | worker P3-T1 (k3) | **完成**（只读；S4/S5 同根因=abcd-file 不建模 module record（_ESModuleRecord 字段写回悬挂偏移 + ≤12.x 伪 LA），lowering 洗清——orchestrator 已独立实证恒等重写即损坏；S1=string_entities 名字键撞名（首录者胜）+ 静默错方法双胞胎 N2；S2=wide.callrange 未选择 + sta/lda 无 wide 形需低位 scratch；S3=copydataproperties 被建模成合成名 StoreProperty；新登记 N1-N6） |
 | 3.2 | S6 修复：异常边活性 + handler live-in 禁染 Acc + fusion 三前提门禁 | worker P3-T2 (k3) | **完成**（9dad2cb；worker 探针纠正 orchestrator 根因——真身是异常边活性洞，fusion 为潜伏不健全；orchestrator 独立复现红色 4 失败 1 钉住、直方图 lift 1011→1029/lower-other 18→0） |
 | 3.3 | S3 修复：copydataproperties 专属 InstData + lift/isel 臂（含 deprecated 形） | worker P3-T3 (k3) | **完成**（86f810a；附纠正：旧 lift 臂操作数角色与 vendor 相反，已对 sig+pandasm 实证修正；orchestrator 干净 worktree 独立复验：61 套件绿、直方图 untraceable 18→0、object-spread VM 18/18） |
-| 3.4 | S4+S5 修复：abcd-file 建模 module record（blob 保留 + 字段值重定位；含 N1 _ESScopeNamesRecord 同类）；identity 证据面扩到 module 用例（N6） | worker P3-T4 (k3) | **进行中**（与 3.3 并行——crate 不相交） |
-| 3.5 | S1+N2 修复：方法引用携带源 offset（名字不是身份，offset 才是）；EntityTrace 按 kind 限定 | worker P3-T5 (k3) | **进行中**（与 3.4 并行——crate 不相交） |
+| 3.4 | S4+S5 修复：abcd-file 建模 module record（FieldValue::ModuleData/LiteralArrayRef + 桥接 module-data 写路径 + ScalarValueItem ID 引用自动重定位）；identity 证据面扩到 module 用例（N6） | worker P3-T4 (k3) | **完成**（158ee23+312d960；orchestrator 独立实证：恒等重写 module-exports 9.0.0.0 从 disasm abort/VM FATAL → VM 打印 42 exit 0；72 fixture disasm 净、54/54 VM 过、62 套件绿；新登记 N7 moduleRequestPhaseIdx blob、N8 typeSummaryOffset 存疑） |
+| 3.5 | S1+N2 修复：DefineFunc/DefineMethod/DefineClassWithBuffer 携带 method_offset 作身份；kind 限定 EntityTrace；to_method_body 校验 all_methods 成员；inline 改 offset 匹配 | worker P3-T5 (k3) | **完成**（740611b；红色实证 S1 encode 报错 + N2 静默错方法 [145,145]vs[145,178]；orchestrator 复验：直方图 encode 72→18（仅剩 S2）、重写 1047→1101、算术基线 18/18 不退；新暴露 V8：class-accessors/newtarget-this 达 VM 但语义失败） |
 | 3.6 | S2 修复：wide.callrange 选择 + 高位寄存器经低位 scratch 中转（含 N4 起始寄存器 u8 约束） | 待定 | 未开始 |
 
 ## 审计纪律

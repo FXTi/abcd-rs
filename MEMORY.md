@@ -186,8 +186,22 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   selected + sta/lda have no wide form (regs ≥256 unencodable; upstream
   routes via mov + low scratch). S3 = copydataproperties modeled as a
   synthetic-name StoreProperty. New issues N1-N6 registered in
-  design/agent-roadmap.md Phase 3. Fix order: S3 → (S4+S5 parallel, file
-  layer) → S1+N2 → S2.
+  design/agent-roadmap.md Phase 3.
+- S3/S4+S5/S1+N2 ALL RESOLVED (86f810a, 158ee23+312d960, 740611b):
+  copydataproperties is a dedicated IR instruction (its old lift arm also
+  had operand roles swapped vs vendor — corrected); abcd-file models
+  module-record/scope-names field blobs (FieldValue::ModuleData /
+  LiteralArrayRef, untagged vendored ModuleDataAccessor layout written via
+  a new guarded bridge writer, ScalarValueItem ID field references relocate
+  automatically at layout); method references carry method_offset as
+  identity (kind-qualified EntityTrace; to_method_body validates
+  all_methods membership; opt/inline matches callees by offset). Corpus
+  state: rewrite 1101/1119 per variant, only S2 (wide-call) remains at
+  encode. Orchestrator-verified: module-exports identity rewrite went from
+  disasm abort/VM FATAL to VM-clean 42; arithmetic 18/18 unchanged.
+  Newly registered: N7 moduleRequestPhaseIdx blobs (same dangling class,
+  unscheduled), N8 typeSummaryOffset question, V8 class/constructor
+  semantic cluster exposed by the S1 unskip.
 
 ## Phase 1 outcome (done, 2026-09-19)
 
