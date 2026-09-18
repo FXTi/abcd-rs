@@ -136,3 +136,28 @@ fn decode_invalid_jump_target_negative_overflow() {
         "expected InvalidJumpTarget, got {err}"
     );
 }
+
+// --- True invalid opcodes (audit #1: used to abort the process) ---
+
+#[test]
+fn decode_unassigned_primary_opcode_is_an_error_not_abort() {
+    // 0xE2 is unassigned: isa.yaml's last non-prefixed opcode is 0xE1.
+    // Before the bridge validated opcodes, this aborted via UNREACHABLE().
+    let err = decode(&[0xE2]).unwrap_err();
+    assert_eq!(err, DecodeError::InvalidOpcode(0), "got {err}");
+}
+
+#[test]
+fn decode_unassigned_prefixed_sub_opcode_is_an_error_not_abort() {
+    // callruntime (0xFB) sub-opcode 0xFF is unassigned (last is 0x1b).
+    let err = decode(&[0xFB, 0xFF]).unwrap_err();
+    assert_eq!(err, DecodeError::InvalidOpcode(0), "got {err}");
+}
+
+#[test]
+fn decode_unassigned_opcode_mid_stream_reports_offset() {
+    let (mut bytes, _) = encode(&[insn::Ldundefined::new()]).unwrap();
+    bytes.push(0xE2);
+    let err = decode(&bytes).unwrap_err();
+    assert_eq!(err, DecodeError::InvalidOpcode(1), "got {err}");
+}

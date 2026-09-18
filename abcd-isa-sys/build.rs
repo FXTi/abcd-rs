@@ -77,6 +77,15 @@ fn main() {
         &format!("{out_dir}/isa_bridge_emit_dispatch.h"),
     );
 
+    // Generate isa_bridge_valid_opcode.h (opcode validity lookup)
+    run_ruby(
+        &gen_rb,
+        &isa_yaml,
+        &requires,
+        &format!("{manifest}/templates/isa_bridge_valid_opcode.h.erb"),
+        &format!("{out_dir}/isa_bridge_valid_opcode.h"),
+    );
+
     // Generate bytecode.rs (Rust Bytecode enum + Operands + insn constructors)
     run_ruby(
         &gen_rb,

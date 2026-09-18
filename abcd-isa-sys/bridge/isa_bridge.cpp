@@ -2,11 +2,28 @@
 #include "bytecode_instruction-inl.h"
 #include "bytecode_emitter.h"
 #include <file_format_version.h>
+#include <isa_bridge_valid_opcode.h>
 #include <cstring>
 #include <sstream>
 #include <vector>
 
 using Inst = panda::BytecodeInst<panda::BytecodeInstMode::FAST>;
+
+/* Audit fix (review #1): vendor GetFormat() falls into UNREACHABLE()
+ * (= std::abort under NDEBUG) on unassigned opcodes. Every opcode-derived
+ * entry point below validates first, so malformed bytecode is reported
+ * through sentinels instead of killing the host process. */
+static bool opcode_is_valid(uint16_t opcode) {
+    return isa_opcode_is_valid(opcode) != 0;
+}
+
+static bool inst_opcode_is_valid(const uint8_t* bytes) {
+    Inst inst(bytes);
+    return opcode_is_valid(static_cast<uint16_t>(inst.GetOpcode()));
+}
+
+/* Sentinel for uint8_t format results on invalid opcodes. */
+#define ISA_FORMAT_INVALID 0xFF
 
 /* The C header uses uint8_t out[4] in version signatures; guard against drift. */
 static_assert(panda::panda_file::File::VERSION_SIZE == 4,
@@ -21,6 +38,7 @@ struct IsaEmitter {
 extern "C" {
 
 uint8_t isa_get_format(uint16_t opcode) {
+    if (!opcode_is_valid(opcode)) return ISA_FORMAT_INVALID;
     auto fmt = Inst::GetFormat(static_cast<Inst::Opcode>(opcode));
     return static_cast<uint8_t>(fmt);
 }
@@ -40,29 +58,35 @@ uint16_t isa_get_opcode(const uint8_t* bytes) {
 
 uint8_t isa_get_format_from_bytes(const uint8_t* bytes) {
     Inst inst(bytes);
+    if (!opcode_is_valid(static_cast<uint16_t>(inst.GetOpcode()))) return ISA_FORMAT_INVALID;
     return static_cast<uint8_t>(inst.GetFormat());
 }
 
 size_t isa_get_size_from_bytes(const uint8_t* bytes) {
     Inst inst(bytes);
+    if (!opcode_is_valid(static_cast<uint16_t>(inst.GetOpcode()))) return 0;
     return inst.GetSize();
 }
 
 size_t isa_get_size_by_opcode(uint16_t opcode) {
+    if (!opcode_is_valid(opcode)) return 0;
     return Inst::Size(static_cast<Inst::Opcode>(opcode));
 }
 
 uint16_t isa_get_vreg(const uint8_t* bytes, size_t idx) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.GetVReg(idx);
 }
 
 int64_t isa_get_imm64(const uint8_t* bytes, size_t idx) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.GetImm64(idx);
 }
 
 uint32_t isa_get_id(const uint8_t* bytes, size_t idx) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.GetId(idx).AsRawValue();
 }
@@ -80,41 +104,49 @@ int isa_has_id(uint8_t format, size_t idx) {
 }
 
 int isa_can_throw(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.CanThrow() ? 1 : 0;
 }
 
 int isa_is_terminator(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.IsTerminator() ? 1 : 0;
 }
 
 int isa_is_return_or_throw(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.IsReturnOrThrowInstruction() ? 1 : 0;
 }
 
 int isa_has_flag(const uint8_t* bytes, uint32_t flag) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.HasFlag(static_cast<Inst::Flags>(flag)) ? 1 : 0;
 }
 
 int isa_is_throw_ex(const uint8_t* bytes, uint32_t exception_mask) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.IsThrow(static_cast<Inst::Exceptions>(exception_mask)) ? 1 : 0;
 }
 
 int isa_is_jump(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.IsJumpInstruction() ? 1 : 0;
 }
 
 int isa_is_range(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.IsRangeInstruction() ? 1 : 0;
 }
 
 int isa_is_suspend(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.IsSuspend() ? 1 : 0;
 }
@@ -133,39 +165,48 @@ static Inst inst_from_opcode(uint16_t opcode) {
 }
 
 int isa_is_jump_opcode(uint16_t opcode) {
+    if (!opcode_is_valid(opcode)) return 0;
     return inst_from_opcode(opcode).IsJumpInstruction() ? 1 : 0;
 }
 
 int isa_can_throw_opcode(uint16_t opcode) {
+    if (!opcode_is_valid(opcode)) return 0;
     return inst_from_opcode(opcode).CanThrow() ? 1 : 0;
 }
 
 int isa_is_terminator_opcode(uint16_t opcode) {
+    if (!opcode_is_valid(opcode)) return 0;
     return inst_from_opcode(opcode).IsTerminator() ? 1 : 0;
 }
 
 int isa_has_flag_opcode(uint16_t opcode, uint32_t flag) {
+    if (!opcode_is_valid(opcode)) return 0;
     return inst_from_opcode(opcode).HasFlag(static_cast<Inst::Flags>(flag)) ? 1 : 0;
 }
 
 int isa_is_range_opcode(uint16_t opcode) {
+    if (!opcode_is_valid(opcode)) return 0;
     return inst_from_opcode(opcode).IsRangeInstruction() ? 1 : 0;
 }
 
 int isa_is_return_or_throw_opcode(uint16_t opcode) {
+    if (!opcode_is_valid(opcode)) return 0;
     return inst_from_opcode(opcode).IsReturnOrThrowInstruction() ? 1 : 0;
 }
 
 int isa_is_suspend_opcode(uint16_t opcode) {
+    if (!opcode_is_valid(opcode)) return 0;
     return inst_from_opcode(opcode).IsSuspend() ? 1 : 0;
 }
 
 int isa_is_throw_ex_opcode(uint16_t opcode, uint32_t exception_mask) {
+    if (!opcode_is_valid(opcode)) return 0;
     return inst_from_opcode(opcode).IsThrow(static_cast<Inst::Exceptions>(exception_mask)) ? 1 : 0;
 }
 
 size_t isa_format_opcode_name(uint16_t opcode, char* buf, size_t buf_len) {
     if (buf_len == 0) return 0;
+    if (!opcode_is_valid(opcode)) return 0;
     auto op = static_cast<Inst::Opcode>(opcode);
     std::ostringstream oss;
     panda::operator<< <panda::BytecodeInstMode::FAST>(oss, op);
@@ -179,6 +220,12 @@ size_t isa_format_opcode_name(uint16_t opcode, char* buf, size_t buf_len) {
 size_t isa_format_instruction(const uint8_t* bytes, size_t len,
                                char* buf, size_t buf_len) {
     if (len == 0 || buf_len == 0) return 0;
+    // Validate before constructing Inst: a lone prefix byte at the end of
+    // the buffer must not read bytes[1], and an invalid opcode must not
+    // reach GetSize (audit findings: latent 1-byte over-read + abort).
+    uint8_t primary = bytes[0];
+    if (primary >= Inst::GetMinPrefixOpcodeIndex() && len < 2) return 0;
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     if (inst.GetSize() > len) return 0;
     std::ostringstream oss;
@@ -192,6 +239,7 @@ size_t isa_format_instruction(const uint8_t* bytes, size_t len,
 
 size_t isa_format_opcode(const uint8_t* bytes, char* buf, size_t buf_len) {
     if (buf_len == 0) return 0;
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     auto op = inst.GetOpcode();
     std::ostringstream oss;
@@ -220,21 +268,25 @@ int isa_is_primary_opcode_valid(uint8_t primary) {
 /* === Additional operand methods === */
 
 int64_t isa_get_imm_data(const uint8_t* bytes, size_t idx) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.GetImmData(idx);
 }
 
 size_t isa_get_imm_count(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.GetImmCount();
 }
 
 size_t isa_get_literal_index(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return ISA_NO_LITERAL_INDEX;
     Inst inst(bytes);
     return inst.GetLiteralIndex();
 }
 
 void isa_update_id(uint8_t* bytes, uint32_t new_id, uint32_t idx) {
+    if (!inst_opcode_is_valid(bytes)) return;
     // SAFETY: BytecodeInst stores a const pointer, but the original `bytes`
     // is mutable. UpdateId writes through the stored pointer, which is safe
     // because the underlying memory was allocated as non-const by the caller.
@@ -244,28 +296,33 @@ void isa_update_id(uint8_t* bytes, uint32_t new_id, uint32_t idx) {
 }
 
 int64_t isa_get_last_vreg(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return -1;
     Inst inst(bytes);
     auto result = inst.GetLastVReg();
     return result.has_value() ? static_cast<int64_t>(result.value()) : -1;
 }
 
 int64_t isa_get_range_last_reg_idx(const uint8_t* bytes) {
+    if (!inst_opcode_is_valid(bytes)) return -1;
     Inst inst(bytes);
     auto result = inst.GetRangeInsLastRegIdx();
     return result.has_value() ? static_cast<int64_t>(result.value()) : -1;
 }
 
 int isa_is_id_string(const uint8_t* bytes, size_t idx) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.IsIdMatchFlag(idx, Inst::Flags::STRING_ID) ? 1 : 0;
 }
 
 int isa_is_id_method(const uint8_t* bytes, size_t idx) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.IsIdMatchFlag(idx, Inst::Flags::METHOD_ID) ? 1 : 0;
 }
 
 int isa_is_id_literal_array(const uint8_t* bytes, size_t idx) {
+    if (!inst_opcode_is_valid(bytes)) return 0;
     Inst inst(bytes);
     return inst.IsIdMatchFlag(idx, Inst::Flags::LITERALARRAY_ID) ? 1 : 0;
 }
