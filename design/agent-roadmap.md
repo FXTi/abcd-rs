@@ -54,8 +54,8 @@ orchestrator 静态分析确认的三个 bug 机制（worker 需在代码中复�
 
 | # | 任务 | 执行者 | 状态 |
 |---|------|--------|------|
-| 1.1 | B1+B2+B3 红色回归测试（手工构造 RegAlloc/IselResult 驱动 layout/isel + 迷你字节码模拟器断言语义；`#[ignore]` 保持主线绿） | worker P1-T1 (k3) | **进行中** |
-| 1.2 | B1+B2 修复：槽位级并行拷贝解析 + 每函数显式预留临时寄存器（溢出报错，禁 saturating）+ 条件边 trampoline 插入 | 待定 | 未开始 |
+| 1.1 | B1+B2+B3 红色回归测试（手工构造 RegAlloc/IselResult 驱动 layout/isel + 迷你字节码模拟器断言语义；`#[ignore]` 保持主线绿） | worker P1-T1 (k3) | **完成**（30d254a；orchestrator 逐行复审 + 独立复验 4 条断言红色输出一致；Mov 操作数序对 vendor isa.yaml 签名核验无误） |
+| 1.2 | B1+B2 修复：槽位级并行拷贝解析 + 每函数显式预留临时寄存器（溢出报错，禁 saturating）+ 条件边 trampoline 插入 | worker P1-T2 (k3) | **进行中**（复审裁决：槽位解析必须在 layout 发射点，否则绕过 regalloc 的红色测试不变绿） |
 | 1.3 | B3 修复：溢出槽移入声明帧（isel 前 spill 所有 acc 色寄存器操作数再 ensure_acc）；num_regs 贯通到 LayoutResult；未分配 value 改硬错误（若可达） | 待定 | 未开始 |
 | 1.4 | lower 实体重定位通道：LayoutResult 携带实体操作数元数据，产出 `abcd_file::MethodBody`（entity_offsets + num_vregs），复用 `Builder::relocate_code_id` 的 decode→encode 路径 | 待定 | 未开始 |
 
