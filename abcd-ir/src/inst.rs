@@ -83,6 +83,15 @@ pub enum InstData {
     LiteralBool(bool),
     LiteralNumber(f64),
     LiteralString(StringId),
+    /// BigInt literal — vendor `ldbigint string_id`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1622-1626, `acc: out:top`): the
+    /// runtime builds a BigInt from the constant-pool entry
+    /// (`SlowRuntimeStub::LdBigInt`, arkcompiler_ets_runtime-master/
+    /// ecmascript/interpreter/interpreter_assembly.cpp:2915-2930), NOT a
+    /// string — this must never collapse into [`InstData::LiteralString`].
+    /// Opaque to the optimizers (SCCP treats it as a non-foldable
+    /// constant); dead-code-eliminable when unused, like every literal.
+    LiteralBigInt(StringId),
     LiteralNaN,
     LiteralInfinity,
     LiteralHole,
@@ -391,6 +400,7 @@ impl InstData {
             | LiteralBool(_)
             | LiteralNumber(_)
             | LiteralString(_)
+            | LiteralBigInt(_)
             | LiteralNaN
             | LiteralInfinity
             | LiteralHole

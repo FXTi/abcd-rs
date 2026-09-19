@@ -81,8 +81,12 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Ldbigint(eid) => {
+            // Vendor `ldbigint string_id` (isa.yaml:1622-1626): acc out is
+            // a BIGINT built from the constant-pool entry
+            // (`SlowRuntimeStub::LdBigInt`), not a string — a distinct IR
+            // literal so lowering emits `ldbigint`, never `lda.str`.
             let s = resolve(file, body, module, *eid, EntityKind::StringId)?;
-            let v = emit_val(module, block, InstData::LiteralString(s), loc);
+            let v = emit_val(module, block, InstData::LiteralBigInt(s), loc);
             write_acc(ssa, block, v);
         }
         Bytecode::Ldnan => {

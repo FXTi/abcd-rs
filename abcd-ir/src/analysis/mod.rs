@@ -143,6 +143,7 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         | LiteralBool(_)
         | LiteralNumber(_)
         | LiteralString(_)
+        | LiteralBigInt(_)
         | LiteralNaN
         | LiteralInfinity
         | LiteralHole

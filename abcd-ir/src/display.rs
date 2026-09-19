@@ -114,6 +114,7 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
         InstData::LiteralBool(b) => write!(f, "LiteralBool {b}"),
         InstData::LiteralNumber(n) => write!(f, "LiteralNumber {n}"),
         InstData::LiteralString(s) => write!(f, "LiteralString \"{}\"", m.strings.get(*s)),
+        InstData::LiteralBigInt(s) => write!(f, "LiteralBigInt \"{}\"", m.strings.get(*s)),
         InstData::LiteralNaN => write!(f, "LiteralNaN"),
         InstData::LiteralInfinity => write!(f, "LiteralInfinity"),
         InstData::LiteralHole => write!(f, "LiteralHole"),

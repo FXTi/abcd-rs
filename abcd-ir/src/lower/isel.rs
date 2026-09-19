@@ -786,6 +786,14 @@ fn select_inst(
             codes.push(Bytecode::LdaStr(tracer.eid(*s)));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
+        InstData::LiteralBigInt(s) => {
+            // Vendor `ldbigint string_id` (isa.yaml:1622-1626) — the same
+            // entity channel as `lda.str` (a StringId constant-pool
+            // operand), but a distinct opcode: the runtime builds a
+            // BigInt. Result homed per `acc: out:top`.
+            codes.push(Bytecode::Ldbigint(tracer.eid(*s)));
+            home_result(tracker, result, used, func_id, alloc, codes)?;
+        }
         InstData::LiteralNaN => {
             codes.push(Bytecode::Ldnan);
             home_result(tracker, result, used, func_id, alloc, codes)?;
