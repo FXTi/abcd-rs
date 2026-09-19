@@ -123,8 +123,8 @@ VM 语义簇（需逐簇拆根因）：
 | 3.14 | 空跳转 phi 守卫 | worker P3-T14 (k3) | **完成**（4a6d6ae；守卫条件=汇聚边 phi 值不等则拒绝消块，同值照常合并；orchestrator 复验：红色 2 失败 1 钉住复现、lift 树零变化、opt 差集恰 6 文件、opt 702 复跑一致；merge_single_succ_pred 审计结论：不同 bug 类，无需加守卫；新登记 N23 SCCP 折叠留陈旧 phi 条目——无活失败） |
 | 3.15 | N14 generator 三件套建模 | worker P3-T15 (k3) | **完成**（aa6e786；vendor sig 逐条核验；orchestrator 复验：门禁绿、字节差集恰 36、lift 666/opt 708 复跑一致、18 例 SIGSEGV 清零、生成器剩余 12 例归 B4） |
 | 3.16 | N24 oracle 工具链卫生 | orchestrator | **完成**（3883291；标签+finally 清理+客户端超时兜底；默认行为不变、崩溃族跑后容器零残留实证） |
-| 3.17 | N12 ThrowIfSuperNotCorrectCall 修复 | worker P3-T16 (k3) | **进行中** |
-| 3.18 | **B4 acc 跨指令覆盖建模**（acc-as-color 不跟踪物理 clobber；class-accessors lift×18 + generator baseline/debug×12 实锤）——Phase 3 收官战 | 待定 | 未开始 |
+| 3.17 | N12 ThrowIfSuperNotCorrectCall 修复 | worker P3-T16 (k3) | **完成**（cd410e5；kind 语义钉死（0=TDZ 守卫/1=重绑守卫，acc=this）；orchestrator 复验：72 套件绿、差集恰 144、lift 666 零翻转、opt 690 复跑一致；opt -18 为诚实回归——修复前的通过跑的是不可能抛错的空检查，修复后撞上 B4；新登记 N25 ThrowConstAssignment、N26 ThrowUndefinedIfHole 两寄存器形（同类）） |
+| 3.18 | **B4：acc-as-cache 重构**（RegSlot::Acc 退出分配，acc 降级为发射期物理缓存+内容跟踪；B3 溢出槽/多 acc 不变式整个消灭）——Phase 3 收官战。活证据 48 例：class-accessors lift×18 + generator baseline/debug×12 + super-properties opt×18 | 待定 | 未开始 |
 
 P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle  harness 无幻影）：
 
