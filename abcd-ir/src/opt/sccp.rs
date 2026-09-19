@@ -230,8 +230,23 @@ impl FuncPass for Sccp {
                         let target = if is_true { true_dest } else { false_dest };
                         let dead = if is_true { false_dest } else { true_dest };
                         module.inst_mut(last).data = InstData::Branch { dest: target };
-                        // Remove bb from dead target's preds.
-                        module.block_mut(dead).preds.retain(|p| *p != bb);
+                        // Remove bb from dead target's preds AND from its
+                        // phi entries (N23/N27): a stale entry keyed by bb
+                        // survives on the IMPOSSIBLE path, and a later
+                        // merge/dedup can resurrect its value over the
+                        // value from the only live path. When both dests
+                        // name the same block the edge is still live (the
+                        // branch still targets it), so nothing is removed.
+                        if dead != target {
+                            module.block_mut(dead).preds.retain(|p| *p != bb);
+                            let dead_phis = module.block(dead).phis.clone();
+                            for phi_id in dead_phis {
+                                if let InstData::Phi { entries } = &mut module.inst_mut(phi_id).data
+                                {
+                                    entries.retain(|(pred, _)| *pred != bb);
+                                }
+                            }
+                        }
                         changed = true;
                     }
                 }

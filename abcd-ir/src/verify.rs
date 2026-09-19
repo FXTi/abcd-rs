@@ -108,6 +108,41 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
         ));
     }
 
+    // N27: a phi on a REACHABLE block with no predecessors can never
+    // receive a value — no incoming edge carries a phi copy at lowering,
+    // so any use reads a never-written frame register. Reachability uses
+    // the augmented successor relation (terminator edges + try→handler
+    // exception edges), matching the optimizer's own liveness model.
+    // Dead pred-less blocks (N18) legitimately carry junk and are exempt:
+    // CfgSimplify removes them, and this rule must not fire on them.
+    // (The entry block with a self-loop back-edge has itself as a pred
+    // and is unaffected; handlers have their try blocks as preds.)
+    {
+        let mut reachable: HashSet<Block> = HashSet::new();
+        let mut queue: std::collections::VecDeque<Block> = std::collections::VecDeque::new();
+        reachable.insert(entry);
+        queue.push_back(entry);
+        while let Some(bb) = queue.pop_front() {
+            for succ in analysis::augmented_succs(module, func_id, bb) {
+                if func_blocks.contains(&succ) && reachable.insert(succ) {
+                    queue.push_back(succ);
+                }
+            }
+        }
+        for &bb in &func.blocks {
+            if !reachable.contains(&bb) || !module.block(bb).preds.is_empty() {
+                continue;
+            }
+            for &inst_id in &module.block(bb).phis {
+                errors.push(err(
+                    Some(bb),
+                    Some(inst_id),
+                    "phi on a reachable block with no predecessors".into(),
+                ));
+            }
+        }
+    }
+
     for &bb in &func.blocks {
         let block = module.block(bb);
 
@@ -465,6 +500,48 @@ mod tests {
         assert!(
             errs.iter()
                 .any(|e| e.message.contains("duplicate predecessor"))
+        );
+    }
+
+    /// N27: a phi on a REACHABLE block with no predecessors can never
+    /// receive a value — no edge carries a phi copy at lowering, so any
+    /// use reads a never-written frame register. This must be an error.
+    #[test]
+    fn phi_on_reachable_zero_pred_block_is_error() {
+        let mut m = make_module();
+        let func = IRBuilder::create_function(&mut m, "f", FunctionKind::Function, 0);
+        let mut b = IRBuilder::new(&mut m, func);
+        // Entry block (reachable, zero preds) carrying an EMPTY phi — the
+        // exact N27 end state the optimizer once produced.
+        b.emit_val(InstData::Phi { entries: vec![] }, IrType::default());
+        b.emit_void(InstData::Return { value: None });
+
+        let errs = verify_func(&m, func);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("reachable block with no predecessors")),
+            "expected the zero-pred reachable phi rule to fire, got: {errs:?}"
+        );
+    }
+
+    /// N18 twin: a phi on an UNREACHABLE zero-pred block is tolerated —
+    /// dead pred-less blocks legitimately carry junk and CfgSimplify
+    /// removes them; the rule must not fire on them.
+    #[test]
+    fn phi_on_unreachable_zero_pred_block_is_tolerated() {
+        let mut m = make_module();
+        let func = IRBuilder::create_function(&mut m, "f", FunctionKind::Function, 0);
+        let mut b = IRBuilder::new(&mut m, func);
+        let dead = b.create_block();
+        b.emit_void(InstData::Return { value: None });
+        b.set_insert_block(dead);
+        b.emit_val(InstData::Phi { entries: vec![] }, IrType::default());
+        b.emit_void(InstData::Return { value: None });
+
+        let errs = verify_func(&m, func);
+        assert!(
+            errs.is_empty(),
+            "dead pred-less blocks must not trip the rule: {errs:?}"
         );
     }
 

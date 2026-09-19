@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::analysis::{augmented_succs, block_succs, inst_operands};
+use crate::analysis::{augmented_succs, block_succs, inst_operands, replace_uses_in_func};
 use crate::entity::{Block, FuncId, Inst, Value};
 use crate::inst::InstData;
 use crate::module::Module;
@@ -199,30 +199,47 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
             if !phi_inputs_match {
                 continue;
             }
-            let bb_preds = module.block(bb).preds.clone();
+            // A single-pred phi is definitionally equal to its one
+            // incoming value: SUBSTITUTE the value for every use of the
+            // phi result and drop the phi. Re-keying the entry to bb's
+            // preds instead would (a) manufacture a trivial phi for
+            // copyprop to clean up, and (b) — when bb is the entry block
+            // and has no preds — produce `Phi { entries: [] }` whose
+            // result may stay live: no edge ever writes its home
+            // register at lowering, so uses read frame garbage (N27).
             for &phi_id in &succ_phis {
-                if let InstData::Phi { entries } = &mut module.inst_mut(phi_id).data {
-                    let incoming = entries
-                        .iter()
-                        .find(|(pred, _)| *pred == bb)
-                        .map(|(_, v)| *v);
-                    if let Some(value) = incoming {
-                        entries.clear();
-                        entries.extend(bb_preds.iter().copied().map(|pred| (pred, value)));
+                let (result, incoming) = {
+                    let inst = module.inst(phi_id);
+                    let incoming = match &inst.data {
+                        InstData::Phi { entries } => entries
+                            .iter()
+                            .find(|(pred, _)| *pred == bb)
+                            .map(|(_, v)| *v),
+                        _ => None,
+                    };
+                    (inst.result, incoming)
+                };
+                if let (Some(result), Some(value)) = (result, incoming) {
+                    if value != result {
+                        replace_uses_in_func(module, func, result, value);
                     }
+                    // Self-referential single-entry phis (dead cycles)
+                    // need no rewrite: uses already name the phi result,
+                    // and ADCE sweeps them when the result is unused.
                 }
             }
 
             // Remove the terminator from bb.
             module.block_mut(bb).insts.pop();
 
-            // Move succ's phis (should be empty for single-pred) and insts.
-            module.block_mut(bb).phis.extend(succ_phis.iter().copied());
+            // Move succ's insts. Its phis are eliminated above, so they
+            // are NOT moved into bb (a moved phi would sit at a join it
+            // does not belong to — or, for entry bb, become empty).
             module
                 .block_mut(bb)
                 .insts
                 .extend(succ_insts.iter().copied());
-            for &inst_id in succ_phis.iter().chain(succ_insts.iter()) {
+            for &inst_id in succ_insts.iter() {
                 module.inst_mut(inst_id).block = bb;
             }
 

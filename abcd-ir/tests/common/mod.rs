@@ -115,6 +115,10 @@ pub struct Machine {
 pub const UNDEFINED: i64 = i64::MIN;
 #[allow(dead_code)]
 pub const HOLE: i64 = i64::MIN + 1;
+/// Sentinel for `createemptyobject` — the i64 machine has no objects, so
+/// the created empty object is modeled as a distinct sentinel (N27 tests).
+#[allow(dead_code)]
+pub const EMPTY_OBJECT: i64 = i64::MIN + 2;
 
 #[allow(dead_code)] // helpers are shared across several test binaries
 impl Machine {
@@ -208,6 +212,12 @@ impl Machine {
                 // HOLE sentinel docs).
                 Bytecode::Ldhole => {
                     self.acc = HOLE;
+                    pc += 1;
+                }
+                // `createemptyobject` — acc = a fresh empty object
+                // (modeled as the EMPTY_OBJECT sentinel).
+                Bytecode::Createemptyobject => {
+                    self.acc = EMPTY_OBJECT;
                     pc += 1;
                 }
                 // `add2 imm:u8, v:in:top` with `acc: inout:top`
