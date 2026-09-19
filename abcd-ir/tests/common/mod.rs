@@ -2,8 +2,9 @@
 //! regression tests.
 //!
 //! It supports only the opcodes the crafted sequences use
-//! (`Lda`/`Sta`/`Mov`/`Ldai`/`Add2`/`Sub2`/`Greater`/`Eq`/`Istrue`/`Jmp`/
-//! `Jnez`/`Jeq`/`Return`/`Returnundefined`, no-op `Stobjbyname`, plus
+//! (`Lda`/`Sta`/`Mov`/`Ldai`/`Ldundefined`/`Ldhole`/`Add2`/`Sub2`/
+//! `Greater`/`Eq`/`Istrue`/`Jmp`/`Jnez`/`Jeq`/`Return`/`Returnundefined`,
+//! no-op `Stobjbyname`, plus
 //! record-and-stop for `Stobjbyvalue`). Labels in `layout` output are
 //! already resolved to absolute instruction indices by `resolve_labels`,
 //! so jumps use the label operand directly as a program counter.
@@ -46,6 +47,23 @@ pub struct Machine {
     pub regs: HashMap<u16, i64>,
     pub acc: i64,
 }
+
+/// Frame-initial value sentinels. The i64 machine has no tagged values,
+/// so the two VM frame-initial states are modeled as distinct sentinels:
+///
+/// - `UNDEFINED`: every vreg slot is initialized to `undefined` at frame
+///   creation — vendor `CALL_PUSH_UNDEFINED(numVregs)` pushing
+///   `JSTaggedValue::VALUE_UNDEFINED`
+///   (arkcompiler_ets_runtime-master/ecmascript/interpreter/interpreter-inl.cpp:285-291,
+///   call sites :731-732 and :1471-1472; same fill in the fast-new-frame
+///   path, interpreter_assembly.cpp:3653-3657).
+/// - `HOLE`: the accumulator is initialized to the hole at frame creation
+///   — vendor `state->acc = JSTaggedValue::Hole()`
+///   (interpreter-inl.cpp:739 and :1482, interpreter_assembly.cpp:3695).
+#[allow(dead_code)] // used by the vreg-hole regressions
+pub const UNDEFINED: i64 = i64::MIN;
+#[allow(dead_code)]
+pub const HOLE: i64 = i64::MIN + 1;
 
 #[allow(dead_code)] // helpers are shared across several test binaries
 impl Machine {
@@ -95,6 +113,18 @@ impl Machine {
                 }
                 Bytecode::Ldai(imm) => {
                     self.acc = imm.0;
+                    pc += 1;
+                }
+                // `ldundefined` — acc = undefined (frame-initial vreg
+                // value; see the UNDEFINED sentinel docs).
+                Bytecode::Ldundefined => {
+                    self.acc = UNDEFINED;
+                    pc += 1;
+                }
+                // `ldhole` — acc = hole (frame-initial acc value; see the
+                // HOLE sentinel docs).
+                Bytecode::Ldhole => {
+                    self.acc = HOLE;
                     pc += 1;
                 }
                 // `add2 imm:u8, v:in:top` with `acc: inout:top`

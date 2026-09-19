@@ -40,14 +40,33 @@ pub struct SsaBuilder {
     sealed: HashMap<Block, bool>,
     /// Incomplete phis: block → [(location, phi_value)] for unsealed blocks.
     incomplete_phis: HashMap<Block, Vec<(RegOrAcc, Value)>>,
+    /// The function entry block: where frame-initial constants are
+    /// materialized so they dominate every reachable use.
+    entry: Block,
+    /// Lazily materialized frame-initial constants, one shared value per
+    /// location kind (minimal liveness perturbation). Ark defines the
+    /// frame-initial state at frame creation: every vreg slot starts as
+    /// `undefined` and the accumulator starts as the hole — vendor
+    /// `CALL_PUSH_UNDEFINED(numVregs)` pushing
+    /// `JSTaggedValue::VALUE_UNDEFINED` per vreg
+    /// (arkcompiler_ets_runtime-master/ecmascript/interpreter/
+    /// interpreter-inl.cpp:285-291, call sites :731-732 and :1471-1472;
+    /// same fill in interpreter_assembly.cpp:3653-3657) and
+    /// `state->acc = JSTaggedValue::Hole()` (interpreter-inl.cpp:739 and
+    /// :1482, interpreter_assembly.cpp:3695).
+    frame_initial_undefined: Option<Value>,
+    frame_initial_hole: Option<Value>,
 }
 
 impl SsaBuilder {
-    pub fn new() -> Self {
+    pub fn new(entry: Block) -> Self {
         Self {
             defs: HashMap::new(),
             sealed: HashMap::new(),
             incomplete_phis: HashMap::new(),
+            entry,
+            frame_initial_undefined: None,
+            frame_initial_hole: None,
         }
     }
 
@@ -72,7 +91,15 @@ impl SsaBuilder {
         module: &mut Module,
     ) -> Value {
         let preds = module.block(block).preds.clone();
-        let val = if !self.is_sealed(block) {
+        // Predecessor edges are fully built before SSA construction
+        // starts, so a block with no predecessors (the entry block, or
+        // code unreachable from it) can never gain phi operands later —
+        // not even via the unsealed/incomplete-phi path. A location read
+        // there has no reaching definition: resolve to the Ark
+        // frame-initial value instead of an invalid zero-entry phi.
+        let val = if preds.is_empty() {
+            self.frame_initial(loc, module)
+        } else if !self.is_sealed(block) {
             // Block not sealed yet — create an incomplete phi.
             let phi_val = self.emit_empty_phi(block, module);
             self.incomplete_phis
@@ -91,6 +118,54 @@ impl SsaBuilder {
             self.add_phi_operands(loc, block, phi_val, module)
         };
         self.write_variable(loc, block, val);
+        val
+    }
+
+    /// The frame-initial value for a location with no reaching definition:
+    /// one shared `LiteralUndefined` for vregs, one shared `LiteralHole`
+    /// for the accumulator (vendor citations on the struct fields).
+    ///
+    /// The literal is materialized at the TOP of the entry block so it
+    /// dominates every reachable use and the terminator stays last. Top
+    /// placement (rather than at the triggering read site) keeps it ahead
+    /// of every other definition: no already-emitted acc-resident value
+    /// can be live across its acc-clobbering load (cf. the registered B4
+    /// acc-clobber modeling gap).
+    fn frame_initial(&mut self, loc: RegOrAcc, module: &mut Module) -> Value {
+        let cached = match loc {
+            RegOrAcc::Acc => self.frame_initial_hole,
+            RegOrAcc::Reg(_) => self.frame_initial_undefined,
+        };
+        if let Some(val) = cached {
+            return val;
+        }
+
+        use crate::entity::Inst;
+        use crate::module::{InstNode, ValueData, ValueDef};
+
+        let data = match loc {
+            RegOrAcc::Acc => InstData::LiteralHole,
+            RegOrAcc::Reg(_) => InstData::LiteralUndefined,
+        };
+        let inst_id = Inst::from_index(module.insts.len());
+        let val = Value::from_index(module.values.len());
+        module.values.push(ValueData {
+            def: ValueDef::Inst(inst_id),
+            ty: IrType::default(),
+        });
+        module.insts.push(InstNode {
+            data,
+            result: Some(val),
+            result_type: IrType::default(),
+            block: self.entry,
+            loc: None,
+        });
+        module.block_mut(self.entry).insts.insert(0, inst_id);
+
+        match loc {
+            RegOrAcc::Acc => self.frame_initial_hole = Some(val),
+            RegOrAcc::Reg(_) => self.frame_initial_undefined = Some(val),
+        }
         val
     }
 

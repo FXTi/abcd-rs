@@ -268,7 +268,7 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
     module.func_mut(func_id).try_regions = try_regions;
 
     // SSA construction.
-    let mut ssa = SsaBuilder::new();
+    let mut ssa = SsaBuilder::new(entry_block);
 
     // Entry seeding: arguments arrive in the ABI top slots
     // `Reg(num_vregs + i)` (frame = num_vregs + num_args, args at the top;
@@ -279,9 +279,13 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
     // pins these values to the vreg homes Reg(0..n) and isel emits the
     // copy-in prologue from the ABI top slots.
     //
-    // Out of scope (follow-up): reads of never-written VREG slots
-    // (< num_vregs) at entry still produce empty phis; Ark initializes
-    // vregs to hole.
+    // Locations with NO reaching definition (never-written vregs, or the
+    // accumulator read before any write) resolve to the Ark frame-initial
+    // state via `SsaBuilder::frame_initial`: one shared `LiteralUndefined`
+    // for vregs, one shared `LiteralHole` for the accumulator (vendor:
+    // `CALL_PUSH_UNDEFINED(numVregs)` + `state->acc = JSTaggedValue::Hole()`
+    // at frame creation — see ssa.rs). The Braun base case therefore never
+    // emits a zero-entry phi.
     for i in 0..param_count {
         let val = Value::from_index(module.values.len());
         module.values.push(ValueData {
