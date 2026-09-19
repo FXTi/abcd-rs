@@ -914,6 +914,17 @@ fn select_inst(
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
+        InstData::SetObjectWithProto { proto, obj } => {
+            // Vendor `setobjectwithproto imm:u16, v:in:top, acc: in:top`
+            // (isa.yaml:1333-1337): proto in the register operand, the
+            // object in the accumulator; two-slot IC. Both the modern
+            // source form and the folded deprecated form
+            // (`deprecated.setobjectwithproto v1, v2`, isa.yaml:1338-1342)
+            // emit this modern opcode.
+            let regs = materialize_operands(tracker, func_id, &[*proto], Some(*obj), alloc, codes)?;
+            codes.push(Bytecode::Setobjectwithproto(ic.two(), regs[0]));
+        }
+
         // ── Property access ──────────────────────────────────────────
         InstData::LoadProperty { object, key } => {
             match key {

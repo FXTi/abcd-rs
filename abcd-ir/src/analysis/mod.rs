@@ -184,6 +184,7 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
             v.extend(keys);
             v
         }
+        SetObjectWithProto { proto, obj } => vec![*proto, *obj],
 
         LoadProperty { object, key } => {
             let mut v = vec![*object];

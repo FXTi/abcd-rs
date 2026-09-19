@@ -130,6 +130,21 @@ pub enum InstData {
         obj: Value,
         keys: Vec<Value>,
     },
+    /// Vendor `setobjectwithproto imm:u16, v:in:top, acc: in:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1333-1337, opcode_idx 0x77/0xc7,
+    /// `properties: [ic_slot, two_slot, eight_sixteen_bit_ic]`): sets the
+    /// object's prototype WITHOUT running any `__proto__` setter
+    /// machinery — never collapsible into a named-property store. `proto`
+    /// is the register operand value, `obj` the accumulator value. The
+    /// deprecated form (`deprecated.setobjectwithproto v1:in:top,
+    /// v2:in:top, acc: none`, isa.yaml:1338-1342; v1 = proto, v2 = obj)
+    /// folds into this variant (the codebase folds deprecated opcodes
+    /// into the modern IR variant, cf. `DeprecatedDelobjprop` →
+    /// `DeleteProperty`); isel emits the modern opcode for both.
+    SetObjectWithProto {
+        proto: Value,
+        obj: Value,
+    },
 
     // ── Property access ──────────────────────────────────────────────
     LoadProperty {
@@ -567,6 +582,7 @@ impl InstData {
                 v.extend(keys.iter_mut());
                 v
             }
+            SetObjectWithProto { proto, obj } => vec![proto, obj],
 
             LoadProperty { object, key } => {
                 let mut v: Vec<&mut Value> = vec![object];
@@ -678,6 +694,7 @@ impl InstData {
             InstData::StoreProperty { .. }
                 | InstData::StoreOwnProperty { .. }
                 | InstData::StoreSuperProperty { .. }
+                | InstData::SetObjectWithProto { .. }
                 | InstData::CopyDataProperties { .. }
                 | InstData::StorePrivateProperty { .. }
                 | InstData::DefinePrivateProperty { .. }

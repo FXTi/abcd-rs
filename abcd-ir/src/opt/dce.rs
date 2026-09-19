@@ -98,6 +98,10 @@ fn is_essential(data: &InstData) -> bool {
         | StoreOwnProperty { .. }
         | StoreSuperProperty { .. }
         | CopyDataProperties { .. }
+        // Mutates the object's prototype link (vendor
+        // `setobjectwithproto`, isa.yaml:1333-1337) — observable even
+        // though it produces no IR value.
+        | SetObjectWithProto { .. }
         // Mutates the destination array (vendor
         // `SlowRuntimeStub::StArraySpread`, isa.yaml:1329-1332) — the
         // new-index result being unused (the corpus shape: acc is

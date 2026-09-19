@@ -157,6 +157,9 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
             }
             Ok(())
         }
+        InstData::SetObjectWithProto { proto, obj } => {
+            write!(f, "SetObjectWithProto {obj}, proto {proto}")
+        }
 
         // Property access
         InstData::LoadProperty { object, key } => {

@@ -109,6 +109,12 @@ pub enum Halt {
     /// `throw.undefinedifholewithname string_id, acc: in:top`
     /// (abcd-isa-sys/vendor/isa/isa.yaml:1010-1015).
     ThrowUndefinedIfHoleWithName { value: i64 },
+    /// `Setobjectwithproto` (record-and-stop): `proto` is the register
+    /// operand's contents, `obj` the accumulator — vendor
+    /// `setobjectwithproto imm:u16, v:in:top, acc: in:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1333-1337); the IC slot imm is
+    /// ignored.
+    SetObjectWithProto { proto: i64, obj: i64 },
     /// `run_until` reached the stop pc WITHOUT executing the instruction
     /// there — models an exception thrown between two instructions.
     Stopped,
@@ -412,6 +418,15 @@ impl Machine {
                 // (isa.yaml:1010-1015) — record the acc (the checked value).
                 Bytecode::ThrowUndefinedifholewithname(_) => {
                     return Halt::ThrowUndefinedIfHoleWithName { value: self.acc };
+                }
+                // `setobjectwithproto imm, v:in:top, acc: in:top`
+                // (isa.yaml:1333-1337) — record the proto register's
+                // contents and the acc (the object).
+                Bytecode::Setobjectwithproto(_, proto_r) => {
+                    return Halt::SetObjectWithProto {
+                        proto: self.reg(proto_r.0),
+                        obj: self.acc,
+                    };
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),
             }

@@ -1313,17 +1313,16 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Setobjectwithproto(_ic, proto_reg) => {
+            // Vendor `setobjectwithproto imm:u16, v:in:top, acc: in:top`
+            // (isa.yaml:1333-1337): v is the proto, the OBJECT rides the
+            // accumulator. Sets the prototype link directly — NOT a
+            // named-property store.
             let obj = read_acc(ssa, block, module);
             let proto = read_reg(ssa, *proto_reg, block, module);
-            let name = module.strings.intern("__proto__");
             emit_void(
                 module,
                 block,
-                InstData::StoreProperty {
-                    object: obj,
-                    key: PropKind::ByName(name),
-                    value: proto,
-                },
+                InstData::SetObjectWithProto { proto, obj },
                 loc,
             );
         }
@@ -2140,17 +2139,16 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, dst);
         }
         Bytecode::DeprecatedSetobjectwithproto(proto_reg, obj_reg) => {
+            // Vendor `deprecated.setobjectwithproto v1:in:top, v2:in:top,
+            // acc: none` (isa.yaml:1338-1342): v1 = proto, v2 = obj.
+            // Folds into the modern IR variant; isel emits the modern
+            // opcode (`setobjectwithproto imm, v, acc: in:top`).
             let proto = read_reg(ssa, *proto_reg, block, module);
             let obj = read_reg(ssa, *obj_reg, block, module);
-            let name = module.strings.intern("__proto__");
             emit_void(
                 module,
                 block,
-                InstData::StoreProperty {
-                    object: obj,
-                    key: PropKind::ByName(name),
-                    value: proto,
-                },
+                InstData::SetObjectWithProto { proto, obj },
                 loc,
             );
         }
