@@ -1,7 +1,14 @@
 //! Dominator tree via Semi-NCA (Georgiadis 2005).
 //!
 //! Single-pass DFS + semi-dominator computation → immediate dominators.
-//! Provides `idom`, `dominates`, and `post_idom` queries.
+//! Provides `idom` and `dominates` queries over the TERMINATOR CFG
+//! (`block_succs`). Blocks unreachable from the entry — in the
+//! terminator-successor model that is every catch handler (exception
+//! dispatch is implicit, N13/N21) plus genuinely dead blocks (N18) —
+//! have no tree entry, and `dominates` returns false for queries
+//! touching them. Consumers that reason about exception value flow must
+//! apply their own exemptions (see `verify`'s use-def dominance pass,
+//! N45).
 
 use std::collections::HashMap;
 

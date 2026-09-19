@@ -6,6 +6,8 @@
 //! - Phi entry count matches predecessor count
 //! - Entry block has no predecessors
 //! - Values used by instructions are defined (exist in the module)
+//! - Every use is dominated by its definition (terminator-CFG
+//!   dominance, with documented exception-model exemptions — N45)
 
 use std::collections::HashSet;
 use std::fmt;
@@ -327,6 +329,8 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
         }
     }
 
+    verify_dominance(module, func_id, &mut errors);
+
     // Try/catch metadata must only reference blocks owned by this function.
     // Keep the region lists consistent with the CFG so lowering cannot emit
     // handlers or protected ranges from another function.
@@ -363,6 +367,171 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
     }
 
     errors
+}
+
+/// N45 use-def dominance: every use of a value must be dominated by its
+/// definition, over the TERMINATOR CFG (`analysis::domtree::DomTree`).
+///
+/// The terminator-successor model gives catch handlers no incoming CFG
+/// edges — exception dispatch is implicit — so handlers (and blocks only
+/// reachable through them, plus genuinely dead blocks, N18) have no
+/// dominator-tree entry. The documented exemptions, all forced by that
+/// model:
+///
+/// 1. USES IN CFG-UNREACHABLE BLOCKS are exempt. A handler reads values
+///    defined in its protected try blocks (live there at the point of
+///    exception — N13/N21), which terminator-CFG dominance can never
+///    justify; that flow is governed by the augmented liveness model
+///    (`analysis::augmented_succs`). Dead pred-less blocks legitimately
+///    carry junk (same standing as the N27 zero-pred phi rule's
+///    exemption).
+/// 2. PHI ENTRIES are uses on the incoming EDGE: the value must be
+///    available at the END of the keyed predecessor — defined in the
+///    pred itself, or in a block dominating the pred. Entries keyed by a
+///    CFG-unreachable pred (handler → merge edges, dead preds) are
+///    exempt per (1).
+/// 3. ENTRY-DEFINED values — function parameters (`ValueDef::FuncParam`,
+///    bound to the frame's argument slots at function entry) and
+///    instruction results defined in the entry block (including the
+///    shared frame-initial LiteralUndefined/LiteralHole seeds, P3-T7) —
+///    dominate everything, handlers included: control can only reach any
+///    block after executing the entry block. (Within the entry block
+///    itself the usual def-before-use ordering still applies.)
+/// 4. EXCEPTION PARAMS (`ValueDef::ExceptionParam`, N13) are defined by
+///    the exception dispatch itself, at the owning handler's entry:
+///    valid in the owning handler block, in CFG-unreachable blocks
+///    downstream of it, and on phi edges keyed by that handler.
+fn verify_dominance(module: &Module, func_id: FuncId, errors: &mut Vec<VerifyError>) {
+    let func = module.func(func_id);
+    let entry = func.entry_block;
+    let dom = crate::analysis::domtree::DomTree::build(module, func_id);
+    let cfg_reachable = |b: Block| dom.dominates(entry, b);
+    let exception_owner: std::collections::HashMap<Value, Block> = func
+        .exception_values
+        .iter()
+        .map(|&(handler, val)| (val, handler))
+        .collect();
+    let err = |block: Option<Block>, inst: Option<Inst>, msg: String| VerifyError {
+        func: func_id,
+        block,
+        inst,
+        message: msg,
+    };
+
+    for &bb in &func.blocks {
+        let block = module.block(bb);
+        // Instruction positions (phis first, then insts) for the
+        // same-block def-before-use ordering check.
+        let mut position: std::collections::HashMap<Inst, usize> = std::collections::HashMap::new();
+        for (i, &inst_id) in block.phis.iter().chain(block.insts.iter()).enumerate() {
+            position.insert(inst_id, i);
+        }
+
+        for (i, &inst_id) in block.phis.iter().chain(block.insts.iter()).enumerate() {
+            let data = &module.inst(inst_id).data;
+
+            if let InstData::Phi { entries } = data {
+                // Phi entries: uses on the incoming edge (exemption 2).
+                for &(pred, val) in entries {
+                    match module.values.get(val.index()).map(|v| v.def) {
+                        // Params are entry-defined (exemption 3).
+                        Some(ValueDef::FuncParam(_)) => {}
+                        // Exception params: edge must leave the owning
+                        // handler (exemption 4); unreachable preds are
+                        // exempt per (1).
+                        Some(ValueDef::ExceptionParam) => {
+                            let owner = exception_owner.get(&val).copied();
+                            if owner.is_some() && owner != Some(pred) && cfg_reachable(pred) {
+                                errors.push(err(
+                                    Some(bb),
+                                    Some(inst_id),
+                                    format!(
+                                        "phi entry from {pred} uses exception value {val} \
+                                         delivered at {:?} — not available at the end of {pred}",
+                                        owner.unwrap()
+                                    ),
+                                ));
+                            }
+                        }
+                        Some(ValueDef::Inst(def_inst)) => {
+                            let def_block = module.inst(def_inst).block;
+                            if def_block == pred || def_block == entry || !cfg_reachable(pred) {
+                                continue;
+                            }
+                            if !dom.dominates(def_block, pred) {
+                                errors.push(err(
+                                    Some(bb),
+                                    Some(inst_id),
+                                    format!(
+                                        "phi entry from {pred} uses {val} whose definition in \
+                                         {def_block} does not dominate the predecessor"
+                                    ),
+                                ));
+                            }
+                        }
+                        // Undefined values are reported by the existence check.
+                        None => {}
+                    }
+                }
+                continue;
+            }
+
+            for val in analysis::inst_operands(data) {
+                match module.values.get(val.index()).map(|v| v.def) {
+                    Some(ValueDef::FuncParam(_)) => {}
+                    Some(ValueDef::ExceptionParam) => {
+                        let owner = exception_owner.get(&val).copied();
+                        if owner.is_some() && owner != Some(bb) && cfg_reachable(bb) {
+                            errors.push(err(
+                                Some(bb),
+                                Some(inst_id),
+                                format!(
+                                    "uses exception value {val} delivered at handler {:?} — \
+                                     not available in this block",
+                                    owner.unwrap()
+                                ),
+                            ));
+                        }
+                    }
+                    Some(ValueDef::Inst(def_inst)) => {
+                        let def_block = module.inst(def_inst).block;
+                        if def_block == bb {
+                            // Same block: the definition must precede the
+                            // use (phis precede all regular insts).
+                            let def_pos = position.get(&def_inst).copied().unwrap_or(usize::MAX);
+                            if def_pos >= i {
+                                errors.push(err(
+                                    Some(bb),
+                                    Some(inst_id),
+                                    format!(
+                                        "uses {val} before its definition — the definition does \
+                                         not dominate this use"
+                                    ),
+                                ));
+                            }
+                            continue;
+                        }
+                        // Entry-defined values dominate everything,
+                        // handlers included (exemption 3).
+                        if def_block == entry || !cfg_reachable(bb) {
+                            continue;
+                        }
+                        if !dom.dominates(def_block, bb) {
+                            errors.push(err(
+                                Some(bb),
+                                Some(inst_id),
+                                format!(
+                                    "uses {val} whose definition in {def_block} does not \
+                                     dominate this block"
+                                ),
+                            ));
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
 }
 
 /// Verify all functions in the module.
@@ -542,6 +711,151 @@ mod tests {
         assert!(
             errs.is_empty(),
             "dead pred-less blocks must not trip the rule: {errs:?}"
+        );
+    }
+
+    /// N45 red pin: a use whose definition does NOT dominate it (over
+    /// the terminator CFG) must be an error. Existence-only
+    /// verification accepts this today.
+    ///
+    /// ```text
+    /// entry: CondBranch(p0, b1, b2)
+    /// b1: v = 1.0; Return          — v defined in b1
+    /// b2: Return(v)                — b1 does not dominate b2
+    /// ```
+    #[test]
+    fn use_not_dominated_by_def_is_error() {
+        let mut m = make_module();
+        let func = IRBuilder::create_function(&mut m, "f", FunctionKind::Function, 1);
+        let mut b = IRBuilder::new(&mut m, func);
+        let p0 = b.create_func_param(0, IrType::default());
+        let b1 = b.create_block();
+        let b2 = b.create_block();
+        let entry = b.current_block();
+        b.add_predecessor(b1, entry);
+        b.add_predecessor(b2, entry);
+        b.emit_void(InstData::CondBranch {
+            cond: p0,
+            true_dest: b1,
+            false_dest: b2,
+        });
+        b.set_insert_block(b1);
+        let v = b.emit_val(InstData::LiteralNumber(1.0), IrType::default());
+        b.emit_void(InstData::Return { value: None });
+        b.set_insert_block(b2);
+        b.emit_void(InstData::Return { value: Some(v) });
+
+        let errs = verify_func(&m, func);
+        assert!(
+            errs.iter().any(|e| e.message.contains("dominat")),
+            "expected a use-def dominance error, got: {errs:?}"
+        );
+    }
+
+    /// N45 red pin: within one block a use must come AFTER its
+    /// definition (dominance is not just block-granular).
+    #[test]
+    fn use_before_def_in_same_block_is_error() {
+        let mut m = make_module();
+        let func = IRBuilder::create_function(&mut m, "f", FunctionKind::Function, 0);
+        let entry;
+        let use_inst;
+        {
+            let mut b = IRBuilder::new(&mut m, func);
+            entry = b.current_block();
+            let v = b.emit_val(InstData::LiteralNumber(1.0), IrType::default());
+            let (ui, _) = b.emit(
+                InstData::BinaryOp {
+                    op: crate::inst::BinOp::Add,
+                    left: v,
+                    right: v,
+                },
+                IrType::default(),
+            );
+            use_inst = ui;
+            b.emit_void(InstData::Return { value: None });
+        }
+        // Move the use BEFORE its definition within the same block.
+        let insts = &mut m.block_mut(entry).insts;
+        insts.swap(0, 1);
+
+        let errs = verify_func(&m, func);
+        assert!(
+            errs.iter()
+                .any(|e| e.inst == Some(use_inst) && e.message.contains("dominat")),
+            "expected a same-block def-after-use dominance error, got: {errs:?}"
+        );
+    }
+
+    /// N45 exemptions pin: exception-dispatch value flow is NOT
+    /// terminator-CFG dominance, so the check must stay silent on:
+    ///
+    /// ```text
+    /// entry: e0 = undefined; Branch(t)
+    /// t (try-protected): v = 1.0; Branch(join)
+    /// h (catch-all handler of t): w = v + e0; Branch(join)
+    /// join: phi[(t, v), (h, w)]; Return(phi)
+    /// ```
+    ///
+    /// - `w = v + e0` in h uses a try-PROTECTED def (v in t) and an
+    ///   ENTRY-defined value (e0) from a block the terminator CFG cannot
+    ///   reach — exempt (N13/N21 exception dispatch is implicit).
+    /// - The phi entry `(h, w)` is keyed by a CFG-unreachable pred —
+    ///   the edge use is exempt the same way.
+    /// - The phi entry `(t, v)` is a normal dominated edge use.
+    #[test]
+    fn handler_uses_of_protected_and_entry_defs_are_exempt() {
+        let mut m = make_module();
+        let func = IRBuilder::create_function(&mut m, "f", FunctionKind::Function, 0);
+        let mut b = IRBuilder::new(&mut m, func);
+        let entry = b.current_block();
+        let t = b.create_block();
+        let h = b.create_block();
+        let join = b.create_block();
+        b.add_predecessor(t, entry);
+        b.add_predecessor(h, t);
+        b.add_predecessor(join, t);
+        b.add_predecessor(join, h);
+
+        let e0 = b.emit_val(InstData::LiteralUndefined, IrType::default());
+        b.emit_void(InstData::Branch { dest: t });
+
+        b.set_insert_block(t);
+        let v = b.emit_val(InstData::LiteralNumber(1.0), IrType::default());
+        b.emit_void(InstData::Branch { dest: join });
+
+        b.set_insert_block(h);
+        let w = b.emit_val(
+            InstData::BinaryOp {
+                op: crate::inst::BinOp::Add,
+                left: v,
+                right: e0,
+            },
+            IrType::default(),
+        );
+        b.emit_void(InstData::Branch { dest: join });
+
+        b.set_insert_block(join);
+        let (_, result) = b.emit(
+            InstData::Phi {
+                entries: vec![(t, v), (h, w)],
+            },
+            IrType::default(),
+        );
+        b.emit_void(InstData::Return { value: result });
+
+        m.func_mut(func).try_regions.push(TryRegion {
+            try_blocks: vec![t],
+            catches: vec![CatchHandler {
+                type_idx: u32::MAX,
+                handler_block: h,
+            }],
+        });
+
+        let errs = verify_func(&m, func);
+        assert!(
+            errs.is_empty(),
+            "exception-dispatch value flow must be exempt from CFG dominance: {errs:?}"
         );
     }
 
