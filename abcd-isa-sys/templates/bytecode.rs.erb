@@ -122,6 +122,23 @@ pub enum EntityKind {
 % end
 }
 
+/// One decoded operand with its ISA signature role.
+///
+/// Produced by [`Bytecode::operands`]; unlike [`Bytecode::entity_operands`]
+/// this retains every operand (registers, immediates, entities, jump labels)
+/// in signature order — the canonical view used by the pandasm cross-check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Operand {
+    /// Virtual register (frame slot index; arguments start at `num_vregs`).
+    Reg(u16),
+    /// Plain immediate (float immediates carry the raw value bits).
+    Imm(i64),
+    /// Constant-pool entity reference (raw encoded index + role).
+    Entity(EntityKind, u32),
+    /// Jump target instruction index within the decoded method body.
+    Label(u32),
+}
+
 /// Decoded ArkCompiler bytecode instruction.
 ///
 /// Each variant represents a mnemonic (e.g. `Mov` merges `MOV_V4_V4`,
@@ -159,6 +176,32 @@ impl Bytecode {
 %   pats = ops.each_with_index.map { |op, i| op.id? ? "id#{i}" : '_' }
 %   refs = ops.each_with_index.select { |op, _| op.id? }.map { |op, i| "(EntityKind::#{op.name.to_s.split('_').map(&:capitalize).join}, *id#{i})" }
             Bytecode::<%= mnemonic_variant_name(mnemonic) %>(<%= pats.join(', ') %>) => vec![<%= refs.join(', ') %>],
+% end
+            _ => Vec::new(),
+        }
+    }
+
+    /// All operands in ISA signature order, retaining per-operand roles.
+    pub fn operands(&self) -> Vec<Operand> {
+        match self {
+% mnemonic_groups.each do |mnemonic, group|
+%   vname = mnemonic_variant_name(mnemonic)
+%   is_jump = group.first.jump?
+%   ops = group.first.operands
+%   next if ops.empty?
+%   pats = ops.each_with_index.map { |_, i| "a#{i}" }
+%   exprs = ops.each_with_index.map { |op, i|
+%     if is_jump && op.imm?
+%       "Operand::Label(a#{i}.0)"
+%     elsif op.reg?
+%       "Operand::Reg(a#{i}.0)"
+%     elsif op.id?
+%       "Operand::Entity(EntityKind::#{op.name.to_s.split('_').map(&:capitalize).join}, a#{i}.0)"
+%     else
+%       "Operand::Imm(a#{i}.0)"
+%     end
+%   }
+            Bytecode::<%= vname %>(<%= pats.join(', ') %>) => vec![<%= exprs.join(', ') %>],
 % end
             _ => Vec::new(),
         }
