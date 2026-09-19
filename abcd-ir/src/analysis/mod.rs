@@ -243,7 +243,8 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         | AsyncFunctionReject { value }
         | GetTemplateObject { literal: value } => vec![*value],
 
-        ThrowUndefinedIfHole { value, .. } => vec![*value],
+        ThrowUndefinedIfHole { name, value } => vec![*name, *value],
+        ThrowUndefinedIfHoleWithName { value, .. } => vec![*value],
         ThrowConstAssignment { name } => vec![*name],
         SuspendGenerator { genobj, value } => vec![*genobj, *value],
         CreateIterResultObj { value, done } => vec![*value, *done],

@@ -1554,23 +1554,31 @@ pub(super) fn translate_bytecode(
             emit_void(module, block, InstData::ThrowIfNotObject { value }, loc);
         }
         Bytecode::ThrowUndefinedifhole(name_reg, val_reg) => {
+            // Vendor `throw.undefinedifhole v1:in:top, v2:in:top,
+            // acc: none` (isa.yaml:998-1002): v1 carries the variable
+            // name AS A RUNTIME STRING VALUE, v2 the checked value; the
+            // accumulator is untouched. Distinct opcode from the
+            // string_id+acc `throw.undefinedifholewithname`.
+            let name = read_reg(ssa, *name_reg, block, module);
             let value = read_reg(ssa, *val_reg, block, module);
-            let name_val = read_reg(ssa, *name_reg, block, module);
-            let s = module.strings.intern(&format!("hole_check_{}", name_val.0));
             emit_void(
                 module,
                 block,
-                InstData::ThrowUndefinedIfHole { name: s, value },
+                InstData::ThrowUndefinedIfHole { name, value },
                 loc,
             );
         }
         Bytecode::ThrowUndefinedifholewithname(eid) => {
+            // Vendor `throw.undefinedifholewithname string_id,
+            // acc: in:top` (isa.yaml:1010-1015): here the name IS a
+            // compile-time source string (StringId path) and the checked
+            // value rides the accumulator.
             let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
             let acc = read_acc(ssa, block, module);
             emit_void(
                 module,
                 block,
-                InstData::ThrowUndefinedIfHole { name, value: acc },
+                InstData::ThrowUndefinedIfHoleWithName { name, value: acc },
                 loc,
             );
         }

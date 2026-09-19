@@ -1396,7 +1396,17 @@ fn select_inst(
             codes.push(Bytecode::ThrowConstassignment(name_r));
         }
         InstData::ThrowUndefinedIfHole { name, value } => {
-            // ThrowUndefinedifholewithname reads the value from the acc.
+            // Vendor `throw.undefinedifhole v1:in:top, v2:in:top,
+            // acc: none` (isa.yaml:998-1002): v1 = name value, v2 =
+            // checked value; no accumulator traffic.
+            let regs =
+                materialize_operands(tracker, func_id, &[*name, *value], None, alloc, codes)?;
+            codes.push(Bytecode::ThrowUndefinedifhole(regs[0], regs[1]));
+        }
+        InstData::ThrowUndefinedIfHoleWithName { name, value } => {
+            // Vendor `throw.undefinedifholewithname string_id,
+            // acc: in:top` (isa.yaml:1010-1015): the checked value rides
+            // the accumulator, the name is a compile-time string id.
             ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::ThrowUndefinedifholewithname(tracer.eid(*name)));
         }

@@ -455,7 +455,23 @@ pub enum InstData {
     ThrowConstAssignment {
         name: Value,
     },
+    /// Vendor `throw.undefinedifhole v1:in:top, v2:in:top, acc: none`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:998-1002, opcode_idx 0x06, format
+    /// `pref_op_v1_8_v2_8`, `properties: [conditional_throw]`): v1 holds
+    /// the variable name AS A RUNTIME STRING VALUE, v2 the value being
+    /// hole-checked; the accumulator is untouched. `name` is the runtime
+    /// value, NOT a compile-time `StringId`.
     ThrowUndefinedIfHole {
+        name: Value,
+        value: Value,
+    },
+    /// Vendor `throw.undefinedifholewithname string_id, acc: in:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1010-1015, opcode_idx 0x09,
+    /// format `pref_op_id_16`, `properties: [string_id,
+    /// conditional_throw]`) — a DIFFERENT instruction from the
+    /// two-register form: the name IS a compile-time string constant and
+    /// the checked value rides the accumulator.
+    ThrowUndefinedIfHoleWithName {
         name: StringId,
         value: Value,
     },
@@ -610,7 +626,8 @@ impl InstData {
             | AsyncFunctionReject { value }
             | GetTemplateObject { literal: value } => vec![value],
 
-            ThrowUndefinedIfHole { value, .. } => vec![value],
+            ThrowUndefinedIfHole { name, value } => vec![name, value],
+            ThrowUndefinedIfHoleWithName { value, .. } => vec![value],
             ThrowConstAssignment { name } => vec![name],
             SuspendGenerator { genobj, value } => vec![genobj, value],
             CreateIterResultObj { value, done } => vec![value, done],
@@ -678,6 +695,7 @@ impl InstData {
                 | InstData::ThrowIfNotObject { .. }
                 | InstData::ThrowConstAssignment { .. }
                 | InstData::ThrowUndefinedIfHole { .. }
+                | InstData::ThrowUndefinedIfHoleWithName { .. }
                 | InstData::ThrowIfSuperNotCorrectCall { .. }
                 | InstData::ThrowNotExists
                 | InstData::ThrowPatternNonCoercible

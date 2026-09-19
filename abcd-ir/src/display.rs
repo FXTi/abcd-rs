@@ -372,9 +372,12 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
             write!(f, "ThrowConstAssignment {name}")
         }
         InstData::ThrowUndefinedIfHole { name, value } => {
+            write!(f, "ThrowUndefinedIfHole {name}, {value}")
+        }
+        InstData::ThrowUndefinedIfHoleWithName { name, value } => {
             write!(
                 f,
-                "ThrowUndefinedIfHole \"{}\", {value}",
+                "ThrowUndefinedIfHoleWithName \"{}\", {value}",
                 m.strings.get(*name)
             )
         }

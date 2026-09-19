@@ -119,6 +119,7 @@ fn is_essential(data: &InstData) -> bool {
         | ThrowIfNotObject { .. }
         | ThrowConstAssignment { .. }
         | ThrowUndefinedIfHole { .. }
+        | ThrowUndefinedIfHoleWithName { .. }
         | ThrowIfSuperNotCorrectCall { .. }
         | ThrowNotExists
         | ThrowPatternNonCoercible

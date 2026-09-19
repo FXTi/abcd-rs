@@ -98,6 +98,17 @@ pub enum Halt {
     /// `throw.constassignment v:in:top, acc: none`
     /// (abcd-isa-sys/vendor/isa/isa.yaml:987-991).
     ThrowConstAssignment { name: i64 },
+    /// `ThrowUndefinedifhole` (record-and-stop): `name` is the FIRST
+    /// register operand's contents (the variable name string VALUE),
+    /// `value` the SECOND register operand's contents (the checked
+    /// value) — vendor `throw.undefinedifhole v1:in:top, v2:in:top,
+    /// acc: none` (abcd-isa-sys/vendor/isa/isa.yaml:998-1002).
+    ThrowUndefinedIfHole { name: i64, value: i64 },
+    /// `ThrowUndefinedifholewithname` (record-and-stop): `value` is the
+    /// accumulator (the checked value) — vendor
+    /// `throw.undefinedifholewithname string_id, acc: in:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1010-1015).
+    ThrowUndefinedIfHoleWithName { value: i64 },
     /// `run_until` reached the stop pc WITHOUT executing the instruction
     /// there — models an exception thrown between two instructions.
     Stopped,
@@ -387,6 +398,20 @@ impl Machine {
                     return Halt::ThrowConstAssignment {
                         name: self.reg(name_r.0),
                     };
+                }
+                // `throw.undefinedifhole v1:in:top, v2:in:top, acc: none`
+                // (isa.yaml:998-1002) — record the name register's and the
+                // value register's contents.
+                Bytecode::ThrowUndefinedifhole(name_r, val_r) => {
+                    return Halt::ThrowUndefinedIfHole {
+                        name: self.reg(name_r.0),
+                        value: self.reg(val_r.0),
+                    };
+                }
+                // `throw.undefinedifholewithname string_id, acc: in:top`
+                // (isa.yaml:1010-1015) — record the acc (the checked value).
+                Bytecode::ThrowUndefinedifholewithname(_) => {
+                    return Halt::ThrowUndefinedIfHoleWithName { value: self.acc };
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),
             }
