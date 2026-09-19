@@ -115,6 +115,19 @@ pub enum Halt {
     /// (abcd-isa-sys/vendor/isa/isa.yaml:1333-1337); the IC slot imm is
     /// ignored.
     SetObjectWithProto { proto: i64, obj: i64 },
+    /// `Createobjectwithexcludedkeys` (record-and-inspect): vendor
+    /// `createobjectwithexcludedkeys imm:u8, v1:in:top, v2:in:top,
+    /// acc: out:top` with `properties: [range_1]`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:494-498) — imm is the key count,
+    /// v1 the source object, v2 the START of the consecutive key
+    /// register range. The key values are `regs[start .. start + argc]`
+    /// at halt time.
+    CreateObjectWithExcludedKeys { argc: i64, obj: i64, start: u16 },
+    /// `WideCreateobjectwithexcludedkeys` (record-and-inspect): vendor
+    /// `wide.createobjectwithexcludedkeys imm:u16, v1:in:top, v2:in:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:499-504) — u16 key count, u8
+    /// range start.
+    WideCreateObjectWithExcludedKeys { argc: i64, obj: i64, start: u16 },
     /// `run_until` reached the stop pc WITHOUT executing the instruction
     /// there — models an exception thrown between two instructions.
     Stopped,
@@ -426,6 +439,25 @@ impl Machine {
                     return Halt::SetObjectWithProto {
                         proto: self.reg(proto_r.0),
                         obj: self.acc,
+                    };
+                }
+                // `createobjectwithexcludedkeys imm:u8, v1, v2` with
+                // `range_1` (isa.yaml:494-498) — record the key count,
+                // the object register's contents, and the range start.
+                Bytecode::Createobjectwithexcludedkeys(argc, obj_r, start) => {
+                    return Halt::CreateObjectWithExcludedKeys {
+                        argc: argc.0,
+                        obj: self.reg(obj_r.0),
+                        start: start.0,
+                    };
+                }
+                // `wide.createobjectwithexcludedkeys imm:u16, v1, v2`
+                // (isa.yaml:499-504) — same recording for the u16 form.
+                Bytecode::WideCreateobjectwithexcludedkeys(argc, obj_r, start) => {
+                    return Halt::WideCreateObjectWithExcludedKeys {
+                        argc: argc.0,
+                        obj: self.reg(obj_r.0),
+                        start: start.0,
                     };
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),

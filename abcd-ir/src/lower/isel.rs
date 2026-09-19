@@ -896,21 +896,31 @@ fn select_inst(
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CreateObjectWithExcludedKeys { obj, keys } => {
-            // Only the object and the first key are register operands that
-            // need materialization; the remaining keys are assumed to occupy
-            // consecutive registers (approximate, pre-existing).
-            let mut reg_operands = vec![*obj];
-            if let Some(first) = keys.first() {
-                reg_operands.push(*first);
-            }
-            let regs = materialize_operands(tracker, func_id, &reg_operands, None, alloc, codes)?;
+            // Vendor `createobjectwithexcludedkeys imm:u8, v1:in:top,
+            // v2:in:top, acc: out:top` with `properties: [range_1]`
+            // (isa.yaml:494-498): v2 is the START of a CONSECUTIVE
+            // register range holding the `imm` keys. Regalloc never
+            // guarantees consecutiveness (N4 class), so the keys are
+            // mov-filled into the reserved per-function window — the
+            // SAME window the range calls use (each fill+use sequence
+            // completes within this instruction's selection;
+            // `range_call_window_size` takes the max over both kinds of
+            // site, N9). Width selection follows the S2 rule: ≤ 255 keys
+            // keep the narrow form; 256..=65535 select
+            // `wide.createobjectwithexcludedkeys` (u16 count, isa.yaml
+            // :499-504); above u16::MAX, `fill_call_window` hard-errors
+            // (CallArgcOverflow). The window base fits the u8 start
+            // operand of BOTH forms (CallWindowOverflow otherwise).
+            let regs = materialize_operands(tracker, func_id, &[*obj], None, alloc, codes)?;
             let obj_r = regs[0];
-            let start_r = if keys.is_empty() { Reg(0) } else { regs[1] };
-            codes.push(Bytecode::Createobjectwithexcludedkeys(
-                Imm(keys.len() as i64),
-                obj_r,
-                start_r,
-            ));
+            let start_r = fill_call_window(func_id, keys, alloc, codes)?;
+            let count = Imm(keys.len() as i64);
+            let bc = if keys.len() <= 255 {
+                Bytecode::Createobjectwithexcludedkeys(count, obj_r, start_r)
+            } else {
+                Bytecode::WideCreateobjectwithexcludedkeys(count, obj_r, start_r)
+            };
+            codes.push(bc);
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 

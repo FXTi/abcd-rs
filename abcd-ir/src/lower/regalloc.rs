@@ -372,29 +372,40 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     })
 }
 
-/// Largest argument count among the function's range-form calls — the arms
-/// where isel encodes a start register and the VM reads argc consecutive
-/// slots: `Call` with > 3 args, `CallThis` with > 4 args (args[0] is `this`),
-/// the always-range `SuperCall`/`SuperCallArrow`, and every `Construct`
-/// (the window holds [callee, args...] — the constructor counts, so the
-/// window is args.len() + 1 slots). Fixed-arity forms and spread/apply
-/// calls pass individual register operands and need no window.
+/// Largest operand count among the function's range-form instructions —
+/// the arms where isel encodes a start register and the VM reads N
+/// consecutive slots: `Call` with > 3 args, `CallThis` with > 4 args
+/// (args[0] is `this`), the always-range `SuperCall`/`SuperCallArrow`,
+/// every `Construct` (the window holds [callee, args...] — the
+/// constructor counts, so the window is args.len() + 1 slots), and
+/// `CreateObjectWithExcludedKeys` (vendor `properties: [range_1]` — the
+/// keys are read from a consecutive range starting at the encoded
+/// register, isa.yaml:494-504; N9). Fixed-arity forms and spread/apply
+/// calls pass individual register operands and need no window. All sites
+/// share ONE window (each fill+use sequence completes within its own
+/// instruction's selection), so the size is the max over all of them.
 fn range_call_window_size(module: &Module, rpo: &[Block]) -> usize {
     use crate::inst::CallKind;
     let mut window = 0usize;
     for &bb in rpo {
         for &inst_id in &module.block(bb).insts {
-            if let InstData::Call { kind, args, .. } = &module.inst(inst_id).data {
-                let range_argc = match kind {
-                    CallKind::Call if args.len() > 3 => Some(args.len()),
-                    CallKind::CallThis if args.len() > 4 => Some(args.len()),
-                    CallKind::SuperCall | CallKind::SuperCallArrow => Some(args.len()),
-                    CallKind::Construct => Some(args.len() + 1),
-                    _ => None,
-                };
-                if let Some(argc) = range_argc {
-                    window = window.max(argc);
+            match &module.inst(inst_id).data {
+                InstData::Call { kind, args, .. } => {
+                    let range_argc = match kind {
+                        CallKind::Call if args.len() > 3 => Some(args.len()),
+                        CallKind::CallThis if args.len() > 4 => Some(args.len()),
+                        CallKind::SuperCall | CallKind::SuperCallArrow => Some(args.len()),
+                        CallKind::Construct => Some(args.len() + 1),
+                        _ => None,
+                    };
+                    if let Some(argc) = range_argc {
+                        window = window.max(argc);
+                    }
                 }
+                InstData::CreateObjectWithExcludedKeys { keys, .. } => {
+                    window = window.max(keys.len());
+                }
+                _ => {}
             }
         }
     }
