@@ -113,8 +113,8 @@ VM 语义簇（需逐簇拆根因）：
 
 **结构性簇 S1-S6 全部关闭（2026-09-19）**。剩余：V 族语义簇（V1-V8）、B4、vreg-hole、N7/N8/N9、SSA trivial-phi、dominance/string-pool/exception CFG 复审。
 
-| 3.7 | vreg-hole 修复：从未写入的 vreg 读取产空 phi → 入口播种 LiteralHole（P2-T2 延期项，V1/V2 疑似主因之一） | 待定 | 未开始 |
-| 3.8 | V 族诊断（只读）：V3 NewTarget、V8 类构造器、V4 optional-chain SIGSEGV 根因到 file:line | 待定 | 未开始 |
+| 3.7 | vreg-hole 修复：从未写入的 vreg 读取产空 phi → 入口播种 LiteralHole（先取证危害再修） | worker P3-T7 (k3) | **进行中** |
+| 3.8 | V 族诊断（只读）：V3 NewTarget、V8 类构造器、V4 SIGSEGV 根因到 file:line | worker P3-T8 (k3) | **进行中** |
 
 ## 审计纪律
 
