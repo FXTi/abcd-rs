@@ -174,13 +174,13 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 |---|---|---|
 | N1 | _ESScopeNamesRecord 悬挂偏移 | ✅ 修复（312d960，S4/S5 一并） |
 | N2 | 静默错方法引用双胞胎 | ✅ 修复（740611b） |
-| N3 | DeprecatedSetobjectwithproto 合成名 "__proto__"（无语料覆盖） | 🔲 **未修**（此前漏进最终清单，本表补登） |
+| N3 | DeprecatedSetobjectwithproto 合成名 "__proto__"（无语料覆盖） | ✅ 修复（e9fd5db，P4-T1：专用 SetObjectWithProto{proto,obj}，现代+deprecated 两臂都映射，isel 发当代 opcode；合成往返测试） |
 | N4 | range-call 连续寄存器假设 | ✅ 修复（b90bc00） |
 | N5 | copydataproperties dst>255 高位风险族 | ✅ 覆盖于 S2 的 u8 审计+scratch 路由 |
 | N6 | identity 证据面只有算术 | ✅ 修复（312d960 扩 module 用例） |
 | N7 | moduleRequestPhaseIdx blob 同类悬挂（不在 passed 集） | 🔲 未修（Phase 5 清扫批） |
 | N8 | typeSummaryOffset 是否偏移存疑 | ❓ 未证实（待证） |
-| N9 | CreateObjectWithExcludedKeys 连续键假设+wide 形未选 | 🔲 **未修**（此前漏进最终清单，本表补登） |
+| N9 | CreateObjectWithExcludedKeys 连续键假设+wide 形未选 | ✅ 修复（d5ec683，P4-T1：keys mov 填充共享低位窗口（与 range call 共存取 max），>255 选 wide 形；语料仅 object-spread imm=0，字节不变） |
 | N10-N14 | handler pc0 / opt 删 handler / ThrowIfSuper / handler acc / generator 三件套 | ✅ 全修（ff23195/606cdcd/cd410e5/0270f9b/aa6e786） |
 | N15 | DefineClassWithBuffer 丢 imm2（仅字节差异） | 🔲 未修（P3，Phase 5） |
 | N16 | Newobjapply↔Apply arity 往返脆弱 | 🔲 未修（P3，Phase 5） |
@@ -192,7 +192,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | N22 | 异常值活性保守 +1 寄存器 | 📝 无害记录（不修） |
 | N23 | SCCP 折叠留陈旧 phi 条目 | ✅ 修复（76cb828） |
 | N24 | oracle 容器僵尸 | ✅ 修复（3883291） |
-| N25/N26 | ThrowConstAssignment / ThrowUndefinedIfHole 双寄存器形 opcode 身份损坏 | 🔲 未修（P2，下一个修复批） |
+| N25/N26 | ThrowConstAssignment / ThrowUndefinedIfHole 双寄存器形 opcode 身份损坏 | ✅ 修复（f121d74/55dba05，P4-T1：name 改为寄存器 VALUE；ThrowUndefinedIfHoleWithName 独立变体保留 string_id+acc 形；P1 期 unsupported 标记移除） |
 | N27 | 优化器空 phi | ✅ 修复（76cb828） |
 | N28 | copyprop "ADCE 会清理"假设残余风险 | 📝 残余风险记录（verify 兜底已就位） |
 | N29-N35 | T20 五根因 | ✅ 全修（T21 六连） |
@@ -215,7 +215,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | N46 | Type::Reference(StringId) 引用源文件池而 Module 不持有——今日安全（无消费者解析） | 📝 潜伏记录（先文档化） |
 | N47 | SCCP add_cfg_edges 对 Return/Unreachable 终结提前返回跳过异常边 | 📝 P3 记录（少优化，不错误） |
 | N48 | ADCE 把可观察 load（getter/品牌检查/CreateRegExp 等）当纯——死结果删除会丢副作用 | 🔲 未修（P2 潜伏；当前管线不可达） |
-| P4-T1 | N25+N26+N3+N9 修复批 | worker P4-T1 (k3) | **进行中** |
+| P4-T1 | N25+N26+N3+N9 修复批 | worker P4-T1 (k3) | **完成**（f121d74/55dba05/e9fd5db/d5ec683；每条 red-first 实证；语料重写 1119/1119 双变体、与 /tmp/t22-verify 基线字节差为空、本地 docker oracle 双变体 1119/1119） |
 | P4-T2 | dominance/string-pool/异常 CFG 系统复审 | worker P4-T2 (k3) | **完成**（只读；两 P1 声明 orchestrator 静态核实；N42-N48 登记） |
 
 ## 审计纪律

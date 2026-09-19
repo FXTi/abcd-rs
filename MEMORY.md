@@ -343,10 +343,12 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
 - Remaining registered work: SEE THE COMPLETE RECONCILIATION TABLE in
   design/agent-roadmap.md (「全量发现对账表」) — every N/F item has a final
   status there; do not maintain a second list here. As of 2026-09-20 the
-  only OPEN items: N3, N9 (both补登——they were missing from an earlier
-  summary), N25/N26 (throw-family modeling), N7/N8, N15/N16, N18, F-new-1,
+  only OPEN items: N42-N44, N48 (P1), N7/N8, N15/N16, N18, N45, F-new-1,
   F-new-2, dominance + string-pool-ownership reviews, the Phase 5 sweep
-  batch, and Phase 4 evidence upgrades. N28/N22 are notes, not bugs. The
+  batch, and Phase 4 evidence upgrades. N25/N26/N3/N9 RESOLVED by P4-T1
+  (f121d74/55dba05/e9fd5db/d5ec683; corpus rewrite 1119/1119 both
+  variants byte-identical to the /tmp/t22-verify baseline, oracle
+  1119/1119 both). N28/N22 are notes, not bugs. The
   IR v0.2 decision point is a MAINTAINER decision — stop there.
 
 ## Phase 1 outcome (done, 2026-09-19)
