@@ -194,6 +194,13 @@ fn as_bool_strict(module: &Module, val: Value) -> Option<bool> {
 }
 
 /// Try to extract a constant number from a value's defining instruction.
+///
+/// N41: LiteralNull is NOT coerced to 0.0 here — doing so folded
+/// `null == 0` to true where JS loose equality says false (null equals
+/// only null/undefined), and folded null arithmetic through a zero the
+/// program never computes. (ToNumber(null) IS 0 for the arithmetic
+/// slow path, but a compile-time fold through coercion was proven
+/// unsound by P3-T19 — no eq-nullish fold lives in peephole.)
 fn as_number(module: &Module, val: Value) -> Option<f64> {
     let vd = module.value(val);
     match vd.def {
@@ -201,7 +208,6 @@ fn as_number(module: &Module, val: Value) -> Option<f64> {
             InstData::LiteralNumber(n) => Some(*n),
             InstData::LiteralBool(true) => Some(1.0),
             InstData::LiteralBool(false) => Some(0.0),
-            InstData::LiteralNull => Some(0.0),
             _ => None,
         },
         _ => None,

@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::analysis::{block_succs, inst_operands};
+use crate::analysis::{augmented_succs, inst_operands};
 use crate::entity::{Block, FuncId, Inst, Value};
 use crate::inst::{BinOp, InstData, UnOp};
 use crate::module::Module;
@@ -36,6 +36,19 @@ impl FuncPass for Sccp {
     fn run(&self, module: &mut Module, func: FuncId) -> bool {
         let entry = module.func(func).entry_block;
         let blocks: Vec<Block> = module.func(func).blocks.clone();
+
+        // N38(ii): catch-handler blocks. Exception dispatch transfers
+        // control from ANY protected instruction to the handler
+        // mid-block, so a handler phi entry keyed by a protected pred
+        // carries that pred's BLOCK-END value, which is not the value
+        // live at the point of exception — folding handler phis is
+        // unsound. They are forced to lattice Bottom in evaluate_phi.
+        let handler_blocks: HashSet<Block> = module
+            .func(func)
+            .try_regions
+            .iter()
+            .flat_map(|region| region.catches.iter().map(|c| c.handler_block))
+            .collect();
 
         // Initialize lattice: all values start at Top.
         let mut lattice: HashMap<Value, LatticeVal> = HashMap::new();
@@ -83,8 +96,9 @@ impl FuncPass for Sccp {
                 }
             }
         }
-        // Seed CFG edges from entry.
-        for succ in block_succs(module, entry) {
+        // Seed CFG edges from entry — AUGMENTED successors (N38(i)):
+        // exception edges included, so catch handlers are reachable.
+        for succ in augmented_succs(module, func, entry) {
             cfg_worklist.push_back((entry, succ));
         }
 
@@ -106,7 +120,8 @@ impl FuncPass for Sccp {
                 // Re-evaluate phis in `to` (new edge may change phi values).
                 let phis: Vec<Inst> = module.block(to).phis.clone();
                 for &phi_id in &phis {
-                    if let Some(new_val) = evaluate_phi(module, phi_id, &lattice, &reachable_edges)
+                    if let Some(new_val) =
+                        evaluate_phi(module, phi_id, &lattice, &reachable_edges, &handler_blocks)
                     {
                         if let Some(result) = module.inst(phi_id).result {
                             let old = lattice.get(&result).cloned().unwrap_or(LatticeVal::Top);
@@ -134,7 +149,7 @@ impl FuncPass for Sccp {
                             }
                         }
                         // Add CFG edges from terminators.
-                        add_cfg_edges(module, inst_id, &lattice, &mut cfg_worklist);
+                        add_cfg_edges(module, func, inst_id, &lattice, &mut cfg_worklist);
                     }
                 }
             }
@@ -149,9 +164,13 @@ impl FuncPass for Sccp {
                         }
 
                         if module.inst(inst_id).data.is_phi() {
-                            if let Some(new_val) =
-                                evaluate_phi(module, inst_id, &lattice, &reachable_edges)
-                            {
+                            if let Some(new_val) = evaluate_phi(
+                                module,
+                                inst_id,
+                                &lattice,
+                                &reachable_edges,
+                                &handler_blocks,
+                            ) {
                                 if let Some(result) = module.inst(inst_id).result {
                                     let old =
                                         lattice.get(&result).cloned().unwrap_or(LatticeVal::Top);
@@ -174,7 +193,7 @@ impl FuncPass for Sccp {
                                     }
                                 }
                             }
-                            add_cfg_edges(module, inst_id, &lattice, &mut cfg_worklist);
+                            add_cfg_edges(module, func, inst_id, &lattice, &mut cfg_worklist);
                         }
                     }
                 }
@@ -357,13 +376,22 @@ fn evaluate_inst(
 }
 
 /// Evaluate a phi node considering only reachable incoming edges.
+///
+/// Phis in catch-handler blocks are forced to Bottom (N38(ii)): their
+/// entries carry the protected preds' BLOCK-END values, but exception
+/// dispatch transfers control mid-block, so the value live at the point
+/// of exception is not the block-end value — folding them is unsound.
 fn evaluate_phi(
     module: &Module,
     phi_id: Inst,
     lattice: &HashMap<Value, LatticeVal>,
     reachable_edges: &HashSet<(Block, Block)>,
+    handler_blocks: &HashSet<Block>,
 ) -> Option<LatticeVal> {
     let phi_block = module.inst(phi_id).block;
+    if handler_blocks.contains(&phi_block) {
+        return Some(LatticeVal::Bottom);
+    }
     if let InstData::Phi { entries } = &module.inst(phi_id).data {
         let mut result = LatticeVal::Top;
         for &(pred, val) in entries {
@@ -379,17 +407,26 @@ fn evaluate_phi(
     }
 }
 
-/// Add CFG edges from a terminator instruction based on lattice state.
+/// Add CFG edges from a terminator instruction based on lattice state,
+/// PLUS the implicit exception edges of any try region protecting the
+/// block (N38(i)): catch handlers are reachable from every protected
+/// block regardless of how the terminator folds. Non-terminator
+/// instructions contribute no edges (the exception edge is added once,
+/// at the block's terminator — enough for reachability, and the
+/// mid-block dispatch unsoundness is covered by the handler-phi guard
+/// in `evaluate_phi`).
 fn add_cfg_edges(
     module: &Module,
+    func: FuncId,
     inst_id: Inst,
     lattice: &HashMap<Value, LatticeVal>,
     cfg_worklist: &mut VecDeque<(Block, Block)>,
 ) {
     let block = module.inst(inst_id).block;
+    let mut dests: Vec<Block> = Vec::new();
     match &module.inst(inst_id).data {
         InstData::Branch { dest } => {
-            cfg_worklist.push_back((block, *dest));
+            dests.push(*dest);
         }
         InstData::CondBranch {
             cond,
@@ -399,19 +436,38 @@ fn add_cfg_edges(
             match get_lattice(lattice, *cond) {
                 LatticeVal::Constant(c) => {
                     if const_is_truthy(&c) {
-                        cfg_worklist.push_back((block, *true_dest));
+                        dests.push(*true_dest);
                     } else {
-                        cfg_worklist.push_back((block, *false_dest));
+                        dests.push(*false_dest);
                     }
                 }
                 _ => {
                     // Unknown or Bottom: both edges are possible.
-                    cfg_worklist.push_back((block, *true_dest));
-                    cfg_worklist.push_back((block, *false_dest));
+                    dests.push(*true_dest);
+                    dests.push(*false_dest);
                 }
             }
         }
-        _ => {}
+        _ => return, // non-terminator: no edges
+    }
+    // Exception edges: handlers of the try regions protecting this
+    // block (the exception half of `analysis::augmented_succs`; the
+    // terminator half is computed above so lattice-pruned CondBranch
+    // edges stay pruned).
+    let func_data = module.func(func);
+    for region in &func_data.try_regions {
+        if !region.try_blocks.contains(&block) {
+            continue;
+        }
+        for catch in &region.catches {
+            let handler = catch.handler_block;
+            if func_data.blocks.contains(&handler) && !dests.contains(&handler) {
+                dests.push(handler);
+            }
+        }
+    }
+    for dest in dests {
+        cfg_worklist.push_back((block, dest));
     }
 }
 
@@ -457,6 +513,21 @@ fn const_to_number(c: &ConstVal) -> Option<f64> {
 }
 
 fn eval_binop_lattice(op: BinOp, a: &ConstVal, b: &ConstVal) -> Option<LatticeVal> {
+    // N38(iii): JS loose equality does NOT ToNumber-coerce nullish
+    // operands — `undefined == undefined` and `null == undefined` are
+    // true, `null == 0` is false. The ToNumber path below maps
+    // Undefined → NaN (so undefined == undefined folded to FALSE,
+    // rewiring es2abc's finally guards) and Null → 0.0 (so null == 0
+    // folded to TRUE). Never fold Eq/NotEq when either operand is a
+    // Null/Undefined constant.
+    if matches!(op, BinOp::Eq | BinOp::NotEq)
+        && matches!(
+            (a, b),
+            (ConstVal::Null | ConstVal::Undefined, _) | (_, ConstVal::Null | ConstVal::Undefined)
+        )
+    {
+        return Some(LatticeVal::Bottom);
+    }
     let an = const_to_number(a)?;
     let bn = const_to_number(b)?;
     match op {
