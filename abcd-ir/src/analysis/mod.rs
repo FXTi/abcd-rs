@@ -85,6 +85,50 @@ pub fn inst_succs(data: &InstData) -> Vec<Block> {
     }
 }
 
+/// Successors of `block` INCLUDING implicit exception edges: the terminator
+/// successors (`block_succs`) plus, for every try region that protects
+/// `block`, each of the region's catch-handler blocks. Exception dispatch
+/// transfers control from any protected instruction to the handler without
+/// a terminator-level edge, so any analysis that reasons about
+/// reachability or value flow must use this relation — a try body may end
+/// in `Throw`/`Unreachable` while the handler still reads values defined
+/// there.
+///
+/// Handler blocks no longer owned by `func` (partially pruned metadata)
+/// are skipped, so this never hands out dangling `Block`s.
+///
+/// Caller audit — which relation each successor consumer needs:
+///
+/// - **Augmented (exception edges)**: `lower::regalloc::compute_liveness`
+///   (S6: handler-used values are live out of every protected block) and
+///   `opt::dce::remove_unreachable_blocks` / `rebuild_predecessors`
+///   (N11: handlers are reachable code; deleting them silently drops the
+///   exceptional control-flow path).
+/// - **Terminator-only by design**: `compute_rpo` (layout contract — N10
+///   relies on handlers being unreachable here so they append after all
+///   reachable blocks), `DomTree::build` (dominance over the explicit
+///   CFG), `opt::dce` merge/redirect eligibility (exception edges must not
+///   block merging a try body with its fallthrough successor),
+///   `opt::sccp` (handlers stay non-executable → untouched; conservative
+///   and sound), and `verify` (preds↔terminator agreement, with an
+///   explicit try-region exemption for handler preds).
+pub fn augmented_succs(module: &Module, func: FuncId, block: Block) -> Vec<Block> {
+    let func_data = module.func(func);
+    let mut succs = block_succs(module, block);
+    for region in &func_data.try_regions {
+        if !region.try_blocks.contains(&block) {
+            continue;
+        }
+        for catch in &region.catches {
+            let handler = catch.handler_block;
+            if func_data.blocks.contains(&handler) && !succs.contains(&handler) {
+                succs.push(handler);
+            }
+        }
+    }
+    succs
+}
+
 // ─── Operand queries ─────────────────────────────────────────────────────────
 
 /// Extract all Value operands used by an instruction.

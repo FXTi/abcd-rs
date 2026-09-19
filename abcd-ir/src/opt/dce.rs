@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::analysis::{block_succs, inst_operands};
+use crate::analysis::{augmented_succs, block_succs, inst_operands};
 use crate::entity::{Block, FuncId, Inst, Value};
 use crate::inst::InstData;
 use crate::module::Module;
@@ -167,6 +167,20 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
             if succ == entry {
                 continue;
             } // don't merge into entry
+            // Exception-neutrality: merging bb+succ must not disturb
+            // try-region semantics. The merged block keeps bb's identity,
+            // so this is sound iff (a) both blocks have IDENTICAL region
+            // membership (the protected byte range is unchanged), (b)
+            // neither is a catch handler (handler entry identity), and
+            // (c) every handler phi carries the SAME incoming value for
+            // both blocks — handler phi entries are keyed by the
+            // individual protected block (the value live at the point of
+            // exception) and the absorbed block's entry is dropped by
+            // rebuild_predecessors, so the survivor's entry must hold an
+            // equal value.
+            if !merge_is_exception_neutral(module, func, bb, succ) {
+                continue;
+            }
 
             let succ_preds = module.block(succ).preds.clone();
             if succ_preds.len() != 1 || succ_preds[0] != bb {
@@ -281,6 +295,19 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
 
         // Redirect all predecessors of bb to target.
         let preds = block.preds.clone();
+
+        // Exception-neutrality: eliminating a jump-only block is sound
+        // for try regions iff (a) bb is not a catch handler and target is
+        // not one either (handler entry identity; a terminator edge into
+        // a handler would give it preds its phis are not keyed by), and
+        // (b) every region protecting bb also protects ALL of bb's
+        // predecessors — a bare `jmp` cannot throw, so removing bb loses
+        // no throwing code, while extending a region over an unprotected
+        // predecessor would misdispatch that predecessor's exceptions.
+        if !elimination_is_exception_neutral(module, func, bb, target, &preds) {
+            continue;
+        }
+
         for &pred in &preds {
             redirect_terminator(module, pred, bb, target);
             // Update target's preds.
@@ -369,22 +396,14 @@ fn rebuild_predecessors(module: &mut Module, func: FuncId) {
     for &block in &blocks {
         module.block_mut(block).preds.clear();
     }
+    // Predecessors derive from the augmented successor relation:
+    // terminator edges plus try→handler exception edges (handlers still
+    // owned by this function only). This keeps handler preds consistent
+    // with the pruned try_regions.
     for &block in &blocks {
-        for succ in block_succs(module, block) {
+        for succ in augmented_succs(module, func, block) {
             if !module.block(succ).preds.contains(&block) {
                 module.block_mut(succ).preds.push(block);
-            }
-        }
-    }
-    let regions = module.func(func).try_regions.clone();
-    for region in regions {
-        for &protected in &region.try_blocks {
-            for catch in &region.catches {
-                if module.func(func).blocks.contains(&catch.handler_block)
-                    && !module.block(catch.handler_block).preds.contains(&protected)
-                {
-                    module.block_mut(catch.handler_block).preds.push(protected);
-                }
             }
         }
     }
@@ -399,6 +418,79 @@ fn rebuild_predecessors(module: &mut Module, func: FuncId) {
             }
         }
     }
+}
+
+/// Is `block` a catch handler of any of `func`'s try regions?
+fn is_handler_block(module: &Module, func: FuncId, block: Block) -> bool {
+    module
+        .func(func)
+        .try_regions
+        .iter()
+        .any(|region| region.catches.iter().any(|c| c.handler_block == block))
+}
+
+/// May `bb` (single terminator successor `succ`) absorb `succ` without
+/// disturbing try-region semantics? Requires: identical region membership
+/// for both blocks (protected byte range unchanged), no handler
+/// involvement (handler entry identity), and — for every handler of every
+/// region covering both — phi incoming values that agree on `bb` and
+/// `succ`. The absorbed block's handler-phi entries are dropped by
+/// `rebuild_predecessors` (only the survivor `bb` stays a handler pred),
+/// so the two entries must carry equal values for the merge to preserve
+/// the value live at the point of exception.
+fn merge_is_exception_neutral(module: &Module, func: FuncId, bb: Block, succ: Block) -> bool {
+    let func_data = module.func(func);
+    if is_handler_block(module, func, bb) || is_handler_block(module, func, succ) {
+        return false;
+    }
+    for region in &func_data.try_regions {
+        let bb_in = region.try_blocks.contains(&bb);
+        let succ_in = region.try_blocks.contains(&succ);
+        if bb_in != succ_in {
+            return false;
+        }
+        if !bb_in {
+            continue;
+        }
+        for catch in &region.catches {
+            let handler = catch.handler_block;
+            if !func_data.blocks.contains(&handler) {
+                continue;
+            }
+            for &phi_id in &module.block(handler).phis {
+                if let InstData::Phi { entries } = &module.inst(phi_id).data {
+                    let vb = entries.iter().find(|(p, _)| *p == bb).map(|(_, v)| *v);
+                    let vs = entries.iter().find(|(p, _)| *p == succ).map(|(_, v)| *v);
+                    if vb != vs {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// May the jump-only block `bb` (predecessors `preds`, branch target
+/// `target`) be eliminated without disturbing try-region semantics?
+/// Handlers keep their identity on both sides of the rewrite, and any
+/// region protecting `bb` must already protect every predecessor — a bare
+/// `jmp` cannot throw, so dropping `bb` loses no throwing code, while
+/// extending the region over an unprotected predecessor would
+/// misdispatch that predecessor's exceptions.
+fn elimination_is_exception_neutral(
+    module: &Module,
+    func: FuncId,
+    bb: Block,
+    target: Block,
+    preds: &[Block],
+) -> bool {
+    if is_handler_block(module, func, bb) || is_handler_block(module, func, target) {
+        return false;
+    }
+    module.func(func).try_regions.iter().all(|region| {
+        !region.try_blocks.contains(&bb) || preds.iter().all(|p| region.try_blocks.contains(p))
+    })
 }
 
 /// Rewrite exception metadata when a CFG block is replaced by other blocks.
@@ -426,17 +518,24 @@ fn rewrite_try_regions(module: &mut Module, func: FuncId, removed: Block, replac
 }
 
 /// Remove blocks not reachable from entry.
+///
+/// Reachability uses the AUGMENTED successor relation
+/// (`analysis::augmented_succs`): terminator successors plus try→handler
+/// exception edges. Catch handlers have no terminator-level incoming
+/// edges — exception dispatch is implicit — so a terminator-only BFS
+/// deletes every catch handler and prunes its try-region entry, silently
+/// dropping the exceptional control-flow path (N11).
 fn remove_unreachable_blocks(module: &mut Module, func: FuncId) -> bool {
     let entry = module.func(func).entry_block;
     let blocks: Vec<Block> = module.func(func).blocks.clone();
 
-    // BFS from entry.
+    // BFS from entry over terminator successors + exception edges.
     let mut reachable = HashSet::new();
     let mut queue = VecDeque::new();
     reachable.insert(entry);
     queue.push_back(entry);
     while let Some(bb) = queue.pop_front() {
-        for succ in block_succs(module, bb) {
+        for succ in augmented_succs(module, func, bb) {
             if reachable.insert(succ) {
                 queue.push_back(succ);
             }

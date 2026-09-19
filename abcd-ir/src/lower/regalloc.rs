@@ -11,7 +11,7 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use crate::analysis::{self, block_succs, inst_operands};
+use crate::analysis::{self, augmented_succs, inst_operands};
 use crate::entity::{Block, FuncId, Value};
 use crate::inst::InstData;
 use crate::module::Module;
@@ -326,14 +326,14 @@ fn range_call_window_size(module: &Module, rpo: &[Block]) -> usize {
 /// Compute live_in and live_out sets for each block.
 /// Phi operands are treated as uses in the predecessor block.
 ///
-/// Exception edges participate: a catch handler is a control-flow
-/// successor of every block in its try region — an exception can transfer
-/// control from any protected instruction to the handler, so values the
-/// handler uses are live out of every try block. Terminator-only
-/// successors (`block_succs`) miss this: a try body may end in
-/// `Throw`/`Unreachable` while the handler still reads values defined
-/// there (S6 — without these edges such values look dead past their
-/// definition, never interfere, and can all be colored Acc).
+/// Exception edges participate (`analysis::augmented_succs`): a catch
+/// handler is a control-flow successor of every block in its try region —
+/// an exception can transfer control from any protected instruction to
+/// the handler, so values the handler uses are live out of every try
+/// block. Terminator-only successors (`block_succs`) miss this: a try
+/// body may end in `Throw`/`Unreachable` while the handler still reads
+/// values defined there (S6 — without these edges such values look dead
+/// past their definition, never interfere, and can all be colored Acc).
 fn compute_liveness(
     module: &Module,
     func_id: FuncId,
@@ -342,25 +342,12 @@ fn compute_liveness(
     HashMap<Block, HashSet<Value>>,
     HashMap<Block, HashSet<Value>>,
 ) {
-    let func = module.func(func_id);
-
     // Augmented successor map: terminator successors plus, for every try
     // region, an edge from each protected block to each of its handlers.
-    let mut succs: HashMap<Block, Vec<Block>> = rpo
+    let succs: HashMap<Block, Vec<Block>> = rpo
         .iter()
-        .map(|&bb| (bb, block_succs(module, bb)))
+        .map(|&bb| (bb, augmented_succs(module, func_id, bb)))
         .collect();
-    for region in &func.try_regions {
-        for &try_block in &region.try_blocks {
-            if let Some(edges) = succs.get_mut(&try_block) {
-                for catch in &region.catches {
-                    if !edges.contains(&catch.handler_block) {
-                        edges.push(catch.handler_block);
-                    }
-                }
-            }
-        }
-    }
 
     // Compute use and def sets per block.
     let mut block_use: HashMap<Block, HashSet<Value>> = HashMap::new();
