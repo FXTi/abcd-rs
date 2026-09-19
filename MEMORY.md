@@ -202,6 +202,19 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   Newly registered: N7 moduleRequestPhaseIdx blobs (same dangling class,
   unscheduled), N8 typeSummaryOffset question, V8 class/constructor
   semantic cluster exposed by the S1 unskip.
+- S2 RESOLVED (b90bc00) — the last encode-skip cluster: regalloc reserves
+  a LOW shared range-call argument window (sized to the largest range call;
+  coloring skips it; isel mov-fills it in call order — kills the N4
+  consecutive-assumption landmine) plus a 5-register low scratch block for
+  high-register acc traffic (sta/lda are op_v_8-only; mov auto-widens).
+  Wide range-call forms selected when argc > 255 (no IC slot consumed).
+  Corpus: rewrite 1119/1119, ZERO skips, histograms empty. Full-corpus VM:
+  lift 516/1119, opt 636/1119 (baseline was 390/1011, 462/1029);
+  orchestrator re-ran and reproduced exactly. STRUCTURAL CLUSTERS S1-S6 ALL
+  CLOSED. Remaining: V1-V8 semantic clusters, B4, vreg-hole empty phis
+  (P2-T2 deferral), N7/N8/N9, SSA trivial-phi, dominance/string-pool/
+  exception-CFG reviews. New: N9 CreateObjectWithExcludedKeys consecutive/
+  wide-form gap (N4 twin).
 
 ## Phase 1 outcome (done, 2026-09-19)
 

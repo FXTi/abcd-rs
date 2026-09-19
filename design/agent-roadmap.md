@@ -109,7 +109,12 @@ VM 语义簇（需逐簇拆根因）：
 | 3.3 | S3 修复：copydataproperties 专属 InstData + lift/isel 臂（含 deprecated 形） | worker P3-T3 (k3) | **完成**（86f810a；附纠正：旧 lift 臂操作数角色与 vendor 相反，已对 sig+pandasm 实证修正；orchestrator 干净 worktree 独立复验：61 套件绿、直方图 untraceable 18→0、object-spread VM 18/18） |
 | 3.4 | S4+S5 修复：abcd-file 建模 module record（FieldValue::ModuleData/LiteralArrayRef + 桥接 module-data 写路径 + ScalarValueItem ID 引用自动重定位）；identity 证据面扩到 module 用例（N6） | worker P3-T4 (k3) | **完成**（158ee23+312d960；orchestrator 独立实证：恒等重写 module-exports 9.0.0.0 从 disasm abort/VM FATAL → VM 打印 42 exit 0；72 fixture disasm 净、54/54 VM 过、62 套件绿；新登记 N7 moduleRequestPhaseIdx blob、N8 typeSummaryOffset 存疑） |
 | 3.5 | S1+N2 修复：DefineFunc/DefineMethod/DefineClassWithBuffer 携带 method_offset 作身份；kind 限定 EntityTrace；to_method_body 校验 all_methods 成员；inline 改 offset 匹配 | worker P3-T5 (k3) | **完成**（740611b；红色实证 S1 encode 报错 + N2 静默错方法 [145,145]vs[145,178]；orchestrator 复验：直方图 encode 72→18（仅剩 S2）、重写 1047→1101、算术基线 18/18 不退；新暴露 V8：class-accessors/newtarget-this 达 VM 但语义失败） |
-| 3.6 | S2 修复：range-call 参数窗口（顺带灭 N4 连续寄存器假设）+ wide 形选择 + 高位寄存器低位 scratch 中转 | worker P3-T6 (k3) | **进行中** |
+| 3.6 | S2 修复：低位共享参数窗口 + wide 形选择 + 5 低位 scratch 中转（N4 一并消灭） | worker P3-T6 (k3) | **完成**（b90bc00；设计变更批准：窗口低位预留而非帧顶——300 参数两两干涉必超 255，与上游 es2abc 输出一致；orchestrator 独立复验：直方图清空 1119/1119、wide-call 18/18×2、全量 VM lift 516/opt 636 与 worker 一致；新登记 N9 CreateObjectWithExcludedKeys 同类连续假设） |
+
+**结构性簇 S1-S6 全部关闭（2026-09-19）**。剩余：V 族语义簇（V1-V8）、B4、vreg-hole、N7/N8/N9、SSA trivial-phi、dominance/string-pool/exception CFG 复审。
+
+| 3.7 | vreg-hole 修复：从未写入的 vreg 读取产空 phi → 入口播种 LiteralHole（P2-T2 延期项，V1/V2 疑似主因之一） | 待定 | 未开始 |
+| 3.8 | V 族诊断（只读）：V3 NewTarget、V8 类构造器、V4 optional-chain SIGSEGV 根因到 file:line | 待定 | 未开始 |
 
 ## 审计纪律
 
