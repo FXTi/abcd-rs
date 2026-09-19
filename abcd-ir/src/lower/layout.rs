@@ -12,7 +12,7 @@
 //! sort after every real block offset, so `reconstruct_try_blocks` never
 //! extends a try/handler range over them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use abcd_file::TryBlock;
 use abcd_isa::{Bytecode, EntityKind, Label};
@@ -53,7 +53,13 @@ pub fn layout(
     // Step 1: Resolve each edge's phi copies at SLOT level. Coalescing lets
     // distinct values share a slot, so the value-level list must be re-mapped
     // and re-ordered here, at the emission point.
-    let mut edge_codes: HashMap<(Block, Block), Vec<Bytecode>> = HashMap::new();
+    //
+    // BTreeMap (N20): the legacy/unconditional placement loops below iterate
+    // this map, and that iteration order is byte-observable in the flattened
+    // output — a HashMap would permute copy-sequence order (and thereby the
+    // encoded bytes) between runs. Block/edge keys are arena indices, so the
+    // sorted order is stable and total.
+    let mut edge_codes: BTreeMap<(Block, Block), Vec<Bytecode>> = BTreeMap::new();
     for (&edge, copies) in &alloc.phi_copies {
         if copies.is_empty() {
             continue;

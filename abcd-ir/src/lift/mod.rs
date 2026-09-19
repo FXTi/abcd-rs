@@ -368,11 +368,18 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
         }
     }
 
-    // Seal any remaining unsealed blocks.
-    for bb in block_map.values() {
-        if !ssa.is_sealed(*bb) {
-            ssa.seal_block(*bb, module);
-        }
+    // Seal any remaining unsealed blocks. N20: iterate in raw-block order,
+    // not HashMap order — sealing completes incomplete phis, and the order
+    // of that phi creation assigns Value/Inst arena indices, which feed
+    // regalloc tie-breaks; a hash-order iteration would make the lowered
+    // bytes run-dependent whenever more than one block is sealed here.
+    let mut remaining: Vec<Block> = (0..raw_cfg.blocks.len())
+        .map(|bi| block_map[&bi])
+        .filter(|bb| !ssa.is_sealed(*bb))
+        .collect();
+    remaining.sort_unstable();
+    for bb in remaining {
+        ssa.seal_block(bb, module);
     }
 
     Ok(func_id)

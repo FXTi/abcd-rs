@@ -1416,11 +1416,19 @@ fn decode_literal_arrays(
             }
         }
     }
-    for &off in referenced_offsets {
-        if off != ABSENT && !offsets.contains(&off) && !module_data_offsets.contains(&off) {
-            offsets.push(off);
-        }
-    }
+    // N20: `referenced_offsets` is a HashSet — iterating it directly would
+    // append the extras in hash order, permuting the decoded literal-array
+    // table (and every LiteralarrayId table index derived from it) between
+    // runs. Sort the candidates so the table order is canonical.
+    let mut referenced: Vec<u32> = referenced_offsets
+        .iter()
+        .copied()
+        .filter(|&off| {
+            off != ABSENT && !offsets.contains(&off) && !module_data_offsets.contains(&off)
+        })
+        .collect();
+    referenced.sort_unstable();
+    offsets.extend(referenced);
     if offsets.is_empty() {
         return (Vec::new(), HashMap::new());
     }
