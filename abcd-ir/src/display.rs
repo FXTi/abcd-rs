@@ -316,8 +316,11 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
 
         // Generator / Async
         InstData::CreateGeneratorObj { func } => write!(f, "CreateGeneratorObj {func}"),
-        InstData::SuspendGenerator { value } => write!(f, "SuspendGenerator {value}"),
-        InstData::ResumeGenerator => write!(f, "ResumeGenerator"),
+        InstData::SuspendGenerator { genobj, value } => {
+            write!(f, "SuspendGenerator {genobj}, {value}")
+        }
+        InstData::ResumeGenerator { genobj } => write!(f, "ResumeGenerator {genobj}"),
+        InstData::GetResumeMode { genobj } => write!(f, "GetResumeMode {genobj}"),
         InstData::AsyncFunctionEnter => write!(f, "AsyncFunctionEnter"),
         InstData::AsyncFunctionAwaitUncaught { value } => {
             write!(f, "AsyncFunctionAwaitUncaught {value}")

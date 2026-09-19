@@ -117,6 +117,7 @@ fn is_essential(data: &InstData) -> bool {
         | PopLexEnv
         | DynamicImport { .. }
         | SuspendGenerator { .. }
+        | ResumeGenerator { .. }
         | AsyncFunctionAwaitUncaught { .. }
         | AsyncFunctionResolve { .. }
         | AsyncFunctionReject { .. }

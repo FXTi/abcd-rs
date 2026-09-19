@@ -712,6 +712,18 @@ fn compute_acc_scores(module: &Module, rpo: &[Block]) -> HashMap<Value, i32> {
                     *scores.entry(*dst).or_default() -= 3;
                     *scores.entry(*src).or_default() += 2;
                 }
+                // Generator trio (vendor isa.yaml:1302-1305, :1261-1273):
+                // suspendgenerator's register operand is the genobj (-3)
+                // while the acc carries the yield value (+2);
+                // resumegenerator/getresumemode read the genobj FROM the
+                // acc (+2).
+                InstData::SuspendGenerator { genobj, value } => {
+                    *scores.entry(*genobj).or_default() -= 3;
+                    *scores.entry(*value).or_default() += 2;
+                }
+                InstData::ResumeGenerator { genobj } | InstData::GetResumeMode { genobj } => {
+                    *scores.entry(*genobj).or_default() += 2;
+                }
                 _ => {}
             }
         }

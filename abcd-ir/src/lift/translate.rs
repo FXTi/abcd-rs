@@ -1186,18 +1186,37 @@ pub(super) fn translate_bytecode(
             let v = emit_val(module, block, InstData::CreateGeneratorObj { func }, loc);
             write_acc(ssa, block, v);
         }
-        Bytecode::Suspendgenerator(val_reg) => {
-            let value = read_reg(ssa, *val_reg, block, module);
-            let v = emit_val(module, block, InstData::SuspendGenerator { value }, loc);
+        Bytecode::Suspendgenerator(gen_reg) => {
+            // Vendor `suspendgenerator v:in:top, acc: inout:top`
+            // (isa.yaml:1302-1305): the register operand is the generator
+            // object, the accumulator carries the YIELD VALUE; the result
+            // (the resume result delivered by a later resume) is written
+            // back to acc.
+            let genobj = read_reg(ssa, *gen_reg, block, module);
+            let value = read_acc(ssa, block, module);
+            let v = emit_val(
+                module,
+                block,
+                InstData::SuspendGenerator { genobj, value },
+                loc,
+            );
             write_acc(ssa, block, v);
         }
         Bytecode::Resumegenerator => {
-            let v = emit_val(module, block, InstData::ResumeGenerator, loc);
+            // Vendor `resumegenerator` (isa.yaml:1261-1264):
+            // `acc: inout:top`, no register operand — the generator
+            // object is read from acc, the resume result goes back.
+            let genobj = read_acc(ssa, block, module);
+            let v = emit_val(module, block, InstData::ResumeGenerator { genobj }, loc);
             write_acc(ssa, block, v);
         }
         Bytecode::Getresumemode => {
-            // GetResumeMode returns a number; model as ResumeGenerator (same SSA value)
-            let v = emit_val(module, block, InstData::ResumeGenerator, loc);
+            // Vendor `getresumemode` (isa.yaml:1270-1273):
+            // `acc: inout:top`, no register operand — the generator
+            // object is read from acc, the resume mode (a number) goes
+            // back. Distinct from ResumeGenerator.
+            let genobj = read_acc(ssa, block, module);
+            let v = emit_val(module, block, InstData::GetResumeMode { genobj }, loc);
             write_acc(ssa, block, v);
         }
         Bytecode::Setgeneratorstate(_imm) => {
@@ -1977,13 +1996,17 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedResumegenerator(gen_reg) => {
-            let _gen = read_reg(ssa, *gen_reg, block, module);
-            let v = emit_val(module, block, InstData::ResumeGenerator, loc);
+            // Vendor `deprecated.resumegenerator v:in:top, acc: out:top`
+            // (isa.yaml:1265-1269): genobj is the register operand here.
+            let genobj = read_reg(ssa, *gen_reg, block, module);
+            let v = emit_val(module, block, InstData::ResumeGenerator { genobj }, loc);
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedGetresumemode(gen_reg) => {
-            let _gen = read_reg(ssa, *gen_reg, block, module);
-            let v = emit_val(module, block, InstData::ResumeGenerator, loc);
+            // Vendor `deprecated.getresumemode v:in:top, acc: out:top`
+            // (isa.yaml:1274-1278): genobj is the register operand here.
+            let genobj = read_reg(ssa, *gen_reg, block, module);
+            let v = emit_val(module, block, InstData::GetResumeMode { genobj }, loc);
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedGettemplateobject(tpl_reg) => {
@@ -2011,9 +2034,17 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedSuspendgenerator(gen_reg, val_reg) => {
-            let _gen = read_reg(ssa, *gen_reg, block, module);
+            // Vendor `deprecated.suspendgenerator v1:in:top, v2:in:top,
+            // acc: out:top` (isa.yaml:1306-1310): v1 is the generator
+            // object, v2 the yield value.
+            let genobj = read_reg(ssa, *gen_reg, block, module);
             let value = read_reg(ssa, *val_reg, block, module);
-            let v = emit_val(module, block, InstData::SuspendGenerator { value }, loc);
+            let v = emit_val(
+                module,
+                block,
+                InstData::SuspendGenerator { genobj, value },
+                loc,
+            );
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedAsyncfunctionawaituncaught(async_reg, val_reg) => {

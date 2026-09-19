@@ -1147,13 +1147,31 @@ fn select_inst(
             codes.push(Bytecode::Creategeneratorobj(func_r));
             store_result(func_id, result_slot, alloc, codes)?;
         }
-        InstData::SuspendGenerator { value } => {
-            let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
-            codes.push(Bytecode::Suspendgenerator(val_r));
+        InstData::SuspendGenerator { genobj, value } => {
+            // Vendor `suspendgenerator v:in:top, acc: inout:top`
+            // (isa.yaml:1302-1305): the register operand is the generator
+            // object, the acc carries the yield value (and receives the
+            // resume result). Spill-before-load (B3): resolve the register
+            // operand first via materialize_operands, ensure_acc the
+            // yield value LAST. No entity operands.
+            let regs = materialize_operands(func_id, &[*genobj], Some(*value), alloc, codes)?;
+            codes.push(Bytecode::Suspendgenerator(regs[0]));
             store_result(func_id, result_slot, alloc, codes)?;
         }
-        InstData::ResumeGenerator => {
+        InstData::ResumeGenerator { genobj } => {
+            // Vendor `resumegenerator` (isa.yaml:1261-1264):
+            // `acc: inout:top`, no register operand — genobj in acc,
+            // resume result back to acc.
+            ensure_acc(func_id, *genobj, alloc, codes)?;
             codes.push(Bytecode::Resumegenerator);
+            store_result(func_id, result_slot, alloc, codes)?;
+        }
+        InstData::GetResumeMode { genobj } => {
+            // Vendor `getresumemode` (isa.yaml:1270-1273):
+            // `acc: inout:top`, no register operand — genobj in acc,
+            // resume mode back to acc.
+            ensure_acc(func_id, *genobj, alloc, codes)?;
+            codes.push(Bytecode::Getresumemode);
             store_result(func_id, result_slot, alloc, codes)?;
         }
         InstData::AsyncFunctionEnter => {

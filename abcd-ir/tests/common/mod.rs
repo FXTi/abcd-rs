@@ -54,6 +54,21 @@ pub enum Halt {
     /// argument count including the constructor, u8 window start, NO IC
     /// slot operand on the wide form.
     WideNewObjRange { argc: i64, start: u16 },
+    /// `Suspendgenerator` (record-and-inspect): `genobj` is the operand
+    /// register's contents (the generator object), `value` the
+    /// accumulator (the YIELD VALUE) — vendor `suspendgenerator v:in:top,
+    /// acc: inout:top` (abcd-isa-sys/vendor/isa/isa.yaml:1302-1305).
+    SuspendGenerator { genobj: i64, value: i64 },
+    /// `Resumegenerator` (record-and-inspect): `genobj` is the
+    /// accumulator (the generator object) — vendor `resumegenerator`
+    /// with `acc: inout:top`, NO register operand
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1261-1264).
+    ResumeGenerator { genobj: i64 },
+    /// `Getresumemode` (record-and-inspect): `genobj` is the accumulator
+    /// (the generator object) — vendor `getresumemode` with
+    /// `acc: inout:top`, NO register operand
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1270-1273).
+    GetResumeMode { genobj: i64 },
     /// `run_until` reached the stop pc WITHOUT executing the instruction
     /// there — models an exception thrown between two instructions.
     Stopped,
@@ -271,6 +286,25 @@ impl Machine {
                         argc: argc.0,
                         start: start.0,
                     };
+                }
+                // `suspendgenerator v:in:top, acc: inout:top`
+                // (isa.yaml:1302-1305) — record the genobj register's
+                // contents and the acc (the yield value).
+                Bytecode::Suspendgenerator(gen_r) => {
+                    return Halt::SuspendGenerator {
+                        genobj: self.reg(gen_r.0),
+                        value: self.acc,
+                    };
+                }
+                // `resumegenerator acc: inout:top` (isa.yaml:1261-1264) —
+                // record the acc (the genobj).
+                Bytecode::Resumegenerator => {
+                    return Halt::ResumeGenerator { genobj: self.acc };
+                }
+                // `getresumemode acc: inout:top` (isa.yaml:1270-1273) —
+                // record the acc (the genobj).
+                Bytecode::Getresumemode => {
+                    return Halt::GetResumeMode { genobj: self.acc };
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),
             }

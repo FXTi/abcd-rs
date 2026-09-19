@@ -167,7 +167,6 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         | LoadFunction
         | GetUnmappedArgs
         | CopyRestArgs { .. }
-        | ResumeGenerator
         | AsyncFunctionEnter
         | ThrowNotExists
         | ThrowPatternNonCoercible
@@ -230,12 +229,14 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         | GetPropIterator { obj: value }
         | CloseIterator { iterator: value }
         | CreateGeneratorObj { func: value }
-        | SuspendGenerator { value }
+        | ResumeGenerator { genobj: value }
+        | GetResumeMode { genobj: value }
         | AsyncFunctionAwaitUncaught { value }
         | AsyncFunctionResolve { value }
         | AsyncFunctionReject { value } => vec![*value],
 
         ThrowUndefinedIfHole { value, .. } => vec![*value],
+        SuspendGenerator { genobj, value } => vec![*genobj, *value],
         CreateIterResultObj { value, done } => vec![*value, *done],
 
         DefineMethod { home_object, .. } => vec![*home_object],

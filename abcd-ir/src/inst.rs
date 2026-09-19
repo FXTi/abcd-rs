@@ -290,10 +290,27 @@ pub enum InstData {
     CreateGeneratorObj {
         func: Value,
     },
+    /// Vendor `suspendgenerator v:in:top, acc: inout:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1302-1305): the register operand
+    /// is the generator object, the accumulator carries the YIELD VALUE;
+    /// the result (the resume result after a later resume) goes back to
+    /// the accumulator.
     SuspendGenerator {
+        genobj: Value,
         value: Value,
     },
-    ResumeGenerator,
+    /// Vendor `resumegenerator` (isa.yaml:1261-1264): `acc: inout:top`,
+    /// NO register operand — the generator object is read from acc, the
+    /// resume result is written back to acc.
+    ResumeGenerator {
+        genobj: Value,
+    },
+    /// Vendor `getresumemode` (isa.yaml:1270-1273): `acc: inout:top`,
+    /// NO register operand — the generator object is read from acc, the
+    /// resume mode (a number) is written back to acc.
+    GetResumeMode {
+        genobj: Value,
+    },
     AsyncFunctionEnter,
     AsyncFunctionAwaitUncaught {
         value: Value,
@@ -389,7 +406,6 @@ impl InstData {
             | LoadFunction
             | GetUnmappedArgs
             | CopyRestArgs { .. }
-            | ResumeGenerator
             | AsyncFunctionEnter
             | ThrowNotExists
             | ThrowPatternNonCoercible
@@ -452,12 +468,14 @@ impl InstData {
             | GetPropIterator { obj: value }
             | CloseIterator { iterator: value }
             | CreateGeneratorObj { func: value }
-            | SuspendGenerator { value }
+            | ResumeGenerator { genobj: value }
+            | GetResumeMode { genobj: value }
             | AsyncFunctionAwaitUncaught { value }
             | AsyncFunctionResolve { value }
             | AsyncFunctionReject { value } => vec![value],
 
             ThrowUndefinedIfHole { value, .. } => vec![value],
+            SuspendGenerator { genobj, value } => vec![genobj, value],
             CreateIterResultObj { value, done } => vec![value, done],
 
             DefineMethod { home_object, .. } => vec![home_object],
