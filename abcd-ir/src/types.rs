@@ -8,6 +8,17 @@ pub enum IrType {
     /// Dynamic type lattice (bitmask), used for JS/TS values.
     Dynamic(DynType),
     /// Static type from ArkTS method signatures (delegates to `abcd_file::Type`).
+    ///
+    /// OWNERSHIP (N46): a `Type::Reference(abcd_file::StringId)` payload
+    /// is FILE-BOUND — it indexes the SOURCE FILE's string pool, which the
+    /// IR [`crate::module::Module`] does NOT own; it is not an index into
+    /// `Module::strings`. No IR consumer may resolve such an id through
+    /// any pool the module owns (and none does today: the payload is
+    /// carried for round-trip fidelity only — lift records it, nothing
+    /// reads it). The day a module-only encoder needs the descriptor
+    /// string, these ids must first be remapped into a pool the module
+    /// owns (or resolved against the source `File` while it is still
+    /// available).
     Static(AbcType),
 }
 

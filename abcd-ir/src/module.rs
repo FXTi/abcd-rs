@@ -163,11 +163,15 @@ pub struct FunctionData {
     pub source_lang: SourceLang,
     pub is_external: bool,
     pub param_count: u16,
+    /// Declared return type. A `Type::Reference(..)` payload inside is
+    /// FILE-BOUND (indexes the source file's string pool, which this
+    /// module does not own) — see [`crate::types::IrType::Static`] (N46).
     pub return_type: Option<IrType>,
     /// Advisory parameter types, from the proto shorty when the file
     /// version carries one. May be shorter than `param_count` (12.0.x+
     /// files have no shorty — format fact #A7); `param_count` is the
-    /// authoritative arity.
+    /// authoritative arity. `Type::Reference(..)` payloads are FILE-BOUND
+    /// like `return_type` (N46).
     pub param_types: Vec<IrType>,
     /// SSA values for the function parameters, in argument order:
     /// `param_values[i]` is the value for argument `i`. Populated by lift
