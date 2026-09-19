@@ -120,7 +120,7 @@ VM 语义簇（需逐簇拆根因）：
 | 3.11 | N20 确定性审计+修复 | worker P3-T11 (k3) | **完成**（16dc8ff；三处根因皆字节级：layout edge_codes HashMap→BTreeMap、decode LA extras HashSet→排序、lift 封印序→块序；orchestrator 独立复验：3 次重写两两 diff=0、67 套件绿、新基线 lift 618/opt 696 复跑一致。遗留 wart 登记：layout legacy 兜底路径对 handler 边拷贝的语义假设——handler 当前无 CFG 前驱故不可达，N13 落地时须重审） |
 | 3.12 | N11 修复：augmented_succs 共享 + 异常中性合并守卫 | worker P3-T12 (k3) | **完成**（606cdcd；orchestrator 复验：红色 5 失败复现、lift 树与确定性基线逐字节一致、opt 666 复跑一致。-30 为**诚实回归**：unused-ldhole×18 是 N13 族被 N11 删 handler 掩盖的旧失败、iterator-close×12 是 N21 wart 活化——靠删代码换来的通过被取消，证据完整性为正。新登记 N21（P1）：handler 边 phi 拷贝的 legacy 内联放置在 CondBranch 前驱上腐蚀正常边值） |
 | 3.13 | N21+N13 异常边建模：ValueDef::ExceptionParam + handler 入口 Sta 序幕 + phi 结果钉槽 + 入值写穿透存储 + legacy 内联删除改硬错误 | worker P3-T13 (k3) | **完成**（0270f9b；两条批准修正 + 一条新修正（def-block→per-entry 放置，destructuring 的 vreg 重绑定形态证伪纯定义点放置）全部成立；orchestrator 独立复验：69 套件绿、7/7 测试、双跑字节一致、delta 集合恰为 339 try fixture×2、lift 660(+42)/opt 696(+30) 零回归、翻转族精确吻合；新登记 N22 异常值活性保守回传 +1 寄存器） |
-| 3.14 | 空跳转 phi 守卫（dce.rs:303-318 按前驱去重丢汇聚边异值——optional-chain opt×6 与 V1 部分） | 待定 | 未开始 |
+| 3.14 | 空跳转 phi 守卫 | worker P3-T14 (k3) | **进行中**（基线：lift 660 / opt 696） |
 | 3.15 | N14 generator 三件套建模（Getresumemode 误映射 + acc 操作数丢失；opt SIGSEGV 机制已钉死） | 待定 | 未开始 |
 
 P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle  harness 无幻影）：
