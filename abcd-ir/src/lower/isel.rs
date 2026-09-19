@@ -1188,6 +1188,15 @@ fn select_inst(
             codes.push(Bytecode::Copyrestargs(Imm(*start_index as i64)));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
+        InstData::GetTemplateObject { literal } => {
+            // Vendor `gettemplateobject imm:u16, acc: inout:top`
+            // (isa.yaml:1279-1283): ONE IC slot (`one_slot`); acc in =
+            // the template literal, acc out = the cached template
+            // object.
+            ensure_acc(tracker, func_id, *literal, alloc, codes)?;
+            codes.push(Bytecode::Gettemplateobject(ic.one()));
+            home_result(tracker, result, used, func_id, alloc, codes)?;
+        }
 
         // ── Iterators ────────────────────────────────────────────────
         InstData::GetIterator { obj } => {

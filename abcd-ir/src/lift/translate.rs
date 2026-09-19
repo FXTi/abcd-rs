@@ -1279,17 +1279,12 @@ pub(super) fn translate_bytecode(
 
         // ── Misc ─────────────────────────────────────────────────────
         Bytecode::Gettemplateobject(_ic) => {
-            let obj = read_acc(ssa, block, module);
-            // Template object is essentially the tagged template array
-            let v = emit_val(
-                module,
-                block,
-                InstData::LoadProperty {
-                    object: obj,
-                    key: PropKind::ByIndex(0),
-                },
-                loc,
-            );
+            // Vendor `gettemplateobject imm:u16, acc: inout:top`
+            // (isa.yaml:1279-1283): the acc carries the template
+            // literal, the (cached) template object goes back to acc.
+            // NOT an element read.
+            let literal = read_acc(ssa, block, module);
+            let v = emit_val(module, block, InstData::GetTemplateObject { literal }, loc);
             write_acc(ssa, block, v);
         }
         Bytecode::Setobjectwithproto(_ic, proto_reg) => {
@@ -2031,16 +2026,13 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedGettemplateobject(tpl_reg) => {
-            let obj = read_reg(ssa, *tpl_reg, block, module);
-            let v = emit_val(
-                module,
-                block,
-                InstData::LoadProperty {
-                    object: obj,
-                    key: PropKind::ByIndex(0),
-                },
-                loc,
-            );
+            // Vendor `deprecated.gettemplateobject v:in:top,
+            // acc: inout:top` (isa.yaml:1284-1288): the template
+            // literal comes from the register operand; folds into the
+            // modern IR instruction (the codebase's deprecated-opcode
+            // convention).
+            let literal = read_reg(ssa, *tpl_reg, block, module);
+            let v = emit_val(module, block, InstData::GetTemplateObject { literal }, loc);
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedDelobjprop(obj_reg, key_reg) => {

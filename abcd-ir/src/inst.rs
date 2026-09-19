@@ -348,6 +348,23 @@ pub enum InstData {
         value: Value,
         done: Value,
     },
+    /// Vendor `gettemplateobject imm:u16, acc: inout:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1279-1283; properties
+    /// `[ic_slot, one_slot, eight_sixteen_bit_ic]` — ONE IC slot): the
+    /// accumulator carries the template literal, the (cached) template
+    /// object is written back to the accumulator
+    /// (`SlowRuntimeStub::GetTemplateObject(thread, literal)` +
+    /// `SET_ACC`, arkcompiler_ets_runtime-master/ecmascript/
+    /// interpreter/interpreter_assembly.cpp:2071-2083). The deprecated
+    /// form (`deprecated.gettemplateobject v:in:top, acc: inout:top`,
+    /// isa.yaml:1284-1288) takes the literal from the register operand;
+    /// both map here (the codebase folds deprecated opcodes into the
+    /// modern IR variant, cf. `DeprecatedDelobjprop` →
+    /// `DeleteProperty`). NOT an element read — never collapsible into
+    /// [`InstData::LoadProperty`].
+    GetTemplateObject {
+        literal: Value,
+    },
 
     // ── Exception handling ───────────────────────────────────────────
     Throw {
@@ -506,7 +523,8 @@ impl InstData {
             | GetResumeMode { genobj: value }
             | AsyncFunctionAwaitUncaught { value }
             | AsyncFunctionResolve { value }
-            | AsyncFunctionReject { value } => vec![value],
+            | AsyncFunctionReject { value }
+            | GetTemplateObject { literal: value } => vec![value],
 
             ThrowUndefinedIfHole { value, .. } => vec![value],
             SuspendGenerator { genobj, value } => vec![genobj, value],

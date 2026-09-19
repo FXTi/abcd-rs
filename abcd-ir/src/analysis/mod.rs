@@ -235,7 +235,8 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         | GetResumeMode { genobj: value }
         | AsyncFunctionAwaitUncaught { value }
         | AsyncFunctionResolve { value }
-        | AsyncFunctionReject { value } => vec![*value],
+        | AsyncFunctionReject { value }
+        | GetTemplateObject { literal: value } => vec![*value],
 
         ThrowUndefinedIfHole { value, .. } => vec![*value],
         SuspendGenerator { genobj, value } => vec![*genobj, *value],

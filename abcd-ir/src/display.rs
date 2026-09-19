@@ -332,6 +332,7 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
         InstData::CreateIterResultObj { value, done } => {
             write!(f, "CreateIterResultObj {value}, {done}")
         }
+        InstData::GetTemplateObject { literal } => write!(f, "GetTemplateObject {literal}"),
 
         // Exception handling
         InstData::Throw { value } => write!(f, "Throw {value}"),
