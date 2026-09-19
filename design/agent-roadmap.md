@@ -13,7 +13,7 @@
 | Phase 1 | Lower 正确性旧账（out-of-SSA 破环、val_reg 溢出槽、lower 实体重定位通道） | **完成（2026-09-19，4 commits：30d254a/0620a12/99e5a52/793e234）** |
 | Phase 2 | VM oracle 证据链（corpus_lower_oracle → 1119 passed fixture 全量） | **完成（2026-09-20：双变体 VM oracle 1119/1119）** |
 | Phase 3 | P1 漏洞 + V 族语义簇 + 优化器正确性 | **完成（2026-09-20，P3-T1…T22；见下方登记）** |
-| Phase 4 | 证据升级（真实 9/11 读验证、pandasm 逐指令对照） | 未开始 |
+| Phase 4 | 证据升级（真实 9/11 读验证、pandasm 逐指令对照、补 fixture） | **进行中** |
 | Phase 5 | 清扫（死依赖、-sys README、panic 路径）+ FormatProfile 评估 + IR v0.2 决策点 | 未开始 |
 
 ## Phase 0 任务登记
