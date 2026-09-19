@@ -168,6 +168,46 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 - N40（P3 潜伏）：peephole StrictEq 用 to_bits 折叠——`0===-0` 错判 false、同位 NaN 错判 true；改成普通 `a == b`。
 - N41（P2 潜伏）：peephole as_number 把 LiteralNull 映射成 0.0 → `null==0` 会错折 true。
 
+## 全量发现对账表（2026-09-20 双 100% 时点；每条发现的最终状态，补漏自聊天记录）
+
+| 条目 | 内容 | 状态 |
+|---|---|---|
+| N1 | _ESScopeNamesRecord 悬挂偏移 | ✅ 修复（312d960，S4/S5 一并） |
+| N2 | 静默错方法引用双胞胎 | ✅ 修复（740611b） |
+| N3 | DeprecatedSetobjectwithproto 合成名 "__proto__"（无语料覆盖） | 🔲 **未修**（此前漏进最终清单，本表补登） |
+| N4 | range-call 连续寄存器假设 | ✅ 修复（b90bc00） |
+| N5 | copydataproperties dst>255 高位风险族 | ✅ 覆盖于 S2 的 u8 审计+scratch 路由 |
+| N6 | identity 证据面只有算术 | ✅ 修复（312d960 扩 module 用例） |
+| N7 | moduleRequestPhaseIdx blob 同类悬挂（不在 passed 集） | 🔲 未修（Phase 5 清扫批） |
+| N8 | typeSummaryOffset 是否偏移存疑 | ❓ 未证实（待证） |
+| N9 | CreateObjectWithExcludedKeys 连续键假设+wide 形未选 | 🔲 **未修**（此前漏进最终清单，本表补登） |
+| N10-N14 | handler pc0 / opt 删 handler / ThrowIfSuper / handler acc / generator 三件套 | ✅ 全修（ff23195/606cdcd/cd410e5/0270f9b/aa6e786） |
+| N15 | DefineClassWithBuffer 丢 imm2（仅字节差异） | 🔲 未修（P3，Phase 5） |
+| N16 | Newobjapply↔Apply arity 往返脆弱 | 🔲 未修（P3，Phase 5） |
+| N17 | 种子常量 B4 残余 + MCS/acc_score 不一致观察 | Ⓜ️ moot（acc_score 已被 B4 删除） |
+| N18 | 无前驱死 catch 块清理 | 🔲 未修（Phase 5） |
+| N19 | typed-array 残值 ×12 | ✅ 已愈（终态双 100% 覆盖证明；具体由 B4/T22 修复链吸收） |
+| N20 | 管道非确定性 | ✅ 修复（16dc8ff） |
+| N21 | handler 边拷贝 legacy 内联 | ✅ 修复（0270f9b） |
+| N22 | 异常值活性保守 +1 寄存器 | 📝 无害记录（不修） |
+| N23 | SCCP 折叠留陈旧 phi 条目 | ✅ 修复（76cb828） |
+| N24 | oracle 容器僵尸 | ✅ 修复（3883291） |
+| N25/N26 | ThrowConstAssignment / ThrowUndefinedIfHole 双寄存器形 opcode 身份损坏 | 🔲 未修（P2，下一个修复批） |
+| N27 | 优化器空 phi | ✅ 修复（76cb828） |
+| N28 | copyprop "ADCE 会清理"假设残余风险 | 📝 残余风险记录（verify 兜底已就位） |
+| N29-N35 | T20 五根因 | ✅ 全修（T21 六连） |
+| N36-N41 | T19 opt 域六条 | ✅ 全修（T22 四连） |
+| F-new-1 | vendor writer 创建顺序敏感（SET_FILE 偏移） | 🔲 未修（Phase 5；bridge 专项） |
+| F-new-2 | 注解内嵌 LA 的方法引用写裸源偏移 | 🔲 未修（Phase 5） |
+| 死表面 | 108/324 导出未用 | ⏸️ 政策讨论，维护者定夺 |
+| CI #22 | 重复 vendor 文件保护 | ⏸️ 维护者决定不动 |
+| SSA trivial-phi | 删除不写全 uses | ✅ 实质关闭（76cb828 替换式）+ N28 残余记录 |
+| dominance 复审 | Phase 3 遗留评审项 | 🔲 **从未安排**（本表补登，Phase 5 前做） |
+| string-pool 所有权复审 | 引用类型字符串池所有权 | 🔲 **从未安排**（本表补登，Phase 5 前做） |
+| exception CFG 复审 | 异常 CFG 语义 | ✅ 实质覆盖（N10/N11/N13/N21 + augmented_succs 共享审计）；系统性复审并入 dominance 复审一起做 |
+| Phase 5 清扫批 | literal_val_to_c 死代码、builder 二次 finalize staging、-sys README（#20/#21）、回调文档（#15）、abcd-file README 漂移 6 项、P2 测试缺口 | 🔲 未开始 |
+| Phase 4 | 9/11 真实读验证（444+477 fixture）、pandasm 逐指令对照、stthisbyvalue/stprivateproperty/testin 补 fixture | 🔲 未开始 |
+
 ## 审计纪律
 
 - 审计期间 abcd-isa-sys / abcd-isa / abcd-file-sys / abcd-file 冻结功能性改动（允许新增测试文件）。
