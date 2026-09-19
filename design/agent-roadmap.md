@@ -138,7 +138,9 @@ P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle
 - **N16（P3）**：Newobjapply ↔ CallKind::Apply arity 重载往返脆弱。
 - **N27（P1，P3-T17 登记）**：优化器（SCCP/trivial-phi 类）留下 entries 为空的 phi，其宿主槽位从无写入 → 调用读到帧垃圾——N23 当时"无活失败"，现在有 6 例活失败（test-namespace/optimized opt 变体，B4 重排槽位后从 wrong-benign 变 wrong-fatal）。属 opt 域，下一棒。
 
-| 3.19 | N27 优化器空 phi 修复（SCCP/trivial-phi 类；6 例活失败 test-namespace/optimized） | worker P3-T18 (k3) | **进行中**（基线：lift 1026 / opt 894） |
+| 3.19 | N27 优化器空 phi 修复 | worker P3-T18 (k3) | **完成**（76cb828；双根因：SCCP 折枝留陈旧 phi 条目（N23 关闭）+ merge 重键造空 phi；修复=条目随 pred 删除 + 单前驱 phi 替换而非重键 + verify 结构兜底（可达零前驱 phi 报错，N18 死块豁免）；orchestrator 复验：红色 3/3 远端复现、lift 1026 不变、opt 894→900 精确 +6 零回归。新登记 N28 copyprop "ADCE 会清理"假设的残余风险） **新基线：lift 1026 / opt 900（80.4%）** |
+| 3.20 | 诊断（只读）：opt-only 失败族（literals/bitwise/numeric-operators/call-shapes/test-branch-elimination/try-catch×3——lift 过 opt 挂=优化器语义 bug） | 待定 | 未开始 |
+| 3.21 | 诊断（只读）：双变体共挂族（bigint/template/tagged-template/call-shapes/for-in[GC abort]+private-field——lift/lower 层根因） | 待定 | 未开始 |
 - **N25（P2，P3-T16 登记）**：ThrowConstAssignment 同属 N12 类双重损坏——vendor `throw.constassignment v:in:top`（isa.yaml:987-991，acc:none）的寄存器操作数承载变量名字符串值，lift（translate.rs:1516-1528）捏造合成名 `const_assign_N` 并丢弃寄存器操作数，isel（isel.rs:1211-1214）硬编码 `Reg(0)` 占位。
 - **N26（P2，P3-T16 登记）**：ThrowUndefinedIfHole 双寄存器形态 opcode 身份损坏——vendor `throw.undefinedifhole v1:in:top, v2:in:top`（isa.yaml:998-1002，acc:none；v1=name，v2=value），lift 捏造合成名 `hole_check_N`，isel 一律重发为**另一条 opcode** `throw.undefinedifholewithname`（0x09，string_id + acc 形态）——往返把寄存器形态换成 acc 形态（N14 getresumemode 同类）。
 - V4 更正：optional-chain 的 SIGSEGV 数据已过时（S2/S6 时代已愈）；现行失败 = 空跳转 phi 输入丢失（dce.rs:303-318 按前驱去重模型无法表达两条汇聚边的不同值——MEMORY.md 已知风险的具体语料实例）+ N14。
