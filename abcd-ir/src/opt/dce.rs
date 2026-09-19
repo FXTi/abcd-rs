@@ -308,6 +308,21 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
             continue;
         }
 
+        // Converging-edge phi guard (V4): if a predecessor `pred` of bb
+        // ALSO has a direct edge to `target`, eliminating bb threads a
+        // second pred→target edge that claims the same per-pred phi
+        // entry. Phi entries are keyed by edge SOURCE block, so the
+        // per-pred model cannot represent two converging edges from one
+        // pred carrying DIFFERENT values — elimination is sound only
+        // when, for every phi in `target`, the value arriving via bb
+        // equals the value arriving via pred directly. Otherwise the
+        // rewrite below would skip pred's existing entry
+        // (`any(|(p,_)| *p == pred)`) and silently drop the bb-mediated
+        // value (optional-chain corpus family).
+        if elimination_loses_converging_phi_value(module, bb, target, &preds) {
+            continue;
+        }
+
         for &pred in &preds {
             redirect_terminator(module, pred, bb, target);
             // Update target's preds.
@@ -490,6 +505,41 @@ fn elimination_is_exception_neutral(
     }
     module.func(func).try_regions.iter().all(|region| {
         !region.try_blocks.contains(&bb) || preds.iter().all(|p| region.try_blocks.contains(p))
+    })
+}
+
+/// Would eliminating the jump-only block `bb` (predecessors `preds`,
+/// branch target `target`) drop a phi value? For every predecessor that
+/// ALSO has a direct edge to `target` (i.e. is already one of target's
+/// preds), threading bb's edge onto `target` merges two converging
+/// edges into one per-pred phi entry. The merge is value-preserving
+/// only when every phi in `target` carries the SAME incoming value for
+/// the bb-mediated path (entry keyed `bb`) as for the direct path
+/// (entry keyed `pred`); any difference means one value would be lost.
+fn elimination_loses_converging_phi_value(
+    module: &Module,
+    bb: Block,
+    target: Block,
+    preds: &[Block],
+) -> bool {
+    let target_preds = &module.block(target).preds;
+    let converging: Vec<Block> = preds
+        .iter()
+        .copied()
+        .filter(|p| target_preds.contains(p))
+        .collect();
+    if converging.is_empty() {
+        return false;
+    }
+    module.block(target).phis.iter().any(|&phi_id| {
+        let InstData::Phi { entries } = &module.inst(phi_id).data else {
+            return false;
+        };
+        let via_bb = entries.iter().find(|(p, _)| *p == bb).map(|(_, v)| *v);
+        converging.iter().any(|&pred| {
+            let direct = entries.iter().find(|(p, _)| *p == pred).map(|(_, v)| *v);
+            via_bb != direct
+        })
     })
 }
 
