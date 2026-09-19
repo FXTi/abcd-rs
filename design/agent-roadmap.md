@@ -114,7 +114,21 @@ VM 语义簇（需逐簇拆根因）：
 **结构性簇 S1-S6 全部关闭（2026-09-19）**。剩余：V 族语义簇（V1-V8）、B4、vreg-hole、N7/N8/N9、SSA trivial-phi、dominance/string-pool/exception CFG 复审。
 
 | 3.7 | vreg-hole 修复：从未写入的 vreg 读取产空 phi → 入口播种 LiteralHole（先取证危害再修） | worker P3-T7 (k3) | **进行中** |
-| 3.8 | V 族诊断（只读）：V3 NewTarget、V8 类构造器、V4 SIGSEGV 根因到 file:line | worker P3-T8 (k3) | **进行中** |
+| 3.8 | V 族诊断（V3/V4/V8） | worker P3-T8 (k3) | **完成**（只读；orchestrator 已独立实证 N10：静态 compute_rpo 反转逻辑 + 动态 exception-finally 反汇编 handler 在函数 pc 0） |
+
+P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle  harness 无幻影）：
+
+- **N10（P0）**：`compute_rpo`（analysis/mod.rs:37-47）把不可达的 catch handler 追加在 post_order 末尾再整体反转 → handler 块排在 entry 之前 → layout 平铺后 handler 落在函数 pc 0，调用即进 handler。阻塞全部 8 个含 catchall 的用例族（144 fixture）。修复：先反转可达后序，再追加未访问块。
+- **缺 Construct 调用种类**（V3+V8-opt 共同根因）：CallKind 无 Construct；lift 把 Newobjrange 映射成普通 Call → `new` 变普通调用，NewTarget 未定义（proxy/typed-array 36，class-accessors/newtarget-this opt 36）。
+- **N11（P1）**：opt `remove_unreachable_blocks`（dce.rs:429-475）只走终结指令后继 → 静默删除 catch handler 并修剪 try_regions——异常路径被删。
+- **N12（P2）**：ThrowIfSuperNotCorrectCall lift/isel 双重损坏（操作数捏造、acc 输入丢失、kind 硬编码 0）。
+- **N13（P1）**：handler 入口 acc（捕获的异常对象）从未在 lift 播种 → handler 里的 throw 重抛的是陈旧值。
+- **N14（P1）**：generator 三件套建模错误——Getresumemode 被 lift 成 ResumeGenerator；SuspendGenerator 丢 acc 里的 yield 值；ResumeGenerator/GetResumeMode 丢 acc 里的 genobj。opt 变体 SIGSEGV 机制已钉死（DCE 删 yield 值 → resume 后 acc=undefined → 野指针解引用）。
+- **N15（P3）**：DefineClassWithBuffer 丢 imm2（_count）——运行时忽略，仅字节差异。
+- **N16（P3）**：Newobjapply ↔ CallKind::Apply arity 重载往返脆弱。
+- V4 更正：optional-chain 的 SIGSEGV 数据已过时（S2/S6 时代已愈）；现行失败 = 空跳转 phi 输入丢失（dce.rs:303-318 按前驱去重模型无法表达两条汇聚边的不同值——MEMORY.md 已知风险的具体语料实例）+ N14。
+- B4 从"潜伏"升级为**实锤**：class-accessors lift 18 例的 acc 覆盖链完整钉出（lda.str "value" → ldundefined 覆盖 → definegettersetterbyvalue 拿到 false；prototype 覆盖 → stglobalvar B = prototype → 'Object is not callable'）。
+- 修复顺序（性价比）：N10 → Construct → N11 → 空跳转 phi 守卫 → N14 → N12+N13 → B4（大）。
 
 ## 审计纪律
 

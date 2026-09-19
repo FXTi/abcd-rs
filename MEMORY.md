@@ -215,6 +215,25 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   (P2-T2 deferral), N7/N8/N9, SSA trivial-phi, dominance/string-pool/
   exception-CFG reviews. New: N9 CreateObjectWithExcludedKeys consecutive/
   wide-form gap (N4 twin).
+- P3-T8 V-cluster diagnosis (read-only, accepted): N10 (P0) — compute_rpo
+  appends unreachable catch handlers after the DFS post-order and THEN
+  reverses, so handlers land before the entry block and layout emits them
+  at pc 0 (orchestrator-verified statically + via exception-finally disasm:
+  function f starts with handler code). Blocks all 8 catchall-containing
+  case families (144 lift fixtures). Missing CallKind::Construct is the
+  shared V3/V8-opt root (newobjrange lowered to plain call → NewTarget
+  undefined). N11 opt deletes catch handlers (terminator-only BFS).
+  N12/N13 throw-if-super + handler-entry exception acc unseeded. N14
+  generator trio mis-modeled (getresumemode as ResumeGenerator; acc
+  operands dropped; opt SIGSEGV mechanism proven). V4's old SIGSEGV data
+  is stale (healed by S2/S6); live optional-chain opt failures = the known
+  empty-jump phi-input loss (per-pred phi model can't hold two converging
+  edges with distinct values). B4 acc-clobber upgraded from latent to
+  CONFIRMED LIVE (class-accessors lift ×18, full clobber chain pinned).
+  Fix order by cost/benefit: N10 → Construct → N11 → empty-jump phi guard
+  → N14 → N12+N13 → B4. Serialization constraint: block-order or lift
+  changes shift corpus numbers — never run two abcd-ir fix workers
+  concurrently while corpus-delta measurements are in flight.
 
 ## Phase 1 outcome (done, 2026-09-19)
 
