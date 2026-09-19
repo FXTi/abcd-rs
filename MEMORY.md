@@ -215,6 +215,29 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   (P2-T2 deferral), N7/N8/N9, SSA trivial-phi, dominance/string-pool/
   exception-CFG reviews. New: N9 CreateObjectWithExcludedKeys consecutive/
   wide-form gap (N4 twin).
+- N10 RESOLVED (ff23195): compute_rpo reverses the reachable post-order
+  FIRST, then appends unreachable blocks — handlers no longer land at pc 0.
+  Deterministic VM baseline AFTER N20 fix (16dc8ff, three byte-ordering
+  root causes: layout edge_codes HashMap, decode LA-extras HashSet order,
+  lift seal order): lift 618/1119, opt 696/1119 — all future deltas must
+  be measured against DETERMINISTIC bytes only.
+- N11 RESOLVED (606cdcd): opt's remove_unreachable_blocks now uses the
+  shared analysis::augmented_succs (terminator + try→handler edges;
+  compute_rpo/domtree/SCCP/merge-eligibility deliberately stay
+  terminator-only — documented caller audit). Merge/empty-jump elimination
+  gained exception-neutrality guards. Opt oracle moved 696→666: an HONEST
+  regression — 18 unused-ldhole passes were fake (achieved by deleting the
+  exception path; the family fails at lift baseline on the N13 handler-acc
+  gap) and 12 iterator-close hits are the N21 wart going live.
+- N21 (P1): handler-edge phi copies placed by layout's legacy in-block
+  fallback execute on the NORMAL path of a CondBranch predecessor and can
+  clobber coalesced slots (iterator-close: iterator object destroyed →
+  TypeError → N13-broken handler rethrows stale value). Trampolines cannot
+  serve exception edges (the VM dispatches directly to the handler offset).
+  Correct treatment: handler-edge copies never inline; handler-phi incoming
+  values must be coalesced to the phi's slot or hard-error; handler-entry
+  acc must be seeded with the exception object (vendored SET_ACC(exception),
+  interpreter_assembly.cpp:7860-7863). N21+N13 sequence together.
 - P3-T8 V-cluster diagnosis (read-only, accepted): N10 (P0) — compute_rpo
   appends unreachable catch handlers after the DFS post-order and THEN
   reverses, so handlers land before the entry block and layout emits them
