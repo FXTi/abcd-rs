@@ -32,15 +32,60 @@ pub struct RegAlloc {
     pub copy_temp: Option<RegSlot>,
     /// Reserved real register for isel's intra-instruction accumulator spills
     /// (an Acc-colored value needed as a register operand). `Some` iff any
-    /// allocated value is `RegSlot::Acc`; always a `RegSlot::Reg`; never
-    /// assigned to a value.
+    /// allocated value is `RegSlot::Acc` AND the frame is low-only (see
+    /// `low_scratch_base`); always a `RegSlot::Reg`; never assigned to a
+    /// value. In high-register mode acc spills route through the low scratch
+    /// block instead, because this top-of-frame slot would itself be
+    /// unencodable for the `op_v_8`-only `sta`/`lda`.
     pub spill_slot: Option<RegSlot>,
+    /// Base of the reserved consecutive range-call argument window. `Some`
+    /// iff the function contains a range-form call (isel's
+    /// Callrange/Callthisrange/Supercallthisrange/Supercallarrowrange arms,
+    /// narrow or wide). Every vendored range-call form encodes only a u8
+    /// START register and reads argc consecutive slots, while the args'
+    /// colored slots are not guaranteed consecutive (N4) — isel copies the
+    /// args into `base .. base + argc` with auto-widening `mov`s and encodes
+    /// `base` as the start. The window is reserved ONCE per function (sized
+    /// to the largest range call); windows of different call sites overlap
+    /// because each site's fill+call sequence completes before the next
+    /// instruction is emitted — the window registers are dead outside the
+    /// fill sequence. Coloring never assigns these slots to a value.
+    /// Guaranteed ≤ 255 (checked at reservation; isel re-checks).
+    pub call_window_base: Option<u16>,
+    /// Base of the [`LOW_SCRATCH_COUNT`] consecutive reserved low (≤ 255)
+    /// scratch registers, present iff the frame may exceed the u8 register
+    /// operand encodings ("high-register mode"): indices `base .. base+3`
+    /// route high register OPERANDS (one per operand position, so a
+    /// 4-register-operand instruction never aliases two operands), index
+    /// `base + 4` routes acc traffic (`sta scratch; mov high, scratch` for
+    /// stores, `mov scratch, high; lda scratch` for loads, likewise for
+    /// phi-copy emission in layout). `sta`/`lda` are `op_v_8`-only in the
+    /// vendored ISA, so high registers are reachable only via `mov` (the
+    /// sole auto-widening mnemonic, op_v1_16_v2_16). Never assigned to a
+    /// value.
+    pub low_scratch_base: Option<u16>,
 }
+
+/// Number of low scratch registers reserved in high-register mode for
+/// routing register OPERANDS of one instruction: the maximum simultaneous
+/// register operands of any instruction isel emits is 4
+/// (`definegettersetterbyvalue`, `callthis3`).
+pub const LOW_OPERAND_SCRATCHES: u16 = 4;
+/// Total size of the reserved low scratch block: the operand scratches plus
+/// one acc-routing scratch at index [`LOW_OPERAND_SCRATCHES`]. The acc
+/// scratch must be distinct from the operand scratches: operand registers
+/// stay live in their scratches across the acc operand's `lda`.
+pub const LOW_SCRATCH_COUNT: u16 = LOW_OPERAND_SCRATCHES + 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RegAllocError {
     #[error("function requires more than 65535 registers")]
     RegisterOverflow,
+    #[error(
+        "range-call argument window needs a start register <= 255 (u8 in every vendored \
+         callrange form, narrow and wide), but the parameter/scratch area already extends past it"
+    )]
+    WindowBaseOverflow,
 }
 
 /// Where a value lives after allocation.
@@ -91,8 +136,63 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
             num_regs: 0,
             copy_temp: None,
             spill_slot: None,
+            call_window_base: None,
+            low_scratch_base: None,
         });
     }
+
+    // Range-call argument window + low scratch block reservation (S2/N4).
+    //
+    // The vendored range-call forms encode only a u8 START register and read
+    // argc consecutive slots, and `sta`/`lda` are op_v_8-only, so:
+    //
+    // 1. `window` = the largest range-call argc in the function. When > 0, a
+    //    consecutive window of that many slots is reserved right after the
+    //    parameter homes (plus the scratch block in high-register mode) and
+    //    coloring never assigns it; isel copies each call's args into it in
+    //    call order (auto-widening `mov`, encodable for any slot). The
+    //    window start must be ≤ 255 even for the wide forms.
+    // 2. High-register mode: when even the most compact packing (values +
+    //    params + window + the two top reservations) cannot keep every slot
+    //    ≤ 255, some value may be colored to a register ≥ 256, which
+    //    `sta`/`lda` cannot encode. LOW_SCRATCH_COUNT low scratch registers
+    //    are then reserved between the parameter homes and the window, and
+    //    isel/layout route all high-register acc traffic through them.
+    //    Coloring skips the reserved slots, so the reservation is honest:
+    //    the scratches are never live across any instruction.
+    //
+    // Both reservations are computed BEFORE liveness/interference: the
+    // overflow checks are cheap hard errors even for pathological inputs
+    // (e.g. a > u16::MAX-arg call would otherwise build a quadratic
+    // interference graph before failing).
+    let window = range_call_window_size(module, &rpo) as u64;
+    let param_count = func.param_count as u64;
+    let n_values = all_values.len() as u64;
+    // Low mode must also fit the copy_temp/spill_slot top reservations (+ 2).
+    let low_mode_fits = param_count + window + n_values + 2 <= 256;
+    let low_scratches = if low_mode_fits {
+        0
+    } else {
+        LOW_SCRATCH_COUNT as u64
+    };
+    let window_base = param_count + low_scratches;
+    if window > 0 {
+        if window_base > 255 {
+            return Err(RegAllocError::WindowBaseOverflow);
+        }
+        if window_base + window > u16::MAX as u64 {
+            // The frame cannot hold the window (this also rejects
+            // argc > u16::MAX, which no vendored form can encode).
+            return Err(RegAllocError::RegisterOverflow);
+        }
+    }
+    if low_scratches > 0 && param_count + low_scratches > 256 {
+        // The scratch block itself would not be low-addressable.
+        return Err(RegAllocError::RegisterOverflow);
+    }
+    let reserved_start = param_count as u16;
+    let reserved_len = (low_scratches + window) as u16;
+
     // Step 1: Exact backward dataflow liveness (exception edges included).
     let (live_in, live_out) = compute_liveness(module, func_id, &rpo);
 
@@ -115,15 +215,23 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     // Step 3: Compute accumulator preference scores.
     let acc_score = compute_acc_scores(module, &rpo);
 
-    // Step 4: MCS ordering + greedy coloring.
-    let (allocation, mut num_regs) = mcs_color(
+    // Step 4: MCS ordering + greedy coloring. The reserved parameter homes
+    // are pre-assigned; the reserved window/scratch range is skipped by the
+    // smallest-slot scan.
+    let (allocation, colored_regs) = mcs_color(
         &all_values,
         &interference,
         &acc_score,
         func.param_count,
         &func.param_values,
         &handler_live_in,
+        reserved_start,
+        reserved_len,
     )?;
+
+    // The frame must cover the reserved window/scratch range even when
+    // coloring stayed below it.
+    let mut num_regs = colored_regs.max(reserved_start + reserved_len);
 
     // Step 5: Boissinot SSA destruction — collect the per-edge value-level
     // copy sets. Slot-level resolution happens at the emission point in
@@ -149,7 +257,12 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     // order is deterministic: `copy_temp` (step 6) first, then `spill_slot`,
     // each taking the current `num_regs` and incrementing it. Both registers
     // are therefore distinct, in-frame, and disjoint from every colored slot.
-    let spill_slot = if allocation.values().any(|&slot| slot == RegSlot::Acc) {
+    //
+    // High-register mode skips this reservation: a top-of-frame slot would
+    // be ≥ 256 and unencodable for the op_v_8-only `sta`, and isel routes
+    // acc spills through the low scratch block (`low_scratch_base`) instead.
+    let spill_slot = if low_scratches == 0 && allocation.values().any(|&slot| slot == RegSlot::Acc)
+    {
         let spill = num_regs;
         if spill >= TEMP_REG_BASE {
             return Err(RegAllocError::RegisterOverflow);
@@ -166,7 +279,43 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
         num_regs,
         copy_temp,
         spill_slot,
+        call_window_base: if window > 0 {
+            Some(window_base as u16)
+        } else {
+            None
+        },
+        low_scratch_base: if low_scratches > 0 {
+            Some(param_count as u16)
+        } else {
+            None
+        },
     })
+}
+
+/// Largest argument count among the function's range-form calls — the arms
+/// where isel encodes a start register and the VM reads argc consecutive
+/// slots: `Call` with > 3 args, `CallThis` with > 4 args (args[0] is `this`),
+/// and the always-range `SuperCall`/`SuperCallArrow`. Fixed-arity forms and
+/// spread/apply calls pass individual register operands and need no window.
+fn range_call_window_size(module: &Module, rpo: &[Block]) -> usize {
+    use crate::inst::CallKind;
+    let mut window = 0usize;
+    for &bb in rpo {
+        for &inst_id in &module.block(bb).insts {
+            if let InstData::Call { kind, args, .. } = &module.inst(inst_id).data {
+                let range_argc = match kind {
+                    CallKind::Call if args.len() > 3 => Some(args.len()),
+                    CallKind::CallThis if args.len() > 4 => Some(args.len()),
+                    CallKind::SuperCall | CallKind::SuperCallArrow => Some(args.len()),
+                    _ => None,
+                };
+                if let Some(argc) = range_argc {
+                    window = window.max(argc);
+                }
+            }
+        }
+    }
+    window
 }
 
 // ─── Step 1: Exact backward dataflow liveness ────────────────────────────────
@@ -452,6 +601,13 @@ fn compute_acc_scores(module: &Module, rpo: &[Block]) -> HashMap<Value, i32> {
 ///
 /// `acc_forbidden` values (live into a catch handler) are never colored
 /// Acc: exception dispatch physically clobbers the accumulator.
+///
+/// `reserved_start .. reserved_start + reserved_len` is the reserved
+/// low-slot range (low scratch block + range-call argument window, starting
+/// right after the parameter homes): the smallest-slot scan never hands
+/// those slots to a value, so isel can use them as dead scratch at any
+/// emission point.
+#[allow(clippy::too_many_arguments)]
 fn mcs_color(
     all_values: &[Value],
     interference: &InterferenceGraph,
@@ -459,6 +615,8 @@ fn mcs_color(
     param_count: u16,
     params: &[Value],
     acc_forbidden: &HashSet<Value>,
+    reserved_start: u16,
+    reserved_len: u16,
 ) -> Result<(HashMap<Value, RegSlot>, u16), RegAllocError> {
     let n = all_values.len();
     let val_set: HashSet<Value> = all_values.iter().copied().collect();
@@ -532,9 +690,17 @@ fn mcs_color(
         if score > 0 && !acc_forbidden.contains(&v) && !used_colors.contains(&RegSlot::Acc) {
             allocation.insert(v, RegSlot::Acc);
         } else {
-            // Find smallest available register.
+            // Find smallest available register, skipping the reserved
+            // scratch/window range: those slots must stay dead for isel.
             let mut reg = 0u16;
-            while used_colors.contains(&RegSlot::Reg(reg)) {
+            loop {
+                if reg >= reserved_start && reg < reserved_start + reserved_len {
+                    reg = reserved_start + reserved_len;
+                    continue;
+                }
+                if !used_colors.contains(&RegSlot::Reg(reg)) {
+                    break;
+                }
                 if reg == u16::MAX {
                     return Err(RegAllocError::RegisterOverflow);
                 }

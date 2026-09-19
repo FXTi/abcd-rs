@@ -82,6 +82,8 @@ fn acc_spill_before_ensure_acc_captures_object_not_key() {
         num_regs: 3,
         copy_temp: None,
         spill_slot: Some(RegSlot::Reg(2)),
+        call_window_base: None,
+        low_scratch_base: None,
     };
 
     let rpo = regalloc::compute_rpo(&module, func);

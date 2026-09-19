@@ -59,6 +59,31 @@ pub enum LowerError {
         kind: EntityKind,
         raw: u32,
     },
+    #[error(
+        "function {0:?} routes a high (>= 256) register through the accumulator but register \
+         allocation reserved no low (<= 255) scratch block; sta/lda are op_v_8-only"
+    )]
+    MissingLowScratch(FuncId),
+    #[error(
+        "function {0:?} has an instruction with more register operands than the reserved low \
+         scratch block holds"
+    )]
+    LowScratchExhausted(FuncId),
+    #[error(
+        "function {0:?} contains a range-form call but register allocation reserved no \
+         consecutive argument window"
+    )]
+    MissingCallWindow(FuncId),
+    #[error(
+        "range-call argument window in function {0:?} would start above register 255; the \
+         vendored start-register operand is u8 in every callrange form (narrow and wide)"
+    )]
+    CallWindowOverflow(FuncId),
+    #[error(
+        "range-form call in function {func:?} has {argc} arguments, exceeding the u16 argc \
+         encoding limit of the wide callrange forms"
+    )]
+    CallArgcOverflow { func: FuncId, argc: usize },
 }
 
 /// Lower a single IR function back to bytecodes.
@@ -72,8 +97,10 @@ pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, 
     let string_map = build_string_map(module);
 
     // Step 1: Register allocation.
-    let alloc =
-        regalloc::allocate(module, func_id).map_err(|_| LowerError::RegisterOverflow(func_id))?;
+    let alloc = regalloc::allocate(module, func_id).map_err(|e| match e {
+        regalloc::RegAllocError::RegisterOverflow => LowerError::RegisterOverflow(func_id),
+        regalloc::RegAllocError::WindowBaseOverflow => LowerError::CallWindowOverflow(func_id),
+    })?;
 
     // Step 2: Compute RPO (reuse from regalloc).
     let rpo = regalloc::compute_rpo(module, func_id);

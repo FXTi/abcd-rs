@@ -176,6 +176,8 @@ fn fusion_rejected_when_compare_operand_is_acc_colored() {
         num_regs: 2,
         copy_temp: None,
         spill_slot: Some(RegSlot::Reg(1)),
+        call_window_base: None,
+        low_scratch_base: None,
     };
 
     let (bytecodes, halt) = select_layout_run(&shape, &alloc);
@@ -223,6 +225,8 @@ fn fusion_rejected_when_intervening_instruction_reuses_operand_slot() {
         num_regs: 5,
         copy_temp: None,
         spill_slot: Some(RegSlot::Reg(4)),
+        call_window_base: None,
+        low_scratch_base: None,
     };
 
     let (bytecodes, halt) = select_layout_run(&shape, &alloc);
@@ -260,6 +264,8 @@ fn fusion_rejected_when_compare_result_reuses_operand_slot() {
         num_regs: 4,
         copy_temp: None,
         spill_slot: Some(RegSlot::Reg(3)),
+        call_window_base: None,
+        low_scratch_base: None,
     };
 
     let (bytecodes, halt) = select_layout_run(&shape, &alloc);
@@ -297,6 +303,8 @@ fn fusion_still_fires_when_adjacent_and_reg_colored() {
         num_regs: 3,
         copy_temp: None,
         spill_slot: Some(RegSlot::Reg(2)),
+        call_window_base: None,
+        low_scratch_base: None,
     };
 
     let (bytecodes, halt) = select_layout_run(&shape, &alloc);

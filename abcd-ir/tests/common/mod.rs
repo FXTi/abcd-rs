@@ -28,6 +28,16 @@ pub enum Halt {
     /// (the source object) — vendor `copydataproperties v:in:top,
     /// acc: inout:top`.
     CopyDataProperties { dst: i64, src: i64 },
+    /// `Callrange` (record-and-inspect): vendor `callrange imm1:u8, imm2:u8,
+    /// v:in:top` (isa.yaml ~:1082) — imm1 is the IC slot (ignored), imm2 the
+    /// argument count, v the START of the consecutive argument register
+    /// window. `argc`/`start` are the recorded operands; the argument
+    /// values are `regs[start .. start + argc]` at halt time.
+    CallRange { argc: i64, start: u16 },
+    /// `WideCallrange` (record-and-inspect): vendor `wide.callrange imm:u16,
+    /// v:in:top` (isa.yaml ~:1087) — imm is the u16 argument count, v the
+    /// u8 window start; NO IC slot operand on the wide form.
+    WideCallRange { argc: i64, start: u16 },
 }
 
 /// A tiny register machine: `HashMap<u16, i64>` registers plus one
@@ -157,6 +167,22 @@ impl Machine {
                     return Halt::CopyDataProperties {
                         dst: self.reg(dst_r.0),
                         src: self.acc,
+                    };
+                }
+                // `callrange imm1:u8, imm2:u8, v:in:top` — record imm2 (argc)
+                // and v (window start); the IC slot imm1 is ignored.
+                Bytecode::Callrange(_, argc, start) => {
+                    return Halt::CallRange {
+                        argc: argc.0,
+                        start: start.0,
+                    };
+                }
+                // `wide.callrange imm:u16, v:in:top` — u16 argc, u8 start,
+                // no IC slot.
+                Bytecode::WideCallrange(argc, start) => {
+                    return Halt::WideCallRange {
+                        argc: argc.0,
+                        start: start.0,
                     };
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),

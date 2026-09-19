@@ -26,6 +26,11 @@ pub enum CopyResolveError {
     /// reserved temporary itself participates in the copy set).
     #[error("slot-level copy cycle requires a reserved temporary slot")]
     CycleNeedsTemp,
+    /// A copy between the accumulator and a register ≥ 256 needs the
+    /// reserved low acc-routing scratch (sta/lda are op_v_8-only), but
+    /// register allocation reserved none.
+    #[error("accumulator copy to/from a high (>= 256) register requires a reserved low scratch")]
+    HighRegNeedsScratch,
 }
 
 /// Sequentialize a parallel copy set in slot space.
@@ -93,15 +98,43 @@ pub fn resolve_slot_copies(
     Ok(result)
 }
 
-/// Emit one resolved slot-level copy as a bytecode.
-/// Returns `None` for `Acc → Acc` (no machine operation needed).
-pub fn emit_copy(src: RegSlot, dst: RegSlot) -> Option<Bytecode> {
-    match (src, dst) {
-        (RegSlot::Reg(s), RegSlot::Reg(d)) => Some(Bytecode::Mov(Reg(d), Reg(s))),
-        (RegSlot::Acc, RegSlot::Reg(d)) => Some(Bytecode::Sta(Reg(d))),
-        (RegSlot::Reg(s), RegSlot::Acc) => Some(Bytecode::Lda(Reg(s))),
-        (RegSlot::Acc, RegSlot::Acc) => None,
-    }
+/// Emit one resolved slot-level copy as bytecodes (0 for a same-slot no-op,
+/// 1 normally, 2 when acc traffic to/from a high register detours through
+/// the low acc scratch).
+///
+/// `acc_scratch` is the reserved low (≤ 255) acc-routing scratch register
+/// (`RegAlloc::low_scratch_base` + the acc index) and is consulted only when
+/// an Acc↔Reg copy involves a register ≥ 256: `sta`/`lda` are op_v_8-only,
+/// so such a copy is `sta scratch; mov high, scratch` (store) or
+/// `mov scratch, high; lda scratch` (load). Reg→Reg copies use the
+/// auto-widening `mov` and need no scratch at any height. A routed copy
+/// fully completes before the next one starts, so one scratch suffices for
+/// the whole sequentialized set.
+pub fn emit_copy(
+    src: RegSlot,
+    dst: RegSlot,
+    acc_scratch: Option<u16>,
+) -> Result<Vec<Bytecode>, CopyResolveError> {
+    Ok(match (src, dst) {
+        (RegSlot::Reg(s), RegSlot::Reg(d)) => vec![Bytecode::Mov(Reg(d), Reg(s))],
+        (RegSlot::Acc, RegSlot::Reg(d)) if d <= 255 => vec![Bytecode::Sta(Reg(d))],
+        (RegSlot::Acc, RegSlot::Reg(d)) => {
+            let scratch = acc_scratch.ok_or(CopyResolveError::HighRegNeedsScratch)?;
+            vec![
+                Bytecode::Sta(Reg(scratch)),
+                Bytecode::Mov(Reg(d), Reg(scratch)),
+            ]
+        }
+        (RegSlot::Reg(s), RegSlot::Acc) if s <= 255 => vec![Bytecode::Lda(Reg(s))],
+        (RegSlot::Reg(s), RegSlot::Acc) => {
+            let scratch = acc_scratch.ok_or(CopyResolveError::HighRegNeedsScratch)?;
+            vec![
+                Bytecode::Mov(Reg(scratch), Reg(s)),
+                Bytecode::Lda(Reg(scratch)),
+            ]
+        }
+        (RegSlot::Acc, RegSlot::Acc) => vec![],
+    })
 }
 
 #[cfg(test)]
@@ -208,17 +241,49 @@ mod tests {
     fn emit_copy_maps_slot_pairs_to_bytecodes() {
         // `Bytecode` does not implement PartialEq; match structurally.
         assert!(matches!(
-            emit_copy(r(1), r(2)),
-            Some(Bytecode::Mov(Reg(2), Reg(1)))
+            emit_copy(r(1), r(2), None).as_deref(),
+            Ok([Bytecode::Mov(Reg(2), Reg(1))])
         ));
         assert!(matches!(
-            emit_copy(RegSlot::Acc, r(2)),
-            Some(Bytecode::Sta(Reg(2)))
+            emit_copy(RegSlot::Acc, r(2), None).as_deref(),
+            Ok([Bytecode::Sta(Reg(2))])
         ));
         assert!(matches!(
-            emit_copy(r(1), RegSlot::Acc),
-            Some(Bytecode::Lda(Reg(1)))
+            emit_copy(r(1), RegSlot::Acc, None).as_deref(),
+            Ok([Bytecode::Lda(Reg(1))])
         ));
-        assert!(emit_copy(RegSlot::Acc, RegSlot::Acc).is_none());
+        assert!(matches!(
+            emit_copy(RegSlot::Acc, RegSlot::Acc, None).as_deref(),
+            Ok([])
+        ));
+    }
+
+    #[test]
+    fn emit_copy_routes_high_registers_through_the_low_acc_scratch() {
+        // Acc → R300: sta scratch; mov r300, scratch.
+        assert!(matches!(
+            emit_copy(RegSlot::Acc, r(300), Some(7)).as_deref(),
+            Ok([Bytecode::Sta(Reg(7)), Bytecode::Mov(Reg(300), Reg(7))])
+        ));
+        // R300 → Acc: mov scratch, r300; lda scratch.
+        assert!(matches!(
+            emit_copy(r(300), RegSlot::Acc, Some(7)).as_deref(),
+            Ok([Bytecode::Mov(Reg(7), Reg(300)), Bytecode::Lda(Reg(7))])
+        ));
+        // Without a reserved scratch these are hard errors, not truncated
+        // sta/lda operands. (`Bytecode` has no PartialEq; match structurally.)
+        assert!(matches!(
+            emit_copy(RegSlot::Acc, r(300), None),
+            Err(CopyResolveError::HighRegNeedsScratch)
+        ));
+        assert!(matches!(
+            emit_copy(r(300), RegSlot::Acc, None),
+            Err(CopyResolveError::HighRegNeedsScratch)
+        ));
+        // Reg→Reg at any height is the auto-widening mov — no scratch.
+        assert!(matches!(
+            emit_copy(r(300), r(600), None).as_deref(),
+            Ok([Bytecode::Mov(Reg(600), Reg(300))])
+        ));
     }
 }

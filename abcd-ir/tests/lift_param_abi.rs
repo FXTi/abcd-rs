@@ -232,6 +232,8 @@ fn acc_colored_param_is_a_hard_lower_error() {
         num_regs: 1,
         copy_temp: None,
         spill_slot: Some(RegSlot::Reg(1)),
+        call_window_base: None,
+        low_scratch_base: None,
     };
     let rpo = regalloc::compute_rpo(&module, func);
     let string_map: HashMap<StringId, EntityId> = HashMap::new();

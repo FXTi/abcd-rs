@@ -70,10 +70,23 @@ pub fn layout(
             .collect();
         let resolved = resolve_slot_copies(&slot_pairs, alloc.copy_temp)
             .map_err(|_| LowerError::MissingCopyTemp(func_id))?;
-        let codes: Vec<Bytecode> = resolved
-            .into_iter()
-            .filter_map(|(s, d)| emit_copy(s, d))
-            .collect();
+        // Acc↔Reg copies involving a register ≥ 256 detour through the
+        // reserved low acc scratch (sta/lda are op_v_8-only; S2).
+        let acc_scratch = alloc
+            .low_scratch_base
+            .map(|base| base + super::regalloc::LOW_OPERAND_SCRATCHES);
+        let mut codes: Vec<Bytecode> = Vec::new();
+        for (s, d) in resolved {
+            let emitted = emit_copy(s, d, acc_scratch).map_err(|e| match e {
+                super::copy_resolve::CopyResolveError::CycleNeedsTemp => {
+                    LowerError::MissingCopyTemp(func_id)
+                }
+                super::copy_resolve::CopyResolveError::HighRegNeedsScratch => {
+                    LowerError::MissingLowScratch(func_id)
+                }
+            })?;
+            codes.extend(emitted);
+        }
         if !codes.is_empty() {
             edge_codes.insert(edge, codes);
         }
