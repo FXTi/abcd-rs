@@ -1590,7 +1590,13 @@ pub(super) fn translate_bytecode(
         Bytecode::CallruntimeNotifyconcurrentresult | Bytecode::CallruntimeTopropertykey => {
             // acc stays unchanged or is a pass-through
         }
-        Bytecode::CallruntimeDefinefieldbyvalue(_ic, obj_reg, key_reg) => {
+        Bytecode::CallruntimeDefinefieldbyvalue(_ic, key_reg, obj_reg) => {
+            // Vendor `callruntime.definefieldbyvalue imm:u8, v1:in:top,
+            // v2:in:top, acc: in:top` (isa.yaml:826-831): the FIRST
+            // register operand is the propKey, the SECOND is the obj, the
+            // acc carries the value — `DefineField(glue, obj, propKey,
+            // acc)` (interpreter_stub.cpp:6031-6043, `v0 = ReadInst8_2`
+            // → propKey, `v1 = ReadInst8_3` → obj).
             let value = read_acc(ssa, block, module);
             let obj = read_reg(ssa, *obj_reg, block, module);
             let key = read_reg(ssa, *key_reg, block, module);
