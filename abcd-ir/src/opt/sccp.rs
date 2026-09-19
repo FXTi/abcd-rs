@@ -448,7 +448,17 @@ fn add_cfg_edges(
                 }
             }
         }
-        _ => return, // non-terminator: no edges
+        // Non-branch terminators (Return/Unreachable): no CFG successors,
+        // but the block may still be try-protected — FALL THROUGH to the
+        // exception-edge append below (N47: an early `return` here skipped
+        // the handler edge, so SCCP never reached the catch handler of a
+        // protected block ending in Return/Unreachable — including the
+        // corpus Throw+Unreachable shape — leaving foldable handler code
+        // untouched).
+        _ if module.inst(inst_id).data.is_terminator() => {}
+        // Non-terminator: no edges (the exception edge is added once, at
+        // the block's terminator — enough for reachability).
+        _ => return,
     }
     // Exception edges: handlers of the try regions protecting this
     // block (the exception half of `analysis::augmented_succs`; the

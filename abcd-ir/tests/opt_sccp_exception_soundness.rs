@@ -201,6 +201,113 @@ fn sccp_forces_handler_block_phis_to_bottom() {
     );
 }
 
+/// N47 fixture: a NON-ENTRY try-protected block whose terminator is not
+/// a branch (Return here; the Throw+Unreachable corpus shape below), with
+/// a catch handler feeding a downstream merge:
+///
+/// ```text
+/// entry -> t (try body, ends in `Return`)     [t is protected]
+///          t ~~> h (catch-all handler, exception edge)
+/// h: x = 1.0; y = 2.0; z = x + y; -> join -> Return
+/// ```
+///
+/// `add_cfg_edges` used to `return` early for any terminator that is not
+/// Branch/CondBranch, so the exception edge `t ~~> h` was never pushed
+/// and SCCP never reached `h`: the foldable `z = 1.0 + 2.0` stayed
+/// unfolded (missed optimization, and a reachability hole in the lattice
+/// traversal). The handler MUST be reached and `z` MUST fold to 3.0.
+/// (Handler phis stay Bottom per N38(ii), but plain instructions whose
+/// operands are defined inside the handler fold normally.)
+fn build_non_branch_terminated_try_module(
+    terminator: &str,
+) -> (Module, FuncId, abcd_ir::entity::Inst) {
+    let mut module = Module::new(Version::new(12, 0, 6, 0), FileType::Dynamic);
+    let func = IRBuilder::create_function(&mut module, "f", FunctionKind::Function, 0);
+    let entry = module.func(func).entry_block;
+
+    let t;
+    let h;
+    let binop_inst;
+    {
+        let mut builder = IRBuilder::new(&mut module, func);
+        t = builder.create_block();
+        h = builder.create_block();
+        let join = builder.create_block();
+
+        builder.add_predecessor(t, entry);
+        builder.add_predecessor(h, t);
+        builder.add_predecessor(join, h);
+
+        builder.emit_void(InstData::Branch { dest: t });
+
+        builder.set_insert_block(t);
+        match terminator {
+            "return" => builder.emit_void(InstData::Return { value: None }),
+            "throw" => {
+                let v = builder.emit_val(InstData::LiteralNumber(9.0), IrType::default());
+                builder.emit_void(InstData::Throw { value: v });
+                // Lift emits an explicit Unreachable after a block-ending
+                // Throw (bytecode-level terminator, IR-level regular inst).
+                builder.emit_void(InstData::Unreachable);
+            }
+            other => panic!("unknown terminator shape {other}"),
+        }
+
+        builder.set_insert_block(h);
+        let x = builder.emit_val(InstData::LiteralNumber(1.0), IrType::default());
+        let y = builder.emit_val(InstData::LiteralNumber(2.0), IrType::default());
+        let (inst, _result) = builder.emit(
+            InstData::BinaryOp {
+                op: BinOp::Add,
+                left: x,
+                right: y,
+            },
+            IrType::default(),
+        );
+        binop_inst = inst;
+        builder.emit_void(InstData::Branch { dest: join });
+
+        builder.set_insert_block(join);
+        builder.emit_void(InstData::Return { value: None });
+    }
+    module.func_mut(func).try_regions.push(TryRegion {
+        try_blocks: vec![t],
+        catches: vec![CatchHandler {
+            type_idx: u32::MAX,
+            handler_block: h,
+        }],
+    });
+    (module, func, binop_inst)
+}
+
+/// N47 red pin: SCCP must reach the catch handler of a try-protected
+/// block even when that block's terminator is Return or
+/// Throw+Unreachable — the exception-edge append must run for EVERY
+/// terminator, not just Branch/CondBranch.
+#[test]
+fn sccp_reaches_handler_of_non_branch_terminated_try_block() {
+    for shape in ["return", "throw"] {
+        let (mut module, func, binop_inst) = build_non_branch_terminated_try_module(shape);
+        assert!(
+            verify_module(&module).is_empty(),
+            "{shape}: fixture must verify pre-opt: {:?}",
+            verify_module(&module)
+        );
+
+        Sccp.run(&mut module, func);
+
+        assert!(
+            matches!(
+                &module.inst(binop_inst).data,
+                InstData::LiteralNumber(n) if *n == 3.0
+            ),
+            "{shape}: handler never reached — foldable binop survived \
+             (N47 exception-edge fallthrough missing): {:?}",
+            module.inst(binop_inst).data
+        );
+    }
+}
+
 /// N38(iii) fixture helper: `f() { return <lhs> OP <rhs> }` with both
 /// operands literal instructions, run through Sccp, return the binop's
 /// resulting data.
