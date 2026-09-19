@@ -140,12 +140,22 @@ P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle
 
 | 3.19 | N27 优化器空 phi 修复 | worker P3-T18 (k3) | **完成**（76cb828；双根因：SCCP 折枝留陈旧 phi 条目（N23 关闭）+ merge 重键造空 phi；修复=条目随 pred 删除 + 单前驱 phi 替换而非重键 + verify 结构兜底（可达零前驱 phi 报错，N18 死块豁免）；orchestrator 复验：红色 3/3 远端复现、lift 1026 不变、opt 894→900 精确 +6 零回归。新登记 N28 copyprop "ADCE 会清理"假设的残余风险） **新基线：lift 1026 / opt 900（80.4%）** |
 | 3.20 | 诊断（只读）：opt-only 失败族 | worker P3-T19 (k3) | **进行中** |
-| 3.21 | 诊断（只读）：双变体共挂族 | worker P3-T20 (k3) | **进行中** |
+| 3.21 | 诊断（只读）：双变体共挂族 | worker P3-T20 (k3) | **完成**（五根因全部 file:line+反汇编+VM 签名三重钉死；orchestrator 抽查 N35/N33/N33 静态证实；登记 N29-N35；预期上限 lift 1119 / opt ~993） |
 - **N25（P2，P3-T16 登记）**：ThrowConstAssignment 同属 N12 类双重损坏——vendor `throw.constassignment v:in:top`（isa.yaml:987-991，acc:none）的寄存器操作数承载变量名字符串值，lift（translate.rs:1516-1528）捏造合成名 `const_assign_N` 并丢弃寄存器操作数，isel（isel.rs:1211-1214）硬编码 `Reg(0)` 占位。
 - **N26（P2，P3-T16 登记）**：ThrowUndefinedIfHole 双寄存器形态 opcode 身份损坏——vendor `throw.undefinedifhole v1:in:top, v2:in:top`（isa.yaml:998-1002，acc:none；v1=name，v2=value），lift 捏造合成名 `hole_check_N`，isel 一律重发为**另一条 opcode** `throw.undefinedifholewithname`（0x09，string_id + acc 形态）——往返把寄存器形态换成 acc 形态（N14 getresumemode 同类）。
 - V4 更正：optional-chain 的 SIGSEGV 数据已过时（S2/S6 时代已愈）；现行失败 = 空跳转 phi 输入丢失（dce.rs:303-318 按前驱去重模型无法表达两条汇聚边的不同值——MEMORY.md 已知风险的具体语料实例）+ N14。
 - B4 从"潜伏"升级为**实锤**：class-accessors lift 18 例的 acc 覆盖链完整钉出（lda.str "value" → ldundefined 覆盖 → definegettersetterbyvalue 拿到 false；prototype 覆盖 → stglobalvar B = prototype → 'Object is not callable'）。
 - 修复顺序（性价比）：N10 → Construct → N11 → 空跳转 phi 守卫 → N14 → N12+N13 → B4（大）。
+
+P3-T20 新登记（2026-09-20）：
+
+- N29（P0）：`callruntime.definefieldbyvalue` lift 操作数交换（v1=key/v2=obj 被绑反）——一行修，解锁 tagged-template×18 并解除 template 阻塞。
+- N30（P1）：`gettemplateobject` 被建模成 LoadProperty(obj, 0)——template×18 的最终阻塞；tagged-template 的 .raw/缓存语义也有潜伏错误。
+- N31（P1）：`starrayspread` 塌缩成单条 StoreProperty 且丢 acc-out——call-shapes×18。
+- N32（P1）：isel StoreProperty::ByValue 与 lift Stobjbyvalue/Stthisbyvalue 携带一致的 acc↔v2 置换——双置换今日字节透明，但是地雷（N31 已踩爆）；opt 会看到交换后的 key/value。
+- N33（P0）：`getnextpropname` → GetPropIterator 塌缩（注释自认）→ 迭代器套娃 → 堆爆炸 GC abort——for-in×18，最坏的失败形态。
+- N34（P2）：私有属性指令族整体未建模（create 丢弃；ld/st/define/testin 塌缩成 ByIndex(0)）——private-field×3。
+- N35（P0）：IR 无 LiteralBigInt（ldbigint→LiteralString）——bigint×18。
 
 ## 审计纪律
 
