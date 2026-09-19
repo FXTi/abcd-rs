@@ -116,11 +116,13 @@ fn try_fold_comparison(op: BinOp, module: &Module, left: Value, right: Value) ->
         }
         BinOp::StrictEq => {
             // StrictEq requires same type — only fold when both are numbers or both are bools.
+            // N40: JS strict equality on numbers is plain ==, NOT a bit
+            // comparison: `0 === -0` is true and `NaN === NaN` is false.
             if let (Some(a), Some(b)) = (
                 as_number_strict(module, left),
                 as_number_strict(module, right),
             ) {
-                return Some(InstData::LiteralBool(a.to_bits() == b.to_bits()));
+                return Some(InstData::LiteralBool(a == b));
             }
             if let (Some(a), Some(b)) =
                 (as_bool_strict(module, left), as_bool_strict(module, right))
@@ -134,7 +136,7 @@ fn try_fold_comparison(op: BinOp, module: &Module, left: Value, right: Value) ->
                 as_number_strict(module, left),
                 as_number_strict(module, right),
             ) {
-                return Some(InstData::LiteralBool(a.to_bits() != b.to_bits()));
+                return Some(InstData::LiteralBool(a != b));
             }
             if let (Some(a), Some(b)) =
                 (as_bool_strict(module, left), as_bool_strict(module, right))

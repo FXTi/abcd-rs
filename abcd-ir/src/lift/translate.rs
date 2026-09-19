@@ -138,7 +138,12 @@ pub(super) fn translate_bytecode(
 
         // ── Unary operations (acc = OP acc, IC slot discarded) ───────
         Bytecode::Neg(_ic) => unary_op(UnOp::Minus, block, loc, module, ssa),
-        Bytecode::Not(_ic) => unary_op(UnOp::LogicalNot, block, loc, module, ssa),
+        // N39: vendored `not` is BITWISE ~acc, not logical negation
+        // (interpreter_assembly.cpp:767-790 — both fast paths
+        // `SET_ACC(JSTaggedValue(~number))`). There is no logical-not
+        // opcode in this ISA; JS `!x` compiles to isfalse-family
+        // bytecodes. isel keeps mapping both UnOp arms to Bytecode::Not.
+        Bytecode::Not(_ic) => unary_op(UnOp::BitNot, block, loc, module, ssa),
         Bytecode::Inc(_ic) => unary_op(UnOp::Inc, block, loc, module, ssa),
         Bytecode::Dec(_ic) => unary_op(UnOp::Dec, block, loc, module, ssa),
         Bytecode::Typeof(_ic) => unary_op(UnOp::TypeOf, block, loc, module, ssa),
@@ -1885,12 +1890,14 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::DeprecatedNot(src) => {
+            // N39: `deprecated.not` is the same BITWISE ~ on the
+            // register operand (interpreter_assembly.cpp:4761-4786).
             let val = read_reg(ssa, *src, block, module);
             let v = emit_val(
                 module,
                 block,
                 InstData::UnaryOp {
-                    op: UnOp::LogicalNot,
+                    op: UnOp::BitNot,
                     operand: val,
                 },
                 loc,
