@@ -775,7 +775,11 @@ fn select_inst(
         }
         InstData::LiteralNumber(n) => {
             let bits = n.to_bits();
-            if *n == (*n as i32) as f64 {
+            // N37: `-0.0 == 0.0` in IEEE, so the plain integer check took
+            // the `ldai 0` path for -0.0 and lost the sign bit (observable:
+            // `1 / -0` is -Infinity, `Object.is(-0, 0)` is false). Exclude
+            // negative zero from the Ldai path.
+            if *n == (*n as i32) as f64 && !(*n == 0.0 && n.is_sign_negative()) {
                 codes.push(Bytecode::Ldai(Imm(*n as i64)));
             } else {
                 codes.push(Bytecode::Fldai(Imm(bits as i64)));
