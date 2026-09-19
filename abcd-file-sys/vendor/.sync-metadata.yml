@@ -88,7 +88,7 @@ files:
   libpandafile/file_format_version.cpp:
     sha256: c36a8688527d8f1b1c9660b200436979018eebf15584915b57f5be5394762776
   libpandafile/file_item_container.cpp:
-    sha256: 56057fa7f602a96aedaca58661380f3df64ae5d95c797c4976df6984d30a9358
+    sha256: e14884a058545a8038b39d5a05ed4579aedde56a6d134ae445fae1fda4feb785
   libpandafile/file_item_container.h:
     sha256: 3440f9dc66856b06250e3867a7bab324080f0373c86dd8c7285f0ddacad87678
   libpandafile/file_items.cpp:
