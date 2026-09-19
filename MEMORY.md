@@ -288,6 +288,22 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   empty-phi bug whose never-written home became visible). B4 was the main
   root of the V1 mega-cluster. NEW BASELINES: lift 1026/1119 (91.7%), opt
   894/1119 (79.9%). N27 (P1, opt domain) is the next task.
+- N27+N23 RESOLVED (76cb828): SCCP branch fold dropped the pred but left
+  stale phi entries (N23 gone live), then merge_single_succ_pred re-keyed a
+  single-pred phi to the entry block manufacturing Phi{entries:[]} with a
+  LIVE result → frame garbage at the call site. Fix: fold drops dead-edge
+  phi entries with the pred; single-pred phis are SUBSTITUTED (not
+  re-keyed); verify.rs gained the reachable-zero-pred-phi structural rule
+  (dead pred-less N18 blocks exempt). opt 894→900 (+6 = N27 fixtures, zero
+  regressions), lift 1026 unchanged. NEW BASELINES: lift 1026/1119 (91.7%),
+  opt 900/1119 (80.4%). Failure composition now: lift 93 (bigint/template/
+  call-shapes/for-in[GC abort]/tagged-template/private-field — lift/lower
+  domain); opt 219 (adds literals/bitwise/numeric-operators/branch-
+  elimination/try-catch families — OPTIMIZER semantic domain, now the
+  biggest lever). N28 registered: copyprop's "ADCE will clean it" only
+  holds for DEAD phi results. Incident note: a buggy ad-hoc python edit
+  script truncated design/agent-roadmap.md (open('w') before NameError);
+  restored from git (61b24f9) — docs edits use the safe edit tool only.
 
 ## Phase 1 outcome (done, 2026-09-19)
 
