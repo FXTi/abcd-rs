@@ -1,5 +1,5 @@
 //! Opt-in corpus test (requires the exported GHCR corpus): for every
-//! manifest row with `runtime.status == "passed"` (1119 fixtures),
+//! manifest row with `runtime.status == "passed"` (1149 fixtures),
 //! decode → lift → verify → lower every function → splice the lowered
 //! bodies into a cloned File → `abcd_file::encode` → write the result to
 //! `$ABCD_LOWERED_DIR/<variant>/<manifest-relative abc path>` for the
@@ -334,7 +334,9 @@ for path in sorted(paths):
     }
 
     if full_run {
-        assert_eq!(fixtures, 1119, "expected 1119 runtime-passed fixtures");
+        // 1119 original runtime-passed fixtures + 30 P4-T6 opcode-coverage
+        // fixtures (private-property-store/-in, 5 versions x 3 profiles).
+        assert_eq!(fixtures, 1149, "expected 1149 runtime-passed fixtures");
     }
     assert!(fixtures > 0, "no fixtures selected");
     eprintln!(

@@ -33,12 +33,18 @@
   `ssh dabai rm -rf` the kept run dir.
 - `exports/corpus` is local and ignored. Read `index.jsonl`; do not infer cases
   by walking directories. Image: `ghcr.io/fxti/arkcompiler-test:latest`.
-- Local export: 2757 fixtures, 1119 runtime `passed`, 1638 `not-applicable`.
+- Local export: 2757 fixtures, 1119 runtime `passed`, 1638 `not-applicable`;
+  +30 P4-T6 opcode-coverage fixtures → 2787 / 1149 (regenerate with
+  `python3 scripts/gen-opcode-fixtures.py`).
   Image ID at export: `sha256:5e7627bdcb78e6ddfc36ea45f6ed0a306928b11ca3adfde7203b82e86c64759f`.
 - `abcd-file/tests/real_module_abc.rs` has opt-in decode and ISA tests.
-  Its ISA test currently compares instruction counts only: this is not a
-  semantic round-trip or VM oracle result. Its JSON substring parsing should
-  be replaced with proper manifest parsing.
+  Since P4-T6 (48cddf4) the manifest is parsed via python3 standard JSON
+  everywhere, and `exported_corpus_instructions_match_upstream_pandasm`
+  compares EVERY method's decoded instruction stream against each
+  fixture's reference.pa (upstream ark_disasm output) per instruction
+  (mnemonic + canonical operands; mapping documented in the test):
+  2787 fixtures / 12996 methods / 2,691,470 instructions, zero
+  mismatches across 6 versions × 3 profiles.
 - `abcd-ir/tests/corpus_entities.rs` selects arithmetic rows through Python's
   standard JSON parser, then compares resolved function names to `row.pandasm`.
   It covers 6 versions × 3 profiles. It checks entity resolution and lifting,
@@ -313,9 +319,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   (byte-transparent round trips hid it), private-property family modeled
   (create/ld/st/define/testin). Oracle: **lift 1119/1119 (100%)**, opt
   993/1119 — zero regressions at every checkpoint (orchestrator
-  independently reproduced the final numbers). stthisbyvalue/
-  stprivateproperty/testin have NO corpus coverage — fixed by inspection
-  against vendored sigs; Phase 4 should add fixtures.
+  independently reproduced the final numbers). P4-T6 then added
+  stprivateproperty/testin corpus fixtures (local/private-property-store,
+  local/private-property-in; 11.0.2.0+ only — 9.0.0.0 es2abc rejects
+  private-field syntax) via scripts/gen-opcode-fixtures.py (sources in
+  scripts/corpus-fixtures/); corpus is now 2787 fixtures / 1149
+  runtime-passed. stthisbyvalue is unemittable by es2abc (es2panda never
+  emits the whole this-by-* family) — registered as N51 in the roadmap.
 - P3-T19 opt diagnosis (accepted; renumbered N36-N41 after a collision
   with P3-T20's N29-N35): the BIG one is N36 — peephole AND SCCP fold
   non-commutative binops with operands swapped (IR convention left=acc,

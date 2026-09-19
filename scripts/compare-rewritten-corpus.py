@@ -90,6 +90,39 @@ def main():
             result = json.loads(process.stdout)
         except json.JSONDecodeError:
             result = {"error": process.stdout, "stderr": process.stderr}
+        if (
+            process.returncode != 0
+            and "select exactly one fixture" in (process.stdout + process.stderr)
+        ):
+            # The image's baked manifest does not know this case (locally
+            # generated fixture, e.g. scripts/gen-opcode-fixtures.py).
+            # Fall back to running the candidate in the VM and comparing
+            # stdout/exit/timeout against the manifest's recorded runtime
+            # expectation — the same oracle semantics as `compare`.
+            expected = row["runtime"]
+            try:
+                run = subprocess.run(
+                    ["docker", "run", "--rm", "--platform", "linux/amd64",
+                     "--network", "none", "--label", label,
+                     "-v", f"{candidates}:/work:ro", args.image,
+                     "run", f"/work/{relative}"],
+                    capture_output=True, text=True, timeout=120)
+            except subprocess.TimeoutExpired:
+                return {"abc": row["abc"], "passed": False,
+                        "oracle": {"error": "client-side timeout", "timeout": True}}
+            try:
+                result = json.loads(run.stdout)
+            except json.JSONDecodeError:
+                result = {"error": run.stdout, "stderr": run.stderr}
+                return {"abc": row["abc"], "passed": False, "oracle": result}
+            result["expectation"] = "manifest runtime record (case not baked into the image)"
+            passed = (
+                run.returncode == 0
+                and result.get("exit_code") == expected["exit_code"]
+                and result.get("stdout") == expected["stdout"]
+                and result.get("timeout") is False
+            )
+            return {"abc": row["abc"], "passed": passed, "oracle": result}
         passed = process.returncode == 0 and result.get("matches") is True
         return {"abc": row["abc"], "passed": passed, "oracle": result}
 

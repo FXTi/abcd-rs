@@ -61,5 +61,7 @@ fn exported_corpus_lifts_every_fixture() {
         });
         fixtures += 1;
     }
-    assert_eq!(fixtures, 2757);
+    // 2757 exported fixtures + 30 P4-T6 opcode-coverage fixtures
+    // (private-property-store/-in).
+    assert_eq!(fixtures, 2787);
 }
