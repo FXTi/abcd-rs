@@ -139,8 +139,9 @@ P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle
 - **N27（P1，P3-T17 登记）**：优化器（SCCP/trivial-phi 类）留下 entries 为空的 phi，其宿主槽位从无写入 → 调用读到帧垃圾——N23 当时"无活失败"，现在有 6 例活失败（test-namespace/optimized opt 变体，B4 重排槽位后从 wrong-benign 变 wrong-fatal）。属 opt 域，下一棒。
 
 | 3.19 | N27 优化器空 phi 修复 | worker P3-T18 (k3) | **完成**（76cb828；双根因：SCCP 折枝留陈旧 phi 条目（N23 关闭）+ merge 重键造空 phi；修复=条目随 pred 删除 + 单前驱 phi 替换而非重键 + verify 结构兜底（可达零前驱 phi 报错，N18 死块豁免）；orchestrator 复验：红色 3/3 远端复现、lift 1026 不变、opt 894→900 精确 +6 零回归。新登记 N28 copyprop "ADCE 会清理"假设的残余风险） **新基线：lift 1026 / opt 900（80.4%）** |
-| 3.20 | 诊断（只读）：opt-only 失败族 | worker P3-T19 (k3) | **进行中** |
+| 3.20 | 诊断（只读）：opt-only 失败族 | worker P3-T19 (k3) | **完成**（scratch 验证 10/10 VM 通过；orchestrator 抽查两声明成立；实际 opt-only 差=126 非 219。编号冲突已重排为 N36-N41） |
 | 3.21 | 诊断（只读）：双变体共挂族 | worker P3-T20 (k3) | **完成**（五根因全部 file:line+反汇编+VM 签名三重钉死；orchestrator 抽查 N35/N33/N33 静态证实；登记 N29-N35；预期上限 lift 1119 / opt ~993） |
+| 3.23 | opt 修复批（T21 落盘后开工，isel.rs 避让）：N36 双引擎交换 → N37 -0.0 守卫 → N38 SCCP 异常三层+N41 → N39/N40 | 待定 | 未开始 |
 - **N25（P2，P3-T16 登记）**：ThrowConstAssignment 同属 N12 类双重损坏——vendor `throw.constassignment v:in:top`（isa.yaml:987-991，acc:none）的寄存器操作数承载变量名字符串值，lift（translate.rs:1516-1528）捏造合成名 `const_assign_N` 并丢弃寄存器操作数，isel（isel.rs:1211-1214）硬编码 `Reg(0)` 占位。
 - **N26（P2，P3-T16 登记）**：ThrowUndefinedIfHole 双寄存器形态 opcode 身份损坏——vendor `throw.undefinedifhole v1:in:top, v2:in:top`（isa.yaml:998-1002，acc:none；v1=name，v2=value），lift 捏造合成名 `hole_check_N`，isel 一律重发为**另一条 opcode** `throw.undefinedifholewithname`（0x09，string_id + acc 形态）——往返把寄存器形态换成 acc 形态（N14 getresumemode 同类）。
 - V4 更正：optional-chain 的 SIGSEGV 数据已过时（S2/S6 时代已愈）；现行失败 = 空跳转 phi 输入丢失（dce.rs:303-318 按前驱去重模型无法表达两条汇聚边的不同值——MEMORY.md 已知风险的具体语料实例）+ N14。
@@ -156,6 +157,15 @@ P3-T20 新登记（2026-09-20）：
 - N33（P0）：`getnextpropname` → GetPropIterator 塌缩（注释自认）→ 迭代器套娃 → 堆爆炸 GC abort——for-in×18，最坏的失败形态。
 - N34（P2）：私有属性指令族整体未建模（create 丢弃；ld/st/define/testin 塌缩成 ByIndex(0)）——private-field×3。
 - N35（P0）：IR 无 LiteralBigInt（ldbigint→LiteralString）——bigint×18。
+
+P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 N36-N41）：
+
+- N36（P0）：peephole + sccp 折叠引擎对**所有非交换**二元操作数序折叠错误——IR 约定 left=acc/right=reg，但 vendor 语义是 `vreg OP acc`（即 right OP left），两个引擎都按 left OP right 算。覆盖 numeric-operators/bitwise/test-branch-elimination（V6 真身：不是折叠条件错，是这个交换被 SCCP 首轮结构化播种掩盖、copyprop 后暴露）共 54 例 opt 失败。
+- N37（P1）：isel `LiteralNumber(-0.0)` 命中 `*n == (*n as i32) as f64` → 误发 `ldai 0`（+0.0）——literals×18（Object.is(-0,0)）；不修 opt 也可经原始 fldai 触发（潜伏 lower bug）。
+- N38（P1）：SCCP 异常不健全三层——(i) CFG 遍历只看终结指令（handler 出口边在下游 merge 被忽略→phi 被错误常量替换）；(ii) handler phi 的块尾值对块内抛出点不健全；(iii) Eq/NotEq 折叠经 ToNumber 强转（undefined==undefined 折成 false 改写了 es2abc 的 finally 守卫）。修复件已验证：SCCP 用 augmented_succs + handler phi 强制 Bottom + nullish 规则；peephole 只做保守化（去掉 LiteralNull→0.0）——peephole 的 eq-nullish 折叠被证明不健全，不要加。
+- N39（P3 潜伏）：`Bytecode::Not` vendor 语义是**位反**（~acc），lift 标成 LogicalNot——往返掩盖；任何未来 `~常量` 折叠会错。
+- N40（P3 潜伏）：peephole StrictEq 用 to_bits 折叠——`0===-0` 错判 false、同位 NaN 错判 true；改成普通 `a == b`。
+- N41（P2 潜伏）：peephole as_number 把 LiteralNull 映射成 0.0 → `null==0` 会错折 true。
 
 ## 审计纪律
 
