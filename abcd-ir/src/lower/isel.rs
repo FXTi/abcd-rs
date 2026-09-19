@@ -1259,6 +1259,9 @@ fn select_call(
                 codes.push(Bytecode::Callarg0(ic.two()));
             }
         }
+        CallKind::Construct => {
+            emit_construct(callee, args, func_id, alloc, codes, ic)?;
+        }
     }
     Ok(())
 }
@@ -1304,58 +1307,11 @@ fn emit_range_call(
     codes: &mut Vec<Bytecode>,
     ic: &mut IcAllocator,
 ) -> Result<(), LowerError> {
-    let argc = args.len();
-    if argc > u16::MAX as usize {
-        return Err(LowerError::CallArgcOverflow {
-            func: func_id,
-            argc,
-        });
-    }
-
-    let start = if argc == 0 {
-        // imm2 = 0: the runtime reads no argument registers, so the start
-        // operand is dead; no window is needed (or reserved) for the site.
-        Reg(0)
-    } else {
-        let base = alloc
-            .call_window_base
-            .ok_or(LowerError::MissingCallWindow(func_id))?;
-        if base > 255 {
-            return Err(LowerError::CallWindowOverflow(func_id));
-        }
-        if base as u32 + argc as u32 - 1 > u16::MAX as u32 {
-            return Err(LowerError::RegisterOverflow(func_id));
-        }
-        // Fill the window in call order. `mov` auto-widens to its v16 form,
-        // so both the window slot (which may exceed 255) and the arg's
-        // colored slot are always encodable. The — at most one, by the
-        // interference invariant — Acc-colored argument spills into scratch
-        // BEFORE the callee's acc load below (spill-before-load order).
-        let mut acc_arg: Option<Value> = None;
-        for (j, &arg) in args.iter().enumerate() {
-            let dst = Reg(base + j as u16);
-            match slot_of(func_id, arg, alloc)? {
-                RegSlot::Reg(r) => codes.push(Bytecode::Mov(dst, Reg(r))),
-                RegSlot::Acc => {
-                    if let Some(prev) = acc_arg {
-                        return Err(LowerError::MultipleAccOperands {
-                            func: func_id,
-                            a: prev,
-                            b: arg,
-                        });
-                    }
-                    acc_arg = Some(arg);
-                    let scratch = spill_scratch(func_id, alloc, 0)?;
-                    codes.push(Bytecode::Sta(scratch));
-                    codes.push(Bytecode::Mov(dst, scratch));
-                }
-            }
-        }
-        Reg(base)
-    };
+    let start = fill_call_window(func_id, args, alloc, codes)?;
 
     ensure_acc(func_id, callee, alloc, codes)?;
 
+    let argc = args.len();
     let argc_imm = Imm(argc as i64);
     let bc = match (form, argc <= 255) {
         (RangeForm::Call, true) => Bytecode::Callrange(ic.two(), argc_imm, start),
@@ -1371,6 +1327,121 @@ fn emit_range_call(
     };
     codes.push(bc);
     Ok(())
+}
+
+/// Emit a construct call (`new callee(args...)`) — vendor
+/// `newobjrange imm1:u16, imm2:u8, v:in:top` /
+/// `wide.newobjrange imm:u16, v:in:top`
+/// (abcd-isa-sys/vendor/isa/isa.yaml ~:535/:540).
+///
+/// The reserved consecutive window is filled [callee, args...] IN ORDER:
+/// the runtime reads the constructor from the FIRST register of the range
+/// and passes it as BOTH func and newTarget
+/// (`SlowRuntimeStub::NewObjRange(thread, ctor, ctor, ...)`,
+/// arkcompiler_ets_runtime-master/ecmascript/interpreter/interpreter-inl.cpp:4205),
+/// and the encoded argc counts it (argc = args.len() + 1). Unlike the
+/// plain-call range forms the accumulator is NOT an input (vendor
+/// `acc: out:top`), so no `ensure_acc` is emitted for the callee.
+///
+/// Width selection inherits the S2 rule: argc+1 ≤ 255 keeps the narrow
+/// form (with its two-slot IC); 256..=65535 selects the wide form (u16
+/// argc, NO IC slot consumed — verified for newobjrange specifically:
+/// isa.yaml ~:540 has no ic_slot property); argc+1 above u16::MAX, a
+/// window base above 255, or a window end past the register space are the
+/// same hard errors as the plain range calls (shared `fill_call_window`).
+fn emit_construct(
+    callee: Value,
+    args: &[Value],
+    func_id: FuncId,
+    alloc: &RegAlloc,
+    codes: &mut Vec<Bytecode>,
+    ic: &mut IcAllocator,
+) -> Result<(), LowerError> {
+    let mut window_values = Vec::with_capacity(args.len() + 1);
+    window_values.push(callee);
+    window_values.extend_from_slice(args);
+    let start = fill_call_window(func_id, &window_values, alloc, codes)?;
+
+    let argc = window_values.len();
+    let argc_imm = Imm(argc as i64);
+    let bc = if argc <= 255 {
+        Bytecode::Newobjrange(ic.two(), argc_imm, start)
+    } else {
+        Bytecode::WideNewobjrange(argc_imm, start)
+    };
+    codes.push(bc);
+    Ok(())
+}
+
+/// Fill the reserved consecutive per-function call window
+/// (`RegAlloc::call_window_base`) with `values` in order and return the
+/// encoded start register. Shared by the plain range calls (values = the
+/// arguments) and construct calls (values = [callee, args...]).
+///
+/// An empty `values` encodes start = Reg(0): argc = 0 reads no argument
+/// registers, so the start operand is dead and no window is needed (or
+/// reserved) for the site.
+///
+/// Hard errors (S2 contract — nothing is silently truncated): argc above
+/// u16::MAX (`CallArgcOverflow`), a window base above 255
+/// (`CallWindowOverflow` — BOTH the narrow and the wide forms carry a u8
+/// start operand), a window end past the register space
+/// (`RegisterOverflow`), and more than one Acc-colored value in the fill
+/// (`MultipleAccOperands`; the interference invariant guarantees at most
+/// one).
+fn fill_call_window(
+    func_id: FuncId,
+    values: &[Value],
+    alloc: &RegAlloc,
+    codes: &mut Vec<Bytecode>,
+) -> Result<Reg, LowerError> {
+    let argc = values.len();
+    if argc > u16::MAX as usize {
+        return Err(LowerError::CallArgcOverflow {
+            func: func_id,
+            argc,
+        });
+    }
+    if argc == 0 {
+        return Ok(Reg(0));
+    }
+
+    let base = alloc
+        .call_window_base
+        .ok_or(LowerError::MissingCallWindow(func_id))?;
+    if base > 255 {
+        return Err(LowerError::CallWindowOverflow(func_id));
+    }
+    if base as u32 + argc as u32 - 1 > u16::MAX as u32 {
+        return Err(LowerError::RegisterOverflow(func_id));
+    }
+    // Fill the window in order. `mov` auto-widens to its v16 form,
+    // so both the window slot (which may exceed 255) and the value's
+    // colored slot are always encodable. The — at most one, by the
+    // interference invariant — Acc-colored value spills into scratch
+    // BEFORE any later acc load in the caller's sequence
+    // (spill-before-load order).
+    let mut acc_arg: Option<Value> = None;
+    for (j, &val) in values.iter().enumerate() {
+        let dst = Reg(base + j as u16);
+        match slot_of(func_id, val, alloc)? {
+            RegSlot::Reg(r) => codes.push(Bytecode::Mov(dst, Reg(r))),
+            RegSlot::Acc => {
+                if let Some(prev) = acc_arg {
+                    return Err(LowerError::MultipleAccOperands {
+                        func: func_id,
+                        a: prev,
+                        b: val,
+                    });
+                }
+                acc_arg = Some(val);
+                let scratch = spill_scratch(func_id, alloc, 0)?;
+                codes.push(Bytecode::Sta(scratch));
+                codes.push(Bytecode::Mov(dst, scratch));
+            }
+        }
+    }
+    Ok(Reg(base))
 }
 
 /// Try to fuse a compare + branch into a single bytecode.

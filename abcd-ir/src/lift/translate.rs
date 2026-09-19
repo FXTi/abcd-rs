@@ -1063,25 +1063,31 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Newobjrange(_, argc, start) | Bytecode::WideNewobjrange(argc, start) => {
-            let args = read_reg_range(ssa, start.0, argc.0 as u16, block, module);
-            // first arg is the constructor
-            let callee = if args.is_empty() {
-                read_acc(ssa, block, module)
-            } else {
-                args[0]
-            };
-            let rest = if args.len() > 1 {
-                args[1..].to_vec()
-            } else {
-                vec![]
+            // Vendor: the constructor is the FIRST register of the range
+            // and argc COUNTS it — `ctor = GET_VREG_VALUE(firstArgRegIdx)`,
+            // `firstArgIdx = firstArgRegIdx + 1`, `length = numArgs - 1`,
+            // and the slow path passes the ctor as both func and newTarget
+            // (`SlowRuntimeStub::NewObjRange(thread, ctor, ctor, ...)`,
+            // interpreter-inl.cpp:4205, wide twin :4476). Model as a
+            // Construct call: callee = the ctor value (first range
+            // register), args = the remaining registers. Operand VALUE
+            // identity is exact — read_reg_range reads each range register
+            // through the same SSA read as any other use.
+            let range = read_reg_range(ssa, start.0, argc.0 as u16, block, module);
+            let (callee, args) = match range.split_first() {
+                Some((&ctor, rest)) => (ctor, rest.to_vec()),
+                // Degenerate argc = 0: the runtime would still read the
+                // start register as the ctor; keep the historical acc
+                // fallback so no operand is invented or dropped.
+                None => (read_acc(ssa, block, module), Vec::new()),
             };
             let v = emit_val(
                 module,
                 block,
                 InstData::Call {
-                    kind: CallKind::Call,
+                    kind: CallKind::Construct,
                     callee,
-                    args: rest,
+                    args,
                 },
                 loc,
             );

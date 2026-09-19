@@ -39,6 +39,21 @@ pub enum Halt {
     /// v:in:top` (isa.yaml ~:1087) — imm is the u16 argument count, v the
     /// u8 window start; NO IC slot operand on the wide form.
     WideCallRange { argc: i64, start: u16 },
+    /// `Newobjrange` (record-and-inspect): vendor `newobjrange imm1:u16,
+    /// imm2:u8, v:in:top` (abcd-isa-sys/vendor/isa/isa.yaml ~:535) — imm1 is
+    /// the IC slot (ignored), imm2 the argument count INCLUDING the
+    /// constructor, v the START of the consecutive register window whose
+    /// FIRST slot holds the constructor (vendor
+    /// arkcompiler_ets_runtime-master/ecmascript/interpreter/interpreter-inl.cpp:4205
+    /// passes `NewObjRange(thread, ctor, ctor, ...)` — ctor as both func and
+    /// newTarget). The window contents are `regs[start .. start + argc]`
+    /// at halt time: window[0] = ctor, window[1..] = the call arguments.
+    NewObjRange { argc: i64, start: u16 },
+    /// `WideNewobjrange` (record-and-inspect): vendor `wide.newobjrange
+    /// imm:u16, v:in:top` (abcd-isa-sys/vendor/isa/isa.yaml ~:540) — u16
+    /// argument count including the constructor, u8 window start, NO IC
+    /// slot operand on the wide form.
+    WideNewObjRange { argc: i64, start: u16 },
 }
 
 /// A tiny register machine: `HashMap<u16, i64>` registers plus one
@@ -218,6 +233,23 @@ impl Machine {
                 // no IC slot.
                 Bytecode::WideCallrange(argc, start) => {
                     return Halt::WideCallRange {
+                        argc: argc.0,
+                        start: start.0,
+                    };
+                }
+                // `newobjrange imm1:u16, imm2:u8, v:in:top` — record imm2
+                // (argc, INCLUDING the constructor) and v (window start;
+                // window[0] is the constructor). The IC slot imm1 is ignored.
+                Bytecode::Newobjrange(_, argc, start) => {
+                    return Halt::NewObjRange {
+                        argc: argc.0,
+                        start: start.0,
+                    };
+                }
+                // `wide.newobjrange imm:u16, v:in:top` — u16 argc including
+                // the constructor, u8 start, no IC slot.
+                Bytecode::WideNewobjrange(argc, start) => {
+                    return Halt::WideNewObjRange {
                         argc: argc.0,
                         start: start.0,
                     };

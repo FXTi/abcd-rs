@@ -60,6 +60,14 @@ pub enum CallKind {
     SuperCallArrow,
     SuperCallSpread,
     Apply,
+    /// `new callee(args...)` — the callee is the constructor and the VM
+    /// receives it as BOTH func and newTarget (vendor
+    /// `SlowRuntimeStub::NewObjRange(thread, ctor, ctor, ...)`,
+    /// arkcompiler_ets_runtime-master/ecmascript/interpreter/interpreter-inl.cpp:4205).
+    /// Lowers to the newobjrange family: the reserved call window is filled
+    /// [callee, args...] in order and the encoded argc is args.len() + 1
+    /// (the constructor counts).
+    Construct,
 }
 
 /// IR instruction data.

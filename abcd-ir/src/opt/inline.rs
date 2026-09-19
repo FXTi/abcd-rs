@@ -76,6 +76,14 @@ fn find_inline_candidates(module: &Module, func: FuncId, max_inst_count: usize) 
         let insts: Vec<Inst> = module.block(bb).insts.clone();
         for inst_id in insts {
             let node = module.inst(inst_id);
+            // Only plain `Call` sites are inlined. `Construct` is
+            // deliberately NOT inlined: the callee body reads `this` /
+            // newTarget through LoadThis/LoadNewTarget, and a construct
+            // call binds them differently than a plain call (the VM
+            // allocates `this` from the ctor's prototype and passes the
+            // ctor itself as newTarget) — inlining a constructor as if it
+            // were a plain call would silently change those bindings.
+            // Super/apply kinds are likewise out of scope.
             if let InstData::Call {
                 kind: CallKind::Call,
                 callee,

@@ -295,8 +295,10 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
 /// Largest argument count among the function's range-form calls — the arms
 /// where isel encodes a start register and the VM reads argc consecutive
 /// slots: `Call` with > 3 args, `CallThis` with > 4 args (args[0] is `this`),
-/// and the always-range `SuperCall`/`SuperCallArrow`. Fixed-arity forms and
-/// spread/apply calls pass individual register operands and need no window.
+/// the always-range `SuperCall`/`SuperCallArrow`, and every `Construct`
+/// (the window holds [callee, args...] — the constructor counts, so the
+/// window is args.len() + 1 slots). Fixed-arity forms and spread/apply
+/// calls pass individual register operands and need no window.
 fn range_call_window_size(module: &Module, rpo: &[Block]) -> usize {
     use crate::inst::CallKind;
     let mut window = 0usize;
@@ -307,6 +309,7 @@ fn range_call_window_size(module: &Module, rpo: &[Block]) -> usize {
                     CallKind::Call if args.len() > 3 => Some(args.len()),
                     CallKind::CallThis if args.len() > 4 => Some(args.len()),
                     CallKind::SuperCall | CallKind::SuperCallArrow => Some(args.len()),
+                    CallKind::Construct => Some(args.len() + 1),
                     _ => None,
                 };
                 if let Some(argc) = range_argc {
