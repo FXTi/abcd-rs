@@ -1,11 +1,16 @@
-//! Function inlining pass.
+//! Function inlining pass — **QUARANTINED (N44)**.
 //!
-//! This pass is NOT enabled in the default optimization pipeline.
-//! To use it, call `Inline::new(threshold).run(module, func)` manually.
-//!
-//! The inliner identifies call sites where the callee is a known function
-//! defined in the same module, checks if it's small enough to inline,
-//! and replaces the call with a copy of the callee's body.
+//! This pass produces module-INVALID IR: the P4-T2 review red-proved on a
+//! trivial caller/callee probe that inlining leaves callee parameters
+//! unmapped, does not rebuild block predecessors, leaves stale
+//! per-instruction block fields, and drops try-regions (4 structural
+//! verifier errors from a single inline). It was never in the default
+//! pipeline (`opt::optimize_func`), so the treatment is quarantine, not a
+//! rushed rewrite: [`Inline::run`] is a hard-gated no-op until a v0.2-era
+//! rewrite decision. The machinery below is retained for reference only
+//! and is unreachable by design; `abcd-ir/tests/opt_inline_quarantine.rs`
+//! pins the no-op contract.
+#![allow(dead_code)] // quarantined machinery (N44): nothing may call it
 
 use std::collections::HashMap;
 
@@ -18,12 +23,10 @@ use super::FuncPass;
 
 /// Function inlining pass with configurable size threshold.
 ///
-/// Not included in the default pipeline. Enable manually:
-/// ```ignore
-/// use abcd_ir::opt::inline::Inline;
-/// use abcd_ir::opt::FuncPass;
-/// Inline::new(50).run(&mut module, func_id);
-/// ```
+/// **QUARANTINED (N44): `run` is a no-op.** Do not re-enable without a
+/// full rewrite (parameter mapping, predecessor rebuild, instruction
+/// block-field maintenance, try-region transplant) — the current
+/// implementation corrupts the module. See the module docs.
 pub struct Inline {
     /// Maximum number of instructions in a callee to be eligible for inlining.
     max_inst_count: usize,
@@ -37,18 +40,12 @@ impl Inline {
 
 impl FuncPass for Inline {
     fn run(&self, module: &mut Module, func: FuncId) -> bool {
-        let mut changed = false;
-
-        // Collect call sites: (caller_block, call_inst, callee_func_id).
-        let call_sites = find_inline_candidates(module, func, self.max_inst_count);
-
-        for site in call_sites {
-            if inline_call_site(module, func, &site) {
-                changed = true;
-            }
-        }
-
-        changed
+        // N44 quarantine gate: hard no-op. The pre-quarantine body
+        // (find_inline_candidates + inline_call_site) is retained below
+        // for reference but MUST NOT be called until the pass is
+        // rewritten — it emits module-invalid IR.
+        let _ = (module, func, self.max_inst_count);
+        false
     }
 }
 
