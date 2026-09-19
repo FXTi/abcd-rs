@@ -143,6 +143,44 @@ fn is_essential(data: &InstData) -> bool {
         // side effect on the iterator even when the result name is
         // unused; deleting it would skip an enumeration step.
         | GetNextPropName { .. }
+        // ── Observable loads (N48) ── a dead RESULT does not make the
+        // load dead: each of these can run user code or throw.
+        //
+        // Vendored-property audit: the vendored isa.yaml has NO
+        // `can_throw` property at all, and every instruction group
+        // declares `exceptions: x_none` (including the groups holding
+        // getiterator, isa.yaml:401-416; createregexpwithliteral,
+        // :466-525; ldglobalvar/ldobjbyname, :1250-1513) — so
+        // essentiality cannot be derived from vendored yaml properties.
+        // The entries below rest on vendored RUNTIME evidence instead:
+        //
+        // Calls the user @@iterator/@@asyncIterator method
+        // (`RuntimeGetIterator` → `EcmaInterpreter::Execute`,
+        // runtime_stubs-inl.h:1569-1582, :1584+).
+        | GetIterator { .. }
+        | GetAsyncIterator { .. }
+        // Property load: invokes getters and throws TypeError on a
+        // nullish receiver (`ldobjbyname`,
+        // interpreter_assembly.cpp:5543+, via JSTaggedValue::GetProperty).
+        | LoadProperty { .. }
+        // Private-property load/test: brand check throws TypeError
+        // ("invalid or cannot find private key",
+        // runtime_stubs-inl.h:1592-1620) and getter keys are CALLED;
+        // `testin` brand-checks the same way
+        // (compiler/interpreter_stub.cpp:881-890).
+        | LoadPrivateProperty { .. }
+        | TestPrivateProperty { .. }
+        // RegExp creation validates pattern/flags
+        // (`RuntimeCreateRegExpWithLiteral` →
+        // `BuiltinsRegExp::RegExpCreateWithRawFlags`,
+        // runtime_stubs-inl.h:2508-2513) — invalid flags throw.
+        | CreateRegExp { .. }
+        // Global load: fast path calls global getters (`CallGetter`,
+        // fast_runtime_stub-inl.h:224-225); TDZ/undefined-name paths
+        // raise ReferenceError (`RuntimeThrowReferenceError`,
+        // runtime_stubs-inl.h:1769-1779; handler
+        // interpreter_assembly.cpp:2575-2614 is abrupt-checked).
+        | LoadGlobalVar { .. }
         | DefineFunc { .. }
         | DefineMethod { .. }
         | DefineClassWithBuffer { .. }
