@@ -340,13 +340,14 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   516/636 (S2) → 618/696 (N20) → 660/696 (N13) → 666/708 (N14) →
   690 (N12 honest dip) → 1026/894 (B4) → 1026/900 (N27) → 1119/993
   (T21 six-fix batch) → **1119/1119 (T22)**.
-- Remaining registered work: N25/N26 (throw-family opcode modeling, P2),
-  N28 (copyprop residual risk note), N18 (dead catch blocks cleanup),
-  N22 (harmless), N7 (moduleRequestPhaseIdx, sweep), N8 (open question),
-  N15/N16 (P3 byte-level), Phase 4 (evidence upgrades: real 9/11 read
-  verification, pandasm per-instruction comparison, corpus fixtures for
-  stthisbyvalue/stprivateproperty/testin), Phase 5 (sweep + FormatProfile +
-  IR v0.2 DECISION POINT — maintainer decision, stop there).
+- Remaining registered work: SEE THE COMPLETE RECONCILIATION TABLE in
+  design/agent-roadmap.md (「全量发现对账表」) — every N/F item has a final
+  status there; do not maintain a second list here. As of 2026-09-20 the
+  only OPEN items: N3, N9 (both补登——they were missing from an earlier
+  summary), N25/N26 (throw-family modeling), N7/N8, N15/N16, N18, F-new-1,
+  F-new-2, dominance + string-pool-ownership reviews, the Phase 5 sweep
+  batch, and Phase 4 evidence upgrades. N28/N22 are notes, not bugs. The
+  IR v0.2 decision point is a MAINTAINER decision — stop there.
 
 ## Phase 1 outcome (done, 2026-09-19)
 
