@@ -17,6 +17,20 @@
 
 ## Corpus and evidence boundaries
 
+- REMOTE TEST PROTOCOL (maintainer directive 2026-09-19): ALL cargo test
+  runs go through `scripts/remote-test.sh [cargo args]` — the script rsyncs
+  the working tree (uncommitted changes included; target/ .vscode/
+  decompiled/ excluded, .git and exports/ included) to dabai
+  (Ubuntu 22.04 x86_64, 16 cores, rustup toolchain), renames staging→run
+  dir after upload, runs cargo there (networked; Cargo.lock pins the set;
+  shared CARGO_TARGET_DIR=/home/zjx/abcdtest/.shared-target caches the C++
+  bridge build across runs), and deletes the run dir afterwards (KEEP=1 to
+  retain for debugging). --offline flags are stripped on purpose. Docker
+  VM-oracle runs stay LOCAL. cargo fmt and git stay local. For corpus
+  rewrite tests whose output feeds the local oracle: run remotely with
+  KEEP=1 and a RELATIVE ABCD_LOWERED_DIR (e.g. target/lowered-out), rsync
+  that subtree back to local /tmp, run the oracle locally, then
+  `ssh dabai rm -rf` the kept run dir.
 - `exports/corpus` is local and ignored. Read `index.jsonl`; do not infer cases
   by walking directories. Image: `ghcr.io/fxti/arkcompiler-test:latest`.
 - Local export: 2757 fixtures, 1119 runtime `passed`, 1638 `not-applicable`.
