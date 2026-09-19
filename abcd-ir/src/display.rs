@@ -344,8 +344,8 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
                 m.strings.get(*name)
             )
         }
-        InstData::ThrowIfSuperNotCorrectCall { value } => {
-            write!(f, "ThrowIfSuperNotCorrectCall {value}")
+        InstData::ThrowIfSuperNotCorrectCall { value, kind } => {
+            write!(f, "ThrowIfSuperNotCorrectCall {value}, kind {kind}")
         }
         InstData::ThrowNotExists => write!(f, "ThrowNotExists"),
         InstData::ThrowPatternNonCoercible => write!(f, "ThrowPatternNonCoercible"),

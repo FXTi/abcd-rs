@@ -223,7 +223,7 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         | DynamicImport { specifier: value }
         | Throw { value }
         | ThrowIfNotObject { value }
-        | ThrowIfSuperNotCorrectCall { value }
+        | ThrowIfSuperNotCorrectCall { value, .. }
         | GetIterator { obj: value }
         | GetAsyncIterator { obj: value }
         | GetPropIterator { obj: value }

@@ -341,7 +341,16 @@ pub enum InstData {
         value: Value,
     },
     ThrowIfSuperNotCorrectCall {
+        /// The `this` value being checked, read from the accumulator —
+        /// vendor `throw.ifsupernotcorrectcall imm:u16, acc: in:top`
+        /// (abcd-isa-sys/vendor/isa/isa.yaml:1003-1008).
         value: Value,
+        /// The bytecode imm operand selecting the CHECK KIND: 0 = TDZ
+        /// guard ("sub-class must call super before use 'this'"),
+        /// 1 = re-bind guard ("super() forbidden re-bind 'this'") —
+        /// `RuntimeThrowIfSuperNotCorrectCall` (arkcompiler_ets_runtime
+        /// ecmascript/stubs/runtime_stubs-inl.h:2520-2532).
+        kind: u16,
     },
     ThrowNotExists,
     ThrowPatternNonCoercible,
@@ -462,7 +471,7 @@ impl InstData {
             | DynamicImport { specifier: value }
             | Throw { value }
             | ThrowIfNotObject { value }
-            | ThrowIfSuperNotCorrectCall { value }
+            | ThrowIfSuperNotCorrectCall { value, .. }
             | GetIterator { obj: value }
             | GetAsyncIterator { obj: value }
             | GetPropIterator { obj: value }

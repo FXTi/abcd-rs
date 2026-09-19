@@ -1217,9 +1217,15 @@ fn select_inst(
             ensure_acc(func_id, *value, alloc, codes)?;
             codes.push(Bytecode::ThrowUndefinedifholewithname(tracer.eid(*name)));
         }
-        InstData::ThrowIfSuperNotCorrectCall { value } => {
+        InstData::ThrowIfSuperNotCorrectCall { value, kind } => {
+            // Vendor `throw.ifsupernotcorrectcall imm:u16, acc: in:top`
+            // (isa.yaml:1003-1008): the checked `this` value rides the
+            // accumulator; imm is the check kind. `kind: u16` is the
+            // encoding's own width, so the emitter's Imm range check
+            // (EncodeError::OperandOutOfRange) can never fire on a
+            // well-formed IR value.
             ensure_acc(func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::ThrowIfsupernotcorrectcall(Imm(0)));
+            codes.push(Bytecode::ThrowIfsupernotcorrectcall(Imm(i64::from(*kind))));
         }
         InstData::ThrowNotExists => {
             codes.push(Bytecode::ThrowNotexists);

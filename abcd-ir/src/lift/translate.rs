@@ -1553,11 +1553,23 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::ThrowIfsupernotcorrectcall(imm) => {
-            let value = emit_val(module, block, InstData::LiteralNumber(imm.0 as f64), loc);
+            // Vendor `throw.ifsupernotcorrectcall imm:u16, acc: in:top`
+            // (isa.yaml:1003-1008, `conditional_throw`): the imm selects
+            // the CHECK KIND (0 = TDZ guard "sub-class must call super
+            // before use 'this'", 1 = re-bind guard "super() forbidden
+            // re-bind 'this'" — arkcompiler_ets_runtime
+            // ecmascript/stubs/runtime_stubs-inl.h:2520-2532) and the
+            // acc carries the `this` value being checked. The imm comes
+            // from the vendored decoder's imm8/imm16 operand, so the
+            // u16 cast is exact.
+            let value = read_acc(ssa, block, module);
             emit_void(
                 module,
                 block,
-                InstData::ThrowIfSuperNotCorrectCall { value },
+                InstData::ThrowIfSuperNotCorrectCall {
+                    value,
+                    kind: imm.0 as u16,
+                },
                 loc,
             );
         }

@@ -136,6 +136,8 @@ P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle
 - **N14（P1）**：generator 三件套建模错误——Getresumemode 被 lift 成 ResumeGenerator；SuspendGenerator 丢 acc 里的 yield 值；ResumeGenerator/GetResumeMode 丢 acc 里的 genobj。opt 变体 SIGSEGV 机制已钉死（DCE 删 yield 值 → resume 后 acc=undefined → 野指针解引用）。
 - **N15（P3）**：DefineClassWithBuffer 丢 imm2（_count）——运行时忽略，仅字节差异。
 - **N16（P3）**：Newobjapply ↔ CallKind::Apply arity 重载往返脆弱。
+- **N25（P2，P3-T16 登记）**：ThrowConstAssignment 同属 N12 类双重损坏——vendor `throw.constassignment v:in:top`（isa.yaml:987-991，acc:none）的寄存器操作数承载变量名字符串值，lift（translate.rs:1516-1528）捏造合成名 `const_assign_N` 并丢弃寄存器操作数，isel（isel.rs:1211-1214）硬编码 `Reg(0)` 占位。
+- **N26（P2，P3-T16 登记）**：ThrowUndefinedIfHole 双寄存器形态 opcode 身份损坏——vendor `throw.undefinedifhole v1:in:top, v2:in:top`（isa.yaml:998-1002，acc:none；v1=name，v2=value），lift 捏造合成名 `hole_check_N`，isel 一律重发为**另一条 opcode** `throw.undefinedifholewithname`（0x09，string_id + acc 形态）——往返把寄存器形态换成 acc 形态（N14 getresumemode 同类）。
 - V4 更正：optional-chain 的 SIGSEGV 数据已过时（S2/S6 时代已愈）；现行失败 = 空跳转 phi 输入丢失（dce.rs:303-318 按前驱去重模型无法表达两条汇聚边的不同值——MEMORY.md 已知风险的具体语料实例）+ N14。
 - B4 从"潜伏"升级为**实锤**：class-accessors lift 18 例的 acc 覆盖链完整钉出（lda.str "value" → ldundefined 覆盖 → definegettersetterbyvalue 拿到 false；prototype 覆盖 → stglobalvar B = prototype → 'Object is not callable'）。
 - 修复顺序（性价比）：N10 → Construct → N11 → 空跳转 phi 守卫 → N14 → N12+N13 → B4（大）。

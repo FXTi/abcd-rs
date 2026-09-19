@@ -69,6 +69,14 @@ pub enum Halt {
     /// `acc: inout:top`, NO register operand
     /// (abcd-isa-sys/vendor/isa/isa.yaml:1270-1273).
     GetResumeMode { genobj: i64 },
+    /// `ThrowIfsupernotcorrectcall` (record-and-stop): `value` is the
+    /// accumulator (the `this` value being checked), `kind` the imm
+    /// operand selecting the check kind — vendor
+    /// `throw.ifsupernotcorrectcall imm:u16, acc: in:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1003-1008; kind semantics in
+    /// arkcompiler_ets_runtime ecmascript/stubs/runtime_stubs-inl.h:
+    /// 2520-2532).
+    ThrowIfSuperNotCorrectCall { kind: i64, value: i64 },
     /// `run_until` reached the stop pc WITHOUT executing the instruction
     /// there — models an exception thrown between two instructions.
     Stopped,
@@ -305,6 +313,15 @@ impl Machine {
                 // record the acc (the genobj).
                 Bytecode::Getresumemode => {
                     return Halt::GetResumeMode { genobj: self.acc };
+                }
+                // `throw.ifsupernotcorrectcall imm:u16, acc: in:top`
+                // (isa.yaml:1003-1008) — record the acc (the checked
+                // `this` value) and the kind imm.
+                Bytecode::ThrowIfsupernotcorrectcall(imm) => {
+                    return Halt::ThrowIfSuperNotCorrectCall {
+                        kind: imm.0,
+                        value: self.acc,
+                    };
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),
             }

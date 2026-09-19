@@ -724,6 +724,12 @@ fn compute_acc_scores(module: &Module, rpo: &[Block]) -> HashMap<Value, i32> {
                 InstData::ResumeGenerator { genobj } | InstData::GetResumeMode { genobj } => {
                     *scores.entry(*genobj).or_default() += 2;
                 }
+                // throw.ifsupernotcorrectcall reads the checked `this`
+                // value FROM the acc (vendor `acc: in:top`,
+                // isa.yaml:1003-1008) — Acc-prefer (+2).
+                InstData::ThrowIfSuperNotCorrectCall { value, .. } => {
+                    *scores.entry(*value).or_default() += 2;
+                }
                 _ => {}
             }
         }
