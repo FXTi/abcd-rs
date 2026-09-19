@@ -11,8 +11,10 @@
 //! writer besides result homing — consults the emission-time acc tracker.
 //!
 //! What survives here as the pinned contract: `StoreProperty` with a
-//! ByValue key (object/value as register operands, key in acc) must see
-//! the COMPUTED object value in the object's register operand. The module
+//! ByValue key (object/key as register operands, VALUE in acc — vendor
+//! `stobjbyvalue imm, v1: receiver, v2: propKey, acc: value`,
+//! isa.yaml:1353-1357) must see the COMPUTED object value in the
+//! object's register operand. The module
 //! is real IR built with `IRBuilder` (one block: `p = k + v`, then
 //! `StoreProperty { object: p, key: ByValue(k), value: v }`, then
 //! `Return`). The `RegAlloc` is hand-constructed (all fields public) to
@@ -106,8 +108,11 @@ fn byvalue_store_reads_the_computed_object_from_its_home() {
 
     // New structural contract (acc-as-cache): the add's result is homed
     // with Sta(R2) immediately after the Add2 (p has a use), and the
-    // store's key Lda reloads k from its home — the tracker knows the acc
-    // holds p at that point, not k. No spill slot, no Sta anywhere else.
+    // store's VALUE Lda reloads v from its home — vendor `stobjbyvalue
+    // imm, v1: receiver, v2: propKey, acc: value` (isa.yaml:1353-1357):
+    // the register operands are object (R2) and key (R0), the acc
+    // carries the value. The tracker knows the acc holds p at that
+    // point, not v. No spill slot, no Sta anywhere else.
     assert!(
         matches!(codes.get(2), Some(Bytecode::Lda(Reg(0)))),
         "expected the add's left-operand Lda(R0), got {codes:?}"
@@ -121,16 +126,16 @@ fn byvalue_store_reads_the_computed_object_from_its_home() {
         "expected the result-homing Sta(R2) right after the add, got {codes:?}"
     );
     assert!(
-        matches!(codes.get(5), Some(Bytecode::Lda(Reg(0)))),
-        "expected ensure_acc(key) = Lda(R0) — a tracker miss, the acc \
+        matches!(codes.get(5), Some(Bytecode::Lda(Reg(1)))),
+        "expected ensure_acc(value) = Lda(R1) — a tracker miss, the acc \
          holds p at this point — got {codes:?}"
     );
-    let Some(Bytecode::Stobjbyvalue(_, obj_r, val_r)) = codes.get(6) else {
-        panic!("expected Stobjbyvalue after the key's Lda, got {codes:?}");
+    let Some(Bytecode::Stobjbyvalue(_, obj_r, key_r)) = codes.get(6) else {
+        panic!("expected Stobjbyvalue after the value's Lda, got {codes:?}");
     };
-    let (obj_r, val_r) = (*obj_r, *val_r);
+    let (obj_r, key_r) = (*obj_r, *key_r);
     assert_eq!(obj_r, Reg(2), "object operand must be p's home register");
-    assert_eq!(val_r, Reg(1));
+    assert_eq!(key_r, Reg(0), "key operand must be k's home register");
 
     // Simulate with the ABI frame layout: the arguments arrive in the top
     // slots (num_regs = 3, so v3 = k and v4 = v) and the copy-in prologue
@@ -141,8 +146,14 @@ fn byvalue_store_reads_the_computed_object_from_its_home() {
     let Halt::StObjByValue { key, obj, value } = halt else {
         panic!("expected execution to stop at Stobjbyvalue, got {halt:?}");
     };
-    assert_eq!(key, KEY, "stobjbyvalue key operand = acc");
-    assert_eq!(value, VALUE, "stobjbyvalue value operand = R1");
+    assert_eq!(
+        key, KEY,
+        "stobjbyvalue key operand = the key register (vendor v2 = propKey)"
+    );
+    assert_eq!(
+        value, VALUE,
+        "stobjbyvalue value operand = acc (vendor acc = value)"
+    );
     assert_eq!(
         obj, OBJ,
         "stobjbyvalue object operand (R{}) must be p = k + v = OBJ, homed \
@@ -220,9 +231,11 @@ fn store_byvalue_with_computed_value_lowers_correctly_end_to_end() {
 
     let result = lower_function(&module, func).expect("store_byvalue must lower");
 
-    // p = Q + R = 42; the store must see (key = acc = K, object = R0, value
-    // = p's home = 42). The simulator seeds the ABI top slots (num_regs,
-    // so v[num_regs..num_regs+4) hold the four arguments); the copy-in
+    // p = Q + R = 42; the store must see (object = R0, key = the key
+    // register's home = K, value = acc = p = 42) — vendor `stobjbyvalue
+    // imm, v1: receiver, v2: propKey, acc: value` (isa.yaml:1353-1357).
+    // The simulator seeds the ABI top slots (num_regs, so
+    // v[num_regs..num_regs+4) hold the four arguments); the copy-in
     // prologue moves them into the homes R0..R3.
     let mut machine = Machine::new()
         .with_reg(result.num_regs, OBJ)
@@ -237,13 +250,16 @@ fn store_byvalue_with_computed_value_lowers_correctly_end_to_end() {
             result.bytecodes
         );
     };
-    assert_eq!(key, KEY, "stobjbyvalue key operand = acc");
+    assert_eq!(
+        key, KEY,
+        "stobjbyvalue key operand = the key register (vendor v2 = propKey)"
+    );
     assert_eq!(obj, OBJ, "stobjbyvalue object operand = R0");
     assert_eq!(
         value,
         Q + R,
-        "stobjbyvalue value operand must be p = q + r, read from its home \
-         (bytecodes: {:?})",
+        "stobjbyvalue value operand = acc (vendor acc = value) must be \
+         p = q + r, loaded from its home (bytecodes: {:?})",
         result.bytecodes
     );
 }

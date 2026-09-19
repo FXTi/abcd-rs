@@ -179,6 +179,9 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
         InstData::CopyDataProperties { dst, src } => {
             write!(f, "CopyDataProperties {dst}, {src}")
         }
+        InstData::ArraySpread { dst, index, src } => {
+            write!(f, "ArraySpread {dst}, {index}, {src}")
+        }
         InstData::LoadSuperProperty { key } => {
             write!(f, "LoadSuperProperty")?;
             write_prop(f, m, key)

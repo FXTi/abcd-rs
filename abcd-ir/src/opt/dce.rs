@@ -98,6 +98,11 @@ fn is_essential(data: &InstData) -> bool {
         | StoreOwnProperty { .. }
         | StoreSuperProperty { .. }
         | CopyDataProperties { .. }
+        // Mutates the destination array (vendor
+        // `SlowRuntimeStub::StArraySpread`, isa.yaml:1329-1332) — the
+        // new-index result being unused (the corpus shape: acc is
+        // immediately clobbered) does not make the spread dead.
+        | ArraySpread { .. }
         | StoreGlobalVar { .. }
         | TryStoreGlobalByName { .. }
         | StoreLexVar { .. }

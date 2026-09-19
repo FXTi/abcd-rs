@@ -21,8 +21,14 @@ pub enum Halt {
     Return(i64),
     /// `Returnundefined`.
     ReturnUndefined,
-    /// `Stobjbyvalue` (record-and-inspect): `key` is the accumulator
-    /// (the ByValue key), `obj`/`value` are the operand register contents.
+    /// `Stobjbyvalue` (record-and-inspect): `obj` is the FIRST register
+    /// operand's contents (the receiver), `key` the SECOND register
+    /// operand's contents (the propKey), `value` the accumulator —
+    /// vendor `stobjbyvalue imm:u16, v1:in:top, v2:in:top, acc: in:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1353-1357;
+    /// interpreter_assembly.cpp:2306-2335: `receiver =
+    /// GET_VREG_VALUE(v0)`, `propKey = GET_VREG_VALUE(v1)`, `value =
+    /// GET_ACC()`).
     StObjByValue { key: i64, obj: i64, value: i64 },
     /// `Copydataproperties` (record-and-inspect): `dst` is the operand
     /// register's contents (the target object), `src` the accumulator
@@ -274,11 +280,11 @@ impl Machine {
                 }
                 Bytecode::Return => return Halt::Return(self.acc),
                 Bytecode::Returnundefined => return Halt::ReturnUndefined,
-                Bytecode::Stobjbyvalue(_, obj_r, val_r) => {
+                Bytecode::Stobjbyvalue(_, obj_r, key_r) => {
                     return Halt::StObjByValue {
-                        key: self.acc,
+                        key: self.reg(key_r.0),
                         obj: self.reg(obj_r.0),
-                        value: self.reg(val_r.0),
+                        value: self.acc,
                     };
                 }
                 // Store to a named property: a side effect the lowering

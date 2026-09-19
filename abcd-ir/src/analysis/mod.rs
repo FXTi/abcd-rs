@@ -202,6 +202,7 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         }
         DeleteProperty { object, key } => vec![*object, *key],
         CopyDataProperties { dst, src } => vec![*dst, *src],
+        ArraySpread { dst, index, src } => vec![*dst, *index, *src],
         LoadSuperProperty { key } => {
             if let PropKind::ByValue(k) = key {
                 vec![*k]

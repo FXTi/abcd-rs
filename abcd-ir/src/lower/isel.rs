@@ -939,11 +939,15 @@ fn select_inst(
                 codes.push(Bytecode::Stobjbyname(ic.two(), tracer.eid(*name), regs[0]));
             }
             PropKind::ByValue(k) => {
+                // Vendor `stobjbyvalue imm:u16, v1:in:top, v2:in:top,
+                // acc: in:top` (isa.yaml:1353-1357): v1 = receiver, v2 =
+                // propKey, acc = VALUE. Register operands first, then
+                // the acc operand (B3 ordering).
                 let regs = materialize_operands(
                     tracker,
                     func_id,
-                    &[*object, *value],
-                    Some(*k),
+                    &[*object, *k],
+                    Some(*value),
                     alloc,
                     codes,
                 )?;
@@ -997,6 +1001,17 @@ fn select_inst(
             let regs = materialize_operands(tracker, func_id, &[*dst], Some(*src), alloc, codes)?;
             codes.push(Bytecode::Copydataproperties(regs[0]));
             *tracker = AccContent::Unknown;
+        }
+        InstData::ArraySpread { dst, index, src } => {
+            // Vendor `starrayspread v1:in:top, v2:in:top, acc: inout:top`
+            // (isa.yaml:1329-1332): v1 = destination array, v2 = start
+            // index, acc = source iterable; acc out = the NEW INDEX (the
+            // IR result). Register operands first, then the acc operand
+            // (B3 ordering); the result is homed per `acc: inout`.
+            let regs =
+                materialize_operands(tracker, func_id, &[*dst, *index], Some(*src), alloc, codes)?;
+            codes.push(Bytecode::Starrayspread(regs[0], regs[1]));
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LoadSuperProperty { key } => {
             match key {

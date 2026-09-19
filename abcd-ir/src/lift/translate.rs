@@ -254,10 +254,14 @@ pub(super) fn translate_bytecode(
             );
             write_acc(ssa, block, v);
         }
-        Bytecode::Stobjbyvalue(_ic, obj_reg, val_reg) => {
-            let key = read_acc(ssa, block, module);
+        Bytecode::Stobjbyvalue(_ic, obj_reg, key_reg) => {
+            // Vendor `stobjbyvalue imm:u16, v1:in:top, v2:in:top,
+            // acc: in:top` (isa.yaml:1353-1357): v1 = receiver, v2 =
+            // propKey, acc = VALUE (`propKey = GET_VREG_VALUE(v1)`,
+            // `value = GET_ACC()`, interpreter_assembly.cpp:2306-2335).
+            let value = read_acc(ssa, block, module);
             let obj = read_reg(ssa, *obj_reg, block, module);
-            let value = read_reg(ssa, *val_reg, block, module);
+            let key = read_reg(ssa, *key_reg, block, module);
             emit_void(
                 module,
                 block,
@@ -399,10 +403,14 @@ pub(super) fn translate_bytecode(
             );
             write_acc(ssa, block, v);
         }
-        Bytecode::Stthisbyvalue(_ic, val_reg) => {
-            let key = read_acc(ssa, block, module);
+        Bytecode::Stthisbyvalue(_ic, key_reg) => {
+            // Vendor `stthisbyvalue imm:u16, v:in:top, acc: in:top`
+            // (isa.yaml:1642-1646): receiver = this, v = propKey, acc =
+            // VALUE (`propKey = GET_VREG_VALUE(v0)`, `value =
+            // GET_ACC()`, interpreter_assembly.cpp:6195-6257).
+            let value = read_acc(ssa, block, module);
             let this = emit_val(module, block, InstData::LoadThis, loc);
-            let value = read_reg(ssa, *val_reg, block, module);
+            let key = read_reg(ssa, *key_reg, block, module);
             emit_void(
                 module,
                 block,
@@ -1303,19 +1311,22 @@ pub(super) fn translate_bytecode(
             );
         }
         Bytecode::Starrayspread(arr_reg, index_reg) => {
-            let value = read_acc(ssa, block, module);
-            let arr = read_reg(ssa, *arr_reg, block, module);
-            let idx = read_reg(ssa, *index_reg, block, module);
-            emit_void(
+            // Vendor `starrayspread v1:in:top, v2:in:top, acc: inout:top`
+            // (isa.yaml:1329-1332): v1 = destination array, v2 = start
+            // index, acc = source iterable; the NEW INDEX is written
+            // back to acc (`SlowRuntimeStub::StArraySpread`,
+            // interpreter_assembly.cpp:2876-2894) — hence the result
+            // value and write_acc, not a void store.
+            let src = read_acc(ssa, block, module);
+            let dst = read_reg(ssa, *arr_reg, block, module);
+            let index = read_reg(ssa, *index_reg, block, module);
+            let v = emit_val(
                 module,
                 block,
-                InstData::StoreProperty {
-                    object: arr,
-                    key: PropKind::ByValue(idx),
-                    value,
-                },
+                InstData::ArraySpread { dst, index, src },
                 loc,
             );
+            write_acc(ssa, block, v);
         }
         Bytecode::Copydataproperties(dst_reg) => {
             // Vendor `copydataproperties v:in:top, acc: inout:top`: the

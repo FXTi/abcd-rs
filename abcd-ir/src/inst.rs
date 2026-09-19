@@ -173,6 +173,21 @@ pub enum InstData {
         dst: Value,
         src: Value,
     },
+    /// Vendor `starrayspread v1:in:top, v2:in:top, acc: inout:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1329-1332): `dst` (v1) is the
+    /// destination array, `index` (v2) the start index, `src` the
+    /// accumulator iterable; the runtime appends the spread elements
+    /// and writes the NEW INDEX back to the accumulator
+    /// (`SlowRuntimeStub::StArraySpread(thread, dst, index, src)` +
+    /// `SET_ACC`, arkcompiler_ets_runtime-master/ecmascript/
+    /// interpreter/interpreter_assembly.cpp:2876-2894). Side-effecting
+    /// (mutates `dst`) AND result-producing (the new index) — never a
+    /// single [`InstData::StoreProperty`].
+    ArraySpread {
+        dst: Value,
+        index: Value,
+        src: Value,
+    },
 
     // ── Global variables ─────────────────────────────────────────────
     LoadGlobalVar {
@@ -490,6 +505,7 @@ impl InstData {
             }
             DeleteProperty { object, key } => vec![object, key],
             CopyDataProperties { dst, src } => vec![dst, src],
+            ArraySpread { dst, index, src } => vec![dst, index, src],
             LoadSuperProperty { key } => {
                 if let PropKind::ByValue(k) = key {
                     vec![k]
