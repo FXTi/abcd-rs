@@ -26,11 +26,6 @@ pub enum CopyResolveError {
     /// reserved temporary itself participates in the copy set).
     #[error("slot-level copy cycle requires a reserved temporary slot")]
     CycleNeedsTemp,
-    /// A copy between the accumulator and a register ≥ 256 needs the
-    /// reserved low acc-routing scratch (sta/lda are op_v_8-only), but
-    /// register allocation reserved none.
-    #[error("accumulator copy to/from a high (>= 256) register requires a reserved low scratch")]
-    HighRegNeedsScratch,
 }
 
 /// Sequentialize a parallel copy set in slot space.
@@ -42,6 +37,12 @@ pub enum CopyResolveError {
 /// Same-slot copies are dropped (they are no-ops). The remaining copies are
 /// returned in an order that preserves parallel-copy semantics when emitted
 /// sequentially.
+///
+/// Since B4 every slot is a register (`RegSlot::Acc` is deleted: the
+/// accumulator is an emission-time resource, not a coloring class), so the
+/// resolved pairs all lower to the auto-widening `Mov` — acc never appears
+/// in copy slots, and the old acc-routing arms (low-scratch detours for
+/// acc↔high-register copies) are dead by construction.
 pub fn resolve_slot_copies(
     copies: &[(RegSlot, RegSlot)],
     temp: Option<RegSlot>,
@@ -98,43 +99,13 @@ pub fn resolve_slot_copies(
     Ok(result)
 }
 
-/// Emit one resolved slot-level copy as bytecodes (0 for a same-slot no-op,
-/// 1 normally, 2 when acc traffic to/from a high register detours through
-/// the low acc scratch).
-///
-/// `acc_scratch` is the reserved low (≤ 255) acc-routing scratch register
-/// (`RegAlloc::low_scratch_base` + the acc index) and is consulted only when
-/// an Acc↔Reg copy involves a register ≥ 256: `sta`/`lda` are op_v_8-only,
-/// so such a copy is `sta scratch; mov high, scratch` (store) or
-/// `mov scratch, high; lda scratch` (load). Reg→Reg copies use the
-/// auto-widening `mov` and need no scratch at any height. A routed copy
-/// fully completes before the next one starts, so one scratch suffices for
-/// the whole sequentialized set.
-pub fn emit_copy(
-    src: RegSlot,
-    dst: RegSlot,
-    acc_scratch: Option<u16>,
-) -> Result<Vec<Bytecode>, CopyResolveError> {
-    Ok(match (src, dst) {
-        (RegSlot::Reg(s), RegSlot::Reg(d)) => vec![Bytecode::Mov(Reg(d), Reg(s))],
-        (RegSlot::Acc, RegSlot::Reg(d)) if d <= 255 => vec![Bytecode::Sta(Reg(d))],
-        (RegSlot::Acc, RegSlot::Reg(d)) => {
-            let scratch = acc_scratch.ok_or(CopyResolveError::HighRegNeedsScratch)?;
-            vec![
-                Bytecode::Sta(Reg(scratch)),
-                Bytecode::Mov(Reg(d), Reg(scratch)),
-            ]
-        }
-        (RegSlot::Reg(s), RegSlot::Acc) if s <= 255 => vec![Bytecode::Lda(Reg(s))],
-        (RegSlot::Reg(s), RegSlot::Acc) => {
-            let scratch = acc_scratch.ok_or(CopyResolveError::HighRegNeedsScratch)?;
-            vec![
-                Bytecode::Mov(Reg(scratch), Reg(s)),
-                Bytecode::Lda(Reg(scratch)),
-            ]
-        }
-        (RegSlot::Acc, RegSlot::Acc) => vec![],
-    })
+/// Emit one resolved slot-level copy as its bytecode. Since B4 every slot
+/// is a register, this is always the auto-widening `Mov` (encodable at any
+/// register height — no scratch routing, no acc involvement).
+pub fn emit_copy(src: RegSlot, dst: RegSlot) -> Bytecode {
+    match (src, dst) {
+        (RegSlot::Reg(s), RegSlot::Reg(d)) => Bytecode::Mov(Reg(d), Reg(s)),
+    }
 }
 
 #[cfg(test)]
@@ -162,11 +133,6 @@ mod tests {
     #[test]
     fn same_slot_copies_are_dropped() {
         assert_eq!(resolve_slot_copies(&[(r(1), r(1))], Some(r(9))), Ok(vec![]));
-        // Acc → Acc is a same-slot copy: skipped, no temp consulted.
-        assert_eq!(
-            resolve_slot_copies(&[(RegSlot::Acc, RegSlot::Acc)], None),
-            Ok(vec![])
-        );
     }
 
     #[test]
@@ -195,31 +161,6 @@ mod tests {
     }
 
     #[test]
-    fn acc_cycle_is_broken_with_temp() {
-        // Swap Acc ↔ R1: Sta tmp; Lda R1; Mov R1, tmp at the bytecode level.
-        assert_eq!(
-            resolve_slot_copies(&[(RegSlot::Acc, r(1)), (r(1), RegSlot::Acc)], Some(r(9))),
-            Ok(vec![
-                (RegSlot::Acc, r(9)),
-                (r(1), RegSlot::Acc),
-                (r(9), r(1))
-            ])
-        );
-    }
-
-    #[test]
-    fn acc_can_serve_as_temp_for_reg_cycle() {
-        assert_eq!(
-            resolve_slot_copies(&[(r(1), r(2)), (r(2), r(1))], Some(RegSlot::Acc)),
-            Ok(vec![
-                (r(1), RegSlot::Acc),
-                (r(2), r(1)),
-                (RegSlot::Acc, r(2))
-            ])
-        );
-    }
-
-    #[test]
     fn cycle_without_temp_is_an_error_not_a_panic() {
         assert_eq!(
             resolve_slot_copies(&[(r(1), r(2)), (r(2), r(1))], None),
@@ -238,52 +179,16 @@ mod tests {
     }
 
     #[test]
-    fn emit_copy_maps_slot_pairs_to_bytecodes() {
+    fn emit_copy_maps_slot_pairs_to_a_mov() {
         // `Bytecode` does not implement PartialEq; match structurally.
         assert!(matches!(
-            emit_copy(r(1), r(2), None).as_deref(),
-            Ok([Bytecode::Mov(Reg(2), Reg(1))])
-        ));
-        assert!(matches!(
-            emit_copy(RegSlot::Acc, r(2), None).as_deref(),
-            Ok([Bytecode::Sta(Reg(2))])
-        ));
-        assert!(matches!(
-            emit_copy(r(1), RegSlot::Acc, None).as_deref(),
-            Ok([Bytecode::Lda(Reg(1))])
-        ));
-        assert!(matches!(
-            emit_copy(RegSlot::Acc, RegSlot::Acc, None).as_deref(),
-            Ok([])
-        ));
-    }
-
-    #[test]
-    fn emit_copy_routes_high_registers_through_the_low_acc_scratch() {
-        // Acc → R300: sta scratch; mov r300, scratch.
-        assert!(matches!(
-            emit_copy(RegSlot::Acc, r(300), Some(7)).as_deref(),
-            Ok([Bytecode::Sta(Reg(7)), Bytecode::Mov(Reg(300), Reg(7))])
-        ));
-        // R300 → Acc: mov scratch, r300; lda scratch.
-        assert!(matches!(
-            emit_copy(r(300), RegSlot::Acc, Some(7)).as_deref(),
-            Ok([Bytecode::Mov(Reg(7), Reg(300)), Bytecode::Lda(Reg(7))])
-        ));
-        // Without a reserved scratch these are hard errors, not truncated
-        // sta/lda operands. (`Bytecode` has no PartialEq; match structurally.)
-        assert!(matches!(
-            emit_copy(RegSlot::Acc, r(300), None),
-            Err(CopyResolveError::HighRegNeedsScratch)
-        ));
-        assert!(matches!(
-            emit_copy(r(300), RegSlot::Acc, None),
-            Err(CopyResolveError::HighRegNeedsScratch)
+            emit_copy(r(1), r(2)),
+            Bytecode::Mov(Reg(2), Reg(1))
         ));
         // Reg→Reg at any height is the auto-widening mov — no scratch.
         assert!(matches!(
-            emit_copy(r(300), r(600), None).as_deref(),
-            Ok([Bytecode::Mov(Reg(600), Reg(300))])
+            emit_copy(r(300), r(600)),
+            Bytecode::Mov(Reg(600), Reg(300))
         ));
     }
 }

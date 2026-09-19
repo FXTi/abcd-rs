@@ -99,7 +99,6 @@ fn phi_copies_for_untaken_successor_clobber_taken_path() {
         num_regs: 6,
         copy_temp: Some(RegSlot::Reg(15)),
         // No Acc-colored values in this fixture.
-        spill_slot: None,
         call_window_base: None,
         low_scratch_base: None,
     };

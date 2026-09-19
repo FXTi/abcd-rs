@@ -261,10 +261,14 @@ fn lowering_without_unreachable_blocks_is_byte_identical() {
 
     let result = lower_function(&module, func).expect("diamond must lower");
 
-    // Byte-identical pin (pre-fix capture, Debug rendering of the flat
-    // stream — `Bytecode` has no PartialEq).
+    // Byte-identical pin (Debug rendering of the flat stream — `Bytecode`
+    // has no PartialEq). Re-captured at the B4 acc-as-cache refactor: the
+    // acc color and the spill-slot reservation are gone, so this fixture's
+    // frame collapsed to ONE register (cond/phi/x/y never interfere and
+    // share v0) and the copy-in prologue reads arg slot v1 instead of v3.
+    // The instruction SHAPE is unchanged — same blocks, same order.
     let rendered = format!("{:?}", result.bytecodes);
-    let expected = "[Bytecode(mov v0 v3), Bytecode(lda v0), Bytecode(jnez label_6), \
+    let expected = "[Bytecode(mov v0 v1), Bytecode(lda v0), Bytecode(jnez label_6), \
 Bytecode(ldai 9), Bytecode(sta v0), Bytecode(jmp label_9), Bytecode(ldai 7), \
 Bytecode(sta v0), Bytecode(jmp label_9), Bytecode(lda v0), Bytecode(return)]";
     assert_eq!(rendered, expected, "reachable-only lowering output drifted");

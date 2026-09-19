@@ -155,7 +155,6 @@ fn high_register_store_and_reload_routes_through_low_scratch() {
         handler_phi_stores: Vec::new(),
         num_regs: 302,
         copy_temp: None,
-        spill_slot: None,
         // High-register mode: the reserved low scratch block at 250..=254
         // (operand scratches 250..=253, acc-routing scratch 254), as
         // regalloc would reserve it right after the parameter homes.

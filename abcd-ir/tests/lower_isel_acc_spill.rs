@@ -1,27 +1,25 @@
-//! P1 regression (B3): isel accumulator spill must capture the acc BEFORE
-//! any `Lda` of the same instruction clobbers it.
+//! P1/P3 regression: an acc-held value needed as a register operand must
+//! read its own content, never whatever the last acc write left behind.
 //!
-//! `lower::isel` lowers `InstData::StoreProperty { key: PropKind::ByValue(k), .. }`
-//! with the key in the accumulator (`Lda`) and the object/value as register
-//! operands. The old code emitted `ensure_acc(k)` (the clobbering `Lda`)
-//! BEFORE `val_reg(object)` spilled an Acc-colored object with `Sta` — the
-//! spill captured the *key*, not the object — into a rotating slot at
-//! `TEMP_REG_BASE + len % 16`, outside any declared frame.
+//! History: B3 was the intra-instruction form (the spill of an Acc-colored
+//! register operand ran AFTER the acc operand's clobbering `Lda`, and into
+//! a rotating out-of-frame slot); B4 was the cross-instruction form (an
+//! Acc-colored value live across an intervening acc write read garbage).
+//! Both are deleted by construction under acc-as-cache (Phase 3 finale):
+//! `RegSlot::Acc` is gone, every value has a register home, register
+//! operands always read their homes, and `ensure_acc` — the only acc
+//! writer besides result homing — consults the emission-time acc tracker.
 //!
-//! The fixed contract: the (at most one, by the interference invariant)
-//! Acc-colored register operand is spilled into the reserved in-frame
-//! `RegAlloc::spill_slot` register BEFORE the acc operand's `Lda`.
-//!
-//! The module is real IR built with `IRBuilder` (one block:
-//! `p = k + v`, then `StoreProperty { object: p, key: ByValue(k), value: v }`,
-//! then `Return`). `p` is the Acc-colored object — a computed value, not a
-//! parameter: since Phase 2.2 parameters must keep a register home for the
-//! copy-in prologue (`LowerError::AccColoredParam` otherwise). The
-//! `RegAlloc` is hand-constructed (all fields public) to pin k->R0, v->R1,
-//! p->Acc, spill slot -> R2. The bytecodes produced by the public
-//! `isel::select` are executed on a tiny deterministic interpreter with the
-//! ABI argument slots (top of frame) seeded: the `Stobjbyvalue` object
-//! operand must be p = k + v = OBJ.
+//! What survives here as the pinned contract: `StoreProperty` with a
+//! ByValue key (object/value as register operands, key in acc) must see
+//! the COMPUTED object value in the object's register operand. The module
+//! is real IR built with `IRBuilder` (one block: `p = k + v`, then
+//! `StoreProperty { object: p, key: ByValue(k), value: v }`, then
+//! `Return`). The `RegAlloc` is hand-constructed (all fields public) to
+//! pin k->R0, v->R1, p->R2. The bytecodes produced by the public
+//! `isel::select` are executed on a tiny deterministic interpreter with
+//! the ABI argument slots (top of frame) seeded: the `Stobjbyvalue`
+//! object operand must be p = k + v = OBJ.
 
 mod common;
 
@@ -45,7 +43,7 @@ const OBJ: i64 = 333; // == KEY + VALUE, so p = k + v is the OBJ sentinel
 const VALUE: i64 = 222;
 
 #[test]
-fn acc_spill_before_ensure_acc_captures_object_not_key() {
+fn byvalue_store_reads_the_computed_object_from_its_home() {
     let mut module = Module::new(Version::new(12, 0, 6, 0), FileType::Dynamic);
     let func = IRBuilder::create_function(&mut module, "f", FunctionKind::Function, 2);
     let entry = module.func(func).entry_block;
@@ -68,21 +66,19 @@ fn acc_spill_before_ensure_acc_captures_object_not_key() {
     });
     builder.emit_void(InstData::Return { value: None });
 
-    // Hand-pinned allocation: key in R0, value in R1, the computed object
-    // p in the accumulator, and the reserved in-frame spill slot R2 (as
-    // regalloc would reserve it: `num_regs` before reservation, then
-    // bumped to 3).
+    // Hand-pinned allocation (post-B4 shape: every value Reg-colored, no
+    // spill slot — there is nothing to spill): key in R0, value in R1,
+    // the computed object p in R2.
     let alloc = RegAlloc {
         allocation: HashMap::from([
             (k, RegSlot::Reg(0)),
             (v, RegSlot::Reg(1)),
-            (p, RegSlot::Acc),
+            (p, RegSlot::Reg(2)),
         ]),
         phi_copies: HashMap::new(),
         handler_phi_stores: Vec::new(),
         num_regs: 3,
         copy_temp: None,
-        spill_slot: Some(RegSlot::Reg(2)),
         call_window_base: None,
         low_scratch_base: None,
     };
@@ -108,10 +104,10 @@ fn acc_spill_before_ensure_acc_captures_object_not_key() {
         "expected copy-in Mov(home R1, arg slot R4) second, got {codes:?}"
     );
 
-    // New structural contract: the object's spill Sta into the reserved
-    // in-frame register R2 is emitted AFTER the add that leaves p in acc
-    // and BEFORE the key's Lda (acc clobber); Stobjbyvalue reads the spill
-    // register.
+    // New structural contract (acc-as-cache): the add's result is homed
+    // with Sta(R2) immediately after the Add2 (p has a use), and the
+    // store's key Lda reloads k from its home — the tracker knows the acc
+    // holds p at that point, not k. No spill slot, no Sta anywhere else.
     assert!(
         matches!(codes.get(2), Some(Bytecode::Lda(Reg(0)))),
         "expected the add's left-operand Lda(R0), got {codes:?}"
@@ -122,17 +118,18 @@ fn acc_spill_before_ensure_acc_captures_object_not_key() {
     );
     assert!(
         matches!(codes.get(4), Some(Bytecode::Sta(Reg(2)))),
-        "expected val_reg(object) = Sta(reserved spill R2) before the key's Lda, got {codes:?}"
+        "expected the result-homing Sta(R2) right after the add, got {codes:?}"
     );
     assert!(
         matches!(codes.get(5), Some(Bytecode::Lda(Reg(0)))),
-        "expected ensure_acc(key) = Lda(R0) after the spill, got {codes:?}"
+        "expected ensure_acc(key) = Lda(R0) — a tracker miss, the acc \
+         holds p at this point — got {codes:?}"
     );
     let Some(Bytecode::Stobjbyvalue(_, obj_r, val_r)) = codes.get(6) else {
         panic!("expected Stobjbyvalue after the key's Lda, got {codes:?}");
     };
     let (obj_r, val_r) = (*obj_r, *val_r);
-    assert_eq!(obj_r, Reg(2), "object operand must be the spill register");
+    assert_eq!(obj_r, Reg(2), "object operand must be p's home register");
     assert_eq!(val_r, Reg(1));
 
     // Simulate with the ABI frame layout: the arguments arrive in the top
@@ -148,49 +145,46 @@ fn acc_spill_before_ensure_acc_captures_object_not_key() {
     assert_eq!(value, VALUE, "stobjbyvalue value operand = R1");
     assert_eq!(
         obj, OBJ,
-        "stobjbyvalue object operand (R{}) must be p = k + v = OBJ held in \
-         acc after the add; a B3 regression would spill the clobbered acc \
-         (the key) instead (bytecodes: {codes:?})",
+        "stobjbyvalue object operand (R{}) must be p = k + v = OBJ, homed \
+         after the add (bytecodes: {codes:?})",
         obj_r.0
     );
 }
 
-/// End-to-end B3 reproduction through the full `lower_function` pipeline
-/// (regalloc picks the slots itself, including the reserved spill slot).
+/// End-to-end through the full `lower_function` pipeline (regalloc picks
+/// the slots itself — all Reg, no spill reservation since B4).
 ///
 /// IR shape (4 params: o, k, q, r — pinned to R0..R3 by param
 /// pre-assignment):
 ///
 /// ```text
-/// entry: p = q + r                                          // result left in acc
+/// entry: p = q + r
 ///        StoreProperty { object: o, key: ByValue(k), value: p }
-///        d = p + r        // score-shaping only: p's use as a binop left
-///        return d         //   operand makes p prefer Acc (+2 result,
-///                          //   +2 left operand, -3 store value = +1 > 0)
+///        d = p + r
+///        return d
 /// ```
 ///
-/// `p` interferes only with the params (all Reg-colored), so the allocator
-/// colors it Acc. The store is where B3 lived: the key's `Lda` must not
-/// precede the spill of the acc-resident `p`. The simulator halts at the
-/// `Stobjbyvalue`, so the trailing instructions (which would trip the
-/// cross-instruction acc-clobber gap tracked separately as B4) are never
-/// executed — they exist only to shape the acc-preference score.
+/// p is defined, then used as the store's value operand AFTER the key's
+/// acc load — the exact B3/B4 clobber window. Under acc-as-cache p is
+/// homed right after the add and the store reads that home. The simulator
+/// halts at the `Stobjbyvalue`.
 #[test]
-fn store_byvalue_with_acc_resident_value_lowers_correctly_end_to_end() {
+fn store_byvalue_with_computed_value_lowers_correctly_end_to_end() {
     const Q: i64 = 7;
     const R: i64 = 35;
 
     let mut module = Module::new(Version::new(12, 0, 6, 0), FileType::Dynamic);
     let func = IRBuilder::create_function(&mut module, "store_byvalue", FunctionKind::Function, 4);
 
+    let (o, k, q, r, p, d);
     {
         let mut builder = IRBuilder::new(&mut module, func);
-        let o = builder.create_func_param(0, IrType::default());
-        let k = builder.create_func_param(1, IrType::default());
-        let q = builder.create_func_param(2, IrType::default());
-        let r = builder.create_func_param(3, IrType::default());
+        o = builder.create_func_param(0, IrType::default());
+        k = builder.create_func_param(1, IrType::default());
+        q = builder.create_func_param(2, IrType::default());
+        r = builder.create_func_param(3, IrType::default());
 
-        let p = builder.emit_val(
+        p = builder.emit_val(
             InstData::BinaryOp {
                 op: abcd_ir::inst::BinOp::Add,
                 left: q,
@@ -203,7 +197,7 @@ fn store_byvalue_with_acc_resident_value_lowers_correctly_end_to_end() {
             key: PropKind::ByValue(k),
             value: p,
         });
-        let d = builder.emit_val(
+        d = builder.emit_val(
             InstData::BinaryOp {
                 op: abcd_ir::inst::BinOp::Add,
                 left: p,
@@ -214,26 +208,27 @@ fn store_byvalue_with_acc_resident_value_lowers_correctly_end_to_end() {
         builder.emit_void(InstData::Return { value: Some(d) });
     }
 
+    // Post-B4 structural pin: every value has a register home; nothing is
+    // acc-colored and no spill slot exists (the field is deleted).
+    let alloc = regalloc::allocate(&module, func).expect("allocation must succeed");
+    for value in [o, k, q, r, p, d] {
+        assert!(
+            matches!(alloc.allocation.get(&value), Some(RegSlot::Reg(_))),
+            "every value must have a register home (acc-as-cache)"
+        );
+    }
+
     let result = lower_function(&module, func).expect("store_byvalue must lower");
 
-    // The frame is exactly the 4 params plus the one reserved spill
-    // register: every SSA value in this function is Acc-colored and no phi
-    // copy temp is needed.
-    assert_eq!(
-        result.num_regs, 5,
-        "expected 4 params + 1 reserved spill register, got {} (bytecodes: {:?})",
-        result.num_regs, result.bytecodes
-    );
-
     // p = Q + R = 42; the store must see (key = acc = K, object = R0, value
-    // = spilled p = 42). The simulator seeds the ABI top slots (num_regs =
-    // 5, so v5..v8 hold the four arguments); the copy-in prologue moves
-    // them into the homes R0..R3.
+    // = p's home = 42). The simulator seeds the ABI top slots (num_regs,
+    // so v[num_regs..num_regs+4) hold the four arguments); the copy-in
+    // prologue moves them into the homes R0..R3.
     let mut machine = Machine::new()
-        .with_reg(5, OBJ)
-        .with_reg(6, KEY)
-        .with_reg(7, Q)
-        .with_reg(8, R);
+        .with_reg(result.num_regs, OBJ)
+        .with_reg(result.num_regs + 1, KEY)
+        .with_reg(result.num_regs + 2, Q)
+        .with_reg(result.num_regs + 3, R);
     let halt = machine.run(&result.bytecodes);
 
     let Halt::StObjByValue { key, obj, value } = halt else {
@@ -247,8 +242,8 @@ fn store_byvalue_with_acc_resident_value_lowers_correctly_end_to_end() {
     assert_eq!(
         value,
         Q + R,
-        "stobjbyvalue value operand must be p = q + r, spilled before the \
-         key's Lda (bytecodes: {:?})",
+        "stobjbyvalue value operand must be p = q + r, read from its home \
+         (bytecodes: {:?})",
         result.bytecodes
     );
 }

@@ -3,16 +3,16 @@
 //! Takes an IR function with register allocation results and produces
 //! a sequence of ArkCompiler bytecodes per basic block.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use abcd_isa::{Bytecode, EntityId, EntityKind, Imm, Label, Reg};
 
+use crate::analysis::inst_operands;
 use crate::entity::{Block, FuncId, Inst, StringId, Value};
 use crate::inst::{BinOp, CallKind, InstData, PropKind, UnOp};
 use crate::module::{Module, ValueDef};
 
 use super::LowerError;
-use super::copy_resolve::{CopyResolveError, emit_copy};
 use super::regalloc::{self, RegAlloc, RegSlot};
 
 /// Result of instruction selection for one function.
@@ -128,6 +128,61 @@ impl IcAllocator {
     }
 }
 
+/// Emission-time model of the PHYSICAL accumulator content (B4:
+/// "acc-as-cache"). The accumulator is one physical location; register
+/// allocation gives every value a register home, and this tracker records
+/// — as an emission-time fact — which value's content the acc provably
+/// holds at each point. `ensure_acc` consults it: a hit elides the `Lda`.
+///
+/// Soundness invariant: [`AccContent::Holds`]`(v)` is recorded ONLY at
+/// points where the physical acc was just written with v's content (an
+/// acc-writing instruction's result, the homing `Sta`, an `Lda(home v)`,
+/// or exception dispatch), and every later acc write updates the tracker
+/// (the helpers in this file are the only acc writers). A stale entry is
+/// therefore impossible in the dangerous direction: a hit and a miss
+/// always produce the same physical acc content. The worst a modeling gap
+/// can do is forget a content (`Unknown`), costing a redundant `Lda`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccContent {
+    /// Frame-entry state: the vendor frame init leaves the hole in acc
+    /// (arkcompiler_ets_runtime-master/ecmascript/interpreter/
+    /// interpreter-inl.cpp:739, :1482). Never equal to a value's content.
+    Hole,
+    /// The physical acc provably holds this SSA value's content.
+    Holds(Value),
+    /// Unknown content: an acc-writing instruction whose result is not a
+    /// tracked value, exception dispatch of an uncolored exception value,
+    /// the meet of disagreeing predecessors, or a not-yet-emitted
+    /// (back-edge) predecessor.
+    Unknown,
+}
+
+/// Meet the acc content at a block entry over its already-emitted
+/// predecessors: the content is known only when EVERY predecessor exits
+/// with the SAME content. A predecessor without a recorded exit state (a
+/// back edge — RPO emits it later — or an unreachable block) degrades the
+/// meet to `Unknown`. Layout-inserted phi copies and trampolines are pure
+/// `Mov`s (vendor `acc: none`) and never perturb the content across an
+/// edge, so per-predecessor exit states are valid at successor entries.
+fn meet_acc_content<'a>(
+    preds: impl IntoIterator<Item = &'a Block>,
+    exit_states: &HashMap<Block, AccContent>,
+) -> AccContent {
+    let mut meet: Option<AccContent> = None;
+    for pred in preds {
+        let state = exit_states
+            .get(pred)
+            .copied()
+            .unwrap_or(AccContent::Unknown);
+        meet = Some(match (meet, state) {
+            (None, s) => s,
+            (Some(a), b) if a == b => a,
+            _ => AccContent::Unknown,
+        });
+    }
+    meet.unwrap_or(AccContent::Unknown)
+}
+
 /// Select instructions for a function.
 pub fn select(
     module: &Module,
@@ -147,6 +202,21 @@ pub fn select(
 
     let entry_block = module.func(func_id).entry_block;
 
+    // Values with at least one use: an acc-writing instruction's result is
+    // homed (`Sta`) only when it has a use — a dead result never leaves the
+    // accumulator, so its acc content is `Unknown` to the tracker.
+    let mut used: HashSet<Value> = HashSet::new();
+    for &bb in rpo {
+        let block = module.block(bb);
+        for &inst_id in block.phis.iter().chain(block.insts.iter()) {
+            used.extend(inst_operands(&module.inst(inst_id).data));
+        }
+    }
+
+    // Per-block EXIT acc content, filled as blocks are emitted (RPO: every
+    // non-back-edge predecessor is emitted before its successors).
+    let mut exit_states: HashMap<Block, AccContent> = HashMap::new();
+
     // N13: handler block → its exception value. The exception is delivered
     // in acc by the dispatch itself; the prologue below materializes it
     // into its register home.
@@ -156,15 +226,24 @@ pub fn select(
         .iter()
         .copied()
         .collect();
+    // EVERY catch-handler block (try-region derived, not just the ones with
+    // a seeded exception value): exception dispatch physically clobbers the
+    // accumulator at handler entry, so a handler's entry acc content is
+    // never the meet of its CFG predecessors — values defined in the try
+    // body are NOT in acc, even when every predecessor agrees.
+    let handler_blocks: HashSet<Block> = module
+        .func(func_id)
+        .try_regions
+        .iter()
+        .flat_map(|region| region.catches.iter().map(|c| c.handler_block))
+        .collect();
     // N21 pinned stores for handler-block phis, grouped by emission point.
     // Deterministic order: sorted by (pred, src, dst) / (src, dst).
     //
     // - AfterDef: the source is defined by an instruction inside the pred —
     //   the store is emitted immediately after that instruction (the
-    //   closest implementable point to the vendored `sta`; if the source is
-    //   Acc-colored its content is still physically in acc at that point —
-    //   the instruction's own emission ends with store_result, which for an
-    //   Acc home emits nothing — so `Sta(S)` reads the right value).
+    //   closest implementable point to the vendored `sta`; the source's
+    //   result homing has just run, so its register home holds it).
     // - BlockStart(pred): every other source — defined in a dominating
     //   block, a phi result (materialized by the incoming edge copies), a
     //   parameter (the entry copy-in prologue has run), or an exception
@@ -191,17 +270,26 @@ pub fn select(
         stores.sort_unstable();
     }
 
-    let acc_scratch_slot = alloc
-        .low_scratch_base
-        .map(|base| base + regalloc::LOW_OPERAND_SCRATCHES);
-
     for &bb in rpo {
         let mut codes = Vec::new();
         let block = module.block(bb);
 
+        // Block-entry acc content (B4): the entry block starts with the
+        // vendor frame-init hole; a catch handler starts with the
+        // dispatched exception object (unknown to the tracker until the
+        // prologue homes it); every other block meets its predecessors'
+        // exit contents.
+        let mut tracker = if bb == entry_block {
+            AccContent::Hole
+        } else if handler_blocks.contains(&bb) {
+            AccContent::Unknown
+        } else {
+            meet_acc_content(&block.preds, &exit_states)
+        };
+
         // Copy-in prologue: arguments arrive in the ABI top slots and are
         // moved into the parameters' vreg homes at the very start of the
-        // entry block.
+        // entry block. `mov` never touches acc — the tracker stays Hole.
         if bb == entry_block {
             emit_param_copy_in(func_id, module, alloc, &mut codes)?;
         }
@@ -212,24 +300,26 @@ pub fn select(
         // register home as the handler's FIRST bytecode, before anything
         // can clobber acc. This is exactly the vendored handler-entry
         // `sta vX`. Skipped when the handler never reads the exception (the
-        // value is then uncolored).
+        // value is then uncolored). After the store the tracker knows the
+        // acc holds the exception value (a `sta` reads but never writes
+        // acc — vendor `acc: in`).
         if let Some(&exc) = handler_exc.get(&bb) {
-            if let Some(&home) = alloc.allocation.get(&exc) {
-                if home != RegSlot::Acc {
-                    emit_pinned_copy(func_id, RegSlot::Acc, home, acc_scratch_slot, &mut codes)?;
-                }
+            if let Some(&RegSlot::Reg(home)) = alloc.allocation.get(&exc) {
+                emit_sta_home(func_id, home, alloc, &mut codes)?;
+                tracker = AccContent::Holds(exc);
             }
         }
 
         // N21 pinned stores at block start (phi-result / exception /
         // parameter sources). Runs after the exception prologue so a store
-        // sourcing the exception reads its just-written home.
+        // sourcing the exception reads its just-written home. Pure `Mov`s:
+        // the tracker is unaffected.
         if let Some(stores) = block_start_stores.get(&bb) {
             for &(src, dst) in stores {
-                let s = slot_of(func_id, src, alloc)?;
-                let d = slot_of(func_id, dst, alloc)?;
+                let s = home_of(func_id, src, alloc)?;
+                let d = home_of(func_id, dst, alloc)?;
                 if s != d {
-                    emit_pinned_copy(func_id, s, d, acc_scratch_slot, &mut codes)?;
+                    codes.push(Bytecode::Mov(Reg(d), Reg(s)));
                 }
             }
         }
@@ -253,40 +343,38 @@ pub fn select(
                     _ => "super property access by index".to_string(),
                 });
             }
-            let result_slot = match node.result {
-                Some(v) => Some(slot_of(func_id, v, alloc)?),
-                None => None,
-            };
 
             select_inst(
                 &node.data,
-                result_slot,
+                node.result,
                 inst,
                 &block.insts,
                 func_id,
                 module,
                 alloc,
+                &used,
                 &mut tracer,
                 &mut codes,
                 &mut ic,
+                &mut tracker,
             )?;
 
             // N21 pinned stores right after the defining instruction (see
-            // the ordering argument at `after_def_stores`).
+            // the ordering argument at `after_def_stores`). Pure `Mov`s.
             if let Some(v) = node.result {
                 if let Some(stores) = after_def_stores.get(&v) {
                     for &(_, dst) in stores {
-                        let d = slot_of(func_id, dst, alloc)?;
-                        if let Some(s) = result_slot {
-                            if s != d {
-                                emit_pinned_copy(func_id, s, d, acc_scratch_slot, &mut codes)?;
-                            }
+                        let d = home_of(func_id, dst, alloc)?;
+                        let s = home_of(func_id, v, alloc)?;
+                        if s != d {
+                            codes.push(Bytecode::Mov(Reg(d), Reg(s)));
                         }
                     }
                 }
             }
         }
 
+        exit_states.insert(bb, tracker);
         block_codes.push((bb, codes));
     }
 
@@ -306,12 +394,13 @@ pub fn select(
 /// (static_core/runtime/include/method.h); `to_method_body` declares
 /// `num_vregs = num_regs`, so the arg slots of the lowered frame start
 /// exactly at `Reg(num_regs)`. `alloc.num_regs` is final here — it already
-/// includes the `copy_temp`/`spill_slot` reservations.
+/// includes the `copy_temp` reservation.
 ///
-/// `mcs_color` pre-assigns every parameter a register home, so an
-/// Acc-colored parameter can only come from a hand-crafted allocation;
-/// both that and an uncolored parameter are hard errors, never a silent
-/// path.
+/// `mcs_color` pre-assigns every parameter a register home (there is no
+/// accumulator coloring since B4), so an uncolored parameter can only come
+/// from a hand-crafted allocation and is a hard error, never a silent
+/// path. The prologue is pure `Mov`s (vendor `acc: none`) and does not
+/// perturb the emission-time acc tracker.
 ///
 /// Emission-point safety: `layout` inserts phi copies before predecessor
 /// TERMINATORS (or into trampolines appended after all real blocks), never
@@ -326,21 +415,7 @@ fn emit_param_copy_in(
 ) -> Result<(), LowerError> {
     let func = module.func(func_id);
     for (i, &val) in func.param_values.iter().enumerate() {
-        let home = match alloc.allocation.get(&val).copied() {
-            Some(RegSlot::Reg(r)) => r,
-            Some(RegSlot::Acc) => {
-                return Err(LowerError::AccColoredParam {
-                    func: func_id,
-                    value: val,
-                });
-            }
-            None => {
-                return Err(LowerError::UnallocatedOperand {
-                    func: func_id,
-                    value: val,
-                });
-            }
-        };
+        let home = home_of(func_id, val, alloc)?;
         let arg_slot = u32::from(alloc.num_regs) + i as u32;
         if arg_slot > u32::from(u16::MAX) {
             return Err(LowerError::RegisterOverflow(func_id));
@@ -350,53 +425,32 @@ fn emit_param_copy_in(
     Ok(())
 }
 
-/// Emit one pinned slot copy (the N13 handler exception prologue or an N21
-/// handler-phi write-through store), routing acc↔high-register traffic
-/// through the reserved low scratch (`sta`/`lda` are op_v_8-only; S2). A
-/// single copy never cycles, so `CycleNeedsTemp` is unreachable; both error
-/// arms still map to hard errors, never a silent drop.
-fn emit_pinned_copy(
-    func_id: FuncId,
-    src: RegSlot,
-    dst: RegSlot,
-    acc_scratch: Option<u16>,
-    codes: &mut Vec<Bytecode>,
-) -> Result<(), LowerError> {
-    let emitted = emit_copy(src, dst, acc_scratch).map_err(|e| match e {
-        CopyResolveError::CycleNeedsTemp => LowerError::MissingCopyTemp(func_id),
-        CopyResolveError::HighRegNeedsScratch => LowerError::MissingLowScratch(func_id),
-    })?;
-    codes.extend(emitted);
-    Ok(())
-}
-
-/// Look up the slot register allocation assigned to a value. A missing entry
-/// means the operand was never colored (e.g. a dangling value reference in
-/// unverified IR), which the old code silently treated as acc-resident.
-fn slot_of(func_id: FuncId, val: Value, alloc: &RegAlloc) -> Result<RegSlot, LowerError> {
-    alloc
-        .allocation
-        .get(&val)
-        .copied()
-        .ok_or(LowerError::UnallocatedOperand {
+/// Look up the register home allocation assigned to a value. A missing
+/// entry means the operand was never colored (e.g. a dangling value
+/// reference in unverified IR), which the old code silently treated as
+/// acc-resident.
+fn home_of(func_id: FuncId, val: Value, alloc: &RegAlloc) -> Result<u16, LowerError> {
+    match alloc.allocation.get(&val).copied() {
+        Some(RegSlot::Reg(r)) => Ok(r),
+        None => Err(LowerError::UnallocatedOperand {
             func: func_id,
             value: val,
-        })
+        }),
+    }
 }
 
-/// Get the Reg for a value, spilling an acc-resident value into the reserved
-/// in-frame spill slot (`Sta`) when needed.
+/// Get the Reg for a value's register operand: its colored home.
 ///
 /// High-register routing (S2): `sta`/`lda` are `op_v_8`-only in the vendored
 /// ISA and — except for the auto-widening `mov` — every register operand
 /// slot isel emits is u8-only as well (isa.yaml format audit: all `v`/`vN`
 /// operands are `_8`; the `op_imm_16_v_8`-style second formats widen only
 /// the imm). A value colored to a register ≥ 256 is therefore routed
-/// through the reserved LOW scratch block (`RegAlloc::low_scratch_base`):
-/// register operands via `mov scratch[i], high` (one scratch per operand
-/// position, so simultaneous operands never alias), acc spills via
-/// `sta scratch[i]`. `operand_idx` is the operand's position within its
-/// instruction.
+/// through the reserved LOW scratch block (`RegAlloc::low_scratch_base`),
+/// one scratch per operand position, so simultaneous operands never alias.
+/// `operand_idx` is the operand's position within its instruction. The
+/// emitted `mov` never touches the accumulator (vendor `acc: none`), so
+/// the emission-time acc tracker is unaffected.
 fn val_reg(
     func_id: FuncId,
     val: Value,
@@ -404,25 +458,13 @@ fn val_reg(
     codes: &mut Vec<Bytecode>,
     operand_idx: usize,
 ) -> Result<Reg, LowerError> {
-    match slot_of(func_id, val, alloc)? {
-        RegSlot::Reg(r) if r <= 255 => Ok(Reg(r)),
-        RegSlot::Reg(r) => {
-            let scratch = operand_scratch(func_id, alloc, operand_idx)?;
-            codes.push(Bytecode::Mov(scratch, Reg(r)));
-            Ok(scratch)
-        }
-        RegSlot::Acc => {
-            // Value is in acc — spill it to a reserved register. In
-            // high-register mode that is the operand's low scratch (the
-            // operand slot is u8-only anyway); otherwise it is the
-            // top-of-frame spill slot. At most one operand per instruction
-            // is Acc-colored (interference invariant, see
-            // `materialize_operands`), so one slot per position suffices.
-            let scratch = spill_scratch(func_id, alloc, operand_idx)?;
-            codes.push(Bytecode::Sta(scratch));
-            Ok(scratch)
-        }
+    let r = home_of(func_id, val, alloc)?;
+    if r <= 255 {
+        return Ok(Reg(r));
     }
+    let scratch = operand_scratch(func_id, alloc, operand_idx)?;
+    codes.push(Bytecode::Mov(scratch, Reg(r)));
+    Ok(scratch)
 }
 
 /// The low operand-routing scratch for position `idx` (high-register mode).
@@ -436,19 +478,6 @@ fn operand_scratch(func_id: FuncId, alloc: &RegAlloc, idx: usize) -> Result<Reg,
     Ok(Reg(base + idx as u16))
 }
 
-/// The scratch an Acc-colored operand spills into: the operand's low
-/// scratch in high-register mode, the reserved top-of-frame spill slot
-/// otherwise.
-fn spill_scratch(func_id: FuncId, alloc: &RegAlloc, idx: usize) -> Result<Reg, LowerError> {
-    if alloc.low_scratch_base.is_some() {
-        return operand_scratch(func_id, alloc, idx);
-    }
-    match alloc.spill_slot {
-        Some(RegSlot::Reg(r)) => Ok(Reg(r)),
-        _ => Err(LowerError::MissingSpillSlot(func_id)),
-    }
-}
-
 /// The reserved low acc-routing scratch (high-register mode).
 fn acc_scratch(func_id: FuncId, alloc: &RegAlloc) -> Result<Reg, LowerError> {
     alloc
@@ -457,141 +486,141 @@ fn acc_scratch(func_id: FuncId, alloc: &RegAlloc) -> Result<Reg, LowerError> {
         .ok_or(LowerError::MissingLowScratch(func_id))
 }
 
-/// Ensure a value is in the accumulator. If it's in a register, emit lda;
-/// a high register first detours through the reserved low acc scratch
-/// (`mov scratch, high; lda scratch`).
+/// Emit `Sta(home)` for the register home `r` (a high home detours through
+/// the reserved low acc scratch: `sta scratch; mov home, scratch`). `sta`
+/// reads but never writes the accumulator (vendor `acc: in`), so the
+/// emission-time acc tracker is the caller's concern.
+fn emit_sta_home(
+    func_id: FuncId,
+    r: u16,
+    alloc: &RegAlloc,
+    codes: &mut Vec<Bytecode>,
+) -> Result<(), LowerError> {
+    if r <= 255 {
+        codes.push(Bytecode::Sta(Reg(r)));
+    } else {
+        let scratch = acc_scratch(func_id, alloc)?;
+        codes.push(Bytecode::Sta(scratch));
+        codes.push(Bytecode::Mov(Reg(r), scratch));
+    }
+    Ok(())
+}
+
+/// Ensure a value's content is physically in the accumulator, consulting
+/// the emission-time acc tracker (B4, acc-as-cache): a hit — the tracker
+/// proves the acc already holds THIS value — is a no-op. A miss emits
+/// `Lda(home)` (a high home first detours through the reserved low acc
+/// scratch: `mov scratch, high; lda scratch`) and records the new content.
 fn ensure_acc(
+    tracker: &mut AccContent,
     func_id: FuncId,
     val: Value,
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
 ) -> Result<(), LowerError> {
-    match slot_of(func_id, val, alloc)? {
-        RegSlot::Reg(r) if r <= 255 => {
-            codes.push(Bytecode::Lda(Reg(r)));
-        }
-        RegSlot::Reg(r) => {
-            let scratch = acc_scratch(func_id, alloc)?;
-            codes.push(Bytecode::Mov(scratch, Reg(r)));
-            codes.push(Bytecode::Lda(scratch));
-        }
-        RegSlot::Acc => {
-            // Already in acc, nothing to do.
-        }
+    if *tracker == AccContent::Holds(val) {
+        return Ok(());
     }
+    let r = home_of(func_id, val, alloc)?;
+    if r <= 255 {
+        codes.push(Bytecode::Lda(Reg(r)));
+    } else {
+        let scratch = acc_scratch(func_id, alloc)?;
+        codes.push(Bytecode::Mov(scratch, Reg(r)));
+        codes.push(Bytecode::Lda(scratch));
+    }
+    *tracker = AccContent::Holds(val);
     Ok(())
 }
 
-/// Materialize one instruction's operands in spill-before-load order.
+/// Materialize one instruction's operands: resolve every register operand
+/// to its home (high registers detour through a per-position low scratch —
+/// `mov` never touches acc), then bring the acc operand into the
+/// accumulator (tracker-aware: a hit elides the `Lda`).
 ///
-/// (a) Resolve every register operand first: the — at most one —
-///     Acc-colored register operand is spilled into the reserved in-frame
-///     spill slot via `Sta`, which reads but never clobbers the acc.
-/// (b) Only then bring the acc operand into the accumulator (`Lda` unless
-///     it is the acc-resident value itself).
-///
-/// The invariant that makes a single spill slot sufficient comes from the
-/// interference construction in `regalloc::build_interference`: all operands
-/// of one instruction are simultaneously live at that instruction, hence
-/// pairwise interfere (the later-defined operand's definition point sees the
-/// other operand live), hence the greedy coloring can assign `RegSlot::Acc`
-/// to at most one of them. A hand-crafted allocation may violate it; rather
-/// than emitting a spill sequence that would overwrite the first spill,
-/// selection fails hard.
+/// The old spill-before-load dance (B3) is gone by construction: no
+/// operand can be "acc-resident" anymore, because the accumulator is not a
+/// coloring class — register operands always read their register homes,
+/// and `ensure_acc` is the only acc writer here.
 fn materialize_operands(
+    tracker: &mut AccContent,
     func_id: FuncId,
     reg_operands: &[Value],
     acc_operand: Option<Value>,
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
 ) -> Result<Vec<Reg>, LowerError> {
-    let mut acc_colored: Option<Value> = None;
-    for &v in reg_operands.iter().chain(acc_operand.iter()) {
-        if matches!(alloc.allocation.get(&v), Some(RegSlot::Acc)) {
-            match acc_colored {
-                None => acc_colored = Some(v),
-                Some(prev) if prev != v => {
-                    return Err(LowerError::MultipleAccOperands {
-                        func: func_id,
-                        a: prev,
-                        b: v,
-                    });
-                }
-                Some(_) => {}
-            }
-        }
-    }
-
     let mut regs = Vec::with_capacity(reg_operands.len());
     for (idx, &v) in reg_operands.iter().enumerate() {
         regs.push(val_reg(func_id, v, alloc, codes, idx)?);
     }
     if let Some(acc_val) = acc_operand {
-        ensure_acc(func_id, acc_val, alloc, codes)?;
+        ensure_acc(tracker, func_id, acc_val, alloc, codes)?;
     }
     Ok(regs)
 }
 
-/// If the result should go to a register (not acc), emit sta; a high
-/// register detours through the reserved low acc scratch
-/// (`sta scratch; mov high, scratch`).
-fn store_result(
+/// Home an acc-writing instruction's result and update the emission-time
+/// acc tracker.
+///
+/// The instruction's bytecode just wrote the accumulator (vendor
+/// `acc: out`/`acc: inout` — every result-producing opcode isel emits has
+/// one of those modes). A result with at least one use gets a `Sta(home)`
+/// and the tracker records that acc now holds the value — the next acc use
+/// of it is a cache hit. A dead result (no uses) needs no store; the acc
+/// content is then not a tracked value (`Unknown`), so the next acc use of
+/// ANY value reloads from its home.
+fn home_result(
+    tracker: &mut AccContent,
+    result: Option<Value>,
+    used: &HashSet<Value>,
     func_id: FuncId,
-    result_slot: Option<RegSlot>,
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
 ) -> Result<(), LowerError> {
-    match result_slot {
-        Some(RegSlot::Reg(r)) if r <= 255 => codes.push(Bytecode::Sta(Reg(r))),
-        Some(RegSlot::Reg(r)) => {
-            let scratch = acc_scratch(func_id, alloc)?;
-            codes.push(Bytecode::Sta(scratch));
-            codes.push(Bytecode::Mov(Reg(r), scratch));
+    match result {
+        Some(v) if used.contains(&v) => {
+            let r = home_of(func_id, v, alloc)?;
+            emit_sta_home(func_id, r, alloc, codes)?;
+            *tracker = AccContent::Holds(v);
         }
-        _ => {}
+        _ => *tracker = AccContent::Unknown,
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LowerError, RegAlloc, RegSlot, ensure_acc, materialize_operands, val_reg};
+    use super::{
+        AccContent, LowerError, RegAlloc, RegSlot, ensure_acc, home_result, materialize_operands,
+        val_reg,
+    };
     use crate::entity::{FuncId, Value};
     use abcd_isa::{Bytecode, Reg};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     const F: FuncId = FuncId(0);
 
-    fn alloc_with(slots: &[(Value, RegSlot)], spill_slot: Option<RegSlot>) -> RegAlloc {
+    fn alloc_with(slots: &[(Value, u16)]) -> RegAlloc {
         RegAlloc {
-            allocation: slots.iter().copied().collect(),
+            allocation: slots.iter().map(|&(v, r)| (v, RegSlot::Reg(r))).collect(),
             phi_copies: HashMap::new(),
             handler_phi_stores: Vec::new(),
             num_regs: 8,
             copy_temp: None,
-            spill_slot,
             call_window_base: None,
             low_scratch_base: None,
         }
     }
 
-    #[test]
-    fn acc_operand_spills_into_the_reserved_in_frame_slot() {
-        let v = Value::from_index(1);
-        let alloc = alloc_with(&[(v, RegSlot::Acc)], Some(RegSlot::Reg(7)));
-        let mut codes = Vec::new();
-        let r = val_reg(F, v, &alloc, &mut codes, 0).expect("spill must succeed");
-        assert_eq!(r, Reg(7));
-        assert!(
-            matches!(codes.as_slice(), [Bytecode::Sta(Reg(7))]),
-            "expected a single Sta into the reserved slot, got {codes:?}"
-        );
+    fn used_set(values: &[Value]) -> HashSet<Value> {
+        values.iter().copied().collect()
     }
 
     #[test]
     fn reg_colored_operand_passes_through_without_emission() {
         let v = Value::from_index(1);
-        let alloc = alloc_with(&[(v, RegSlot::Reg(2))], None);
+        let alloc = alloc_with(&[(v, 2)]);
         let mut codes = Vec::new();
         let r = val_reg(F, v, &alloc, &mut codes, 0).expect("reg operand must resolve");
         assert_eq!(r, Reg(2));
@@ -599,106 +628,100 @@ mod tests {
     }
 
     #[test]
-    fn acc_spill_without_reserved_slot_is_a_hard_error() {
-        let v = Value::from_index(1);
-        let alloc = alloc_with(&[(v, RegSlot::Acc)], None);
-        let mut codes = Vec::new();
-        assert!(
-            matches!(
-                val_reg(F, v, &alloc, &mut codes, 0),
-                Err(LowerError::MissingSpillSlot(_))
-            ),
-            "an Acc-colored register operand with no reserved spill slot must fail"
-        );
-    }
-
-    #[test]
     fn unallocated_operand_is_a_hard_error_not_silent_acc() {
-        let alloc = alloc_with(&[], None);
+        let alloc = alloc_with(&[]);
         let mut codes = Vec::new();
+        let mut tracker = AccContent::Hole;
         let dangling = Value::from_index(42);
         assert!(matches!(
             val_reg(F, dangling, &alloc, &mut codes, 0),
             Err(LowerError::UnallocatedOperand { value, .. }) if value == dangling
         ));
         assert!(matches!(
-            ensure_acc(F, dangling, &alloc, &mut codes),
+            ensure_acc(&mut tracker, F, dangling, &alloc, &mut codes),
             Err(LowerError::UnallocatedOperand { value, .. }) if value == dangling
         ));
     }
 
     #[test]
-    fn spill_is_emitted_before_the_acc_load() {
-        // obj is Acc-colored and needed as a register operand; key is
-        // Reg-colored and needed in acc. The Sta must precede the Lda, or
-        // the spill would capture the key (B3).
+    fn ensure_acc_loads_the_home_on_a_miss_and_records_the_content() {
+        let v = Value::from_index(1);
+        let alloc = alloc_with(&[(v, 3)]);
+        let mut codes = Vec::new();
+        let mut tracker = AccContent::Hole;
+        ensure_acc(&mut tracker, F, v, &alloc, &mut codes).expect("load must succeed");
+        assert!(
+            matches!(codes.as_slice(), [Bytecode::Lda(Reg(3))]),
+            "a tracker miss must emit Lda(home), got {codes:?}"
+        );
+        assert_eq!(tracker, AccContent::Holds(v));
+    }
+
+    #[test]
+    fn ensure_acc_hit_emits_no_load() {
+        let v = Value::from_index(1);
+        let alloc = alloc_with(&[(v, 3)]);
+        let mut codes = Vec::new();
+        let mut tracker = AccContent::Holds(v);
+        ensure_acc(&mut tracker, F, v, &alloc, &mut codes).expect("hit must succeed");
+        assert!(codes.is_empty(), "a cache hit must not emit, got {codes:?}");
+        // A DIFFERENT value is a miss even when the tracker holds something.
+        let w = Value::from_index(2);
+        let alloc = alloc_with(&[(v, 3), (w, 4)]);
+        ensure_acc(&mut tracker, F, w, &alloc, &mut codes).expect("miss must succeed");
+        assert!(
+            matches!(codes.as_slice(), [Bytecode::Lda(Reg(4))]),
+            "a different value must reload from its own home, got {codes:?}"
+        );
+        assert_eq!(tracker, AccContent::Holds(w));
+    }
+
+    #[test]
+    fn used_results_are_homed_and_tracked_dead_results_are_not() {
+        let live = Value::from_index(1);
+        let dead = Value::from_index(2);
+        let alloc = alloc_with(&[(live, 5), (dead, 6)]);
+        let used = used_set(&[live]);
+        let mut codes = Vec::new();
+        let mut tracker = AccContent::Hole;
+
+        home_result(&mut tracker, Some(live), &used, F, &alloc, &mut codes)
+            .expect("homing must succeed");
+        assert!(
+            matches!(codes.as_slice(), [Bytecode::Sta(Reg(5))]),
+            "a used result must be homed with Sta, got {codes:?}"
+        );
+        assert_eq!(tracker, AccContent::Holds(live));
+
+        codes.clear();
+        home_result(&mut tracker, Some(dead), &used, F, &alloc, &mut codes)
+            .expect("dead result must not error");
+        assert!(codes.is_empty(), "a dead result gets no Sta, got {codes:?}");
+        assert_eq!(
+            tracker,
+            AccContent::Unknown,
+            "a dead result's acc content is untracked"
+        );
+    }
+
+    #[test]
+    fn register_operands_read_homes_and_the_acc_operand_loads_last() {
+        // obj in R7, key in R0: val_reg emits nothing (low homes), then
+        // ensure_acc(key) emits the Lda. No spill slot, no Sta — the old
+        // B3 spill-before-load dance is gone by construction.
         let obj = Value::from_index(1);
         let key = Value::from_index(2);
-        let alloc = alloc_with(
-            &[(obj, RegSlot::Acc), (key, RegSlot::Reg(0))],
-            Some(RegSlot::Reg(7)),
-        );
+        let alloc = alloc_with(&[(obj, 7), (key, 0)]);
         let mut codes = Vec::new();
-        let regs = materialize_operands(F, &[obj], Some(key), &alloc, &mut codes)
+        let mut tracker = AccContent::Hole;
+        let regs = materialize_operands(&mut tracker, F, &[obj], Some(key), &alloc, &mut codes)
             .expect("materialization must succeed");
         assert_eq!(regs, vec![Reg(7)]);
         assert!(
-            matches!(
-                codes.as_slice(),
-                [Bytecode::Sta(Reg(7)), Bytecode::Lda(Reg(0))]
-            ),
-            "expected Sta(spill) then Lda(key), got {codes:?}"
+            matches!(codes.as_slice(), [Bytecode::Lda(Reg(0))]),
+            "expected exactly the key's Lda(home), got {codes:?}"
         );
-    }
-
-    #[test]
-    fn acc_resident_acc_operand_emits_no_load() {
-        // The unique Acc-colored value is the acc operand: nothing to spill,
-        // nothing to load.
-        let k = Value::from_index(1);
-        let o = Value::from_index(2);
-        let alloc = alloc_with(
-            &[(k, RegSlot::Acc), (o, RegSlot::Reg(0))],
-            Some(RegSlot::Reg(7)),
-        );
-        let mut codes = Vec::new();
-        let regs = materialize_operands(F, &[o], Some(k), &alloc, &mut codes)
-            .expect("materialization must succeed");
-        assert_eq!(regs, vec![Reg(0)]);
-        assert!(codes.is_empty(), "no lda/sta expected, got {codes:?}");
-    }
-
-    #[test]
-    fn the_same_acc_value_as_reg_and_acc_operand_spills_once() {
-        let v = Value::from_index(1);
-        let alloc = alloc_with(&[(v, RegSlot::Acc)], Some(RegSlot::Reg(7)));
-        let mut codes = Vec::new();
-        let regs = materialize_operands(F, &[v], Some(v), &alloc, &mut codes)
-            .expect("one value in both roles is not a conflict");
-        assert_eq!(regs, vec![Reg(7)]);
-        assert!(matches!(codes.as_slice(), [Bytecode::Sta(Reg(7))]));
-    }
-
-    #[test]
-    fn two_distinct_acc_colored_operands_are_rejected() {
-        // Violates the interference invariant (possible only with a
-        // hand-crafted allocation); must fail instead of overwriting the
-        // first spill with the second.
-        let a = Value::from_index(1);
-        let b = Value::from_index(2);
-        let alloc = alloc_with(
-            &[(a, RegSlot::Acc), (b, RegSlot::Acc)],
-            Some(RegSlot::Reg(7)),
-        );
-        let mut codes = Vec::new();
-        assert!(matches!(
-            materialize_operands(F, &[a], Some(b), &alloc, &mut codes),
-            Err(LowerError::MultipleAccOperands { .. })
-        ));
-        assert!(matches!(
-            materialize_operands(F, &[a, b], None, &alloc, &mut codes),
-            Err(LowerError::MultipleAccOperands { .. })
-        ));
+        assert_eq!(tracker, AccContent::Holds(key));
     }
 }
 
@@ -708,36 +731,47 @@ mod tests {
 /// needed by the CondBranch compare-fusion soundness checks: fusion
 /// re-reads another instruction's operands, which is only valid when the
 /// comparison chain sits immediately before the branch in the same block.
+///
+/// `tracker` is the emission-time acc-content model (B4, acc-as-cache):
+/// every acc load goes through `ensure_acc`/`materialize_operands` (the
+/// only acc writers besides result homing), and every arm whose bytecode
+/// writes the accumulator (vendor `acc: out`/`inout` — exactly the arms
+/// with a result, plus `CopyDataProperties`) ends with `home_result` or an
+/// explicit tracker invalidation. Arms whose bytecodes only READ the acc
+/// (`acc: in`, e.g. `stobjbyname`) or ignore it (`acc: none`, e.g. `mov`,
+/// `throw.ifnotobject`) leave the tracker untouched.
 #[allow(clippy::too_many_arguments)]
 fn select_inst(
     data: &InstData,
-    result_slot: Option<RegSlot>,
+    result: Option<Value>,
     inst: Inst,
     block_insts: &[Inst],
     func_id: FuncId,
     module: &Module,
     alloc: &RegAlloc,
+    used: &HashSet<Value>,
     tracer: &mut EntityTracer,
     codes: &mut Vec<Bytecode>,
     ic: &mut IcAllocator,
+    tracker: &mut AccContent,
 ) -> Result<(), LowerError> {
     match data {
         // ── Literals ─────────────────────────────────────────────────
         InstData::LiteralUndefined => {
             codes.push(Bytecode::Ldundefined);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LiteralNull => {
             codes.push(Bytecode::Ldnull);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LiteralBool(true) => {
             codes.push(Bytecode::Ldtrue);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LiteralBool(false) => {
             codes.push(Bytecode::Ldfalse);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LiteralNumber(n) => {
             let bits = n.to_bits();
@@ -746,28 +780,29 @@ fn select_inst(
             } else {
                 codes.push(Bytecode::Fldai(Imm(bits as i64)));
             }
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LiteralString(s) => {
             codes.push(Bytecode::LdaStr(tracer.eid(*s)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LiteralNaN => {
             codes.push(Bytecode::Ldnan);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LiteralInfinity => {
             codes.push(Bytecode::Ldinfinity);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LiteralHole => {
             codes.push(Bytecode::Ldhole);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Binary operations ────────────────────────────────────────
         InstData::BinaryOp { op, left, right } => {
-            let regs = materialize_operands(func_id, &[*right], Some(*left), alloc, codes)?;
+            let regs =
+                materialize_operands(tracker, func_id, &[*right], Some(*left), alloc, codes)?;
             let r = regs[0];
             let bc = match op {
                 BinOp::Add => Bytecode::Add2(ic.one(), r),
@@ -794,12 +829,12 @@ fn select_inst(
                 BinOp::InstanceOf => Bytecode::Instanceof(ic.one(), r),
             };
             codes.push(bc);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Unary operations ─────────────────────────────────────────
         InstData::UnaryOp { op, operand } => {
-            ensure_acc(func_id, *operand, alloc, codes)?;
+            ensure_acc(tracker, func_id, *operand, alloc, codes)?;
             let bc = match op {
                 UnOp::Minus => Bytecode::Neg(ic.one()),
                 UnOp::LogicalNot => Bytecode::Not(ic.one()),
@@ -812,44 +847,44 @@ fn select_inst(
                 UnOp::Void => Bytecode::Ldundefined,     // void x → undefined
             };
             codes.push(bc);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::IsTrue { operand } => {
-            ensure_acc(func_id, *operand, alloc, codes)?;
+            ensure_acc(tracker, func_id, *operand, alloc, codes)?;
             codes.push(Bytecode::Istrue);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::IsFalse { operand } => {
-            ensure_acc(func_id, *operand, alloc, codes)?;
+            ensure_acc(tracker, func_id, *operand, alloc, codes)?;
             codes.push(Bytecode::Isfalse);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Object / Array creation ──────────────────────────────────
         InstData::CreateEmptyObject => {
             codes.push(Bytecode::Createemptyobject);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CreateEmptyArray => {
             codes.push(Bytecode::Createemptyarray(ic.one()));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CreateArrayWithBuffer { literal_array } => {
             let la_eid = EntityId(*literal_array);
             codes.push(Bytecode::Createarraywithbuffer(ic.one(), la_eid));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CreateObjectWithBuffer { literal_array } => {
             let la_eid = EntityId(*literal_array);
             codes.push(Bytecode::Createobjectwithbuffer(ic.one(), la_eid));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CreateRegExp { pattern, flags } => {
             let p = tracer.eid(*pattern);
             let f_str = module.strings.get(*flags);
             let f_val: i64 = f_str.parse().unwrap_or(0);
             codes.push(Bytecode::Createregexpwithliteral(ic.one(), p, Imm(f_val)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CreateObjectWithExcludedKeys { obj, keys } => {
             // Only the object and the first key are register operands that
@@ -859,7 +894,7 @@ fn select_inst(
             if let Some(first) = keys.first() {
                 reg_operands.push(*first);
             }
-            let regs = materialize_operands(func_id, &reg_operands, None, alloc, codes)?;
+            let regs = materialize_operands(tracker, func_id, &reg_operands, None, alloc, codes)?;
             let obj_r = regs[0];
             let start_r = if keys.is_empty() { Reg(0) } else { regs[1] };
             codes.push(Bytecode::Createobjectwithexcludedkeys(
@@ -867,73 +902,93 @@ fn select_inst(
                 obj_r,
                 start_r,
             ));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Property access ──────────────────────────────────────────
         InstData::LoadProperty { object, key } => {
             match key {
                 PropKind::ByName(name) => {
-                    ensure_acc(func_id, *object, alloc, codes)?;
+                    ensure_acc(tracker, func_id, *object, alloc, codes)?;
                     codes.push(Bytecode::Ldobjbyname(ic.two(), tracer.eid(*name)));
                 }
                 PropKind::ByValue(k) => {
-                    let regs = materialize_operands(func_id, &[*object], Some(*k), alloc, codes)?;
+                    let regs =
+                        materialize_operands(tracker, func_id, &[*object], Some(*k), alloc, codes)?;
                     codes.push(Bytecode::Ldobjbyvalue(ic.two(), regs[0]));
                 }
                 PropKind::ByIndex(idx) => {
-                    ensure_acc(func_id, *object, alloc, codes)?;
+                    ensure_acc(tracker, func_id, *object, alloc, codes)?;
                     codes.push(Bytecode::Ldobjbyindex(ic.two(), Imm(*idx as i64)));
                 }
             }
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::StoreProperty { object, key, value } => match key {
             PropKind::ByName(name) => {
-                let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
+                let regs =
+                    materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
                 codes.push(Bytecode::Stobjbyname(ic.two(), tracer.eid(*name), regs[0]));
             }
             PropKind::ByValue(k) => {
-                let regs =
-                    materialize_operands(func_id, &[*object, *value], Some(*k), alloc, codes)?;
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[*object, *value],
+                    Some(*k),
+                    alloc,
+                    codes,
+                )?;
                 codes.push(Bytecode::Stobjbyvalue(ic.two(), regs[0], regs[1]));
             }
             PropKind::ByIndex(idx) => {
-                let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
+                let regs =
+                    materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
                 codes.push(Bytecode::Stobjbyindex(ic.two(), regs[0], Imm(*idx as i64)));
             }
         },
         InstData::StoreOwnProperty { object, key, value } => match key {
             PropKind::ByName(name) => {
-                let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
+                let regs =
+                    materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
                 codes.push(Bytecode::Stownbyname(ic.two(), tracer.eid(*name), regs[0]));
             }
             PropKind::ByValue(k) => {
-                let regs =
-                    materialize_operands(func_id, &[*object, *k], Some(*value), alloc, codes)?;
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[*object, *k],
+                    Some(*value),
+                    alloc,
+                    codes,
+                )?;
                 codes.push(Bytecode::Stownbyvalue(ic.two(), regs[0], regs[1]));
             }
             PropKind::ByIndex(idx) => {
-                let regs = materialize_operands(func_id, &[*object], Some(*value), alloc, codes)?;
+                let regs =
+                    materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
                 codes.push(Bytecode::Stownbyindex(ic.two(), regs[0], Imm(*idx as i64)));
             }
         },
         InstData::DeleteProperty { object, key } => {
-            let regs = materialize_operands(func_id, &[*key], Some(*object), alloc, codes)?;
+            let regs =
+                materialize_operands(tracker, func_id, &[*key], Some(*object), alloc, codes)?;
             codes.push(Bytecode::Delobjprop(regs[0]));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CopyDataProperties { dst, src } => {
             // Vendor `copydataproperties v:in:top, acc: inout:top`: the
             // register operand is the target, the accumulator carries the
-            // source (and receives the result). Spill-before-load order
-            // via materialize_operands: dst is resolved first (an
-            // Acc-colored dst spills through the reserved slot), then src
-            // is brought into acc. No entity operands — nothing for the
-            // tracer/relocation channel. Both vendor forms lower to the
-            // modern opcode (the codebase's deprecated-opcode convention).
-            let regs = materialize_operands(func_id, &[*dst], Some(*src), alloc, codes)?;
+            // source (and receives the result). dst is resolved to its
+            // home first, then src is brought into acc (tracker-aware).
+            // No entity operands — nothing for the tracer/relocation
+            // channel. Both vendor forms lower to the modern opcode (the
+            // codebase's deprecated-opcode convention). The bytecode
+            // writes acc but the IR instruction has no result, so the acc
+            // content is afterwards untracked.
+            let regs = materialize_operands(tracker, func_id, &[*dst], Some(*src), alloc, codes)?;
             codes.push(Bytecode::Copydataproperties(regs[0]));
+            *tracker = AccContent::Unknown;
         }
         InstData::LoadSuperProperty { key } => {
             match key {
@@ -948,7 +1003,7 @@ fn select_inst(
                     // No direct bytecode; approximate with ByValue
                 }
             }
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::StoreSuperProperty { key, value } => match key {
             PropKind::ByName(name) => {
@@ -956,7 +1011,8 @@ fn select_inst(
                 codes.push(Bytecode::Stsuperbyname(ic.two(), tracer.eid(*name), val_r));
             }
             PropKind::ByValue(k) => {
-                let regs = materialize_operands(func_id, &[*k, *value], None, alloc, codes)?;
+                let regs =
+                    materialize_operands(tracker, func_id, &[*k, *value], None, alloc, codes)?;
                 codes.push(Bytecode::Stsuperbyvalue(ic.two(), regs[0], regs[1]));
             }
             PropKind::ByIndex(_) => {}
@@ -965,33 +1021,33 @@ fn select_inst(
         // ── Global variables ─────────────────────────────────────────
         InstData::LoadGlobalVar { name } => {
             codes.push(Bytecode::Ldglobalvar(ic.one(), tracer.eid(*name)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::StoreGlobalVar { name, value } => {
-            ensure_acc(func_id, *value, alloc, codes)?;
+            ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Stglobalvar(ic.one(), tracer.eid(*name)));
         }
         InstData::TryLoadGlobalByName { name } => {
             codes.push(Bytecode::Tryldglobalbyname(ic.one(), tracer.eid(*name)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::TryStoreGlobalByName { name, value } => {
-            ensure_acc(func_id, *value, alloc, codes)?;
+            ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Trystglobalbyname(ic.one(), tracer.eid(*name)));
         }
 
         // ── Lexical variables ────────────────────────────────────────
         InstData::LoadLexVar { level, slot } => {
             codes.push(Bytecode::Ldlexvar(Imm(*level as i64), Imm(*slot as i64)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::StoreLexVar { level, slot, value } => {
-            ensure_acc(func_id, *value, alloc, codes)?;
+            ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Stlexvar(Imm(*level as i64), Imm(*slot as i64)));
         }
         InstData::NewLexEnv { num_vars } => {
             codes.push(Bytecode::Newlexenv(Imm(*num_vars as i64)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::NewLexEnvWithName {
             num_vars,
@@ -1001,7 +1057,7 @@ fn select_inst(
                 Imm(*num_vars as i64),
                 EntityId(*scope_literal_array),
             ));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::PopLexEnv => {
             codes.push(Bytecode::Poplexenv);
@@ -1010,24 +1066,24 @@ fn select_inst(
         // ── Module variables ─────────────────────────────────────────
         InstData::LoadLocalModuleVar { index } => {
             codes.push(Bytecode::Ldlocalmodulevar(Imm(*index as i64)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LoadExternalModuleVar { index } => {
             codes.push(Bytecode::Ldexternalmodulevar(Imm(*index as i64)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::StoreModuleVar { index, value } => {
-            ensure_acc(func_id, *value, alloc, codes)?;
+            ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Stmodulevar(Imm(*index as i64)));
         }
         InstData::GetModuleNamespace { index } => {
             codes.push(Bytecode::Getmodulenamespace(Imm(*index as i64)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::DynamicImport { specifier } => {
-            ensure_acc(func_id, *specifier, alloc, codes)?;
+            ensure_acc(tracker, func_id, *specifier, alloc, codes)?;
             codes.push(Bytecode::Dynamicimport);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Function / Class definition ──────────────────────────────
@@ -1041,7 +1097,7 @@ fn select_inst(
                 tracer.method_eid(*method_offset),
                 Imm(*length as i64),
             ));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::DefineMethod {
             method_offset,
@@ -1049,13 +1105,13 @@ fn select_inst(
             home_object,
             ..
         } => {
-            ensure_acc(func_id, *home_object, alloc, codes)?;
+            ensure_acc(tracker, func_id, *home_object, alloc, codes)?;
             codes.push(Bytecode::Definemethod(
                 ic.one(),
                 tracer.method_eid(*method_offset),
                 Imm(*length as i64),
             ));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::DefineClassWithBuffer {
             method_offset,
@@ -1071,7 +1127,7 @@ fn select_inst(
                 Imm(0),
                 base_r,
             ));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::DefineGetterSetterByValue {
             obj,
@@ -1079,73 +1135,79 @@ fn select_inst(
             getter,
             setter,
         } => {
-            let regs =
-                materialize_operands(func_id, &[*obj, *key, *getter, *setter], None, alloc, codes)?;
+            let regs = materialize_operands(
+                tracker,
+                func_id,
+                &[*obj, *key, *getter, *setter],
+                None,
+                alloc,
+                codes,
+            )?;
             codes.push(Bytecode::Definegettersetterbyvalue(
                 regs[0], regs[1], regs[2], regs[3],
             ));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Calls ────────────────────────────────────────────────────
         InstData::Call { kind, callee, args } => {
-            select_call(*kind, *callee, args, func_id, alloc, codes, ic)?;
-            store_result(func_id, result_slot, alloc, codes)?;
+            select_call(*kind, *callee, args, func_id, alloc, codes, ic, tracker)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Special value loaders ────────────────────────────────────
         InstData::LoadThis => {
             codes.push(Bytecode::Ldthis);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LoadNewTarget => {
             codes.push(Bytecode::Ldnewtarget);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LoadGlobalObject => {
             codes.push(Bytecode::Ldglobal);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::LoadFunction => {
             codes.push(Bytecode::Ldfunction);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::GetUnmappedArgs => {
             codes.push(Bytecode::Getunmappedargs);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CopyRestArgs { start_index } => {
             codes.push(Bytecode::Copyrestargs(Imm(*start_index as i64)));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Iterators ────────────────────────────────────────────────
         InstData::GetIterator { obj } => {
-            ensure_acc(func_id, *obj, alloc, codes)?;
+            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
             codes.push(Bytecode::Getiterator(ic.two()));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::GetAsyncIterator { obj } => {
-            ensure_acc(func_id, *obj, alloc, codes)?;
+            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
             codes.push(Bytecode::Getasynciterator(ic.two()));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::GetPropIterator { obj } => {
-            ensure_acc(func_id, *obj, alloc, codes)?;
+            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
             codes.push(Bytecode::Getpropiterator);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CloseIterator { iterator } => {
             let iter_r = val_reg(func_id, *iterator, alloc, codes, 0)?;
             codes.push(Bytecode::Closeiterator(ic.two(), iter_r));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Generator / Async ────────────────────────────────────────
         InstData::CreateGeneratorObj { func } => {
             let func_r = val_reg(func_id, *func, alloc, codes, 0)?;
             codes.push(Bytecode::Creategeneratorobj(func_r));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::SuspendGenerator { genobj, value } => {
             // Vendor `suspendgenerator v:in:top, acc: inout:top`
@@ -1154,54 +1216,56 @@ fn select_inst(
             // resume result). Spill-before-load (B3): resolve the register
             // operand first via materialize_operands, ensure_acc the
             // yield value LAST. No entity operands.
-            let regs = materialize_operands(func_id, &[*genobj], Some(*value), alloc, codes)?;
+            let regs =
+                materialize_operands(tracker, func_id, &[*genobj], Some(*value), alloc, codes)?;
             codes.push(Bytecode::Suspendgenerator(regs[0]));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::ResumeGenerator { genobj } => {
             // Vendor `resumegenerator` (isa.yaml:1261-1264):
             // `acc: inout:top`, no register operand — genobj in acc,
             // resume result back to acc.
-            ensure_acc(func_id, *genobj, alloc, codes)?;
+            ensure_acc(tracker, func_id, *genobj, alloc, codes)?;
             codes.push(Bytecode::Resumegenerator);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::GetResumeMode { genobj } => {
             // Vendor `getresumemode` (isa.yaml:1270-1273):
             // `acc: inout:top`, no register operand — genobj in acc,
             // resume mode back to acc.
-            ensure_acc(func_id, *genobj, alloc, codes)?;
+            ensure_acc(tracker, func_id, *genobj, alloc, codes)?;
             codes.push(Bytecode::Getresumemode);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::AsyncFunctionEnter => {
             codes.push(Bytecode::Asyncfunctionenter);
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::AsyncFunctionAwaitUncaught { value } => {
             let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
             codes.push(Bytecode::Asyncfunctionawaituncaught(val_r));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::AsyncFunctionResolve { value } => {
             let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
             codes.push(Bytecode::Asyncfunctionresolve(val_r));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::AsyncFunctionReject { value } => {
             let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
             codes.push(Bytecode::Asyncfunctionreject(val_r));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         InstData::CreateIterResultObj { value, done } => {
-            let regs = materialize_operands(func_id, &[*value, *done], None, alloc, codes)?;
+            let regs =
+                materialize_operands(tracker, func_id, &[*value, *done], None, alloc, codes)?;
             codes.push(Bytecode::Createiterresultobj(regs[0], regs[1]));
-            store_result(func_id, result_slot, alloc, codes)?;
+            home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
         // ── Exception handling ───────────────────────────────────────
         InstData::Throw { value } => {
-            ensure_acc(func_id, *value, alloc, codes)?;
+            ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Throw);
         }
         InstData::ThrowIfNotObject { value } => {
@@ -1214,7 +1278,7 @@ fn select_inst(
         }
         InstData::ThrowUndefinedIfHole { name, value } => {
             // ThrowUndefinedifholewithname reads the value from the acc.
-            ensure_acc(func_id, *value, alloc, codes)?;
+            ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::ThrowUndefinedifholewithname(tracer.eid(*name)));
         }
         InstData::ThrowIfSuperNotCorrectCall { value, kind } => {
@@ -1224,7 +1288,7 @@ fn select_inst(
             // encoding's own width, so the emitter's Imm range check
             // (EncodeError::OperandOutOfRange) can never fire on a
             // well-formed IR value.
-            ensure_acc(func_id, *value, alloc, codes)?;
+            ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::ThrowIfsupernotcorrectcall(Imm(i64::from(*kind))));
         }
         InstData::ThrowNotExists => {
@@ -1253,9 +1317,9 @@ fn select_inst(
             // Fusion re-reads the COMPARISON's operands at this branch, so
             // it fires only when that re-read is provably sound (S6; see
             // try_fuse_cmp_branch). Otherwise fall back to the unfused
-            // path, which is sound: `cond` is the branch's own operand —
-            // physically in acc right after its definition (Acc-colored)
-            // or reloaded from its register (Reg-colored).
+            // path, which is sound: `cond` is the branch's own operand and
+            // the tracker reloads it from its home unless the acc provably
+            // still holds it (the common def→use chain).
             if let Some(fused) = try_fuse_cmp_branch(
                 *cond,
                 *true_dest,
@@ -1265,10 +1329,11 @@ fn select_inst(
                 module,
                 alloc,
                 codes,
+                tracker,
             )? {
                 codes.push(fused);
             } else {
-                ensure_acc(func_id, *cond, alloc, codes)?;
+                ensure_acc(tracker, func_id, *cond, alloc, codes)?;
                 // Emit: if acc truthy → jump to true_dest, fall through to false_dest
                 codes.push(Bytecode::Jnez(Label(true_dest.0)));
             }
@@ -1278,7 +1343,7 @@ fn select_inst(
         }
         InstData::Return { value } => {
             if let Some(val) = value {
-                ensure_acc(func_id, *val, alloc, codes)?;
+                ensure_acc(tracker, func_id, *val, alloc, codes)?;
                 codes.push(Bytecode::Return);
             } else {
                 codes.push(Bytecode::Returnundefined);
@@ -1301,9 +1366,9 @@ fn select_inst(
 
 /// Select call bytecodes based on kind and argument count.
 ///
-/// Every arm materializes operands in spill-before-load order: the argument
-/// registers are resolved first (spilling the at-most-one Acc-colored
-/// register operand), then the callee is brought into the acc.
+/// Every arm materializes operands the same way: the argument registers
+/// are resolved to their homes first (pure reads, plus scratch `mov`s for
+/// high homes), then the callee is brought into the acc (tracker-aware).
 fn select_call(
     kind: CallKind,
     callee: Value,
@@ -1312,15 +1377,17 @@ fn select_call(
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
     ic: &mut IcAllocator,
+    tracker: &mut AccContent,
 ) -> Result<(), LowerError> {
     match kind {
         CallKind::Call => match args.len() {
             0 => {
-                materialize_operands(func_id, &[], Some(callee), alloc, codes)?;
+                materialize_operands(tracker, func_id, &[], Some(callee), alloc, codes)?;
                 codes.push(Bytecode::Callarg0(ic.two()));
             }
             n @ (1..=3) => {
-                let regs = materialize_operands(func_id, args, Some(callee), alloc, codes)?;
+                let regs =
+                    materialize_operands(tracker, func_id, args, Some(callee), alloc, codes)?;
                 let bc = match n {
                     1 => Bytecode::Callarg1(ic.two(), regs[0]),
                     2 => Bytecode::Callargs2(ic.two(), regs[0], regs[1]),
@@ -1328,18 +1395,28 @@ fn select_call(
                 };
                 codes.push(bc);
             }
-            _ => emit_range_call(RangeForm::Call, callee, args, func_id, alloc, codes, ic)?,
+            _ => emit_range_call(
+                RangeForm::Call,
+                callee,
+                args,
+                func_id,
+                alloc,
+                codes,
+                ic,
+                tracker,
+            )?,
         },
         CallKind::CallThis => {
             // args[0] = this, args[1..] = actual args
             match args.len() {
                 0 => {
                     // No this — shouldn't happen, but handle gracefully
-                    materialize_operands(func_id, &[], Some(callee), alloc, codes)?;
+                    materialize_operands(tracker, func_id, &[], Some(callee), alloc, codes)?;
                     codes.push(Bytecode::Callarg0(ic.two()));
                 }
                 n @ (1..=4) => {
-                    let regs = materialize_operands(func_id, args, Some(callee), alloc, codes)?;
+                    let regs =
+                        materialize_operands(tracker, func_id, args, Some(callee), alloc, codes)?;
                     let bc = match n {
                         1 => Bytecode::Callthis0(ic.two(), regs[0]),
                         2 => Bytecode::Callthis1(ic.two(), regs[0], regs[1]),
@@ -1348,7 +1425,16 @@ fn select_call(
                     };
                     codes.push(bc);
                 }
-                _ => emit_range_call(RangeForm::CallThis, callee, args, func_id, alloc, codes, ic)?,
+                _ => emit_range_call(
+                    RangeForm::CallThis,
+                    callee,
+                    args,
+                    func_id,
+                    alloc,
+                    codes,
+                    ic,
+                    tracker,
+                )?,
             }
         }
         CallKind::SuperCall => {
@@ -1360,6 +1446,7 @@ fn select_call(
                 alloc,
                 codes,
                 ic,
+                tracker,
             )?;
         }
         CallKind::SuperCallArrow => {
@@ -1371,10 +1458,12 @@ fn select_call(
                 alloc,
                 codes,
                 ic,
+                tracker,
             )?;
         }
         CallKind::SuperCallSpread => {
             let regs = materialize_operands(
+                tracker,
                 func_id,
                 &args[..1.min(args.len())],
                 Some(callee),
@@ -1386,13 +1475,15 @@ fn select_call(
         }
         CallKind::Apply => {
             if args.len() >= 2 {
-                let regs = materialize_operands(func_id, &args[..2], Some(callee), alloc, codes)?;
+                let regs =
+                    materialize_operands(tracker, func_id, &args[..2], Some(callee), alloc, codes)?;
                 codes.push(Bytecode::Apply(ic.two(), regs[0], regs[1]));
             } else if args.len() == 1 {
-                let regs = materialize_operands(func_id, &args[..1], Some(callee), alloc, codes)?;
+                let regs =
+                    materialize_operands(tracker, func_id, &args[..1], Some(callee), alloc, codes)?;
                 codes.push(Bytecode::Newobjapply(ic.two(), regs[0]));
             } else {
-                materialize_operands(func_id, &[], Some(callee), alloc, codes)?;
+                materialize_operands(tracker, func_id, &[], Some(callee), alloc, codes)?;
                 codes.push(Bytecode::Callarg0(ic.two()));
             }
         }
@@ -1443,10 +1534,11 @@ fn emit_range_call(
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
     ic: &mut IcAllocator,
+    tracker: &mut AccContent,
 ) -> Result<(), LowerError> {
     let start = fill_call_window(func_id, args, alloc, codes)?;
 
-    ensure_acc(func_id, callee, alloc, codes)?;
+    ensure_acc(tracker, func_id, callee, alloc, codes)?;
 
     let argc = args.len();
     let argc_imm = Imm(argc as i64);
@@ -1522,10 +1614,12 @@ fn emit_construct(
 /// Hard errors (S2 contract — nothing is silently truncated): argc above
 /// u16::MAX (`CallArgcOverflow`), a window base above 255
 /// (`CallWindowOverflow` — BOTH the narrow and the wide forms carry a u8
-/// start operand), a window end past the register space
-/// (`RegisterOverflow`), and more than one Acc-colored value in the fill
-/// (`MultipleAccOperands`; the interference invariant guarantees at most
-/// one).
+/// start operand), and a window end past the register space
+/// (`RegisterOverflow`).
+///
+/// The fill is pure `mov`s from the values' register homes (every value
+/// has one — B4), so it never touches the accumulator and needs no
+/// tracker update (vendor `mov` is `acc: none`).
 fn fill_call_window(
     func_id: FuncId,
     values: &[Value],
@@ -1554,29 +1648,11 @@ fn fill_call_window(
     }
     // Fill the window in order. `mov` auto-widens to its v16 form,
     // so both the window slot (which may exceed 255) and the value's
-    // colored slot are always encodable. The — at most one, by the
-    // interference invariant — Acc-colored value spills into scratch
-    // BEFORE any later acc load in the caller's sequence
-    // (spill-before-load order).
-    let mut acc_arg: Option<Value> = None;
+    // colored home are always encodable.
     for (j, &val) in values.iter().enumerate() {
         let dst = Reg(base + j as u16);
-        match slot_of(func_id, val, alloc)? {
-            RegSlot::Reg(r) => codes.push(Bytecode::Mov(dst, Reg(r))),
-            RegSlot::Acc => {
-                if let Some(prev) = acc_arg {
-                    return Err(LowerError::MultipleAccOperands {
-                        func: func_id,
-                        a: prev,
-                        b: val,
-                    });
-                }
-                acc_arg = Some(val);
-                let scratch = spill_scratch(func_id, alloc, 0)?;
-                codes.push(Bytecode::Sta(scratch));
-                codes.push(Bytecode::Mov(dst, scratch));
-            }
-        }
+        let r = home_of(func_id, val, alloc)?;
+        codes.push(Bytecode::Mov(dst, Reg(r)));
     }
     Ok(Reg(base))
 }
@@ -1595,19 +1671,24 @@ fn fill_call_window(
 /// 1. The comparison — and the `IsTrue` wrapper, if present — are the
 ///    instructions immediately preceding this branch IN THE SAME BLOCK.
 ///    Any instruction in between could reuse an operand slot whose live
-///    range ended at the comparison.
-/// 2. Both `left` and `right` are Reg-colored. At the branch the physical
-///    acc holds `cond`, not `left`: `ensure_acc(left)` on an Acc-colored
-///    `left` would no-op with the wrong value, and `val_reg(right)` on an
-///    Acc-colored `right` would spill `cond`. (A hand-crafted allocation
-///    can also color both operands Acc — they are operands of the
-///    comparison, not of this branch, so the single-acc-per-instruction
-///    interference invariant does not apply at this materialization
-///    point.)
+///    range ended at the comparison. (B4 re-audit: still required. The
+///    fused re-read extends the operands' liveness past whatever sits
+///    between the comparison and the branch; adjacency is what bounds the
+///    re-read to stores the next precondition can enumerate.)
+/// 2. Both `left` and `right` are Reg-colored. Since B4 EVERY value is
+///    Reg-colored, so this holds by construction — the operands are read
+///    from their register homes, and the emission-time acc tracker makes
+///    the fused `ensure_acc(left)` reload `left` from its home (the acc at
+///    the branch provably holds `cond`, not `left`, so the tracker miss
+///    is correct, never a stale no-op).
 /// 3. Neither the comparison result nor the `IsTrue` result reuses an
 ///    operand's slot. An operand that dies at the comparison does not
 ///    interfere with those results, so the allocator may co-locate them;
 ///    the fused re-read would then observe the result, not the operand.
+///    (B4 re-audit: still reachable in principle — each result has its
+///    own home and interference keeps live ranges disjoint, but a result
+///    and a dead-at-the-comparison operand do NOT interfere, so sharing
+///    remains possible and must stay checked.)
 ///
 /// Returns `Ok(Some(fused_bytecode))` if fusion succeeded, `Ok(None)`
 /// when any precondition fails — the caller then emits the unfused
@@ -1622,6 +1703,7 @@ fn try_fuse_cmp_branch(
     module: &Module,
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
+    tracker: &mut AccContent,
 ) -> Result<Option<Bytecode>, LowerError> {
     let cond_inst = match module.value(cond).def {
         crate::module::ValueDef::Inst(i) => i,
@@ -1675,14 +1757,16 @@ fn try_fuse_cmp_branch(
         }
     }
 
-    fuse_binop_branch(*op, *left, *right, true_dest, func_id, alloc, codes)
+    fuse_binop_branch(
+        *op, *left, *right, true_dest, func_id, alloc, codes, tracker,
+    )
 }
 
 /// Emit a fused compare-branch for a BinOp comparison.
 ///
-/// The comparison's operands follow the same spill-before-load ordering as
-/// any two-operand instruction: spill the register operand first, then load
-/// the acc operand. Soundness preconditions (adjacency, Reg-colored
+/// The comparison's operands materialize like any two-operand instruction:
+/// the register operand reads its home, then the acc operand loads
+/// (tracker-aware). Soundness preconditions (adjacency, Reg-colored
 /// operands, no result-slot sharing) are enforced by the caller,
 /// `try_fuse_cmp_branch`.
 fn fuse_binop_branch(
@@ -1693,6 +1777,7 @@ fn fuse_binop_branch(
     func_id: FuncId,
     alloc: &RegAlloc,
     codes: &mut Vec<Bytecode>,
+    tracker: &mut AccContent,
 ) -> Result<Option<Bytecode>, LowerError> {
     // Only the Eq family has fused branch bytecodes in the ABC ISA; for
     // Less/Greater/etc there is nothing to fuse.
@@ -1703,7 +1788,7 @@ fn fuse_binop_branch(
         return Ok(None);
     }
     let label = Label(true_dest.0);
-    let regs = materialize_operands(func_id, &[right], Some(left), alloc, codes)?;
+    let regs = materialize_operands(tracker, func_id, &[right], Some(left), alloc, codes)?;
     let r = regs[0];
     Ok(Some(match op {
         BinOp::Eq => Bytecode::Jeq(r, label),

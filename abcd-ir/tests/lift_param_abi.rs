@@ -16,19 +16,13 @@
 
 mod common;
 
-use std::collections::HashMap;
-
-use abcd_file::{AccessFlags, Builder, File, FileType, FunctionKind, Type, Version};
-use abcd_ir::builder::IRBuilder;
-use abcd_ir::entity::{FuncId, StringId};
-use abcd_ir::inst::InstData;
+use abcd_file::{AccessFlags, Builder, File, Type};
+use abcd_ir::entity::FuncId;
 use abcd_ir::lift::lift_file;
-use abcd_ir::lower::regalloc::{self, RegAlloc, RegSlot};
-use abcd_ir::lower::{isel, lower_function, to_method_body};
+use abcd_ir::lower::{lower_function, to_method_body};
 use abcd_ir::module::Module;
-use abcd_ir::types::IrType;
 use abcd_ir::verify::verify_module;
-use abcd_isa::{Bytecode, EntityId, Reg, encode as encode_bytecodes};
+use abcd_isa::{Bytecode, Reg, encode as encode_bytecodes};
 
 use common::{Halt, Machine};
 
@@ -211,40 +205,8 @@ fn second_function_params_lower_with_their_own_homes() {
     );
 }
 
-/// The copy-in prologue copies from an ABI slot into a register home; a
-/// parameter colored `Acc` (possible only with a hand-crafted allocation —
-/// `mcs_color` pre-assigns parameters to registers) has no register home
-/// and must be a hard error, never a silent path.
-#[test]
-fn acc_colored_param_is_a_hard_lower_error() {
-    let mut module = Module::new(Version::new(12, 0, 6, 0), FileType::Dynamic);
-    let func = IRBuilder::create_function(&mut module, "f", FunctionKind::Function, 1);
-    let p;
-    {
-        let mut builder = IRBuilder::new(&mut module, func);
-        p = builder.create_func_param(0, IrType::default());
-        builder.emit_void(InstData::Return { value: Some(p) });
-    }
-
-    let alloc = RegAlloc {
-        allocation: HashMap::from([(p, RegSlot::Acc)]),
-        phi_copies: HashMap::new(),
-        handler_phi_stores: Vec::new(),
-        num_regs: 1,
-        copy_temp: None,
-        spill_slot: Some(RegSlot::Reg(1)),
-        call_window_base: None,
-        low_scratch_base: None,
-    };
-    let rpo = regalloc::compute_rpo(&module, func);
-    let string_map: HashMap<StringId, EntityId> = HashMap::new();
-    let err = isel::select(&module, func, &alloc, &rpo, &string_map)
-        .expect_err("an Acc-colored parameter must be a hard LowerError");
-    assert!(
-        matches!(
-            err,
-            abcd_ir::lower::LowerError::AccColoredParam { value, .. } if value == p
-        ),
-        "expected AccColoredParam, got {err:?}"
-    );
-}
+// RETIRED (B4, acc-as-cache): the `acc_colored_param_is_a_hard_lower_error`
+// test pinned `LowerError::AccColoredParam` for a hand-crafted Acc-colored
+// parameter. The accumulator is no longer a coloring class — `RegSlot::Acc`
+// and the error variant are deleted — so the shape is unrepresentable and
+// every parameter trivially has a register home for the copy-in prologue.

@@ -77,6 +77,16 @@ pub enum Halt {
     /// arkcompiler_ets_runtime ecmascript/stubs/runtime_stubs-inl.h:
     /// 2520-2532).
     ThrowIfSuperNotCorrectCall { kind: i64, value: i64 },
+    /// `Definegettersetterbyvalue` (record-and-inspect): the four register
+    /// operands' contents (obj, key, getter, setter) — vendor
+    /// `definegettersetterbyvalue v0:in:top, v1:in:top, v2:in:top,
+    /// v3:in:top` with `acc: inout:top`.
+    DefineGetterSetterByValue {
+        obj: i64,
+        key: i64,
+        getter: i64,
+        setter: i64,
+    },
     /// `run_until` reached the stop pc WITHOUT executing the instruction
     /// there — models an exception thrown between two instructions.
     Stopped,
@@ -184,6 +194,16 @@ impl Machine {
                     self.acc = UNDEFINED;
                     pc += 1;
                 }
+                // `ldtrue`/`ldfalse` — acc = the boolean constant
+                // (modeled as 1/0).
+                Bytecode::Ldtrue => {
+                    self.acc = 1;
+                    pc += 1;
+                }
+                Bytecode::Ldfalse => {
+                    self.acc = 0;
+                    pc += 1;
+                }
                 // `ldhole` — acc = hole (frame-initial acc value; see the
                 // HOLE sentinel docs).
                 Bytecode::Ldhole => {
@@ -256,6 +276,12 @@ impl Machine {
                 Bytecode::Stobjbyname(..) => {
                     pc += 1;
                 }
+                // Store to a named global: same side-effect-only treatment
+                // (vendor `stglobalvar imm, string_id` with `acc: in:top`
+                // — it reads but never writes the accumulator).
+                Bytecode::Stglobalvar(..) => {
+                    pc += 1;
+                }
                 Bytecode::Copydataproperties(dst_r) => {
                     return Halt::CopyDataProperties {
                         dst: self.reg(dst_r.0),
@@ -321,6 +347,16 @@ impl Machine {
                     return Halt::ThrowIfSuperNotCorrectCall {
                         kind: imm.0,
                         value: self.acc,
+                    };
+                }
+                // `definegettersetterbyvalue v0, v1, v2, v3` — record the
+                // four register operands (obj, key, getter, setter).
+                Bytecode::Definegettersetterbyvalue(obj_r, key_r, get_r, set_r) => {
+                    return Halt::DefineGetterSetterByValue {
+                        obj: self.reg(obj_r.0),
+                        key: self.reg(key_r.0),
+                        getter: self.reg(get_r.0),
+                        setter: self.reg(set_r.0),
                     };
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),

@@ -2,8 +2,12 @@
 //!
 //! 1. Exact backward dataflow liveness analysis.
 //! 2. Interference graph construction (SSA guarantees chordal graph).
-//! 3. MCS (Maximum Cardinality Search) ordering + greedy coloring with
-//!    accumulator preference heuristic.
+//! 3. MCS (Maximum Cardinality Search) ordering + greedy coloring to
+//!    register homes. Every value is colored to a REGISTER: the
+//!    accumulator is not a coloring class but one physical location whose
+//!    content is tracked at emission time by isel ("acc-as-cache", B4) —
+//!    an acc-"colored" value used after an intervening acc write would
+//!    read garbage, and the allocator cannot see those clobbers.
 //! 4. Boissinot SSA destruction: coalesce same-color phi operands, collect
 //!    the per-edge parallel copy sets for different colors. The copies are
 //!    resolved (sequentialized) at slot level at the emission point in
@@ -14,12 +18,14 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use crate::analysis::{self, augmented_succs, inst_operands};
 use crate::entity::{Block, FuncId, Value};
 use crate::inst::InstData;
-use crate::module::{Module, ValueDef};
+use crate::module::Module;
 
 /// The result of register allocation for a function.
 #[derive(Debug)]
 pub struct RegAlloc {
-    /// Value → allocated slot.
+    /// Value → allocated register home. Every value lives in a register;
+    /// the accumulator is a physical emission-time resource tracked by
+    /// isel (acc-as-cache, B4), never a coloring class.
     pub allocation: HashMap<Value, RegSlot>,
     /// Parallel copies for phi elimination.
     /// Key: (predecessor, successor). Value: (src, dst) copies.
@@ -44,20 +50,12 @@ pub struct RegAlloc {
     /// into or defined in the pred, so the store never clobbers the normal
     /// path either.
     pub handler_phi_stores: Vec<(Block, Value, Value)>,
-    /// Total registers used (excluding accumulator), including the reserved
-    /// `copy_temp` and `spill_slot` registers when present.
+    /// Total registers used, including the reserved `copy_temp` register
+    /// when present.
     pub num_regs: u16,
     /// Reserved real register for breaking slot-level copy cycles in layout.
     /// `Some` iff the function has any phi copies; never assigned to a value.
     pub copy_temp: Option<RegSlot>,
-    /// Reserved real register for isel's intra-instruction accumulator spills
-    /// (an Acc-colored value needed as a register operand). `Some` iff any
-    /// allocated value is `RegSlot::Acc` AND the frame is low-only (see
-    /// `low_scratch_base`); always a `RegSlot::Reg`; never assigned to a
-    /// value. In high-register mode acc spills route through the low scratch
-    /// block instead, because this top-of-frame slot would itself be
-    /// unencodable for the `op_v_8`-only `sta`/`lda`.
-    pub spill_slot: Option<RegSlot>,
     /// Base of the reserved consecutive range-call argument window. `Some`
     /// iff the function contains a range-form call (isel's
     /// Callrange/Callthisrange/Supercallthisrange/Supercallarrowrange arms,
@@ -78,11 +76,10 @@ pub struct RegAlloc {
     /// route high register OPERANDS (one per operand position, so a
     /// 4-register-operand instruction never aliases two operands), index
     /// `base + 4` routes acc traffic (`sta scratch; mov high, scratch` for
-    /// stores, `mov scratch, high; lda scratch` for loads, likewise for
-    /// phi-copy emission in layout). `sta`/`lda` are `op_v_8`-only in the
-    /// vendored ISA, so high registers are reachable only via `mov` (the
-    /// sole auto-widening mnemonic, op_v1_16_v2_16). Never assigned to a
-    /// value.
+    /// result homing, `mov scratch, high; lda scratch` for acc loads).
+    /// `sta`/`lda` are `op_v_8`-only in the vendored ISA, so high registers
+    /// are reachable only via `mov` (the sole auto-widening mnemonic,
+    /// op_v1_16_v2_16). Never assigned to a value.
     pub low_scratch_base: Option<u16>,
 }
 
@@ -112,18 +109,19 @@ pub enum RegAllocError {
          (hand-crafted) input"
     )]
     HandlerPhiSlotConflict,
-    #[error(
-        "a catch-handler phi result has no register home or an incoming value was never \
-         colored (exception dispatch clobbers the accumulator at handler entry)"
-    )]
+    #[error("a catch-handler phi result or one of its incoming values was never colored")]
     HandlerPhiUncoalesced,
 }
 
-/// Where a value lives after allocation.
+/// Where a value lives after allocation. Single-variant by design (B4):
+/// the accumulator used to be a second "color" (`RegSlot::Acc`), but acc
+/// is one physical location whose content any `Lda`/acc-writing
+/// instruction destroys — an assignment the allocator cannot keep honest.
+/// Every value now gets a register home and isel tracks the physical acc
+/// content at emission time (acc-as-cache).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RegSlot {
     Reg(u16),
-    Acc,
 }
 
 /// Ceiling for allocated (and reserved) registers. Slots at or above this
@@ -157,6 +155,18 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
             }
         }
     }
+    // Values with at least one use (any instruction or phi operand). A phi
+    // result with NO use needs no copies/stores at all: its slot content is
+    // never read, and emitting its edge copies can only CLOBBER the live
+    // value that legally shares the dead result's slot (dead values do not
+    // interfere with anyone). See boissinot_destruction.
+    let mut used: HashSet<Value> = HashSet::new();
+    for &bb in &rpo {
+        let block = module.block(bb);
+        for &inst_id in block.phis.iter().chain(block.insts.iter()) {
+            used.extend(inst_operands(&module.inst(inst_id).data));
+        }
+    }
     // Add function parameters. `param_values` is the authoritative
     // parameter identity (lift entry seeding / IRBuilder::create_func_param);
     // an arena-index convention (`Value::from_index(i)`) would name values
@@ -169,13 +179,6 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     // Add the catch-handler exception values (N13) that are actually used.
     // An unused one needs no register home and no handler prologue store.
     if !func.exception_values.is_empty() {
-        let mut used: HashSet<Value> = HashSet::new();
-        for &bb in &rpo {
-            let block = module.block(bb);
-            for &inst_id in block.phis.iter().chain(block.insts.iter()) {
-                used.extend(inst_operands(&module.inst(inst_id).data));
-            }
-        }
         for &(_, exc) in &func.exception_values {
             if used.contains(&exc) && !all_values.contains(&exc) {
                 all_values.push(exc);
@@ -190,7 +193,6 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
             handler_phi_stores: Vec::new(),
             num_regs: 0,
             copy_temp: None,
-            spill_slot: None,
             call_window_base: None,
             low_scratch_base: None,
         });
@@ -208,13 +210,13 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     //    call order (auto-widening `mov`, encodable for any slot). The
     //    window start must be ≤ 255 even for the wide forms.
     // 2. High-register mode: when even the most compact packing (values +
-    //    params + window + the two top reservations) cannot keep every slot
-    //    ≤ 255, some value may be colored to a register ≥ 256, which
-    //    `sta`/`lda` cannot encode. LOW_SCRATCH_COUNT low scratch registers
-    //    are then reserved between the parameter homes and the window, and
-    //    isel/layout route all high-register acc traffic through them.
-    //    Coloring skips the reserved slots, so the reservation is honest:
-    //    the scratches are never live across any instruction.
+    //    params + window + the copy-temp top reservation) cannot keep
+    //    every slot ≤ 255, some value may be colored to a register ≥ 256,
+    //    which `sta`/`lda` cannot encode. LOW_SCRATCH_COUNT low scratch
+    //    registers are then reserved between the parameter homes and the
+    //    window, and isel routes all high-register acc traffic through
+    //    them. Coloring skips the reserved slots, so the reservation is
+    //    honest: the scratches are never live across any instruction.
     //
     // Both reservations are computed BEFORE liveness/interference: the
     // overflow checks are cheap hard errors even for pathological inputs
@@ -223,8 +225,8 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     let window = range_call_window_size(module, &rpo) as u64;
     let param_count = func.param_count as u64;
     let n_values = all_values.len() as u64;
-    // Low mode must also fit the copy_temp/spill_slot top reservations (+ 2).
-    let low_mode_fits = param_count + window + n_values + 2 <= 256;
+    // Low mode must also fit the copy_temp top reservation (+ 1).
+    let low_mode_fits = param_count + window + n_values + 1 <= 256;
     let low_scratches = if low_mode_fits {
         0
     } else {
@@ -250,64 +252,6 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
 
     // Step 1: Exact backward dataflow liveness (exception edges included).
     let (live_in, live_out) = compute_liveness(module, func_id, &rpo);
-
-    // Values live into a catch handler must not be Acc-colored: exception
-    // dispatch physically delivers the thrown object in the accumulator,
-    // so the acc content of any value live across an exception edge is
-    // dead at handler entry. They must keep a real register home.
-    //
-    // The handler's exception value itself (N13) is DEFINED at handler
-    // entry by the dispatch — it is not live across the edge in that
-    // problematic sense — but it still lands in `live_in[handler]` through
-    // the handler's own uses, so this same rule gives it the register home
-    // its isel prologue (`Sta(home)`, the vendored handler-entry `sta vX`)
-    // writes. Pinning it to Acc instead would silently rethrow whatever
-    // the handler last loaded whenever an acc-clobbering instruction
-    // precedes the first use (iterator-close handlers run `ldtrue` before
-    // rethrowing).
-    //
-    // Handler phi results (N21) also materialize at handler entry — after
-    // the dispatch has clobbered acc — so they too are forbidden Acc.
-    let mut acc_forbidden: HashSet<Value> = func
-        .try_regions
-        .iter()
-        .flat_map(|region| region.catches.iter())
-        .filter_map(|catch| live_in.get(&catch.handler_block))
-        .flatten()
-        .copied()
-        .collect();
-    for &handler in &handler_blocks {
-        for &phi_id in &module.block(handler).phis {
-            if let Some(result) = module.inst(phi_id).result {
-                acc_forbidden.insert(result);
-            }
-        }
-    }
-    // N21: a handler-phi source whose store runs at the pred's BLOCK START
-    // (i.e. any source not defined by an instruction inside that pred) must
-    // not be Acc-colored: the block-start store reads the source's slot
-    // long after the acc held it. Sources defined inside the pred get their
-    // store immediately after the defining instruction, where an Acc home
-    // is still physically intact.
-    for &handler in &handler_blocks {
-        for &phi_id in &module.block(handler).phis {
-            let node = module.inst(phi_id);
-            let InstData::Phi { entries } = &node.data else {
-                continue;
-            };
-            for &(pred, src) in entries {
-                let defined_in_pred = match module.value(src).def {
-                    ValueDef::Inst(i) => {
-                        !module.inst(i).data.is_phi() && module.inst(i).block == pred
-                    }
-                    _ => false,
-                };
-                if !defined_in_pred {
-                    acc_forbidden.insert(src);
-                }
-            }
-        }
-    }
 
     // Step 2: Build interference graph.
     let mut interference = build_interference(module, &rpo, &live_out);
@@ -344,6 +288,9 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
         for &phi_id in &module.block(handler).phis {
             let node = module.inst(phi_id);
             let Some(result) = node.result else { continue };
+            if !used.contains(&result) {
+                continue; // dead phi result: no stores (same class as edge copies)
+            }
             let InstData::Phi { entries } = &node.data else {
                 continue;
             };
@@ -365,19 +312,15 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
         }
     }
 
-    // Step 3: Compute accumulator preference scores.
-    let acc_score = compute_acc_scores(module, &rpo);
-
-    // Step 4: MCS ordering + greedy coloring. The reserved parameter homes
+    // Step 3: MCS ordering + greedy coloring. The reserved parameter homes
     // are pre-assigned; the reserved window/scratch range is skipped by the
-    // smallest-slot scan.
+    // smallest-slot scan. Every value lands in a register — the accumulator
+    // is a physical emission-time resource (acc-as-cache, B4), not a color.
     let (allocation, colored_regs) = mcs_color(
         &all_values,
         &interference,
-        &acc_score,
         func.param_count,
         &func.param_values,
-        &acc_forbidden,
         reserved_start,
         reserved_len,
     )?;
@@ -385,7 +328,7 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     // N21: handler-block phi slot consistency + the pinned store list
     // (computed before SSA destruction, which skips handler blocks).
     let handler_phi_stores =
-        collect_handler_phi_stores(module, &handler_blocks, &allocation, &interference)?;
+        collect_handler_phi_stores(module, &handler_blocks, &allocation, &interference, &used)?;
 
     // The frame must cover the reserved window/scratch range even when
     // coloring stayed below it.
@@ -394,7 +337,7 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     // Step 5: Boissinot SSA destruction — collect the per-edge value-level
     // copy sets. Slot-level resolution happens at the emission point in
     // `layout`, so no value-level cycle breaking (or pseudo-temp) is done here.
-    let phi_copies = boissinot_destruction(module, &rpo, &allocation, &handler_blocks);
+    let phi_copies = boissinot_destruction(module, &rpo, &allocation, &handler_blocks, &used);
 
     // Step 6: When any edge carries phi copies, reserve exactly one real temp
     // register for slot-level cycle breaking. Overflow is a hard error, not
@@ -410,34 +353,12 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
         None
     };
 
-    // Step 7: When any value lives in the accumulator, reserve exactly one
-    // real register as isel's intra-instruction spill slot. The reservation
-    // order is deterministic: `copy_temp` (step 6) first, then `spill_slot`,
-    // each taking the current `num_regs` and incrementing it. Both registers
-    // are therefore distinct, in-frame, and disjoint from every colored slot.
-    //
-    // High-register mode skips this reservation: a top-of-frame slot would
-    // be ≥ 256 and unencodable for the op_v_8-only `sta`, and isel routes
-    // acc spills through the low scratch block (`low_scratch_base`) instead.
-    let spill_slot = if low_scratches == 0 && allocation.values().any(|&slot| slot == RegSlot::Acc)
-    {
-        let spill = num_regs;
-        if spill >= TEMP_REG_BASE {
-            return Err(RegAllocError::RegisterOverflow);
-        }
-        num_regs += 1;
-        Some(RegSlot::Reg(spill))
-    } else {
-        None
-    };
-
     Ok(RegAlloc {
         allocation,
         phi_copies,
         handler_phi_stores,
         num_regs,
         copy_temp,
-        spill_slot,
         call_window_base: if window > 0 {
             Some(window_base as u16)
         } else {
@@ -672,89 +593,7 @@ fn build_interference(
     graph
 }
 
-// ─── Step 3: Accumulator preference ──────────────────────────────────────────
-
-/// Compute accumulator preference score for each value.
-/// Positive = prefer acc, negative = prefer register.
-fn compute_acc_scores(module: &Module, rpo: &[Block]) -> HashMap<Value, i32> {
-    let mut scores: HashMap<Value, i32> = HashMap::new();
-
-    for &bb in rpo {
-        let block = module.block(bb);
-        for &inst_id in block.insts.iter() {
-            let node = module.inst(inst_id);
-
-            // Result produced to acc: +2
-            if let Some(result) = node.result {
-                *scores.entry(result).or_default() += 2;
-            }
-
-            match &node.data {
-                // BinOp left operand in acc: +2
-                InstData::BinaryOp { left, .. } => {
-                    *scores.entry(*left).or_default() += 2;
-                }
-                // Values used as register operands: -3
-                InstData::Call { callee, args, .. } => {
-                    *scores.entry(*callee).or_default() -= 3;
-                    for a in args {
-                        *scores.entry(*a).or_default() -= 3;
-                    }
-                }
-                InstData::StoreProperty { object, value, .. } => {
-                    *scores.entry(*object).or_default() -= 3;
-                    *scores.entry(*value).or_default() -= 3;
-                }
-                // copydataproperties: dst is a register operand (-3), src
-                // rides the accumulator (+2) — vendor
-                // `copydataproperties v:in:top, acc: inout:top`.
-                InstData::CopyDataProperties { dst, src } => {
-                    *scores.entry(*dst).or_default() -= 3;
-                    *scores.entry(*src).or_default() += 2;
-                }
-                // Generator trio (vendor isa.yaml:1302-1305, :1261-1273):
-                // suspendgenerator's register operand is the genobj (-3)
-                // while the acc carries the yield value (+2);
-                // resumegenerator/getresumemode read the genobj FROM the
-                // acc (+2).
-                InstData::SuspendGenerator { genobj, value } => {
-                    *scores.entry(*genobj).or_default() -= 3;
-                    *scores.entry(*value).or_default() += 2;
-                }
-                InstData::ResumeGenerator { genobj } | InstData::GetResumeMode { genobj } => {
-                    *scores.entry(*genobj).or_default() += 2;
-                }
-                // throw.ifsupernotcorrectcall reads the checked `this`
-                // value FROM the acc (vendor `acc: in:top`,
-                // isa.yaml:1003-1008) — Acc-prefer (+2).
-                InstData::ThrowIfSuperNotCorrectCall { value, .. } => {
-                    *scores.entry(*value).or_default() += 2;
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Values with >2 uses: -5 (long-lived, better in register).
-    let mut use_count: HashMap<Value, u32> = HashMap::new();
-    for &bb in rpo {
-        let block = module.block(bb);
-        for &inst_id in block.phis.iter().chain(block.insts.iter()) {
-            for val in inst_operands(&module.inst(inst_id).data) {
-                *use_count.entry(val).or_default() += 1;
-            }
-        }
-    }
-    for (val, count) in &use_count {
-        if *count > 2 {
-            *scores.entry(*val).or_default() -= 5;
-        }
-    }
-
-    scores
-}
-
-// ─── Step 4: MCS + Greedy coloring ──────────────────────────────────────────
+// ─── Step 3: MCS + Greedy coloring ──────────────────────────────────────────
 
 /// MCS ordering followed by reverse greedy coloring.
 /// Returns (allocation, num_regs).
@@ -766,25 +605,24 @@ fn compute_acc_scores(module: &Module, rpo: &[Block]) -> HashMap<Value, i32> {
 /// function that declares more args than it created values for keeps the
 /// bottom slots reserved, preserving the historical frame size.
 ///
-/// `acc_forbidden` values are never colored Acc: values live into a catch
-/// handler (exception dispatch clobbers the physical acc), handler phi
-/// results (they materialize at handler entry, after the clobber), and the
-/// handler exception values themselves (isel's `Sta(home)` prologue reads
-/// the dispatched acc before anything else in the handler).
+/// Every value is colored to a register: the accumulator is not a
+/// coloring class (B4, acc-as-cache) — an acc-"colored" value used after
+/// an intervening acc write reads garbage, and only emission-time
+/// tracking (isel) can know the physical acc content. This also moots the
+/// old acc-forbidden sets (handler live-in values, handler phi results,
+/// block-start store sources): they were Acc-avoidance rules, and there
+/// is no Acc anymore.
 ///
 /// `reserved_start .. reserved_start + reserved_len` is the reserved
 /// low-slot range (low scratch block + range-call argument window, starting
 /// right after the parameter homes): the smallest-slot scan never hands
 /// those slots to a value, so isel can use them as dead scratch at any
 /// emission point.
-#[allow(clippy::too_many_arguments)]
 fn mcs_color(
     all_values: &[Value],
     interference: &InterferenceGraph,
-    acc_score: &HashMap<Value, i32>,
     param_count: u16,
     params: &[Value],
-    acc_forbidden: &HashSet<Value>,
     reserved_start: u16,
     reserved_len: u16,
 ) -> Result<(HashMap<Value, RegSlot>, u16), RegAllocError> {
@@ -797,14 +635,14 @@ fn mcs_color(
     let mut weight: HashMap<Value, u32> = HashMap::new();
     let mut visited = HashSet::new();
     let mut mcs_order: Vec<Value> = Vec::with_capacity(n);
-    let mut heap: BinaryHeap<(u32, i32, Value)> = BinaryHeap::new();
+    let mut heap: BinaryHeap<(u32, Value)> = BinaryHeap::new();
     for &value in all_values {
-        heap.push((0, acc_score.get(&value).copied().unwrap_or(0), value));
+        heap.push((0, value));
     }
 
     for _ in 0..n {
         let v = loop {
-            let Some((w, _score, value)) = heap.pop() else {
+            let Some((w, value)) = heap.pop() else {
                 return Err(RegAllocError::RegisterOverflow);
             };
             if visited.contains(&value) || weight.get(&value).copied().unwrap_or(0) != w {
@@ -822,7 +660,7 @@ fn mcs_color(
                 if !visited.contains(&nb) && val_set.contains(&nb) {
                     let new_weight = weight.entry(nb).or_default();
                     *new_weight += 1;
-                    heap.push((*new_weight, acc_score.get(&nb).copied().unwrap_or(0), nb));
+                    heap.push((*new_weight, nb));
                 }
             }
         }
@@ -843,47 +681,38 @@ fn mcs_color(
         }
 
         // Collect colors used by neighbors.
-        let mut used_colors: HashSet<RegSlot> = HashSet::new();
+        let mut used_colors: HashSet<u16> = HashSet::new();
         if let Some(neighbors) = interference.get(&v) {
             for nb in neighbors {
-                if let Some(&color) = allocation.get(nb) {
+                if let Some(&RegSlot::Reg(color)) = allocation.get(nb) {
                     used_colors.insert(color);
                 }
             }
         }
 
-        let score = acc_score.get(&v).copied().unwrap_or(0);
-
-        // Try accumulator first if score is positive, acc is available, and
-        // the value is not live into a catch handler (exception dispatch
-        // clobbers the physical acc).
-        if score > 0 && !acc_forbidden.contains(&v) && !used_colors.contains(&RegSlot::Acc) {
-            allocation.insert(v, RegSlot::Acc);
-        } else {
-            // Find smallest available register, skipping the reserved
-            // scratch/window range: those slots must stay dead for isel.
-            let mut reg = 0u16;
-            loop {
-                if reg >= reserved_start && reg < reserved_start + reserved_len {
-                    reg = reserved_start + reserved_len;
-                    continue;
-                }
-                if !used_colors.contains(&RegSlot::Reg(reg)) {
-                    break;
-                }
-                if reg == u16::MAX {
-                    return Err(RegAllocError::RegisterOverflow);
-                }
-                reg += 1;
+        // Find smallest available register, skipping the reserved
+        // scratch/window range: those slots must stay dead for isel.
+        let mut reg = 0u16;
+        loop {
+            if reg >= reserved_start && reg < reserved_start + reserved_len {
+                reg = reserved_start + reserved_len;
+                continue;
             }
-            if reg >= TEMP_REG_BASE {
+            if !used_colors.contains(&reg) {
+                break;
+            }
+            if reg == u16::MAX {
                 return Err(RegAllocError::RegisterOverflow);
             }
-            if reg >= next_reg {
-                next_reg = reg + 1;
-            }
-            allocation.insert(v, RegSlot::Reg(reg));
+            reg += 1;
         }
+        if reg >= TEMP_REG_BASE {
+            return Err(RegAllocError::RegisterOverflow);
+        }
+        if reg >= next_reg {
+            next_reg = reg + 1;
+        }
+        allocation.insert(v, RegSlot::Reg(reg));
     }
 
     Ok((allocation, next_reg))
@@ -899,11 +728,22 @@ fn mcs_color(
 /// They are NOT sequentialized here: coalescing lets distinct values share
 /// a slot, so the safe emission order (and any cycle breaking through the
 /// reserved `copy_temp` register) is computed at slot level in `layout`.
+///
+/// A phi whose RESULT has no use (`used` does not contain it) gets no
+/// copies at all: its slot content is never read, so the copies are dead
+/// traffic — and they are worse than dead, because a dead result does not
+/// interfere with any value, so its slot can legally be shared with a
+/// LIVE value whose home the copy would clobber at the edge (the
+/// typescript-enum regression at the B4 refactor: a dead phi's `mov`
+/// overwrote the live phi result sharing its slot on the fall-through
+/// edge). Live phi results always interfere pairwise when both are live,
+/// so their slots never collide this way.
 fn boissinot_destruction(
     module: &Module,
     rpo: &[Block],
     allocation: &HashMap<Value, RegSlot>,
     handler_blocks: &HashSet<Block>,
+    used: &HashSet<Value>,
 ) -> HashMap<(Block, Block), Vec<(Value, Value)>> {
     let mut copies: HashMap<(Block, Block), Vec<(Value, Value)>> = HashMap::new();
 
@@ -923,6 +763,9 @@ fn boissinot_destruction(
                 Some(v) => v,
                 None => continue,
             };
+            if !used.contains(&dst) {
+                continue; // dead phi result: no copies (see the fn doc)
+            }
             let dst_color = allocation.get(&dst);
 
             if let InstData::Phi { entries } = &inst_node.data {
@@ -958,8 +801,8 @@ fn boissinot_destruction(
 ///
 /// Hard checks (never silent):
 ///
-/// - the result must be colored and must have a register home (exception
-///   dispatch clobbers the accumulator at handler entry);
+/// - the result must be colored (it always has a register home — there is
+///   no accumulator coloring since B4);
 /// - every differently-keyed incoming source must be colored;
 /// - a same-slot result/incoming pair must not interfere — coloring never
 ///   assigns one slot to an interfering pair, so this can only fire on
@@ -969,12 +812,16 @@ fn collect_handler_phi_stores(
     handler_blocks: &HashSet<Block>,
     allocation: &HashMap<Value, RegSlot>,
     interference: &InterferenceGraph,
+    used: &HashSet<Value>,
 ) -> Result<Vec<(Block, Value, Value)>, RegAllocError> {
     let mut stores: Vec<(Block, Value, Value)> = Vec::new();
     for &handler in handler_blocks {
         for &phi_id in &module.block(handler).phis {
             let node = module.inst(phi_id);
             let Some(result) = node.result else { continue };
+            if !used.contains(&result) {
+                continue; // dead phi result: no stores (same class as edge copies)
+            }
             let InstData::Phi { entries } = &node.data else {
                 continue;
             };
@@ -982,9 +829,6 @@ fn collect_handler_phi_stores(
                 .get(&result)
                 .copied()
                 .ok_or(RegAllocError::HandlerPhiUncoalesced)?;
-            if result_slot == RegSlot::Acc {
-                return Err(RegAllocError::HandlerPhiUncoalesced);
-            }
             for &(pred, src) in entries {
                 if src == result {
                     continue; // self-reference (loop phi)

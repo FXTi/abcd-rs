@@ -37,20 +37,6 @@ pub enum LowerError {
     #[error("function {func:?} uses value {value:?} that register allocation never colored")]
     UnallocatedOperand { func: FuncId, value: Value },
     #[error(
-        "function {func:?} has parameter {value:?} colored Acc; parameters need a register home \
-         for the copy-in prologue"
-    )]
-    AccColoredParam { func: FuncId, value: Value },
-    #[error(
-        "function {0:?} has an accumulator-colored register operand but no reserved spill register"
-    )]
-    MissingSpillSlot(FuncId),
-    #[error(
-        "function {func:?} has an instruction with two distinct accumulator-colored operands \
-         ({a:?} and {b:?}); the interference invariant guarantees at most one"
-    )]
-    MultipleAccOperands { func: FuncId, a: Value, b: Value },
-    #[error(
         "function {func:?} has a {kind:?} entity operand with raw value {raw:#x} that cannot \
          be traced to a source-file offset recorded by lift"
     )]

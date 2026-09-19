@@ -607,7 +607,6 @@ fn layout_rejects_residual_handler_edge_copies() {
         handler_phi_stores: Vec::new(),
         num_regs: 10,
         copy_temp: None,
-        spill_slot: None,
         call_window_base: None,
         low_scratch_base: None,
     };
@@ -661,7 +660,6 @@ fn layout_rejects_copies_to_non_successor() {
         handler_phi_stores: Vec::new(),
         num_regs: 10,
         copy_temp: None,
-        spill_slot: None,
         call_window_base: None,
         low_scratch_base: None,
     };

@@ -47,8 +47,8 @@ pub struct LayoutResult {
     pub num_regs: u16,
     /// Entity operand traceability inherited from instruction selection,
     /// keyed by (entity kind, raw operand value).
-    /// Layout only inserts `Mov`/`Lda`/`Sta` copies and `Jmp` trampolines —
-    /// none of which carry entity operands — so the selection-time records
+    /// Layout only inserts `Mov` copies and `Jmp` trampolines — none of
+    /// which carry entity operands — so the selection-time records
     /// stay valid for the flattened sequence.
     pub entity_traces: HashMap<(EntityKind, u32), super::isel::EntityTrace>,
 }
@@ -87,23 +87,10 @@ pub fn layout(
             .collect();
         let resolved = resolve_slot_copies(&slot_pairs, alloc.copy_temp)
             .map_err(|_| LowerError::MissingCopyTemp(func_id))?;
-        // Acc↔Reg copies involving a register ≥ 256 detour through the
-        // reserved low acc scratch (sta/lda are op_v_8-only; S2).
-        let acc_scratch = alloc
-            .low_scratch_base
-            .map(|base| base + super::regalloc::LOW_OPERAND_SCRATCHES);
-        let mut codes: Vec<Bytecode> = Vec::new();
-        for (s, d) in resolved {
-            let emitted = emit_copy(s, d, acc_scratch).map_err(|e| match e {
-                super::copy_resolve::CopyResolveError::CycleNeedsTemp => {
-                    LowerError::MissingCopyTemp(func_id)
-                }
-                super::copy_resolve::CopyResolveError::HighRegNeedsScratch => {
-                    LowerError::MissingLowScratch(func_id)
-                }
-            })?;
-            codes.extend(emitted);
-        }
+        // Every resolved copy is Reg→Reg (B4: there is no accumulator
+        // coloring, so acc never appears in copy slots): the auto-widening
+        // `Mov` encodes at any register height without scratch routing.
+        let codes: Vec<Bytecode> = resolved.into_iter().map(|(s, d)| emit_copy(s, d)).collect();
         if !codes.is_empty() {
             edge_codes.insert(edge, codes);
         }

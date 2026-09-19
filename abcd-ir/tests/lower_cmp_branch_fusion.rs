@@ -5,16 +5,15 @@
 //!
 //! `lower::isel`'s `try_fuse_cmp_branch` re-reads the COMPARISON's
 //! operands (`left`, `right`) at the CondBranch site. Register allocation
-//! computed live ranges where those operands die at the comparison, and
-//! the comparison plus the `IsTrue` wrapper both write the accumulator —
-//! so at the branch the physical acc holds `cond`, not `left`. Fusing is
-//! only sound when:
+//! computed live ranges where those operands die at the comparison.
+//! Fusing is only sound when:
 //!
 //! 1. the comparison (and the `IsTrue` wrapper, if present) immediately
 //!    precede the branch IN THE SAME BLOCK (no slot-reuse window);
-//! 2. both `left` and `right` are Reg-colored (an Acc-colored operand is
-//!    physically dead at the branch: `ensure_acc(left)` would no-op with
-//!    acc = cond, `val_reg(right)` would spill cond);
+//! 2. both `left` and `right` are Reg-colored — since B4 (acc-as-cache)
+//!    EVERY value is Reg-colored, so this holds by construction and the
+//!    old "Acc-colored compare operand" red shape is unrepresentable
+//!    (test 1 retired: there is no `RegSlot::Acc` anymore);
 //! 3. neither the comparison result nor the `IsTrue` result reuses an
 //!    operand slot (a dying-at-the-comparison operand does not interfere
 //!    with those results, so the allocator may co-locate them).
@@ -22,14 +21,13 @@
 //! Otherwise the branch must fall back to `ensure_acc(cond)` + `Jnez`,
 //! which is sound because `cond` is the branch's own operand.
 //!
-//! Tests 1–3 build real IR with `IRBuilder`, drive the public
+//! Tests 2–3 build real IR with `IRBuilder`, drive the public
 //! `isel::select` + `layout::layout` with a hand-pinned `RegAlloc` (all
 //! fields public — the same technique as lower_isel_acc_spill.rs), and
 //! execute the flat bytecodes on the shared simulator. Each red shape
-//! takes the WRONG branch under fusion today; the fix must route them to
+//! takes the WRONG branch under fusion; the gate must route them to
 //! the unfused `Jnez` path. Test 4 pins the sound fusion shape (adjacent,
-//! Reg-colored, no result-slot sharing) so the fix cannot simply delete
-//! fusion.
+//! no result-slot sharing) so the gate cannot simply delete fusion.
 //!
 //! ── Part 2: exception-edge liveness (regalloc) ───────────────────────
 //!
@@ -153,51 +151,11 @@ fn select_layout_run(shape: &FusionShape, alloc: &RegAlloc) -> (Vec<Bytecode>, H
     (laid_out.bytecodes, halt)
 }
 
-/// Test 1 (red): an Acc-colored comparison operand is physically dead at
-/// the branch — acc holds `cond` (the IsTrue result), not `left`. The
-/// fused `Jeq` compares cond against right and falls through; the correct
-/// path is taken. The fix must reject fusion (operand not Reg-colored)
-/// and emit the unfused `Jnez` path.
-#[test]
-fn fusion_rejected_when_compare_operand_is_acc_colored() {
-    let (shape, _) = build_fusion_shape(|_, _| {});
-    // a (left) in Acc, b (right) in R0, cmp/cond and both return values
-    // Acc-colored; R1 is the reserved in-frame spill slot.
-    let alloc = RegAlloc {
-        allocation: HashMap::from([
-            (shape.b, RegSlot::Reg(0)),
-            (shape.a, RegSlot::Acc),
-            (shape.cmp, RegSlot::Acc),
-            (shape.cond, RegSlot::Acc),
-            (shape.then_ret, RegSlot::Acc),
-            (shape.else_ret, RegSlot::Acc),
-        ]),
-        phi_copies: HashMap::new(),
-        handler_phi_stores: Vec::new(),
-        num_regs: 2,
-        copy_temp: None,
-        spill_slot: Some(RegSlot::Reg(1)),
-        call_window_base: None,
-        low_scratch_base: None,
-    };
-
-    let (bytecodes, halt) = select_layout_run(&shape, &alloc);
-    assert_eq!(
-        halt,
-        Halt::Return(THEN),
-        "a == b == 7 must take the then edge; fused Jeq compares acc \
-         (= cond = 1) against right (= 7) and wrongly falls through \
-         (bytecodes: {bytecodes:?})"
-    );
-    assert!(
-        !bytecodes.iter().any(|bc| matches!(bc, Bytecode::Jeq(..))),
-        "an Acc-colored compare operand must reject fusion, got {bytecodes:?}"
-    );
-    assert!(
-        bytecodes.iter().any(|bc| matches!(bc, Bytecode::Jnez(_))),
-        "the unfused fallback must emit Jnez, got {bytecodes:?}"
-    );
-}
+// Test 1 RETIRED (B4): "an Acc-colored comparison operand is physically
+// dead at the branch" — the accumulator is no longer a coloring class
+// (`RegSlot::Acc` is deleted), so the shape is unrepresentable. The
+// emission-time acc tracker makes the fused `ensure_acc(left)` reload
+// `left` from its register home instead of no-oping on stale acc.
 
 /// Test 2 (red): an instruction between the comparison and the branch
 /// reuses `right`'s slot — valid coloring, because right dies at the
@@ -208,7 +166,11 @@ fn fusion_rejected_when_intervening_instruction_reuses_operand_slot() {
     let (shape, extra) = build_fusion_shape(|builder, extra| {
         // d lands in R0 = right's slot (hand-pinned below), AFTER the
         // comparison: a slot-reuse window the fused re-read must not cross.
+        // d is used by a global store so the acc-as-cache model homes it
+        // (a dead result gets no Sta and could not clobber the slot).
         let d = builder.emit_val(InstData::LiteralNumber(99.0), IrType::default());
+        let gd = builder.intern("gd");
+        builder.emit_void(InstData::StoreGlobalVar { name: gd, value: d });
         extra.insert("d", d);
     });
     let d = extra["d"];
@@ -219,14 +181,13 @@ fn fusion_rejected_when_intervening_instruction_reuses_operand_slot() {
             (shape.cmp, RegSlot::Reg(2)),
             (d, RegSlot::Reg(0)), // reuses right's slot
             (shape.cond, RegSlot::Reg(3)),
-            (shape.then_ret, RegSlot::Acc),
-            (shape.else_ret, RegSlot::Acc),
+            (shape.then_ret, RegSlot::Reg(4)),
+            (shape.else_ret, RegSlot::Reg(5)),
         ]),
         phi_copies: HashMap::new(),
         handler_phi_stores: Vec::new(),
-        num_regs: 5,
+        num_regs: 6,
         copy_temp: None,
-        spill_slot: Some(RegSlot::Reg(4)),
         call_window_base: None,
         low_scratch_base: None,
     };
@@ -259,14 +220,13 @@ fn fusion_rejected_when_compare_result_reuses_operand_slot() {
             (shape.a, RegSlot::Reg(1)),
             (shape.cmp, RegSlot::Reg(1)), // reuses left's slot
             (shape.cond, RegSlot::Reg(2)),
-            (shape.then_ret, RegSlot::Acc),
-            (shape.else_ret, RegSlot::Acc),
+            (shape.then_ret, RegSlot::Reg(3)),
+            (shape.else_ret, RegSlot::Reg(4)),
         ]),
         phi_copies: HashMap::new(),
         handler_phi_stores: Vec::new(),
-        num_regs: 4,
+        num_regs: 5,
         copy_temp: None,
-        spill_slot: Some(RegSlot::Reg(3)),
         call_window_base: None,
         low_scratch_base: None,
     };
@@ -288,8 +248,8 @@ fn fusion_rejected_when_compare_result_reuses_operand_slot() {
 
 /// Test 4 (pin, green before and after the fix): the sound fusion shape —
 /// comparison and IsTrue immediately precede the branch in the same
-/// block, both operands Reg-colored, results in disjoint slots. Fusion
-/// MUST still fire (Jeq present, no Jnez) and take the correct edge.
+/// block, results in disjoint slots. Fusion MUST still fire (Jeq present,
+/// no Jnez) and take the correct edge.
 #[test]
 fn fusion_still_fires_when_adjacent_and_reg_colored() {
     let (shape, _) = build_fusion_shape(|_, _| {});
@@ -297,16 +257,15 @@ fn fusion_still_fires_when_adjacent_and_reg_colored() {
         allocation: HashMap::from([
             (shape.b, RegSlot::Reg(0)),
             (shape.a, RegSlot::Reg(1)),
-            (shape.cmp, RegSlot::Acc),
-            (shape.cond, RegSlot::Acc),
-            (shape.then_ret, RegSlot::Acc),
-            (shape.else_ret, RegSlot::Acc),
+            (shape.cmp, RegSlot::Reg(2)),
+            (shape.cond, RegSlot::Reg(3)),
+            (shape.then_ret, RegSlot::Reg(4)),
+            (shape.else_ret, RegSlot::Reg(5)),
         ]),
         phi_copies: HashMap::new(),
         handler_phi_stores: Vec::new(),
-        num_regs: 3,
+        num_regs: 6,
         copy_temp: None,
-        spill_slot: Some(RegSlot::Reg(2)),
         call_window_base: None,
         low_scratch_base: None,
     };
@@ -327,18 +286,16 @@ fn fusion_still_fires_when_adjacent_and_reg_colored() {
     );
 }
 
-/// Test 5 (red): the concrete S6 corpus mechanism. Two values defined in
+/// Test 5 (pin): the concrete S6 corpus mechanism. Two values defined in
 /// a try body that ends in `Throw`/`Unreachable` are used by the catch
-/// handler's `Add`. Terminator-only liveness sees an empty live-out for
-/// the try body, so the handler operands never interfere and BOTH are
-/// colored Acc — today `lower_function` fails with
-/// `LowerError::MultipleAccOperands` at the Add's own emission (18
-/// lift-variant corpus skips in
+/// handler's `Add`. Terminator-only liveness saw an empty live-out for
+/// the try body, so the handler operands never interfered (the historical
+/// red was `LowerError::MultipleAccOperands` at the Add's own emission,
+/// 18 lift-variant corpus skips in
 /// `opt-try-catch-func/test-passes-under-try-catch`, function
-/// `testTryWithRegAccAlloc`). Exception edges must extend liveness, and
-/// handler live-in values must be Reg-colored: exception dispatch
-/// physically delivers the thrown object in the accumulator, so the acc
-/// content of a value live across the edge is dead at handler entry.
+/// `testTryWithRegAccAlloc`). Exception edges must extend liveness so the
+/// handler operands keep DISTINCT register homes (since B4 every value is
+/// Reg-colored anyway; the interference requirement is what survives).
 #[test]
 fn try_handler_values_interfere_across_the_exception_edge() {
     const S1: i64 = 30;
@@ -380,7 +337,7 @@ fn try_handler_values_interfere_across_the_exception_edge() {
         }],
     });
 
-    // Red today: LowerError::MultipleAccOperands at the handler's Add.
+    // Historical red: LowerError::MultipleAccOperands at the handler's Add.
     let result = lower_function(&module, func);
     assert!(
         result.is_ok(),
@@ -389,8 +346,7 @@ fn try_handler_values_interfere_across_the_exception_edge() {
         result.err()
     );
 
-    // The handler operands must be Reg-colored (exception dispatch
-    // clobbers acc), in distinct slots.
+    // The handler operands must have distinct register homes.
     let alloc = regalloc::allocate(&module, func).expect("allocation must succeed");
     let s1_slot = match alloc.allocation.get(&s1) {
         Some(RegSlot::Reg(r)) => *r,
