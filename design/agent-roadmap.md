@@ -11,8 +11,8 @@
 | Phase 0 | Bridge/封装层全面审计（完整性/清爽/漂亮） | **完成（2026-09-18，报告 design/review-bridge-wrapper.md）** |
 | Phase 0.5 | 审计 findings 的 P0/P1 修复批 | **完成（12 commits：ff092bb…81d3b71）** |
 | Phase 1 | Lower 正确性旧账（out-of-SSA 破环、val_reg 溢出槽、lower 实体重定位通道） | **完成（2026-09-19，4 commits：30d254a/0620a12/99e5a52/793e234）** |
-| Phase 2 | VM oracle 证据链（corpus_lower_oracle → 1119 passed fixture 全量） | **进行中** |
-| Phase 3 | P1 漏洞（参数所有权三连修、encode_debug_info 作用域、SSA trivial-phi） | 未开始 |
+| Phase 2 | VM oracle 证据链（corpus_lower_oracle → 1119 passed fixture 全量） | **完成（2026-09-20：双变体 VM oracle 1119/1119）** |
+| Phase 3 | P1 漏洞 + V 族语义簇 + 优化器正确性 | **完成（2026-09-20，P3-T1…T22；见下方登记）** |
 | Phase 4 | 证据升级（真实 9/11 读验证、pandasm 逐指令对照） | 未开始 |
 | Phase 5 | 清扫（死依赖、-sys README、panic 路径）+ FormatProfile 评估 + IR v0.2 决策点 | 未开始 |
 
@@ -142,7 +142,7 @@ P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle
 | 3.20 | 诊断（只读）：opt-only 失败族 | worker P3-T19 (k3) | **完成**（scratch 验证 10/10 VM 通过；orchestrator 抽查两声明成立；实际 opt-only 差=126 非 219。编号冲突已重排为 N36-N41） |
 | 3.21 | 诊断（只读）：双变体共挂族 | worker P3-T20 (k3) | **完成**（五根因全部 file:line+反汇编+VM 签名三重钉死；orchestrator 抽查 N35/N33/N33 静态证实；登记 N29-N35；预期上限 lift 1119 / opt ~993） |
 | 3.22 | 修复批六连（N35→N29→N33→N30→N31+N32→N34，每个一 commit + 红色先行 + vendor 引用） | worker P3-T21 (k3) | **完成**（2b61870/e22962c/4eb28ba/cf19614/d2b9b6a/3a22adf；orchestrator 独立复现终态：**lift 1119/1119（100%）**、opt 993/1119，每检查点零回归；81 套件绿；N32 零翻转字节证明成立。残留观察：stthisbyvalue/stprivateproperty/testin 无语料覆盖——按 vendor 检视修复，Phase 4 补 fixture） **新基线：lift 1119 / opt 993（88.7%）** |
-| 3.23 | opt 修复批：N36 双引擎交换 → N37 -0.0 守卫 → N38 SCCP 异常三层+N41 → N39/N40 | worker P3-T22 (k3) | **进行中**（基线：lift 1119 / opt 993） |
+| 3.23 | opt 修复批：N36 双引擎交换 → N37 -0.0 守卫 → N38 SCCP 异常三层+N41 → N39/N40 | worker P3-T22 (k3) | **完成**（65f9704/1999fd4/d7f8533/a797fc1；N36 附带纠正 Shr/Ashr 符号性反转（vendor 验证）；orchestrator 独立复现终态：**lift 1119/1119、opt 1119/1119，双 100%，零失败零缺失**；85 套件绿；每检查点 lift 硬门槛守住） |
 - **N25（P2，P3-T16 登记）**：ThrowConstAssignment 同属 N12 类双重损坏——vendor `throw.constassignment v:in:top`（isa.yaml:987-991，acc:none）的寄存器操作数承载变量名字符串值，lift（translate.rs:1516-1528）捏造合成名 `const_assign_N` 并丢弃寄存器操作数，isel（isel.rs:1211-1214）硬编码 `Reg(0)` 占位。
 - **N26（P2，P3-T16 登记）**：ThrowUndefinedIfHole 双寄存器形态 opcode 身份损坏——vendor `throw.undefinedifhole v1:in:top, v2:in:top`（isa.yaml:998-1002，acc:none；v1=name，v2=value），lift 捏造合成名 `hole_check_N`，isel 一律重发为**另一条 opcode** `throw.undefinedifholewithname`（0x09，string_id + acc 形态）——往返把寄存器形态换成 acc 形态（N14 getresumemode 同类）。
 - V4 更正：optional-chain 的 SIGSEGV 数据已过时（S2/S6 时代已愈）；现行失败 = 空跳转 phi 输入丢失（dce.rs:303-318 按前驱去重模型无法表达两条汇聚边的不同值——MEMORY.md 已知风险的具体语料实例）+ N14。

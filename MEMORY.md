@@ -326,6 +326,28 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   bitwise, lift labels LogicalNot), N40 (peephole StrictEq to_bits fold),
   N41 (peephole LiteralNull→0.0). Fix batch = P3-T22.
 
+- P3-T22 (65f9704..a797fc1) — PHASE 2+3 COMPLETE: **VM oracle 1119/1119 on
+  BOTH variants** (lift and lift+optimize), zero failures, zero missing,
+  deterministic bytes, orchestrator-reproduced end-to-end on dabai+local
+  docker. N36 = both fold engines (peephole+SCCP) evaluated non-commutative
+  binops in swapped operand order (vendored `*2` = vreg OP acc = right OP
+  left in IR terms) + Shr/Ashr signedness inverted (shr2 is the LOGICAL
+  shift); N37 = -0.0 emitted as ldai 0; N38 = SCCP exception unsoundness
+  (terminator-only traversal / handler-phi block-end values / Eq-ToNumber
+  coercion of es2abc's finally guards); N41 = peephole null→0.0; N39 =
+  Bytecode::Not is bitwise (lift now labels BitNot); N40 = peephole
+  StrictEq to_bits fold → plain ==. Timeline: 390/462 (Phase 2.1) →
+  516/636 (S2) → 618/696 (N20) → 660/696 (N13) → 666/708 (N14) →
+  690 (N12 honest dip) → 1026/894 (B4) → 1026/900 (N27) → 1119/993
+  (T21 six-fix batch) → **1119/1119 (T22)**.
+- Remaining registered work: N25/N26 (throw-family opcode modeling, P2),
+  N28 (copyprop residual risk note), N18 (dead catch blocks cleanup),
+  N22 (harmless), N7 (moduleRequestPhaseIdx, sweep), N8 (open question),
+  N15/N16 (P3 byte-level), Phase 4 (evidence upgrades: real 9/11 read
+  verification, pandasm per-instruction comparison, corpus fixtures for
+  stthisbyvalue/stprivateproperty/testin), Phase 5 (sweep + FormatProfile +
+  IR v0.2 DECISION POINT — maintainer decision, stop there).
+
 ## Phase 1 outcome (done, 2026-09-19)
 
 - Four commits: 30d254a (red tests) → 0620a12 (B1/B2 fix) → 99e5a52 (B3 fix)
