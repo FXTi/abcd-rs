@@ -12,7 +12,20 @@ use crate::module::Module;
 // ─── CFG traversal ───────────────────────────────────────────────────────────
 
 /// Compute reverse post-order of blocks reachable from the entry.
-/// Unreachable blocks (e.g. catch handlers) are appended at the end.
+///
+/// The REACHABLE post-order is reversed first, so the entry block lands at
+/// index 0. Blocks the DFS never visited are then appended in stable
+/// `func.blocks` order, AFTER all reachable blocks. In the
+/// terminator-successor model (`block_succs`) catch handlers have no
+/// incoming CFG edges — exception dispatch is implicit — so handlers are
+/// always unreachable and lay out after every reachable block. This is
+/// correct for lowering: `lower::layout` flattens this vector verbatim, and
+/// `reconstruct_try_blocks` resolves try/handler offsets from the
+/// block-offsets map rather than from stream position, so a handler placed
+/// late still gets the right catch-entry offset (and trampolines, appended
+/// after all real blocks, still sort last). Reversing unreachable blocks
+/// together with the reachable ones — the old behavior — put handlers
+/// BEFORE the entry block, i.e. at the lowered function's pc 0 (N10).
 pub fn compute_rpo(module: &Module, func_id: FuncId) -> Vec<Block> {
     let func = module.func(func_id);
     let entry = func.entry_block;
@@ -36,14 +49,17 @@ pub fn compute_rpo(module: &Module, func_id: FuncId) -> Vec<Block> {
 
     dfs(entry, module, &mut visited, &mut post_order);
 
-    // Include unreachable blocks.
+    // Reverse the reachable post-order: entry lands at index 0.
+    post_order.reverse();
+
+    // Append blocks unreachable from the entry (e.g. catch handlers),
+    // keeping `func.blocks` order for determinism.
     for &bb in &func.blocks {
         if visited.insert(bb) {
             post_order.push(bb);
         }
     }
 
-    post_order.reverse();
     post_order
 }
 

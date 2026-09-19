@@ -91,7 +91,14 @@ impl Machine {
     /// Execute `code` from index 0 until a terminator/`Stobjbyvalue`.
     /// Panics on any opcode outside the supported subset.
     pub fn run(&mut self, code: &[Bytecode]) -> Halt {
-        let mut pc = 0usize;
+        self.run_at(code, 0)
+    }
+
+    /// Execute `code` from `pc` until a terminator/`Stobjbyvalue`.
+    /// Used to simulate exception dispatch: the VM enters a catch handler
+    /// at its `TryBlock` offset, not at pc 0.
+    pub fn run_at(&mut self, code: &[Bytecode], pc: usize) -> Halt {
+        let mut pc = pc;
         loop {
             let Some(bc) = code.get(pc) else {
                 panic!("simulator: program counter {pc} escaped the code buffer")
