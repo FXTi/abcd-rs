@@ -16,6 +16,39 @@ pub trait FuncPass {
     fn run(&self, module: &mut Module, func: FuncId) -> bool;
 }
 
+/// ECMA-262 ToInt32, shared by BOTH constant-fold engines (N42).
+///
+/// Rust's `n as i32` SATURATES (out-of-range clamps to ±2^31, NaN → 0);
+/// JS bitwise/shift operators WRAP mod 2^32 and map NaN/±Infinity to +0.
+/// Matches the vendored conversion used by every `*2` bitwise/shift fast
+/// path, `base::NumberHelper::DoubleToInt(d, INT32_BITS)`
+/// (arkcompiler_ets_runtime-master ecmascript/base/number_helper.cpp:1137-
+/// 1158 — truncate toward zero, keep the low 32 bits, reinterpret as
+/// signed; the explicit `SaturateTruncDoubleToInt32` is a different
+/// function those handlers do NOT call).
+pub(crate) fn to_int32(n: f64) -> i32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    // Exact: f64 `%` is fmod (exactly rounded) and every integer in
+    // [0, 2^32) is exactly representable, so the wrap loses nothing.
+    let wrapped = n.trunc() % 4294967296.0;
+    let positive = if wrapped < 0.0 {
+        wrapped + 4294967296.0
+    } else {
+        wrapped
+    };
+    (positive as u32) as i32
+}
+
+/// ECMA-262 ToUint32 — the same wrap, reinterpreted unsigned. The shift
+/// count mask `& 0x1f` applies AFTER this conversion: a negative count
+/// wraps to a large unsigned value and then masks (e.g. -1 → 31), it is
+/// not saturated to 0 first.
+pub(crate) fn to_uint32(n: f64) -> u32 {
+    to_int32(n) as u32
+}
+
 /// Run the full optimization pipeline on a single function.
 /// Pipeline: peephole → sccp → dce → copyprop → peephole → dce
 /// Returns `true` if any pass modified the IR.

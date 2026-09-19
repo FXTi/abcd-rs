@@ -11,7 +11,7 @@ use crate::entity::{Block, FuncId, Inst, Value};
 use crate::inst::{BinOp, InstData, UnOp};
 use crate::module::Module;
 
-use super::FuncPass;
+use super::{FuncPass, to_int32, to_uint32};
 
 /// Lattice value for SCCP.
 #[derive(Clone, Debug, PartialEq)]
@@ -530,6 +530,10 @@ fn eval_binop_lattice(op: BinOp, a: &ConstVal, b: &ConstVal) -> Option<LatticeVa
     }
     let an = const_to_number(a)?;
     let bn = const_to_number(b)?;
+    // Bitwise/shift operands convert with ECMA-262 ToInt32/ToUint32
+    // (N42): WRAP mod 2^32 with NaN/±Infinity → 0, NOT Rust's saturating
+    // `as` casts — matches vendored DoubleToInt (number_helper.cpp:1137).
+    // The shift count is masked `& 0x1f` AFTER the wrap, so -1 → 31.
     match op {
         BinOp::Add => Some(LatticeVal::Constant(ConstVal::Number(an + bn))),
         BinOp::Sub => Some(LatticeVal::Constant(ConstVal::Number(an - bn))),
@@ -538,27 +542,27 @@ fn eval_binop_lattice(op: BinOp, a: &ConstVal, b: &ConstVal) -> Option<LatticeVa
         BinOp::Mod => Some(LatticeVal::Constant(ConstVal::Number(an % bn))),
         BinOp::Exp => Some(LatticeVal::Constant(ConstVal::Number(an.powf(bn)))),
         BinOp::Shl => Some(LatticeVal::Constant(ConstVal::Number(
-            ((an as i32) << (bn as u32 & 0x1f)) as f64,
+            (to_int32(an) << (to_uint32(bn) & 0x1f)) as f64,
         ))),
         BinOp::Shr => Some(LatticeVal::Constant(ConstVal::Number(
             // JS `>>>`: vendored shr2 is the LOGICAL (unsigned) shift —
             // (uint32)ToInt32(v) >> shift, so the unsigned reinterpret
             // goes through i32 (a direct `as u32` saturates negatives).
-            (((an as i32) as u32) >> (bn as u32 & 0x1f)) as f64,
+            ((to_int32(an) as u32) >> (to_uint32(bn) & 0x1f)) as f64,
         ))),
         BinOp::Ashr => Some(LatticeVal::Constant(ConstVal::Number(
             // JS `>>`: vendored ashr2 is the ARITHMETIC (signed) shift.
             // The two arms were inverted.
-            ((an as i32) >> (bn as u32 & 0x1f)) as f64,
+            (to_int32(an) >> (to_uint32(bn) & 0x1f)) as f64,
         ))),
         BinOp::BitAnd => Some(LatticeVal::Constant(ConstVal::Number(
-            ((an as i32) & (bn as i32)) as f64,
+            (to_int32(an) & to_int32(bn)) as f64,
         ))),
         BinOp::BitOr => Some(LatticeVal::Constant(ConstVal::Number(
-            ((an as i32) | (bn as i32)) as f64,
+            (to_int32(an) | to_int32(bn)) as f64,
         ))),
         BinOp::BitXor => Some(LatticeVal::Constant(ConstVal::Number(
-            ((an as i32) ^ (bn as i32)) as f64,
+            (to_int32(an) ^ to_int32(bn)) as f64,
         ))),
         BinOp::Eq => Some(LatticeVal::Constant(ConstVal::Bool(an == bn))),
         BinOp::NotEq => Some(LatticeVal::Constant(ConstVal::Bool(an != bn))),
@@ -579,7 +583,8 @@ fn eval_unop_lattice(op: UnOp, c: &ConstVal) -> Option<LatticeVal> {
         }
         UnOp::BitNot => {
             let n = const_to_number(c)?;
-            Some(LatticeVal::Constant(ConstVal::Number(!(n as i32) as f64)))
+            // ECMA-262 ToInt32 (wrap, NaN/±Inf → 0), not saturating (N42).
+            Some(LatticeVal::Constant(ConstVal::Number(!to_int32(n) as f64)))
         }
         UnOp::LogicalNot => Some(LatticeVal::Constant(ConstVal::Bool(!const_is_truthy(c)))),
         UnOp::ToNumber | UnOp::ToNumeric => {

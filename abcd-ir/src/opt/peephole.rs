@@ -4,7 +4,7 @@ use crate::entity::{Block, FuncId, Inst, Value};
 use crate::inst::{BinOp, InstData, UnOp};
 use crate::module::Module;
 
-use super::FuncPass;
+use super::{FuncPass, to_int32, to_uint32};
 
 pub struct Peephole;
 
@@ -60,13 +60,13 @@ fn try_fold(module: &Module, inst_id: Inst) -> Option<InstData> {
             Some(InstData::LiteralNumber(-n))
         }
 
-        // UnOp(BitNot, Lit(n)) → Lit(~n)
+        // UnOp(BitNot, Lit(n)) → Lit(~ToInt32(n)) — wrap, not saturate (N42).
         InstData::UnaryOp {
             op: UnOp::BitNot,
             operand,
         } => {
             let n = as_number(module, *operand)?;
-            Some(InstData::LiteralNumber(!(n as i32) as f64))
+            Some(InstData::LiteralNumber(!to_int32(n) as f64))
         }
 
         // UnOp(LogicalNot, Lit(b)) → Lit(!b)
@@ -240,18 +240,24 @@ fn eval_binop(op: BinOp, a: f64, b: f64) -> Option<f64> {
         BinOp::Div => a / b,
         BinOp::Mod => a % b,
         BinOp::Exp => a.powf(b),
-        BinOp::Shl => ((a as i32) << (b as u32 & 0x1f)) as f64,
+        // Bitwise/shift operands convert with ECMA-262 ToInt32/ToUint32
+        // (N42): WRAP mod 2^32 with NaN/±Infinity → 0, NOT Rust's
+        // saturating `as` casts — matches vendored DoubleToInt
+        // (number_helper.cpp:1137). The shift count is masked `& 0x1f`
+        // AFTER the wrap (vendored HandleShl2Imm8V8:
+        // `static_cast<uint32_t>(opNumber1) & 0x1f`), so -1 shifts by 31.
+        BinOp::Shl => (to_int32(a) << (to_uint32(b) & 0x1f)) as f64,
         // JS `>>>`: vendored shr2 is the LOGICAL (unsigned) shift
         // (interpreter_assembly.cpp HandleShr2Imm8V8: (uint32)ToInt32(v)
         // >> shift — the unsigned reinterpret goes through i32; a direct
         // `as u32` float cast would saturate negatives to 0).
-        BinOp::Shr => (((a as i32) as u32) >> (b as u32 & 0x1f)) as f64,
+        BinOp::Shr => ((to_int32(a) as u32) >> (to_uint32(b) & 0x1f)) as f64,
         // JS `>>`: vendored ashr2 is the ARITHMETIC (signed) shift
         // (HandleAshr2Imm8V8: int32 >> shift). The two arms were inverted.
-        BinOp::Ashr => ((a as i32) >> (b as u32 & 0x1f)) as f64,
-        BinOp::BitAnd => ((a as i32) & (b as i32)) as f64,
-        BinOp::BitOr => ((a as i32) | (b as i32)) as f64,
-        BinOp::BitXor => ((a as i32) ^ (b as i32)) as f64,
+        BinOp::Ashr => (to_int32(a) >> (to_uint32(b) & 0x1f)) as f64,
+        BinOp::BitAnd => (to_int32(a) & to_int32(b)) as f64,
+        BinOp::BitOr => (to_int32(a) | to_int32(b)) as f64,
+        BinOp::BitXor => (to_int32(a) ^ to_int32(b)) as f64,
         // Comparison ops return 0.0/1.0 but we can't fold them to LiteralNumber
         // since the result type is bool. Return None for now.
         BinOp::Eq
