@@ -36,9 +36,17 @@ fn try_fold(module: &Module, inst_id: Inst) -> Option<InstData> {
             if let Some(result) = try_fold_comparison(*op, module, *left, *right) {
                 return Some(result);
             }
-            // Arithmetic ops → LiteralNumber
-            let a = as_number(module, *left)?;
-            let b = as_number(module, *right)?;
+            // Arithmetic ops → LiteralNumber.
+            //
+            // Operand order (N36): the IR convention is `left` = acc
+            // operand, `right` = register operand (lift `binary_op`),
+            // while every vendored `*2` handler computes
+            // `vreg OP acc` (e.g. div2 interpreter_assembly.cpp:1095-1096:
+            // `left = GET_VREG_VALUE(v0); right = acc`). The true semantic
+            // is therefore `right OP left` in IR field terms — evaluate
+            // a = right, b = left.
+            let a = as_number(module, *right)?;
+            let b = as_number(module, *left)?;
             let result = eval_binop(*op, a, b)?;
             Some(InstData::LiteralNumber(result))
         }
@@ -87,16 +95,23 @@ fn try_fold(module: &Module, inst_id: Inst) -> Option<InstData> {
 }
 
 /// Try to fold a comparison BinOp with constant operands into LiteralBool.
+///
+/// Operand order (N36): `left` is the acc operand, `right` the register
+/// operand, and the vendored handlers compute `vreg CMP acc` (e.g. less
+/// interpreter_assembly.cpp:1188-1189: `left = GET_VREG_VALUE(v0);
+/// right = GET_ACC()`), so `a` is extracted from `right` and `b` from
+/// `left`. (For the symmetric Eq/NotEq/StrictEq/StrictNotEq the order is
+/// immaterial but kept uniform.)
 fn try_fold_comparison(op: BinOp, module: &Module, left: Value, right: Value) -> Option<InstData> {
     match op {
         BinOp::Eq => {
-            let a = as_number(module, left)?;
-            let b = as_number(module, right)?;
+            let a = as_number(module, right)?;
+            let b = as_number(module, left)?;
             Some(InstData::LiteralBool(a == b))
         }
         BinOp::NotEq => {
-            let a = as_number(module, left)?;
-            let b = as_number(module, right)?;
+            let a = as_number(module, right)?;
+            let b = as_number(module, left)?;
             Some(InstData::LiteralBool(a != b))
         }
         BinOp::StrictEq => {
@@ -129,23 +144,23 @@ fn try_fold_comparison(op: BinOp, module: &Module, left: Value, right: Value) ->
             None
         }
         BinOp::Less => {
-            let a = as_number(module, left)?;
-            let b = as_number(module, right)?;
+            let a = as_number(module, right)?;
+            let b = as_number(module, left)?;
             Some(InstData::LiteralBool(a < b))
         }
         BinOp::LessEq => {
-            let a = as_number(module, left)?;
-            let b = as_number(module, right)?;
+            let a = as_number(module, right)?;
+            let b = as_number(module, left)?;
             Some(InstData::LiteralBool(a <= b))
         }
         BinOp::Greater => {
-            let a = as_number(module, left)?;
-            let b = as_number(module, right)?;
+            let a = as_number(module, right)?;
+            let b = as_number(module, left)?;
             Some(InstData::LiteralBool(a > b))
         }
         BinOp::GreaterEq => {
-            let a = as_number(module, left)?;
-            let b = as_number(module, right)?;
+            let a = as_number(module, right)?;
+            let b = as_number(module, left)?;
             Some(InstData::LiteralBool(a >= b))
         }
         // In / InstanceOf cannot be folded at compile time.
@@ -218,8 +233,14 @@ fn eval_binop(op: BinOp, a: f64, b: f64) -> Option<f64> {
         BinOp::Mod => a % b,
         BinOp::Exp => a.powf(b),
         BinOp::Shl => ((a as i32) << (b as u32 & 0x1f)) as f64,
-        BinOp::Shr => ((a as i32) >> (b as u32 & 0x1f)) as f64,
-        BinOp::Ashr => ((a as u32) >> (b as u32 & 0x1f)) as f64,
+        // JS `>>>`: vendored shr2 is the LOGICAL (unsigned) shift
+        // (interpreter_assembly.cpp HandleShr2Imm8V8: (uint32)ToInt32(v)
+        // >> shift — the unsigned reinterpret goes through i32; a direct
+        // `as u32` float cast would saturate negatives to 0).
+        BinOp::Shr => (((a as i32) as u32) >> (b as u32 & 0x1f)) as f64,
+        // JS `>>`: vendored ashr2 is the ARITHMETIC (signed) shift
+        // (HandleAshr2Imm8V8: int32 >> shift). The two arms were inverted.
+        BinOp::Ashr => ((a as i32) >> (b as u32 & 0x1f)) as f64,
         BinOp::BitAnd => ((a as i32) & (b as i32)) as f64,
         BinOp::BitOr => ((a as i32) | (b as i32)) as f64,
         BinOp::BitXor => ((a as i32) ^ (b as i32)) as f64,

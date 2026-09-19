@@ -292,7 +292,11 @@ fn evaluate_inst(
             match (&lv, &rv) {
                 (LatticeVal::Bottom, _) | (_, LatticeVal::Bottom) => Some(LatticeVal::Bottom),
                 (LatticeVal::Top, _) | (_, LatticeVal::Top) => None, // not yet determined
-                (LatticeVal::Constant(a), LatticeVal::Constant(b)) => eval_binop_lattice(*op, a, b),
+                // Operand order (N36): IR `left` = acc, `right` = vreg,
+                // while the vendored `*2` handlers compute `vreg OP acc`
+                // (e.g. div2 interpreter_assembly.cpp:1095-1096) — evaluate
+                // with (right, left).
+                (LatticeVal::Constant(a), LatticeVal::Constant(b)) => eval_binop_lattice(*op, b, a),
             }
         }
 
@@ -466,10 +470,15 @@ fn eval_binop_lattice(op: BinOp, a: &ConstVal, b: &ConstVal) -> Option<LatticeVa
             ((an as i32) << (bn as u32 & 0x1f)) as f64,
         ))),
         BinOp::Shr => Some(LatticeVal::Constant(ConstVal::Number(
-            ((an as i32) >> (bn as u32 & 0x1f)) as f64,
+            // JS `>>>`: vendored shr2 is the LOGICAL (unsigned) shift —
+            // (uint32)ToInt32(v) >> shift, so the unsigned reinterpret
+            // goes through i32 (a direct `as u32` saturates negatives).
+            (((an as i32) as u32) >> (bn as u32 & 0x1f)) as f64,
         ))),
         BinOp::Ashr => Some(LatticeVal::Constant(ConstVal::Number(
-            ((an as u32) >> (bn as u32 & 0x1f)) as f64,
+            // JS `>>`: vendored ashr2 is the ARITHMETIC (signed) shift.
+            // The two arms were inverted.
+            ((an as i32) >> (bn as u32 & 0x1f)) as f64,
         ))),
         BinOp::BitAnd => Some(LatticeVal::Constant(ConstVal::Number(
             ((an as i32) & (bn as i32)) as f64,
