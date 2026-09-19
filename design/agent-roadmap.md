@@ -122,6 +122,7 @@ VM 语义簇（需逐簇拆根因）：
 | 3.13 | N21+N13 异常边建模：ValueDef::ExceptionParam + handler 入口 Sta 序幕 + phi 结果钉槽 + 入值写穿透存储 + legacy 内联删除改硬错误 | worker P3-T13 (k3) | **完成**（0270f9b；两条批准修正 + 一条新修正（def-block→per-entry 放置，destructuring 的 vreg 重绑定形态证伪纯定义点放置）全部成立；orchestrator 独立复验：69 套件绿、7/7 测试、双跑字节一致、delta 集合恰为 339 try fixture×2、lift 660(+42)/opt 696(+30) 零回归、翻转族精确吻合；新登记 N22 异常值活性保守回传 +1 寄存器） |
 | 3.14 | 空跳转 phi 守卫 | worker P3-T14 (k3) | **完成**（4a6d6ae；守卫条件=汇聚边 phi 值不等则拒绝消块，同值照常合并；orchestrator 复验：红色 2 失败 1 钉住复现、lift 树零变化、opt 差集恰 6 文件、opt 702 复跑一致；merge_single_succ_pred 审计结论：不同 bug 类，无需加守卫；新登记 N23 SCCP 折叠留陈旧 phi 条目——无活失败） |
 | 3.15 | N14 generator 三件套建模 | worker P3-T15 (k3) | **进行中**（基线：lift 660 / opt 702） |
+| 3.16 | N24 oracle 工具链卫生：崩溃/挂起的 qemu 容器在客户端被超时杀死后残留烧 CPU（本次 30 分钟卡慢的真凶）→ compare 脚本每批后清理残留容器 | orchestrator | **进行中** |
 
 P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle  harness 无幻影）：
 

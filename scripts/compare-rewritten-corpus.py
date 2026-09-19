@@ -4,6 +4,7 @@
 import argparse
 import concurrent.futures
 import json
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 
@@ -62,15 +63,29 @@ def main():
             continue
         comparable.append((row, relative))
 
+    # Every container gets a label unique to this process so crashed/hung
+    # qemu VMs (which do not exit, so `--rm` never fires) can be reaped in
+    # the finally block below — a killed client leaves the container burning
+    # CPU otherwise.
+    label = f"abcd-oracle={os.getpid()}"
+
     def compare(entry):
         row, relative = entry
         command = [
             "docker", "run", "--rm", "--platform", "linux/amd64",
-            "--network", "none", "-v", f"{candidates}:/work:ro", args.image,
+            "--network", "none", "--label", label,
+            "-v", f"{candidates}:/work:ro", args.image,
             "compare", f"/work/{relative}", "--case", row["case"],
             "--version", row["version"], "--profile", row["profile"],
         ]
-        process = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        try:
+            process = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            # The docker CLI itself hung (qemu core-dump): the labeled
+            # container is reaped in the finally block; record a timeout
+            # failure instead of aborting the whole run.
+            return {"abc": row["abc"], "passed": False,
+                    "oracle": {"error": "client-side timeout", "timeout": True}}
         try:
             result = json.loads(process.stdout)
         except json.JSONDecodeError:
@@ -78,14 +93,22 @@ def main():
         passed = process.returncode == 0 and result.get("matches") is True
         return {"abc": row["abc"], "passed": passed, "oracle": result}
 
-    if args.jobs == 1:
-        for entry in comparable:
-            results.append(compare(entry))
-    else:
-        # Parallel mode (--jobs N): results stay in manifest order, so the
-        # report is deterministic regardless of completion order.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            results.extend(pool.map(compare, comparable))
+    try:
+        if args.jobs == 1:
+            for entry in comparable:
+                results.append(compare(entry))
+        else:
+            # Parallel mode (--jobs N): results stay in manifest order, so the
+            # report is deterministic regardless of completion order.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+                results.extend(pool.map(compare, comparable))
+    finally:
+        lingering = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", f"label={label}"],
+            capture_output=True, text=True,
+        ).stdout.split()
+        if lingering:
+            subprocess.run(["docker", "rm", "-f", *lingering], capture_output=True)
 
     compared = [result for result in results if not result.get("missing")]
     missing = [result["abc"] for result in results if result.get("missing")]
