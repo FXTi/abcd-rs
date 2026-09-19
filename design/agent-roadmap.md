@@ -209,16 +209,17 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | Phase 4 | 9/11 真实读验证（444+477 fixture）、pandasm 逐指令对照、stthisbyvalue/stprivateproperty/testin 补 fixture | 🔲 未开始 |
 
 | N42 | peephole+SCCP 位/移折叠用 Rust 饱和转换代替 JS ToInt32/ToUint32（≥2³¹/负移位/NaN/Inf 全错） | ✅ 修复（72975eb，P4-T3：共享 to_int32/to_uint32 对 vendor DoubleToInt number_helper.cpp:1137-1158 核验；双引擎 4 红探针+扩展表红转绿；N36 操作数序测试零回归） |
-| N43 | reconstruct_try_blocks 的 min/max 单区间假设 RPO 连续——可被交错破坏 → 异常误分发 | 🔲 未修（P1，红色探针实证；T1 落盘后修） |
+| N43 | reconstruct_try_blocks 的 min/max 单区间假设 RPO 连续——可被交错破坏 → 异常误分发 | ✅ 修复（P4-T4：每连续段一个 TryBlock，同 region 相邻段合并——连续 region 字节不变；红探针+嵌套+单段钉住；语料实证 8 族 region 非连续（旧字节 gap 内含 throw/callarg1/tryldglobalbyname 等真投掷指令，误分发潜伏未触发）；重写差集恰为此 8 族（lift 132/opt 108 文件），逐例 VM oracle 144/144+108/108，全量 1119/1119 双变体） |
 | N44 | opt::inline 产出模块非法 IR（参数未映射/前驱未重建/try 区域丢失……） | ✅ 已隔离（cab3ab8，P4-T3：Inline::run 硬门控 no-op + 文档 not-ready + opt_inline_quarantine.rs 钉住探针形状零腐蚀；重写留 v0.2 决策） |
 | N45 | DomTree 正确但零消费者（死代码）；verify 缺 use-def 支配检查 | 🔲 未修（P2 加固） |
 | N46 | Type::Reference(StringId) 引用源文件池而 Module 不持有——今日安全（无消费者解析） | 📝 潜伏记录（先文档化） |
 | N47 | SCCP add_cfg_edges 对 Return/Unreachable 终结提前返回跳过异常边 | 📝 P3 记录（少优化，不错误） |
 | N48 | ADCE 把可观察 load（getter/品牌检查/CreateRegExp 等）当纯——死结果删除会丢副作用 | 🔲 未修（P2 潜伏；当前管线不可达） |
+| N49 | layout 块区间公式（next-greater-offset）对零长块会把后继块代码吞进区间——今日无触发（每块必有终结指令≥1 字节码），潜伏 P3 | 🔲 潜伏记录（P4-T4 登记，Phase 5 前复审） |
 | P4-T1 | N25+N26+N3+N9 修复批 | worker P4-T1 (k3) | **完成**（f121d74/55dba05/e9fd5db/d5ec683；每条 red-first 实证；语料重写 1119/1119 双变体、与 /tmp/t22-verify 基线字节差为空、本地 docker oracle 双变体 1119/1119）**+ orchestrator 联合复验通过（fmt/91 套件/字节差 0/oracle 复跑一致；N3 范围扩大批准）** |
 | P4-T2 | dominance/string-pool/异常 CFG 系统复审 | worker P4-T2 (k3) | **完成**（只读；两 P1 声明 orchestrator 静态核实；N42-N48 登记） |
 | P4-T3 | N42（双引擎 JS 整数转换）+ N44（inline 隔离） | worker P4-T3 (k3) | **完成**（72975eb/cab3ab8；red-first 均远端实证；语料重写 1119/1119 双变体零 skip、与 /tmp/t22-verify 字节差为空、本地 docker oracle 双变体 1119/1119，image sha256:5e7627…）**+ orchestrator 联合复验通过（同上）** |
-| P4-T4 | N43 try 区域连续性修复（reconstruct_try_blocks 单区间假设 → 按块区间） | 待定 | 未开始（下一棒） |
+| P4-T4 | N43 try 区域连续性修复（reconstruct_try_blocks 单区间假设 → 按块区间） | worker P4-T4 (k3) | **完成**（方案 (a)：每保护块一段、同 region 相邻段合并——格式证据：vendored CodeItem 持 try_blocks 向量 file_items.h:1370-1373,1426、运行时首匹配扫描 method.cpp:86-107、encode/decode 多条目往返 encode.rs:1313-1348/decode.rs:1790-1839；red→green 远端逐字实证；新测试 lower_try_range_contiguity.rs 三例（交错排除/单段合并钉住/嵌套首匹配序）；workspace 套件绿；语料重写 1119/1119 双变体零 skip，与 /tmp/t22-verify 字节差集恰为 8 个非连续 region 族（lift 132/opt 108 文件），scratch 解码对照证明指令流逐函数相同+覆盖仅为精化+gap 含真投掷指令，差集逐例 oracle 144/144+108/108，全量 oracle 双变体 1119/1119；新登记 N49 零长块区间公式潜伏） |
 
 ## 审计纪律
 

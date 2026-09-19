@@ -291,6 +291,40 @@ fn rewrite_branch_target(bc: &mut Bytecode, target: Block) {
 }
 
 /// Reconstruct TryBlock entries from the function's try_regions using final block offsets.
+///
+/// N43: ONE TryBlock PER CONTIGUOUS RUN of protected blocks — no contiguity
+/// assumption. `compute_rpo` may interleave an unprotected block between two
+/// protected blocks of the same region (shape: `try { if (c) return 1; }
+/// catch {…}; o.p` — the after-try block sorts between the protected entry
+/// and the protected return block in RPO). The old single
+/// `[min_start, max_end)` span then covered the unprotected block, and the
+/// VM's linear first-match scan (vendored
+/// arkcompiler_ets_runtime-master/ecmascript/method.cpp:86-107,
+/// `Method::FindCatchBlock`) would misdispatch an exception raised in the
+/// AFTER-try code to the region's handler.
+///
+/// Multiple try blocks per code item are native to the format: the vendored
+/// writer stores a `std::vector<TryBlock>` per CodeItem
+/// (abcd-file-sys/vendor/libpandafile/file_items.h:1370-1373,1426), our
+/// encode path emits one file entry per model TryBlock
+/// (abcd-file/src/encode.rs:1313-1348), and decode enumerates every try
+/// block independently (abcd-file/src/decode.rs:1790-1839), so several
+/// ranges sharing the same catch entries round-trip. Region order in the
+/// output vector follows `func.try_regions` order, preserving the
+/// first-match-wins dispatch priority for nested regions (the inner region
+/// must precede the outer one — the same ordering the old overlapping spans
+/// relied on).
+///
+/// Ranges of the SAME region that are adjacent in the flat stream coalesce:
+/// a region whose blocks are contiguous yields exactly one
+/// `[min_start, max_end)` TryBlock — byte-identical to the pre-N43 output.
+///
+/// Phi-copy placement vs ranges: copies for an unconditional predecessor are
+/// inserted before its terminator, INSIDE the block's extent, and are pure
+/// `Mov` sequences that cannot throw — covering them is harmless. Copies on
+/// `CondBranch` edges live in trampolines, which sort after every real block
+/// offset and therefore stay outside every try/handler range. Handler-edge
+/// copies cannot exist (hard `LowerError::HandlerEdgeCopies`, N21).
 fn reconstruct_try_blocks(
     module: &Module,
     func_id: FuncId,
@@ -302,60 +336,66 @@ fn reconstruct_try_blocks(
     let func = module.func(func_id);
     let mut try_blocks = Vec::new();
 
+    // Extent of a block in the flat stream: [offset, next greater offset).
+    // Trampoline offsets sort after every real block, so a range end never
+    // extends over a trampoline.
+    let extent_of = |bb: Block| -> Option<(usize, usize)> {
+        let &start = block_offsets.get(&bb)?;
+        let end = block_offsets
+            .values()
+            .filter(|&&o| o > start)
+            .min()
+            .copied()
+            .unwrap_or(total_len);
+        Some((start, end))
+    };
+
     for region in &func.try_regions {
         if region.try_blocks.is_empty() || region.catches.is_empty() {
             continue;
         }
 
-        // Find the min start and max end of all try blocks in this region.
-        let mut min_start = usize::MAX;
-        let mut max_end = 0usize;
-        for &bb in &region.try_blocks {
-            if let Some(&offset) = block_offsets.get(&bb) {
-                min_start = min_start.min(offset);
-                // Compute block end: find the next block's offset or use total_len.
-                let block_end = block_offsets
-                    .values()
-                    .filter(|&&o| o > offset)
-                    .min()
-                    .copied()
-                    .unwrap_or(total_len);
-                max_end = max_end.max(block_end);
+        // Per-block extents, coalesced into contiguous runs (N43).
+        let mut extents: Vec<(usize, usize)> = region
+            .try_blocks
+            .iter()
+            .filter_map(|&bb| extent_of(bb))
+            .collect();
+        if extents.is_empty() {
+            continue;
+        }
+        extents.sort_unstable();
+        let mut runs: Vec<(usize, usize)> = Vec::with_capacity(extents.len());
+        for (start, end) in extents {
+            match runs.last_mut() {
+                Some((_, cur_end)) if start <= *cur_end => *cur_end = (*cur_end).max(end),
+                _ => runs.push((start, end)),
             }
         }
 
-        if min_start == usize::MAX {
-            continue;
-        }
-
-        let try_len = max_end - min_start;
-
-        // Build catch entries.
+        // Build catch entries (shared by every run of this region).
         let catches: Vec<CatchBlock> = region
             .catches
             .iter()
             .filter_map(|ch| {
-                let handler_offset = block_offsets.get(&ch.handler_block)?;
-                // Compute handler length: distance to next block or end.
-                let handler_end = block_offsets
-                    .values()
-                    .filter(|&&o| o > *handler_offset)
-                    .min()
-                    .copied()
-                    .unwrap_or(total_len);
+                let (handler_start, handler_end) = extent_of(ch.handler_block)?;
                 Some(CatchBlock {
                     type_idx: ch.type_idx,
-                    handler: *handler_offset as u32,
-                    len: (handler_end - handler_offset) as u32,
+                    handler: handler_start as u32,
+                    len: (handler_end - handler_start) as u32,
                 })
             })
             .collect();
 
-        if !catches.is_empty() {
+        if catches.is_empty() {
+            continue;
+        }
+
+        for (start, end) in runs {
             try_blocks.push(TryBlock {
-                start: min_start as u32,
-                len: try_len as u32,
-                catches,
+                start: start as u32,
+                len: (end - start) as u32,
+                catches: catches.clone(),
             });
         }
     }
