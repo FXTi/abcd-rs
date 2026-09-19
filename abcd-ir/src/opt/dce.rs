@@ -103,6 +103,12 @@ fn is_essential(data: &InstData) -> bool {
         // new-index result being unused (the corpus shape: acc is
         // immediately clobbered) does not make the spread dead.
         | ArraySpread { .. }
+        // Private-property stores/defines mutate the object; the create
+        // registers the private names in the environment (vendor
+        // isa.yaml:441-445, 849-854, 843-848) — all observable.
+        | StorePrivateProperty { .. }
+        | DefinePrivateProperty { .. }
+        | CreatePrivateProperty { .. }
         | StoreGlobalVar { .. }
         | TryStoreGlobalByName { .. }
         | StoreLexVar { .. }

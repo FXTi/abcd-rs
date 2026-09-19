@@ -182,6 +182,34 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
         InstData::ArraySpread { dst, index, src } => {
             write!(f, "ArraySpread {dst}, {index}, {src}")
         }
+        InstData::LoadPrivateProperty { level, slot, obj } => {
+            write!(f, "LoadPrivateProperty {level}, {slot}, {obj}")
+        }
+        InstData::StorePrivateProperty {
+            level,
+            slot,
+            obj,
+            value,
+        } => {
+            write!(f, "StorePrivateProperty {level}, {slot}, {obj}, {value}")
+        }
+        InstData::DefinePrivateProperty {
+            level,
+            slot,
+            obj,
+            value,
+        } => {
+            write!(f, "DefinePrivateProperty {level}, {slot}, {obj}, {value}")
+        }
+        InstData::TestPrivateProperty { level, slot, obj } => {
+            write!(f, "TestPrivateProperty {level}, {slot}, {obj}")
+        }
+        InstData::CreatePrivateProperty {
+            count,
+            literal_array,
+        } => {
+            write!(f, "CreatePrivateProperty {count}, #{literal_array}")
+        }
         InstData::LoadSuperProperty { key } => {
             write!(f, "LoadSuperProperty")?;
             write_prop(f, m, key)

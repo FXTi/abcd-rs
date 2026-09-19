@@ -1013,6 +1013,81 @@ fn select_inst(
             codes.push(Bytecode::Starrayspread(regs[0], regs[1]));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
+
+        // ── Private properties ───────────────────────────────────────
+        InstData::LoadPrivateProperty { level, slot, obj } => {
+            // Vendor `ldprivateproperty imm1:u8, imm2:u16, imm3:u16,
+            // acc: inout:top` (isa.yaml:436-440, two_slot): acc in =
+            // the object, acc out = the private value.
+            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
+            codes.push(Bytecode::Ldprivateproperty(
+                ic.two(),
+                Imm(*level as i64),
+                Imm(*slot as i64),
+            ));
+            home_result(tracker, result, used, func_id, alloc, codes)?;
+        }
+        InstData::StorePrivateProperty {
+            level,
+            slot,
+            obj,
+            value,
+        } => {
+            // Vendor `stprivateproperty imm1, imm2, imm3, v:in:top,
+            // acc: in:top` (isa.yaml:441-445, two_slot): obj = register
+            // operand, value = acc. The bytecode only READS acc — the
+            // tracker is untouched.
+            let regs = materialize_operands(tracker, func_id, &[*obj], Some(*value), alloc, codes)?;
+            codes.push(Bytecode::Stprivateproperty(
+                ic.two(),
+                Imm(*level as i64),
+                Imm(*slot as i64),
+                regs[0],
+            ));
+        }
+        InstData::DefinePrivateProperty {
+            level,
+            slot,
+            obj,
+            value,
+        } => {
+            // Vendor `callruntime.defineprivateproperty imm1, imm2,
+            // imm3, v:in:top, acc: in:top` (isa.yaml:849-854,
+            // two_slot): obj = register operand, value = acc. acc
+            // read-only — the tracker is untouched.
+            let regs = materialize_operands(tracker, func_id, &[*obj], Some(*value), alloc, codes)?;
+            codes.push(Bytecode::CallruntimeDefineprivateproperty(
+                ic.two(),
+                Imm(*level as i64),
+                Imm(*slot as i64),
+                regs[0],
+            ));
+        }
+        InstData::TestPrivateProperty { level, slot, obj } => {
+            // Vendor `testin imm1:u8, imm2:u16, imm3:u16,
+            // acc: inout:top` (isa.yaml:446-450, two_slot): acc in =
+            // the object, acc out = the boolean result.
+            ensure_acc(tracker, func_id, *obj, alloc, codes)?;
+            codes.push(Bytecode::Testin(
+                ic.two(),
+                Imm(*level as i64),
+                Imm(*slot as i64),
+            ));
+            home_result(tracker, result, used, func_id, alloc, codes)?;
+        }
+        InstData::CreatePrivateProperty {
+            count,
+            literal_array,
+        } => {
+            // Vendor `callruntime.createprivateproperty imm:u16,
+            // literalarray_id, acc: none` (isa.yaml:843-848): no acc
+            // effect — the tracker is untouched. Literal-array operand
+            // on the identity channel, like CreateArrayWithBuffer.
+            codes.push(Bytecode::CallruntimeCreateprivateproperty(
+                Imm(*count as i64),
+                EntityId(*literal_array),
+            ));
+        }
         InstData::LoadSuperProperty { key } => {
             match key {
                 PropKind::ByName(name) => {

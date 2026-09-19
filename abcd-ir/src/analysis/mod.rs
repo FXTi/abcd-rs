@@ -203,6 +203,11 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         DeleteProperty { object, key } => vec![*object, *key],
         CopyDataProperties { dst, src } => vec![*dst, *src],
         ArraySpread { dst, index, src } => vec![*dst, *index, *src],
+        LoadPrivateProperty { obj, .. } | TestPrivateProperty { obj, .. } => vec![*obj],
+        StorePrivateProperty { obj, value, .. } | DefinePrivateProperty { obj, value, .. } => {
+            vec![*obj, *value]
+        }
+        CreatePrivateProperty { .. } => vec![],
         LoadSuperProperty { key } => {
             if let PropKind::ByValue(k) = key {
                 vec![*k]

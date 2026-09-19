@@ -486,43 +486,55 @@ pub(super) fn translate_bytecode(
 
         // ── Private properties ───────────────────────────────────────
         Bytecode::Ldprivateproperty(_ic, level, slot) => {
+            // Vendor `ldprivateproperty imm1:u8, imm2:u16, imm3:u16,
+            // acc: inout:top` (isa.yaml:436-440): imm1 = IC slot, imm2 =
+            // level, imm3 = slot; acc in = the OBJECT, acc out = the
+            // private value (interpreter_stub.cpp:853-867). NOT a
+            // ByIndex load.
             let obj = read_acc(ssa, block, module);
-            let index = (level.0 as u32) << 16 | (slot.0 as u32);
             let v = emit_val(
                 module,
                 block,
-                InstData::LoadProperty {
-                    object: obj,
-                    key: PropKind::ByIndex(index),
+                InstData::LoadPrivateProperty {
+                    level: level.0 as u16,
+                    slot: slot.0 as u16,
+                    obj,
                 },
                 loc,
             );
             write_acc(ssa, block, v);
         }
-        Bytecode::Stprivateproperty(_ic, level, slot, val_reg) => {
-            let obj = read_acc(ssa, block, module);
-            let value = read_reg(ssa, *val_reg, block, module);
-            let index = (level.0 as u32) << 16 | (slot.0 as u32);
+        Bytecode::Stprivateproperty(_ic, level, slot, obj_reg) => {
+            // Vendor `stprivateproperty imm1:u8, imm2:u16, imm3:u16,
+            // v:in:top, acc: in:top` (isa.yaml:441-445): the REGISTER
+            // operand is the OBJECT, the acc carries the VALUE
+            // (interpreter_stub.cpp:869-879).
+            let value = read_acc(ssa, block, module);
+            let obj = read_reg(ssa, *obj_reg, block, module);
             emit_void(
                 module,
                 block,
-                InstData::StoreProperty {
-                    object: obj,
-                    key: PropKind::ByIndex(index),
+                InstData::StorePrivateProperty {
+                    level: level.0 as u16,
+                    slot: slot.0 as u16,
+                    obj,
                     value,
                 },
                 loc,
             );
         }
         Bytecode::Testin(_ic, level, slot) => {
+            // Vendor `testin imm1:u8, imm2:u16, imm3:u16, acc: inout:top`
+            // (isa.yaml:446-450): acc in = the OBJECT, acc out = the
+            // boolean result (interpreter_stub.cpp:881-890).
             let obj = read_acc(ssa, block, module);
-            let index = (level.0 as u32) << 16 | (slot.0 as u32);
             let v = emit_val(
                 module,
                 block,
-                InstData::LoadProperty {
-                    object: obj,
-                    key: PropKind::ByIndex(index),
+                InstData::TestPrivateProperty {
+                    level: level.0 as u16,
+                    slot: slot.0 as u16,
+                    obj,
                 },
                 loc,
             );
@@ -1630,20 +1642,38 @@ pub(super) fn translate_bytecode(
                 loc,
             );
         }
-        Bytecode::CallruntimeCreateprivateproperty(_count, eid) => {
-            let _literal_array = super::resolve_literal(file, body, *eid)?;
-            // Private property creation — bookkeeping, no IR side effect
-        }
-        Bytecode::CallruntimeDefineprivateproperty(_ic, level, slot, val_reg) => {
-            let obj = read_acc(ssa, block, module);
-            let value = read_reg(ssa, *val_reg, block, module);
-            let index = (level.0 as u32) << 16 | (slot.0 as u32);
+        Bytecode::CallruntimeCreateprivateproperty(count, eid) => {
+            // Vendor `callruntime.createprivateproperty imm:u16,
+            // literalarray_id, acc: none` (isa.yaml:843-848): registers
+            // `count` private names from the literal array in the
+            // current environment (interpreter_stub.cpp:6066-6077).
+            // VOID, but observable — must round-trip, not be dropped.
+            let literal_array = super::resolve_literal(file, body, *eid)?;
             emit_void(
                 module,
                 block,
-                InstData::StoreOwnProperty {
-                    object: obj,
-                    key: PropKind::ByIndex(index),
+                InstData::CreatePrivateProperty {
+                    count: count.0 as u16,
+                    literal_array,
+                },
+                loc,
+            );
+        }
+        Bytecode::CallruntimeDefineprivateproperty(_ic, level, slot, obj_reg) => {
+            // Vendor `callruntime.defineprivateproperty imm1:u8,
+            // imm2:u16, imm3:u16, v:in:top, acc: in:top`
+            // (isa.yaml:849-854): the REGISTER operand is the OBJECT,
+            // the acc carries the VALUE (interpreter_stub.cpp:
+            // 6079-6091).
+            let value = read_acc(ssa, block, module);
+            let obj = read_reg(ssa, *obj_reg, block, module);
+            emit_void(
+                module,
+                block,
+                InstData::DefinePrivateProperty {
+                    level: level.0 as u16,
+                    slot: slot.0 as u16,
+                    obj,
                     value,
                 },
                 loc,

@@ -189,6 +189,64 @@ pub enum InstData {
         src: Value,
     },
 
+    // ── Private properties ───────────────────────────────────────────
+    /// Vendor `ldprivateproperty imm1:u8, imm2:u16, imm3:u16,
+    /// acc: inout:top` (abcd-isa-sys/vendor/isa/isa.yaml:436-440,
+    /// properties `[ic_slot, two_slot, eight_bit_ic]`): imm1 = IC slot,
+    /// imm2 = `level`, imm3 = `slot`; the accumulator carries the
+    /// OBJECT and receives the private value
+    /// (`RTSTUB_ID(LdPrivateProperty){currentEnv, level, slot, obj}`,
+    /// acc as obj — arkcompiler_ets_runtime-master/ecmascript/compiler/
+    /// interpreter_stub.cpp:853-867). NOT a `ByIndex` property load.
+    LoadPrivateProperty {
+        level: u16,
+        slot: u16,
+        obj: Value,
+    },
+    /// Vendor `stprivateproperty imm1:u8, imm2:u16, imm3:u16, v:in:top,
+    /// acc: in:top` (isa.yaml:441-445, `[ic_slot, two_slot,
+    /// eight_bit_ic]`): the REGISTER operand is the OBJECT, the
+    /// accumulator carries the VALUE (`obj = GetVregValue(...)`, acc as
+    /// value — interpreter_stub.cpp:869-879).
+    StorePrivateProperty {
+        level: u16,
+        slot: u16,
+        obj: Value,
+        value: Value,
+    },
+    /// Vendor `callruntime.defineprivateproperty imm1:u8, imm2:u16,
+    /// imm3:u16, v:in:top, acc: in:top` (isa.yaml:849-854, `[ic_slot,
+    /// two_slot, eight_bit_ic]`): the REGISTER operand is the OBJECT,
+    /// the accumulator carries the VALUE (interpreter_stub.cpp:
+    /// 6079-6091).
+    DefinePrivateProperty {
+        level: u16,
+        slot: u16,
+        obj: Value,
+        value: Value,
+    },
+    /// Vendor `testin imm1:u8, imm2:u16, imm3:u16, acc: inout:top`
+    /// (isa.yaml:446-450, `[ic_slot, two_slot, eight_bit_ic]`): the
+    /// accumulator carries the OBJECT and receives the boolean result
+    /// (interpreter_stub.cpp:881-890).
+    TestPrivateProperty {
+        level: u16,
+        slot: u16,
+        obj: Value,
+    },
+    /// Vendor `callruntime.createprivateproperty imm:u16,
+    /// literalarray_id, acc: none` (isa.yaml:843-848,
+    /// `[literalarray_id]`): registers `count` private names from the
+    /// literal array in the current environment
+    /// (`RTSTUB_ID(CreatePrivateProperty){currentEnv, count, constpool,
+    /// literalId, module}` — interpreter_stub.cpp:6066-6077). VOID and
+    /// `acc: none`, but observable — without it the private names are
+    /// never registered and every later ld/st/define/testin fails.
+    CreatePrivateProperty {
+        count: u16,
+        literal_array: u32,
+    },
+
     // ── Global variables ─────────────────────────────────────────────
     LoadGlobalVar {
         name: StringId,
@@ -506,6 +564,11 @@ impl InstData {
             DeleteProperty { object, key } => vec![object, key],
             CopyDataProperties { dst, src } => vec![dst, src],
             ArraySpread { dst, index, src } => vec![dst, index, src],
+            LoadPrivateProperty { obj, .. } | TestPrivateProperty { obj, .. } => vec![obj],
+            StorePrivateProperty { obj, value, .. } | DefinePrivateProperty { obj, value, .. } => {
+                vec![obj, value]
+            }
+            CreatePrivateProperty { .. } => vec![],
             LoadSuperProperty { key } => {
                 if let PropKind::ByValue(k) = key {
                     vec![k]
@@ -593,6 +656,9 @@ impl InstData {
                 | InstData::StoreOwnProperty { .. }
                 | InstData::StoreSuperProperty { .. }
                 | InstData::CopyDataProperties { .. }
+                | InstData::StorePrivateProperty { .. }
+                | InstData::DefinePrivateProperty { .. }
+                | InstData::CreatePrivateProperty { .. }
                 | InstData::StoreGlobalVar { .. }
                 | InstData::TryStoreGlobalByName { .. }
                 | InstData::StoreLexVar { .. }
