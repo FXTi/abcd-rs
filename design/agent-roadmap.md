@@ -215,9 +215,10 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | N46 | Type::Reference(StringId) 引用源文件池而 Module 不持有——今日安全（无消费者解析） | 📝 潜伏记录（先文档化） |
 | N47 | SCCP add_cfg_edges 对 Return/Unreachable 终结提前返回跳过异常边 | 📝 P3 记录（少优化，不错误） |
 | N48 | ADCE 把可观察 load（getter/品牌检查/CreateRegExp 等）当纯——死结果删除会丢副作用 | 🔲 未修（P2 潜伏；当前管线不可达） |
-| P4-T1 | N25+N26+N3+N9 修复批 | worker P4-T1 (k3) | **完成**（f121d74/55dba05/e9fd5db/d5ec683；每条 red-first 实证；语料重写 1119/1119 双变体、与 /tmp/t22-verify 基线字节差为空、本地 docker oracle 双变体 1119/1119） |
+| P4-T1 | N25+N26+N3+N9 修复批 | worker P4-T1 (k3) | **完成**（f121d74/55dba05/e9fd5db/d5ec683；每条 red-first 实证；语料重写 1119/1119 双变体、与 /tmp/t22-verify 基线字节差为空、本地 docker oracle 双变体 1119/1119）**+ orchestrator 联合复验通过（fmt/91 套件/字节差 0/oracle 复跑一致；N3 范围扩大批准）** |
 | P4-T2 | dominance/string-pool/异常 CFG 系统复审 | worker P4-T2 (k3) | **完成**（只读；两 P1 声明 orchestrator 静态核实；N42-N48 登记） |
-| P4-T3 | N42（双引擎 JS 整数转换）+ N44（inline 隔离） | worker P4-T3 (k3) | **完成**（72975eb/cab3ab8；red-first 均远端实证；语料重写 1119/1119 双变体零 skip、与 /tmp/t22-verify 字节差为空、本地 docker oracle 双变体 1119/1119，image sha256:5e7627…） |
+| P4-T3 | N42（双引擎 JS 整数转换）+ N44（inline 隔离） | worker P4-T3 (k3) | **完成**（72975eb/cab3ab8；red-first 均远端实证；语料重写 1119/1119 双变体零 skip、与 /tmp/t22-verify 字节差为空、本地 docker oracle 双变体 1119/1119，image sha256:5e7627…）**+ orchestrator 联合复验通过（同上）** |
+| P4-T4 | N43 try 区域连续性修复（reconstruct_try_blocks 单区间假设 → 按块区间） | 待定 | 未开始（下一棒） |
 
 ## 审计纪律
 
