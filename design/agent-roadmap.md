@@ -208,6 +208,16 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | Phase 5 清扫批 | literal_val_to_c 死代码、builder 二次 finalize staging、-sys README（#20/#21）、回调文档（#15）、abcd-file README 漂移 6 项、P2 测试缺口 | 🔲 未开始 |
 | Phase 4 | 9/11 真实读验证（444+477 fixture）、pandasm 逐指令对照、stthisbyvalue/stprivateproperty/testin 补 fixture | 🔲 未开始 |
 
+| N42 | peephole+SCCP 位/移折叠用 Rust 饱和转换代替 JS ToInt32/ToUint32（≥2³¹/负移位/NaN/Inf 全错） | 🔲 未修（P1，下一棒；语料无覆盖但属真实误折叠） |
+| N43 | reconstruct_try_blocks 的 min/max 单区间假设 RPO 连续——可被交错破坏 → 异常误分发 | 🔲 未修（P1，红色探针实证；T1 落盘后修） |
+| N44 | opt::inline 产出模块非法 IR（参数未映射/前驱未重建/try 区域丢失……） | 🔲 未修（P1 潜伏；默认管线未启用——先隔离） |
+| N45 | DomTree 正确但零消费者（死代码）；verify 缺 use-def 支配检查 | 🔲 未修（P2 加固） |
+| N46 | Type::Reference(StringId) 引用源文件池而 Module 不持有——今日安全（无消费者解析） | 📝 潜伏记录（先文档化） |
+| N47 | SCCP add_cfg_edges 对 Return/Unreachable 终结提前返回跳过异常边 | 📝 P3 记录（少优化，不错误） |
+| N48 | ADCE 把可观察 load（getter/品牌检查/CreateRegExp 等）当纯——死结果删除会丢副作用 | 🔲 未修（P2 潜伏；当前管线不可达） |
+| P4-T1 | N25+N26+N3+N9 修复批 | worker P4-T1 (k3) | **进行中** |
+| P4-T2 | dominance/string-pool/异常 CFG 系统复审 | worker P4-T2 (k3) | **完成**（只读；两 P1 声明 orchestrator 静态核实；N42-N48 登记） |
+
 ## 审计纪律
 
 - 审计期间 abcd-isa-sys / abcd-isa / abcd-file-sys / abcd-file 冻结功能性改动（允许新增测试文件）。
