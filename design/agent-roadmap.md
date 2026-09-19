@@ -206,7 +206,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | string-pool 所有权复审 | 引用类型字符串池所有权 | ✅ 实质覆盖（9988e40，N46：FILE-BOUND 契约文档化，审计确认无消费者解析） |
 | exception CFG 复审 | 异常 CFG 语义 | ✅ 实质覆盖（N10/N11/N13/N21 + augmented_succs 共享审计）；系统性复审并入 dominance 复审一起做 |
 | Phase 5 清扫批 | literal_val_to_c 死代码、builder 二次 finalize staging、-sys README（#20/#21）、回调文档（#15）、abcd-file README 漂移 6 项、P2 测试缺口 | 🔲 未开始 |
-| Phase 4 | 9/11 真实读验证（444+477 fixture）、pandasm 逐指令对照、stthisbyvalue/stprivateproperty/testin 补 fixture | 🔲 未开始 |
+| Phase 4 | 9/11 真实读验证（444+477 fixture）、pandasm 逐指令对照、stthisbyvalue/stprivateproperty/testin 补 fixture | **进行中**（P4-T6，worker k3） |
 
 | N42 | peephole+SCCP 位/移折叠用 Rust 饱和转换代替 JS ToInt32/ToUint32（≥2³¹/负移位/NaN/Inf 全错） | ✅ 修复（72975eb，P4-T3：共享 to_int32/to_uint32 对 vendor DoubleToInt number_helper.cpp:1137-1158 核验；双引擎 4 红探针+扩展表红转绿；N36 操作数序测试零回归） |
 | N43 | reconstruct_try_blocks 的 min/max 单区间假设 RPO 连续——可被交错破坏 → 异常误分发 | ✅ 修复（P4-T4：每连续段一个 TryBlock，同 region 相邻段合并——连续 region 字节不变；红探针+嵌套+单段钉住；语料实证 8 族 region 非连续（旧字节 gap 内含 throw/callarg1/tryldglobalbyname 等真投掷指令，误分发潜伏未触发）；重写差集恰为此 8 族（lift 132/opt 108 文件），逐例 VM oracle 144/144+108/108，全量 1119/1119 双变体） |
