@@ -57,6 +57,7 @@ impl<'m> IRBuilder<'m> {
             annotations: IrAnnotations::default(),
             debug: None,
             try_regions: Vec::new(),
+            exception_values: Vec::new(),
         });
         func_id
     }

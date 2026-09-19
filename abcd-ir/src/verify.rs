@@ -90,6 +90,12 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> Vec<VerifyError> {
     for &val in &func.param_values {
         defined_values.insert(val);
     }
+    // Exception values delivered at catch-handler entries (N13) are defined
+    // values of this function — recorded per function in `exception_values`
+    // for the same ownership reason as `param_values`.
+    for &(_, val) in &func.exception_values {
+        defined_values.insert(val);
+    }
 
     // Entry normally has no predecessors. A loop may legally branch back to
     // itself, so only predecessors from a different block are invalid.

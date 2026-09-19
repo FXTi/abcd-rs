@@ -73,6 +73,7 @@ fn run_edge_copies(
     let alloc = RegAlloc {
         allocation,
         phi_copies,
+        handler_phi_stores: Vec::new(),
         num_regs: 16,
         copy_temp: Some(RegSlot::Reg(15)),
         // No Acc-colored values in this fixture.

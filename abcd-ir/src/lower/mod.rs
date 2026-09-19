@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use abcd_isa::{EntityId, EntityKind};
 
-use crate::entity::{FuncId, StringId, Value};
+use crate::entity::{Block, FuncId, StringId, Value};
 use crate::module::Module;
 
 pub use self::isel::EntityTrace;
@@ -84,6 +84,36 @@ pub enum LowerError {
          encoding limit of the wide callrange forms"
     )]
     CallArgcOverflow { func: FuncId, argc: usize },
+    #[error(
+        "function {0:?}: a catch-handler phi has a same-slot result/incoming pair that \
+         interferes (inconsistent input — coloring never assigns one slot to an \
+         interfering pair)"
+    )]
+    HandlerPhiConflict(FuncId),
+    #[error(
+        "function {0:?}: a catch-handler phi result has no register home or an incoming \
+         value was never colored"
+    )]
+    HandlerPhiUncoalesced(FuncId),
+    #[error(
+        "function {func:?}: phi copies remain on exception edge {pred:?} -> {handler:?}; \
+         no code may run on an exception edge — the VM dispatches directly to the handler's \
+         flat offset (N21)"
+    )]
+    HandlerEdgeCopies {
+        func: FuncId,
+        pred: Block,
+        handler: Block,
+    },
+    #[error(
+        "function {func:?}: phi copies keyed to {pred:?} -> {succ:?}, which is neither a \
+         terminator successor nor a catch-handler edge — inconsistent input"
+    )]
+    InconsistentEdgeCopies {
+        func: FuncId,
+        pred: Block,
+        succ: Block,
+    },
 }
 
 /// Lower a single IR function back to bytecodes.
@@ -100,6 +130,10 @@ pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, 
     let alloc = regalloc::allocate(module, func_id).map_err(|e| match e {
         regalloc::RegAllocError::RegisterOverflow => LowerError::RegisterOverflow(func_id),
         regalloc::RegAllocError::WindowBaseOverflow => LowerError::CallWindowOverflow(func_id),
+        regalloc::RegAllocError::HandlerPhiSlotConflict => LowerError::HandlerPhiConflict(func_id),
+        regalloc::RegAllocError::HandlerPhiUncoalesced => {
+            LowerError::HandlerPhiUncoalesced(func_id)
+        }
     })?;
 
     // Step 2: Compute RPO (reuse from regalloc).

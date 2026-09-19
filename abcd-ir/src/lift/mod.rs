@@ -232,6 +232,7 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
         annotations,
         debug,
         try_regions: Vec::new(), // populated below after block_map is built
+        exception_values: Vec::new(), // populated by handler seeding below
     });
 
     // Create IR blocks corresponding to raw CFG blocks.
@@ -269,6 +270,54 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
 
     // SSA construction.
     let mut ssa = SsaBuilder::new(entry_block);
+
+    // N13 handler seeding: exception dispatch physically delivers the
+    // thrown object in the ACCUMULATOR at handler entry (vendor
+    // `SET_ACC(exception)`, interpreter_assembly.cpp:7860-7863). Seed every
+    // catch handler's acc location with a fresh exception value BEFORE any
+    // block is translated, so a handler's read of the caught exception
+    // resolves to it instead of whatever acc value the try body left
+    // behind (a stale value the handler would otherwise rethrow — e.g.
+    // class-accessors B rethrew the supercall result), and so no acc phi
+    // over the try predecessors materializes (the generator family).
+    //
+    // Seeding before translation (not lazily at the handler's first acc
+    // read) also covers reads that recurse INTO the handler from a
+    // successor: `SsaBuilder::read_variable` consults the handler's local
+    // definition map first, so the seeded value is the acc state at handler
+    // exit unless the handler itself overwrites acc — which matches the
+    // physical machine (dispatch sets acc; `sta` does not modify it).
+    //
+    // Register allocation gives each exception value a register home and
+    // isel materializes it with a `Sta(home)` prologue as the handler's
+    // first bytecode — the vendored handler-entry `sta vX`. The value is
+    // defined AT handler entry by the dispatch itself, so it is not "live
+    // across the exception edge" in the S6 sense; the S6 handler-live-in
+    // Acc-forbidden rule still applies to it through the handler's own uses
+    // (it is in `live_in[handler]`), which is exactly what forces the
+    // register home the prologue writes.
+    {
+        let mut handlers: Vec<Block> = module
+            .func(func_id)
+            .try_regions
+            .iter()
+            .flat_map(|region| region.catches.iter().map(|c| c.handler_block))
+            .collect();
+        handlers.sort_unstable();
+        handlers.dedup();
+        for handler in handlers {
+            let val = Value::from_index(module.values.len());
+            module.values.push(ValueData {
+                def: ValueDef::ExceptionParam,
+                ty: IrType::default(),
+            });
+            ssa.write_variable(RegOrAcc::Acc, handler, val);
+            module
+                .func_mut(func_id)
+                .exception_values
+                .push((handler, val));
+        }
+    }
 
     // Entry seeding: arguments arrive in the ABI top slots
     // `Reg(num_vregs + i)` (frame = num_vregs + num_args, args at the top;

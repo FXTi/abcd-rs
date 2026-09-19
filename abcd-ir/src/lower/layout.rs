@@ -11,8 +11,19 @@
 //! branch target is rewritten to it. Trampolines belong to no IR block and
 //! sort after every real block offset, so `reconstruct_try_blocks` never
 //! extends a try/handler range over them.
+//!
+//! Exception edges (try block → catch handler) NEVER carry copies: the VM
+//! dispatches directly to the handler's flat offset, so no copy code could
+//! run there (trampolines cannot serve them). Regalloc eliminates them via
+//! pinned write-through stores (N21); any residual handler-edge copy set
+//! is inconsistent input and a hard [`LowerError::HandlerEdgeCopies`], and
+//! copies keyed to a block that is neither a terminator successor nor a
+//! catch handler of the predecessor are [`LowerError::InconsistentEdgeCopies`].
+//! (The legacy fallback that inlined such copies before the predecessor's
+//! terminator — executing them on the NORMAL path, clobbering coalesced
+//! slots — is deleted.)
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use abcd_file::TryBlock;
 use abcd_isa::{Bytecode, EntityKind, Label};
@@ -98,6 +109,44 @@ pub fn layout(
         }
     }
 
+    // N21: validate every edge that carries copies BEFORE placement.
+    //
+    // - Exception edges (try block → catch handler) must never carry
+    //   copies: the VM dispatches directly to the handler's flat offset, so
+    //   no copy code can run there. Regalloc's write-through stores make
+    //   them unnecessary; a residual copy set is inconsistent input and
+    //   fails loudly.
+    // - Any other edge whose successor is not a terminator successor of the
+    //   predecessor is inconsistent input (verification enforces
+    //   preds↔terminator agreement with a try-region exemption); it
+    //   previously fell into the legacy in-block placement that ran the
+    //   copies on the predecessor's NORMAL path (the N21 wart — iterator-close
+    //   `func_main_0` clobbered the iterator object in v0 before a `jnez`).
+    let mut exception_edges: HashSet<(Block, Block)> = HashSet::new();
+    for region in &module.func(func_id).try_regions {
+        for &try_block in &region.try_blocks {
+            for catch in &region.catches {
+                exception_edges.insert((try_block, catch.handler_block));
+            }
+        }
+    }
+    for &(pred, succ) in edge_codes.keys() {
+        if exception_edges.contains(&(pred, succ)) {
+            return Err(LowerError::HandlerEdgeCopies {
+                func: func_id,
+                pred,
+                handler: succ,
+            });
+        }
+        if !crate::analysis::block_succs(module, pred).contains(&succ) {
+            return Err(LowerError::InconsistentEdgeCopies {
+                func: func_id,
+                pred,
+                succ,
+            });
+        }
+    }
+
     // Step 2: Place copies on their edges.
     let mut block_codes: HashMap<Block, Vec<Bytecode>> = HashMap::new();
     for (bb, codes) in &isel.block_codes {
@@ -123,14 +172,13 @@ pub fn layout(
         {
             let (true_dest, false_dest) = (*true_dest, *false_dest);
 
-            // Copies keyed to a successor that is neither branch target are
-            // inconsistent input; keep the legacy in-block placement rather
-            // than dropping them.
-            let legacy: Vec<Bytecode> = edge_codes
-                .iter()
-                .filter(|&(&(pred, succ), _)| pred == bb && succ != true_dest && succ != false_dest)
-                .flat_map(|(_, c)| c.iter().cloned())
-                .collect();
+            // The edge validation above guarantees that every copy-bearing
+            // edge out of a CondBranch predecessor targets one of the two
+            // branch destinations: copies keyed to any other block are an
+            // exception edge (hard error) or inconsistent input (hard
+            // error) — there is no in-block placement for them (that legacy
+            // fallback executed copies on the NORMAL path and clobbered
+            // coalesced slots; deleted, N21).
 
             // True edge: redirect the conditional branch (always the last
             // bytecode of the block) to the trampoline when the edge has copies.
@@ -148,12 +196,6 @@ pub fn layout(
             let Some(codes) = block_codes.get_mut(&bb) else {
                 continue;
             };
-            if !legacy.is_empty() {
-                let insert_pos = codes.len().saturating_sub(1);
-                for (j, bc) in legacy.into_iter().enumerate() {
-                    codes.insert(insert_pos + j, bc);
-                }
-            }
             if let Some(last) = codes.last_mut() {
                 rewrite_branch_target(last, true_target);
             }

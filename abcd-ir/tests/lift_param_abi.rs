@@ -229,6 +229,7 @@ fn acc_colored_param_is_a_hard_lower_error() {
     let alloc = RegAlloc {
         allocation: HashMap::from([(p, RegSlot::Acc)]),
         phi_copies: HashMap::new(),
+        handler_phi_stores: Vec::new(),
         num_regs: 1,
         copy_temp: None,
         spill_slot: Some(RegSlot::Reg(1)),

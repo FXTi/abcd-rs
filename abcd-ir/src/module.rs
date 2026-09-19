@@ -87,6 +87,17 @@ pub enum ValueDef {
     Inst(Inst),
     /// Function parameter (by index).
     FuncParam(u16),
+    /// The exception object delivered in the accumulator by exception
+    /// dispatch at a catch handler's entry — vendor `SET_ACC(exception)`
+    /// (arkcompiler_ets_runtime-master/ecmascript/interpreter/
+    /// interpreter_assembly.cpp:7860-7863). Not an instruction: the
+    /// dispatch itself is the definition point, so the value is live from
+    /// the handler's entry. The owning function records it in
+    /// [`FunctionData::exception_values`]; register allocation gives it a
+    /// register home and isel materializes it with a `Sta(home)` prologue
+    /// as the handler's first bytecode — exactly the vendored handler-entry
+    /// `sta vX` (N13).
+    ExceptionParam,
 }
 
 /// Per-value metadata stored in the arena.
@@ -173,6 +184,12 @@ pub struct FunctionData {
     pub debug: Option<FuncDebugInfo>,
     /// Try/catch scope info preserved from lifting for reconstruction during lowering.
     pub try_regions: Vec<TryRegion>,
+    /// Catch-handler exception values (N13): `(handler block, exception
+    /// object value)` — the value the handler's acc location is seeded with
+    /// at lift time. Recorded per function (like `param_values`) so
+    /// verification and register allocation know the owning function; see
+    /// [`ValueDef::ExceptionParam`].
+    pub exception_values: Vec<(Block, Value)>,
 }
 
 /// A try/catch region in the IR, mapping protected blocks to catch handlers.

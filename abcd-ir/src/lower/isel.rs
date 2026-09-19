@@ -9,9 +9,10 @@ use abcd_isa::{Bytecode, EntityId, EntityKind, Imm, Label, Reg};
 
 use crate::entity::{Block, FuncId, Inst, StringId, Value};
 use crate::inst::{BinOp, CallKind, InstData, PropKind, UnOp};
-use crate::module::Module;
+use crate::module::{Module, ValueDef};
 
 use super::LowerError;
+use super::copy_resolve::{CopyResolveError, emit_copy};
 use super::regalloc::{self, RegAlloc, RegSlot};
 
 /// Result of instruction selection for one function.
@@ -146,6 +147,54 @@ pub fn select(
 
     let entry_block = module.func(func_id).entry_block;
 
+    // N13: handler block → its exception value. The exception is delivered
+    // in acc by the dispatch itself; the prologue below materializes it
+    // into its register home.
+    let handler_exc: HashMap<Block, Value> = module
+        .func(func_id)
+        .exception_values
+        .iter()
+        .copied()
+        .collect();
+    // N21 pinned stores for handler-block phis, grouped by emission point.
+    // Deterministic order: sorted by (pred, src, dst) / (src, dst).
+    //
+    // - AfterDef: the source is defined by an instruction inside the pred —
+    //   the store is emitted immediately after that instruction (the
+    //   closest implementable point to the vendored `sta`; if the source is
+    //   Acc-colored its content is still physically in acc at that point —
+    //   the instruction's own emission ends with store_result, which for an
+    //   Acc home emits nothing — so `Sta(S)` reads the right value).
+    // - BlockStart(pred): every other source — defined in a dominating
+    //   block, a phi result (materialized by the incoming edge copies), a
+    //   parameter (the entry copy-in prologue has run), or an exception
+    //   value (the handler prologue has run). The store is emitted before
+    //   the pred's first instruction, so an exception at any pred
+    //   instruction observes it.
+    let mut after_def_stores: HashMap<Value, Vec<(Value, Value)>> = HashMap::new();
+    let mut block_start_stores: HashMap<Block, Vec<(Value, Value)>> = HashMap::new();
+    for &(pred, src, dst) in &alloc.handler_phi_stores {
+        let defined_in_pred = match module.value(src).def {
+            ValueDef::Inst(i) => !module.inst(i).data.is_phi() && module.inst(i).block == pred,
+            _ => false,
+        };
+        if defined_in_pred {
+            after_def_stores.entry(src).or_default().push((src, dst));
+        } else {
+            block_start_stores.entry(pred).or_default().push((src, dst));
+        }
+    }
+    for stores in block_start_stores.values_mut() {
+        stores.sort_unstable();
+    }
+    for stores in after_def_stores.values_mut() {
+        stores.sort_unstable();
+    }
+
+    let acc_scratch_slot = alloc
+        .low_scratch_base
+        .map(|base| base + regalloc::LOW_OPERAND_SCRATCHES);
+
     for &bb in rpo {
         let mut codes = Vec::new();
         let block = module.block(bb);
@@ -155,6 +204,34 @@ pub fn select(
         // entry block.
         if bb == entry_block {
             emit_param_copy_in(func_id, module, alloc, &mut codes)?;
+        }
+
+        // N13 handler prologue: exception dispatch physically delivers the
+        // thrown object in acc (vendor `SET_ACC(exception)`,
+        // interpreter_assembly.cpp:7860-7863) — materialize it into its
+        // register home as the handler's FIRST bytecode, before anything
+        // can clobber acc. This is exactly the vendored handler-entry
+        // `sta vX`. Skipped when the handler never reads the exception (the
+        // value is then uncolored).
+        if let Some(&exc) = handler_exc.get(&bb) {
+            if let Some(&home) = alloc.allocation.get(&exc) {
+                if home != RegSlot::Acc {
+                    emit_pinned_copy(func_id, RegSlot::Acc, home, acc_scratch_slot, &mut codes)?;
+                }
+            }
+        }
+
+        // N21 pinned stores at block start (phi-result / exception /
+        // parameter sources). Runs after the exception prologue so a store
+        // sourcing the exception reads its just-written home.
+        if let Some(stores) = block_start_stores.get(&bb) {
+            for &(src, dst) in stores {
+                let s = slot_of(func_id, src, alloc)?;
+                let d = slot_of(func_id, dst, alloc)?;
+                if s != d {
+                    emit_pinned_copy(func_id, s, d, acc_scratch_slot, &mut codes)?;
+                }
+            }
         }
 
         // Phi copies from predecessors are handled in layout (inserted before terminators).
@@ -193,6 +270,21 @@ pub fn select(
                 &mut codes,
                 &mut ic,
             )?;
+
+            // N21 pinned stores right after the defining instruction (see
+            // the ordering argument at `after_def_stores`).
+            if let Some(v) = node.result {
+                if let Some(stores) = after_def_stores.get(&v) {
+                    for &(_, dst) in stores {
+                        let d = slot_of(func_id, dst, alloc)?;
+                        if let Some(s) = result_slot {
+                            if s != d {
+                                emit_pinned_copy(func_id, s, d, acc_scratch_slot, &mut codes)?;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         block_codes.push((bb, codes));
@@ -255,6 +347,26 @@ fn emit_param_copy_in(
         }
         codes.push(Bytecode::Mov(Reg(home), Reg(arg_slot as u16)));
     }
+    Ok(())
+}
+
+/// Emit one pinned slot copy (the N13 handler exception prologue or an N21
+/// handler-phi write-through store), routing acc↔high-register traffic
+/// through the reserved low scratch (`sta`/`lda` are op_v_8-only; S2). A
+/// single copy never cycles, so `CycleNeedsTemp` is unreachable; both error
+/// arms still map to hard errors, never a silent drop.
+fn emit_pinned_copy(
+    func_id: FuncId,
+    src: RegSlot,
+    dst: RegSlot,
+    acc_scratch: Option<u16>,
+    codes: &mut Vec<Bytecode>,
+) -> Result<(), LowerError> {
+    let emitted = emit_copy(src, dst, acc_scratch).map_err(|e| match e {
+        CopyResolveError::CycleNeedsTemp => LowerError::MissingCopyTemp(func_id),
+        CopyResolveError::HighRegNeedsScratch => LowerError::MissingLowScratch(func_id),
+    })?;
+    codes.extend(emitted);
     Ok(())
 }
 
@@ -454,6 +566,7 @@ mod tests {
         RegAlloc {
             allocation: slots.iter().copied().collect(),
             phi_copies: HashMap::new(),
+            handler_phi_stores: Vec::new(),
             num_regs: 8,
             copy_temp: None,
             spill_slot,

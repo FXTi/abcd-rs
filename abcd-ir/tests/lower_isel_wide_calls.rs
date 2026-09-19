@@ -152,6 +152,7 @@ fn high_register_store_and_reload_routes_through_low_scratch() {
             (r, RegSlot::Reg(301)),
         ]),
         phi_copies: HashMap::new(),
+        handler_phi_stores: Vec::new(),
         num_regs: 302,
         copy_temp: None,
         spill_slot: None,

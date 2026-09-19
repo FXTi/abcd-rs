@@ -54,6 +54,9 @@ pub enum Halt {
     /// argument count including the constructor, u8 window start, NO IC
     /// slot operand on the wide form.
     WideNewObjRange { argc: i64, start: u16 },
+    /// `run_until` reached the stop pc WITHOUT executing the instruction
+    /// there — models an exception thrown between two instructions.
+    Stopped,
 }
 
 /// A tiny register machine: `HashMap<u16, i64>` registers plus one
@@ -113,8 +116,23 @@ impl Machine {
     /// Used to simulate exception dispatch: the VM enters a catch handler
     /// at its `TryBlock` offset, not at pc 0.
     pub fn run_at(&mut self, code: &[Bytecode], pc: usize) -> Halt {
+        self.exec(code, pc, None)
+    }
+
+    /// Execute `code` from `pc`, stopping WITHOUT executing the
+    /// instruction at `stop_pc` (returns [`Halt::Stopped`]). Simulates an
+    /// exception thrown between two instructions: run a try body up to
+    /// the throw point, then enter the handler with `run_at`.
+    pub fn run_until(&mut self, code: &[Bytecode], pc: usize, stop_pc: usize) -> Halt {
+        self.exec(code, pc, Some(stop_pc))
+    }
+
+    fn exec(&mut self, code: &[Bytecode], pc: usize, stop_pc: Option<usize>) -> Halt {
         let mut pc = pc;
         loop {
+            if Some(pc) == stop_pc {
+                return Halt::Stopped;
+            }
             let Some(bc) = code.get(pc) else {
                 panic!("simulator: program counter {pc} escaped the code buffer")
             };

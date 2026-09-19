@@ -95,6 +95,7 @@ fn phi_copies_for_untaken_successor_clobber_taken_path() {
     let alloc = RegAlloc {
         allocation,
         phi_copies,
+        handler_phi_stores: Vec::new(),
         num_regs: 6,
         copy_temp: Some(RegSlot::Reg(15)),
         // No Acc-colored values in this fixture.

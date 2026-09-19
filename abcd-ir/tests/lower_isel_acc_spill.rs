@@ -79,6 +79,7 @@ fn acc_spill_before_ensure_acc_captures_object_not_key() {
             (p, RegSlot::Acc),
         ]),
         phi_copies: HashMap::new(),
+        handler_phi_stores: Vec::new(),
         num_regs: 3,
         copy_temp: None,
         spill_slot: Some(RegSlot::Reg(2)),

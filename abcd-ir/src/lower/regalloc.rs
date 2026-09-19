@@ -14,7 +14,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use crate::analysis::{self, augmented_succs, inst_operands};
 use crate::entity::{Block, FuncId, Value};
 use crate::inst::InstData;
-use crate::module::Module;
+use crate::module::{Module, ValueDef};
 
 /// The result of register allocation for a function.
 #[derive(Debug)]
@@ -23,7 +23,27 @@ pub struct RegAlloc {
     pub allocation: HashMap<Value, RegSlot>,
     /// Parallel copies for phi elimination.
     /// Key: (predecessor, successor). Value: (src, dst) copies.
+    /// Never carries exception-edge copies: phis in catch-handler blocks
+    /// lower to [`Self::handler_phi_stores`] instead (N21).
     pub phi_copies: HashMap<(Block, Block), Vec<(Value, Value)>>,
+    /// N21 pinned stores for handler-block phis, as `(pred, incoming value,
+    /// phi result)` triples sorted by index — one per phi entry whose source
+    /// is not already co-located with the result.
+    ///
+    /// A phi in a catch handler means "the handler sees the variable as of
+    /// the dynamic exception point", and the VM dispatches directly to the
+    /// handler's flat offset — no copy code can run on an exception edge
+    /// (trampolines cannot serve it). The phi result's slot S therefore
+    /// tracks the variable imperatively, like the vendored vreg home: isel
+    /// emits `S ← slot(src)` at the pred's block start, or — when `src` is
+    /// defined by an instruction inside the pred — immediately after that
+    /// instruction (the closest implementable point to the vendored `sta`;
+    /// an exception at an earlier instruction of the pred then correctly
+    /// observes the previous writer, exactly like the original bytecode).
+    /// `allocate` adds interference edges keeping S free of any value live
+    /// into or defined in the pred, so the store never clobbers the normal
+    /// path either.
+    pub handler_phi_stores: Vec<(Block, Value, Value)>,
     /// Total registers used (excluding accumulator), including the reserved
     /// `copy_temp` and `spill_slot` registers when present.
     pub num_regs: u16,
@@ -86,6 +106,17 @@ pub enum RegAllocError {
          callrange form, narrow and wide), but the parameter/scratch area already extends past it"
     )]
     WindowBaseOverflow,
+    #[error(
+        "a catch-handler phi has a same-slot result/incoming pair that interferes — greedy \
+         coloring never assigns one slot to an interfering pair, so this is inconsistent \
+         (hand-crafted) input"
+    )]
+    HandlerPhiSlotConflict,
+    #[error(
+        "a catch-handler phi result has no register home or an incoming value was never \
+         colored (exception dispatch clobbers the accumulator at handler entry)"
+    )]
+    HandlerPhiUncoalesced,
 }
 
 /// Where a value lives after allocation.
@@ -109,6 +140,13 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     let func = module.func(func_id);
     let rpo = analysis::compute_rpo(module, func_id);
 
+    // Catch-handler blocks of this function (N13/N21).
+    let handler_blocks: HashSet<Block> = func
+        .try_regions
+        .iter()
+        .flat_map(|region| region.catches.iter().map(|c| c.handler_block))
+        .collect();
+
     // Collect all values in the function.
     let mut all_values: Vec<Value> = Vec::new();
     for &bb in &rpo {
@@ -128,11 +166,28 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
             all_values.push(val);
         }
     }
+    // Add the catch-handler exception values (N13) that are actually used.
+    // An unused one needs no register home and no handler prologue store.
+    if !func.exception_values.is_empty() {
+        let mut used: HashSet<Value> = HashSet::new();
+        for &bb in &rpo {
+            let block = module.block(bb);
+            for &inst_id in block.phis.iter().chain(block.insts.iter()) {
+                used.extend(inst_operands(&module.inst(inst_id).data));
+            }
+        }
+        for &(_, exc) in &func.exception_values {
+            if used.contains(&exc) && !all_values.contains(&exc) {
+                all_values.push(exc);
+            }
+        }
+    }
 
     if all_values.is_empty() {
         return Ok(RegAlloc {
             allocation: HashMap::new(),
             phi_copies: HashMap::new(),
+            handler_phi_stores: Vec::new(),
             num_regs: 0,
             copy_temp: None,
             spill_slot: None,
@@ -200,7 +255,20 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     // dispatch physically delivers the thrown object in the accumulator,
     // so the acc content of any value live across an exception edge is
     // dead at handler entry. They must keep a real register home.
-    let handler_live_in: HashSet<Value> = func
+    //
+    // The handler's exception value itself (N13) is DEFINED at handler
+    // entry by the dispatch — it is not live across the edge in that
+    // problematic sense — but it still lands in `live_in[handler]` through
+    // the handler's own uses, so this same rule gives it the register home
+    // its isel prologue (`Sta(home)`, the vendored handler-entry `sta vX`)
+    // writes. Pinning it to Acc instead would silently rethrow whatever
+    // the handler last loaded whenever an acc-clobbering instruction
+    // precedes the first use (iterator-close handlers run `ldtrue` before
+    // rethrowing).
+    //
+    // Handler phi results (N21) also materialize at handler entry — after
+    // the dispatch has clobbered acc — so they too are forbidden Acc.
+    let mut acc_forbidden: HashSet<Value> = func
         .try_regions
         .iter()
         .flat_map(|region| region.catches.iter())
@@ -208,9 +276,94 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
         .flatten()
         .copied()
         .collect();
+    for &handler in &handler_blocks {
+        for &phi_id in &module.block(handler).phis {
+            if let Some(result) = module.inst(phi_id).result {
+                acc_forbidden.insert(result);
+            }
+        }
+    }
+    // N21: a handler-phi source whose store runs at the pred's BLOCK START
+    // (i.e. any source not defined by an instruction inside that pred) must
+    // not be Acc-colored: the block-start store reads the source's slot
+    // long after the acc held it. Sources defined inside the pred get their
+    // store immediately after the defining instruction, where an Acc home
+    // is still physically intact.
+    for &handler in &handler_blocks {
+        for &phi_id in &module.block(handler).phis {
+            let node = module.inst(phi_id);
+            let InstData::Phi { entries } = &node.data else {
+                continue;
+            };
+            for &(pred, src) in entries {
+                let defined_in_pred = match module.value(src).def {
+                    ValueDef::Inst(i) => {
+                        !module.inst(i).data.is_phi() && module.inst(i).block == pred
+                    }
+                    _ => false,
+                };
+                if !defined_in_pred {
+                    acc_forbidden.insert(src);
+                }
+            }
+        }
+    }
 
     // Step 2: Build interference graph.
-    let interference = build_interference(module, &rpo, &live_out);
+    let mut interference = build_interference(module, &rpo, &live_out);
+
+    // N13: an exception value has no defining instruction, so it never
+    // acquires interference edges at a definition point. It is live from
+    // handler entry and must not share its register home with any value
+    // live into the handler.
+    for &(handler, exc) in &func.exception_values {
+        if let Some(live) = live_in.get(&handler) {
+            for &w in live {
+                if w != exc {
+                    interference.entry(exc).or_default().insert(w);
+                    interference.entry(w).or_default().insert(exc);
+                }
+            }
+        }
+    }
+
+    // N21 store-site safety. Every handler-phi entry (pred, src) lowers to
+    // a store `S ← slot(src)` where S is the phi result's slot, emitted at
+    // the pred's block start — or, when src is defined by an instruction
+    // inside the pred, immediately after that instruction (the closest
+    // implementable point to the vendored `sta`; an exception at an earlier
+    // instruction of the pred then correctly observes the PREVIOUS writer,
+    // exactly like the original bytecode). For this to be sound, no value
+    // colored S may be live across the store (everything in live_in[pred]
+    // for a block-start store) nor defined in the pred after the store
+    // point (its definition would overwrite S mid-block): hence result ×
+    // (live_in[pred] ∪ defs[pred]). defs[pred] ∪ live_in[pred] also covers
+    // live_out[pred] and the terminator's operands, so normal-path
+    // continuation and conditional branch conditions are safe as well.
+    for &handler in &handler_blocks {
+        for &phi_id in &module.block(handler).phis {
+            let node = module.inst(phi_id);
+            let Some(result) = node.result else { continue };
+            let InstData::Phi { entries } = &node.data else {
+                continue;
+            };
+            for &(pred, _) in entries {
+                let mut forbid: HashSet<Value> = live_in.get(&pred).cloned().unwrap_or_default();
+                let pred_block = module.block(pred);
+                for &inst_id in pred_block.phis.iter().chain(pred_block.insts.iter()) {
+                    if let Some(r) = module.inst(inst_id).result {
+                        forbid.insert(r);
+                    }
+                }
+                for w in forbid {
+                    if w != result {
+                        interference.entry(result).or_default().insert(w);
+                        interference.entry(w).or_default().insert(result);
+                    }
+                }
+            }
+        }
+    }
 
     // Step 3: Compute accumulator preference scores.
     let acc_score = compute_acc_scores(module, &rpo);
@@ -224,10 +377,15 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
         &acc_score,
         func.param_count,
         &func.param_values,
-        &handler_live_in,
+        &acc_forbidden,
         reserved_start,
         reserved_len,
     )?;
+
+    // N21: handler-block phi slot consistency + the pinned store list
+    // (computed before SSA destruction, which skips handler blocks).
+    let handler_phi_stores =
+        collect_handler_phi_stores(module, &handler_blocks, &allocation, &interference)?;
 
     // The frame must cover the reserved window/scratch range even when
     // coloring stayed below it.
@@ -236,7 +394,7 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     // Step 5: Boissinot SSA destruction — collect the per-edge value-level
     // copy sets. Slot-level resolution happens at the emission point in
     // `layout`, so no value-level cycle breaking (or pseudo-temp) is done here.
-    let phi_copies = boissinot_destruction(module, &rpo, &allocation);
+    let phi_copies = boissinot_destruction(module, &rpo, &allocation, &handler_blocks);
 
     // Step 6: When any edge carries phi copies, reserve exactly one real temp
     // register for slot-level cycle breaking. Overflow is a hard error, not
@@ -276,6 +434,7 @@ pub fn allocate(module: &Module, func_id: FuncId) -> Result<RegAlloc, RegAllocEr
     Ok(RegAlloc {
         allocation,
         phi_copies,
+        handler_phi_stores,
         num_regs,
         copy_temp,
         spill_slot,
@@ -589,8 +748,11 @@ fn compute_acc_scores(module: &Module, rpo: &[Block]) -> HashMap<Value, i32> {
 /// function that declares more args than it created values for keeps the
 /// bottom slots reserved, preserving the historical frame size.
 ///
-/// `acc_forbidden` values (live into a catch handler) are never colored
-/// Acc: exception dispatch physically clobbers the accumulator.
+/// `acc_forbidden` values are never colored Acc: values live into a catch
+/// handler (exception dispatch clobbers the physical acc), handler phi
+/// results (they materialize at handler entry, after the clobber), and the
+/// handler exception values themselves (isel's `Sta(home)` prologue reads
+/// the dispatched acc before anything else in the handler).
 ///
 /// `reserved_start .. reserved_start + reserved_len` is the reserved
 /// low-slot range (low scratch block + range-call argument window, starting
@@ -723,10 +885,19 @@ fn boissinot_destruction(
     module: &Module,
     rpo: &[Block],
     allocation: &HashMap<Value, RegSlot>,
+    handler_blocks: &HashSet<Block>,
 ) -> HashMap<(Block, Block), Vec<(Value, Value)>> {
     let mut copies: HashMap<(Block, Block), Vec<(Value, Value)>> = HashMap::new();
 
     for &bb in rpo {
+        // N21: phis in catch-handler blocks lower to def-site write-through
+        // stores (`collect_handler_phi_stores`), never edge copies — no
+        // code may run on an exception edge, and the store covers the
+        // normal-path arrival too when a handler block is also reachable by
+        // a terminator edge.
+        if handler_blocks.contains(&bb) {
+            continue;
+        }
         let block = module.block(bb);
         for &phi_id in &block.phis {
             let inst_node = module.inst(phi_id);
@@ -749,4 +920,72 @@ fn boissinot_destruction(
     }
 
     copies
+}
+
+// ─── N21: handler-phi slot pinning (pinned stores) ──────────────────────────
+
+/// Collect the pinned stores for handler-block phis as `(pred, src,
+/// result)` triples sorted by index, and check slot consistency.
+///
+/// A phi in a catch handler means "the handler sees the variable as of the
+/// dynamic exception point". The VM dispatches directly to the handler's
+/// flat offset, so no copy code may run on the exception edge; instead the
+/// phi result's slot S tracks the variable imperatively (the vendored vreg
+/// home): isel emits `S ← slot(src)` at the pred's block start — or
+/// immediately after the defining instruction when `src` is defined inside
+/// the pred. `allocate` added interference edges `result × (live_in[pred]
+/// ∪ defs[pred])` so that no value colored S is live across or defined
+/// after the store point; the store is therefore invisible to the normal
+/// path as well.
+///
+/// Hard checks (never silent):
+///
+/// - the result must be colored and must have a register home (exception
+///   dispatch clobbers the accumulator at handler entry);
+/// - every differently-keyed incoming source must be colored;
+/// - a same-slot result/incoming pair must not interfere — coloring never
+///   assigns one slot to an interfering pair, so this can only fire on
+///   hand-crafted allocations.
+fn collect_handler_phi_stores(
+    module: &Module,
+    handler_blocks: &HashSet<Block>,
+    allocation: &HashMap<Value, RegSlot>,
+    interference: &InterferenceGraph,
+) -> Result<Vec<(Block, Value, Value)>, RegAllocError> {
+    let mut stores: Vec<(Block, Value, Value)> = Vec::new();
+    for &handler in handler_blocks {
+        for &phi_id in &module.block(handler).phis {
+            let node = module.inst(phi_id);
+            let Some(result) = node.result else { continue };
+            let InstData::Phi { entries } = &node.data else {
+                continue;
+            };
+            let result_slot = allocation
+                .get(&result)
+                .copied()
+                .ok_or(RegAllocError::HandlerPhiUncoalesced)?;
+            if result_slot == RegSlot::Acc {
+                return Err(RegAllocError::HandlerPhiUncoalesced);
+            }
+            for &(pred, src) in entries {
+                if src == result {
+                    continue; // self-reference (loop phi)
+                }
+                let src_slot = allocation
+                    .get(&src)
+                    .copied()
+                    .ok_or(RegAllocError::HandlerPhiUncoalesced)?;
+                if src_slot == result_slot {
+                    if interference.get(&result).is_some_and(|n| n.contains(&src)) {
+                        return Err(RegAllocError::HandlerPhiSlotConflict);
+                    }
+                    continue; // already co-located: no store needed
+                }
+                stores.push((pred, src, result));
+            }
+        }
+    }
+    stores.sort_unstable();
+    stores.dedup();
+    Ok(stores)
 }
