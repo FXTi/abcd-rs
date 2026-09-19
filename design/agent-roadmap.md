@@ -124,7 +124,7 @@ VM 语义簇（需逐簇拆根因）：
 | 3.15 | N14 generator 三件套建模 | worker P3-T15 (k3) | **完成**（aa6e786；vendor sig 逐条核验；orchestrator 复验：门禁绿、字节差集恰 36、lift 666/opt 708 复跑一致、18 例 SIGSEGV 清零、生成器剩余 12 例归 B4） |
 | 3.16 | N24 oracle 工具链卫生 | orchestrator | **完成**（3883291；标签+finally 清理+客户端超时兜底；默认行为不变、崩溃族跑后容器零残留实证） |
 | 3.17 | N12 ThrowIfSuperNotCorrectCall 修复 | worker P3-T16 (k3) | **完成**（cd410e5；kind 语义钉死（0=TDZ 守卫/1=重绑守卫，acc=this）；orchestrator 复验：72 套件绿、差集恰 144、lift 666 零翻转、opt 690 复跑一致；opt -18 为诚实回归——修复前的通过跑的是不可能抛错的空检查，修复后撞上 B4；新登记 N25 ThrowConstAssignment、N26 ThrowUndefinedIfHole 两寄存器形（同类）） |
-| 3.18 | **B4：acc-as-cache 重构**——Phase 3 收官战 | worker P3-T17 (k3) | **进行中**（基线：lift 666 / opt 708；目标 ≥+48 零回归） |
+| 3.18 | **B4：acc-as-cache 重构**——Phase 3 收官战 | worker P3-T17 (k3) | **完成**（7816ccc；orchestrator 复审 tracker 不变式/meet/全臂覆盖 + dabai 门禁 73+29 套件绿 + 本地 oracle 复跑 lift 1026/opt 894 与 worker 完全一致：lift +360 零回归、opt +210/-6（6 例=N27 优化器空 phi 既存 bug，test-namespace/optimized）；B4 是 V1 大簇主根因实锤。新基线：**lift 1026/1119（91.7%）、opt 894/1119（79.9%）**） |
 
 P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle  harness 无幻影）：
 
@@ -136,6 +136,7 @@ P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle
 - **N14（P1）**：generator 三件套建模错误——Getresumemode 被 lift 成 ResumeGenerator；SuspendGenerator 丢 acc 里的 yield 值；ResumeGenerator/GetResumeMode 丢 acc 里的 genobj。opt 变体 SIGSEGV 机制已钉死（DCE 删 yield 值 → resume 后 acc=undefined → 野指针解引用）。
 - **N15（P3）**：DefineClassWithBuffer 丢 imm2（_count）——运行时忽略，仅字节差异。
 - **N16（P3）**：Newobjapply ↔ CallKind::Apply arity 重载往返脆弱。
+- **N27（P1，P3-T17 登记）**：优化器（SCCP/trivial-phi 类）留下 entries 为空的 phi，其宿主槽位从无写入 → 调用读到帧垃圾——N23 当时"无活失败"，现在有 6 例活失败（test-namespace/optimized opt 变体，B4 重排槽位后从 wrong-benign 变 wrong-fatal）。属 opt 域，下一棒。
 - **N25（P2，P3-T16 登记）**：ThrowConstAssignment 同属 N12 类双重损坏——vendor `throw.constassignment v:in:top`（isa.yaml:987-991，acc:none）的寄存器操作数承载变量名字符串值，lift（translate.rs:1516-1528）捏造合成名 `const_assign_N` 并丢弃寄存器操作数，isel（isel.rs:1211-1214）硬编码 `Reg(0)` 占位。
 - **N26（P2，P3-T16 登记）**：ThrowUndefinedIfHole 双寄存器形态 opcode 身份损坏——vendor `throw.undefinedifhole v1:in:top, v2:in:top`（isa.yaml:998-1002，acc:none；v1=name，v2=value），lift 捏造合成名 `hole_check_N`，isel 一律重发为**另一条 opcode** `throw.undefinedifholewithname`（0x09，string_id + acc 形态）——往返把寄存器形态换成 acc 形态（N14 getresumemode 同类）。
 - V4 更正：optional-chain 的 SIGSEGV 数据已过时（S2/S6 时代已愈）；现行失败 = 空跳转 phi 输入丢失（dce.rs:303-318 按前驱去重模型无法表达两条汇聚边的不同值——MEMORY.md 已知风险的具体语料实例）+ N14。

@@ -273,6 +273,22 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   changes shift corpus numbers — never run two abcd-ir fix workers
   concurrently while corpus-delta measurements are in flight.
 
+- B4 RESOLVED by redesign (7816ccc): acc-as-CACHE replaces acc-as-color.
+  Every value gets a register home; an emission-time AccContent tracker
+  (Hole / Holds(v) / Unknown, meet-over-preds at block entries, handlers
+  never-meet, entry=hole) records the PHYSICAL acc content; ensure_acc
+  elides Lda only on a proven hit. RegSlot::Acc, acc_score, acc_forbidden,
+  spill_slot, MissingSpillSlot/MultipleAccOperands/AccColoredParam and the
+  B3 spill path are DELETED — the whole bug class is structurally
+  impossible now (a stale cache entry costs one redundant Lda, never a
+  wrong value). Two latent bugs found + fixed by the re-coloring: dead-phi
+  copy clobber (typescript-enum) and unseeded-handler stale meet.
+  Oracle: lift 666→1026 (+360, ZERO regressions), opt 690→894 (+210; the 6
+  regressions are test-namespace/optimized = N27, a PRE-EXISTING optimizer
+  empty-phi bug whose never-written home became visible). B4 was the main
+  root of the V1 mega-cluster. NEW BASELINES: lift 1026/1119 (91.7%), opt
+  894/1119 (79.9%). N27 (P1, opt domain) is the next task.
+
 ## Phase 1 outcome (done, 2026-09-19)
 
 - Four commits: 30d254a (red tests) → 0620a12 (B1/B2 fix) → 99e5a52 (B3 fix)

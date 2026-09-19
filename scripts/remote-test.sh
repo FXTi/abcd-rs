@@ -43,6 +43,17 @@ for arg in "$@"; do
 done
 set -- "${FILTERED[@]}"
 
+# Forward ABCD_* env vars (e.g. ABCD_LOWERED_DIR for corpus rewrites) to
+# the remote run. Use an ABSOLUTE remote path for ABCD_LOWERED_DIR (e.g.
+# /home/zjx/abcdtest/lowered-out) and fetch it back with rsync afterwards;
+# the tests treat it verbatim.
+REMOTE_ENV=()
+while IFS='=' read -r name value; do
+    case "${name}" in
+        ABCD_*) REMOTE_ENV+=("${name}=${value}") ;;
+    esac
+done < <(env)
+
 echo "[remote-test] uploading ${LOCAL_ROOT} -> ${REMOTE_HOST}:${STAGING}"
 ssh "${REMOTE_HOST}" "mkdir -p '${STAGING}' '${SHARED_TARGET}'"
 # Trailing slash on source = contents. Excludes: build output, editor state,
@@ -58,10 +69,15 @@ ssh "${REMOTE_HOST}" "mv '${STAGING}' '${REMOTE_DIR}'"
 
 rc=0
 # shellcheck disable=SC2088
+ENV_PREFIX=""
+if [ "${#REMOTE_ENV[@]}" -gt 0 ]; then
+    ENV_PREFIX="$(printf 'export %s\n' "${REMOTE_ENV[@]}")"
+fi
 ssh "${REMOTE_HOST}" "
     set -e
     source ~/.cargo/env 2>/dev/null || true
     cd '${REMOTE_DIR}'
+    ${ENV_PREFIX}
     CARGO_TARGET_DIR='${SHARED_TARGET}' cargo $*
 " || rc=$?
 
