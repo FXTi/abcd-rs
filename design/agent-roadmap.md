@@ -113,7 +113,7 @@ VM 语义簇（需逐簇拆根因）：
 
 **结构性簇 S1-S6 全部关闭（2026-09-19）**。剩余：V 族语义簇（V1-V8）、B4、vreg-hole、N7/N8/N9、SSA trivial-phi、dominance/string-pool/exception CFG 复审。
 
-| 3.7 | vreg-hole 修复：从未写入的 vreg 读取产空 phi → 入口播种 LiteralHole（先取证危害再修） | worker P3-T7 (k3) | **进行中** |
+| 3.7 | vreg-hole 修复：Braun 基例 preds.is_empty() → 惰性共享帧初值常量（vreg=undefined / acc=hole） | worker P3-T7 (k3) | **完成**（2972495；vendor 纠正：vreg 初值是 undefined 不是 hole——orchestrator 用语料 NaN 签名 corroborate；VM 层零翻转（124 例失败另有根因），修复立足 SSA 合法性；0/1119 零元 phi；orchestrator 复验门禁+直方图 1119/0；新登记 N17 种子常量的 B4 残余暴露 + MCS/acc_score 不一致观察、N18 无前驱死 catch 块） |
 | 3.8 | V 族诊断（V3/V4/V8） | worker P3-T8 (k3) | **完成**（只读；orchestrator 已独立实证 N10：静态 compute_rpo 反转逻辑 + 动态 exception-finally 反汇编 handler 在函数 pc 0） |
 
 P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle  harness 无幻影）：
