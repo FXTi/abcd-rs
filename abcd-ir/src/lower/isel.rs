@@ -336,12 +336,9 @@ pub fn select(
                 } | InstData::StoreSuperProperty {
                     key: PropKind::ByIndex(_),
                     ..
-                } | InstData::ThrowConstAssignment { .. }
+                }
             ) {
-                unsupported = Some(match &node.data {
-                    InstData::ThrowConstAssignment { .. } => "throw const assignment".to_string(),
-                    _ => "super property access by index".to_string(),
-                });
+                unsupported = Some("super property access by index".to_string());
             }
 
             select_inst(
@@ -1391,9 +1388,12 @@ fn select_inst(
             let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
             codes.push(Bytecode::ThrowIfnotobject(val_r));
         }
-        InstData::ThrowConstAssignment { .. } => {
-            // ThrowConstassignment takes a Reg; use a dummy
-            codes.push(Bytecode::ThrowConstassignment(Reg(0)));
+        InstData::ThrowConstAssignment { name } => {
+            // Vendor `throw.constassignment v:in:top, acc: none`
+            // (isa.yaml:987-991): the register operand carries the name
+            // VALUE. No accumulator traffic.
+            let name_r = val_reg(func_id, *name, alloc, codes, 0)?;
+            codes.push(Bytecode::ThrowConstassignment(name_r));
         }
         InstData::ThrowUndefinedIfHole { name, value } => {
             // ThrowUndefinedifholewithname reads the value from the acc.

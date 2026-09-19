@@ -93,6 +93,11 @@ pub enum Halt {
         getter: i64,
         setter: i64,
     },
+    /// `ThrowConstassignment` (record-and-stop): `name` is the operand
+    /// register's contents — the variable NAME string VALUE — vendor
+    /// `throw.constassignment v:in:top, acc: none`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:987-991).
+    ThrowConstAssignment { name: i64 },
     /// `run_until` reached the stop pc WITHOUT executing the instruction
     /// there — models an exception thrown between two instructions.
     Stopped,
@@ -373,6 +378,14 @@ impl Machine {
                         key: self.reg(key_r.0),
                         getter: self.reg(get_r.0),
                         setter: self.reg(set_r.0),
+                    };
+                }
+                // `throw.constassignment v:in:top, acc: none`
+                // (isa.yaml:987-991) — record the name register's contents
+                // (the variable name string value).
+                Bytecode::ThrowConstassignment(name_r) => {
+                    return Halt::ThrowConstAssignment {
+                        name: self.reg(name_r.0),
                     };
                 }
                 other => panic!("simulator: unsupported bytecode {other:?}"),

@@ -369,7 +369,7 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
         InstData::Throw { value } => write!(f, "Throw {value}"),
         InstData::ThrowIfNotObject { value } => write!(f, "ThrowIfNotObject {value}"),
         InstData::ThrowConstAssignment { name } => {
-            write!(f, "ThrowConstAssignment \"{}\"", m.strings.get(*name))
+            write!(f, "ThrowConstAssignment {name}")
         }
         InstData::ThrowUndefinedIfHole { name, value } => {
             write!(

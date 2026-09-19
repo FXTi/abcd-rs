@@ -172,7 +172,6 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         | ThrowNotExists
         | ThrowPatternNonCoercible
         | ThrowDeleteSuperProperty
-        | ThrowConstAssignment { .. }
         | Branch { .. }
         | Unreachable
         | Debugger => vec![],
@@ -245,6 +244,7 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         | GetTemplateObject { literal: value } => vec![*value],
 
         ThrowUndefinedIfHole { value, .. } => vec![*value],
+        ThrowConstAssignment { name } => vec![*name],
         SuspendGenerator { genobj, value } => vec![*genobj, *value],
         CreateIterResultObj { value, done } => vec![*value, *done],
 

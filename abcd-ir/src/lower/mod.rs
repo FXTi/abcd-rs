@@ -167,16 +167,25 @@ mod tests {
     use abcd_file::{FileType, FunctionKind, Version};
 
     #[test]
-    fn rejects_dummy_register_lowering() {
+    fn const_assignment_lowers_with_the_name_register() {
+        // N25: the name is the runtime VALUE in the register operand
+        // (vendor `throw.constassignment v:in:top, acc: none`,
+        // isa.yaml:987-991) — lowering succeeds and emits the name's
+        // register home, never a hardcoded Reg(0).
         let mut module = Module::new(Version::new(12, 0, 6, 0), FileType::Dynamic);
-        let func = IRBuilder::create_function(&mut module, "f", FunctionKind::Function, 0);
+        let func = IRBuilder::create_function(&mut module, "f", FunctionKind::Function, 1);
         let mut builder = IRBuilder::new(&mut module, func);
-        let name = builder.intern("constant");
+        let name = builder.create_func_param(0, crate::types::IrType::default());
         builder.emit_void(InstData::ThrowConstAssignment { name });
         builder.emit_void(InstData::Return { value: None });
-        assert!(matches!(
-            lower_function(&module, func),
-            Err(LowerError::UnsupportedInstruction { .. })
-        ));
+        let result = lower_function(&module, func).expect("throw.constassignment must lower");
+        assert!(
+            result
+                .bytecodes
+                .iter()
+                .any(|bc| matches!(bc, abcd_isa::Bytecode::ThrowConstassignment(_))),
+            "the lowered stream must contain throw.constassignment: {:?}",
+            result.bytecodes
+        );
     }
 }

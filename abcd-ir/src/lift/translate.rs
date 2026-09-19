@@ -1540,18 +1540,14 @@ pub(super) fn translate_bytecode(
             emit_void(module, block, InstData::ThrowDeleteSuperProperty, loc);
         }
         Bytecode::ThrowConstassignment(name_reg) => {
-            // The register holds the variable name as a string value
-            // We model this with a synthetic StringId
-            let name_val = read_reg(ssa, *name_reg, block, module);
-            let s = module
-                .strings
-                .intern(&format!("const_assign_{}", name_val.0));
-            emit_void(
-                module,
-                block,
-                InstData::ThrowConstAssignment { name: s },
-                loc,
-            );
+            // Vendor `throw.constassignment v:in:top, acc: none`
+            // (isa.yaml:987-991): the register operand carries the
+            // variable name AS A RUNTIME STRING VALUE (es2abc shape:
+            // `lda.str <name>; sta vX; throw.constassignment vX`) — the
+            // name is the VALUE in the register, not a compile-time
+            // string id.
+            let name = read_reg(ssa, *name_reg, block, module);
+            emit_void(module, block, InstData::ThrowConstAssignment { name }, loc);
         }
         Bytecode::ThrowIfnotobject(val_reg) => {
             let value = read_reg(ssa, *val_reg, block, module);

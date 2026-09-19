@@ -446,8 +446,14 @@ pub enum InstData {
     ThrowIfNotObject {
         value: Value,
     },
+    /// Vendor `throw.constassignment v:in:top, acc: none`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:987-991, opcode_idx 0x04, format
+    /// `pref_op_v_8`): the register operand holds the variable name AS A
+    /// STRING VALUE produced at runtime (es2abc shape: `lda.str <name>;
+    /// sta vX; throw.constassignment vX`). `name` is that runtime value,
+    /// NOT a compile-time `StringId`.
     ThrowConstAssignment {
-        name: StringId,
+        name: Value,
     },
     ThrowUndefinedIfHole {
         name: StringId,
@@ -533,7 +539,6 @@ impl InstData {
             | ThrowNotExists
             | ThrowPatternNonCoercible
             | ThrowDeleteSuperProperty
-            | ThrowConstAssignment { .. }
             | Branch { .. }
             | Unreachable
             | Debugger => vec![],
@@ -606,6 +611,7 @@ impl InstData {
             | GetTemplateObject { literal: value } => vec![value],
 
             ThrowUndefinedIfHole { value, .. } => vec![value],
+            ThrowConstAssignment { name } => vec![name],
             SuspendGenerator { genobj, value } => vec![genobj, value],
             CreateIterResultObj { value, done } => vec![value, done],
 
