@@ -291,6 +291,20 @@ pub enum InstData {
     GetPropIterator {
         obj: Value,
     },
+    /// Vendor `getnextpropname v:in:top, acc: out:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:1289-1292): the register
+    /// operand is the for-in ITERATOR; the next property name is written
+    /// to the accumulator. The handler ADVANCES the iterator
+    /// (`SlowRuntimeStub::GetNextPropName(thread, iter)` + `SET_ACC`,
+    /// arkcompiler_ets_runtime-master/ecmascript/interpreter/
+    /// interpreter_assembly.cpp:2085-2099) — a side effect on the
+    /// iterator object, so DCE keeps the instruction essential even when
+    /// the result name is unused. Never collapsible into
+    /// [`InstData::GetPropIterator`] (which CREATES an iterator from the
+    /// accumulator instead).
+    GetNextPropName {
+        iterator: Value,
+    },
     CloseIterator {
         iterator: Value,
     },
@@ -485,6 +499,7 @@ impl InstData {
             | GetIterator { obj: value }
             | GetAsyncIterator { obj: value }
             | GetPropIterator { obj: value }
+            | GetNextPropName { iterator: value }
             | CloseIterator { iterator: value }
             | CreateGeneratorObj { func: value }
             | ResumeGenerator { genobj: value }

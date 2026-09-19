@@ -228,6 +228,7 @@ pub fn inst_operands(data: &InstData) -> Vec<Value> {
         | GetIterator { obj: value }
         | GetAsyncIterator { obj: value }
         | GetPropIterator { obj: value }
+        | GetNextPropName { iterator: value }
         | CloseIterator { iterator: value }
         | CreateGeneratorObj { func: value }
         | ResumeGenerator { genobj: value }

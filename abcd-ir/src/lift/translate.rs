@@ -1168,14 +1168,13 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Getnextpropname(iter_reg) => {
+            // Vendor `getnextpropname v:in:top, acc: out:top`
+            // (isa.yaml:1289-1292): the register operand is the for-in
+            // iterator, the NEXT PROPERTY NAME goes to acc. Distinct
+            // from GetPropIterator (which creates an iterator) — the
+            // handler advances the iterator object.
             let iterator = read_reg(ssa, *iter_reg, block, module);
-            // Reuse GetPropIterator to advance; semantically it's "next prop name"
-            let v = emit_val(
-                module,
-                block,
-                InstData::GetPropIterator { obj: iterator },
-                loc,
-            );
+            let v = emit_val(module, block, InstData::GetNextPropName { iterator }, loc);
             write_acc(ssa, block, v);
         }
 

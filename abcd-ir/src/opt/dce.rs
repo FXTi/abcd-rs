@@ -122,6 +122,11 @@ fn is_essential(data: &InstData) -> bool {
         | AsyncFunctionResolve { .. }
         | AsyncFunctionReject { .. }
         | CloseIterator { .. }
+        // Advances the for-in iterator object (vendor
+        // `SlowRuntimeStub::GetNextPropName`, isa.yaml:1289-1292) — a
+        // side effect on the iterator even when the result name is
+        // unused; deleting it would skip an enumeration step.
+        | GetNextPropName { .. }
         | DefineFunc { .. }
         | DefineMethod { .. }
         | DefineClassWithBuffer { .. }

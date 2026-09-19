@@ -1205,6 +1205,14 @@ fn select_inst(
             codes.push(Bytecode::Getpropiterator);
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
+        InstData::GetNextPropName { iterator } => {
+            // Vendor `getnextpropname v:in:top, acc: out:top`
+            // (isa.yaml:1289-1292): the iterator is a REGISTER operand
+            // (materialized from its home), the result name goes to acc.
+            let iter_r = val_reg(func_id, *iterator, alloc, codes, 0)?;
+            codes.push(Bytecode::Getnextpropname(iter_r));
+            home_result(tracker, result, used, func_id, alloc, codes)?;
+        }
         InstData::CloseIterator { iterator } => {
             let iter_r = val_reg(func_id, *iterator, alloc, codes, 0)?;
             codes.push(Bytecode::Closeiterator(ic.two(), iter_r));

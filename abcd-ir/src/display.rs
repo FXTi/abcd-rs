@@ -313,6 +313,7 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
         InstData::GetIterator { obj } => write!(f, "GetIterator {obj}"),
         InstData::GetAsyncIterator { obj } => write!(f, "GetAsyncIterator {obj}"),
         InstData::GetPropIterator { obj } => write!(f, "GetPropIterator {obj}"),
+        InstData::GetNextPropName { iterator } => write!(f, "GetNextPropName {iterator}"),
         InstData::CloseIterator { iterator } => write!(f, "CloseIterator {iterator}"),
 
         // Generator / Async
