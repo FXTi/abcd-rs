@@ -305,6 +305,27 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   script truncated design/agent-roadmap.md (open('w') before NameError);
   restored from git (61b24f9) — docs edits use the safe edit tool only.
 
+- P3-T20/P3-T21 (six lift/isel fixes, 2b61870..3a22adf): LiteralBigInt
+  (ldbigint was lifted as LiteralString!), definefieldbyvalue operand swap,
+  GetNextPropName (was collapsed into GetPropIterator → iterator-wrapping
+  loop → GC heap abort), GetTemplateObject (was LoadProperty(obj,0)),
+  ArraySpread + the acc↔v2 key/value permutation removed at BOTH ends
+  (byte-transparent round trips hid it), private-property family modeled
+  (create/ld/st/define/testin). Oracle: **lift 1119/1119 (100%)**, opt
+  993/1119 — zero regressions at every checkpoint (orchestrator
+  independently reproduced the final numbers). stthisbyvalue/
+  stprivateproperty/testin have NO corpus coverage — fixed by inspection
+  against vendored sigs; Phase 4 should add fixtures.
+- P3-T19 opt diagnosis (accepted; renumbered N36-N41 after a collision
+  with P3-T20's N29-N35): the BIG one is N36 — peephole AND SCCP fold
+  non-commutative binops with operands swapped (IR convention left=acc,
+  right=reg; vendor computes `vreg OP acc` = right OP left; both engines
+  computed left OP right). Also N37 (isel LiteralNumber(-0.0) → ldai 0),
+  N38 (SCCP exception unsoundness ×3: terminator-only CFG, handler-phi
+  block-end values, Eq/NotEq ToNumber coercion), N39 (Bytecode::Not is
+  bitwise, lift labels LogicalNot), N40 (peephole StrictEq to_bits fold),
+  N41 (peephole LiteralNull→0.0). Fix batch = P3-T22.
+
 ## Phase 1 outcome (done, 2026-09-19)
 
 - Four commits: 30d254a (red tests) → 0620a12 (B1/B2 fix) → 99e5a52 (B3 fix)
