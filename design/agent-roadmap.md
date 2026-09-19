@@ -116,7 +116,7 @@ VM 语义簇（需逐簇拆根因）：
 | 3.7 | vreg-hole 修复：Braun 基例 preds.is_empty() → 惰性共享帧初值常量（vreg=undefined / acc=hole） | worker P3-T7 (k3) | **完成**（2972495；vendor 纠正：vreg 初值是 undefined 不是 hole——orchestrator 用语料 NaN 签名 corroborate；VM 层零翻转（124 例失败另有根因），修复立足 SSA 合法性；0/1119 零元 phi；orchestrator 复验门禁+直方图 1119/0；新登记 N17 种子常量的 B4 残余暴露 + MCS/acc_score 不一致观察、N18 无前驱死 catch 块） |
 | 3.8 | V 族诊断（V3/V4/V8） | worker P3-T8 (k3) | **完成**（只读；orchestrator 已独立实证 N10：静态 compute_rpo 反转逻辑 + 动态 exception-finally 反汇编 handler 在函数 pc 0） |
 | 3.9 | N10 修复：compute_rpo 先反转可达后序再追加未访问块 | worker P3-T9 (k3) | **完成**（ff23195；orchestrator 独立复验：红色 2 失败签名一致、字节稳定守卫通过、lift oracle 516→575（+59，零回归，两跑一致——worker 报 571，差 4 例归因环境噪声，双方翻转族完全一致：lexicalEnv/destructuring catchall 族）；opt 不变（N11 掩盖）） |
-| 3.10 | Construct 调用种类：CallKind::Construct + Newobjrange 正确往返（V3+V8-opt 共同根因，~108 fixture-runs） | 待定 | 未开始 |
+| 3.10 | Construct 调用种类：CallKind::Construct + Newobjrange 正确往返（V3+V8-opt 共同根因，~108 fixture-runs） | worker P3-T10 (k3) | **进行中**（baseline：lift 575 / opt 636，orchestrator 实测） |
 
 P3-T8 诊断结论（2026-09-19，全部有 file:line + 运行时证据，oracle  harness 无幻影）：
 
