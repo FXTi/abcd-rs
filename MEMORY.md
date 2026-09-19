@@ -69,10 +69,11 @@
   decode regression was re-run after this change.
 - SSA trivial-phi removal rewrites definition maps but not all existing uses;
   deleting the phi from a block alone does not prove correctness.
-- Empty-jump elimination must preserve distinct values when a predecessor
-  already has a direct edge to the target. CFG merge also needs instruction
-  ownership and try-region maintenance; partial predecessor rewrites are not
-  sufficient.
+- Empty-jump elimination RESOLVED (4a6d6ae, V4): elimination is refused
+  when a predecessor already has a direct edge to the target carrying a
+  different phi value (per-pred phi model can't hold two converging
+  edges). CFG merge ownership/try-region maintenance was resolved earlier
+  (N11 exception-neutrality guards, 606cdcd).
 - IR parameter ownership and input parameter seeding were fixed in 900a39c
   (param_values per-function identity + entry seeding + copy-in prologue).
   Still needing review: dominance, reference-type string-pool ownership,
