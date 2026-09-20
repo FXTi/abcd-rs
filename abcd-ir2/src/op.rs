@@ -1054,9 +1054,6 @@ impl Op {
             | Mov { .. }
             | AllocClosure { .. }
             | LoadProp { .. }
-            | LoadPropIdx { .. }
-            | LoadPropDyn { .. }
-            | DeleteProp { .. }
             | GetIterator { .. }
             | GetPropIterator { .. }
             | IteratorNext { .. }
@@ -1113,6 +1110,9 @@ impl Op {
             | CreateIterResultObj { .. }
             | StorePrivate { .. }
             | DefinePrivate { .. }
+            | DeleteProp { .. }
+            | LoadPropIdx { .. }
+            | LoadPropDyn { .. }
             | ThrowUndefinedIfHole { .. }
             | SuspendGenerator { .. } => Arity::Exact(2),
             StorePropIdx { .. } | StorePropDyn { .. } => Arity::Exact(3),
@@ -1166,6 +1166,18 @@ mod tests {
                 object: v(),
                 index: v(),
                 value: v(),
+            },
+            Op::DeleteProp {
+                object: v(),
+                key: v(),
+            },
+            Op::LoadPropIdx {
+                object: v(),
+                index: v(),
+            },
+            Op::LoadPropDyn {
+                object: v(),
+                key: v(),
             },
             Op::TestProp {
                 object: v(),
