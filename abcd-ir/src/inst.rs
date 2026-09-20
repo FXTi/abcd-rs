@@ -60,6 +60,16 @@ pub enum CallKind {
     SuperCallArrow,
     SuperCallSpread,
     Apply,
+    /// `newobjapply imm:u16, v:in:top` (isa.yaml:530): construct with a
+    /// spread argument array. NOT an arity overload of [`CallKind::Apply`]
+    /// (a 2-register `func.apply(this, args)` call) — newobjapply is a
+    /// construct (vendor `SlowRuntimeStub::NewObjApply`,
+    /// interpreter_assembly.cpp:1912-1926) with SWAPPED operand roles:
+    /// the ctor is the register operand (`args[0]` here) and the spread
+    /// array is the acc (the `callee` field carries the acc value, same
+    /// convention as the other call kinds' acc-role operand). Exactly one
+    /// argument; isel hard-errors otherwise.
+    NewObjApply,
     /// `new callee(args...)` — the callee is the constructor and the VM
     /// receives it as BOTH func and newTarget (vendor
     /// `SlowRuntimeStub::NewObjRange(thread, ctor, ctor, ...)`,

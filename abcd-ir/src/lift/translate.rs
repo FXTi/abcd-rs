@@ -1124,15 +1124,22 @@ pub(super) fn translate_bytecode(
             write_acc(ssa, block, v);
         }
         Bytecode::Newobjapply(_ic, obj_reg) => {
-            let callee = read_acc(ssa, block, module);
-            let arg = read_reg(ssa, *obj_reg, block, module);
+            // Vendor (interpreter_assembly.cpp:1912-1926): the REGISTER
+            // operand is the constructor (func = GET_VREG_VALUE(v0)) and
+            // the ACC is the spread array (array = GET_ACC()) — the roles
+            // are swapped vs `apply`. The Call's callee field carries the
+            // acc value (the array); args[0] is the ctor. Distinct
+            // CallKind so isel can never confuse it with a 1-arg `apply`
+            // (N16).
+            let array = read_acc(ssa, block, module);
+            let ctor = read_reg(ssa, *obj_reg, block, module);
             let v = emit_val(
                 module,
                 block,
                 InstData::Call {
-                    kind: CallKind::Apply,
-                    callee,
-                    args: vec![arg],
+                    kind: CallKind::NewObjApply,
+                    callee: array,
+                    args: vec![ctor],
                 },
                 loc,
             );
@@ -2012,16 +2019,26 @@ pub(super) fn translate_bytecode(
             );
             write_acc(ssa, block, v);
         }
-        Bytecode::DeprecatedCallspread(callee_reg, args_reg, _undef_reg) => {
-            let callee = read_reg(ssa, *callee_reg, block, module);
-            let args_arr = read_reg(ssa, *args_reg, block, module);
+        Bytecode::DeprecatedCallspread(func_reg, this_reg, array_reg) => {
+            // Vendor `deprecated.callspread v1, v2, v3` (isa.yaml:1109):
+            // CallSpread(thread, func=v1, obj=v2, array=v3)
+            // (interpreter_assembly.cpp:4651-4670) — identical semantics to
+            // the modern `apply imm, v1, v2` with func in acc
+            // (interpreter_assembly.cpp:6973-6991), so lift to a 2-arg Apply
+            // (isel emits the modern opcode; N3 deprecated->modern
+            // precedent). Pre-N16 this arm dropped v3 (the actual argument
+            // array!) and produced a 1-arg "Apply" that isel turned into a
+            // CONSTRUCT (newobjapply).
+            let func = read_reg(ssa, *func_reg, block, module);
+            let this = read_reg(ssa, *this_reg, block, module);
+            let array = read_reg(ssa, *array_reg, block, module);
             let v = emit_val(
                 module,
                 block,
                 InstData::Call {
                     kind: CallKind::Apply,
-                    callee,
-                    args: vec![args_arr],
+                    callee: func,
+                    args: vec![this, array],
                 },
                 loc,
             );

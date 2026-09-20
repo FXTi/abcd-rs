@@ -327,6 +327,7 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
                 CallKind::SuperCallArrow => "SuperCallArrow",
                 CallKind::SuperCallSpread => "SuperCallSpread",
                 CallKind::Apply => "Apply",
+                CallKind::NewObjApply => "NewObjApply",
                 CallKind::Construct => "Construct",
             };
             write!(f, "{kind_str} {callee}")?;

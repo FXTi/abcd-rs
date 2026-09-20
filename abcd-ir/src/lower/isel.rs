@@ -1626,19 +1626,45 @@ fn select_call(
             let arg_r = if args.is_empty() { Reg(0) } else { regs[0] };
             codes.push(Bytecode::Supercallspread(ic.two(), arg_r));
         }
+        // Vendor `apply imm:u8, v1:in:top, v2:in:top` (isa.yaml:1104):
+        // func = acc, this = v1, args array = v2 — exactly two arguments.
+        // Any other arity is not an apply (N16): emit nothing silently.
         CallKind::Apply => {
-            if args.len() >= 2 {
-                let regs =
-                    materialize_operands(tracker, func_id, &args[..2], Some(callee), alloc, codes)?;
-                codes.push(Bytecode::Apply(ic.two(), regs[0], regs[1]));
-            } else if args.len() == 1 {
-                let regs =
-                    materialize_operands(tracker, func_id, &args[..1], Some(callee), alloc, codes)?;
-                codes.push(Bytecode::Newobjapply(ic.two(), regs[0]));
-            } else {
-                materialize_operands(tracker, func_id, &[], Some(callee), alloc, codes)?;
-                codes.push(Bytecode::Callarg0(ic.two()));
-            }
+            let [this, array] = args else {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: format!(
+                        "apply requires exactly 2 arguments (this, args array), got {}",
+                        args.len()
+                    ),
+                });
+            };
+            let regs = materialize_operands(
+                tracker,
+                func_id,
+                &[*this, *array],
+                Some(callee),
+                alloc,
+                codes,
+            )?;
+            codes.push(Bytecode::Apply(ic.two(), regs[0], regs[1]));
+        }
+        // Vendor `newobjapply imm:u16, v:in:top` (isa.yaml:530): ctor = v,
+        // spread array = acc (the Call's callee field holds the acc value —
+        // see the CallKind::NewObjApply doc). Exactly one argument.
+        CallKind::NewObjApply => {
+            let [ctor] = args else {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: format!(
+                        "newobjapply requires exactly 1 argument (the ctor register), got {}",
+                        args.len()
+                    ),
+                });
+            };
+            let regs =
+                materialize_operands(tracker, func_id, &[*ctor], Some(callee), alloc, codes)?;
+            codes.push(Bytecode::Newobjapply(ic.two(), regs[0]));
         }
         CallKind::Construct => {
             emit_construct(callee, args, func_id, alloc, codes, ic)?;
