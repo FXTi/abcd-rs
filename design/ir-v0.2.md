@@ -269,11 +269,14 @@ P5 — taint analysis scaffolding (separate crate `abcd-taint`: call graph +
 IFDS skeleton + summary registry for the top-20 builtins), evaluated on
 the corpus' own `print` sinks as smoke.
 
-## 9. Open questions for the maintainer
+## 9. Open questions for the maintainer — RESOLVED 2026-09-21
 
-1. Crate naming for v0.2 (`abcd-ir2` vs replace-in-place with a flag day).
-2. Whether `Switch` stays (lowering has no direct opcode for it; v0.1
-   never produced one — keep for future frontend or drop).
-3. Access-path field for `LoadPropIdx`: do we want the constant-index
-   distinction (`LoadPropIdx{const}` vs dynamic) baked into the op, or
-   leave it to `ty`/const analysis (current design: single op + ty).
+1. Crate naming for v0.2 → **new crate `abcd-ir2`**; replace `abcd-ir`
+   only after the full acceptance sequence (P4 swap point).
+2. `Switch` → **dropped**. No producer exists (es2abc lowers JS switch to
+   compare/branch chains — the ISA has no switch opcode) and no lowering
+   consumer; re-adding later is trivial if a frontend needs it.
+3. `LoadPropIdx` const distinction → **single op**; constant-index
+   detection is a def-chain query for the analysis layer (SCCP already
+   proves indices constant), so two ops would only create competing
+   sources of truth.
