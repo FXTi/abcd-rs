@@ -199,7 +199,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | N36-N41 | T19 opt 域六条 | ✅ 全修（T22 四连） |
 | F-new-1 | vendor writer 创建顺序敏感（SET_FILE 偏移） | ✅ 修复（980ec16，P5-T2：根因在**我们的 bridge** 而非 vendored writer——flush_lnp_staging 在 literal staging 未应用时就 ComputeLayout 并烘焙字符串偏移，finalize 的 AddItems 再撑大 LA → 烘焙值过期；创建顺序只决定哪些字符串被移。修复=烘焙前先 flush literal staging（幂等），创建顺序约束消失。红色实证：hazard 测试 pre-fix 解出 "\u{2}\u{2}" 而非 "late.js"。附带修复 N55 encode 侧） |
 | F-new-2 | 注解内嵌 LA 的方法引用写裸源偏移 | ✅ 修复（8a6671f，P5-T2：encode_literal_value_simple 接入实体句柄解析（offset 优先 + entity_map 名字兜底），不可解析即 CodeRelocation 硬错误；另发现 decode 把 '#' 标量注解元素按数组误读（vendored GetArrayValue 重解释不会失败）——vendor pandasm annotation.h 证明 '#' 只有标量形（GetArrayTypeAsChar 无 LA 情形），decode 改直读标量，annotation_all_types.rs 的旧 '#' 数组钉按 vendor 契约更正） |
-| 死表面 | 108/324 导出未用 | ⏸️ 政策讨论，维护者定夺 |
+| 死表面 | 108/324 导出未用 | ✅ **维护者拍板保留**（2026-09-20，D3：publish 形态 crate 保留完整导出面，不删） |
 | CI #22 | 重复 vendor 文件保护 | ⏸️ 维护者决定不动 |
 | SSA trivial-phi | 删除不写全 uses | ✅ 实质关闭（76cb828 替换式）+ N28 残余记录 |
 | dominance 复审 | Phase 3 遗留评审项 | ✅ 实质覆盖（eb62547，N45：verify use-def 支配检查上线，四条豁免文档化） |
@@ -251,3 +251,5 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | v2-P3 | pass 移植：SCCP/copyprop/DCE/peephole（T3 Effects 表），opt 变体 oracle 对齐 | 待定 | 未开始 |
 | v2-P4 | 替换：v0.1 退役为 abcd-ir-v1 留档，abcd-ir2 正名 abcd-ir | 待定 | 未开始（维护者验收后执行） |
 | v2-P5 | abcd-taint 脚手架：调用图 + IFDS 骨架 + top-20 builtin 摘要注册，语料 print sink 冒烟 | 待定 | 未开始 |
+
+**维护者决策（2026-09-20）**：D2（inline 是否在 v0.2 IR 上重写）**排在 v2-P3 之后**再议——pass 框架落地后才有讨论内联的基座；D3（死 FFI 表面 108/324）**拍板保留**，对账表已核销。v2-P2 启动前按约定暂停，等维护者发话。

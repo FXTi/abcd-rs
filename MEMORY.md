@@ -493,9 +493,10 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   (decode keeps both). `ISA_EMIT_INTERNAL_ERROR = -5` added (never reuse
   -1: that is ISA_EMIT_INVALID_LABEL). 12+ files carry no proto signatures
   (format fact #A7) — do not re-report as a bug.
-- Follow-up register (not yet scheduled): dead FFI
-  surface policy (108/324 in-repo-unused exports — publish-shaped crates,
-  needs maintainer decision, NOT a delete list); 12.x builder
+- Follow-up register: dead FFI
+  surface policy RESOLVED (2026-09-20, D3 — maintainer ruled KEEP: the
+  publish-shaped crates' surface is the product; reconciliation table row
+  closed); 12.x builder
   `abc_method_has_valid_proto` behavior matches #A7 (no action).
 - F-new-1/F-new-2 RESOLVED (P5-T2, 980ec16/8a6671f): F-new-1's root cause
   was OUR bridge, not the vendored writer — the LNP staging flush computed

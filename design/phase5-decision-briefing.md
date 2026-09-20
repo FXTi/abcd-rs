@@ -42,6 +42,8 @@ Quarantined as a hard-gated no-op (cab3ab8): it produces module-invalid IR
 (N44, red-probed). Options: rewrite under v0.2 (1-2 days agent-time) /
 delete outright / leave quarantined indefinitely. Recommendation: decide
 with D1 — rewrite only makes sense on the v0.2 IR.
+**RULED (2026-09-20, maintainer): revisited AFTER v2-P3** — the inline
+discussion needs the pass framework as its base; not scheduled before then.
 
 ### D3. Dead FFI surface policy
 
@@ -51,6 +53,7 @@ keep-as-published (status quo) / prune to the used set / feature-gate.
 Recommendation: keep (the crates' value proposition is the wrapped surface;
 pruning saves nothing but docs). If you want a prune, it's a mechanical
 task with CI guards.
+**RULED (2026-09-20, maintainer): KEEP.** Reconciliation-table row closed.
 
 ### D4. FormatProfile evaluation
 
