@@ -815,6 +815,32 @@ fn decode_field_at(
                 field_off,
             });
         }
+        // `moduleRequestPhaseIdx` u32 fields (any class — merge-abc emits
+        // them on the module's own record) reference untagged
+        // module-request-phase blobs by file offset; decode structurally so
+        // encode can re-emit and relocate (same dangling-offset class as
+        // _ESModuleRecord/_ESScopeNamesRecord). This name guard must come
+        // BEFORE the `_ESModuleRecord` catch-all u32 arm below (N56):
+        // merge-abc hangs the phase field on the module record itself, and
+        // the catch-all would otherwise mis-route the phase-blob offset
+        // into the module-data blob decoder (hard `invalid entity offset`,
+        // whole file undecodable).
+        (_, TypeId::U32, Some(FieldValue::I32(off)))
+            if strings.resolve(name) == Some(MODULE_REQUEST_PHASE_FIELD) =>
+        {
+            let offset = u32::try_from(off).map_err(|_| {
+                Error::ModuleData(format!(
+                    "{class_descriptor} field at {field_off:#x}: negative blob offset {off}"
+                ))
+            })?;
+            let phase = decode_module_request_phase_at(f, offset).map_err(|e| {
+                Error::ModuleData(format!(
+                    "{class_descriptor} moduleRequestPhaseIdx field at {field_off:#x}: {e}"
+                ))
+            })?;
+            phase_blob_offsets.insert(offset);
+            Some(FieldValue::ModuleRequestPhase(phase))
+        }
         (ES_MODULE_RECORD_DESCRIPTOR, TypeId::U32, Some(FieldValue::I32(off))) => {
             let offset = u32::try_from(off).map_err(|_| {
                 Error::ModuleData(format!(
@@ -835,27 +861,6 @@ fn decode_field_at(
             })?;
             scope_names_offsets.insert(offset);
             Some(FieldValue::LiteralArrayRef(offset))
-        }
-        // `moduleRequestPhaseIdx` u32 fields (any class — merge-abc emits
-        // them on the module's own record) reference untagged
-        // module-request-phase blobs by file offset; decode structurally so
-        // encode can re-emit and relocate (same dangling-offset class as
-        // _ESModuleRecord/_ESScopeNamesRecord).
-        (_, TypeId::U32, Some(FieldValue::I32(off)))
-            if strings.resolve(name) == Some(MODULE_REQUEST_PHASE_FIELD) =>
-        {
-            let offset = u32::try_from(off).map_err(|_| {
-                Error::ModuleData(format!(
-                    "{class_descriptor} field at {field_off:#x}: negative blob offset {off}"
-                ))
-            })?;
-            let phase = decode_module_request_phase_at(f, offset).map_err(|e| {
-                Error::ModuleData(format!(
-                    "{class_descriptor} moduleRequestPhaseIdx field at {field_off:#x}: {e}"
-                ))
-            })?;
-            phase_blob_offsets.insert(offset);
-            Some(FieldValue::ModuleRequestPhase(phase))
         }
         (_, _, value) => value,
     };
