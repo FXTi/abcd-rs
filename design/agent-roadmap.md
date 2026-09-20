@@ -233,11 +233,11 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 
 | N56 | Builder `literal_array_add_module_request_phase` + module-data staging 疑似损坏 module blob 字符串偏移（decode: invalid entity offset；无 Builder 先例，疑 bridge staging 顺序问题，abcd-file 域） | ✅ 修复（c79220d，诊断 worker v2-P2a + orchestrator 落地）：**原假设证伪**——bridge/vendored writer 输出逐字节正确（对照实验：phase 字段挂别的类全绿、字符串逐字验证）；真根因是 `decode_field_at` **分派臂顺序**：`_ESModuleRecord` catch-all u32 臂排在 N7 名匹配臂之上，merge-abc 布局（phase 字段挂模块记录自身）被误路由进 module-data blob 解码器 → 整文件不可 decode。修复=一臂重排（N8 同型陷阱，N8 修过顺序而 N7 臂后加没修）。语料零暴露的原因：es2panda 把 phase 字段挂独立的 `L_ModuleRequestPhaseRecord;`（9 fixture 探针实证）。red-first：9 红 3 绿 orchestrator 独立复现 → 4 精选测试（同类 decode/300 字符串池增长/往返/异类对照）；abcd-file 91/91 + 语料套件字节中性 |
 
-| N57 | v2-P1 折叠 `apply` → Call{Dynamic,this,args:[array]} 与 callthis1 同形——spread 语义丢失，v0.2 lower 无法忠实还原（18 个 runtime-passed 文件） | 🛠️ **维护者已批**（2026-09-20，随 v2-P2c 落地）：Op::Call 加 CallKind::Apply |
-| N58 | v2-P1 折叠 supercallspread(42 passed) 与 callruntime.supercallforwardallargs(12 passed) 同形 Call{Super,[x]}——v0.1 分发 supercallspread vs supercallthisrange(argc=1)，单一选择必破一边 | 🛠️ 已批（同上）：CallKind 拆 SuperSpread/SuperForwardAllArgs |
-| N59 | createobjectwithbuffer vs createarraywithbuffer 都折成 AllocObject{shape}——对象/数组标签不在字面量数组内容里（平铺 buffer 内容不可嗅探），语料无处不在 | 🛠️ 已批（同上）：拆 Op::AllocArray{shape} |
-| N60 | own-store 族（stownbyname 6 / definefieldbyname+definepropertybyname 90 / callruntime.definefieldbyvalue 180 passed 文件）折进 StoreProp 族——v0.1 StoreOwnProperty→stownby*（define-own 语义），v0.2 只能发 stobjby*（普通 set，走 setter/原型链），语义+字节双分歧 | 🛠️ 已批（同上）：Op::StoreOwnProp{Name,Dyn,Idx} |
-| N61 | trystglobalbyname（54 passed 文件）折进 StoreGlobal——tolerant store 变 throwing stglobalvar，字节必分歧、全局缺席时语义分歧 | 🛠️ 已批（同上）：Op::TryStoreGlobal |
+| N57 | v2-P1 折叠 `apply` → Call{Dynamic,this,args:[array]} 与 callthis1 同形——spread 语义丢失，v0.2 lower 无法忠实还原（18 个 runtime-passed 文件） | ✅ 落地（55c989b，v2-P2c；orchestrator 复验绿） |
+| N58 | v2-P1 折叠 supercallspread(42 passed) 与 callruntime.supercallforwardallargs(12 passed) 同形 Call{Super,[x]}——v0.1 分发 supercallspread vs supercallthisrange(argc=1)，单一选择必破一边 | ✅ 落地（894f573，v2-P2c；orchestrator 复验绿） |
+| N59 | createobjectwithbuffer vs createarraywithbuffer 都折成 AllocObject{shape}——对象/数组标签不在字面量数组内容里（平铺 buffer 内容不可嗅探），语料无处不在 | ✅ 落地（b3be74b，v2-P2c；orchestrator 复验绿）：Op::AllocArray{shape: Option<ConstId>}（None=createemptyarray） |
+| N60 | own-store 族（stownbyname 6 / definefieldbyname+definepropertybyname 90 / callruntime.definefieldbyvalue 180 passed 文件）折进 StoreProp 族——v0.1 StoreOwnProperty→stownby*（define-own 语义），v0.2 只能发 stobjby*（普通 set，走 setter/原型链），语义+字节双分歧 | ✅ 落地（73e0d05，v2-P2c；orchestrator 复验绿） |
+| N61 | trystglobalbyname（54 passed 文件）折进 StoreGlobal——tolerant store 变 throwing stglobalvar，字节必分歧、全局缺席时语义分歧 | ✅ 落地（9425e73，v2-P2c；orchestrator 复验绿） |
 
 ## 审计纪律
 
@@ -255,7 +255,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | v2-P1a | abcd-file 嵌套字面量数组 decode | worker v2-P1a (k3) | **完成**（6d1fcd0；worklist 递归收集（排序批=N20 确定性、先注册后解码=循环安全、排除规则与表头一致）；orchestrator 复验：新套件绿、real_module_abc 7/7、2787 fixture decode-diff 恰 57 个、恒等重写 ark_disasm 全净且与 reference.pa 内容一致（模布局重编号）） |
 | v2-P2 | lower：v0.2 Module → MethodBody（复用重定位通道），VM oracle 对齐 1149/1149×2 | worker v2-P2 (k3) | **进行中**（2026-09-20 启动；门禁解释：P2 无 pass 故 opt 变体不存在——门禁=v2lift 变体 oracle 1149/1149 零跳过 + 与 v0.1 lift 重写**逐字节恒等** + 3 次确定性，opt 半边随 P3 补齐；任务卡禁改 abcd-file/src（P2a 并行域）/abcd-ir/abcd-ir2/abcd-lift，IR 缺口只报不修） |
 | v2-P2a | N56 诊断（Builder module-blob staging 疑似损坏）：最小复现+定责+修复 sketch，**只读不落 commit** | worker v2-P2a (k3) | **完成**（2026-09-20：7 变体复现 + 对照实验证伪 bridge staging 假设，真根因=decode 臂顺序；orchestrator 落地修复 c79220d，见 N56 行） |
-| v2-P2c | N57-N61 落地：abcd-ir2 补 CallKind::Apply/SuperSpread/SuperForwardAllArgs + AllocArray + StoreOwnProp 族 + TryStoreGlobal，abcd-lift 解除 5 处折叠，compare.rs 分歧表同步 | worker v2-P2c (k3) | **进行中**（2026-09-20 维护者批准；门禁：2787 parity 零不一致 + 全套件绿；P2 并行，完成后 P2 填 5 个硬错误臂） |
+| v2-P2c | N57-N61 落地：abcd-ir2 补 CallKind::Apply/SuperSpread/SuperForwardAllArgs + AllocArray + StoreOwnProp 族 + TryStoreGlobal，abcd-lift 解除 5 处折叠，compare.rs 分歧表同步 | worker v2-P2c (k3) | **完成**（55c989b/894f573/b3be74b/73e0d05/9425e73；每项带合成体测试 + 真实 fixture pre/post 证据；对照器五区分改精确比较，唯一残余折叠 SuperForwardAllArgs→super 系 v0.1 自身表示所限、文档化；orchestrator 独立复验：fmt 净、ir2+lift 59 测试绿、parity 2787/0 mismatch、workspace 132 套件全 ok——P2 已同步集成全部新 op 含 TryStoreGlobal 臂） |
 | v2-P3 | pass 移植：SCCP/copyprop/DCE/peephole（T3 Effects 表），opt 变体 oracle 对齐 | 待定 | 未开始 |
 | v2-P4 | 替换：v0.1 退役为 abcd-ir-v1 留档，abcd-ir2 正名 abcd-ir | 待定 | 未开始（维护者验收后执行） |
 | v2-P5 | abcd-taint 脚手架：调用图 + IFDS 骨架 + top-20 builtin 摘要注册，语料 print sink 冒烟 | 待定 | 未开始 |
