@@ -231,6 +231,8 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | N55 | decode 给无 debug info 项的方法捏造 `debug: Some(source_file: Some(""))`（vendor DebugInfoExtractor::GetSourceFile 对缺失条目返回 ""，debug_info_extractor.cpp:318-324；decode.rs:415 无条件 Some 包装）；且 vendor extractor 遇 file_=EntityId(0) 的 debug 项时 GetSpanFromId 抛 INVALID_FILE_OFFSET（file.h:190）→ 整文件 debug 区全灭。encode 侧已修（980ec16：空 debug 字符串不算内容，不再发射退化 debug 项）；decode 模型 wart 留存 | 📝 encode 侧已修（980ec16）；decode wart 待 v0.2 |
 | P5-T2 | 对账表遗留批：F-new-1 / F-new-2 / N7 / N8 / N15 / N16 | worker P5-T2 (k3) | **完成**（980ec16 F-new-1 / 8a6671f F-new-2 / 71adc56 N7 / 3ed4228 N15 / 53ba936 N16 + N8 裁决登记；逐条 red-first 远端实证；终态检查点：重写 lift 1149/1149 opt 1149/1149 零 skip 直方图空，与 /tmp/t51-verify 字节差集恰为 class-accessors+module-exports 两族 36 文件/变体且 pandasm 逐文件仅 defineclasswithbuffer imm2 一行 0x0→0x1（=N15 语义修正），本地 docker oracle 双变体 1149/1149（image sha256:5e7627…）；新登记 N53/N54/N55；remote run 目录已清理）**；orchestrator 复验通过（fmt/101 套件绿、差集精确 72 文件=N15、oracle 双 1149/1149 复跑一致、容器零残留；F-new-1 bridge 修复机制对 vendor 烘焙序实证）** |
 
+| N56 | Builder `literal_array_add_module_request_phase` + module-data staging 疑似损坏 module blob 字符串偏移（decode: invalid entity offset；无 Builder 先例，疑 bridge staging 顺序问题，abcd-file 域） | 🔲 未修（P5-T1 登记候选，待诊断） |
+
 ## 审计纪律
 
 - 审计期间 abcd-isa-sys / abcd-isa / abcd-file-sys / abcd-file 冻结功能性改动（允许新增测试文件）。
@@ -243,7 +245,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 |---|------|--------|------|
 | v2-P0 | abcd-ir2 骨架：taxonomy + Effects + Ty + verifier 骨架（零格式依赖 Cargo 强制） | worker v2-P0 (k3) | **完成**（e83a2c4；orchestrator 复审 effects 派生表/Ty 格 join/verifier 豁免语义 + 复验：fmt/103 套件绿/ir2 22 测试绿/doc 零警告） |
 | v2-P0.5 | abcd-ir2 分类表扩到 ISA 全覆盖 | worker v2-P1 (k3) | **完成**（741fb8e；22 个新 op + payload homes + 全套 vendor 依据 effects；orchestrator 复审 effects 条目（GetTemplateObject/ArraySpread/SetObjectWithProto）+ 复验 fmt/ir2 23/23 绿；设计文档 §4.1 已同步为 ~70 ops） |
-| v2-P1 | lift：decode(v0.1 File) → v0.2 Module，全语料结构验证 + 与 v0.1 lift 对照 | worker v2-P1 (k3) | **进行中** |
+| v2-P1 | abcd-lift 转换器 + v0.1 parity 对照 | worker v2-P1 (k3) | **主体完成**（57f336f+6ab12b7；orchestrator 独立复现：2730/2787 lift+verify 零错误，11148 函数 1,423,087 canonical token **零不一致**，对照器 smoke 非空转；57 sendable 待 v2-P1a；全 268 变体臂移植清单交付；新登记 N56 Builder module-blob staging 疑似损坏） |
 | v2-P1a | abcd-file 嵌套字面量数组 decode（57 个 sendable fixture 的类缓冲含未注册嵌套 LA 引用；orchestrator 裁决选 (1) 真修，否占位/否裸偏移变体） | worker v2-P1a (k3) | **进行中** |
 | v2-P2 | lower：v0.2 Module → MethodBody（复用重定位通道），VM oracle 对齐 1149/1149×2 | 待定 | 未开始 |
 | v2-P3 | pass 移植：SCCP/copyprop/DCE/peephole（T3 Effects 表），opt 变体 oracle 对齐 | 待定 | 未开始 |
