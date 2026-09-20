@@ -24,7 +24,9 @@
 //! §9 resolution 3), stownby*/definefieldbyname/definepropertybyname/
 //! callruntime.definefieldby* → the `StoreProp*` family (the
 //! own-vs-plain store distinction folds — documented), ld/stthisby* →
-//! the same families over the `this` value, ld/stsuperbyname →
+//! hard [`LiftError::UnsupportedThisByAccess`] (N51: es2panda never
+//! emits the IC-fused this-by-* family — never silently invented),
+//! ld/stsuperbyname →
 //! `LoadSuper`/`StoreSuper` (Name), ld/stsuperbyvalue → (Dynamic),
 //! delobjprop → `DeleteProp`, private-property family →
 //! `LoadPrivate`/`StorePrivate`/`DefinePrivate`/`TestPrivate`/
@@ -640,47 +642,24 @@ pub fn translate_bytecode(
                 loc,
             );
         }
-        Bytecode::Ldthisbyname(_ic, eid) => {
-            let name = fx.resolve_str(*eid)?;
-            let this = fx.this_value(block, loc);
-            let v = fx.emit_val(block, Op::LoadProp { object: this, name }, loc);
-            fx.write_acc(block, v);
+        // N51: the `this-by-*` family (isa.yaml:1627-1642) is IC-fused
+        // `this` property access that es2panda NEVER emits (`this[k] = v`
+        // compiles to `ldthis` + `stobjbyvalue`; upstream source grep zero
+        // hits). Zero corpus coverage means no VM evidence for the IC
+        // semantics — hard error, never silently invented (maintainer
+        // ruling 2026-09-20; mirrors v0.1's
+        // `LiftError::UnsupportedThisByAccess`).
+        Bytecode::Ldthisbyname(..) => {
+            return Err(LiftError::UnsupportedThisByAccess("ldthisbyname"));
         }
-        Bytecode::Stthisbyname(_ic, eid) => {
-            let name = fx.resolve_str(*eid)?;
-            let value = fx.read_acc(block);
-            let this = fx.this_value(block, loc);
-            fx.emit_void(
-                block,
-                Op::StoreProp {
-                    object: this,
-                    name,
-                    value,
-                },
-                loc,
-            );
+        Bytecode::Stthisbyname(..) => {
+            return Err(LiftError::UnsupportedThisByAccess("stthisbyname"));
         }
-        Bytecode::Ldthisbyvalue(_ic) => {
-            let key = fx.read_acc(block);
-            let this = fx.this_value(block, loc);
-            let v = fx.emit_val(block, Op::LoadPropDyn { object: this, key }, loc);
-            fx.write_acc(block, v);
+        Bytecode::Ldthisbyvalue(..) => {
+            return Err(LiftError::UnsupportedThisByAccess("ldthisbyvalue"));
         }
-        Bytecode::Stthisbyvalue(_ic, key_reg) => {
-            // Vendor: receiver = this, v = propKey, acc = VALUE
-            // (isa.yaml:1642-1646, interpreter_assembly.cpp:6195-6257).
-            let value = fx.read_acc(block);
-            let this = fx.this_value(block, loc);
-            let key = fx.read_reg(*key_reg, block);
-            fx.emit_void(
-                block,
-                Op::StorePropDyn {
-                    object: this,
-                    key,
-                    value,
-                },
-                loc,
-            );
+        Bytecode::Stthisbyvalue(..) => {
+            return Err(LiftError::UnsupportedThisByAccess("stthisbyvalue"));
         }
         Bytecode::Ldsuperbyname(_ic, eid) => {
             let name = fx.resolve_str(*eid)?;

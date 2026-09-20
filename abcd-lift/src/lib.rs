@@ -112,6 +112,18 @@ pub enum LiftError {
         "super-property access by constant index has no ArkCompiler opcode (isa.yaml has no super-by-index form)"
     )]
     UnsupportedSuperByIndex,
+    /// `ldthisbyname` / `stthisbyname` / `ldthisbyvalue` /
+    /// `stthisbyvalue` (abcd-isa-sys/vendor/isa/isa.yaml:1627-1642):
+    /// IC-fused `this` property access that es2panda NEVER emits (N51 —
+    /// upstream source grep zero hits; the 36-compile matrix shows
+    /// `this[k] = v` always compiles to `ldthis` + `stobjbyvalue`).
+    /// Corpus coverage is zero, so there is no VM evidence for the IC
+    /// semantics — a hard error (maintainer ruling 2026-09-20), never
+    /// silently invented.
+    #[error(
+        "unsupported this-by-* opcode `{0}` (N51): es2panda never emits this IC-fused family and its IC semantics are unsupported — please report this file to the abcd-rs maintainers"
+    )]
+    UnsupportedThisByAccess(&'static str),
     /// `throw.ifsupernotcorrectcall` carries a check-kind immediate the
     /// vendor does not define (0 = TDZ guard, 1 = re-bind guard).
     #[error(
