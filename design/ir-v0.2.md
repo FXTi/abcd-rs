@@ -97,32 +97,42 @@ literal-array indices, no four-bucket annotations, no `Tagged`, no
 
 ## 4. Op taxonomy and effects
 
-### 4.1 Ops (≈45 variants)
+### 4.1 Ops (≈70 variants after the v2-P0.5 growth)
 
 Compute: `BinaryOp{op}` / `UnaryOp{op}` / `Compare{op}` (+ `ty` on the
 value, not the op). `Mov`. `LoadConst(ConstId)`.
 Objects: `AllocObject{shape: ConstId}`, `AllocArray`,
 `AllocRegExp{pattern: Sym, flags: u32}`, `AllocClosure(DefineFunc)`,
-`LoadProp/StoreProp{name: Sym}`, `LoadPropIdx/StorePropIdx{index: ValueId}`,
-`LoadPropDyn/StorePropDyn{key: ValueId}`, `DefineMethod{name: Sym}`,
-`DeleteProp`, `TestProp{name|idx|dyn}`, `CopyDataProps`.
-Iteration: `GetIterator`, `IteratorNext`, `IteratorReturn`, `IteratorThrow`,
-`GetPropIterator`, `NextPropName`.
-Lexical/global/module: `GetLexEnv`, `GetLexVar/PutLexVar{level, slot}`,
-`TryGetGlobal{name, default: Option<…>}`, `StoreGlobal`,
-`LoadModuleVar/StoreModuleVar`, `GetModuleNamespace`, `DynamicImport`.
+`AllocGenerator(CreateGenerator)`, `LoadProp/StoreProp{name: Sym}`,
+`LoadPropIdx/StorePropIdx{index: ValueId}`, `LoadPropDyn/StorePropDyn{key: ValueId}`,
+`DefineMethod{name: Sym, length: u16}`, `DefineGetterSetterByValue`,
+`DeleteProp`, `TestProp{name|idx|dyn}`, `CopyDataProps`, `SetObjectWithProto`,
+`CreateObjectWithExcludedKeys{obj, keys}`, `CreateIterResultObj{value, done}`,
+`GetTemplateObject{literal}`, `ArraySpread{dst, index, src}` (result = new index),
+`CopyRestArgs{start_index}`, `GetUnmappedArgs`.
+Iteration: `GetIterator`, `GetAsyncIterator`, `IteratorNext`, `IteratorReturn`,
+`IteratorThrow`, `GetPropIterator`, `NextPropName`.
+Lexical/global/module: `NewLexEnv{num_vars}`, `NewLexEnvWithName{num_vars, scope_names: ConstId}`,
+`PopLexEnv`, `GetLexVar/PutLexVar{level, slot}`,
+`TryGetGlobal{name, default}`, `StoreGlobal`,
+`LoadModuleVar/StoreModuleVar`, `GetModuleNamespace`, `DynamicImport`,
+`LoadGlobalObject`, `LoadFunction`, `LoadNewTarget`.
 Calls: `Call{callee, this, args, kind, result?}`,
-`DefineFunc{body: FuncId, captures: Vec<(Sym, ValueId)>}` (feeds AllocClosure),
-`DefineClass{ctor: FuncId, heritage: Option<ValueId>, members: ConstId}`.
+`DefineFunc{body: FuncId, length: u16, captures: Vec<(Sym, ValueId)>}`,
+`DefineClass{ctor: FuncId, count: u16, heritage, members: ConstId}`.
 Private: `LoadPrivate{level, slot}`, `StorePrivate{level, slot, value}`,
 `DefinePrivate{level, slot, value}`, `TestPrivate{level, slot}`,
-`CreatePrivateNames{count}`.
+`CreatePrivateNames{names: ConstId}`.
 Exceptions: `Throw`, `ThrowIfSuperNotCalled{kind}`, `ThrowUndefinedIfHole`,
-`ThrowConstAssignment`, `ThrowIfNotObject`.
+`ThrowUndefinedIfHoleWithName{name: Sym}`, `ThrowConstAssignment`,
+`ThrowIfNotObject`, `ThrowPatternNonCoercible`, `ThrowNotExists`,
+`ThrowDeleteSuperProperty`.
 Generator/async: `CreateGenerator`, `SuspendGenerator`, `ResumeGenerator`,
-`GetResumeMode`, `Await`, `AsyncResolve/Reject`.
+`GetResumeMode`, `Await`, `AwaitUncaught{value}`, `AsyncFunctionEnter`,
+`AsyncResolve/Reject`.
 Super: `LoadSuper{name|dyn}`, `StoreSuper{name|dyn}`.
-Control: `Branch`, `CondBranch`, `Switch`, `Return`, `Phi`, `Unreachable`.
+Debug: `Debugger`.
+Control: `Branch`, `CondBranch`, `Return`, `Phi`, `Unreachable`.
 
 ### 4.2 Effect model (T3)
 

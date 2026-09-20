@@ -211,6 +211,9 @@ into a small semantic set; encoding selection is a lowering concern.
 
 Result: analyzers face ~40 semantic ops instead of 268 encodings, with no
 fidelity loss — width/variant choice carries no semantic difference.
+(2026-09-21 update: the implementable taxonomy grew to ~70 ops for full
+ISA coverage with zero placeholder mappings — see design/ir-v0.2.md §4.1
+and commit 741fb8e.)
 
 ## 5. Types: dynamic lattice + static precise layer
 
