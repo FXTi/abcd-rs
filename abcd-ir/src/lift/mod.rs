@@ -431,7 +431,91 @@ pub fn lift_method(file: &File, method: &Method, module: &mut Module) -> Result<
         ssa.seal_block(bb, module);
     }
 
+    sweep_dead_blocks(module, func_id);
+
     Ok(func_id)
+}
+
+/// N18 dead-island sweep (Phase 5).
+///
+/// es2abc emits unreachable bytecode: dead code after unconditional control
+/// flow, dead catch bodies. Lift faithfully materializes those islands as
+/// blocks that read frame-initial values (P3-T7) and sit in the module as
+/// junk — lowering lays them out and emits them, and their preds/phi
+/// entries perturb regalloc and the optimizer.
+///
+/// Reachability uses the AUGMENTED successor relation (terminator edges +
+/// try→handler exception edges, `analysis::augmented_succs`) — the same
+/// model opt's `remove_unreachable_blocks` (N11) and verify's N27 rule
+/// use. A terminator-only sweep would mark every catch handler — and all
+/// code reachable only through it — unreachable, deleting LIVE catch
+/// bodies (pinned by `lift_dead_island_sweep.rs`); the augmented relation
+/// keeps exactly the blocks exception dispatch can reach. A handler whose
+/// ENTIRE protected range is dead can never receive a dispatch, so it is
+/// swept with its island (empirically zero such handlers in the
+/// 2787-fixture corpus).
+fn sweep_dead_blocks(module: &mut Module, func_id: FuncId) {
+    use std::collections::{HashSet, VecDeque};
+
+    let func = module.func(func_id);
+    let entry = func.entry_block;
+    let func_blocks: HashSet<Block> = func.blocks.iter().copied().collect();
+    let mut reachable: HashSet<Block> = HashSet::new();
+    let mut queue: VecDeque<Block> = VecDeque::new();
+    reachable.insert(entry);
+    queue.push_back(entry);
+    while let Some(bb) = queue.pop_front() {
+        for succ in crate::analysis::augmented_succs(module, func_id, bb) {
+            if func_blocks.contains(&succ) && reachable.insert(succ) {
+                queue.push_back(succ);
+            }
+        }
+    }
+    let dead: HashSet<Block> = func_blocks
+        .into_iter()
+        .filter(|bb| !reachable.contains(bb))
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+
+    // Kept blocks: drop dead predecessors and the phi entries keyed by them
+    // (verify requires phi entry count == predecessor count). A kept block
+    // always retains at least one kept pred: its reachability path's last
+    // edge (terminator or try→handler) comes from a kept block, and lift
+    // records both edge kinds in `preds`.
+    let kept: Vec<Block> = module
+        .func(func_id)
+        .blocks
+        .iter()
+        .filter(|bb| !dead.contains(bb))
+        .copied()
+        .collect();
+    for bb in kept {
+        module.block_mut(bb).preds.retain(|p| !dead.contains(p));
+        let phis = module.block(bb).phis.clone();
+        for phi_id in phis {
+            if let InstData::Phi { entries } = &mut module.inst_mut(phi_id).data {
+                entries.retain(|(p, _)| !dead.contains(p));
+            }
+        }
+    }
+
+    // Remove the dead blocks and prune dependent metadata consistently:
+    // try-region coverage/handler references, and the N13 exception values
+    // keyed by swept handlers.
+    let func = module.func_mut(func_id);
+    func.blocks.retain(|bb| !dead.contains(bb));
+    for region in &mut func.try_regions {
+        region.try_blocks.retain(|bb| !dead.contains(bb));
+        region.catches.retain(|c| !dead.contains(&c.handler_block));
+    }
+    // A region with no surviving protected blocks or no surviving handler
+    // can never dispatch; drop it.
+    func.try_regions
+        .retain(|r| !r.try_blocks.is_empty() && !r.catches.is_empty());
+    func.exception_values
+        .retain(|(handler, _)| !dead.contains(handler));
 }
 
 /// Build TryRegion entries from the original bytecode try_blocks.
