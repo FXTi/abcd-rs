@@ -35,9 +35,15 @@ pub struct File {
     pub strings: StringPool,
     /// Classes keyed by interned descriptor (e.g. `"L_GLOBAL;"`).
     pub classes: BTreeMap<StringId, Class>,
-    /// Literal arrays (indexed by position in the file).
+    /// Literal arrays (indexed by position in the file). Beyond
+    /// header-table entries this includes arrays reached through method
+    /// index regions, scope-names fields, and nested `LITERALARRAY`
+    /// payloads recovered transitively at decode (v2-P1a).
     pub literal_arrays: Vec<LiteralArray>,
-    /// Source-file literal-array offset → decoded table index.
+    /// Source-file literal-array offset → decoded table index. Nested
+    /// arrays recovered from literal payloads are registered here too, so a
+    /// `LiteralValue::LiteralArray` slot is resolvable whenever its target
+    /// was decodable.
     pub literal_array_offsets: HashMap<u32, u32>,
     /// offset → interned name/descriptor, for resolving bytecode `EntityId` operands.
     pub entity_map: HashMap<u32, StringId>,

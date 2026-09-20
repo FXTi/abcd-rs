@@ -117,6 +117,15 @@ pub enum LiteralValue {
     /// Method affiliate data (index into auxiliary tables).
     MethodAffiliate(u16),
     /// Index into [`File::literal_arrays`](crate::File::literal_arrays).
+    ///
+    /// On the wire the payload is the target array's FILE OFFSET; decode
+    /// rewrites it to a table index through [`File::literal_array_offsets`]
+    /// (header-table, method-index-region, scope-names, and — since v2-P1a —
+    /// transitively recovered nested targets). A payload whose target is
+    /// excluded (module-record / request-phase blobs) or unrecoverable stays
+    /// a raw file offset. Arrays decoded through the annotation path
+    /// (`AnnotationValue::LiteralArray`) are never rewritten: their payloads
+    /// stay raw offsets.
     LiteralArray(LiteralArrayIdx),
     /// Index into the literal buffer table.
     LiteralBufferIndex(LiteralArrayIdx),
@@ -126,29 +135,31 @@ pub enum LiteralValue {
     EtsImplements(crate::StringId),
     /// Null sentinel value.
     NullValue(u8),
-    /// Typed `bool[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `bool[]` data — raw source-file offset of the untagged payload
+    /// (u32 element count + elements; N52 wart: NOT a table index, unlike
+    /// [`LiteralValue::LiteralArray`], and never rewritten by decode).
     ArrayU1(LiteralArrayIdx),
-    /// Typed `u8[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `u8[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayU8(LiteralArrayIdx),
-    /// Typed `i8[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `i8[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayI8(LiteralArrayIdx),
-    /// Typed `u16[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `u16[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayU16(LiteralArrayIdx),
-    /// Typed `i16[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `i16[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayI16(LiteralArrayIdx),
-    /// Typed `u32[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `u32[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayU32(LiteralArrayIdx),
-    /// Typed `i32[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `i32[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayI32(LiteralArrayIdx),
-    /// Typed `u64[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `u64[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayU64(LiteralArrayIdx),
-    /// Typed `i64[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `i64[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayI64(LiteralArrayIdx),
-    /// Typed `f32[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `f32[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayF32(LiteralArrayIdx),
-    /// Typed `f64[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `f64[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayF64(LiteralArrayIdx),
-    /// Typed `string[]` data — index into [`File::literal_arrays`](crate::File::literal_arrays).
+    /// Typed `string[]` data — raw payload offset (see [`LiteralValue::ArrayU1`]).
     ArrayString(LiteralArrayIdx),
 }
 

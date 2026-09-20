@@ -1512,9 +1512,23 @@ fn decode_literal_arrays(
     }
     let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
 
-    let mut arrays: Vec<LiteralArray> = offsets
-        .iter()
-        .filter_map(|&off| {
+    // Nested-reference recovery (v2-P1a): a LITERALARRAY payload holds the
+    // target array's FILE OFFSET, and class buffers (sendable classes on
+    // 13.x/24.x) reference arrays registered nowhere — not in the header
+    // table and not in any method index region. Recover them transitively:
+    // `offsets` doubles as the worklist, and an offset is registered in
+    // `offset_to_index` BEFORE its array is decoded, so reference cycles
+    // terminate and every offset is decoded at most once per table entry.
+    // Newly discovered offsets are appended in sorted batches, keeping the
+    // table order deterministic (N20). The module-record / request-phase
+    // exclusions apply to nested candidates exactly as to table entries:
+    // those blobs are untagged and must never be decoded here (a reference
+    // to one stays a raw offset, the pre-existing representation).
+    let mut arrays: Vec<LiteralArray> = Vec::with_capacity(offsets.len());
+    let mut decoded = 0usize;
+    while decoded < offsets.len() {
+        let mut nested: Vec<u32> = Vec::new();
+        for &off in &offsets[decoded..] {
             let mut ctx = crate::literal::LiteralCollectCtx {
                 file: f,
                 strings: strings as *mut StringPool,
@@ -1528,9 +1542,28 @@ fn decode_literal_arrays(
                     &mut ctx as *mut crate::literal::LiteralCollectCtx as *mut c_void,
                 );
             }
-            Some(LiteralArray { values: ctx.values })
-        })
-        .collect();
+            for value in &ctx.values {
+                if let LiteralValue::LiteralArray(idx) = value {
+                    let target = idx.0;
+                    if target != ABSENT
+                        && !offset_to_index.contains_key(&target)
+                        && !module_data_offsets.contains(&target)
+                        && !phase_blob_offsets.contains(&target)
+                    {
+                        nested.push(target);
+                    }
+                }
+            }
+            arrays.push(LiteralArray { values: ctx.values });
+        }
+        decoded = offsets.len();
+        nested.sort_unstable();
+        nested.dedup();
+        for off in nested {
+            offset_to_index.insert(off, offsets.len() as u32);
+            offsets.push(off);
+        }
+    }
 
     // Rewrite nested references (file offset → table index).
     for arr in &mut arrays {
