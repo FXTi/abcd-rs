@@ -17,7 +17,7 @@ data-path panic) · **P1** rule violation (hand mirrors, layering, missing
 guards, sentinel contract) or material doc-vs-code mismatch · **P2** design
 quality / dead code / test gaps.
 
-Status: **all findings triaged and fixed in Phase 0.5** (commits listed below), except items explicitly deferred to the Phase 5 sweep (dead-surface policy, README rewrites #20/#21, callback-contract docs #15, CI duplicate-file protection #22) and the follow-up register below.
+Status: **all findings triaged and fixed in Phase 0.5** (commits listed below), except items explicitly deferred to the Phase 5 sweep (dead-surface policy, CI duplicate-file protection #22 — maintainer chose "leave as is") and the follow-up register below. **Phase 5 sweep update (worker P5-T1): the deferred items are now done** — dead `literal_val_to_c` deleted (2e38fbe), double-finalize investigated and the claim disproved (69a4cd8, see the correction note in the P2 section), callback early-stop contract documented in file_bridge.h (#15, 58af748), both -sys READMEs rewritten (#20/#21, 92a5cbb), abcd-file README drift fixed (ab17b40), and the P2 test-gap list triaged with 3 cheap tests added (ba7e40e).
 
 ## Summary
 
@@ -339,9 +339,18 @@ extract.
   `END_SEQUENCE`; truncated LNP yields garbage rows — bounded in practice by
   the 16-byte open padding, so P2 with a note that finding #3 must be fixed
   first. No upstream length guarantee exists (debug_data_accessor-inl.h:67-73).
-- `abc_builder_finalize` twice on one builder duplicates literal items and
+- ~~`abc_builder_finalize` twice on one builder duplicates literal items and
   re-applies code relocations (`literal_items_staging`/`code_id_relocations`
-  never cleared; `lnp_staging` is — inconsistent).
+  never cleared; `lnp_staging` is — inconsistent).~~ **CORRECTION (Phase 5,
+  69a4cd8): false positive.** Vendored `LiteralArrayItem::AddItems` is
+  `items_.assign` (replace, not append), so re-flushing the retained staging
+  is idempotent; vendored `BytecodeInst::UpdateId` overwrites the operand
+  field, so re-applying relocations is idempotent when layout is unchanged
+  and corrective when it shifted. The retained staging is load-bearing for
+  items staged after a first finalize — clearing it would introduce the
+  very data loss the finding warned about. Behavior pinned by
+  `abcd-file/tests/double_finalize.rs`; rationale documented at the
+  staging fields in `file_bridge.cpp`.
 - `component_type_from_tag` default silently maps unknown tags to U32;
   builder accepts any annotation tag char unchecked.
 - `CheckFileVersion` stub is no-op; unsupported versions pass silently.
@@ -403,6 +412,13 @@ extract.
   v24 index-region literal collection, foreign/is_external encode
   roundtrip, `method_add_param`/`method_param_add_*`, both dedup variants,
   double-finalize behavior.
+  **Phase 5 triage (ba7e40e)**: only 3 remained genuinely open and cheap —
+  typed-array literal decode at the model level, foreign/is_external
+  decode→encode→decode roundtrip, and the two split dedup variants — all
+  added. The rest were already covered by Phase 0.5 regressions or later
+  work, except foreign-member annotation ENCODE roundtrip, which stays
+  registered: it is blocked on the foreign-member entity model gap (the
+  #6/#7 fix note), and phase05 pins the loud failure instead.
 
 ---
 

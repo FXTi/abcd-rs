@@ -450,11 +450,22 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   surface policy (108/324 in-repo-unused exports — publish-shaped crates,
   needs maintainer decision, NOT a delete list); 12.x builder
   `abc_method_has_valid_proto` behavior matches #A7 (no action).
-- Deferred to Phase 5 sweep: dead `literal_val_to_c`, builder second-finalize
-  staging not cleared, -sys README rewrites (#20/#21), callback early-stop
-  docs (#15), abcd-file README drift (6 items), P2 test-gap list, CI
-  duplicate-vendor-file protection (#22 — maintainer chose "leave as is",
-  revisit only if drift ever appears).
+- Phase 5 sweep (worker P5-T1, 2026-09-20): DONE — dead `literal_val_to_c`
+  deleted; builder second-finalize claim DISPROVED (AddItems=assign,
+  UpdateId=overwrite make retained staging idempotent and load-bearing;
+  contract pinned by abcd-file/tests/double_finalize.rs); N18 dead-island
+  sweep at lift (augmented reachability — the literal terminator-only rule
+  deletes live catch bodies, corpus-probe-proven); N49 hard
+  LowerError::ZeroExtentBlock; N50 TryLoadGlobalByName/LoadSuperProperty
+  essential (byte-neutral); #15 callback early-stop contract documented in
+  file_bridge.h; #20/#21 -sys READMEs rewritten; abcd-file README 6 drift
+  items fixed; P2 test gaps triaged (3 added, rest registered). Final
+  checkpoint: rewrite 1149/1149 both variants zero skips, VM oracle
+  1149/1149 both variants (image sha256:5e7627…). New: N52 typed ARRAY_*
+  literal values keep raw file offsets inside LiteralArrayIdx (no
+  offset→index rewrite, unlike LiteralValue::LiteralArray) — model wart,
+  no corpus trigger. CI duplicate-vendor-file protection (#22 — maintainer
+  chose "leave as is", revisit only if drift ever appears).
 - Phase 1 started 2026-09-18: lower correctness (out-of-SSA cycle breaking at
   SLOT level with a reserved real temp register, edge-correct phi-copy
   placement for conditional predecessors, val_reg spill slots moved into the
