@@ -221,9 +221,25 @@ pub fn layout(
     let mut final_offsets: HashMap<Block, usize> = HashMap::new();
 
     for &bb in rpo {
-        final_offsets.insert(bb, flat.len());
+        let start = flat.len();
+        final_offsets.insert(bb, start);
         if let Some(codes) = block_codes.get(&bb) {
             flat.extend(codes.iter().cloned());
+        }
+        // N49: every block must emit at least one bytecode. On verified IR
+        // this is guaranteed — every block ends in a terminator and every
+        // terminator arm of `select_inst` emits >= 1 bytecode — so flat
+        // offsets are strictly increasing and the next-greater-offset
+        // extent in `reconstruct_try_blocks` is exactly `[own, next)`. A
+        // zero-emission block (reachable only via unverified input: a
+        // block with no terminator) would alias the next block's offset,
+        // and its extent would swallow the following block into this one's
+        // try/handler range — silent exception misdispatch. Fail loudly.
+        if flat.len() == start {
+            return Err(LowerError::ZeroExtentBlock {
+                func: func_id,
+                block: bb,
+            });
         }
     }
     for (key, codes) in &trampolines {
@@ -338,7 +354,12 @@ fn reconstruct_try_blocks(
 
     // Extent of a block in the flat stream: [offset, next greater offset).
     // Trampoline offsets sort after every real block, so a range end never
-    // extends over a trampoline.
+    // extends over a trampoline. Correctness depends on strictly
+    // increasing block offsets (N49): layout hard-errors
+    // (`LowerError::ZeroExtentBlock`) on any block that emits zero
+    // bytecodes, so the "next greater offset" is always the IMMEDIATELY
+    // following block's start — a zero-extent block can never swallow its
+    // successor into this range.
     let extent_of = |bb: Block| -> Option<(usize, usize)> {
         let &start = block_offsets.get(&bb)?;
         let end = block_offsets

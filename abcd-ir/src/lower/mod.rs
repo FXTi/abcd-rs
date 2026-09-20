@@ -100,6 +100,13 @@ pub enum LowerError {
         pred: Block,
         succ: Block,
     },
+    #[error(
+        "function {func:?}: block {block:?} emitted zero bytecodes — inconsistent input (a \
+         block with no terminator). Its flat offset would alias the next block's, and the \
+         next-greater-offset extent in try/handler range reconstruction would swallow the \
+         following block into this one's range (N49)"
+    )]
+    ZeroExtentBlock { func: FuncId, block: Block },
 }
 
 /// Lower a single IR function back to bytecodes.
