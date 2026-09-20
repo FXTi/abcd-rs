@@ -358,6 +358,20 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
 
 ## Phase 5 outcome (done, 2026-09-21)
 
+- IR v0.2 TRACK STATUS (2026-09-21, P0-P1 done): abcd-ir2 scaffold
+  (taxonomy ~70 ops incl. v2-P0.5 full ISA coverage, Effects, Ty lattice,
+  verifier with N45/N27/N38 rules) + abcd-lift converter (v2-P1:
+  57f336f+6ab12b7) — **full-corpus parity achieved: 2787/2787 fixtures
+  lift, 0 verifier errors, 0 mismatches over 12,996 functions /
+  1,434,154 canonical tokens vs the v0.1 lift** (function count == upstream
+  pandasm method count). Comparator at abcd-lift/tests/common/compare.rs
+  (canonical op-name/operand-role/value-renumbered/constant-by-value
+  stream comparison, proven non-vacuous). v2-P1a (6d1fcd0) fixed the
+  abcd-file nested-literal-array decode model gap (57 sendable fixtures;
+  worklist collection, cycle-safe, N20-deterministic). N56 registered:
+  Builder module-blob staging suspicion (needs diagnosis). PAUSED per
+  maintainer request before v2-P2 (lower: biggest remaining task —
+  v0.1 lower port to v0.2 Module with VM oracle parity gate).
 - MAINTAINER DECISIONS (2026-09-21): D1 = build IR v0.2 (first design it,
   compare v0.1 + Hermes; the IR must ALSO serve future FlowDroid-style
   taint analysis). Design at design/ir-v0.2.md (requirements T1-T10,
