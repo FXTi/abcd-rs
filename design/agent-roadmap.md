@@ -236,3 +236,14 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 - 审计期间 abcd-isa-sys / abcd-isa / abcd-file-sys / abcd-file 冻结功能性改动（允许新增测试文件）。
 - findings 必须有 file:line 证据；不接受无指向的结论。
 - 修复走项目既有评审流程：逐 commit + 回归测试 + design 状态列更新。
+
+## IR v0.2 任务登记（2026-09-21 开工；设计 design/ir-v0.2.md，维护者已批 D1+三问）
+
+| # | 任务 | 执行者 | 状态 |
+|---|------|--------|------|
+| v2-P0 | abcd-ir2 骨架：taxonomy + Effects + Ty + verifier 骨架（零格式依赖 Cargo 强制） | worker v2-P0 (k3) | **进行中** |
+| v2-P1 | lift：decode(v0.1 File) → v0.2 Module，全语料结构验证 + 与 v0.1 lift 对照 | 待定 | 未开始 |
+| v2-P2 | lower：v0.2 Module → MethodBody（复用重定位通道），VM oracle 对齐 1149/1149×2 | 待定 | 未开始 |
+| v2-P3 | pass 移植：SCCP/copyprop/DCE/peephole（T3 Effects 表），opt 变体 oracle 对齐 | 待定 | 未开始 |
+| v2-P4 | 替换：v0.1 退役为 abcd-ir-v1 留档，abcd-ir2 正名 abcd-ir | 待定 | 未开始（维护者验收后执行） |
+| v2-P5 | abcd-taint 脚手架：调用图 + IFDS 骨架 + top-20 builtin 摘要注册，语料 print sink 冒烟 | 待定 | 未开始 |
