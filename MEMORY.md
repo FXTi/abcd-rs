@@ -356,6 +356,32 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   stale; the table is the single source of truth). The IR v0.2 decision
   point is a MAINTAINER decision — stop there.
 
+## Phase 5 outcome (done, 2026-09-21)
+
+- P5-T1/P5-T2 (2e38fbe…823abc8) — mechanical sweep complete (dead
+  literal_val_to_c, callback docs #15, both -sys READMEs rewritten,
+  abcd-file README ×6 drifts, P2 test-gap triage); N18 dead-island sweep
+  via augmented reachability (480 blocks, zero handler casualties on 2787
+  fixtures); N49 hard LowerError::ZeroExtentBlock; N50 essential loads.
+  Format layer: F-new-1 root-caused to OUR bridge (LNP offsets baked
+  before literal staging was applied → stale SET_FILE strings; fixed by
+  flushing staging before any offset-baking layout pass); F-new-2 fixed
+  (annotation-embedded LA method refs resolve through entity handles;
+  '#' annotation elements are scalar per vendored pandasm); N7 fixed
+  (moduleRequestPhaseIdx blobs modeled; lazy imports no longer silently
+  eager on rewrite); N8 adjudicated (typeSummaryOffset IS a file offset
+  but has no vendored producer/consumer — registered with fix sketch);
+  N15 fixed (defineclasswithbuffer imm2 IS the constructor .length —
+  P3-T8's "runtime ignores it" was wrong); N16 fixed
+  (deprecated.callspread dropped its args array and became a construct —
+  split CallKind::NewObjApply). Two audit claims disproved with evidence
+  and corrected: the double-finalize "staging not cleared" finding (FALSE
+  POSITIVE — vendored AddItems is assign, UpdateId overwrites; retained
+  staging is load-bearing) and the N18 literal sweep rule (would have
+  deleted 1146 LIVE catch bodies). New registrations N52-N55 in the
+  reconciliation table (v0.2 material). Final state: rewrite 1149/1149
+  zero skips, VM oracle 1149/1149 on BOTH variants, deterministic bytes.
+
 ## Phase 1 outcome (done, 2026-09-19)
 
 - Four commits: 30d254a (red tests) → 0620a12 (B1/B2 fix) → 99e5a52 (B3 fix)

@@ -14,7 +14,7 @@
 | Phase 2 | VM oracle 证据链（corpus_lower_oracle → 1119 passed fixture 全量） | **完成（2026-09-20：双变体 VM oracle 1119/1119）** |
 | Phase 3 | P1 漏洞 + V 族语义簇 + 优化器正确性 | **完成（2026-09-20，P3-T1…T22；见下方登记）** |
 | Phase 4 | 证据升级（真实 9/11 读验证、pandasm 逐指令对照、补 fixture） | **完成**（2026-09-20，P4-T6；orchestrator 复验：逐指令套件 6/6、oracle 1149/1149×2 复跑一致） |
-| Phase 5 | 清扫（死依赖、-sys README、panic 路径）+ FormatProfile 评估 + IR v0.2 决策点 | **进行中** |
+| Phase 5 | 清扫（死依赖、-sys README、panic 路径）+ FormatProfile 评估 + IR v0.2 决策点 | **完成**（2026-09-21，P5-T1+P5-T2；决策简报 design/phase5-decision-briefing.md 待维护者拍板 D1-D4） |
 
 ## Phase 0 任务登记
 
@@ -229,7 +229,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | N53 | `callruntime.definesendableclass` 塌缩进 InstData::DefineClassWithBuffer 且 isel 重发**当代** defineclasswithbuffer——opcode 身份损坏（sendable 语义走 RuntimeCreateSharedClass，与 RuntimeCreateClassWithBuffer 不同 stub），N26 同类。语料 24.0.0.0 sendable-class fixture 均 runtime not-applicable 且不进重写集 → 潜伏。P5-T2 于 N15 修复时发现 | 🔲 登记（v0.2 定夺：建模 SendableClass 变体或硬错误） |
 | N54 | `deprecated.defineclasswithbuffer` lift 操作数角色损坏：vendor 运行时读 v1=lexenv、v2=proto（interpreter_assembly.cpp:4625-4648），我们 lift 以 v1 为 base(proto)、丢 v2（且当代形从帧 env 取 lexenv）——双重角色错。语料零 fixture（reference.pa 全 grep 无）→ 潜伏 | 🔲 登记（同上） |
 | N55 | decode 给无 debug info 项的方法捏造 `debug: Some(source_file: Some(""))`（vendor DebugInfoExtractor::GetSourceFile 对缺失条目返回 ""，debug_info_extractor.cpp:318-324；decode.rs:415 无条件 Some 包装）；且 vendor extractor 遇 file_=EntityId(0) 的 debug 项时 GetSpanFromId 抛 INVALID_FILE_OFFSET（file.h:190）→ 整文件 debug 区全灭。encode 侧已修（980ec16：空 debug 字符串不算内容，不再发射退化 debug 项）；decode 模型 wart 留存 | 📝 encode 侧已修（980ec16）；decode wart 待 v0.2 |
-| P5-T2 | 对账表遗留批：F-new-1 / F-new-2 / N7 / N8 / N15 / N16 | worker P5-T2 (k3) | **完成**（980ec16 F-new-1 / 8a6671f F-new-2 / 71adc56 N7 / 3ed4228 N15 / 53ba936 N16 + N8 裁决登记；逐条 red-first 远端实证；终态检查点：重写 lift 1149/1149 opt 1149/1149 零 skip 直方图空，与 /tmp/t51-verify 字节差集恰为 class-accessors+module-exports 两族 36 文件/变体且 pandasm 逐文件仅 defineclasswithbuffer imm2 一行 0x0→0x1（=N15 语义修正），本地 docker oracle 双变体 1149/1149（image sha256:5e7627…）；新登记 N53/N54/N55；remote run 目录已清理） |
+| P5-T2 | 对账表遗留批：F-new-1 / F-new-2 / N7 / N8 / N15 / N16 | worker P5-T2 (k3) | **完成**（980ec16 F-new-1 / 8a6671f F-new-2 / 71adc56 N7 / 3ed4228 N15 / 53ba936 N16 + N8 裁决登记；逐条 red-first 远端实证；终态检查点：重写 lift 1149/1149 opt 1149/1149 零 skip 直方图空，与 /tmp/t51-verify 字节差集恰为 class-accessors+module-exports 两族 36 文件/变体且 pandasm 逐文件仅 defineclasswithbuffer imm2 一行 0x0→0x1（=N15 语义修正），本地 docker oracle 双变体 1149/1149（image sha256:5e7627…）；新登记 N53/N54/N55；remote run 目录已清理）**；orchestrator 复验通过（fmt/101 套件绿、差集精确 72 文件=N15、oracle 双 1149/1149 复跑一致、容器零残留；F-new-1 bridge 修复机制对 vendor 烘焙序实证）** |
 
 ## 审计纪律
 
