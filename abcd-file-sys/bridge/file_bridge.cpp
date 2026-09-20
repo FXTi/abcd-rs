@@ -2474,6 +2474,13 @@ struct AbcBuilder {
         uint32_t operand;
         panda::panda_file::IndexedItem *target;
     };
+    // Registered code-id relocations, applied at finalize after layout.
+    // Deliberately NOT cleared at finalize: vendored
+    // BytecodeInst::UpdateId overwrites the operand field (plain Write), so
+    // re-applying is idempotent when layout is unchanged and CORRECTIVE when
+    // items added after a first finalize shifted the layout (clearing would
+    // leave the old patches stale). Pinned by
+    // abcd-file/tests/double_finalize.rs.
     std::vector<CodeIdRelocation> code_id_relocations;
     std::vector<FieldItem *> fields;
     std::vector<CodeItem *> code_items;
@@ -2500,7 +2507,13 @@ struct AbcBuilder {
     std::vector<ForeignFieldItem *> foreign_fields;
     std::vector<ForeignMethodItem *> foreign_methods;
     std::vector<MethodHandleItem *> method_handle_items;
-    // Staged literal items: flushed to LiteralArrayItem in finalize
+    // Staged literal items: flushed to LiteralArrayItem in finalize.
+    // Deliberately NOT cleared at finalize: vendored LiteralArrayItem::AddItems
+    // is items_.assign (replace, not append), so re-flushing is idempotent,
+    // and retaining the staging keeps items staged AFTER a first finalize
+    // accumulating correctly (a cleared staging + assign would drop the
+    // earlier items). Second finalize is therefore byte-identical — pinned by
+    // abcd-file/tests/double_finalize.rs.
     std::vector<std::vector<panda::panda_file::LiteralItem>> literal_items_staging;
     // Staged line-number-program ops: flushed after the first ComputeLayout
     std::vector<AbcStagedLnpOp> lnp_staging;
@@ -3967,7 +3980,10 @@ const uint8_t *abc_builder_finalize_with_code_ids(AbcBuilder *b, uint32_t *out_l
         // Flush staged line-number-program ops (their operands encode item
         // offsets, so the flush runs its own layout pass first)
         abc_builder_flush_lnp_staging(b);
-        // Flush staged literal items to their LiteralArrayItems
+        // Flush staged literal items to their LiteralArrayItems. AddItems
+        // replaces (assign), so a second finalize re-flushes the same set —
+        // idempotent, not duplicated. The staging is intentionally retained
+        // (see the field comment).
         for (size_t i = 0; i < b->literal_items_staging.size(); i++) {
             if (!b->literal_items_staging[i].empty()) {
                 b->literal_arrays[i]->AddItems(b->literal_items_staging[i]);
