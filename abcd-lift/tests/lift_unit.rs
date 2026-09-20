@@ -243,7 +243,7 @@ fn module_record_becomes_declarations() {
         b.class_add_method(global, "main", proto, AccessFlags::STATIC, &code, 0, 0);
     });
 
-    let mut m = lift_file(&file).expect("lift");
+    let m = lift_file(&file).expect("lift");
     verify_clean(&m);
 
     // Imports.
@@ -508,7 +508,7 @@ fn debug_locals_lines_and_params() {
         b.method_set_debug_info(m, debug);
     });
 
-    let mut m = lift_file(&file).expect("lift");
+    let m = lift_file(&file).expect("lift");
     verify_clean(&m);
     let f = &m.functions[0];
     let debug = f.debug.as_ref().expect("debug data");
