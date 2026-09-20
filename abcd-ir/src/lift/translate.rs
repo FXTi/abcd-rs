@@ -365,67 +365,23 @@ pub(super) fn translate_bytecode(
                 loc,
             );
         }
-        Bytecode::Ldthisbyname(_ic, eid) => {
-            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
-            let this = emit_val(module, block, InstData::LoadThis, loc);
-            let v = emit_val(
-                module,
-                block,
-                InstData::LoadProperty {
-                    object: this,
-                    key: PropKind::ByName(name),
-                },
-                loc,
-            );
-            write_acc(ssa, block, v);
+        // N51: the `this-by-*` family (isa.yaml:1627-1642) is IC-fused
+        // `this` property access that es2panda NEVER emits (`this[k] = v`
+        // compiles to `ldthis` + `stobjbyvalue`; upstream source grep zero
+        // hits). Zero corpus coverage means no VM evidence for the IC
+        // semantics — hard error, never silently lowered (maintainer
+        // ruling 2026-09-20).
+        Bytecode::Ldthisbyname(..) => {
+            return Err(LiftError::UnsupportedThisByAccess("ldthisbyname"));
         }
-        Bytecode::Stthisbyname(_ic, eid) => {
-            let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
-            let value = read_acc(ssa, block, module);
-            let this = emit_val(module, block, InstData::LoadThis, loc);
-            emit_void(
-                module,
-                block,
-                InstData::StoreProperty {
-                    object: this,
-                    key: PropKind::ByName(name),
-                    value,
-                },
-                loc,
-            );
+        Bytecode::Stthisbyname(..) => {
+            return Err(LiftError::UnsupportedThisByAccess("stthisbyname"));
         }
-        Bytecode::Ldthisbyvalue(_ic) => {
-            let key = read_acc(ssa, block, module);
-            let this = emit_val(module, block, InstData::LoadThis, loc);
-            let v = emit_val(
-                module,
-                block,
-                InstData::LoadProperty {
-                    object: this,
-                    key: PropKind::ByValue(key),
-                },
-                loc,
-            );
-            write_acc(ssa, block, v);
+        Bytecode::Ldthisbyvalue(..) => {
+            return Err(LiftError::UnsupportedThisByAccess("ldthisbyvalue"));
         }
-        Bytecode::Stthisbyvalue(_ic, key_reg) => {
-            // Vendor `stthisbyvalue imm:u16, v:in:top, acc: in:top`
-            // (isa.yaml:1642-1646): receiver = this, v = propKey, acc =
-            // VALUE (`propKey = GET_VREG_VALUE(v0)`, `value =
-            // GET_ACC()`, interpreter_assembly.cpp:6195-6257).
-            let value = read_acc(ssa, block, module);
-            let this = emit_val(module, block, InstData::LoadThis, loc);
-            let key = read_reg(ssa, *key_reg, block, module);
-            emit_void(
-                module,
-                block,
-                InstData::StoreProperty {
-                    object: this,
-                    key: PropKind::ByValue(key),
-                    value,
-                },
-                loc,
-            );
+        Bytecode::Stthisbyvalue(..) => {
+            return Err(LiftError::UnsupportedThisByAccess("stthisbyvalue"));
         }
         Bytecode::Ldsuperbyname(_ic, eid) => {
             let name = resolve(file, body, module, *eid, EntityKind::StringId)?;
