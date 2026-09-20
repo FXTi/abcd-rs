@@ -3229,10 +3229,33 @@ try {
  * which do not exist before layout. Flushing happens in finalize and in
  * every dedup entry point (dedup must hash fully-built programs). */
 
+/* Flush staged literal items to their LiteralArrayItems. AddItems replaces
+ * (assign), so re-flushing is idempotent, and the staging is intentionally
+ * retained (see the field comment): items staged after a first finalize keep
+ * accumulating correctly.
+ *
+ * This MUST run before any layout pass whose offsets get baked into other
+ * items (F-new-1): the LNP flush below bakes StringItem offsets into debug
+ * constant pools, and applying the staged items grows the LiteralArrayItems,
+ * shifting every item laid out after them in the container's
+ * creation-ordered list. Previously the bake happened against a layout
+ * computed while the arrays were still empty, so string items created after
+ * a literal array (P3-era: ALL strings when arrays were created before
+ * classes) kept stale offsets — observed as SET_FILE decoding "main.js" as
+ * "n_0". */
+static void abc_builder_flush_literal_staging(AbcBuilder *b) {
+    for (size_t i = 0; i < b->literal_items_staging.size(); i++) {
+        if (!b->literal_items_staging[i].empty()) {
+            b->literal_arrays[i]->AddItems(b->literal_items_staging[i]);
+        }
+    }
+}
+
 static void abc_builder_flush_lnp_staging(AbcBuilder *b) {
     if (b->lnp_staging.empty()) {
         return;
     }
+    abc_builder_flush_literal_staging(b);
     b->container.ComputeLayout();
     for (const auto &op : b->lnp_staging) {
         if (op.lnp >= b->lnps.size()) continue;
@@ -3978,17 +4001,11 @@ const uint8_t *abc_builder_finalize_with_code_ids(AbcBuilder *b, uint32_t *out_l
     try {
         BuilderVersionScope version_scope(b);
         // Flush staged line-number-program ops (their operands encode item
-        // offsets, so the flush runs its own layout pass first)
+        // offsets; the flush applies the literal staging first — F-new-1 —
+        // then runs its own layout pass).
         abc_builder_flush_lnp_staging(b);
-        // Flush staged literal items to their LiteralArrayItems. AddItems
-        // replaces (assign), so a second finalize re-flushes the same set —
-        // idempotent, not duplicated. The staging is intentionally retained
-        // (see the field comment).
-        for (size_t i = 0; i < b->literal_items_staging.size(); i++) {
-            if (!b->literal_items_staging[i].empty()) {
-                b->literal_arrays[i]->AddItems(b->literal_items_staging[i]);
-            }
-        }
+        // Flush staged literal items (no-op if the LNP flush already did).
+        abc_builder_flush_literal_staging(b);
         b->container.ComputeLayout();
         for (const auto &reloc : b->code_id_relocations) {
             if (!updater || !reloc.target->HasIndex(reloc.owner)) return nullptr;

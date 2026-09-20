@@ -2261,12 +2261,22 @@ fn encode_debug_info(
     code_len: u32,
 ) -> Result<(), Error> {
     // Skip if debug info is completely empty (no meaningful content).
+    // Decode surfaces methods WITHOUT a debug info item as
+    // `Some(MethodDebugInfo { source_file: Some(""), .. })` — the vendored
+    // extractor's GetSourceFile returns "" for missing entries
+    // (debug_info_extractor.cpp:318). Counting that invented empty string as
+    // content would emit a degenerate debug item whose LNP never SET_FILEs;
+    // the vendored extractor then reads string offset 0
+    // (GetSpanFromId throws INVALID_FILE_OFFSET, file.h:190) and the whole
+    // file's debug region dies on the next decode. Empty strings are not
+    // content (the emitters below skip them too).
+    let non_empty = |sid: StringId| !pool.resolve(sid).unwrap_or("").is_empty();
     let has_content = !dbg.line_table.is_empty()
         || !dbg.column_table.is_empty()
         || !dbg.local_vars.is_empty()
         || !dbg.params.is_empty()
-        || dbg.source_file.is_some()
-        || dbg.source_code.is_some();
+        || dbg.source_file.is_some_and(non_empty)
+        || dbg.source_code.is_some_and(non_empty);
     if !has_content {
         return Ok(());
     }
