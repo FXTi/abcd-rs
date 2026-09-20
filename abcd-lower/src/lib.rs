@@ -205,3 +205,72 @@ pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, 
     // Step 4: Layout and jump resolution.
     layout::layout(module, func_id, &isel_result, &alloc, &rpo)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::lower_function;
+    use abcd_ir2::{Block, BlockId, ClassId, FuncId, FunctionData, FunctionKind, Inst, InstId, Module, Op, Ty, Value, ValueDef, ValueId};
+
+    /// N25 (v0.1 parity): the name is the runtime VALUE in the register
+    /// operand (vendor `throw.constassignment v:in:top, acc: none`,
+    /// isa.yaml:987-991) — lowering succeeds and emits the name's
+    /// register home, never a hardcoded Reg(0).
+    #[test]
+    fn const_assignment_lowers_with_the_name_register() {
+        let mut module = Module::new();
+        let descriptor = module.sym.intern("Ltest;");
+        module.classes.push(abcd_ir2::ClassData {
+            descriptor,
+            name: descriptor,
+            modifiers: abcd_ir2::Modifiers::NONE,
+            source_lang: abcd_ir2::SourceLang::EcmaScript,
+            super_class: None,
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            annotations: Vec::new(),
+            source_file: None,
+        });
+        let name_sym = module.sym.intern("f");
+        let func = FuncId::new(0);
+        module
+            .functions
+            .push(FunctionData::new(ClassId::new(0), name_sym, FunctionKind::Function));
+        let entry = BlockId::new(0);
+        module.blocks.push(Block::default());
+        module.functions[0].blocks.push(entry);
+        // One parameter (the name value).
+        let param = ValueId::new(0);
+        module.values.push(Value {
+            def: ValueDef::Param(0),
+            ty: Ty::Any,
+        });
+        module.functions[0].params.push(param);
+        let throw = InstId::new(0);
+        module.insts.push(Inst {
+            op: Op::ThrowConstAssignment { name: param },
+            result: None,
+            block: entry,
+            loc: None,
+        });
+        let ret = InstId::new(1);
+        module.insts.push(Inst {
+            op: Op::Return { value: None },
+            result: None,
+            block: entry,
+            loc: None,
+        });
+        module.blocks[0].insts.push(throw);
+        module.blocks[0].insts.push(ret);
+
+        let result = lower_function(&module, func).expect("throw.constassignment must lower");
+        assert!(
+            result
+                .bytecodes
+                .iter()
+                .any(|bc| matches!(bc, abcd_isa::Bytecode::ThrowConstassignment(_))),
+            "the lowered stream must contain throw.constassignment: {:?}",
+            result.bytecodes
+        );
+    }
+}

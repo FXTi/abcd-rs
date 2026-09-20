@@ -1267,11 +1267,14 @@ fn select_inst(
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         Op::StoreGlobal { name, value } => {
-            // (N61 transitional state: trystglobalbyname sources also
-            // lift here — a reported IR gap. P2c's `Op::TryStoreGlobal`
-            // takes that arm.)
             ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Stglobalvar(ic.one(), tracer.eid(*name)));
+        }
+        Op::TryStoreGlobal { name, value } => {
+            // The tolerant store (N61; v0.1 `TryStoreGlobalByName`):
+            // acc := value, then trystglobalbyname with ONE IC slot.
+            ensure_acc(tracker, func_id, *value, alloc, codes)?;
+            codes.push(Bytecode::Trystglobalbyname(ic.one(), tracer.eid(*name)));
         }
 
         // ── Lexical variables ────────────────────────────────────────

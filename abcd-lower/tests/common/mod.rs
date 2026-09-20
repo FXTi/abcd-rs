@@ -2,6 +2,11 @@
 //! a minimal deterministic bytecode interpreter (ported verbatim from
 //! v0.1 `abcd-ir/tests/common`) and a small hand-builder for v0.2 IR
 //! modules (abcd-ir2 has no IRBuilder — tests construct modules directly).
+//!
+//! Every test target compiles this shared module separately and uses a
+//! different subset of the helpers — allow dead code module-wide (the
+//! same policy as v0.1's per-helper `#[allow(dead_code)]`s).
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 
