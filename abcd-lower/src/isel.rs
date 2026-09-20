@@ -242,18 +242,14 @@ pub fn select(
         .flat_map(|region| region.catches.iter().map(|c| c.handler))
         .collect();
 
-    // Used frame-initial constants (v0.1's entry-top seed literals):
-    // materialized at the entry block top, LATER-CREATED FIRST — v0.1
-    // inserted each new seed at entry index 0, so the entry block began
-    // with the seeds in reverse creation order.
-    let mut entry_consts: Vec<ValueId> = Vec::new();
-    for &val in &used {
-        if matches!(module.value(val).map(|v| v.def), Some(ValueDef::Const(_)))
-            && alloc.allocation.contains_key(&val)
-        {
-            entry_consts.push(val);
-        }
-    }
+    // Frame-initial constants owned by this function (v0.1's entry-top
+    // seed literals), materialized at the entry block top, LATER-CREATED
+    // FIRST — v0.1 inserted each new seed at entry index 0, so the entry
+    // block began with the seeds in reverse creation order. UNUSED seeds
+    // are materialized too: v0.1 emits the seed's load unconditionally
+    // (only the `Sta` is use-gated) and an unused seed's load leaves the
+    // acc tracker `Unknown`.
+    let mut entry_consts = regalloc::frame_init_consts(module, func_id);
     entry_consts.sort_unstable_by(|a, b| b.cmp(a)); // descending id = reverse creation
 
     // N21 pinned stores for handler-block phis, grouped by emission point.
@@ -278,6 +274,11 @@ pub fn select(
                     .inst(i)
                     .is_some_and(|inst| !inst.op.is_phi() && inst.block == pred)
             }
+            // A frame-initial const's definition site is the entry-block
+            // materialization: for an entry-pred handler phi, its pinned
+            // store belongs right after the materialization (after-def),
+            // never at block start (the home is written only there).
+            Some(ValueDef::Const(_)) => pred == entry_block,
             _ => false,
         };
         if defined_in_pred {
@@ -349,7 +350,10 @@ pub fn select(
 
         // Frame-initial constants (v0.1's entry-top seed literals), at the
         // head of the entry block's instruction stream — after the pinned
-        // stores, exactly where v0.1's seed instructions sat.
+        // stores, exactly where v0.1's seed instructions sat. The load is
+        // unconditional (v0.1 emits it for unused seeds too); the homing
+        // `Sta` is use-gated, and an unused seed's acc write leaves the
+        // tracker `Unknown` (v0.1's `home_result` semantics).
         if bb == entry_block {
             for &cval in &entry_consts {
                 let Some(ValueDef::Const(cid)) = module.value(cval).map(|v| v.def) else {
@@ -357,9 +361,25 @@ pub fn select(
                 };
                 let bc = const_load_bytecode(module, cid, func_id, &mut tracer)?;
                 codes.push(bc);
-                let r = home_of(func_id, cval, alloc)?;
-                emit_sta_home(func_id, r, alloc, &mut codes)?;
-                tracker = AccContent::Holds(cval);
+                if used.contains(&cval) {
+                    let r = home_of(func_id, cval, alloc)?;
+                    emit_sta_home(func_id, r, alloc, &mut codes)?;
+                    tracker = AccContent::Holds(cval);
+                } else {
+                    tracker = AccContent::Unknown;
+                }
+                // N21 after-def pinned stores keyed by this const value:
+                // the materialization is its definition site (v0.1's seed
+                // instruction — the store runs right after its `Sta`).
+                if let Some(stores) = after_def_stores.get(&cval) {
+                    for &(_, dst) in stores {
+                        let d = home_of(func_id, dst, alloc)?;
+                        let s = home_of(func_id, cval, alloc)?;
+                        if s != d {
+                            codes.push(Bytecode::Mov(Reg(d), Reg(s)));
+                        }
+                    }
+                }
             }
         }
 

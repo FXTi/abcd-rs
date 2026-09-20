@@ -183,6 +183,63 @@ fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir2::In
     }
 }
 
+/// The frame-initial constant values owned by `func_id` — v0.1's
+/// entry-top seed literals, including UNUSED ones (v0.1 colors them and
+/// emits their loads unconditionally; only the `Sta` is use-gated).
+///
+/// v0.2's `ValueDef::Const` values carry no owning-function back-pointer,
+/// but the lift creates values function-by-function in function-table
+/// order, so each function's values form a contiguous id range. A const
+/// value is attributed to the function whose range contains it: the
+/// function with the greatest anchor minimum ≤ the const's id, where a
+/// function's anchors are its params, exception params, and instruction
+/// results (all function-scoped by construction).
+///
+/// Boundary note: a const created as a 0-parameter function's VERY FIRST
+/// value (before any anchor) sorts into the previous function's range —
+/// the only placement ambiguity the id ranges cannot resolve; v0.1 would
+/// place it in the owning function. Never observed in the corpus.
+pub fn frame_init_consts(module: &Module, func_id: FuncId) -> Vec<ValueId> {
+    // Each function's anchor minimum, in function-table order.
+    let mut starts: Vec<(FuncId, u32)> = Vec::new();
+    for (i, f) in module.functions.iter().enumerate() {
+        let mut lo = u32::MAX;
+        for v in &f.params {
+            lo = lo.min(v.0);
+        }
+        for region in &f.try_regions {
+            for catch in &region.catches {
+                lo = lo.min(catch.exception.0);
+            }
+        }
+        for &bb in &f.blocks {
+            let Some(block) = module.block(bb) else { continue };
+            for &iid in &block.insts {
+                if let Some(result) = module.inst(iid).and_then(|inst| inst.result) {
+                    lo = lo.min(result.0);
+                }
+            }
+        }
+        if lo != u32::MAX {
+            starts.push((FuncId::new(i as u32), lo));
+        }
+    }
+    let mut out = Vec::new();
+    for (vid, value) in module.values.iter().enumerate() {
+        if !matches!(value.def, ValueDef::Const(_)) {
+            continue;
+        }
+        let id = vid as u32;
+        // The owning function: the last one whose anchor minimum is <= id.
+        if let Some((owner, _)) = starts.iter().rev().find(|(_, lo)| *lo <= id) {
+            if *owner == func_id {
+                out.push(ValueId::new(id));
+            }
+        }
+    }
+    out
+}
+
 /// Allocate registers for a function using SSA-based chordal coloring.
 ///
 /// `suppression` (fusion analysis) names the v0.2-expansion values that
@@ -226,9 +283,22 @@ pub fn allocate(
     }
 
     // Collect all values in the function, skipping suppressed results
-    // (v0.1-invisible expansion values — see `fusion`).
+    // (v0.1-invisible expansion values — see `fusion`). The frame-initial
+    // constants owned by this function (v0.1's entry-top seed literals,
+    // used or not) come FIRST — v0.1's seeds are the entry block's first
+    // instructions, so v0.1's scan pushes them first, in reverse creation
+    // order (each new seed was inserted at entry index 0). The insertion
+    // order matters: MCS's heap pops equal (weight, rank) keys in
+    // heap-structural order.
+    let const_values = frame_init_consts(module, func_id);
+    let entry = rpo.first().copied();
     let mut all_values: Vec<ValueId> = Vec::new();
     for &bb in &rpo {
+        if Some(bb) == entry {
+            for &c in const_values.iter().rev() {
+                all_values.push(c);
+            }
+        }
         let Some(block) = module.block(bb) else { continue };
         for &inst_id in &block.insts {
             if suppression.insts.contains(&inst_id) {
@@ -274,22 +344,6 @@ pub fn allocate(
             all_values.push(exc);
         }
     }
-    // Add the frame-initial CONSTANTS (v0.1's entry-top seed literals)
-    // that are actually used: they have no defining instruction, so the
-    // scans above never see them, but they need a register home that isel
-    // materializes at the entry block top (v0.1 parity).
-    let mut const_values: Vec<ValueId> = Vec::new();
-    for &val in &used {
-        if matches!(
-            module.value(val).map(|v| v.def),
-            Some(ValueDef::Const(_))
-        ) && !all_values.contains(&val)
-        {
-            all_values.push(val);
-            const_values.push(val);
-        }
-    }
-    const_values.sort_unstable();
 
     if all_values.is_empty() {
         return Ok(RegAlloc {
@@ -401,6 +455,12 @@ pub fn allocate(
                         forbid.insert(r);
                     }
                 }
+            }
+            // The frame-initial constants are entry-block defs (v0.1's
+            // seed literals are entry instructions, so they land in
+            // defs[entry] there).
+            if Some(pred) == entry {
+                forbid.extend(const_values.iter().copied());
             }
             for w in forbid {
                 if w != result {
@@ -767,22 +827,38 @@ fn mcs_color(
     let n = all_values.len();
     let val_set: HashSet<ValueId> = all_values.iter().copied().collect();
 
+    // MCS tie-breaking must match v0.1 byte-exactly. v0.1's heap pops
+    // (weight, value-id) max-first; v0.2's ABSOLUTE value ids are shifted
+    // by the suppressed expansion values (fusion) interleaved in the id
+    // space, which would flip equal-weight ties against v0.1. The
+    // non-suppressed values in id order are exactly v0.1's values in
+    // creation order (same translation algorithm), so rank among the
+    // non-suppressed is the correct tie-break key.
+    let mut sorted = all_values.to_vec();
+    sorted.sort_unstable();
+    let rank_of: HashMap<ValueId, u32> = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (v, i as u32))
+        .collect();
+
     // MCS: repeatedly pick the unvisited vertex with the most visited
     // neighbors. A heap avoids rescanning the complete value set for every
     // vertex on high-register-pressure methods.
     let mut weight: HashMap<ValueId, u32> = HashMap::new();
     let mut visited = HashSet::new();
     let mut mcs_order: Vec<ValueId> = Vec::with_capacity(n);
-    let mut heap: BinaryHeap<(u32, ValueId)> = BinaryHeap::new();
+    let mut heap: BinaryHeap<(u32, u32)> = BinaryHeap::new();
     for &value in all_values {
-        heap.push((0, value));
+        heap.push((0, rank_of[&value]));
     }
 
     for _ in 0..n {
         let v = loop {
-            let Some((w, value)) = heap.pop() else {
+            let Some((w, rank)) = heap.pop() else {
                 return Err(RegAllocError::RegisterOverflow);
             };
+            let value = sorted[rank as usize];
             if visited.contains(&value) || weight.get(&value).copied().unwrap_or(0) != w {
                 continue;
             }
@@ -798,7 +874,7 @@ fn mcs_color(
                 if !visited.contains(&nb) && val_set.contains(&nb) {
                     let new_weight = weight.entry(nb).or_default();
                     *new_weight += 1;
-                    heap.push((*new_weight, nb));
+                    heap.push((*new_weight, rank_of[&nb]));
                 }
             }
         }
