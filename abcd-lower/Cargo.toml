@@ -1,0 +1,17 @@
+[package]
+name = "abcd-lower"
+description = "IR v0.2 → ArkCompiler bytecode lowering (abcd_ir2::Module → abcd_file::MethodBody)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# Crate-graph invariant (design/ir-v0.2.md §8): the lower pipeline is the
+# ONLY v0.2 consumer allowed to see the format layer. It may depend on
+# `abcd-ir2` (the semantic IR), `abcd-file` + `abcd-isa` (the container
+# end), and NOTHING else from this workspace — in particular never on
+# `abcd-ir` (v0.1, frozen oracle) or `abcd-lift` (the forward direction).
+[dependencies]
+abcd-ir2 = { workspace = true }
+abcd-file = { workspace = true }
+abcd-isa = { workspace = true }
+thiserror = { workspace = true }

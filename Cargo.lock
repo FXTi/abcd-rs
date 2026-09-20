@@ -33,6 +33,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "abcd-ir2"
+version = "0.1.0"
+dependencies = [
+ "string-interner",
+ "thiserror",
+]
+
+[[package]]
 name = "abcd-isa"
 version = "0.1.0"
 dependencies = [
@@ -47,6 +55,27 @@ dependencies = [
  "bindgen",
  "bitflags",
  "cc",
+]
+
+[[package]]
+name = "abcd-lift"
+version = "0.1.0"
+dependencies = [
+ "abcd-file",
+ "abcd-ir",
+ "abcd-ir2",
+ "abcd-isa",
+ "thiserror",
+]
+
+[[package]]
+name = "abcd-lower"
+version = "0.1.0"
+dependencies = [
+ "abcd-file",
+ "abcd-ir2",
+ "abcd-isa",
+ "thiserror",
 ]
 
 [[package]]
