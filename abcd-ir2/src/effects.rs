@@ -1,0 +1,487 @@
+//! First-class per-op effects (design/ir-v0.2.md §4.2, requirement T3).
+//!
+//! [`Op::effects`] is computed mechanically from the op itself plus its
+//! operand *shapes* — never hand-maintained per pass. This table is the
+//! single source of truth that replaces v0.1's `is_essential` hand list
+//! (N48/N50): DCE, reordering, and taint propagation all read effects
+//! from here.
+//!
+//! Modelling notes (deliberate, documented):
+//!
+//! - JS coercion side effects of the dynamic compute ops (`BinaryOp`,
+//!   `UnaryOp`, `Compare` can invoke `valueOf`/`toString` on object
+//!   operands) are NOT modeled at the op level: the op alone cannot know
+//!   its operands' types (`ty` lives on values, not ops — §4.1). A
+//!   type-refined effect *refinement* (object-typed operand ⇒ may call)
+//!   is an analysis-layer extension over this baseline, not more entries
+//!   in this table.
+//! - [`CallEffect::KnownSummary`] and [`CallEffect::SelfRecursive`] are
+//!   produced by refinement (a callee-resolving analysis rewrites
+//!   `UnknownCallee`); the mechanical derivation only ever emits
+//!   `UnknownCallee` for call-capable ops.
+
+use crate::id::Sym;
+use crate::op::Op;
+
+/// A set of memory classes an op may read or write.
+///
+/// Memory is classified by *what is being accessed*, not by monolithic
+/// "the heap" (the Hermes `Unknown` collapse this design explicitly
+/// avoids — §6.3): field-sensitive taint tracks [`MemClasses::HEAP`]
+/// separately from lexical/global/module bindings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MemClasses(u8);
+
+impl MemClasses {
+    /// No memory.
+    pub const NONE: Self = Self(0);
+    /// Object properties / elements (the JS heap).
+    pub const HEAP: Self = Self(1 << 0);
+    /// Lexical environments (scope slots).
+    pub const LEX_ENV: Self = Self(1 << 1);
+    /// Global bindings.
+    pub const GLOBAL: Self = Self(1 << 2);
+    /// Module-variable slots.
+    pub const MODULE: Self = Self(1 << 3);
+    /// Iterator/generator internal state.
+    pub const ITERATOR: Self = Self(1 << 4);
+    /// Prototype chains.
+    pub const PROTOTYPE: Self = Self(1 << 5);
+    /// Every class.
+    pub const ALL: Self = Self(0x3F);
+
+    /// Whether `other` is fully contained in this set.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// Union of two sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether the set is empty.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    const NAMES: [(MemClasses, &str); 6] = [
+        (Self::HEAP, "heap"),
+        (Self::LEX_ENV, "lexenv"),
+        (Self::GLOBAL, "global"),
+        (Self::MODULE, "module"),
+        (Self::ITERATOR, "iterator"),
+        (Self::PROTOTYPE, "prototype"),
+    ];
+}
+
+impl std::ops::BitOr for MemClasses {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        self.union(rhs)
+    }
+}
+
+impl std::ops::BitOrAssign for MemClasses {
+    fn bitor_assign(&mut self, rhs: Self) {
+        *self = self.union(rhs);
+    }
+}
+
+impl std::fmt::Display for MemClasses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut first = true;
+        for (class, name) in Self::NAMES {
+            if self.contains(class) {
+                if !first {
+                    write!(f, "|")?;
+                }
+                write!(f, "{name}")?;
+                first = false;
+            }
+        }
+        if first {
+            write!(f, "none")?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether (and what) an op may call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CallEffect {
+    /// Cannot call anything.
+    #[default]
+    None,
+    /// May call an unknown callee (getters/setters, Proxy traps, coercion,
+    /// protocol methods, or a genuine call).
+    UnknownCallee,
+    /// May call a callee that has a registered external summary (T6);
+    /// produced by refinement, keyed by the summary's symbol.
+    KnownSummary(Sym),
+    /// May call the containing function (direct recursion); produced by
+    /// refinement.
+    SelfRecursive,
+}
+
+/// What an op may allocate (T7 — allocation sites are unique ops; the
+/// [`InstId`](crate::id::InstId) of the instruction is the
+/// allocation-site identity).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AllocKind {
+    /// Allocates nothing.
+    #[default]
+    None,
+    /// A plain object (also namespace/iterator wrapper objects).
+    Object,
+    /// An array.
+    Array,
+    /// A closure.
+    Closure,
+    /// A RegExp.
+    RegExp,
+    /// A generator object.
+    GeneratorObj,
+    /// May allocate arbitrary objects (calls, dynamic import) — the
+    /// conservative over-approximation of "any of the above".
+    Unknown,
+}
+
+/// The effect record of one op (§4.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Effects {
+    /// Memory classes read.
+    pub reads: MemClasses,
+    /// Memory classes written.
+    pub writes: MemClasses,
+    /// Whether the op may throw (including conditional throws).
+    pub may_throw: bool,
+    /// Whether (and what) the op may call.
+    pub may_call: CallEffect,
+    /// What the op may allocate.
+    pub allocs: AllocKind,
+}
+
+impl Effects {
+    /// No effects at all.
+    pub const PURE: Self = Self {
+        reads: MemClasses::NONE,
+        writes: MemClasses::NONE,
+        may_throw: false,
+        may_call: CallEffect::None,
+        allocs: AllocKind::None,
+    };
+
+    /// Whether the op has no observable effect (DCE-eligible when its
+    /// result is unused).
+    pub fn is_pure(&self) -> bool {
+        *self == Self::PURE
+    }
+}
+
+impl Op {
+    /// The op's effects, mechanically derived from the taxonomy (T3).
+    /// This is the single source of effect truth; passes must not
+    /// hand-maintain their own lists.
+    pub fn effects(&self) -> Effects {
+        use crate::op::Op::*;
+        let reads = |reads: MemClasses| Effects {
+            reads,
+            ..Effects::PURE
+        };
+        let writes = |writes: MemClasses| Effects {
+            writes,
+            ..Effects::PURE
+        };
+        let rw = |mem: MemClasses| Effects {
+            reads: mem,
+            writes: mem,
+            ..Effects::PURE
+        };
+        match self {
+            // Pure compute / value flow / control. (Coercion effects of
+            // dynamic operators are a type-refined extension — see module
+            // docs.)
+            BinaryOp { .. }
+            | UnaryOp { .. }
+            | Compare { .. }
+            | Mov { .. }
+            | LoadConst(_)
+            | Phi { .. }
+            | Branch { .. }
+            | CondBranch { .. }
+            | Return { .. }
+            | Unreachable => Effects::PURE,
+
+            // Allocation sites (T7).
+            AllocObject { .. } => Effects {
+                allocs: AllocKind::Object,
+                ..Effects::PURE
+            },
+            AllocArray => Effects {
+                allocs: AllocKind::Array,
+                ..Effects::PURE
+            },
+            AllocRegExp { .. } => Effects {
+                allocs: AllocKind::RegExp,
+                may_throw: true, // invalid pattern/flags
+                ..Effects::PURE
+            },
+            AllocClosure { .. } => Effects {
+                allocs: AllocKind::Closure,
+                ..Effects::PURE
+            },
+            CreateGenerator { .. } => Effects {
+                allocs: AllocKind::GeneratorObj,
+                ..Effects::PURE
+            },
+
+            // Property access (T2/T3): getters/setters/Proxy traps may
+            // run arbitrary code.
+            LoadProp { .. } | LoadPropDyn { .. } => Effects {
+                reads: MemClasses::HEAP | MemClasses::PROTOTYPE,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            LoadPropIdx { .. } => Effects {
+                reads: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            StoreProp { .. } | StorePropDyn { .. } | StoreSuper { .. } => Effects {
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            StorePropIdx { .. } => Effects {
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            LoadSuper { .. } => Effects {
+                reads: MemClasses::HEAP | MemClasses::PROTOTYPE,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            DefineMethod { .. } => writes(MemClasses::HEAP),
+            DeleteProp { .. } => Effects {
+                writes: MemClasses::HEAP,
+                may_throw: true,                     // strict-mode delete failures
+                may_call: CallEffect::UnknownCallee, // Proxy deleteProperty trap
+                ..Effects::PURE
+            },
+            TestProp { .. } => Effects {
+                reads: MemClasses::HEAP | MemClasses::PROTOTYPE,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // Proxy has trap
+                ..Effects::PURE
+            },
+            CopyDataProps { .. } => Effects {
+                reads: MemClasses::HEAP,
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // source getters
+                ..Effects::PURE
+            },
+
+            // Iteration protocol.
+            GetIterator { .. } => Effects {
+                reads: MemClasses::HEAP, // @@iterator lookup
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                allocs: AllocKind::Object, // the iterator record
+                ..Effects::PURE
+            },
+            GetPropIterator { .. } => Effects {
+                allocs: AllocKind::Object,
+                ..Effects::PURE
+            },
+            IteratorNext { .. } | IteratorReturn { .. } | IteratorThrow { .. } => Effects {
+                reads: MemClasses::ITERATOR | MemClasses::HEAP,
+                writes: MemClasses::ITERATOR,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // next/return/throw methods
+                ..Effects::PURE
+            },
+            NextPropName { .. } => rw(MemClasses::ITERATOR),
+
+            // Lexical / global / module bindings.
+            GetLexEnv | GetLexVar { .. } => reads(MemClasses::LEX_ENV),
+            PutLexVar { .. } => writes(MemClasses::LEX_ENV),
+            TryGetGlobal { .. } => reads(MemClasses::GLOBAL), // never throws
+            StoreGlobal { .. } => Effects {
+                writes: MemClasses::GLOBAL,
+                may_throw: true, // unresolved reference in strict mode
+                ..Effects::PURE
+            },
+            LoadModuleVar { .. } => reads(MemClasses::MODULE),
+            StoreModuleVar { .. } => writes(MemClasses::MODULE),
+            GetModuleNamespace { .. } => Effects {
+                reads: MemClasses::MODULE,
+                allocs: AllocKind::Object, // the namespace exotic object
+                ..Effects::PURE
+            },
+            DynamicImport { .. } => Effects {
+                reads: MemClasses::MODULE,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // host hook
+                allocs: AllocKind::Unknown,          // the promise
+                ..Effects::PURE
+            },
+
+            // Calls / definitions (T4).
+            Call { .. } => Effects {
+                reads: MemClasses::ALL,
+                writes: MemClasses::ALL,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                allocs: AllocKind::Unknown,
+            },
+            DefineFunc { .. } => reads(MemClasses::LEX_ENV), // capture env
+            DefineClass { .. } => Effects {
+                reads: MemClasses::HEAP | MemClasses::PROTOTYPE, // heritage
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // heritage/proto machinery
+                allocs: AllocKind::Object,
+            },
+
+            // Private properties.
+            LoadPrivate { .. } | TestPrivate { .. } => Effects {
+                reads: MemClasses::HEAP,
+                may_throw: true, // brand check failure
+                ..Effects::PURE
+            },
+            StorePrivate { .. } | DefinePrivate { .. } => Effects {
+                writes: MemClasses::HEAP,
+                may_throw: true, // brand check / redefinition failure
+                ..Effects::PURE
+            },
+            CreatePrivateNames { .. } => writes(MemClasses::LEX_ENV),
+
+            // Exceptions: conditional or unconditional throws.
+            Throw { .. }
+            | ThrowIfSuperNotCalled { .. }
+            | ThrowUndefinedIfHole { .. }
+            | ThrowConstAssignment { .. }
+            | ThrowIfNotObject { .. } => Effects {
+                may_throw: true,
+                ..Effects::PURE
+            },
+
+            // Generator / async protocol.
+            SuspendGenerator { .. } => Effects {
+                reads: MemClasses::ITERATOR,
+                writes: MemClasses::ITERATOR,
+                may_throw: true, // resume can throw back in
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
+            ResumeGenerator { .. } => Effects {
+                reads: MemClasses::ITERATOR,
+                writes: MemClasses::ITERATOR,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // runs generator body
+                ..Effects::PURE
+            },
+            GetResumeMode { .. } => reads(MemClasses::ITERATOR),
+            Await { .. } => Effects {
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // thenables
+                ..Effects::PURE
+            },
+            AsyncResolve { .. } | AsyncReject { .. } => Effects {
+                may_call: CallEffect::UnknownCallee, // promise reactions
+                ..Effects::PURE
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::{ConstId, ValueId};
+    use crate::op::{BinOp, CallKind};
+
+    /// The §4.2 spot table: pinned effect derivations.
+    #[test]
+    fn effects_spot_table() {
+        let v = ValueId::new(0);
+        let name = Sym::new(0);
+
+        // LoadConst is pure.
+        assert_eq!(Op::LoadConst(ConstId::new(0)).effects(), Effects::PURE);
+        // Compute ops and control flow are pure at the op level.
+        assert_eq!(
+            Op::BinaryOp {
+                op: BinOp::Add,
+                left: v,
+                right: v
+            }
+            .effects(),
+            Effects::PURE
+        );
+        assert_eq!(
+            Op::Branch {
+                dest: crate::id::BlockId::new(0)
+            }
+            .effects(),
+            Effects::PURE
+        );
+
+        // LoadProp reads Heap + may call a getter.
+        let e = Op::LoadProp { object: v, name }.effects();
+        assert!(e.reads.contains(MemClasses::HEAP));
+        assert_eq!(e.may_call, CallEffect::UnknownCallee);
+        assert!(e.writes.is_empty());
+        assert!(!e.is_pure());
+
+        // StoreGlobal writes Global.
+        let e = Op::StoreGlobal { name, value: v }.effects();
+        assert!(e.writes.contains(MemClasses::GLOBAL));
+        assert!(e.reads.is_empty());
+
+        // Call touches everything.
+        let e = Op::Call {
+            callee: v,
+            this: None,
+            args: vec![],
+            kind: CallKind::Dynamic,
+        }
+        .effects();
+        assert_eq!(e.reads, MemClasses::ALL);
+        assert_eq!(e.writes, MemClasses::ALL);
+        assert!(e.may_throw);
+        assert_eq!(e.may_call, CallEffect::UnknownCallee);
+        assert_eq!(e.allocs, AllocKind::Unknown);
+
+        // Allocation sites have distinct kinds (T7).
+        assert_eq!(Op::AllocArray.effects().allocs, AllocKind::Array);
+        assert_eq!(
+            Op::AllocClosure { func: v }.effects().allocs,
+            AllocKind::Closure
+        );
+    }
+
+    /// Every op's effect record is constructible (the match is total —
+    /// this test fails to compile if a variant is added without an
+    /// effects entry, because `match` on `Op` is exhaustive).
+    #[test]
+    fn effects_total_over_taxonomy() {
+        let e = Op::GetLexVar { level: 0, slot: 0 }.effects();
+        assert!(e.reads.contains(MemClasses::LEX_ENV));
+        let e = Op::PutLexVar {
+            level: 0,
+            slot: 0,
+            value: ValueId::new(0),
+        }
+        .effects();
+        assert!(e.writes.contains(MemClasses::LEX_ENV));
+    }
+}

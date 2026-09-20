@@ -6,6 +6,7 @@ members = [
     "abcd-file-sys",
     "abcd-file",
     "abcd-ir",
+    "abcd-ir2",
 ]
 
 [workspace.package]
@@ -29,3 +30,4 @@ abcd-isa = { path = "abcd-isa" }
 abcd-file-sys = { path = "abcd-file-sys" }
 abcd-file = { path = "abcd-file" }
 abcd-ir = { path = "abcd-ir" }
+abcd-ir2 = { path = "abcd-ir2" }
