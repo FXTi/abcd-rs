@@ -499,14 +499,34 @@ verified red before the fix where the bug was reachable.
 
 ## Follow-up findings registered during Phase 0.5
 
-- **F-new-1 (open, bridge/vendor)**: the vendored writer is sensitive to
-  item *creation order*. Moving literal-array creation before class
-  creation corrupts SET_FILE debug string offsets (source_file decoded as
-  a stale offset into "func_main_0" — observed as "n_0"). The #8 fix keeps
-  the original creation order (classes first) as a workaround. Root cause
-  needs a bridge-side investigation (likely stale string offsets captured
-  before ComputeLayout somewhere in the LNP staging flush), tracked here
-  until filed into a fix batch.
+- **F-new-1 (FIXED, 980ec16 / P5-T2)**: root-caused to OUR bridge, not the
+  vendored writer (vendor stays zero-diff): `abc_builder_flush_lnp_staging`
+  computed the layout while `literal_items_staging` had not been applied to
+  the `LiteralArrayItem`s (they were still 4-byte empty shells), so
+  `EmitSetFile`/`EmitStartLocal` baked string offsets that the final
+  `AddItems` growth then invalidated for every item positioned after a
+  literal array in the container's creation-ordered list. Creation order
+  only decided WHICH strings shifted. Fix: flush the literal staging before
+  any offset-baking layout pass (idempotent); the classes-first creation
+  order in `encode` is no longer load-bearing. Red evidence:
+  `abcd-file/tests/lnp_staging_order.rs` fails pre-fix with the SET_FILE
+  string decoded as garbage bytes, passes post-fix. Companion fix pinned by
+  the same file's control test: encode no longer emits degenerate END-only
+  debug items for methods whose decode-invented debug is empty (vendored
+  `DebugInfoExtractor::GetSourceFile` returns `""` for missing entries; the
+  degenerate item killed the file's ENTIRE debug region on the next decode
+  via `GetSpanFromId(EntityId(0))` throwing) — decode-side model wart
+  registered as N55.
+- **F-new-2 (FIXED, 8a6671f / P5-T2)**: `encode_literal_value_simple` now
+  resolves method references through the entity handles (offset-first, name
+  fallback for hand-built models) and hard-errors on unresolvable
+  references, instead of writing the raw source offset. Decode side fixed
+  too: `#` annotation elements were read array-first, but vendored pandasm
+  (`annotation.h`) defines `#` as scalar-only (no array-of-literal-arrays
+  form exists upstream); `annotation_all_types.rs`'s `#` case was corrected
+  to the vendored scalar shape. Red evidence:
+  `abcd-file/tests/annotation_literal_method_ref.rs` (both tests fail
+  pre-fix, pass post-fix).
 - **F-note-1 (accepted)**: the `annotation_value_to_raw` error arm for
   64-bit annotation arrays is unreachable through `encode()` because
   `validate_annotation_arrays` preflight rejects them first; kept as a

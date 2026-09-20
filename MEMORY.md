@@ -442,14 +442,24 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   (decode keeps both). `ISA_EMIT_INTERNAL_ERROR = -5` added (never reuse
   -1: that is ISA_EMIT_INVALID_LABEL). 12+ files carry no proto signatures
   (format fact #A7) — do not re-report as a bug.
-- Follow-up register (not yet scheduled): F-new-1 vendored writer is
-  creation-order sensitive (literal arrays before classes corrupts SET_FILE
-  debug string offsets — needs bridge-side investigation); F-new-2
-  annotation-embedded literal arrays write raw source offsets for method
-  references (encode_literal_value_simple lacks entity context); dead FFI
+- Follow-up register (not yet scheduled): dead FFI
   surface policy (108/324 in-repo-unused exports — publish-shaped crates,
   needs maintainer decision, NOT a delete list); 12.x builder
   `abc_method_has_valid_proto` behavior matches #A7 (no action).
+- F-new-1/F-new-2 RESOLVED (P5-T2, 980ec16/8a6671f): F-new-1's root cause
+  was OUR bridge, not the vendored writer — the LNP staging flush computed
+  layout before the literal staging was applied, baking string offsets that
+  the final AddItems growth then invalidated for items created after a
+  literal array; fixed by flushing literal staging before any offset-baking
+  layout pass (creation order is no longer load-bearing). F-new-2:
+  annotation-embedded literal-array method references resolve through entity
+  handles (hard error when unresolvable); decode reads '#' annotation
+  elements as the vendored scalar form (arrays of literal arrays do not
+  exist upstream). Companion fix: encode skips contentless debug items
+  (decode invents `source_file: Some("")` for debug-less methods — vendored
+  extractor returns "" for missing entries — and the degenerate emission
+  killed the whole file's debug region on rewrite); the decode-side
+  invention is registered as N55.
 - Phase 5 sweep (worker P5-T1, 2026-09-20): DONE — dead `literal_val_to_c`
   deleted; builder second-finalize claim DISPROVED (AddItems=assign,
   UpdateId=overwrite make retained staging idempotent and load-bearing;
@@ -466,6 +476,23 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   offset→index rewrite, unlike LiteralValue::LiteralArray) — model wart,
   no corpus trigger. CI duplicate-vendor-file protection (#22 — maintainer
   chose "leave as is", revisit only if drift ever appears).
+- Phase 5 sweep (worker P5-T2, 2026-09-20): DONE — F-new-1/F-new-2 (above),
+  N7 moduleRequestPhaseIdx blobs modeled (untagged u8 lazy-flag blob;
+  FieldValue::ModuleRequestPhase + guarded bridge writer; name-matched like
+  the vendored runtime/disassembler), N15 DefineClassWithBuffer imm2 modeled
+  (P3-T8's "runtime ignores it" was WRONG — RuntimeSetClassConstructorLength
+  consumes it as the constructor .length, runtime_stubs-inl.h:1037→1227),
+  N16 CallKind::NewObjApply split + deprecated.callspread operand-drop fixed
+  + wrong-arity hard errors, N8 adjudicated (typeSummaryOffset IS a file
+  offset per the 2022-08-18 changelog, but no vendored producer/consumer/
+  corpus trigger — registered with a fix sketch, not fixed). Final
+  checkpoint: rewrite 1149/1149 both variants zero skips; byte delta vs
+  /tmp/t51-verify is exactly class-accessors+module-exports (36
+  files/variant), pandasm-verified as ONLY the defineclasswithbuffer imm2
+  line 0x0→0x1 (N15); local docker oracle 1149/1149 both variants (image
+  sha256:5e7627…). New registrations N53 (definesendableclass opcode
+  collapse), N54 (deprecated.defineclasswithbuffer operand roles), N55
+  (decode debug invention) — see the roadmap reconciliation table.
 - Phase 1 started 2026-09-18: lower correctness (out-of-SSA cycle breaking at
   SLOT level with a reserved real temp register, edge-correct phi-copy
   placement for conditional predecessors, val_reg spill slots moved into the
