@@ -384,7 +384,12 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   catch-all u32 arm beat the N7 moduleRequestPhaseIdx name arm, so
   merge-abc-layout files were undecodable; one-arm reorder, N8 pattern).
   v2-P2 (abcd-lower port) + P2a dispatched 2026-09-20; P2a done, P2 in
-  flight. P2 gate interpretation: no passes exist at P2, so the gate is
+  flight. v2-P2c DONE (55c989b..9425e73): N57–N61 lossy folds fixed —
+  CallKind::{Apply,SuperSpread,SuperForwardAllArgs}, AllocArray{shape:
+  Option<ConstId>}, StoreOwnProp{Name,Dyn,Idx}, TryStoreGlobal; lift
+  un-folded; comparator now compares these EXACTLY (residual fold
+  SuperForwardAllArgs→super is v0.1-representation-forced, documented).
+  Orchestrator-verified: parity 2787/0, workspace 132 suites ok. P2 gate interpretation: no passes exist at P2, so the gate is
   v2lift-variant oracle 1149/1149 zero-skip + BYTE-IDENTITY vs the v0.1
   lift rewrite + 3-run determinism; the opt half lands with P3.
 - MAINTAINER DECISIONS (2026-09-21): D1 = build IR v0.2 (first design it,
