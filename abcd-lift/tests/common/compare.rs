@@ -48,7 +48,10 @@
 //!    than anything v0.1 can express.
 //! 5. **Folded distinctions**: own-vs-plain stores, strict-vs-tolerant
 //!    global stores, local-vs-external module vars, async-vs-sync
-//!    iterators/generators fold per the mapping table.
+//!    iterators/generators fold per the mapping table. NOT folded
+//!    (compares exactly): the object/array literal-buffer tag (N59 —
+//!    v0.1 `CreateObjectWithBuffer`/`CreateArrayWithBuffer` vs v0.2
+//!    `AllocObject`/`AllocArray{Some}`).
 //! 6. **Edge-keyed phis**: v0.2 phi entries key on `(Edge, value)` —
 //!    a block that is both a Normal and an Exceptional predecessor
 //!    produces two entries with the same value where v0.1 has one.
@@ -494,10 +497,17 @@ fn canon_inst_v1(cx: &mut V1Cx, iid: abcd_ir::entity::Inst) {
             one!("AllocObject", CVal::Konst("obj:{}/{}".into()))
         }
         InstData::CreateEmptyArray => one!("AllocArray"),
-        InstData::CreateObjectWithBuffer { literal_array }
-        | InstData::CreateArrayWithBuffer { literal_array } => {
+        InstData::CreateObjectWithBuffer { literal_array } => {
             one!(
                 "AllocObject",
+                CVal::Konst(canon_literal_array_at(cx.file, *literal_array, 0))
+            )
+        }
+        InstData::CreateArrayWithBuffer { literal_array } => {
+            // N59: the object/array tag is opcode-carried on both
+            // sides — compares EXACTLY (no fold to "AllocObject").
+            one!(
+                "AllocArray",
                 CVal::Konst(canon_literal_array_at(cx.file, *literal_array, 0))
             )
         }
@@ -1099,7 +1109,10 @@ fn canon_inst_v2(cx: &mut V2Cx, iid: abcd_ir2::InstId) {
         Op::Mov { src } => tok!("Mov", cx.val(*src)),
         Op::LoadConst(c) => tok!("LoadConst", cx.konst(*c)),
         Op::AllocObject { shape } => tok!("AllocObject", cx.konst(*shape)),
-        Op::AllocArray => tok!("AllocArray"),
+        Op::AllocArray { shape } => match shape {
+            Some(s) => tok!("AllocArray", cx.konst(*s)),
+            None => tok!("AllocArray"),
+        },
         Op::AllocRegExp { pattern, flags } => {
             tok!(
                 "AllocRegExp",

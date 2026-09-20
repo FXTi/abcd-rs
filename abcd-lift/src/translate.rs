@@ -13,9 +13,12 @@
 //! comparisons (eq/noteq/less*/greater*/strict*/isin/instanceof) →
 //! `Compare`, unary → `UnaryOp` (`not` is BITWISE, N39), istrue/isfalse
 //! → `UnaryOp::{IsTrue,IsFalse}`, createemptyobject → `AllocObject`
-//! (empty shape), createemptyarray → `AllocArray`,
-//! createarray/objectwithbuffer → `AllocObject{shape}` (the literal
-//! array as a pooled shape), createregexpwithliteral → `AllocRegExp`
+//! (empty shape), createemptyarray → `AllocArray{shape: None}`,
+//! createobjectwithbuffer → `AllocObject{shape}`,
+//! createarraywithbuffer → `AllocArray{shape: Some(shape)}` (the
+//! literal array as a pooled shape; the object/array tag is
+//! OPCODE-carried — never recoverable from the flat literal-buffer
+//! content, N59), createregexpwithliteral → `AllocRegExp`
 //! (flags as u32 — v0.1's decimal-string flags canonicalize to it),
 //! createobjectwithexcludedkeys → `CreateObjectWithExcludedKeys`,
 //! ld/stobjbyname → `LoadProp`/`StoreProp`, ld/stobjbyvalue →
@@ -100,7 +103,10 @@
 //! deprecated.getmodulenamespace keep v0.1's raw-symbol-index payload
 //! hack (documented), deprecated.createarray/objectwithbuffer and
 //! deprecated.createobjecthavingmethod resolve the RAW table index
-//! (v0.1 parity), deprecated.defineclasswithbuffer keeps v0.1's operand
+//! (v0.1 parity — and v0.1 lifts BOTH deprecated buffer forms to
+//! CreateArrayWithBuffer, so both fold to `AllocArray{shape:
+//! Some(shape)}` here, N59), deprecated.defineclasswithbuffer keeps
+//! v0.1's operand
 //! roles (N54's registered latent issue — base_reg as heritage, env
 //! unread).
 //!
@@ -495,12 +501,15 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Createemptyarray(_ic) => {
-            let v = fx.emit_val(block, Op::AllocArray, loc);
+            let v = fx.emit_val(block, Op::AllocArray { shape: None }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Createarraywithbuffer(_ic, eid) => {
+            // N59: the ARRAY tag is opcode-carried — never recoverable
+            // from the flat literal-buffer content (v0.1
+            // `InstData::CreateArrayWithBuffer`).
             let shape = fx.resolve_literal(*eid)?;
-            let v = fx.emit_val(block, Op::AllocObject { shape }, loc);
+            let v = fx.emit_val(block, Op::AllocArray { shape: Some(shape) }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Createobjectwithbuffer(_ic, eid) => {
@@ -1789,9 +1798,11 @@ pub fn translate_bytecode(
         Bytecode::DeprecatedCreatearraywithbuffer(idx)
         | Bytecode::DeprecatedCreateobjectwithbuffer(idx) => {
             // v0.1 parity: the deprecated form carries the RAW table
-            // index (no entity-offset indirection).
+            // index (no entity-offset indirection), and v0.1 lifts BOTH
+            // deprecated forms to CreateArrayWithBuffer — so both fold
+            // to AllocArray here (the comparator machine-checks it).
             let shape = resolve::const_for_literal_array(fx.lf, idx.0 as u32)?;
-            let v = fx.emit_val(block, Op::AllocObject { shape }, loc);
+            let v = fx.emit_val(block, Op::AllocArray { shape: Some(shape) }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedTonumber(dst) | Bytecode::DeprecatedTonumeric(dst) => {

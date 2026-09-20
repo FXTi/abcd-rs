@@ -235,8 +235,16 @@ pub enum Op {
         /// The object-literal shape constant.
         shape: ConstId,
     },
-    /// Allocate an array (T7).
-    AllocArray,
+    /// Allocate an array (T7). `shape: None` is the empty array
+    /// (`createemptyarray`); `Some(shape)` is an array with a literal
+    /// shape (`createarraywithbuffer` — the literal array as a pooled
+    /// shape). The object/array tag is OPCODE-carried (N59): it is not
+    /// recoverable from the flat literal-buffer content, so it must
+    /// come from the op, mirroring [`Op::AllocObject`]'s treatment.
+    AllocArray {
+        /// The array-literal shape constant, when present.
+        shape: Option<ConstId>,
+    },
     /// Allocate a RegExp (T7).
     AllocRegExp {
         /// The pattern source.
@@ -796,7 +804,7 @@ impl Op {
             BinaryOp { left, right, .. } | Compare { left, right, .. } => vec![*left, *right],
             UnaryOp { operand, .. } => vec![*operand],
             Mov { src } => vec![*src],
-            LoadConst(_) | AllocObject { .. } | AllocArray | AllocRegExp { .. } => vec![],
+            LoadConst(_) | AllocObject { .. } | AllocArray { .. } | AllocRegExp { .. } => vec![],
             AllocClosure { func } => vec![*func],
             LoadProp { object, .. } => vec![*object],
             StoreProp { object, value, .. } => vec![*object, *value],
@@ -912,7 +920,7 @@ impl Op {
             BinaryOp { left, right, .. } | Compare { left, right, .. } => vec![left, right],
             UnaryOp { operand, .. } => vec![operand],
             Mov { src } => vec![src],
-            LoadConst(_) | AllocObject { .. } | AllocArray | AllocRegExp { .. } => vec![],
+            LoadConst(_) | AllocObject { .. } | AllocArray { .. } | AllocRegExp { .. } => vec![],
             AllocClosure { func } => vec![func],
             LoadProp { object, .. } => vec![object],
             StoreProp { object, value, .. } => vec![object, value],
@@ -1108,7 +1116,7 @@ impl Op {
             | AsyncReject { .. } => Arity::Exact(1),
             LoadConst(_)
             | AllocObject { .. }
-            | AllocArray
+            | AllocArray { .. }
             | AllocRegExp { .. }
             | NewLexEnv { .. }
             | NewLexEnvWithName { .. }

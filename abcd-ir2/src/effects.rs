@@ -227,7 +227,7 @@ impl Op {
                 allocs: AllocKind::Object,
                 ..Effects::PURE
             },
-            AllocArray => Effects {
+            AllocArray { .. } => Effects {
                 allocs: AllocKind::Array,
                 ..Effects::PURE
             },
@@ -556,7 +556,10 @@ mod tests {
         assert_eq!(e.allocs, AllocKind::Unknown);
 
         // Allocation sites have distinct kinds (T7).
-        assert_eq!(Op::AllocArray.effects().allocs, AllocKind::Array);
+        assert_eq!(
+            Op::AllocArray { shape: None }.effects().allocs,
+            AllocKind::Array
+        );
         assert_eq!(
             Op::AllocClosure { func: v }.effects().allocs,
             AllocKind::Closure

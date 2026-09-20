@@ -174,13 +174,14 @@ fn literal_array_nested_and_method_ref() {
 
     let mut m = lift_file(&file).expect("lift");
     verify_clean(&m);
-    // Find the AllocObject and inspect its shape constant.
+    // Find the AllocArray (N59: createarraywithbuffer carries the
+    // ARRAY tag) and inspect its shape constant.
     let alloc = m
         .insts
         .iter()
-        .find(|i| matches!(i.op, Op::AllocObject { .. }))
-        .expect("AllocObject emitted");
-    let Op::AllocObject { shape } = alloc.op else {
+        .find(|i| matches!(i.op, Op::AllocArray { shape: Some(_) }))
+        .expect("AllocArray emitted");
+    let Op::AllocArray { shape: Some(shape) } = alloc.op else {
         unreachable!()
     };
     // Method order in the decoded class is the Builder's layout order,
