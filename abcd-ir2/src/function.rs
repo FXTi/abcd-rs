@@ -101,6 +101,9 @@ pub struct Catch {
     /// The exception object value delivered at the handler entry. Its
     /// [`Value::def`] must be [`ValueDef::ExceptionParam`] of `handler`.
     pub exception: ValueId,
+    /// The exception type index of a TYPED catch, when the source
+    /// carried one (`None` = catch-all).
+    pub type_idx: Option<u32>,
 }
 
 /// A structured try region (§5.2): both structure (for lowering) and the
@@ -121,6 +124,9 @@ pub struct TryRegion {
 pub struct DebugData {
     /// Source file name, when known.
     pub source_file: Option<Sym>,
+    /// Source code text, when the file carried it (content, not a name —
+    /// deliberately not interned into the [`crate::symbol::SymbolTable`]).
+    pub source_code: Option<String>,
     /// Instruction → source line table.
     pub line_table: Vec<LineEntry>,
     /// Instruction → source column table.
@@ -130,6 +136,9 @@ pub struct DebugData {
     /// Parameter names, in parameter order (may be shorter than
     /// [`FunctionData::params`]).
     pub param_names: Vec<Sym>,
+    /// The lexical scope-names constant of the function's home record
+    /// (the `_ESScopeNamesRecord` field blob), when present.
+    pub scope_names: Option<ConstId>,
 }
 
 /// One line-table entry.
@@ -157,6 +166,24 @@ pub struct LocalName {
     pub name: Sym,
     /// Its declared type, when the source carried one.
     pub ty: Option<Ty>,
+    /// The source-level scope of the name (the debug info's `start`/`end`
+    /// extents, mapped onto lifted instructions): `start` is the first
+    /// lifted instruction whose source position is at-or-after the
+    /// scope's start, `end` the last lifted instruction whose source
+    /// position is at-or-before the scope's end. `None` when the source
+    /// range covers no lifted instruction (e.g. the range only contained
+    /// register moves, which have no IR presence).
+    pub scope: Option<LocalScope>,
+}
+
+/// A local variable's scope extent over lifted instructions (inclusive
+/// on both ends).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalScope {
+    /// First in-scope instruction.
+    pub start: InstId,
+    /// Last in-scope instruction.
+    pub end: InstId,
 }
 
 /// IR representation of one function/method.

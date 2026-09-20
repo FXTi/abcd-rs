@@ -280,6 +280,9 @@ pub enum Op {
         name: Sym,
         /// The function value (a closure).
         func: ValueId,
+        /// The method's `.length` property value (vendor `definemethod
+        /// imm1, method_id, imm2:u8`, isa.yaml).
+        length: u16,
     },
     /// `delete object[key]`.
     DeleteProp {
@@ -303,10 +306,81 @@ pub enum Op {
         /// The source object.
         src: ValueId,
     },
+    /// Vendor `setobjectwithproto imm:u16, v:in:top, acc: in:top`
+    /// (isa.yaml:1333-1337): set `obj`'s prototype link to `proto`
+    /// directly, WITHOUT running any `__proto__` setter machinery —
+    /// never collapsible into a named-property store or a
+    /// [`Op::CopyDataProps`].
+    SetObjectWithProto {
+        /// The new prototype.
+        proto: ValueId,
+        /// The object whose prototype link is set.
+        obj: ValueId,
+    },
+    /// Vendor `starrayspread v1:in:top, v2:in:top, acc: inout:top`
+    /// (isa.yaml:1329-1332): spread the `src` iterable's elements into
+    /// the `dst` array starting at `index`; the runtime writes the NEW
+    /// index back to the accumulator — the op's result is that new
+    /// index (never a plain element store).
+    ArraySpread {
+        /// The destination array.
+        dst: ValueId,
+        /// The start index.
+        index: ValueId,
+        /// The source iterable.
+        src: ValueId,
+    },
+    /// Vendor `createobjectwithexcludedkeys imm, v1, v2, acc: out:top`
+    /// (isa.yaml:494-504, `range_1`): create a fresh object copying
+    /// `obj`'s own enumerable properties EXCEPT the listed `keys`
+    /// (rest-destructuring semantics).
+    CreateObjectWithExcludedKeys {
+        /// The source object.
+        obj: ValueId,
+        /// The excluded key values.
+        keys: Vec<ValueId>,
+    },
+    /// Vendor `definegettersetterbyvalue v1, v2, v3, v4, acc: inout:top`
+    /// (isa.yaml:1220): define an accessor property on `obj` under the
+    /// computed `key` with the given `getter`/`setter` closures.
+    DefineGetterSetterByValue {
+        /// The target object.
+        obj: ValueId,
+        /// The computed property key.
+        key: ValueId,
+        /// The getter closure.
+        getter: ValueId,
+        /// The setter closure.
+        setter: ValueId,
+    },
+    /// Vendor `gettemplateobject imm:u16, acc: inout:top`
+    /// (isa.yaml:1279-1283): turn the template `literal` into its
+    /// (cached) template object. The cache identity is the point —
+    /// never an element read and never a `Mov`.
+    GetTemplateObject {
+        /// The template literal value.
+        literal: ValueId,
+    },
+    /// Vendor `createiterresultobj v1, v2, acc: out:top`
+    /// (isa.yaml:490-493): allocate the iterator result object
+    /// `{ value, done }`.
+    CreateIterResultObj {
+        /// The iteration value.
+        value: ValueId,
+        /// The done flag.
+        done: ValueId,
+    },
 
     // ── Iteration ──────────────────────────────────────────────────────
     /// Get an iterator (`@@iterator` protocol).
     GetIterator {
+        /// The iterable.
+        obj: ValueId,
+    },
+    /// Get an async iterator (`@@asyncIterator` protocol) — a distinct
+    /// protocol lookup from [`Op::GetIterator`], vendor `getasynciterator
+    /// imm:u8, acc: inout:top` (isa.yaml:431-435).
+    GetAsyncIterator {
         /// The iterable.
         obj: ValueId,
     },
@@ -337,8 +411,29 @@ pub enum Op {
     },
 
     // ── Lexical / global / module ──────────────────────────────────────
-    /// Push a new lexical environment, yielding it.
-    GetLexEnv,
+    /// Push a new lexical environment with `num_vars` slots, yielding it
+    /// (vendor `newlexenv` / `wide.newlexenv`, isa.yaml; v0.2's original
+    /// `GetLexEnv` renamed to the ISA-honest name and given its payload).
+    NewLexEnv {
+        /// Number of variables in the new environment.
+        num_vars: u16,
+    },
+    /// Push a new NAMED lexical environment, yielding it (vendor
+    /// `newlexenvwithname` / `wide.newlexenvwithname`, isa.yaml): the
+    /// scope's variable names come from a literal-array constant.
+    NewLexEnvWithName {
+        /// Number of variables in the new environment.
+        num_vars: u16,
+        /// The scope-names constant (an
+        /// [`Const::ArrayLiteral`](crate::consts::Const::ArrayLiteral) of
+        /// [`Const::String`](crate::consts::Const::String) names).
+        scope_names: ConstId,
+    },
+    /// Pop the current lexical environment (vendor `poplexenv`,
+    /// isa.yaml:367-370). Void, but observable: the lexical scope
+    /// discipline is part of the program's semantics (round-tripping
+    /// and the lexical model depend on it).
+    PopLexEnv,
     /// Load a lexical variable by environment level and slot.
     GetLexVar {
         /// Scope-chain level.
@@ -415,6 +510,10 @@ pub enum Op {
         body: FuncId,
         /// `(name, value)` captured bindings, explicit.
         captures: Vec<(Sym, ValueId)>,
+        /// The function's `.length` property value (vendor `definefunc
+        /// imm1, method_id, imm2:u8`, isa.yaml — the declared formal
+        /// parameter count the runtime installs).
+        length: u16,
     },
     /// Define a class with a member buffer.
     DefineClass {
@@ -428,6 +527,11 @@ pub enum Op {
         /// shape with [`Const::MethodRef`](crate::consts::Const::MethodRef)
         /// entries).
         members: ConstId,
+        /// The class constructor's `.length` (vendor
+        /// `defineclasswithbuffer imm2`, isa.yaml) — the runtime consumes
+        /// it via RuntimeSetClassConstructorLength (N15); modeled for
+        /// byte fidelity and semantics.
+        count: u16,
     },
 
     // ── Private properties ─────────────────────────────────────────────
@@ -475,6 +579,12 @@ pub enum Op {
     CreatePrivateNames {
         /// How many private names to register.
         count: u16,
+        /// The private-name strings (an
+        /// [`Const::ArrayLiteral`](crate::consts::Const::ArrayLiteral) of
+        /// [`Const::String`](crate::consts::Const::String)) — vendor
+        /// `callruntime.createprivateproperty imm:u16, literalarray_id`
+        /// (isa.yaml:843-848).
+        names: ConstId,
     },
 
     // ── Exceptions ─────────────────────────────────────────────────────
@@ -498,6 +608,26 @@ pub enum Op {
         /// The value being hole-checked.
         value: ValueId,
     },
+    /// TDZ guard with a COMPILE-TIME name — a different vendor
+    /// instruction from [`Op::ThrowUndefinedIfHole`]:
+    /// `throw.undefinedifholewithname string_id, acc: in:top`
+    /// (isa.yaml:1010-1015). The name is a constant string; the checked
+    /// value is the operand.
+    ThrowUndefinedIfHoleWithName {
+        /// The variable name (a compile-time string).
+        name: Sym,
+        /// The value being hole-checked.
+        value: ValueId,
+    },
+    /// Throw a ReferenceError for a nonexistent binding (vendor
+    /// `throw.notexists`, isa.yaml).
+    ThrowNotExists,
+    /// Throw on a pattern applied to a non-coercible value (vendor
+    /// `throw.patternnoncoercible`, isa.yaml).
+    ThrowPatternNonCoercible,
+    /// Throw on `delete super.x` (vendor `throw.deletesuperproperty`,
+    /// isa.yaml).
+    ThrowDeleteSuperProperty,
     /// Throw on assignment to a `const` binding.
     ThrowConstAssignment {
         /// The variable name (a runtime value).
@@ -538,6 +668,18 @@ pub enum Op {
         /// The awaited value.
         value: ValueId,
     },
+    /// Vendor `asyncfunctionawaituncaught v:in:top, acc: out:top`
+    /// (isa.yaml) — the es2abc await form: await `value` without the
+    /// caught-completion wrapper. Distinct from [`Op::Await`]; lift
+    /// emits this op for the (deprecated.)asyncfunctionawaituncaught
+    /// bytecodes.
+    AwaitUncaught {
+        /// The awaited value.
+        value: ValueId,
+    },
+    /// Vendor `asyncfunctionenter` (isa.yaml, `acc: out:top`): enter an
+    /// async function, yielding the async context/promise value.
+    AsyncFunctionEnter,
     /// Resolve the async function's promise.
     AsyncResolve {
         /// The resolution value.
@@ -547,6 +689,26 @@ pub enum Op {
     AsyncReject {
         /// The rejection reason.
         value: ValueId,
+    },
+
+    // ── Frame / special value loaders ──────────────────────────────────
+    /// Load `new.target` (vendor `ldnewtarget`, isa.yaml — `acc:
+    /// out:top`): a real frame-state value (the construct receiver in a
+    /// constructor, `undefined` otherwise), never a constant.
+    LoadNewTarget,
+    /// Load the global object (vendor `ldglobal`, isa.yaml).
+    LoadGlobalObject,
+    /// Load the currently executing function object (vendor
+    /// `ldfunction`, isa.yaml).
+    LoadFunction,
+    /// Create the unmapped `arguments` object (vendor `getunmappedargs`,
+    /// isa.yaml): an exotic-object allocation site.
+    GetUnmappedArgs,
+    /// Copy the rest arguments from `start_index` into a fresh array
+    /// (vendor `copyrestargs` / `wide.copyrestargs`, isa.yaml).
+    CopyRestArgs {
+        /// Index of the first rest argument.
+        start_index: u16,
     },
 
     // ── Super ──────────────────────────────────────────────────────────
@@ -591,6 +753,12 @@ pub enum Op {
     },
     /// Dead control point.
     Unreachable,
+
+    // ── Debug ──────────────────────────────────────────────────────────
+    /// Vendor `debugger` (isa.yaml): a debugger breakpoint — observable
+    /// when a debugger is attached (v0.1 kept it essential; the effect
+    /// record models the potential debugger hook).
+    Debugger,
 }
 
 impl Op {
@@ -630,14 +798,35 @@ impl Op {
                 v
             }
             CopyDataProps { dst, src } => vec![*dst, *src],
-            GetIterator { obj } | GetPropIterator { obj } => vec![*obj],
+            SetObjectWithProto { proto, obj } => vec![*proto, *obj],
+            ArraySpread { dst, index, src } => vec![*dst, *index, *src],
+            CreateObjectWithExcludedKeys { obj, keys } => {
+                let mut v = vec![*obj];
+                v.extend(keys.iter());
+                v
+            }
+            DefineGetterSetterByValue {
+                obj,
+                key,
+                getter,
+                setter,
+            } => vec![*obj, *key, *getter, *setter],
+            GetTemplateObject { literal } => vec![*literal],
+            CreateIterResultObj { value, done } => vec![*value, *done],
+            GetIterator { obj } | GetPropIterator { obj } | GetAsyncIterator { obj } => vec![*obj],
             IteratorNext { iterator }
             | IteratorReturn { iterator }
             | IteratorThrow { iterator } => {
                 vec![*iterator]
             }
             NextPropName { iterator } => vec![*iterator],
-            GetLexEnv | GetLexVar { .. } | CreatePrivateNames { .. } => vec![],
+            NewLexEnv { .. } | NewLexEnvWithName { .. } | PopLexEnv | GetLexVar { .. } => vec![],
+            CreatePrivateNames { .. } => vec![],
+            LoadNewTarget | LoadGlobalObject | LoadFunction => vec![],
+            GetUnmappedArgs | CopyRestArgs { .. } | AsyncFunctionEnter => vec![],
+            ThrowNotExists | ThrowPatternNonCoercible | ThrowDeleteSuperProperty | Debugger => {
+                vec![]
+            }
             PutLexVar { value, .. } => vec![*value],
             TryGetGlobal { default, .. } => default.iter().copied().collect(),
             StoreGlobal { value, .. } | StoreModuleVar { value, .. } => vec![*value],
@@ -661,7 +850,9 @@ impl Op {
             | ThrowIfSuperNotCalled { value, .. }
             | ThrowConstAssignment { name: value }
             | ThrowIfNotObject { value }
+            | ThrowUndefinedIfHoleWithName { value, .. }
             | Await { value }
+            | AwaitUncaught { value }
             | AsyncResolve { value }
             | AsyncReject { value } => vec![*value],
             ThrowUndefinedIfHole { name, value } => vec![*name, *value],
@@ -723,14 +914,35 @@ impl Op {
                 v
             }
             CopyDataProps { dst, src } => vec![dst, src],
-            GetIterator { obj } | GetPropIterator { obj } => vec![obj],
+            SetObjectWithProto { proto, obj } => vec![proto, obj],
+            ArraySpread { dst, index, src } => vec![dst, index, src],
+            CreateObjectWithExcludedKeys { obj, keys } => {
+                let mut v = vec![obj];
+                v.extend(keys.iter_mut());
+                v
+            }
+            DefineGetterSetterByValue {
+                obj,
+                key,
+                getter,
+                setter,
+            } => vec![obj, key, getter, setter],
+            GetTemplateObject { literal } => vec![literal],
+            CreateIterResultObj { value, done } => vec![value, done],
+            GetIterator { obj } | GetPropIterator { obj } | GetAsyncIterator { obj } => vec![obj],
             IteratorNext { iterator }
             | IteratorReturn { iterator }
             | IteratorThrow { iterator } => {
                 vec![iterator]
             }
             NextPropName { iterator } => vec![iterator],
-            GetLexEnv | GetLexVar { .. } | CreatePrivateNames { .. } => vec![],
+            NewLexEnv { .. } | NewLexEnvWithName { .. } | PopLexEnv | GetLexVar { .. } => vec![],
+            CreatePrivateNames { .. } => vec![],
+            LoadNewTarget | LoadGlobalObject | LoadFunction => vec![],
+            GetUnmappedArgs | CopyRestArgs { .. } | AsyncFunctionEnter => vec![],
+            ThrowNotExists | ThrowPatternNonCoercible | ThrowDeleteSuperProperty | Debugger => {
+                vec![]
+            }
             PutLexVar { value, .. } => vec![value],
             TryGetGlobal { default, .. } => default.iter_mut().collect(),
             StoreGlobal { value, .. } | StoreModuleVar { value, .. } => vec![value],
@@ -754,7 +966,9 @@ impl Op {
             | ThrowIfSuperNotCalled { value, .. }
             | ThrowConstAssignment { name: value }
             | ThrowIfNotObject { value }
+            | ThrowUndefinedIfHoleWithName { value, .. }
             | Await { value }
+            | AwaitUncaught { value }
             | AsyncResolve { value }
             | AsyncReject { value } => vec![value],
             ThrowUndefinedIfHole { name, value } => vec![name, value],
@@ -789,17 +1003,24 @@ impl Op {
                 | StorePropDyn { .. }
                 | StoreSuper { .. }
                 | CopyDataProps { .. }
+                | SetObjectWithProto { .. }
                 | StorePrivate { .. }
                 | DefinePrivate { .. }
                 | CreatePrivateNames { .. }
                 | PutLexVar { .. }
+                | PopLexEnv
                 | StoreGlobal { .. }
                 | StoreModuleVar { .. }
                 | Throw { .. }
                 | ThrowIfSuperNotCalled { .. }
                 | ThrowUndefinedIfHole { .. }
+                | ThrowUndefinedIfHoleWithName { .. }
                 | ThrowConstAssignment { .. }
                 | ThrowIfNotObject { .. }
+                | ThrowNotExists
+                | ThrowPatternNonCoercible
+                | ThrowDeleteSuperProperty
+                | Debugger
                 | Branch { .. }
                 | CondBranch { .. }
                 | Return { .. }
@@ -856,33 +1077,54 @@ impl Op {
             | ResumeGenerator { .. }
             | GetResumeMode { .. }
             | Await { .. }
+            | AwaitUncaught { .. }
+            | GetAsyncIterator { .. }
+            | GetTemplateObject { .. }
+            | ThrowUndefinedIfHoleWithName { .. }
             | AsyncResolve { .. }
             | AsyncReject { .. } => Arity::Exact(1),
             LoadConst(_)
             | AllocObject { .. }
             | AllocArray
             | AllocRegExp { .. }
-            | GetLexEnv
+            | NewLexEnv { .. }
+            | NewLexEnvWithName { .. }
+            | PopLexEnv
             | GetLexVar { .. }
             | LoadModuleVar { .. }
             | GetModuleNamespace { .. }
             | CreatePrivateNames { .. }
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | AsyncFunctionEnter
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | Debugger
             | Branch { .. }
             | Unreachable => Arity::Exact(0),
             StoreProp { .. }
             | DefineMethod { .. }
             | CopyDataProps { .. }
+            | SetObjectWithProto { .. }
+            | CreateIterResultObj { .. }
             | StorePrivate { .. }
             | DefinePrivate { .. }
             | ThrowUndefinedIfHole { .. }
             | SuspendGenerator { .. } => Arity::Exact(2),
             StorePropIdx { .. } | StorePropDyn { .. } => Arity::Exact(3),
+            ArraySpread { .. } => Arity::Exact(3),
+            DefineGetterSetterByValue { .. } => Arity::Exact(4),
             CondBranch { .. } => Arity::Exact(1),
             TestProp { .. }
             | TryGetGlobal { .. }
             | Call { .. }
             | DefineFunc { .. }
             | DefineClass { .. }
+            | CreateObjectWithExcludedKeys { .. }
             | LoadSuper { .. }
             | StoreSuper { .. }
             | Return { .. }
@@ -938,6 +1180,7 @@ mod tests {
             Op::DefineFunc {
                 body: FuncId::new(0),
                 captures: vec![(s, v())],
+                length: 2,
             },
             Op::Phi { entries: vec![] },
             Op::Branch {
@@ -945,6 +1188,69 @@ mod tests {
             },
             Op::Return { value: Some(v()) },
             Op::Unreachable,
+            // ── v2-P0.5 taxonomy growth: full ISA coverage ──
+            Op::NewLexEnv { num_vars: 3 },
+            Op::NewLexEnvWithName {
+                num_vars: 3,
+                scope_names: ConstId::new(0),
+            },
+            Op::PopLexEnv,
+            Op::SetObjectWithProto {
+                proto: v(),
+                obj: v(),
+            },
+            Op::ArraySpread {
+                dst: v(),
+                index: v(),
+                src: v(),
+            },
+            Op::CreateObjectWithExcludedKeys {
+                obj: v(),
+                keys: vec![v(), v()],
+            },
+            Op::DefineGetterSetterByValue {
+                obj: v(),
+                key: v(),
+                getter: v(),
+                setter: v(),
+            },
+            Op::GetTemplateObject { literal: v() },
+            Op::CreateIterResultObj {
+                value: v(),
+                done: v(),
+            },
+            Op::GetAsyncIterator { obj: v() },
+            Op::CopyRestArgs { start_index: 1 },
+            Op::GetUnmappedArgs,
+            Op::LoadNewTarget,
+            Op::LoadGlobalObject,
+            Op::LoadFunction,
+            Op::AsyncFunctionEnter,
+            Op::AwaitUncaught { value: v() },
+            Op::ThrowUndefinedIfHoleWithName {
+                name: s,
+                value: v(),
+            },
+            Op::ThrowNotExists,
+            Op::ThrowPatternNonCoercible,
+            Op::ThrowDeleteSuperProperty,
+            Op::Debugger,
+            Op::DefineMethod {
+                object: v(),
+                name: s,
+                func: v(),
+                length: 1,
+            },
+            Op::DefineClass {
+                ctor: FuncId::new(0),
+                heritage: Some(v()),
+                members: ConstId::new(0),
+                count: 2,
+            },
+            Op::CreatePrivateNames {
+                count: 2,
+                names: ConstId::new(0),
+            },
         ];
         for op in &mut ops {
             assert_eq!(op.operands().len(), op.operands_mut().len(), "{op:?}");

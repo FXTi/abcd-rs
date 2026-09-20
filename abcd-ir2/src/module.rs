@@ -182,6 +182,18 @@ pub struct ClassData {
     pub source_file: Option<Sym>,
 }
 
+/// One entry of a module's module-request list (N7): the specifier plus
+/// its lazy-import flag from the `moduleRequestPhaseIdx` blob. The list
+/// is in module-record request order; declarations reference specifiers
+/// by content ([`ImportDecl`]/[`ExportDecl`] carry the `Sym`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleRequest {
+    /// The module specifier (`"./foo"`, `"std.core"`, …).
+    pub specifier: Sym,
+    /// Whether the request is lazily imported (raw flag `> 0`).
+    pub lazy: bool,
+}
+
 /// An import declaration — a semantic ES module record (the N7-era
 /// module-data model, with the file's `module_request_idx` pool indices
 /// resolved to the specifier symbols they denote).
@@ -251,6 +263,9 @@ pub struct Module {
     pub imports: Vec<ImportDecl>,
     /// Export declarations.
     pub exports: Vec<ExportDecl>,
+    /// Module requests with their lazy-import flags (N7
+    /// `moduleRequestPhaseIdx` blobs), in module-record request order.
+    pub module_requests: Vec<ModuleRequest>,
 
     /// Instruction arena.
     pub insts: Vec<Inst>,

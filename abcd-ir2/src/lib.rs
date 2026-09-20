@@ -79,12 +79,12 @@ pub use consts::{Const, ConstPool};
 pub use effects::{AllocKind, CallEffect, Effects, MemClasses};
 pub use function::{
     Block, Catch, ColumnEntry, DebugData, Edge, EdgeKind, FunctionData, Inst, LineEntry, Loc,
-    LocalName, TryRegion, Value, ValueDef,
+    LocalName, LocalScope, TryRegion, Value, ValueDef,
 };
 pub use id::{BlockId, ClassId, ConstId, FieldId, FuncId, InstId, Sym, ValueId};
 pub use module::{
     AnnValue, Annotation, ClassData, ExportDecl, FieldData, FunctionKind, ImportDecl, Modifiers,
-    Module, Signature, SourceLang,
+    Module, ModuleRequest, Signature, SourceLang,
 };
 pub use op::{Arity, BinOp, CallKind, CmpOp, Op, PropKey, SuperCheck, SuperKey, UnOp};
 pub use symbol::SymbolTable;

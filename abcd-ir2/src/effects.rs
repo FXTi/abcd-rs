@@ -213,6 +213,15 @@ impl Op {
             | Return { .. }
             | Unreachable => Effects::PURE,
 
+            // Frame-state loads: pure reads of the physical frame (vendor
+            // `acc: out:top`, no memory interaction).
+            LoadNewTarget | LoadGlobalObject | LoadFunction => Effects::PURE,
+
+            // Vendor `asyncfunctionenter`: v0.1's proven DCE contract
+            // treats it as non-essential (dead-deletable when the result
+            // is unused) — modeled PURE to preserve that behavior.
+            AsyncFunctionEnter => Effects::PURE,
+
             // Allocation sites (T7).
             AllocObject { .. } => Effects {
                 allocs: AllocKind::Object,
@@ -233,6 +242,32 @@ impl Op {
             },
             CreateGenerator { .. } => Effects {
                 allocs: AllocKind::GeneratorObj,
+                ..Effects::PURE
+            },
+            // The unmapped `arguments` exotic object.
+            GetUnmappedArgs => Effects {
+                allocs: AllocKind::Object,
+                ..Effects::PURE
+            },
+            // The rest-args array.
+            CopyRestArgs { .. } => Effects {
+                allocs: AllocKind::Array,
+                ..Effects::PURE
+            },
+            // The iterator result object `{ value, done }`.
+            CreateIterResultObj { .. } => Effects {
+                allocs: AllocKind::Object,
+                ..Effects::PURE
+            },
+            // Vendor `gettemplateobject` (isa.yaml:1279-1283): reads the
+            // template-object cache and allocates the (cached) template
+            // object on first call; the vendored handler is
+            // abrupt-checked (`INTERPRETER_RETURN_IF_ABRUPT`,
+            // interpreter_assembly.cpp:2079-2082).
+            GetTemplateObject { .. } => Effects {
+                reads: MemClasses::HEAP,
+                may_throw: true,
+                allocs: AllocKind::Object,
                 ..Effects::PURE
             },
 
@@ -288,10 +323,54 @@ impl Op {
                 may_call: CallEffect::UnknownCallee, // source getters
                 ..Effects::PURE
             },
+            // Prototype-link mutation (vendor `setobjectwithproto`,
+            // isa.yaml:1333-1337): NOT a property copy — writes the
+            // object's prototype link directly.
+            SetObjectWithProto { .. } => Effects {
+                writes: MemClasses::PROTOTYPE,
+                may_throw: true, // cyclic prototype chain
+                ..Effects::PURE
+            },
+            // Vendor `starrayspread` (isa.yaml:1329-1332): drives the
+            // source's iterator protocol and mutates the destination
+            // array; the new-index result is the acc write-back.
+            ArraySpread { .. } => Effects {
+                reads: MemClasses::ITERATOR | MemClasses::HEAP,
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // iterator protocol
+                ..Effects::PURE
+            },
+            // Rest destructuring (`createobjectwithexcludedkeys`): copies
+            // the source's own enumerable properties except the excluded
+            // keys into a FRESH object — a heap read plus an allocation;
+            // the copy invokes getters (CopyDataProperties semantics).
+            CreateObjectWithExcludedKeys { .. } => Effects {
+                reads: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                allocs: AllocKind::Object,
+                ..Effects::PURE
+            },
+            // Accessor definition on an object
+            // (`definegettersetterbyvalue`): defines the property — the
+            // closures are installed, not invoked.
+            DefineGetterSetterByValue { .. } => Effects {
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                ..Effects::PURE
+            },
 
             // Iteration protocol.
             GetIterator { .. } => Effects {
                 reads: MemClasses::HEAP, // @@iterator lookup
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                allocs: AllocKind::Object, // the iterator record
+                ..Effects::PURE
+            },
+            GetAsyncIterator { .. } => Effects {
+                reads: MemClasses::HEAP, // @@asyncIterator lookup
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
                 allocs: AllocKind::Object, // the iterator record
@@ -311,7 +390,10 @@ impl Op {
             NextPropName { .. } => rw(MemClasses::ITERATOR),
 
             // Lexical / global / module bindings.
-            GetLexEnv | GetLexVar { .. } => reads(MemClasses::LEX_ENV),
+            GetLexVar { .. } => reads(MemClasses::LEX_ENV),
+            // Lexical-environment lifecycle: pushing/popping an
+            // environment mutates the scope stack (v0.1 essential).
+            NewLexEnv { .. } | NewLexEnvWithName { .. } | PopLexEnv => writes(MemClasses::LEX_ENV),
             PutLexVar { .. } => writes(MemClasses::LEX_ENV),
             TryGetGlobal { .. } => reads(MemClasses::GLOBAL), // never throws
             StoreGlobal { .. } => Effects {
@@ -368,9 +450,21 @@ impl Op {
             Throw { .. }
             | ThrowIfSuperNotCalled { .. }
             | ThrowUndefinedIfHole { .. }
+            | ThrowUndefinedIfHoleWithName { .. }
             | ThrowConstAssignment { .. }
-            | ThrowIfNotObject { .. } => Effects {
+            | ThrowIfNotObject { .. }
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty => Effects {
                 may_throw: true,
+                ..Effects::PURE
+            },
+
+            // Vendor `debugger`: a breakpoint can invoke the attached
+            // debugger's hook — kept non-pure so DCE preserves it (v0.1's
+            // is_essential parity).
+            Debugger { .. } => Effects {
+                may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
 
@@ -390,7 +484,7 @@ impl Op {
                 ..Effects::PURE
             },
             GetResumeMode { .. } => reads(MemClasses::ITERATOR),
-            Await { .. } => Effects {
+            Await { .. } | AwaitUncaught { .. } => Effects {
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee, // thenables
                 ..Effects::PURE
@@ -483,5 +577,89 @@ mod tests {
         }
         .effects();
         assert!(e.writes.contains(MemClasses::LEX_ENV));
+    }
+
+    /// The v2-P0.5 taxonomy-growth pins: the new ISA-coverage ops carry
+    /// the documented effect records.
+    #[test]
+    fn effects_taxonomy_growth_pins() {
+        let v = ValueId::new(0);
+
+        // Lexical-env lifecycle mutates the scope stack.
+        for op in [
+            Op::NewLexEnv { num_vars: 1 },
+            Op::NewLexEnvWithName {
+                num_vars: 1,
+                scope_names: ConstId::new(0),
+            },
+            Op::PopLexEnv,
+        ] {
+            let e = op.effects();
+            assert!(e.writes.contains(MemClasses::LEX_ENV), "{op:?}");
+        }
+
+        // SetObjectWithProto writes the prototype link, never the heap
+        // property space.
+        let e = Op::SetObjectWithProto { proto: v, obj: v }.effects();
+        assert!(e.writes.contains(MemClasses::PROTOTYPE));
+        assert!(!e.writes.contains(MemClasses::HEAP));
+        assert!(e.may_throw);
+
+        // ArraySpread: heap mutation + iterator protocol.
+        let e = Op::ArraySpread {
+            dst: v,
+            index: v,
+            src: v,
+        }
+        .effects();
+        assert!(e.reads.contains(MemClasses::ITERATOR));
+        assert!(e.writes.contains(MemClasses::HEAP));
+        assert_eq!(e.may_call, CallEffect::UnknownCallee);
+
+        // GetTemplateObject: cache read + first-call allocation + abrupt.
+        let e = Op::GetTemplateObject { literal: v }.effects();
+        assert!(e.reads.contains(MemClasses::HEAP));
+        assert_eq!(e.allocs, AllocKind::Object);
+        assert!(e.may_throw);
+
+        // Frame-state loaders are pure.
+        for op in [Op::LoadNewTarget, Op::LoadGlobalObject, Op::LoadFunction] {
+            assert!(op.effects().is_pure(), "{op:?}");
+        }
+
+        // The exotic allocations.
+        assert_eq!(Op::GetUnmappedArgs.effects().allocs, AllocKind::Object);
+        assert_eq!(
+            Op::CopyRestArgs { start_index: 0 }.effects().allocs,
+            AllocKind::Array
+        );
+        assert_eq!(
+            Op::CreateIterResultObj { value: v, done: v }
+                .effects()
+                .allocs,
+            AllocKind::Object
+        );
+
+        // The async forms.
+        let e = Op::AwaitUncaught { value: v }.effects();
+        assert!(e.may_throw);
+        assert_eq!(e.may_call, CallEffect::UnknownCallee);
+        assert!(Op::AsyncFunctionEnter.effects().is_pure());
+
+        // The dedicated throw ops throw.
+        for op in [
+            Op::ThrowUndefinedIfHoleWithName {
+                name: Sym::new(0),
+                value: v,
+            },
+            Op::ThrowNotExists,
+            Op::ThrowPatternNonCoercible,
+            Op::ThrowDeleteSuperProperty,
+        ] {
+            assert!(op.effects().may_throw, "{op:?}");
+        }
+
+        // Debugger stays essential (v0.1 parity) via the hook call effect.
+        assert!(!Op::Debugger.effects().is_pure());
     }
 }

@@ -1298,6 +1298,7 @@ mod tests {
             catches: vec![Catch {
                 handler,
                 exception: exc,
+                type_idx: None,
             }],
         });
     }
