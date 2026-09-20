@@ -891,6 +891,11 @@ fn module_field_snapshots(f: &abcd_file::File) -> Vec<(String, String)> {
                         .collect();
                     format!("module({requests:?};{})", records.join(","))
                 }
+                Some(abcd_file::FieldValue::ModuleRequestPhase(p)) => {
+                    // source_offset is informational (the blob relocates on
+                    // rewrite); the flags are the content.
+                    format!("phase({:?})", p.flags)
+                }
                 Some(abcd_file::FieldValue::LiteralArrayRef(off)) => {
                     let idx = f
                         .literal_array_offsets
@@ -970,4 +975,91 @@ fn rewritten_corpus_module_cases() {
         checked += 1;
     }
     assert_eq!(checked, 72, "4 module cases x 6 versions x 3 profiles");
+}
+
+/// Identity rewrite of fixtures carrying `moduleRequestPhaseIdx` fields
+/// (N7): the u32 field value is the file offset of an UNTAGGED
+/// module-request-phase blob (one u8 lazy flag per module request; vendored
+/// runtime reader ModuleLazyImportFlagAccessor, ecmascript/module/
+/// module_data_extractor.cpp:178-189; excluded from tagged literal-array
+/// disassembly upstream, disassembler.cpp:372). Pre-N7 the field wrote the
+/// raw source offset back (dangling on rewrite) and the blob was misdecoded
+/// as a tagged literal array.
+///
+/// Evidence beyond this snapshot equality: the rewritten bytes are written
+/// to $ABCD_REWRITTEN_DIR for a local ark_disasm check (must be clean —
+/// a dangling field value makes the disassembler parse the wrong blob).
+#[test]
+#[ignore = "requires exported GHCR corpus"]
+fn rewritten_corpus_module_request_phase_cases() {
+    const CASES: &[&str] = &[
+        "upstream/version_control/API12beta3/syntax_feature/lazy_import",
+        "upstream/version_control/API12beta3/bytecode_feature/lazy_import_bytecode",
+        "upstream/version_control/API12beta3/bytecode_feature/wide_lazy_import_bytecode",
+    ];
+    let root = exported_corpus_root();
+    let rows: Vec<serde_json::Value> = std::fs::read_to_string(root.join("index.jsonl"))
+        .expect("corpus index")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid index JSON"))
+        .collect();
+    let mut checked = 0;
+    for row in rows.iter().filter(|row| {
+        row["case"]
+            .as_str()
+            .is_some_and(|case| CASES.contains(&case))
+    }) {
+        let relative = row["abc"].as_str().expect("abc path");
+        let file = decode(&std::fs::read(root.join(relative)).expect("fixture"))
+            .unwrap_or_else(|error| panic!("decode {relative}: {error}"));
+        // The fixture must actually carry phase data (guard against drift).
+        let phase_flags: Vec<Vec<u8>> = file
+            .classes
+            .values()
+            .flat_map(|c| c.fields.iter())
+            .filter_map(|f| match &f.initial_value {
+                Some(abcd_file::FieldValue::ModuleRequestPhase(p)) => Some(p.flags.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !phase_flags.is_empty(),
+            "{relative}: fixture must carry module-request-phase data"
+        );
+
+        let expected = module_field_snapshots(&file);
+        let output = encode(&file).unwrap_or_else(|error| panic!("encode {relative}: {error}"));
+        let rewritten =
+            decode(&output).unwrap_or_else(|error| panic!("decode rewritten {relative}: {error}"));
+        assert_eq!(
+            module_field_snapshots(&rewritten),
+            expected,
+            "{relative}: module/scope/phase data must survive the identity rewrite"
+        );
+        // The rewritten field must point at a VALID re-emitted blob:
+        // decoding the rewritten file must yield the same flags.
+        let rewritten_flags: Vec<Vec<u8>> = rewritten
+            .classes
+            .values()
+            .flat_map(|c| c.fields.iter())
+            .filter_map(|f| match &f.initial_value {
+                Some(abcd_file::FieldValue::ModuleRequestPhase(p)) => Some(p.flags.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rewritten_flags, phase_flags,
+            "{relative}: lazy-import flags must survive the rewrite"
+        );
+        if let Some(directory) = std::env::var_os("ABCD_REWRITTEN_DIR") {
+            let target = std::path::PathBuf::from(directory).join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, output).expect("write disasm candidate");
+        }
+        checked += 1;
+    }
+    assert_eq!(
+        checked, 9,
+        "3 lazy-import cases x 3 profiles (12.0.6.0 only)"
+    );
 }

@@ -2096,6 +2096,31 @@ try {
 }
 }
 
+/* Module-request-phase blob (`moduleRequestPhaseIdx` field values): an
+ * UNTAGGED literal-array-slot blob of one u8 lazy-import flag per module
+ * request. Layout from the vendored runtime reader
+ * (arkcompiler_ets_runtime-master ecmascript/module/
+ * module_data_extractor.cpp ModuleLazyImportFlagAccessor:178-189):
+ * [u32 count][u8 flag]*. The upstream disassembler excludes these offsets
+ * from tagged literal-array disassembly for the same reason
+ * (disassembler.cpp:372, 1007-1008). Returns the flag count, or -1 on
+ * error; cb receives each flag in order. */
+int32_t abc_module_request_phase_read(const AbcFileHandle *f, uint32_t offset,
+                                      void (*cb)(uint8_t flag, void *ctx), void *ctx) {
+try {
+    if (f == nullptr || cb == nullptr) return -1;
+    auto sp = f->file->GetSpanFromId(File::EntityId(offset));
+    uint32_t count = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+    for (uint32_t i = 0; i < count; i++) {
+        if (sp.empty()) return -1;
+        cb(static_cast<uint8_t>(panda::panda_file::helpers::Read<sizeof(uint8_t)>(&sp)), ctx);
+    }
+    return static_cast<int32_t>(count);
+} catch (...) {
+    return -1;
+}
+}
+
 /* ========== Annotation Data Accessor ========== */
 
 AbcAnnotationAccessor *abc_annotation_open(const AbcFileHandle *f, uint32_t offset) {
@@ -2899,6 +2924,25 @@ try {
                     return -1;  // unreachable: tags pre-validated above
             }
         }
+    }
+    return 0;
+} catch (...) {
+    return -1;
+}
+}
+
+/* Stage a module-request-phase blob: one raw u8 per flag after the u32
+ * item-count header LiteralArrayItem writes itself. UNtagged — the runtime
+ * reader (ModuleLazyImportFlagAccessor) expects no LiteralTag bytes, unlike
+ * every other literal-array writer here. */
+int32_t abc_builder_literal_array_add_module_request_phase(AbcBuilder *b, uint32_t lit_handle,
+                                                           const uint8_t *flags, uint32_t num_flags) {
+try {
+    if (lit_handle >= b->literal_items_staging.size()) return -1;
+    if (num_flags > 0 && flags == nullptr) return -1;
+    auto &staging = b->literal_items_staging[lit_handle];
+    for (uint32_t i = 0; i < num_flags; i++) {
+        staging.emplace_back(flags[i]);
     }
     return 0;
 } catch (...) {

@@ -707,6 +707,33 @@ impl Builder {
         Ok(())
     }
 
+    /// Stage a module-request-phase blob: one raw u8 lazy flag per module
+    /// request after the u32 item-count header the vendored writer emits
+    /// itself. UNtagged — matches the vendored runtime reader
+    /// (`ModuleLazyImportFlagAccessor`); do not add LiteralTag bytes.
+    pub fn literal_array_add_module_request_phase(
+        &mut self,
+        la: LiteralArrayHandle,
+        flags: &[u8],
+    ) -> Result<(), Error> {
+        // SAFETY: the builder is live; the slice outlives the call.
+        let rc = unsafe {
+            sys::abc_builder_literal_array_add_module_request_phase(
+                self.raw,
+                la.0,
+                flags.as_ptr(),
+                flags.len() as u32,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::ModuleData(format!(
+                "module-request-phase blob staging rejected ({flags} flags)",
+                flags = flags.len()
+            )));
+        }
+        Ok(())
+    }
+
     // --- MethodHandle items ---
 
     /// Create a method handle item.
@@ -1491,12 +1518,12 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 Some(FieldValue::I64(v)) => b.field_set_value_i64(field_h, *v),
                 Some(FieldValue::F32(v)) => b.field_set_value_f32(field_h, *v),
                 Some(FieldValue::F64(v)) => b.field_set_value_f64(field_h, *v),
-                Some(FieldValue::ModuleData(_)) | Some(FieldValue::LiteralArrayRef(_)) => {
-                    deferred_field_values.push((
-                        field_h,
-                        field.initial_value.as_ref().expect("deferred value"),
-                    ))
-                }
+                Some(FieldValue::ModuleData(_))
+                | Some(FieldValue::LiteralArrayRef(_))
+                | Some(FieldValue::ModuleRequestPhase(_)) => deferred_field_values.push((
+                    field_h,
+                    field.initial_value.as_ref().expect("deferred value"),
+                )),
                 None => {}
             }
 
@@ -1591,6 +1618,12 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     .map(|rec| module_record_def(rec, &mut b, &mut string_handles, pool))
                     .collect::<Result<_, _>>()?;
                 b.literal_array_add_module_data(la_h, &requests, &records)?;
+                b.field_set_value_literalarray(field_h, la_h)?;
+            }
+            FieldValue::ModuleRequestPhase(phase) => {
+                let la_h = b.add_literal_array(&format!("phase_la_{module_la_counter}"));
+                module_la_counter += 1;
+                b.literal_array_add_module_request_phase(la_h, &phase.flags)?;
                 b.field_set_value_literalarray(field_h, la_h)?;
             }
             FieldValue::LiteralArrayRef(source_offset) => {

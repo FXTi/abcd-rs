@@ -17,7 +17,7 @@ pub use crate::annotation::{
 pub use crate::code::{CatchBlock, TryBlock};
 pub use crate::debug::{ColumnEntry, LineEntry, LocalVarInfo, ParamInfo};
 pub use crate::literal::{LiteralArrayIdx, LiteralValue};
-pub use crate::module::{ModuleData, ModuleRecord};
+pub use crate::module::{ModuleData, ModuleRecord, ModuleRequestPhase};
 pub use abcd_isa::{Bytecode, DecodeError};
 
 // ---------------------------------------------------------------------------
@@ -126,6 +126,13 @@ pub enum FieldValue {
     /// resolved through [`File::literal_array_offsets`] at encode time, so
     /// the rewritten field points at the re-emitted literal array.
     LiteralArrayRef(u32),
+    /// `moduleRequestPhaseIdx` field (on `_ModuleRequestPhaseRecord`, or on
+    /// the module's own record in merge-abc output): the u32 wire value is
+    /// the source-file offset of an untagged module-request-phase blob
+    /// (vendored `ModuleLazyImportFlagAccessor` layout). Decode reads the
+    /// blob structurally; encode re-emits it and relocates the field value,
+    /// exactly like [`FieldValue::ModuleData`].
+    ModuleRequestPhase(ModuleRequestPhase),
 }
 
 /// Decoded method body (bytecodes + exception handlers).

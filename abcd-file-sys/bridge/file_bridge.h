@@ -421,6 +421,14 @@ typedef void (*AbcModuleRecordCb)(uint8_t tag, uint32_t export_name_off,
                                   uint32_t import_name_off,
                                   uint32_t local_name_off, void *ctx);
 void abc_module_enumerate_records(AbcModuleAccessor *a, AbcModuleRecordCb cb, void *ctx);
+
+/* Module-request-phase blob (untagged u32 count + u8 lazy flags per module
+ * request; vendored runtime layout in
+ * ecmascript/module/module_data_extractor.cpp ModuleLazyImportFlagAccessor).
+ * Returns the flag count, or -1 on error. The callback family here does not
+ * early-stop (pure collector). */
+int32_t abc_module_request_phase_read(const AbcFileHandle *f, uint32_t offset,
+                                      void (*cb)(uint8_t flag, void *ctx), void *ctx);
 /* Module data entity ID */
 uint32_t abc_module_get_data_id(const AbcModuleAccessor *a);
 
@@ -615,6 +623,11 @@ typedef struct AbcModuleRecordDef {
  * staged unless every input validates.
  * Returns 0 on success, -1 on error (bad handle, unknown tag, missing
  * required name, module_request_idx wider than the vendored u16 slot). */
+/* Stage a module-request-phase blob (untagged u8 flags; see
+ * abc_module_request_phase_read). Returns 0 on success, -1 on error. */
+int32_t abc_builder_literal_array_add_module_request_phase(AbcBuilder *b, uint32_t lit_handle,
+                                                           const uint8_t *flags, uint32_t num_flags);
+
 int32_t abc_builder_literal_array_add_module_data(AbcBuilder *b, uint32_t lit_handle,
                                                   const uint32_t *request_handles,
                                                   uint32_t num_requests,

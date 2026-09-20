@@ -120,6 +120,9 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     // latter must be included even when no header table lists them (13.x+).
     let mut module_data_offsets: HashSet<u32> = HashSet::new();
     let mut scope_names_offsets: HashSet<u32> = HashSet::new();
+    // Untagged module-request-phase blobs (`moduleRequestPhaseIdx` field
+    // values): excluded from tagged literal-array decoding, like module blobs.
+    let mut phase_blob_offsets: HashSet<u32> = HashSet::new();
     for i in 0..num_classes {
         let class_off = unsafe { sys::abc_file_class_offset(f, i) };
         if class_off == ABSENT {
@@ -184,6 +187,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                     &descriptor_str,
                     &mut module_data_offsets,
                     &mut scope_names_offsets,
+                    &mut phase_blob_offsets,
                 )
             })
             .collect();
@@ -309,6 +313,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         &mut strings,
         &referenced_literal_offsets,
         &module_data_offsets,
+        &phase_blob_offsets,
     );
 
     Ok(File {
@@ -522,6 +527,16 @@ const ES_MODULE_RECORD_DESCRIPTOR: &str = "L_ESModuleRecord;";
 /// literal arrays (upstream `_ESScopeNamesRecord`, same sources).
 const ES_SCOPE_NAMES_RECORD_DESCRIPTOR: &str = "L_ESScopeNamesRecord;";
 
+/// Name of the u32 field whose value is the file offset of an untagged
+/// module-request-phase blob (one u8 lazy-import flag per module request).
+/// Matched by NAME, not by class: upstream's merge-abc mode emits the field
+/// on the module's own record (es2panda emitter.cpp
+/// `Emitter::AddModuleRequestPhaseRecord` IsMergeAbc branch), and the
+/// vendored runtime/disassembler key on the name too
+/// (js_pandafile.cpp:217 `LAZY_IMPORT`, disassembler.cpp:1007
+/// `MODULE_REQUEST_PAHSE_IDX`).
+const MODULE_REQUEST_PHASE_FIELD: &str = "moduleRequestPhaseIdx";
+
 /// Decode a module-record blob through the vendored ModuleDataAccessor.
 ///
 /// Layout (module_data_accessor.cpp ctor + module_data_accessor-inl.h
@@ -635,6 +650,37 @@ fn decode_module_data_at(
     })
 }
 
+/// Layout (vendored runtime reader `ModuleLazyImportFlagAccessor`,
+/// ecmascript/module/module_data_extractor.cpp:178-189): `[u32 item count]`
+/// (written by the literal-array item itself) then one raw u8 per module
+/// request — UNtagged, unlike a normal literal array.
+fn decode_module_request_phase_at(
+    f: *const sys::AbcFileHandle,
+    offset: u32,
+) -> Result<crate::ModuleRequestPhase, Error> {
+    let mut flags: Vec<u8> = Vec::new();
+    unsafe extern "C" fn collect(flag: u8, ctx: *mut c_void) {
+        unsafe { &mut *(ctx as *mut Vec<u8>) }.push(flag);
+    }
+    let n = unsafe {
+        sys::abc_module_request_phase_read(
+            f,
+            offset,
+            Some(collect),
+            &mut flags as *mut Vec<u8> as *mut c_void,
+        )
+    };
+    if n < 0 {
+        return Err(Error::ModuleData(format!(
+            "module-request-phase blob at {offset:#x} is unreadable"
+        )));
+    }
+    Ok(crate::ModuleRequestPhase {
+        source_offset: offset,
+        flags,
+    })
+}
+
 fn decode_field_at(
     f: *const sys::AbcFileHandle,
     field_off: u32,
@@ -643,6 +689,7 @@ fn decode_field_at(
     class_descriptor: &str,
     module_data_offsets: &mut HashSet<u32>,
     scope_names_offsets: &mut HashSet<u32>,
+    phase_blob_offsets: &mut HashSet<u32>,
 ) -> Result<Field, Error> {
     let fr = unsafe { sys::abc_field_open(f as *mut _, field_off) };
     if fr.is_null() {
@@ -762,6 +809,27 @@ fn decode_field_at(
             })?;
             scope_names_offsets.insert(offset);
             Some(FieldValue::LiteralArrayRef(offset))
+        }
+        // `moduleRequestPhaseIdx` u32 fields (any class — merge-abc emits
+        // them on the module's own record) reference untagged
+        // module-request-phase blobs by file offset; decode structurally so
+        // encode can re-emit and relocate (same dangling-offset class as
+        // _ESModuleRecord/_ESScopeNamesRecord).
+        (_, TypeId::U32, Some(FieldValue::I32(off)))
+            if strings.resolve(name) == Some(MODULE_REQUEST_PHASE_FIELD) =>
+        {
+            let offset = u32::try_from(off).map_err(|_| {
+                Error::ModuleData(format!(
+                    "{class_descriptor} field at {field_off:#x}: negative blob offset {off}"
+                ))
+            })?;
+            let phase = decode_module_request_phase_at(f, offset).map_err(|e| {
+                Error::ModuleData(format!(
+                    "{class_descriptor} moduleRequestPhaseIdx field at {field_off:#x}: {e}"
+                ))
+            })?;
+            phase_blob_offsets.insert(offset);
+            Some(FieldValue::ModuleRequestPhase(phase))
         }
         (_, _, value) => value,
     };
@@ -1390,16 +1458,21 @@ fn decode_literal_arrays(
     strings: &mut StringPool,
     referenced_offsets: &HashSet<u32>,
     module_data_offsets: &HashSet<u32>,
+    phase_blob_offsets: &HashSet<u32>,
 ) -> (Vec<LiteralArray>, HashMap<u32, u32>) {
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
     let mut offsets = Vec::new();
     if n != 0 {
         for i in 0..n {
             let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
-            // Module-record blobs ride the legacy header table on <=12.x but
-            // are NOT tagged literal arrays; they are modeled structurally
-            // via FieldValue::ModuleData and must never be decoded here.
-            if off != ABSENT && !module_data_offsets.contains(&off) {
+            // Module-record and module-request-phase blobs ride the legacy
+            // header table on <=12.x but are NOT tagged literal arrays; they
+            // are modeled structurally (FieldValue::ModuleData /
+            // FieldValue::ModuleRequestPhase) and must never be decoded here.
+            if off != ABSENT
+                && !module_data_offsets.contains(&off)
+                && !phase_blob_offsets.contains(&off)
+            {
                 offsets.push(off);
             }
         }
@@ -1412,7 +1485,10 @@ fn decode_literal_arrays(
         .iter()
         .copied()
         .filter(|&off| {
-            off != ABSENT && !offsets.contains(&off) && !module_data_offsets.contains(&off)
+            off != ABSENT
+                && !offsets.contains(&off)
+                && !module_data_offsets.contains(&off)
+                && !phase_blob_offsets.contains(&off)
         })
         .collect();
     referenced.sort_unstable();

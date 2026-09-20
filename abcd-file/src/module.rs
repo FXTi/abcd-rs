@@ -31,6 +31,31 @@ pub enum ModuleRecord {
     },
 }
 
+/// Decoded module-request-phase blob (`moduleRequestPhaseIdx` field values).
+///
+/// On disk this is an UNTAGGED literal-array-slot blob: `[u32 count]` (the
+/// header the literal-array item writes) then one raw u8 lazy-import flag
+/// per module request — no LiteralTag bytes, matching the vendored runtime
+/// reader (`ModuleLazyImportFlagAccessor`,
+/// ecmascript/module/module_data_extractor.cpp:178-189) and the producer
+/// (es2panda `ModuleRecordEmitter::GenModuleRequests`, one INTEGER_8
+/// `isLazy_` per request). The upstream disassembler excludes these offsets
+/// from tagged literal-array disassembly (disassembler.cpp:372, 1007-1008).
+///
+/// `_ModuleRequestPhaseRecord` fields (or same-named fields on the module's
+/// own record in merge-abc output) reference the blob by file offset; decode
+/// surfaces them as [`crate::FieldValue::ModuleRequestPhase`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleRequestPhase {
+    /// Offset of the phase blob in the source file; 0 for hand-built models.
+    /// Re-emission relocates the blob, so this is informational.
+    pub source_offset: u32,
+    /// Raw lazy flags, one per module request of the owning module record,
+    /// in module-request order. The runtime interprets `> 0` as lazy; the
+    /// raw u8s are preserved for byte fidelity.
+    pub flags: Vec<u8>,
+}
+
 /// Decoded module data (import/export declarations for an ES module).
 ///
 /// On disk the module data is an UNTAGGED literal-array item read through
