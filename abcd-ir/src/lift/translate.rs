@@ -733,7 +733,7 @@ pub(super) fn translate_bytecode(
             );
             write_acc(ssa, block, v);
         }
-        Bytecode::Defineclasswithbuffer(_ic, method_eid, lit_eid, _count, base_reg) => {
+        Bytecode::Defineclasswithbuffer(_ic, method_eid, lit_eid, count, base_reg) => {
             let (method_id, method_offset) = resolve_method(file, body, module, *method_eid)?;
             let lit_s = super::resolve_literal(file, body, *lit_eid)?;
             let base = read_reg(ssa, *base_reg, block, module);
@@ -744,6 +744,7 @@ pub(super) fn translate_bytecode(
                     method_id,
                     method_offset,
                     literal_array: lit_s,
+                    count: count.0 as u16,
                     base,
                 },
                 loc,
@@ -1702,7 +1703,7 @@ pub(super) fn translate_bytecode(
             );
             write_acc(ssa, block, v);
         }
-        Bytecode::CallruntimeDefinesendableclass(_ic, method_eid, lit_eid, _count, base_reg) => {
+        Bytecode::CallruntimeDefinesendableclass(_ic, method_eid, lit_eid, count, base_reg) => {
             let (method_id, method_offset) = resolve_method(file, body, module, *method_eid)?;
             let lit_s = super::resolve_literal(file, body, *lit_eid)?;
             let base = read_reg(ssa, *base_reg, block, module);
@@ -1713,6 +1714,7 @@ pub(super) fn translate_bytecode(
                     method_id,
                     method_offset,
                     literal_array: lit_s,
+                    count: count.0 as u16,
                     base,
                 },
                 loc,
@@ -2043,7 +2045,7 @@ pub(super) fn translate_bytecode(
         Bytecode::DeprecatedDefineclasswithbuffer(
             method_eid,
             lit_idx,
-            _count,
+            count,
             base_reg,
             _env_reg,
         ) => {
@@ -2056,6 +2058,7 @@ pub(super) fn translate_bytecode(
                     method_id,
                     method_offset,
                     literal_array: lit_idx.0 as u32,
+                    count: count.0 as u16,
                     base,
                 },
                 loc,

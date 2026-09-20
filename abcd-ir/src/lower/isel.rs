@@ -1236,6 +1236,7 @@ fn select_inst(
         InstData::DefineClassWithBuffer {
             method_offset,
             literal_array,
+            count,
             base,
             ..
         } => {
@@ -1244,7 +1245,9 @@ fn select_inst(
                 ic.one(),
                 tracer.method_eid(*method_offset),
                 EntityId(*literal_array),
-                Imm(0),
+                // Vendor imm2 (_count): consumed by the runtime as the
+                // constructor's .length (RuntimeSetClassConstructorLength).
+                Imm(i64::from(*count)),
                 base_r,
             ));
             home_result(tracker, result, used, func_id, alloc, codes)?;

@@ -343,6 +343,11 @@ pub enum InstData {
         /// Source-file offset of the constructor method (the identity).
         method_offset: u32,
         literal_array: u32,
+        /// Vendor imm2 (`_count`): the class constructor's `.length` —
+        /// the runtime consumes it via RuntimeSetClassConstructorLength
+        /// (arkcompiler_ets_runtime-master/ecmascript/stubs/runtime_stubs-inl.h:1037
+        /// -> :1227). NOT ignorable; modeled for byte fidelity and semantics.
+        count: u16,
         base: Value,
     },
     DefineGetterSetterByValue {

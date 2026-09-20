@@ -297,11 +297,12 @@ fn write_inst_data(f: &mut fmt::Formatter<'_>, m: &Module, data: &InstData) -> f
             method_id,
             method_offset,
             literal_array,
+            count,
             base,
         } => {
             write!(
                 f,
-                "DefineClassWithBuffer \"{}\"@{method_offset:#x}, #{literal_array}, {base}",
+                "DefineClassWithBuffer \"{}\"@{method_offset:#x}, #{literal_array}, {count}, {base}",
                 m.strings.get(*method_id)
             )
         }
