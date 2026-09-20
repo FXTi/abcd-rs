@@ -82,14 +82,17 @@
 //! callthis* (+withname, callruntime.callinit) → `Dynamic{this:
 //! Some(args[0]), args: args[1..]}`, supercallthis/arrowrange →
 //! `Super{this: None}` (arrow distinction folds), supercallspread →
-//! `Super{args: [array]}` (spread role documented), apply (+deprecated.
+//! `SuperSpread{args: [array]}` (the spread role is IR-explicit —
+//! v0.1's `CallKind::SuperCallSpread`, N58), apply (+deprecated.
 //! callspread) → `Apply{this: Some(this), args: [array]}` (the spread
 //! role is IR-explicit — v0.1's `CallKind::Apply`, N57), newobjrange → `New{callee: window[0], args:
 //! window[1..]}` (argc counts the ctor; argc=0 keeps v0.1's acc
 //! fallback), newobjapply → `New{callee: ctor, args: [array]}` (v0.1's
 //! swapped NewObjApply roles NORMALIZED to callee=ctor — documented),
-//! callruntime.supercallforwardallargs → `Super{args: [this]}` (v0.1's
-//! approximation kept verbatim).
+//! callruntime.supercallforwardallargs →
+//! `SuperForwardAllArgs{args: [this]}` (the forward-all kind stays
+//! distinct from `Super`, N58; v0.1's SuperCall approximation — args
+//! [this], lowering to supercallthisrange argc=1 — kept verbatim).
 //!
 //! Deprecated opcodes fold to the modern ops (v0.1 convention), with
 //! v0.1's exact operand reads preserved (including its DISCARDED reads
@@ -1193,6 +1196,9 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Supercallspread(_ic, arg_reg) => {
+            // N58: the spread role is IR-explicit
+            // (`CallKind::SuperSpread`, v0.1 parity) — args[0] is the
+            // argument ARRAY, never a positional argument.
             let callee = fx.read_acc(block);
             let arg = fx.read_reg(*arg_reg, block);
             let v = fx.emit_val(
@@ -1201,7 +1207,7 @@ pub fn translate_bytecode(
                     callee,
                     this: None,
                     args: vec![arg],
-                    kind: CallKind::Super,
+                    kind: CallKind::SuperSpread,
                 },
                 loc,
             );
@@ -1715,8 +1721,12 @@ pub fn translate_bytecode(
         Bytecode::CallruntimeIstrue(_ic) => unary_op(fx, UnOp::IsTrue, block, loc),
         Bytecode::CallruntimeIsfalse(_ic) => unary_op(fx, UnOp::IsFalse, block, loc),
         Bytecode::CallruntimeSupercallforwardallargs(this_reg) => {
-            // v0.1's approximation kept verbatim: the enclosing `this`
-            // is modeled as the single forwarded argument.
+            // N58: the forward-all form keeps its own kind
+            // (`CallKind::SuperForwardAllArgs`) so the lower never
+            // confuses it with supercallspread; v0.1's approximation is
+            // kept verbatim — the enclosing `this` is modeled as the
+            // single forwarded argument (v0.1 `CallKind::SuperCall`,
+            // args [this], lowering to supercallthisrange argc=1).
             let callee = fx.read_acc(block);
             let this = fx.read_reg(*this_reg, block);
             let v = fx.emit_val(
@@ -1725,7 +1735,7 @@ pub fn translate_bytecode(
                     callee,
                     this: None,
                     args: vec![this],
-                    kind: CallKind::Super,
+                    kind: CallKind::SuperForwardAllArgs,
                 },
                 loc,
             );

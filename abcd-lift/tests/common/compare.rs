@@ -36,11 +36,16 @@
 //!    `Sym`, no materialization in v0.2). Rule: the v0.1 side expands
 //!    to the same token sequence.
 //! 4. **Call-kind normalization**: v0.1's arity/leak kinds (`CallThis`,
-//!    `SuperCall*`, `NewObjApply`, `Construct`) normalize to
-//!    `Dynamic`/`Super`/`New` with explicit `this` roles — including
-//!    `NewObjApply`'s swapped vendor roles (v0.2 normalizes to
-//!    callee=ctor). `Apply` is NOT normalized (N57): both IRs carry the
-//!    apply distinction explicitly and it compares exactly.
+//!    `SuperCall`, `SuperCallArrow`, `NewObjApply`, `Construct`)
+//!    normalize to `Dynamic`/`Super`/`New` with explicit `this` roles —
+//!    including `NewObjApply`'s swapped vendor roles (v0.2 normalizes
+//!    to callee=ctor). `Apply` (N57) and `SuperCallSpread` (N58) are
+//!    NOT normalized: both IRs carry those distinctions explicitly and
+//!    they compare exactly. v0.2's `SuperForwardAllArgs` canonicalizes
+//!    DOWN to `super` (N58 residual fold): v0.1 represents the
+//!    forward-all form as plain `SuperCall`, indistinguishable from
+//!    `supercallthisrange` — the v0.2 kind is strictly more precise
+//!    than anything v0.1 can express.
 //! 5. **Folded distinctions**: own-vs-plain stores, strict-vs-tolerant
 //!    global stores, local-vs-external module vars, async-vs-sync
 //!    iterators/generators fold per the mapping table.
@@ -793,7 +798,10 @@ fn canon_inst_v1(cx: &mut V1Cx, iid: abcd_ir::entity::Inst) {
                     ops.push(cx.val(*callee));
                     ops.push(CVal::Konst("this:none".into()));
                     ops.extend(args.iter().map(|&a| cx.val(a)));
-                    "super"
+                    // N58: the super-spread distinction is IR-explicit
+                    // on both sides — compares EXACTLY (no fold to
+                    // "super").
+                    "superspread"
                 }
                 V1CallKind::Apply => {
                     ops.push(cx.val(*callee));
@@ -1241,6 +1249,13 @@ fn canon_inst_v2(cx: &mut V2Cx, iid: abcd_ir2::InstId) {
                     abcd_ir2::CallKind::Dynamic => "dynamic",
                     abcd_ir2::CallKind::Apply => "apply",
                     abcd_ir2::CallKind::Super => "super",
+                    abcd_ir2::CallKind::SuperSpread => "superspread",
+                    // N58 residual fold (documented, rule 4): v0.1
+                    // represents supercallforwardallargs as plain
+                    // SuperCall — indistinguishable from
+                    // supercallthisrange — so the strictly-more-precise
+                    // v0.2 kind canonicalizes DOWN to v0.1's token.
+                    abcd_ir2::CallKind::SuperForwardAllArgs => "super",
                     abcd_ir2::CallKind::New => "new",
                 }
             )));

@@ -104,6 +104,8 @@ pub enum CmpOp {
 /// | `Dynamic` | computed at callee entry            | undefined     | args→params[1..] |
 /// | `Apply`   | `call.this` (explicit receiver)     | undefined     | SPREAD of args[0] |
 /// | `Super`   | inherited from enclosing ctor       | inherited     | args→params[1..] |
+/// | `SuperSpread` | inherited from enclosing ctor   | inherited     | SPREAD of args[0] |
+/// | `SuperForwardAllArgs` | inherited               | inherited     | ALL own args (forwarded) |
 /// | `New`     | fresh object from callee.prototype  | callee itself | args→params[1..] |
 ///
 /// The result is the callee's return value; a throw inside the callee
@@ -123,8 +125,24 @@ pub enum CallKind {
     /// `Some(receiver)` and `Call::args` is exactly `[array]` (N16/N57;
     /// v0.1 `CallKind::Apply`, isel emits the `apply` opcode).
     Apply,
-    /// A `super(...)` call in a constructor.
+    /// A `super(...)` call in a constructor with EXPLICIT arguments
+    /// (vendor `supercallthisrange`/`supercallarrowrange`).
     Super,
+    /// A `super(...args)` call spreading an argument ARRAY into the super
+    /// constructor — vendor `supercallspread imm, v_args` (isa.yaml).
+    /// `Call::this` is `None` (inherited) and `Call::args` is exactly
+    /// `[array]` (N58; v0.1 `CallKind::SuperCallSpread`, isel emits the
+    /// `supercallspread` opcode). Never a 1-argument [`CallKind::Super`].
+    SuperSpread,
+    /// Vendor `callruntime.supercallforwardallargs v_this` (isa.yaml): a
+    /// default derived constructor forwarding ALL of its own arguments to
+    /// the super constructor. v0.1's representation is kept verbatim
+    /// (`CallKind::SuperCall`, args = `[this]` — the enclosing `this`
+    /// models the forwarded argument list, lowering to
+    /// `supercallthisrange` argc=1), but the KIND stays distinct from
+    /// [`CallKind::Super`] so the lower never confuses the forward-all
+    /// form with an explicit-arguments super call (N58).
+    SuperForwardAllArgs,
     /// `new callee(args...)`.
     New,
 }
