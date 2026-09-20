@@ -245,8 +245,8 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 |---|------|--------|------|
 | v2-P0 | abcd-ir2 骨架：taxonomy + Effects + Ty + verifier 骨架（零格式依赖 Cargo 强制） | worker v2-P0 (k3) | **完成**（e83a2c4；orchestrator 复审 effects 派生表/Ty 格 join/verifier 豁免语义 + 复验：fmt/103 套件绿/ir2 22 测试绿/doc 零警告） |
 | v2-P0.5 | abcd-ir2 分类表扩到 ISA 全覆盖 | worker v2-P1 (k3) | **完成**（741fb8e；22 个新 op + payload homes + 全套 vendor 依据 effects；orchestrator 复审 effects 条目（GetTemplateObject/ArraySpread/SetObjectWithProto）+ 复验 fmt/ir2 23/23 绿；设计文档 §4.1 已同步为 ~70 ops） |
-| v2-P1 | abcd-lift 转换器 + v0.1 parity 对照 | worker v2-P1 (k3) | **主体完成**（57f336f+6ab12b7；orchestrator 独立复现：2730/2787 lift+verify 零错误，11148 函数 1,423,087 canonical token **零不一致**，对照器 smoke 非空转；57 sendable 待 v2-P1a；全 268 变体臂移植清单交付；新登记 N56 Builder module-blob staging 疑似损坏） |
-| v2-P1a | abcd-file 嵌套字面量数组 decode（57 个 sendable fixture 的类缓冲含未注册嵌套 LA 引用；orchestrator 裁决选 (1) 真修，否占位/否裸偏移变体） | worker v2-P1a (k3) | **进行中** |
+| v2-P1 | abcd-lift 转换器 + v0.1 parity 对照 | worker v2-P1 (k3) | **完成**（57f336f+6ab12b7；关门复现：**2787/2787 lift 零失败零 pending、verifier 零错误、12996 函数 1,434,154 token 零不一致**——函数数与上游 pandasm 方法数精确相等；workspace 109 套件绿；新登记 N56 Builder module-blob staging 疑似损坏） |
+| v2-P1a | abcd-file 嵌套字面量数组 decode | worker v2-P1a (k3) | **完成**（6d1fcd0；worklist 递归收集（排序批=N20 确定性、先注册后解码=循环安全、排除规则与表头一致）；orchestrator 复验：新套件绿、real_module_abc 7/7、2787 fixture decode-diff 恰 57 个、恒等重写 ark_disasm 全净且与 reference.pa 内容一致（模布局重编号）） |
 | v2-P2 | lower：v0.2 Module → MethodBody（复用重定位通道），VM oracle 对齐 1149/1149×2 | 待定 | 未开始 |
 | v2-P3 | pass 移植：SCCP/copyprop/DCE/peephole（T3 Effects 表），opt 变体 oracle 对齐 | 待定 | 未开始 |
 | v2-P4 | 替换：v0.1 退役为 abcd-ir-v1 留档，abcd-ir2 正名 abcd-ir | 待定 | 未开始（维护者验收后执行） |
