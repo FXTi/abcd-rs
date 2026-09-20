@@ -16,10 +16,12 @@ println!("version: {}", file.version);
 println!("classes: {}", file.classes.len());
 
 for (descriptor, class) in &file.classes {
+    let descriptor = file.strings.resolve(*descriptor).unwrap();
     println!("{descriptor} ({} methods, {} fields)", class.methods.len(), class.fields.len());
     for method in &class.methods {
         if let Some(ref body) = method.body {
-            println!("  {} — {} instructions", method.name, body.bytecodes.len());
+            let name = file.strings.resolve(method.name).unwrap();
+            println!("  {name} — {} instructions", body.bytecodes.len());
         }
     }
 }
@@ -65,15 +67,17 @@ let abc_bytes = b.finalize().unwrap();
 | `checksum` | `u32` | Adler-32 checksum |
 | `size` | `u32` | File size in bytes |
 | `file_type` | `FileType` | `Dynamic` (JS/TS) or `Static` (ArkTS) |
-| `classes` | `BTreeMap<String, Class>` | Classes keyed by descriptor (e.g. `"L_GLOBAL;"`) |
+| `strings` | `StringPool` | String interner — all string data lives here |
+| `classes` | `BTreeMap<StringId, Class>` | Classes keyed by interned descriptor (e.g. `"L_GLOBAL;"`) |
 | `literal_arrays` | `Vec<LiteralArray>` | Literal arrays indexed by position |
-| `entity_map` | `HashMap<u32, String>` | Entity offset → name/descriptor |
+| `literal_array_offsets` | `HashMap<u32, u32>` | Source-file literal-array offset → decoded table index |
+| `entity_map` | `HashMap<u32, StringId>` | Entity offset → interned name/descriptor |
 
 Navigation methods on `File`:
 
-- `class(descriptor)` — look up a class by descriptor
-- `all_methods()` — flat iterator over `(class_descriptor, &Method)` pairs
-- `resolve_entity(offset)` — resolve a bytecode `EntityId` to its name/descriptor
+- `class(descriptor: StringId)` / `class_by_str(&str)` — look up a class by descriptor
+- `all_methods()` — flat iterator over `(StringId, &Method)` pairs
+- `resolve_entity(offset)` → `Option<StringId>` / `resolve_entity_str(offset)` → `Option<&str>` — resolve a bytecode entity offset to its name/descriptor
 - `literal_array(index)` — get a literal array by index
 - `decode_module(index)` — decode ES module data from a literal array
 
@@ -81,9 +85,9 @@ Navigation methods on `File`:
 
 Each `Class` contains `methods: Vec<Method>`, `fields: Vec<Field>`, and `annotations: Annotations`. Convenience lookups: `method_by_name()`, `field_by_name()`, `super_class_in(&file)`.
 
-`Method` carries `body: Option<MethodBody>` (bytecodes + try-catch blocks), `debug: Option<MethodDebugInfo>`, typed `arg_types`/`return_type`, and annotations.
+`Method` carries `body: Option<MethodBody>` (bytecodes + try-catch blocks), `debug: Option<MethodDebugInfo>`, `return_type: Option<Type>` / `arg_types: Vec<Type>`, `param_annotations`, and annotations. The `offset` field is the file's unique method identity — names are not unique across classes.
 
-`Field` has `type_descriptor` (raw descriptor string), optional `initial_value`, and annotations.
+`Field` has `field_type: Type`, optional `initial_value`, and annotations.
 
 All three types expose access flag helpers (`is_public()`, `is_static()`, `is_abstract()`, etc.) derived from `AccessFlags`.
 
@@ -100,22 +104,24 @@ pub struct Annotations {
 }
 ```
 
-Each `Annotation` has a `class_descriptor` and `elements: Vec<AnnotationElem>`. Element values are fully typed via `AnnotationValue`:
+Each `Annotation` has a `class_descriptor: StringId` and `elements: Vec<AnnotationElem>`. Element values are fully typed via `AnnotationValue`:
 
 - Primitives: `Bool`, `I8`/`U8`, `I16`/`U16`, `I32`/`U32`, `I64`/`U64`, `F32`/`F64`
-- Resolved references: `String(String)`, `Record(String)`, `Method(String)`, `Enum(String)`
-- Unresolved entity offsets: `Annotation(u32)`, `MethodHandle(u32)`, `LiteralArray(u32)` — resolve via `File::resolve_entity()`
-- Special: `Void`, `StringNullptr`, `Array { tag, count, entity_offset }`
+- Interned strings: `String(StringId)`, `Record(StringId)` (class descriptor)
+- Resolved references: `Method { name: StringId, offset: u32 }`, `Enum { name: StringId, offset: u32 }` — name plus the item offset in the source file (the unique entity identity)
+- Resolved compound values: `Annotation(Box<Annotation>)` (nested annotation), `MethodHandle(ResolvedMethodHandle)`, `LiteralArray(Vec<LiteralValue>)`
+- Special: `Void`, `StringNullptr`, `Array { tag: u8, values: Vec<AnnotationValue> }` (`tag` preserves the original element-type tag)
 
 ## Literal Arrays & Modules
 
 `LiteralArray` holds `values: Vec<LiteralValue>`. Literal values include:
 
-- Primitives: `Bool`, `Integer`, `Float`, `Double`
-- `String(String)` — decoded MUTF-8 content
-- Method references: `Method(u32)`, `GeneratorMethod(u32)`, `Getter(u32)`, `Setter(u32)` — entity offsets, resolve via `File::resolve_entity()`
-- `MethodAffiliate(u16)`, `Accessor(u8)`, `LiteralArray(u32)`, `LiteralBufferIndex(u32)`
-- Typed arrays: `ArrayU1(u32)`, `ArrayI8(u32)`, ..., `ArrayString(u32)` — entity offsets to array data
+- Primitives: `Bool`, `Integer8(u8)` (the 12.x `TAGVALUE`/`INTEGER_8` tag), `Integer(u32)`, `Float(f32)`, `Double(f64)`
+- `String(StringId)` / `EtsImplements(StringId)` — interned content
+- Method references: `Method(u32)`, `GeneratorMethod(u32)`, `AsyncGeneratorMethod(u32)`, `Getter(u32)`, `Setter(u32)` — entity offsets, resolve via `File::resolve_entity_str()`
+- `MethodAffiliate(u16)`, `Accessor(u8)`, `BuiltinTypeIndex(u8)`, `NullValue(u8)`
+- Nested arrays: `LiteralArray(LiteralArrayIdx)`, `LiteralBufferIndex(LiteralArrayIdx)` — indices into `File::literal_arrays`
+- Typed arrays: `ArrayU1(LiteralArrayIdx)`, `ArrayU8`, `ArrayI8`, `ArrayU16`, `ArrayI16`, `ArrayU32`, `ArrayI32`, `ArrayU64`, `ArrayI64`, `ArrayF32`, `ArrayF64`, `ArrayString` — each an index into `File::literal_arrays` holding the element payload
 
 ES module data is encoded as a special literal array. Decode it with:
 
@@ -143,20 +149,23 @@ for record in &module.records {
 
 | Type | Description |
 |------|-------------|
-| `Type` | Resolved type: `Void`, `Bool`, `I32`, `F64`, `Reference(String)`, etc. |
+| `Type` | Resolved type: `Void`, `Bool`, `I32`, `F64`, `Reference(StringId)`, etc. |
 | `AccessFlags` | Bitflags: `PUBLIC`, `STATIC`, `FINAL`, `ABSTRACT`, `SYNTHETIC`, etc. |
 | `SourceLang` | `EcmaScript`, `JavaScript`, `TypeScript`, `ArkTs`, `PandaAssembly` |
 | `FunctionKind` | `Function`, `AsyncFunction`, `GeneratorFunction`, `ConcurrentFunction`, etc. |
 
 ## Re-exported Types
 
-From `abcd-isa`: `Version`, `Bytecode`, `DecodeError`, `Reg`, `Imm`, `EntityId`, `Label`.
+From `abcd-isa`: `Version`, `Bytecode`, `DecodeError` (operand newtypes `Reg`/`Imm`/`EntityId`/`Label` are used with `MethodBody::bytecodes` and come from the `abcd-isa` crate directly).
 
 From `abcd-file-sys`: `FileType`.
+
+From `string_interner`: `StringPool`, `StringId`.
+
+The crate also re-exports its own public model (`model::*`), `decode`, `file_type`, and the builder surface (`Builder`, `encode`, handle types, `CodeEntity`, `CatchBlockDef`, `ModuleRecordDef`, …) — see `src/lib.rs` for the exact list.
 
 ## Known Limitations
 
 - Byte-level roundtrip is not possible — the builder computes its own layout, so checksums and offsets will differ. Semantic equivalence is preserved.
-- `AnnotationValue::Annotation`, `MethodHandle`, and `LiteralArray` variants store raw entity offsets that are not automatically resolved during decode. Use `File::resolve_entity()` to look them up.
-- `LiteralValue` method variants (`Method`, `Getter`, `Setter`, etc.) also store raw entity offsets.
+- `LiteralValue` method-reference variants (`Method`, `GeneratorMethod`, `Getter`, `Setter`, …) store source-file entity offsets; use `File::resolve_entity_str()` to look them up. On encode, entity references written into literal arrays relocate automatically to the new file's layout.
 - `ParamInfo::signature` is not preserved during encode (C++ writer limitation).
