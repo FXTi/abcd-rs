@@ -383,8 +383,14 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   real root cause was decode_field_at arm ordering (the _ESModuleRecord
   catch-all u32 arm beat the N7 moduleRequestPhaseIdx name arm, so
   merge-abc-layout files were undecodable; one-arm reorder, N8 pattern).
-  v2-P2 (abcd-lower port) + P2a dispatched 2026-09-20; P2a done, P2 in
-  flight. v2-P2c DONE (55c989b..9425e73): N57–N61 lossy folds fixed —
+  v2-P2 DONE (2026-09-21): abcd-lower delivered — full v0.1 lower port
+  onto abcd_ir2::Module. Orchestrator-verified gates: v2lift 1149/1149
+  zero-skip, VM oracle 1149/1149 (sha256:5e7627bdcb78...), determinism
+  (two full rewrites byte-identical), 139 suites green, byte-identity
+  1096/1149 + 53 N62-attributed (duplicate-content literal arrays merge;
+  maintainer ACCEPTED the divergence — gate-2 final form is
+  "1149/1149 minus 53 N62 files"; analysis at
+  design/n62-literal-array-dedup-divergence.md). P2a done (N56). v2-P2c DONE (55c989b..9425e73): N57–N61 lossy folds fixed —
   CallKind::{Apply,SuperSpread,SuperForwardAllArgs}, AllocArray{shape:
   Option<ConstId>}, StoreOwnProp{Name,Dyn,Idx}, TryStoreGlobal; lift
   un-folded; comparator now compares these EXACTLY (residual fold
