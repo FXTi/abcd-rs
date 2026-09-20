@@ -358,8 +358,18 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
 
 ## Phase 5 outcome (done, 2026-09-21)
 
-- IR v0.2 TRACK STATUS (2026-09-21, P0-P1 done): abcd-ir2 scaffold
-  (taxonomy ~70 ops incl. v2-P0.5 full ISA coverage, Effects, Ty lattice,
+- MAINTAINER RULINGS (2026-09-20, hard-error batch): N8 — decode errors on
+  any field named `typeSummaryOffset` (`Error::TypeSummaryOffset`, e8c8446;
+  name guard placed FIRST in the field-value dispatch because upstream
+  attaches the field to _ESModuleRecord itself). N51 — both lifters error
+  on the this-by-* family (`LiftError::UnsupportedThisByAccess(mnemonic)`,
+  bab1efb + a8c2699; format layer untouched). General principle ruled:
+  hard Err when the seam is Result-typed, unreachable-style abort only
+  when it is not — warnings are NOT sufficient for unsupported upstream
+  constructs. D2 deferred to post-v2-P3; D3 = keep the dead FFI surface.
+  Gates: fmt clean, remote 112 suites / 451 tests green, corpus suites
+  byte-neutral (zero occurrences); orchestrator re-verified.
+- IR v0.2 TRACK STATUS (2026-09-21, P0-P1 done): abcd-ir2 scaffold  (taxonomy ~70 ops incl. v2-P0.5 full ISA coverage, Effects, Ty lattice,
   verifier with N45/N27/N38 rules) + abcd-lift converter (v2-P1:
   57f336f+6ab12b7) — **full-corpus parity achieved: 2787/2787 fixtures
   lift, 0 verifier errors, 0 mismatches over 12,996 functions /
@@ -537,7 +547,9 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   N16 CallKind::NewObjApply split + deprecated.callspread operand-drop fixed
   + wrong-arity hard errors, N8 adjudicated (typeSummaryOffset IS a file
   offset per the 2022-08-18 changelog, but no vendored producer/consumer/
-  corpus trigger — registered with a fix sketch, not fixed). Final
+  corpus trigger — SUPERSEDED 2026-09-20: maintainer ruled hard error, so
+  decode now fails with Error::TypeSummaryOffset on the field name,
+  e8c8446). Final
   checkpoint: rewrite 1149/1149 both variants zero skips; byte delta vs
   /tmp/t51-verify is exactly class-accessors+module-exports (36
   files/variant), pandasm-verified as ONLY the defineclasswithbuffer imm2
