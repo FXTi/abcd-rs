@@ -210,10 +210,14 @@ fn array_tags_all_decode() {
             b'X',
             AnnotationElemValue::EntityArray(vec![fm.as_raw()]),
         ),
+        // '#' is the SCALAR literal-array tag in the vendored data model
+        // (pandasm annotation.h: GetCharAsType '#' -> LITERALARRAY;
+        // GetArrayTypeAsChar has no literal-array case — arrays of literal
+        // arrays are not representable upstream).
         (
             b.add_string("alla"),
             b'#',
-            AnnotationElemValue::EntityArray(vec![la.as_raw()]),
+            AnnotationElemValue::EntityRef(la.as_raw()),
         ),
     ]
     .into_iter()
@@ -337,23 +341,17 @@ fn array_tags_all_decode() {
         }
         other => panic!("expected X array, got {other:?}"),
     }
+    // The scalar '#' element decodes as the literal array's contents.
     match vals[12] {
-        AnnotationValue::Array { tag, values } => {
-            assert_eq!(*tag, b'#');
-            assert_eq!(values.len(), 1);
-            match &values[0] {
-                AnnotationValue::LiteralArray(vals_la) => {
-                    // the referenced array holds one INTEGER 7
-                    assert_eq!(vals_la.len(), 1);
-                    match &vals_la[0] {
-                        abcd_file::LiteralValue::Integer(7) => {}
-                        other => panic!("expected Integer(7) in referenced array, got {other:?}"),
-                    }
-                }
-                other => panic!("expected LiteralArray element, got {other:?}"),
+        AnnotationValue::LiteralArray(vals_la) => {
+            // the referenced array holds one INTEGER 7
+            assert_eq!(vals_la.len(), 1);
+            match &vals_la[0] {
+                abcd_file::LiteralValue::Integer(7) => {}
+                other => panic!("expected Integer(7) in referenced array, got {other:?}"),
             }
         }
-        other => panic!("expected # array, got {other:?}"),
+        other => panic!("expected scalar # literal array, got {other:?}"),
     }
 }
 

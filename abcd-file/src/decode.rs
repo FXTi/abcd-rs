@@ -1145,31 +1145,19 @@ fn decode_annotation_list(
                             }
                         }
                         AVT::LiteralArray => {
-                            // '#' is both a scalar and an array component
-                            // tag: try the array interpretation first, fall
-                            // back to a scalar literal-array reference.
-                            let mut arr = sys::AbcAnnotationArrayVal {
-                                count: 0,
-                                entity_off: 0,
-                            };
-                            if unsafe { sys::abc_annotation_get_array_element(ar, idx, &mut arr) }
-                                == 0
-                            {
-                                AnnotationValue::Array {
-                                    tag: b'#',
-                                    values: decode_annotation_array_elements(
-                                        f,
-                                        b'#',
-                                        arr.count,
-                                        arr.entity_off,
-                                        entity_map,
-                                        strings,
-                                    ),
-                                }
-                            } else {
-                                let values = decode_literal_array_at(f, out.value, strings);
-                                AnnotationValue::LiteralArray(values)
-                            }
+                            // '#' is the SCALAR literal-array tag in the
+                            // vendored data model: pandasm GetCharAsType maps
+                            // '#' to Type::LITERALARRAY and GetArrayTypeAsChar
+                            // has no literal-array case (arrays of literal
+                            // arrays are not representable upstream). The
+                            // element value IS the literal array's offset
+                            // (vendored disassembler reads it via
+                            // GetScalarValue, disassembler.cpp:569-574).
+                            // Trying the array interpretation first reads the
+                            // target array's own item count as an array
+                            // length — pure misparse (F-new-2 evidence).
+                            let values = decode_literal_array_at(f, out.value, strings);
+                            AnnotationValue::LiteralArray(values)
                         }
                         AVT::Void => AnnotationValue::Void,
                         AVT::StringNullptr => AnnotationValue::StringNullptr,

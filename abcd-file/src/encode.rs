@@ -1381,6 +1381,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
                     entities: &entities,
+                    entity_map: &file.entity_map,
                     ann_la_counter: &mut ann_la_counter,
                     ann_la_base,
                     literal_array_count: file.literal_arrays.len(),
@@ -1433,6 +1434,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
                     entities: &entities,
+                    entity_map: &file.entity_map,
                     ann_la_counter: &mut ann_la_counter,
                     ann_la_base,
                     literal_array_count: file.literal_arrays.len(),
@@ -1504,6 +1506,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
                     entities: &entities,
+                    entity_map: &file.entity_map,
                     ann_la_counter: &mut ann_la_counter,
                     ann_la_base,
                     literal_array_count: file.literal_arrays.len(),
@@ -1524,6 +1527,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 string_handles: &mut string_handles,
                 class_handles: &mut class_handles,
                 entities: &entities,
+                entity_map: &file.entity_map,
                 ann_la_counter: &mut ann_la_counter,
                 ann_la_base,
                 literal_array_count: file.literal_arrays.len(),
@@ -1787,6 +1791,9 @@ struct AnnotationEncodeCtx<'a> {
     string_handles: &'a mut HashMap<StringId, StringHandle>,
     class_handles: &'a mut HashMap<StringId, ClassHandle>,
     entities: &'a EntityHandles,
+    /// Source-offset → string map, used by the offset-0 name fallback for
+    /// hand-built models (same contract as the model literal-array path).
+    entity_map: &'a HashMap<u32, StringId>,
     ann_la_counter: &'a mut u32,
     /// Handle of the first model literal array (= number of
     /// annotation-embedded arrays, which are created first), plus the model
@@ -1957,6 +1964,8 @@ fn annotation_value_to_raw(
                     ctx.pool,
                     la_h,
                     val,
+                    ctx.entities,
+                    ctx.entity_map,
                     ctx.ann_la_base,
                     ctx.literal_array_count,
                 )?;
@@ -2118,22 +2127,43 @@ fn resolve_class_for_ann(
 }
 
 /// Simplified literal value encoding for annotation-embedded literal arrays.
-/// Does not resolve method entity offsets (no entity_map available).
+///
+/// Method references carry the SOURCE-FILE offset as identity and resolve
+/// through the same entity handles as the model literal-array path
+/// (F-new-2): writing the raw offset into the new file's different layout
+/// leaves a dangling reference (audit findings #6/#7 class), so an
+/// unresolvable reference is a hard error, never a silent raw value.
 ///
 /// Nested `LiteralValue::LiteralArray` references carry a model table index
 /// into `File::literal_arrays`. Model arrays are created after all
 /// annotation-embedded ones, so the builder handle is
 /// `ann_la_base + idx` (`literal_array_count` bounds-checks `idx`).
+#[allow(clippy::too_many_arguments)]
 fn encode_literal_value_simple(
     b: &mut Builder,
     string_handles: &mut HashMap<StringId, StringHandle>,
     pool: &StringPool,
     la: LiteralArrayHandle,
     val: &LiteralValue,
+    entities: &EntityHandles,
+    entity_map: &HashMap<u32, StringId>,
     ann_la_base: u32,
     literal_array_count: usize,
 ) -> Result<(), Error> {
     use crate::literal::LiteralTag;
+    // Resolve a method entity offset to a MethodHandle: the offset is the
+    // unique entity identity; the name lookup via entity_map is only a
+    // fallback for hand-built models (offset 0). Same contract as
+    // encode_literal_value.
+    let resolve_method = |off: u32| -> Option<MethodHandle> {
+        if off != 0
+            && let Some(&mh) = entities.methods_by_offset.get(&off)
+        {
+            return Some(mh);
+        }
+        let sid = entity_map.get(&off)?;
+        entities.methods_by_name.get(sid).copied()
+    };
     match val {
         LiteralValue::Bool(v) => {
             b.literal_array_add_u8(la, LiteralTag::Bool as u8);
@@ -2174,7 +2204,12 @@ fn encode_literal_value_simple(
                 _ => unreachable!(),
             };
             b.literal_array_add_u8(la, tag as u8);
-            b.literal_array_add_u32(la, *off);
+            let mh = resolve_method(*off).ok_or_else(|| {
+                Error::CodeRelocation(format!(
+                    "annotation-embedded literal array method reference at offset {off:#x} cannot be resolved"
+                ))
+            })?;
+            b.literal_array_add_raw_method(la, mh);
         }
         LiteralValue::Accessor(v) => {
             b.literal_array_add_u8(la, LiteralTag::Accessor as u8);
