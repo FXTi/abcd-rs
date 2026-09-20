@@ -115,10 +115,7 @@ fn front_end(path: &std::path::Path) -> Result<(File, Module), Skip> {
     let module = lift_file(&file).map_err(|e| (SkipCategory::Lift, format!("lift: {e}")))?;
     let report = verify_module(&module);
     if !report.is_ok() {
-        return Err((
-            SkipCategory::Verify,
-            format!("verify: {:?}", report.errors),
-        ));
+        return Err((SkipCategory::Verify, format!("verify: {:?}", report.errors)));
     }
     Ok((file, module))
 }
@@ -158,8 +155,7 @@ fn rewrite_fixture(module: &Module, file: &File) -> Result<(Vec<u8>, usize), Ski
         for method in &mut class.methods {
             let body = cursor.next().expect("one slot per method");
             if method.body.is_some() {
-                method.body =
-                    Some(body.expect("a lowered body for every method that had one"));
+                method.body = Some(body.expect("a lowered body for every method that had one"));
             }
         }
     }

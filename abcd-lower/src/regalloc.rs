@@ -159,7 +159,9 @@ fn phi_entries(module: &Module, block: BlockId) -> Vec<(BlockId, ValueId, ValueI
         return out;
     };
     for &iid in &bb.insts {
-        let Some(inst) = module.inst(iid) else { continue };
+        let Some(inst) = module.inst(iid) else {
+            continue;
+        };
         let Op::Phi { entries } = &inst.op else {
             break; // phis form the leading prefix
         };
@@ -173,7 +175,9 @@ fn phi_entries(module: &Module, block: BlockId) -> Vec<(BlockId, ValueId, ValueI
 
 /// Iterate a block's phi instructions (the leading [`Op::Phi`] prefix).
 fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir2::Inst)) {
-    let Some(bb) = module.block(block) else { return };
+    let Some(bb) = module.block(block) else {
+        return;
+    };
     for &iid in &bb.insts {
         let Some(inst) = module.inst(iid) else { break };
         if !inst.op.is_phi() {
@@ -213,7 +217,9 @@ pub fn frame_init_consts(module: &Module, func_id: FuncId) -> Vec<ValueId> {
             }
         }
         for &bb in &f.blocks {
-            let Some(block) = module.block(bb) else { continue };
+            let Some(block) = module.block(bb) else {
+                continue;
+            };
             for &iid in &block.insts {
                 if let Some(result) = module.inst(iid).and_then(|inst| inst.result) {
                     lo = lo.min(result.0);
@@ -279,7 +285,7 @@ pub fn allocate(
             if !handler_exc.contains(&pair) {
                 handler_exc.push(pair);
             }
-    }
+        }
     }
 
     // Collect all values in the function, skipping suppressed results
@@ -299,7 +305,9 @@ pub fn allocate(
                 all_values.push(c);
             }
         }
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
         for &inst_id in &block.insts {
             if suppression.insts.contains(&inst_id) {
                 continue;
@@ -317,7 +325,9 @@ pub fn allocate(
     // never count as used (they are never read from a register home).
     let mut used: HashSet<ValueId> = HashSet::new();
     for &bb in &rpo {
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
         for &inst_id in &block.insts {
             if let Some(inst) = module.inst(inst_id) {
                 used.extend(
@@ -549,9 +559,13 @@ fn range_call_window_size(module: &Module, rpo: &[BlockId]) -> usize {
     use abcd_ir2::CallKind;
     let mut window = 0usize;
     for &bb in rpo {
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
         for &inst_id in &block.insts {
-            let Some(inst) = module.inst(inst_id) else { continue };
+            let Some(inst) = module.inst(inst_id) else {
+                continue;
+            };
             match &inst.op {
                 Op::Call {
                     kind, this, args, ..
@@ -627,7 +641,9 @@ fn compute_liveness(
     for &bb in rpo {
         let mut uses = HashSet::new();
         let mut defs = HashSet::new();
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
 
         for &inst_id in &block.insts {
             let Some(node) = module.inst(inst_id) else {
@@ -746,12 +762,16 @@ fn build_interference(
     let entry = rpo.first().copied();
 
     for &bb in rpo {
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
         let mut live: HashSet<ValueId> = live_out.get(&bb).cloned().unwrap_or_default();
 
         // Walk instructions backward.
         for &inst_id in block.insts.iter().rev() {
-            let Some(node) = module.inst(inst_id) else { continue };
+            let Some(node) = module.inst(inst_id) else {
+                continue;
+            };
 
             if let Some(result) = node.result {
                 // result interferes with everything currently live (except itself).

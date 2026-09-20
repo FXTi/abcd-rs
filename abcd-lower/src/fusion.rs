@@ -40,12 +40,19 @@ pub struct Suppression {
 
 /// Count the uses of every value in the function (all op operands,
 /// including phi entries).
-fn use_counts(module: &Module, blocks: &[abcd_ir2::BlockId]) -> std::collections::HashMap<ValueId, usize> {
+fn use_counts(
+    module: &Module,
+    blocks: &[abcd_ir2::BlockId],
+) -> std::collections::HashMap<ValueId, usize> {
     let mut counts: std::collections::HashMap<ValueId, usize> = std::collections::HashMap::new();
     for &bb in blocks {
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
         for &iid in &block.insts {
-            let Some(inst) = module.inst(iid) else { continue };
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
             for v in inst.op.operands() {
                 *counts.entry(v).or_default() += 1;
             }
@@ -103,9 +110,13 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir2::BlockId]) -> Suppression {
     let counts = use_counts(module, blocks);
 
     for &bb in blocks {
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
         for (pos, &iid) in block.insts.iter().enumerate() {
-            let Some(inst) = module.inst(iid) else { continue };
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
             match &inst.op {
                 // `LoadConst(number)` + `LoadPropIdx`/`StorePropIdx` →
                 // ld/stobjbyindex. The fused immediate round-trips any
@@ -167,9 +178,13 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir2::BlockId]) -> Suppression {
     // adjacent single-use AllocClosure when that closure's DefineFunc is
     // itself suppressible (adjacent, single-use).
     for &bb in blocks {
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
         for (pos, &iid) in block.insts.iter().enumerate() {
-            let Some(inst) = module.inst(iid) else { continue };
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
             let func_val = match &inst.op {
                 Op::AllocClosure { func } => Some((*func, None::<InstId>)),
                 Op::DefineMethod { func, .. } => Some((*func, Some(iid))),

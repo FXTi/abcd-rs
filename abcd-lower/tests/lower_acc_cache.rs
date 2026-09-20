@@ -14,9 +14,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use abcd_ir2::{
-    BinOp, BlockId, Catch, FunctionKind, Module, Op, TryRegion, UnOp, ValueDef,
-};
+use abcd_ir2::{BinOp, BlockId, Catch, FunctionKind, Module, Op, TryRegion, UnOp, ValueDef};
 use abcd_isa::Bytecode;
 use abcd_lower::regalloc::{self, RegSlot};
 use abcd_lower::{fusion, isel, lower_function};
@@ -505,8 +503,8 @@ fn handler_entry_never_inherits_predecessor_acc_content() {
         other => panic!("v must have a register home, got {other:?}"),
     };
     let rpo = regalloc::compute_rpo(&module, func);
-    let selected = isel::select(&module, func, &alloc, &rpo, &suppression)
-        .expect("selection must succeed");
+    let selected =
+        isel::select(&module, func, &alloc, &rpo, &suppression).expect("selection must succeed");
     let (_, handler_codes) = selected
         .block_codes
         .iter()

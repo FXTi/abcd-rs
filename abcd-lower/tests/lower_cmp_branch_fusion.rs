@@ -16,9 +16,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use abcd_ir2::{
-    BinOp, Catch, CmpOp, FunctionKind, Module, Op, TryRegion, UnOp, ValueId,
-};
+use abcd_ir2::{BinOp, Catch, CmpOp, FunctionKind, Module, Op, TryRegion, UnOp, ValueId};
 use abcd_isa::Bytecode;
 use abcd_lower::regalloc::{self, RegAlloc, RegSlot};
 use abcd_lower::{fusion, isel, layout, lower_function};
@@ -112,12 +110,15 @@ fn build_fusion_shape(
 /// Run `isel::select` + `layout::layout` with a hand-pinned allocation
 /// and execute the flat bytecodes on the simulator.
 fn select_layout_run(shape: &FusionShape, alloc: &RegAlloc) -> (Vec<Bytecode>, Halt) {
-    let suppression = fusion::analyze(&shape.module, &shape.module.functions[shape.func.index()].blocks);
+    let suppression = fusion::analyze(
+        &shape.module,
+        &shape.module.functions[shape.func.index()].blocks,
+    );
     let rpo = regalloc::compute_rpo(&shape.module, shape.func);
     let isel = isel::select(&shape.module, shape.func, alloc, &rpo, &suppression)
         .expect("selection must succeed for a consistent allocation");
-    let laid_out = layout::layout(&shape.module, shape.func, &isel, alloc, &rpo)
-        .expect("layout must succeed");
+    let laid_out =
+        layout::layout(&shape.module, shape.func, &isel, alloc, &rpo).expect("layout must succeed");
     let mut machine = Machine::new();
     let halt = machine.run(&laid_out.bytecodes);
     (laid_out.bytecodes, halt)

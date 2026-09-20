@@ -189,14 +189,8 @@ fn lowered_method_body_roundtrips_through_encode_relocation() {
     // the source offsets — the method by function-table position, the
     // string by content, the literal shape by content.
     let targets = relocation_targets(&body);
-    assert_eq!(
-        targets[&EntityKind::MethodId],
-        vec![entities.target_offset]
-    );
-    assert_eq!(
-        targets[&EntityKind::StringId],
-        vec![entities.string_offset]
-    );
+    assert_eq!(targets[&EntityKind::MethodId], vec![entities.target_offset]);
+    assert_eq!(targets[&EntityKind::StringId], vec![entities.string_offset]);
     assert_eq!(
         targets[&EntityKind::LiteralarrayId],
         vec![entities.array_offset]
@@ -491,9 +485,7 @@ fn unknown_literal_shape_is_a_hard_error() {
             Const::number(2.0),
             Const::number(3.0),
         ]));
-        builder.emit_val(Op::AllocArray {
-            shape: Some(shape),
-        });
+        builder.emit_val(Op::AllocArray { shape: Some(shape) });
         builder.emit_void(Op::Return { value: None });
     }
 

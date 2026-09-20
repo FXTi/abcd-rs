@@ -71,31 +71,30 @@ pub fn to_method_body(
     let mut entity_offsets: HashMap<(EntityKind, u32), u32> = HashMap::new();
     for bc in &result.bytecodes {
         for (kind, id) in bc.entity_operands() {
-            let offset = match kind {
-                EntityKind::StringId => resolver.string_offset(Sym::new(id.0)).ok_or(
-                    LowerError::UntraceableEntity {
-                        func: func_id,
-                        kind,
-                        raw: id.0,
-                    },
-                )?,
-                EntityKind::MethodId => resolver.method_offset(FuncId::new(id.0)).ok_or(
-                    LowerError::UntraceableEntity {
-                        func: func_id,
-                        kind,
-                        raw: id.0,
-                    },
-                )?,
-                EntityKind::LiteralarrayId => {
-                    resolver.literal_array_offset(ConstId::new(id.0)).ok_or(
+            let offset =
+                match kind {
+                    EntityKind::StringId => resolver.string_offset(Sym::new(id.0)).ok_or(
                         LowerError::UntraceableEntity {
                             func: func_id,
                             kind,
                             raw: id.0,
                         },
-                    )?
-                }
-            };
+                    )?,
+                    EntityKind::MethodId => resolver.method_offset(FuncId::new(id.0)).ok_or(
+                        LowerError::UntraceableEntity {
+                            func: func_id,
+                            kind,
+                            raw: id.0,
+                        },
+                    )?,
+                    EntityKind::LiteralarrayId => resolver
+                        .literal_array_offset(ConstId::new(id.0))
+                        .ok_or(LowerError::UntraceableEntity {
+                            func: func_id,
+                            kind,
+                            raw: id.0,
+                        })?,
+                };
             entity_offsets.insert((kind, id.0), offset);
         }
     }
@@ -211,15 +210,11 @@ impl<'a> EntityResolver<'a> {
     fn const_matches_literal_value(&self, c: &Const, v: &LiteralValue, depth: u32) -> bool {
         match (c, v) {
             (Const::Bool(b), LiteralValue::Bool(vb)) => b == vb,
-            (Const::Number(bits), LiteralValue::Integer8(n)) => {
-                *bits == (*n as f64).to_bits()
-            }
+            (Const::Number(bits), LiteralValue::Integer8(n)) => *bits == (*n as f64).to_bits(),
             (Const::Number(bits), LiteralValue::Integer(n)) => *bits == (*n as f64).to_bits(),
             (Const::Number(bits), LiteralValue::Float(x)) => *bits == (*x as f64).to_bits(),
             (Const::Number(bits), LiteralValue::Double(x)) => *bits == x.to_bits(),
-            (Const::Number(bits), LiteralValue::Accessor(n)) => {
-                *bits == f64::from(*n).to_bits()
-            }
+            (Const::Number(bits), LiteralValue::Accessor(n)) => *bits == f64::from(*n).to_bits(),
             (Const::Number(bits), LiteralValue::MethodAffiliate(n)) => {
                 *bits == f64::from(*n).to_bits()
             }

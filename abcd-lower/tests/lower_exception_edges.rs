@@ -90,10 +90,7 @@ fn the_handler(module: &Module, func: FuncId) -> BlockId {
 }
 
 /// The result of the (single) instruction matching `pred`.
-fn inst_result_of(
-    module: &Module,
-    pred: impl Fn(&Op) -> bool,
-) -> Option<(BlockId, ValueId)> {
+fn inst_result_of(module: &Module, pred: impl Fn(&Op) -> bool) -> Option<(BlockId, ValueId)> {
     for func in &module.functions {
         for &bb in &func.blocks {
             for &i in &module.blocks[bb.index()].insts {
@@ -235,7 +232,8 @@ fn lifted_multi_pred_handler_seeds_acc_without_phi() {
         .take_while(|&&i| module.insts[i.index()].op.is_phi())
         .count();
     assert_eq!(
-        phi_count, 0,
+        phi_count,
+        0,
         "N13: with the exception seeded at handler entry, the handler needs \
          no acc phi over its try predecessors (generator family): {:?}",
         module.blocks[handler.index()].insts

@@ -99,10 +99,7 @@ fn pinpoint(module_a: &Module, module_b: &Module, file: &File) -> String {
             .and_then(|f| module_a.sym.resolve(f.name))
             .unwrap_or("?")
             .to_string();
-        if module_a
-            .func(func_id)
-            .is_none_or(|f| f.blocks.is_empty())
-        {
+        if module_a.func(func_id).is_none_or(|f| f.blocks.is_empty()) {
             continue;
         }
         let (Ok(la), Ok(lb)) = (

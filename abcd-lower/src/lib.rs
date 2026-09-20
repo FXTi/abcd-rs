@@ -209,7 +209,10 @@ pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, 
 #[cfg(test)]
 mod tests {
     use super::lower_function;
-    use abcd_ir2::{Block, BlockId, ClassId, FuncId, FunctionData, FunctionKind, Inst, InstId, Module, Op, Ty, Value, ValueDef, ValueId};
+    use abcd_ir2::{
+        Block, BlockId, ClassId, FuncId, FunctionData, FunctionKind, Inst, InstId, Module, Op, Ty,
+        Value, ValueDef, ValueId,
+    };
 
     /// N25 (v0.1 parity): the name is the runtime VALUE in the register
     /// operand (vendor `throw.constassignment v:in:top, acc: none`,
@@ -233,9 +236,11 @@ mod tests {
         });
         let name_sym = module.sym.intern("f");
         let func = FuncId::new(0);
-        module
-            .functions
-            .push(FunctionData::new(ClassId::new(0), name_sym, FunctionKind::Function));
+        module.functions.push(FunctionData::new(
+            ClassId::new(0),
+            name_sym,
+            FunctionKind::Function,
+        ));
         let entry = BlockId::new(0);
         module.blocks.push(Block::default());
         module.functions[0].blocks.push(entry);

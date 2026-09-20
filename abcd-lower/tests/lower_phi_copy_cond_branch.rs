@@ -18,8 +18,8 @@ use std::collections::HashMap;
 use abcd_ir2::{FunctionKind, Module, Op, ValueId};
 use abcd_isa::{Bytecode, Imm, Label, Reg};
 use abcd_lower::isel::IselResult;
-use abcd_lower::regalloc::{self, RegAlloc, RegSlot};
 use abcd_lower::layout;
+use abcd_lower::regalloc::{self, RegAlloc, RegSlot};
 
 use common::{Halt, Machine, V2Builder};
 

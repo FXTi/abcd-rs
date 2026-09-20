@@ -111,7 +111,9 @@ pub fn layout(
     //   copies on the predecessor's NORMAL path (the N21 wart — iterator-close
     //   `func_main_0` clobbered the iterator object in v0 before a `jnez`).
     let mut exception_edges: HashSet<(BlockId, BlockId)> = HashSet::new();
-    let func = module.func(func_id).ok_or(LowerError::EmptyFunction(func_id))?;
+    let func = module
+        .func(func_id)
+        .ok_or(LowerError::EmptyFunction(func_id))?;
     for region in &func.try_regions {
         for &try_block in &region.protected {
             for catch in &region.catches {

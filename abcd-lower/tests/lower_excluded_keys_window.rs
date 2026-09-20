@@ -230,8 +230,7 @@ fn wide_form_selected_above_u8_key_count() {
         assert_eq!(
             narrow, !expect_wide,
             "{n} keys: narrow form expected={} ({:?})",
-            !expect_wide,
-            lowered.bytecodes
+            !expect_wide, lowered.bytecodes
         );
 
         let mut machine = Machine::new();

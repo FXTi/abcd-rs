@@ -205,7 +205,9 @@ pub fn select(
     // Suppressed values are never home-read (fusion).
     let mut used: HashSet<ValueId> = HashSet::new();
     for &bb in rpo {
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
         for &inst_id in &block.insts {
             if let Some(inst) = module.inst(inst_id) {
                 used.extend(
@@ -269,11 +271,9 @@ pub fn select(
     let mut block_start_stores: HashMap<BlockId, Vec<(ValueId, ValueId)>> = HashMap::new();
     for &(pred, src, dst) in &alloc.handler_phi_stores {
         let defined_in_pred = match module.value(src).map(|v| v.def) {
-            Some(ValueDef::Inst(i)) => {
-                module
-                    .inst(i)
-                    .is_some_and(|inst| !inst.op.is_phi() && inst.block == pred)
-            }
+            Some(ValueDef::Inst(i)) => module
+                .inst(i)
+                .is_some_and(|inst| !inst.op.is_phi() && inst.block == pred),
             // A frame-initial const's definition site is the entry-block
             // materialization: for an entry-pred handler phi, its pinned
             // store belongs right after the materialization (after-def),
@@ -296,7 +296,9 @@ pub fn select(
 
     for &bb in rpo {
         let mut codes = Vec::new();
-        let Some(block) = module.block(bb) else { continue };
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
 
         // Block-entry acc content (B4): the entry block starts with the
         // vendor frame-init hole; a catch handler starts with the
@@ -705,11 +707,7 @@ fn const_load_bytecode(
 /// the value of the suppressed adjacent `LoadConst(number)`, as the
 /// vendor's i64 imm truncated to u32 exactly the way v0.1's lift truncated
 /// it (`index.0 as u32`).
-fn fused_index_imm(
-    module: &Module,
-    index: ValueId,
-    suppression: &Suppression,
-) -> Option<Imm> {
+fn fused_index_imm(module: &Module, index: ValueId, suppression: &Suppression) -> Option<Imm> {
     if !suppression.values.contains(&index) {
         return None;
     }
@@ -730,11 +728,7 @@ fn fused_index_imm(
 /// closure-wrapped) fused define-chain value: directly a suppressed
 /// `DefineFunc` result, or a suppressed `AllocClosure` result wrapping
 /// one.
-fn fused_definefunc_body(
-    module: &Module,
-    v: ValueId,
-    suppression: &Suppression,
-) -> Option<FuncId> {
+fn fused_definefunc_body(module: &Module, v: ValueId, suppression: &Suppression) -> Option<FuncId> {
     if !suppression.values.contains(&v) {
         return None;
     }
@@ -848,7 +842,7 @@ fn select_inst(
                 UnOp::ToNumber => Bytecode::Tonumber(ic.one()),
                 UnOp::ToNumeric => Bytecode::Tonumeric(ic.one()),
                 UnOp::BitNot => Bytecode::Not(ic.one()), // vendored `not` IS bitwise (N39)
-                UnOp::Void => Bytecode::Ldundefined,    // void x → undefined
+                UnOp::Void => Bytecode::Ldundefined,     // void x → undefined
                 UnOp::IsTrue => Bytecode::Istrue,
                 UnOp::IsFalse => Bytecode::Isfalse,
             };
@@ -873,7 +867,9 @@ fn select_inst(
         // ── Object / Array creation ──────────────────────────────────
         Op::AllocObject { shape } => {
             match module.consts.get(*shape) {
-                Some(Const::ObjectLiteral { keys, values }) if keys.is_empty() && values.is_empty() => {
+                Some(Const::ObjectLiteral { keys, values })
+                    if keys.is_empty() && values.is_empty() =>
+                {
                     // The lift's shared empty shape: createemptyobject.
                     codes.push(Bytecode::Createemptyobject);
                 }
@@ -1029,11 +1025,7 @@ fn select_inst(
             codes.push(Bytecode::Ldobjbyvalue(ic.two(), regs[0]));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
-        Op::StorePropDyn {
-            object,
-            key,
-            value,
-        } => {
+        Op::StorePropDyn { object, key, value } => {
             // Vendor `stobjbyvalue imm:u16, v1:in:top, v2:in:top,
             // acc: in:top` (isa.yaml:1353-1357): v1 = receiver, v2 =
             // propKey, acc = VALUE. Register operands first, then
@@ -1089,11 +1081,7 @@ fn select_inst(
                 materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
             codes.push(Bytecode::Stownbyname(ic.two(), tracer.eid(*name), regs[0]));
         }
-        Op::StoreOwnPropDyn {
-            object,
-            key,
-            value,
-        } => {
+        Op::StoreOwnPropDyn { object, key, value } => {
             // Vendor stownbyvalue (v0.1 `StoreOwnProperty` ByValue):
             // v1 = receiver, v2 = propKey, acc = VALUE.
             let regs = materialize_operands(
@@ -1446,7 +1434,9 @@ fn select_inst(
             args,
             kind,
         } => {
-            select_call(*kind, *callee, *this, args, func_id, alloc, codes, ic, tracker)?;
+            select_call(
+                *kind, *callee, *this, args, func_id, alloc, codes, ic, tracker,
+            )?;
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
 
@@ -2126,7 +2116,9 @@ fn try_fuse_cmp_branch(
         }
     }
 
-    fuse_cmp_branch(*op, *left, *right, true_dest, func_id, alloc, codes, tracker)
+    fuse_cmp_branch(
+        *op, *left, *right, true_dest, func_id, alloc, codes, tracker,
+    )
 }
 
 /// Emit a fused compare-branch for a CmpOp comparison.
