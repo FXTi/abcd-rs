@@ -181,6 +181,22 @@ fn is_essential(data: &InstData) -> bool {
         // runtime_stubs-inl.h:1769-1779; handler
         // interpreter_assembly.cpp:2575-2614 is abrupt-checked).
         | LoadGlobalVar { .. }
+        // Try-global load (N50): unlike `ldglobalvar`, the try form
+        // throws ReferenceError " is not defined" when the name is
+        // missing (`RuntimeStubs::RuntimeTryLdGlobalByName`,
+        // stubs/runtime_stubs-inl.h:1739-1748, via
+        // `SlowRuntimeStub::TryLdGlobalByNameFromGlobalProto`,
+        // slow_runtime_stub.cpp:850-858), and its `GetProperty` runs
+        // global-prototype getters (handler
+        // interpreter_assembly.cpp:2385-2429 is abrupt-checked).
+        | TryLoadGlobalByName { .. }
+        // Super-property load (N50): `RuntimeStubs::RuntimeLdSuperByValue`
+        // (stubs/runtime_stubs-inl.h:681-697) — `GetSuperBase` /
+        // `RequireObjectCoercible` / `ToPropertyKey` are abrupt-checked
+        // and the final `JSTaggedValue::GetProperty(superBase, key,
+        // receiver)` CALLS super getters (handler
+        // interpreter_assembly.cpp:5313-5334 abrupt-checked).
+        | LoadSuperProperty { .. }
         | DefineFunc { .. }
         | DefineMethod { .. }
         | DefineClassWithBuffer { .. }

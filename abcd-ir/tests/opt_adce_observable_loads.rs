@@ -176,3 +176,53 @@ fn adce_keeps_operand_chain_of_observable_load() {
         "operand producer of a live observable load must survive"
     );
 }
+
+/// N50 red pins: two more observable loads the N48 list missed.
+///
+/// - TryLoadGlobalByName (`tryldglobalbyname`,
+///   interpreter_assembly.cpp:2385-2429): unlike `ldglobalvar` (which
+///   loads `undefined` for a missing name), the try form throws
+///   ReferenceError " is not defined" when the name is not found —
+///   `RuntimeStubs::RuntimeTryLdGlobalByName`
+///   (stubs/runtime_stubs-inl.h:1739-1748) via
+///   `SlowRuntimeStub::TryLdGlobalByNameFromGlobalProto`
+///   (slow_runtime_stub.cpp:850-858) — and its `GetProperty` call runs
+///   global prototype getters. Deleting a dead result drops both.
+/// - LoadSuperProperty (`ldsuperbyname`,
+///   interpreter_assembly.cpp:5313-5334): `SlowRuntimeStub::LdSuperByValue`
+///   (slow_runtime_stub.cpp:1066-1075) →
+///   `RuntimeStubs::RuntimeLdSuperByValue`
+///   (stubs/runtime_stubs-inl.h:681-697) — `GetSuperBase` /
+///   `RequireObjectCoercible` / `ToPropertyKey` are all abrupt-checked
+///   and the final `JSTaggedValue::GetProperty(superBase, key, receiver)`
+///   CALLS super getters. Deleting a dead result drops the getter call.
+#[test]
+fn adce_keeps_n50_observable_loads_with_dead_results() {
+    let cases: Vec<(
+        &str,
+        Box<dyn FnOnce(&mut IRBuilder, abcd_ir::entity::Value) -> InstData>,
+    )> = vec![
+        (
+            "TryLoadGlobalByName (ReferenceError 'is not defined' + proto getters)",
+            Box::new(|m, _p0| InstData::TryLoadGlobalByName {
+                name: m.intern("missing_global"),
+            }),
+        ),
+        (
+            "LoadSuperProperty (super getter call)",
+            Box::new(|m, _p0| InstData::LoadSuperProperty {
+                key: PropKind::ByName(m.intern("p")),
+            }),
+        ),
+    ];
+    let mut deleted = Vec::new();
+    for (name, make) in cases {
+        if !inst_survives_adce(make) {
+            deleted.push(name);
+        }
+    }
+    assert!(
+        deleted.is_empty(),
+        "ADCE deleted observable loads with dead results (N50): {deleted:?}"
+    );
+}
