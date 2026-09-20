@@ -7,6 +7,7 @@ members = [
     "abcd-file",
     "abcd-ir",
     "abcd-ir2",
+    "abcd-lift",
 ]
 
 [workspace.package]

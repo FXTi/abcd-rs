@@ -1,0 +1,15 @@
+[package]
+name = "abcd-lift"
+description = "Lift converter: abcd_file::File (v0.1 decode) → abcd_ir2::Module (IR v0.2) — design/ir-v0.2.md migration plan P1"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+abcd-file.workspace = true
+abcd-isa.workspace = true
+abcd-ir2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+abcd-ir.workspace = true
