@@ -124,13 +124,15 @@ fn exported_corpus_lifts_and_verifies_v2() {
         let cmp = compare::compare_modules(&file, &v1, &module);
         compared += cmp.functions_compared;
         tokens += cmp.tokens_compared;
-        for m in &cmp.mismatches {
-            mismatches += 1;
-            if mismatches <= 20 {
-                eprintln!(
-                    "MISMATCH [{version}/{profile}] {relative} fn {} ({}): token {}\n  v1: {}\n  v2: {}",
-                    m.func, m.func_name, m.token, m.v1, m.v2
-                );
+        if !cmp.is_parity() {
+            for m in &cmp.mismatches {
+                mismatches += 1;
+                if mismatches <= 20 {
+                    eprintln!(
+                        "MISMATCH [{version}/{profile}] {relative} fn {} ({}): token {}\n  v1: {}\n  v2: {}",
+                        m.func, m.func_name, m.token, m.v1, m.v2
+                    );
+                }
             }
         }
     }

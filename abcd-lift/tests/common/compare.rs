@@ -62,7 +62,11 @@ use abcd_ir::module::{Module as V1Module, ValueDef as V1ValueDef};
 use abcd_ir2::{Const, Module as V2Module, Op, ValueDef};
 
 /// One comparison finding.
+// The locating fields are consumed by corpus_parity's diagnostic output;
+// each test target compiles this shared module separately, so targets that
+// only count mismatches would otherwise trip per-target dead_code.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct Mismatch {
     /// Function-table index.
     pub func: usize,
