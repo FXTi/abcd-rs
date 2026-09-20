@@ -231,7 +231,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | N55 | decode 给无 debug info 项的方法捏造 `debug: Some(source_file: Some(""))`（vendor DebugInfoExtractor::GetSourceFile 对缺失条目返回 ""，debug_info_extractor.cpp:318-324；decode.rs:415 无条件 Some 包装）；且 vendor extractor 遇 file_=EntityId(0) 的 debug 项时 GetSpanFromId 抛 INVALID_FILE_OFFSET（file.h:190）→ 整文件 debug 区全灭。encode 侧已修（980ec16：空 debug 字符串不算内容，不再发射退化 debug 项）；decode 模型 wart 留存 | 📝 encode 侧已修（980ec16）；decode wart 待 v0.2 |
 | P5-T2 | 对账表遗留批：F-new-1 / F-new-2 / N7 / N8 / N15 / N16 | worker P5-T2 (k3) | **完成**（980ec16 F-new-1 / 8a6671f F-new-2 / 71adc56 N7 / 3ed4228 N15 / 53ba936 N16 + N8 裁决登记；逐条 red-first 远端实证；终态检查点：重写 lift 1149/1149 opt 1149/1149 零 skip 直方图空，与 /tmp/t51-verify 字节差集恰为 class-accessors+module-exports 两族 36 文件/变体且 pandasm 逐文件仅 defineclasswithbuffer imm2 一行 0x0→0x1（=N15 语义修正），本地 docker oracle 双变体 1149/1149（image sha256:5e7627…）；新登记 N53/N54/N55；remote run 目录已清理）**；orchestrator 复验通过（fmt/101 套件绿、差集精确 72 文件=N15、oracle 双 1149/1149 复跑一致、容器零残留；F-new-1 bridge 修复机制对 vendor 烘焙序实证）** |
 
-| N56 | Builder `literal_array_add_module_request_phase` + module-data staging 疑似损坏 module blob 字符串偏移（decode: invalid entity offset；无 Builder 先例，疑 bridge staging 顺序问题，abcd-file 域） | 🔲 未修（P5-T1 登记候选，待诊断） |
+| N56 | Builder `literal_array_add_module_request_phase` + module-data staging 疑似损坏 module blob 字符串偏移（decode: invalid entity offset；无 Builder 先例，疑 bridge staging 顺序问题，abcd-file 域） | ✅ 修复（c79220d，诊断 worker v2-P2a + orchestrator 落地）：**原假设证伪**——bridge/vendored writer 输出逐字节正确（对照实验：phase 字段挂别的类全绿、字符串逐字验证）；真根因是 `decode_field_at` **分派臂顺序**：`_ESModuleRecord` catch-all u32 臂排在 N7 名匹配臂之上，merge-abc 布局（phase 字段挂模块记录自身）被误路由进 module-data blob 解码器 → 整文件不可 decode。修复=一臂重排（N8 同型陷阱，N8 修过顺序而 N7 臂后加没修）。语料零暴露的原因：es2panda 把 phase 字段挂独立的 `L_ModuleRequestPhaseRecord;`（9 fixture 探针实证）。red-first：9 红 3 绿 orchestrator 独立复现 → 4 精选测试（同类 decode/300 字符串池增长/往返/异类对照）；abcd-file 91/91 + 语料套件字节中性 |
 
 ## 审计纪律
 
@@ -248,7 +248,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | v2-P1 | abcd-lift 转换器 + v0.1 parity 对照 | worker v2-P1 (k3) | **完成**（57f336f+6ab12b7；关门复现：**2787/2787 lift 零失败零 pending、verifier 零错误、12996 函数 1,434,154 token 零不一致**——函数数与上游 pandasm 方法数精确相等；workspace 109 套件绿；新登记 N56 Builder module-blob staging 疑似损坏） |
 | v2-P1a | abcd-file 嵌套字面量数组 decode | worker v2-P1a (k3) | **完成**（6d1fcd0；worklist 递归收集（排序批=N20 确定性、先注册后解码=循环安全、排除规则与表头一致）；orchestrator 复验：新套件绿、real_module_abc 7/7、2787 fixture decode-diff 恰 57 个、恒等重写 ark_disasm 全净且与 reference.pa 内容一致（模布局重编号）） |
 | v2-P2 | lower：v0.2 Module → MethodBody（复用重定位通道），VM oracle 对齐 1149/1149×2 | worker v2-P2 (k3) | **进行中**（2026-09-20 启动；门禁解释：P2 无 pass 故 opt 变体不存在——门禁=v2lift 变体 oracle 1149/1149 零跳过 + 与 v0.1 lift 重写**逐字节恒等** + 3 次确定性，opt 半边随 P3 补齐；任务卡禁改 abcd-file/src（P2a 并行域）/abcd-ir/abcd-ir2/abcd-lift，IR 缺口只报不修） |
-| v2-P2a | N56 诊断（Builder module-blob staging 疑似损坏）：最小复现+定责+修复 sketch，**只读不落 commit** | worker v2-P2a (k3) | **进行中**（2026-09-20 启动） |
+| v2-P2a | N56 诊断（Builder module-blob staging 疑似损坏）：最小复现+定责+修复 sketch，**只读不落 commit** | worker v2-P2a (k3) | **完成**（2026-09-20：7 变体复现 + 对照实验证伪 bridge staging 假设，真根因=decode 臂顺序；orchestrator 落地修复 c79220d，见 N56 行） |
 | v2-P3 | pass 移植：SCCP/copyprop/DCE/peephole（T3 Effects 表），opt 变体 oracle 对齐 | 待定 | 未开始 |
 | v2-P4 | 替换：v0.1 退役为 abcd-ir-v1 留档，abcd-ir2 正名 abcd-ir | 待定 | 未开始（维护者验收后执行） |
 | v2-P5 | abcd-taint 脚手架：调用图 + IFDS 骨架 + top-20 builtin 摘要注册，语料 print sink 冒烟 | 待定 | 未开始 |

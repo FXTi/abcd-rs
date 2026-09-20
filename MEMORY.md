@@ -378,10 +378,15 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   (canonical op-name/operand-role/value-renumbered/constant-by-value
   stream comparison, proven non-vacuous). v2-P1a (6d1fcd0) fixed the
   abcd-file nested-literal-array decode model gap (57 sendable fixtures;
-  worklist collection, cycle-safe, N20-deterministic). N56 registered:
-  Builder module-blob staging suspicion (needs diagnosis). PAUSED per
-  maintainer request before v2-P2 (lower: biggest remaining task —
-  v0.1 lower port to v0.2 Module with VM oracle parity gate).
+  worklist collection, cycle-safe, N20-deterministic). N56 RESOLVED
+  (2026-09-20, c79220d): the bridge-staging suspicion was FALSIFIED —
+  real root cause was decode_field_at arm ordering (the _ESModuleRecord
+  catch-all u32 arm beat the N7 moduleRequestPhaseIdx name arm, so
+  merge-abc-layout files were undecodable; one-arm reorder, N8 pattern).
+  v2-P2 (abcd-lower port) + P2a dispatched 2026-09-20; P2a done, P2 in
+  flight. P2 gate interpretation: no passes exist at P2, so the gate is
+  v2lift-variant oracle 1149/1149 zero-skip + BYTE-IDENTITY vs the v0.1
+  lift rewrite + 3-run determinism; the opt half lands with P3.
 - MAINTAINER DECISIONS (2026-09-21): D1 = build IR v0.2 (first design it,
   compare v0.1 + Hermes; the IR must ALSO serve future FlowDroid-style
   taint analysis). Design at design/ir-v0.2.md (requirements T1-T10,
