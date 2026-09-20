@@ -2000,29 +2000,16 @@ pub fn translate_bytecode(
             );
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedDefineclasswithbuffer(
-            method_eid,
-            lit_idx,
-            count,
-            base_reg,
-            _env_reg,
-        ) => {
-            // v0.1 parity (N54's registered latent issue): base_reg is
-            // read as the heritage, _env_reg is NOT read.
-            let (_name, ctor) = fx.resolve_method(*method_eid)?;
-            let members = resolve::const_for_literal_array(fx.lf, lit_idx.0 as u32)?;
-            let base = fx.read_reg(*base_reg, block);
-            let v = fx.emit_val(
-                block,
-                Op::DefineClass {
-                    ctor,
-                    heritage: Some(base),
-                    members,
-                    count: count.0 as u16,
-                },
-                loc,
-            );
-            fx.write_acc(block, v);
+        Bytecode::DeprecatedDefineclasswithbuffer(..) => {
+            // N54: HARD ERROR (v0.1 parity). The vendor runtime reads v1
+            // as the LEXENV and v2 as the PROTO
+            // (interpreter_assembly.cpp:4622-4648,
+            // HandleDeprecatedDefineclasswithbufferPrefId16Imm16Imm16V8V8);
+            // this arm historically read v1 as the base (proto) and dropped
+            // v2 — double role corruption with zero corpus coverage (no
+            // evidence path). Maintainer ruling N8/N51: hard error, never
+            // a warning, never silent.
+            return Err(LiftError::UnsupportedDeprecatedDefineClassWithBuffer);
         }
         Bytecode::DeprecatedResumegenerator(gen_reg) => {
             // Vendor: genobj is the register operand here

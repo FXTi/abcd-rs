@@ -124,6 +124,21 @@ pub enum LiftError {
         "unsupported this-by-* opcode `{0}` (N51): es2panda never emits this IC-fused family and its IC semantics are unsupported — please report this file to the abcd-rs maintainers"
     )]
     UnsupportedThisByAccess(&'static str),
+    /// `deprecated.defineclasswithbuffer method_id, imm1:u16, imm2:u16,
+    /// v1:in:top, v2:in:top` (abcd-isa-sys/vendor/isa/isa.yaml:1239-1244):
+    /// the vendor runtime reads v1 as the LEXENV and v2 as the PROTO
+    /// (arkcompiler_ets_runtime-master/ecmascript/interpreter/
+    /// interpreter_assembly.cpp:4622-4648,
+    /// `HandleDeprecatedDefineclasswithbufferPrefId16Imm16Imm16V8V8`),
+    /// but both lifters historically took v1 as the base (proto) and
+    /// DROPPED v2 — double role corruption (N54). Corpus coverage is
+    /// zero (reference.pa grep: none), so there is no evidence path
+    /// for a corrected lift — a hard error (maintainer ruling N8/N51:
+    /// hard error, never a warning, never silent), mirroring v0.1.
+    #[error(
+        "unsupported opcode `deprecated.defineclasswithbuffer` (N54): the vendor runtime reads v1=lexenv, v2=proto (interpreter_assembly.cpp:4622-4648) and zero corpus coverage makes the corrected roles unverifiable — please report this file to the abcd-rs maintainers"
+    )]
+    UnsupportedDeprecatedDefineClassWithBuffer,
     /// `throw.ifsupernotcorrectcall` carries a check-kind immediate the
     /// vendor does not define (0 = TDZ guard, 1 = re-bind guard).
     #[error(

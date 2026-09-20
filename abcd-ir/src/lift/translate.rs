@@ -2015,28 +2015,15 @@ pub(super) fn translate_bytecode(
             );
             write_acc(ssa, block, v);
         }
-        Bytecode::DeprecatedDefineclasswithbuffer(
-            method_eid,
-            lit_idx,
-            count,
-            base_reg,
-            _env_reg,
-        ) => {
-            let (method_id, method_offset) = resolve_method(file, body, module, *method_eid)?;
-            let base = read_reg(ssa, *base_reg, block, module);
-            let v = emit_val(
-                module,
-                block,
-                InstData::DefineClassWithBuffer {
-                    method_id,
-                    method_offset,
-                    literal_array: lit_idx.0 as u32,
-                    count: count.0 as u16,
-                    base,
-                },
-                loc,
-            );
-            write_acc(ssa, block, v);
+        Bytecode::DeprecatedDefineclasswithbuffer(..) => {
+            // N54: HARD ERROR. The vendor runtime reads v1 as the LEXENV
+            // and v2 as the PROTO (interpreter_assembly.cpp:4622-4648,
+            // HandleDeprecatedDefineclasswithbufferPrefId16Imm16Imm16V8V8);
+            // this arm historically read v1 as the base (proto) and dropped
+            // v2 — double role corruption with zero corpus coverage (no
+            // evidence path). Maintainer ruling N8/N51: hard error, never
+            // a warning, never silent.
+            return Err(LiftError::UnsupportedDeprecatedDefineClassWithBuffer);
         }
         Bytecode::DeprecatedResumegenerator(gen_reg) => {
             // Vendor `deprecated.resumegenerator v:in:top, acc: out:top`
