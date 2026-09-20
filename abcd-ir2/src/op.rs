@@ -102,6 +102,7 @@ pub enum CmpOp {
 /// |-----------|-------------------------------------|---------------|--------------|
 /// | `Direct`  | `call.this`                         | undefined     | args→params[1..] |
 /// | `Dynamic` | computed at callee entry            | undefined     | args→params[1..] |
+/// | `Apply`   | `call.this` (explicit receiver)     | undefined     | SPREAD of args[0] |
 /// | `Super`   | inherited from enclosing ctor       | inherited     | args→params[1..] |
 /// | `New`     | fresh object from callee.prototype  | callee itself | args→params[1..] |
 ///
@@ -115,6 +116,13 @@ pub enum CallKind {
     /// (non-strict = global, strict = undefined), so `Call::this` is
     /// `None`.
     Dynamic,
+    /// `func.apply(this, argsArray)` — vendor `apply imm, v_this, v_args`
+    /// (isa.yaml:1104, the func in the acc): the receiver is explicit and
+    /// the single argument is an ARRAY spread over the formal parameters.
+    /// Never an arity overload of [`CallKind::Dynamic`]: `Call::this` is
+    /// `Some(receiver)` and `Call::args` is exactly `[array]` (N16/N57;
+    /// v0.1 `CallKind::Apply`, isel emits the `apply` opcode).
+    Apply,
     /// A `super(...)` call in a constructor.
     Super,
     /// `new callee(args...)`.

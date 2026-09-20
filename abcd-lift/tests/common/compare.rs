@@ -36,10 +36,11 @@
 //!    `Sym`, no materialization in v0.2). Rule: the v0.1 side expands
 //!    to the same token sequence.
 //! 4. **Call-kind normalization**: v0.1's arity/leak kinds (`CallThis`,
-//!    `SuperCall*`, `Apply`, `NewObjApply`, `Construct`) normalize to
+//!    `SuperCall*`, `NewObjApply`, `Construct`) normalize to
 //!    `Dynamic`/`Super`/`New` with explicit `this` roles — including
 //!    `NewObjApply`'s swapped vendor roles (v0.2 normalizes to
-//!    callee=ctor).
+//!    callee=ctor). `Apply` is NOT normalized (N57): both IRs carry the
+//!    apply distinction explicitly and it compares exactly.
 //! 5. **Folded distinctions**: own-vs-plain stores, strict-vs-tolerant
 //!    global stores, local-vs-external module vars, async-vs-sync
 //!    iterators/generators fold per the mapping table.
@@ -803,7 +804,9 @@ fn canon_inst_v1(cx: &mut V1Cx, iid: abcd_ir::entity::Inst) {
                         }
                         _ => ops.push(CVal::Konst("this:none".into())),
                     }
-                    "dynamic"
+                    // N57: the apply distinction is IR-explicit on both
+                    // sides — compares EXACTLY (no fold to "dynamic").
+                    "apply"
                 }
                 V1CallKind::NewObjApply => {
                     // v0.2 normalizes: callee = the ctor (args[0] in
@@ -1236,6 +1239,7 @@ fn canon_inst_v2(cx: &mut V2Cx, iid: abcd_ir2::InstId) {
                 match kind {
                     abcd_ir2::CallKind::Direct => "direct",
                     abcd_ir2::CallKind::Dynamic => "dynamic",
+                    abcd_ir2::CallKind::Apply => "apply",
                     abcd_ir2::CallKind::Super => "super",
                     abcd_ir2::CallKind::New => "new",
                 }

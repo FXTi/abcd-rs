@@ -83,8 +83,8 @@
 //! Some(args[0]), args: args[1..]}`, supercallthis/arrowrange →
 //! `Super{this: None}` (arrow distinction folds), supercallspread →
 //! `Super{args: [array]}` (spread role documented), apply (+deprecated.
-//! callspread) → `Dynamic{this: Some(this), args: [array]}` (spread
-//! role documented), newobjrange → `New{callee: window[0], args:
+//! callspread) → `Apply{this: Some(this), args: [array]}` (the spread
+//! role is IR-explicit — v0.1's `CallKind::Apply`, N57), newobjrange → `New{callee: window[0], args:
 //! window[1..]}` (argc counts the ctor; argc=0 keeps v0.1's acc
 //! fallback), newobjapply → `New{callee: ctor, args: [array]}` (v0.1's
 //! swapped NewObjApply roles NORMALIZED to callee=ctor — documented),
@@ -1208,7 +1208,9 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Apply(_ic, this_reg, args_reg) => {
-            // Spread role documented: args[0] is the argument ARRAY.
+            // N57: the apply opcode identity is IR-explicit
+            // (`CallKind::Apply`, v0.1 parity) — args[0] is the argument
+            // ARRAY, never a positional argument.
             let callee = fx.read_acc(block);
             let this = fx.read_reg(*this_reg, block);
             let args_arr = fx.read_reg(*args_reg, block);
@@ -1218,7 +1220,7 @@ pub fn translate_bytecode(
                     callee,
                     this: Some(this),
                     args: vec![args_arr],
-                    kind: CallKind::Dynamic,
+                    kind: CallKind::Apply,
                 },
                 loc,
             );
@@ -1925,7 +1927,8 @@ pub fn translate_bytecode(
             // Vendor `deprecated.callspread v1, v2, v3`
             // (isa.yaml:1109): CallSpread(func=v1, obj=v2, array=v3) —
             // identical semantics to the modern `apply` with func in
-            // acc; lifts to the 2-role Dynamic form (N16, v0.1 parity).
+            // acc; lifts to the 2-role Apply form (N16/N57, v0.1
+            // parity).
             let func = fx.read_reg(*func_reg, block);
             let this = fx.read_reg(*this_reg, block);
             let array = fx.read_reg(*array_reg, block);
@@ -1935,7 +1938,7 @@ pub fn translate_bytecode(
                     callee: func,
                     this: Some(this),
                     args: vec![array],
-                    kind: CallKind::Dynamic,
+                    kind: CallKind::Apply,
                 },
                 loc,
             );
