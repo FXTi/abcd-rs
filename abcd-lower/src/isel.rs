@@ -858,13 +858,9 @@ fn select_inst(
                     codes.push(Bytecode::Createemptyobject);
                 }
                 Some(Const::ObjectLiteral { .. }) | Some(Const::ArrayLiteral(_)) => {
-                    // Vendor createobjectwithbuffer — the object-literal
-                    // shape. (N60 transitional state: the current lift
-                    // also routes createarraywithbuffer here as an
-                    // ArrayLiteral shape — a reported IR gap; P2c's
-                    // `Op::AllocArray`-with-shape takes the array arm.
-                    // Until then ArrayLiteral shapes lower to the object
-                    // form — attributed divergence, never silent.)
+                    // Vendor createobjectwithbuffer: the OBJECT tag is
+                    // op-carried (N60) — the shape is the flat literal
+                    // buffer content ([k0, v0, ...] as a Const tree).
                     codes.push(Bytecode::Createobjectwithbuffer(
                         ic.one(),
                         tracer.literal_eid(*shape),
@@ -881,8 +877,20 @@ fn select_inst(
             }
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
-        Op::AllocArray => {
-            codes.push(Bytecode::Createemptyarray(ic.one()));
+        Op::AllocArray { shape } => {
+            match shape {
+                None => {
+                    codes.push(Bytecode::Createemptyarray(ic.one()));
+                }
+                Some(shape) => {
+                    // Vendor createarraywithbuffer (N60: the ARRAY tag is
+                    // op-carried).
+                    codes.push(Bytecode::Createarraywithbuffer(
+                        ic.one(),
+                        tracer.literal_eid(*shape),
+                    ));
+                }
+            }
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         Op::AllocRegExp { pattern, flags } => {
@@ -1049,6 +1057,51 @@ fn select_inst(
             let regs =
                 materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
             codes.push(Bytecode::Stobjbyindex(ic.two(), regs[0], imm));
+        }
+        Op::StoreOwnPropName {
+            object,
+            name,
+            value,
+        } => {
+            // Own-property DEFINITION (N60; v0.1 `StoreOwnProperty`):
+            // vendor stownbyname — no setters, no prototype walk.
+            let regs =
+                materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
+            codes.push(Bytecode::Stownbyname(ic.two(), tracer.eid(*name), regs[0]));
+        }
+        Op::StoreOwnPropDyn {
+            object,
+            key,
+            value,
+        } => {
+            // Vendor stownbyvalue (v0.1 `StoreOwnProperty` ByValue):
+            // v1 = receiver, v2 = propKey, acc = VALUE.
+            let regs = materialize_operands(
+                tracker,
+                func_id,
+                &[*object, *key],
+                Some(*value),
+                alloc,
+                codes,
+            )?;
+            codes.push(Bytecode::Stownbyvalue(ic.two(), regs[0], regs[1]));
+        }
+        Op::StoreOwnPropIdx {
+            object,
+            index,
+            value,
+        } => {
+            let Some(imm) = fused_index_imm(module, *index, suppression) else {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: "StoreOwnPropIdx with a non-constant index has no by-index \
+                         encoding (the ISA's stownbyindex takes a compile-time immediate)"
+                        .into(),
+                });
+            };
+            let regs =
+                materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
+            codes.push(Bytecode::Stownbyindex(ic.two(), regs[0], imm));
         }
         Op::DeleteProp { object, key } => {
             let regs =

@@ -113,7 +113,9 @@ pub fn analyze(module: &Module, blocks: &[abcd_ir2::BlockId]) -> Suppression {
                 // as f64), so no range check is needed for EXACTNESS —
                 // but the const must be integral, or the source could
                 // never have been a by-index bytecode.
-                Op::LoadPropIdx { index, .. } | Op::StorePropIdx { index, .. } => {
+                Op::LoadPropIdx { index, .. }
+                | Op::StorePropIdx { index, .. }
+                | Op::StoreOwnPropIdx { index, .. } => {
                     let Some(const_inst) = def_inst(module, *index) else {
                         continue;
                     };
