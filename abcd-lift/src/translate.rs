@@ -40,9 +40,11 @@
 //! `CreatePrivateNames{count, names}`, ldglobalvar →
 //! `TryGetGlobal{name, default: None}` (the THROWING form: `None` =
 //! no fallback), tryldglobalbyname → `TryGetGlobal{name, default:
-//! Some(undefined)}` (the tolerant form), stglobalvar/trystglobalbyname/
-//! st(const)toglobalrecord → `StoreGlobal` (tolerant/strict store
-//! distinction folds — documented), ld/stlexvar → `GetLexVar`/
+//! Some(undefined)}` (the tolerant form), stglobalvar/
+//! st(const)toglobalrecord → `StoreGlobal` (the throwing form),
+//! trystglobalbyname → `TryStoreGlobal` (the tolerant form — no
+//! ReferenceError when the global is absent, N61; v0.1
+//! `InstData::TryStoreGlobalByName`), ld/stlexvar → `GetLexVar`/
 //! `PutLexVar`, newlexenv → `NewLexEnv{num_vars}`, newlexenvwithname →
 //! `NewLexEnvWithName{num_vars, scope_names}`, poplexenv → `PopLexEnv`,
 //! module-var family → `LoadModuleVar`/`StoreModuleVar` (local vs
@@ -820,10 +822,12 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::Trystglobalbyname(_ic, eid) => {
-            // Tolerant/strict store distinction folds (documented).
+            // N61: the TOLERANT store (v0.1
+            // `InstData::TryStoreGlobalByName`) — no ReferenceError when
+            // the global is absent; never folds to StoreGlobal.
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
-            fx.emit_void(block, Op::StoreGlobal { name, value }, loc);
+            fx.emit_void(block, Op::TryStoreGlobal { name, value }, loc);
         }
         Bytecode::Stconsttoglobalrecord(_ic, eid) | Bytecode::Sttoglobalrecord(_ic, eid) => {
             let name = fx.resolve_str(*eid)?;

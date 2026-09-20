@@ -535,6 +535,16 @@ pub enum Op {
         /// The stored value.
         value: ValueId,
     },
+    /// Store a global by name, TOLERANT of absence (vendor
+    /// `trystglobalbyname`): no ReferenceError when the global does not
+    /// exist — unlike the throwing [`Op::StoreGlobal`] (N61; v0.1
+    /// `InstData::TryStoreGlobalByName`).
+    TryStoreGlobal {
+        /// The global's name.
+        name: Sym,
+        /// The stored value.
+        value: ValueId,
+    },
     /// Load a module-local variable by its module slot.
     LoadModuleVar {
         /// The module-variable slot (module semantics, not a file pool
@@ -910,7 +920,11 @@ impl Op {
             }
             PutLexVar { value, .. } => vec![*value],
             TryGetGlobal { default, .. } => default.iter().copied().collect(),
-            StoreGlobal { value, .. } | StoreModuleVar { value, .. } => vec![*value],
+            StoreGlobal { value, .. }
+            | TryStoreGlobal { value, .. }
+            | StoreModuleVar { value, .. } => {
+                vec![*value]
+            }
             LoadModuleVar { .. } | GetModuleNamespace { .. } => vec![],
             DynamicImport { specifier } => vec![*specifier],
             Call {
@@ -1037,7 +1051,11 @@ impl Op {
             }
             PutLexVar { value, .. } => vec![value],
             TryGetGlobal { default, .. } => default.iter_mut().collect(),
-            StoreGlobal { value, .. } | StoreModuleVar { value, .. } => vec![value],
+            StoreGlobal { value, .. }
+            | TryStoreGlobal { value, .. }
+            | StoreModuleVar { value, .. } => {
+                vec![value]
+            }
             LoadModuleVar { .. } | GetModuleNamespace { .. } => vec![],
             DynamicImport { specifier } => vec![specifier],
             Call {
@@ -1105,6 +1123,7 @@ impl Op {
                 | PutLexVar { .. }
                 | PopLexEnv
                 | StoreGlobal { .. }
+                | TryStoreGlobal { .. }
                 | StoreModuleVar { .. }
                 | Throw { .. }
                 | ThrowIfSuperNotCalled { .. }
@@ -1157,6 +1176,7 @@ impl Op {
             | NextPropName { .. }
             | PutLexVar { .. }
             | StoreGlobal { .. }
+            | TryStoreGlobal { .. }
             | StoreModuleVar { .. }
             | DynamicImport { .. }
             | LoadPrivate { .. }

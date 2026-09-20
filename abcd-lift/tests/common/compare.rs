@@ -46,14 +46,16 @@
 //!    forward-all form as plain `SuperCall`, indistinguishable from
 //!    `supercallthisrange` — the v0.2 kind is strictly more precise
 //!    than anything v0.1 can express.
-//! 5. **Folded distinctions**: strict-vs-tolerant global stores,
-//!    local-vs-external module vars, async-vs-sync iterators/generators
-//!    fold per the mapping table. NOT folded (they compare exactly):
-//!    the object/array literal-buffer tag (N59 — v0.1
+//! 5. **Folded distinctions**: local-vs-external module vars and
+//!    async-vs-sync iterators/generators fold per the mapping table.
+//!    NOT folded (they compare exactly): the object/array
+//!    literal-buffer tag (N59 — v0.1
 //!    `CreateObjectWithBuffer`/`CreateArrayWithBuffer` vs v0.2
-//!    `AllocObject`/`AllocArray{Some}`) and the own-vs-plain store
+//!    `AllocObject`/`AllocArray{Some}`), the own-vs-plain store
 //!    distinction (N60 — v0.1 `StoreOwnProperty` vs v0.2
-//!    `StoreOwnProp{Name,Dyn,Idx}`).
+//!    `StoreOwnProp{Name,Dyn,Idx}`), and the tolerant-vs-throwing
+//!    global store (N61 — v0.1 `TryStoreGlobalByName` vs v0.2
+//!    `TryStoreGlobal`).
 //! 6. **Edge-keyed phis**: v0.2 phi entries key on `(Edge, value)` —
 //!    a block that is both a Normal and an Exceptional predecessor
 //!    produces two entries with the same value where v0.1 has one.
@@ -697,9 +699,13 @@ fn canon_inst_v1(cx: &mut V1Cx, iid: abcd_ir::entity::Inst) {
             let k0 = tok!("LoadConst", CVal::Konst("undefined".into()));
             one!("TryGetGlobal", cx.name(*name), CVal::Tok(k0))
         }
-        InstData::StoreGlobalVar { name, value }
-        | InstData::TryStoreGlobalByName { name, value } => {
+        InstData::StoreGlobalVar { name, value } => {
             let _ = tok!("StoreGlobal", cx.name(*name), cx.val(*value));
+        }
+        InstData::TryStoreGlobalByName { name, value } => {
+            // N61: the tolerant-store distinction is IR-explicit on
+            // both sides — compares EXACTLY (no fold to "StoreGlobal").
+            let _ = tok!("TryStoreGlobal", cx.name(*name), cx.val(*value));
         }
 
         // ── Lexical ──
@@ -1292,6 +1298,9 @@ fn canon_inst_v2(cx: &mut V2Cx, iid: abcd_ir2::InstId) {
             tok!("TryGetGlobal", cx.name(*name), dflt)
         }
         Op::StoreGlobal { name, value } => tok!("StoreGlobal", cx.name(*name), cx.val(*value)),
+        Op::TryStoreGlobal { name, value } => {
+            tok!("TryStoreGlobal", cx.name(*name), cx.val(*value))
+        }
         Op::LoadModuleVar { index } => tok!("LoadModuleVar", CVal::Konst(format!("index:{index}"))),
         Op::StoreModuleVar { index, value } => {
             tok!(

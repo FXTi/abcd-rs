@@ -412,6 +412,10 @@ impl Op {
                 may_throw: true, // unresolved reference in strict mode
                 ..Effects::PURE
             },
+            // Vendor `trystglobalbyname`: the TOLERANT store — no
+            // ReferenceError when the global is absent (mirrors
+            // TryGetGlobal's "never throws").
+            TryStoreGlobal { .. } => writes(MemClasses::GLOBAL),
             LoadModuleVar { .. } => reads(MemClasses::MODULE),
             StoreModuleVar { .. } => writes(MemClasses::MODULE),
             GetModuleNamespace { .. } => Effects {
