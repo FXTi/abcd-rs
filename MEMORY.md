@@ -358,6 +358,17 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
 
 ## Phase 5 outcome (done, 2026-09-21)
 
+- MAINTAINER DECISIONS (2026-09-21): D1 = build IR v0.2 (first design it,
+  compare v0.1 + Hermes; the IR must ALSO serve future FlowDroid-style
+  taint analysis). Design at design/ir-v0.2.md (requirements T1-T10,
+  shape, Effects model, contracts, three-way comparison, migration plan
+  P0-P5); Hermes survey at design/hermes-ir-survey.md. Q1: new crate
+  abcd-ir2, replace abcd-ir only after full acceptance. Q2: Switch dropped
+  (no producer/consumer in the ISA). Q3: single LoadPropIdx (const-index
+  is an analysis-layer query). Track: v2-P0 scaffold (in flight) → P1 lift
+  → P2 lower+oracle parity → P3 pass port → P4 swap → P5 abcd-taint
+  skeleton. D2/D3/D4 deferred to the same track (inline rewrite on v0.2
+  IR; FFI surface stays as-is; FormatProfile bundles with v0.2).
 - P5-T1/P5-T2 (2e38fbe…823abc8) — mechanical sweep complete (dead
   literal_val_to_c, callback docs #15, both -sys READMEs rewritten,
   abcd-file README ×6 drifts, P2 test-gap triage); N18 dead-island sweep
