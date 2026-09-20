@@ -141,3 +141,42 @@ fn method_element_referencing_foreign_method_resolves_name() {
         other => panic!("expected Method element, got {other:?}"),
     }
 }
+
+/// P2 test gap: decode → encode → decode roundtrip of a foreign (external)
+/// class. The high-level encode re-creates external classes in the foreign
+/// region (encode.rs "foreign first" pass), so they must survive.
+#[test]
+fn external_class_survives_decode_encode_roundtrip() {
+    let mut b = Builder::new();
+    b.set_api(12, "beta1");
+    let cls = b.add_global_class();
+    b.class_set_source_lang(cls, SourceLang::EcmaScript);
+    let _ext = b.add_foreign_class("LExternal;");
+    let proto = b.create_proto(Type::Tagged, &[]);
+    let m = b.class_add_method(
+        cls,
+        "func_main_0",
+        proto,
+        AccessFlags::PUBLIC,
+        &[0x65],
+        1,
+        0,
+    );
+    b.method_set_source_lang(m, SourceLang::EcmaScript);
+    let data = b.finalize().expect("finalize");
+
+    let file = decode(&data).expect("decode");
+    let bytes2 = abcd_file::encode(&file).expect("encode");
+    let file2 = decode(&bytes2).expect("decode #2");
+    let external = file2
+        .classes
+        .values()
+        .find(|c| c.is_external)
+        .expect("foreign class must survive the decode→encode→decode roundtrip");
+    assert_eq!(
+        file2.strings.resolve(external.descriptor),
+        Some("LExternal;")
+    );
+    let global = file2.classes.values().find(|c| !c.is_external).unwrap();
+    assert_eq!(global.methods.len(), 1, "normal class must stay intact");
+}

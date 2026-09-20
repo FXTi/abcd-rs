@@ -153,3 +153,44 @@ fn nested_literal_arrays_roundtrip() {
         other => panic!("expected nested LiteralArray, got {other:?}"),
     }
 }
+
+/// Finding #4, model level: typed ARRAY_* literal values must be DELIVERED
+/// to the model — the tolerant enumerator once returned without invoking
+/// the callback for ARRAY_U1…ARRAY_STRING, silently dropping every
+/// typed-array literal. (Bridge-level delivery is pinned by abcd-file-sys's
+/// `literal_array_tag_value_is_delivered`; this pins the model mapping.)
+///
+/// Format facts (vendored `literal_data_accessor-inl.h:94-115`): an ARRAY_*
+/// item is always the LAST item of its literal array — the tag byte is
+/// followed by the array payload, not by more [tag][value] pairs — and the
+/// delivered value is the payload's file offset, delivered once.
+#[test]
+fn typed_array_tags_decode_to_model_values() {
+    let (mut data, array_off) = build_one_string_array();
+
+    // In-place rewrite (exactly the old 9 bytes, so no offset fixups): the
+    // array holds a single ARRAY_U8 literal. Per the vendored format an
+    // ARRAY_* item is always LAST — the tag byte is followed by the array
+    // payload, not by more [tag][value] pairs — and the delivered value is
+    // the payload's file offset, delivered once (vendor
+    // `literal_data_accessor-inl.h:94-115`).
+    let payload_off = (array_off + 4 + 1) as u32; // after count + tag byte
+    let new_arr: Vec<u8> = [
+        &2u32.to_le_bytes()[..], // one literal = one [tag][payload] pair
+        &[0x0b],                 // ARRAY_U8
+        &0u32.to_le_bytes()[..], // payload: element count 0 (no elements)
+    ]
+    .concat();
+    assert_eq!(new_arr.len(), 4 + 5, "must match the old array size");
+    data[array_off..array_off + new_arr.len()].copy_from_slice(&new_arr);
+
+    let file = decode(&data).expect("decode");
+    let vals = &file.literal_arrays[0].values;
+    assert_eq!(
+        vals.as_slice(),
+        &[LiteralValue::ArrayU8(abcd_file::LiteralArrayIdx(
+            payload_off
+        ))],
+        "the typed-array value must be delivered, not silently dropped"
+    );
+}
