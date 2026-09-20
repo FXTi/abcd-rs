@@ -537,6 +537,20 @@ const ES_SCOPE_NAMES_RECORD_DESCRIPTOR: &str = "L_ESScopeNamesRecord;";
 /// `MODULE_REQUEST_PAHSE_IDX`).
 const MODULE_REQUEST_PHASE_FIELD: &str = "moduleRequestPhaseIdx";
 
+/// Name of the upstream-DEAD module-record field whose value is a NESTED
+/// file offset — it points to a literal array whose elements are
+/// themselves offsets (arkcompiler_runtime_core
+/// docs/changelogs/2022-08-18-isa-changelog.md item 5; name from vendored
+/// libpandabase/utils/const_value.h:25 `TYPE_SUMMARY_FIELD_NAME`). No
+/// producer (es2panda never emits it), no runtime consumer
+/// (`TYPE_SUMMARY_OFFSET_NOT_FOUND` is a dead constant), the disassembler
+/// excludes it (disassembler.cpp:1009), and the corpus has zero
+/// occurrences. Our relocation machinery has no support for the nested
+/// indirection, so decode is a HARD ERROR on the name alone (N8,
+/// maintainer ruling 2026-09-20) — never a warning, never a silent raw
+/// `FieldValue::I32` pass-through that a rewrite would leave dangling.
+const TYPE_SUMMARY_OFFSET_FIELD: &str = "typeSummaryOffset";
+
 /// Decode a module-record blob through the vendored ModuleDataAccessor.
 ///
 /// Layout (module_data_accessor.cpp ctor + module_data_accessor-inl.h
@@ -789,6 +803,18 @@ fn decode_field_at(
     //   collect the offset for literal-array decoding (13.x+ has no header
     //   table entry for it).
     let initial_value = match (class_descriptor, type_id, initial_value) {
+        // N8: `typeSummaryOffset` (any class, any type, valued or not) is a
+        // hard error — see TYPE_SUMMARY_OFFSET_FIELD. This arm must come
+        // FIRST: upstream attaches the field to the module record itself,
+        // so the `_ESModuleRecord` catch-all u32 arm below would otherwise
+        // win and mis-route the nested offset into the module-data blob
+        // decoder.
+        (_, _, _) if strings.resolve(name) == Some(TYPE_SUMMARY_OFFSET_FIELD) => {
+            return Err(Error::TypeSummaryOffset {
+                class_descriptor: class_descriptor.to_owned(),
+                field_off,
+            });
+        }
         (ES_MODULE_RECORD_DESCRIPTOR, TypeId::U32, Some(FieldValue::I32(off))) => {
             let offset = u32::try_from(off).map_err(|_| {
                 Error::ModuleData(format!(

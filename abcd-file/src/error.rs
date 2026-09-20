@@ -58,4 +58,21 @@ pub enum Error {
     /// Module-record blob decode/encode failure (never a silent fallback).
     #[error("module data error: {0}")]
     ModuleData(String),
+    /// A field named `typeSummaryOffset` was encountered (N8). Upstream
+    /// (`libpandabase/utils/const_value.h:25` `TYPE_SUMMARY_FIELD_NAME`)
+    /// defines the name, but its value is a NESTED file offset — it points
+    /// to a literal array whose elements are themselves offsets
+    /// (arkcompiler_runtime_core 2022-08-18 ISA changelog item 5) — and
+    /// upstream has no producer (es2panda never emits it) and no consumer
+    /// (`TYPE_SUMMARY_OFFSET_NOT_FOUND` is a dead constant; the
+    /// disassembler excludes it). Relocation of the nested indirection is
+    /// unsupported, so decode fails loudly instead of passing a raw scalar
+    /// through to a dangling rewrite.
+    #[error(
+        "unsupported `typeSummaryOffset` field on {class_descriptor} at {field_off:#x}: value is a nested file offset (2022-08-18 ISA changelog item 5) with no upstream producer or consumer and relocation is unsupported — please report this file to the abcd-rs maintainers"
+    )]
+    TypeSummaryOffset {
+        class_descriptor: String,
+        field_off: u32,
+    },
 }
