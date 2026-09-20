@@ -24,9 +24,13 @@
 //! ld/stobjbyname → `LoadProp`/`StoreProp`, ld/stobjbyvalue →
 //! `LoadPropDyn`/`StorePropDyn`, ld/stobjbyindex → `LoadPropIdx`/
 //! `StorePropIdx` (the constant index MATERIALIZED as a `LoadConst` —
-//! §9 resolution 3), stownby*/definefieldbyname/definepropertybyname/
-//! callruntime.definefieldby* → the `StoreProp*` family (the
-//! own-vs-plain store distinction folds — documented), ld/stthisby* →
+//! §9 resolution 3), the OWN-STORE family is IR-explicit (N60; v0.1
+//! `InstData::StoreOwnProperty` — define-own-property semantics, no
+//! setters, no prototype-chain walk): stownbyname(+withnameset)/
+//! definefieldbyname/definepropertybyname → `StoreOwnPropName`,
+//! stownbyvalue(+withnameset)/callruntime.definefieldbyvalue →
+//! `StoreOwnPropDyn`, stownbyindex(+wide)/callruntime.
+//! definefieldbyindex → `StoreOwnPropIdx`, ld/stthisby* →
 //! hard [`LiftError::UnsupportedThisByAccess`] (N51: es2panda never
 //! emits the IC-fused this-by-* family — never silently invented),
 //! ld/stsuperbyname →
@@ -610,14 +614,16 @@ pub fn translate_bytecode(
         }
         Bytecode::Stownbyname(_ic, eid, obj_reg)
         | Bytecode::Stownbynamewithnameset(_ic, eid, obj_reg) => {
-            // Own-store fold: v0.2 has one named-store family
-            // (documented).
+            // N60: own-property DEFINITION (v0.1
+            // `InstData::StoreOwnProperty` + PropKind::ByName) — no
+            // setters, no prototype-chain walk; never folds to
+            // StoreProp.
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
             let obj = fx.read_reg(*obj_reg, block);
             fx.emit_void(
                 block,
-                Op::StoreProp {
+                Op::StoreOwnPropName {
                     object: obj,
                     name,
                     value,
@@ -627,12 +633,14 @@ pub fn translate_bytecode(
         }
         Bytecode::Stownbyvalue(_ic, obj_reg, key_reg)
         | Bytecode::Stownbyvaluewithnameset(_ic, obj_reg, key_reg) => {
+            // N60: own-property definition with a computed key (v0.1
+            // PropKind::ByValue).
             let value = fx.read_acc(block);
             let obj = fx.read_reg(*obj_reg, block);
             let key = fx.read_reg(*key_reg, block);
             fx.emit_void(
                 block,
-                Op::StorePropDyn {
+                Op::StoreOwnPropDyn {
                     object: obj,
                     key,
                     value,
@@ -641,12 +649,15 @@ pub fn translate_bytecode(
             );
         }
         Bytecode::Stownbyindex(_, obj_reg, index) | Bytecode::WideStownbyindex(obj_reg, index) => {
+            // N60: own-property definition at a constant index (v0.1
+            // PropKind::ByIndex — the index MATERIALIZED as a LoadConst,
+            // §9 resolution 3).
             let value = fx.read_acc(block);
             let obj = fx.read_reg(*obj_reg, block);
             let konst = fx.load_const(block, Const::number(index.0 as f64), loc);
             fx.emit_void(
                 block,
-                Op::StorePropIdx {
+                Op::StoreOwnPropIdx {
                     object: obj,
                     index: konst,
                     value,
@@ -757,12 +768,14 @@ pub fn translate_bytecode(
         // ── Define field/property by name ────────────────────────────
         Bytecode::Definefieldbyname(_ic, eid, obj_reg)
         | Bytecode::Definepropertybyname(_ic, eid, obj_reg) => {
+            // N60: own-property DEFINITION (v0.1
+            // `InstData::StoreOwnProperty` + PropKind::ByName).
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
             let obj = fx.read_reg(*obj_reg, block);
             fx.emit_void(
                 block,
-                Op::StoreProp {
+                Op::StoreOwnPropName {
                     object: obj,
                     name,
                     value,
@@ -1581,13 +1594,14 @@ pub fn translate_bytecode(
         Bytecode::CallruntimeDefinefieldbyvalue(_ic, key_reg, obj_reg) => {
             // Vendor: the FIRST register operand is the propKey, the
             // SECOND is the obj, the acc carries the value
-            // (isa.yaml:826-831, interpreter_stub.cpp:6031-6043).
+            // (isa.yaml:826-831, interpreter_stub.cpp:6031-6043). N60:
+            // own-property definition (v0.1 PropKind::ByValue).
             let value = fx.read_acc(block);
             let obj = fx.read_reg(*obj_reg, block);
             let key = fx.read_reg(*key_reg, block);
             fx.emit_void(
                 block,
-                Op::StorePropDyn {
+                Op::StoreOwnPropDyn {
                     object: obj,
                     key,
                     value,
@@ -1596,12 +1610,14 @@ pub fn translate_bytecode(
             );
         }
         Bytecode::CallruntimeDefinefieldbyindex(_ic, index, obj_reg) => {
+            // N60: own-property definition at a constant index (v0.1
+            // PropKind::ByIndex — the index MATERIALIZED as a LoadConst).
             let value = fx.read_acc(block);
             let obj = fx.read_reg(*obj_reg, block);
             let konst = fx.load_const(block, Const::number(index.0 as f64), loc);
             fx.emit_void(
                 block,
-                Op::StorePropIdx {
+                Op::StoreOwnPropIdx {
                     object: obj,
                     index: konst,
                     value,

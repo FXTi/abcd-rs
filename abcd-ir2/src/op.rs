@@ -306,6 +306,42 @@ pub enum Op {
         /// The stored value.
         value: ValueId,
     },
+    /// Named OWN-property store: define `object.name = value` as an own
+    /// property (vendor `stownbyname`(+withnameset)/`definefieldbyname`/
+    /// `definepropertybyname`) — CreateDataProperty/DefineField
+    /// semantics: NO setters, NO prototype-chain walk, unlike
+    /// [`Op::StoreProp`] (N60; v0.1 `InstData::StoreOwnProperty` with
+    /// `PropKind::ByName`, isel emits the `stownby*` family).
+    StoreOwnPropName {
+        /// The receiver object.
+        object: ValueId,
+        /// The property name.
+        name: Sym,
+        /// The stored value.
+        value: ValueId,
+    },
+    /// Computed-key own-property store (vendor
+    /// `stownbyvalue`(+withnameset)/`callruntime.definefieldbyvalue` —
+    /// v0.1 `PropKind::ByValue`).
+    StoreOwnPropDyn {
+        /// The receiver object.
+        object: ValueId,
+        /// The computed key.
+        key: ValueId,
+        /// The stored value.
+        value: ValueId,
+    },
+    /// Integer-indexed own-property store (vendor
+    /// `stownbyindex`/`wide.stownbyindex`/
+    /// `callruntime.definefieldbyindex` — v0.1 `PropKind::ByIndex`).
+    StoreOwnPropIdx {
+        /// The receiver object.
+        object: ValueId,
+        /// The index.
+        index: ValueId,
+        /// The stored value.
+        value: ValueId,
+    },
     /// Define a method on an object (class/object-literal semantics).
     DefineMethod {
         /// The home object.
@@ -808,6 +844,7 @@ impl Op {
             AllocClosure { func } => vec![*func],
             LoadProp { object, .. } => vec![*object],
             StoreProp { object, value, .. } => vec![*object, *value],
+            StoreOwnPropName { object, value, .. } => vec![*object, *value],
             LoadPropIdx { object, index } | LoadPropDyn { object, key: index } => {
                 vec![*object, *index]
             }
@@ -819,6 +856,16 @@ impl Op {
             | StorePropDyn {
                 object,
                 key: index,
+                value,
+            } => vec![*object, *index, *value],
+            StoreOwnPropDyn {
+                object,
+                key: index,
+                value,
+            }
+            | StoreOwnPropIdx {
+                object,
+                index,
                 value,
             } => vec![*object, *index, *value],
             DefineMethod { object, func, .. } => vec![*object, *func],
@@ -924,6 +971,7 @@ impl Op {
             AllocClosure { func } => vec![func],
             LoadProp { object, .. } => vec![object],
             StoreProp { object, value, .. } => vec![object, value],
+            StoreOwnPropName { object, value, .. } => vec![object, value],
             LoadPropIdx { object, index } | LoadPropDyn { object, key: index } => {
                 vec![object, index]
             }
@@ -935,6 +983,16 @@ impl Op {
             | StorePropDyn {
                 object,
                 key: index,
+                value,
+            } => vec![object, index, value],
+            StoreOwnPropDyn {
+                object,
+                key: index,
+                value,
+            }
+            | StoreOwnPropIdx {
+                object,
+                index,
                 value,
             } => vec![object, index, value],
             DefineMethod { object, func, .. } => vec![object, func],
@@ -1035,6 +1093,9 @@ impl Op {
             StoreProp { .. }
                 | StorePropIdx { .. }
                 | StorePropDyn { .. }
+                | StoreOwnPropName { .. }
+                | StoreOwnPropDyn { .. }
+                | StoreOwnPropIdx { .. }
                 | StoreSuper { .. }
                 | CopyDataProps { .. }
                 | SetObjectWithProto { .. }
@@ -1138,6 +1199,7 @@ impl Op {
             | Branch { .. }
             | Unreachable => Arity::Exact(0),
             StoreProp { .. }
+            | StoreOwnPropName { .. }
             | DefineMethod { .. }
             | CopyDataProps { .. }
             | SetObjectWithProto { .. }
@@ -1150,6 +1212,7 @@ impl Op {
             | ThrowUndefinedIfHole { .. }
             | SuspendGenerator { .. } => Arity::Exact(2),
             StorePropIdx { .. } | StorePropDyn { .. } => Arity::Exact(3),
+            StoreOwnPropDyn { .. } | StoreOwnPropIdx { .. } => Arity::Exact(3),
             ArraySpread { .. } => Arity::Exact(3),
             DefineGetterSetterByValue { .. } => Arity::Exact(4),
             CondBranch { .. } => Arity::Exact(1),

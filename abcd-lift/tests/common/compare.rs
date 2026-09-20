@@ -46,12 +46,14 @@
 //!    forward-all form as plain `SuperCall`, indistinguishable from
 //!    `supercallthisrange` — the v0.2 kind is strictly more precise
 //!    than anything v0.1 can express.
-//! 5. **Folded distinctions**: own-vs-plain stores, strict-vs-tolerant
-//!    global stores, local-vs-external module vars, async-vs-sync
-//!    iterators/generators fold per the mapping table. NOT folded
-//!    (compares exactly): the object/array literal-buffer tag (N59 —
-//!    v0.1 `CreateObjectWithBuffer`/`CreateArrayWithBuffer` vs v0.2
-//!    `AllocObject`/`AllocArray{Some}`).
+//! 5. **Folded distinctions**: strict-vs-tolerant global stores,
+//!    local-vs-external module vars, async-vs-sync iterators/generators
+//!    fold per the mapping table. NOT folded (they compare exactly):
+//!    the object/array literal-buffer tag (N59 — v0.1
+//!    `CreateObjectWithBuffer`/`CreateArrayWithBuffer` vs v0.2
+//!    `AllocObject`/`AllocArray{Some}`) and the own-vs-plain store
+//!    distinction (N60 — v0.1 `StoreOwnProperty` vs v0.2
+//!    `StoreOwnProp{Name,Dyn,Idx}`).
 //! 6. **Edge-keyed phis**: v0.2 phi entries key on `(Edge, value)` —
 //!    a block that is both a Normal and an Exceptional predecessor
 //!    produces two entries with the same value where v0.1 has one.
@@ -541,9 +543,7 @@ fn canon_inst_v1(cx: &mut V1Cx, iid: abcd_ir::entity::Inst) {
                 one!("LoadPropIdx", cx.val(*object), CVal::Tok(k0))
             }
         },
-        InstData::StoreProperty { object, key, value }
-        | InstData::StoreOwnProperty { object, key, value } => {
-            // Own-vs-plain store distinction folds (divergence rule 5).
+        InstData::StoreProperty { object, key, value } => {
             match key {
                 PropKind::ByName(n) => {
                     let _ = tok!("StoreProp", cx.val(*object), cx.name(*n), cx.val(*value));
@@ -558,6 +558,41 @@ fn canon_inst_v1(cx: &mut V1Cx, iid: abcd_ir::entity::Inst) {
                     );
                     let _ = tok!(
                         "StorePropIdx",
+                        cx.val(*object),
+                        CVal::Tok(k0),
+                        cx.val(*value)
+                    );
+                }
+            }
+            debug_assert!(result.is_none());
+        }
+        InstData::StoreOwnProperty { object, key, value } => {
+            // N60: the own-store family is IR-explicit on both sides —
+            // compares EXACTLY (no fold to the plain StoreProp* tokens).
+            match key {
+                PropKind::ByName(n) => {
+                    let _ = tok!(
+                        "StoreOwnPropName",
+                        cx.val(*object),
+                        cx.name(*n),
+                        cx.val(*value)
+                    );
+                }
+                PropKind::ByValue(k) => {
+                    let _ = tok!(
+                        "StoreOwnPropDyn",
+                        cx.val(*object),
+                        cx.val(*k),
+                        cx.val(*value)
+                    );
+                }
+                PropKind::ByIndex(i) => {
+                    let k0 = tok!(
+                        "LoadConst",
+                        CVal::Konst(format!("num:{:#x}", (*i as f64).to_bits()))
+                    );
+                    let _ = tok!(
+                        "StoreOwnPropIdx",
                         cx.val(*object),
                         CVal::Tok(k0),
                         cx.val(*value)
@@ -1145,6 +1180,32 @@ fn canon_inst_v2(cx: &mut V2Cx, iid: abcd_ir2::InstId) {
             "StorePropDyn",
             cx.val(*object),
             cx.val(*key),
+            cx.val(*value)
+        ),
+        Op::StoreOwnPropName {
+            object,
+            name,
+            value,
+        } => tok!(
+            "StoreOwnPropName",
+            cx.val(*object),
+            cx.name(*name),
+            cx.val(*value)
+        ),
+        Op::StoreOwnPropDyn { object, key, value } => tok!(
+            "StoreOwnPropDyn",
+            cx.val(*object),
+            cx.val(*key),
+            cx.val(*value)
+        ),
+        Op::StoreOwnPropIdx {
+            object,
+            index,
+            value,
+        } => tok!(
+            "StoreOwnPropIdx",
+            cx.val(*object),
+            cx.val(*index),
             cx.val(*value)
         ),
         Op::DefineMethod {

@@ -297,6 +297,17 @@ impl Op {
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
+            // Own-property DEFINITION (vendor stownby*/definefieldby*/
+            // definepropertybyname): CreateDataProperty semantics — no
+            // setters and no prototype-chain walk, so NO may_call
+            // (mirrors DefineMethod/DefineGetterSetterByValue); throws
+            // like defineproperty (define-on-non-extensible /
+            // non-configurable redefinition failure).
+            StoreOwnPropName { .. } | StoreOwnPropDyn { .. } | StoreOwnPropIdx { .. } => Effects {
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                ..Effects::PURE
+            },
             LoadSuper { .. } => Effects {
                 reads: MemClasses::HEAP | MemClasses::PROTOTYPE,
                 may_throw: true,
