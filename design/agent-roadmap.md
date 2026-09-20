@@ -233,6 +233,12 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 
 | N56 | Builder `literal_array_add_module_request_phase` + module-data staging 疑似损坏 module blob 字符串偏移（decode: invalid entity offset；无 Builder 先例，疑 bridge staging 顺序问题，abcd-file 域） | ✅ 修复（c79220d，诊断 worker v2-P2a + orchestrator 落地）：**原假设证伪**——bridge/vendored writer 输出逐字节正确（对照实验：phase 字段挂别的类全绿、字符串逐字验证）；真根因是 `decode_field_at` **分派臂顺序**：`_ESModuleRecord` catch-all u32 臂排在 N7 名匹配臂之上，merge-abc 布局（phase 字段挂模块记录自身）被误路由进 module-data blob 解码器 → 整文件不可 decode。修复=一臂重排（N8 同型陷阱，N8 修过顺序而 N7 臂后加没修）。语料零暴露的原因：es2panda 把 phase 字段挂独立的 `L_ModuleRequestPhaseRecord;`（9 fixture 探针实证）。red-first：9 红 3 绿 orchestrator 独立复现 → 4 精选测试（同类 decode/300 字符串池增长/往返/异类对照）；abcd-file 91/91 + 语料套件字节中性 |
 
+| N57 | v2-P1 折叠 `apply` → Call{Dynamic,this,args:[array]} 与 callthis1 同形——spread 语义丢失，v0.2 lower 无法忠实还原（18 个 runtime-passed 文件） | 🔲 待维护者裁决（v2-P2 发现；建议 Op::Call 加 CallKind::Apply） |
+| N58 | v2-P1 折叠 supercallspread(42 passed) 与 callruntime.supercallforwardallargs(12 passed) 同形 Call{Super,[x]}——v0.1 分发 supercallspread vs supercallthisrange(argc=1)，单一选择必破一边 | 🔲 待裁决（建议 CallKind 拆 SuperSpread/SuperForwardAllArgs） |
+| N59 | createobjectwithbuffer vs createarraywithbuffer 都折成 AllocObject{shape}——对象/数组标签不在字面量数组内容里（平铺 buffer 内容不可嗅探），语料无处不在 | 🔲 待裁决（建议拆 Op::AllocArray{shape}） |
+| N60 | own-store 族（stownbyname 6 / definefieldbyname+definepropertybyname 90 / callruntime.definefieldbyvalue 180 passed 文件）折进 StoreProp 族——v0.1 StoreOwnProperty→stownby*（define-own 语义），v0.2 只能发 stobjby*（普通 set，走 setter/原型链），语义+字节双分歧 | 🔲 待裁决（建议 Op::StoreOwnProp{Name,Dyn,Idx}） |
+| N61 | trystglobalbyname（54 passed 文件）折进 StoreGlobal——tolerant store 变 throwing stglobalvar，字节必分歧、全局缺席时语义分歧 | 🔲 待裁决（建议 Op::TryStoreGlobal 或 tolerant 标志） |
+
 ## 审计纪律
 
 - 审计期间 abcd-isa-sys / abcd-isa / abcd-file-sys / abcd-file 冻结功能性改动（允许新增测试文件）。
