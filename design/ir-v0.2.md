@@ -214,10 +214,34 @@ buckets (→ one list + profile fold); `IrType::Static(file StringId)` (N46);
 (→ structured regions); register/acc concepts in `RegOrAcc` (→ out-of-SSA
 problem in lower only).
 
-### 6.3 Hermes IR (see research report; placeholder for deltas)
+### 6.3 Hermes IR (survey: `hermes-ir-report.md`, citations there)
 
-(pending: variable/scope model, effect granularity, call/closure modeling,
-type lattice, exceptions, verifier — with the three-way table)
+Hermes (Meta's JS engine, `hermes-main/`) is the closest mature sibling.
+Three-way comparison on the dimensions this design cares about:
+
+| Dimension | abcd v0.1 (as built) | Hermes IR | abcd v0.2 (this design) |
+|---|---|---|---|
+| SSA | Braun SSA at lift (correct on 2,787 fixtures incl. handlers) | NOT initially SSA: `AllocStack/Load/StoreStackInst` + Mem2Reg/StackPromotion (Instrs.h:511-614,2349) | Braun SSA at lift, kept |
+| Value identity | arena `Value(u32)`, stable across passes | `Value*` + closed `ValueKind` enum (IR.h:438); def-use `Users` lists of Instruction* | arena ids + stable-across-passes contract (T1); def-use lists kept as pass-computed analysis, not stored |
+| Property access | `LoadProperty{ByName(Sym)/ByValue/ByIndex}` — by-name is typed | `LoadPropertyInst(object, property)` with property as general `Value*` (LiteralString when static) | three explicit ops: named (`Sym`) / index (`ValueId`) / dynamic (`ValueId`) — access-path vocabulary (T2/T9) |
+| Effects | `is_essential` hand list (N48/N50) + vendor citations | `SideEffectKind {None, MayRead, MayWrite, Unknown}` hand-written per class (IR.h:356-66); ALL property/call insts are `Unknown` | `Effects` struct: mem classes + may_throw + may_call + allocs, mechanically derived from the taxonomy (T3) — strictly finer than Hermes |
+| Calls | CallKind::{Call, CallThis, SuperCall(×3), Apply, Construct} — arity-form variants leak | `CallInst {Callee, NewTarget, This, args…}` + ConstructInst + CallBuiltinInst (builtin as LiteralNumber index) (Instrs.h:842) | one `Call{callee, this, args, kind}` + binding table §5.3 (vendor-verified); builtins via `is_external`+Sym summaries (T6) |
+| Closures/scope | `GetLexEnv/GetLexVar/PutLexVar{level,slot}` + `DefineFunc` (captures not explicit) | ScopeDesc tree of Variables (IR.h:561-660); env as SSA value; parent-scope link is a def-use edge (Instrs.h:138) | same lexical ops + `DefineFunc{captures: Vec<(Sym, ValueId)>}` — capture flow is explicit data for taint (T4) |
+| Exceptions | structured TryRegion + augmented_succs analysis edges (N10-N21 battle-tested) | `TryStartInst` terminator with catch successor + `CatchInst` head value (Instrs.h:2278-2325); implicit exceptional edges otherwise | `EdgeKind::Exceptional` first-class + `ExceptionParam` values + structured TryRegion (T5) — Hermes' explicitness AND region structure |
+| Types | static-biased `IrType` + file-bound `Type::Reference` leak (N46) | bitmask lattice over JS kinds + Int32/Uint32 submask (IR.h:51-350); local rule propagation, no shapes | dynamic-first `Ty::{Any, DynPrim, Static, Union, Unknown}`; static as annotation; no file-bound payloads (T-ready for provenance) |
+| Round-trip | 2.69M instructions pandasm-exact + VM oracle CI | textual dump only, NO parser/round-trip (doc/IR.md; IR.cpp:265-816) | round-trip fixed point as CI invariant (§8 of design/ir.md) |
+| Verifier | verify.rs incl. SSA dominance (N45) + exception-model exemptions | `verifyModule` debug-build-only, structural per-opcode checks (IRVerifier.h:34) | verifier is a first-class contract (dominance, metadata, effects-consistency) |
+| Call graph | none wired (inline quarantined N44) | `SimpleCallGraphProvider` is local-only, "no closure analysis" (SimpleCallGraphProvider.h:17-27) | IR carries the facts (Call kinds + DefineFunc captures); `abcd-taint` builds CHA/RTA outside (§2, T4/T6) |
+| Taint fitness | too format-leaky | named Variables + def-use lists help; but effects are monolithic-memory, no access paths, no call graph, implicit exception edges, no serialization | T1-T10 by construction (§2) |
+
+**What we take from Hermes**: explicit catch-edge terminator semantics
+(already independently arrived at via N10-N21); env/scope as first-class
+flow (already in our lexical ops + captures); def-use user lists as a
+cheap analysis commodity (keep, but computed per-pass rather than stored,
+to preserve the clone-never-renumber contract). **What we deliberately do
+NOT take**: stack-slot pre-SSA phase (Braun is strictly better here);
+monolithic memory effects; the JIT-shaped bitmask type lattice as the only
+type story; debug-only verification; no round-trip.
 
 ## 7. Metadata fidelity contract (hard, verifier-checked)
 
