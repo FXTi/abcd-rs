@@ -1831,34 +1831,6 @@ try {
 }
 }
 
-// Convert a C++ std::variant LiteralValue to our C union.
-// Dispatches on the variant's active type, not on LiteralTag — so adding
-// new tags upstream (with existing types) requires zero changes here.
-static void literal_val_to_c(const LiteralDA::LiteralValue &val, LiteralTag tag,
-                              AbcLiteralValCb cb, void *ctx) {
-    AbcLiteralVal out;
-    out.tag = static_cast<uint8_t>(tag);
-    out.data.u64_val = 0;
-    out.str_data = nullptr;
-    out.str_utf16_len = 0;
-    std::visit([&out](auto &&arg) {
-        using T = std::decay_t<decltype(arg)>;
-        if constexpr (std::is_same_v<T, bool>)          out.data.bool_val = arg ? 1 : 0;
-        else if constexpr (std::is_same_v<T, uint8_t>)  out.data.u8_val = arg;
-        else if constexpr (std::is_same_v<T, uint16_t>) out.data.u16_val = arg;
-        else if constexpr (std::is_same_v<T, uint32_t>) out.data.u32_val = arg;
-        else if constexpr (std::is_same_v<T, uint64_t>) out.data.u64_val = arg;
-        else if constexpr (std::is_same_v<T, float>)    out.data.f32_val = arg;
-        else if constexpr (std::is_same_v<T, double>)   out.data.f64_val = arg;
-        else if constexpr (std::is_same_v<T, void *>)   out.data.u64_val = reinterpret_cast<uintptr_t>(arg);
-        else if constexpr (std::is_same_v<T, File::StringData>) {
-            out.str_data = arg.data;
-            out.str_utf16_len = arg.utf16_length;
-        }
-    }, val);
-    cb(&out, ctx);
-}
-
 // Tolerant literal-array enumerator. The vendor
 // LiteralDataAccessor::EnumerateLiteralVals aborts on LiteralTag 0x00
 // (TAGVALUE / INTEGER_8 — a legal 1-byte integer literal in real 12.x
