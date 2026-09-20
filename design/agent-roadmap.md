@@ -241,7 +241,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 
 | # | 任务 | 执行者 | 状态 |
 |---|------|--------|------|
-| v2-P0 | abcd-ir2 骨架：taxonomy + Effects + Ty + verifier 骨架（零格式依赖 Cargo 强制） | worker v2-P0 (k3) | **进行中** |
+| v2-P0 | abcd-ir2 骨架：taxonomy + Effects + Ty + verifier 骨架（零格式依赖 Cargo 强制） | worker v2-P0 (k3) | **完成**（e83a2c4；orchestrator 复审 effects 派生表/Ty 格 join/verifier 豁免语义 + 复验：fmt/103 套件绿/ir2 22 测试绿/doc 零警告） |
 | v2-P1 | lift：decode(v0.1 File) → v0.2 Module，全语料结构验证 + 与 v0.1 lift 对照 | 待定 | 未开始 |
 | v2-P2 | lower：v0.2 Module → MethodBody（复用重定位通道），VM oracle 对齐 1149/1149×2 | 待定 | 未开始 |
 | v2-P3 | pass 移植：SCCP/copyprop/DCE/peephole（T3 Effects 表），opt 变体 oracle 对齐 | 待定 | 未开始 |
