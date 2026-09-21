@@ -414,8 +414,11 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   101 suites/462 tests green, three driver variants byte-identical to
   accepted baselines, v2opt oracle 1149/1149. The v0.2 stack IS the
   project now: abcd-lift -> abcd-ir -> abcd-opt -> abcd-lower.
-  NEXT: v2-P5 (abcd-taint scaffold: call graph + IFDS skeleton + top-20
-  builtin summaries, print-sink smoke) — the last registered task.
+  NEXT: v2-P5 — maintainer ruled TWO crates (2026-09-21):
+  abcd-dataflow (infra: callgraph/IFDS/heap-model-v0 alloc-site-keyed
+  with strong/weak updates + access paths + precision-ladder doc) then
+  abcd-taint (app: source/sink config + top-20 builtin summaries +
+  print-sink smoke). Dispatched as v2-P5a then v2-P5b.
   v2-P3b DONE (2026-09-21): inline rewritten on the v0.2 IR (D2=YES).
   N44 killed by construction (fresh-arena clone, vendored frame-slot
   param model [func][newTarget][this][formals...] with callType bits /
