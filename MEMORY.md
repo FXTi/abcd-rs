@@ -366,7 +366,11 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   bab1efb + a8c2699; format layer untouched). General principle ruled:
   hard Err when the seam is Result-typed, unreachable-style abort only
   when it is not — warnings are NOT sufficient for unsupported upstream
-  constructs. D2 deferred to post-v2-P3; D3 = keep the dead FFI surface.
+  constructs. D3 = keep the dead FFI surface. D2 RULED (2026-09-21):
+  inline IS wanted — rewrite on the v0.2 IR as v2-P3b (N44 killed by
+  construction). P4 RULED same day: NO v1 archival — abcd-ir is
+  DELETED at the swap (git history is the archive); the parity
+  comparator and v0.1 corpus drivers retire with it.
   Gates: fmt clean, remote 112 suites / 451 tests green, corpus suites
   byte-neutral (zero occurrences); orchestrator re-verified.
 - IR v0.2 TRACK STATUS (2026-09-21, P0-P1 done): abcd-ir2 scaffold  (taxonomy ~70 ops incl. v2-P0.5 full ISA coverage, Effects, Ty lattice,
