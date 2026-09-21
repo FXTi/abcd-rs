@@ -14,13 +14,21 @@ A Rust toolkit for ArkCompiler bytecode (`.abc`) files — read, write, inspect,
 | [`abcd-isa`](abcd-isa) | Safe Rust API: bytecode decode/encode, versions, per-mnemonic constructors |
 | [`abcd-file-sys`](abcd-file-sys) | C FFI bindings for the `.abc` container format (libpandafile) |
 | [`abcd-file`](abcd-file) | Safe Rust API: read / write / inspect ABC files |
-| [`abcd-ir`](abcd-ir) | SSA intermediate representation: lift (bytecode → IR), optimize, lower (IR → bytecode) |
+| [`abcd-lift`](abcd-lift) | Lifter: decode → IR (`abcd_file::File` → `abcd_ir::Module`) |
+| [`abcd-ir`](abcd-ir) | The SSA intermediate representation: module/function graphs, op taxonomy, effects, type lattice, verifier |
+| [`abcd-opt`](abcd-opt) | Optimization passes on the IR (IR → IR): peephole, SCCP, ADCE + CFG simplify, copyprop, inline |
+| [`abcd-lower`](abcd-lower) | Lowering: IR → ArkCompiler bytecode (`abcd_ir::Module` → `abcd_file::MethodBody`) |
 
 ```
-.abc file ──decode──▶ abcd-isa ──▶ abcd-file ──lift──▶ abcd-ir (SSA)
-                                                        │ opt / lower
-.abc file ◀──encode── abcd-isa ◀─ abcd-file ◀──────────┘
+.abc file ──decode──▶ abcd-file ──lift──▶ abcd-ir (SSA) ──opt──▶ abcd-ir
+       (abcd-file-sys / abcd-isa underneath)              │
+.abc file ◀──encode── abcd-file ◀──lower──────────────────┘
 ```
+
+Layering: **lift = decode→IR**, **opt = IR→IR**, **lower = IR→file**.
+`abcd-ir` and `abcd-opt` are format-independent — they never depend on
+the container/ISA crates; only `abcd-lift` and `abcd-lower` straddle the
+boundary.
 
 ## Quick start
 
@@ -36,13 +44,14 @@ for (desc, class) in &file.classes {
 
 ## IR
 
-`abcd-ir` provides the full SSA round-trip:
+`abcd-ir` is the SSA intermediate representation; the pipeline around it
+provides the full round-trip:
 
-- **Lift**: CFG construction → Braun SSA → instruction translation
-- **Optimize**: peephole → SCCP → ADCE → copy propagation
-- **Lower**: chordal-graph register allocation (MCS coloring + Boissinot out-of-SSA) → instruction selection → layout
+- **Lift** (`abcd-lift`): CFG construction → Braun SSA → instruction translation
+- **Optimize** (`abcd-opt`): peephole → SCCP → ADCE → copy propagation (inline is opt-in)
+- **Lower** (`abcd-lower`): chordal-graph register allocation (MCS coloring + Boissinot out-of-SSA) → instruction selection → layout
 
-See [`abcd-ir/README.md`](abcd-ir/README.md) for the IR user guide.
+See [`abcd-ir/README.md`](abcd-ir/README.md) for the IR module map.
 
 ## Design
 
@@ -52,6 +61,7 @@ Architecture and design decisions are documented in [`design/`](design/README.md
 - [ISA](design/isa.md) — code generation pipeline, bytecode decode/encode
 - [File format](design/file-format.md) — ABC container, FFI bridge, builder
 - [IR](design/ir.md) — SSA lift/optimize/lower, register allocation, references
+- [IR v0.2](design/ir-v0.2.md) — the implemented IR design (as of P4, `abcd-ir` IS this IR; v0.1 deleted)
 - [Vendor sync](design/vendor-sync.md) — upstream consistency system
 - [CI/CD](design/ci.md) — jobs rationale, release policy
 
