@@ -15,6 +15,17 @@
 //!   RE-VERIFY (post-optimize; N27/N28 hygiene gate) → lower → encode —
 //!   the byte-identity comparison target for the v0.1 pipeline's `opt`
 //!   tree.
+//! - `v2inline` (v2-P3b, D2): decode → lift → verify →
+//!   `abcd_opt::inline::inline_module` (OPT-IN — never part of
+//!   `optimize_module`, so the v2lift/v2opt gates are untouched) →
+//!   RE-VERIFY → lower → encode. Byte output WILL differ from v2lift
+//!   (that is the point); the gate is the VM oracle (inlining must not
+//!   change observable behavior) plus determinism. Aggregate inline
+//!   statistics (sites inlined, instructions cloned, skip-reason
+//!   histogram) are printed at the end as `INLINE-STATS`/`INLINE-SKIP`
+//!   lines. Setting `ABCD_INLINE_DETERMINISM=1` re-runs the whole
+//!   v2inline rewrite per fixture from a fresh front-end and asserts
+//!   the two encodes are byte-identical.
 //!
 //! ## Gate 2 (v2opt vs v0.1 opt byte-identity) — ACCEPTED form
 //!
@@ -90,7 +101,11 @@ use abcd_file::File;
 use abcd_ir2::{FuncId, Module, verify_module};
 use abcd_lift::lift_file;
 use abcd_lower::{LowerError, LowerOptions, lower_function_with_options, to_method_body};
+use abcd_opt::inline::{InlinePolicy, InlineReport, inline_module};
 use abcd_opt::optimize_module;
+
+/// The three rewrite variants, in driver order.
+const VARIANTS: [&str; 3] = ["v2lift", "v2opt", "v2inline"];
 
 /// Fixed SKIP category vocabulary (mirrors the v0.1 driver's; the
 /// histogram keys are gate evidence — keep them stable).
@@ -282,7 +297,7 @@ for path in sorted(paths):
     let out_root = std::env::var_os("ABCD_LOWERED_DIR").map(PathBuf::from);
     if let Some(dir) = &out_root {
         if full_run {
-            for variant in ["v2lift", "v2opt"] {
+            for variant in VARIANTS {
                 let sub = dir.join(variant);
                 if sub.exists() {
                     std::fs::remove_dir_all(&sub).expect("clear previous oracle output");
@@ -290,7 +305,7 @@ for path in sorted(paths):
             }
         } else {
             for relative in paths.lines() {
-                for variant in ["v2lift", "v2opt"] {
+                for variant in VARIANTS {
                     let target = dir.join(variant).join(relative);
                     if target.exists() {
                         std::fs::remove_file(&target).expect("clear stale oracle output");
@@ -301,14 +316,17 @@ for path in sorted(paths):
     }
 
     let mut fixtures = 0usize;
-    let mut wrote = [0usize; 2];
-    let mut histograms: [BTreeMap<String, usize>; 2] = [BTreeMap::new(), BTreeMap::new()];
+    let mut wrote = [0usize; 3];
+    let mut histograms: [BTreeMap<String, usize>; 3] =
+        [BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
+    let mut inline_stats = InlineReport::default();
+    let determinism = std::env::var("ABCD_INLINE_DETERMINISM").as_deref() == Ok("1");
 
     let record_skip = |variant: usize,
                        name: &str,
                        relative: &str,
                        (category, reason): Skip,
-                       histograms: &mut [BTreeMap<String, usize>; 2]| {
+                       histograms: &mut [BTreeMap<String, usize>; 3]| {
         let key = category.to_string();
         eprintln!("SKIP {name} {relative} | {key} | {reason}");
         *histograms[variant].entry(key).or_insert(0) += 1;
@@ -317,13 +335,13 @@ for path in sorted(paths):
     for relative in paths.lines() {
         fixtures += 1;
 
-        // Front-end stage shared by both variants.
+        // Front-end stage shared by all variants.
         let (file, module) = match guarded(|| front_end(&root.join(relative))) {
             Ok(pair) => pair,
             Err(skip) => {
                 let reason = skip.1;
                 let key = skip.0.to_string();
-                for (variant, name) in ["v2lift", "v2opt"].iter().enumerate() {
+                for (variant, name) in VARIANTS.iter().enumerate() {
                     eprintln!("SKIP {name} {relative} | {key} | {reason}");
                     *histograms[variant].entry(key.clone()).or_insert(0) += 1;
                 }
@@ -386,6 +404,70 @@ for path in sorted(paths):
             }
             Err(skip) => record_skip(1, "v2opt", relative, skip, &mut histograms),
         }
+
+        // Variant: lift + inline (OPT-IN — the D2 inline pass, never
+        // part of optimize_module; re-verify after inlining — zero
+        // verifier errors is the hard gate). LowerOptions::default():
+        // inline does not optimize, so no frame-init pruning.
+        let inline_result = guarded(|| {
+            let mut inlined = module.clone();
+            let report = inline_module(&mut inlined, &InlinePolicy::default());
+            let verify = verify_module(&inlined);
+            if !verify.is_ok() {
+                return Err((
+                    SkipCategory::Verify,
+                    format!("post-inline verify: {:?}", verify.errors),
+                ));
+            }
+            Ok((inlined, report))
+        });
+        let (inlined, report) = match inline_result {
+            Ok(pair) => pair,
+            Err(skip) => {
+                record_skip(2, "v2inline", relative, skip, &mut histograms);
+                continue;
+            }
+        };
+        inline_stats.merge(&report);
+        match guarded(|| rewrite_fixture(&inlined, &file, LowerOptions::default())) {
+            Ok((encoded, functions)) => {
+                eprintln!("WROTE v2inline {relative} ({functions} functions)");
+                if determinism {
+                    // Two inline-on rewrites of the same fixture must be
+                    // byte-identical (fresh front-end: decode → lift →
+                    // inline → lower → encode again).
+                    let second = guarded(|| {
+                        let (file2, module2) = front_end(&root.join(relative))?;
+                        let mut inlined2 = module2;
+                        inline_module(&mut inlined2, &InlinePolicy::default());
+                        let verify2 = verify_module(&inlined2);
+                        if !verify2.is_ok() {
+                            return Err((
+                                SkipCategory::Verify,
+                                format!("post-inline re-verify: {:?}", verify2.errors),
+                            ));
+                        }
+                        rewrite_fixture(&inlined2, &file2, LowerOptions::default())
+                    });
+                    match second {
+                        Ok((encoded2, _)) => assert_eq!(
+                            encoded, encoded2,
+                            "inline-on rewrite must be deterministic: {relative}"
+                        ),
+                        Err((category, reason)) => panic!(
+                            "determinism re-run failed for {relative}: {category} | {reason}"
+                        ),
+                    }
+                }
+                if let Some(dir) = &out_root {
+                    let target = dir.join("v2inline").join(relative);
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(target, encoded).expect("write oracle candidate");
+                }
+                wrote[2] += 1;
+            }
+            Err(skip) => record_skip(2, "v2inline", relative, skip, &mut histograms),
+        }
     }
 
     if full_run {
@@ -396,17 +478,27 @@ for path in sorted(paths):
     assert!(fixtures > 0, "no fixtures selected");
     eprintln!(
         "corpus lower oracle rewrite: v2lift wrote {} skipped {}; \
-         v2opt wrote {} skipped {} (fixtures: {})",
+         v2opt wrote {} skipped {}; v2inline wrote {} skipped {} (fixtures: {})",
         wrote[0],
         histograms[0].values().sum::<usize>(),
         wrote[1],
         histograms[1].values().sum::<usize>(),
+        wrote[2],
+        histograms[2].values().sum::<usize>(),
         fixtures
     );
-    for (variant, name) in ["v2lift", "v2opt"].iter().enumerate() {
+    for (variant, name) in VARIANTS.iter().enumerate() {
         eprintln!("HISTOGRAM {name}:");
         for (category, count) in &histograms[variant] {
             eprintln!("  {category}: {count}");
         }
+    }
+    eprintln!(
+        "INLINE-STATS sites_inlined={} insts_inlined={} (fixtures: {})",
+        inline_stats.sites_inlined, inline_stats.insts_inlined, fixtures
+    );
+    eprintln!("INLINE-SKIP-HISTOGRAM:");
+    for (reason, count) in &inline_stats.skips {
+        eprintln!("  {}: {count}", reason.label());
     }
 }

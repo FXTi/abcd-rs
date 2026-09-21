@@ -75,7 +75,20 @@ dependencies = [
  "abcd-file",
  "abcd-ir2",
  "abcd-isa",
+ "abcd-lift",
+ "abcd-opt",
  "thiserror",
+]
+
+[[package]]
+name = "abcd-opt"
+version = "0.1.0"
+dependencies = [
+ "abcd-file",
+ "abcd-ir2",
+ "abcd-isa",
+ "abcd-lift",
+ "abcd-lower",
 ]
 
 [[package]]
