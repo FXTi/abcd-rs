@@ -404,11 +404,21 @@ fn static_callee_arity_rules() {
         panic!("f ends in Return");
     };
     let v = value.expect("returns a value");
+    // The missing formal binds the materialized `undefined`: a
+    // `LoadConst` of the pooled Undefined in the call block (an
+    // inst-defined value — regalloc colors it; a ValueDef::Const value
+    // would escape the lower's id-range attribution).
+    let ValueDef::Inst(def) = module.values[v.index()].def else {
+        panic!(
+            "undefined is materialized as an instruction: {:?}",
+            module.values[v.index()].def
+        );
+    };
     assert!(
-        matches!(module.values[v.index()].def, ValueDef::Const(c)
-            if matches!(module.consts.get(c), Some(Const::Undefined))),
+        matches!(&module.insts[def.index()].op, Op::LoadConst(c)
+            if matches!(module.consts.get(*c), Some(Const::Undefined))),
         "the missing formal must bind a pooled undefined: {:?}",
-        module.values[v.index()].def
+        module.insts[def.index()].op
     );
 
     // Extra arg → dropped (callee cannot observe it; `arguments` users
@@ -1115,6 +1125,60 @@ fn generator_callee_is_skipped() {
     let report = inline_module(&mut module, &default_policy());
     assert_eq!(report.sites_inlined, 0, "{report:?}");
     assert_eq!(skip_count(&report, SkipReason::CalleeKind), 1);
+    verify_ok(&module);
+}
+
+/// A callee whose entry block has predecessors (a self-loop entry) is
+/// ineligible: the call block's edge into the cloned entry would need
+/// extra phi entries the splice does not synthesize.
+#[test]
+fn callee_with_self_loop_entry_is_skipped() {
+    let mut module = Module::new();
+    let g = create_static(&mut module, "g");
+    {
+        let mut b = V2Builder::new(&mut module, g);
+        let entry = b.entry();
+        b.add_predecessor(entry, entry); // the self-loop pred
+        let cond = b.emit_number(1.0);
+        b.emit_void(Op::CondBranch {
+            cond,
+            true_dest: entry,
+            false_dest: entry,
+        });
+    }
+    let f = create_static(&mut module, "f");
+    {
+        let mut b = V2Builder::new(&mut module, f);
+        let (_c, r) = emit_closure_call(&mut b, g, None, vec![], CallKind::Dynamic);
+        b.emit_void(Op::Return { value: Some(r) });
+    }
+    let pre = verify_module(&module);
+    assert!(pre.is_ok(), "probe verifies: {:?}", pre.errors);
+    let report = inline_module(&mut module, &default_policy());
+    assert_eq!(report.sites_inlined, 0, "{report:?}");
+    assert_eq!(skip_count(&report, SkipReason::CalleeEntryHasPreds), 1);
+    verify_ok(&module);
+}
+
+/// A bodyless (external) callee is ineligible.
+#[test]
+fn external_callee_is_skipped() {
+    let mut module = Module::new();
+    let g = V2Builder::create_function(&mut module, "g", FunctionKind::Function);
+    // Make g external and bodyless (native declaration shape).
+    module.functions[g.index()].is_external = true;
+    module.functions[g.index()].blocks.clear();
+    let f = create_static(&mut module, "f");
+    {
+        let mut b = V2Builder::new(&mut module, f);
+        let (_c, r) = emit_closure_call(&mut b, g, None, vec![], CallKind::Dynamic);
+        b.emit_void(Op::Return { value: Some(r) });
+    }
+    let pre = verify_module(&module);
+    assert!(pre.is_ok(), "probe verifies: {:?}", pre.errors);
+    let report = inline_module(&mut module, &default_policy());
+    assert_eq!(report.sites_inlined, 0, "{report:?}");
+    assert_eq!(skip_count(&report, SkipReason::CalleeNoBody), 1);
     verify_ok(&module);
 }
 

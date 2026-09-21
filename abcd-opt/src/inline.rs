@@ -653,19 +653,63 @@ fn callee_uses_value(module: &Module, callee: FuncId, value: ValueId) -> bool {
 }
 
 /// Get-or-create the pooled `Const::Undefined` (scalar dedup, lift
-/// parity) and return a FRESH const-defined value for it (one per
-/// splice; values are the SSA identity, constants the payload).
-fn undefined_value(module: &mut Module) -> (ConstId, ValueId) {
-    let cid = (0..module.consts.len())
+/// parity). Passes must NEVER create `ValueDef::Const` values of their
+/// own: the lower's `frame_init_consts` attributes const-defined values
+/// to functions by id RANGE under the lift's creation-order convention,
+/// so a pass-created const value lands in the wrong function's range
+/// and register allocation never colors it (the typescript-enum corpus
+/// failure). `undefined` is instead materialized as a `LoadConst`
+/// INSTRUCTION — see [`Undef`].
+fn undefined_const(module: &mut Module) -> ConstId {
+    (0..module.consts.len())
         .map(|i| ConstId::new(i as u32))
         .find(|&c| matches!(module.consts.get(c), Some(Const::Undefined)))
-        .unwrap_or_else(|| module.consts.push(Const::Undefined));
-    let val = ValueId::new(module.values.len() as u32);
-    module.values.push(abcd_ir2::Value {
-        def: ValueDef::Const(cid),
-        ty: Ty::Any,
-    });
-    (cid, val)
+        .unwrap_or_else(|| module.consts.push(Const::Undefined))
+}
+
+/// The per-splice `undefined` materialization: ONE `LoadConst` of the
+/// pooled undefined, inserted into the call block immediately before
+/// the call (so it dominates every cloned block and the continuation —
+/// the call block is on every path through the splice). Lazily created
+/// on first use; inst-defined, so register allocation colors it like
+/// any other instruction result. Glue instruction: `loc: None` (never
+/// fabricated).
+struct Undef {
+    cid: ConstId,
+    value: Option<ValueId>,
+}
+
+impl Undef {
+    fn new(module: &mut Module) -> Self {
+        Self {
+            cid: undefined_const(module),
+            value: None,
+        }
+    }
+
+    /// The undefined value, materializing the `LoadConst` on first use
+    /// at `insert_pos` in `block`.
+    fn get(&mut self, module: &mut Module, block: BlockId, insert_pos: usize) -> ValueId {
+        if let Some(v) = self.value {
+            return v;
+        }
+        let iid = InstId::new(module.insts.len() as u32);
+        let val = ValueId::new(module.values.len() as u32);
+        module.values.push(abcd_ir2::Value {
+            def: ValueDef::Inst(iid),
+            ty: Ty::Any,
+        });
+        module.insts.push(Inst {
+            op: Op::LoadConst(self.cid),
+            result: Some(val),
+            block,
+            loc: None,
+        });
+        let pos = insert_pos.min(module.blocks[block.index()].insts.len());
+        module.blocks[block.index()].insts.insert(pos, iid);
+        self.value = Some(val);
+        val
+    }
 }
 
 /// The `new.target` binding for a call kind (T4/§5.3): `New` binds the
@@ -708,28 +752,42 @@ fn inline_site(
     args: &[ValueId],
     kind: CallKind,
 ) -> Result<(), SkipReason> {
-    let (undef_cid, undef_val) = undefined_value(module);
+    let mut undef = Undef::new(module);
     let nt_binding = new_target_binding(kind).expect("eligibility limited kinds to Direct/Dynamic");
+    // The call's position in its block: the `undefined` materialization
+    // (when needed) is inserted there, before the call, so it dominates
+    // every cloned block and the continuation.
+    let call_pos = module
+        .block(call_block)
+        .and_then(|b| b.insts.iter().position(|&i| i == call_iid))
+        .ok_or(SkipReason::CalleeNoBody)?;
 
     // ── Step A: parameter binding (T4 + §5.3) ────────────────────────
     let callee_data = module.func(callee).ok_or(SkipReason::CalleeNoBody)?;
     let is_static = callee_data.modifiers.contains(Modifiers::STATIC);
+    let callee_params = callee_data.params.clone();
+    let callee_blocks = callee_data.blocks.clone();
     let mut value_map: HashMap<ValueId, ValueId> = HashMap::new();
-    for (i, &param) in callee_data.params.iter().enumerate() {
+    for (i, param) in callee_params.iter().copied().enumerate() {
         let binding = if !is_static && i == 0 {
             // The `this` binding: explicit receiver when present;
             // otherwise the callee never uses it (eligibility) — bind
-            // the shared undefined so the map is total.
-            this.unwrap_or(undef_val)
+            // the materialized undefined so the map is total.
+            match this {
+                Some(t) => *t,
+                None => undef.get(module, call_block, call_pos),
+            }
         } else {
             let formal = if is_static { i } else { i - 1 };
-            args.get(formal).copied().unwrap_or(undef_val)
+            match args.get(formal) {
+                Some(a) => *a,
+                None => undef.get(module, call_block, call_pos),
+            }
         };
         value_map.insert(param, binding);
     }
 
     // ── Step B: clone blocks (fresh BlockIds, arena append) ──────────
-    let callee_blocks = callee_data.blocks.clone();
     let mut block_map: HashMap<BlockId, BlockId> = HashMap::new();
     for &gb in &callee_blocks {
         let fresh = BlockId::new(module.blocks.len() as u32);
@@ -819,7 +877,7 @@ fn inline_site(
             // is rewritten to a Mov of the call-site callee value.
             if matches!(op, Op::LoadNewTarget) {
                 op = match nt_binding {
-                    NewTargetBinding::Undefined => Op::LoadConst(undef_cid),
+                    NewTargetBinding::Undefined => Op::LoadConst(undef.cid),
                     NewTargetBinding::CalleeValue => {
                         let Some(inst) = module.inst(call_iid) else {
                             return Err(SkipReason::UnresolvedCallee);
@@ -1001,12 +1059,12 @@ fn inline_site(
         // The callee never returns (throws/loops forever): the
         // continuation is unreachable; bind the result to undefined so
         // no orphan value lingers.
-        [] => undef_val,
+        [] => undef.get(module, call_block, call_pos),
         [(_rb, riid, value)] => {
             if let Some(inst) = module.inst_mut(*riid) {
                 inst.op = Op::Branch { dest: cont };
             }
-            value.unwrap_or(undef_val)
+            value.unwrap_or_else(|| undef.get(module, call_block, call_pos))
         }
         many => {
             // One branch per return block into the continuation, and a
@@ -1021,7 +1079,7 @@ fn inline_site(
                         from: rb,
                         kind: EdgeKind::Normal,
                     },
-                    value.unwrap_or(undef_val),
+                    value.unwrap_or_else(|| undef.get(module, call_block, call_pos)),
                 ));
             }
             let phi_iid = InstId::new(module.insts.len() as u32);
