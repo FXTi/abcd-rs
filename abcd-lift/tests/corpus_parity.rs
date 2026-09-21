@@ -69,12 +69,11 @@ with open(sys.argv[1], encoding="utf-8") as manifest:
 /// (a) + (b) + (c): lift success + verifier zero errors + canonical
 /// v0.1-parity comparison on all fixtures.
 ///
-/// The 57 sendable-class fixtures whose class buffers reference
-/// literal arrays the file model never surfaces (unregistered nested
-/// arrays — the abcd-file model gap under v2-P1a repair) form the
-/// REGISTERED-PENDING set: their hard `LiteralArrayOutOfRange` lift
-/// error is documented, never silent, and they are the ONLY tolerated
-/// lift failures. Every other failure class is a hard gate failure.
+/// History note: the 57 sendable-class fixtures whose class buffers
+/// reference unregistered nested literal arrays were a REGISTERED-PENDING
+/// set until v2-P1a (6d1fcd0) fixed the abcd-file nested-literal-array
+/// decode — since then ZERO pending is the gate: every fixture lifts and
+/// every failure class is a hard gate failure.
 #[test]
 #[ignore = "requires exported GHCR corpus + python3"]
 fn exported_corpus_lifts_and_verifies_v2() {
