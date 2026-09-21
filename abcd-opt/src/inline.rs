@@ -373,20 +373,33 @@ fn callee_inst_count(module: &Module, callee: FuncId) -> usize {
 
 /// Resolve the callee value to a same-module function:
 /// `AllocClosure { func }` whose operand is `DefineFunc { body }`.
+/// `Mov` chains are traced through (a pure copy cannot change the
+/// closure's identity). Anything else — a global load (a mutable
+/// binding another script could reassign), a phi, a parameter — is
+/// deliberately NOT resolved.
 fn resolve_callee(module: &Module, callee_val: ValueId) -> Option<FuncId> {
-    let ValueDef::Inst(closure_inst) = module.value(callee_val)?.def else {
-        return None;
-    };
-    let Op::AllocClosure { func } = &module.inst(closure_inst)?.op else {
-        return None;
-    };
-    let ValueDef::Inst(define_inst) = module.value(*func)?.def else {
-        return None;
-    };
-    let Op::DefineFunc { body, .. } = &module.inst(define_inst)?.op else {
-        return None;
-    };
-    Some(*body)
+    let mut current = callee_val;
+    // Mov chains are short and acyclic in valid SSA; the bound is
+    // defensive against malformed input.
+    for _ in 0..16 {
+        let ValueDef::Inst(def) = module.value(current)?.def else {
+            return None;
+        };
+        match &module.inst(def)?.op {
+            Op::Mov { src } => current = *src,
+            Op::AllocClosure { func } => {
+                let ValueDef::Inst(define_inst) = module.value(*func)?.def else {
+                    return None;
+                };
+                let Op::DefineFunc { body, .. } = &module.inst(define_inst)?.op else {
+                    return None;
+                };
+                return Some(*body);
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// All eligibility checks for one call site. `Ok(callee)` means the
