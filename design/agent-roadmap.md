@@ -264,7 +264,21 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | v2-P3b | inline 在 v0.2 上重写（D2=要；按构造消灭 N44：形式↔实际参数映射、调用点前驱重建、try 区域保留、产出 verifier 洁净；opt-in 不进默认管线；门禁=inline-on 语料 oracle 1149/1149） | worker v2-P3b (k3) | **完成**（9bd8653/35ca7de/0bf9636/d1435af/2b4a379/0b5bde1/1180b95；中途 5h 限额打断一次恢复零丢失。里程碑发现：**vendor 帧槽模型 [func][newTarget][this][formals…]**（callType 注解位，语料全无注解→默认 0xF→3 隐式槽；method_literal.cpp Initialize + 实证探针）——初版参数模型 oracle 18/1149 挂，修正后绿。内联统计：18 点/210 指令（typescript-enum IIFE 族），跳过直方图在案（unresolved-callee 5268 等=保守策略）。**orchestrator 独立复验**：v2inline oracle 1149/1149（sha256:5e7627bdcb78…）、确定性 0 差异、v2lift/v2opt 对基线 0 差异、fmt 净、157 套件绿、parity 2787/0） |
 | v2-P4 | 替换：abcd-ir **删除**（不留档，维护者 2026-09-21 拍板；git 历史即留档），abcd-ir2 正名 abcd-ir；parity 对照器/v0.1 语料 driver 一并退役 | worker v2-P4 (k3) | **完成**（b42e8f4 退役对照器(-1665 行)/d0060a5 删 v0.1(-26370 行)/c6fbe36 改名/ec68bee 文档；**orchestrator 独立复验**：fmt 净、workspace 101 套件 462 测试零失败零 warning、自跑 driver 三变体对验收基线 **0 差异**、v2opt oracle 1149/1149（sha256:5e7627bdcb78…）、corpus_lift_verify 2787/12996 钉住绿；远端目录全清。**v0.2 正式成为 abcd-ir**） |
 | v2-P5a | abcd-dataflow 基建 crate：callgraph（on-the-fly 函数值解析）+ ifds（骨架+流函数走 Effects）+ heap v0（分配点键控+强/弱更新+访问路径+精度阶梯文档） | worker v2-P5a (k3) | **进行中**（2026-09-21 启动；维护者拍板拆两 crate） |
-| v2-P5b | abcd-taint 应用 crate：source/sink 配置 + top-20 builtin 摘要注册表 + 污点驱动 + loc 报告，语料 print sink 冒烟 | 待定 | 未开始（P5a 验收后启动） |
+| v2-P5b | abcd-taint 应用 crate：source/sink 配置 + top-20 builtin 摘要注册表 + 污点驱动 + loc 报告，语料 print sink 冒烟 | 待定 | **冻结**（等 FlowDroid 对照研究裁决指针分析问题） |
+
+## 反编译轨道（2026-09-21 维护者批准登记；crate 名 abcd-decompile，动词家族）
+
+历史：项目初代即反编译器（5de5ab9 abcd-decompiler+abcd-cli；1a8e3f4 二代转型移入 recovery/gen1/；f045e4a 存档删除，git 历史可查）。v0.2 设计非目标但"不许堵死"（ir-v0.2.md §1），§7 元数据契约已为它保留 Import/ExportDecl + loc + 无损 Sym。
+
+| # | 任务 | 状态 |
+|---|------|------|
+| d-P0 | 规划+技术准备：design/decompile.md（架构、IR 适配审计、先例调研、阶段门禁） | 进行中 |
+| d-P1 | 基建前置：支配树/循环分析/区域结构化分析（P4 删 v0.1 后支配树已缺位；归属 crate 待定——倾向 abcd-dataflow::structural 复用） | 未开始 |
+| d-P2 | 表达式恢复（SSA → 表达式树；acc/临时量折叠） | 未开始 |
+| d-P3 | 控制流结构化（if/else、循环、try/catch、switch 链模式） | 未开始 |
+| d-P4 | 发射 JS/TS 源码 + 语料评估（理想门禁：反编译→es2abc 重编译→oracle 对照） | 未开始 |
+
+排序：与 taint 轨道平行（crate 不相交）；d-P0 现在就做，d-P1 起等 FlowDroid 对照结论（若支配树/循环分析落 abcd-dataflow 则受其节奏影响）。
 
 **维护者决策（2026-09-20）**：D2（inline 是否在 v0.2 IR 上重写）**排在 v2-P3 之后**再议——pass 框架落地后才有讨论内联的基座；D3（死 FFI 表面 108/324）**拍板保留**，对账表已核销。v2-P2 启动前按约定暂停，等维护者发话。
 
