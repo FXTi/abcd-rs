@@ -99,7 +99,7 @@ literal-array indices, no four-bucket annotations, no `Tagged`, no
 
 ## 4. Op taxonomy and effects
 
-### 4.1 Ops (≈70 variants after the v2-P0.5 growth)
+### 4.1 Ops (87 variants as of P4 — code is the source of truth; grew via v2-P0.5/P2b/P2c)
 
 Compute: `BinaryOp{op}` / `UnaryOp{op}` / `Compare{op}` (+ `ty` on the
 value, not the op). `Mov`. `LoadConst(ConstId)`.
