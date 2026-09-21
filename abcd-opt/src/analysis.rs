@@ -10,7 +10,7 @@
 //! then region handlers in region order) so pass output stays
 //! byte-comparable with the v0.1 oracle.
 
-use abcd_ir2::{BlockId, EdgeKind, FuncId, Module, Op, ValueId};
+use abcd_ir::{BlockId, EdgeKind, FuncId, Module, Op, ValueId};
 
 /// Terminator (Normal-edge) successors of a block (v0.1 `block_succs`).
 ///
@@ -43,7 +43,7 @@ pub fn normal_succs(module: &Module, block: BlockId) -> Vec<BlockId> {
 /// [`EdgeKind::Normal`] edges plus, for every try region that protects
 /// `block`, each of the region's catch handlers as an
 /// [`EdgeKind::Exceptional`] edge. Returns `(successor, kind)` pairs
-/// (the CFG stores edges successor-side as [`abcd_ir2::Edge`], so the
+/// (the CFG stores edges successor-side as [`abcd_ir::Edge`], so the
 /// successor is not part of the edge record itself). Exception dispatch transfers control
 /// from any protected instruction to the handler without a
 /// terminator-level edge, so any analysis that reasons about
@@ -106,7 +106,7 @@ pub fn replace_uses_in_func(
         let Some(block) = module.block(bb) else {
             continue;
         };
-        let all_insts: Vec<abcd_ir2::InstId> = block.insts.clone();
+        let all_insts: Vec<abcd_ir::InstId> = block.insts.clone();
         for inst_id in all_insts {
             let Some(inst) = module.inst_mut(inst_id) else {
                 continue;

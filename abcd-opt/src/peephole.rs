@@ -15,7 +15,7 @@
 //!   (v0.2's frame-initial values are const-defined, not seeded
 //!   instructions — a constant is a constant).
 
-use abcd_ir2::{BinOp, BlockId, CmpOp, Const, FuncId, InstId, Module, Op, UnOp, ValueDef, ValueId};
+use abcd_ir::{BinOp, BlockId, CmpOp, Const, FuncId, InstId, Module, Op, UnOp, ValueDef, ValueId};
 
 use crate::FuncPass;
 use crate::{to_int32, to_uint32};

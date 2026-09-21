@@ -7,7 +7,7 @@
 //! - phi entries key on [`Edge`] (kind-qualified), not bare blocks —
 //!   exception edges are first-class (T5);
 //! - frame-initial values are CONSTANTS
-//!   ([`ValueDef::Const`](abcd_ir2::ValueDef)) — no seeding
+//!   ([`ValueDef::Const`](abcd_ir::ValueDef)) — no seeding
 //!   instructions; the v0.1 entry-block `LiteralUndefined`/`LiteralHole`
 //!   materialization stays a v0.1 detail (design/ir-v0.2.md §5.1). One
 //!   shared `Const::Undefined` for vregs, one shared `Const::Hole` for
@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use abcd_ir2::{BlockId, ConstId, InstId, Module, Op, Ty, Value, ValueDef, ValueId};
+use abcd_ir::{BlockId, ConstId, InstId, Module, Op, Ty, Value, ValueDef, ValueId};
 
 use crate::emit_inst;
 

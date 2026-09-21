@@ -12,8 +12,8 @@
 mod common;
 
 use abcd_file::{AccessFlags, Builder, CatchBlockDef, File, Type};
-use abcd_ir2::verify_module;
-use abcd_ir2::{BlockId, Edge, EdgeKind, FuncId, FunctionKind, Module, Op};
+use abcd_ir::verify_module;
+use abcd_ir::{BlockId, Edge, EdgeKind, FuncId, FunctionKind, Module, Op};
 use abcd_isa::{Bytecode, Imm, Label, encode as encode_bytecodes};
 use abcd_lift::lift_file;
 use abcd_lower::lower_function;
@@ -131,7 +131,7 @@ fn optimize_preserves_catch_handler_and_try_region() {
     assert!(
         handler_block.insts.iter().any(|&id| matches!(
             &module.insts[id.index()].op,
-            Op::LoadConst(cid) if module.consts.get(*cid).and_then(abcd_ir2::Const::as_f64)
+            Op::LoadConst(cid) if module.consts.get(*cid).and_then(abcd_ir::Const::as_f64)
                 == Some(HANDLER_SENTINEL as f64)
         )),
         "handler sentinel instruction must survive: {:?}",

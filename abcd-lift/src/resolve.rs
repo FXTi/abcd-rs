@@ -11,7 +11,7 @@
 //! `File::literal_array_offsets` here).
 
 use abcd_file::{File, LiteralValue, MethodBody};
-use abcd_ir2::{Const, ConstId, FuncId, Sym};
+use abcd_ir::{Const, ConstId, FuncId, Sym};
 use abcd_isa::{EntityId, EntityKind};
 
 use crate::{LiftError, Lifter};

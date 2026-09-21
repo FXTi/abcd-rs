@@ -3,7 +3,7 @@
 //! parameters unmapped, call-site predecessors not rebuilt, try regions
 //! lost. Before the real v0.2 rewrite landed, this test demonstrated
 //! that a naive inliner with exactly those defect shapes produces
-//! verifier errors on the v0.2 IR (`abcd_ir2::Module`), proving the
+//! verifier errors on the v0.2 IR (`abcd_ir::Module`), proving the
 //! probe shapes below discriminate valid from invalid inline output.
 //!
 //! The deliberate defects of [`naive_inline`] (each one an N44 defect):
@@ -27,9 +27,9 @@
 
 mod common;
 
-use abcd_ir2::verify_module;
-use abcd_ir2::{BinOp, CallKind, FuncId, FunctionKind, Module, Op, ValueId, VerifyErrorKind};
-use abcd_ir2::{BlockId, EdgeKind};
+use abcd_ir::verify_module;
+use abcd_ir::{BinOp, CallKind, FuncId, FunctionKind, Module, Op, ValueId, VerifyErrorKind};
+use abcd_ir::{BlockId, EdgeKind};
 
 use common::V2Builder;
 
@@ -54,7 +54,7 @@ fn build_n44_probe() -> (Module, FuncId, FuncId, BlockId, BlockId, BlockId) {
     let mut module = Module::new();
 
     let g = V2Builder::create_function(&mut module, "g", FunctionKind::Function);
-    module.functions[g.index()].modifiers = abcd_ir2::Modifiers::STATIC;
+    module.functions[g.index()].modifiers = abcd_ir::Modifiers::STATIC;
     {
         let mut b = V2Builder::new(&mut module, g);
         let p = b.create_param();
@@ -68,7 +68,7 @@ fn build_n44_probe() -> (Module, FuncId, FuncId, BlockId, BlockId, BlockId) {
     }
 
     let f = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
-    module.functions[f.index()].modifiers = abcd_ir2::Modifiers::STATIC;
+    module.functions[f.index()].modifiers = abcd_ir::Modifiers::STATIC;
     let b_call;
     let b_next;
     let h;
@@ -117,7 +117,7 @@ fn build_n44_probe() -> (Module, FuncId, FuncId, BlockId, BlockId, BlockId) {
         b.set_insert_block(b_next);
         let phi = b.emit_val(Op::Phi {
             entries: vec![(
-                abcd_ir2::Edge {
+                abcd_ir::Edge {
                     from: b_call,
                     kind: EdgeKind::Normal,
                 },
@@ -161,7 +161,7 @@ fn naive_inline(module: &mut Module, caller: FuncId, callee: FuncId) {
     // fresh continuation, branch into the callee — and leave every old
     // successor's preds/phi entries keyed on the call block.
     let cont = BlockId::new(module.blocks.len() as u32);
-    module.blocks.push(abcd_ir2::Block::default());
+    module.blocks.push(abcd_ir::Block::default());
     let post: Vec<_> = module.block(call_block).unwrap().insts[call_pos + 1..].to_vec();
     for &iid in &post {
         module.inst_mut(iid).unwrap().block = cont;
@@ -191,8 +191,8 @@ fn naive_inline(module: &mut Module, caller: FuncId, callee: FuncId) {
     };
 
     // Split branch into the callee entry (no loc — glue).
-    let br = abcd_ir2::InstId::new(module.insts.len() as u32);
-    module.insts.push(abcd_ir2::Inst {
+    let br = abcd_ir::InstId::new(module.insts.len() as u32);
+    module.insts.push(abcd_ir::Inst {
         op: Op::Branch { dest: callee_entry },
         result: None,
         block: call_block,

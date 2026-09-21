@@ -2,13 +2,13 @@
 //! reconstructed try ranges must cover ONLY protected instructions — no
 //! contiguity assumption over the flattened (RPO) order.
 //!
-//! v0.2 differences: try regions are structured `abcd_ir2::TryRegion`s
+//! v0.2 differences: try regions are structured `abcd_ir::TryRegion`s
 //! (`protected` blocks + `catches` with handler/exception/type_idx), and
 //! the catch-all sentinel is `type_idx: None` (v0.1's u32::MAX).
 
 mod common;
 
-use abcd_ir2::{Catch, FunctionKind, Module, Op, TryRegion, UnOp};
+use abcd_ir::{Catch, FunctionKind, Module, Op, TryRegion, UnOp};
 use abcd_isa::{Bytecode, Imm};
 use abcd_lower::lower_function;
 
@@ -39,8 +39,8 @@ fn dispatches(try_blocks: &[abcd_file::TryBlock], pc: usize) -> bool {
 }
 
 /// Emit `ldai <v>; return acc` shape helpers.
-fn emit_ldai(builder: &mut V2Builder, v: i64) -> abcd_ir2::ValueId {
-    let cid = builder.konst(abcd_ir2::Const::number(v as f64));
+fn emit_ldai(builder: &mut V2Builder, v: i64) -> abcd_ir::ValueId {
+    let cid = builder.konst(abcd_ir::Const::number(v as f64));
     builder.emit_val(Op::LoadConst(cid))
 }
 

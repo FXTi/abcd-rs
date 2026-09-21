@@ -13,7 +13,7 @@
 //! LoadSuperProperty) each rest on vendored runtime evidence (getter
 //! calls, brand checks, ReferenceErrors). In v0.2 that evidence lives in
 //! ONE place — the T3 effects table
-//! ([`abcd_ir2::Op::effects`], design/ir-v0.2.md §4.4): an instruction is
+//! ([`abcd_ir::Op::effects`], design/ir-v0.2.md §4.4): an instruction is
 //! essential iff it is a terminator or its effects record shows a write,
 //! a possible throw, or a possible call. Pure reads (lexical/global/module
 //! loads that cannot throw or call) and pure allocations stay
@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use abcd_ir2::{BlockId, Edge, EdgeKind, FuncId, InstId, Module, Op, ValueDef, ValueId};
+use abcd_ir::{BlockId, Edge, EdgeKind, FuncId, InstId, Module, Op, ValueDef, ValueId};
 
 use crate::FuncPass;
 use crate::analysis::{augmented_succs, normal_succs, replace_uses_in_func};
@@ -136,9 +136,7 @@ fn is_essential(op: &Op) -> bool {
         return true;
     }
     let effects = op.effects();
-    !effects.writes.is_empty()
-        || effects.may_throw
-        || effects.may_call != abcd_ir2::CallEffect::None
+    !effects.writes.is_empty() || effects.may_throw || effects.may_call != abcd_ir::CallEffect::None
 }
 
 // ─── CFG Simplify ────────────────────────────────────────────────────────────

@@ -14,7 +14,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use abcd_ir2::{BinOp, BlockId, Catch, FunctionKind, Module, Op, TryRegion, UnOp, ValueDef};
+use abcd_ir::{BinOp, BlockId, Catch, FunctionKind, Module, Op, TryRegion, UnOp, ValueDef};
 use abcd_isa::Bytecode;
 use abcd_lower::regalloc::{self, RegSlot};
 use abcd_lower::{fusion, isel, lower_function};
@@ -42,7 +42,7 @@ fn definegettersetter_operands_survive_intervening_acc_writes() {
     {
         let mut builder = V2Builder::new(&mut module, func);
         let lit = |b: &mut V2Builder, v: f64| {
-            let cid = b.konst(abcd_ir2::Const::number(v));
+            let cid = b.konst(abcd_ir::Const::number(v));
             b.emit_val(Op::LoadConst(cid))
         };
         let k = lit(&mut builder, 111.0);
@@ -112,9 +112,9 @@ fn acc_held_yield_value_survives_clobber_before_suspend() {
         let mut builder = V2Builder::new(&mut module, func);
         let genobj = builder.create_param();
         let obj = builder.create_param();
-        let ycid = builder.konst(abcd_ir2::Const::number(777.0));
+        let ycid = builder.konst(abcd_ir::Const::number(777.0));
         let y = builder.emit_val(Op::LoadConst(ycid));
-        let fcid = builder.konst(abcd_ir2::Const::Bool(false));
+        let fcid = builder.konst(abcd_ir::Const::Bool(false));
         let f = builder.emit_val(Op::LoadConst(fcid));
         let name = builder.sym("x");
         builder.emit_void(Op::StoreProp {
@@ -176,7 +176,7 @@ fn def_use_chains_hit_the_acc_cache() {
     let func = V2Builder::create_function(&mut module, "chain", FunctionKind::Function);
     {
         let mut builder = V2Builder::new(&mut module, func);
-        let cid = builder.konst(abcd_ir2::Const::number(1.0));
+        let cid = builder.konst(abcd_ir::Const::number(1.0));
         let a = builder.emit_val(Op::LoadConst(cid));
         let b = builder.emit_val(Op::UnaryOp {
             op: UnOp::Minus,
@@ -215,7 +215,7 @@ fn repeated_acc_use_across_non_clobbering_stores_loads_once() {
     let func = V2Builder::create_function(&mut module, "twice", FunctionKind::Function);
     {
         let mut builder = V2Builder::new(&mut module, func);
-        let cid = builder.konst(abcd_ir2::Const::number(42.0));
+        let cid = builder.konst(abcd_ir::Const::number(42.0));
         let v = builder.emit_val(Op::LoadConst(cid));
         let a = builder.sym("a");
         let b = builder.sym("b");
@@ -241,7 +241,7 @@ fn repeated_acc_use_across_non_clobbering_stores_loads_once() {
 
 /// Select instructions with the REAL allocator and return the per-block
 /// bytecodes keyed by block (easier meet-rule assertions than flat code).
-fn select_blocks(module: &Module, func: abcd_ir2::FuncId) -> HashMap<BlockId, Vec<Bytecode>> {
+fn select_blocks(module: &Module, func: abcd_ir::FuncId) -> HashMap<BlockId, Vec<Bytecode>> {
     let suppression = fusion::analyze(module, &module.functions[func.index()].blocks);
     let alloc = regalloc::allocate(module, func, &suppression).expect("allocation must succeed");
     let rpo = regalloc::compute_rpo(module, func);
@@ -263,9 +263,9 @@ fn single_predecessor_acc_content_propagates() {
     {
         let mut builder = V2Builder::new(&mut module, func);
         entry = builder.entry();
-        let cid1 = builder.konst(abcd_ir2::Const::number(1.0));
+        let cid1 = builder.konst(abcd_ir::Const::number(1.0));
         let _a = builder.emit_val(Op::LoadConst(cid1));
-        let cid2 = builder.konst(abcd_ir2::Const::number(2.0));
+        let cid2 = builder.konst(abcd_ir::Const::number(2.0));
         let b = builder.emit_val(Op::LoadConst(cid2));
         body = builder.create_block();
         builder.add_predecessor(body, entry);
@@ -298,9 +298,9 @@ fn disagreeing_predecessors_force_a_reload_at_the_join() {
     {
         let mut builder = V2Builder::new(&mut module, func);
         entry = builder.entry();
-        let cid9 = builder.konst(abcd_ir2::Const::number(9.0));
+        let cid9 = builder.konst(abcd_ir::Const::number(9.0));
         let w = builder.emit_val(Op::LoadConst(cid9));
-        let cidt = builder.konst(abcd_ir2::Const::Bool(true));
+        let cidt = builder.konst(abcd_ir::Const::Bool(true));
         let c = builder.emit_val(Op::LoadConst(cidt));
         t = builder.create_block();
         f = builder.create_block();
@@ -321,7 +321,7 @@ fn disagreeing_predecessors_force_a_reload_at_the_join() {
         builder.emit_void(Op::Branch { dest: join });
 
         builder.set_insert_block(f);
-        let cid3 = builder.konst(abcd_ir2::Const::number(3.0));
+        let cid3 = builder.konst(abcd_ir::Const::number(3.0));
         let x = builder.emit_val(Op::LoadConst(cid3));
         let g2 = builder.sym("g2");
         builder.emit_void(Op::StoreGlobal { name: g2, value: x });
@@ -365,7 +365,7 @@ fn disagreeing_predecessors_force_a_reload_at_the_join() {
 /// ```
 #[test]
 fn dead_phi_result_emits_no_clobbering_copies() {
-    use abcd_ir2::{Edge, EdgeKind};
+    use abcd_ir::{Edge, EdgeKind};
 
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "dead_phi", FunctionKind::Function);
@@ -374,9 +374,9 @@ fn dead_phi_result_emits_no_clobbering_copies() {
         let mut builder = V2Builder::new(&mut module, func);
         entry = builder.entry();
         cond = builder.create_param();
-        let cx = builder.konst(abcd_ir2::Const::number(222.0));
+        let cx = builder.konst(abcd_ir::Const::number(222.0));
         x = builder.emit_val(Op::LoadConst(cx));
-        let cy = builder.konst(abcd_ir2::Const::number(333.0));
+        let cy = builder.konst(abcd_ir::Const::number(333.0));
         y = builder.emit_val(Op::LoadConst(cy));
         t = builder.create_block();
         f = builder.create_block();
@@ -392,7 +392,7 @@ fn dead_phi_result_emits_no_clobbering_copies() {
         });
 
         builder.set_insert_block(t);
-        let cobj = builder.konst(abcd_ir2::Const::number(111.0));
+        let cobj = builder.konst(abcd_ir::Const::number(111.0));
         obj = builder.emit_val(Op::LoadConst(cobj));
         builder.emit_void(Op::Branch { dest: join });
 
@@ -462,9 +462,9 @@ fn handler_entry_never_inherits_predecessor_acc_content() {
     {
         let mut builder = V2Builder::new(&mut module, func);
         entry = builder.entry();
-        let cv = builder.konst(abcd_ir2::Const::number(42.0));
+        let cv = builder.konst(abcd_ir::Const::number(42.0));
         v = builder.emit_val(Op::LoadConst(cv));
-        let cx = builder.konst(abcd_ir2::Const::number(1.0));
+        let cx = builder.konst(abcd_ir::Const::number(1.0));
         x = builder.emit_val(Op::LoadConst(cx));
         builder.emit_void(Op::Throw { value: x });
         builder.emit_void(Op::Unreachable);

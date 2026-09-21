@@ -24,7 +24,7 @@
 use abcd_file::{
     self, AccessFlags, AnnotationValue, Class, Field, Method, ModuleData, ModuleRecord, Type,
 };
-use abcd_ir2::{
+use abcd_ir::{
     AnnValue, Annotation, ClassData, ClassId, Const, ExportDecl, FieldData, FieldId, FunctionKind,
     ImportDecl, LineEntry, LocalName, LocalScope, Modifiers, ModuleRequest, Signature, SourceLang,
     StaticTy, Sym, Ty, ValueId,
@@ -149,8 +149,8 @@ pub fn external_params(lf: &mut Lifter, method: &Method) -> Vec<ValueId> {
     for (i, ty) in method.arg_types.iter().enumerate() {
         let ty = ty_of(lf, ty);
         let val = ValueId::new(lf.module.values.len() as u32);
-        lf.module.values.push(abcd_ir2::Value {
-            def: abcd_ir2::ValueDef::Param(i as u16),
+        lf.module.values.push(abcd_ir::Value {
+            def: abcd_ir::ValueDef::Param(i as u16),
             ty,
         });
         params.push(val);
@@ -190,7 +190,7 @@ pub fn lift_class<'f>(lf: &mut Lifter<'f>, class: &'f Class) -> Result<ClassId, 
         // FuncIds were reserved in pass 1 in this exact order (base +
         // declaration index — exact even for hand-built files with
         // duplicate method offsets).
-        let func_id = abcd_ir2::FuncId::new(func_base + mi as u32);
+        let func_id = abcd_ir::FuncId::new(func_base + mi as u32);
         crate::lift_method(lf, class_id, method, func_id)?;
         method_ids.push(func_id);
     }
@@ -466,7 +466,7 @@ fn debug_is_empty_invention(lf: &Lifter, debug: &abcd_file::MethodDebugInfo) -> 
         && debug.params.is_empty()
 }
 
-/// Assemble the function's [`abcd_ir2::DebugData`] after translation:
+/// Assemble the function's [`abcd_ir::DebugData`] after translation:
 /// line/column tables keyed by the lifted InstIds, local names with
 /// scope extents, param names, source file/code, and the home-record
 /// scope names.
@@ -489,7 +489,7 @@ pub fn finish_debug(fx: &mut FnLift) {
     let mut column_table = Vec::new();
     // Ordered (inst, pc) list for the scope-extent mapping (phis carry
     // no source position and are skipped).
-    let mut inst_pcs: Vec<(abcd_ir2::InstId, u32)> = Vec::new();
+    let mut inst_pcs: Vec<(abcd_ir::InstId, u32)> = Vec::new();
     let blocks = fx.lf.module.functions[func_id.index()].blocks.clone();
     for bb in &blocks {
         let insts = fx.lf.module.blocks[bb.index()].insts.clone();
@@ -502,7 +502,7 @@ pub fn finish_debug(fx: &mut FnLift) {
                 line_table.push(LineEntry { inst: iid, line });
             }
             if let Some(column) = fx.column_of(pc) {
-                column_table.push(abcd_ir2::ColumnEntry { inst: iid, column });
+                column_table.push(abcd_ir::ColumnEntry { inst: iid, column });
             }
         }
     }
@@ -554,7 +554,7 @@ pub fn finish_debug(fx: &mut FnLift) {
             .map(|(_, c)| *c)
     });
 
-    fx.lf.module.functions[func_id.index()].debug = Some(abcd_ir2::DebugData {
+    fx.lf.module.functions[func_id.index()].debug = Some(abcd_ir::DebugData {
         source_file,
         source_code,
         line_table,

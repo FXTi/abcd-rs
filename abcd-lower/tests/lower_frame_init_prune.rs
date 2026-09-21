@@ -7,8 +7,8 @@
 
 mod common;
 
-use abcd_ir2::verify_module;
-use abcd_ir2::{Const, Module, Op};
+use abcd_ir::verify_module;
+use abcd_ir::{Const, Module, Op};
 use abcd_isa::Bytecode;
 use abcd_lower::{LowerOptions, lower_function, lower_function_with_options};
 
@@ -17,9 +17,9 @@ use common::V2Builder;
 /// One function `f()` ending in `return undefined`, with two
 /// frame-initial-style const values attributed to it: one UNUSED (the
 /// discarded-read seed shape), one used by a store.
-fn build() -> (Module, abcd_ir2::FuncId) {
+fn build() -> (Module, abcd_ir::FuncId) {
     let mut module = Module::new();
-    let func = V2Builder::create_function(&mut module, "f", abcd_ir2::FunctionKind::Function);
+    let func = V2Builder::create_function(&mut module, "f", abcd_ir::FunctionKind::Function);
     {
         let mut b = V2Builder::new(&mut module, func);
         let _param_anchor = b.create_param(); // anchors the function's value-id range

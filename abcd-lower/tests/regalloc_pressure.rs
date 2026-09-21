@@ -2,7 +2,7 @@
 //! corpus fixture must lower without nontermination.
 
 use abcd_file::decode;
-use abcd_ir2::{FuncId, verify_module};
+use abcd_ir::{FuncId, verify_module};
 use abcd_lift::lift_file;
 use abcd_lower::lower_function;
 

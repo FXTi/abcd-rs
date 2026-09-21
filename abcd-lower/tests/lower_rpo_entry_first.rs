@@ -8,7 +8,7 @@
 
 mod common;
 
-use abcd_ir2::{Catch, Edge, EdgeKind, FunctionKind, Module, Op, TryRegion, ValueDef};
+use abcd_ir::{Catch, Edge, EdgeKind, FunctionKind, Module, Op, TryRegion, ValueDef};
 use abcd_isa::{Bytecode, Imm};
 use abcd_lower::analysis::compute_rpo;
 use abcd_lower::lower_function;
@@ -64,7 +64,7 @@ fn compute_rpo_reachable_only_order_is_reverse_post_order() {
     {
         let mut builder = V2Builder::new(&mut module, func);
         entry = builder.entry();
-        let cid = builder.konst(abcd_ir2::Const::Bool(true));
+        let cid = builder.konst(abcd_ir::Const::Bool(true));
         let cond = builder.emit_val(Op::LoadConst(cid));
         a = builder.create_block();
         b = builder.create_block();
@@ -105,7 +105,7 @@ fn lowered_try_function_executes_entry_code_at_pc0_not_handler() {
         let mut builder = V2Builder::new(&mut module, func);
         entry = builder.entry();
         // Entry (the try body): return the normal sentinel.
-        let cn = builder.konst(abcd_ir2::Const::number(NORMAL_SENTINEL as f64));
+        let cn = builder.konst(abcd_ir::Const::number(NORMAL_SENTINEL as f64));
         let normal = builder.emit_val(Op::LoadConst(cn));
         builder.emit_void(Op::Return {
             value: Some(normal),
@@ -115,7 +115,7 @@ fn lowered_try_function_executes_entry_code_at_pc0_not_handler() {
         builder.add_exceptional_predecessor(handler, entry);
         let exception = builder.create_exception_param(handler);
         builder.set_insert_block(handler);
-        let ch = builder.konst(abcd_ir2::Const::number(HANDLER_SENTINEL as f64));
+        let ch = builder.konst(abcd_ir::Const::number(HANDLER_SENTINEL as f64));
         let caught = builder.emit_val(Op::LoadConst(ch));
         builder.emit_void(Op::Return {
             value: Some(caught),
@@ -216,17 +216,17 @@ fn reachable_only_diamond_matches_v0_1_byte_shape() {
         });
 
         builder.set_insert_block(a);
-        let c7 = builder.konst(abcd_ir2::Const::number(7.0));
+        let c7 = builder.konst(abcd_ir::Const::number(7.0));
         let x = builder.emit_val(Op::LoadConst(c7));
         builder.emit_void(Op::Branch { dest: join });
 
         builder.set_insert_block(b);
-        let c9 = builder.konst(abcd_ir2::Const::number(9.0));
+        let c9 = builder.konst(abcd_ir::Const::number(9.0));
         let y = builder.emit_val(Op::LoadConst(c9));
         builder.emit_void(Op::Branch { dest: join });
 
         builder.set_insert_block(join);
-        let normal = |from: abcd_ir2::BlockId| Edge {
+        let normal = |from: abcd_ir::BlockId| Edge {
             from,
             kind: EdgeKind::Normal,
         };

@@ -1,7 +1,7 @@
 //! Shared test infrastructure for the abcd-lower regression tests:
 //! a minimal deterministic bytecode interpreter (ported verbatim from
 //! v0.1 `abcd-ir/tests/common`) and a small hand-builder for v0.2 IR
-//! modules (abcd-ir2 has no IRBuilder — tests construct modules directly).
+//! modules (abcd-ir has no IRBuilder — tests construct modules directly).
 //!
 //! Every test target compiles this shared module separately and uses a
 //! different subset of the helpers — allow dead code module-wide (the
@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use abcd_ir2::{
+use abcd_ir::{
     Block, BlockId, ClassId, Const, ConstId, Edge, EdgeKind, FuncId, FunctionData, FunctionKind,
     Inst, InstId, Module, Op, Sym, Ty, Value, ValueDef, ValueId,
 };
@@ -34,11 +34,11 @@ impl<'m> V2Builder<'m> {
     pub fn create_function(module: &'m mut Module, name: &str, kind: FunctionKind) -> FuncId {
         if module.classes.is_empty() {
             let descriptor = module.sym.intern("Ltest;");
-            module.classes.push(abcd_ir2::ClassData {
+            module.classes.push(abcd_ir::ClassData {
                 descriptor,
                 name: descriptor,
-                modifiers: abcd_ir2::Modifiers::NONE,
-                source_lang: abcd_ir2::SourceLang::EcmaScript,
+                modifiers: abcd_ir::Modifiers::NONE,
+                source_lang: abcd_ir::SourceLang::EcmaScript,
                 super_class: None,
                 interfaces: Vec::new(),
                 fields: Vec::new(),

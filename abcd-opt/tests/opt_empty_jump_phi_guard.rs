@@ -19,8 +19,8 @@
 mod common;
 
 use abcd_file::{AccessFlags, Builder, File, Type};
-use abcd_ir2::verify_module;
-use abcd_ir2::{BlockId, Edge, EdgeKind, FuncId, FunctionKind, Module, Op, ValueId};
+use abcd_ir::verify_module;
+use abcd_ir::{BlockId, Edge, EdgeKind, FuncId, FunctionKind, Module, Op, ValueId};
 use abcd_isa::{Bytecode, Imm, Label, Reg, encode as encode_bytecodes};
 use abcd_lift::lift_file;
 use abcd_lower::lower_function;

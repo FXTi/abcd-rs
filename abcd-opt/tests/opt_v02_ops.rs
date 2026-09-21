@@ -13,8 +13,8 @@
 
 mod common;
 
-use abcd_ir2::verify_module;
-use abcd_ir2::{BinOp, CallKind, Const, FuncId, FunctionKind, InstId, Module, Op, UnOp, ValueId};
+use abcd_ir::verify_module;
+use abcd_ir::{BinOp, CallKind, Const, FuncId, FunctionKind, InstId, Module, Op, UnOp, ValueId};
 use abcd_opt::peephole::Peephole;
 use abcd_opt::sccp::Sccp;
 use abcd_opt::{FuncPass, optimize_module};

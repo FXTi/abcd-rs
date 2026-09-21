@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "abcd-ir2"
+name = "abcd-ir"
 version = "0.1.0"
 dependencies = [
  "string-interner",
@@ -52,7 +52,7 @@ name = "abcd-lift"
 version = "0.1.0"
 dependencies = [
  "abcd-file",
- "abcd-ir2",
+ "abcd-ir",
  "abcd-isa",
  "thiserror",
 ]
@@ -62,7 +62,7 @@ name = "abcd-lower"
 version = "0.1.0"
 dependencies = [
  "abcd-file",
- "abcd-ir2",
+ "abcd-ir",
  "abcd-isa",
  "abcd-lift",
  "abcd-opt",
@@ -74,7 +74,7 @@ name = "abcd-opt"
 version = "0.1.0"
 dependencies = [
  "abcd-file",
- "abcd-ir2",
+ "abcd-ir",
  "abcd-isa",
  "abcd-lift",
  "abcd-lower",

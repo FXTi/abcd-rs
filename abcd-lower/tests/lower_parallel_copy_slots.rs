@@ -20,7 +20,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use abcd_ir2::{FunctionKind, Module, Op, ValueId};
+use abcd_ir::{FunctionKind, Module, Op, ValueId};
 use abcd_isa::{Bytecode, Imm, Label, Reg};
 use abcd_lower::isel::IselResult;
 use abcd_lower::layout;

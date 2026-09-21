@@ -5,7 +5,7 @@
 use abcd_file::{
     AccessFlags, Builder, CatchBlockDef, FieldValue, ModuleRecordDef, SourceLang, Type, decode,
 };
-use abcd_ir2::{
+use abcd_ir::{
     self, AnnValue, Const, EdgeKind, ExportDecl, FunctionKind as IrFunctionKind, ImportDecl, Op,
     ValueDef,
 };
@@ -23,8 +23,8 @@ fn build(setup: impl FnOnce(&mut Builder)) -> abcd_file::File {
 const PLACEHOLDER: EntityId = EntityId(u16::MAX as u32);
 
 /// The lifted module must verify with ZERO errors.
-fn verify_clean(m: &abcd_ir2::Module) {
-    let report = abcd_ir2::verify_module(m);
+fn verify_clean(m: &abcd_ir::Module) {
+    let report = abcd_ir::verify_module(m);
     assert!(
         report.errors.is_empty(),
         "verifier errors: {:?}",
@@ -32,7 +32,7 @@ fn verify_clean(m: &abcd_ir2::Module) {
     );
 }
 
-fn resolve<'m>(m: &'m abcd_ir2::Module, s: abcd_ir2::Sym) -> &'m str {
+fn resolve<'m>(m: &'m abcd_ir::Module, s: abcd_ir::Sym) -> &'m str {
     m.sym.resolve(s).expect("dangling sym")
 }
 
@@ -120,7 +120,7 @@ fn handler_gets_exception_param_and_exceptional_edges() {
     let handler = &m.blocks[catch.handler.index()];
     for &p in &region.protected {
         assert!(
-            handler.preds.contains(&abcd_ir2::Edge {
+            handler.preds.contains(&abcd_ir::Edge {
                 from: p,
                 kind: EdgeKind::Exceptional,
             }),
@@ -186,7 +186,7 @@ fn literal_array_nested_and_method_ref() {
     };
     // Method order in the decoded class is the Builder's layout order,
     // not necessarily creation order — resolve by name.
-    let target_fid = abcd_ir2::FuncId::new(
+    let target_fid = abcd_ir::FuncId::new(
         m.functions
             .iter()
             .position(|f| resolve(&m, f.name) == "target")
@@ -546,7 +546,7 @@ fn debug_locals_lines_and_params() {
     assert_eq!(debug.local_names.len(), 1);
     let lv = &debug.local_names[0];
     assert_eq!(resolve(&m, lv.name), "local_var");
-    assert_eq!(lv.ty, Some(abcd_ir2::Ty::Static(abcd_ir2::StaticTy::I32)));
+    assert_eq!(lv.ty, Some(abcd_ir::Ty::Static(abcd_ir::StaticTy::I32)));
     let scope = lv.scope.expect("scope extents mapped");
     assert!(block_insts.contains(&scope.start));
     assert!(block_insts.contains(&scope.end));
@@ -585,7 +585,7 @@ fn deprecated_opcodes_fold_to_modern() {
     // deprecated.tonumber → UnaryOp{ToNumber} over the frame-initial
     // UNDEFINED constant (v0 was never written — P3-T7).
     let Some(Op::UnaryOp {
-        op: abcd_ir2::UnOp::ToNumber,
+        op: abcd_ir::UnOp::ToNumber,
         operand,
     }) = ops.first()
     else {
@@ -616,11 +616,11 @@ fn super_by_index_is_a_hard_error() {
         super_key(SuperKeyForm::Index(3)),
         Err(LiftError::UnsupportedSuperByIndex)
     ));
-    let m = abcd_ir2::Module::new();
+    let m = abcd_ir::Module::new();
     let _ = m;
-    let name = abcd_ir2::Sym::new(0);
+    let name = abcd_ir::Sym::new(0);
     assert!(super_key(SuperKeyForm::Name(name)).is_ok());
-    assert!(super_key(SuperKeyForm::Dynamic(abcd_ir2::ValueId::new(0))).is_ok());
+    assert!(super_key(SuperKeyForm::Dynamic(abcd_ir::ValueId::new(0))).is_ok());
 }
 
 // ─── Function kind mapping smoke ────────────────────────────────────

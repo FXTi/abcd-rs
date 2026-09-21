@@ -1,13 +1,13 @@
 //! Corpus lift-verify harness (opt-in, all 2787 fixtures):
 //!
 //! (a) the v0.2 lift succeeds on every fixture;
-//! (b) `abcd_ir2::verify_module` reports ZERO errors on the result.
+//! (b) `abcd_ir::verify_module` reports ZERO errors on the result.
 //!
 //! History: parity against the v0.1 crate was proven at v2-P1/v2-P2c
 //! (2787 fixtures / 12,996 functions / 1,434,154 canonical tokens /
 //! 0 mismatches). The v0.1-vs-v0.2 canonical comparator
 //! (`tests/common/compare.rs`) was retired together with the v0.1 crate
-//! at v2-P4 (the swap: abcd-ir2 becomes abcd-ir, v0.1 deleted; git
+//! at v2-P4 (the swap: abcd-ir becomes abcd-ir, v0.1 deleted; git
 //! history is the archive). This harness keeps the corpus lift+verify
 //! gates without any v0.1 dependency.
 //!
@@ -108,7 +108,7 @@ fn exported_corpus_lifts_and_verifies_v2() {
             }
         };
         functions += module.functions.len();
-        let report = abcd_ir2::verify_module(&module);
+        let report = abcd_ir::verify_module(&module);
         if !report.errors.is_empty() {
             verify_failures += 1;
             verify_errors_total += report.errors.len();

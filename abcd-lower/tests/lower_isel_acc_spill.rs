@@ -10,7 +10,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use abcd_ir2::{BinOp, FunctionKind, Module, Op, ValueId};
+use abcd_ir::{BinOp, FunctionKind, Module, Op, ValueId};
 use abcd_isa::{Bytecode, Reg};
 use abcd_lower::regalloc::{self, RegAlloc, RegSlot};
 use abcd_lower::{LowerError, fusion, isel, lower_function};

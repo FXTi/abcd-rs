@@ -3,12 +3,12 @@
 //! Port of v0.1 `abcd_ir::analysis`'s lowering-facing half onto the v0.2
 //! IR. v0.2 materializes exception flow as first-class
 //! [`EdgeKind::Exceptional`] predecessors and structured
-//! [`TryRegion`](abcd_ir2::TryRegion)s, so v0.1's `augmented_succs`
+//! [`TryRegion`](abcd_ir::TryRegion)s, so v0.1's `augmented_succs`
 //! (terminator successors ∪ try→handler) maps directly onto them.
 
 use std::collections::HashSet;
 
-use abcd_ir2::{BlockId, FuncId, Module, Op};
+use abcd_ir::{BlockId, FuncId, Module, Op};
 
 /// Compute reverse post-order of blocks reachable from the entry.
 ///
@@ -101,7 +101,7 @@ pub fn inst_succs(op: &Op) -> Vec<BlockId> {
 /// reachability or value flow must use this relation — a try body may end
 /// in `Throw`/`Unreachable` while the handler still reads values defined
 /// there. This is the v0.1 `augmented_succs` contract; v0.2's
-/// [`EdgeKind::Exceptional`](abcd_ir2::EdgeKind) edges encode the same
+/// [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) edges encode the same
 /// relation on the CFG.
 ///
 /// Handler blocks no longer owned by `func` (partially pruned metadata)

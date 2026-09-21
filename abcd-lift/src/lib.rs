@@ -1,10 +1,10 @@
-//! # abcd-lift — lift converter: `abcd_file::File` → `abcd_ir2::Module`
+//! # abcd-lift — lift converter: `abcd_file::File` → `abcd_ir::Module`
 //!
 //! IR v0.2 migration plan P1 (design/ir-v0.2.md §8, design/ir.md §7):
 //! the format-aware conversion layer that decodes v0.1's container model
 //! into the format-independent v0.2 IR. This crate is the ONLY component
 //! that imports both sides (`abcd-file` + `abcd-isa` on the container
-//! end, `abcd-ir2` on the semantic end).
+//! end, `abcd-ir` on the semantic end).
 //!
 //! The conversion ports v0.1 `abcd_ir::lift`'s battle-proven semantics
 //! (VM oracle 1149/1149 on both pipelines) into v0.2's types:
@@ -22,28 +22,28 @@
 //!   `_ESModuleRecord` field blobs (`FieldValue::ModuleData`) parsed into
 //!   declarations with `module_request_idx` resolved to specifier syms;
 //!   `moduleRequestPhaseIdx` blobs become
-//!   [`ModuleRequest`](abcd_ir2::ModuleRequest)`{specifier, lazy}`;
+//!   [`ModuleRequest`](abcd_ir::ModuleRequest)`{specifier, lazy}`;
 //!   `_ESScopeNamesRecord` fields land on
-//!   [`DebugData::scope_names`](abcd_ir2::DebugData) of the functions
+//!   [`DebugData::scope_names`](abcd_ir::DebugData) of the functions
 //!   whose source file matches the field name.
 //! - **Annotations** — the four file buckets merge into ONE list per
 //!   attach site, in the documented order: `compile_time`, `runtime`,
 //!   `compile_time_type`, `runtime_type`.
 //! - **Debug** — the LNP dual stream becomes
-//!   [`DebugData`](abcd_ir2::DebugData): line/column keyed by the lifted
-//!   [`InstId`](abcd_ir2::InstId)s (also on `Inst.loc`), local names with
+//!   [`DebugData`](abcd_ir::DebugData): line/column keyed by the lifted
+//!   [`InstId`](abcd_ir::InstId)s (also on `Inst.loc`), local names with
 //!   their #5 scope extents mapped onto lifted instructions, param
 //!   names, source file/code.
 //! - **CFG + Braun SSA** — v0.1's exact semantics: param seeding from
 //!   the code-header `num_args` (u32→u16 checked, B5), entry param
 //!   seeding, frame-initial values as CONSTANTS
-//!   ([`Const::Undefined`](abcd_ir2::Const) for vregs,
-//!   [`Const::Hole`](abcd_ir2::Const) for acc-read-before-write — P3-T7,
+//!   ([`Const::Undefined`](abcd_ir::Const) for vregs,
+//!   [`Const::Hole`](abcd_ir::Const) for acc-read-before-write — P3-T7,
 //!   represented as `ValueDef::Const`, no seeding instructions), handler
-//!   [`ExceptionParam`](abcd_ir2::ValueDef) seeding (N13), Braun
+//!   [`ExceptionParam`](abcd_ir::ValueDef) seeding (N13), Braun
 //!   construction with preds known before SSA (empty-phi-free).
-//! - **Try regions** — structured [`TryRegion`](abcd_ir2::TryRegion)s
-//!   plus materialized [`EdgeKind::Exceptional`](abcd_ir2::EdgeKind)
+//! - **Try regions** — structured [`TryRegion`](abcd_ir::TryRegion)s
+//!   plus materialized [`EdgeKind::Exceptional`](abcd_ir::EdgeKind)
 //!   edges in `Block.preds` for EVERY (protected block → handler) pair
 //!   (the verifier's `MissingExceptionalPred` rule), and the N18
 //!   dead-island sweep over augmented reachability.
@@ -53,7 +53,7 @@
 //!   in `translate.rs`'s header docs; the machine-checked version is
 //!   `compare.rs`'s canonicalization.
 //!
-//! Library rule (mirroring abcd-ir2): no panics on data; every fallible
+//! Library rule (mirroring abcd-ir): no panics on data; every fallible
 //! finding is a [`LiftError`].
 
 #![deny(missing_docs)]
@@ -67,7 +67,7 @@ mod translate;
 use std::collections::{BTreeSet, HashMap};
 
 use abcd_file::{File, Method, MethodBody};
-use abcd_ir2::{
+use abcd_ir::{
     Block, BlockId, Catch, ClassId, Const, ConstId, Edge, EdgeKind, FuncId, FunctionData, Inst,
     InstId, Module, Sym, TryRegion, Ty, Value, ValueDef, ValueId,
 };
@@ -261,11 +261,11 @@ impl<'f> Lifter<'f> {
         }
         let descriptor = self.sym_of_file_sid(sid)?;
         let cid = ClassId::new(self.module.classes.len() as u32);
-        self.module.classes.push(abcd_ir2::ClassData {
+        self.module.classes.push(abcd_ir::ClassData {
             descriptor,
             name: descriptor,
-            modifiers: abcd_ir2::Modifiers::NONE,
-            source_lang: abcd_ir2::SourceLang::EcmaScript,
+            modifiers: abcd_ir::Modifiers::NONE,
+            source_lang: abcd_ir::SourceLang::EcmaScript,
             super_class: None,
             interfaces: Vec::new(),
             fields: Vec::new(),
@@ -338,11 +338,11 @@ pub fn lift_file(file: &File) -> Result<Module, LiftError> {
         let descriptor = lf
             .sym_of_file_sid(class.descriptor)
             .unwrap_or_else(|| lf.sym("<unnamed-class>"));
-        lf.module.classes.push(abcd_ir2::ClassData {
+        lf.module.classes.push(abcd_ir::ClassData {
             descriptor,
             name: descriptor,
-            modifiers: abcd_ir2::Modifiers::NONE,
-            source_lang: abcd_ir2::SourceLang::EcmaScript,
+            modifiers: abcd_ir::Modifiers::NONE,
+            source_lang: abcd_ir::SourceLang::EcmaScript,
             super_class: None,
             interfaces: Vec::new(),
             fields: Vec::new(),
@@ -560,13 +560,13 @@ pub(crate) fn lift_method<'f>(
             match succs.as_slice() {
                 [succ_bi] => {
                     let dest = fx.block_map[succ_bi];
-                    fx.emit_void(ir_block, abcd_ir2::Op::Branch { dest }, None);
+                    fx.emit_void(ir_block, abcd_ir::Op::Branch { dest }, None);
                 }
                 [] => {
-                    fx.emit_void(ir_block, abcd_ir2::Op::Unreachable, None);
+                    fx.emit_void(ir_block, abcd_ir::Op::Unreachable, None);
                 }
                 _ => {
-                    fx.emit_void(ir_block, abcd_ir2::Op::Unreachable, None);
+                    fx.emit_void(ir_block, abcd_ir::Op::Unreachable, None);
                 }
             }
         }
@@ -691,8 +691,8 @@ fn sweep_dead_blocks(fx: &mut translate::FnLift) {
             if let Some(&last) = block.insts.last() {
                 if let Some(inst) = module.insts.get(last.index()) {
                     match &inst.op {
-                        abcd_ir2::Op::Branch { dest } => out.push(*dest),
-                        abcd_ir2::Op::CondBranch {
+                        abcd_ir::Op::Branch { dest } => out.push(*dest),
+                        abcd_ir::Op::CondBranch {
                             true_dest,
                             false_dest,
                             ..
@@ -751,7 +751,7 @@ fn sweep_dead_blocks(fx: &mut translate::FnLift) {
             .filter(|&iid| module.insts.get(iid.index()).is_some_and(|i| i.op.is_phi()))
             .collect();
         for phi_id in phi_ids {
-            if let abcd_ir2::Op::Phi { entries } = &mut module.insts[phi_id.index()].op {
+            if let abcd_ir::Op::Phi { entries } = &mut module.insts[phi_id.index()].op {
                 entries.retain(|(e, _)| !dead.contains(&e.from));
             }
         }
@@ -775,8 +775,8 @@ fn sweep_dead_blocks(fx: &mut translate::FnLift) {
 pub(crate) fn emit_inst(
     module: &mut Module,
     block: BlockId,
-    op: abcd_ir2::Op,
-    loc: Option<abcd_ir2::Loc>,
+    op: abcd_ir::Op,
+    loc: Option<abcd_ir::Loc>,
 ) -> (InstId, Option<ValueId>) {
     let has_result = op.has_result();
     let is_phi = op.is_phi();

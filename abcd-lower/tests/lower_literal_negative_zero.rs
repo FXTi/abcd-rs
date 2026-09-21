@@ -9,7 +9,7 @@
 
 mod common;
 
-use abcd_ir2::{Const, FunctionKind, Module, Op};
+use abcd_ir::{Const, FunctionKind, Module, Op};
 use abcd_isa::Bytecode;
 use abcd_lower::lower_function;
 

@@ -31,8 +31,8 @@
 
 mod common;
 
-use abcd_ir2::verify_module;
-use abcd_ir2::{
+use abcd_ir::verify_module;
+use abcd_ir::{
     BinOp, BlockId, CmpOp, Const, Edge, EdgeKind, FuncId, FunctionKind, InstId, Module, Op,
 };
 use abcd_opt::FuncPass;

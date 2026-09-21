@@ -1,14 +1,14 @@
 //! D2 inline rewrite (v2-P3b) — unit tests for `abcd_opt::inline`,
 //! one per N44 defect shape plus the eligibility matrix. Every green
-//! test runs `abcd_ir2::verify_module` after inlining: zero errors is
+//! test runs `abcd_ir::verify_module` after inlining: zero errors is
 //! the hard gate. The red counterparts (naive inliner producing
 //! module-invalid IR on the same probe shape) live in
 //! `opt_inline_red.rs`.
 
 mod common;
 
-use abcd_ir2::verify_module;
-use abcd_ir2::{
+use abcd_ir::verify_module;
+use abcd_ir::{
     BinOp, BlockId, CallKind, Const, Edge, EdgeKind, FuncId, FunctionKind, Loc, Module, Op, Sym,
     UnOp, ValueDef, ValueId,
 };
@@ -34,7 +34,7 @@ fn default_policy() -> InlinePolicy {
 /// Create a STATIC function (params are all formals — no `this`).
 fn create_static(module: &mut Module, name: &str) -> FuncId {
     let f = V2Builder::create_function(module, name, FunctionKind::Function);
-    module.functions[f.index()].modifiers = abcd_ir2::Modifiers::STATIC;
+    module.functions[f.index()].modifiers = abcd_ir::Modifiers::STATIC;
     f
 }
 
@@ -49,13 +49,13 @@ fn set_call_type(module: &mut Module, f: FuncId, bits: u32) {
         .iter()
         .position(|c| c.descriptor == descriptor)
     {
-        Some(i) => abcd_ir2::ClassId::new(i as u32),
+        Some(i) => abcd_ir::ClassId::new(i as u32),
         None => {
-            module.classes.push(abcd_ir2::ClassData {
+            module.classes.push(abcd_ir::ClassData {
                 descriptor,
                 name: descriptor,
-                modifiers: abcd_ir2::Modifiers::NONE,
-                source_lang: abcd_ir2::SourceLang::EcmaScript,
+                modifiers: abcd_ir::Modifiers::NONE,
+                source_lang: abcd_ir::SourceLang::EcmaScript,
                 super_class: None,
                 interfaces: Vec::new(),
                 fields: Vec::new(),
@@ -63,16 +63,16 @@ fn set_call_type(module: &mut Module, f: FuncId, bits: u32) {
                 annotations: Vec::new(),
                 source_file: None,
             });
-            abcd_ir2::ClassId::new((module.classes.len() - 1) as u32)
+            abcd_ir::ClassId::new((module.classes.len() - 1) as u32)
         }
     };
     let name = module.sym.intern("callType");
     let value = module.consts.push(Const::number(bits as f64));
     module.functions[f.index()]
         .annotations
-        .push(abcd_ir2::Annotation {
+        .push(abcd_ir::Annotation {
             class: class_id,
-            elements: vec![(name, abcd_ir2::AnnValue::Const(value))],
+            elements: vec![(name, abcd_ir::AnnValue::Const(value))],
         });
 }
 
@@ -100,7 +100,7 @@ fn emit_closure_call(
     this: Option<ValueId>,
     args: Vec<ValueId>,
     kind: CallKind,
-) -> (abcd_ir2::InstId, ValueId) {
+) -> (abcd_ir::InstId, ValueId) {
     let df = b.emit_val(Op::DefineFunc {
         body: g,
         captures: vec![],
@@ -127,7 +127,7 @@ struct N44Probe {
     call_block: BlockId,
     successor: BlockId,
     handler: BlockId,
-    mul_inst: abcd_ir2::InstId,
+    mul_inst: abcd_ir::InstId,
     handler_phi_value: ValueId,
 }
 
@@ -225,13 +225,13 @@ fn module_mul_result_placeholder() -> ValueId {
 }
 
 /// The block an instruction lives in.
-fn block_of(module: &Module, iid: abcd_ir2::InstId) -> BlockId {
+fn block_of(module: &Module, iid: abcd_ir::InstId) -> BlockId {
     module.insts[iid.index()].block
 }
 
 /// The (unique) Return instruction of a single-exit probe function —
 /// found across blocks, since inlining moves it into the continuation.
-fn return_inst(module: &Module, f: FuncId) -> abcd_ir2::InstId {
+fn return_inst(module: &Module, f: FuncId) -> abcd_ir::InstId {
     module.functions[f.index()]
         .blocks
         .iter()
@@ -241,7 +241,7 @@ fn return_inst(module: &Module, f: FuncId) -> abcd_ir2::InstId {
 }
 
 /// All `Op::Call` instructions in a function.
-fn calls_in(module: &Module, f: FuncId) -> Vec<abcd_ir2::InstId> {
+fn calls_in(module: &Module, f: FuncId) -> Vec<abcd_ir::InstId> {
     let mut out = Vec::new();
     for &bb in &module.functions[f.index()].blocks {
         for &iid in &module.blocks[bb.index()].insts {
@@ -1161,7 +1161,7 @@ fn callee_with_try_regions_is_skipped() {
 /// The forbidden-op eligibility exclusions, one probe per class.
 #[test]
 fn forbidden_callee_ops_are_skipped() {
-    use abcd_ir2::SuperKey;
+    use abcd_ir::SuperKey;
     let cases: Vec<(&str, Op, SkipReason)> = vec![
         (
             "lexenv",
@@ -1335,7 +1335,7 @@ fn forbidden_callee_ops_are_skipped() {
 fn generator_callee_is_skipped() {
     let mut module = Module::new();
     let g = V2Builder::create_function(&mut module, "g", FunctionKind::Generator);
-    module.functions[g.index()].modifiers = abcd_ir2::Modifiers::STATIC;
+    module.functions[g.index()].modifiers = abcd_ir::Modifiers::STATIC;
     set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);

@@ -40,7 +40,7 @@
 use std::collections::HashMap;
 
 use abcd_file::{File, LiteralValue, MethodBody};
-use abcd_ir2::{Const, ConstId, FuncId, Module, Sym};
+use abcd_ir::{Const, ConstId, FuncId, Module, Sym};
 use abcd_isa::EntityKind;
 
 use crate::LowerError;

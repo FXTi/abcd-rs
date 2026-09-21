@@ -1,6 +1,6 @@
 [package]
-name = "abcd-ir2"
-description = "SSA IR v0.2 — format-independent program representation (design/ir-v0.2.md)"
+name = "abcd-ir"
+description = "The SSA IR — format-independent program representation (design/ir-v0.2.md)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -8,8 +8,8 @@ license.workspace = true
 # DELIBERATE INVARIANT (design/ir-v0.2.md §1, design/ir.md §8 invariant 1):
 # this crate must NEVER depend on abcd-file, abcd-isa, abcd-file-sys, or
 # abcd-isa-sys. The IR describes a *program*, never a *file*; all container/
-# encoding knowledge lives in the (future) lift/lower crates. This is
-# enforced structurally by the crate graph — do not add such a dependency.
+# encoding knowledge lives in the lift/lower crates. This is enforced
+# structurally by the crate graph — do not add such a dependency.
 [dependencies]
 thiserror.workspace = true
 string-interner.workspace = true

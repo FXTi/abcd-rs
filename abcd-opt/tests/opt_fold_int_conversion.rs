@@ -19,7 +19,7 @@
 
 mod common;
 
-use abcd_ir2::{BinOp, Const, FuncId, FunctionKind, InstId, Module, Op, UnOp};
+use abcd_ir::{BinOp, Const, FuncId, FunctionKind, InstId, Module, Op, UnOp};
 use abcd_opt::FuncPass;
 use abcd_opt::peephole::Peephole;
 use abcd_opt::sccp::Sccp;

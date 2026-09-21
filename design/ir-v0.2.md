@@ -1,6 +1,8 @@
 # abcd-ir v0.2 — design
 
-Status: design under review (maintainer approved direction 2026-09-21).
+Status: P4 complete (2026-09-21): abcd-ir2 renamed abcd-ir; v0.1 deleted.
+
+Historical status at writing: design under review (maintainer approved direction 2026-09-21).
 Supersedes nothing yet: `design/ir.md` remains the agreed proposal text;
 this document is the implementable design, extended for taint-analysis
 consumers, with the v0.1 / Hermes / v0.2 comparison and the migration

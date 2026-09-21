@@ -1,6 +1,6 @@
 //! Function inlining for the v0.2 IR — the D2 (maintainer ruling
 //! 2026-09-21) rewrite of v0.1's quarantined inline pass (N44), built
-//! on [`abcd_ir2::Module`]. **Opt-in only**: nothing here is wired into
+//! on [`abcd_ir::Module`]. **Opt-in only**: nothing here is wired into
 //! [`crate::optimize_module`]; the corpus gates (v2lift/v2opt
 //! byte-identity and the VM oracle) stay untouched. Callers opt in via
 //! [`inline_module`].
@@ -125,7 +125,7 @@
 //!
 //! ## Loc fidelity (design §7)
 //!
-//! Cloned instructions keep their source [`Loc`](abcd_ir2::Loc)s
+//! Cloned instructions keep their source [`Loc`](abcd_ir::Loc)s
 //! verbatim. Glue instructions created by the splice (the call block's
 //! branch into the callee, return-block branches into the continuation,
 //! the continuation's result phi) carry `loc: None` — never fabricated.
@@ -138,7 +138,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use abcd_ir2::{
+use abcd_ir::{
     BlockId, CallKind, Const, ConstId, Edge, EdgeKind, FuncId, FunctionKind, Inst, InstId,
     Modifiers, Module, Op, Ty, ValueDef, ValueId,
 };
@@ -472,7 +472,7 @@ impl CallType {
                 if module.sym.resolve(*name) != Some("callType") {
                     continue;
                 }
-                let abcd_ir2::AnnValue::Const(cid) = value else {
+                let abcd_ir::AnnValue::Const(cid) = value else {
                     continue;
                 };
                 let bits = module
@@ -803,7 +803,7 @@ impl Undef {
         }
         let iid = InstId::new(module.insts.len() as u32);
         let val = ValueId::new(module.values.len() as u32);
-        module.values.push(abcd_ir2::Value {
+        module.values.push(abcd_ir::Value {
             def: ValueDef::Inst(iid),
             ty: Ty::Any,
         });
@@ -923,7 +923,7 @@ fn inline_site(
     let mut block_map: HashMap<BlockId, BlockId> = HashMap::new();
     for &gb in &callee_blocks {
         let fresh = BlockId::new(module.blocks.len() as u32);
-        module.blocks.push(abcd_ir2::Block::default());
+        module.blocks.push(abcd_ir::Block::default());
         block_map.insert(gb, fresh);
     }
 
@@ -947,7 +947,7 @@ fn inline_site(
                         return Err(SkipReason::CalleeForeignValue);
                     };
                     let fresh = ValueId::new(module.values.len() as u32);
-                    module.values.push(abcd_ir2::Value {
+                    module.values.push(abcd_ir::Value {
                         def: ValueDef::Inst(InstId::new(base_iid + seq)),
                         ty,
                     });
@@ -1073,7 +1073,7 @@ fn inline_site(
         (pos, block.insts[pos + 1..].to_vec())
     };
     let cont = BlockId::new(module.blocks.len() as u32);
-    module.blocks.push(abcd_ir2::Block {
+    module.blocks.push(abcd_ir::Block {
         insts: post.clone(),
         preds: Vec::new(),
     });
@@ -1211,7 +1211,7 @@ fn inline_site(
             }
             let phi_iid = InstId::new(module.insts.len() as u32);
             let phi_val = ValueId::new(module.values.len() as u32);
-            module.values.push(abcd_ir2::Value {
+            module.values.push(abcd_ir::Value {
                 def: ValueDef::Inst(phi_iid),
                 ty: Ty::Any,
             });

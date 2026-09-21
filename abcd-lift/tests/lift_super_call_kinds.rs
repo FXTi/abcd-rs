@@ -14,7 +14,7 @@
 //! `supercallthisrange` keeps `CallKind::Super` (explicit arguments).
 
 use abcd_file::{AccessFlags, Builder, Type, decode};
-use abcd_ir2::{CallKind, Op};
+use abcd_ir::{CallKind, Op};
 use abcd_isa::{Bytecode, Imm, Reg, encode as encode_bytecodes};
 use abcd_lift::lift_file;
 
@@ -31,7 +31,7 @@ fn build(bytecodes: &[Bytecode], num_vregs: u32) -> abcd_file::File {
 }
 
 /// The single Call in the lifted module.
-fn the_call(m: &abcd_ir2::Module) -> &Op {
+fn the_call(m: &abcd_ir::Module) -> &Op {
     let calls: Vec<&Op> = m
         .insts
         .iter()
@@ -42,8 +42,8 @@ fn the_call(m: &abcd_ir2::Module) -> &Op {
     calls[0]
 }
 
-fn verify_clean(m: &abcd_ir2::Module) {
-    let report = abcd_ir2::verify_module(m);
+fn verify_clean(m: &abcd_ir::Module) {
+    let report = abcd_ir::verify_module(m);
     assert!(
         report.errors.is_empty(),
         "verifier errors: {:?}",

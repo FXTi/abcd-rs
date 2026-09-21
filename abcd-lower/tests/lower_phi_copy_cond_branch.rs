@@ -15,7 +15,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use abcd_ir2::{FunctionKind, Module, Op, ValueId};
+use abcd_ir::{FunctionKind, Module, Op, ValueId};
 use abcd_isa::{Bytecode, Imm, Label, Reg};
 use abcd_lower::isel::IselResult;
 use abcd_lower::layout;
@@ -37,7 +37,7 @@ fn phi_copies_for_untaken_successor_clobber_taken_path() {
     {
         let mut builder = V2Builder::new(&mut module, func);
         entry = builder.entry();
-        let cid = builder.konst(abcd_ir2::Const::Bool(true));
+        let cid = builder.konst(abcd_ir::Const::Bool(true));
         let cond = builder.emit_val(Op::LoadConst(cid));
         s1 = builder.create_block();
         s2 = builder.create_block();

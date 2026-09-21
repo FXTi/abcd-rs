@@ -1,12 +1,13 @@
-//! # abcd-lower — lower converter: `abcd_ir2::Module` → `abcd_file::MethodBody`
+//! # abcd-lower — lower converter: `abcd_ir::Module` → `abcd_file::MethodBody`
 //!
 //! IR v0.2 migration plan P2 (design/ir-v0.2.md §8): the lowering half of
-//! the v0.2 pipeline. This is a source-level port of v0.1 `abcd_ir::lower`
-//! (frozen oracle) onto the v0.2 IR: the same algorithms (MCS chordal
+//! the pipeline (lower = IR→file). This is a source-level port of v0.1
+//! `abcd_ir::lower` (deleted at v2-P4; git history is the archive) onto
+//! the IR: the same algorithms (MCS chordal
 //! coloring, slot-level parallel-copy resolution, acc-as-cache instruction
 //! selection, block layout with edge trampolines, N43 try-range
 //! reconstruction, and the entity relocation channel), operating on
-//! [`abcd_ir2::Module`] and producing [`abcd_file::MethodBody`].
+//! [`abcd_ir::Module`] and producing [`abcd_file::MethodBody`].
 
 #![deny(missing_docs)]
 
@@ -18,7 +19,7 @@ pub mod layout;
 pub mod method_body;
 pub mod regalloc;
 
-use abcd_ir2::{BlockId, FuncId, Module, ValueId};
+use abcd_ir::{BlockId, FuncId, Module, ValueId};
 
 pub use layout::LayoutResult;
 pub use method_body::to_method_body;
@@ -36,7 +37,7 @@ pub struct LowerOptions {
     /// unconditionally at lower, even when a discarded operand read left
     /// them unused), while v0.1's optimizer sweeps an unused seed
     /// instruction with ADCE. v0.2's seeds are instruction-less
-    /// [`ValueDef::Const`](abcd_ir2::ValueDef) values (design/ir-v0.2.md
+    /// [`ValueDef::Const`](abcd_ir::ValueDef) values (design/ir-v0.2.md
     /// §5.1), so there is no instruction for a pass to sweep — the
     /// lowering must skip the materialization instead. Set this when
     /// lowering an OPTIMIZED module (abcd-opt's output): it reproduces
@@ -245,7 +246,7 @@ pub fn lower_function_with_options(
 #[cfg(test)]
 mod tests {
     use super::lower_function;
-    use abcd_ir2::{
+    use abcd_ir::{
         Block, BlockId, ClassId, FuncId, FunctionData, FunctionKind, Inst, InstId, Module, Op, Ty,
         Value, ValueDef, ValueId,
     };
@@ -258,11 +259,11 @@ mod tests {
     fn const_assignment_lowers_with_the_name_register() {
         let mut module = Module::new();
         let descriptor = module.sym.intern("Ltest;");
-        module.classes.push(abcd_ir2::ClassData {
+        module.classes.push(abcd_ir::ClassData {
             descriptor,
             name: descriptor,
-            modifiers: abcd_ir2::Modifiers::NONE,
-            source_lang: abcd_ir2::SourceLang::EcmaScript,
+            modifiers: abcd_ir::Modifiers::NONE,
+            source_lang: abcd_ir::SourceLang::EcmaScript,
             super_class: None,
             interfaces: Vec::new(),
             fields: Vec::new(),

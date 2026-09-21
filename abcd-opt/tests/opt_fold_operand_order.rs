@@ -23,8 +23,8 @@
 
 mod common;
 
-use abcd_ir2::{BinOp, CmpOp, Const, FuncId, FunctionKind, InstId, Module, Op};
-use abcd_ir2::{VerifyReport, verify_func};
+use abcd_ir::{BinOp, CmpOp, Const, FuncId, FunctionKind, InstId, Module, Op};
+use abcd_ir::{VerifyReport, verify_func};
 use abcd_opt::FuncPass;
 use abcd_opt::peephole::Peephole;
 use abcd_opt::sccp::Sccp;

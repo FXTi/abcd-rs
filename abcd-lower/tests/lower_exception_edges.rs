@@ -21,7 +21,7 @@ mod common;
 use std::collections::HashMap;
 
 use abcd_file::{AccessFlags, Builder, CatchBlockDef, File, Type};
-use abcd_ir2::{
+use abcd_ir::{
     BinOp, BlockId, Catch, Edge, EdgeKind, FuncId, FunctionKind, Module, Op, TryRegion, ValueDef,
     ValueId, verify_module,
 };
@@ -374,7 +374,7 @@ fn handler_phi_produces_no_edge_copies() {
         builder.emit_void(Op::Branch { dest: a });
 
         builder.set_insert_block(a);
-        let c41 = builder.konst(abcd_ir2::Const::number(41.0));
+        let c41 = builder.konst(abcd_ir::Const::number(41.0));
         let x41 = builder.emit_val(Op::LoadConst(c41));
         let _u1 = builder.emit_val(Op::BinaryOp {
             op: BinOp::Add,
@@ -384,7 +384,7 @@ fn handler_phi_produces_no_edge_copies() {
         builder.emit_void(Op::Branch { dest: b });
 
         builder.set_insert_block(b);
-        let c43 = builder.konst(abcd_ir2::Const::number(43.0));
+        let c43 = builder.konst(abcd_ir::Const::number(43.0));
         let x43 = builder.emit_val(Op::LoadConst(c43));
         let _u2 = builder.emit_val(Op::BinaryOp {
             op: BinOp::Add,
@@ -476,7 +476,7 @@ fn handler_phi_param_incoming_detaches_from_param_home() {
         builder.emit_void(Op::Branch { dest: b });
 
         builder.set_insert_block(b);
-        let c43 = builder.konst(abcd_ir2::Const::number(43.0));
+        let c43 = builder.konst(abcd_ir::Const::number(43.0));
         let vb = builder.emit_val(Op::LoadConst(c43));
         let _u = builder.emit_val(Op::BinaryOp {
             op: BinOp::Add,
@@ -586,10 +586,10 @@ fn layout_rejects_copies_to_non_successor() {
 
     // An extra block that is no successor of entry and no handler.
     let other = BlockId::new(module.blocks.len() as u32);
-    module.blocks.push(abcd_ir2::Block::default());
+    module.blocks.push(abcd_ir::Block::default());
     module.functions[func.index()].blocks.push(other);
-    let other_inst = abcd_ir2::InstId::new(module.insts.len() as u32);
-    module.insts.push(abcd_ir2::Inst {
+    let other_inst = abcd_ir::InstId::new(module.insts.len() as u32);
+    module.insts.push(abcd_ir::Inst {
         op: Op::Return { value: None },
         result: None,
         block: other,
@@ -642,9 +642,9 @@ fn build_condbranch_try_module() -> (Module, FuncId, BlockId, BlockId, ValueId, 
         builder.add_exceptional_predecessor(h, entry);
         let exception = builder.create_exception_param(h);
 
-        let ctrue = builder.konst(abcd_ir2::Const::Bool(true));
+        let ctrue = builder.konst(abcd_ir::Const::Bool(true));
         let cond = builder.emit_val(Op::LoadConst(ctrue));
-        let c5 = builder.konst(abcd_ir2::Const::number(5.0));
+        let c5 = builder.konst(abcd_ir::Const::number(5.0));
         v = builder.emit_val(Op::LoadConst(c5));
         builder.emit_void(Op::CondBranch {
             cond,

@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use abcd_ir2::{
+use abcd_ir::{
     BinOp, BlockId, CmpOp, Const, Edge, EdgeKind, FuncId, InstId, Module, Op, UnOp, ValueDef,
     ValueId,
 };

@@ -25,7 +25,7 @@
 
 use std::collections::HashSet;
 
-use abcd_ir2::{Const, InstId, Module, Op, ValueDef, ValueId};
+use abcd_ir::{Const, InstId, Module, Op, ValueDef, ValueId};
 
 /// The result of fusion analysis for one function.
 #[derive(Debug, Default)]
@@ -42,7 +42,7 @@ pub struct Suppression {
 /// including phi entries).
 fn use_counts(
     module: &Module,
-    blocks: &[abcd_ir2::BlockId],
+    blocks: &[abcd_ir::BlockId],
 ) -> std::collections::HashMap<ValueId, usize> {
     let mut counts: std::collections::HashMap<ValueId, usize> = std::collections::HashMap::new();
     for &bb in blocks {
@@ -105,7 +105,7 @@ fn single_use(
 }
 
 /// Compute the suppression set for one function.
-pub fn analyze(module: &Module, blocks: &[abcd_ir2::BlockId]) -> Suppression {
+pub fn analyze(module: &Module, blocks: &[abcd_ir::BlockId]) -> Suppression {
     let mut out = Suppression::default();
     let counts = use_counts(module, blocks);
 

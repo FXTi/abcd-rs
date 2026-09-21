@@ -17,7 +17,7 @@
 mod common;
 
 use abcd_file::{AccessFlags, Builder, CodeEntity, File, LiteralValue, Type};
-use abcd_ir2::{Const, FuncId, FunctionKind, Module, Op, verify_module};
+use abcd_ir::{Const, FuncId, FunctionKind, Module, Op, verify_module};
 use abcd_isa::{Bytecode, EntityId, EntityKind, Imm, Reg, encode as encode_bytecodes};
 use abcd_lift::lift_file;
 use abcd_lower::{LowerError, lower_function, to_method_body};

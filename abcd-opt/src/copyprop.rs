@@ -9,7 +9,7 @@
 //! — and folding it is sound even for handler phis, since the folded
 //! value equals every incoming value regardless of dispatch timing).
 
-use abcd_ir2::{BlockId, FuncId, InstId, Module, Op};
+use abcd_ir::{BlockId, FuncId, InstId, Module, Op};
 
 use crate::FuncPass;
 use crate::analysis::replace_uses_in_func;
@@ -64,7 +64,7 @@ fn eliminate_trivial_phis(module: &mut Module, func: FuncId) -> bool {
             };
             if let Op::Phi { entries } = &inst.op {
                 // Find the unique non-self value.
-                let mut unique: Option<abcd_ir2::ValueId> = None;
+                let mut unique: Option<abcd_ir::ValueId> = None;
                 let mut is_trivial = true;
 
                 for (_edge, val) in entries {

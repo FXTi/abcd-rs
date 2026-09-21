@@ -1,10 +1,15 @@
-//! # abcd-ir2 — SSA IR v0.2
+//! # abcd-ir — the SSA IR
 //!
-//! The v0.2 intermediate representation for ArkCompiler bytecode programs
-//! (`design/ir-v0.2.md`, background in `design/ir.md` §1–§8). This crate
-//! is the P0 scaffold: identity tables, module/function graphs, the op
-//! taxonomy, the effects table, the type lattice, and the verifier
-//! skeleton. Lift/lower live in separate crates (P1/P2).
+//! The intermediate representation for ArkCompiler bytecode programs
+//! (`design/ir-v0.2.md`, background in `design/ir.md` §1–§8): identity
+//! tables, module/function graphs, the op taxonomy, the effects table,
+//! the type lattice, and the verifier. Lift (`abcd-lift`, decode → IR),
+//! optimize (`abcd-opt`, IR → IR), and lower (`abcd-lower`, IR →
+//! bytecode) live in separate crates.
+//!
+//! This crate **is** the IR (the v2-P4 swap, 2026-09-21: the v0.1
+//! `abcd-ir` crate was deleted — git history is the archive — and
+//! `abcd-ir2` was renamed `abcd-ir`).
 //!
 //! ## Format independence (hard, structurally enforced)
 //!

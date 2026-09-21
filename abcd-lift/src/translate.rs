@@ -130,7 +130,7 @@
 use std::collections::HashMap;
 
 use abcd_file::{AccessFlags, Method, MethodBody};
-use abcd_ir2::{
+use abcd_ir::{
     BinOp, BlockId, CallKind, CmpOp, Const, ConstId, FuncId, InstId, Loc, Op, SuperCheck, SuperKey,
     Sym, Ty, UnOp, ValueDef, ValueId,
 };
@@ -241,7 +241,7 @@ impl<'l, 'f> FnLift<'l, 'f> {
     /// Push a fresh SSA value into the arena.
     pub fn new_value(&mut self, def: ValueDef, ty: Ty) -> ValueId {
         let val = ValueId::new(self.lf.module.values.len() as u32);
-        self.lf.module.values.push(abcd_ir2::Value { def, ty });
+        self.lf.module.values.push(abcd_ir::Value { def, ty });
         val
     }
 

@@ -17,7 +17,7 @@
 //! - phis are the leading [`Op::Phi`] prefix of `block.insts`, keyed by
 //!   `(Edge, value)` — the pred of an entry is `edge.from`;
 //! - exception values are first-class [`ValueDef::ExceptionParam`]
-//!   recorded on the try regions' [`Catch`](abcd_ir2::Catch) entries
+//!   recorded on the try regions' [`Catch`](abcd_ir::Catch) entries
 //!   (v0.1's `exception_values`);
 //! - frame-initial values are [`ValueDef::Const`] constants (v0.1
 //!   materialized seed instructions at the entry top); they are colored
@@ -25,7 +25,7 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use abcd_ir2::{BlockId, FuncId, Module, Op, ValueDef, ValueId};
+use abcd_ir::{BlockId, FuncId, Module, Op, ValueDef, ValueId};
 
 use crate::analysis::{self, augmented_succs};
 use crate::fusion::Suppression;
@@ -174,7 +174,7 @@ fn phi_entries(module: &Module, block: BlockId) -> Vec<(BlockId, ValueId, ValueI
 }
 
 /// Iterate a block's phi instructions (the leading [`Op::Phi`] prefix).
-fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir2::Inst)) {
+fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir::Inst)) {
     let Some(bb) = module.block(block) else {
         return;
     };
@@ -606,7 +606,7 @@ pub fn allocate_with_options(
 /// share ONE window (each fill+use sequence completes within its own
 /// instruction's selection), so the size is the max over all of them.
 fn range_call_window_size(module: &Module, rpo: &[BlockId]) -> usize {
-    use abcd_ir2::CallKind;
+    use abcd_ir::CallKind;
     let mut window = 0usize;
     for &bb in rpo {
         let Some(block) = module.block(bb) else {

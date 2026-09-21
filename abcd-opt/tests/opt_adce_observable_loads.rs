@@ -13,7 +13,7 @@
 //! design/ir-v0.2.md §4.4): write / may-throw / may-call effects make an
 //! op essential. These tests pin the end-to-end behavior (dead-result
 //! observable loads survive ADCE); the table-level coverage pin lives in
-//! abcd-ir2's effects tests (`effects_cover_v0_1_observable_loads`).
+//! abcd-ir's effects tests (`effects_cover_v0_1_observable_loads`).
 //!
 //! Vendored runtime evidence (unchanged from v0.1):
 //!
@@ -43,8 +43,8 @@
 
 mod common;
 
-use abcd_ir2::verify_module;
-use abcd_ir2::{BinOp, Const, FunctionKind, Module, Op, SuperKey, UnOp, ValueId};
+use abcd_ir::verify_module;
+use abcd_ir::{BinOp, Const, FunctionKind, Module, Op, SuperKey, UnOp, ValueId};
 use abcd_opt::FuncPass;
 use abcd_opt::dce::Adce;
 

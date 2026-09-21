@@ -1,4 +1,4 @@
-//! # abcd-opt — optimization passes for the v0.2 IR
+//! # abcd-opt — optimization passes for the SSA IR (`abcd-ir`)
 //!
 //! The v0.2 port of v0.1's `abcd-ir/src/opt` pipeline (migration P3 of
 //! `design/ir-v0.2.md`): [`peephole`] (constant folding), [`sccp`] (sparse
@@ -11,10 +11,10 @@
 //!
 //! ## Format independence (hard, structurally enforced)
 //!
-//! Every pass operates on [`abcd_ir2::Module`] alone. This crate's
-//! `Cargo.toml` declares **no dependency** on `abcd-file`, `abcd-isa`,
-//! `abcd-file-sys`, `abcd-isa-sys`, `abcd-ir`, `abcd-lift`, or
-//! `abcd-lower` (the format-coupled crates are dev-dependencies only,
+//! Every pass operates on [`abcd_ir::Module`] alone. This crate's
+//! `Cargo.toml` [dependencies] list **only** `abcd-ir` (the IR) — never
+//! `abcd-file`, `abcd-isa`, `abcd-file-sys`, `abcd-isa-sys`, `abcd-lift`,
+//! or `abcd-lower` (the format-coupled crates are dev-dependencies only,
 //! for the end-to-end regression tests) — the crate graph is the
 //! enforcement mechanism.
 //!
@@ -25,10 +25,10 @@
 //!   field terms — lift's `binary_op`/`compare` emit `left = acc`,
 //!   `right = vreg`).
 //! - **N37**: folds preserve `-0.0` (constants are bit-exact
-//!   [`Const::Number`](abcd_ir2::Const) payloads; no fold canonicalizes
+//!   [`Const::Number`](abcd_ir::Const) payloads; no fold canonicalizes
 //!   `-0.0` to `+0.0`).
 //! - **N38**: SCCP exception soundness — reachability includes
-//!   [`EdgeKind::Exceptional`](abcd_ir2::EdgeKind) edges, handler-block
+//!   [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) edges, handler-block
 //!   phis are forced to lattice Bottom, and `Eq`/`NotEq` never
 //!   ToNumber-coerce nullish operands.
 //! - **N39**: `UnOp::BitNot` (vendor `not`) is bitwise; `LogicalNot` is
@@ -41,7 +41,7 @@
 //! - **N47**: SCCP's edge seeding does not stop at `Return`/`Unreachable`
 //!   terminators — exception edges are still added.
 //! - **N48/N50**: ADCE essentiality is DERIVED from
-//!   [`Op::effects`](abcd_ir2::Op::effects) (T3) — no hand-maintained
+//!   [`Op::effects`](abcd_ir::Op::effects) (T3) — no hand-maintained
 //!   list; see [`dce`].
 //! - **N27/N28**: passes keep the module verifier-clean (no empty phis on
 //!   reachable blocks, no copyprop residue); the corpus driver re-verifies
@@ -66,7 +66,7 @@
 //! - **N63 (6 files)** — v0.1's SCCP left exception-param values at
 //!   lattice Top (the identity element), folding phis that mix a
 //!   constant with the exception object down to the constant; v0.2
-//!   resolves [`ValueDef::ExceptionParam`](abcd_ir2::ValueDef) to Bottom
+//!   resolves [`ValueDef::ExceptionParam`](abcd_ir::ValueDef) to Bottom
 //!   and keeps the phi — strictly more sound.
 //!
 //! ## Library rule
@@ -83,7 +83,7 @@ pub mod inline;
 pub mod peephole;
 pub mod sccp;
 
-use abcd_ir2::{FuncId, Module};
+use abcd_ir::{FuncId, Module};
 
 /// A function-level optimization pass (v0.1 `opt::FuncPass`).
 pub trait FuncPass {

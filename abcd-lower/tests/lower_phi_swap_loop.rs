@@ -35,7 +35,7 @@
 
 mod common;
 
-use abcd_ir2::{BinOp, CmpOp, Edge, EdgeKind, FunctionKind, Module, Op, ValueDef};
+use abcd_ir::{BinOp, CmpOp, Edge, EdgeKind, FunctionKind, Module, Op, ValueDef};
 use abcd_lower::lower_function;
 
 use common::{Halt, Machine, V2Builder};
@@ -119,7 +119,7 @@ fn phi_swap_across_loop_back_edge_executes_correctly() {
 
         // Fill the phi entries now that every value exists (same pattern as
         // the lift: emit empty phis, then set entries).
-        let normal = |from: abcd_ir2::BlockId| Edge {
+        let normal = |from: abcd_ir::BlockId| Edge {
             from,
             kind: EdgeKind::Normal,
         };

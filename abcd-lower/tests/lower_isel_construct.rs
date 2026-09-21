@@ -18,7 +18,7 @@
 
 mod common;
 
-use abcd_ir2::{CallKind, FunctionKind, Module, Op, verify_module};
+use abcd_ir::{CallKind, FunctionKind, Module, Op, verify_module};
 use abcd_isa::{Bytecode, Reg};
 use abcd_lower::lower_function;
 
@@ -26,7 +26,7 @@ use common::{Halt, Machine, V2Builder};
 
 /// Build `f(ctor) { return new ctor(1000, 1001, ..., 1000+argc-1) }` with
 /// one literal per argument.
-fn build_construct(argc: usize) -> (Module, abcd_ir2::FuncId) {
+fn build_construct(argc: usize) -> (Module, abcd_ir::FuncId) {
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "ctor", FunctionKind::Function);
     {
@@ -34,7 +34,7 @@ fn build_construct(argc: usize) -> (Module, abcd_ir2::FuncId) {
         let ctor = builder.create_param();
         let args: Vec<_> = (0..argc)
             .map(|i| {
-                let cid = builder.konst(abcd_ir2::Const::number(1000.0 + i as f64));
+                let cid = builder.konst(abcd_ir::Const::number(1000.0 + i as f64));
                 builder.emit_val(Op::LoadConst(cid))
             })
             .collect();

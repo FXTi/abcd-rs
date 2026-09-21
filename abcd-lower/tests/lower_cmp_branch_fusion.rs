@@ -16,7 +16,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use abcd_ir2::{BinOp, Catch, CmpOp, FunctionKind, Module, Op, TryRegion, UnOp, ValueId};
+use abcd_ir::{BinOp, Catch, CmpOp, FunctionKind, Module, Op, TryRegion, UnOp, ValueId};
 use abcd_isa::Bytecode;
 use abcd_lower::regalloc::{self, RegAlloc, RegSlot};
 use abcd_lower::{fusion, isel, layout, lower_function};
@@ -32,7 +32,7 @@ const THEN: i64 = 111;
 /// sentinels. `customize` runs between the comparison and the terminator.
 struct FusionShape {
     module: Module,
-    func: abcd_ir2::FuncId,
+    func: abcd_ir::FuncId,
     a: ValueId,
     b: ValueId,
     cmp: ValueId,
@@ -55,9 +55,9 @@ fn build_fusion_shape(
         entry = builder.entry();
         // b defined first so its (register) store precedes a's definition;
         // a == b == 7 makes the Eq comparison true.
-        let c7a = builder.konst(abcd_ir2::Const::number(7.0));
+        let c7a = builder.konst(abcd_ir::Const::number(7.0));
         b = builder.emit_val(Op::LoadConst(c7a));
-        let c7b = builder.konst(abcd_ir2::Const::number(7.0));
+        let c7b = builder.konst(abcd_ir::Const::number(7.0));
         a = builder.emit_val(Op::LoadConst(c7b));
         cmp = builder.emit_val(Op::Compare {
             op: CmpOp::Eq,
@@ -79,13 +79,13 @@ fn build_fusion_shape(
             false_dest: else_bb,
         });
         builder.set_insert_block(then_bb);
-        let ct = builder.konst(abcd_ir2::Const::number(111.0));
+        let ct = builder.konst(abcd_ir::Const::number(111.0));
         then_ret = builder.emit_val(Op::LoadConst(ct));
         builder.emit_void(Op::Return {
             value: Some(then_ret),
         });
         builder.set_insert_block(else_bb);
-        let ce = builder.konst(abcd_ir2::Const::number(222.0));
+        let ce = builder.konst(abcd_ir::Const::number(222.0));
         else_ret = builder.emit_val(Op::LoadConst(ce));
         builder.emit_void(Op::Return {
             value: Some(else_ret),
@@ -134,7 +134,7 @@ fn fusion_rejected_when_intervening_instruction_reuses_operand_slot() {
         // d lands in R0 = right's slot (hand-pinned below), AFTER the
         // comparison: a slot-reuse window the fused re-read must not cross.
         // d is used by a global store so the acc-as-cache model homes it.
-        let cd = builder.konst(abcd_ir2::Const::number(99.0));
+        let cd = builder.konst(abcd_ir::Const::number(99.0));
         let d = builder.emit_val(Op::LoadConst(cd));
         let gd = builder.sym("gd");
         builder.emit_void(Op::StoreGlobal { name: gd, value: d });
@@ -270,11 +270,11 @@ fn try_handler_values_interfere_across_the_exception_edge() {
         let mut builder = V2Builder::new(&mut module, func);
         entry = builder.entry();
         // Try body: two definitions the handler will read, then a throw.
-        let c30 = builder.konst(abcd_ir2::Const::number(30.0));
+        let c30 = builder.konst(abcd_ir::Const::number(30.0));
         s1 = builder.emit_val(Op::LoadConst(c30));
-        let c12 = builder.konst(abcd_ir2::Const::number(12.0));
+        let c12 = builder.konst(abcd_ir::Const::number(12.0));
         s2 = builder.emit_val(Op::LoadConst(c12));
-        let c1 = builder.konst(abcd_ir2::Const::number(1.0));
+        let c1 = builder.konst(abcd_ir::Const::number(1.0));
         let x = builder.emit_val(Op::LoadConst(c1));
         builder.emit_void(Op::Throw { value: x });
         builder.emit_void(Op::Unreachable);

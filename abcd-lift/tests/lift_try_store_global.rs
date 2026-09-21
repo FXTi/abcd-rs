@@ -7,15 +7,15 @@
 //! `trystglobalbyname`).
 
 use abcd_file::{AccessFlags, Builder, CodeEntity, Type, decode};
-use abcd_ir2::Op;
+use abcd_ir::Op;
 use abcd_isa::{Bytecode, EntityId, Imm, Reg, encode as encode_bytecodes};
 use abcd_lift::lift_file;
 
 /// Placeholder entity id wired later via `relocate_code_id`.
 const PLACEHOLDER: EntityId = EntityId(u16::MAX as u32);
 
-fn verify_clean(m: &abcd_ir2::Module) {
-    let report = abcd_ir2::verify_module(m);
+fn verify_clean(m: &abcd_ir::Module) {
+    let report = abcd_ir::verify_module(m);
     assert!(
         report.errors.is_empty(),
         "verifier errors: {:?}",
@@ -43,7 +43,7 @@ fn build(make: impl FnOnce(EntityId) -> Bytecode) -> abcd_file::File {
     decode(&b.finalize().unwrap()).unwrap()
 }
 
-fn ops(m: &abcd_ir2::Module) -> Vec<&Op> {
+fn ops(m: &abcd_ir::Module) -> Vec<&Op> {
     m.insts.iter().map(|i| &i.op).collect()
 }
 

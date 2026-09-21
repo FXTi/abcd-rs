@@ -32,8 +32,8 @@
 mod common;
 
 use abcd_file::{AccessFlags, Builder, File, Type};
-use abcd_ir2::verify_module;
-use abcd_ir2::{
+use abcd_ir::verify_module;
+use abcd_ir::{
     BlockId, CallKind, Const, Edge, EdgeKind, FuncId, FunctionKind, Module, Op, ValueId,
 };
 use abcd_isa::{Bytecode, Label, Reg, encode as encode_bytecodes};
@@ -69,11 +69,11 @@ fn build_namespace_shape() -> (Module, FuncId, BlockId, BlockId, BlockId, ValueI
         let v_8 = b.emit_val(Op::LoadConst(undefined));
         let v_9 = b.emit_number(1.0);
         let v_10 = b.emit_val(Op::UnaryOp {
-            op: abcd_ir2::UnOp::IsTrue,
+            op: abcd_ir::UnOp::IsTrue,
             operand: v_8,
         });
         let v_11 = b.emit_val(Op::UnaryOp {
-            op: abcd_ir2::UnOp::IsTrue,
+            op: abcd_ir::UnOp::IsTrue,
             operand: v_10,
         });
         b.emit_void(Op::CondBranch {

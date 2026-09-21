@@ -12,15 +12,15 @@
 //! `CreateArrayWithBuffer` — abcd-ir/src/lift/translate.rs:1822).
 
 use abcd_file::{AccessFlags, Builder, CodeEntity, Type, decode};
-use abcd_ir2::{Const, Op};
+use abcd_ir::{Const, Op};
 use abcd_isa::{Bytecode, EntityId, Imm, encode as encode_bytecodes};
 use abcd_lift::lift_file;
 
 /// Placeholder entity id wired later via `relocate_code_id`.
 const PLACEHOLDER: EntityId = EntityId(u16::MAX as u32);
 
-fn verify_clean(m: &abcd_ir2::Module) {
-    let report = abcd_ir2::verify_module(m);
+fn verify_clean(m: &abcd_ir::Module) {
+    let report = abcd_ir::verify_module(m);
     assert!(
         report.errors.is_empty(),
         "verifier errors: {:?}",

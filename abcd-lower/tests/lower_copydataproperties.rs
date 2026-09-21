@@ -10,7 +10,7 @@
 
 mod common;
 
-use abcd_ir2::{FunctionKind, Module, Op, verify_module};
+use abcd_ir::{FunctionKind, Module, Op, verify_module};
 use abcd_isa::Bytecode;
 use abcd_lower::lower_function;
 
@@ -21,7 +21,7 @@ const SRC: i64 = 222; // source object sentinel
 
 /// Build a two-parameter function `f(dst, src)` whose body is a single
 /// `CopyDataProps { dst, src }` followed by `return undefined`.
-fn build_spread_function() -> (Module, abcd_ir2::FuncId) {
+fn build_spread_function() -> (Module, abcd_ir::FuncId) {
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "spread", FunctionKind::Function);
     {

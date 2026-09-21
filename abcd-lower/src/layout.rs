@@ -21,13 +21,13 @@
 //! copies keyed to a block that is neither a terminator successor nor a
 //! catch handler of the predecessor are [`LowerError::InconsistentEdgeCopies`].
 //! v0.2 note: the exception-edge set comes from the function's structured
-//! [`TryRegion`](abcd_ir2::TryRegion)s — the same information v0.2
-//! materializes as [`EdgeKind::Exceptional`](abcd_ir2::EdgeKind) preds.
+//! [`TryRegion`](abcd_ir::TryRegion)s — the same information v0.2
+//! materializes as [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) preds.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use abcd_file::TryBlock;
-use abcd_ir2::{BlockId, FuncId, Module, Op};
+use abcd_ir::{BlockId, FuncId, Module, Op};
 use abcd_isa::{Bytecode, EntityKind, Label};
 
 use crate::LowerError;

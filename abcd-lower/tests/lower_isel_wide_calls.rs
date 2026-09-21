@@ -17,7 +17,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use abcd_ir2::{BinOp, CallKind, FunctionKind, Module, Op};
+use abcd_ir::{BinOp, CallKind, FunctionKind, Module, Op};
 use abcd_isa::{Bytecode, Reg};
 use abcd_lower::regalloc::{self, RegAlloc, RegSlot};
 use abcd_lower::{LowerError, fusion, isel, lower_function};
@@ -26,7 +26,7 @@ use common::{Halt, Machine, V2Builder};
 
 /// Build `f(callee) { return callee(0, 1, ..., argc-1) }` with one literal
 /// per argument.
-fn build_const_arg_call(argc: usize) -> (Module, abcd_ir2::FuncId) {
+fn build_const_arg_call(argc: usize) -> (Module, abcd_ir::FuncId) {
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "wide", FunctionKind::Function);
     {
@@ -34,7 +34,7 @@ fn build_const_arg_call(argc: usize) -> (Module, abcd_ir2::FuncId) {
         let callee = builder.create_param();
         let args: Vec<_> = (0..argc)
             .map(|i| {
-                let cid = builder.konst(abcd_ir2::Const::number(i as f64));
+                let cid = builder.konst(abcd_ir::Const::number(i as f64));
                 builder.emit_val(Op::LoadConst(cid))
             })
             .collect();
@@ -123,9 +123,9 @@ fn high_register_store_and_reload_routes_through_low_scratch() {
     {
         let mut builder = V2Builder::new(&mut module, func);
         p = builder.create_param();
-        let cs = builder.konst(abcd_ir2::Const::number(40.0));
+        let cs = builder.konst(abcd_ir::Const::number(40.0));
         s = builder.emit_val(Op::LoadConst(cs));
-        let ct = builder.konst(abcd_ir2::Const::number(2.0));
+        let ct = builder.konst(abcd_ir::Const::number(2.0));
         t = builder.emit_val(Op::LoadConst(ct));
         r = builder.emit_val(Op::BinaryOp {
             op: BinOp::Add,
@@ -217,7 +217,7 @@ fn five_arg_call_keeps_narrow_callrange_with_window_copies() {
         // Creation order is the REVERSE of the call order.
         let lits: Vec<_> = (0..5)
             .map(|i| {
-                let cid = builder.konst(abcd_ir2::Const::number(100.0 + i as f64));
+                let cid = builder.konst(abcd_ir::Const::number(100.0 + i as f64));
                 builder.emit_val(Op::LoadConst(cid))
             })
             .collect();

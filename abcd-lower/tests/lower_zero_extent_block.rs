@@ -14,7 +14,7 @@
 
 mod common;
 
-use abcd_ir2::{FunctionKind, Module, Op};
+use abcd_ir::{FunctionKind, Module, Op};
 use abcd_lower::{LowerError, lower_function};
 
 use common::V2Builder;
@@ -30,8 +30,8 @@ fn zero_emission_block_is_a_hard_error() {
         // bytecodes at isel. Unreachable in the terminator-successor model
         // but still laid out (compute_rpo appends unreachable blocks).
         dead = builder.create_block();
-        let cid = builder.konst(abcd_ir2::Const::number(1.0));
-        let x = builder.emit_val(abcd_ir2::Op::LoadConst(cid));
+        let cid = builder.konst(abcd_ir::Const::number(1.0));
+        let x = builder.emit_val(abcd_ir::Op::LoadConst(cid));
         builder.emit_void(Op::Return { value: Some(x) });
     }
     let err =

@@ -1,14 +1,14 @@
 //! D2 inline rewrite — end-to-end tests: real bytecode files →
 //! `abcd_lift::lift_file` → `abcd_opt::inline::inline_module` →
-//! `abcd_ir2::verify_module` → `abcd_lower::lower_function` → the
+//! `abcd_ir::verify_module` → `abcd_lower::lower_function` → the
 //! deterministic simulator, with the inline-OFF run as the behavioral
 //! oracle (inlining must not change observable behavior).
 
 mod common;
 
 use abcd_file::{AccessFlags, Builder, CatchBlockDef, File, Type};
-use abcd_ir2::verify_module;
-use abcd_ir2::{FuncId, Module};
+use abcd_ir::verify_module;
+use abcd_ir::{FuncId, Module};
 use abcd_isa::{Bytecode, EntityId, Imm, Label, Reg, encode as encode_bytecodes};
 use abcd_lift::lift_file;
 use abcd_lower::lower_function;

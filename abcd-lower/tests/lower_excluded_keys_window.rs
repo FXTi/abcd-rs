@@ -22,7 +22,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use abcd_ir2::{CallKind, FunctionKind, Module, Op, verify_module};
+use abcd_ir::{CallKind, FunctionKind, Module, Op, verify_module};
 use abcd_isa::Bytecode;
 use abcd_lower::regalloc::{self, RegAlloc, RegSlot};
 use abcd_lower::{fusion, isel, lower_function};
@@ -31,16 +31,16 @@ use common::{Halt, Machine, V2Builder};
 
 /// `f() { createobjectwithexcludedkeys obj, [keys...]; return }` with
 /// literal-number keys carrying the sentinels `key_base + i`.
-fn build_excluded_keys(n_keys: usize, key_base: i64) -> (Module, abcd_ir2::FuncId) {
+fn build_excluded_keys(n_keys: usize, key_base: i64) -> (Module, abcd_ir::FuncId) {
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
     {
         let mut builder = V2Builder::new(&mut module, func);
-        let cobj = builder.konst(abcd_ir2::Const::number(0x0b1 as f64));
+        let cobj = builder.konst(abcd_ir::Const::number(0x0b1 as f64));
         let obj = builder.emit_val(Op::LoadConst(cobj));
         let keys: Vec<_> = (0..n_keys)
             .map(|i| {
-                let cid = builder.konst(abcd_ir2::Const::number((key_base + i as i64) as f64));
+                let cid = builder.konst(abcd_ir::Const::number((key_base + i as i64) as f64));
                 builder.emit_val(Op::LoadConst(cid))
             })
             .collect();
@@ -127,11 +127,11 @@ fn window_is_shared_with_range_calls() {
     let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
     {
         let mut builder = V2Builder::new(&mut module, func);
-        let cc = builder.konst(abcd_ir2::Const::number(0xca11 as f64));
+        let cc = builder.konst(abcd_ir::Const::number(0xca11 as f64));
         let callee = builder.emit_val(Op::LoadConst(cc));
         let args: Vec<_> = (0..5)
             .map(|i| {
-                let cid = builder.konst(abcd_ir2::Const::number((0xa00 + i) as f64));
+                let cid = builder.konst(abcd_ir::Const::number((0xa00 + i) as f64));
                 builder.emit_val(Op::LoadConst(cid))
             })
             .collect();
@@ -141,11 +141,11 @@ fn window_is_shared_with_range_calls() {
             args,
             kind: CallKind::Dynamic,
         });
-        let cobj = builder.konst(abcd_ir2::Const::number(0x0b1 as f64));
+        let cobj = builder.konst(abcd_ir::Const::number(0x0b1 as f64));
         let obj = builder.emit_val(Op::LoadConst(cobj));
         let keys: Vec<_> = (0..3)
             .map(|i| {
-                let cid = builder.konst(abcd_ir2::Const::number((0xce1 + i) as f64));
+                let cid = builder.konst(abcd_ir::Const::number((0xce1 + i) as f64));
                 builder.emit_val(Op::LoadConst(cid))
             })
             .collect();

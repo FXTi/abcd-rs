@@ -98,7 +98,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use abcd_file::File;
-use abcd_ir2::{FuncId, Module, verify_module};
+use abcd_ir::{FuncId, Module, verify_module};
 use abcd_lift::lift_file;
 use abcd_lower::{LowerError, LowerOptions, lower_function_with_options, to_method_body};
 use abcd_opt::inline::{InlinePolicy, InlineReport, inline_module};

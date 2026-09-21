@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use abcd_ir2::{
+use abcd_ir::{
     BinOp, BlockId, CallKind, CmpOp, Const, ConstId, FuncId, InstId, Module, Op, SuperCheck,
     SuperKey, Sym, UnOp, ValueDef, ValueId,
 };
@@ -162,7 +162,7 @@ enum AccContent {
 /// `Mov`s (vendor `acc: none`) and never perturb the content across an
 /// edge, so per-predecessor exit states are valid at successor entries.
 fn meet_acc_content<'a>(
-    preds: impl IntoIterator<Item = &'a abcd_ir2::Edge>,
+    preds: impl IntoIterator<Item = &'a abcd_ir::Edge>,
     exit_states: &HashMap<BlockId, AccContent>,
 ) -> AccContent {
     let mut meet: Option<AccContent> = None;
@@ -789,7 +789,7 @@ fn fused_definefunc_body(module: &Module, v: ValueId, suppression: &Suppression)
 /// `throw.ifnotobject`) leave the tracker untouched.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn select_inst(
-    node: &abcd_ir2::Inst,
+    node: &abcd_ir::Inst,
     inst: InstId,
     block_insts: &[InstId],
     func_id: FuncId,
@@ -2219,7 +2219,7 @@ mod tests {
         AccContent, LowerError, RegAlloc, RegSlot, ensure_acc, home_result, materialize_operands,
         val_reg,
     };
-    use abcd_ir2::{FuncId, ValueId};
+    use abcd_ir::{FuncId, ValueId};
     use abcd_isa::{Bytecode, Reg};
     use std::collections::{HashMap, HashSet};
 
