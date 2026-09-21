@@ -414,11 +414,20 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   101 suites/462 tests green, three driver variants byte-identical to
   accepted baselines, v2opt oracle 1149/1149. The v0.2 stack IS the
   project now: abcd-lift -> abcd-ir -> abcd-opt -> abcd-lower.
-  NEXT: v2-P5 — maintainer ruled TWO crates (2026-09-21):
-  abcd-dataflow (infra: callgraph/IFDS/heap-model-v0 alloc-site-keyed
-  with strong/weak updates + access paths + precision-ladder doc) then
-  abcd-taint (app: source/sink config + top-20 builtin summaries +
-  print-sink smoke). Dispatched as v2-P5a then v2-P5b.
+  NEXT: v2-P5 — maintainer ruled (2026-09-21, two rounds): infra crate
+  is **abcd-analysis** (NOT abcd-dataflow) with modules control/
+  (RPO/succs/dominators/loops/regions — lower's analysis.rs migrates
+  in, byte-identity-gated), dataflow/ (monotone framework, use-def,
+  IFDS skeleton, heap-model-v0 alloc-site-keyed with strong/weak
+  updates + precision-ladder doc), callgraph/ (on-the-fly). abcd-taint
+  stays the app crate (source/sink config + top-20 summaries + smoke).
+  abcd-ir::verify keeps its private minimal dominators (layering) +
+  corpus agreement test. P5 FROZEN pending the FlowDroid study
+  (pointer-analysis ruling); dispatched as v2-P5a/P5b after it.
+  DECOMPILE TRACK registered (abcd-decompile, d-P0..d-P4): d-P0
+  planning doc in flight; gen1 history: initial commit 5de5ab9 was a
+  decompiler (abcd-decompiler+abcd-cli), dropped at 1a8e3f4 (2nd gen),
+  archive deleted f045e4a — git history only.
   v2-P3b DONE (2026-09-21): inline rewritten on the v0.2 IR (D2=YES).
   N44 killed by construction (fresh-arena clone, vendored frame-slot
   param model [func][newTarget][this][formals...] with callType bits /
