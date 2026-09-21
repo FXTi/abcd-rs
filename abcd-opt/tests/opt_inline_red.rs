@@ -129,7 +129,9 @@ fn build_n44_probe() -> (Module, FuncId, FuncId, BlockId, BlockId, BlockId) {
         // h: catch-all handler of the region protecting b_call.
         b.set_insert_block(h);
         let caught = b.emit_number(777.0);
-        b.emit_void(Op::Return { value: Some(caught) });
+        b.emit_void(Op::Return {
+            value: Some(caught),
+        });
         b.add_try(vec![b_call], h);
     }
 
@@ -191,14 +193,16 @@ fn naive_inline(module: &mut Module, caller: FuncId, callee: FuncId) {
     // Split branch into the callee entry (no loc — glue).
     let br = abcd_ir2::InstId::new(module.insts.len() as u32);
     module.insts.push(abcd_ir2::Inst {
-        op: Op::Branch {
-            dest: callee_entry,
-        },
+        op: Op::Branch { dest: callee_entry },
         result: None,
         block: call_block,
         loc: None,
     });
-    module.block_mut(call_block).unwrap().insts.truncate(call_pos);
+    module
+        .block_mut(call_block)
+        .unwrap()
+        .insts
+        .truncate(call_pos);
     module.block_mut(call_block).unwrap().insts.push(br);
 
     // DEFECT 3 (try regions lost): drop the caller's try regions while
@@ -273,10 +277,10 @@ fn naive_inline_produces_module_invalid_ir() {
     // DEFECT 3 — try regions lost: the handler keeps Exceptional preds
     // no region dispatches to.
     assert!(
-        report.errors.iter().any(|e| matches!(
-            e.kind,
-            VerifyErrorKind::ExceptionalPredWithoutRegion(_)
-        )),
+        report
+            .errors
+            .iter()
+            .any(|e| matches!(e.kind, VerifyErrorKind::ExceptionalPredWithoutRegion(_))),
         "expected the lost-try-region defect (ExceptionalPredWithoutRegion): {kinds:?}"
     );
 }
