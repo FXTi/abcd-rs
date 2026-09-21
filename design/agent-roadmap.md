@@ -258,7 +258,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | v2-P2a | N56 诊断（Builder module-blob staging 疑似损坏）：最小复现+定责+修复 sketch，**只读不落 commit** | worker v2-P2a (k3) | **完成**（2026-09-20：7 变体复现 + 对照实验证伪 bridge staging 假设，真根因=decode 臂顺序；orchestrator 落地修复 c79220d，见 N56 行） |
 | v2-P2c | N57-N61 落地：abcd-ir2 补 CallKind::Apply/SuperSpread/SuperForwardAllArgs + AllocArray + StoreOwnProp 族 + TryStoreGlobal，abcd-lift 解除 5 处折叠，compare.rs 分歧表同步 | worker v2-P2c (k3) | **完成**（55c989b/894f573/b3be74b/73e0d05/9425e73；每项带合成体测试 + 真实 fixture pre/post 证据；对照器五区分改精确比较，唯一残余折叠 SuperForwardAllArgs→super 系 v0.1 自身表示所限、文档化；orchestrator 独立复验：fmt 净、ir2+lift 59 测试绿、parity 2787/0 mismatch、workspace 132 套件全 ok——P2 已同步集成全部新 op 含 TryStoreGlobal 臂） |
 | v2-P2b | N53（建模 SendableClass）+ N54（deprecated.defineclasswithbuffer 双 lifter 硬错误）+ N55（decode debug "" 捏造修复） | worker v2-P2b (k3) | **完成**（e1d87fe/9159e9a/279b6cc；中途 5h 限额打断一次，恢复零丢失；orchestrator 独立复验：fmt 净、workspace 143 套件全 ok 零 warning、parity 2787/0、corpus_verify+opt_verify 绿；N53 sendable 证据=ark_disasm pre/post；N55 第二半程坐实静默 debug 丢失→硬错误） |
-| v2-P3 | pass 移植：SCCP/copyprop/DCE/peephole（T3 Effects 表），opt 变体 oracle 对齐 | 待定 | 未开始 |
+| v2-P3 | pass 移植：SCCP/copyprop/DCE/peephole（T3 Effects 表），opt 变体 oracle 对齐 | worker v2-P3 (k3) | **进行中**（2026-09-21 启动；新 crate abcd-opt，inline 不移植=D2 未定；门禁=opt 变体 oracle 1149/1149 + 与 v0.1 opt 重写字节恒等（预期差集⊆N62 53 且须精确归因）+ 确定性 + N36-N42/N47/N48/N50 全部回归移植） |
 | v2-P4 | 替换：v0.1 退役为 abcd-ir-v1 留档，abcd-ir2 正名 abcd-ir | 待定 | 未开始（维护者验收后执行） |
 | v2-P5 | abcd-taint 脚手架：调用图 + IFDS 骨架 + top-20 builtin 摘要注册，语料 print sink 冒烟 | 待定 | 未开始 |
 
