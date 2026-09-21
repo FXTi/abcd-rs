@@ -424,6 +424,17 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   abcd-ir::verify keeps its private minimal dominators (layering) +
   corpus agreement test. P5 FROZEN pending the FlowDroid study
   (pointer-analysis ruling); dispatched as v2-P5a/P5b after it.
+   Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
+   right"): infra/app split generalizes — abcd-analysis stays
+   domain-neutral; every DOMAIN app is its own crate (taint=security:
+   summaries/source-sink config/report cadence; decompile=source
+   recovery: pretty-printer/name legalization). Existing pipeline
+   crates are consumers too (lower=control analyses, opt=use-def
+   commodity). FlowDroid precedent: heros/soot-infoflow/FlowDroid =
+   our abcd-analysis/abcd-taint/(no driver). Our IR's mechanical
+   Effects keep flow functions thin, dodging soot-infoflow's
+   engine-bloat failure mode. Crate split is trivially reversible
+   (module->crate later); the reverse is not.
   DECOMPILE TRACK registered (abcd-decompile, d-P0..d-P4): d-P0
   planning doc in flight; gen1 history: initial commit 5de5ab9 was a
   decompiler (abcd-decompiler+abcd-cli), dropped at 1a8e3f4 (2nd gen),
