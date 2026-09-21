@@ -24,6 +24,27 @@ pub use layout::LayoutResult;
 pub use method_body::to_method_body;
 pub use regalloc::RegAlloc;
 
+/// Lowering options (the default is the v0.1-LIFT-faithful behavior).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LowerOptions {
+    /// Prune frame-initial constants (v0.1's entry-top seed literals)
+    /// that have no operand use left in the function.
+    ///
+    /// The two v0.1 pipeline variants differ here and the v0.2 IR cannot
+    /// represent the difference on its own: v0.1's lift seeds the
+    /// frame-initial undefined/hole as entry-top INSTRUCTIONS (emitted
+    /// unconditionally at lower, even when a discarded operand read left
+    /// them unused), while v0.1's optimizer sweeps an unused seed
+    /// instruction with ADCE. v0.2's seeds are instruction-less
+    /// [`ValueDef::Const`](abcd_ir2::ValueDef) values (design/ir-v0.2.md
+    /// §5.1), so there is no instruction for a pass to sweep — the
+    /// lowering must skip the materialization instead. Set this when
+    /// lowering an OPTIMIZED module (abcd-opt's output): it reproduces
+    /// v0.1-opt's byte stream. Leave it clear for lift output (it would
+    /// otherwise drop the unused seed loads v0.1-lift emits).
+    pub prune_unused_frame_init_consts: bool,
+}
+
 /// Errors that can occur during lowering.
 #[derive(Debug, thiserror::Error)]
 pub enum LowerError {
@@ -161,8 +182,18 @@ pub enum LowerError {
     },
 }
 
-/// Lower a single IR function back to bytecodes.
+/// Lower a single IR function back to bytecodes (default options —
+/// v0.1-lift-faithful; see [`LowerOptions`]).
 pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, LowerError> {
+    lower_function_with_options(module, func_id, LowerOptions::default())
+}
+
+/// Lower a single IR function back to bytecodes with explicit options.
+pub fn lower_function_with_options(
+    module: &Module,
+    func_id: FuncId,
+    options: LowerOptions,
+) -> Result<LayoutResult, LowerError> {
     let func = module
         .func(func_id)
         .ok_or(LowerError::EmptyFunction(func_id))?;
@@ -181,20 +212,25 @@ pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, 
     let suppression = fusion::analyze(module, &func.blocks);
 
     // Step 1: Register allocation.
-    let alloc = regalloc::allocate(module, func_id, &suppression).map_err(|e| match e {
-        regalloc::RegAllocError::RegisterOverflow => LowerError::RegisterOverflow(func_id),
-        regalloc::RegAllocError::WindowBaseOverflow => LowerError::CallWindowOverflow(func_id),
-        regalloc::RegAllocError::HandlerPhiSlotConflict => LowerError::HandlerPhiConflict(func_id),
-        regalloc::RegAllocError::HandlerPhiUncoalesced => {
-            LowerError::HandlerPhiUncoalesced(func_id)
-        }
-    })?;
+    let alloc = regalloc::allocate_with_options(module, func_id, &suppression, options).map_err(
+        |e| match e {
+            regalloc::RegAllocError::RegisterOverflow => LowerError::RegisterOverflow(func_id),
+            regalloc::RegAllocError::WindowBaseOverflow => LowerError::CallWindowOverflow(func_id),
+            regalloc::RegAllocError::HandlerPhiSlotConflict => {
+                LowerError::HandlerPhiConflict(func_id)
+            }
+            regalloc::RegAllocError::HandlerPhiUncoalesced => {
+                LowerError::HandlerPhiUncoalesced(func_id)
+            }
+        },
+    )?;
 
     // Step 2: Compute RPO (reuse from regalloc).
     let rpo = regalloc::compute_rpo(module, func_id);
 
     // Step 3: Instruction selection.
-    let isel_result = isel::select(module, func_id, &alloc, &rpo, &suppression)?;
+    let isel_result =
+        isel::select_with_options(module, func_id, &alloc, &rpo, &suppression, options)?;
     if let Some(message) = isel_result.unsupported.clone() {
         return Err(LowerError::UnsupportedInstruction {
             func: func_id,

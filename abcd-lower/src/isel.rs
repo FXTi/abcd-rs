@@ -188,6 +188,25 @@ pub fn select(
     rpo: &[BlockId],
     suppression: &Suppression,
 ) -> Result<IselResult, LowerError> {
+    select_with_options(
+        module,
+        func_id,
+        alloc,
+        rpo,
+        suppression,
+        crate::LowerOptions::default(),
+    )
+}
+
+/// [`select`] with explicit [`crate::LowerOptions`].
+pub fn select_with_options(
+    module: &Module,
+    func_id: FuncId,
+    alloc: &RegAlloc,
+    rpo: &[BlockId],
+    suppression: &Suppression,
+    options: crate::LowerOptions,
+) -> Result<IselResult, LowerError> {
     let mut block_codes: Vec<(BlockId, Vec<Bytecode>)> = Vec::new();
     let mut ic = IcAllocator::new();
     let mut tracer = EntityTracer {
@@ -247,11 +266,13 @@ pub fn select(
     // Frame-initial constants owned by this function (v0.1's entry-top
     // seed literals), materialized at the entry block top, LATER-CREATED
     // FIRST — v0.1 inserted each new seed at entry index 0, so the entry
-    // block began with the seeds in reverse creation order. UNUSED seeds
-    // are materialized too: v0.1 emits the seed's load unconditionally
-    // (only the `Sta` is use-gated) and an unused seed's load leaves the
-    // acc tracker `Unknown`.
-    let mut entry_consts = regalloc::frame_init_consts(module, func_id);
+    // block began with the seeds in reverse creation order. The set is
+    // option-gated (`LowerOptions::prune_unused_frame_init_consts` — see
+    // `frame_init_consts`): lift parity keeps unused seeds' loads (v0.1
+    // emits the seed's load unconditionally, only the `Sta` use-gated);
+    // opt parity drops seeds whose last use the optimizer deleted.
+    let mut entry_consts =
+        regalloc::frame_init_consts(module, func_id, options.prune_unused_frame_init_consts);
     entry_consts.sort_unstable_by(|a, b| b.cmp(a)); // descending id = reverse creation
 
     // N21 pinned stores for handler-block phis, grouped by emission point.
@@ -353,9 +374,10 @@ pub fn select(
         // Frame-initial constants (v0.1's entry-top seed literals), at the
         // head of the entry block's instruction stream — after the pinned
         // stores, exactly where v0.1's seed instructions sat. The load is
-        // unconditional (v0.1 emits it for unused seeds too); the homing
-        // `Sta` is use-gated, and an unused seed's acc write leaves the
-        // tracker `Unknown` (v0.1's `home_result` semantics).
+        // unconditional for every seed in `entry_consts` (the option gate
+        // — see `frame_init_consts` — decides which seeds are in the set;
+        // the homing `Sta` is use-gated, and an unused seed's acc write
+        // leaves the tracker `Unknown`, v0.1's `home_result` semantics).
         if bb == entry_block {
             for &cval in &entry_consts {
                 let Some(ValueDef::Const(cid)) = module.value(cval).map(|v| v.def) else {

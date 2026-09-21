@@ -188,8 +188,24 @@ fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir2::In
 }
 
 /// The frame-initial constant values owned by `func_id` — v0.1's
-/// entry-top seed literals, including UNUSED ones (v0.1 colors them and
-/// emits their loads unconditionally; only the `Sta` is use-gated).
+/// entry-top seed literals.
+///
+/// `used_only` selects between the two v0.1 pipeline variants'
+/// behaviors, and is what makes ONE implementation byte-faithful to
+/// both:
+///
+/// - `false` (lift parity): include UNUSED constants. v0.1's lift
+///   creates the seed as an entry-top instruction and its lower emits
+///   the seed's load unconditionally (only the homing `Sta` is
+///   use-gated). Lift creates seeds lazily but a DISCARDED operand read
+///   can leave one unused, so unused seeds do occur at lift.
+/// - `true` (opt parity): only constants with at least one operand use
+///   in the function's instructions. v0.1's optimizer sweeps the seed
+///   instruction with ADCE once its last use is gone; the v0.2 seed is
+///   an instruction-less `ValueDef::Const` value, so nothing remains to
+///   sweep and the lower must skip it instead. (Post-pipeline, dead
+///   instructions are swept, so "used by any instruction" is exactly
+///   "used by a live instruction" — ADCE's survival criterion.)
 ///
 /// v0.2's `ValueDef::Const` values carry no owning-function back-pointer,
 /// but the lift creates values function-by-function in function-table
@@ -203,7 +219,28 @@ fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir2::In
 /// value (before any anchor) sorts into the previous function's range —
 /// the only placement ambiguity the id ranges cannot resolve; v0.1 would
 /// place it in the owning function. Never observed in the corpus.
-pub fn frame_init_consts(module: &Module, func_id: FuncId) -> Vec<ValueId> {
+pub fn frame_init_consts(module: &Module, func_id: FuncId, used_only: bool) -> Vec<ValueId> {
+    // The use gate (opt parity): constants with at least one operand use
+    // in the owning function (phi entries are operands). Fusion
+    // suppression never hides a frame-initial const's use: suppressed
+    // instructions are the fused-away LoadConst/constant-index producers,
+    // which carry no SSA operands of their own.
+    let mut used: HashSet<ValueId> = HashSet::new();
+    if used_only {
+        if let Some(func) = module.func(func_id) {
+            for &bb in &func.blocks {
+                let Some(block) = module.block(bb) else {
+                    continue;
+                };
+                for &iid in &block.insts {
+                    if let Some(inst) = module.inst(iid) {
+                        used.extend(inst.op.operands());
+                    }
+                }
+            }
+        }
+    }
+
     // Each function's anchor minimum, in function-table order.
     let mut starts: Vec<(FuncId, u32)> = Vec::new();
     for (i, f) in module.functions.iter().enumerate() {
@@ -238,7 +275,7 @@ pub fn frame_init_consts(module: &Module, func_id: FuncId) -> Vec<ValueId> {
         let id = vid as u32;
         // The owning function: the last one whose anchor minimum is <= id.
         if let Some((owner, _)) = starts.iter().rev().find(|(_, lo)| *lo <= id) {
-            if *owner == func_id {
+            if *owner == func_id && (!used_only || used.contains(&ValueId::new(id))) {
                 out.push(ValueId::new(id));
             }
         }
@@ -251,10 +288,22 @@ pub fn frame_init_consts(module: &Module, func_id: FuncId) -> Vec<ValueId> {
 /// `suppression` (fusion analysis) names the v0.2-expansion values that
 /// must be invisible to allocation — v0.1's allocator never saw them,
 /// and coloring them would drift every other value's home.
+///
+/// Default options (v0.1-lift-faithful); see [`crate::LowerOptions`].
 pub fn allocate(
     module: &Module,
     func_id: FuncId,
     suppression: &Suppression,
+) -> Result<RegAlloc, RegAllocError> {
+    allocate_with_options(module, func_id, suppression, crate::LowerOptions::default())
+}
+
+/// [`allocate`] with explicit [`crate::LowerOptions`].
+pub fn allocate_with_options(
+    module: &Module,
+    func_id: FuncId,
+    suppression: &Suppression,
+    options: crate::LowerOptions,
 ) -> Result<RegAlloc, RegAllocError> {
     let Some(func) = module.func(func_id) else {
         return Ok(RegAlloc {
@@ -290,13 +339,14 @@ pub fn allocate(
 
     // Collect all values in the function, skipping suppressed results
     // (v0.1-invisible expansion values — see `fusion`). The frame-initial
-    // constants owned by this function (v0.1's entry-top seed literals,
-    // used or not) come FIRST — v0.1's seeds are the entry block's first
+    // constants owned by this function (v0.1's entry-top seed literals;
+    // use-gated — see `frame_init_consts`) come FIRST — v0.1's seeds are
+    // the entry block's first
     // instructions, so v0.1's scan pushes them first, in reverse creation
     // order (each new seed was inserted at entry index 0). The insertion
     // order matters: MCS's heap pops equal (weight, rank) keys in
     // heap-structural order.
-    let const_values = frame_init_consts(module, func_id);
+    let const_values = frame_init_consts(module, func_id, options.prune_unused_frame_init_consts);
     let entry = rpo.first().copied();
     let mut all_values: Vec<ValueId> = Vec::new();
     for &bb in &rpo {
