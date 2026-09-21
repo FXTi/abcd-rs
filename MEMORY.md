@@ -395,7 +395,17 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   Option<ConstId>}, StoreOwnProp{Name,Dyn,Idx}, TryStoreGlobal; lift
   un-folded; comparator now compares these EXACTLY (residual fold
   SuperForwardAllArgs→super is v0.1-representation-forced, documented).
-  Orchestrator-verified: parity 2787/0, workspace 132 suites ok. P2 gate interpretation: no passes exist at P2, so the gate is
+  Orchestrator-verified: parity 2787/0, workspace 132 suites ok.
+  v2-P3 DONE (2026-09-21): abcd-opt (SCCP/copyprop/ADCE+CfgSimplify/
+  peephole + optimize_module; inline NOT ported — D2 deferred). ADCE
+  essentiality fully Effects-derived; TryGetGlobal effects gap fixed;
+  ExceptionParam=Bottom exposed v0.1's latent SCCP mis-fold (N63).
+  Orchestrator-verified: v2opt oracle 1149/1149, determinism 0-diff,
+  byte-identity vs v0.1 opt = 143 divergent (53 N62 + 90 maintainer-
+  accepted M1/M2/M3b — all v2-better or VM-neutral), 154 suites green.
+  NEXT DECISION POINTS for maintainer: D2 (inline rewrite on v0.2?)
+  then v2-P4 (swap: abcd-ir -> abcd-ir-v1, abcd-ir2 -> abcd-ir) then
+  v2-P5 (abcd-taint scaffold). P2 gate interpretation: no passes exist at P2, so the gate is
   v2lift-variant oracle 1149/1149 zero-skip + BYTE-IDENTITY vs the v0.1
   lift rewrite + 3-run determinism; the opt half lands with P3.
 - MAINTAINER DECISIONS (2026-09-21): D1 = build IR v0.2 (first design it,
