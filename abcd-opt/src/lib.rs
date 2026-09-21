@@ -45,6 +45,28 @@
 //!   reachable blocks, no copyprop residue); the corpus driver re-verifies
 //!   after optimizing.
 //!
+//! ## Accepted byte divergences from the v0.1 optimizer (gate 2)
+//!
+//! Maintainer ruling (2026-09-21, v2-P3): the v2opt rewrite diverges from
+//! the v0.1 opt rewrite on exactly the 53 N62 files (lift-layer literal
+//! array dedup, accepted) plus 90 files in three attributed, VM-neutral
+//! mechanisms — `1149/1149 − 53 N62 − 90 (P3-M1/P3-M2/N63)`:
+//!
+//! - **P3-M1 (72 files)** — fold re-materialization keeps opcode
+//!   identity: a folded canonical-NaN/+∞ pools as `Const::Number` bits
+//!   and lowers back to `ldnan`/`ldinfinity`, where v0.1's
+//!   `LiteralNumber` fold degraded to `fldai`.
+//! - **P3-M2 (12 files)** — ADCE essentiality is effects-derived, and
+//!   the honest `DefineFunc`/`AllocClosure` records (vendor
+//!   `RuntimeDefinefunc` runs no user code,
+//!   runtime_stubs-inl.h:2459-2505) let ADCE delete dead
+//!   definefunc+closure chains that v0.1's conservative hand-list kept.
+//! - **N63 (6 files)** — v0.1's SCCP left exception-param values at
+//!   lattice Top (the identity element), folding phis that mix a
+//!   constant with the exception object down to the constant; v0.2
+//!   resolves [`ValueDef::ExceptionParam`](abcd_ir2::ValueDef) to Bottom
+//!   and keeps the phi — strictly more sound.
+//!
 //! ## Library rule
 //!
 //! No panics on data: arena lookups return `Option`; passes skip what

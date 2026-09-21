@@ -16,6 +16,30 @@
 //!   the byte-identity comparison target for the v0.1 pipeline's `opt`
 //!   tree.
 //!
+//! ## Gate 2 (v2opt vs v0.1 opt byte-identity) — ACCEPTED form
+//!
+//! Maintainer ruling (2026-09-21, v2-P3): the accepted divergence set is
+//! **1149/1149 minus the 53 N62 files minus 90 v2-P3 files**, all
+//! attributed (mechanisms documented in `abcd-opt/src/lib.rs`):
+//!
+//! - **P3-M1 (72 files)**: v0.1's fold engines re-materialize a folded
+//!   NaN/+∞ as `LiteralNumber` → isel `fldai`; v0.2's pooled
+//!   `Const::Number` keeps the canonical bits → `ldnan`/`ldinfinity`.
+//!   v0.2 preserves the opcode identity v0.1 degrades; VM-identical.
+//! - **P3-M2 (12 files)**: v0.1's ADCE hand-list marked `DefineFunc`
+//!   essential; the v0.2 effects table derives honest effects
+//!   (vendor `RuntimeDefinefunc` runs no user code,
+//!   runtime_stubs-inl.h:2459-2505), so ADCE deletes dead
+//!   definefunc+closure chains. Sound dead-code removal.
+//! - **N63 (6 files)**: v0.1's SCCP lattice left exception-param values
+//!   at Top (the lattice identity), folding phis that mix a constant
+//!   with the exception object to the constant; v0.2 resolves
+//!   `ValueDef::ExceptionParam` to Bottom and keeps the phi — strictly
+//!   more sound (v0.1 frozen; superseded).
+//!
+//! All three are VM-neutral: the v2opt tree passes the VM oracle
+//! 1149/1149 (image sha256:5e7627…).
+//!
 //! Per fixture and variant this is all-or-nothing: if ANY function fails
 //! to lower/relocate (`LowerError`, including `UnsupportedInstruction` /
 //! `UntraceableEntity`) or encode fails, that variant is not written and
@@ -65,7 +89,7 @@ use std::process::Command;
 use abcd_file::File;
 use abcd_ir2::{FuncId, Module, verify_module};
 use abcd_lift::lift_file;
-use abcd_lower::{LowerError, lower_function, to_method_body};
+use abcd_lower::{LowerError, LowerOptions, lower_function_with_options, to_method_body};
 use abcd_opt::optimize_module;
 
 /// Fixed SKIP category vocabulary (mirrors the v0.1 driver's; the
@@ -133,7 +157,18 @@ fn front_end(path: &std::path::Path) -> Result<(File, Module), Skip> {
 /// `file`, and encode. Returns the encoded bytes and the function count.
 /// All-or-nothing: the first lower/relocate/encode error aborts the
 /// fixture; nothing is written by the caller in that case.
-fn rewrite_fixture(module: &Module, file: &File) -> Result<(Vec<u8>, usize), Skip> {
+///
+/// `options` selects the v0.1 parity target: default (lift) for
+/// `v2lift`; `prune_unused_frame_init_consts` for `v2opt` — the
+/// optimizer deletes the last use of a frame-initial constant, and the
+/// v0.1 pipeline's ADCE swept the seed INSTRUCTION in that case (the
+/// v0.2 seed is instruction-less, so the lower must skip the
+/// materialization — see `LowerOptions`).
+fn rewrite_fixture(
+    module: &Module,
+    file: &File,
+    options: abcd_lower::LowerOptions,
+) -> Result<(Vec<u8>, usize), Skip> {
     // Function i corresponds to the i-th method in lift order (classes in
     // file order, methods in declaration order — the lift's pass-1
     // reservation order, which is `File::all_methods()` order).
@@ -150,7 +185,7 @@ fn rewrite_fixture(module: &Module, file: &File) -> Result<(Vec<u8>, usize), Ski
             continue;
         }
         let name = module.sym.resolve(func.name).unwrap_or("?").to_string();
-        let lowered = lower_function(module, func_id)
+        let lowered = lower_function_with_options(module, func_id, options)
             .map_err(|e| (lower_category(&e), format!("lower {name}: {e}")))?;
         let body = to_method_body(module, func_id, &lowered, file)
             .map_err(|e| (lower_category(&e), format!("to_method_body {name}: {e}")))?;
@@ -297,7 +332,7 @@ for path in sorted(paths):
         };
 
         // Variant: lift-only.
-        match guarded(|| rewrite_fixture(&module, &file)) {
+        match guarded(|| rewrite_fixture(&module, &file, LowerOptions::default())) {
             Ok((encoded, functions)) => {
                 eprintln!("WROTE v2lift {relative} ({functions} functions)");
                 if let Some(dir) = &out_root {
@@ -331,7 +366,15 @@ for path in sorted(paths):
                 continue;
             }
         };
-        match guarded(|| rewrite_fixture(&optimized, &file)) {
+        match guarded(|| {
+            rewrite_fixture(
+                &optimized,
+                &file,
+                LowerOptions {
+                    prune_unused_frame_init_consts: true,
+                },
+            )
+        }) {
             Ok((encoded, functions)) => {
                 eprintln!("WROTE v2opt {relative} ({functions} functions)");
                 if let Some(dir) = &out_root {
