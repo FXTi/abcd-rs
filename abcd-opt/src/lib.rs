@@ -4,8 +4,10 @@
 //! `design/ir-v0.2.md`): [`peephole`] (constant folding), [`sccp`] (sparse
 //! conditional constant propagation), [`dce`] (aggressive dead code
 //! elimination + CFG simplification), and [`copyprop`] (trivial-phi
-//! elimination). `inline` is deliberately NOT ported (N44 quarantine; the
-//! D2 inline-rewrite decision is deferred past P3).
+//! elimination). [`inline`] is the D2 (2026-09-21) rewrite of v0.1's
+//! N44-quarantined inliner on the v0.2 IR — OPT-IN ONLY, never wired
+//! into [`optimize_module`] (the corpus byte-identity gates measure the
+//! default pipeline).
 //!
 //! ## Format independence (hard, structurally enforced)
 //!
@@ -77,6 +79,7 @@
 pub mod analysis;
 pub mod copyprop;
 pub mod dce;
+pub mod inline;
 pub mod peephole;
 pub mod sccp;
 

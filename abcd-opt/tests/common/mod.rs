@@ -338,6 +338,10 @@ pub const HOLE: i64 = i64::MIN + 1;
 /// Sentinel for `createemptyobject` — the i64 machine has no objects.
 #[allow(dead_code)]
 pub const EMPTY_OBJECT: i64 = i64::MIN + 2;
+/// Sentinel for `definefunc` — the i64 machine has no function objects;
+/// the closure value only needs to be distinguishable from numbers.
+#[allow(dead_code)]
+pub const FUNCTION: i64 = i64::MIN + 3;
 
 #[allow(dead_code)] // helpers are shared across several test binaries
 impl Machine {
@@ -499,6 +503,37 @@ impl Machine {
                     return Halt::CopyDataProperties {
                         dst: self.reg(dst_r.0),
                         src: self.acc,
+                    };
+                }
+                // `definefunc imm, method_id, length` — acc = a fresh
+                // closure (modeled as the FUNCTION sentinel; the machine
+                // does not execute calls itself).
+                Bytecode::Definefunc(..) => {
+                    self.acc = FUNCTION;
+                    pc += 1;
+                }
+                // Fixed-arity calls (record-and-inspect): the callee is
+                // the acc; `start` is the first argument register (0 for
+                // the no-argument form).
+                Bytecode::Callarg0(_) => {
+                    return Halt::CallRange { argc: 0, start: 0 };
+                }
+                Bytecode::Callarg1(_, a0) => {
+                    return Halt::CallRange {
+                        argc: 1,
+                        start: a0.0,
+                    };
+                }
+                Bytecode::Callargs2(_, a0, _) => {
+                    return Halt::CallRange {
+                        argc: 2,
+                        start: a0.0,
+                    };
+                }
+                Bytecode::Callargs3(_, a0, ..) => {
+                    return Halt::CallRange {
+                        argc: 3,
+                        start: a0.0,
                     };
                 }
                 Bytecode::Callrange(_, argc, start) => {
