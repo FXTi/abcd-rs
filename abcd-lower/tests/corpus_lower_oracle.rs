@@ -1,31 +1,39 @@
 //! Opt-in corpus test (requires the exported GHCR corpus): for every
 //! manifest row with `runtime.status == "passed"` (1149 fixtures),
-//! decode → `abcd_lift::lift_file` (v0.2 lift) → ir2 verify →
-//! `abcd_lower::lower_function` + `to_method_body` every function →
-//! splice the lowered bodies into a cloned File → `abcd_file::encode` →
-//! write the result to `$ABCD_LOWERED_DIR/v2lift/<manifest-relative abc
-//! path>` for the black-box VM oracle
-//! (`scripts/compare-rewritten-corpus.py`) and for the byte-identity
-//! faithfulness diff against the v0.1 pipeline's `lift` tree
-//! (`abcd-ir`'s corpus_lower_oracle).
+//! decode → `abcd_lift::lift_file` (v0.2 lift) → ir2 verify → lower →
+//! encode, writing the result to `$ABCD_LOWERED_DIR/<variant>/` for the
+//! black-box VM oracle (`scripts/compare-rewritten-corpus.py`).
 //!
-//! Per fixture this is all-or-nothing: if ANY function fails to
-//! lower/relocate (`LowerError`, including `UnsupportedInstruction` /
-//! `UntraceableEntity`) or encode fails, the fixture is not written and
+//! Two variants are produced per fixture (mirroring the v0.1 driver's
+//! `lift`/`opt` pair):
+//!
+//! - `v2lift`: decode → lift → verify → `abcd_lower::lower_function` +
+//!   `to_method_body` every function → splice → `abcd_file::encode` —
+//!   also the byte-identity faithfulness baseline against the v0.1
+//!   pipeline's `lift` tree.
+//! - `v2opt`: decode → lift → verify → `abcd_opt::optimize_module` →
+//!   RE-VERIFY (post-optimize; N27/N28 hygiene gate) → lower → encode —
+//!   the byte-identity comparison target for the v0.1 pipeline's `opt`
+//!   tree.
+//!
+//! Per fixture and variant this is all-or-nothing: if ANY function fails
+//! to lower/relocate (`LowerError`, including `UnsupportedInstruction` /
+//! `UntraceableEntity`) or encode fails, that variant is not written and
 //! the skip is reported as:
 //!
 //! ```text
-//! SKIP v2lift <path> | <category> | <reason>
+//! SKIP <variant> <path> | <category> | <reason>
 //! ```
 //!
 //! with the SAME fixed category vocabulary as the v0.1 driver: `lift`
-//! (front-end: read/decode/lift), `verify` (ir2 structural verifier),
-//! `lower-unsupported:<instruction>` (`LowerError::UnsupportedInstruction`),
+//! (front-end: read/decode/lift), `verify` (ir2 structural verifier,
+//! pre- or post-optimize), `lower-unsupported:<instruction>`
+//! (`LowerError::UnsupportedInstruction`),
 //! `lower-untraceable:<EntityKind>` (`LowerError::UntraceableEntity`),
 //! `lower-other` (any other lower/to_method_body error), `encode`, and
 //! `panic` (caught by `catch_unwind`). Successful rewrites are reported
-//! as `WROTE v2lift <path> (N functions)`. At the end a sorted
-//! category → count histogram is printed.
+//! as `WROTE <variant> <path> (N functions)`. At the end a sorted
+//! category → count histogram is printed per variant.
 //!
 //! Selection: by default ALL passed rows are processed. Setting
 //! `ABCD_LOWERED_CASE` to a comma-separated case list (e.g.
@@ -33,9 +41,9 @@
 //! cases.
 //!
 //! Fresh output tree per run: a full run (no `ABCD_LOWERED_CASE`) wipes
-//! `$ABCD_LOWERED_DIR/v2lift` entirely; a filtered run deletes only the
-//! selected fixtures' target files, so stale files from an earlier run
-//! never survive a fixture that now skips.
+//! `$ABCD_LOWERED_DIR/{v2lift,v2opt}` entirely; a filtered run deletes
+//! only the selected fixtures' target files, so stale files from an
+//! earlier run never survive a fixture that now skips.
 //!
 //! The test asserts the expected fixture count was processed; it does NOT
 //! assert that all fixtures lowered — skips are data for the oracle run.
@@ -46,7 +54,7 @@
 //! ABCD_LOWERED_DIR=/tmp/abcd-lowered-full \
 //!   cargo test -p abcd-lower --test corpus_lower_oracle --offline -- --ignored --nocapture
 //! python3 scripts/compare-rewritten-corpus.py \
-//!   exports/corpus/index.jsonl /tmp/abcd-lowered-full/v2lift --allow-missing
+//!   exports/corpus/index.jsonl /tmp/abcd-lowered-full/v2opt --allow-missing
 //! ```
 
 use std::collections::BTreeMap;
@@ -58,6 +66,7 @@ use abcd_file::File;
 use abcd_ir2::{FuncId, Module, verify_module};
 use abcd_lift::lift_file;
 use abcd_lower::{LowerError, lower_function, to_method_body};
+use abcd_opt::optimize_module;
 
 /// Fixed SKIP category vocabulary (mirrors the v0.1 driver's; the
 /// histogram keys are gate evidence — keep them stable).
@@ -233,44 +242,61 @@ for path in sorted(paths):
 
     // Fresh output tree per run: stale files from an earlier run must not
     // survive a fixture that now skips (the oracle script would otherwise
-    // compare outdated bytes). A full run wipes the variant tree; a
+    // compare outdated bytes). A full run wipes both variant trees; a
     // filtered run deletes only the selected fixtures' target files.
     let out_root = std::env::var_os("ABCD_LOWERED_DIR").map(PathBuf::from);
     if let Some(dir) = &out_root {
-        let sub = dir.join("v2lift");
         if full_run {
-            if sub.exists() {
-                std::fs::remove_dir_all(&sub).expect("clear previous oracle output");
+            for variant in ["v2lift", "v2opt"] {
+                let sub = dir.join(variant);
+                if sub.exists() {
+                    std::fs::remove_dir_all(&sub).expect("clear previous oracle output");
+                }
             }
         } else {
             for relative in paths.lines() {
-                let target = sub.join(relative);
-                if target.exists() {
-                    std::fs::remove_file(&target).expect("clear stale oracle output");
+                for variant in ["v2lift", "v2opt"] {
+                    let target = dir.join(variant).join(relative);
+                    if target.exists() {
+                        std::fs::remove_file(&target).expect("clear stale oracle output");
+                    }
                 }
             }
         }
     }
 
     let mut fixtures = 0usize;
-    let mut wrote = 0usize;
-    let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
+    let mut wrote = [0usize; 2];
+    let mut histograms: [BTreeMap<String, usize>; 2] = [BTreeMap::new(), BTreeMap::new()];
+
+    let record_skip = |variant: usize,
+                       name: &str,
+                       relative: &str,
+                       (category, reason): Skip,
+                       histograms: &mut [BTreeMap<String, usize>; 2]| {
+        let key = category.to_string();
+        eprintln!("SKIP {name} {relative} | {key} | {reason}");
+        *histograms[variant].entry(key).or_insert(0) += 1;
+    };
 
     for relative in paths.lines() {
         fixtures += 1;
 
-        // Front-end stage.
+        // Front-end stage shared by both variants.
         let (file, module) = match guarded(|| front_end(&root.join(relative))) {
             Ok(pair) => pair,
-            Err((category, reason)) => {
-                let key = category.to_string();
-                eprintln!("SKIP v2lift {relative} | {key} | {reason}");
-                *histogram.entry(key).or_insert(0) += 1;
+            Err(skip) => {
+                let reason = skip.1;
+                let key = skip.0.to_string();
+                for (variant, name) in ["v2lift", "v2opt"].iter().enumerate() {
+                    eprintln!("SKIP {name} {relative} | {key} | {reason}");
+                    *histograms[variant].entry(key.clone()).or_insert(0) += 1;
+                }
                 continue;
             }
         };
 
-        // Rewrite.
+        // Variant: lift-only.
         match guarded(|| rewrite_fixture(&module, &file)) {
             Ok((encoded, functions)) => {
                 eprintln!("WROTE v2lift {relative} ({functions} functions)");
@@ -279,13 +305,43 @@ for path in sorted(paths):
                     std::fs::create_dir_all(target.parent().unwrap()).unwrap();
                     std::fs::write(target, encoded).expect("write oracle candidate");
                 }
-                wrote += 1;
+                wrote[0] += 1;
             }
-            Err((category, reason)) => {
-                let key = category.to_string();
-                eprintln!("SKIP v2lift {relative} | {key} | {reason}");
-                *histogram.entry(key).or_insert(0) += 1;
+            Err(skip) => record_skip(0, "v2lift", relative, skip, &mut histograms),
+        }
+
+        // Variant: lift + optimize (optimize mutates the module; re-verify
+        // before lowering — the N27/N28 post-opt hygiene gate).
+        let opt_result = guarded(|| {
+            let mut optimized = module.clone();
+            optimize_module(&mut optimized);
+            let report = verify_module(&optimized);
+            if !report.is_ok() {
+                return Err((
+                    SkipCategory::Verify,
+                    format!("post-optimize verify: {:?}", report.errors),
+                ));
             }
+            Ok(optimized)
+        });
+        let optimized = match opt_result {
+            Ok(optimized) => optimized,
+            Err(skip) => {
+                record_skip(1, "v2opt", relative, skip, &mut histograms);
+                continue;
+            }
+        };
+        match guarded(|| rewrite_fixture(&optimized, &file)) {
+            Ok((encoded, functions)) => {
+                eprintln!("WROTE v2opt {relative} ({functions} functions)");
+                if let Some(dir) = &out_root {
+                    let target = dir.join("v2opt").join(relative);
+                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                    std::fs::write(target, encoded).expect("write oracle candidate");
+                }
+                wrote[1] += 1;
+            }
+            Err(skip) => record_skip(1, "v2opt", relative, skip, &mut histograms),
         }
     }
 
@@ -296,13 +352,18 @@ for path in sorted(paths):
     }
     assert!(fixtures > 0, "no fixtures selected");
     eprintln!(
-        "corpus lower oracle rewrite: v2lift wrote {} skipped {} (fixtures: {})",
-        wrote,
-        histogram.values().sum::<usize>(),
+        "corpus lower oracle rewrite: v2lift wrote {} skipped {}; \
+         v2opt wrote {} skipped {} (fixtures: {})",
+        wrote[0],
+        histograms[0].values().sum::<usize>(),
+        wrote[1],
+        histograms[1].values().sum::<usize>(),
         fixtures
     );
-    eprintln!("HISTOGRAM v2lift:");
-    for (category, count) in &histogram {
-        eprintln!("  {category}: {count}");
+    for (variant, name) in ["v2lift", "v2opt"].iter().enumerate() {
+        eprintln!("HISTOGRAM {name}:");
+        for (category, count) in &histograms[variant] {
+            eprintln!("  {category}: {count}");
+        }
     }
 }
