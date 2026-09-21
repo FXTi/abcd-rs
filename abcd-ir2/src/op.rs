@@ -613,6 +613,40 @@ pub enum Op {
         /// byte fidelity and semantics.
         count: u16,
     },
+    /// Define a SENDABLE (shared) class with a member buffer — vendor
+    /// `callruntime.definesendableclass imm1:u16, method_id,
+    /// literalarray_id, imm2:u16, v:in:top`
+    /// (abcd-isa-sys/vendor/isa/isa.yaml:861-866).
+    ///
+    /// Distinct from [`Op::DefineClass`] (N53): the vendor runtime
+    /// builds the class through `SlowRuntimeStub::CreateSharedClass`
+    /// (arkcompiler_ets_runtime-master/ecmascript/interpreter/
+    /// interpreter_assembly.cpp:6157-6180,
+    /// `HandleCallRuntimeDefineSendableClassPrefImm16Id16Id16Imm16V8` —
+    /// `ASSERT(res.IsJSSharedFunction())`), NOT the contemporary
+    /// `defineclasswithbuffer`'s `SlowRuntimeStub::CreateClassWithBuffer`
+    /// (interpreter_assembly.cpp:6007/6033). v0.1 collapsed this opcode
+    /// into `InstData::DefineClassWithBuffer` and its isel re-emitted
+    /// the CONTEMPORARY `defineclasswithbuffer` — opcode-identity
+    /// corruption. The 24.0.0.0 sendable fixtures are runtime-N/A
+    /// (structural only, not in the 1149-fixture VM set), so no VM
+    /// evidence is possible; the distinction is anchored to the vendor
+    /// sources above.
+    DefineSendableClass {
+        /// The constructor in the module's function table.
+        ctor: FuncId,
+        /// The heritage (`extends`) expression value, when present
+        /// (vendor `v:in:top` — `base` in the handler).
+        heritage: Option<ValueId>,
+        /// The member-buffer constant (same shape as
+        /// [`Op::DefineClass::members`]).
+        members: ConstId,
+        /// The class constructor's `.length` (vendor imm2, isa.yaml) —
+        /// `CreateSharedClass` consumes it the way
+        /// `CreateClassWithBuffer` consumes the contemporary form's
+        /// (N15).
+        count: u16,
+    },
 
     // ── Private properties ─────────────────────────────────────────────
     /// Load a private field by environment level and slot.
@@ -936,7 +970,9 @@ impl Op {
                 v
             }
             DefineFunc { captures, .. } => captures.iter().map(|(_, v)| *v).collect(),
-            DefineClass { heritage, .. } => heritage.iter().copied().collect(),
+            DefineClass { heritage, .. } | DefineSendableClass { heritage, .. } => {
+                heritage.iter().copied().collect()
+            }
             LoadPrivate { obj, .. } | TestPrivate { obj, .. } => vec![*obj],
             StorePrivate { obj, value, .. } | DefinePrivate { obj, value, .. } => {
                 vec![*obj, *value]
@@ -1067,7 +1103,9 @@ impl Op {
                 v
             }
             DefineFunc { captures, .. } => captures.iter_mut().map(|(_, v)| v).collect(),
-            DefineClass { heritage, .. } => heritage.iter_mut().collect(),
+            DefineClass { heritage, .. } | DefineSendableClass { heritage, .. } => {
+                heritage.iter_mut().collect()
+            }
             LoadPrivate { obj, .. } | TestPrivate { obj, .. } => vec![obj],
             StorePrivate { obj, value, .. } | DefinePrivate { obj, value, .. } => {
                 vec![obj, value]
@@ -1241,6 +1279,7 @@ impl Op {
             | Call { .. }
             | DefineFunc { .. }
             | DefineClass { .. }
+            | DefineSendableClass { .. }
             | CreateObjectWithExcludedKeys { .. }
             | LoadSuper { .. }
             | StoreSuper { .. }
@@ -1371,6 +1410,12 @@ mod tests {
                 length: 1,
             },
             Op::DefineClass {
+                ctor: FuncId::new(0),
+                heritage: Some(v()),
+                members: ConstId::new(0),
+                count: 2,
+            },
+            Op::DefineSendableClass {
                 ctor: FuncId::new(0),
                 heritage: Some(v()),
                 members: ConstId::new(0),

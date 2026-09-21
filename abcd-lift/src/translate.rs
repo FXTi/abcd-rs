@@ -53,9 +53,13 @@
 //! length}` + `AllocClosure` (the closure allocation is explicit in
 //! v0.2 — captures are analysis-layer, deferred empty), definemethod →
 //! `DefineFunc` + `AllocClosure` + `DefineMethod{object, name, func,
-//! length}`, defineclasswithbuffer (+callruntime.definesendableclass,
-//! N53) → `DefineClass{ctor, heritage, members, count}` (N15's count
-//! modeled), definegettersetterbyvalue → `DefineGetterSetterByValue`,
+//! length}`, defineclasswithbuffer → `DefineClass{ctor, heritage,
+//! members, count}` (N15's count modeled),
+//! callruntime.definesendableclass → `DefineSendableClass{ctor,
+//! heritage, members, count}` (N53 — the sendable distinction is
+//! modeled, NOT folded into `DefineClass`: the vendor runtime uses
+//! SlowRuntimeStub::CreateSharedClass, a different stub from the
+//! contemporary form's CreateClassWithBuffer), definegettersetterbyvalue → `DefineGetterSetterByValue`,
 //! iterators → `GetIterator`/`GetAsyncIterator`/`GetPropIterator`/
 //! `IteratorReturn` (closeiterator) /`NextPropName`, generator family →
 //! `CreateGenerator` (async folds — documented) /`SuspendGenerator`/
@@ -111,10 +115,13 @@
 //! deprecated.createobjecthavingmethod resolve the RAW table index
 //! (v0.1 parity — and v0.1 lifts BOTH deprecated buffer forms to
 //! CreateArrayWithBuffer, so both fold to `AllocArray{shape:
-//! Some(shape)}` here, N59), deprecated.defineclasswithbuffer keeps
-//! v0.1's operand
-//! roles (N54's registered latent issue — base_reg as heritage, env
-//! unread).
+//! Some(shape)}` here, N59), and
+//! deprecated.defineclasswithbuffer is a HARD
+//! [`LiftError::UnsupportedDeprecatedDefineClassWithBuffer`] (N54 —
+//! the vendor runtime reads v1=lexenv, v2=proto
+//! (interpreter_assembly.cpp:4622-4648) where the historical lift
+//! read v1 as base and dropped v2; zero corpus coverage, so hard
+//! error per the N8/N51 ruling).
 //!
 //! Super-property access by constant INDEX: the ISA has no such opcode
 //! — [`LiftError::UnsupportedSuperByIndex`], a hard error, never
@@ -1676,13 +1683,17 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::CallruntimeDefinesendableclass(_ic, method_eid, lit_eid, count, base_reg) => {
-            // N53: folds into the plain defineclasswithbuffer form.
+            // N53: the sendable form is its OWN op — the vendor runtime
+            // builds the class via SlowRuntimeStub::CreateSharedClass
+            // (interpreter_assembly.cpp:6157-6180), not the contemporary
+            // defineclasswithbuffer's CreateClassWithBuffer. v0.1's fold
+            // into DefineClassWithBuffer corrupted the opcode identity.
             let (_name, ctor) = fx.resolve_method(*method_eid)?;
             let members = fx.resolve_literal(*lit_eid)?;
             let base = fx.read_reg(*base_reg, block);
             let v = fx.emit_val(
                 block,
-                Op::DefineClass {
+                Op::DefineSendableClass {
                     ctor,
                     heritage: Some(base),
                     members,

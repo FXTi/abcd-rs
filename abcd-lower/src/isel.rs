@@ -1407,6 +1407,38 @@ fn select_inst(
             ));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
+        Op::DefineSendableClass {
+            ctor,
+            heritage,
+            members,
+            count,
+        } => {
+            // N53: re-emit the SENDABLE opcode
+            // (`callruntime.definesendableclass`, isa.yaml:861-866 —
+            // vendor SlowRuntimeStub::CreateSharedClass), NEVER the
+            // contemporary defineclasswithbuffer. v0.1's fold corrupted
+            // the opcode identity.
+            let Some(base) = heritage else {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: "DefineSendableClass without a heritage register has no \
+                         callruntime.definesendableclass encoding"
+                        .into(),
+                });
+            };
+            let base_r = val_reg(func_id, *base, alloc, codes, 0)?;
+            codes.push(Bytecode::CallruntimeDefinesendableclass(
+                ic.one(),
+                tracer.method_eid(*ctor),
+                tracer.literal_eid(*members),
+                // Vendor imm2 (_count): consumed by CreateSharedClass as
+                // the constructor's .length, like the contemporary
+                // form's RuntimeSetClassConstructorLength (N15).
+                Imm(i64::from(*count)),
+                base_r,
+            ));
+            home_result(tracker, result, used, func_id, alloc, codes)?;
+        }
         Op::DefineGetterSetterByValue {
             obj,
             key,

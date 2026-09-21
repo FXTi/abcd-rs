@@ -63,6 +63,19 @@
 //!    agree) before comparison.
 //! 7. **Deprecated→modern folds**: identical on both sides by
 //!    construction (the lift ports v0.1's arms verbatim).
+//! 8. **Sendable class definition (N53)**: v0.1 folds
+//!    `callruntime.definesendableclass` into
+//!    `InstData::DefineClassWithBuffer` — the known N53 opcode-identity
+//!    collapse (the vendor runtime builds sendable classes through
+//!    SlowRuntimeStub::CreateSharedClass, a different stub from the
+//!    contemporary defineclasswithbuffer's CreateClassWithBuffer;
+//!    interpreter_assembly.cpp:6157-6180 vs :6007/6033). v0.2 models
+//!    the distinction with `Op::DefineSendableClass` and is
+//!    SEMANTICALLY CORRECT where v0.1 is collapsed. Rule: v0.2's
+//!    `DefineSendableClass` canonicalizes DOWN to the `DefineClass`
+//!    token (v0.2 is strictly more precise than anything v0.1 can
+//!    express; the operand roles — ctor, heritage, members, count —
+//!    are identical, so the streams compare exactly).
 //!
 //! Any remaining difference is a FINDING, reported with fixture,
 //! function, and stream position.
@@ -1366,6 +1379,29 @@ fn canon_inst_v2(cx: &mut V2Cx, iid: abcd_ir2::InstId) {
             )
         }
         Op::DefineClass {
+            ctor,
+            heritage,
+            members,
+            count,
+        } => {
+            let heritage_cv = match heritage {
+                Some(v) => cx.val(*v),
+                None => CVal::Konst("heritage:none".into()),
+            };
+            tok!(
+                "DefineClass",
+                CVal::Konst(format!("method:{}", ctor.index())),
+                heritage_cv,
+                cx.konst(*members),
+                CVal::Konst(format!("count:{count}"))
+            )
+        }
+        // N53 (divergence rule 8): canonicalize DOWN to the plain
+        // `DefineClass` token — v0.1's DefineClassWithBuffer cannot
+        // express the sendable distinction (its known collapse), and
+        // the operand roles are identical. v0.2 is semantically
+        // correct here; the fold is comparator-only.
+        Op::DefineSendableClass {
             ctor,
             heritage,
             members,

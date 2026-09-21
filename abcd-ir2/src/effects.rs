@@ -447,6 +447,17 @@ impl Op {
                 may_call: CallEffect::UnknownCallee, // heritage/proto machinery
                 allocs: AllocKind::Object,
             },
+            // N53: same effect shape as DefineClass — the difference is
+            // the runtime stub (CreateSharedClass, shared/sendable
+            // machinery vs CreateClassWithBuffer), not the effect
+            // classes the IR tracks.
+            DefineSendableClass { .. } => Effects {
+                reads: MemClasses::HEAP | MemClasses::PROTOTYPE, // heritage
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // heritage/proto machinery
+                allocs: AllocKind::Object,
+            },
 
             // Private properties.
             LoadPrivate { .. } | TestPrivate { .. } => Effects {
