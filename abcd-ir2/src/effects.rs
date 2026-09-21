@@ -406,7 +406,29 @@ impl Op {
             // environment mutates the scope stack (v0.1 essential).
             NewLexEnv { .. } | NewLexEnvWithName { .. } | PopLexEnv => writes(MemClasses::LEX_ENV),
             PutLexVar { .. } => writes(MemClasses::LEX_ENV),
-            TryGetGlobal { .. } => reads(MemClasses::GLOBAL), // never throws
+            TryGetGlobal { .. } => Effects {
+                reads: MemClasses::GLOBAL,
+                // N48/N50: BOTH source forms (v0.1 `LoadGlobalVar` =
+                // `ldglobalvar`, `TryLoadGlobalByName` =
+                // `tryldglobalbyname`) were ADCE-essential — a dead
+                // result does not make the load dead. Vendor grounding:
+                // both handlers' slow paths run
+                // `JSTaggedValue::GetProperty` on the global's prototype
+                // chain, CALLING global getters, and abrupt-check the
+                // result (RuntimeStubs::RuntimeLdGlobalVarFromProto,
+                // stubs/runtime_stubs-inl.h:1782-1793 via
+                // SlowRuntimeStub::LdGlobalVarFromGlobalProto;
+                // RuntimeStubs::RuntimeTryLdGlobalByName,
+                // :1739-1748 via
+                // SlowRuntimeStub::TryLdGlobalByNameFromGlobalProto,
+                // interpreter/slow_runtime_stub.cpp; INTERPRETER_RETURN_
+                // IF_ABRUPT in both handlers, interpreter_assembly.cpp
+                // :2425/:2611). The try form additionally raises
+                // ReferenceError " is not defined" on a miss.
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
+                ..Effects::PURE
+            },
             StoreGlobal { .. } => Effects {
                 writes: MemClasses::GLOBAL,
                 may_throw: true, // unresolved reference in strict mode
@@ -690,5 +712,83 @@ mod tests {
 
         // Debugger stays essential (v0.1 parity) via the hook call effect.
         assert!(!Op::Debugger.effects().is_pure());
+    }
+
+    /// N48/N50: every entry of v0.1's ADCE essential OBSERVABLE-LOAD list
+    /// must derive non-pure from this table (a write, a possible throw,
+    /// or a possible call — the abcd-opt ADCE essentiality rule). The
+    /// v0.1 list: GetIterator, GetAsyncIterator, LoadProperty,
+    /// LoadPrivateProperty, TestPrivateProperty, CreateRegExp,
+    /// LoadGlobalVar, TryLoadGlobalByName, LoadSuperProperty.
+    #[test]
+    fn effects_cover_v0_1_observable_loads() {
+        let v = ValueId::new(0);
+        let name = Sym::new(0);
+        let essential = |op: Op| {
+            let e = op.effects();
+            !e.writes.is_empty() || e.may_throw || e.may_call != CallEffect::None
+        };
+        let cases = [
+            Op::GetIterator { obj: v },
+            Op::GetAsyncIterator { obj: v },
+            Op::LoadProp { object: v, name },
+            Op::LoadPropDyn { object: v, key: v },
+            Op::LoadPropIdx {
+                object: v,
+                index: v,
+            },
+            Op::LoadPrivate {
+                level: 0,
+                slot: 0,
+                obj: v,
+            },
+            Op::TestPrivate {
+                level: 0,
+                slot: 0,
+                obj: v,
+            },
+            Op::AllocRegExp {
+                pattern: name,
+                flags: 0,
+            },
+            // LoadGlobalVar (the throwing form) and TryLoadGlobalByName
+            // (the tolerant form) BOTH fold to TryGetGlobal.
+            Op::TryGetGlobal {
+                name,
+                default: None,
+            },
+            Op::TryGetGlobal {
+                name,
+                default: Some(v),
+            },
+            Op::LoadSuper {
+                key: crate::op::SuperKey::Name(name),
+            },
+        ];
+        for op in cases {
+            assert!(
+                essential(op.clone()),
+                "v0.1-essential observable load must derive non-pure (N48/N50): {op:?}"
+            );
+        }
+
+        // Control: the pure reads / pure allocations stay dead-deletable
+        // (v0.1 parity — they were NOT on the essential list).
+        for op in [
+            Op::GetLexVar { level: 0, slot: 0 },
+            Op::LoadModuleVar { index: 0 },
+            Op::GetResumeMode { genobj: v },
+            Op::AllocObject {
+                shape: ConstId::new(0),
+            },
+            Op::AllocArray { shape: None },
+            Op::AllocClosure { func: v },
+            Op::GetPropIterator { obj: v },
+        ] {
+            assert!(
+                !essential(op.clone()),
+                "pure read/alloc must stay dead-deletable (v0.1 parity): {op:?}"
+            );
+        }
     }
 }

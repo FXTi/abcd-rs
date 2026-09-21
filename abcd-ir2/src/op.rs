@@ -521,7 +521,11 @@ pub enum Op {
         value: ValueId,
     },
     /// Load a global by name, tolerating absence (`default` when the
-    /// global does not exist); never throws.
+    /// global does not exist). Absence-tolerant does NOT mean
+    /// side-effect-free: the vendored slow paths of both source forms
+    /// (`ldglobalvar`, `tryldglobalbyname`) run `GetProperty` on the
+    /// global's prototype chain — global getters are called and the
+    /// calls are abrupt-checked (see [`Op::effects`], N48/N50).
     TryGetGlobal {
         /// The global's name.
         name: Sym,
