@@ -2329,15 +2329,18 @@ fn encode_debug_info(
     code_len: u32,
 ) -> Result<(), Error> {
     // Skip if debug info is completely empty (no meaningful content).
-    // Decode surfaces methods WITHOUT a debug info item as
-    // `Some(MethodDebugInfo { source_file: Some(""), .. })` — the vendored
-    // extractor's GetSourceFile returns "" for missing entries
-    // (debug_info_extractor.cpp:318). Counting that invented empty string as
-    // content would emit a degenerate debug item whose LNP never SET_FILEs;
-    // the vendored extractor then reads string offset 0
-    // (GetSpanFromId throws INVALID_FILE_OFFSET, file.h:190) and the whole
-    // file's debug region dies on the next decode. Empty strings are not
-    // content (the emitters below skip them too).
+    // Empty strings are not content (the emitters below skip them too):
+    // the vendored extractor's GetSourceFile/GetSourceCode return ""
+    // for missing entries (debug_info_extractor.cpp:318-333), and
+    // counting an empty string as content would emit a degenerate
+    // debug item whose LNP never SET_FILEs; the vendored extractor
+    // then reads string offset 0 (GetSpanFromId throws
+    // INVALID_FILE_OFFSET, file.h:190) and the whole file's debug
+    // region dies on the next decode. Since the N55 decode fix, decode
+    // no longer invents `source_file: Some("")` for debug-less methods
+    // (they get `debug: None`) and maps a real "" answer to `None` —
+    // this guard now covers hand-built models and genuinely contentless
+    // debug items.
     let non_empty = |sid: StringId| !pool.resolve(sid).unwrap_or("").is_empty();
     let has_content = !dbg.line_table.is_empty()
         || !dbg.column_table.is_empty()

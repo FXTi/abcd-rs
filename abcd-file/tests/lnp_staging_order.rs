@@ -15,14 +15,16 @@
 //! the second method's SET_FILE must still read its own source-file string
 //! after the rewrite.
 //!
-//! The control additionally pins a companion fix: decode surfaces methods
-//! without a debug info item as `source_file: Some("")` (vendored
-//! DebugInfoExtractor::GetSourceFile returns "" for missing entries), and
-//! counting that invented empty string as content used to emit a degenerate
-//! END-only debug item; the vendored extractor then read string offset 0 and
-//! threw (file.h GetSpanFromId INVALID_FILE_OFFSET), killing the ENTIRE
-//! file's debug region on rewrite. Encode now treats empty debug strings as
-//! no content.
+//! The control additionally pins a companion fix: decode used to
+//! surface methods without a debug info item as `source_file:
+//! Some("")` (vendored DebugInfoExtractor::GetSourceFile returns ""
+//! for missing entries — the N55 invention, since fixed at decode:
+//! such methods now get `debug: None`), and counting that invented
+//! empty string as content used to emit a degenerate END-only debug
+//! item; the vendored extractor then read string offset 0 and threw
+//! (file.h GetSpanFromId INVALID_FILE_OFFSET), killing the ENTIRE
+//! file's debug region on rewrite. Encode now treats empty debug
+//! strings as no content.
 
 use abcd_file::{
     AccessFlags, Annotation, AnnotationElem, AnnotationValue, Builder, LineEntry, LiteralValue,
@@ -135,11 +137,10 @@ fn set_file_roundtrips_without_literal_array() {
         .find(|m| file2.strings.resolve(m.name) == Some("m1"))
         .expect("m1 present");
     assert!(
-        m1.debug.is_none()
-            || m1.debug.as_ref().is_some_and(|d| d
-                .source_file
-                .is_none_or(|sf| file2.strings.resolve(sf).is_none_or(str::is_empty))),
-        "m1 never had debug info; rewrite must not invent a source file for it"
+        m1.debug.is_none(),
+        "m1 never had debug info; since the N55 decode fix, rewrite must \
+         surface it as debug: None (no invented record), got {:?}",
+        m1.debug.as_ref().map(|d| d.source_file)
     );
 }
 

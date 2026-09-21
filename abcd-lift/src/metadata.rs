@@ -444,10 +444,15 @@ fn annotation_value_as_const(lf: &mut Lifter, v: &AnnotationValue) -> Const {
     }
 }
 
-/// Whether a decoded debug record is the N55 empty invention (decode
-/// wraps a contentless `source_file: Some("")` for debug-less
-/// methods). v0.2's lift treats the invention as "no debug info" (the
-/// N55 decode wart is fixed at this boundary — documented).
+/// Whether a decoded debug record carries no content. Since the N55
+/// decode fix, decode attaches `debug: Some(..)` ONLY to methods that
+/// structurally have a debug info item (the old `source_file:
+/// Some("")` invention for debug-less methods is gone — the vendored
+/// extractor's ""-for-missing, debug_info_extractor.cpp:318-333, now
+/// decodes to `None`). This guard remains for a REAL debug item whose
+/// content is entirely empty (a degenerate line program) — treated as
+/// "no debug info" at this boundary (empty strings are not content,
+/// 980ec16).
 fn debug_is_empty_invention(lf: &Lifter, debug: &abcd_file::MethodDebugInfo) -> bool {
     let empty_source = match debug.source_file {
         None => true,

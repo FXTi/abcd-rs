@@ -14,11 +14,17 @@ fn build_identical_methods(dedup: impl FnOnce(&mut Builder)) -> Vec<u8> {
     let cls = b.add_global_class();
     let proto = b.create_proto(Type::Void, &[]);
     let (code, _) = abcd_isa::encode(&[Bytecode::Returnundefined]).unwrap();
+    // The debug items must SET_FILE: a line program that never sets a
+    // file in a class without a source-file record leaves the vendor
+    // extractor's file_ = EntityId(0), which throws INVALID_FILE_OFFSET
+    // and is a hard decode error (N55).
+    let src = b.add_string("main.js");
     for name in ["f1", "f2"] {
         let m = b.class_add_method(cls, name, proto, AccessFlags::STATIC, &code, 0, 0);
         let lnp = b.create_lnp();
-        b.lnp_emit_end(lnp);
         let dbg = b.create_debug_info(lnp, 1);
+        b.lnp_emit_set_file(lnp, dbg, src);
+        b.lnp_emit_end(lnp);
         b.method_set_debug_info(m, dbg);
     }
     dedup(&mut b);

@@ -48,14 +48,28 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     let mut strings = StringPool::new();
 
     // Open debug info (file-level, lives for entire decode).
+    //
+    // N55 (second half): a null handle means the vendored extractor
+    // THREW during construction — e.g. a debug item whose line program
+    // never SET_FILEs in a class without a source-file record leaves
+    // `file_ = File::EntityId(0)`, and reading it hits
+    // `GetSpanFromId`'s `ThrowIfWithCheck(..., INVALID_FILE_OFFSET)`
+    // (vendored file.h:186-193 via debug_info_extractor.cpp:252's
+    // `value_or(File::EntityId(0))` and line_number_program.h
+    // `LineProgramState::GetFile`); the bridge swallows the exception
+    // and returns nullptr (file_bridge.cpp `abc_debug_info_open`). A
+    // file with NO debug items never throws (the extractor skips
+    // methods without a debug_info_id), so null is never benign.
+    // Previously decode treated null as "no debug info" — silently
+    // dropping the WHOLE file's debug region. Per the N55 ruling that
+    // is now a hard error, never silent.
     let debug_raw = unsafe { sys::abc_debug_info_open(f) };
-    let _debug_guard = if debug_raw.is_null() {
-        None
-    } else {
-        Some(HandleGuard(Some(move || unsafe {
-            sys::abc_debug_info_close(debug_raw)
-        })))
-    };
+    if debug_raw.is_null() {
+        return Err(Error::DebugInfoExtraction);
+    }
+    let _debug_guard = HandleGuard(Some(move || unsafe {
+        sys::abc_debug_info_close(debug_raw)
+    }));
 
     // Build entity_map: offset → interned descriptor/name.
     let mut entity_map = HashMap::new();
@@ -417,7 +431,17 @@ fn decode_method_at(
         )?,
     };
 
-    let debug = if debug_raw.is_null() {
+    // N55: attach a debug record ONLY when the method structurally has
+    // a debug info item (its own index entry, read via the method
+    // accessor — independent of the extractor). Previously EVERY method
+    // got `Some(..)` whenever the file-level extractor opened, and the
+    // extractor's ""-for-missing answers (vendored
+    // DebugInfoExtractor::GetSourceFile/GetSourceCode,
+    // debug_info_extractor.cpp:318-333) were wrapped in `Some`,
+    // inventing `debug: Some(source_file: Some(""))` for methods that
+    // have no debug info at all.
+    let has_debug_item = unsafe { sys::abc_method_debug_info_off(mr) } != ABSENT;
+    let debug = if debug_raw.is_null() || !has_debug_item {
         None
     } else {
         Some(read_debug_info(
@@ -1640,13 +1664,25 @@ fn read_debug_info(
         byte_offsets.binary_search(&off).unwrap_or_else(|i| i) as u32
     };
 
+    // N55: the vendored extractor answers "" for MISSING entries
+    // (DebugInfoExtractor::GetSourceFile/GetSourceCode,
+    // debug_info_extractor.cpp:318-333) — "" is the vendor's
+    // "no value", not a value. Map it to `None` instead of wrapping it
+    // in `Some` (the old behavior invented `source_file: Some("")`
+    // for methods with no recorded file; encode already treats empty
+    // debug strings as no content, 980ec16). Null (bridge catch) maps
+    // to `None` too.
     let source_file = {
         let ptr = unsafe { sys::abc_debug_get_source_file(debug_raw, method_off) };
         if ptr.is_null() {
             None
         } else {
             let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
-            Some(strings.get_or_intern(s.as_ref()))
+            if s.is_empty() {
+                None
+            } else {
+                Some(strings.get_or_intern(s.as_ref()))
+            }
         }
     };
     let source_code = {
@@ -1655,7 +1691,11 @@ fn read_debug_info(
             None
         } else {
             let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
-            Some(strings.get_or_intern(s.as_ref()))
+            if s.is_empty() {
+                None
+            } else {
+                Some(strings.get_or_intern(s.as_ref()))
+            }
         }
     };
 

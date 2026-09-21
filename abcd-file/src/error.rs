@@ -75,4 +75,21 @@ pub enum Error {
         class_descriptor: String,
         field_off: u32,
     },
+    /// The vendored debug-info extractor failed to initialize (N55,
+    /// second half). The extractor throws `INVALID_FILE_OFFSET`
+    /// (`GetSpanFromId`, vendored file.h:186-193) when a debug item's
+    /// line program leaves `file_ = File::EntityId(0)` — e.g. a class
+    /// carrying debug items but no source-file record
+    /// (debug_info_extractor.cpp:252 `value_or(File::EntityId(0))` →
+    /// `LineProgramState::GetFile`) — and the bridge swallows the
+    /// exception, returning nullptr (`abc_debug_info_open`,
+    /// file_bridge.cpp). A file with NO debug items never throws (the
+    /// extractor skips methods without a debug_info_id), so null is
+    /// never benign: previously decode treated it as "no debug info",
+    /// silently dropping the WHOLE file's debug region. Hard error,
+    /// never silent.
+    #[error(
+        "debug info extraction failed (N55): the vendored extractor threw during initialization (e.g. INVALID_FILE_OFFSET from a debug item with file_=EntityId(0)) — refusing to silently drop the whole file's debug region"
+    )]
+    DebugInfoExtraction,
 }
