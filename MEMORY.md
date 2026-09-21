@@ -407,9 +407,16 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   Orchestrator-verified: v2opt oracle 1149/1149, determinism 0-diff,
   byte-identity vs v0.1 opt = 143 divergent (53 N62 + 90 maintainer-
   accepted M1/M2/M3b — all v2-better or VM-neutral), 154 suites green.
-  NEXT DECISION POINTS for maintainer: D2 (inline rewrite on v0.2?)
-  then v2-P4 (swap: abcd-ir -> abcd-ir-v1, abcd-ir2 -> abcd-ir) then
-  v2-P5 (abcd-taint scaffold). P2 gate interpretation: no passes exist at P2, so the gate is
+  v2-P3b DONE (2026-09-21): inline rewritten on the v0.2 IR (D2=YES).
+  N44 killed by construction (fresh-arena clone, vendored frame-slot
+  param model [func][newTarget][this][formals...] with callType bits /
+  0xF default, full pred/phi re-key, exception-edge participation rule).
+  Opt-in (never in optimize_module). Oracle 1149/1149 inline-on, v2lift/
+  v2opt byte-unchanged. 18 sites inlined corpus-wide (conservative
+  policy; skip histogram in the worker report). P4 ruling: NO v1
+  archival — abcd-ir is DELETED at the swap; parity comparator and v0.1
+  corpus drivers retire with it. NEXT: v2-P4 (swap, maintainer
+  acceptance gate) then v2-P5 (abcd-taint scaffold). P2 gate interpretation: no passes exist at P2, so the gate is
   v2lift-variant oracle 1149/1149 zero-skip + BYTE-IDENTITY vs the v0.1
   lift rewrite + 3-run determinism; the opt half lands with P3.
 - MAINTAINER DECISIONS (2026-09-21): D1 = build IR v0.2 (first design it,
