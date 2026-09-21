@@ -407,6 +407,15 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   Orchestrator-verified: v2opt oracle 1149/1149, determinism 0-diff,
   byte-identity vs v0.1 opt = 143 divergent (53 N62 + 90 maintainer-
   accepted M1/M2/M3b — all v2-better or VM-neutral), 154 suites green.
+  v2-P4 DONE (2026-09-21): THE SWAP — v0.1 abcd-ir DELETED (no archival;
+  git history is the archive), abcd-ir2 renamed abcd-ir; parity harness
+  retired (parity proven: 2787/12996/1,434,154 tokens/0 mismatches),
+  corpus_lift_verify keeps the lift+verify gate. Orchestrator-verified:
+  101 suites/462 tests green, three driver variants byte-identical to
+  accepted baselines, v2opt oracle 1149/1149. The v0.2 stack IS the
+  project now: abcd-lift -> abcd-ir -> abcd-opt -> abcd-lower.
+  NEXT: v2-P5 (abcd-taint scaffold: call graph + IFDS skeleton + top-20
+  builtin summaries, print-sink smoke) — the last registered task.
   v2-P3b DONE (2026-09-21): inline rewritten on the v0.2 IR (D2=YES).
   N44 killed by construction (fresh-arena clone, vendored frame-slot
   param model [func][newTarget][this][formals...] with callType bits /
