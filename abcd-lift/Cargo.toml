@@ -10,6 +10,3 @@ abcd-file.workspace = true
 abcd-isa.workspace = true
 abcd-ir2.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-abcd-ir.workspace = true

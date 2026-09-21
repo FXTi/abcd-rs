@@ -1,9 +1,15 @@
-//! Corpus parity harness (opt-in, all 2787 fixtures):
+//! Corpus lift-verify harness (opt-in, all 2787 fixtures):
 //!
 //! (a) the v0.2 lift succeeds on every fixture;
-//! (b) `abcd_ir2::verify_module` reports ZERO errors on the result;
-//! (c) the canonical op-stream comparison against the v0.1 lifted
-//!     module (`abcd_ir::lift::lift_file`) — see `compare.rs`.
+//! (b) `abcd_ir2::verify_module` reports ZERO errors on the result.
+//!
+//! History: parity against the v0.1 crate was proven at v2-P1/v2-P2c
+//! (2787 fixtures / 12,996 functions / 1,434,154 canonical tokens /
+//! 0 mismatches). The v0.1-vs-v0.2 canonical comparator
+//! (`tests/common/compare.rs`) was retired together with the v0.1 crate
+//! at v2-P4 (the swap: abcd-ir2 becomes abcd-ir, v0.1 deleted; git
+//! history is the archive). This harness keeps the corpus lift+verify
+//! gates without any v0.1 dependency.
 //!
 //! Requires the exported GHCR corpus (`exports/corpus`, or
 //! `$ABCD_CORPUS_ROOT`) and python3 (the manifest is parsed with its
@@ -14,9 +20,6 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use abcd_file::decode;
-
-mod common;
-use common::compare;
 
 fn corpus_root() -> PathBuf {
     std::env::var_os("ABCD_CORPUS_ROOT")
@@ -66,8 +69,7 @@ with open(sys.argv[1], encoding="utf-8") as manifest:
         .collect()
 }
 
-/// (a) + (b) + (c): lift success + verifier zero errors + canonical
-/// v0.1-parity comparison on all fixtures.
+/// (a) + (b): lift success + verifier zero errors on all fixtures.
 ///
 /// History note: the 57 sendable-class fixtures whose class buffers
 /// reference unregistered nested literal arrays were a REGISTERED-PENDING
@@ -85,9 +87,6 @@ fn exported_corpus_lifts_and_verifies_v2() {
     let mut pending = 0usize;
     let mut verify_failures = 0usize;
     let mut verify_errors_total = 0usize;
-    let mut compared = 0usize;
-    let mut tokens = 0usize;
-    let mut mismatches = 0usize;
     for (relative, version, profile) in &rows {
         let data = std::fs::read(root.join(relative)).expect("fixture");
         let file = decode(&data).unwrap_or_else(|e| panic!("decode {relative}: {e}"));
@@ -117,36 +116,19 @@ fn exported_corpus_lifts_and_verifies_v2() {
                 eprintln!("VERIFY [{version}/{profile}] {relative}: {e}");
             }
         }
-        // (c) canonical parity vs the v0.1 lifted module.
-        let v1 = abcd_ir::lift::lift_file(&file)
-            .unwrap_or_else(|e| panic!("v0.1 lift (the oracle) failed on {relative}: {e}"));
-        let cmp = compare::compare_modules(&file, &v1, &module);
-        compared += cmp.functions_compared;
-        tokens += cmp.tokens_compared;
-        if !cmp.is_parity() {
-            for m in &cmp.mismatches {
-                mismatches += 1;
-                if mismatches <= 20 {
-                    eprintln!(
-                        "MISMATCH [{version}/{profile}] {relative} fn {} ({}): token {}\n  v1: {}\n  v2: {}",
-                        m.func, m.func_name, m.token, m.v1, m.v2
-                    );
-                }
-            }
-        }
     }
     eprintln!(
-        "corpus v2 lift+verify+parity: {fixtures} fixtures, {functions} functions, \
+        "corpus v2 lift+verify: {fixtures} fixtures, {functions} functions, \
          {lift_failures} lift failures, {pending} registered-pending, \
-         {verify_failures} fixtures with verifier errors ({verify_errors_total} errors), \
-         {compared} functions compared ({tokens} canonical tokens), {mismatches} mismatches"
+         {verify_failures} fixtures with verifier errors ({verify_errors_total} errors)"
     );
     // 2757 exported fixtures + 30 P4-T6 opcode-coverage fixtures.
     assert_eq!(fixtures, 2787);
+    // Function-count pin (12,996) proven at v2-P2c parity close-out.
+    assert_eq!(functions, 12996);
     assert_eq!(
         lift_failures, 0,
         "lift failures outside the pending register"
     );
     assert_eq!(verify_failures, 0, "verifier failures");
-    assert_eq!(mismatches, 0, "canonical parity mismatches");
 }
