@@ -5,7 +5,6 @@ members = [
     "abcd-isa",
     "abcd-file-sys",
     "abcd-file",
-    "abcd-ir",
     "abcd-ir2",
     "abcd-lift",
     "abcd-lower",
@@ -32,7 +31,6 @@ abcd-isa-sys = { path = "abcd-isa-sys" }
 abcd-isa = { path = "abcd-isa" }
 abcd-file-sys = { path = "abcd-file-sys" }
 abcd-file = { path = "abcd-file" }
-abcd-ir = { path = "abcd-ir" }
 abcd-ir2 = { path = "abcd-ir2" }
 abcd-lift = { path = "abcd-lift" }
 abcd-lower = { path = "abcd-lower" }

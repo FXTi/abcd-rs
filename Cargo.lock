@@ -23,16 +23,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "abcd-ir"
-version = "0.1.0"
-dependencies = [
- "abcd-file",
- "abcd-isa",
- "string-interner",
- "thiserror",
-]
-
-[[package]]
 name = "abcd-ir2"
 version = "0.1.0"
 dependencies = [
@@ -62,7 +52,6 @@ name = "abcd-lift"
 version = "0.1.0"
 dependencies = [
  "abcd-file",
- "abcd-ir",
  "abcd-ir2",
  "abcd-isa",
  "thiserror",

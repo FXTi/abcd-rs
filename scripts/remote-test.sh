@@ -17,7 +17,7 @@
 #
 # Usage:
 #   scripts/remote-test.sh                      # cargo test --workspace --offline
-#   scripts/remote-test.sh test -p abcd-ir --test lower_isel_construct --offline
+#   scripts/remote-test.sh test -p abcd-lower --test lower_isel_construct --offline
 #   KEEP=1 scripts/remote-test.sh ...           # keep the remote dir (debugging)
 #   REMOTE_HOST=other-host scripts/remote-test.sh ...
 set -euo pipefail
