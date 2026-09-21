@@ -27,10 +27,13 @@ fn func_by_name(module: &Module, name: &str) -> FuncId {
         .unwrap_or_else(|| panic!("function {name}"))
 }
 
-/// Build a file with two static methods on the global class:
+/// Build a file with two static methods on the global class, in the
+/// es2abc frame convention (vendored MethodLiteral: no
+/// L_ESCallTypeAnnotation → 0xF → three implicit leading arg slots
+/// [func, new.target, this]; the formal is a3):
 ///
 /// ```text
-/// g(x):  ldai 1; add2 imm, v0; return        // return x + 1
+/// g(x):  ldai 1; add2 imm, v3; return        // return x + 1
 /// f():   ldai 41; sta v0; definefunc g;      // v0 = 41
 ///        callarg1 imm, v0; return            // return g(41)
 /// ```
@@ -43,11 +46,11 @@ fn build_call_file() -> File {
 
     let (g_code, _) = encode_bytecodes(&[
         Bytecode::Ldai(Imm(1)),
-        Bytecode::Add2(Imm(0), Reg(0)),
+        Bytecode::Add2(Imm(0), Reg(3)),
         Bytecode::Return,
     ])
     .unwrap();
-    let g = builder.class_add_method(class, "g", proto_int, AccessFlags::STATIC, &g_code, 0, 1);
+    let g = builder.class_add_method(class, "g", proto_int, AccessFlags::STATIC, &g_code, 0, 4);
 
     let placeholder = EntityId(u16::MAX as u32);
     let (f_code, f_offsets) = encode_bytecodes(&[
@@ -58,7 +61,7 @@ fn build_call_file() -> File {
         Bytecode::Return,
     ])
     .unwrap();
-    let f = builder.class_add_method(class, "f", proto_void, AccessFlags::STATIC, &f_code, 1, 0);
+    let f = builder.class_add_method(class, "f", proto_void, AccessFlags::STATIC, &f_code, 1, 3);
     builder
         .relocate_code_id(f, f_offsets[2], 0, abcd_file::CodeEntity::Method(g))
         .unwrap();
@@ -89,8 +92,8 @@ fn lift_inline_verify_lower_simulate_preserves_behavior() {
     let arg = machine.reg(start);
     assert_eq!(arg, 41, "the call argument is 41");
     // The ABI: arguments live ABOVE the declared frame (v[num_regs +
-    // arg_index]); g has one argument at v[num_regs].
-    let arg_slot = g_oracle.num_regs;
+    // arg_index]); g's sole formal is a3 (three implicit slots lead).
+    let arg_slot = g_oracle.num_regs + 3;
     let mut callee_machine = Machine::new().with_reg(arg_slot, arg);
     let oracle_result = callee_machine.run(&g_oracle.bytecodes);
     assert_eq!(oracle_result, Halt::Return(42), "g(41) = 42");
@@ -149,7 +152,7 @@ fn build_try_call_file() -> File {
     let proto = builder.create_proto(Type::Void, &[]);
 
     let (g_code, _) = encode_bytecodes(&[Bytecode::Ldai(Imm(42)), Bytecode::Return]).unwrap();
-    let g = builder.class_add_method(class, "g", proto, AccessFlags::STATIC, &g_code, 0, 0);
+    let g = builder.class_add_method(class, "g", proto, AccessFlags::STATIC, &g_code, 0, 3);
 
     let placeholder = EntityId(u16::MAX as u32);
     let (f_code, f_offsets) = encode_bytecodes(&[
@@ -161,7 +164,7 @@ fn build_try_call_file() -> File {
         Bytecode::Return,                                  // 5 (normal end)
     ])
     .unwrap();
-    let f = builder.class_add_method(class, "f", proto, AccessFlags::STATIC, &f_code, 0, 0);
+    let f = builder.class_add_method(class, "f", proto, AccessFlags::STATIC, &f_code, 0, 3);
     builder
         .relocate_code_id(f, f_offsets[0], 0, abcd_file::CodeEntity::Method(g))
         .unwrap();

@@ -15,12 +15,20 @@
 //!
 //! - **Fresh identities**: the callee CFG is cloned with FRESH
 //!   `ValueId`s/`InstId`s/`BlockId`s (arena append — no id reuse, T1).
-//! - **Parameter mapping** (`bind_params`): callee `params` are bound
-//!   to call-site operands per the §5.3 [`CallKind`] table — `this`
-//!   (T4: `params[0]` for non-static callees), formals in order,
-//!   missing formals bound to a pooled `undefined` constant, extra
-//!   arguments dropped (the callee cannot observe them: `arguments`
-//!   users are ineligible).
+//! - **Parameter mapping** (the vendored frame-slot model — see
+//!   [`CallType`]): the callee's `params` are the code-header arg
+//!   slots. The leading slots are the vendored implicit frame slots
+//!   `[func][new.target][this]` (present per the callee's
+//!   `L_ESCallTypeAnnotation;` callType bits; annotation ABSENT → the
+//!   vendored `0xF` default, the es2abc corpus shape), followed by the
+//!   source formals filled LEFT-aligned, `undefined`-padded
+//!   (interpreter-inl.cpp:488), extra arguments dropped (unreadable
+//!   for `arguments`-free callees, which are the only eligible ones).
+//!   Slot bindings: func → the call-site closure value, new.target →
+//!   per call kind (T4), this → the explicit receiver
+//!   (`callthis*`/Direct) or EXACTLY `undefined` (vendored `setVregs`
+//!   pushes undefined when callThis = false). `LoadFunction` and
+//!   `LoadNewTarget` in the body bind the same two values.
 //! - **Predecessor rebuild** (`inline_site` steps E–H): the call block
 //!   is split at the call; the continuation block inherits the moved
 //!   terminator, EVERY old Normal successor's preds and phi entries are
@@ -79,21 +87,25 @@
 //!   `PutLexVar`/`NewLexEnv*`/`PopLexEnv` — env identity changes across
 //!   inlining), private-name ops (env level/slot addressing), `arguments`
 //!   (`GetUnmappedArgs`/`CopyRestArgs` — the caller's arguments object
-//!   is a different object), `LoadFunction` (function identity),
-//!   super ops (home-object/`this` context), suspend ops
-//!   (`Await`/`SuspendGenerator`/… — the caller is not the callee's
-//!   async/generator frame), or nested definitions whose transitive
-//!   bodies read or mutate the lexical environment they would capture
-//!   (`DefineFunc`/`DefineClass`/`DefineSendableClass` — a nested
-//!   closure's captured env is the callee's frame env, not the
-//!   caller's; env-observability is decided by
+//!   is a different object), super ops (home-object/`this` context),
+//!   suspend ops (`Await`/`SuspendGenerator`/… — the caller is not the
+//!   callee's async/generator frame), or nested definitions whose
+//!   transitive bodies read or mutate the lexical environment they
+//!   would capture (`DefineFunc`/`DefineClass`/`DefineSendableClass` —
+//!   a nested closure's captured env is the callee's frame env, not
+//!   the caller's; env-observability is decided by
 //!   `nested_definitions_read_outer_env`, so callees that merely CALL
 //!   other known functions still inline).
-//! - `this` is bindable: `this: Some(v)` at the call site binds the
-//!   callee's `this` param to `v` (both `Direct` and `Dynamic`+`Some`
-//!   — the `callthis*` family); `this: None` requires the callee to
-//!   never USE its `this` param (a `Dynamic` callee computes `this`
-//!   from its own strictness, which the IR cannot prove).
+//! - The call-type slot roles are determinable ([`CallType`]): from
+//!   the callee's `L_ESCallTypeAnnotation;` when present, else the
+//!   vendored `0xF` default for STATIC callees (the corpus shape). A
+//!   NON-STATIC callee without the annotation is refused
+//!   (`SkipReason::CallTypeUnknown`): the vendored default and lift's
+//!   T4 `params[0]`-is-this convention conflict there and no corpus
+//!   evidence arbitrates.
+//! - `this` is bindable: trivially always — `this: Some(v)` binds the
+//!   receiver; `this: None` binds exactly `undefined` (vendored
+//!   `setVregs`). `Direct` with `this: None` is malformed and skipped.
 //! - Size caps: the callee has at most [`InlinePolicy::max_callee_insts`]
 //!   instructions and the caller's per-function inlined-instruction
 //!   budget ([`InlinePolicy::max_inlined_insts_per_caller`]) is not
@@ -190,8 +202,6 @@ pub enum SkipReason {
     /// The callee uses `arguments` (`GetUnmappedArgs`/`CopyRestArgs` —
     /// the caller's arguments object is a different object).
     CalleeUsesArguments,
-    /// The callee loads its own function object (`LoadFunction`).
-    CalleeUsesFunctionIdentity,
     /// The callee uses super ops (home-object/`this` context).
     CalleeUsesSuper,
     /// The callee suspends (`Await`/`SuspendGenerator`/`Resume*`/
@@ -203,13 +213,14 @@ pub enum SkipReason {
     /// `nested_definitions_read_outer_env`). Nested definitions that
     /// never observe the env are inlined fine.
     CalleeDefinesClosure,
-    /// `this: None` (a non-`callthis*` dynamic call) but the callee
-    /// uses its `this` param — the binding depends on the callee's
-    /// strictness, which the IR cannot prove.
-    ThisBindingUnprovable,
     /// `CallKind::Direct` with `this: None` (the §5.3 table requires
     /// an explicit receiver; malformed input).
     DirectWithoutThis,
+    /// The callee's call-type slot roles cannot be determined: a
+    /// NON-STATIC callee without an `L_ESCallTypeAnnotation;` (the
+    /// vendored default and lift's T4 convention conflict there), or a
+    /// callee with fewer params than its call-type's implicit slots.
+    CallTypeUnknown,
     /// A region protecting the call block also uses it as a catch
     /// handler (handler identity would be disturbed).
     CallBlockIsHandler,
@@ -232,12 +243,11 @@ impl SkipReason {
             SkipReason::CalleeUsesLexEnv => "callee-uses-lexenv",
             SkipReason::CalleeUsesPrivateNames => "callee-uses-private-names",
             SkipReason::CalleeUsesArguments => "callee-uses-arguments",
-            SkipReason::CalleeUsesFunctionIdentity => "callee-uses-function-identity",
             SkipReason::CalleeUsesSuper => "callee-uses-super",
             SkipReason::CalleeSuspends => "callee-suspends",
             SkipReason::CalleeDefinesClosure => "callee-defines-closure",
-            SkipReason::ThisBindingUnprovable => "this-binding-unprovable",
             SkipReason::DirectWithoutThis => "direct-without-this",
+            SkipReason::CallTypeUnknown => "call-type-unknown",
             SkipReason::CallBlockIsHandler => "call-block-is-handler",
         }
     }
@@ -402,6 +412,122 @@ fn resolve_callee(module: &Module, callee_val: ValueId) -> Option<FuncId> {
     None
 }
 
+/// The callee's call-type: which leading `params` slots are the
+/// vendored implicit frame slots rather than source formals.
+///
+/// Vendored ground truth (arkcompiler_ets_runtime-master
+/// ecmascript/jspandafile/method_literal.cpp `MethodLiteral::Initialize`
+/// + ecmascript/method.h:459-464): the runtime builds the frame as
+/// `[func?][newTarget?][this?][formals...]` inside the code header's
+/// `num_args`, with the three implicit slots present iff the
+/// corresponding `L_ESCallTypeAnnotation;` `callType` bits
+/// (HaveThis = bit 0, HaveNewTarget = bit 1, HaveFunc = bit 3;
+/// HaveExtra = bit 2 changes only the un-named actualNumArgs push, not
+/// a param slot). When the annotation is ABSENT the vendored default is
+/// `callType = 0xF` — all three implicit slots — which is exactly the
+/// es2abc corpus shape (every corpus function is `<static>` with
+/// `num_args = 3 + formals`; verified empirically against the VM: a
+/// 4-formal function declares `num_args = 7` and reads its first formal
+/// from `a3`).
+///
+/// Arguments fill the formal slots LEFT-aligned; missing formals are
+/// `undefined` (interpreter-inl.cpp:488 `CALL_PUSH_UNDEFINED`), extra
+/// arguments are unreadable stack content for callees that cannot
+/// observe `arguments` (those are ineligible anyway).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CallType {
+    /// The func slot (the closure itself) leads.
+    func: bool,
+    /// The new.target slot follows.
+    new_target: bool,
+    /// The this slot follows.
+    this: bool,
+}
+
+impl CallType {
+    /// The vendored annotation-absent default (`UINT32_MAX & 0xF`).
+    const DEFAULT: Self = Self {
+        func: true,
+        new_target: true,
+        this: true,
+    };
+
+    /// Number of leading implicit slots.
+    fn implicit_slots(self) -> usize {
+        self.func as usize + self.new_target as usize + self.this as usize
+    }
+
+    /// Whether the callType annotation was present.
+    fn from_annotation(module: &Module, callee: FuncId) -> Option<Self> {
+        let func = module.func(callee)?;
+        for ann in &func.annotations {
+            let is_call_type = module
+                .class(ann.class)
+                .and_then(|c| module.sym.resolve(c.descriptor))
+                == Some("L_ESCallTypeAnnotation;");
+            if !is_call_type {
+                continue;
+            }
+            for (name, value) in &ann.elements {
+                if module.sym.resolve(*name) != Some("callType") {
+                    continue;
+                }
+                let abcd_ir2::AnnValue::Const(cid) = value else {
+                    continue;
+                };
+                let bits = module
+                    .consts
+                    .get(*cid)
+                    .and_then(Const::as_f64)
+                    .map(|x| x as u32)?;
+                return Some(Self {
+                    func: bits & 0b1000 != 0,
+                    new_target: bits & 0b0010 != 0,
+                    this: bits & 0b0001 != 0,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// The role of one callee `params` slot (vendored frame order:
+/// func, new.target, this, then formals).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotRole {
+    /// The closure object itself.
+    Func,
+    /// `new.target`.
+    NewTarget,
+    /// The `this` binding.
+    This,
+    /// A source formal, by index into the call's argument list.
+    Formal(usize),
+}
+
+/// Assign roles to the callee's params per its [`CallType`]; `None`
+/// when the params are fewer than the implicit slots (malformed — the
+/// vendored ASSERT's shape).
+fn slot_roles(call_type: CallType, param_count: usize) -> Option<Vec<SlotRole>> {
+    if param_count < call_type.implicit_slots() {
+        return None;
+    }
+    let mut roles = Vec::with_capacity(param_count);
+    if call_type.func {
+        roles.push(SlotRole::Func);
+    }
+    if call_type.new_target {
+        roles.push(SlotRole::NewTarget);
+    }
+    if call_type.this {
+        roles.push(SlotRole::This);
+    }
+    for i in 0..(param_count - call_type.implicit_slots()) {
+        roles.push(SlotRole::Formal(i));
+    }
+    Some(roles)
+}
+
 /// All eligibility checks for one call site. `Ok(callee)` means the
 /// site is inlinable; `Err(reason)` is the skip-histogram entry.
 #[allow(clippy::too_many_arguments)]
@@ -443,8 +569,6 @@ fn eligibility(
     // function/class definitions are collected and checked separately
     // (a nested closure is skippable only when its captured env is
     // OBSERVABLE — see nested_definitions_read_outer_env).
-    let is_static = func.modifiers.contains(Modifiers::STATIC);
-    let this_param = (!is_static).then(|| func.params.first()).flatten().copied();
     let mut nested_roots: Vec<FuncId> = Vec::new();
     let blocks = func.blocks.clone();
     for &bb in &blocks {
@@ -506,20 +630,26 @@ fn eligibility(
         return Err(SkipReason::CalleeDefinesClosure);
     }
 
-    // `this` binding per §5.3 (T4: params[0] for non-static callees).
-    match (this, this_param) {
-        (None, Some(tp)) => {
-            // A non-callthis* dynamic/direct call: the callee's `this`
-            // is computed at callee entry from its own strictness —
-            // unprovable here. Direct without a receiver is malformed.
-            if kind == CallKind::Direct {
-                return Err(SkipReason::DirectWithoutThis);
-            }
-            if callee_uses_value(module, callee, tp) {
-                return Err(SkipReason::ThisBindingUnprovable);
-            }
-        }
-        _ => {}
+    // The call-type slot roles (vendored MethodLiteral rule). A
+    // NON-STATIC callee WITHOUT the annotation is refused: the vendored
+    // 0xF default (this at slot 2) and lift's T4 convention (this at
+    // params[0] for non-static kinds) conflict there, and no corpus
+    // evidence arbitrates. Static callees without the annotation take
+    // the vendored default (the corpus shape).
+    let is_static = func.modifiers.contains(Modifiers::STATIC);
+    let call_type = match CallType::from_annotation(module, callee) {
+        Some(ct) => ct,
+        None if is_static => CallType::DEFAULT,
+        None => return Err(SkipReason::CallTypeUnknown),
+    };
+    if slot_roles(call_type, func.params.len()).is_none() {
+        return Err(SkipReason::CallTypeUnknown);
+    }
+
+    // `Direct` without an explicit receiver is malformed per the §5.3
+    // table (Direct: this = call.this).
+    if kind == CallKind::Direct && this.is_none() {
+        return Err(SkipReason::DirectWithoutThis);
     }
 
     // Structural oddity: a region protecting the call block that also
@@ -555,7 +685,6 @@ fn forbidden_op(op: &Op) -> Option<SkipReason> {
         | TestPrivate { .. }
         | CreatePrivateNames { .. } => Some(SkipReason::CalleeUsesPrivateNames),
         GetUnmappedArgs | CopyRestArgs { .. } => Some(SkipReason::CalleeUsesArguments),
-        LoadFunction => Some(SkipReason::CalleeUsesFunctionIdentity),
         LoadSuper { .. } | StoreSuper { .. } | ThrowIfSuperNotCalled { .. } => {
             Some(SkipReason::CalleeUsesSuper)
         }
@@ -625,27 +754,6 @@ fn nested_definitions_read_outer_env(module: &Module, roots: &[FuncId]) -> bool 
                     }
                     _ => {}
                 }
-            }
-        }
-    }
-    false
-}
-
-/// Does the callee's body use `value` anywhere?
-fn callee_uses_value(module: &Module, callee: FuncId, value: ValueId) -> bool {
-    let Some(func) = module.func(callee) else {
-        return false;
-    };
-    for &bb in &func.blocks {
-        let Some(block) = module.block(bb) else {
-            continue;
-        };
-        for &iid in &block.insts {
-            if module
-                .inst(iid)
-                .is_some_and(|i| i.op.operands().contains(&value))
-            {
-                return true;
             }
         }
     }
@@ -762,27 +870,51 @@ fn inline_site(
         .and_then(|b| b.insts.iter().position(|&i| i == call_iid))
         .ok_or(SkipReason::CalleeNoBody)?;
 
-    // ── Step A: parameter binding (T4 + §5.3) ────────────────────────
+    // ── Step A: parameter binding (the vendored frame-slot model — see
+    // CallType): leading implicit slots [func][new.target][this], then
+    // formals left-aligned, undefined-padded. ─────────────────────────
     let callee_data = module.func(callee).ok_or(SkipReason::CalleeNoBody)?;
     let is_static = callee_data.modifiers.contains(Modifiers::STATIC);
     let callee_params = callee_data.params.clone();
     let callee_blocks = callee_data.blocks.clone();
+    let call_type = match CallType::from_annotation(module, callee) {
+        Some(ct) => ct,
+        None if is_static => CallType::DEFAULT,
+        None => return Err(SkipReason::CallTypeUnknown),
+    };
+    let roles = slot_roles(call_type, callee_params.len()).ok_or(SkipReason::CallTypeUnknown)?;
+    let callee_val = match &module
+        .inst(call_iid)
+        .ok_or(SkipReason::UnresolvedCallee)?
+        .op
+    {
+        Op::Call { callee, .. } => *callee,
+        _ => return Err(SkipReason::UnresolvedCallee),
+    };
     let mut value_map: HashMap<ValueId, ValueId> = HashMap::new();
-    for (i, param) in callee_params.iter().copied().enumerate() {
-        let binding = if !is_static && i == 0 {
-            // The `this` binding: explicit receiver when present;
-            // otherwise the callee never uses it (eligibility) — bind
-            // the materialized undefined so the map is total.
-            match this {
+    for (param, role) in callee_params.iter().copied().zip(roles.iter().copied()) {
+        let binding = match role {
+            // The closure being called (vendored: the func slot is the
+            // called closure).
+            SlotRole::Func => callee_val,
+            // new.target: bound per call kind (T4; Direct/Dynamic →
+            // undefined, like `LoadNewTarget`).
+            SlotRole::NewTarget => match nt_binding {
+                NewTargetBinding::Undefined => undef.get(module, call_block, call_pos),
+                NewTargetBinding::CalleeValue => callee_val,
+            },
+            // this: the explicit receiver for callthis*/Direct;
+            // vendored `setVregs` pushes exactly `undefined` for a
+            // non-callthis call (callThis = false), so a receiver-less
+            // Dynamic call binds undefined EXACTLY.
+            SlotRole::This => match this {
                 Some(t) => *t,
                 None => undef.get(module, call_block, call_pos),
-            }
-        } else {
-            let formal = if is_static { i } else { i - 1 };
-            match args.get(formal) {
+            },
+            SlotRole::Formal(k) => match args.get(k) {
                 Some(a) => *a,
                 None => undef.get(module, call_block, call_pos),
-            }
+            },
         };
         value_map.insert(param, binding);
     }
@@ -878,19 +1010,14 @@ fn inline_site(
             if matches!(op, Op::LoadNewTarget) {
                 op = match nt_binding {
                     NewTargetBinding::Undefined => Op::LoadConst(undef.cid),
-                    NewTargetBinding::CalleeValue => {
-                        let Some(inst) = module.inst(call_iid) else {
-                            return Err(SkipReason::UnresolvedCallee);
-                        };
-                        let Op::Call {
-                            callee: callee_val, ..
-                        } = &inst.op
-                        else {
-                            return Err(SkipReason::UnresolvedCallee);
-                        };
-                        Op::Mov { src: *callee_val }
-                    }
+                    NewTargetBinding::CalleeValue => Op::Mov { src: callee_val },
                 };
+            }
+            // Function-identity binding: the callee observing its own
+            // function object sees exactly the called closure (the same
+            // value the vendored func slot carries).
+            if matches!(op, Op::LoadFunction) {
+                op = Op::Mov { src: callee_val };
             }
             let result = match inst.result {
                 Some(r) => Some(
@@ -1255,9 +1382,6 @@ mod tests {
             SkipReason::CalleeHasTryRegions.label(),
             "callee-has-try-regions"
         );
-        assert_eq!(
-            SkipReason::ThisBindingUnprovable.label(),
-            "this-binding-unprovable"
-        );
+        assert_eq!(SkipReason::CallTypeUnknown.label(), "call-type-unknown");
     }
 }

@@ -38,9 +38,48 @@ fn create_static(module: &mut Module, name: &str) -> FuncId {
     f
 }
 
+/// Attach an `L_ESCallTypeAnnotation;` with `callType = bits` to `f`
+/// (the vendored slot-role descriptor; absent in es2abc files, where
+/// the runtime defaults to 0xF — hand-built probes declare their slot
+/// roles explicitly). bits: HaveThis = 1, HaveNewTarget = 2, HaveFunc = 8.
+fn set_call_type(module: &mut Module, f: FuncId, bits: u32) {
+    let descriptor = module.sym.intern("L_ESCallTypeAnnotation;");
+    let class_id = match module
+        .classes
+        .iter()
+        .position(|c| c.descriptor == descriptor)
+    {
+        Some(i) => abcd_ir2::ClassId::new(i as u32),
+        None => {
+            module.classes.push(abcd_ir2::ClassData {
+                descriptor,
+                name: descriptor,
+                modifiers: abcd_ir2::Modifiers::NONE,
+                source_lang: abcd_ir2::SourceLang::EcmaScript,
+                super_class: None,
+                interfaces: Vec::new(),
+                fields: Vec::new(),
+                methods: Vec::new(),
+                annotations: Vec::new(),
+                source_file: None,
+            });
+            abcd_ir2::ClassId::new((module.classes.len() - 1) as u32)
+        }
+    };
+    let name = module.sym.intern("callType");
+    let value = module.consts.push(Const::number(bits as f64));
+    module.functions[f.index()]
+        .annotations
+        .push(abcd_ir2::Annotation {
+            class: class_id,
+            elements: vec![(name, abcd_ir2::AnnValue::Const(value))],
+        });
+}
+
 /// `g` callee: static, one formal `p`, body `return p + 1`.
 fn build_add1_callee(module: &mut Module) -> FuncId {
     let g = create_static(module, "g");
+    set_call_type(module, g, 0);
     let mut b = V2Builder::new(module, g);
     let p = b.create_param();
     let one = b.emit_number(1.0);
@@ -220,21 +259,25 @@ fn skip_count(report: &InlineReport, reason: SkipReason) -> usize {
 
 // ─── Parameter mapping (N44 defect 1) ────────────────────────────────────────
 
+/// A STATIC callee annotated `callType = HaveThis`: slot roles
+/// [this, formals...]. `body_select` 0 → `return this`, 1 → `return x`.
+fn create_this_callee(module: &mut Module, body_select: u8) -> FuncId {
+    let g = create_static(module, "g");
+    set_call_type(module, g, 1);
+    let mut b = V2Builder::new(module, g);
+    let this_p = b.create_param();
+    let x = b.create_param();
+    let v = if body_select == 0 { this_p } else { x };
+    b.emit_void(Op::Return { value: Some(v) });
+    g
+}
+
 /// Dynamic call WITH an explicit receiver (the `callthis*` shape): the
 /// callee's `this` param binds to the receiver value.
 #[test]
 fn dynamic_call_with_receiver_binds_this_param() {
     let mut module = Module::new();
-    // g (NON-static): params [this, x]; body `return this`.
-    let g = V2Builder::create_function(&mut module, "g", FunctionKind::Function);
-    {
-        let mut b = V2Builder::new(&mut module, g);
-        let this_p = b.create_param();
-        let _x = b.create_param();
-        b.emit_void(Op::Return {
-            value: Some(this_p),
-        });
-    }
+    let g = create_this_callee(&mut module, 0); // return this
     let f = create_static(&mut module, "f");
     {
         let mut b = V2Builder::new(&mut module, f);
@@ -263,11 +306,11 @@ fn dynamic_call_with_receiver_binds_this_param() {
     assert!(calls_in(&module, f).is_empty(), "the call is gone");
 }
 
-/// Dynamic call WITHOUT a receiver whose callee USES `this`: skipped —
-/// the binding depends on the callee's strictness, which the IR cannot
-/// prove.
+/// A NON-STATIC callee without a callType annotation is refused: the
+/// vendored 0xF default (this at slot 2) and lift's T4 convention
+/// (this at params[0] for non-static kinds) conflict there.
 #[test]
-fn dynamic_call_without_receiver_using_this_is_skipped() {
+fn non_static_callee_without_call_type_annotation_is_skipped() {
     let mut module = Module::new();
     let g = V2Builder::create_function(&mut module, "g", FunctionKind::Function);
     {
@@ -286,9 +329,41 @@ fn dynamic_call_without_receiver_using_this_is_skipped() {
 
     let report = inline_module(&mut module, &default_policy());
     assert_eq!(report.sites_inlined, 0, "{report:?}");
-    assert_eq!(skip_count(&report, SkipReason::ThisBindingUnprovable), 1);
+    assert_eq!(skip_count(&report, SkipReason::CallTypeUnknown), 1);
     assert_eq!(calls_in(&module, f).len(), 1, "the call stays");
     verify_ok(&module);
+}
+
+/// Dynamic call WITHOUT a receiver whose callee reads `this`: binds
+/// undefined EXACTLY (vendored setVregs pushes undefined when
+/// callThis = false) — inlined, never skipped.
+#[test]
+fn dynamic_call_without_receiver_binds_this_to_undefined() {
+    let mut module = Module::new();
+    let g = create_this_callee(&mut module, 0); // return this
+    let f = create_static(&mut module, "f");
+    {
+        let mut b = V2Builder::new(&mut module, f);
+        let (_c, r) = emit_closure_call(&mut b, g, None, vec![], CallKind::Dynamic);
+        b.emit_void(Op::Return { value: Some(r) });
+    }
+
+    let report = inline_module(&mut module, &default_policy());
+    assert_eq!(report.sites_inlined, 1, "{report:?}");
+    verify_ok(&module);
+    let ret = return_inst(&module, f);
+    let Op::Return { value } = &module.insts[ret.index()].op else {
+        panic!("f ends in Return");
+    };
+    let v = value.expect("returns a value");
+    let ValueDef::Inst(def) = module.values[v.index()].def else {
+        panic!("undefined is materialized as an instruction");
+    };
+    assert!(
+        matches!(&module.insts[def.index()].op, Op::LoadConst(c)
+            if matches!(module.consts.get(*c), Some(Const::Undefined))),
+        "the this slot binds a materialized undefined"
+    );
 }
 
 /// Dynamic call without a receiver is fine when the callee never reads
@@ -296,13 +371,7 @@ fn dynamic_call_without_receiver_using_this_is_skipped() {
 #[test]
 fn dynamic_call_without_receiver_unused_this_inlines() {
     let mut module = Module::new();
-    let g = V2Builder::create_function(&mut module, "g", FunctionKind::Function);
-    {
-        let mut b = V2Builder::new(&mut module, g);
-        let _this_p = b.create_param();
-        let x = b.create_param();
-        b.emit_void(Op::Return { value: Some(x) });
-    }
+    let g = create_this_callee(&mut module, 1); // return x (this unused)
     let f = create_static(&mut module, "f");
     {
         let mut b = V2Builder::new(&mut module, f);
@@ -335,14 +404,7 @@ fn dynamic_call_without_receiver_unused_this_inlines() {
 fn direct_call_binding_rules() {
     // Direct + Some(this): inlines.
     let mut module = Module::new();
-    let g = V2Builder::create_function(&mut module, "g", FunctionKind::Function);
-    {
-        let mut b = V2Builder::new(&mut module, g);
-        let this_p = b.create_param();
-        b.emit_void(Op::Return {
-            value: Some(this_p),
-        });
-    }
+    let g = create_this_callee(&mut module, 0);
     let f = create_static(&mut module, "f");
     {
         let mut b = V2Builder::new(&mut module, f);
@@ -356,14 +418,7 @@ fn direct_call_binding_rules() {
 
     // Direct + None: skipped.
     let mut module = Module::new();
-    let g = V2Builder::create_function(&mut module, "g", FunctionKind::Function);
-    {
-        let mut b = V2Builder::new(&mut module, g);
-        let this_p = b.create_param();
-        b.emit_void(Op::Return {
-            value: Some(this_p),
-        });
-    }
+    let g = create_this_callee(&mut module, 0);
     let f = create_static(&mut module, "f");
     {
         let mut b = V2Builder::new(&mut module, f);
@@ -383,6 +438,7 @@ fn static_callee_arity_rules() {
     // Missing arg → undefined.
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);
         let _p0 = b.create_param();
@@ -425,6 +481,7 @@ fn static_callee_arity_rules() {
     // are ineligible).
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);
         let p0 = b.create_param();
@@ -441,6 +498,167 @@ fn static_callee_arity_rules() {
     let report = inline_module(&mut module, &default_policy());
     assert_eq!(report.sites_inlined, 1, "{report:?}");
     verify_ok(&module);
+}
+
+/// The es2abc corpus shape: a STATIC callee WITHOUT a callType
+/// annotation takes the vendored 0xF default — slots
+/// [func, new.target, this, formals...]. A single argument binds the
+/// FIRST FORMAL (params[3]), matching the VM's left-aligned formal
+/// fill (the typescript-enum IIFE shape).
+#[test]
+fn es2abc_default_call_type_slot_roles() {
+    let mut module = Module::new();
+    let g = create_static(&mut module, "g"); // NO annotation → 0xF
+    let closure_val;
+    {
+        let mut b = V2Builder::new(&mut module, g);
+        let func_slot = b.create_param(); // params[0] = func
+        let _nt_slot = b.create_param(); // params[1] = new.target
+        let _this_slot = b.create_param(); // params[2] = this
+        let e = b.create_param(); // params[3] = the first formal
+        let sum = b.emit_val(Op::BinaryOp {
+            op: BinOp::Add,
+            left: func_slot,
+            right: e,
+        });
+        b.emit_void(Op::Return { value: Some(sum) });
+        let _ = func_slot;
+    }
+    let f = create_static(&mut module, "f");
+    {
+        let mut b = V2Builder::new(&mut module, f);
+        let df = b.emit_val(Op::DefineFunc {
+            body: g,
+            captures: vec![],
+            length: 1,
+        });
+        closure_val = b.emit_val(Op::AllocClosure { func: df });
+        let arg = b.emit_number(5.0);
+        let (iid, result) = b.emit(Op::Call {
+            callee: closure_val,
+            this: None,
+            args: vec![arg],
+            kind: CallKind::Dynamic,
+        });
+        let _ = iid;
+        b.emit_void(Op::Return { value: result });
+    }
+
+    let report = inline_module(&mut module, &default_policy());
+    assert_eq!(report.sites_inlined, 1, "{report:?}");
+    verify_ok(&module);
+    // f returns func_slot + E = closure + 5. The add's operands must be
+    // the call-site closure value and the argument's LoadConst result.
+    let ret = return_inst(&module, f);
+    let Op::Return { value: Some(v), .. } = &module.insts[ret.index()].op else {
+        panic!("f returns a value")
+    };
+    let ValueDef::Inst(add) = module.values[v.index()].def else {
+        panic!("add result")
+    };
+    let Op::BinaryOp { left, right, .. } = &module.insts[add.index()].op else {
+        panic!("the cloned add")
+    };
+    assert_eq!(*left, closure_val, "the func slot binds the closure");
+    let ValueDef::Inst(rc) = module.values[right.index()].def else {
+        panic!("arg value")
+    };
+    assert!(
+        matches!(&module.insts[rc.index()].op, Op::LoadConst(c)
+            if module.consts.get(*c).and_then(Const::as_f64) == Some(5.0)),
+        "params[3] binds the argument (left-aligned formals)"
+    );
+}
+
+/// The new.target SLOT (params[1] under the 0xF default) binds
+/// undefined for Direct/Dynamic calls, exactly like `LoadNewTarget`.
+#[test]
+fn es2abc_default_new_target_slot_binds_undefined() {
+    let mut module = Module::new();
+    let g = create_static(&mut module, "g"); // NO annotation → 0xF
+    {
+        let mut b = V2Builder::new(&mut module, g);
+        let _func = b.create_param();
+        let nt = b.create_param();
+        let _this = b.create_param();
+        b.emit_void(Op::Return { value: Some(nt) });
+    }
+    let f = create_static(&mut module, "f");
+    {
+        let mut b = V2Builder::new(&mut module, f);
+        let (_c, r) = emit_closure_call(&mut b, g, None, vec![], CallKind::Dynamic);
+        b.emit_void(Op::Return { value: Some(r) });
+    }
+    let report = inline_module(&mut module, &default_policy());
+    assert_eq!(report.sites_inlined, 1, "{report:?}");
+    verify_ok(&module);
+    let ret = return_inst(&module, f);
+    let Op::Return { value: Some(v), .. } = &module.insts[ret.index()].op else {
+        panic!("f returns a value")
+    };
+    let ValueDef::Inst(def) = module.values[v.index()].def else {
+        panic!("undefined materialized as an instruction")
+    };
+    assert!(
+        matches!(&module.insts[def.index()].op, Op::LoadConst(c)
+            if matches!(module.consts.get(*c), Some(Const::Undefined))),
+        "the new.target slot binds undefined"
+    );
+}
+
+/// `LoadFunction` in the callee binds the called closure (the same
+/// value the func slot carries) — supported, never skipped.
+#[test]
+fn load_function_binds_the_called_closure() {
+    let mut module = Module::new();
+    let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
+    {
+        let mut b = V2Builder::new(&mut module, g);
+        let lf = b.emit_val(Op::LoadFunction);
+        b.emit_void(Op::Return { value: Some(lf) });
+    }
+    let f = create_static(&mut module, "f");
+    let closure_val;
+    {
+        let mut b = V2Builder::new(&mut module, f);
+        let df = b.emit_val(Op::DefineFunc {
+            body: g,
+            captures: vec![],
+            length: 0,
+        });
+        closure_val = b.emit_val(Op::AllocClosure { func: df });
+        let (_iid, r) = b.emit(Op::Call {
+            callee: closure_val,
+            this: None,
+            args: vec![],
+            kind: CallKind::Dynamic,
+        });
+        b.emit_void(Op::Return { value: r });
+    }
+    let report = inline_module(&mut module, &default_policy());
+    assert_eq!(report.sites_inlined, 1, "{report:?}");
+    verify_ok(&module);
+    // No LoadFunction survives in f; f returns the closure value.
+    for &bb in &module.functions[f.index()].blocks {
+        for &iid in &module.blocks[bb.index()].insts {
+            assert!(
+                !matches!(&module.insts[iid.index()].op, Op::LoadFunction),
+                "LoadFunction must be bound, never cloned raw"
+            );
+        }
+    }
+    let ret = return_inst(&module, f);
+    let Op::Return { value: Some(v), .. } = &module.insts[ret.index()].op else {
+        panic!("f returns a value")
+    };
+    let ValueDef::Inst(def) = module.values[v.index()].def else {
+        panic!("the cloned LoadFunction result")
+    };
+    assert!(
+        matches!(&module.insts[def.index()].op, Op::Mov { src } if *src == closure_val),
+        "LoadFunction bound to the called closure"
+    );
 }
 
 // ─── Predecessor rebuild (N44 defect 2) ──────────────────────────────────────
@@ -683,6 +901,7 @@ fn try_region_caller_exception_participation() {
 fn multi_return_callee_flows_through_phi() {
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);
         let p = b.create_param();
@@ -774,6 +993,7 @@ fn multi_return_callee_flows_through_phi() {
 fn never_returning_callee_leaves_unreachable_continuation() {
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);
         let v = b.emit_number(9.0);
@@ -798,6 +1018,7 @@ fn never_returning_callee_leaves_unreachable_continuation() {
 fn recursive_callee_is_skipped() {
     let mut module = Module::new();
     let f = create_static(&mut module, "f");
+    set_call_type(&mut module, f, 0);
     {
         let mut b = V2Builder::new(&mut module, f);
         let a = b.create_param();
@@ -818,6 +1039,8 @@ fn mutual_recursion_is_bounded() {
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
     let f = create_static(&mut module, "f");
+    set_call_type(&mut module, g, 0);
+    set_call_type(&mut module, f, 0);
     // g calls f; f calls g. Both bodies are otherwise trivial.
     {
         let mut b = V2Builder::new(&mut module, g);
@@ -850,6 +1073,7 @@ fn mutual_recursion_is_bounded() {
 fn new_target_bound_to_undefined_for_dynamic_call() {
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);
         let nt = b.emit_val(Op::LoadNewTarget);
@@ -888,6 +1112,7 @@ fn new_target_bound_to_undefined_for_dynamic_call() {
 fn new_kind_call_site_is_skipped() {
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);
         let nt = b.emit_val(Op::LoadNewTarget);
@@ -959,11 +1184,6 @@ fn forbidden_callee_ops_are_skipped() {
             SkipReason::CalleeUsesArguments,
         ),
         (
-            "function-identity",
-            Op::LoadFunction,
-            SkipReason::CalleeUsesFunctionIdentity,
-        ),
-        (
             "private",
             Op::LoadPrivate {
                 level: 0,
@@ -984,6 +1204,7 @@ fn forbidden_callee_ops_are_skipped() {
     for (name, op, expected) in cases {
         let mut module = Module::new();
         let g = create_static(&mut module, "g");
+        set_call_type(&mut module, g, 0);
         {
             let mut b = V2Builder::new(&mut module, g);
             // Operand-carrying probes use a real const value.
@@ -1020,6 +1241,7 @@ fn forbidden_callee_ops_are_skipped() {
     // super and nested-definition cases (need extra module plumbing).
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);
         let name = b.sym("x");
@@ -1044,6 +1266,7 @@ fn forbidden_callee_ops_are_skipped() {
 
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     let h = create_static(&mut module, "h");
     {
         // The nested body OBSERVES the captured environment — unsafe
@@ -1079,6 +1302,7 @@ fn forbidden_callee_ops_are_skipped() {
     // observes the environment inlines fine.
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     let h = create_static(&mut module, "h");
     {
         let mut b = V2Builder::new(&mut module, h);
@@ -1112,6 +1336,7 @@ fn generator_callee_is_skipped() {
     let mut module = Module::new();
     let g = V2Builder::create_function(&mut module, "g", FunctionKind::Generator);
     module.functions[g.index()].modifiers = abcd_ir2::Modifiers::STATIC;
+    set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);
         b.emit_void(Op::Return { value: None });
@@ -1135,6 +1360,7 @@ fn generator_callee_is_skipped() {
 fn callee_with_self_loop_entry_is_skipped() {
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     {
         let mut b = V2Builder::new(&mut module, g);
         let entry = b.entry();
@@ -1280,6 +1506,7 @@ fn two_calls_in_one_block_both_inline() {
 fn loc_fidelity() {
     let mut module = Module::new();
     let g = create_static(&mut module, "g");
+    set_call_type(&mut module, g, 0);
     let src_loc = Loc {
         line: 9,
         column: Some(3),
