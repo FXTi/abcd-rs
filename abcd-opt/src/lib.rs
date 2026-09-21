@@ -1,0 +1,142 @@
+//! # abcd-opt — optimization passes for the v0.2 IR
+//!
+//! The v0.2 port of v0.1's `abcd-ir/src/opt` pipeline (migration P3 of
+//! `design/ir-v0.2.md`): [`peephole`] (constant folding), [`sccp`] (sparse
+//! conditional constant propagation), [`dce`] (aggressive dead code
+//! elimination + CFG simplification), and [`copyprop`] (trivial-phi
+//! elimination). `inline` is deliberately NOT ported (N44 quarantine; the
+//! D2 inline-rewrite decision is deferred past P3).
+//!
+//! ## Format independence (hard, structurally enforced)
+//!
+//! Every pass operates on [`abcd_ir2::Module`] alone. This crate's
+//! `Cargo.toml` declares **no dependency** on `abcd-file`, `abcd-isa`,
+//! `abcd-file-sys`, `abcd-isa-sys`, `abcd-ir`, `abcd-lift`, or
+//! `abcd-lower` (the format-coupled crates are dev-dependencies only,
+//! for the end-to-end regression tests) — the crate graph is the
+//! enforcement mechanism.
+//!
+//! ## The v0.1 behavioral contract that survives the port
+//!
+//! - **N36**: both fold engines evaluate non-commutative operators in
+//!   vendored operand order (`vreg OP acc`, i.e. `right OP left` in IR
+//!   field terms — lift's `binary_op`/`compare` emit `left = acc`,
+//!   `right = vreg`).
+//! - **N37**: folds preserve `-0.0` (constants are bit-exact
+//!   [`Const::Number`](abcd_ir2::Const) payloads; no fold canonicalizes
+//!   `-0.0` to `+0.0`).
+//! - **N38**: SCCP exception soundness — reachability includes
+//!   [`EdgeKind::Exceptional`](abcd_ir2::EdgeKind) edges, handler-block
+//!   phis are forced to lattice Bottom, and `Eq`/`NotEq` never
+//!   ToNumber-coerce nullish operands.
+//! - **N39**: `UnOp::BitNot` (vendor `not`) is bitwise; `LogicalNot` is
+//!   the boolean one.
+//! - **N40**: `StrictEq` folds with host `==` on numbers (`0 === -0`
+//!   true, `NaN !== NaN`), never a bit comparison.
+//! - **N41**: `null` is never coerced to `0.0` by a fold.
+//! - **N42**: bitwise/shift folds use ECMA-262 [`to_int32`]/[`to_uint32`]
+//!   (wrap mod 2^32, NaN/±Inf → +0), not Rust's saturating casts.
+//! - **N47**: SCCP's edge seeding does not stop at `Return`/`Unreachable`
+//!   terminators — exception edges are still added.
+//! - **N48/N50**: ADCE essentiality is DERIVED from
+//!   [`Op::effects`](abcd_ir2::Op::effects) (T3) — no hand-maintained
+//!   list; see [`dce`].
+//! - **N27/N28**: passes keep the module verifier-clean (no empty phis on
+//!   reachable blocks, no copyprop residue); the corpus driver re-verifies
+//!   after optimizing.
+//!
+//! ## Library rule
+//!
+//! No panics on data: arena lookups return `Option`; passes skip what
+//! they cannot soundly rewrite.
+
+#![deny(missing_docs)]
+
+pub mod analysis;
+pub mod copyprop;
+pub mod dce;
+pub mod peephole;
+pub mod sccp;
+
+use abcd_ir2::{FuncId, Module};
+
+/// A function-level optimization pass (v0.1 `opt::FuncPass`).
+pub trait FuncPass {
+    /// Run the pass on `func` within `module`.
+    /// Returns `true` if the IR was modified.
+    fn run(&self, module: &mut Module, func: FuncId) -> bool;
+}
+
+/// ECMA-262 ToInt32, shared by BOTH constant-fold engines (N42).
+///
+/// Rust's `n as i32` SATURATES (out-of-range clamps to ±2^31, NaN → 0);
+/// JS bitwise/shift operators WRAP mod 2^32 and map NaN/±Infinity to +0.
+/// Matches the vendored conversion used by every `*2` bitwise/shift fast
+/// path, `base::NumberHelper::DoubleToInt(d, INT32_BITS)`
+/// (arkcompiler_ets_runtime-master ecmascript/base/number_helper.cpp:1137-
+/// 1158 — truncate toward zero, keep the low 32 bits, reinterpret as
+/// signed; the explicit `SaturateTruncDoubleToInt32` is a different
+/// function those handlers do NOT call).
+pub(crate) fn to_int32(n: f64) -> i32 {
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    // Exact: f64 `%` is fmod (exactly rounded) and every integer in
+    // [0, 2^32) is exactly representable, so the wrap loses nothing.
+    let wrapped = n.trunc() % 4294967296.0;
+    let positive = if wrapped < 0.0 {
+        wrapped + 4294967296.0
+    } else {
+        wrapped
+    };
+    (positive as u32) as i32
+}
+
+/// ECMA-262 ToUint32 — the same wrap, reinterpreted unsigned. The shift
+/// count mask `& 0x1f` applies AFTER this conversion: a negative count
+/// wraps to a large unsigned value and then masks (e.g. -1 → 31), it is
+/// not saturated to 0 first.
+pub(crate) fn to_uint32(n: f64) -> u32 {
+    to_int32(n) as u32
+}
+
+/// Run the full optimization pipeline on a single function.
+/// Pipeline: peephole → sccp → adce + cfg-simplify → copyprop → peephole
+/// → adce + cfg-simplify (v0.1 `opt::optimize_func`).
+/// Returns `true` if any pass modified the IR.
+pub fn optimize_func(module: &mut Module, func: FuncId) -> bool {
+    let mut changed = false;
+
+    // Round 1: peephole → sccp → adce + cfg simplify → copyprop
+    changed |= peephole::Peephole.run(module, func);
+    changed |= sccp::Sccp.run(module, func);
+    changed |= dce::Adce.run(module, func);
+    changed |= dce::CfgSimplify.run(module, func);
+    changed |= copyprop::CopyProp.run(module, func);
+
+    // Round 2: peephole → adce + cfg simplify (cleanup)
+    changed |= peephole::Peephole.run(module, func);
+    changed |= dce::Adce.run(module, func);
+    changed |= dce::CfgSimplify.run(module, func);
+
+    changed
+}
+
+/// Run the optimization pipeline on all functions in the module
+/// (v0.1 `opt::optimize_module`). Bodyless functions (external/native
+/// declarations) are skipped.
+pub fn optimize_module(module: &mut Module) -> bool {
+    let func_count = module.functions.len();
+    let mut changed = false;
+    for i in 0..func_count {
+        let func_id = FuncId::new(i as u32);
+        let Some(func) = module.func(func_id) else {
+            continue;
+        };
+        if func.blocks.is_empty() {
+            continue;
+        }
+        changed |= optimize_func(module, func_id);
+    }
+    changed
+}

@@ -1,0 +1,24 @@
+[package]
+name = "abcd-opt"
+description = "Optimization passes for SSA IR v0.2 (abcd_ir2::Module): peephole, SCCP, ADCE + CFG simplify, copyprop (design/ir-v0.2.md migration P3)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# DELIBERATE INVARIANT (design/ir-v0.2.md §1, design/ir.md §8 invariant 1,
+# same enforcement mechanism as abcd-ir2): the passes are
+# FORMAT-INDEPENDENT — they see `abcd_ir2::Module` and nothing else. This
+# crate's [dependencies] must ONLY ever list `abcd-ir2` — never
+# abcd-file, abcd-isa, abcd-file-sys, abcd-isa-sys (the container/ISA
+# layer), abcd-ir (the frozen v0.1 oracle), abcd-lift, or abcd-lower.
+# The format-coupled crates appear exclusively under [dev-dependencies],
+# where the regression tests build bytecode files and drive the
+# decode → lift → optimize → lower pipeline end-to-end.
+[dependencies]
+abcd-ir2 = { workspace = true }
+
+[dev-dependencies]
+abcd-file = { workspace = true }
+abcd-isa = { workspace = true }
+abcd-lift = { workspace = true }
+abcd-lower = { workspace = true }

@@ -9,6 +9,7 @@ members = [
     "abcd-ir2",
     "abcd-lift",
     "abcd-lower",
+    "abcd-opt",
 ]
 
 [workspace.package]
@@ -35,3 +36,4 @@ abcd-ir = { path = "abcd-ir" }
 abcd-ir2 = { path = "abcd-ir2" }
 abcd-lift = { path = "abcd-lift" }
 abcd-lower = { path = "abcd-lower" }
+abcd-opt = { path = "abcd-opt" }
