@@ -527,6 +527,33 @@ pub fn dump_expr(e: &Expr) -> String {
             dump_expr(setter)
         ),
         Expr::ModuleNamespace { index } => format!("ns{index}"),
+        Expr::ObjectBuild { entries } => {
+            let inner: Vec<String> = entries
+                .iter()
+                .map(|e| match e {
+                    crate::expr::ObjEntry::KeyValue(k, v) => {
+                        format!("{}: {}", render_lit(k), dump_expr(v))
+                    }
+                    crate::expr::ObjEntry::Computed(k, v) => {
+                        format!("[{}]: {}", dump_expr(k), dump_expr(v))
+                    }
+                    crate::expr::ObjEntry::Spread(s) => format!("...{}", dump_expr(s)),
+                    crate::expr::ObjEntry::Proto(p) => format!("__proto__: {}", dump_expr(p)),
+                    crate::expr::ObjEntry::Method(n, f) => format!("{n}: {}", dump_expr(f)),
+                })
+                .collect();
+            format!("build-object({{{}}})", inner.join(", "))
+        }
+        Expr::ArrayBuild { elements } => {
+            let inner: Vec<String> = elements
+                .iter()
+                .map(|e| match e {
+                    crate::expr::ArrayElem::Item(i) => dump_expr(i),
+                    crate::expr::ArrayElem::Spread(s) => format!("...{}", dump_expr(s)),
+                })
+                .collect();
+            format!("build-array([{}])", inner.join(", "))
+        }
         Expr::Fallback { op, note, operands } => {
             let ops: Vec<String> = operands.iter().map(dump_expr).collect();
             if ops.is_empty() {

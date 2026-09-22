@@ -1314,6 +1314,29 @@ impl<'m> Recover<'m> {
             },
             Op::AllocObject { shape } => match lit_of(self.module, *shape) {
                 Some(Lit::Object(entries)) => Expr::ObjectLit { entries },
+                // `createobjectwithbuffer`'s vendor buffer is a FLAT
+                // array `[k0, v0, k1, v1, …]` (probe-verified on the
+                // corpus, e.g. 9.0.0.0 for-in); interpret pairwise.
+                Some(Lit::Array(items)) => {
+                    if items.len() % 2 == 0
+                        && items
+                            .chunks_exact(2)
+                            .all(|p| matches!(p[0], Lit::String(_) | Lit::Number(_)))
+                    {
+                        Expr::ObjectLit {
+                            entries: items
+                                .chunks_exact(2)
+                                .map(|p| (p[0].clone(), p[1].clone()))
+                                .collect(),
+                        }
+                    } else {
+                        Expr::Fallback {
+                            op: "AllocObject",
+                            note: "shape buffer is not a flat key/value array",
+                            operands: vec![],
+                        }
+                    }
+                }
                 _ => Expr::Fallback {
                     op: "AllocObject",
                     note: "shape constant is not an ObjectLiteral",

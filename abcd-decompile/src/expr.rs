@@ -381,6 +381,20 @@ pub enum Expr {
         /// The module slot.
         index: u32,
     },
+    /// A Stage-B folded object literal: an `AllocObject` shape plus the
+    /// absorbed own-store/spread/proto/method sequence (the d-P3
+    /// literal-fold desugar rule, design §4.2.6). Not produced by
+    /// Stage A; [`crate::folds`] introduces it.
+    ObjectBuild {
+        /// The entries, in source order.
+        entries: Vec<ObjEntry>,
+    },
+    /// A Stage-B folded array literal (same provenance as
+    /// [`Expr::ObjectBuild`]).
+    ArrayBuild {
+        /// The elements, in source order.
+        elements: Vec<ArrayElem>,
+    },
     /// The documented fallback node: an op Stage A could not map, with
     /// its operand expressions kept verbatim. Loud, never silent.
     Fallback {
@@ -391,6 +405,32 @@ pub enum Expr {
         /// The operand expressions.
         operands: Vec<Expr>,
     },
+}
+
+/// One entry of a Stage-B folded object literal ([`Expr::ObjectBuild`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ObjEntry {
+    /// `key: value` with a literal key (identifier/string/number form
+    /// chosen by the emitter).
+    KeyValue(Lit, Expr),
+    /// `[computed]: value`.
+    Computed(Expr, Expr),
+    /// `...src` (`CopyDataProps` inside the builder sequence).
+    Spread(Expr),
+    /// `__proto__: proto` (`SetObjectWithProto`; the no-setter semantics
+    /// match the op exactly).
+    Proto(Expr),
+    /// `name() { … }` (`DefineMethod`; `func` is the closure node).
+    Method(String, Expr),
+}
+
+/// One element of a Stage-B folded array literal ([`Expr::ArrayBuild`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum ArrayElem {
+    /// A plain element.
+    Item(Expr),
+    /// `...src` (`ArraySpread`).
+    Spread(Expr),
 }
 
 /// The iteration-protocol op behind an [`Expr::Iter`] node.
@@ -437,9 +477,19 @@ impl Expr {
                 CmpOp::Eq | CmpOp::NotEq | CmpOp::StrictEq | CmpOp::StrictNotEq => 11,
                 _ => 12,
             },
-            Expr::Unary { .. } | Expr::Delete { .. } | Expr::Yield { .. } | Expr::Await { .. } => {
-                17
-            }
+            Expr::Unary { .. } | Expr::Delete { .. } | Expr::Await { .. } => 17,
+            // `yield` parses as an AssignmentExpression: as the operand of
+            // any real operator it MUST be parenthesized (`yield v + w`
+            // means `yield (v + w)`).
+            Expr::Yield { .. } => 2,
+            // Object literals are not PrimaryExpressions at statement /
+            // member position; giving them the lowest precedence makes the
+            // printer parenthesize them inside any operator context (the
+            // statement-position rule lives in the emitter).
+            Expr::ObjectLit { .. } | Expr::ObjectBuild { .. } => 0,
+            // A `function` expression as a callee/operand parenthesizes
+            // (`function f(){}()` is a declaration + error, not a call).
+            Expr::Closure { .. } => 1,
             Expr::Call { .. }
             | Expr::PropName { .. }
             | Expr::PropIndex { .. }
