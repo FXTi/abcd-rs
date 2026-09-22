@@ -10,6 +10,7 @@ members = [
     "abcd-lower",
     "abcd-opt",
     "abcd-analysis",
+    "abcd-taint",
 ]
 
 [workspace.package]
@@ -37,3 +38,4 @@ abcd-lift = { path = "abcd-lift" }
 abcd-lower = { path = "abcd-lower" }
 abcd-opt = { path = "abcd-opt" }
 abcd-analysis = { path = "abcd-analysis" }
+abcd-taint = { path = "abcd-taint" }

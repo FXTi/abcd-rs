@@ -1,0 +1,20 @@
+[package]
+name = "abcd-taint"
+description = "Taint analysis on the v0.2 IR: IFDS fact model, summary registry, source/sink driver (design/analysis-strategy.md §5.2–§5.5, design/flowdroid/summaries.md)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# Crate-graph invariant (design/analysis-strategy.md §5): taint analysis
+# consumes ONLY `abcd-ir` (the IR) and `abcd-analysis` (the IFDS solver,
+# heap model, call graph). It never depends on the format/pipeline crates
+# abcd-file/abcd-isa/abcd-lift/abcd-lower/abcd-opt in the LIBRARY — the
+# corpus smoke test under tests/ pulls `abcd-file`/`abcd-lift` as
+# DEV-dependencies only (they drive decode → lift to obtain real modules).
+[dependencies]
+abcd-ir = { workspace = true }
+abcd-analysis = { workspace = true }
+
+[dev-dependencies]
+abcd-file = { workspace = true }
+abcd-lift = { workspace = true }
