@@ -65,7 +65,12 @@ fn evaluate(module: &Module, family: &str, expected: Counts) {
 
 /// `print(x)` over `value` in block `b`, with a distinguishing marker
 /// line number so multi-sink probes can tell hits apart.
-fn print_call_at(m: &mut Module, b: BlockId, value: abcd_ir::ValueId, line: u32) -> abcd_ir::InstId {
+fn print_call_at(
+    m: &mut Module,
+    b: BlockId,
+    value: abcd_ir::ValueId,
+    line: u32,
+) -> abcd_ir::InstId {
     let print = try_get_global(m, b, "print");
     push_inst_loc(
         m,
@@ -98,7 +103,15 @@ fn probe_straight_line_local() {
     print_call_at(&mut m, entry, r, 10);
     emit_void(&mut m, entry, Op::Return { value: None });
 
-    evaluate(&m, "straight-line-local", Counts { tp: 1, fp: 0, fn_: 0 });
+    evaluate(
+        &m,
+        "straight-line-local",
+        Counts {
+            tp: 1,
+            fp: 0,
+            fn_: 0,
+        },
+    );
 }
 
 /// Family 2 — heap store/load through the same alloc site, with a
@@ -147,8 +160,16 @@ fn probe_heap_store_load_same_alloc_site() {
     emit_void(&mut m, entry, Op::Return { value: None });
 
     let report = abcd_taint::run_taint(&m, &probe_config());
-    let lines: Vec<u32> = report.hits.iter().filter_map(|h| h.loc.map(|l| l.line)).collect();
-    eprintln!("PROBE heap-same-site tp={} fp={} fn=0 (hit lines {lines:?})", report.hits.len(), 0);
+    let lines: Vec<u32> = report
+        .hits
+        .iter()
+        .filter_map(|h| h.loc.map(|l| l.line))
+        .collect();
+    eprintln!(
+        "PROBE heap-same-site tp={} fp={} fn=0 (hit lines {lines:?})",
+        report.hits.len(),
+        0
+    );
     assert_eq!(lines, vec![20], "only the same-site load flows");
 }
 
@@ -226,8 +247,20 @@ fn probe_dynamic_dispatch() {
         join,
         Op::Phi {
             entries: vec![
-                (Edge { from: t, kind: EdgeKind::Normal }, c1),
-                (Edge { from: e, kind: EdgeKind::Normal }, c2),
+                (
+                    Edge {
+                        from: t,
+                        kind: EdgeKind::Normal,
+                    },
+                    c1,
+                ),
+                (
+                    Edge {
+                        from: e,
+                        kind: EdgeKind::Normal,
+                    },
+                    c2,
+                ),
             ],
         },
     );
@@ -244,7 +277,15 @@ fn probe_dynamic_dispatch() {
     print_call_at(&mut m, join, r, 30);
     emit_void(&mut m, join, Op::Return { value: None });
 
-    evaluate(&m, "dynamic-dispatch", Counts { tp: 1, fp: 0, fn_: 0 });
+    evaluate(
+        &m,
+        "dynamic-dispatch",
+        Counts {
+            tp: 1,
+            fp: 0,
+            fn_: 0,
+        },
+    );
 }
 
 /// Family 4 — interprocedural call/return: a direct call to a helper
@@ -281,7 +322,10 @@ fn probe_interprocedural_call_return() {
     emit_void(&mut m, entry, Op::Return { value: None });
 
     let report = abcd_taint::run_taint(&m, &probe_config());
-    eprintln!("PROBE interprocedural-call-return tp={} fp=0 fn=0", report.hits.len());
+    eprintln!(
+        "PROBE interprocedural-call-return tp={} fp=0 fn=0",
+        report.hits.len()
+    );
     assert_eq!(report.hits.len(), 1);
     // The reconstructed path must cross the call and return.
     let path = &report.hits[0].path;
@@ -327,8 +371,14 @@ fn probe_exception_only_path() {
     add_try(&mut m, f, vec![thrower], handler, exc);
 
     let report = abcd_taint::run_taint(&m, &probe_config());
-    let lines: Vec<u32> = report.hits.iter().filter_map(|h| h.loc.map(|l| l.line)).collect();
-    eprintln!("PROBE exception-only tp={} fp=0 fn=0 (hit lines {lines:?})", report.hits.len());
+    let lines: Vec<u32> = report
+        .hits
+        .iter()
+        .filter_map(|h| h.loc.map(|l| l.line))
+        .collect();
+    eprintln!(
+        "PROBE exception-only tp={} fp=0 fn=0 (hit lines {lines:?})",
+        report.hits.len()
+    );
     assert_eq!(lines, vec![55], "only the exceptional path flows");
 }
-

@@ -32,8 +32,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use abcd_analysis::callgraph::CallGraph;
-use abcd_analysis::dataflow::ifds::CallGraphOracle;
 use abcd_analysis::dataflow::heap::DEFAULT_MAX_FIELD_CHAIN;
+use abcd_analysis::dataflow::ifds::CallGraphOracle;
 use abcd_analysis::dataflow::ifds::{IfdsConfig, IfdsResult, IfdsSolver};
 use abcd_ir::{FuncId, InstId, Loc, Module, Op, ValueId};
 
@@ -151,6 +151,11 @@ pub struct TaintReport {
     pub stats: RegistryStats,
     /// `(call site, summary name)` in application order.
     pub summaries_applied: Vec<(InstId, String)>,
+    /// Summary hits by NAME (resolved; aggregation-safe across modules).
+    pub summary_hits: std::collections::BTreeMap<String, usize>,
+    /// Named misses by NAME — the "report missing" backlog
+    /// (aggregation-safe across modules).
+    pub summary_misses: std::collections::BTreeMap<String, usize>,
     /// Total propagated path edges (solver work).
     pub path_edges: usize,
 }
@@ -158,7 +163,7 @@ pub struct TaintReport {
 impl TaintReport {
     /// The smoke-summary lines (verbatim format pinned by the corpus
     /// smoke test): flows, counters, determinism-friendly.
-    pub fn summary_lines(&self, registry: &SummaryRegistry) -> Vec<String> {
+    pub fn summary_lines(&self) -> Vec<String> {
         let mut lines = vec![
             format!("TAINT-FLOWS hits={}", self.hits.len()),
             format!(
@@ -170,21 +175,17 @@ impl TaintReport {
                 self.stats.sites_unknown,
             ),
         ];
-        let mut hits: Vec<String> = self
-            .stats
-            .hits
+        let hits: Vec<String> = self
+            .summary_hits
             .iter()
-            .map(|(s, n)| format!("{}={}", registry.resolve(*s).unwrap_or_default(), n))
+            .map(|(s, n)| format!("{s}={n}"))
             .collect();
-        hits.sort();
         lines.push(format!("TAINT-SUMMARY-HITS {}", hits.join(" ")));
-        let mut misses: Vec<String> = self
-            .stats
-            .misses_named
+        let misses: Vec<String> = self
+            .summary_misses
             .iter()
-            .map(|(s, n)| format!("{}={}", registry.resolve(*s).unwrap_or_default(), n))
+            .map(|(s, n)| format!("{s}={n}"))
             .collect();
-        misses.sort();
         lines.push(format!("TAINT-SUMMARY-MISSES {}", misses.join(" ")));
         lines
     }
@@ -222,8 +223,15 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     let hits = collect_hits(module, config, &callgraph, &result);
     let applied = problem.applied_summaries();
     let stats = registry.stats();
+    let resolve_map = |m: &std::collections::BTreeMap<abcd_ir::Sym, usize>| {
+        m.iter()
+            .map(|(s, n)| (registry.resolve(*s).unwrap_or_default(), *n))
+            .collect()
+    };
     let mut report = TaintReport {
         hits,
+        summary_hits: resolve_map(&stats.hits),
+        summary_misses: resolve_map(&stats.misses_named),
         stats,
         summaries_applied: applied,
         path_edges: result.path_edges().len(),
@@ -249,12 +257,11 @@ fn collect_hits(
     let zero = Fact::Zero;
     let mut hits = Vec::new();
     for (iid, _edge) in callgraph.sites() {
-        let Some(inst) = module.inst(iid) else { continue };
+        let Some(inst) = module.inst(iid) else {
+            continue;
+        };
         let Op::Call {
-            callee,
-            this,
-            args,
-            ..
+            callee, this, args, ..
         } = &inst.op
         else {
             continue;
@@ -318,8 +325,12 @@ fn func_of_inst(module: &Module, inst: InstId) -> Option<FuncId> {
 /// instruction in the block, or the last instruction of each predecessor
 /// block (Normal and Exceptional edges alike).
 fn inst_preds(module: &Module, inst: InstId) -> Vec<InstId> {
-    let Some(i) = module.inst(inst) else { return Vec::new() };
-    let Some(block) = module.block(i.block) else { return Vec::new() };
+    let Some(i) = module.inst(inst) else {
+        return Vec::new();
+    };
+    let Some(block) = module.block(i.block) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     if let Some(pos) = block.insts.iter().position(|&x| x == inst) {
         if pos > 0 {
@@ -341,8 +352,12 @@ fn inst_preds(module: &Module, inst: InstId) -> Vec<InstId> {
 /// reconstruction (the supergraph is solver-internal): the normal
 /// continuation plus handler entries when the call may throw.
 fn return_sites_of(module: &Module, call: InstId) -> Vec<InstId> {
-    let Some(inst) = module.inst(call) else { return Vec::new() };
-    let Some(block) = module.block(inst.block) else { return Vec::new() };
+    let Some(inst) = module.inst(call) else {
+        return Vec::new();
+    };
+    let Some(block) = module.block(inst.block) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
     if let Some(pos) = block.insts.iter().position(|&x| x == call) {
         if pos + 1 < block.insts.len() {
@@ -356,7 +371,11 @@ fn return_sites_of(module: &Module, call: InstId) -> Vec<InstId> {
         }
     }
     if inst.op.effects().may_throw {
-        if let Some(f) = module.functions.iter().find(|f| f.blocks.contains(&inst.block)) {
+        if let Some(f) = module
+            .functions
+            .iter()
+            .find(|f| f.blocks.contains(&inst.block))
+        {
             for region in &f.try_regions {
                 if !region.protected.contains(&inst.block) {
                     continue;
@@ -415,7 +434,9 @@ impl PathIndex {
             for &b in &f.blocks {
                 let Some(bb) = module.block(b) else { continue };
                 for &iid in &bb.insts {
-                    let Some(inst) = module.inst(iid) else { continue };
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
                     if matches!(inst.op, Op::Return { .. } | Op::Throw { .. }) {
                         exits.push(iid);
                     }
@@ -477,7 +498,10 @@ fn reconstruct_path(
 
     let fallback = || {
         (
-            (func_of_inst(module, hit.call).unwrap_or(FuncId::new(0)), Fact::Zero),
+            (
+                func_of_inst(module, hit.call).unwrap_or(FuncId::new(0)),
+                Fact::Zero,
+            ),
             vec![step_of(hit.call)],
         )
     };
@@ -564,10 +588,7 @@ fn reconstruct_path(
                                 });
                                 if let Some(cands) = index.by_node.get(exit) {
                                     exit_preds.extend(cands.iter().copied().filter(|&pi| {
-                                        edges[pi]
-                                            .target_fact
-                                            .taint()
-                                            .and_then(|t| t.local_base())
+                                        edges[pi].target_fact.taint().and_then(|t| t.local_base())
                                             == exit_val
                                     }));
                                 }
@@ -636,7 +657,10 @@ fn reconstruct_path(
             break;
         }
     }
-    let path = chain.into_iter().map(|ei| step_of(edges[ei].target_node)).collect();
+    let path = chain
+        .into_iter()
+        .map(|ei| step_of(edges[ei].target_node))
+        .collect();
     (seed, path)
 }
 

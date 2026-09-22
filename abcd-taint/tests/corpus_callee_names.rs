@@ -18,7 +18,11 @@ use abcd_taint::names::callee_name_candidates;
 fn callee_name_frequency() {
     let root = common::corpus_root();
     let paths = common::runtime_passed_paths(&root);
-    assert_eq!(paths.len(), 1149, "expected the 1149 runtime-passed fixtures");
+    assert_eq!(
+        paths.len(),
+        1149,
+        "expected the 1149 runtime-passed fixtures"
+    );
 
     let mut freq: std::collections::BTreeMap<String, usize> = Default::default();
     let mut sites = 0usize;

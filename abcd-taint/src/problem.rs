@@ -37,8 +37,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use abcd_analysis::callgraph::CallGraph;
-use abcd_analysis::dataflow::heap::{FieldChain, FieldKey, Rung0AliasOracle, update_kind};
 use abcd_analysis::dataflow::heap::{AllocSiteSet, UpdateKind};
+use abcd_analysis::dataflow::heap::{FieldChain, FieldKey, Rung0AliasOracle, update_kind};
 use abcd_analysis::dataflow::ifds::{CallGraphOracle, IfdsProblem};
 use abcd_ir::{CallKind, FuncId, InstId, Module, Op, Sym, ValueId};
 
@@ -255,7 +255,11 @@ impl<'m> TaintProblem<'m> {
     /// The catch binding of the handler whose entry block is
     /// `succ_block`, restricted to try regions of the function owning
     /// `from_block` (intraprocedural throw dispatch).
-    fn handler_exception_for(&self, from_block: abcd_ir::BlockId, succ_block: abcd_ir::BlockId) -> Option<ValueId> {
+    fn handler_exception_for(
+        &self,
+        from_block: abcd_ir::BlockId,
+        succ_block: abcd_ir::BlockId,
+    ) -> Option<ValueId> {
         let func = self
             .module
             .functions
@@ -327,12 +331,16 @@ impl<'m> TaintProblem<'m> {
         match &fact.base {
             TaintBase::Local(v) if self.local_alias_evidence(*v, object) => {
                 if let Some(rest) = try_cut(&fact.fields) {
-                    out.push(Fact::of(fact.with_fields(rest).rebased(TaintBase::Local(result))));
+                    out.push(Fact::of(
+                        fact.with_fields(rest).rebased(TaintBase::Local(result)),
+                    ));
                 }
             }
             TaintBase::Heap(sites) if self.heap_may_reach(sites, object) => {
                 if let Some(rest) = try_cut(&fact.fields) {
-                    out.push(Fact::of(fact.with_fields(rest).rebased(TaintBase::Local(result))));
+                    out.push(Fact::of(
+                        fact.with_fields(rest).rebased(TaintBase::Local(result)),
+                    ));
                 }
             }
             _ => {}
@@ -536,8 +544,12 @@ impl IfdsProblem for TaintProblem<'_> {
         source: &Fact,
         out: &mut Vec<Fact>,
     ) {
-        let Some(curr_inst) = module.inst(curr) else { return };
-        let Some(succ_inst) = module.inst(succ) else { return };
+        let Some(curr_inst) = module.inst(curr) else {
+            return;
+        };
+        let Some(succ_inst) = module.inst(succ) else {
+            return;
+        };
 
         // ── Source generation fires on EVERY incoming edge, including
         // the zero fact's (FlowDroid's SourcePropagationRule: a source
@@ -645,20 +657,26 @@ impl IfdsProblem for TaintProblem<'_> {
                 out.push(source.clone());
             }
             // ── Stores (heap re-keying + strong/weak kills) ──────────
-            Op::StoreProp { object, name, value }
-            | Op::StoreOwnPropName { object, name, value } => {
+            Op::StoreProp {
+                object,
+                name,
+                value,
+            }
+            | Op::StoreOwnPropName {
+                object,
+                name,
+                value,
+            } => {
                 if self.store_rule(fact, *object, FieldKey::Named(*name), *value, out) {
                     out.push(source.clone());
                 }
             }
-            Op::StorePropIdx { object, value, .. }
-            | Op::StoreOwnPropIdx { object, value, .. } => {
+            Op::StorePropIdx { object, value, .. } | Op::StoreOwnPropIdx { object, value, .. } => {
                 if self.store_rule(fact, *object, FieldKey::AnyIndex, *value, out) {
                     out.push(source.clone());
                 }
             }
-            Op::StorePropDyn { object, value, .. }
-            | Op::StoreOwnPropDyn { object, value, .. } => {
+            Op::StorePropDyn { object, value, .. } | Op::StoreOwnPropDyn { object, value, .. } => {
                 if self.store_rule(fact, *object, FieldKey::AnyDynamic, *value, out) {
                     out.push(source.clone());
                 }
@@ -749,11 +767,19 @@ impl IfdsProblem for TaintProblem<'_> {
     ) {
         // Exclusive summaries kill the call edge into the callee body —
         // never merged (summaries.md §2.1).
-        if matches!(self.classify(call), SiteClass::Summary { exclusive: true, .. }) {
+        if matches!(
+            self.classify(call),
+            SiteClass::Summary {
+                exclusive: true,
+                ..
+            }
+        ) {
             return;
         }
         let Fact::Taint(fact) = source else { return };
-        let Some(call_inst) = module.inst(call) else { return };
+        let Some(call_inst) = module.inst(call) else {
+            return;
+        };
         let Op::Call {
             callee: callee_val,
             this,
@@ -763,7 +789,9 @@ impl IfdsProblem for TaintProblem<'_> {
         else {
             return;
         };
-        let Some(fd) = module.func(callee) else { return };
+        let Some(fd) = module.func(callee) else {
+            return;
+        };
 
         // The oracle learns the calling context (rung 0: no-op; the seam
         // discipline of analysis-strategy §5.2 / infoflow.md §4.3).
@@ -818,7 +846,9 @@ impl IfdsProblem for TaintProblem<'_> {
                             rest = rest.pushed(k, self.cap());
                         }
                         if let Some(&p1) = fd.params.get(1) {
-                            out.push(Fact::of(fact.with_fields(rest).rebased(TaintBase::Local(p1))));
+                            out.push(Fact::of(
+                                fact.with_fields(rest).rebased(TaintBase::Local(p1)),
+                            ));
                         }
                     }
                 }
@@ -843,7 +873,9 @@ impl IfdsProblem for TaintProblem<'_> {
         out: &mut Vec<Fact>,
     ) {
         let Fact::Taint(fact) = source else { return };
-        let Some(exit_inst) = module.inst(exit) else { return };
+        let Some(exit_inst) = module.inst(exit) else {
+            return;
+        };
 
         // State bases are function-global: they cross returns unchanged
         // (also for unbalanced returns with `None` endpoints).
@@ -894,7 +926,9 @@ impl IfdsProblem for TaintProblem<'_> {
         out: &mut Vec<Fact>,
     ) {
         let Fact::Taint(fact) = source else { return };
-        let Some(call_inst) = module.inst(call) else { return };
+        let Some(call_inst) = module.inst(call) else {
+            return;
+        };
         let Op::Call { args, .. } = &call_inst.op else {
             return;
         };
@@ -917,9 +951,7 @@ impl IfdsProblem for TaintProblem<'_> {
                     .any(|c| Self::match_endpoint(c, fact, args, base).is_some());
                 if !cleared {
                     for flow in &summary.flows {
-                        if let Some(leftover) =
-                            Self::match_endpoint(&flow.from, fact, args, base)
-                        {
+                        if let Some(leftover) = Self::match_endpoint(&flow.from, fact, args, base) {
                             self.substitute(
                                 &flow.to,
                                 &leftover,

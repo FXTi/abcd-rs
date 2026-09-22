@@ -228,7 +228,11 @@ impl SummaryRegistry {
             *stats.misses_named.entry(sym).or_insert(0) += 1;
             return None;
         }
-        if let Some(s) = self.by_key.get(&exact).or_else(|| self.by_key.get(&variadic)) {
+        if let Some(s) = self
+            .by_key
+            .get(&exact)
+            .or_else(|| self.by_key.get(&variadic))
+        {
             return Some(s);
         }
         self.neg.borrow_mut().insert(exact);
@@ -311,21 +315,47 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         // print (3795): the corpus' dominant call; a SINK in the smoke
         // config. The model is an exclusive no-op: print returns
         // undefined and mutates nothing.
-        ("print", None, Summary::new("corpus-freq 3795; sink; no propagation, no mutation").exclusive()),
+        (
+            "print",
+            None,
+            Summary::new("corpus-freq 3795; sink; no propagation, no mutation").exclusive(),
+        ),
         // Object.is (36): pure comparison; fresh boolean, copies nothing.
-        ("Object.is", Some(2), Summary::new("corpus-freq 36; pure test; fresh boolean result").exclusive()),
+        (
+            "Object.is",
+            Some(2),
+            Summary::new("corpus-freq 36; pure test; fresh boolean result").exclusive(),
+        ),
         // RegExp (36): constructor; the pattern/flags taint the new
         // RegExp object (its `.source` and `test` results derive from it).
-        ("RegExp", None, Summary::new("corpus-freq 36; ctor; pattern taint → new RegExp object").flow(Param(0), Return)),
+        (
+            "RegExp",
+            None,
+            Summary::new("corpus-freq 36; ctor; pattern taint → new RegExp object")
+                .flow(Param(0), Return),
+        ),
         // Number.isNaN (18): pure test; fresh boolean.
-        ("Number.isNaN", Some(1), Summary::new("corpus-freq 18; pure test; fresh boolean result").exclusive()),
+        (
+            "Number.isNaN",
+            Some(1),
+            Summary::new("corpus-freq 18; pure test; fresh boolean result").exclusive(),
+        ),
         // Object.setPrototypeOf (18): mutator — the tainted prototype is
         // reachable through reads on the target (coarse: whole-target
         // taint; field-precise proto-chain taint is a rung-1 matter).
-        ("Object.setPrototypeOf", Some(2), Summary::new("corpus-freq 18; proto taint → target (coarse)").alias_flow(Param(1), Param(0))),
+        (
+            "Object.setPrototypeOf",
+            Some(2),
+            Summary::new("corpus-freq 18; proto taint → target (coarse)")
+                .alias_flow(Param(1), Param(0)),
+        ),
         // Proxy (18): constructor; a tainted target's reads flow through
         // traps (unmodeled user code) — conservatively taint the proxy.
-        ("Proxy", None, Summary::new("corpus-freq 18; ctor; target taint → proxy").flow(Param(0), Return)),
+        (
+            "Proxy",
+            None,
+            Summary::new("corpus-freq 18; ctor; target taint → proxy").flow(Param(0), Return),
+        ),
         // String.raw (18): template cook; any tainted substitution or
         // template taints the cooked string (variadic, params 0–3).
         ("String.raw", None, {
@@ -337,21 +367,61 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         }),
         // Symbol (18): the description is carried by the symbol value
         // (readable via `.description`); conservative param→return.
-        ("Symbol", None, Summary::new("corpus-freq 18; description taint → symbol value").flow(Param(0), Return).exclusive()),
+        (
+            "Symbol",
+            None,
+            Summary::new("corpus-freq 18; description taint → symbol value")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
         // Uint8Array (18): constructor; source-buffer taint → the typed
         // array's contents.
-        ("Uint8Array", None, Summary::new("corpus-freq 18; ctor; source taint → typed array").flow(Param(0), Return)),
+        (
+            "Uint8Array",
+            None,
+            Summary::new("corpus-freq 18; ctor; source taint → typed array").flow(Param(0), Return),
+        ),
         // ── Canonical namespace builtins (corpus-freq 0, preemptive) ──
         // JSON.parse: string taint → the whole parsed object graph.
-        ("JSON.parse", Some(1), Summary::new("canonical; string taint → parsed object graph").flow(Param(0), Return).exclusive()),
+        (
+            "JSON.parse",
+            Some(1),
+            Summary::new("canonical; string taint → parsed object graph")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
         // JSON.stringify: value taint → the JSON string.
-        ("JSON.stringify", None, Summary::new("canonical; value taint → JSON string").flow(Param(0), Return).exclusive()),
+        (
+            "JSON.stringify",
+            None,
+            Summary::new("canonical; value taint → JSON string")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
         // Object.keys: the own-key set derives from the object.
-        ("Object.keys", Some(1), Summary::new("canonical; object taint → key array").flow(Param(0), Return).exclusive()),
+        (
+            "Object.keys",
+            Some(1),
+            Summary::new("canonical; object taint → key array")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
         // Object.values: own values carry the object's field taint.
-        ("Object.values", Some(1), Summary::new("canonical; object field taint → value array").flow(Param(0), Return).exclusive()),
+        (
+            "Object.values",
+            Some(1),
+            Summary::new("canonical; object field taint → value array")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
         // Object.entries: [key, value] pairs carry the object's taint.
-        ("Object.entries", Some(1), Summary::new("canonical; object taint → entry array").flow(Param(0), Return).exclusive()),
+        (
+            "Object.entries",
+            Some(1),
+            Summary::new("canonical; object taint → entry array")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
         // Object.assign: the mutator — each source's fields flow into
         // param 0 (alias: the reference is mutated, not copied).
         ("Object.assign", None, {
@@ -363,14 +433,40 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         }),
         // Object.create: the new object's prototype-chain reads reach
         // the proto's fields.
-        ("Object.create", Some(1), Summary::new("canonical; prototype taint → new object").flow(Param(0), Return)),
+        (
+            "Object.create",
+            Some(1),
+            Summary::new("canonical; prototype taint → new object").flow(Param(0), Return),
+        ),
         // Array.isArray: pure test; fresh boolean.
-        ("Array.isArray", Some(1), Summary::new("canonical; pure test; fresh boolean result").exclusive()),
+        (
+            "Array.isArray",
+            Some(1),
+            Summary::new("canonical; pure test; fresh boolean result").exclusive(),
+        ),
         // Array.from: iterable/element taint → the new array.
-        ("Array.from", None, Summary::new("canonical; iterable taint → new array").flow(Param(0), Return).exclusive()),
+        (
+            "Array.from",
+            None,
+            Summary::new("canonical; iterable taint → new array")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
         // Number coercion: operand taint → number.
-        ("Number", None, Summary::new("canonical; coercion; operand taint → number").flow(Param(0), Return).exclusive()),
+        (
+            "Number",
+            None,
+            Summary::new("canonical; coercion; operand taint → number")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
         // String coercion: operand taint → string.
-        ("String", None, Summary::new("canonical; coercion; operand taint → string").flow(Param(0), Return).exclusive()),
+        (
+            "String",
+            None,
+            Summary::new("canonical; coercion; operand taint → string")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
     ]
 }

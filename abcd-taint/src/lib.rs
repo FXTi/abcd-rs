@@ -41,9 +41,7 @@ pub mod names;
 pub mod problem;
 pub mod summary;
 
-pub use driver::{
-    PathStep, SinkHit, SinkSpec, SourceSpec, TaintConfig, TaintReport, run_taint,
-};
+pub use driver::{PathStep, SinkHit, SinkSpec, SourceSpec, TaintConfig, TaintReport, run_taint};
 pub use fact::{Fact, TaintBase, TaintFact};
 pub use problem::TaintProblem;
 pub use summary::{Endpoint, Flow, RegistryStats, Summary, SummaryRegistry, builtin_summaries};

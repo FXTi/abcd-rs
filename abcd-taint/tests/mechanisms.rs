@@ -29,7 +29,11 @@ fn std_config() -> TaintConfig {
 }
 
 /// `print(...)` call in block `b` over `args`; returns the call inst.
-fn print_call(m: &mut abcd_ir::Module, b: abcd_ir::BlockId, args: Vec<abcd_ir::ValueId>) -> abcd_ir::InstId {
+fn print_call(
+    m: &mut abcd_ir::Module,
+    b: abcd_ir::BlockId,
+    args: Vec<abcd_ir::ValueId>,
+) -> abcd_ir::InstId {
     let print = try_get_global(m, b, "print");
     push_inst(
         m,
@@ -61,7 +65,14 @@ fn access_path_cutoff() {
     //   ... alternating grows the chain until the cap merges it.
     let f1 = intern(&mut m, "f1");
     let f2 = intern(&mut m, "f2");
-    let mut cur = emit(&mut m, entry, Op::LoadProp { object: p, name: f1 });
+    let mut cur = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: p,
+            name: f1,
+        },
+    );
     let mut last_store = None;
     for _ in 0..6 {
         let obj = alloc_object(&mut m, entry);
@@ -74,7 +85,14 @@ fn access_path_cutoff() {
                 value: cur,
             },
         );
-        cur = emit(&mut m, entry, Op::LoadProp { object: obj, name: f2 });
+        cur = emit(
+            &mut m,
+            entry,
+            Op::LoadProp {
+                object: obj,
+                name: f2,
+            },
+        );
         last_store = Some(obj);
     }
     let _ = last_store;
@@ -201,7 +219,10 @@ fn fallback_steps_into_body() {
     let report = abcd_taint::run_taint(&m, &std_config());
     assert_eq!(report.hits.len(), 1);
     assert_eq!(report.stats.sites_body_step, 1, "the ladder stepped in");
-    assert_eq!(report.stats.sites_native_keep, 1, "print itself was a named miss");
+    assert_eq!(
+        report.stats.sites_native_keep, 1,
+        "print itself was a named miss"
+    );
 }
 
 /// Fallback ladder rung 3: native/unknown no-summary callee →
@@ -239,7 +260,11 @@ fn fallback_native_keep_and_miss_counters() {
         .keys()
         .map(|s| format!("{s:?}"))
         .collect();
-    assert_eq!(misses.len(), 2, "print and mysteryBuiltin missed: {misses:?}");
+    assert_eq!(
+        misses.len(),
+        2,
+        "print and mysteryBuiltin missed: {misses:?}"
+    );
     assert!(report.stats.sites_native_keep >= 1);
 
     // With the identity heuristic off, the operand taint still passes
@@ -281,7 +306,15 @@ fn exception_param_taints_catch_binding() {
     let handler = add_block(&mut m, f);
     let exc = add_exception_param(&mut m, handler);
 
-    emit_void_loc(&mut m, entry, Op::Throw { value: p }, Some(Loc { line: 3, column: Some(9) }));
+    emit_void_loc(
+        &mut m,
+        entry,
+        Op::Throw { value: p },
+        Some(Loc {
+            line: 3,
+            column: Some(9),
+        }),
+    );
     let print_inst = {
         let print = try_get_global(&mut m, handler, "print");
         push_inst_loc(
@@ -293,7 +326,10 @@ fn exception_param_taints_catch_binding() {
                 args: vec![exc],
                 kind: CallKind::Dynamic,
             },
-            Some(Loc { line: 7, column: Some(5) }),
+            Some(Loc {
+                line: 7,
+                column: Some(5),
+            }),
         )
     };
     emit_void(&mut m, handler, Op::Return { value: None });
@@ -306,7 +342,10 @@ fn exception_param_taints_catch_binding() {
     assert_eq!(hit.position, "arg 0");
     assert_eq!(
         hit.loc,
-        Some(Loc { line: 7, column: Some(5) }),
+        Some(Loc {
+            line: 7,
+            column: Some(5)
+        }),
         "T8: the report carries line/column"
     );
     assert!(!hit.path.is_empty(), "a path was reconstructed");
@@ -329,10 +368,33 @@ fn heap_weak_vs_strong_update() {
         let p = add_param(&mut m, f, 1);
         let obj = alloc_object(&mut m, entry);
         let fld = intern(&mut m, "f");
-        emit_void(&mut m, entry, Op::StoreProp { object: obj, name: fld, value: p });
+        emit_void(
+            &mut m,
+            entry,
+            Op::StoreProp {
+                object: obj,
+                name: fld,
+                value: p,
+            },
+        );
         let clean = load_string(&mut m, entry, "clean");
-        emit_void(&mut m, entry, Op::StoreProp { object: obj, name: fld, value: clean });
-        let x = emit(&mut m, entry, Op::LoadProp { object: obj, name: fld });
+        emit_void(
+            &mut m,
+            entry,
+            Op::StoreProp {
+                object: obj,
+                name: fld,
+                value: clean,
+            },
+        );
+        let x = emit(
+            &mut m,
+            entry,
+            Op::LoadProp {
+                object: obj,
+                name: fld,
+            },
+        );
         print_call(&mut m, entry, vec![x]);
         emit_void(&mut m, entry, Op::Return { value: None });
         abcd_taint::run_taint(&m, &std_config()).hits.len()
@@ -350,7 +412,15 @@ fn heap_weak_vs_strong_update() {
         let t = add_block(&mut m, f);
         let e = add_block(&mut m, f);
         let join = add_block(&mut m, f);
-        emit_void(&mut m, entry, Op::CondBranch { cond: p, true_dest: t, false_dest: e });
+        emit_void(
+            &mut m,
+            entry,
+            Op::CondBranch {
+                cond: p,
+                true_dest: t,
+                false_dest: e,
+            },
+        );
         let a = alloc_object(&mut m, t);
         emit_void(&mut m, t, Op::Branch { dest: join });
         let b = alloc_object(&mut m, e);
@@ -364,16 +434,51 @@ fn heap_weak_vs_strong_update() {
             join,
             Op::Phi {
                 entries: vec![
-                    (Edge { from: t, kind: EdgeKind::Normal }, a),
-                    (Edge { from: e, kind: EdgeKind::Normal }, b),
+                    (
+                        Edge {
+                            from: t,
+                            kind: EdgeKind::Normal,
+                        },
+                        a,
+                    ),
+                    (
+                        Edge {
+                            from: e,
+                            kind: EdgeKind::Normal,
+                        },
+                        b,
+                    ),
                 ],
             },
         );
         let fld = intern(&mut m, "f");
-        emit_void(&mut m, join, Op::StoreProp { object: phi, name: fld, value: p });
+        emit_void(
+            &mut m,
+            join,
+            Op::StoreProp {
+                object: phi,
+                name: fld,
+                value: p,
+            },
+        );
         let clean = load_string(&mut m, join, "clean");
-        emit_void(&mut m, join, Op::StoreProp { object: phi, name: fld, value: clean });
-        let x = emit(&mut m, join, Op::LoadProp { object: phi, name: fld });
+        emit_void(
+            &mut m,
+            join,
+            Op::StoreProp {
+                object: phi,
+                name: fld,
+                value: clean,
+            },
+        );
+        let x = emit(
+            &mut m,
+            join,
+            Op::LoadProp {
+                object: phi,
+                name: fld,
+            },
+        );
         print_call(&mut m, join, vec![x]);
         emit_void(&mut m, join, Op::Return { value: None });
         abcd_taint::run_taint(&m, &std_config()).hits.len()
@@ -396,7 +501,14 @@ fn global_store_load_roundtrip() {
     // An intervening "clean" store does NOT kill the global taint
     // (globals are mutable across scripts: always weak).
     let clean = load_string(&mut m, entry, "clean");
-    emit_void(&mut m, entry, Op::StoreGlobal { name: g, value: clean });
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: g,
+            value: clean,
+        },
+    );
     let loaded = try_get_global(&mut m, entry, "g");
     print_call(&mut m, entry, vec![loaded]);
     emit_void(&mut m, entry, Op::Return { value: None });
@@ -459,7 +571,11 @@ fn summary_hit_applies_flows() {
     ));
     let report = abcd_taint::run_taint(&m, &config);
     assert_eq!(report.hits.len(), 1, "param(0)→return flow applied");
-    assert_eq!(report.summaries_applied.len(), 1, "the application was logged");
+    assert_eq!(
+        report.summaries_applied.len(),
+        1,
+        "the application was logged"
+    );
 }
 
 /// Clear semantics: a clear kills the incoming taint even though a flow
@@ -557,8 +673,23 @@ fn determinism_two_runs_identical() {
         let q = emit(&mut m, entry, Op::Mov { src: p });
         let obj = alloc_object(&mut m, entry);
         let fld = intern(&mut m, "f");
-        emit_void(&mut m, entry, Op::StoreProp { object: obj, name: fld, value: q });
-        let x = emit(&mut m, entry, Op::LoadProp { object: obj, name: fld });
+        emit_void(
+            &mut m,
+            entry,
+            Op::StoreProp {
+                object: obj,
+                name: fld,
+                value: q,
+            },
+        );
+        let x = emit(
+            &mut m,
+            entry,
+            Op::LoadProp {
+                object: obj,
+                name: fld,
+            },
+        );
         print_call(&mut m, entry, vec![x]);
         emit_void(&mut m, entry, Op::Return { value: None });
         m
