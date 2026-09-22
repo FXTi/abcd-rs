@@ -154,6 +154,38 @@ you what to write next.
 - `tests/corpus_taint_smoke.rs` (ignored) — the 1149-fixture print-sink smoke
   with determinism pinned (two runs, identical reports).
 
+## Corpus smoke results (v2-P5b, verbatim)
+
+Registered config (source = all `func_main_0` params; sink = `print`; top-20
+builtin summaries; 1149 runtime-passed fixtures; two runs identical):
+
+```text
+SMOKE fixtures=1149 fixtures_with_flows=0
+TAINT-FLOWS hits=0
+TAINT-COUNTERS lookups=7626 neg_cache_hits=90 body_step=108 native_keep=996 unknown=357
+TAINT-PATH-EDGES total=198734
+TAINT-SUMMARY-MISSES top10=[("foo", 117), ("f", 90), ("A", 69), ("s.next", 54), ("B", 36), ("c", 36), ("count", 36), ("s.charCodeAt", 36), ("a.pop", 18), ("add", 18)]
+TAINT-SUMMARY-HITS top10=[("print", 1437), ("Object.is", 36), ("RegExp", 36), ("Number.isNaN", 18), ("Object.setPrototypeOf", 18), ("Proxy", 18), ("String.raw", 18), ("Symbol", 18), ("Uint8Array", 18)]
+SMOKE-DETERMINISM runs=2 identical=true
+```
+
+`hits=0` is a TRUE negative, not a dead pipeline: the corpus fixtures are
+self-contained compiler tests whose entry params never reach a `print`. The
+sensitivity control (`ABCD_TAINT_SMOKE_SOURCE=all-params` — every function's
+params seeded) finds real flows end-to-end on real bytecode, also
+deterministic:
+
+```text
+SMOKE fixtures=1149 fixtures_with_flows=18
+TAINT-FLOWS hits=36
+TAINT-PATH-EDGES total=353569
+SMOKE-DETERMINISM runs=2 identical=true
+```
+
+Counters classify only call sites the solver actually processed (a site with
+no incoming fact edge — dead code, or a function body unreachable even by the
+zero fact — is never classified).
+
 ## Known imprecisions (rung-0 heap) and the ladder
 
 - **Unknown-base heap matching is conservative**: a heap fact with an empty
