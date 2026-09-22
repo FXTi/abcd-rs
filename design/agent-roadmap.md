@@ -276,7 +276,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | d-P0 | 规划+技术准备：design/decompile.md（架构、IR 适配审计、先例调研、阶段门禁） | 进行中 |
 | d-P1 | 基建前置：区域结构化分析落 abcd-analysis::control（支配/循环 P5a 已交付）；门禁=合成 CFG 测试 + 2787 全量结构化/不可约计数报告（预期≈0）+ 确定性 | worker d-P1 (k3) | **完成**（c538017/d357e3c；中途 5h 限额打断一次恢复零丢失。模式无关归约：循环剥离+出口尾吸收（消灭 360 假多入口）、条件臂全后支配合并+兄弟臂回避、Alternates/Labeled 多入口续体、Irreducible 折叠节点；不可约检测=环减支配回边。**orchestrator 独立复验逐字复现**：12996/12996 结构化、**不可约核 0、逃生舱 0**、try 区域 1797 零错误（234 处 try 切断结构化区域=es2abc 字节级连续 try 范围的观察而非错误）、cross_arm_edges 690 留给 d-P3 作复制提示、10 个合成测试绿、113 套件绿、fmt 净） |
 | d-P2 | 表达式恢复（SSA → 表达式树；内联规则走 Effects 表；phi→临时变量；命名合法化器） | worker d-P2 (k3) | **完成**（1c6fa83/def104b/8d7f296；新 crate abcd-decompile：expr.rs 表达式模型/recover.rs 恢复/names.rs+legalize.rs 命名。内联规则 O(1) 前缀和效应屏障；单使用按操作数槽计（文档化强化 §4.1）；影子守卫防 `const foo=foo` TDZ。**orchestrator 独立复验**：语料门禁 2787/12996 函数、**1,398,139 指令 1:1 有去向**、fallback 仅 hard-7 族 1230 条（全在文档化集合）、确定性两次逐字节一致、19 黄金测试 + 7 lib 绿、fmt 净、117 套件绿、lift_verify 未触绿；发现 §5 表 T=32/N=48 与摘要 31 的行级漂移（按行为准，记录在 fitness.rs）） |
-| d-P3 | 控制流结构化（if/else、循环、try/catch、switch 链模式） | 未开始 |
+| d-P3 | 结构化+发射 v1：区域树→语句 AST（语法糖折叠/try-catch 投影/模块与类重建）+ 文本发射（d-P4 做精修与梦想门禁） | worker d-P3 (k3) | **进行中**（2026-09-21 启动） |
 | d-P4 | 发射 JS/TS 源码 + 语料评估（理想门禁：反编译→es2abc 重编译→oracle 对照） | 未开始 |
 
 排序：与 taint 轨道平行（crate 不相交）；d-P0 现在就做，d-P1 起等 FlowDroid 对照结论（若支配树/循环分析落 abcd-dataflow 则受其节奏影响）。
