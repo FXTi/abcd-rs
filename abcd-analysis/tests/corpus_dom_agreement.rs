@@ -27,127 +27,8 @@
 
 mod common;
 
-use std::collections::{HashMap, HashSet};
-
-use abcd_analysis::control::Dominators;
-use abcd_ir::{BlockId, EdgeKind, FuncId, Module};
+use abcd_ir::FuncId;
 use abcd_lift::lift_file;
-
-/// Verbatim port of abcd-ir/src/verify.rs's iterative dominator sets over
-/// the Normal-edge CFG (stored predecessors). Returns, per
-/// `func.blocks` index, that block's dominator set as block indices.
-fn verify_reference_dom_sets(module: &Module, func_id: FuncId) -> Vec<HashSet<usize>> {
-    let func = module.func(func_id).expect("function");
-    let index: HashMap<BlockId, usize> = func
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| (b, i))
-        .collect();
-    let n = func.blocks.len();
-    let entry_i = 0usize;
-
-    // Normal-edge predecessors per block (in-function only).
-    let mut npreds: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for &bb in &func.blocks {
-        let Some(block) = module.block(bb) else {
-            continue;
-        };
-        let i = index[&bb];
-        for edge in &block.preds {
-            if edge.kind == EdgeKind::Normal {
-                if let Some(&p) = index.get(&edge.from) {
-                    npreds[i].push(p);
-                }
-            }
-        }
-    }
-
-    // Iterative dominator sets over the Normal-edge CFG.
-    let all: HashSet<usize> = (0..n).collect();
-    let mut dom: Vec<HashSet<usize>> = vec![all; n];
-    dom[entry_i] = HashSet::from([entry_i]);
-    loop {
-        let mut changed = false;
-        for i in 0..n {
-            if i == entry_i {
-                continue;
-            }
-            let mut new: HashSet<usize> = if npreds[i].is_empty() {
-                HashSet::new()
-            } else {
-                let mut acc = dom[npreds[i][0]].clone();
-                for &p in &npreds[i][1..] {
-                    acc = acc.intersection(&dom[p]).copied().collect();
-                }
-                acc
-            };
-            new.insert(i);
-            if new != dom[i] {
-                dom[i] = new;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    dom
-}
-
-/// Check one function: agreement over all Normal-reachable blocks.
-fn check_function(module: &Module, func_id: FuncId) -> (usize, usize) {
-    let func = module.func(func_id).expect("function");
-    if func.blocks.is_empty() {
-        return (0, 0);
-    }
-    let index_of = |b: BlockId| {
-        func.blocks
-            .iter()
-            .position(|&x| x == b)
-            .expect("in-function")
-    };
-
-    // The shared relation: Normal-edge successors = inverse of the stored
-    // Normal predecessors (in-function only). Both implementations see
-    // exactly this graph.
-    let mut succs: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
-    for &bb in &func.blocks {
-        let Some(block) = module.block(bb) else {
-            continue;
-        };
-        for edge in &block.preds {
-            if edge.kind == EdgeKind::Normal && func.blocks.contains(&edge.from) {
-                succs.entry(edge.from).or_default().push(bb);
-            }
-        }
-    }
-    let succ_of = |b: BlockId| succs.get(&b).cloned().unwrap_or_default();
-
-    let dom = Dominators::over(module, func_id, &succ_of);
-    let reference = verify_reference_dom_sets(module, func_id);
-    let entry = func.blocks[0];
-
-    // The agreement domain: blocks reachable from the entry over the
-    // Normal relation (BFS). For these, the verifier's `dom[i]` contains
-    // the entry and equals the tree-derived dominator set.
-    let reachable = abcd_analysis::control::reachable_blocks(module, func_id, &succ_of);
-
-    let mut compared = 0usize;
-    for &b in &reachable {
-        let i = index_of(b);
-        let reference_set: std::collections::BTreeSet<BlockId> =
-            reference[i].iter().map(|&j| func.blocks[j]).collect();
-        let mine: std::collections::BTreeSet<BlockId> =
-            dom.dominator_chain(b).into_iter().collect();
-        assert_eq!(
-            mine, reference_set,
-            "dominator-set disagreement in {func_id:?} block {b:?} (entry {entry:?})"
-        );
-        compared += 1;
-    }
-    (compared, func.blocks.len())
-}
 
 #[test]
 #[ignore = "requires exported GHCR corpus and python3"]
@@ -159,6 +40,7 @@ fn dominators_agree_with_verifier_on_corpus() {
     let mut fixtures = 0usize;
     let mut functions = 0usize;
     let mut blocks_compared = 0usize;
+    let mut blocks_skipped = 0usize;
     let mut blocks_total = 0usize;
 
     for relative in &paths {
@@ -167,16 +49,19 @@ fn dominators_agree_with_verifier_on_corpus() {
         let module = lift_file(&file).expect("lift fixture");
         fixtures += 1;
         for fi in 0..module.functions.len() {
-            let (compared, total) = check_function(&module, FuncId::new(fi as u32));
+            let (compared, skipped, total) =
+                common::check_function(&module, FuncId::new(fi as u32), relative);
             functions += 1;
             blocks_compared += compared;
+            blocks_skipped += skipped;
             blocks_total += total;
         }
     }
 
     eprintln!(
         "DOM-AGREEMENT fixtures={fixtures} functions={functions} \
-         blocks_compared={blocks_compared} blocks_total={blocks_total}"
+         blocks_compared={blocks_compared} blocks_skipped={blocks_skipped} \
+         blocks_total={blocks_total}"
     );
     assert!(blocks_compared > 0);
 }

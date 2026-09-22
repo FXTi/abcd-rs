@@ -25,17 +25,26 @@
 //! `abcd-ir::verify` keeps its own private, minimal iterative dominator
 //! computation (the N45 use-def check) because the layering is one-way:
 //! `abcd-ir` must never depend on `abcd-analysis`. The two implementations
-//! are pinned to agree by the corpus agreement test
-//! (`abcd-analysis/tests/corpus_dom_agreement.rs`, which re-implements the
-//! verifier's set-based algorithm verbatim as the reference) over **all
-//! Normal-edge-reachable blocks** of every corpus function: for any such
-//! block pair `(a, b)`, `a` dominates `b` under [`Dominators`] iff `a ∈
-//! dom[b]` under the verifier's algorithm. Blocks with no Normal-edge path
-//! from the entry are outside the contract (the verifier's iterative sets
-//! degenerate there: an unreachable block with no Normal predecessors is
-//! dominated only by itself, and an unreachable Normal-edge cycle keeps the
-//! initial "everything" set — both are dead-code cases the verifier exempts
-//! from N45 anyway).
+//! are pinned to agree by the agreement tests (`abcd-analysis/tests/
+//! corpus_dom_agreement.rs` corpus-wide and `dom_agreement_crafted.rs` on
+//! hand-built shapes), which re-implement the verifier's set-based
+//! algorithm verbatim as the reference. The contract:
+//!
+//! > Over all blocks BOTH implementations consider Normal-reachable —
+//! > reachable from the entry in the [`Dominators`] tree AND containing
+//! > the entry in the verifier's `dom[b]` — the two compute the same
+//! > dominator SETS.
+//!
+//! Two divergence classes are documented and excluded (both dead-code
+//! shapes the verifier's N45 check exempts anyway): (1) unreachable
+//! Normal-edge cycles keep the verifier's initial "everything" set while
+//! the tree reports them unreachable; (2) a reachable block with an
+//! unreachable Normal predecessor is *polluted* by the verifier's all-set
+//! initialization (the intersection with the dead predecessor's set
+//! empties it, so the verifier treats the block as unreachable) while the
+//! CHK tree computes dominators on the reachable subgraph — the
+//! graph-theoretic answer. The divergence always weakens the verifier's
+//! check, never strengthens it.
 
 mod dom;
 mod loops;
