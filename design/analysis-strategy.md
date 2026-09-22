@@ -208,6 +208,18 @@ This is a durable differentiation, not an accident of timing:
 
 ### 4.1 Evidence from APAK: context sensitivity is not optional on ArkTS
 
+> **Corrigendum (2026-09-21, post ArkAnalyzer code read):** APAK's CODE is
+> not public at our reference commit — SMAT-Lab/ArkAnalyzer @ e9167ba
+> contains only a 291-line, explicitly context-INSENSITIVE prototype
+> (`Scene.ts:244` comments "WIP context-insensitive"; no plugins, no ArkUI
+> modeling, no 1,663-app harness in-repo — see
+> `design/arkanalyzer/callgraph-and-pta.md` §0). The paper's claims
+> (merged into ArkAnalyzer, FP 20%→2%) are therefore **external,
+> unverifiable-at-code-level evidence**: the direction (Huawei invested in
+> context sensitivity for exactly this domain) stands, the magnitude stays
+> unverified. This downgrades §4.1 from "demonstrated in production" to
+> "published evaluation, code not inspectable".
+
 APAK ([arXiv:2602.00457](https://arxiv.org/abs/2602.00457)) is the first
 context-sensitive pointer analysis for ArkTS, evaluated on 1,663 real
 OpenHarmony apps. Three findings bear directly on us:
