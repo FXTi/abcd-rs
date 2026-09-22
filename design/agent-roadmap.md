@@ -265,7 +265,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | v2-P3b | inline 在 v0.2 上重写（D2=要；按构造消灭 N44：形式↔实际参数映射、调用点前驱重建、try 区域保留、产出 verifier 洁净；opt-in 不进默认管线；门禁=inline-on 语料 oracle 1149/1149） | worker v2-P3b (k3) | **完成**（9bd8653/35ca7de/0bf9636/d1435af/2b4a379/0b5bde1/1180b95；中途 5h 限额打断一次恢复零丢失。里程碑发现：**vendor 帧槽模型 [func][newTarget][this][formals…]**（callType 注解位，语料全无注解→默认 0xF→3 隐式槽；method_literal.cpp Initialize + 实证探针）——初版参数模型 oracle 18/1149 挂，修正后绿。内联统计：18 点/210 指令（typescript-enum IIFE 族），跳过直方图在案（unresolved-callee 5268 等=保守策略）。**orchestrator 独立复验**：v2inline oracle 1149/1149（sha256:5e7627bdcb78…）、确定性 0 差异、v2lift/v2opt 对基线 0 差异、fmt 净、157 套件绿、parity 2787/0） |
 | v2-P4 | 替换：abcd-ir **删除**（不留档，维护者 2026-09-21 拍板；git 历史即留档），abcd-ir2 正名 abcd-ir；parity 对照器/v0.1 语料 driver 一并退役 | worker v2-P4 (k3) | **完成**（b42e8f4 退役对照器(-1665 行)/d0060a5 删 v0.1(-26370 行)/c6fbe36 改名/ec68bee 文档；**orchestrator 独立复验**：fmt 净、workspace 101 套件 462 测试零失败零 warning、自跑 driver 三变体对验收基线 **0 差异**、v2opt oracle 1149/1149（sha256:5e7627bdcb78…）、corpus_lift_verify 2787/12996 钉住绿；远端目录全清。**v0.2 正式成为 abcd-ir**） |
 | v2-P5a | **abcd-analysis** 基建 crate（维护者 2026-09-21 再裁决：不叫 abcd-dataflow）：`control/`（RPO/后继/支配/循环/区域/可达性——含 abcd-lower analysis.rs 迁入+字节恒等门禁）+ `dataflow/`（单调框架/use-def/IFDS 骨架/heap v0 分配点键控+强弱更新+精度阶梯文档）+ `callgraph/`（on-the-fly）；abcd-ir verify 保留私有最小支配实现+语料一致性钉测试 | worker v2-P5a (k3) | **完成**（32fefb8/4c3b90f/06093d0/800fcbf；control（含 lower analysis.rs 迁入+re-export shim）/dataflow（单调框架+use-def+IFDS 骨架+heap v0+AliasOracle 六方法接缝）/callgraph（on-the-fly+UnknownCallees 显式）。**orchestrator 独立复验全绿**：自跑 v2lift 对基线 **0 差异**、调用图直方图 sites=10962/resolved=345/unknown=10617（96.9% unknown=语料 callee 多为全局加载如 print，保守策略的真实代价）、支配一致性 31086 块 0 分歧、fmt 净、106 套件绿零 warning、corpus_lift_verify 绿。新发现 **N64** 登记（verify 支配污染弱化 N45，仅弱化不强化，待修）） |
-| v2-P5b | abcd-taint 应用 crate：source/sink 配置 + top-20 builtin 摘要注册表 + 污点驱动 + loc 报告，语料 print sink 冒烟 | 待定 | **冻结**（等 FlowDroid 对照研究裁决指针分析问题） |
+| v2-P5b | abcd-taint 应用 crate：source/sink 配置 + top-20 builtin 摘要注册表（call-to-return 拦截/exclusive/回退阶梯/缺失计数）+ 污点驱动 + loc 报告，语料 print sink 冒烟 + 5 族精度探针 | worker v2-P5b (k3) | **进行中**（2026-09-21 启动；P5a trait 表面即插即用） |
 
 ## 反编译轨道（2026-09-21 维护者批准登记；crate 名 abcd-decompile，动词家族）
 
@@ -274,7 +274,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | # | 任务 | 状态 |
 |---|------|------|
 | d-P0 | 规划+技术准备：design/decompile.md（架构、IR 适配审计、先例调研、阶段门禁） | 进行中 |
-| d-P1 | 基建前置：支配树/循环分析/区域结构化分析——归属已定：**abcd-analysis::control**（维护者 2026-09-21 裁决） | 未开始 |
+| d-P1 | 基建前置：区域结构化分析落 abcd-analysis::control（支配/循环 P5a 已交付）；门禁=合成 CFG 测试 + 2787 全量结构化/不可约计数报告（预期≈0）+ 确定性 | worker d-P1 (k3) | **进行中**（2026-09-21 启动，与 P5b 并行；禁碰 workspace Cargo.toml 与 abcd-taint 路径） |
 | d-P2 | 表达式恢复（SSA → 表达式树；acc/临时量折叠） | 未开始 |
 | d-P3 | 控制流结构化（if/else、循环、try/catch、switch 链模式） | 未开始 |
 | d-P4 | 发射 JS/TS 源码 + 语料评估（理想门禁：反编译→es2abc 重编译→oracle 对照） | 未开始 |
