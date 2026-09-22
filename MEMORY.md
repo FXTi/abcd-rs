@@ -448,6 +448,11 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   planning doc in flight; gen1 history: initial commit 5de5ab9 was a
   decompiler (abcd-decompiler+abcd-cli), dropped at 1a8e3f4 (2nd gen),
   archive deleted f045e4a — git history only.
+  d-P2 DONE (2026-09-21): abcd-decompile Stage A (expression
+  recovery) — 1,398,139 corpus instructions 1:1 accounted, fallbacks
+  only in the documented hard-7 set (1,230), deterministic dumps,
+  19 golden tests. Naming: debug-name extents + legalizer + shadowing
+  guard. Next: d-P3 (structuring + emission of JS).
   d-P1 DONE (2026-09-21): control::regions (pattern-independent
   structuring, ~1900 lines) — corpus gate: 12,996/12,996 functions
   structured, ZERO irreducible cores, ZERO escape hatches, 1,797 try
