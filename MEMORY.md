@@ -424,7 +424,16 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   abcd-ir::verify keeps its private minimal dominators (layering) +
   corpus agreement test. P5 FROZEN pending the FlowDroid study
   (pointer-analysis ruling); dispatched as v2-P5a/P5b after it.
-   Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
+   v2-P5a DONE (2026-09-21): abcd-analysis delivered (control/
+  dataflow+IFDS+heap-v0+AliasOracle/callgraph). Orchestrator-verified:
+  byte-identity 0 diffs after the lower analysis.rs migration,
+  callgraph histogram 10962 sites / 96.9% unknown (corpus callees are
+  global loads like print — conservative-resolution cost quantified),
+  dominator agreement 31,086 blocks 0 disagreements. N64 registered:
+  verify.rs's private dominators are polluted by unreachable Normal
+  preds (weakens N45 only); fix = treat unreachable preds as absent,
+  pending abcd-ir thaw. NEXT: v2-P5b (abcd-taint app).
+Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
    summaries/source-sink config/report cadence; decompile=source
