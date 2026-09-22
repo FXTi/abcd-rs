@@ -1,0 +1,24 @@
+[package]
+name = "abcd-decompile"
+description = "Bytecode → JS/TS decompiler on the v0.2 IR: Stage A expression recovery (SSA def-use → expression trees); Stages B/C pending (design/decompile.md §4)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# Crate-graph invariant (design/decompile.md §3.1, same layering rule as
+# abcd-opt/abcd-analysis): abcd-decompile is a pure consumer of abcd-ir +
+# abcd-analysis and must NEVER depend on the format crates
+# (abcd-file/abcd-isa/abcd-file-sys/abcd-isa-sys) nor on abcd-lift/
+# abcd-lower/abcd-opt in its library. The corpus tests under tests/ pull
+# abcd-file + abcd-lift as DEV-dependencies only (they drive decode → lift
+# end-to-end to obtain real modules).
+#
+# Pipeline rule (design/decompile.md §3.2): the `abcd-opt` `inline` pass
+# must never run before decompile — it destroys function boundaries.
+[dependencies]
+abcd-ir = { workspace = true }
+abcd-analysis = { workspace = true }
+
+[dev-dependencies]
+abcd-file = { workspace = true }
+abcd-lift = { workspace = true }

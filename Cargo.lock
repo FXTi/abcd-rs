@@ -12,6 +12,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "abcd-decompile"
+version = "0.1.0"
+dependencies = [
+ "abcd-analysis",
+ "abcd-file",
+ "abcd-ir",
+ "abcd-lift",
+]
+
+[[package]]
 name = "abcd-file"
 version = "0.1.0"
 dependencies = [

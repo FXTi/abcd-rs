@@ -11,6 +11,7 @@ members = [
     "abcd-opt",
     "abcd-analysis",
     "abcd-taint",
+    "abcd-decompile",
 ]
 
 [workspace.package]
@@ -39,3 +40,4 @@ abcd-lower = { path = "abcd-lower" }
 abcd-opt = { path = "abcd-opt" }
 abcd-analysis = { path = "abcd-analysis" }
 abcd-taint = { path = "abcd-taint" }
+abcd-decompile = { path = "abcd-decompile" }
