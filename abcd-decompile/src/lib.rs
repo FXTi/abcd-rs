@@ -46,10 +46,15 @@
 
 pub mod consts;
 pub mod dump;
+pub mod emit;
 pub mod expr;
 pub mod fitness;
+pub mod folds;
 pub mod legalize;
 pub mod names;
 pub mod recover;
+pub mod structure;
 
+pub use emit::{DecompiledModule, EmitOptions, decompile_module};
 pub use recover::{RecoveredFunc, recover_func};
+pub use structure::{SNode, Structured, structure_func};
