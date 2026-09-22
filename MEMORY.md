@@ -448,6 +448,13 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   planning doc in flight; gen1 history: initial commit 5de5ab9 was a
   decompiler (abcd-decompiler+abcd-cli), dropped at 1a8e3f4 (2nd gen),
   archive deleted f045e4a — git history only.
+  d-P1 DONE (2026-09-21): control::regions (pattern-independent
+  structuring, ~1900 lines) — corpus gate: 12,996/12,996 functions
+  structured, ZERO irreducible cores, ZERO escape hatches, 1,797 try
+  regions zero errors (234 try-cuts-region observations = es2abc's
+  bytecode-contiguous try ranges, not bugs). Remaining decompile track:
+  d-P2 expression recovery -> d-P3 structuring emission -> d-P4
+  dream gate (decompile -> es2abc -> VM behavior compare).
   v2-P3b DONE (2026-09-21): inline rewritten on the v0.2 IR (D2=YES).
   N44 killed by construction (fresh-arena clone, vendored frame-slot
   param model [func][newTarget][this][formals...] with callType bits /
