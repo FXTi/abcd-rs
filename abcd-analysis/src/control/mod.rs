@@ -14,11 +14,12 @@
 //!   [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) predecessors.
 //!
 //! On top of these sit the graph algorithms: reverse post-order
-//! ([`compute_rpo`], migrated verbatim from `abcd-lower`), reachability
+//! ([`compute_rpo`], migrated from `abcd-lower`), reachability
 //! ([`reachable_blocks`]), Cooper–Harvey–Kennedy dominators
-//! ([`Dominators`]) and post-dominators ([`PostDominators`]), and
+//! ([`Dominators`]) and post-dominators ([`PostDominators`]),
 //! back-edge / natural-loop detection ([`back_edges`],
-//! [`natural_loop`]).
+//! [`natural_loop`]), and region structuring ([`structure_regions`] —
+//! the d-P1 region layer for the decompile track).
 //!
 //! ## The dominance contract with `abcd-ir`'s verifier
 //!
@@ -49,11 +50,16 @@
 mod dom;
 mod loops;
 mod reach;
+mod regions;
 mod rpo;
 mod succs;
 
 pub use dom::{Dominators, PostDominators};
 pub use loops::{back_edges, natural_loop};
 pub use reach::reachable_blocks;
+pub use regions::{
+    ClassifiedEdge, EdgeClass, EscapeHatch, IrreducibleCore, LoopInfo, LoopKind, RegionError,
+    RegionId, RegionNode, RegionTree, TryPlan, structure_regions,
+};
 pub use rpo::compute_rpo;
 pub use succs::{augmented_succs, block_succs, inst_succs};
