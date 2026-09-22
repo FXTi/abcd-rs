@@ -536,13 +536,28 @@ impl IfdsProblem for TaintProblem<'_> {
         source: &Fact,
         out: &mut Vec<Fact>,
     ) {
-        let Fact::Taint(fact) = source else { return };
         let Some(curr_inst) = module.inst(curr) else { return };
         let Some(succ_inst) = module.inst(succ) else { return };
 
-        // ── Phi-entry edges: the incoming value maps to the phi result
-        // for THIS edge (phi merges union sites via the heap oracle;
-        // here the SSA value mapping is exact per edge).
+        // ── Source generation fires on EVERY incoming edge, including
+        // the zero fact's (FlowDroid's SourcePropagationRule: a source
+        // statement produces taint from Λ).
+        if let Op::TryGetGlobal { name, .. } = &curr_inst.op {
+            if self.global_sources.contains(name) {
+                if let Some(result) = curr_inst.result {
+                    out.push(Fact::of(TaintFact::local(result)));
+                }
+            }
+        }
+
+        let Fact::Taint(fact) = source else { return };
+
+        // ── Phi-entry edges: an incoming value listed for THIS edge
+        // additionally maps to the phi result (phi merges union sites via
+        // the heap oracle; the SSA value mapping is exact per edge).
+        // Non-matching locals PASS THROUGH — a phi edge is a block
+        // boundary, not a kill: the value's taint is path-insensitively
+        // true wherever the value is in scope.
         if let Op::Phi { entries } = &succ_inst.op {
             if let Some(v) = fact.local_base() {
                 for (edge, val) in entries {
@@ -552,9 +567,8 @@ impl IfdsProblem for TaintProblem<'_> {
                         }
                     }
                 }
-                return; // a non-matching local dies at the phi
             }
-            out.push(source.clone()); // state bases pass phis unchanged
+            out.push(source.clone());
             return;
         }
 
@@ -572,13 +586,6 @@ impl IfdsProblem for TaintProblem<'_> {
         match &curr_inst.op {
             // ── Global bindings ──────────────────────────────────────
             Op::TryGetGlobal { name, .. } => {
-                // Source tagging: a configured global load is a source
-                // regardless of the incoming fact.
-                if self.global_sources.contains(name) {
-                    if let Some(result) = curr_inst.result {
-                        out.push(Fact::of(TaintFact::local(result)));
-                    }
-                }
                 // Pick up a previously stored global taint.
                 if fact.base == TaintBase::Global(*name) {
                     if let Some(result) = curr_inst.result {

@@ -286,70 +286,91 @@ pub enum FallbackStep {
 }
 
 /// The top-20 builtin summaries, chosen by corpus frequency of
-/// global-name call sites (see `tests/corpus_taint_smoke.rs`'s
-/// frequency report and the README). One line per builtin.
+/// global-name call sites (`tests/corpus_callee_names.rs` over the 1149
+/// runtime-passed fixtures; one line per builtin).
 ///
-/// Each entry: `(registry name, arity, summary)`. Names are qualified
-/// through the global-load chain (`"JSON.parse"`) or bare globals
-/// (`"print"`).
+/// Corpus evidence (5625 call sites, 5079 with a resolvable name):
+/// `print` dominates at 3795; the rest of the head is user-defined test
+/// globals (`foo` 117, `f` 90, `A` 69, `testXxx` 18×…), not builtins.
+/// The genuine ECMAScript builtins exercised through global-name chains
+/// are: `Object.is` 36, `RegExp` 36, `Number.isNaN` 18,
+/// `Object.setPrototypeOf` 18, `Proxy` 18, `String.raw` 18, `Symbol` 18,
+/// `Uint8Array` 18 (entries 1–9 below, corpus counts in their docs).
+/// Prototype-method calls (`a.pop`, `s.charCodeAt`, `r.test`, `s.next`,
+/// 18–54 each) resolve to USER-global-qualified names
+/// (`TryGetGlobal("a").pop`) and cannot match prototype-keyed summaries
+/// at rung 0 — receiver types are unknown (summaries.md minimal
+/// registry: the prototype-chain walk needs types we do not have).
+/// Entries 10–20 are the canonical namespace builtins of reader D's
+/// minimal-registry set, registered preemptively (corpus frequency 0 —
+/// they are the first rung of the miss-log-driven backlog).
 pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
     use Endpoint::*;
     vec![
-        // print(x): a SINK in the smoke config; as a propagation model it
-        // copies nothing — registered so the miss log is not polluted by
-        // the corpus' hottest call (it is an exclusive no-op model: the
-        // runtime's print returns undefined and mutates nothing).
-        ("print", None, Summary::new("sink; no propagation, no mutation").exclusive()),
-        // Array.prototype.isArray(x) → boolean; pure, copies nothing.
-        ("Array.isArray", Some(1), Summary::new("pure test; result is a fresh boolean").exclusive()),
-        // Array.from(x) → new array carrying x's elements.
-        ("Array.from", None, Summary::new("iterable/element taint → new array").flow(Param(0), Return)),
-        // Object.keys(o) / Object.values(o) → array of o's own keys/values.
-        ("Object.keys", Some(1), Summary::new("object taint → key array").flow(Param(0), Return)),
-        ("Object.values", Some(1), Summary::new("object field taint → value array").flow(Param(0), Return)),
-        // Object.entries(o) → [key, value] pairs of o.
-        ("Object.entries", Some(1), Summary::new("object taint → entry array").flow(Param(0), Return)),
-        // Object.assign(dst, srcs...) — the mutator: each src flows into
+        // ── Corpus-evidenced (frequency in the doc string) ───────────
+        // print (3795): the corpus' dominant call; a SINK in the smoke
+        // config. The model is an exclusive no-op: print returns
+        // undefined and mutates nothing.
+        ("print", None, Summary::new("corpus-freq 3795; sink; no propagation, no mutation").exclusive()),
+        // Object.is (36): pure comparison; fresh boolean, copies nothing.
+        ("Object.is", Some(2), Summary::new("corpus-freq 36; pure test; fresh boolean result").exclusive()),
+        // RegExp (36): constructor; the pattern/flags taint the new
+        // RegExp object (its `.source` and `test` results derive from it).
+        ("RegExp", None, Summary::new("corpus-freq 36; ctor; pattern taint → new RegExp object").flow(Param(0), Return)),
+        // Number.isNaN (18): pure test; fresh boolean.
+        ("Number.isNaN", Some(1), Summary::new("corpus-freq 18; pure test; fresh boolean result").exclusive()),
+        // Object.setPrototypeOf (18): mutator — the tainted prototype is
+        // reachable through reads on the target (coarse: whole-target
+        // taint; field-precise proto-chain taint is a rung-1 matter).
+        ("Object.setPrototypeOf", Some(2), Summary::new("corpus-freq 18; proto taint → target (coarse)").alias_flow(Param(1), Param(0))),
+        // Proxy (18): constructor; a tainted target's reads flow through
+        // traps (unmodeled user code) — conservatively taint the proxy.
+        ("Proxy", None, Summary::new("corpus-freq 18; ctor; target taint → proxy").flow(Param(0), Return)),
+        // String.raw (18): template cook; any tainted substitution or
+        // template taints the cooked string (variadic, params 0–3).
+        ("String.raw", None, {
+            let mut s = Summary::new("corpus-freq 18; template cook; any tainted part → string");
+            for i in 0..4u16 {
+                s = s.flow(Param(i), Return);
+            }
+            s.exclusive()
+        }),
+        // Symbol (18): the description is carried by the symbol value
+        // (readable via `.description`); conservative param→return.
+        ("Symbol", None, Summary::new("corpus-freq 18; description taint → symbol value").flow(Param(0), Return).exclusive()),
+        // Uint8Array (18): constructor; source-buffer taint → the typed
+        // array's contents.
+        ("Uint8Array", None, Summary::new("corpus-freq 18; ctor; source taint → typed array").flow(Param(0), Return)),
+        // ── Canonical namespace builtins (corpus-freq 0, preemptive) ──
+        // JSON.parse: string taint → the whole parsed object graph.
+        ("JSON.parse", Some(1), Summary::new("canonical; string taint → parsed object graph").flow(Param(0), Return).exclusive()),
+        // JSON.stringify: value taint → the JSON string.
+        ("JSON.stringify", None, Summary::new("canonical; value taint → JSON string").flow(Param(0), Return).exclusive()),
+        // Object.keys: the own-key set derives from the object.
+        ("Object.keys", Some(1), Summary::new("canonical; object taint → key array").flow(Param(0), Return).exclusive()),
+        // Object.values: own values carry the object's field taint.
+        ("Object.values", Some(1), Summary::new("canonical; object field taint → value array").flow(Param(0), Return).exclusive()),
+        // Object.entries: [key, value] pairs carry the object's taint.
+        ("Object.entries", Some(1), Summary::new("canonical; object taint → entry array").flow(Param(0), Return).exclusive()),
+        // Object.assign: the mutator — each source's fields flow into
         // param 0 (alias: the reference is mutated, not copied).
         ("Object.assign", None, {
-            let mut s = Summary::new("srcs → dst (mutates param 0)");
+            let mut s = Summary::new("canonical; srcs → dst (mutates param 0)");
             for i in 1..4u16 {
                 s = s.alias_flow(Param(i), Param(0));
             }
             s
         }),
-        // Object.create(proto) → fresh object; proto taint carries (the
-        // new object's prototype chain reads reach proto's fields).
-        ("Object.create", None, Summary::new("prototype taint → new object").flow(Param(0), Return)),
-        // JSON.parse(x) → object graph built from x (transformer).
-        ("JSON.parse", Some(1), Summary::new("string taint → parsed object graph").flow(Param(0), Return).exclusive()),
-        // JSON.stringify(x) → string describing x (transformer).
-        ("JSON.stringify", None, Summary::new("value taint → JSON string").flow(Param(0), Return).exclusive()),
-        // JSON.parse/... covered; placeholder-filled below after the
-        // corpus frequency count finalizes the top-20.
-        ("Math.max", None, {
-            let mut s = Summary::new("numeric fold; any tainted arg → tainted result");
-            for i in 0..4u16 {
-                s = s.flow(Param(i), Return);
-            }
-            s.exclusive()
-        }),
-        ("Math.min", None, {
-            let mut s = Summary::new("numeric fold; any tainted arg → tainted result");
-            for i in 0..4u16 {
-                s = s.flow(Param(i), Return);
-            }
-            s.exclusive()
-        }),
-        ("Math.floor", Some(1), Summary::new("numeric transformer").flow(Param(0), Return).exclusive()),
-        ("Math.abs", Some(1), Summary::new("numeric transformer").flow(Param(0), Return).exclusive()),
-        ("Math.round", Some(1), Summary::new("numeric transformer").flow(Param(0), Return).exclusive()),
-        ("Math.random", Some(0), Summary::new("nullary; no propagation").exclusive()),
-        ("Number", None, Summary::new("coercion; operand taint → number").flow(Param(0), Return).exclusive()),
-        ("String", None, Summary::new("coercion; operand taint → string").flow(Param(0), Return).exclusive()),
-        ("Boolean", None, Summary::new("coercion; operand taint → boolean").flow(Param(0), Return).exclusive()),
-        ("parseInt", None, Summary::new("string taint → parsed number").flow(Param(0), Return).exclusive()),
-        ("parseFloat", Some(1), Summary::new("string taint → parsed number").flow(Param(0), Return).exclusive()),
-        ("isNaN", Some(1), Summary::new("pure test; fresh boolean result").exclusive()),
+        // Object.create: the new object's prototype-chain reads reach
+        // the proto's fields.
+        ("Object.create", Some(1), Summary::new("canonical; prototype taint → new object").flow(Param(0), Return)),
+        // Array.isArray: pure test; fresh boolean.
+        ("Array.isArray", Some(1), Summary::new("canonical; pure test; fresh boolean result").exclusive()),
+        // Array.from: iterable/element taint → the new array.
+        ("Array.from", None, Summary::new("canonical; iterable taint → new array").flow(Param(0), Return).exclusive()),
+        // Number coercion: operand taint → number.
+        ("Number", None, Summary::new("canonical; coercion; operand taint → number").flow(Param(0), Return).exclusive()),
+        // String coercion: operand taint → string.
+        ("String", None, Summary::new("canonical; coercion; operand taint → string").flow(Param(0), Return).exclusive()),
     ]
 }

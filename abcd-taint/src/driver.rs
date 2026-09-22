@@ -35,7 +35,7 @@ use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::ifds::CallGraphOracle;
 use abcd_analysis::dataflow::heap::DEFAULT_MAX_FIELD_CHAIN;
 use abcd_analysis::dataflow::ifds::{IfdsConfig, IfdsResult, IfdsSolver};
-use abcd_ir::{FuncId, InstId, Loc, Module, Op};
+use abcd_ir::{FuncId, InstId, Loc, Module, Op, ValueId};
 
 use crate::fact::{Fact, TaintFact};
 use crate::names::{call_base_value, callee_name_candidates};
@@ -192,6 +192,12 @@ impl TaintReport {
 
 /// Run the taint analysis over `module`.
 pub fn run_taint(module: &Module, config: &TaintConfig) -> TaintReport {
+    run_taint_full(module, config).0
+}
+
+/// Run the analysis, also returning the raw solver result (for tests
+/// that assert on facts at arbitrary program points).
+pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, IfdsResult<Fact>) {
     let callgraph = CallGraph::build(module);
     let mut registry = if config.builtin_summaries {
         SummaryRegistry::with_builtins()
@@ -223,12 +229,14 @@ pub fn run_taint(module: &Module, config: &TaintConfig) -> TaintReport {
         path_edges: result.path_edges().len(),
     };
     for hit in &mut report.hits {
-        hit.path = reconstruct_path(module, &callgraph, &result, hit);
+        let (seed, path) = reconstruct_path(module, &callgraph, &result, hit);
+        hit.seed = seed;
+        hit.path = path;
     }
     report.hits.sort_by(|a, b| {
         (a.call, &a.position, &a.fact, &a.sink).cmp(&(b.call, &b.position, &b.fact, &b.sink))
     });
-    report
+    (report, result)
 }
 
 /// Scan call sites for sink matches with tainted operands.
@@ -281,66 +289,19 @@ fn collect_hits(
                 } else {
                     continue; // unrelated fact at the call node
                 };
-                let seed = seed_of(module, result, iid, &fact).unwrap_or((FuncId::new(0), fact.clone()));
                 hits.push(SinkHit {
                     sink: name.clone(),
                     call: iid,
                     loc: inst.loc,
                     position,
                     fact: tf.clone(),
-                    seed,
-                    path: Vec::new(), // filled by reconstruct_path
+                    seed: (FuncId::new(0), Fact::Zero), // filled by reconstruct
+                    path: Vec::new(),                   // filled by reconstruct
                 });
             }
         }
     }
     hits
-}
-
-/// Find the seed (anchor function + seed fact) a reached fact derives
-/// from: the path edge that first introduced a fact with the same
-/// anchor. The anchor of an edge at the sink IS the seed fact for
-/// caller-side edges; for callee-internal edges the anchor is the
-/// callee-entry fact — follow the anchor chain back to a seed.
-fn seed_of(
-    module: &Module,
-    result: &IfdsResult<Fact>,
-    node: InstId,
-    fact: &Fact,
-) -> Option<(FuncId, Fact)> {
-    let edges = result.path_edges();
-    let mut anchor = edges
-        .iter()
-        .find(|e| e.target_node == node && &e.target_fact == fact)
-        .map(|e| e.source_fact.clone())?;
-    // Walk anchor switches backwards: an anchor that was itself produced
-    // as a target fact at some function's start point by a call edge has
-    // a parent anchor (the caller-side edge's source).
-    let mut seen = HashSet::new();
-    loop {
-        if !seen.insert(anchor.clone()) {
-            return None;
-        }
-        if anchor == Fact::Zero {
-            return None;
-        }
-        // Is `anchor` a seed? Seeds are edges (Zero, sp, anchor) where sp
-        // is the start point.
-        if let Some(e) = edges
-            .iter()
-            .find(|e| e.source_fact == Fact::Zero && e.target_fact == anchor)
-        {
-            let func = func_of_inst(module, e.target_node)?;
-            return Some((func, anchor));
-        }
-        // Otherwise the anchor was produced by a call edge: find an edge
-        // whose target fact equals the anchor at some start point and
-        // continue from ITS source.
-        let parent = edges
-            .iter()
-            .find(|e| e.target_fact == anchor && e.source_fact != Fact::Zero)?;
-        anchor = parent.source_fact.clone();
-    }
 }
 
 /// The function owning an instruction.
@@ -376,38 +337,134 @@ fn inst_preds(module: &Module, inst: InstId) -> Vec<InstId> {
     out
 }
 
-/// Best-effort backward-BFS path from the sink node back to the seed,
-/// over the solver's path-edge set. Links: intraprocedural predecessor
-/// edges with the same anchor; call-entry anchor switches (an edge into
-/// a function's start point follows the caller's call-site edge);
-/// return-site edges follow the callee's exit edges. Deterministic
-/// (BFS over insertion-ordered edges, first path wins, depth-capped).
+/// The solver's return-site computation for a call, replicated for path
+/// reconstruction (the supergraph is solver-internal): the normal
+/// continuation plus handler entries when the call may throw.
+fn return_sites_of(module: &Module, call: InstId) -> Vec<InstId> {
+    let Some(inst) = module.inst(call) else { return Vec::new() };
+    let Some(block) = module.block(inst.block) else { return Vec::new() };
+    let mut out = Vec::new();
+    if let Some(pos) = block.insts.iter().position(|&x| x == call) {
+        if pos + 1 < block.insts.len() {
+            out.push(block.insts[pos + 1]);
+        } else {
+            for s in abcd_analysis::control::block_succs(module, inst.block) {
+                if let Some(first) = module.block(s).and_then(|b| b.insts.first()) {
+                    out.push(*first);
+                }
+            }
+        }
+    }
+    if inst.op.effects().may_throw {
+        if let Some(f) = module.functions.iter().find(|f| f.blocks.contains(&inst.block)) {
+            for region in &f.try_regions {
+                if !region.protected.contains(&inst.block) {
+                    continue;
+                }
+                for catch in &region.catches {
+                    if let Some(first) = module.block(catch.handler).and_then(|b| b.insts.first()) {
+                        if !out.contains(first) {
+                            out.push(*first);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Indices over the path-edge set for backward reconstruction.
+struct PathIndex {
+    /// `(anchor, target node)` → edge indices.
+    by_anchor_node: HashMap<(Fact, InstId), Vec<usize>>,
+    /// target node → edge indices (any anchor).
+    by_node: HashMap<InstId, Vec<usize>>,
+    /// start point → function.
+    func_of_sp: HashMap<InstId, FuncId>,
+    /// function → exit instructions (Return/Throw).
+    exits_of: HashMap<FuncId, Vec<InstId>>,
+    /// return site → call instructions it is a return site of.
+    calls_at_return_site: HashMap<InstId, Vec<InstId>>,
+}
+
+impl PathIndex {
+    fn build(module: &Module, result: &IfdsResult<Fact>) -> Self {
+        let mut by_anchor_node: HashMap<(Fact, InstId), Vec<usize>> = HashMap::new();
+        let mut by_node: HashMap<InstId, Vec<usize>> = HashMap::new();
+        for (i, e) in result.path_edges().iter().enumerate() {
+            by_anchor_node
+                .entry((e.source_fact.clone(), e.target_node))
+                .or_default()
+                .push(i);
+            by_node.entry(e.target_node).or_default().push(i);
+        }
+        let mut func_of_sp = HashMap::new();
+        let mut exits_of: HashMap<FuncId, Vec<InstId>> = HashMap::new();
+        let mut calls_at_return_site: HashMap<InstId, Vec<InstId>> = HashMap::new();
+        for (fi, f) in module.functions.iter().enumerate() {
+            let func = FuncId::new(fi as u32);
+            if let Some(sp) = f
+                .entry()
+                .and_then(|b| module.block(b))
+                .and_then(|bb| bb.insts.first())
+            {
+                func_of_sp.insert(*sp, func);
+            }
+            let mut exits = Vec::new();
+            for &b in &f.blocks {
+                let Some(bb) = module.block(b) else { continue };
+                for &iid in &bb.insts {
+                    let Some(inst) = module.inst(iid) else { continue };
+                    if matches!(inst.op, Op::Return { .. } | Op::Throw { .. }) {
+                        exits.push(iid);
+                    }
+                    if matches!(inst.op, Op::Call { .. }) {
+                        for rs in return_sites_of(module, iid) {
+                            calls_at_return_site.entry(rs).or_default().push(iid);
+                        }
+                    }
+                }
+            }
+            exits_of.insert(func, exits);
+        }
+        PathIndex {
+            by_anchor_node,
+            by_node,
+            func_of_sp,
+            exits_of,
+            calls_at_return_site,
+        }
+    }
+}
+
+/// Best-effort backward-BFS path from the sink edge back to the seed,
+/// over the solver's path-edge set — and the seed itself.
+///
+/// Heros anchoring (the subtlety this implements): intraprocedural
+/// edges keep the ORIGINAL anchor, which for the seed's own function is
+/// the ZERO fact (seeds are `(Zero, sp, fact)` edges); the anchor
+/// switches to the callee-entry fact at call boundaries. Predecessors
+/// of an edge `(d1, n, d2)`:
+///
+/// 1. `n` a start point, `d1 == Zero` → terminal seed edge
+///    (seed = `(func(n), d2)`);
+/// 2. `n` a start point, `d1 == d2 != Zero` → callee-anchor self-loop:
+///    predecessors are the call edges into `func(n)`;
+/// 3. otherwise → same-anchor edges at instruction predecessors, plus —
+///    when `n` is a return site of call `c` — the call edge `(d1, c, *)`
+///    and the callee exit edges (any anchor; the exact producing exit
+///    is not recoverable from the edge set alone — documented
+///    approximation, deterministic via BFS order and insertion-ordered
+///    indices).
 fn reconstruct_path(
     module: &Module,
     callgraph: &CallGraph,
     result: &IfdsResult<Fact>,
     hit: &SinkHit,
-) -> Vec<PathStep> {
+) -> ((FuncId, Fact), Vec<PathStep>) {
     let edges = result.path_edges();
-    // Index: (anchor, node) → edge indices.
-    let mut by_anchor_node: HashMap<(Fact, InstId), Vec<usize>> = HashMap::new();
-    // Start-point edges by function for anchor switching.
-    let mut start_point_of: HashMap<FuncId, InstId> = HashMap::new();
-    for (fi, f) in module.functions.iter().enumerate() {
-        if let Some(sp) = f
-            .entry()
-            .and_then(|b| module.block(b))
-            .and_then(|bb| bb.insts.first())
-        {
-            start_point_of.insert(FuncId::new(fi as u32), *sp);
-        }
-    }
-    for (i, e) in edges.iter().enumerate() {
-        by_anchor_node
-            .entry((e.source_fact.clone(), e.target_node))
-            .or_default()
-            .push(i);
-    }
+    let index = PathIndex::build(module, result);
 
     let step_of = |inst: InstId| -> PathStep {
         let i = module.inst(inst);
@@ -418,15 +475,18 @@ fn reconstruct_path(
         }
     };
 
-    // Backward BFS from (sink node, hit fact, anchor = hit.seed.1).
-    // A state in the search is an edge index; parents are computed per
-    // pop. Stop when we reach an edge whose source is Zero at a start
-    // point (the seed edge).
-    let target = edges
+    let fallback = || {
+        (
+            (func_of_inst(module, hit.call).unwrap_or(FuncId::new(0)), Fact::Zero),
+            vec![step_of(hit.call)],
+        )
+    };
+
+    let Some(start_edge) = edges
         .iter()
-        .position(|e| e.target_node == hit.call && e.target_fact == Fact::Taint(hit.fact.clone()));
-    let Some(start_edge) = target else {
-        return vec![step_of(hit.call)];
+        .position(|e| e.target_node == hit.call && e.target_fact == Fact::Taint(hit.fact.clone()))
+    else {
+        return fallback();
     };
 
     let mut visited: HashSet<usize> = HashSet::new();
@@ -436,71 +496,148 @@ fn reconstruct_path(
     visited.insert(start_edge);
     let mut seed_edge = None;
 
-    'bfs: while let Some(ei) = queue.pop_front() {
+    while let Some(ei) = queue.pop_front() {
         let e = &edges[ei];
+        let n = e.target_node;
+        // Terminal: a seed edge (Zero, sp, non-zero fact).
         if e.source_fact == Fact::Zero {
-            seed_edge = Some(ei);
-            break;
+            if let Some(&func) = index.func_of_sp.get(&n) {
+                if e.target_fact != Fact::Zero {
+                    seed_edge = Some((ei, func));
+                    break;
+                }
+                continue; // the zero self-loop root: do not expand
+            }
         }
         if parent.len() > 4096 {
-            break; // depth cap: report the partial path
+            break; // cap: report the partial path
         }
-        let push_parent = |pi: usize,
-                               queue: &mut VecDeque<usize>,
-                               visited: &mut HashSet<usize>,
-                               parent: &mut HashMap<usize, usize>| {
-            if visited.insert(pi) {
-                parent.insert(pi, ei);
-                queue.push_back(pi);
-            }
-        };
-        // 1. Intraprocedural predecessors with the same anchor.
-        for pred in inst_preds(module, e.target_node) {
-            if let Some(cands) = by_anchor_node.get(&(e.source_fact.clone(), pred)) {
-                for &pi in cands {
-                    push_parent(pi, &mut queue, &mut visited, &mut parent);
+        let mut preds: Vec<usize> = Vec::new();
+        if e.source_fact == e.target_fact
+            && e.source_fact != Fact::Zero
+            && index.func_of_sp.contains_key(&n)
+        {
+            // Callee-anchor self-loop: call edges into this function,
+            // restricted to caller facts on the call's operands (the
+            // only facts call_flow can map).
+            let func = index.func_of_sp[&n];
+            for call in callgraph.callers_of(func) {
+                let operands: Vec<ValueId> = module
+                    .inst(*call)
+                    .map(|i| i.op.operands())
+                    .unwrap_or_default();
+                if let Some(cands) = index.by_node.get(call) {
+                    preds.extend(cands.iter().copied().filter(|&pi| {
+                        edges[pi]
+                            .target_fact
+                            .taint()
+                            .and_then(|t| t.local_base())
+                            .is_some_and(|v| operands.contains(&v))
+                    }));
                 }
             }
-        }
-        // 2. Anchor switch at a callee start point: this edge's anchor
-        // was produced by a call edge into this function.
-        let is_start = start_point_of.values().any(|sp| *sp == e.target_node);
-        if is_start && e.source_fact == e.target_fact {
-            if let Some(func) = func_of_inst(module, e.target_node) {
-                for caller_call in callgraph.callers_of(func) {
-                    if let Some(cands) = by_anchor_node
-                        .iter()
-                        .find(|((_, n), _)| *n == *caller_call)
-                        .map(|(_, v)| v.clone())
-                    {
-                        for pi in cands {
-                            // The caller edge whose target fact maps to
-                            // our anchor (any anchor — over-approximate
-                            // but deterministic).
-                            push_parent(pi, &mut queue, &mut visited, &mut parent);
+        } else {
+            // Return-site disambiguation: if this edge's fact is on the
+            // call's RESULT value, the taint arrived through the callee
+            // (return flow), so the path detours via the callee exit —
+            // not the intraprocedural bypass.
+            let mut via_exit: Option<Vec<usize>> = None;
+            if let Some(calls) = index.calls_at_return_site.get(&n) {
+                'calls: for c in calls {
+                    let result_val = module.inst(*c).and_then(|i| i.result);
+                    let on_result = e
+                        .target_fact
+                        .taint()
+                        .and_then(|t| t.local_base())
+                        .is_some_and(|v| Some(v) == result_val);
+                    if !on_result {
+                        continue;
+                    }
+                    let mut exit_preds: Vec<usize> = Vec::new();
+                    for callee in callgraph.callees_of_call_at(*c) {
+                        if let Some(exits) = index.exits_of.get(callee) {
+                            for exit in exits {
+                                let exit_val = module.inst(*exit).and_then(|i| match &i.op {
+                                    Op::Return { value } => *value,
+                                    Op::Throw { value } => Some(*value),
+                                    _ => None,
+                                });
+                                if let Some(cands) = index.by_node.get(exit) {
+                                    exit_preds.extend(cands.iter().copied().filter(|&pi| {
+                                        edges[pi]
+                                            .target_fact
+                                            .taint()
+                                            .and_then(|t| t.local_base())
+                                            == exit_val
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    if !exit_preds.is_empty() {
+                        via_exit = Some(exit_preds);
+                        break 'calls;
+                    }
+                }
+            }
+            if let Some(exit_preds) = via_exit {
+                preds.extend(exit_preds);
+            } else {
+                for p in inst_preds(module, n) {
+                    if let Some(cands) = index.by_anchor_node.get(&(e.source_fact.clone(), p)) {
+                        // Prefer the exact-fact (pass-through) predecessor;
+                        // widen only at transforming instructions.
+                        let exact: Vec<usize> = cands
+                            .iter()
+                            .copied()
+                            .filter(|&pi| edges[pi].target_fact == e.target_fact)
+                            .collect();
+                        if exact.is_empty() {
+                            preds.extend(cands.iter().copied());
+                        } else {
+                            preds.extend(exact);
+                        }
+                    }
+                }
+                if let Some(calls) = index.calls_at_return_site.get(&n) {
+                    for c in calls {
+                        // The call edge with the same anchor (bypass).
+                        if let Some(cands) = index.by_anchor_node.get(&(e.source_fact.clone(), *c))
+                        {
+                            preds.extend(cands.iter().copied());
                         }
                     }
                 }
             }
         }
+        for pi in preds {
+            if pi != ei && visited.insert(pi) {
+                parent.insert(pi, ei);
+                queue.push_back(pi);
+            }
+        }
         if queue.len() > 8192 {
-            break 'bfs;
+            break;
         }
     }
 
-    // Rebuild seed → sink.
-    let mut chain = Vec::new();
-    let mut cur = seed_edge.unwrap_or(start_edge);
-    chain.push(cur);
-    while let Some(&p) = parent.get(&cur) {
-        chain.push(p);
-        cur = p;
+    let Some((seed_ei, seed_func)) = seed_edge else {
+        return fallback();
+    };
+    let seed = (seed_func, edges[seed_ei].target_fact.clone());
+
+    // Rebuild seed → sink along the child links.
+    let mut chain = vec![seed_ei];
+    let mut cur = seed_ei;
+    while let Some(&next) = parent.get(&cur) {
+        chain.push(next);
+        cur = next;
         if chain.len() > 4096 {
             break;
         }
     }
-    chain.reverse();
-    chain.into_iter().map(|ei| step_of(edges[ei].target_node)).collect()
+    let path = chain.into_iter().map(|ei| step_of(edges[ei].target_node)).collect();
+    (seed, path)
 }
 
 /// The `Op` variant name for reporting (Debug-prefix; no per-variant
