@@ -8,13 +8,17 @@ version.workspace = true
 # Crate-graph invariant (design/ir-v0.2.md §8): layering is lift =
 # decode→IR, opt = IR→IR, lower = IR→file. The lower pipeline is the ONLY
 # IR consumer allowed to see the format layer. The LIBRARY may depend on
-# `abcd-ir` (the IR), `abcd-file` + `abcd-isa` (the container end), and
+# `abcd-ir` (the IR), `abcd-file` + `abcd-isa` (the container end),
+# `abcd-analysis` (the format-independent analysis infrastructure — v2-P5a:
+# the CFG successor/RPO helpers migrated there; analysis depends only on
+# abcd-ir, so this adds no format knowledge to the lower pipeline), and
 # NOTHING else from this workspace — in particular never on `abcd-lift`
 # (the forward direction) or `abcd-opt`. The corpus driver under tests/
 # pulls `abcd-lift`/`abcd-opt` as DEV-dependencies only (it drives the
 # decode → lift → optimize → lower pipeline end-to-end).
 [dependencies]
 abcd-ir = { workspace = true }
+abcd-analysis = { workspace = true }
 abcd-file = { workspace = true }
 abcd-isa = { workspace = true }
 thiserror = { workspace = true }
