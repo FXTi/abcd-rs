@@ -1,0 +1,19 @@
+[package]
+name = "abcd-analysis"
+description = "Analysis infrastructure on the v0.2 IR: control-flow analyses, dataflow framework + IFDS skeleton + heap v0, on-the-fly call graph (design/analysis-strategy.md §5)"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+# Crate-graph invariant (design/ir-v0.2.md §2: "Deliberately NOT in the IR
+# (analysis-side concerns)"; design/analysis-strategy.md §5):
+# analysis infra: format-independent, never depends on abcd-file/abcd-isa/
+# abcd-lift/abcd-lower/abcd-opt. The LIBRARY consumes only `abcd-ir`; the
+# corpus tests under tests/ pull `abcd-file`/`abcd-lift` as DEV-dependencies
+# only (they drive decode → lift end-to-end to obtain real modules).
+[dependencies]
+abcd-ir = { workspace = true }
+
+[dev-dependencies]
+abcd-file = { workspace = true }
+abcd-lift = { workspace = true }
