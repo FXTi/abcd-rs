@@ -124,7 +124,9 @@ impl<'m> TaintProblem<'m> {
         for spec in &config.sources {
             if let SourceSpec::FunctionParams { name, params } = spec {
                 for (fi, f) in module.functions.iter().enumerate() {
-                    if module.sym.resolve(f.name) == Some(name.as_str()) {
+                    // `"*"` is the sensitivity-analysis wildcard (every
+                    // function's params are sources).
+                    if name == "*" || module.sym.resolve(f.name) == Some(name.as_str()) {
                         let values: Vec<ValueId> = match params {
                             Some(indices) => indices
                                 .iter()

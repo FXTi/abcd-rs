@@ -236,8 +236,9 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         summaries_applied: applied,
         path_edges: result.path_edges().len(),
     };
+    let path_index = PathIndex::build(module, &result);
     for hit in &mut report.hits {
-        let (seed, path) = reconstruct_path(module, &callgraph, &result, hit);
+        let (seed, path) = reconstruct_path(module, &callgraph, &result, &path_index, hit);
         hit.seed = seed;
         hit.path = path;
     }
@@ -482,10 +483,10 @@ fn reconstruct_path(
     module: &Module,
     callgraph: &CallGraph,
     result: &IfdsResult<Fact>,
+    index: &PathIndex,
     hit: &SinkHit,
 ) -> ((FuncId, Fact), Vec<PathStep>) {
     let edges = result.path_edges();
-    let index = PathIndex::build(module, result);
 
     let step_of = |inst: InstId| -> PathStep {
         let i = module.inst(inst);

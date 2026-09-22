@@ -21,11 +21,22 @@ mod common;
 
 use abcd_taint::{SinkSpec, SourceSpec, TaintConfig, TaintReport};
 
-/// The smoke configuration (the documented source choice).
+/// The smoke configuration (the documented source choice). A
+/// sensitivity mode seeds ALL functions' params
+/// (`ABCD_TAINT_SMOKE_SOURCE=all-params`) — the positive control that
+/// taint physically reaches `print` on real bytecode (the corpus
+/// fixtures are self-contained and rarely route entry params into
+/// `print`, so the registered config's flow count is legitimately low).
 fn smoke_config() -> TaintConfig {
+    // all-params sensitivity: `"*"` seeds every function's params (the
+    // driver treats the name as a wildcard).
+    let source_name = match std::env::var("ABCD_TAINT_SMOKE_SOURCE").as_deref() {
+        Ok("all-params") => "*",
+        _ => "func_main_0",
+    };
     TaintConfig {
         sources: vec![SourceSpec::FunctionParams {
-            name: "func_main_0".to_owned(),
+            name: source_name.to_owned(),
             params: None, // all params — including params[0] = this
         }],
         sinks: vec![SinkSpec::Call {
