@@ -382,3 +382,294 @@ fn probe_exception_only_path() {
     );
     assert_eq!(lines, vec![55], "only the exceptional path flows");
 }
+
+// ────────────────────────────────────────────────────────────────────
+// The COMPILED probe suite (t-P1; analysis-strategy.md §5.5 — the
+// ladder-trigger instrument). Hand-written JS sources with known ground
+// truth live in probes-taint/src/ (+ annotations.json); they are
+// compiled by scripts/gen-taint-probes.py into the GITIGNORED
+// probes-taint/out/ with the GHCR image's es2abc (24.0.0.0, baseline,
+// script mode — the pin and rationale are in annotations.json).
+//
+// The suite EXTENDS the five hand-built mini-module families above:
+// same axes, real bytecode. Its ground truth is runtime-checked by the
+// generator (every probe runs clean on the image's VM).
+//
+// Expectations per sink line (see annotations.json):
+//   tp    — real flow, MUST hit (a miss is a regression);
+//   clean — no flow, MUST NOT hit (a hit is an FP regression);
+//   fp    — no flow, rung 0 HITS (expected FP; closes_at_rung records
+//           the ladder rung that should kill it);
+//   fn    — real flow, rung 0 MISSES (known FN; closes_at_rung records
+//           the rung that should catch it).
+// Deviations in EITHER direction fail the suite: an expected-fp/fn that
+// stops reproducing means the ladder moved and the annotations must be
+// updated deliberately. That is what makes this the ladder TRIGGER.
+//
+// Run:
+//   python3 scripts/gen-taint-probes.py   # once, needs docker
+//   cargo test -p abcd-taint --test probes --release -- \
+//       --ignored --nocapture probe_suite_compiled
+// ────────────────────────────────────────────────────────────────────
+
+mod compiled {
+    use abcd_taint::{SinkSpec, SourceSpec, TaintConfig, TaintReport};
+    use std::path::{Path, PathBuf};
+
+    /// One sink expectation from annotations.json.
+    #[derive(Debug)]
+    struct SinkExpect {
+        line: u32,
+        expect: String,         // tp | clean | fp | fn
+        closes_at_rung: String, // "", "1", "2"
+    }
+
+    /// One probe row.
+    #[derive(Debug)]
+    struct Probe {
+        id: String,
+        family: String,
+        sinks: Vec<SinkExpect>,
+        summaries_applied: Vec<String>,
+        named_misses: Vec<String>,
+        body_step_min: usize,
+    }
+
+    fn repo_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .canonicalize()
+            .expect("repo root")
+    }
+
+    /// Parse annotations.json with python3's stdlib JSON (the same
+    /// pattern as common::runtime_passed_paths — keeps dev-deps at
+    /// abcd-file/abcd-lift only). Emits a TSV the arms below parse:
+    ///   CONFIG \t source \t sink
+    ///   PROBE  \t id \t family
+    ///   SINK   \t id \t line \t expect \t closes_at_rung
+    ///   COUNTER\t id \t summary_applied|named_miss|body_step_min \t value
+    fn load_annotations(root: &Path) -> (Vec<Probe>, String, String) {
+        let script = r#"
+import json, sys
+a = json.load(open(sys.argv[1], encoding="utf-8"))
+src = next(iter(a["source"].values()))
+snk = next(iter(a["sink"].values()))
+print(f"CONFIG\t{src}\t{snk}")
+for p in a["probes"]:
+    print(f"PROBE\t{p['id']}\t{p['family']}")
+    for s in p["sinks"]:
+        closes = s.get("closes_at_rung")
+        closes = "" if closes is None else str(closes)
+        print(f"SINK\t{p['id']}\t{s['line']}\t{s['expect']}\t{closes}")
+    for kind, values in p.get("expect_counters", {}).items():
+        if not isinstance(values, list):
+            values = [values]
+        for v in values:
+            print(f"COUNTER\t{p['id']}\t{kind}\t{v}")
+"#;
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(root.join("probes-taint/src/annotations.json"))
+            .output()
+            .expect("python3 is required by corpus tooling");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8(out.stdout).expect("UTF-8 annotations");
+        let mut probes: Vec<Probe> = Vec::new();
+        let mut config = (String::new(), String::new());
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            match f[0] {
+                "CONFIG" => config = (f[1].to_owned(), f[2].to_owned()),
+                "PROBE" => probes.push(Probe {
+                    id: f[1].to_owned(),
+                    family: f[2].to_owned(),
+                    sinks: Vec::new(),
+                    summaries_applied: Vec::new(),
+                    named_misses: Vec::new(),
+                    body_step_min: 0,
+                }),
+                "SINK" => probes
+                    .last_mut()
+                    .expect("SINK after PROBE")
+                    .sinks
+                    .push(SinkExpect {
+                        line: f[2].parse().unwrap(),
+                        expect: f[3].to_owned(),
+                        closes_at_rung: f[4].to_owned(),
+                    }),
+                "COUNTER" => {
+                    let p = probes.last_mut().expect("COUNTER after PROBE");
+                    match f[2] {
+                        "summaries_applied" => p.summaries_applied.push(f[3].to_owned()),
+                        "named_misses" => p.named_misses.push(f[3].to_owned()),
+                        "body_step_min" => p.body_step_min = f[3].parse().unwrap(),
+                        other => panic!("unknown counter kind {other}"),
+                    }
+                }
+                other => panic!("bad annotations record {other}"),
+            }
+        }
+        (probes, config.0, config.1)
+    }
+
+    fn compiled_config(source: &str, sink: &str) -> TaintConfig {
+        TaintConfig {
+            sources: vec![SourceSpec::GlobalLoad {
+                name: source.to_owned(),
+            }],
+            sinks: vec![SinkSpec::Call {
+                name: sink.to_owned(),
+            }],
+            builtin_summaries: true,
+            ..TaintConfig::default()
+        }
+    }
+
+    /// The set of 1-based source lines the run hit (synthetic
+    /// u32::MAX-located instructions carry no line).
+    fn hit_lines(report: &TaintReport) -> Vec<u32> {
+        let mut lines: Vec<u32> = report
+            .hits
+            .iter()
+            .filter_map(|h| h.loc.map(|l| l.line))
+            .filter(|&l| l != u32::MAX)
+            .map(|l| l + 1)
+            .collect();
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    }
+
+    #[test]
+    #[ignore = "requires probes-taint/out (run scripts/gen-taint-probes.py first) and python3"]
+    fn probe_suite_compiled() {
+        let root = repo_root();
+        let (probes, source, sink) = load_annotations(&root);
+        assert_eq!((source.as_str(), sink.as_str()), ("TAINT", "print"));
+        assert!(
+            root.join("probes-taint/out/manifest.json").is_file(),
+            "probes-taint/out missing — run `python3 scripts/gen-taint-probes.py` first"
+        );
+        let config = compiled_config(&source, &sink);
+
+        let mut violations: Vec<String> = Vec::new();
+        let mut families: Vec<(String, usize, usize, usize, usize)> = Vec::new(); // name, cases, tp, fp, fn
+        let mut totals = (0usize, 0usize, 0usize);
+
+        for probe in &probes {
+            let data = std::fs::read(
+                root.join("probes-taint/out")
+                    .join(format!("{}.abc", probe.id)),
+            )
+            .unwrap_or_else(|e| panic!("{}: read compiled probe: {e}", probe.id));
+            let file = abcd_file::decode(&data).expect("decode probe");
+            let module = abcd_lift::lift_file(&file).expect("lift probe");
+            let report = abcd_taint::run_taint(&module, &config);
+            let hits = hit_lines(&report);
+
+            let mut tp = 0usize;
+            let mut fp = 0usize;
+            let mut fn_ = 0usize;
+            let mut annotated = Vec::new();
+            for s in &probe.sinks {
+                annotated.push(s.line);
+                let hit = hits.contains(&s.line);
+                match (s.expect.as_str(), hit) {
+                    ("tp", true) => tp += 1,
+                    ("tp", false) => violations.push(format!(
+                        "{}:{}: expected TP missed (regression)",
+                        probe.id, s.line
+                    )),
+                    ("clean", false) => {}
+                    ("clean", true) => violations.push(format!(
+                        "{}:{}: FP regression — clean sink hit",
+                        probe.id, s.line
+                    )),
+                    ("fp", true) => fp += 1,
+                    ("fp", false) => violations.push(format!(
+                        "{}:{}: expected-FP no longer reproduces (closes_at_rung {}) — \
+                         the ladder moved; update annotations.json",
+                        probe.id, s.line, s.closes_at_rung
+                    )),
+                    ("fn", false) => fn_ += 1,
+                    ("fn", true) => violations.push(format!(
+                        "{}:{}: expected-FN closed (closes_at_rung {}) — \
+                         the ladder climbed; update annotations.json",
+                        probe.id, s.line, s.closes_at_rung
+                    )),
+                    (other, _) => panic!("{}: bad expect {other}", probe.id),
+                }
+            }
+            for &l in &hits {
+                if !annotated.contains(&l) {
+                    violations.push(format!(
+                        "{}:{}: hit on an UNANNOTATED sink line (FP regression?)",
+                        probe.id, l
+                    ));
+                }
+            }
+            for name in &probe.summaries_applied {
+                if !report.summaries_applied.iter().any(|(_, n)| n == name) {
+                    violations.push(format!(
+                        "{}: summary {name} never applied (counter regression)",
+                        probe.id
+                    ));
+                }
+            }
+            for name in &probe.named_misses {
+                if !report.summary_misses.contains_key(name) {
+                    violations.push(format!(
+                        "{}: {name} missing from the named-miss log (counter regression)",
+                        probe.id
+                    ));
+                }
+            }
+            if report.stats.sites_body_step < probe.body_step_min {
+                violations.push(format!(
+                    "{}: body_step {} < {} (counter regression)",
+                    probe.id, report.stats.sites_body_step, probe.body_step_min
+                ));
+            }
+
+            eprintln!(
+                "PROBE-CASE {} hits={hits:?} tp={tp} fp={fp} fn={fn_}",
+                probe.id
+            );
+            totals.0 += tp;
+            totals.1 += fp;
+            totals.2 += fn_;
+            match families.iter_mut().find(|(n, ..)| n == &probe.family) {
+                Some((_, cases, ftp, ffp, ffn)) => {
+                    *cases += 1;
+                    *ftp += tp;
+                    *ffp += fp;
+                    *ffn += fn_;
+                }
+                None => families.push((probe.family.clone(), 1, tp, fp, fn_)),
+            }
+        }
+
+        eprintln!("PROBE-SUITE probes={} (rung 0)", probes.len());
+        for (name, cases, tp, fp, fn_) in &families {
+            eprintln!("PROBE-FAMILY {name} cases={cases} tp={tp} fp={fp} fn={fn_}");
+        }
+        eprintln!(
+            "PROBE-TOTAL tp={} fp={} fn={} violations={}",
+            totals.0,
+            totals.1,
+            totals.2,
+            violations.len()
+        );
+        assert!(
+            violations.is_empty(),
+            "probe suite regressions:\n{}",
+            violations.join("\n")
+        );
+    }
+}
