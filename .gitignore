@@ -14,5 +14,6 @@
 .claude
 test-corpus/
 exports/
+probes-taint/out/
 /flowdroid
 /ArkAnalyzer

@@ -1,0 +1,314 @@
+{
+  "schema": 1,
+  "comment": "Ground truth for the taint precision probe suite (analysis-strategy.md §5.5). One family per precision axis. Lines are 1-BASED source lines of `print(...)` call statements (the lifter's loc.line is 0-based; the runner adds 1). expect: tp = real flow, must hit; clean = no flow, must NOT hit (FP guard); fp = no flow but rung 0 hits (EXPECTED false positive; closes_at_rung says which ladder rung should kill it, null = structural/wontfix); fn = real flow rung 0 misses (KNOWN false negative; closes_at_rung says which rung should catch it). The runner FAILS on any deviation in either direction — an expected-fp/fn that stops reproducing means the ladder moved and this file must be updated deliberately.",
+  "es2abc": {
+    "image": "ghcr.io/fxti/arkcompiler-test:latest",
+    "version": "24.0.0.0",
+    "profile": "baseline",
+    "mode": "script",
+    "why": "Newest pinned image version (precision axes are version-independent; the suite is not a version matrix). Baseline profile = --opt-level=0, the least-transformed bytecode, and it still carries the line-number table (verified: lifted Inst.loc present, 0-based). Script mode matches the corpus' local-fixture compiles."
+  },
+  "source": {
+    "GlobalLoad": "TAINT"
+  },
+  "sink": {
+    "Call": "print"
+  },
+  "config_notes": "builtin_summaries on, seed_all_functions on, native_identity on — all defaults. Every probe declares `var TAINT = \"tainted\"` at top level (script mode → global record) so the VM run is clean AND every read compiles to TryGetGlobal(\"TAINT\"), which is the source.",
+  "probes": [
+    {
+      "id": "a-heap-alias/a1-same-site",
+      "family": "a-heap-alias",
+      "file": "a-heap-alias/a1-same-site.js",
+      "rationale": "Same alloc site, store then load of one field — the rung-0 baseline heap case (site-keyed facts meet at the key).",
+      "sinks": [
+        {
+          "line": 7,
+          "expect": "tp"
+        }
+      ]
+    },
+    {
+      "id": "a-heap-alias/a2-distinct-site",
+      "family": "a-heap-alias",
+      "file": "a-heap-alias/a2-distinct-site.js",
+      "rationale": "Distinct alloc sites, same field name — rung-0 site keying must keep them apart (disjoint non-empty site sets ⇒ no alias).",
+      "sinks": [
+        {
+          "line": 8,
+          "expect": "clean"
+        }
+      ]
+    },
+    {
+      "id": "a-heap-alias/a3-mov-alias",
+      "family": "a-heap-alias",
+      "file": "a-heap-alias/a3-mov-alias.js",
+      "rationale": "Store through a Mov alias — the def-chain walk resolves p to o's site, so the store/load keys meet.",
+      "sinks": [
+        {
+          "line": 9,
+          "expect": "tp"
+        }
+      ]
+    },
+    {
+      "id": "a-heap-alias/a4-unknown-base-store",
+      "family": "a-heap-alias",
+      "file": "a-heap-alias/a4-unknown-base-store.js",
+      "rationale": "Store through a call-result (unknown) base keys the fact with an EMPTY site set, which may-aliases every load of the field (README's documented 'unknown-base heap matching is conservative' FP). Rung 1's points_to refines p to mkobj's alloc site, disjoint from o's — the hit dies.",
+      "sinks": [
+        {
+          "line": 12,
+          "expect": "fp",
+          "closes_at_rung": 1
+        }
+      ]
+    },
+    {
+      "id": "a-heap-alias/a5-weak-update-alias",
+      "family": "a-heap-alias",
+      "file": "a-heap-alias/a5-weak-update-alias.js",
+      "rationale": "Sanitizing store through an unproven alias (call result) is a WEAK update — the taint survives even though p === o at runtime and the overwrite is total. Rung 1's must-alias/points_to makes the update strong and kills the taint.",
+      "sinks": [
+        {
+          "line": 14,
+          "expect": "fp",
+          "closes_at_rung": 1
+        }
+      ]
+    },
+    {
+      "id": "a-heap-alias/a6-phi-merge",
+      "family": "a-heap-alias",
+      "file": "a-heap-alias/a6-phi-merge.js",
+      "rationale": "Phi of the aliased object and a fresh one — the site union still intersects o's site (weak update path exercised). Runtime never takes the fresh-object branch (TAINT.length is 7), so the flow is real.",
+      "sinks": [
+        {
+          "line": 12,
+          "expect": "tp"
+        }
+      ]
+    },
+    {
+      "id": "b-closure-capture/b1-capture-direct",
+      "family": "b-closure-capture",
+      "file": "b-closure-capture/b1-capture-direct.js",
+      "rationale": "Captured variable promoted to a lexical-env slot by es2abc; the LexVar fact is a state base and crosses the resolved direct call edge into the closure body.",
+      "sinks": [
+        {
+          "line": 9,
+          "expect": "tp"
+        }
+      ]
+    },
+    {
+      "id": "b-closure-capture/b2-lexvar-cross-function",
+      "family": "b-closure-capture",
+      "file": "b-closure-capture/b2-lexvar-cross-function.js",
+      "rationale": "Rung-0 LexVar keys are function-agnostic (level, slot) pairs — innocent's slot-(0,0) capture merges with main's tainted slot-(0,0) capture across resolved call edges (the README's documented over-approximation). Rung 1 keys environments by identity/points-to and separates them.",
+      "sinks": [
+        {
+          "line": 12,
+          "expect": "fp",
+          "closes_at_rung": 1
+        }
+      ]
+    },
+    {
+      "id": "b-closure-capture/b3-callback-registration",
+      "family": "b-closure-capture",
+      "file": "b-closure-capture/b3-callback-registration.js",
+      "rationale": "The callback is invoked through a PARAMETER callee (register's cb) — unresolved at rung 0, so no call edge carries the captured taint into cb's body. This is §5.5's family-(b) headline case: capture taint across a callback registration. Rung 1's memoized points_to feeds callee resolution (the AliasOracle::points_to seam doubles as the call-graph oracle, heap.rs trait docs).",
+      "sinks": [
+        {
+          "line": 12,
+          "expect": "fn",
+          "closes_at_rung": 1
+        }
+      ]
+    },
+    {
+      "id": "c-dynamic-dispatch/c1-phi-two-closures",
+      "family": "c-dynamic-dispatch",
+      "file": "c-dynamic-dispatch/c1-phi-two-closures.js",
+      "rationale": "Phi of two closures — set-valued resolution steps into BOTH; the real flow through id is found. The konst over-approximation is invisible at sink granularity because the runtime path really goes through id (TAINT.length is 7 > 0). (The N66 frame-slot binding fix — args[i] -> params[3+i] under the vendored 0xF callType default — landed in problem.rs call_flow; this probe was the red-first evidence and flipped to TP when the fix landed.)",
+      "sinks": [
+        {
+          "line": 11,
+          "expect": "tp"
+        }
+      ]
+    },
+    {
+      "id": "c-dynamic-dispatch/c2-name-shadow",
+      "family": "c-dynamic-dispatch",
+      "file": "c-dynamic-dispatch/c2-name-shadow.js",
+      "rationale": "A USER-DEFINED top-level `print` takes over the global binding; name-keyed sink matching keys on TryGetGlobal(\"print\"), so the sink fires on a call whose binding is user code. The corpus' own reality (its call-site head is user globals named foo/f/testXxx): name keying cannot tell a redefined global from the host builtin. No rung closes this; recorded as dispatch-axis FP evidence for the rung-1->2 trigger discussion. (A LOCAL `function print` shadow cannot exercise the axis: es2abc mangles local function names to `#*@0*#print`, which never matches.)",
+      "sinks": [
+        {
+          "line": 14,
+          "expect": "fp",
+          "closes_at_rung": null
+        }
+      ]
+    },
+    {
+      "id": "c-dynamic-dispatch/c3-unresolved-method",
+      "family": "c-dynamic-dispatch",
+      "file": "c-dynamic-dispatch/c3-unresolved-method.js",
+      "rationale": "Method-valued callee off a local object: dispatch unresolved at rung 0 (no receiver typing), the identity heuristic carries arg taint to the call result. TP via the fallback ladder, not via dispatch — documents what currently saves unresolved method calls.",
+      "sinks": [
+        {
+          "line": 10,
+          "expect": "tp"
+        }
+      ]
+    },
+    {
+      "id": "c-dynamic-dispatch/c4-handler-table",
+      "family": "c-dynamic-dispatch",
+      "file": "c-dynamic-dispatch/c4-handler-table.js",
+      "rationale": "Callee loaded from an array element: dispatch unresolved, no call edge enters the stored closure, the sink inside never sees the taint. §5.5's APAK axis — the rung-2 call-graph layer (callee resolution through element points-to) closes it.",
+      "sinks": [
+        {
+          "line": 11,
+          "expect": "fn",
+          "closes_at_rung": 2
+        }
+      ]
+    },
+    {
+      "id": "d-exceptional-flow/d1-throw-to-handler",
+      "family": "d-exceptional-flow",
+      "file": "d-exceptional-flow/d1-throw-to-handler.js",
+      "rationale": "throw→handler is the ONLY route from source to sink — intraprocedural exception dispatch (T5).",
+      "sinks": [
+        {
+          "line": 9,
+          "expect": "tp"
+        }
+      ]
+    },
+    {
+      "id": "d-exceptional-flow/d2-clean-catch",
+      "family": "d-exceptional-flow",
+      "file": "d-exceptional-flow/d2-clean-catch.js",
+      "rationale": "The thrown value is clean; a tainted local stays live across the try but is never thrown nor printed. Two clean sinks (catch binding, normal path) — FP guards.",
+      "sinks": [
+        {
+          "line": 12,
+          "expect": "clean"
+        },
+        {
+          "line": 14,
+          "expect": "clean"
+        }
+      ]
+    },
+    {
+      "id": "d-exceptional-flow/d3-throw-across-call",
+      "family": "d-exceptional-flow",
+      "file": "d-exceptional-flow/d3-throw-across-call.js",
+      "rationale": "Taint thrown inside a RESOLVED callee lands on the caller's catch binding — return_flow Throw wiring (T5/T10). (The N66 frame-slot binding fix — args[i] -> params[3+i] under the vendored 0xF callType default — landed in problem.rs call_flow; this probe was the red-first evidence and flipped to TP when the fix landed.)",
+      "sinks": [
+        {
+          "line": 10,
+          "expect": "tp"
+        }
+      ]
+    },
+    {
+      "id": "d-exceptional-flow/d4-throw-through-global",
+      "family": "d-exceptional-flow",
+      "file": "d-exceptional-flow/d4-throw-through-global.js",
+      "rationale": "The thrower is a top-level function — a global binding, so the call edge is unresolved at rung 0 (the corpus' ~97% unknown-callee reality) and the tainted argument never enters boom. The rung-2 call-graph layer's global-call resolution closes it.",
+      "sinks": [
+        {
+          "line": 14,
+          "expect": "fn",
+          "closes_at_rung": 2
+        }
+      ]
+    },
+    {
+      "id": "e-builtin-summary/e1-stringify",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e1-stringify.js",
+      "rationale": "Exclusive summary application: JSON.stringify's param(0)→return flow carries the taint. The counter assertion proves the SUMMARY fired (not the identity heuristic).",
+      "sinks": [
+        {
+          "line": 8,
+          "expect": "tp"
+        }
+      ],
+      "expect_counters": {
+        "summaries_applied": [
+          "JSON.stringify"
+        ]
+      }
+    },
+    {
+      "id": "e-builtin-summary/e2-pure-test",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e2-pure-test.js",
+      "rationale": "Exclusive pure-test summary: Object.is's result is a fresh boolean, operand taint killed on the call-to-return edge. Proves summary application beats the native identity heuristic (which would otherwise taint the result).",
+      "sinks": [
+        {
+          "line": 9,
+          "expect": "clean"
+        }
+      ],
+      "expect_counters": {
+        "summaries_applied": [
+          "Object.is"
+        ]
+      }
+    },
+    {
+      "id": "e-builtin-summary/e3-body-step",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e3-body-step.js",
+      "rationale": "No summary, resolved callee with a body — the solver steps INTO the body. The counter assertion proves body_step (the flow does not ride the identity heuristic). (The N66 frame-slot binding fix — args[i] -> params[3+i] under the vendored 0xF callType default — landed in problem.rs call_flow; this probe was the red-first evidence and flipped to TP when the fix landed.)",
+      "sinks": [
+        {
+          "line": 9,
+          "expect": "tp"
+        }
+      ],
+      "expect_counters": {
+        "body_step_min": 1
+      }
+    },
+    {
+      "id": "e-builtin-summary/e4-native-identity",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e4-native-identity.js",
+      "rationale": "No summary, external-but-named callee — conservative keep + identity heuristic (fallback ladder rung 3). The named-miss assertion proves NO summary fired for parseInt.",
+      "sinks": [
+        {
+          "line": 9,
+          "expect": "tp"
+        }
+      ],
+      "expect_counters": {
+        "named_misses": [
+          "parseInt"
+        ]
+      }
+    },
+    {
+      "id": "e-builtin-summary/e5-assign-field",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e5-assign-field.js",
+      "rationale": "Object.assign's alias_flow matches WHOLE-VALUE taint on param(1) only — the source literal's FIELD taint is heap-keyed and never enters the target. A field-sensitive summary endpoint over heap facts (rung-1 modeling) closes it.",
+      "sinks": [
+        {
+          "line": 10,
+          "expect": "fn",
+          "closes_at_rung": 1
+        }
+      ]
+    }
+  ]
+}
