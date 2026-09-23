@@ -2139,3 +2139,148 @@ fn s33_finally_fold_bails_without_copy() {
 "#;
     assert_eq!(decompiled(&m), want);
 }
+
+/// s34 — d-P8 LexStore scope reconstruction: the slot initializations
+/// immediately following a `NewLexEnvWithName` push are the source's
+/// `let` declarations (the TDZ hole + elided hole-guards prove every
+/// read is post-init). The scope-push comment is fully consumed.
+#[test]
+fn s34_scope_fold() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let x = intern(&mut m, "x");
+    let y = intern(&mut m, "y");
+    let names = const_id(
+        &mut m,
+        Const::ArrayLiteral(vec![Const::String(x), Const::String(y)]),
+    );
+    let _ne = emit(
+        &mut m,
+        b,
+        Op::NewLexEnvWithName {
+            num_vars: 2,
+            scope_names: names,
+        },
+    );
+    let c1 = load_number(&mut m, b, 1.0);
+    emit_void(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 0,
+            value: c1,
+        },
+    );
+    let c2 = load_number(&mut m, b, 2.0);
+    emit_void(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 1,
+            value: c2,
+        },
+    );
+    let g1 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+    let g2 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 1 });
+    let s = add(&mut m, b, g1, g2);
+    emit_void(&mut m, b, Op::Return { value: Some(s) });
+
+    let want = r#"function f() {
+  let x = 1.0;
+  let y = 2.0;
+  return x + y;
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}
+
+/// s35 — the scope fold's provability boundary: `y`'s only store is the
+/// post-push initialization (converted to `let y = …`), but `x` is
+/// REASSIGNED inside a conditional arm (a store outside the push's
+/// run), so `x` keeps the plain-assignment form with the scope-push
+/// comment listing only its slot (partial consumption).
+#[test]
+fn s35_scope_fold_partial() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let t = add_block(&mut m, f);
+    let e = add_block(&mut m, f);
+    let j = add_block(&mut m, f);
+    let x = intern(&mut m, "x");
+    let y = intern(&mut m, "y");
+    let names = const_id(
+        &mut m,
+        Const::ArrayLiteral(vec![Const::String(x), Const::String(y)]),
+    );
+    let _ne = emit(
+        &mut m,
+        b,
+        Op::NewLexEnvWithName {
+            num_vars: 2,
+            scope_names: names,
+        },
+    );
+    let c1 = load_number(&mut m, b, 1.0);
+    emit_void(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 0,
+            value: c1,
+        },
+    );
+    let c2 = load_number(&mut m, b, 2.0);
+    emit_void(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 1,
+            value: c2,
+        },
+    );
+    let c = istrue(&mut m, b, p1);
+    cond_on(&mut m, b, c, t, e);
+    // t: `x = 3` (a second store to x, outside the push's run).
+    let c3 = load_number(&mut m, t, 3.0);
+    emit_void(
+        &mut m,
+        t,
+        Op::PutLexVar {
+            level: 0,
+            slot: 0,
+            value: c3,
+        },
+    );
+    emit_void(&mut m, t, Op::Branch { dest: j });
+    emit_void(&mut m, e, Op::Branch { dest: j });
+    let g1 = emit(&mut m, j, Op::GetLexVar { level: 0, slot: 0 });
+    let g2 = emit(&mut m, j, Op::GetLexVar { level: 0, slot: 1 });
+    let s = add(&mut m, j, g1, g2);
+    emit_void(&mut m, j, Op::Return { value: Some(s) });
+    link(&mut m, b, t);
+    link(&mut m, b, e);
+    link(&mut m, t, j);
+    link(&mut m, e, j);
+
+    let want = r#"function f(p1) {
+  let x;
+  /* scope-push [x] (lexical binding scope not provably reconstructable — plain assignments, d-P8) */
+  x = 1.0;
+  let y = 2.0;
+  if (p1) {
+    x = 3.0;
+  }
+  return x + y;
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}

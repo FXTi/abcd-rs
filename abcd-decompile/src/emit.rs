@@ -422,6 +422,7 @@ impl<'m> Emitter<'m> {
         let mut structured = structure_func(self.module, &rf);
         let mut fstats = FoldStats::default();
         folds::fold(&mut structured.body, &mut fstats);
+        folds::scope_fold(&mut structured.body, &rf.params, &mut fstats);
         self.stats.structure =
             merge_struct_stats(std::mem::take(&mut self.stats.structure), &structured.stats);
         self.stats.folds = merge_fold_stats(std::mem::take(&mut self.stats.folds), &fstats);
@@ -904,7 +905,7 @@ impl<'m> Emitter<'m> {
                     .map(|n| n.clone().unwrap_or_else(|| "<unnamed>".to_string()))
                     .collect();
                 out.push_str(&format!(
-                    "{pad}/* scope-push [{}] (lexical bindings print as plain assignments at v1) */\n",
+                    "{pad}/* scope-push [{}] (lexical binding scope not provably reconstructable — plain assignments, d-P8) */\n",
                     slots.join(", ")
                 ));
             }
@@ -2273,5 +2274,6 @@ fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.rest += b.rest;
     a.switch += b.switch;
     a.finally_fold += b.finally_fold;
+    a.scope_fold += b.scope_fold;
     a
 }

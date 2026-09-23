@@ -51,6 +51,9 @@ pub struct FoldStats {
     pub switch: usize,
     /// Duplicated-finally idioms re-factored into `finally { … }` (d-P8).
     pub finally_fold: usize,
+    /// Lexenv slot initializations reconstructed as block-scoped
+    /// `let` declarations (d-P8).
+    pub scope_fold: usize,
 }
 
 /// Run every fold over a structured body (recursive driver).
@@ -2420,4 +2423,282 @@ fn fold_finally(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
         }
         i += 1;
     }
+}
+
+// ── d-P8: LexStore scope reconstruction (design §4.3 "Names") ──────
+//
+// v1 (d-P4) printed every lexical binding as a function-top `let n;`
+// plus plain `n = value;` assignments, with `/* scope-push […] */`
+// comments marking the `NewLexEnv*` sites. This fold reconstructs the
+// declaration site where provable: es2abc initializes a pushed frame's
+// slots with `stlexvar 0, slot` IMMEDIATELY after the push (the TDZ
+// hole + the elided `ThrowUndefinedIfHoleWithName` guard prove every
+// read is post-init), so the first store to a slot right after its
+// push IS the source's `let` declaration.
+//
+// Provable means ALL of:
+//   - the store sits in the same statement run as the push, at level 0
+//     (the just-pushed frame), with a slot index inside the frame;
+//   - every store to the same NAME anywhere in the function lives in
+//     that same run after the push (a store elsewhere would become an
+//     assignment to a binding the block declaration does not cover);
+//   - the name is not a parameter (redeclaration is a SyntaxError) and
+//     was not already block-declared by this fold (same-named frames
+//     stay comments + plain assignments — the honesty rule).
+//
+// `const` is deliberately NOT inferred: a capturing closure can
+// reassign the slot from a nested function body (cross-function proof
+// is out of scope) — declarations are uniformly `let`.
+//
+// Where the shape is unprovable the `/* scope-push […] */` comment and
+// the plain assignments stay, unchanged.
+
+/// One LexStore occurrence: which `Stmts` run (walk order) and leaf.
+struct LexStoreSite {
+    /// The run's walk-order id.
+    run: usize,
+    /// The leaf index within the run.
+    index: usize,
+}
+
+/// Reconstruct block-scoped declarations at provable lexenv push
+/// sites. Runs AFTER the desugar folds (it consumes their output).
+pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldStats) {
+    // Pass 1: census of every LexStore name → its sites.
+    fn census(
+        nodes: &[SNode],
+        runs: &mut usize,
+        stores: &mut std::collections::HashMap<String, Vec<LexStoreSite>>,
+    ) {
+        for n in nodes {
+            match n {
+                SNode::Stmts(leaves) => {
+                    let run = *runs;
+                    *runs += 1;
+                    for (index, l) in leaves.iter().enumerate() {
+                        if let Leaf::Raw(Stmt::LexStore { name, .. }) = l {
+                            stores.entry(name.clone()).or_default().push(LexStoreSite {
+                                run,
+                                index,
+                            });
+                        }
+                    }
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    census(then, runs, stores);
+                    census(otherwise, runs, stores);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => census(body, runs, stores),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    census(body, runs, stores);
+                    for c in catches {
+                        census(&c.body, runs, stores);
+                    }
+                    if let Some(f) = finally {
+                        census(f, runs, stores);
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        census(&c.body, runs, stores);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    let mut runs = 0usize;
+    let mut stores: std::collections::HashMap<String, Vec<LexStoreSite>> =
+        std::collections::HashMap::new();
+    census(nodes, &mut runs, &mut stores);
+
+    // Pass 2: convert the provable initializations.
+    let mut converted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    fn convert(
+        nodes: &mut [SNode],
+        runs: &mut usize,
+        stores: &std::collections::HashMap<String, Vec<LexStoreSite>>,
+        params: &[String],
+        converted: &mut std::collections::HashSet<String>,
+        stats: &mut FoldStats,
+    ) {
+        for n in nodes.iter_mut() {
+            match n {
+                SNode::Stmts(leaves) => {
+                    let run = *runs;
+                    *runs += 1;
+                    convert_run(leaves, run, stores, params, converted, stats);
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    convert(then, runs, stores, params, converted, stats);
+                    convert(otherwise, runs, stores, params, converted, stats);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => {
+                    convert(body, runs, stores, params, converted, stats)
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    convert(body, runs, stores, params, converted, stats);
+                    for c in catches {
+                        convert(&mut c.body, runs, stores, params, converted, stats);
+                    }
+                    if let Some(f) = finally {
+                        convert(f, runs, stores, params, converted, stats);
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        convert(&mut c.body, runs, stores, params, converted, stats);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn convert_run(
+        leaves: &mut Vec<Leaf>,
+        run: usize,
+        stores: &std::collections::HashMap<String, Vec<LexStoreSite>>,
+        params: &[String],
+        converted: &mut std::collections::HashSet<String>,
+        stats: &mut FoldStats,
+    ) {
+        let mut push_at: Vec<usize> = Vec::new();
+        for (i, l) in leaves.iter().enumerate() {
+            if matches!(l, Leaf::Raw(Stmt::ScopePush { .. })) {
+                push_at.push(i);
+            }
+        }
+        // Apply edits back-to-front so indices stay valid.
+        for &p in push_at.iter().rev() {
+            let Leaf::Raw(Stmt::ScopePush { names }) = &leaves[p] else {
+                unreachable!()
+            };
+            let slot_count = names.len();
+            // The immediate initialization run: level-0 slot stores
+            // (re-stores of already-initialized slots, elided-guard
+            // markers, and honesty comments may interleave).
+            let mut inits: Vec<(usize, u16)> = Vec::new(); // (leaf index, slot)
+            let mut j = p + 1;
+            while j < leaves.len() {
+                match &leaves[j] {
+                    Leaf::Raw(Stmt::LexStore { level, slot, .. })
+                        if *level == 0 && (*slot as usize) < slot_count =>
+                    {
+                        if inits.iter().any(|&(_, s)| s == *slot) {
+                            // A re-store of an initialized slot ends the
+                            // initialization run (conservative).
+                            break;
+                        }
+                        inits.push((j, *slot));
+                        j += 1;
+                    }
+                    Leaf::Raw(Stmt::Elided { .. } | Stmt::Fallback { .. }) => {
+                        j += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if inits.is_empty() {
+                continue;
+            }
+            // Which inits are provable declarations?
+            let mut declared_slots: Vec<u16> = Vec::new();
+            let mut decl_edits: Vec<(usize, Leaf)> = Vec::new();
+            for &(idx, slot) in &inits {
+                let Leaf::Raw(Stmt::LexStore { name, .. }) = &leaves[idx] else {
+                    unreachable!()
+                };
+                let name = name.clone();
+                if params.iter().any(|p| *p == name) || converted.contains(&name) {
+                    continue;
+                }
+                // Same-name slots within this push: only the first may
+                // become a declaration (a second `let n` in one scope is
+                // a SyntaxError).
+                if decl_edits.iter().any(|(_, l)| {
+                    matches!(l, Leaf::Decl { name: dn, .. } if *dn == crate::legalize::sanitize(&name))
+                }) {
+                    continue;
+                }
+                // Every store to this name must live in THIS run after
+                // the push (else the block declaration would not cover
+                // it — strict-mode ReferenceError, or a shadowed
+                // binding).
+                let ok = stores.get(&name).into_iter().flatten().all(|s| {
+                    s.run == run && s.index > p
+                });
+                if !ok {
+                    continue;
+                }
+                let Leaf::Raw(Stmt::LexStore { value, .. }) = &leaves[idx] else {
+                    unreachable!()
+                };
+                decl_edits.push((
+                    idx,
+                    Leaf::Decl {
+                        name: crate::legalize::sanitize(&name),
+                        mutable: true,
+                        value: Some(value.clone()),
+                    },
+                ));
+                declared_slots.push(slot);
+                converted.insert(name);
+            }
+            if decl_edits.is_empty() {
+                continue;
+            }
+            for (idx, leaf) in decl_edits {
+                leaves[idx] = leaf;
+                stats.scope_fold += 1;
+            }
+            // The push comment: consumed when every slot was declared;
+            // otherwise it stays, listing the undeclared slots only.
+            let Leaf::Raw(Stmt::ScopePush { names }) = &mut leaves[p] else {
+                unreachable!()
+            };
+            let remaining: Vec<Option<String>> = names
+                .iter()
+                .enumerate()
+                .filter_map(|(i, n)| (!declared_slots.contains(&(i as u16))).then(|| n.clone()))
+                .collect();
+            if remaining.is_empty() {
+                // Back-to-front push processing makes removal safe.
+                leaves.remove(p);
+            } else {
+                *names = remaining;
+            }
+        }
+    }
+    let mut runs = 0usize;
+    convert(
+        nodes,
+        &mut runs,
+        &stores,
+        params,
+        &mut converted,
+        stats,
+    );
 }
