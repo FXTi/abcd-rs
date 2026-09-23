@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "comment": "Ground truth for the taint precision probe suite (analysis-strategy.md §5.5). One family per precision axis. Lines are 1-BASED source lines of `print(...)` call statements (the lifter's loc.line is 0-based; the runner adds 1). expect: tp = real flow, must hit; clean = no flow, must NOT hit (FP guard); fp = no flow but the CURRENT rung hits (EXPECTED false positive; closes_at_rung says which ladder rung should kill it, null = structural/wontfix); fn = real flow the current rung misses (KNOWN false negative; closes_at_rung says which rung should catch it). The runner FAILS on any deviation in either direction — an expected-fp/fn that stops reproducing means the ladder moved and this file must be updated deliberately. HISTORY: annotated at rung 0 (t-P1; tp=11 fp=4 fn=4). Rung 1 (t-P2, the on-demand alias engine + points_to-fed call-graph refinement + heap-fact summary endpoints, default rung now 1) flipped: a4 fp→clean (store base refined to mkobj's alloc site, disjoint from o's), a5 fp→clean (balanced call/return hop proves p===o, strong update kills the taint), b3 fn→tp (param-callee bridged to the caller's AllocClosure body), e5 fn→tp (Object.assign alias-flow endpoint matches heap facts by positive points-to intersection). b2 evaluated honestly and RE-TAGGED rung 1→2 (environment identity, not heap aliasing — see its rationale). New table: tp=13 fp=2 fn=2.",
+  "comment": "Ground truth for the taint precision probe suite (analysis-strategy.md §5.5). One family per precision axis. Lines are 1-BASED source lines of `print(...)` call statements (the lifter's loc.line is 0-based; the runner adds 1). expect: tp = real flow, must hit; clean = no flow, must NOT hit (FP guard); fp = no flow but the CURRENT rung hits (EXPECTED false positive; closes_at_rung says which ladder rung should kill it, null = structural/wontfix); fn = real flow the current rung misses (KNOWN false negative; closes_at_rung says which rung should catch it). The runner FAILS on any deviation in either direction — an expected-fp/fn that stops reproducing means the ladder moved and this file must be updated deliberately. HISTORY: annotated at rung 0 (t-P1; tp=11 fp=4 fn=4). Rung 1 (t-P2, the on-demand alias engine + points_to-fed call-graph refinement + heap-fact summary endpoints, default rung now 1) flipped: a4 fp→clean (store base refined to mkobj's alloc site, disjoint from o's), a5 fp→clean (balanced call/return hop proves p===o, strong update kills the taint), b3 fn→tp (param-callee bridged to the caller's AllocClosure body), e5 fn→tp (Object.assign alias-flow endpoint matches heap facts by positive points-to intersection). b2 evaluated honestly and RE-TAGGED rung 1→2 (environment identity, not heap aliasing — see its rationale). New table: tp=13 fp=2 fn=2. t-P3 (prototype-chain summary lookup): e6–e10 added — receiver-typed builtin calls (local alloc array, own-method shadow FP control, global-store provenance string, for-of iterator protocol, repeat-count clean guard). New table: tp=16 fp=3 fn=2.",
   "es2abc": {
     "image": "ghcr.io/fxti/arkcompiler-test:latest",
     "version": "24.0.0.0",
@@ -305,6 +305,95 @@
           "expect": "tp"
         }
       ]
+    },
+    {
+      "id": "e-builtin-summary/e6-array-pop",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e6-array-pop.js",
+      "rationale": "t-P3 prototype-resolution path: a local AllocArray receiver types Array.prototype; push's alias flow tags the [AnyIndex] element channel and pop's Field([AnyIndex])→Return flow carries it to the popped value. TP.",
+      "sinks": [
+        {
+          "line": 11,
+          "expect": "tp"
+        }
+      ],
+      "expect_counters": {
+        "summaries_applied": [
+          "Array.prototype.push",
+          "Array.prototype.pop"
+        ]
+      }
+    },
+    {
+      "id": "e-builtin-summary/e7-own-method-shadow",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e7-own-method-shadow.js",
+      "rationale": "t-P3 own-method shadow collision: an array with its OWN pop still types Array.prototype (the shadow store is invisible at the method load — store-to-load of function values is opaque), so the BUILTIN pop summary fires on a call that runs user code. EXPECTED FP, the c2 lesson: family-keyed collision is structural; closes at rung 2 (whole-program PTA resolving property stores into loads). The shadow precedes the push so the registered AnyIndex-wildcard strong-kill does not remove the element taint first. Ground truth: own pop returns 7 — clean.",
+      "sinks": [
+        {
+          "line": 18,
+          "expect": "fp",
+          "closes_at_rung": 2
+        }
+      ],
+      "expect_counters": {
+        "summaries_applied": [
+          "Array.prototype.push",
+          "Array.prototype.pop"
+        ]
+      }
+    },
+    {
+      "id": "e-builtin-summary/e8-string-charcodeat-global",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e8-string-charcodeat-global.js",
+      "rationale": "t-P3 global-store provenance: the receiver is a local alias of the TAINT global; points-to is opaque through global loads, but the module's stores of TAINT (a string literal) type the receiver String.prototype through the flow-insensitive global-record scan; charCodeAt's Base→Return flow carries the content taint. TP.",
+      "sinks": [
+        {
+          "line": 11,
+          "expect": "tp"
+        }
+      ],
+      "expect_counters": {
+        "summaries_applied": [
+          "String.prototype.charCodeAt"
+        ]
+      }
+    },
+    {
+      "id": "e-builtin-summary/e9-iterator-next",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e9-iterator-next.js",
+      "rationale": "t-P3 for-of protocol: getiterator over an AllocArray types Iterator.prototype; the array's [AnyIndex] element taint re-keys onto the iterator at the GetIterator flow rule and rides Iterator.prototype.next's Field([AnyIndex])→Return flow into the {value,done} wrapper; the .value read picks it up. TP.",
+      "sinks": [
+        {
+          "line": 14,
+          "expect": "tp"
+        }
+      ],
+      "expect_counters": {
+        "summaries_applied": [
+          "Array.prototype.push",
+          "Iterator.prototype.next"
+        ]
+      }
+    },
+    {
+      "id": "e-builtin-summary/e10-string-repeat-count",
+      "family": "e-builtin-summary",
+      "file": "e-builtin-summary/e10-string-repeat-count.js",
+      "rationale": "t-P3 repeat-count FP guard: the constant receiver types String.prototype; repeat's summary flows Base→Return only, so the TAINTED COUNT goes nowhere — pins summary application beating the native-identity heuristic (which would taint the result), e2's prototype-path analogue. Ground truth: \"x\".repeat(\"tainted\") is \"\" — clean.",
+      "sinks": [
+        {
+          "line": 11,
+          "expect": "clean"
+        }
+      ],
+      "expect_counters": {
+        "summaries_applied": [
+          "String.prototype.repeat"
+        ]
+      }
     }
   ]
 }

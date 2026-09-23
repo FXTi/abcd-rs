@@ -575,5 +575,19 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
                     Return,
                 ),
         ),
+        // Iterator.prototype.return: the for-of EARLY-EXIT cleanup
+        // call on the same protocol object (present in every for-of /
+        // array-destructuring compile — lifted as a `return` method
+        // call on the iterator). Same wrapper shape as next().
+        (
+            "Iterator.prototype.return",
+            Some(0),
+            Summary::new("for-of cleanup protocol; same wrapper shape as next()")
+                .flow(Base, Return)
+                .flow(
+                    Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
+                    Return,
+                ),
+        ),
     ]
 }

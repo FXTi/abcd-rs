@@ -124,6 +124,12 @@ fn base_through_movs(
     };
     match module.inst(iid).map(|i| &i.op)? {
         Op::Mov { src } => base_through_movs(module, *src, visiting),
+        // Loop rotation: the callee phi merges the pre-loop LoadProp
+        // with the phi itself; every entry reaches the same LoadProp
+        // in that shape (first-found is exact there, may otherwise).
+        Op::Phi { entries } => entries
+            .iter()
+            .find_map(|(_, incoming)| base_through_movs(module, *incoming, visiting)),
         Op::LoadProp { object, .. } => Some(*object),
         _ => None,
     }
@@ -157,6 +163,11 @@ fn leaf_through_movs(
     };
     match module.inst(iid).map(|i| &i.op)? {
         Op::Mov { src } => leaf_through_movs(module, *src, visiting),
+        // Loop-rotated method calls: the callee phi merges the
+        // pre-loop LoadProp with the phi itself (for-of's `next`).
+        Op::Phi { entries } => entries
+            .iter()
+            .find_map(|(_, incoming)| leaf_through_movs(module, *incoming, visiting)),
         Op::LoadProp { name, .. } => Some(*name),
         _ => None,
     }
