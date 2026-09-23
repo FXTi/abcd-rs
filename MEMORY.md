@@ -459,6 +459,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   (absorbs the "unify the copies" follow-up). Parallel-work rule
   reaffirmed: the shared tree must compile at ALL times (t-P2 was
   blocked by d-P6's broken WIP; workers commit early).
+  STANDING AUTHORIZATION (2026-09-23, maintainer): run the ENTIRE
+  closure queue (design/agent-roadmap.md: d-P5..d-P11 + t-P1..t-P6)
+  WITHOUT per-task confirmation — dispatch, review, independently
+  verify, bookkeep, and proceed to the next pair continuously until
+  done. Escalate only genuine design-level ambiguity or a maintainer
+  message. Standing order pairs decompile-track and taint-track work
+  (disjoint crates, disjoint metrics).
   IN FLIGHT: d-P6 (private member buffers + N67) || t-P2 (rung-1 alias
   engine — trigger fired per the probe suite).
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
