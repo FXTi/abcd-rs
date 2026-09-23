@@ -243,7 +243,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | P3-M1/M2 | v2opt 与 v0.1 opt 的另两类归属字节差异：M1（72 文件）折叠出的 NaN/+∞——v0.1 降级为 fldai，v0.2 保留 ldnan/ldinfinity 身份；M2（12 文件）v0.1 ADCE 手工清单把 DefineFunc 标 essential，v0.2 诚实 effects 表（vendor RuntimeDefinefunc 不跑用户代码）允许删除死 definefunc+闭包链 | ✅ 维护者拍板接受（2026-09-21，与 N63 同批）：v2 严格更好或 VM 中性；v0.1 对齐被否决（不为对齐往 effects 表写假话） |
 | N65 | `delobjprop` 操作数双重反转：vendor 语义 obj=v0/prop=acc/result→acc（isa.yaml:1293-1296 acc:inout），abcd-lift:720 把 acc 读成 object、v0 读成 key，abcd-lower:1136 同形反转写回——**双反相消**，字节恒等/VM oracle 全绿但 IR 语义错（反编译器等语义消费者现形）。源自 v0.1（parity 同反不查），d-P4 发现。语料 18 文件（property-ops 族）runtime-passed 但因字节不变而绿 | ✅ 修复（7fa03cb，d-P4 附带：lift+lower 双边交换；red-first 钉测试 lift_unit/lower_delobjprop_roles/decompile golden s25；acc:inout 族全审计无更多反转（deprecated 形本就正确，无 N66）。**orchestrator 独立复验**：自跑 v2lift 对 P2 基线 **0 差异**（worker 报的 13 个 N55 时代 debug 序差异不复现——字节恒等比其声称更强）、VM oracle 1149/1149（sha256:5e7627bdcb78…）） |
 
-| N64 | abcd-ir verify.rs 的私有支配集被**不可达 Normal 前驱**污染：可达块若有任一不可达 Normal 前驱，全集初始化把它的 dom 集清空 → verify 视其为 Normal 不可达 → 其 uses 豁免 N45（仅弱化不强化）。v2-P5a 支配一致性测试发现（11.0.2.0/local/destructuring 块 32/34/35/45） | 🔲 登记（v2-P5a 报告；abcd-ir 冻结未修。一致性契约因此取**交集域**（两实现都认为 Normal 可达的块才比对，2004 块跳过有文档）。修复方向：verify 把不可达前驱视为缺席——待 abcd-ir 解冻时做） |
+| N64 | abcd-ir verify.rs 的私有支配集被**不可达 Normal 前驱**污染：可达块若有任一不可达 Normal 前驱，全集初始化把它的 dom 集清空 → verify 视其为 Normal 不可达 → 其 uses 豁免 N45（仅弱化不强化）。v2-P5a 支配一致性测试发现（11.0.2.0/local/destructuring 块 32/34/35/45） | ✅ 修复（b41f643，orchestrator 自修，维护者授权解冻 abcd-ir：先算 Normal 可达性再过滤不可达前驱出支配迭代。red-first：worktree@HEAD 新鲜构建红（误豁免实证）、修复后绿。门禁：abcd-ir 25/25、corpus_lift_verify 2787 零新错误、支配一致性 31086 块 0 分歧、workspace 零失败、fmt 净。**过程事件**：远端共享 target 缓存两次给出陈旧二进制假红/假绿——红绿证据必须 touch 强制新鲜构建） |
 
 ## 审计纪律
 
