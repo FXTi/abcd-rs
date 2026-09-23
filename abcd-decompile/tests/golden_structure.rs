@@ -1576,6 +1576,22 @@ fn s28_try_join_hoist() {
     link(&mut m, handler, j);
     add_try(&mut m, f, vec![b0, t, e], handler, exc);
 
-    let want = "PLACEHOLDER";
+    // The join (`p2(); return;`) sits AFTER the try/catch — reachable
+    // from both the else-arm fall-through and the catch fall-through.
+    let want = r#"function f(p1, p2) {
+  try {
+    /* try region 0: the handler continuation (the try's join) is nested inside a protected conditional arm — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there) */
+    if (p1) {
+      throw p2;
+    } else {
+      p1();
+    }
+  } catch (e) {
+    e();
+  }
+  p2();
+  return;
+}
+"#;
     assert_eq!(decompiled(&m), want);
 }

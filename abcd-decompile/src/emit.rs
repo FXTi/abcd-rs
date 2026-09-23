@@ -2156,6 +2156,7 @@ fn merge_struct_stats(mut a: StructStats, b: &StructStats) -> StructStats {
     a.try_splits += b.try_splits;
     a.multi_catch += b.multi_catch;
     a.handler_shims += b.handler_shims;
+    a.try_join_hoists += b.try_join_hoists;
     a.exit_phi_after_loop += b.exit_phi_after_loop;
     a.cross_arm_notes += b.cross_arm_notes;
     a.cross_arm_folds += b.cross_arm_folds;

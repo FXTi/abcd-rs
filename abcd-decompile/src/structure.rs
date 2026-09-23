@@ -278,6 +278,9 @@ pub struct StructStats {
     pub multi_catch: usize,
     /// Handler sub-CFGs structured through the shim module.
     pub handler_shims: usize,
+    /// Handler continuations (try joins) hoisted out of a wrapped
+    /// mixed-coverage conditional to after the try/catch (d-P5).
+    pub try_join_hoists: usize,
     /// Loop-exit phi assignments placed after the loop.
     pub exit_phi_after_loop: usize,
     /// Dropped no-op conditional branches whose cross-arm edge could
@@ -373,6 +376,56 @@ struct ArmBody {
     slice: BTreeSet<BlockId>,
 }
 
+/// An in-flight join hoist (d-P5, RC1): unprotected tail region nodes
+/// of a cut mixed-coverage `If`. While set, [`Ctx::emit_node`]
+/// suppresses their inline emission; the driver emits them after the
+/// try/catch (where the handlers rejoin).
+#[derive(Clone, Debug)]
+struct CutDefer {
+    /// The deferred region nodes (removed as intercepted).
+    ids: HashSet<RegionId>,
+}
+
+/// The phase-1 split classification of a mixed-coverage node for the
+/// join hoist (d-P5, RC1): how the node partitions into a protected
+/// skeleton (stays inside the try) and an unprotected deferred tail
+/// (emitted after the try/catch).
+#[derive(Clone, Debug)]
+enum CutSplit {
+    /// Fully protected by the cut plan.
+    Prot,
+    /// Fully unprotected — deferred whole.
+    Defer,
+    /// `Seq`: `children[..split_at]` protected, `children[split_at]`
+    /// (when `inner`) splits recursively, the rest deferred.
+    Seq {
+        /// Protected prefix length (the `inner` child's index when
+        /// present).
+        split_at: usize,
+        /// The recursively-splitting middle child.
+        inner: Option<Box<CutSplit>>,
+    },
+    /// `If` with a protected head: exactly one arm splits, the other
+    /// is verified terminal-only.
+    If {
+        /// The then-arm classification.
+        then: Option<ArmCut>,
+        /// The else-arm classification.
+        otherwise: Option<ArmCut>,
+    },
+}
+
+/// One arm of a cut `If`.
+#[derive(Clone, Debug)]
+enum ArmCut {
+    /// Fully protected AND every exit path terminal (throw/return or
+    /// an edge with a structural action) — falling out would
+    /// incorrectly route through the hoisted tail.
+    Terminal,
+    /// The arm splits into a protected prefix and a deferred tail.
+    Splits(Box<CutSplit>),
+}
+
 /// One emission frame: a region tree (the main tree or one handler
 /// shim) plus everything derived from it.
 struct Frame {
@@ -400,6 +453,9 @@ struct Frame {
     cross_arm: HashSet<(BlockId, BlockId)>,
     /// Loop headers (the tail fold never duplicates into a loop).
     loop_headers: BTreeSet<BlockId>,
+    /// The in-flight join hoist (d-P5, RC1), when a cut `If` skeleton
+    /// is being emitted.
+    cut_defer: Option<CutDefer>,
 }
 
 impl Frame {
@@ -445,6 +501,7 @@ impl Frame {
             wrap_counts: HashMap::new(),
             cross_arm,
             loop_headers,
+            cut_defer: None,
         }
     }
 
@@ -595,6 +652,10 @@ struct Ctx<'m> {
     shim_trees: HashMap<BlockId, RegionTree>,
     /// handler entry → the plans nested inside its sub-CFG.
     shim_plans: HashMap<BlockId, Vec<Plan>>,
+    /// handler entry → its sub-CFG block set (d-P5: the handler's
+    /// out-of-set Normal edges are its continuation targets — the
+    /// join-hoist correctness condition).
+    shim_sets: HashMap<BlockId, BTreeSet<BlockId>>,
     /// Counter for `A$k` alternates-wrapper labels (deterministic).
     alt_counter: usize,
     /// Counter for `s$k` state-machine temporaries (deterministic).
@@ -621,6 +682,7 @@ impl<'m> Ctx<'m> {
             shim_module: None,
             shim_trees: HashMap::new(),
             shim_plans: HashMap::new(),
+            shim_sets: HashMap::new(),
             alt_counter: 0,
             state_counter: 0,
             folded_xarms: BTreeSet::new(),
@@ -864,6 +926,7 @@ impl<'m> Ctx<'m> {
                 .collect();
             self.shim_trees.insert(h, tree);
             self.shim_plans.insert(h, plans);
+            self.shim_sets.insert(h, set.clone());
             self.stats.handler_shims += 1;
         }
         self.shim_module = Some(shim);
@@ -1267,6 +1330,15 @@ impl<'m> Ctx<'m> {
             Cov::Uniform(p) if p == active => self.emit_content(id, active, follow, out),
             Cov::Uniform(Some(p)) => self.wrap_try(id, p, follow, out),
             Cov::Uniform(None) => {
+                // The d-P5 join hoist: this node is the unprotected
+                // tail of a cut `If` — suppressed here; the driver
+                // emits it after the try/catch (the handlers' rejoin
+                // point).
+                if let Some(cd) = self.f_mut().cut_defer.as_mut()
+                    && cd.ids.remove(&id)
+                {
+                    return;
+                }
                 // Unprotected node inside plan `active`'s span
                 // (non-contiguous protected range).
                 self.stats.try_splits += 1;
@@ -1447,6 +1519,358 @@ impl<'m> Ctx<'m> {
         outer
     }
 
+    // ── The d-P5 join hoist (RC1) ──────────────────────────────────
+    //
+    // A Mixed-coverage `If` whose head is protected is wrapped whole by
+    // the generic path (the condition evaluation must stay protected).
+    // But when one arm is terminal (throw/return), the acyclic region
+    // tree absorbs the try's CONTINUATION — the join the handlers also
+    // rejoin — into the other arm's sequence, and wrapping whole makes
+    // the join unreachable from the catch path (dream gate:
+    // branch-elimination/test-under-try-catch printed "true" for want
+    // "true\ngood1"; opt-try-catch-func/test-passes-under-try-catch
+    // lost the post-try print the same way). The VM's PC-range
+    // dispatch rejoins the handler at the continuation, so the correct
+    // projection is `try { <protected skeleton> } catch { … }` with
+    // the unprotected tail emitted AFTER the try/catch.
+
+    /// Phase 1: classify a Mixed node into protected skeleton +
+    /// deferred tail for plan `p` (no emission, no mutation).
+    fn cut_classify(&mut self, id: RegionId, p: usize) -> Option<CutSplit> {
+        match self.f_mut().cov(id) {
+            Cov::Uniform(Some(q)) if q == p => Some(CutSplit::Prot),
+            Cov::Uniform(None) => Some(CutSplit::Defer),
+            Cov::Uniform(Some(_)) => None, // a different plan — not splittable
+            Cov::Mixed => {
+                let node = self.f().node(id).clone();
+                match node {
+                    RegionNode::Seq(children) => {
+                        // Protected prefix, then at most one recursively
+                        // splitting child, then a fully-unprotected tail.
+                        let mut i = 0;
+                        let mut inner = None;
+                        while i < children.len() {
+                            match self.f_mut().cov(children[i]) {
+                                Cov::Uniform(Some(q)) if q == p => i += 1,
+                                Cov::Mixed => {
+                                    let s = self.cut_classify(children[i], p)?;
+                                    if matches!(s, CutSplit::Prot) {
+                                        return None;
+                                    }
+                                    inner = Some(Box::new(s));
+                                    i += 1;
+                                    break;
+                                }
+                                _ => break,
+                            }
+                        }
+                        for &c in &children[i..] {
+                            if self.f_mut().cov(c) != Cov::Uniform(None) {
+                                return None;
+                            }
+                        }
+                        if inner.is_none() && i >= children.len() {
+                            return None; // no tail at all (not Mixed — defensive)
+                        }
+                        if inner.is_none() && i == 0 {
+                            return Some(CutSplit::Defer); // whole sequence defers
+                        }
+                        let split_at = if inner.is_some() { i - 1 } else { i };
+                        Some(CutSplit::Seq { split_at, inner })
+                    }
+                    RegionNode::If {
+                        head,
+                        then,
+                        otherwise,
+                        ..
+                    } => {
+                        // The condition evaluation must stay protected.
+                        if self.f_mut().plan_of(head) != Some(p) {
+                            return None;
+                        }
+                        let mut has_split = false;
+                        let then = self.cut_classify_arm(then, p, &mut has_split)?;
+                        let otherwise = self.cut_classify_arm(otherwise, p, &mut has_split)?;
+                        if !has_split {
+                            return None;
+                        }
+                        Some(CutSplit::If { then, otherwise })
+                    }
+                    // Loops, labels, alternates, irreducible cores:
+                    // beyond the v1 hoist — the generic wrap applies.
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// Classify one `If` arm for the join hoist: fully-protected arms
+    /// must be terminal-only (falling out would incorrectly route
+    /// through the hoisted tail); at most one arm may split.
+    fn cut_classify_arm(
+        &mut self,
+        arm: Option<RegionId>,
+        p: usize,
+        has_split: &mut bool,
+    ) -> Option<Option<ArmCut>> {
+        let Some(a) = arm else {
+            return Some(None);
+        };
+        match self.f_mut().cov(a) {
+            Cov::Uniform(Some(q)) if q == p => {
+                if self.arm_exits_terminal(a) {
+                    Some(Some(ArmCut::Terminal))
+                } else {
+                    None
+                }
+            }
+            Cov::Mixed => {
+                if *has_split {
+                    return None; // two tails cannot merge into one rejoin
+                }
+                let s = self.cut_classify(a, p)?;
+                if matches!(s, CutSplit::Prot) {
+                    return None;
+                }
+                *has_split = true;
+                Some(Some(ArmCut::Splits(Box::new(s))))
+            }
+            // A whole-arm defer (unprotected arm behind a protected
+            // condition) or a foreign plan: beyond the v1 hoist.
+            _ => None,
+        }
+    }
+
+    /// Every exit path of a fully-protected arm is terminal: each
+    /// out-of-arm edge carries a structural action (break/continue/
+    /// alternates-arm jump) and each no-out-edge block ends in
+    /// `throw`/`return`.
+    fn arm_exits_terminal(&mut self, id: RegionId) -> bool {
+        let blocks = self.f_mut().node_blocks(id);
+        for b in &blocks {
+            let parts = self.block_parts(*b);
+            match parts.term {
+                Term::None => {
+                    let last = parts
+                        .main
+                        .iter()
+                        .rposition(|s| !matches!(s, Stmt::Unreachable));
+                    match last {
+                        Some(i)
+                            if matches!(
+                                parts.main[i],
+                                Stmt::Throw(_) | Stmt::Return(_)
+                            ) => {}
+                        _ => return false,
+                    }
+                }
+                Term::Branch(d) => {
+                    if !blocks.contains(&d) && !self.edge_has_action(*b, d) {
+                        return false;
+                    }
+                }
+                Term::Cond(_, t, f) => {
+                    if !blocks.contains(&t) && !self.edge_has_action(*b, t) {
+                        return false;
+                    }
+                    if !blocks.contains(&f) && !self.edge_has_action(*b, f) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Collect the deferred tail's region nodes, in emission order.
+    fn collect_defers(&mut self, id: RegionId, split: &CutSplit, out: &mut Vec<RegionId>) {
+        match split {
+            CutSplit::Prot => {}
+            CutSplit::Defer => out.push(id),
+            CutSplit::Seq { split_at, inner } => {
+                let children = match self.f().node(id) {
+                    RegionNode::Seq(c) => c.clone(),
+                    _ => unreachable!("cut split shape mirrors the region node"),
+                };
+                let start = if let Some(inner) = inner {
+                    self.collect_defers(children[*split_at], inner, out);
+                    split_at + 1
+                } else {
+                    *split_at
+                };
+                for &c in &children[start..] {
+                    out.push(c);
+                }
+            }
+            CutSplit::If { then, otherwise } => {
+                let (t, o) = match self.f().node(id) {
+                    RegionNode::If {
+                        then, otherwise, ..
+                    } => (*then, *otherwise),
+                    _ => unreachable!("cut split shape mirrors the region node"),
+                };
+                for (arm, cut) in [(t, then), (o, otherwise)] {
+                    if let (Some(a), Some(ArmCut::Splits(s))) = (arm, cut) {
+                        self.collect_defers(a, s, out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The join-hoist correctness condition: every out-of-shim Normal
+    /// edge of every handler of plan `p` (the handlers' continuations,
+    /// which the shim model cuts) targets exactly the tail entry — the
+    /// point where the VM's PC-range dispatch rejoins. At least one
+    /// such edge must exist (otherwise the hoist is unnecessary churn).
+    fn handler_joins_at(&self, p: usize, d_entry: BlockId) -> bool {
+        let mut any = false;
+        for &h in &self.f().plans[p].handlers {
+            let Some(set) = self.shim_sets.get(&h) else {
+                return false; // exotic handler shape — no shim, no hoist
+            };
+            if !set.contains(&h) {
+                return false;
+            }
+            for &b in set {
+                for s in block_succs(self.module, b) {
+                    if !set.contains(&s) {
+                        if s != d_entry {
+                            return false;
+                        }
+                        any = true;
+                    }
+                }
+            }
+        }
+        any
+    }
+
+    /// The join-hoist driver: split the cut `If`, emit
+    /// `try { skeleton } catch { … }`, then the hoisted tail. Returns
+    /// false (the caller falls back to the generic whole-wrap) unless
+    /// every guard holds.
+    fn emit_cut_try_if(
+        &mut self,
+        id: RegionId,
+        p: usize,
+        active: Option<usize>,
+        follow: Follow,
+        out: &mut Vec<SNode>,
+    ) -> bool {
+        // Phase 1 — pure analysis.
+        let Some(split) = self.cut_classify(id, p) else {
+            return false;
+        };
+        if matches!(split, CutSplit::Prot) {
+            return false;
+        }
+        let mut defers = Vec::new();
+        self.collect_defers(id, &split, &mut defers);
+        let Some(&first) = defers.first() else {
+            return false;
+        };
+        let Follow::Entry(d_entry) = self.entry_of(first) else {
+            return false;
+        };
+        if !self.handler_joins_at(p, d_entry) {
+            return false;
+        }
+        let handlers = self.f().plans[p].handlers.clone();
+        // v1: no outer finally-chain around this plan (the hoisted
+        // tail's placement relative to chain wraps needs the generic
+        // path).
+        if self
+            .outer_wrap_plan(&[p].into_iter().collect(), &handlers)
+            .is_some()
+        {
+            return false;
+        }
+
+        // Phase 2 — `try { skeleton } catch { … }` (the same
+        // bookkeeping as `wrap_try_run`, plus the hoist note).
+        let (region, cuts) = {
+            let plan = &self.f().plans[p];
+            (plan.region, plan.cuts)
+        };
+        let wraps = {
+            let f = self.f_mut();
+            let n = f.wrap_counts.entry(p).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if wraps > 1 {
+            self.stats.try_splits += 1;
+        }
+        if cuts {
+            self.stats.try_cuts += 1;
+        }
+        self.stats.try_catches += 1;
+        self.stats.try_join_hoists += 1;
+        let mut body = Vec::new();
+        if cuts {
+            body.push(SNode::Honest(format!(
+                "try region {region}: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary"
+            )));
+        }
+        if wraps > 1 {
+            body.push(SNode::Honest(format!(
+                "try region {region}: protected statements are not contiguous in the structured output — this is wrapper #{wraps} for the same region (catch body duplicated, finally-style)"
+            )));
+        }
+        body.push(SNode::Honest(format!(
+            "try region {region}: the handler continuation (the try's join) is nested inside a protected conditional arm — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there)"
+        )));
+        let defer_ids: HashSet<RegionId> = defers.iter().copied().collect();
+        self.f_mut().cut_defer = Some(CutDefer { ids: defer_ids });
+        self.emit_content(id, Some(p), follow, &mut body);
+        let leftover = match self.f_mut().cut_defer.take() {
+            Some(cd) => !cd.ids.is_empty(),
+            None => false,
+        };
+        if leftover {
+            // Defensive: analysis/emission mismatch — a deferred node
+            // was never intercepted. It is emitted in the tail below
+            // (phase 3 walks the full list), so nothing is dropped.
+            body.push(SNode::Honest(format!(
+                "try region {region}: join-hoist analysis/emission mismatch — part of the tail stayed inline (phase-3 tail remains authoritative)"
+            )));
+        }
+        let mut catches = Vec::new();
+        let mut seen = HashSet::new();
+        for h in &handlers {
+            if seen.insert(*h) {
+                catches.push(self.emit_handler(*h));
+            }
+        }
+        let note = if catches.len() > 1 {
+            self.stats.multi_catch += 1;
+            Some(format!(
+                "try region {region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                catches.len()
+            ))
+        } else {
+            None
+        };
+        out.push(SNode::Try {
+            body,
+            catches,
+            note,
+        });
+
+        // Phase 3 — the hoisted tail: emitted with the caller's active
+        // plan, follows threaded through the tail's own entries.
+        for (i, &d) in defers.iter().enumerate() {
+            let fl = if i + 1 < defers.len() {
+                self.entry_of(defers[i + 1])
+            } else {
+                follow
+            };
+            self.emit_node(d, active, fl, out);
+        }
+        true
+    }
+
     /// A mixed-coverage node: descend (or wrap whole when the head is
     /// protected — the documented cut approximation).
     fn emit_mixed(
@@ -1462,7 +1886,13 @@ impl<'m> Ctx<'m> {
             RegionNode::If { head, .. } => {
                 let hp = self.f_mut().plan_of(head);
                 if hp.is_some() && hp != active {
-                    self.wrap_try(id, hp.expect("checked"), follow, out);
+                    let p = hp.expect("checked");
+                    // The d-P5 join hoist: when the try's continuation
+                    // is buried in an arm, split instead of wrapping
+                    // whole; otherwise the generic wrap.
+                    if !self.emit_cut_try_if(id, p, active, follow, out) {
+                        self.wrap_try(id, p, follow, out);
+                    }
                 } else {
                     self.emit_if(id, active, follow, out);
                 }

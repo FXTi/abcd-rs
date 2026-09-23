@@ -129,6 +129,7 @@ fn merge_stats(a: &mut DecompileStats, b: &DecompileStats) {
     a.structure.try_splits += b.structure.try_splits;
     a.structure.multi_catch += b.structure.multi_catch;
     a.structure.handler_shims += b.structure.handler_shims;
+    a.structure.try_join_hoists += b.structure.try_join_hoists;
     a.structure.exit_phi_after_loop += b.structure.exit_phi_after_loop;
     a.structure.cross_arm_notes += b.structure.cross_arm_notes;
     a.structure.cross_arm_folds += b.structure.cross_arm_folds;
@@ -219,12 +220,13 @@ fn corpus_decompile_gate() {
         stats.structure.alternates
     );
     eprintln!(
-        "STRUCT try_catches={} try_cuts={} try_splits={} multi_catch={} handler_shims={} exit_phi_after_loop={}",
+        "STRUCT try_catches={} try_cuts={} try_splits={} multi_catch={} handler_shims={} try_join_hoists={} exit_phi_after_loop={}",
         stats.structure.try_catches,
         stats.structure.try_cuts,
         stats.structure.try_splits,
         stats.structure.multi_catch,
         stats.structure.handler_shims,
+        stats.structure.try_join_hoists,
         stats.structure.exit_phi_after_loop
     );
     eprintln!(
