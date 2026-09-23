@@ -142,6 +142,7 @@ fn merge_stats(a: &mut DecompileStats, b: &DecompileStats) {
     a.folds.array_lit += b.folds.array_lit;
     a.folds.rest += b.folds.rest;
     a.folds.switch += b.folds.switch;
+    a.folds.finally_fold += b.folds.finally_fold;
     a.function_bodies += b.function_bodies;
 }
 
@@ -201,14 +202,15 @@ fn corpus_decompile_gate() {
     );
 
     eprintln!(
-        "FOLDS for_of={} for_await_of={} for_in={} object_lit={} array_lit={} rest={} switch={}",
+        "FOLDS for_of={} for_await_of={} for_in={} object_lit={} array_lit={} rest={} switch={} finally_fold={}",
         stats.folds.for_of,
         stats.folds.for_await_of,
         stats.folds.for_in,
         stats.folds.object_lit,
         stats.folds.array_lit,
         stats.folds.rest,
-        stats.folds.switch
+        stats.folds.switch,
+        stats.folds.finally_fold
     );
     eprintln!(
         "STRUCT ifs={} while={} do_while={} while_true={} labeled_exits={} alternates={}",

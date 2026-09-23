@@ -193,6 +193,10 @@ pub enum SNode {
         catches: Vec<CatchClause>,
         /// An optional honesty note (cut-boundary placement, …).
         note: Option<String>,
+        /// The `finally { … }` body — set only by the d-P8 finally
+        /// fold ([`crate::folds`]) after it proves the es2abc
+        /// duplicate-finally idiom; `None` everywhere else.
+        finally: Option<Vec<SNode>>,
     },
     /// `for (const binding of iter) { body }` / `for await (…)` — the
     /// iterator-loop desugar fold output ([`crate::folds`]).
@@ -1288,6 +1292,7 @@ impl<'m> Ctx<'m> {
                     note: Some(format!(
                         "cross-arm tail duplication re-wraps try region {p} (wrapper #{wraps}; protectedness is an instruction property, so the duplicated code keeps its own try/catch)"
                     )),
+                    finally: None,
                 });
             } else {
                 out.extend(nodes);
@@ -1451,6 +1456,7 @@ impl<'m> Ctx<'m> {
             body,
             catches,
             note,
+            finally: None,
         };
         // Handlers protected by an OUTER plan (nested try regions whose
         // protected range includes the inner handler — the es2abc
@@ -1500,6 +1506,7 @@ impl<'m> Ctx<'m> {
                 note: Some(format!(
                     "try region {qregion}: handler-protecting outer try (finally idiom) — wrapped around region {region}'s try/catch (wrapper #{wraps})"
                 )),
+                finally: None,
             };
             protected_handlers = qhandlers;
         }
@@ -1954,6 +1961,7 @@ impl<'m> Ctx<'m> {
             body,
             catches,
             note,
+            finally: None,
         });
 
         // Phase 3 — the hoisted tail: emitted with the caller's active

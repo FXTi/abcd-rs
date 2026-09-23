@@ -568,6 +568,7 @@ impl<'m> Emitter<'m> {
                 body,
                 catches,
                 note,
+                finally,
             } => {
                 if let Some(note) = note {
                     out.push_str(&format!("{pad}/* {note} */\n"));
@@ -585,13 +586,24 @@ impl<'m> Emitter<'m> {
                             ));
                             self.emit_nodes(&extra.body, indent + 1, out);
                         }
-                        out.push_str(&format!("{pad}}}\n"));
                     }
                     None => {
-                        out.push_str(&format!("{pad}}} catch (e) {{\n"));
-                        out.push_str(&format!("{pad}  /* handler body unavailable */\n{pad}}}\n"));
+                        // A `finally` clause needs no catch (`try/finally`
+                        // is valid JS); without either, keep the honesty
+                        // empty-catch form.
+                        if finally.is_none() {
+                            out.push_str(&format!("{pad}}} catch (e) {{\n"));
+                            out.push_str(&format!("{pad}  /* handler body unavailable */\n"));
+                        }
                     }
                 }
+                if let Some(fbody) = finally {
+                    // The `} finally {` line closes the try (no catch) or
+                    // the last catch clause.
+                    out.push_str(&format!("{pad}}} finally {{\n"));
+                    self.emit_nodes(fbody, indent + 1, out);
+                }
+                out.push_str(&format!("{pad}}}\n"));
             }
             SNode::ForOf {
                 is_await,
@@ -2260,5 +2272,6 @@ fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.array_lit += b.array_lit;
     a.rest += b.rest;
     a.switch += b.switch;
+    a.finally_fold += b.finally_fold;
     a
 }

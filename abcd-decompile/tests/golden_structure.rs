@@ -1830,3 +1830,312 @@ fn s31_while_exit_phi_break_bypass() {
 "#;
     assert_eq!(decompiled(&m), want);
 }
+
+/// s32 — the d-P8 finally fold (design §4.2 item 5): es2abc duplicates
+/// the finally body onto every exit path (here: before the try arm's
+/// `return 3` and the catch's `return e + 1`) and registers a dispatch
+/// handler (switch on a phi, `case undefined:` runs the body, rethrow
+/// unless the hole) on the handler-protecting outer region. The fold
+/// recognizes the idiom and re-factors it into `finally { … }`
+/// (corpus: local/exception-finally × 6 versions × 3 profiles).
+#[test]
+fn s32_finally_fold() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let h0 = add_block(&mut m, f); // inner catch (finally copy)
+    let h1 = add_block(&mut m, f); // outer dispatch handler
+    let run = add_block(&mut m, f); // dispatch: finally template
+    let def = add_block(&mut m, f); // dispatch: default arm
+    let join = add_block(&mut m, f); // dispatch: rethrow guard
+    let retb = add_block(&mut m, f);
+    let thrb = add_block(&mut m, f);
+
+    // b0 (protected by R0): a call, the finally copy, `return 3`.
+    let _c = call_p1(&mut m, b0, p1);
+    let three = load_number(&mut m, b0, 3.0);
+    let _f1 = call_p1(&mut m, b0, p1);
+    emit_void(
+        &mut m,
+        b0,
+        Op::Return {
+            value: Some(three),
+        },
+    );
+    // h0 (R0's catch, itself R1-protected): finally copy, `return e + 1`.
+    let exc0 = add_exception_param(&mut m, h0);
+    let one = load_number(&mut m, h0, 1.0);
+    let sum = add(&mut m, h0, exc0, one);
+    let _f2 = call_p1(&mut m, h0, p1);
+    emit_void(&mut m, h0, Op::Return { value: Some(sum) });
+    // h1 (R1's handler): the finally DISPATCH — `switch (v22) { case
+    // undefined: p1(); … default: … }` then rethrow-unless-hole.
+    let exc1 = add_exception_param(&mut m, h1);
+    let undef_b0 = load_const(&mut m, b0, Const::Undefined);
+    let hole_h0 = load_const(&mut m, h0, Const::Hole);
+    let v22 = emit(
+        &mut m,
+        h1,
+        Op::Phi {
+            entries: vec![
+                (
+                    Edge {
+                        from: b0,
+                        kind: EdgeKind::Exceptional,
+                    },
+                    undef_b0,
+                ),
+                (
+                    Edge {
+                        from: h0,
+                        kind: EdgeKind::Exceptional,
+                    },
+                    hole_h0,
+                ),
+            ],
+        },
+    );
+    let undef_h1 = load_const(&mut m, h1, Const::Undefined);
+    let eq = emit(
+        &mut m,
+        h1,
+        Op::Compare {
+            op: CmpOp::StrictEq,
+            left: v22,
+            right: undef_h1,
+        },
+    );
+    let eqt = istrue(&mut m, h1, eq);
+    cond_on(&mut m, h1, eqt, run, def);
+    // run: the finally TEMPLATE (`p1()`), then rejoin through a phi
+    // (the default arm's bookkeeping — the dispatch's skip-F path).
+    let _f3 = call_p1(&mut m, run, p1);
+    emit_void(&mut m, run, Op::Branch { dest: join });
+    emit_void(&mut m, def, Op::Branch { dest: join });
+    let _v33 = emit(
+        &mut m,
+        join,
+        Op::Phi {
+            entries: vec![
+                (
+                    Edge {
+                        from: run,
+                        kind: EdgeKind::Normal,
+                    },
+                    exc1,
+                ),
+                (
+                    Edge {
+                        from: def,
+                        kind: EdgeKind::Normal,
+                    },
+                    exc1,
+                ),
+            ],
+        },
+    );
+    // join: `if (hole != e$1) { throw e$1; } else { return; }`.
+    let hole_j = load_const(&mut m, join, Const::Hole);
+    let neq = emit(
+        &mut m,
+        join,
+        Op::Compare {
+            op: CmpOp::NotEq,
+            left: hole_j,
+            right: exc1,
+        },
+    );
+    let neqt = istrue(&mut m, join, neq);
+    cond_on(&mut m, join, neqt, thrb, retb);
+    emit_void(&mut m, thrb, Op::Throw { value: exc1 });
+    emit_void(&mut m, retb, Op::Return { value: None });
+
+    link(&mut m, h1, run);
+    link(&mut m, h1, def);
+    link(&mut m, run, join);
+    link(&mut m, def, join);
+    // R0: the inner try/catch. R1: the handler-protecting outer region
+    // (the es2abc finally idiom — its protected set includes h0).
+    add_try(&mut m, f, vec![b0], h0, exc0);
+    add_try(&mut m, f, vec![b0, h0], h1, exc1);
+
+    let want = r#"function f(p1) {
+  var v12; /* phi */
+  var v17; /* phi */
+  /* finally recovered from es2abc's duplicated-finally idiom (the dispatch handler was finally+rethrow; 2 inlined copy/copies folded) */
+  try {
+    p1();
+    const v3 = 3.0;
+    return v3;
+    v12 = undefined;
+  } catch (e) {
+    const v7 = e + 1.0;
+    return v7;
+    v12 = undefined/*hole*/;
+  } finally {
+    p1();
+  }
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}
+
+/// s33 — the finally fold's HONESTY bail: same idiom shape as s32 but
+/// the inner catch's exit path LACKS its inlined finally copy. Folding
+/// would add a `finally` execution that path never had, so the fold
+/// bails and the duplicated form (idiom note + dispatch handler) stays.
+#[test]
+fn s33_finally_fold_bails_without_copy() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let h0 = add_block(&mut m, f);
+    let h1 = add_block(&mut m, f);
+    let run = add_block(&mut m, f);
+    let def = add_block(&mut m, f);
+    let join = add_block(&mut m, f);
+    let retb = add_block(&mut m, f);
+    let thrb = add_block(&mut m, f);
+
+    // b0 (protected by R0): a call, the finally copy, `return 3`.
+    let _c = call_p1(&mut m, b0, p1);
+    let three = load_number(&mut m, b0, 3.0);
+    let _f1 = call_p1(&mut m, b0, p1);
+    emit_void(
+        &mut m,
+        b0,
+        Op::Return {
+            value: Some(three),
+        },
+    );
+    // h0 (R0's catch, R1-protected): NO finally copy before its return.
+    let exc0 = add_exception_param(&mut m, h0);
+    let one = load_number(&mut m, h0, 1.0);
+    let sum = add(&mut m, h0, exc0, one);
+    emit_void(&mut m, h0, Op::Return { value: Some(sum) });
+    // h1: the dispatch, identical to s32.
+    let exc1 = add_exception_param(&mut m, h1);
+    let undef_b0 = load_const(&mut m, b0, Const::Undefined);
+    let hole_h0 = load_const(&mut m, h0, Const::Hole);
+    let v22 = emit(
+        &mut m,
+        h1,
+        Op::Phi {
+            entries: vec![
+                (
+                    Edge {
+                        from: b0,
+                        kind: EdgeKind::Exceptional,
+                    },
+                    undef_b0,
+                ),
+                (
+                    Edge {
+                        from: h0,
+                        kind: EdgeKind::Exceptional,
+                    },
+                    hole_h0,
+                ),
+            ],
+        },
+    );
+    let undef_h1 = load_const(&mut m, h1, Const::Undefined);
+    let eq = emit(
+        &mut m,
+        h1,
+        Op::Compare {
+            op: CmpOp::StrictEq,
+            left: v22,
+            right: undef_h1,
+        },
+    );
+    let eqt = istrue(&mut m, h1, eq);
+    cond_on(&mut m, h1, eqt, run, def);
+    let _f3 = call_p1(&mut m, run, p1);
+    emit_void(&mut m, run, Op::Branch { dest: join });
+    emit_void(&mut m, def, Op::Branch { dest: join });
+    let _v33 = emit(
+        &mut m,
+        join,
+        Op::Phi {
+            entries: vec![
+                (
+                    Edge {
+                        from: run,
+                        kind: EdgeKind::Normal,
+                    },
+                    exc1,
+                ),
+                (
+                    Edge {
+                        from: def,
+                        kind: EdgeKind::Normal,
+                    },
+                    exc1,
+                ),
+            ],
+        },
+    );
+    let hole_j = load_const(&mut m, join, Const::Hole);
+    let neq = emit(
+        &mut m,
+        join,
+        Op::Compare {
+            op: CmpOp::NotEq,
+            left: hole_j,
+            right: exc1,
+        },
+    );
+    let neqt = istrue(&mut m, join, neq);
+    cond_on(&mut m, join, neqt, thrb, retb);
+    emit_void(&mut m, thrb, Op::Throw { value: exc1 });
+    emit_void(&mut m, retb, Op::Return { value: None });
+
+    link(&mut m, h1, run);
+    link(&mut m, h1, def);
+    link(&mut m, run, join);
+    link(&mut m, def, join);
+    add_try(&mut m, f, vec![b0], h0, exc0);
+    add_try(&mut m, f, vec![b0, h0], h1, exc1);
+
+    // The duplication stays: idiom note, nested trys, dispatch handler.
+    let want = r#"function f(p1) {
+  /* try region 1: handler-protecting outer try (finally idiom) — wrapped around region 0's try/catch (wrapper #1) */
+  try {
+    try {
+      p1();
+      const v3 = 3.0;
+      p1();
+      return v3;
+      v11 = undefined;
+    } catch (e) {
+      return e + 1.0;
+      v11 = undefined/*hole*/;
+    }
+  } catch (e$1) {
+    var v11; /* phi */
+    switch (v11) {
+    case undefined: {
+        p1();
+        v16 = e$1;
+        break;
+      }
+    default: {
+        v16 = e$1;
+      }
+    }
+    var v16; /* phi */
+    if (e$1 != undefined/*hole*/) {
+      throw e$1;
+    } else {
+      return;
+    }
+  }
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}
