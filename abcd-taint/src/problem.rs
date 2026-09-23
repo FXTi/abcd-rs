@@ -40,7 +40,7 @@ use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::heap::{AllocSiteSet, UpdateKind};
 use abcd_analysis::dataflow::heap::{FieldChain, FieldKey, Rung0AliasOracle, update_kind};
 use abcd_analysis::dataflow::ifds::{CallGraphOracle, IfdsProblem};
-use abcd_ir::{CallKind, FuncId, InstId, Module, Op, Sym, ValueId};
+use abcd_ir::{AnnValue, CallKind, Const, FuncId, InstId, Modifiers, Module, Op, Sym, ValueId};
 
 use crate::driver::{SourceSpec, TaintConfig};
 use crate::fact::{Fact, TaintBase, TaintFact};
@@ -60,6 +60,125 @@ enum SiteClass {
     NativeKeep,
     /// No summary and no resolvable name — conservative keep.
     UnknownKeep,
+}
+
+/// The callee's call-type: which leading `params` slots are the
+/// vendored implicit frame slots `[func][newTarget][this]` rather than
+/// source formals (N66; the vendored ground truth is arkcompiler's
+/// `MethodLiteral::Initialize` — slot present iff the corresponding
+/// `L_ESCallTypeAnnotation;` callType bit: HaveThis = 0x1,
+/// HaveNewTarget = 0x2, HaveFunc = 0x8).
+///
+/// When the annotation is ABSENT on a `<static>` callee the vendored
+/// default is `callType = 0xF` — all three implicit slots — which is
+/// exactly the es2abc corpus shape (every corpus function declares
+/// `num_args = 3 + formals` and reads its first formal from `a3`).
+///
+/// This is a deliberate duplicate of `abcd-opt/src/inline.rs`'s
+/// `CallType`: the crate-graph invariant forbids `abcd-taint →
+/// abcd-opt`, and unification into a shared helper is a registered
+/// follow-up.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CallType {
+    /// The func slot (the closure itself) leads.
+    func: bool,
+    /// The new.target slot follows.
+    new_target: bool,
+    /// The this slot follows.
+    this: bool,
+}
+
+impl CallType {
+    /// The vendored annotation-absent default (`UINT32_MAX & 0xF`).
+    const DEFAULT: Self = Self {
+        func: true,
+        new_target: true,
+        this: true,
+    };
+
+    /// Number of leading implicit slots.
+    fn implicit_slots(self) -> usize {
+        self.func as usize + self.new_target as usize + self.this as usize
+    }
+
+    /// The this-slot index (implicit slots are ordered func, newTarget,
+    /// this), when the this slot is present.
+    fn this_slot(self) -> Option<usize> {
+        self.this
+            .then(|| self.func as usize + self.new_target as usize)
+    }
+
+    /// Read the callee's `L_ESCallTypeAnnotation;` callType bits, when
+    /// the annotation is present.
+    fn from_annotation(module: &Module, callee: FuncId) -> Option<Self> {
+        let func = module.func(callee)?;
+        for ann in &func.annotations {
+            let is_call_type = module
+                .class(ann.class)
+                .and_then(|c| module.sym.resolve(c.descriptor))
+                == Some("L_ESCallTypeAnnotation;");
+            if !is_call_type {
+                continue;
+            }
+            for (name, value) in &ann.elements {
+                if module.sym.resolve(*name) != Some("callType") {
+                    continue;
+                }
+                let AnnValue::Const(cid) = value else {
+                    continue;
+                };
+                let bits = module
+                    .consts
+                    .get(*cid)
+                    .and_then(Const::as_f64)
+                    .map(|x| x as u32)?;
+                return Some(Self {
+                    func: bits & 0b1000 != 0,
+                    new_target: bits & 0b0010 != 0,
+                    this: bits & 0b0001 != 0,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// How caller operands bind to callee params (N66).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParamBinding {
+    /// The frame-slot model resolved: `this` → `this_slot`, args[i] →
+    /// `params[formal_base + i]` (left-aligned formals).
+    Precise {
+        /// Index of the this slot, when the callee has one.
+        this_slot: Option<usize>,
+        /// First formal's index in `params` (= implicit slot count).
+        formal_base: usize,
+    },
+    /// No reliable slot model (NON-STATIC callee without a callType
+    /// annotation — inline REFUSES these, but taint must never silently
+    /// drop a flow — or a callee with fewer params than its implicit
+    /// slots, e.g. hand-built test modules): conservative
+    /// over-approximation — a tainted `this`/arg taints EVERY param.
+    OverApproxAll,
+}
+
+/// Resolve the param binding for `callee`.
+fn param_binding(module: &Module, callee: FuncId) -> ParamBinding {
+    let Some(fd) = module.func(callee) else {
+        return ParamBinding::OverApproxAll;
+    };
+    let call_type = match CallType::from_annotation(module, callee) {
+        Some(ct) => ct,
+        None if fd.modifiers.contains(Modifiers::STATIC) => CallType::DEFAULT,
+        None => return ParamBinding::OverApproxAll,
+    };
+    if fd.params.len() < call_type.implicit_slots() {
+        return ParamBinding::OverApproxAll;
+    }
+    ParamBinding::Precise {
+        this_slot: call_type.this_slot(),
+        formal_base: call_type.implicit_slots(),
+    }
 }
 
 /// The taint problem over a module + call graph + rung-0 alias oracle +
@@ -806,36 +925,64 @@ impl IfdsProblem for TaintProblem<'_> {
 
         match &fact.base {
             TaintBase::Local(v) => {
-                // `this` → params[0] (T4 binding convention).
-                if this.is_some_and(|t| t == *v) {
-                    if let Some(&p0) = fd.params.first() {
-                        out.push(Fact::of(fact.rebased(TaintBase::Local(p0))));
-                    }
-                }
-                match kind {
-                    CallKind::Direct | CallKind::Dynamic | CallKind::New | CallKind::Super => {
-                        for (i, &a) in args.iter().enumerate() {
-                            if a == *v {
-                                if let Some(&p) = fd.params.get(i + 1) {
-                                    out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
-                                }
-                            }
+                // N66: bind through the vendored frame-slot model
+                // ([func][newTarget][this][formals…], per the callee's
+                // callType annotation or the 0xF static default) —
+                // args[i] → params[formal_base + i], NOT params[i + 1]
+                // (the pre-N66 table was written for a normalized ABI
+                // the lift never produced).
+                let binding = param_binding(module, callee);
+                if binding == ParamBinding::OverApproxAll {
+                    // Conservative: a tainted this/arg taints EVERY
+                    // param (never silently drop a flow).
+                    let on_operands = this.is_some_and(|t| t == *v) || args.contains(v);
+                    if on_operands {
+                        for &p in &fd.params {
+                            out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
                         }
                     }
-                    CallKind::Apply | CallKind::SuperSpread => {
-                        // args[0] is an ARRAY spread over the formals: a
-                        // tainted array taints every formal (the
-                        // reflective-call mapper case of soot-infoflow).
-                        if args.first() == Some(v) {
-                            for &p in fd.params.iter().skip(1) {
+                } else {
+                    // `this` → the this slot (T4 binding convention).
+                    if let ParamBinding::Precise {
+                        this_slot: Some(slot),
+                        ..
+                    } = binding
+                    {
+                        if this.is_some_and(|t| t == *v) {
+                            if let Some(&p) = fd.params.get(slot) {
                                 out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
                             }
                         }
                     }
-                    CallKind::SuperForwardAllArgs => {
-                        // The forwarded arguments are the caller's own
-                        // formals — not operands of this call. Rung 0
-                        // models nothing here (documented gap).
+                    let formal_base = match binding {
+                        ParamBinding::Precise { formal_base, .. } => formal_base,
+                        ParamBinding::OverApproxAll => unreachable!(),
+                    };
+                    match kind {
+                        CallKind::Direct | CallKind::Dynamic | CallKind::New | CallKind::Super => {
+                            for (i, &a) in args.iter().enumerate() {
+                                if a == *v {
+                                    if let Some(&p) = fd.params.get(formal_base + i) {
+                                        out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
+                                    }
+                                }
+                            }
+                        }
+                        CallKind::Apply | CallKind::SuperSpread => {
+                            // args[0] is an ARRAY spread over the formals: a
+                            // tainted array taints every formal (the
+                            // reflective-call mapper case of soot-infoflow).
+                            if args.first() == Some(v) {
+                                for &p in fd.params.iter().skip(formal_base) {
+                                    out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
+                                }
+                            }
+                        }
+                        CallKind::SuperForwardAllArgs => {
+                            // The forwarded arguments are the caller's own
+                            // formals — not operands of this call. Rung 0
+                            // models nothing here (documented gap).
+                        }
                     }
                 }
                 // The mini-gap channel: a callback value tagged

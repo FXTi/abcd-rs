@@ -715,3 +715,158 @@ fn zero_fact_is_distinct() {
     };
     assert_ne!(Fact::Zero, Fact::of(heap));
 }
+
+// ── N66: the vendored frame-slot param binding (call_flow) ──────────
+//
+// A callee's `params` are the code-header arg slots: leading implicit
+// slots `[func][newTarget][this]` per the `L_ESCallTypeAnnotation;`
+// callType bits, annotation absent on a STATIC callee ⇒ the vendored
+// 0xF default (all three), source formals following left-aligned.
+// These tests pin the binding map.
+
+/// A `print(x)`-shaped module: `callee` is called with the tainted
+/// param and its return is printed. Returns the report.
+fn call_and_print(callee: abcd_ir::FuncId, m: &mut abcd_ir::Module) -> abcd_taint::TaintReport {
+    let f = add_func_named(m, "func_main_0");
+    let entry = entry_of(m, f);
+    add_param(m, f, 0);
+    let p = add_param(m, f, 1);
+    let callee_val = {
+        let c = m.consts.push(abcd_ir::Const::MethodRef(callee));
+        emit(m, entry, Op::LoadConst(c))
+    };
+    let r = emit(
+        m,
+        entry,
+        Op::Call {
+            callee: callee_val,
+            this: None,
+            args: vec![p],
+            kind: CallKind::Direct,
+        },
+    );
+    print_call(m, entry, vec![r]);
+    emit_void(m, entry, Op::Return { value: None });
+    abcd_taint::run_taint(m, &std_config())
+}
+
+/// 0xF-shaped STATIC callee (annotation absent ⇒ [func][newTarget]
+/// [this][formals…]): the tainted argument binds to params[3], NOT
+/// params[1] (the pre-N66 off-by-two). A callee returning its first
+/// formal flows; one returning a hidden slot does not.
+#[test]
+fn call_binding_frame_slot_0xF() {
+    // Callee returning its first formal (params[3]): TP.
+    let mut m = mk_module();
+    let id_fn = add_func_named(&mut m, "identity0xF");
+    m.functions[id_fn.index()].modifiers = abcd_ir::Modifiers::STATIC;
+    let ib = entry_of(&m, id_fn);
+    for i in 0..4 {
+        add_param(&mut m, id_fn, i);
+    }
+    let formal = m.functions[id_fn.index()].params[3];
+    emit_void(
+        &mut m,
+        ib,
+        Op::Return {
+            value: Some(formal),
+        },
+    );
+    let report = call_and_print(id_fn, &mut m);
+    assert_eq!(
+        report.hits.len(),
+        1,
+        "0xF binding: args[0] -> params[3] (the first formal)"
+    );
+
+    // Callee returning a HIDDEN slot (params[1] = newTarget): no flow.
+    let mut m = mk_module();
+    let nt_fn = add_func_named(&mut m, "hidden_slot");
+    m.functions[nt_fn.index()].modifiers = abcd_ir::Modifiers::STATIC;
+    let nb = entry_of(&m, nt_fn);
+    for i in 0..4 {
+        add_param(&mut m, nt_fn, i);
+    }
+    let hidden = m.functions[nt_fn.index()].params[1];
+    emit_void(
+        &mut m,
+        nb,
+        Op::Return {
+            value: Some(hidden),
+        },
+    );
+    let report = call_and_print(nt_fn, &mut m);
+    assert_eq!(
+        report.hits.len(),
+        0,
+        "0xF binding: the argument must NOT land on hidden slot params[1]"
+    );
+}
+
+/// Annotated callee (callType = 0 — NO implicit slots): formals start
+/// at params[0], so the tainted argument binds to params[0].
+#[test]
+fn call_binding_annotated_calltype_zero() {
+    let mut m = mk_module();
+    // The annotation class record.
+    let ann_name = m.sym.intern("L_ESCallTypeAnnotation;");
+    let ann_class = abcd_ir::ClassId::new(m.classes.len() as u32);
+    m.classes.push(abcd_ir::ClassData {
+        descriptor: ann_name,
+        name: ann_name,
+        modifiers: abcd_ir::Modifiers::NONE,
+        source_lang: abcd_ir::module::SourceLang::EcmaScript,
+        super_class: None,
+        interfaces: Vec::new(),
+        fields: Vec::new(),
+        methods: Vec::new(),
+        annotations: Vec::new(),
+        source_file: None,
+    });
+    let f = add_func_named(&mut m, "annotated");
+    let fb = entry_of(&m, f);
+    let formal = add_param(&mut m, f, 0);
+    emit_void(
+        &mut m,
+        fb,
+        Op::Return {
+            value: Some(formal),
+        },
+    );
+    let call_type = m.sym.intern("callType");
+    let zero = m.consts.push(abcd_ir::Const::number(0.0));
+    m.functions[f.index()]
+        .annotations
+        .push(abcd_ir::Annotation {
+            class: ann_class,
+            elements: vec![(call_type, abcd_ir::AnnValue::Const(zero))],
+        });
+
+    let report = call_and_print(f, &mut m);
+    assert_eq!(
+        report.hits.len(),
+        1,
+        "callType=0: no implicit slots, args[0] -> params[0]"
+    );
+}
+
+/// NON-STATIC callee without a callType annotation: no reliable slot
+/// model — taint must over-approximate (a tainted arg taints EVERY
+/// param), never silently drop the flow.
+#[test]
+fn call_binding_nonstatic_unannotated_overapprox() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "opaque");
+    // Modifiers::NONE (non-static), no annotation.
+    let fb = entry_of(&m, f);
+    let slot0 = add_param(&mut m, f, 0);
+    add_param(&mut m, f, 1);
+    emit_void(&mut m, fb, Op::Return { value: Some(slot0) });
+
+    let report = call_and_print(f, &mut m);
+    assert_eq!(
+        report.hits.len(),
+        1,
+        "no slot model: conservative over-approximation taints every param"
+    );
+}
