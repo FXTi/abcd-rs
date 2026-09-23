@@ -926,10 +926,7 @@ impl<'m> Ctx<'m> {
                     let ok = tr.protected.iter().all(|b| {
                         block_set.contains(b)
                             || chosen.iter().any(|&j| {
-                                f.try_regions[j]
-                                    .catches
-                                    .iter()
-                                    .any(|cc| cc.handler == *b)
+                                f.try_regions[j].catches.iter().any(|cc| cc.handler == *b)
                             })
                     });
                     if ok {
@@ -942,10 +939,7 @@ impl<'m> Ctx<'m> {
                 }
             }
             chosen.sort_unstable();
-            fd.try_regions = chosen
-                .iter()
-                .map(|&i| f.try_regions[i].clone())
-                .collect();
+            fd.try_regions = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
             shim.functions.push(fd);
             let tree = structure_regions(&shim, fid);
             let plans = tree
@@ -1046,17 +1040,27 @@ impl<'m> Ctx<'m> {
     /// unaffected (a `throw` block has no Normal successors; any found
     /// are kept in place defensively).
     fn push_main_phi(out: &mut Vec<SNode>, main: &[Stmt], phi: &[Stmt]) {
-        let last_meaningful = main
-            .iter()
-            .rposition(|s| !matches!(s, Stmt::Unreachable));
+        let last_meaningful = main.iter().rposition(|s| !matches!(s, Stmt::Unreachable));
         let throw_at = last_meaningful.filter(|&i| matches!(main[i], Stmt::Throw(_)));
         if let Some(i) = throw_at
-            && phi
-                .iter()
-                .any(|s| matches!(s, Stmt::PhiAssign { exceptional: true, .. }))
+            && phi.iter().any(|s| {
+                matches!(
+                    s,
+                    Stmt::PhiAssign {
+                        exceptional: true,
+                        ..
+                    }
+                )
+            })
         {
             let (xphi, rest): (Vec<Stmt>, Vec<Stmt>) = phi.iter().cloned().partition(|s| {
-                matches!(s, Stmt::PhiAssign { exceptional: true, .. })
+                matches!(
+                    s,
+                    Stmt::PhiAssign {
+                        exceptional: true,
+                        ..
+                    }
+                )
             });
             Self::push_stmts(out, Self::stmts_leaves(&main[..i]));
             Self::push_stmts(out, Self::stmts_leaves(&xphi));
@@ -1534,9 +1538,7 @@ impl<'m> Ctx<'m> {
                 // outside would duplicate the catch (correct but
                 // redundant); skip those, but keep scanning outward.
                 let handled_inside = self.shim_plans.get(h).is_some_and(|plans| {
-                    plans
-                        .iter()
-                        .any(|pl| pl.protected == f.plans[q].protected)
+                    plans.iter().any(|pl| pl.protected == f.plans[q].protected)
                 });
                 if handled_inside {
                     continue;
@@ -1690,11 +1692,7 @@ impl<'m> Ctx<'m> {
                         .iter()
                         .rposition(|s| !matches!(s, Stmt::Unreachable));
                     match last {
-                        Some(i)
-                            if matches!(
-                                parts.main[i],
-                                Stmt::Throw(_) | Stmt::Return(_)
-                            ) => {}
+                        Some(i) if matches!(parts.main[i], Stmt::Throw(_) | Stmt::Return(_)) => {}
                         _ => return false,
                     }
                 }

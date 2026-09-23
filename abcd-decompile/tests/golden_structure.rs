@@ -1597,7 +1597,6 @@ fn s28_try_join_hoist() {
     assert_eq!(decompiled(&m), want);
 }
 
-
 /// s29 — join hoist with a LATER rejoin: the handler's continuation is
 /// the SECOND unprotected tail node; the first is a try-path-only
 /// phi-merge that cannot throw, so it stays inline in the try body

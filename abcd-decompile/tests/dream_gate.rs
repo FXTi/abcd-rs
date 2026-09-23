@@ -198,10 +198,13 @@ fn generate() -> usize {
 /// the recorded acceptance floor. Docker is LOCAL-only
 /// (scripts/remote-test.sh).
 ///
-/// The histogram at d-P4 acceptance (2026-09-23): pass 951 /
-/// decompile-bug 108 / es2abc-cant 0 / expected-fallback 54 /
-/// fixture-unsupported 36 (of 1149). The floor guards regressions;
-/// raise it when the buckets improve.
+/// The histogram at d-P5 (2026-09-23): pass 1023 / decompile-bug 36 /
+/// es2abc-cant 0 / expected-fallback 54 / fixture-unsupported 36 (of
+/// 1149). The d-P4 floor was 951; d-P5 fixed the full 72-fixture
+/// optimizer try-projection family (RC1 join hoist + generalized
+/// rejoin, RC2 exception-edge phi flush, RC3 finally-chain walk, the
+/// shim region closure, the loop-exit ordering trio). The floor guards
+/// regressions; raise it when the buckets improve.
 #[test]
 #[ignore = "requires exported GHCR corpus, python3, and LOCAL docker"]
 fn dream_gate_oracle() {
@@ -235,8 +238,8 @@ fn dream_gate_oracle() {
         report.fixture_unsupported
     );
     assert!(
-        report.pass >= 951,
-        "dream gate regression: pass {} < 951 (the d-P4 acceptance floor)",
+        report.pass >= 1023,
+        "dream gate regression: pass {} < 1023 (the d-P5 acceptance floor)",
         report.pass
     );
 }
