@@ -241,6 +241,8 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | N62 | 重复内容字面量数组经 v0.2 内容键控常量池合并：同内容两个表索引→一个 ConstId→一条重定位条目（v0.1 按表索引两条），53 文件与 v0.1 重写差一个 4 字节索引区条目+下游偏移；指令流全同、运行内容全同、oracle 不可见 | ✅ **维护者拍板接受**（2026-09-21）：门禁 2 终态=「1149/1149 − 53 N62 归属文件」；v0.2 保持格式无关 IR 原则，不引入表索引溯源；若未来出现需要逐站字面量数组身份的消费者再重启（分析 design/n62-literal-array-dedup-divergence.md） |
 | N63 | v0.1 SCCP 把 ExceptionParam 留在 Top（格点单位元）→ phi(异常对象, 常量) 被误折为常量：异常路径真触发时折叠错误——v0.1 的潜伏正确性 bug，oracle 绿只因语料里该路径从不触发（opt-try-catch-func/test-raw-try-catch/optimized 6 文件） | ✅ 裁决登记（2026-09-21，v2-P3 发现）→ **关闭**（P4：v0.1 已删除，bug 随载体消亡；v0.2 把 ExceptionParam 解析为 Bottom、保留 phi，严格更健全——随 P3 门禁 2 的 M3b 归属分歧被维护者接受） |
 | P3-M1/M2 | v2opt 与 v0.1 opt 的另两类归属字节差异：M1（72 文件）折叠出的 NaN/+∞——v0.1 降级为 fldai，v0.2 保留 ldnan/ldinfinity 身份；M2（12 文件）v0.1 ADCE 手工清单把 DefineFunc 标 essential，v0.2 诚实 effects 表（vendor RuntimeDefinefunc 不跑用户代码）允许删除死 definefunc+闭包链 | ✅ 维护者拍板接受（2026-09-21，与 N63 同批）：v2 严格更好或 VM 中性；v0.1 对齐被否决（不为对齐往 effects 表写假话） |
+| N65 | `delobjprop` 操作数双重反转：vendor 语义 obj=v0/prop=acc/result→acc（isa.yaml:1293-1296 acc:inout），abcd-lift:720 把 acc 读成 object、v0 读成 key，abcd-lower:1136 同形反转写回——**双反相消**，字节恒等/VM oracle 全绿但 IR 语义错（反编译器等语义消费者现形）。源自 v0.1（parity 同反不查），d-P4 发现。语料 18 文件（property-ops 族）runtime-passed 但因字节不变而绿 | 🔲 修复中（d-P4 附带任务：lift+lower 双边交换 + red-first + 字节恒等门禁证明字节不变；另查 deprecated.delobjprop 形 translate.rs:2046） |
+
 | N64 | abcd-ir verify.rs 的私有支配集被**不可达 Normal 前驱**污染：可达块若有任一不可达 Normal 前驱，全集初始化把它的 dom 集清空 → verify 视其为 Normal 不可达 → 其 uses 豁免 N45（仅弱化不强化）。v2-P5a 支配一致性测试发现（11.0.2.0/local/destructuring 块 32/34/35/45） | 🔲 登记（v2-P5a 报告；abcd-ir 冻结未修。一致性契约因此取**交集域**（两实现都认为 Normal 可达的块才比对，2004 块跳过有文档）。修复方向：verify 把不可达前驱视为缺席——待 abcd-ir 解冻时做） |
 
 ## 审计纪律
