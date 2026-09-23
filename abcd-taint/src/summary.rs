@@ -428,7 +428,16 @@ pub enum FallbackStep {
 /// resolution).
 /// Entries 10–20 are the canonical namespace builtins of reader D's
 /// minimal-registry set, registered preemptively (corpus frequency 0 —
-/// they are the first rung of the miss-log-driven backlog).
+/// they are the first rung of the miss-log-driven backlog). The t-P5
+/// block at the end is the second rung: the miss log's actionable head
+/// (`String.prototype.replace` ×18, `RegExp.prototype.test` ×18 — the
+/// latter rescued by the t-P5 constructor-result family arm,
+/// `crate::prototype` §5) plus the probe-evidenced canonicals
+/// (`split`/`join`/`parseInt` — corpus reachability checked: split and
+/// parseInt appear in no corpus source, join only in a
+/// runtime-not-applicable fixture) and `Object.assign`'s
+/// result-identity deepening. The README's summary-library section
+/// carries the exclusive policy and the backlog classification.
 pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
     use Endpoint::*;
     vec![
@@ -544,11 +553,21 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
                 .exclusive(),
         ),
         // Object.assign: the mutator — each source's fields flow into
-        // param 0 (alias: the reference is mutated, not copied).
+        // param 0 (alias: the reference is mutated, not copied). The
+        // result IS param 0 (assign returns its target — t-P5): param
+        // taints therefore also flow to Return, so the
+        // `let o = Object.assign({}, src)` shape is covered (probe
+        // e23; the field-precise heap carrier is the t-P2 endpoint
+        // match, probe e5).
         ("Object.assign", None, {
-            let mut s = Summary::new("canonical; srcs → dst (mutates param 0)");
+            let mut s =
+                Summary::new("canonical; srcs → dst (mutates param 0); the result IS param 0");
             for i in 1..4u16 {
                 s = s.alias_flow(Param(i), Param(0));
+            }
+            s = s.flow(Param(0), Return);
+            for i in 1..4u16 {
+                s = s.flow(Param(i), Return);
             }
             s
         }),
@@ -751,6 +770,112 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
             .callback(0)
             .gap_enter(Base, 0)
             .gap_enter(Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)), 0),
+        ),
+        // ── t-P5: the miss-log-driven second tier ────────────────────
+        // String.prototype.replace (corpus ×18, regexp.js — the smoke's
+        // top actionable miss at t-P4). DUAL form, one key (both forms
+        // are arity 2):
+        // - replacement is a STRING: the result's content derives from
+        //   the base (the non-matched parts, plus `$`-substituted group
+        //   text — which is base content) and from the replacement
+        //   (inserted verbatim): Base→Return, Param(1)→Return. The
+        //   PATTERN (param 0) only SELECTS what is replaced — control,
+        //   not content (the repeat-count discipline; probe e17's clean
+        //   sink pins it against the identity heuristic).
+        // - replacement is a FUNCTION: a gap (FlowDroid's
+        //   spawnAnalysisIntoClientCode). The callback receives
+        //   `(match, …groups, offset, string)` — all base-derived, so
+        //   Base enters on formal 0 (the match; the group/offset/string
+        //   formals are pattern-arity-dependent, unmodeled) — and the
+        //   callback's RETURN is inserted into the result string:
+        //   `return_to_result` is the EMPTY chain (the result is a
+        //   string, not an array — contrast map's `[AnyIndex]`).
+        // Non-exclusive by the prototype-path discipline (a may-typed
+        // receiver never kills). The string form's callback slot holds
+        // a constant — the eager scan's not-a-callback refinement keeps
+        // it out of the `gap_sites_unresolved` counter (probe e18's
+        // counterpart; gap.rs).
+        (
+            "String.prototype.replace",
+            Some(2),
+            Summary::new(
+                "corpus ×18 (regexp.js); dual: string replacement Base+Param(1)→Return (pattern is control); function replacement = gap Base→cb(match), cb return→result",
+            )
+            .flow(Base, Return)
+            .flow(Param(1), Return)
+            .callback(1)
+            .gap_enter(Base, 0)
+            .gap_return(FieldChain::new()),
+        ),
+        // RegExp.prototype.test (corpus `r.test` ×18, regexp.js —
+        // rescued by the t-P5 constructor-result family arm: es2abc
+        // lowers regexp literals to `new RegExp(...)`, so the receiver
+        // types RegExp only through that arm). A pure match VERDICT —
+        // the result is a fresh boolean that carries no content (the
+        // Object.is discipline: verdicts are control, not data — a
+        // tainted haystack must NOT taint the verdict; probe e19 pins
+        // the summary against the identity heuristic, which would
+        // taint it). No flows.
+        (
+            "RegExp.prototype.test",
+            Some(1),
+            Summary::new(
+                "corpus r.test ×18; pure match verdict; fresh boolean carries nothing (Object.is discipline)",
+            ),
+        ),
+        // String.prototype.split (corpus-freq 0 — canonical preemptive,
+        // probe e20): the result array's pieces derive from the base's
+        // content (Base→Return covers the element reads — the load
+        // rule's empty-chain cut). The separator and limit SELECT —
+        // control, not content.
+        (
+            "String.prototype.split",
+            None,
+            Summary::new(
+                "canonical; content-derived pieces → result array; separator/limit are control",
+            )
+            .flow(Base, Return),
+        ),
+        // Array.prototype.join (corpus-freq 0 — the only corpus use is
+        // a runtime-not-applicable fixture; canonical preemptive, probe
+        // e21): the joined string carries the base/element taint (the
+        // pop/next two-flow shape) AND the separator, which is inserted
+        // verbatim between elements (Param(0)→Return — unlike split's
+        // separator, which is REMOVED).
+        (
+            "Array.prototype.join",
+            None,
+            Summary::new(
+                "canonical; base/element taint + verbatim separator → joined string",
+            )
+            .flow(Base, Return)
+            .flow(
+                Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
+                Return,
+            )
+            .flow(Param(0), Return),
+        ),
+        // parseInt / Number.parseInt (corpus-freq 0 — canonical
+        // preemptive, probe e22): a content-derived digit parse — the
+        // result number derives from the string's content (the
+        // charCodeAt discipline), the radix is control.
+        // NON-EXCLUSIVE by the t-P5 exclusive-policy review: parseInt
+        // is a pure READ of its operand — the exclusive killSource
+        // (operand taint dies on the bypass edge) would be a real FN
+        // for SSA re-use (`let t = …; parseInt(t); print(t)`), while
+        // exclusive's buy (killing the callee-body edge) is vacuous
+        // for a native callee. The policy table is in the README.
+        (
+            "parseInt",
+            None,
+            Summary::new("canonical; content-derived digit parse → number; radix is control")
+                .flow(Param(0), Return),
+        ),
+        (
+            "Number.parseInt",
+            None,
+            Summary::new("canonical; content-derived digit parse → number; radix is control")
+                .flow(Param(0), Return),
         ),
     ]
 }

@@ -45,6 +45,22 @@
 //!    builtin iterable. Any other iterable (user object with a custom
 //!    `@@iterator`, unknown source) types NOTHING — the family is
 //!    never invented.
+//! 5. **Constructor results** (t-P5) — `new <global>(...)` where the
+//!    callee's def chain bottoms out at `TryGetGlobal(name)` with
+//!    `name` a KNOWN builtin constructor (`Array`/`Object`/`RegExp`/
+//!    `String`/`Number`/`Boolean`) types the result with that
+//!    constructor's family. This is the arm the corpus' RegExp
+//!    literals need: es2abc lowers `/a+/g` to an explicit
+//!    `new RegExp("a+", "g")` CALL (all six corpus versions — the
+//!    `createregexpwithliteral` → `AllocRegExp` lift never fires on
+//!    this corpus), so a literal-regexp receiver (`r.test(...)`,
+//!    regexp.js ×18) is a call result the alloc-kind arm cannot see.
+//!    The constructor name is a mutable global binding (user code can
+//!    shadow `RegExp`), so the answer is marked IMPRECISE — the same
+//!    may-direction discipline as global-store provenance (and
+//!    prototype-path application is additive-only either way). User
+//!    classes and unknown callees contribute NOTHING — the family is
+//!    never invented.
 //!
 //! ## What is honestly NOT recoverable
 //!
@@ -303,6 +319,17 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                 Some(Op::TryGetGlobal { name, .. }) => {
                     self.global_store_families(*name, visiting, ans);
                 }
+                Some(Op::Call {
+                    kind: abcd_ir::CallKind::New,
+                    callee,
+                    ..
+                }) => {
+                    // `new <builtin ctor>(...)` — t-P5 constructor-
+                    // result arm (module docs §5): es2abc lowers regexp
+                    // literals to `new RegExp(...)`, so this is the arm
+                    // that types the corpus' `r.test` receivers.
+                    self.constructor_family(*callee, visiting, ans);
+                }
                 Some(op) if family_of_alloc(op).is_some() => {
                     // Insert directly: values reached through a NESTED
                     // hop (global-store provenance, GetIterator's
@@ -320,6 +347,54 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                     ans.precise = false;
                 }
             },
+        }
+    }
+
+    /// The t-P5 constructor-result arm: `callee` of a `kind: New` call
+    /// is walked through `Mov`/`Phi` to a `TryGetGlobal(name)` leaf; a
+    /// KNOWN builtin constructor name types the constructed value with
+    /// the matching family. Imprecise by construction (the constructor
+    /// binding is a mutable global — a shadowed `RegExp` defeats it;
+    /// the same may-direction discipline as global-store provenance).
+    /// Anything else (user class, computed callee, unknown name)
+    /// contributes no family.
+    fn constructor_family(
+        &self,
+        callee: ValueId,
+        visiting: &mut HashSet<ValueId>,
+        ans: &mut FamilyAnswer,
+    ) {
+        ans.precise = false;
+        let Some(v) = self.module.value(callee) else {
+            return;
+        };
+        let ValueDef::Inst(iid) = v.def else {
+            return;
+        };
+        match self.module.inst(iid).map(|i| &i.op) {
+            Some(Op::Mov { src }) => self.constructor_family(*src, visiting, ans),
+            Some(Op::Phi { entries }) => {
+                for (_, incoming) in entries {
+                    if visiting.insert(*incoming) {
+                        self.constructor_family(*incoming, visiting, ans);
+                    }
+                }
+            }
+            Some(Op::TryGetGlobal { name, .. }) => {
+                let family = match self.module.sym.resolve(*name) {
+                    Some("Array") => Some(ProtoFamily::Array),
+                    Some("Object") => Some(ProtoFamily::Object),
+                    Some("RegExp") => Some(ProtoFamily::RegExp),
+                    Some("String") => Some(ProtoFamily::Str),
+                    Some("Number") => Some(ProtoFamily::Num),
+                    Some("Boolean") => Some(ProtoFamily::Bool),
+                    _ => None,
+                };
+                if let Some(f) = family {
+                    ans.families.insert(f);
+                }
+            }
+            _ => {}
         }
     }
 

@@ -2432,3 +2432,635 @@ fn gap_mini_gap_tag_binds_first_formal_on_direct_call() {
         report.summaries_applied
     );
 }
+
+// ────────────────────────────────────────────────────────────────────
+// t-P5: the miss-log-driven second tier — String.prototype.replace's
+// dual form (string replacement + the callback gap), the
+// constructor-result family arm (RegExp.prototype.test), split/join,
+// parseInt, and Object.assign's result identity.
+// ────────────────────────────────────────────────────────────────────
+
+/// A string receiver typed through global-store provenance (the
+/// `prototype_family_const_string_via_global_provenance` pattern): a
+/// string constant store types the family, a tainted-param store
+/// carries the taint. Returns the receiver value (`TryGetGlobal("s")`).
+fn tainted_string_global(
+    m: &mut abcd_ir::Module,
+    entry: abcd_ir::BlockId,
+    p: abcd_ir::ValueId,
+) -> abcd_ir::ValueId {
+    let s_name = intern(m, "s");
+    let clean = load_string(m, entry, "clean");
+    emit_void(
+        m,
+        entry,
+        Op::StoreGlobal {
+            name: s_name,
+            value: clean,
+        },
+    );
+    emit_void(
+        m,
+        entry,
+        Op::StoreGlobal {
+            name: s_name,
+            value: p,
+        },
+    );
+    try_get_global(m, entry, "s")
+}
+
+/// replace's STRING form: Base→Return carries the receiver's content
+/// taint; Param(1)→Return carries the replacement's; the PATTERN
+/// (param 0) selects — control, not content, so a tainted pattern over
+/// a clean base taints nothing (the identity heuristic would — the
+/// clean assertion pins the summary's win). The string replacement is
+/// a provably non-callable constant: the gap scan must NOT count the
+/// site as an unresolved callback (the t-P5 refinement).
+#[test]
+fn replace_string_form_flows() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    // s.replace("a", "!") — Base→Return.
+    let s = tainted_string_global(&mut m, entry, p);
+    let pat1 = load_string(&mut m, entry, "a");
+    let bang = load_string(&mut m, entry, "!");
+    let r1 = method_call(&mut m, entry, s, "replace", vec![pat1, bang]);
+    print_call(&mut m, entry, vec![r1]);
+    // clean.replace("a", p) — Param(1)→Return (replacement verbatim).
+    let c_name = intern(&mut m, "c");
+    let clean2 = load_string(&mut m, entry, "clean");
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: c_name,
+            value: clean2,
+        },
+    );
+    let c = try_get_global(&mut m, entry, "c");
+    let pat2 = load_string(&mut m, entry, "a");
+    let r2 = method_call(&mut m, entry, c, "replace", vec![pat2, p]);
+    print_call(&mut m, entry, vec![r2]);
+    // c.replace(p, "!") — the pattern is control: CLEAN.
+    let c2 = try_get_global(&mut m, entry, "c");
+    let bang2 = load_string(&mut m, entry, "!");
+    let r3 = method_call(&mut m, entry, c2, "replace", vec![p, bang2]);
+    print_call(&mut m, entry, vec![r3]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report.hits.iter().any(|h| h.fact.local_base() == Some(r1)),
+        "Base→Return: the receiver's content taints the result: {:?}",
+        report.hits
+    );
+    assert!(
+        report.hits.iter().any(|h| h.fact.local_base() == Some(r2)),
+        "Param(1)→Return: the replacement is inserted verbatim: {:?}",
+        report.hits
+    );
+    assert!(
+        !report.hits.iter().any(|h| h.fact.local_base() == Some(r3)),
+        "the pattern selects (control, not content) — no flow: {:?}",
+        report.hits
+    );
+    assert_eq!(
+        report
+            .summaries_applied
+            .iter()
+            .filter(|(_, n)| n == "String.prototype.replace")
+            .count(),
+        3,
+        "all three replace sites applied the summary: {:?}",
+        report.summaries_applied
+    );
+    // The two CONSTANT-replacement sites contribute nothing to the gap
+    // counters (the t-P5 not-a-callback refinement); the
+    // `c.replace("a", p)` site's replacement is a PARAM — possibly a
+    // function — and honestly counts as unresolved.
+    assert_eq!(report.gap_sites_resolved, 0);
+    assert_eq!(
+        report.gap_sites_unresolved, 1,
+        "only the param-replacement site is an honest unresolved callback"
+    );
+}
+
+/// replace's FUNCTION form: the callback receives the base-derived
+/// match (gap enter on formal 0) and its RETURN is inserted into the
+/// result string (the EMPTY-chain return channel — the result is a
+/// string, not map's array). To pin the return channel against the
+/// static Base→Return flow, the receiver is CLEAN and the callback
+/// returns a global it loads (the state base crosses the gap edge; the
+/// return channel is the ONLY route to the result).
+#[test]
+fn replace_function_form_gap_return() {
+    let mut m = mk_module();
+    let leak = intern(&mut m, "LEAK");
+    let (cb, _e, cb_entry) = gap_cb_skeleton(&mut m, "cb");
+    {
+        // cb(m) { return LEAK; } — the returned taint is NOT
+        // base-derived, so only the gap return channel can carry it.
+        let g = try_get_global(&mut m, cb_entry, "LEAK");
+        emit_void(&mut m, cb_entry, Op::Return { value: Some(g) });
+    }
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    // A CLEAN string receiver (one store — the family types String,
+    // the taint never touches it).
+    let s_name = intern(&mut m, "s");
+    let clean = load_string(&mut m, entry, "clean");
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: s_name,
+            value: clean,
+        },
+    );
+    // The taint lives on the LEAK global the callback loads.
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: leak,
+            value: p,
+        },
+    );
+    let s = try_get_global(&mut m, entry, "s");
+    let pat = load_string(&mut m, entry, "a");
+    let def_cb = emit(
+        &mut m,
+        entry,
+        Op::DefineFunc {
+            body: cb,
+            captures: vec![],
+            length: 1,
+        },
+    );
+    let clo_cb = emit(&mut m, entry, Op::AllocClosure { func: def_cb });
+    let r = method_call(&mut m, entry, s, "replace", vec![pat, clo_cb]);
+    print_call(&mut m, entry, vec![r]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report.hits.iter().any(|h| h.fact.local_base() == Some(r)),
+        "the callback return rode the empty-chain gap return onto the result: {:?}",
+        report.hits
+    );
+    assert_eq!(report.gap_sites_resolved, 1, "the callback resolved");
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "String.prototype.replace"),
+        "the replace summary applied"
+    );
+}
+
+/// replace's function form, gap ENTER: a tainted receiver's content
+/// enters the callback on formal 0 (the match) — the print inside the
+/// callback body fires.
+#[test]
+fn replace_function_form_gap_enter() {
+    let mut m = mk_module();
+    let (cb, e, cb_entry) = gap_cb_skeleton(&mut m, "cb");
+    {
+        print_call(&mut m, cb_entry, vec![e]);
+        emit_void(&mut m, cb_entry, Op::Return { value: None });
+    }
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let s = tainted_string_global(&mut m, entry, p);
+    let pat = load_string(&mut m, entry, "a");
+    let def_cb = emit(
+        &mut m,
+        entry,
+        Op::DefineFunc {
+            body: cb,
+            captures: vec![],
+            length: 1,
+        },
+    );
+    let clo_cb = emit(&mut m, entry, Op::AllocClosure { func: def_cb });
+    method_call(&mut m, entry, s, "replace", vec![pat, clo_cb]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report.hits.iter().any(|h| h.fact.local_base() == Some(e)),
+        "the base content entered the callback's match formal: {:?}",
+        report.hits
+    );
+    assert_eq!(report.gap_sites_resolved, 1);
+}
+
+/// The constructor-result family arm (t-P5, prototype.rs §5): the
+/// receiver of `r.test(...)` is the result of `new RegExp(...)` — the
+/// shape es2abc lowers regexp literals to. RegExp.prototype.test
+/// applies, and its NO-FLOW model (a pure verdict) beats the identity
+/// heuristic: the tainted haystack does NOT taint the boolean result.
+#[test]
+fn regexp_test_constructor_result_family() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    // r = new RegExp("a+") — the callee is a bare global load.
+    let ctor = try_get_global(&mut m, entry, "RegExp");
+    let pat = load_string(&mut m, entry, "a+");
+    let r = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: ctor,
+            this: None,
+            args: vec![pat],
+            kind: CallKind::New,
+        },
+    );
+    let verdict = method_call(&mut m, entry, r, "test", vec![p]);
+    print_call(&mut m, entry, vec![verdict]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "RegExp.prototype.test"),
+        "the constructor-result arm typed the receiver RegExp: {:?}",
+        report.summaries_applied
+    );
+    assert!(
+        !report
+            .hits
+            .iter()
+            .any(|h| h.fact.local_base() == Some(verdict)),
+        "the verdict is a fresh boolean — the tainted haystack carries nothing: {:?}",
+        report.hits
+    );
+}
+
+/// The corpus shape (regexp.js): the `new RegExp(...)` result reaches
+/// the receiver through a GLOBAL STORE (flow-insensitive provenance
+/// union), not a direct def chain. Same summary, same verdict purity.
+#[test]
+fn regexp_test_via_global_provenance_constructor_arm() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let r_name = intern(&mut m, "r");
+    let ctor = try_get_global(&mut m, entry, "RegExp");
+    let pat = load_string(&mut m, entry, "a+");
+    let newed = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: ctor,
+            this: None,
+            args: vec![pat],
+            kind: CallKind::New,
+        },
+    );
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: r_name,
+            value: newed,
+        },
+    );
+    let r = try_get_global(&mut m, entry, "r");
+    let verdict = method_call(&mut m, entry, r, "test", vec![p]);
+    print_call(&mut m, entry, vec![verdict]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "RegExp.prototype.test"),
+        "the provenance hop reached the constructor arm: {:?}",
+        report.summaries_applied
+    );
+    assert!(
+        report.hits.is_empty(),
+        "a pure verdict over a tainted haystack: no flow: {:?}",
+        report.hits
+    );
+}
+
+/// Constructor-arm negative control: `new Foo()` (a user/global
+/// constructor NOT in the builtin table) types NOTHING — no prototype
+/// candidate is synthesized, no summary applies.
+#[test]
+fn constructor_arm_never_invents_user_families() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let ctor = try_get_global(&mut m, entry, "Foo");
+    let newed = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: ctor,
+            this: None,
+            args: vec![],
+            kind: CallKind::New,
+        },
+    );
+    let r = method_call(&mut m, entry, newed, "test", vec![p]);
+    print_call(&mut m, entry, vec![r]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .all(|(_, n)| !n.contains(".prototype.")),
+        "no prototype summary fired for a user constructor: {:?}",
+        report.summaries_applied
+    );
+    assert!(
+        report
+            .summary_misses
+            .keys()
+            .all(|n| !n.contains(".prototype.")),
+        "no prototype candidate was synthesized: {:?}",
+        report.summary_misses
+    );
+}
+
+/// split: the pieces derive from the base's content (Base→Return; an
+/// element read cuts one step). The SEPARATOR is removed — control,
+/// not content: a tainted separator over a clean base taints nothing
+/// (the identity heuristic would; the clean assertion pins the win).
+#[test]
+fn split_base_flow_separator_is_control() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    // s.split(",") — tainted base.
+    let s = tainted_string_global(&mut m, entry, p);
+    let comma = load_string(&mut m, entry, ",");
+    let parts = method_call(&mut m, entry, s, "split", vec![comma]);
+    let zero = load_number(&mut m, entry, 0.0);
+    let first = emit(
+        &mut m,
+        entry,
+        Op::LoadPropIdx {
+            object: parts,
+            index: zero,
+        },
+    );
+    print_call(&mut m, entry, vec![first]);
+    // clean.split(p) — tainted separator: CLEAN result.
+    let c_name = intern(&mut m, "c");
+    let clean = load_string(&mut m, entry, "x,y");
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: c_name,
+            value: clean,
+        },
+    );
+    let c = try_get_global(&mut m, entry, "c");
+    let parts2 = method_call(&mut m, entry, c, "split", vec![p]);
+    print_call(&mut m, entry, vec![parts2]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report
+            .hits
+            .iter()
+            .any(|h| h.fact.local_base() == Some(first)),
+        "the piece derives from the base: {:?}",
+        report.hits
+    );
+    assert!(
+        !report
+            .hits
+            .iter()
+            .any(|h| h.fact.local_base() == Some(parts2)),
+        "the separator is control, not content: {:?}",
+        report.hits
+    );
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "String.prototype.split"),
+        "the split summary applied"
+    );
+}
+
+/// join: element taint rides Field([AnyIndex])→Return (the push-tagged
+/// element channel), and the SEPARATOR is inserted verbatim
+/// (Param(0)→Return) — the asymmetry with split is the semantics.
+#[test]
+fn join_element_and_separator_flows() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    // a.push(p); a.join("-") — the element channel.
+    let a = alloc_array(&mut m, entry);
+    method_call(&mut m, entry, a, "push", vec![p]);
+    let dash = load_string(&mut m, entry, "-");
+    let joined = method_call(&mut m, entry, a, "join", vec![dash]);
+    print_call(&mut m, entry, vec![joined]);
+    // clean.join(p) — the separator is inserted verbatim.
+    let b = alloc_array(&mut m, entry);
+    let joined2 = method_call(&mut m, entry, b, "join", vec![p]);
+    print_call(&mut m, entry, vec![joined2]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report
+            .hits
+            .iter()
+            .any(|h| h.fact.local_base() == Some(joined)),
+        "the element taint joined into the string: {:?}",
+        report.hits
+    );
+    assert!(
+        report
+            .hits
+            .iter()
+            .any(|h| h.fact.local_base() == Some(joined2)),
+        "the separator is inserted verbatim: {:?}",
+        report.hits
+    );
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "Array.prototype.join"),
+        "the join summary applied"
+    );
+}
+
+/// parseInt (direct global name): Param(0)→Return — a content-derived
+/// digit parse (the charCodeAt discipline); the radix is control. The
+/// t-P5 exclusive-policy review registers parseInt NON-exclusive (a
+/// pure READ of its operand: killSource would be a real FN for SSA
+/// re-use, and the callee-body kill is vacuous for a native), so the
+/// one tainted param threads all three call sites.
+#[test]
+fn parseint_content_derived_radix_is_control() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let pi = try_get_global(&mut m, entry, "parseInt");
+    let r1 = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: pi,
+            this: None,
+            args: vec![p],
+            kind: CallKind::Dynamic,
+        },
+    );
+    print_call(&mut m, entry, vec![r1]);
+    // parseInt("42", p) — the radix is control: CLEAN.
+    let pi2 = try_get_global(&mut m, entry, "parseInt");
+    let fortytwo = load_string(&mut m, entry, "42");
+    let r2 = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: pi2,
+            this: None,
+            args: vec![fortytwo, p],
+            kind: CallKind::Dynamic,
+        },
+    );
+    print_call(&mut m, entry, vec![r2]);
+    // Number.parseInt(p) — the qualified name resolves the same model.
+    let number = try_get_global(&mut m, entry, "Number");
+    let parseint_leaf = intern(&mut m, "parseInt");
+    let pi3 = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: number,
+            name: parseint_leaf,
+        },
+    );
+    let r3 = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: pi3,
+            this: None,
+            args: vec![p],
+            kind: CallKind::Dynamic,
+        },
+    );
+    print_call(&mut m, entry, vec![r3]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report.hits.iter().any(|h| h.fact.local_base() == Some(r1)),
+        "parseInt(tainted) derives from the string content: {:?}",
+        report.hits
+    );
+    assert!(
+        !report.hits.iter().any(|h| h.fact.local_base() == Some(r2)),
+        "the radix is control, not content: {:?}",
+        report.hits
+    );
+    assert!(
+        report.hits.iter().any(|h| h.fact.local_base() == Some(r3)),
+        "Number.parseInt resolves the same model: {:?}",
+        report.hits
+    );
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "parseInt")
+            && report
+                .summaries_applied
+                .iter()
+                .any(|(_, n)| n == "Number.parseInt"),
+        "both keys applied: {:?}",
+        report.summaries_applied
+    );
+}
+
+/// Object.assign's result identity (t-P5 deepening): the call RESULT
+/// is param 0, so a tainted SOURCE argument flows to the result
+/// directly (Param(1)→Return) — the `let o = Object.assign({}, src)`
+/// shape needs no load through the mutated target.
+#[test]
+fn assign_result_carries_source_taint() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let o = alloc_object(&mut m, entry);
+    let assign = try_get_global(&mut m, entry, "Object");
+    let assign_leaf = intern(&mut m, "assign");
+    let assign_fn = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: assign,
+            name: assign_leaf,
+        },
+    );
+    let r = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: assign_fn,
+            this: None,
+            args: vec![o, p],
+            kind: CallKind::Dynamic,
+        },
+    );
+    print_call(&mut m, entry, vec![r]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report.hits.iter().any(|h| h.fact.local_base() == Some(r)),
+        "the result IS the mutated target — the source taint reaches it: {:?}",
+        report.hits
+    );
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "Object.assign"),
+        "the assign summary applied"
+    );
+}

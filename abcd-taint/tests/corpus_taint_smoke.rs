@@ -124,15 +124,28 @@ fn taint_smoke_all_fixtures() {
     );
     eprintln!("TAINT-PATH-EDGES total={total_edges}");
     eprintln!("TAINT-GAPS resolved={gap_resolved} unresolved={gap_unresolved}");
+    // Top-N of the miss/hit logs to print (default 10 — the README's
+    // quoted table). `ABCD_TAINT_SMOKE_TOPN` widens the cut for
+    // backlog-hygiene work (the miss log IS the summary backlog; the
+    // full tail classifies the non-actionable entries).
+    let topn: usize = std::env::var("ABCD_TAINT_SMOKE_TOPN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
     let mut misses: Vec<(String, usize)> = miss_log.into_iter().collect();
     misses.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     eprintln!(
-        "TAINT-SUMMARY-MISSES top10={:?}",
-        &misses[..misses.len().min(10)]
+        "TAINT-SUMMARY-MISSES top{}={:?}",
+        topn,
+        &misses[..misses.len().min(topn)]
     );
     let mut hits: Vec<(String, usize)> = hit_log.into_iter().collect();
     hits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    eprintln!("TAINT-SUMMARY-HITS top10={:?}", &hits[..hits.len().min(10)]);
+    eprintln!(
+        "TAINT-SUMMARY-HITS top{}={:?}",
+        topn,
+        &hits[..hits.len().min(topn)]
+    );
     eprintln!("SMOKE-DETERMINISM runs=2 identical=true");
     assert!(agg.lookups > 0, "the corpus contains call sites");
 }

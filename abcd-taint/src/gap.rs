@@ -60,7 +60,11 @@
 //! never enters the callback body — an FN the wrapper counter
 //! `gap_sites_unresolved` records (see
 //! [`crate::driver::TaintReport`]). This mirrors FlowDroid: no
-//! implementors found ⇒ the gap flow stays inside the wrapper.
+//! implementors found ⇒ the gap flow stays inside the wrapper. A slot
+//! provably filled with a non-callable CONSTANT (dual-form summaries —
+//! `String.prototype.replace`'s string replacement) is neither
+//! resolved nor unresolved: it is not a callback site at all
+//! ([`definitely_not_callable`], t-P5).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -155,6 +159,56 @@ fn trace_value(
         }
         _ => {}
     }
+}
+
+/// Whether `value` PROVABLY is not callable: every leaf of its def
+/// chain (`Mov`/`Phi` pass through) is a non-function constant
+/// (`LoadConst`/`ValueDef::Const` of string/number/bool/null/undefined/
+/// bigint). Used by the eager gap scan to keep the honest-fallback
+/// counter meaningful: a callback-param slot filled with a CONSTANT
+/// (`String.prototype.replace`'s string-replacement form — the summary
+/// is dual-form, one key) is not an "unresolved callback" — it is not
+/// a callback at all, and counting it would dilute
+/// `gap_sites_unresolved` with sites that have no user code to spawn
+/// into. Conservative: anything not proven constant (global loads,
+/// params, call results — and MethodRef constants, which ARE callable)
+/// answers false.
+pub fn definitely_not_callable(module: &Module, value: ValueId) -> bool {
+    fn walk(module: &Module, value: ValueId, visiting: &mut HashSet<ValueId>) -> bool {
+        if !visiting.insert(value) {
+            return true; // a cycle carries no callable leaf
+        }
+        let Some(v) = module.value(value) else {
+            return false;
+        };
+        match v.def {
+            ValueDef::Const(c) => const_not_callable(module, c),
+            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => false,
+            ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
+                Some(Op::Mov { src }) => walk(module, *src, visiting),
+                Some(Op::Phi { entries }) => entries
+                    .iter()
+                    .all(|(_, incoming)| walk(module, *incoming, visiting)),
+                Some(Op::LoadConst(c)) => const_not_callable(module, *c),
+                _ => false,
+            },
+        }
+    }
+    fn const_not_callable(module: &Module, c: abcd_ir::ConstId) -> bool {
+        matches!(
+            module.consts.get(c),
+            Some(
+                Const::String(_)
+                    | Const::Number(_)
+                    | Const::Bool(_)
+                    | Const::Null
+                    | Const::Undefined
+                    | Const::Hole
+                    | Const::BigInt(_)
+            )
+        )
+    }
+    walk(module, value, &mut HashSet::new())
 }
 
 /// The solver-facing call-graph oracle with the gap edges merged in

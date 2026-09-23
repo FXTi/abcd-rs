@@ -275,7 +275,15 @@ impl<'m> TaintProblem<'m> {
             };
             let funcs = gap::resolve_callback_funcs(self.module, &self.oracle.borrow(), cbv, call);
             if funcs.is_empty() {
-                unresolved += 1;
+                // The not-a-callback refinement (t-P5): a slot filled
+                // with a provably non-callable constant (the dual-form
+                // `String.prototype.replace`'s string replacement) is
+                // not a gap site at all — counting it as unresolved
+                // would dilute the honest-fallback counter with sites
+                // that have no user code to spawn into.
+                if !gap::definitely_not_callable(self.module, cbv) {
+                    unresolved += 1;
+                }
             } else {
                 resolved += 1;
                 edges.insert(call, funcs);
