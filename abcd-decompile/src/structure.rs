@@ -939,6 +939,38 @@ impl<'m> Ctx<'m> {
             .collect()
     }
 
+    /// Push a block's main statements and trailing phi assigns,
+    /// honoring the exception-dispatch rule: for a block whose terminal
+    /// statement is `throw`, the exceptional-edge phi assigns (the
+    /// register flush the dispatching handler observes — N38) must
+    /// execute BEFORE the `throw`; emitted after it they are dead code
+    /// and the handler reads `undefined` temporaries (dream gate:
+    /// upstream/optimizer try families, d-P5). Normal-edge assigns are
+    /// unaffected (a `throw` block has no Normal successors; any found
+    /// are kept in place defensively).
+    fn push_main_phi(out: &mut Vec<SNode>, main: &[Stmt], phi: &[Stmt]) {
+        let last_meaningful = main
+            .iter()
+            .rposition(|s| !matches!(s, Stmt::Unreachable));
+        let throw_at = last_meaningful.filter(|&i| matches!(main[i], Stmt::Throw(_)));
+        if let Some(i) = throw_at
+            && phi
+                .iter()
+                .any(|s| matches!(s, Stmt::PhiAssign { exceptional: true, .. }))
+        {
+            let (xphi, rest): (Vec<Stmt>, Vec<Stmt>) = phi.iter().cloned().partition(|s| {
+                matches!(s, Stmt::PhiAssign { exceptional: true, .. })
+            });
+            Self::push_stmts(out, Self::stmts_leaves(&main[..i]));
+            Self::push_stmts(out, Self::stmts_leaves(&xphi));
+            Self::push_stmts(out, Self::stmts_leaves(&main[i..]));
+            Self::push_stmts(out, Self::stmts_leaves(&rest));
+            return;
+        }
+        Self::push_stmts(out, Self::stmts_leaves(main));
+        Self::push_stmts(out, Self::stmts_leaves(phi));
+    }
+
     fn push_stmts(out: &mut Vec<SNode>, leaves: Vec<Leaf>) {
         if !leaves.is_empty() {
             out.push(SNode::Stmts(leaves));
@@ -1084,8 +1116,7 @@ impl<'m> Ctx<'m> {
             let term = match parts.term {
                 Term::None => {
                     // Terminal (return/throw) or no out-edge.
-                    Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.main));
-                    Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.phi));
+                    Self::push_main_phi(&mut blk, &parts.main, &parts.phi);
                     stop = Some(DupStop::Terminal);
                     None
                 }
@@ -1743,12 +1774,16 @@ impl<'m> Ctx<'m> {
     /// may fall through).
     fn emit_leaf(&mut self, b: BlockId, follow: Follow, out: &mut Vec<SNode>) {
         let parts = self.block_parts(b);
+        if matches!(parts.term, Term::None) {
+            // No control out-edge (return/throw/end): main + phi run
+            // together (the helper moves the exception-dispatch flush
+            // before a terminal `throw`).
+            Self::push_main_phi(out, &parts.main, &parts.phi);
+            return;
+        }
         Self::push_stmts(out, Self::stmts_leaves(&parts.main));
         match parts.term {
-            Term::None => {
-                // Defensive: phi assigns without an out-edge.
-                Self::push_stmts(out, Self::stmts_leaves(&parts.phi));
-            }
+            Term::None => unreachable!("handled above"),
             Term::Branch(dest) => {
                 Self::push_stmts(out, Self::stmts_leaves(&parts.phi));
                 if let Some(act) = self.edge_action(b, dest) {
@@ -2269,8 +2304,7 @@ impl<'m> Ctx<'m> {
         for b in order {
             let parts = self.block_parts(b);
             let mut body = Vec::new();
-            Self::push_stmts(&mut body, Self::stmts_leaves(&parts.main));
-            Self::push_stmts(&mut body, Self::stmts_leaves(&parts.phi));
+            Self::push_main_phi(&mut body, &parts.main, &parts.phi);
             match parts.term {
                 Term::None => {}
                 Term::Branch(dest) => {
@@ -2414,8 +2448,7 @@ impl<'m> Ctx<'m> {
         for b in order {
             let parts = self.block_parts(b);
             let mut body = Vec::new();
-            Self::push_stmts(&mut body, Self::stmts_leaves(&parts.main));
-            Self::push_stmts(&mut body, Self::stmts_leaves(&parts.phi));
+            Self::push_main_phi(&mut body, &parts.main, &parts.phi);
             match parts.term {
                 Term::None => {}
                 Term::Branch(dest) => {

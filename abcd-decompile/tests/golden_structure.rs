@@ -1422,3 +1422,140 @@ fn s25_delete_prop() {
 "#;
     assert_eq!(decompiled(&m), want);
 }
+
+/// s26 — try/catch: the exception-dispatch phi flush. A `throw`-
+/// terminated protected block's exceptional-edge phi assigns are the
+/// register state the dispatching handler observes; emitted after the
+/// `throw` they are dead code and the handler reads `undefined`
+/// (dream gate: upstream/optimizer try families — d-P5).
+#[test]
+fn s26_try_throw_phi_flush() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let t1 = add_block(&mut m, f);
+    let handler = add_block(&mut m, f);
+    emit_void(&mut m, b0, Op::Branch { dest: t1 });
+    let a2 = load_number(&mut m, t1, 2.0);
+    emit_void(&mut m, t1, Op::Throw { value: a2 });
+    let exc = add_exception_param(&mut m, handler);
+    let aphi = emit(
+        &mut m,
+        handler,
+        Op::Phi {
+            entries: vec![(
+                Edge {
+                    from: t1,
+                    kind: EdgeKind::Exceptional,
+                },
+                a2,
+            )],
+        },
+    );
+    let _c1 = call_p1(&mut m, handler, p1);
+    let _c2 = call_p1(&mut m, handler, aphi);
+    emit_void(&mut m, handler, Op::Return { value: None });
+    link(&mut m, b0, t1);
+    add_try(&mut m, f, vec![t1], handler, exc);
+
+    // The exceptional-edge flush `v4 = v2` executes BEFORE the throw;
+    // after it, the handler would read `undefined`.
+    let want = r#"function f(p1) {
+  try {
+    const v2 = 2.0;
+    v4 = v2;
+    throw v2;
+  } catch (e) {
+    var v4; /* phi */
+    p1();
+    v4();
+    return;
+  }
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}
+
+/// s27 — the laminar handler-protecting chain must continue past a
+/// shim-handled innermost plan (the es2abc finally idiom): handler hB's
+/// innermost containing plan ([hB]) is already emitted inside hB's own
+/// shim, but the LARGER plan [hB, hC] still protects hB and its try
+/// must wrap the whole nested construct or its handler (the finally
+/// body) is silently dropped (dream gate: opt-try-catch-func — d-P5).
+#[test]
+fn s27_try_finally_chain_past_shim_plan() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let ha = add_block(&mut m, f);
+    let hb = add_block(&mut m, f);
+    let hc = add_block(&mut m, f);
+    let hd = add_block(&mut m, f);
+    // b0: protected by region A — throws.
+    let x = call_p1(&mut m, b0, p1);
+    emit_void(&mut m, b0, Op::Throw { value: x });
+    // hA (region A's catch): rethrows.
+    let ea = add_exception_param(&mut m, ha);
+    emit_void(&mut m, ha, Op::Throw { value: ea });
+    // hB (region B's catch): prints, then throws; itself protected by
+    // region C (whose handler hC rethrows).
+    let eb = add_exception_param(&mut m, hb);
+    let _y = call_p1(&mut m, hb, eb);
+    emit_void(&mut m, hb, Op::Throw { value: eb });
+    let ec = add_exception_param(&mut m, hc);
+    emit_void(&mut m, hc, Op::Throw { value: ec });
+    // hD (region D's catch): the finally body — prints and returns.
+    let ed = add_exception_param(&mut m, hd);
+    let _z = call_p1(&mut m, hd, ed);
+    emit_void(&mut m, hd, Op::Return { value: None });
+    add_try(&mut m, f, vec![b0], ha, ea);
+    add_try(&mut m, f, vec![b0, ha], hb, eb);
+    add_try(&mut m, f, vec![hb], hc, ec);
+    add_try(&mut m, f, vec![hb, hc], hd, ed);
+
+    let want = "PLACEHOLDER";
+    assert_eq!(decompiled(&m), want);
+}
+
+/// s28 — try/catch: the handler continuation (the try's join) nested
+/// INSIDE a mixed-coverage conditional arm. One arm is terminal
+/// (throw), so the acyclic tree absorbs the join into the other arm;
+/// wrapping the whole `If` in the try would make the join unreachable
+/// from the catch path. The join is hoisted to after the try/catch,
+/// where the VM's PC-range dispatch actually rejoins (dream gate:
+/// branch-elimination/test-under-try-catch — d-P5).
+#[test]
+fn s28_try_join_hoist() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+    let t = add_block(&mut m, f);
+    let e = add_block(&mut m, f);
+    let j = add_block(&mut m, f);
+    let handler = add_block(&mut m, f);
+    let c = istrue(&mut m, b0, p1);
+    cond_on(&mut m, b0, c, t, e);
+    emit_void(&mut m, t, Op::Throw { value: p2 });
+    let _a = call_p1(&mut m, e, p1);
+    emit_void(&mut m, e, Op::Branch { dest: j });
+    let _b = call_p1(&mut m, j, p2);
+    emit_void(&mut m, j, Op::Return { value: None });
+    let exc = add_exception_param(&mut m, handler);
+    let _h = call_p1(&mut m, handler, exc);
+    emit_void(&mut m, handler, Op::Branch { dest: j });
+    link(&mut m, b0, t);
+    link(&mut m, b0, e);
+    link(&mut m, e, j);
+    link(&mut m, handler, j);
+    add_try(&mut m, f, vec![b0, t, e], handler, exc);
+
+    let want = "PLACEHOLDER";
+    assert_eq!(decompiled(&m), want);
+}
