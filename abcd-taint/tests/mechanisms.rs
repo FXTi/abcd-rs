@@ -755,7 +755,7 @@ fn call_and_print(callee: abcd_ir::FuncId, m: &mut abcd_ir::Module) -> abcd_tain
 /// params[1] (the pre-N66 off-by-two). A callee returning its first
 /// formal flows; one returning a hidden slot does not.
 #[test]
-fn call_binding_frame_slot_0xF() {
+fn call_binding_frame_slot_default() {
     // Callee returning its first formal (params[3]): TP.
     let mut m = mk_module();
     let id_fn = add_func_named(&mut m, "identity0xF");
