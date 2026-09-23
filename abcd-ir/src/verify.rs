@@ -912,6 +912,35 @@ fn verify_dominance(
         }
     }
 
+    // N64: Normal-edge reachability from the entry, then drop unreachable
+    // Normal predecessors. Without this, a REACHABLE block with any
+    // unreachable Normal pred loses `entry` from its dominator set
+    // (dom[unreachable] degenerates to a self-singleton that drags the
+    // intersection down) and is wrongly treated as Normal-unreachable —
+    // exempting its uses from the N45 checks below (weakening only, but
+    // wrong). Unreachable blocks themselves stay exempt via the
+    // `dom[i].contains(entry_i)` test either way.
+    let mut nsuccs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, preds) in npreds.iter().enumerate() {
+        for &p in preds {
+            nsuccs[p].push(i);
+        }
+    }
+    let mut normal_reach = vec![false; n];
+    normal_reach[entry_i] = true;
+    let mut queue = VecDeque::from([entry_i]);
+    while let Some(b) = queue.pop_front() {
+        for &s in &nsuccs[b] {
+            if !normal_reach[s] {
+                normal_reach[s] = true;
+                queue.push_back(s);
+            }
+        }
+    }
+    for preds in npreds.iter_mut() {
+        preds.retain(|&p| normal_reach[p]);
+    }
+
     // Iterative dominator sets over the Normal-edge CFG.
     let all: HashSet<usize> = (0..n).collect();
     let mut dom: Vec<HashSet<usize>> = vec![all; n];
@@ -919,7 +948,7 @@ fn verify_dominance(
     loop {
         let mut changed = false;
         for i in 0..n {
-            if i == entry_i {
+            if i == entry_i || !normal_reach[i] {
                 continue;
             }
             let mut new: HashSet<usize> = if npreds[i].is_empty() {
@@ -1373,6 +1402,48 @@ mod tests {
         assert!(
             has_error(&r, |k| matches!(k, VerifyErrorKind::UseNotDominated { .. })),
             "expected dominance error, got: {:?}",
+            r.errors
+        );
+    }
+
+    /// N64 red pin: an unreachable Normal predecessor must NOT exempt a
+    /// reachable block's uses from dominance checks. Same diamond as
+    /// `non_dominated_use_in_diamond_is_error` (b2's use of v is
+    /// non-dominated), plus an unreachable block u with a Normal edge
+    /// into b2 — pre-fix u's degenerate dominator set polluted b2's
+    /// intersection, entry was lost, and b2's uses were exempted.
+    #[test]
+    fn unreachable_normal_pred_does_not_exempt_dominance() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let b1 = add_block(&mut m, f);
+        let b2 = add_block(&mut m, f);
+        link(&mut m, entry, b1);
+        link(&mut m, entry, b2);
+        emit_void(
+            &mut m,
+            entry,
+            Op::CondBranch {
+                cond: p0,
+                true_dest: b1,
+                false_dest: b2,
+            },
+        );
+        let v = load_number(&mut m, b1, 1.0);
+        emit_void(&mut m, b1, Op::Return { value: None });
+        emit_void(&mut m, b2, Op::Return { value: Some(v) });
+        // The N64 polluter: unreachable from the entry, but its
+        // terminator really targets b2 (a Normal pred edge into b2).
+        let u = add_block(&mut m, f);
+        emit_void(&mut m, u, Op::Branch { dest: b2 });
+        link(&mut m, u, b2);
+
+        let r = verify_func(&m, f);
+        assert!(
+            has_error(&r, |k| matches!(k, VerifyErrorKind::UseNotDominated { .. })),
+            "unreachable Normal pred must not exempt b2's non-dominated use, got: {:?}",
             r.errors
         );
     }
