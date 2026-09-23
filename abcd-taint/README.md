@@ -96,7 +96,11 @@ SinkSpec::Call { name }                      // name-matched call sites
 let report = abcd_taint::run_taint(&module, &config);
 ```
 
-The driver builds the on-the-fly call graph + `Rung0AliasOracle`, runs the
+The driver builds the on-the-fly call graph + the rung-selected alias
+oracle (`TaintConfig::alias_rung`: 1 = the demand-driven engine, default;
+0 = the heap-v0 baseline, selectable for A/B), refines the graph once with
+the engine's `points_to` at rung 1 (`CallGraph::refine_with_points_to` —
+param-callee sites bridged to closure bodies), runs the
 IFDS solver (`follow_returns_past_seeds` on; `seed_all_functions` on by default
 — dummy-main coverage, so global-source tagging fires in functions unreachable
 through the 97%-unknown call graph), then collects sink hits: each hit carries
@@ -105,6 +109,47 @@ fact, the seed, a best-effort backward-BFS propagation path over the path-edge
 set (heros anchoring: intraprocedural edges of the seed function are
 zero-anchored; the anchor switches to the callee-entry fact at call boundaries
 — the reconstruction follows those switches), and the applied-summary log.
+
+## The alias oracle ladder (t-P2: rung 1 shipped)
+
+`oracle::Oracle` selects the rung (`TaintConfig::alias_rung`, default 1):
+
+- **Rung 0** (`Rung0AliasOracle`) — local def-chain answers; the trivial
+  baseline and the rung-1 fallback.
+- **Rung 1** (`abcd_analysis::dataflow::alias::Rung1AliasOracle`) — a
+  memoized, demand-driven backward `points_to(base, at)` query fired at
+  heap writes/loads whose base the local def chain cannot resolve (the
+  `computeAliases` analogue, soot-infoflow §4.2). Interprocedural hops
+  carry a per-query call-site context stack — heros §1.6's
+  balanced-parentheses discipline: call results push, params pop through
+  the N66 frame-slot binding (`id(o)` resolves to o's site, and two
+  different call sites of `id` stay apart); an empty-stack param fans
+  out to the recorded callers, marked *unbalanced* (may-direction only —
+  the call-graph bridge consumes those, keying/must-alias never do).
+  Depth cap 8; any imprecise answer falls back to the rung-0 answer
+  (sound floor — never silently wrong).
+
+What rung 1 changes in the flow functions:
+
+- **Store keying** (`store_rule` + the client-side
+  `Oracle::aliases_of_store`): a taint stored through a call-result base
+  is re-keyed by the REFINED site set (probe a4: the store keys to
+  `mkobj`'s site, disjoint from the loaded object's — the rung-0
+  unknown-base wildcard FP dies).
+- **Strong updates**: the must-alias proof may come from an
+  interprocedural def chain (probe a5: `id` returns its formal, the
+  context stack binds it to THIS call's argument — the sanitizing store
+  through the call-result alias becomes strong and kills the taint).
+- **Call-graph refinement** (`CallGraph::refine_with_points_to`, one
+  pass, no fixed point): unknown param-callee sites are bridged through
+  the engine to closure bodies (probe b3: `register(cb) { cb(); }` —
+  the callback body is entered, §5.4's "one engine, two consumers").
+- **Summary endpoints** (`problem::match_flow_endpoint`): a flow's
+  `Param(i)`/`Base` source endpoint now also matches HEAP-keyed facts
+  whose site set positively intersects the endpoint value's sites
+  (probe e5: `Object.assign`'s alias flow picks up the literal's
+  field taint). Not oracle-gated — fires whenever the site resolution
+  knows the argument's sites, locally or through the engine.
 
 ## The top-20 builtins
 
@@ -140,10 +185,13 @@ you what to write next.
 
 ## Tests
 
-- `tests/mechanisms.rs` (14) — one test per mechanism: access-path cutoff,
+- `tests/mechanisms.rs` (22) — one test per mechanism: access-path cutoff,
   exclusive-kill, every fallback-ladder rung, miss counting, ExceptionParam
   catch binding, weak-vs-strong heap update, global round-trip, clears, the
-  base endpoint, negative control, determinism.
+  base endpoint, negative control, determinism, the N66 frame-slot binding
+  (3), and the rung-1 A/B pins (5: store keying through a call result,
+  strong update through a call-result alias, the param-callee bridge,
+  heap-fact summary endpoints, rung-1 determinism).
 - `tests/probes.rs` (5 + 1 ignored) — the §5.5 precision probe suite.
   Five hand-built mini-modules with FP/FN annotations (the P5b
   ladder-trigger baseline): straight-line local; heap store/load same
@@ -168,8 +216,8 @@ probes with KNOWN ground truth, one directory per §5.5 precision axis.
   `TryGetGlobal("TAINT")`, the suite's source). Sinks are `print(...)`.
 - `probes-taint/src/annotations.json` — committed ground truth: per
   probe, per sink line (1-based), `expect` ∈ `tp` (real flow, must hit)
-  / `clean` (no flow, must not hit) / `fp` (no flow, rung 0 hits —
-  EXPECTED false positive) / `fn` (real flow, rung 0 misses — KNOWN
+  / `clean` (no flow, must not hit) / `fp` (no flow, the current rung
+  hits — EXPECTED false positive) / `fn` (real flow, the current rung misses — KNOWN
   false negative); `fp`/`fn` carry `closes_at_rung` (the ladder rung
   that should change the outcome, `null` = structural/wontfix) plus
   optional counter expectations (`summaries_applied`, `named_misses`,
@@ -208,29 +256,49 @@ regression.
 then run the suite — a NEW probe whose expectations are wrong fails
 loudly with the actual hit lines.
 
-**Current table** (rung 0, post-N66 frame-slot binding fix, verbatim):
+**Current table** (rung 1 — the t-P2 on-demand alias engine, verbatim):
 
 ```text
-PROBE-FAMILY a-heap-alias cases=6 tp=3 fp=2 fn=0
-PROBE-FAMILY b-closure-capture cases=3 tp=1 fp=1 fn=1
+PROBE-FAMILY a-heap-alias cases=6 tp=3 fp=0 fn=0
+PROBE-FAMILY b-closure-capture cases=3 tp=2 fp=1 fn=0
 PROBE-FAMILY c-dynamic-dispatch cases=4 tp=2 fp=1 fn=1
 PROBE-FAMILY d-exceptional-flow cases=4 tp=2 fp=0 fn=1
-PROBE-FAMILY e-builtin-summary cases=5 tp=3 fp=0 fn=1
-PROBE-TOTAL tp=11 fp=4 fn=4 violations=0
+PROBE-FAMILY e-builtin-summary cases=5 tp=4 fp=0 fn=0
+PROBE-TOTAL tp=13 fp=2 fn=2 violations=0
 ```
 
-The four known-FNs are the calibration evidence: b3 (callback
-registration — closes at rung 1 via points_to-fed callee resolution),
-c4 (handler table — rung 2), d4 (throw through a global binding — rung
-2), e5 (Object.assign field taint — rung-1 summary modeling). The four
-expected-FPs: a4/a5 (unknown-base may-alias / weak update — rung 1),
-b2 (LexVar function-agnostic merge — rung 1), c2 (user-defined global
-named `print` — structural cost of name-keyed sinks, no rung).
+Rung-1 flips (t-P2; the A/B control is `ABCD_TAINT_RUNG=0`, which
+reproduces a4/a5's FPs and b3's FN — exactly the three engine-dependent
+entries): **a4** fp→clean (store through a call-result base keys to
+`mkobj`'s site, disjoint from the loaded object's), **a5** fp→clean
+(balanced call/return hop proves `p === o` — the sanitizing store
+becomes a strong update), **b3** fn→tp (param-callee bridged to the
+caller's closure body by `refine_with_points_to`), **e5** fn→tp
+(summary alias-flow endpoints match heap facts by positive site
+intersection — NOT oracle-gated: it fires at both rungs for locally
+allocated arguments). **b2** was evaluated honestly and RE-TAGGED rung
+1→2: the LexVar function-agnostic merge is an ENVIRONMENT-identity
+problem (PutLexVar/GetLexVar carry no environment operand — separating
+the two environments needs lexenv-object identity, a heap-model
+extension for the rung-2 whole-program PTA), not a heap-alias problem
+rung 1's value points_to can see. Remaining rung-2 entries: c4 (handler
+table), d4 (throw through a global binding). c2 stays structural
+(name-keyed sinks, no rung).
 
-## Corpus smoke results (v2-P5b, verbatim)
+The rung-0 baseline for comparison (t-P1, verbatim): `tp=11 fp=4 fn=4`
+(families: a 3/2/0, b 1/1/1, c 2/1/1, d 2/0/1, e 3/0/1).
+
+## Corpus smoke results (v2-P5b, verbatim; re-confirmed byte-identical at rung 1, t-P2)
 
 Registered config (source = all `func_main_0` params; sink = `print`; top-20
-builtin summaries; 1149 runtime-passed fixtures; two runs identical):
+builtin summaries; 1149 runtime-passed fixtures; two runs identical). At rung 1
+(t-P2) every number below reproduced EXACTLY (hits, counters, path edges,
+determinism) — attribution: the corpus' 5,517 unknown call sites are global
+loads, not param-passed closures, so the points_to bridge found ZERO sites to
+bridge (measured over all 1149 fixtures), and no tainted store/load base on the
+smoke's paths needed the interprocedural query. The engine's cost on the corpus
+is its memoized queries at locally-unresolvable bases only; the probes are
+where the precision delta lives:
 
 ```text
 SMOKE fixtures=1149 fixtures_with_flows=0
@@ -259,17 +327,21 @@ Counters classify only call sites the solver actually processed (a site with
 no incoming fact edge — dead code, or a function body unreachable even by the
 zero fact — is never classified).
 
-## Known imprecisions (rung-0 heap) and the ladder
+## Known imprecisions and the ladder (rung 1 shipped, t-P2)
 
-- **Unknown-base heap matching is conservative**: a heap fact with an empty
-  site set (store through a param/global/call-result base) may-alias ANY load
-  whose base is unknown — and vice versa. Sound-leaning; FP-prone. Rung 1's
-  memoized backward `points_to` query refines exactly this (the
-  `AliasOracle::points_to` seam).
+- **Unknown-base heap matching is conservative** — PARTIALLY CLOSED at
+  rung 1: stores/loads whose base the engine resolves interprocedurally
+  (call results, call-through-param chains) are keyed/matched by the
+  refined site set (probes a4/a5). Bases the query cannot complete
+  (globals, loads, unbalanced fan-out) keep the rung-0 wildcard.
 - **Local-fact aliasing requires positive evidence** (same value or
-  non-empty intersecting site sets) — taint on `y.f` where `y` is an
-  unproven alias of the loaded object is NOT picked up (FN by design; the
-  param-everywhere FP explosion is worse). Rung 1 closes this.
+  non-empty intersecting site sets) — the rule stands; rung 1 sharpens
+  the site sets it compares (the engine's interprocedural answers when
+  precise), but unknown-on-either-side is still not evidence.
+- **LexVar keys are function-agnostic** — the b2 cross-function merge is
+  an environment-identity problem, re-tagged rung 2 at t-P2 (lexenv
+  objects need alloc-site identity; rung 1's value points_to cannot see
+  it).
 - **Closure captures**: a tainted capture marks the closure value (empty
   chain), but function-object taint is dropped at the call boundary — capture
   taint does not enter the body (FN; the mini-gap `[AnyIndex]` channel covers
@@ -285,8 +357,8 @@ zero fact — is never classified).
   detour through the callee exit); it widens to any-fact predecessors at
   transforming instructions.
 
-Ladder-climbing triggers are evidence-gated (analysis-strategy §5.5): the
-probe suite's numbers are the baseline — rung 0→1 when probe families (heap
-alias / captures) show structurally unclosable FN or smoke shows unacceptable
-taint loss at heap writes; rung 1→2 when FP concentrates at dispatch (probe
-family 3's axis).
+Ladder-climbing triggers are evidence-gated (analysis-strategy §5.5): rung
+0→1 FIRED and shipped (t-P2, this README's rung-1 table); rung 1→2 fires
+when FP concentrates at dispatch (probe family c's axis) — b2's re-tag
+(environment identity) and c4/d4 (call-graph-layer FNs) are the current
+rung-2 evidence pile.
