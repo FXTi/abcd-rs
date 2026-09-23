@@ -1352,42 +1352,17 @@ impl<'m> Ctx<'m> {
         // dropped (dream gate: local/exception-finally). Laminar plans
         // form a chain; walk it outward.
         let mut protected_handlers = handlers.clone();
-        let mut current = p;
+        let mut visited: HashSet<usize> = [p].into_iter().collect();
         let mut depth = 0usize;
         loop {
             depth += 1;
             if depth > self.f().plans.len() + 1 {
                 break; // defensive: the laminar chain is finite
             }
-            // The innermost outer plan protecting any handler. A plan
-            // whose protected set lies INSIDE the handler's own sub-CFG
-            // is already wrapped by the handler shim (nested try in the
-            // catch body) — wrapping it again outside would duplicate
-            // the catch (correct but redundant); skip those.
-            let mut outer: Option<usize> = None;
-            for h in &protected_handlers {
-                if let Some(q) = self.f_mut().plan_of(*h)
-                    && q != current
-                {
-                    let handled_inside = self.shim_plans.get(h).is_some_and(|plans| {
-                        plans
-                            .iter()
-                            .any(|pl| pl.protected == self.f().plans[q].protected)
-                    });
-                    if handled_inside {
-                        continue;
-                    }
-                    if outer.is_none_or(|o| {
-                        self.f().plans[q].protected.len() < self.f().plans[o].protected.len()
-                    }) {
-                        outer = Some(q);
-                    }
-                }
-            }
-            let Some(q) = outer else {
+            let Some(q) = self.outer_wrap_plan(&visited, &protected_handlers) else {
                 break;
             };
-            current = q;
+            visited.insert(q);
             let (qregion, qhandlers) = {
                 let plan = &self.f().plans[q];
                 (plan.region, plan.handlers.clone())
@@ -1419,6 +1394,57 @@ impl<'m> Ctx<'m> {
             protected_handlers = qhandlers;
         }
         out.push(node);
+    }
+
+    /// The next outer plan whose try must wrap a construct whose
+    /// handlers are `protected_handlers` (the es2abc finally idiom):
+    /// the smallest plan — not already wrapped in this chain
+    /// (`visited`) and not already emitted inside the handler's own
+    /// shim — whose protected set contains a handler. This deliberately
+    /// keeps scanning PAST shim-handled plans: the innermost plan
+    /// containing a handler is often that handler's own nested try
+    /// (already emitted by the shim), while a LARGER plan (the outer
+    /// finally) still protects the handler and must wrap here, or its
+    /// handler body is silently dropped (dream gate:
+    /// opt-try-catch-func/test-nested-try-catch, d-P5).
+    fn outer_wrap_plan(
+        &self,
+        visited: &HashSet<usize>,
+        protected_handlers: &[BlockId],
+    ) -> Option<usize> {
+        let f = self.f();
+        let mut outer: Option<usize> = None;
+        for h in protected_handlers {
+            // plan_order is ascending by protected-set size: the first
+            // eligible hit for this handler is its smallest outer plan.
+            let mut cand: Option<usize> = None;
+            for &q in &f.plan_order {
+                if visited.contains(&q) || !f.plans[q].protected.contains(h) {
+                    continue;
+                }
+                // A plan whose protected set lies INSIDE the handler's
+                // own sub-CFG is already wrapped by the handler shim
+                // (nested try in the catch body) — wrapping it again
+                // outside would duplicate the catch (correct but
+                // redundant); skip those, but keep scanning outward.
+                let handled_inside = self.shim_plans.get(h).is_some_and(|plans| {
+                    plans
+                        .iter()
+                        .any(|pl| pl.protected == f.plans[q].protected)
+                });
+                if handled_inside {
+                    continue;
+                }
+                cand = Some(q);
+                break;
+            }
+            if let Some(q) = cand
+                && outer.is_none_or(|o| f.plans[q].protected.len() < f.plans[o].protected.len())
+            {
+                outer = Some(q);
+            }
+        }
+        outer
     }
 
     /// A mixed-coverage node: descend (or wrap whole when the head is

@@ -1517,7 +1517,27 @@ fn s27_try_finally_chain_past_shim_plan() {
     add_try(&mut m, f, vec![hb], hc, ec);
     add_try(&mut m, f, vec![hb, hc], hd, ed);
 
-    let want = "PLACEHOLDER";
+    // Region 3's try (the outer finally) wraps the whole chain; its
+    // handler body (`e$3(); return;`) is no longer dropped.
+    let want = r#"function f(p1) {
+  /* try region 3: handler-protecting outer try (finally idiom) — wrapped around region 0's try/catch (wrapper #1) */
+  try {
+    /* try region 1: handler-protecting outer try (finally idiom) — wrapped around region 0's try/catch (wrapper #1) */
+    try {
+      /* rethrow-only try/catch dissolved (semantic no-op) */
+      const v2 = p1();
+      throw v2;
+    } catch (e$1) {
+      /* rethrow-only try/catch dissolved (semantic no-op) */
+      e$1();
+      throw e$1;
+    }
+  } catch (e$3) {
+    e$3();
+    return;
+  }
+}
+"#;
     assert_eq!(decompiled(&m), want);
 }
 
