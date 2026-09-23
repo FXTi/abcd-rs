@@ -94,15 +94,15 @@ fn param_binding(module: &Module, callee: FuncId) -> ParamBinding {
     let Some(fd) = module.func(callee) else {
         return ParamBinding::OverApproxAll;
     };
-    let Some(slots) = abcd_analysis::frame::FrameSlots::of(module, callee) else {
+    let Some(slots) = abcd_analysis::frame::frame_slots_of(module, callee) else {
         return ParamBinding::OverApproxAll;
     };
-    if fd.params.len() < slots.implicit_slots() {
+    if fd.params.len() < slots.implicit_count() {
         return ParamBinding::OverApproxAll;
     }
     ParamBinding::Precise {
-        this_slot: slots.this_slot(),
-        formal_base: slots.implicit_slots(),
+        this_slot: slots.this_index(),
+        formal_base: slots.implicit_count(),
     }
 }
 

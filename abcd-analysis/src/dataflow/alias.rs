@@ -83,7 +83,7 @@ use super::heap::{
 };
 use super::ifds::CallGraphOracle;
 use crate::callgraph::{CallGraph, CallTargets};
-use crate::frame::FrameSlots;
+use crate::frame::frame_slots_of;
 
 /// Default interprocedural depth cap: the maximum number of call-result
 /// hops the context stack may hold. Generous for closure-heavy ArkTS
@@ -463,7 +463,7 @@ impl<'m> Rung1AliasOracle<'m> {
         call: InstId,
         ctx: &mut Vec<InstId>,
     ) -> QueryAnswer {
-        let Some(slots) = FrameSlots::of(self.module, func) else {
+        let Some(slots) = frame_slots_of(self.module, func) else {
             // No reliable slot model: the conservative answer (taint's
             // ParamBinding::OverApproxAll analogue) is "could be
             // anything" for a points-to query.
@@ -490,13 +490,13 @@ impl<'m> Rung1AliasOracle<'m> {
         let Some(caller) = self.func_of_inst(call) else {
             return QueryAnswer::unknown();
         };
-        let implicit = slots.implicit_slots();
+        let implicit = slots.implicit_count();
         if pos < implicit {
             // Implicit slots, ordered func, newTarget, this.
             if slots.func && pos == 0 {
                 return self.resolve(*callee, caller, ctx);
             }
-            if slots.this_slot() == Some(pos) {
+            if slots.this_index() == Some(pos) {
                 return match this {
                     Some(t) => self.resolve(*t, caller, ctx),
                     // No explicit receiver: `this` is undefined at the
