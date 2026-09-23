@@ -116,7 +116,7 @@ pub fn this_param_index(module: &Module, func: &FunctionData) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::module::{Annotation, ClassData, FunctionKind, Modifiers, SourceLang};
-    use crate::{ClassId, Const, FuncId, Sym};
+    use crate::{ClassId, Const, FuncId};
 
     fn bare_module() -> Module {
         Module::new()

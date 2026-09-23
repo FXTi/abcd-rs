@@ -237,6 +237,7 @@ fn pipeline_keeps_observable_v02_ops() {
                 heritage: None,
                 members: b.konst(Const::ArrayLiteral(vec![])),
                 count: 0,
+                member_attrs: Vec::new(),
             }),
         ),
     ];
