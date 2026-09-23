@@ -44,6 +44,7 @@
 
 #![deny(missing_docs)]
 
+pub mod classfold;
 pub mod consts;
 pub mod dump;
 pub mod emit;

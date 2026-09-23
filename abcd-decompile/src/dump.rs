@@ -412,6 +412,7 @@ pub fn dump_expr(e: &Expr) -> String {
             name,
             heritage,
             members,
+            member_attrs: _,
             sendable,
         } => {
             let ext = heritage

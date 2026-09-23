@@ -233,6 +233,11 @@ pub enum Expr {
         heritage: Option<Box<Expr>>,
         /// The member-buffer constant.
         members: ConstId,
+        /// Per-member attribute payloads decoded from the buffer (B2 —
+        /// [`abcd_ir::op::MemberAttrs`]), parallel to the buffer's
+        /// `MethodRef` sequence; empty = attributes unknown
+        /// (conservative instance-placement fallback at emission).
+        member_attrs: Vec<abcd_ir::op::MemberAttrs>,
         /// `true` for `DefineSendableClass` — fitness class H (no JS
         /// surface syntax); emitted as `class` + `/* sendable */`
         /// annotation at best. Reported as a hard-7 fallback.

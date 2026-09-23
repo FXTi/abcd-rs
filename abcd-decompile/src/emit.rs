@@ -713,6 +713,7 @@ impl<'m> Emitter<'m> {
                     name: class_name,
                     heritage,
                     members,
+                    member_attrs,
                     sendable,
                 } = value
                 {
@@ -720,13 +721,32 @@ impl<'m> Emitter<'m> {
                     let ctor = *ctor;
                     let heritage = heritage.clone();
                     let members = *members;
+                    let member_attrs = member_attrs.clone();
                     let sendable = *sendable;
                     if hoisted {
                         self.emit_class_assign(
-                            &pad, indent, name, ctor, heritage, members, sendable, out,
+                            &pad,
+                            indent,
+                            name,
+                            ctor,
+                            heritage,
+                            members,
+                            &member_attrs,
+                            sendable,
+                            out,
                         );
                     } else {
-                        self.emit_class(&pad, indent, name, ctor, heritage, members, sendable, out);
+                        self.emit_class(
+                            &pad,
+                            indent,
+                            name,
+                            ctor,
+                            heritage,
+                            members,
+                            &member_attrs,
+                            sendable,
+                            out,
+                        );
                     }
                     return;
                 }
@@ -971,10 +991,21 @@ impl<'m> Emitter<'m> {
         ctor: FuncId,
         heritage: Option<Box<Expr>>,
         members: abcd_ir::ConstId,
+        member_attrs: &[abcd_ir::op::MemberAttrs],
         sendable: bool,
         out: &mut String,
     ) {
-        self.emit_class(pad, indent, name, ctor, heritage, members, sendable, out);
+        self.emit_class(
+            pad,
+            indent,
+            name,
+            ctor,
+            heritage,
+            members,
+            member_attrs,
+            sendable,
+            out,
+        );
     }
 
     /// `class Name extends H { constructor(…) {…} …methods… }`.
@@ -986,6 +1017,7 @@ impl<'m> Emitter<'m> {
         ctor: FuncId,
         heritage: Option<Box<Expr>>,
         members: abcd_ir::ConstId,
+        member_attrs: &[abcd_ir::op::MemberAttrs],
         sendable: bool,
         out: &mut String,
     ) {
@@ -1038,19 +1070,51 @@ impl<'m> Emitter<'m> {
                 }
             }
         }
+        // B2 class-field fold: the instance initializer's constant
+        // private definitions print as `#name = <const>;` declarations
+        // (the ctor's initializer call is elided at recover). Folded
+        // names are EXCLUDED from the bare `#name;` set — a duplicate
+        // private declaration would be a SyntaxError.
+        let fold = crate::classfold::plan(self.module, ctor);
+        let folded_names: BTreeSet<&str> = fold
+            .iter()
+            .flat_map(|f| f.fields.iter().map(|(n, _)| n.as_str()))
+            .collect();
         for name in &priv_names {
+            if folded_names.contains(name.as_str()) {
+                continue;
+            }
             out.push_str(&format!("{pad}  #{};\n", sanitize(name)));
         }
-        // The member buffer: flat [name, MethodRef, …metadata…].
+        if let Some(fold) = &fold {
+            for (fname, cid) in &fold.fields {
+                let value = lit_of(self.module, *cid)
+                    .map(|l| self.render_lit_js(&l))
+                    .unwrap_or_else(|| "undefined /* non-literal field value */".to_string());
+                out.push_str(&format!(
+                    "{pad}  #{} = {}; /* es2abc instance-initializer fold */\n",
+                    sanitize(fname),
+                    value
+                ));
+            }
+        }
+        // The member buffer: flat [name, MethodRef, …metadata…]; the
+        // B2 member_attrs projection (parallel to the MethodRef
+        // sequence) carries placement (static/instance) and the
+        // buffer-tag kind — empty = unknown (conservative instance
+        // placement, FunctionData kind).
         if let Some(Lit::Array(items)) = lit_of(self.module, members) {
             let mut pending: Option<String> = None;
             let mut skipped = 0usize;
+            let mut member_idx = 0usize;
             for item in &items {
                 match item {
                     Lit::String(s) => pending = Some(s.clone()),
                     Lit::MethodRef(f) => {
                         let mname = pending.take().unwrap_or_else(|| format!("m${}", f.index()));
-                        self.emit_class_method(pad, indent, &mname, *f, out);
+                        let attrs = member_attrs.get(member_idx);
+                        member_idx += 1;
+                        self.emit_class_method(pad, indent, &mname, *f, attrs, out);
                     }
                     _ => skipped += 1,
                 }
@@ -1075,14 +1139,27 @@ impl<'m> Emitter<'m> {
         indent: usize,
         name: &str,
         f: FuncId,
+        attrs: Option<&abcd_ir::op::MemberAttrs>,
         out: &mut String,
     ) {
         self.stats.class_methods += 1;
-        let kind = self
-            .module
-            .func(f)
-            .map(|d| d.kind)
-            .unwrap_or(FunctionKind::Function);
+        // B2: the buffer's own attribute payloads win when known —
+        // placement (static vs prototype) is ONLY carried by the
+        // buffer's trailing nonStaticNum count, and the callable kind
+        // by the entry's method-kind tag; the conservative fallback
+        // (attrs unknown) is instance placement + the lifted
+        // FunctionData kind (the pre-B2 behavior).
+        let kind = attrs.map(|a| a.kind.clone()).unwrap_or_else(|| {
+            self.module
+                .func(f)
+                .map(|d| d.kind)
+                .unwrap_or(FunctionKind::Function)
+        });
+        let placement = if attrs.is_some_and(|a| a.is_static) {
+            "static "
+        } else {
+            ""
+        };
         let prefix = method_prefix(kind);
         let key = if is_legal_ident(name) {
             name.to_string()
@@ -1092,7 +1169,9 @@ impl<'m> Emitter<'m> {
         let mut body = String::new();
         let rf = self.emit_function_body(f, indent + 2, &mut body);
         let params = rf.params[rf.hidden_params.min(rf.params.len())..].join(", ");
-        out.push_str(&format!("{pad}  {prefix}{key}({params}) {{\n{body}"));
+        out.push_str(&format!(
+            "{pad}  {placement}{prefix}{key}({params}) {{\n{body}"
+        ));
         out.push_str(&format!("{pad}  }}\n"));
     }
 
@@ -1318,11 +1397,18 @@ impl<'m> Emitter<'m> {
                 name,
                 heritage,
                 members,
+                member_attrs,
                 sendable,
             } => {
                 // Class expression form.
-                let (ctor, name, heritage, members, sendable) =
-                    (*ctor, name.clone(), heritage.clone(), *members, *sendable);
+                let (ctor, name, heritage, members, member_attrs, sendable) = (
+                    *ctor,
+                    name.clone(),
+                    heritage.clone(),
+                    *members,
+                    member_attrs.clone(),
+                    *sendable,
+                );
                 let mut s = String::new();
                 self.emit_class(
                     "",
@@ -1331,6 +1417,7 @@ impl<'m> Emitter<'m> {
                     ctor,
                     heritage,
                     members,
+                    &member_attrs,
                     sendable,
                     &mut s,
                 );

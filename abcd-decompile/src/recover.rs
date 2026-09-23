@@ -465,6 +465,9 @@ struct Recover<'m> {
     inst_pos: HashMap<InstId, (BlockId, usize)>,
     /// block → prefix sums of observable-effect instruction counts.
     barriers: HashMap<BlockId, Vec<u32>>,
+    /// B2: the class-field fold plan for THIS function when it is the
+    /// ctor of a `DefineClass` (lazily computed on the first `Call`).
+    class_fold: Option<Option<crate::classfold::ClassFieldFold>>,
     histogram: BTreeMap<&'static str, OpStat>,
 }
 
@@ -485,6 +488,7 @@ impl<'m> Recover<'m> {
             handler_binds: HashMap::new(),
             inst_pos: HashMap::new(),
             barriers: HashMap::new(),
+            class_fold: None,
             histogram: BTreeMap::new(),
         };
         r.precompute_positions();
@@ -873,6 +877,21 @@ impl<'m> Recover<'m> {
             return;
         }
 
+        // 1b. B2 class-field fold: the ctor's instance-initializer call
+        // is elided when the fold moved its constant private-field
+        // definitions into class-field declarations (emit prints
+        // `#name = <const>;` — JS class fields initialize at
+        // construction, when the ctor ran the initializer).
+        if matches!(op, Op::Call { .. }) && self.folded_init_call(iid) {
+            self.record(op, Outcome::Elided);
+            out.push(Stmt::Elided {
+                op: op_name(op),
+                reason: "instance-initializer call — es2abc class-field lowering reversed (constant #field definitions are class-field declarations)",
+                loc,
+            });
+            return;
+        }
+
         // 2. Phi → temporary + per-predecessor assignments.
         if let Op::Phi { entries } = op {
             self.record(op, Outcome::Expressed);
@@ -947,6 +966,15 @@ impl<'m> Recover<'m> {
 
     fn inst_result(&self, iid: InstId) -> Option<ValueId> {
         self.module.inst(iid).and_then(|i| i.result)
+    }
+
+    /// B2: `iid` is the ctor's instance-initializer call, folded into
+    /// class-field declarations (lazy [`crate::classfold::plan`]).
+    fn folded_init_call(&mut self, iid: InstId) -> bool {
+        self.class_fold
+            .get_or_insert_with(|| crate::classfold::plan(self.module, self.func))
+            .as_ref()
+            .is_some_and(|fold| fold.call_insts.contains(&iid))
     }
 
     /// Statement-level ops (scope markers, control, throws, stores).
@@ -1600,14 +1628,16 @@ impl<'m> Recover<'m> {
                 ctor,
                 heritage,
                 members,
+                member_attrs,
                 ..
-            } => self.class_node(*ctor, *heritage, *members, false),
+            } => self.class_node(*ctor, *heritage, *members, member_attrs.clone(), false),
             Op::DefineSendableClass {
                 ctor,
                 heritage,
                 members,
+                member_attrs,
                 ..
-            } => self.class_node(*ctor, *heritage, *members, true),
+            } => self.class_node(*ctor, *heritage, *members, member_attrs.clone(), true),
             Op::LoadPrivate { obj, .. } => Expr::PrivateLoad {
                 object: Box::new(self.expr_of(*obj)),
                 name: self
@@ -1760,6 +1790,7 @@ impl<'m> Recover<'m> {
         ctor: FuncId,
         heritage: Option<ValueId>,
         members: ConstId,
+        member_attrs: Vec<abcd_ir::op::MemberAttrs>,
         sendable: bool,
     ) -> Expr {
         let name = self
@@ -1772,6 +1803,7 @@ impl<'m> Recover<'m> {
             name,
             heritage: heritage.map(|h| Box::new(self.expr_of(h))),
             members,
+            member_attrs,
             sendable,
         }
     }

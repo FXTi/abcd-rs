@@ -508,10 +508,12 @@ pub(crate) fn lift_method<'f>(
     }
 
     // Entry seeding (B5 + the ABI top-slot convention): arguments arrive
-    // in `Reg(num_vregs + i)`; bind each to a fresh Param value. T4:
-    // `params[0]` is the `this` binding for non-static kinds — the
-    // code-header num_args already includes `this` for instance
-    // methods, so the seeding order realizes the convention.
+    // in `Reg(num_vregs + i)`; bind each to a fresh Param value.
+    // Frame-slot model (T4/§5.3, canonical — abcd_ir::frame): the
+    // leading params are the vendored implicit frame slots
+    // `[func][new.target][this]` (per the callee's
+    // `L_ESCallTypeAnnotation;` callType bits; absent → the `0xF`
+    // default, the es2abc shape), then the source formals.
     for i in 0..param_count {
         let ty = method
             .arg_types
@@ -524,11 +526,14 @@ pub(crate) fn lift_method<'f>(
         fd.params.push(val);
     }
 
-    // T4: `params[0]` is the `this` binding for non-static kinds —
-    // `ldthis` and the this-by-* family resolve to it directly.
-    if !method.access_flags.contains(abcd_file::AccessFlags::STATIC) && !fd.params.is_empty() {
-        fx.this_param = Some(fd.params[0]);
-    }
+    // N67: `ldthis` reads the frame's thisObj (vendor
+    // `EcmaInterpreter::GetThis`, interpreter-inl.cpp:7907-7912), bound
+    // from the this-role frame slot — `params[2]` under the `0xF`
+    // default, annotation-aware via abcd_ir::frame::this_param_index;
+    // `None` (→ undefined) for shapes the model can't cover
+    // (documented conservative fallback). NOT `params[0]` — the FUNC
+    // slot under `0xF` (the superseded convention, N66).
+    fx.this_param = abcd_ir::frame::this_param_index(&fx.lf.module, &fd).map(|i| fd.params[i]);
 
     // The entry block has no predecessors: seal it immediately.
     fx.ssa.seal_block(entry_block, &mut fx.lf.module);

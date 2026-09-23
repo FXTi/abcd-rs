@@ -198,13 +198,16 @@ fn generate() -> usize {
 /// the recorded acceptance floor. Docker is LOCAL-only
 /// (scripts/remote-test.sh).
 ///
-/// The histogram at d-P5 (2026-09-23): pass 1023 / decompile-bug 36 /
+/// The histogram at d-P6 (2026-09-24): pass 1041 / decompile-bug 18 /
 /// es2abc-cant 0 / expected-fallback 54 / fixture-unsupported 36 (of
-/// 1149). The d-P4 floor was 951; d-P5 fixed the full 72-fixture
-/// optimizer try-projection family (RC1 join hoist + generalized
-/// rejoin, RC2 exception-edge phi flush, RC3 finally-chain walk, the
-/// shim region closure, the loop-exit ordering trio). The floor guards
-/// regressions; raise it when the buckets improve.
+/// 1149). The d-P5 floor was 1023; d-P6 fixed the 18-fixture class
+/// member-buffer family (B2 — MemberAttrs: static placement from the
+/// buffer's trailing nonStaticNum + the es2abc instance-initializer
+/// class-field fold; private-property-in ×15 + private-field ×3), and
+/// N67 moved `ldthis` to the vendored this-role frame slot (latent,
+/// corpus-absent). The remaining 18 decompile-bugs are the
+/// for-update-continue-1 family. The floor guards regressions; raise
+/// it when the buckets improve.
 #[test]
 #[ignore = "requires exported GHCR corpus, python3, and LOCAL docker"]
 fn dream_gate_oracle() {
@@ -238,8 +241,8 @@ fn dream_gate_oracle() {
         report.fixture_unsupported
     );
     assert!(
-        report.pass >= 1023,
-        "dream gate regression: pass {} < 1023 (the d-P5 acceptance floor)",
+        report.pass >= 1041,
+        "dream gate regression: pass {} < 1041 (the d-P6 acceptance floor)",
         report.pass
     );
 }

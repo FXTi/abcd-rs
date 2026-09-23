@@ -129,7 +129,7 @@
 
 use std::collections::HashMap;
 
-use abcd_file::{AccessFlags, Method, MethodBody};
+use abcd_file::{Method, MethodBody};
 use abcd_ir::{
     BinOp, BlockId, CallKind, CmpOp, Const, ConstId, FuncId, InstId, Loc, Op, SuperCheck, SuperKey,
     Sym, Ty, UnOp, ValueDef, ValueId,
@@ -190,11 +190,12 @@ pub struct FnLift<'l, 'f> {
     /// Emitted inst → its source bytecode index (derived insts share
     /// their parent bytecode's position; phis have none).
     pub inst_pc: HashMap<InstId, u32>,
-    /// `params[0]` for non-static kinds (the `this` value, T4); `None`
-    /// for static/zero-parameter frames (set after entry seeding).
+    /// The this-role frame slot's value (N67 — the vendored frame-slot
+    /// model, [`abcd_ir::frame`]): `params[2]` under the `0xF` default,
+    /// annotation-aware via the callee's `L_ESCallTypeAnnotation;`;
+    /// `None` when the model covers no this slot (set after entry
+    /// seeding). NOT `params[0]` — that is the FUNC slot under `0xF`.
     pub this_param: Option<ValueId>,
-    /// The method is static (no `this` binding).
-    is_static: bool,
 }
 
 impl<'l, 'f> FnLift<'l, 'f> {
@@ -221,7 +222,6 @@ impl<'l, 'f> FnLift<'l, 'f> {
         }
         line_table.sort_unstable();
         col_table.sort_unstable();
-        let is_static = method.access_flags.contains(AccessFlags::STATIC);
         Self {
             lf,
             method,
@@ -234,7 +234,6 @@ impl<'l, 'f> FnLift<'l, 'f> {
             col_table,
             inst_pc: HashMap::new(),
             this_param: None,
-            is_static,
         }
     }
 
@@ -324,14 +323,19 @@ impl<'l, 'f> FnLift<'l, 'f> {
             .collect()
     }
 
-    /// The `this` value: `params[0]` for non-static kinds (T4), a
-    /// materialized `undefined` constant for static/zero-param frames
-    /// (documented — vendor `ldthis` yields undefined there).
+    /// The `this` value (N67): the this-role frame slot per the vendored
+    /// frame-slot model ([`abcd_ir::frame`] — design/ir-v0.2.md T4/§5.3),
+    /// resolved at entry seeding into [`FnLift::this_param`]. `ldthis`
+    /// reads the frame's `thisObj`
+    /// (`EcmaInterpreter::GetThis`, interpreter-inl.cpp:7907-7912), which
+    /// the caller bound from the this-role slot — `params[2]` under the
+    /// `0xF` default, NOT `params[0]` (the FUNC slot). When the model
+    /// covers no this slot (callType without the this bit, or params
+    /// fewer than the implicit slots — the conservative documented
+    /// fallback), a materialized `undefined` constant.
     pub fn this_value(&mut self, block: BlockId, pc: Option<u32>) -> ValueId {
-        if !self.is_static {
-            if let Some(v) = self.this_param {
-                return v;
-            }
+        if let Some(v) = self.this_param {
+            return v;
         }
         let c = self.lf.const_scalar(Const::Undefined);
         self.emit_val(block, Op::LoadConst(c), pc)
