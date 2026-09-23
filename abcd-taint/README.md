@@ -148,13 +148,23 @@ FlowDroid's "no implementors found" case). The wrapper counters
 (probe e15; the smoke prints `TAINT-GAPS`).
 
 **Registered drivers** (the canonical gap trio, prototype-path keyed,
-non-exclusive by the prototype-path discipline):
+non-exclusive by the prototype-path discipline; plus t-P5's dual-form
+`String.prototype.replace`):
 
 | Summary | enter rules | return channel |
 |---|---|---|
 | `Array.prototype.forEach` | Base / `Field([AnyIndex])` → cb formal 0 | `None` (undefined result) |
 | `Array.prototype.map` | same | cb return → result's `[AnyIndex]` elements |
 | `Array.prototype.filter` | same (the predicate body receives the element) | `None`; result elements ← base elements STATICALLY (`Field([AnyIndex])` → `ReturnField([AnyIndex])`, plus the whole-array Base fallback) |
+| `String.prototype.replace` (t-P5) | Base → cb formal 0 (the match; the group/offset/string formals are pattern-arity-dependent, unmodeled) | cb return → result string (the EMPTY chain — the result is a string, not an array) |
+
+**The not-a-callback refinement (t-P5)**: a dual-form summary's
+callback slot filled with a provably non-callable CONSTANT
+(`replace`'s string replacement) is not a gap site at all — the eager
+scan's `gap::definitely_not_callable` check keeps it out of
+`gap_sites_unresolved`, so the honest-fallback counter counts only
+slots that MAY hold user code. A param/global/call-result slot still
+counts as unresolved when it resolves to no body (the honest FN).
 
 ## The fallback ladder (reader D, summaries.md §4)
 
@@ -198,7 +208,17 @@ flow-insensitive union of the module's `StoreGlobal(name, v)` values'
 families — the same discipline as the fact model's never-killed `Global`
 base, always a may-answer), and `GetIterator` over a builtin
 array/string iterable ⇒ `Iterator.prototype` (the for-of protocol
-object). Multi-site receivers merge by family UNION; an empty/unknown
+object). t-P5 added a fifth source: **constructor results** —
+`new <global>(...)` whose callee def chain bottoms out at a KNOWN
+builtin constructor name (`Array`/`Object`/`RegExp`/`String`/`Number`/
+`Boolean`) types the result with that family. This is the arm the
+corpus' regexp literals need: es2abc lowers `/a+/g` to an explicit
+`new RegExp("a+", "g")` call in ALL six corpus versions (the
+`createregexpwithliteral` → `AllocRegExp` lift never fires here), so
+`r.test(...)` (regexp.js ×18) was a call-result receiver the alloc-kind
+arm could not see. Constructor bindings are mutable globals (a shadowed
+`RegExp` defeats the name match), so the answer is marked imprecise —
+the same may-direction discipline as global-store provenance. Multi-site receivers merge by family UNION; an empty/unknown
 answer produces NO candidate (never invent). t-P4 added the
 **may-direction site arm**: receivers the keying-precise `site_info_at`
 cannot type but the engine's RESOLUTION-complete caller fan-out can (a
@@ -227,7 +247,17 @@ e10 pins this against the identity heuristic), `Iterator.prototype.next`
 transparently carrying the source's taint, the `[AnyIndex]` "elements
 of" tag included; `done` is a fresh boolean). Registered (t-P4): the
 gap trio `Array.prototype.forEach` / `.map` / `.filter` (the table in
-the gap section above). Supporting machinery: the
+the gap section above). Registered (t-P5, the miss-log-driven second
+tier): `String.prototype.replace` (the dual form — see the gap table),
+`RegExp.prototype.test` (a pure match verdict — NO flows; the fresh
+boolean carries nothing, the `Object.is` discipline; beats the identity
+heuristic), `String.prototype.split` (content-derived pieces; the
+separator/limit are control), `Array.prototype.join` (base/element
+taint + the separator, which unlike split's is inserted verbatim), and
+`parseInt` / `Number.parseInt` (direct-name, content-derived digit
+parse; NON-exclusive per the exclusive policy below). `Object.assign`
+gained its result-identity flows (the result IS param 0). Supporting
+machinery: the
 summary schema's `Field(path)` flow endpoints now match HEAP facts by
 site intersection + path prefix (pop/next over a push-tagged array), and
 `GetIterator` re-keys the source's `[AnyIndex]` heap taint onto the
@@ -297,7 +327,7 @@ What rung 1 changes in the flow functions:
   field taint). Not oracle-gated — fires whenever the site resolution
   knows the argument's sites, locally or through the engine.
 
-## The top-20 builtins
+## The summary library (the top-20 set + the t-P5 second tier)
 
 Chosen by corpus frequency of global-name call sites
 (`tests/corpus_callee_names.rs`, 1149 runtime-passed fixtures: 5625 sites, 5079
@@ -315,6 +345,87 @@ values/entries/assign/create`, `Array.isArray/from`, `Number`, `String`)
 are reader D's canonical namespace set, registered preemptively
 (corpus-freq 0) as the first backlog rung.
 
+The **t-P5 second tier** grew the library from the miss log (the growth
+process itself — summaries.md §3): `String.prototype.replace` (the smoke's
+top actionable miss, ×18, dual string/callback form), `RegExp.prototype.test`
+(×18, rescued by the constructor-result family arm), and the canonical
+preemptive `String.prototype.split` / `Array.prototype.join` / `parseInt` /
+`Number.parseInt` (corpus-freq 0 — reachability checked against the corpus
+call sites: `split`/`parseInt` appear in NO corpus source; `join` appears
+only in a runtime-not-applicable fixture — they are registered because they
+are probe-able canonical builtins, the same discipline as entries 10–20),
+plus `Object.assign`'s result-identity deepening (the result IS param 0 —
+the `let o = Object.assign({}, src)` shape, probe e23). Every registration
+carries its corpus count (or "canonical") and semantics in its doc string.
+
+### The exclusive policy (t-P5 review of reader D's `exclusiveModels`)
+
+`exclusive` = the summary is the COMPLETE taint model of the call: the
+call edge into the callee body is killed (never merged) AND incoming
+operand taints not re-added by a flow die on the bypass edge
+(FlowDroid's `killSource`). The t-P5 review's policy — **default NO**,
+we model flows, not full behavior — with the whitelist:
+
+- **Sinks / no-ops**: `print` (returns undefined, mutates nothing —
+  complete by construction).
+- **Pure verdict tests**: `Object.is`, `Number.isNaN`, `Array.isArray`
+  (the result is a fresh boolean; the operands are consumed-by-value —
+  the killSource consumption is the accepted convention).
+- **Pure coercions / cooks / structural transformers over enumerable
+  params**: `Number`, `String`, `Symbol`, `String.raw`, `JSON.parse`,
+  `JSON.stringify`, `Object.keys/values/entries`, `Array.from` (the
+  result derives ONLY from the listed params; nothing mutates). Known
+  honest limit: the callback-accepting arities (`JSON.stringify(v,
+  replacer)`, `Array.from(it, mapFn)`) run unmodeled user code — the
+  replacer's per-key transformation is a documented FN direction
+  (over-approximate the value channel, miss replacer-laundered taint);
+  exclusive stays because there is no callee body to kill and the only
+  operand taint consumed is function-object taint, which is inert
+  anyway.
+- **NOT exclusive — mutators** (`Object.assign`, `Object.setPrototypeOf`,
+  `Array.prototype.push`): the mutated reference must retain and gain
+  taint; killSource would lie.
+- **NOT exclusive — constructors with behavioral results** (`RegExp`,
+  `Proxy`, `Uint8Array`, `Object.create`): the result object's identity
+  and traps carry more than the modeled content flow.
+- **NOT exclusive — pure reads whose operand is re-usable**:
+  `parseInt`/`Number.parseInt` (t-P5's call). The exclusive buy (killing
+  the callee-body edge) is VACUOUS for a native callee, and killSource
+  would FN the SSA re-use shape `let t = …; parseInt(t); print(t)`.
+- **NEVER exclusive — the whole prototype path** (`X.prototype.*`):
+  the receiver family is a may-answer; exclusive is forced off at the
+  site class as defense in depth.
+
+### The miss-log backlog: classification (t-P5 — do not chase these)
+
+The named-miss log counts every tried candidate name at every
+non-summary site — including sites the fallback ladder handles fine.
+The current tail (full log via `ABCD_TAINT_SMOKE_TOPN=…`):
+
+- **User-global names with bodies** (`foo` 117, `f` 90, `A` 69, `B` 36,
+  `c` 36, `count` 36, `add`/`counter`/`seq`/`sum`/`tag`/`value`/
+  `testXxx` 18, `f6`/`f19` 9): the call sites STEP INTO the resolved
+  bodies (`sites_body_step`) — the miss entry records only that no
+  SUMMARY applied. Not backlog; registering summaries for user test
+  globals would be wrong.
+- **`s.next` ×54 — generator-receiver-opaque**: the receiver is the
+  result of calling a generator through a global load; the VM
+  manufactures the generator object (no keyed alloc, no constructor
+  name — the t-P5 arm deliberately covers only the six builtin
+  value constructors). Honest non-fix; the rung-2 PTA pile.
+- **`b.value2` ×18 — user class-instance method** (class-accessors.js:
+  `b = new B(5); b.value2()`): a USER method the call graph cannot
+  resolve through a global-stored class instance (`new B` is a
+  user-constructor call — the constructor arm types only KNOWN
+  builtin constructors, never user classes). Not a builtin, not
+  registerable; a call-graph-resolution (rung-2) matter. The
+  `A.has`/`a.get`/`a.set` ×15 entries are the same class (accessor
+  calls on user objects).
+- **`#…#` mangled names ×9**: es2abc-internal mangled identifiers —
+  compiler artifacts, not source-level callees; never backlog.
+- **Resolved at t-P5** (left the log): `String.prototype.replace` ×18
+  and `r.test` ×18 — see the smoke movements below.
+
 ### How to add a summary
 
 One line in `builtin_summaries()` (or `TaintConfig::extra_summaries` for
@@ -326,15 +437,16 @@ ad-hoc runs):
 ```
 
 Name it exactly as the def chain produces it (qualified through global loads).
-Set `exclusive` only for complete models (sanitizers, pure tests,
-thoroughly-modeled namespaces); set `callback` + `gap_enter`/`gap_return`
+Set `exclusive` only per the exclusive policy above (default NO — we model
+flows, not full behavior); set `callback` + `gap_enter`/`gap_return`
 for forEach-style builtins (the full gap propagator, t-P4 — see above);
 use `alias_flow` for mutators. Then run the corpus smoke — the miss log tells
-you what to write next.
+you what to write next (`ABCD_TAINT_SMOKE_TOPN=70` prints past the top-10
+cut — check it before declaring a miss actionable).
 
 ## Tests
 
-- `tests/mechanisms.rs` (40) — one test per mechanism: access-path cutoff,
+- `tests/mechanisms.rs` (50) — one test per mechanism: access-path cutoff,
   exclusive-kill, every fallback-ladder rung, miss counting, ExceptionParam
   catch binding, weak-vs-strong heap update, global round-trip, clears, the
   base endpoint, negative control, determinism, the N66 frame-slot binding
@@ -344,12 +456,20 @@ you what to write next.
   prototype-path pins (10: alloc-kind→family, const family, multi-site
   phi merge, user-object negative control, direct-name precedence,
   negative caching, unknown-receiver fall-through, the GetIterator
-  family, the push alias flow, alloc-via-global-provenance), and the
+  family, the push alias flow, alloc-via-global-provenance), the
   t-P4 gap-propagator pins (8: forEach enter, map return wiring, the
   map-ignore-param negative control, forEach's discarded-return +
   side-effect proof, exclusive-with-callback, the unresolved-callback
   fallback counter, nested-gap termination, the mini-gap tag's
-  first-formal binding on direct calls).
+  first-formal binding on direct calls), and the t-P5 second-tier pins
+  (10: replace's string-form flows + pattern-is-control clean +
+  constant-replacement counter refinement, replace's gap enter, replace's
+  empty-chain gap return isolated from the static Base→Return flow, the
+  constructor-result family arm direct + through global-store provenance,
+  the user-constructor negative control, split's base flow +
+  separator-is-control clean, join's element + verbatim-separator flows,
+  parseInt's content flow + radix-is-control clean + the qualified-name
+  key, Object.assign's result identity).
 - `tests/probes.rs` (5 + 1 ignored) — the §5.5 precision probe suite.
   Five hand-built mini-modules with FP/FN annotations (the P5b
   ladder-trigger baseline): straight-line local; heap store/load same
@@ -363,7 +483,7 @@ you what to write next.
 
 ## The compiled probe suite (t-P1 — the §5.5 ladder-trigger instrument)
 
-Real-bytecode extension of the mini-module probes: 33 hand-written JS
+Real-bytecode extension of the mini-module probes: 40 hand-written JS
 probes with KNOWN ground truth, one directory per §5.5 precision axis.
 
 **Layout** (repo root):
@@ -415,16 +535,34 @@ then run the suite — a NEW probe whose expectations are wrong fails
 loudly with the actual hit lines.
 
 **Current table** (rung 1 + the t-P3 prototype-resolution path + the
-t-P4 gap propagator, verbatim):
+t-P4 gap propagator + the t-P5 second tier, verbatim):
 
 ```text
 PROBE-FAMILY a-heap-alias cases=6 tp=3 fp=0 fn=0
 PROBE-FAMILY b-closure-capture cases=3 tp=2 fp=1 fn=0
 PROBE-FAMILY c-dynamic-dispatch cases=4 tp=2 fp=1 fn=1
 PROBE-FAMILY d-exceptional-flow cases=4 tp=2 fp=0 fn=1
-PROBE-FAMILY e-builtin-summary cases=16 tp=11 fp=2 fn=0
-PROBE-TOTAL tp=20 fp=4 fn=2 violations=0
+PROBE-FAMILY e-builtin-summary cases=23 tp=21 fp=2 fn=0
+PROBE-TOTAL tp=30 fp=4 fn=2 violations=0
 ```
+
+t-P5 added seven family-E probes (all existing entries reproduce
+IDENTICALLY, one sentinel renamed): **e17** replace's string form —
+Base→Return and Param(1)→Return tp, tainted-pattern clean pin (the
+pattern selects — control, not content), **e18** replace's function
+form — the gap enter (print inside the callback) and the empty-chain
+gap return (the result is a string, not map's array), plus the
+tainted-pattern clean pin, **e19** `RegExp.prototype.test`'s no-flow
+verdict — clean against the identity heuristic, receiver typed through
+the constructor-result arm, **e20** split (pieces tp, tainted-separator
+clean), **e21** join (element channel tp, verbatim-separator tp, clean
+control), **e22** parseInt/Number.parseInt (content-derived tp, radix
+clean), **e23** `Object.assign`'s result identity (the
+`let o = Object.assign({}, src)` shape). **e4's unsummarized-native
+sentinel moved parseInt → parseFloat** (t-P5 registered parseInt — the
+miss log drove its summary; the named-miss pin needs a native that is
+STILL unsummarized, and parseFloat is deliberately left so). The e4
+flow itself (identity heuristic over a named native) is unchanged.
 
 The pre-t-P4 table (rung 1 + t-P3, verbatim): family e
 `cases=10 tp=7 fp=1 fn=0`, `PROBE-TOTAL tp=16 fp=3 fn=2 violations=0`.
@@ -480,32 +618,75 @@ store-to-load function resolution). c2 stays structural
 The rung-0 baseline for comparison (t-P1, verbatim): `tp=11 fp=4 fn=4`
 (families: a 3/2/0, b 1/1/1, c 2/1/1, d 2/0/1, e 3/0/1).
 
-## Corpus smoke results (t-P4, verbatim)
+## Corpus smoke results (t-P5, verbatim)
 
-Registered config (source = all `func_main_0` params; sink = `print`; top-20
-builtin summaries + the t-P3 prototype-family set + the t-P4 gap trio; 1149
-runtime-passed fixtures; two runs identical). **Byte-identical to the t-P3
-numbers** — no runtime-passed fixture exercises the gap trio (a byte scan of
-all 1149 `.abc`s finds neither `forEach` nor `filter` nor `map` string-table
-entries; the corpus' only `forEach` fixture family,
-`test-arrow-function-6-directly-call`, is runtime-`not-applicable` and not in
-the smoke set), and the t-P4 may-direction receiver arm typed no corpus
-receiver differently (`lookups` would have moved otherwise). The gap-wrapper
-counters are both zero — the trio's smoke coverage is entirely the probe
-suite's (by design; probes are the ladder instrument):
+Registered config (source = all `func_main_0` params; sink = `print`; the
+builtin summary library incl. the t-P3 prototype-family set, the t-P4 gap
+trio, and the t-P5 second tier; 1149
+runtime-passed fixtures; two runs identical). The t-P5 movements, each
+attributed below the table: `String.prototype.replace` and `r.test` left
+the miss log; the counters moved exactly by the rescued sites; path edges
+and the flow count are byte-identical:
 
 ```text
 SMOKE fixtures=1149 fixtures_with_flows=0
 TAINT-FLOWS hits=0
-TAINT-COUNTERS lookups=10254 neg_cache_hits=90 body_step=108 native_keep=942 unknown=69
+TAINT-COUNTERS lookups=10380 neg_cache_hits=90 body_step=108 native_keep=924 unknown=51
 TAINT-PATH-EDGES total=198734
 TAINT-GAPS resolved=0 unresolved=0
-TAINT-SUMMARY-MISSES top10=[("foo", 117), ("f", 90), ("A", 69), ("s.next", 54), ("B", 36), ("c", 36), ("count", 36), ("String.prototype.replace", 18), ("add", 18), ("b.value2", 18)]
+TAINT-SUMMARY-MISSES top10=[("foo", 117), ("f", 90), ("A", 69), ("s.next", 54), ("B", 36), ("c", 36), ("count", 36), ("add", 18), ("b.value2", 18), ("counter", 18)]
 TAINT-SUMMARY-HITS top10=[("print", 1437), ("Iterator.prototype.next", 162), ("Iterator.prototype.return", 126), ("Object.is", 36), ("RegExp", 36), ("String.prototype.charCodeAt", 36), ("Array.prototype.pop", 18), ("Number.isNaN", 18), ("Object.setPrototypeOf", 18), ("Proxy", 18)]
 SMOKE-DETERMINISM runs=2 identical=true
 ```
 
+The t-P5 miss-counter movements (t-P4 → now, each attributed):
+
+- **`String.prototype.replace` 18 → GONE from the miss log, ×18 in the
+  hit log** (both below the top-10 cut — the 18-count ties sort
+  `"Proxy"` first; the full log via `ABCD_TAINT_SMOKE_TOPN=70` shows
+  `RegExp.prototype.test` 18 and `String.prototype.replace` 18). The
+  regexp.js receiver is a string CONSTANT (`"abc123".replace(/[0-9]+/,
+  "!")`), typed by the const def-chain arm.
+- **`r.test` 18 → GONE, `RegExp.prototype.test` ×18 in the hit log** —
+  the t-P5 constructor-result family arm: the receiver is
+  `new RegExp("a+", "g")` (es2abc lowers regexp literals in ALL six
+  corpus versions) reached through global-store provenance. The
+  summary is deliberately flow-free (a verdict); its win is removing
+  the site from the identity heuristic.
+- **`unknown` 69 → 51 (−18)** — the replace sites: a const-string
+  receiver produces NO direct name candidates, so they were
+  UnknownKeep; **`native_keep` 942 → 924 (−18)** — the r.test sites
+  (named: `r.test`).
+- **`lookups` 10254 → 10380 (+126)** — 18 new prototype-candidate
+  lookups at the r.test sites (the constructor arm synthesizes a key
+  where the resolver previously produced none) + 108 per-fact
+  summary-application lookups in `call_to_return_flow` at the 36
+  rescued sites (the flow function re-resolves the winning summary per
+  processed fact — `classify` is memoized, application is not).
+  `neg_cache_hits` unchanged (90).
+- **`TAINT-GAPS` stays 0/0** — the corpus' replace sites are all
+  string-form (constant `"!"` replacement); the t-P5 not-a-callback
+  refinement keeps them out of `gap_sites_unresolved` (without it the
+  counter would read 18 — noise, not honest fallbacks).
+- **`TAINT-PATH-EDGES` byte-identical (198734), `hits=0` unchanged** —
+  the rescued sites produce exactly the fact shapes the identity
+  heuristic produced on the no-taint corpus (the t-P3 phenomenon); the
+  identity's would-be verdict taint at the r.test sites never existed
+  because no tainted-operand fact reaches them in this config.
+- **No new misses appeared** — the constructor arm types only the six
+  builtin value constructors; user-class constructions (`new B(5)` →
+  `b.value2`) type nothing (the full-log check).
+
 The t-P3 miss-counter movements (baseline → now, each attributed):
+
+(For the record — why t-P4 was byte-identical to t-P3: no
+runtime-passed fixture exercises the gap trio — a byte scan of all 1149
+`.abc`s finds neither `forEach` nor `filter` nor `map` string-table
+entries; the corpus' only `forEach` fixture family,
+`test-arrow-function-6-directly-call`, is runtime-`not-applicable` and
+not in the smoke set — and the t-P4 may-direction receiver arm typed no
+corpus receiver differently. The trio's smoke coverage is entirely the
+probe suite's, by design.)
 
 - **`s.charCodeAt` 36 → GONE from the miss log, `String.prototype.charCodeAt`
   36 in the hit log** — the strings fixtures' receiver is a
@@ -557,8 +738,9 @@ TAINT-GAPS resolved=0 unresolved=0
 SMOKE-DETERMINISM runs=2 identical=true
 ```
 
-(re-confirmed byte-identical at t-P3 AND t-P4 — the sensitivity control's
-flows route through neither prototype-rescued nor gap-resolved sites.)
+(re-confirmed byte-identical at t-P3, t-P4, AND t-P5 — the sensitivity
+control's flows route through neither prototype-rescued nor
+gap-resolved sites.)
 
 Counters classify only call sites the solver actually processed (a site with
 no incoming fact edge — dead code, or a function body unreachable even by the
