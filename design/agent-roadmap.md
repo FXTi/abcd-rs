@@ -300,7 +300,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | d-P11 | C2 生成器/异步管道 | 18 fixture：生成器协议状态机重建为 async/function* 体（最贵） | 未开始 |
 | t-P1 | E6 评估基建 | 带人工标注真实污点的 fixture 集（爬级触发器的可信基线） | **完成**（0716d7b/4f0a27f/86869b7 等 5 commit：22 探针 5 族 + annotations.json ground truth（VM 实跑校验）+ gen-taint-probes.py 生成器 + probes.rs runner（expected-FN 消失会强制失败=爬级仪器）。基线表 tp=11 fp=4 fn=4：4 个 expected-FP（a4/a5/b2/c2）+ 4 个 known-FN（b3→rung1、c4→rung2、d4→rung2、e5→rung1）全部带 closes_at_rung 标注。附带抓到并修复 N66（orchestrator 复验全绿）） |
 | t-P2 | E1 rung-1 引擎 | Boomerang 形按需别名查询（AliasOracle 接缝后的真引擎） | **完成**（570004c/f911ee0/ee08231；记忆化反向 points_to（深度上限 8 + rung-0 声底回退、heros 平衡括号逐查询上下文栈、帧槽绑定穿过参数）、CallGraph::refine_with_points_to 第二消费者、ABCD_TAINT_RUNG A/B 开关。**探针 tp 11→13 / fp 4→2 / fn 4→2 violations=0**（a4/a5 翻 clean、b3/e5 翻 tp、b2 诚实重标 rung-2 环境身份）。**orchestrator 独立复验**：探针表逐字复现 + A/B rung-0 复现三处引擎依赖条目、冒烟逐字节不变（桥接 5517 未知点零触发=语料 callee 全是全局加载的诚实归因）、125 套件绿） |
-| t-P3 | E3 原型链摘要查找 | points-to 驱动的接收者类型近似（依赖 t-P2） | 未开始 |
+| t-P3 | E3 原型链摘要查找 | points-to 驱动的接收者类型近似（依赖 t-P2） | **完成**（71b9e5d/be96a74/ca050b7/c810fb0；abcd-taint/src/prototype.rs 新模块：分配点种类→原型族 + 常量链 + **全局存储出处**（语料关键件）+ GetIterator→Iterator.prototype；优先级=直接名→用户体→原型族→保守保留（additive-only，从不 exclusive）；注册 Array.pop/push、String.charCodeAt/repeat/slice、Iterator.next/return。**orchestrator 独立复验**：探针 tp=16 fp=3 fn=2 violations=0（5 新探针，22 旧探针逐字复现）、冒烟计数器 lookups 7626→10254/unknown 357→69（Iterator 收编 288）逐字复现、charCodeAt/pop 出缺失榜/s.next 诚实留守、125 套件绿零 warning） |
 | t-P4 | E4 mini-gap 完整传播器 | 摘要暂停/回调/恢复（高阶内置函数摘要的前置） | 未开始 |
 | t-P5 | E5 摘要库扩展 | miss 计数器驱动；真实 @ohos.* API（待真实应用语料） | 持续 |
 | t-P6 | E2 rung-2 PTA | APAK 形上下文敏感指针分析（阶段级；触发器：分发误报实证） | 未开始 |
