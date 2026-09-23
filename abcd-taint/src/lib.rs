@@ -28,6 +28,13 @@
 //! - [`driver`] — source/sink configuration, the analysis run, and the
 //!   taint-path report (line/column from `Inst.loc`, T8).
 //!
+//! - [`driver`] — source/sink configuration, the analysis run, and the
+//!   taint-path report (line/column from `Inst.loc`, T8).
+//! - [`prototype`] — the t-P3 receiver-type approximation: alloc-site
+//!   kinds / constant def chains / global-store provenance → prototype
+//!   families, closing the receiver-typed builtin call gap (`a.pop` ⇒
+//!   `Array.prototype.pop`) in the summary lookup.
+//!
 //! The crate graph is the enforcement of the format-independence
 //! invariant: the library depends on `abcd-ir` + `abcd-analysis` only;
 //! `abcd-file`/`abcd-lift` are dev-dependencies for the corpus smoke
@@ -40,10 +47,12 @@ pub mod fact;
 pub mod names;
 pub mod oracle;
 pub mod problem;
+pub mod prototype;
 pub mod summary;
 
 pub use driver::{PathStep, SinkHit, SinkSpec, SourceSpec, TaintConfig, TaintReport, run_taint};
 pub use fact::{Fact, TaintBase, TaintFact};
 pub use oracle::Oracle;
 pub use problem::TaintProblem;
+pub use prototype::{FamilyAnswer, ProtoFamily, PrototypeResolver};
 pub use summary::{Endpoint, Flow, RegistryStats, Summary, SummaryRegistry, builtin_summaries};

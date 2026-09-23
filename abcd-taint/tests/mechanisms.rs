@@ -1313,3 +1313,477 @@ fn rung1_determinism_two_runs_identical() {
     assert_eq!(format!("{:?}", a.stats), format!("{:?}", b.stats));
     assert_eq!(a.hits.len(), 1, "the refined flow itself is found");
 }
+
+// ────────────────────────────────────────────────────────────────────
+// t-P3: the prototype-resolution path (prototype.rs) — receiver-typed
+// builtin summary lookup. One test per mechanism: alloc-kind→family,
+// constant/global-provenance family, multi-site merge, negative
+// control, precedence (direct name beats prototype; user object beats
+// builtin), negative caching, unknown-receiver fall-through, the
+// GetIterator family, and the push alias flow.
+// ────────────────────────────────────────────────────────────────────
+
+/// The std config plus the full builtin registry (top-20 + the t-P3
+/// prototype-family entries).
+fn builtin_config() -> TaintConfig {
+    TaintConfig {
+        builtin_summaries: true,
+        ..std_config()
+    }
+}
+
+/// `recv.leaf(args...)` with an explicit `this` receiver; returns the
+/// call's result value.
+fn method_call(
+    m: &mut abcd_ir::Module,
+    b: abcd_ir::BlockId,
+    recv: abcd_ir::ValueId,
+    leaf: &str,
+    args: Vec<abcd_ir::ValueId>,
+) -> abcd_ir::ValueId {
+    let name = intern(m, leaf);
+    let f = emit(
+        m,
+        b,
+        Op::LoadProp {
+            object: recv,
+            name,
+        },
+    );
+    emit(
+        m,
+        b,
+        Op::Call {
+            callee: f,
+            this: Some(recv),
+            args,
+            kind: CallKind::Dynamic,
+        },
+    )
+}
+
+/// kind→family (AllocArray ⇒ `Array.prototype`): `a[i] = tainted` then
+/// `a.pop()` — the element taint flows to the popped value through the
+/// heap-fact Field([AnyIndex]) endpoint match.
+#[test]
+fn prototype_family_alloc_array_pop() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let a = alloc_array(&mut m, entry);
+    let idx = load_number(&mut m, entry, 0.0);
+    emit_void(
+        &mut m,
+        entry,
+        Op::StorePropIdx {
+            object: a,
+            index: idx,
+            value: p,
+        },
+    );
+    let r = method_call(&mut m, entry, a, "pop", vec![]);
+    print_call(&mut m, entry, vec![r]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    // TWO sink hits on the one print: the element fact fires BOTH of
+    // pop's flows — Field([AnyIndex])→Return (leftover [], the precise
+    // carrier) and Base→Return (leftover [AnyIndex] appended — the
+    // registered leftover-append over-approximation, FlowDroid's
+    // cutSubFields=false default; harmless: the probe runner dedups
+    // sink hits by source line).
+    assert_eq!(report.hits.len(), 2, "the popped element is tainted");
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "Array.prototype.pop"),
+        "the prototype summary applied: {:?}",
+        report.summaries_applied
+    );
+    // The direct name candidate set is empty (a local receiver has no
+    // global name) — nothing was logged as a named miss for this site.
+    assert!(
+        !report.summary_misses.contains_key("Array.prototype.pop"),
+        "a rescued site is not backlog"
+    );
+}
+
+/// Constant family through global-store provenance: two stores into
+/// `sg` (a string constant + the tainted param) — the family union is
+/// {String}, the taint rides the param store, and
+/// `String.prototype.charCodeAt`'s Base→Return flow carries it.
+#[test]
+fn prototype_family_const_string_via_global_provenance() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let sg = intern(&mut m, "sg");
+    let s = load_string(&mut m, entry, "abc");
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: sg,
+            value: s,
+        },
+    );
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: sg,
+            value: p,
+        },
+    );
+    let g = try_get_global(&mut m, entry, "sg");
+    let zero = load_number(&mut m, entry, 0.0);
+    let r = method_call(&mut m, entry, g, "charCodeAt", vec![zero]);
+    print_call(&mut m, entry, vec![r]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert_eq!(report.hits.len(), 1, "the code unit derives from taint");
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "String.prototype.charCodeAt"),
+        "the const-family summary applied: {:?}",
+        report.summaries_applied
+    );
+}
+
+/// Multi-site merge: a phi of an AllocArray and an AllocObject types
+/// the receiver {Array, Object} — the Array family's summary fires
+/// and the heap fact on the array's site still matches through the
+/// phi-merged points-to set.
+#[test]
+fn prototype_multi_site_phi_merge() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let left = add_block(&mut m, f);
+    let right = add_block(&mut m, f);
+    let join = add_block(&mut m, f);
+    emit_void(
+        &mut m,
+        entry,
+        Op::CondBranch {
+            cond: p,
+            true_dest: left,
+            false_dest: right,
+        },
+    );
+    let a = alloc_array(&mut m, left);
+    let idx = load_number(&mut m, left, 0.0);
+    emit_void(
+        &mut m,
+        left,
+        Op::StorePropIdx {
+            object: a,
+            index: idx,
+            value: p,
+        },
+    );
+    emit_void(&mut m, left, Op::Branch { dest: join });
+    let o = alloc_object(&mut m, right);
+    emit_void(&mut m, right, Op::Branch { dest: join });
+    link(&mut m, entry, left);
+    link(&mut m, entry, right);
+    link(&mut m, left, join);
+    link(&mut m, right, join);
+    let recv = emit(
+        &mut m,
+        join,
+        Op::Phi {
+            entries: vec![
+                (
+                    abcd_ir::Edge {
+                        from: left,
+                        kind: abcd_ir::EdgeKind::Normal,
+                    },
+                    a,
+                ),
+                (
+                    abcd_ir::Edge {
+                        from: right,
+                        kind: abcd_ir::EdgeKind::Normal,
+                    },
+                    o,
+                ),
+            ],
+        },
+    );
+    let r = method_call(&mut m, join, recv, "pop", vec![]);
+    print_call(&mut m, join, vec![r]);
+    emit_void(&mut m, join, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    // Two hits: the double-fire documented in
+    // `prototype_family_alloc_array_pop` (Base→Return's leftover plus
+    // the precise Field flow).
+    assert_eq!(
+        report.hits.len(),
+        2,
+        "the array arm's element taint survives the merge"
+    );
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "Array.prototype.pop"),
+        "the Array family's summary applied to the merged receiver"
+    );
+}
+
+/// Negative control: a user OBJECT with a `pop` property read must NOT
+/// get `Array.prototype.pop`'s summary (family Object has no pop
+/// registered — the builtin stays out). The synthesized
+/// `Object.prototype.pop` candidate is logged as a miss (the backlog
+/// signal) and the site falls through to the unknown-keep ladder rung.
+#[test]
+fn prototype_negative_control_user_object_pop() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let _p = add_param(&mut m, f, 1);
+    let o = alloc_object(&mut m, entry);
+    let r = method_call(&mut m, entry, o, "pop", vec![]);
+    print_call(&mut m, entry, vec![r]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert_eq!(report.hits.len(), 0, "no builtin flow on a user object");
+    assert!(
+        !report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "Array.prototype.pop"),
+        "the array builtin stayed out"
+    );
+    assert!(
+        report.summary_misses.contains_key("Object.prototype.pop"),
+        "the prototype miss is the backlog signal: {:?}",
+        report.summary_misses
+    );
+    assert_eq!(
+        report.stats.sites_unknown, 1,
+        "fell through to the unknown-keep rung"
+    );
+}
+
+/// Precedence: a summary registered under the DIRECT qualified name
+/// (`a.pop`) beats the prototype path (`Array.prototype.pop`) — the
+/// direct name match is rung 1 of the lookup ladder.
+#[test]
+fn prototype_precedence_direct_name_wins() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    // The receiver is a global whose store is an array (family Array)
+    // — both the direct candidate `a.pop` AND the prototype candidate
+    // `Array.prototype.pop` are applicable.
+    let a_name = intern(&mut m, "a");
+    let arr = alloc_array(&mut m, entry);
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: a_name,
+            value: arr,
+        },
+    );
+    let g = try_get_global(&mut m, entry, "a");
+    let r = method_call(&mut m, entry, g, "pop", vec![p]);
+    print_call(&mut m, entry, vec![r]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let mut config = builtin_config();
+    config.extra_summaries.push((
+        "a.pop".to_owned(),
+        Some(1),
+        Summary::new("user override: param → return")
+            .flow(Endpoint::Param(0), Endpoint::Return),
+    ));
+    let report = abcd_taint::run_taint(&m, &config);
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "a.pop"),
+        "the direct name won: {:?}",
+        report.summaries_applied
+    );
+    assert!(
+        !report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "Array.prototype.pop"),
+        "the prototype path was not consulted"
+    );
+}
+
+/// Negative caching: two `Object.prototype.pop` misses — the second
+/// lookup is served by the registry's negative cache.
+#[test]
+fn prototype_negative_caching() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let _p = add_param(&mut m, f, 1);
+    let o1 = alloc_object(&mut m, entry);
+    let o2 = alloc_object(&mut m, entry);
+    let r1 = method_call(&mut m, entry, o1, "pop", vec![]);
+    let r2 = method_call(&mut m, entry, o2, "pop", vec![]);
+    let s = add(&mut m, entry, r1, r2);
+    print_call(&mut m, entry, vec![s]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report.stats.negative_cache_hits >= 1,
+        "the second Object.prototype.pop lookup hit the negative cache: {:?}",
+        report.stats
+    );
+    assert_eq!(
+        report.summary_misses.get("Object.prototype.pop"),
+        Some(&2),
+        "both sites logged the miss: {:?}",
+        report.summary_misses
+    );
+}
+
+/// Unknown receiver (a parameter): NO family is invented — the
+/// prototype path produces no candidate at all and the site falls
+/// through untouched.
+#[test]
+fn prototype_unknown_receiver_no_lookup() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let r = method_call(&mut m, entry, p, "pop", vec![]);
+    print_call(&mut m, entry, vec![r]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report
+            .summary_misses
+            .keys()
+            .all(|n| !n.contains(".prototype.")),
+        "no prototype candidate was synthesized: {:?}",
+        report.summary_misses
+    );
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .all(|(_, n)| !n.contains(".prototype.")),
+        "no prototype summary applied: {:?}",
+        report.summaries_applied
+    );
+}
+
+/// The GetIterator family: for-of's protocol object over an AllocArray
+/// types `Iterator.prototype`; the source's `[AnyIndex]` element taint
+/// re-keys onto the iterator (the GetIterator flow rule), rides
+/// `Iterator.prototype.next`'s Field([AnyIndex])→Return flow, and a
+/// `.value` read picks it up.
+#[test]
+fn prototype_iterator_next_family() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let a = alloc_array(&mut m, entry);
+    let idx = load_number(&mut m, entry, 0.0);
+    emit_void(
+        &mut m,
+        entry,
+        Op::StorePropIdx {
+            object: a,
+            index: idx,
+            value: p,
+        },
+    );
+    let it = emit(&mut m, entry, Op::GetIterator { obj: a });
+    let r = method_call(&mut m, entry, it, "next", vec![]);
+    let value_name = intern(&mut m, "value");
+    let v = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: r,
+            name: value_name,
+        },
+    );
+    print_call(&mut m, entry, vec![v]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    // Two hits — the same double-fire as pop (the Base→Return leftover
+    // rides alongside the precise Field([AnyIndex]) carrier).
+    assert_eq!(
+        report.hits.len(),
+        2,
+        "the element taint rode next().value out of the loop protocol"
+    );
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "Iterator.prototype.next"),
+        "the iterator summary applied: {:?}",
+        report.summaries_applied
+    );
+}
+
+/// The push alias flow: `a.push(tainted)` re-keys the argument onto
+/// the array's `[AnyIndex]` element channel; a later indexed load
+/// reads it back.
+#[test]
+fn prototype_array_push_alias_flow() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let a = alloc_array(&mut m, entry);
+    let _ = method_call(&mut m, entry, a, "push", vec![p]);
+    let idx = load_number(&mut m, entry, 0.0);
+    let x = emit(
+        &mut m,
+        entry,
+        Op::LoadPropIdx {
+            object: a,
+            index: idx,
+        },
+    );
+    print_call(&mut m, entry, vec![x]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert_eq!(report.hits.len(), 1, "the pushed element reads back");
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "Array.prototype.push"),
+        "the push summary applied: {:?}",
+        report.summaries_applied
+    );
+}

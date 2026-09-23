@@ -53,7 +53,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use abcd_analysis::dataflow::heap::FieldChain;
+use abcd_analysis::dataflow::heap::{FieldChain, FieldKey};
 use abcd_ir::{Sym, SymbolTable};
 
 /// A flow endpoint of a summary (summaries.md minimal schema).
@@ -160,7 +160,12 @@ pub struct RegistryStats {
     /// Call sites where a summary applied, per builtin name.
     pub hits: BTreeMap<Sym, usize>,
     /// Call sites with a resolvable name but no summary, per name —
-    /// the "report missing" backlog.
+    /// the "report missing" backlog. Counted by the problem
+    /// ([`SummaryRegistry::record_miss`]) once per tried candidate
+    /// name at sites where NO candidate (direct or
+    /// prototype-qualified) produced a summary — a name that resolved
+    /// through the prototype path is deliberately NOT logged as a
+    /// direct-name miss (it is no longer backlog).
     pub misses_named: BTreeMap<Sym, usize>,
     /// Call sites stepped into (no summary, callee has a body).
     pub sites_body_step: usize,
@@ -215,8 +220,12 @@ impl SummaryRegistry {
     }
 
     /// Look up `name` at argument count `argc`: exact arity first, then
-    /// the variadic entry. Negative results are cached; misses are
-    /// counted per name (the backlog log).
+    /// the variadic entry. Negative results are cached (the cache makes
+    /// repeat lookups of the same name O(1)); MISS COUNTING is the
+    /// caller's job ([`SummaryRegistry::record_miss`]) — only the
+    /// problem knows whether some LATER candidate (direct or
+    /// prototype-qualified) rescued the site, and a rescued name is
+    /// not backlog.
     pub fn lookup(&self, name: &str, argc: usize) -> Option<&Summary> {
         let sym = self.syms.borrow_mut().intern(name);
         let mut stats = self.stats.borrow_mut();
@@ -225,7 +234,6 @@ impl SummaryRegistry {
         let variadic = (sym, None);
         if self.neg.borrow().contains(&exact) && self.neg.borrow().contains(&variadic) {
             stats.negative_cache_hits += 1;
-            *stats.misses_named.entry(sym).or_insert(0) += 1;
             return None;
         }
         if let Some(s) = self
@@ -237,8 +245,15 @@ impl SummaryRegistry {
         }
         self.neg.borrow_mut().insert(exact);
         self.neg.borrow_mut().insert(variadic);
-        *stats.misses_named.entry(sym).or_insert(0) += 1;
         None
+    }
+
+    /// Record a named miss (the backlog log) — called by the problem
+    /// once per tried candidate name at sites where no summary
+    /// applied.
+    pub fn record_miss(&self, name: &str) {
+        let sym = self.syms.borrow_mut().intern(name);
+        *self.stats.borrow_mut().misses_named.entry(sym).or_insert(0) += 1;
     }
 
     /// Record a call site where `name`'s summary applied (hit counter).
@@ -302,9 +317,12 @@ pub enum FallbackStep {
 /// `Uint8Array` 18 (entries 1–9 below, corpus counts in their docs).
 /// Prototype-method calls (`a.pop`, `s.charCodeAt`, `r.test`, `s.next`,
 /// 18–54 each) resolve to USER-global-qualified names
-/// (`TryGetGlobal("a").pop`) and cannot match prototype-keyed summaries
-/// at rung 0 — receiver types are unknown (summaries.md minimal
-/// registry: the prototype-chain walk needs types we do not have).
+/// (`TryGetGlobal("a").pop`) — the t-P3 prototype-resolution path
+/// (`crate::prototype`) types the receiver through points-to alloc
+/// kinds / constant def chains / global-store provenance and re-keys
+/// the lookup to the `X.prototype.m` entries at the bottom of this
+/// list (matched ONLY through that path, never through direct name
+/// resolution).
 /// Entries 10–20 are the canonical namespace builtins of reader D's
 /// minimal-registry set, registered preemptively (corpus frequency 0 —
 /// they are the first rung of the miss-log-driven backlog).
@@ -467,6 +485,95 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
             Summary::new("canonical; coercion; operand taint → string")
                 .flow(Param(0), Return)
                 .exclusive(),
+        ),
+        // ── Prototype-family builtins (t-P3; matched through the ─────
+        // receiver-type path, prototype.rs — NEVER through direct name
+        // resolution, which produces user-global-qualified names like
+        // `a.pop`). All entries are deliberately NON-exclusive: a
+        // method call never untaints its receiver, and the receiver
+        // type is a may-answer, so application is additive-only (flows
+        // are added, incoming taint is retained — the may-direction
+        // over-approximation is documented in prototype.rs).
+        //
+        // Array.prototype.pop (corpus `a.pop` ×18): removes and
+        // returns the last element. Two flow shapes: whole-array taint
+        // carries to the popped element (Base → Return), and element
+        // taint ([AnyIndex] — the "elements of" tag, the mini-gap's
+        // convention) carries with its leftover chain
+        // (Field([AnyIndex]) → Return). The array's remaining element
+        // taint is retained (weak-update discipline: pop's mutation
+        // kills nothing in the model).
+        (
+            "Array.prototype.pop",
+            Some(0),
+            Summary::new("corpus a.pop ×18; element/whole-array taint → popped value")
+                .flow(Base, Return)
+                .flow(
+                    Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
+                    Return,
+                ),
+        ),
+        // Array.prototype.push: the mutator — each pushed value becomes
+        // an element of the base (alias: the reference is stored, not
+        // copied). Variadic; params 0–3 modeled (the String.raw
+        // convention).
+        ("Array.prototype.push", None, {
+            let mut s = Summary::new("corpus-evidenced pair of pop; args → base elements (mutates)");
+            for i in 0..4u16 {
+                s = s.alias_flow(Param(i), Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)));
+            }
+            s
+        }),
+        // String.prototype.charCodeAt (corpus `s.charCodeAt` ×36): the
+        // result is a code-unit number DERIVED from the string's
+        // content — content-derived, so base taint carries
+        // (parseInt-consistent; contrast Object.is's fresh boolean,
+        // which carries nothing).
+        (
+            "String.prototype.charCodeAt",
+            Some(1),
+            Summary::new("corpus s.charCodeAt ×36; content-derived code unit → number")
+                .flow(Base, Return),
+        ),
+        // String.prototype.repeat: the repeated string derives from
+        // the base's content; the count argument does NOT taint the
+        // result content (probe e10 pins this against the identity
+        // heuristic, which would taint it).
+        (
+            "String.prototype.repeat",
+            Some(1),
+            Summary::new("content-derived repetition → string; count does not taint")
+                .flow(Base, Return),
+        ),
+        // String.prototype.slice: the substring derives from the
+        // base's content (indices carry nothing).
+        (
+            "String.prototype.slice",
+            None,
+            Summary::new("content-derived substring → string").flow(Base, Return),
+        ),
+        // Iterator.prototype.next (the for-of protocol object over a
+        // builtin array/string iterable — typed via GetIterator,
+        // prototype.rs): returns `{value, done}`; `done` is a fresh
+        // boolean and `value` carries the iteration source's taint.
+        // The wrapper object is modeled as TRANSPARENTLY carrying the
+        // source's taint (Base → Return for whole-source taint,
+        // Field([AnyIndex]) → Return for element taint — a `.value`
+        // read then picks the taint up one step, the load rule's
+        // empty-chain rule). Coarse: field-precise `.value`-only
+        // modeling would need a return-field endpoint the minimal
+        // schema does not have. NON-exclusive on purpose: next() does
+        // not untaint the iterator, which is consulted again on the
+        // next loop iteration.
+        (
+            "Iterator.prototype.next",
+            Some(0),
+            Summary::new("for-of protocol; source/element taint → {value,done} wrapper")
+                .flow(Base, Return)
+                .flow(
+                    Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
+                    Return,
+                ),
         ),
     ]
 }

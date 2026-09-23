@@ -17,7 +17,7 @@
 //! Resolved-callee [`FunctionData`] names are matched by the driver on
 //! top of these candidates (directly-resolved internal functions).
 
-use abcd_ir::{Const, Module, Op, ValueDef, ValueId};
+use abcd_ir::{Const, Module, Op, Sym, ValueDef, ValueId};
 
 /// All candidate names for a callee value, most-qualified first, in
 /// deterministic def-chain order. Recursion is cycle-guarded.
@@ -125,6 +125,39 @@ fn base_through_movs(
     match module.inst(iid).map(|i| &i.op)? {
         Op::Mov { src } => base_through_movs(module, *src, visiting),
         Op::LoadProp { object, .. } => Some(*object),
+        _ => None,
+    }
+}
+
+/// The method leaf of a call whose callee came through a `LoadProp`
+/// chain: `a.pop(...)` → `"pop"`. This is the key the prototype
+/// resolution path (t-P3, `crate::prototype`) qualifies with the
+/// receiver's family — `TryGetGlobal("a").pop` + receiver family
+/// `Array` ⇒ candidate `Array.prototype.pop`. Returns `None` when the
+/// callee is not a property load (bare global calls, direct calls).
+pub fn call_method_leaf(module: &Module, call: &abcd_ir::Inst) -> Option<Sym> {
+    let Op::Call { callee, .. } = &call.op else {
+        return None;
+    };
+    let mut visiting = std::collections::HashSet::new();
+    leaf_through_movs(module, *callee, &mut visiting)
+}
+
+fn leaf_through_movs(
+    module: &Module,
+    value: ValueId,
+    visiting: &mut std::collections::HashSet<ValueId>,
+) -> Option<Sym> {
+    if !visiting.insert(value) {
+        return None;
+    }
+    let v = module.value(value)?;
+    let ValueDef::Inst(iid) = v.def else {
+        return None;
+    };
+    match module.inst(iid).map(|i| &i.op)? {
+        Op::Mov { src } => leaf_through_movs(module, *src, visiting),
+        Op::LoadProp { name, .. } => Some(*name),
         _ => None,
     }
 }

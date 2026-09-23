@@ -44,8 +44,9 @@ use abcd_ir::{CallKind, FuncId, InstId, Module, Op, Sym, ValueId};
 
 use crate::driver::{SourceSpec, TaintConfig};
 use crate::fact::{Fact, TaintBase, TaintFact};
-use crate::names::{call_base_value, callee_name_candidates};
+use crate::names::{call_base_value, call_method_leaf, callee_name_candidates};
 use crate::oracle::Oracle;
+use crate::prototype::{FamilyAnswer, PrototypeResolver};
 use crate::summary::{Endpoint, FallbackStep, SummaryRegistry};
 
 /// How a call site is handled — the fallback ladder, memoized per site.
@@ -127,6 +128,9 @@ pub struct TaintProblem<'m> {
     /// The applied-summary log: `(call site, summary name)` in
     /// application order — reported by the driver.
     applied: RefCell<Vec<(InstId, String)>>,
+    /// The t-P3 receiver-family memo (one entry per queried receiver
+    /// value; engine answers are point-independent at rung 1).
+    proto_memo: RefCell<HashMap<ValueId, FamilyAnswer>>,
 }
 
 impl<'m> TaintProblem<'m> {
@@ -198,6 +202,7 @@ impl<'m> TaintProblem<'m> {
             site_class: RefCell::new(HashMap::new()),
             counted: RefCell::new(HashSet::new()),
             applied: RefCell::new(Vec::new()),
+            proto_memo: RefCell::new(HashMap::new()),
         }
     }
 
@@ -213,6 +218,23 @@ impl<'m> TaintProblem<'m> {
 
     /// Classify a call site on the fallback ladder (memoized; counters
     /// fire exactly once per site).
+    ///
+    /// The lookup precedence (t-P3; documented in the README):
+    ///
+    /// 1. **direct name match** — a summary registered under one of
+    ///    the callee's def-chain name candidates wins (exclusive
+    ///    summaries also win over resolved bodies — never merged);
+    /// 2. **resolved user body** — a callee the call graph resolved to
+    ///    a function with a body is stepped into (USER CODE beats the
+    ///    builtin assumption of the prototype path — the receiver
+    ///    type is a may-answer, the body is evidence);
+    /// 3. **prototype-resolution path** — the receiver's alloc-kind /
+    ///    constant / global-provenance family qualifies the method
+    ///    leaf (`a.pop` + Array ⇒ `Array.prototype.pop`);
+    ///    prototype-applied summaries are ALWAYS applied
+    ///    non-exclusively (additive: flows are added, incoming taint
+    ///    is retained — a may-typed receiver must never kill);
+    /// 4. **native keep** (named) / **unknown keep** (no name).
     fn classify(&self, call: InstId) -> SiteClass {
         if let Some(c) = self.site_class.borrow().get(&call) {
             return c.clone();
@@ -237,6 +259,11 @@ impl<'m> TaintProblem<'m> {
                 }
             }
         }
+        // Candidate names that missed — the backlog log counts them
+        // when NO candidate rescues the site (a rescued name is not
+        // backlog: `a.pop` resolved through the Array family must not
+        // stay in the miss log).
+        let mut tried: Vec<String> = Vec::new();
         let class = {
             let mut found = None;
             for n in &names {
@@ -244,6 +271,7 @@ impl<'m> TaintProblem<'m> {
                     found = Some((n.clone(), s.exclusive));
                     break;
                 }
+                tried.push(n.clone());
             }
             match found {
                 Some((name, exclusive)) => SiteClass::Summary { name, exclusive },
@@ -255,6 +283,14 @@ impl<'m> TaintProblem<'m> {
                     });
                     if has_body {
                         SiteClass::BodyStep
+                    } else if let Some(name) = self.prototype_summary(inst, call, argc, &mut tried)
+                    {
+                        // Prototype-path applications are additive-only
+                        // (exclusive: false) — see the precedence table.
+                        SiteClass::Summary {
+                            name,
+                            exclusive: false,
+                        }
                     } else if names.is_empty() {
                         SiteClass::UnknownKeep
                     } else {
@@ -271,9 +307,48 @@ impl<'m> TaintProblem<'m> {
                 SiteClass::NativeKeep => self.registry.record_fallback(FallbackStep::NativeKeep),
                 SiteClass::UnknownKeep => self.registry.record_fallback(FallbackStep::Unknown),
             }
+            if !matches!(&class, SiteClass::Summary { .. }) {
+                for n in &tried {
+                    self.registry.record_miss(n);
+                }
+            }
         }
         self.site_class.borrow_mut().insert(call, class.clone());
         class
+    }
+
+    /// The t-P3 prototype-resolution path: `recv.m(...)` → the
+    /// receiver's prototype families ([`crate::prototype`]) →
+    /// `Family.prototype.m` candidates, in family order. Returns the
+    /// first registered summary key; every miss appends its
+    /// synthesized key to `tried` (counted into the backlog log by the
+    /// caller when nothing rescues the site). An empty/unknown
+    /// receiver typing produces NO candidate at all — the site falls
+    /// through to the fallback ladder unchanged (never invent).
+    fn prototype_summary(
+        &self,
+        call_inst: &abcd_ir::Inst,
+        call: InstId,
+        argc: usize,
+        tried: &mut Vec<String>,
+    ) -> Option<String> {
+        let leaf = call_method_leaf(self.module, call_inst)?;
+        let leaf = self.module.sym.resolve(leaf)?.to_owned();
+        let base = call_base_value(self.module, call_inst)?;
+        let oracle = self.oracle.borrow();
+        let resolver = PrototypeResolver::new(self.module, &oracle, &self.proto_memo);
+        let answer = resolver.families_of(base, call);
+        drop(oracle);
+        let mut hit = None;
+        for family in &answer.families {
+            let key = format!("{}.{leaf}", family.key());
+            if self.registry.lookup(&key, argc).is_some() {
+                hit = Some(key);
+                break;
+            }
+            tried.push(key);
+        }
+        hit
     }
 
     /// All `ValueId` operands of a call that taint can ride on:
@@ -529,10 +604,14 @@ impl<'m> TaintProblem<'m> {
     /// Positive intersection is required on both sides (an unknown side
     /// is not evidence — the same discipline as
     /// [`TaintProblem::local_alias_evidence`]), so this adds flows over
-    /// rung 0 without re-keying any existing match. Returns the leftover
-    /// chain and whether the match was heap-sourced (the substitute then
-    /// re-keys to `Heap`, keeping the fact function-global instead of
-    /// dying on a local).
+    /// rung 0 without re-keying any existing match. `Field(path)`
+    /// endpoints additionally require the fact's chain to start with
+    /// `path` (the leftover below the path flows on — the t-P3 case:
+    /// an `[AnyIndex]`-tagged array element read by
+    /// `Array.prototype.pop` / `Iterator.prototype.next`). Returns the
+    /// leftover chain and whether the match was heap-sourced (the
+    /// substitute then re-keys to `Heap`, keeping the fact
+    /// function-global instead of dying on a local).
     fn match_flow_endpoint(
         &self,
         endpoint: &Endpoint,
@@ -550,16 +629,39 @@ impl<'m> TaintProblem<'m> {
         if sites.is_empty() {
             return None;
         }
-        let value = match endpoint {
-            Endpoint::Param(i) => *args.get(*i as usize)?,
-            Endpoint::Base => base?,
-            _ => return None,
+        let (value, path) = match endpoint {
+            Endpoint::Param(i) => (*args.get(*i as usize)?, None),
+            Endpoint::Base => (base?, None),
+            Endpoint::Field(path) => (base?, Some(path)),
+            Endpoint::Return => return None,
         };
         let pts = self.oracle.borrow().site_info_at(value, at).sites;
         if pts.is_empty() || !pts.intersects(sites) {
             return None;
         }
-        Some((fact.fields.clone(), true))
+        let leftover = match path {
+            None => fact.fields.clone(),
+            Some(p) => {
+                let elems = fact.fields.elements();
+                let want = p.elements();
+                if elems.len() < want.len() {
+                    return None;
+                }
+                for (a, b) in elems.iter().zip(want.iter()) {
+                    if let (FieldKey::Named(x), FieldKey::Named(y)) = (a, b) {
+                        if x != y {
+                            return None;
+                        }
+                    }
+                }
+                let mut rest = FieldChain::new();
+                for &k in &elems[want.len()..] {
+                    rest = rest.pushed(k, usize::MAX);
+                }
+                rest
+            }
+        };
+        Some((leftover, true))
     }
 
     /// Substitute a sink endpoint at the call site.
@@ -770,6 +872,29 @@ impl IfdsProblem for TaintProblem<'_> {
                 if fact.base == TaintBase::Local(*value) {
                     out.push(Fact::of(fact.rebased(TaintBase::LexVar(*level, *slot))));
                 }
+                out.push(source.clone());
+            }
+            // ── Iterator protocol objects (t-P3) ───────────────────
+            Op::GetIterator { obj } => {
+                // `it = getiterator(obj)`: the iterator yields obj's
+                // elements, so obj's taint state transfers to it.
+                // LOCAL facts ride the generic rule below with their
+                // chain intact (empty = whole-source taint;
+                // `[AnyIndex]` = the "elements of" tag the
+                // `Iterator.prototype.next` summary consumes). HEAP
+                // facts re-key onto the result by positive site
+                // intersection (heap reads are otherwise opaque —
+                // this is the one builtin op whose element channel is
+                // static): `Heap(site(a)).[AnyIndex]` ⇒
+                // `Local(it).[AnyIndex]`.
+                if let Some(result) = curr_inst.result {
+                    if let TaintBase::Heap(sites) = &fact.base {
+                        if self.heap_may_reach(sites, *obj, curr) {
+                            out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                        }
+                    }
+                }
+                self.generic_propagate(curr_inst, fact, out);
                 out.push(source.clone());
             }
             // ── Loads (access-path cut) ──────────────────────────────
