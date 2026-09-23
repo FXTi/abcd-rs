@@ -66,6 +66,8 @@ fn taint_smoke_all_fixtures() {
     let mut total_hits = 0usize;
     let mut fixtures_with_flows = 0usize;
     let mut total_edges = 0usize;
+    let mut gap_resolved = 0usize;
+    let mut gap_unresolved = 0usize;
     let mut agg = abcd_taint::RegistryStats::default();
     let mut miss_log: std::collections::BTreeMap<String, usize> = Default::default();
     let mut hit_log: std::collections::BTreeMap<String, usize> = Default::default();
@@ -92,6 +94,8 @@ fn taint_smoke_all_fixtures() {
 
         total_hits += a.hits.len();
         total_edges += a.path_edges;
+        gap_resolved += a.gap_sites_resolved;
+        gap_unresolved += a.gap_sites_unresolved;
         if !a.hits.is_empty() {
             fixtures_with_flows += 1;
         }
@@ -119,6 +123,7 @@ fn taint_smoke_all_fixtures() {
         agg.sites_unknown,
     );
     eprintln!("TAINT-PATH-EDGES total={total_edges}");
+    eprintln!("TAINT-GAPS resolved={gap_resolved} unresolved={gap_unresolved}");
     let mut misses: Vec<(String, usize)> = miss_log.into_iter().collect();
     misses.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     eprintln!(

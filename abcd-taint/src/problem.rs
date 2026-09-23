@@ -300,7 +300,9 @@ impl<'m> TaintProblem<'m> {
             Some(Op::Call { args, .. }) => args.len(),
             _ => return None,
         };
-        self.registry.peek(&name, argc).and_then(|s| s.callback.clone())
+        self.registry
+            .peek(&name, argc)
+            .and_then(|s| s.callback.clone())
     }
 
     /// The applied-summary log (application order).
@@ -420,7 +422,8 @@ impl<'m> TaintProblem<'m> {
                 });
                 if has_body {
                     SiteClass::BodyStep
-                } else if let Some(name) = self.prototype_summary(inst, call, argc, &mut tried, peek)
+                } else if let Some(name) =
+                    self.prototype_summary(inst, call, argc, &mut tried, peek)
                 {
                     // Prototype-path applications are additive-only
                     // (exclusive: false) — see the precedence table.

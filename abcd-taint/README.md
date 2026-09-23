@@ -57,23 +57,104 @@ backlog for what to summarize next).
 ```rust
 Summary {
     doc: String,                 // rendered in reports
-    flows: Vec<Flow>,            // (from, to) over Endpoint::{Param(i), Base, Return, Field(path)}
+    flows: Vec<Flow>,            // (from, to) over Endpoint::{Param(i), Base, Return, Field(path), ReturnField(path)}
     clears: Vec<Endpoint>,       // taint kills (checked first)
     exclusive: bool,             // complete model: kills the call edge into the callee
-    callback: Option<u16>,       // mini-gap: builtin invokes param(i) with base elements
+    callback: Option<CallbackGap>, // gap: builtin invokes param(i) with base elements
 }
 Flow { from, to, is_alias }     // is_alias: reference stored, not just data (rung-1 marker)
+CallbackGap {
+    param: u16,                         // which call argument is the callback value
+    enter: Vec<GapEnter>,               // taint INTO the callback: Endpoint → callback formal
+    return_to_result: Option<FieldChain>, // callback return → call result (map: [AnyIndex]; forEach: None)
+}
 ```
 
 Application is on the **call-to-return edge** (summaries.md §2.1), with the
 cheap pre-filter (only taints on the call's operands consult the summary),
 leftover-fields append (FlowDroid's `cutSubFields=false` default), and the
 **incoming taint retained unless cleared**. `exclusive` kills the call edge
-into the callee body — never merged (the callee is never stepped into).
-`callback` tags the callback value with an `[AnyIndex]` chain; a direct call to
-that value (resolvable by the call graph) maps the tag onto the callback's
-first formal. A full gap propagator (resuming the summary after user-code
-callbacks) is NOT implemented.
+into the callee body — never merged (the callee is never stepped into; the
+GAP edge into the user callback is NOT killed — see the next section).
+`callback` drives two gap channels: the mini-gap tag (the callback value is
+tagged with an `[AnyIndex]` chain; a direct call to that value, resolvable
+by the call graph, maps the tag onto the callback's first formal —
+`params[formal_base]` under the N66 frame model) and, when `enter` rules
+are present, the full gap propagator below.
+
+## The full gap propagator (t-P4 — FlowDroid's gap mechanism)
+
+FlowDroid's summaries stay sound across library→app callbacks by *spawning
+the normal taint analysis into user code* when a summarized method invokes
+an app callback (`SummaryTaintWrapper.spawnAnalysisIntoClientCode`,
+summaries.md §2.2 step 6). The t-P4 propagator (`gap.rs`) is that mechanism
+for the JS bytecode analyzer — NOT a separate analysis: the summary
+wrapper's call-flow spawns an ordinary IFDS continuation plus the return
+wiring:
+
+1. **Eager static scan** (`TaintProblem` construction, counter-free —
+   classification peeks through `SummaryRegistry::peek`, so the
+   fallback-ladder counters keep classifying only solver-processed sites):
+   every call site whose winning summary (direct-name or prototype path)
+   carries a `CallbackGap` with `enter` rules gets its callback argument
+   resolved to user bodies — the local def-chain trace
+   (`DefineFunc`/`AllocClosure`/`CreateGenerator`/`LoadConst(MethodRef)`,
+   the call graph's own walk) plus the **may-direction** points-to arm
+   (`Oracle::may_sites_at`: the rung-1 engine's resolution-complete caller
+   fan-out is ACCEPTED, the `refine_with_points_to` discipline — a callback
+   arriving through a helper's parameter resolves; probe e16).
+2. **Call-graph augmentation** — `GapCallGraph` wraps the base graph for
+   the SOLVER only, merging gap callees into `callees_of_call_at` and gap
+   callers into `callers_of` (heros §1.7's unbalanced-returns discipline
+   sees them). The base graph is untouched; sink collection, path
+   reconstruction, and classification keep consuming it.
+3. **Gap enter** (`call_flow`'s gap arm): each `enter` rule whose source
+   endpoint matches the incoming fact (local or heap — the latter through
+   the may-direction site query) seeds the callback's formal,
+   `params[formal_base + formal]` under the N66 frame-slot binding
+   (`OverApproxAll` taints every formal — never silently drop). The normal
+   arg→param binding does NOT run on a gap edge (the builtin passes
+   `(element, index, array)`, not the summary call's operands);
+   function-global state bases cross unchanged. The oracle's
+   calling-context injection is skipped: the rung-1 engine reads the BASE
+   graph, which has no gap edges — a query inside the callback that hops
+   through the gap call finds no recorded caller and takes the rung-0
+   floor (sound).
+4. **Gap return** (`return_flow`'s gap arm): the callback's returned taint
+   maps onto the summary call's result with `return_to_result` prepended
+   (map: `[AnyIndex]` — the result array's elements). `None` (forEach —
+   undefined result; filter — the predicate's boolean) DROPS the callback
+   return. Thrown values and state bases cross the gap edge exactly like a
+   normal return, so a callback's side effects (global/lexical stores)
+   persist at the continuation — a callback that leaks its formal to a
+   global is a real flow even when its return is discarded
+   (`gap_for_each_discards_callback_return_but_runs_body`).
+
+**Exclusive × gap**: an exclusive summary kills the call edge into the
+CALLEE's body and the operand taints on its bypass edge — the gap edge into
+the user callback survives both (pinned by
+`gap_exclusive_callback_summary_still_enters`).
+
+**Termination/depth**: gap edges are STATIC (computed once, before the
+solve) — the solver's monotone dedup is the whole termination argument, and
+gap-entered bodies contribute their own gap edges (nested gaps converge;
+`gap_nested_callbacks_terminate`).
+
+**The honest fallback**: an unresolved callback value (global load,
+unproven parameter, call result) produces NO gap edge — the mini-gap tag
+alone remains and taint never enters the callback body (a documented FN;
+FlowDroid's "no implementors found" case). The wrapper counters
+`TaintReport::{gap_sites_resolved, gap_sites_unresolved}` record both
+(probe e15; the smoke prints `TAINT-GAPS`).
+
+**Registered drivers** (the canonical gap trio, prototype-path keyed,
+non-exclusive by the prototype-path discipline):
+
+| Summary | enter rules | return channel |
+|---|---|---|
+| `Array.prototype.forEach` | Base / `Field([AnyIndex])` → cb formal 0 | `None` (undefined result) |
+| `Array.prototype.map` | same | cb return → result's `[AnyIndex]` elements |
+| `Array.prototype.filter` | same (the predicate body receives the element) | `None`; result elements ← base elements STATICALLY (`Field([AnyIndex])` → `ReturnField([AnyIndex])`, plus the whole-array Base fallback) |
 
 ## The fallback ladder (reader D, summaries.md §4)
 
@@ -118,7 +199,13 @@ families — the same discipline as the fact model's never-killed `Global`
 base, always a may-answer), and `GetIterator` over a builtin
 array/string iterable ⇒ `Iterator.prototype` (the for-of protocol
 object). Multi-site receivers merge by family UNION; an empty/unknown
-answer produces NO candidate (never invent). What is NOT recoverable:
+answer produces NO candidate (never invent). t-P4 added the
+**may-direction site arm**: receivers the keying-precise `site_info_at`
+cannot type but the engine's RESOLUTION-complete caller fan-out can (a
+parameter receiver whose callers are all recorded — probe e16's `arr`)
+type through `Oracle::may_sites_at`, the same consumer discipline as the
+call-graph bridge; any family the arm contributes marks the answer
+imprecise (additive-only either way). What is NOT recoverable:
 class instances (`new Foo()` is a call result — no keyed alloc, no class
 link), generator objects (`s.next` ×54 stays a named miss — honest),
 prototype-chain walks (families are exact kinds, not hierarchy roots —
@@ -138,7 +225,9 @@ base's `[AnyIndex]` element channel), `String.prototype.charCodeAt`
 e10 pins this against the identity heuristic), `Iterator.prototype.next`
 / `.return` (the for-of protocol `{value, done}` wrapper — modeled as
 transparently carrying the source's taint, the `[AnyIndex]` "elements
-of" tag included; `done` is a fresh boolean). Supporting machinery: the
+of" tag included; `done` is a fresh boolean). Registered (t-P4): the
+gap trio `Array.prototype.forEach` / `.map` / `.filter` (the table in
+the gap section above). Supporting machinery: the
 summary schema's `Field(path)` flow endpoints now match HEAP facts by
 site intersection + path prefix (pop/next over a push-tagged array), and
 `GetIterator` re-keys the source's `[AnyIndex]` heap taint onto the
@@ -238,23 +327,29 @@ ad-hoc runs):
 
 Name it exactly as the def chain produces it (qualified through global loads).
 Set `exclusive` only for complete models (sanitizers, pure tests,
-thoroughly-modeled namespaces); set `callback` for forEach-style builtins;
+thoroughly-modeled namespaces); set `callback` + `gap_enter`/`gap_return`
+for forEach-style builtins (the full gap propagator, t-P4 — see above);
 use `alias_flow` for mutators. Then run the corpus smoke — the miss log tells
 you what to write next.
 
 ## Tests
 
-- `tests/mechanisms.rs` (32) — one test per mechanism: access-path cutoff,
+- `tests/mechanisms.rs` (40) — one test per mechanism: access-path cutoff,
   exclusive-kill, every fallback-ladder rung, miss counting, ExceptionParam
   catch binding, weak-vs-strong heap update, global round-trip, clears, the
   base endpoint, negative control, determinism, the N66 frame-slot binding
   (3), the rung-1 A/B pins (5: store keying through a call result,
   strong update through a call-result alias, the param-callee bridge,
-  heap-fact summary endpoints, rung-1 determinism), and the t-P3
+  heap-fact summary endpoints, rung-1 determinism), the t-P3
   prototype-path pins (10: alloc-kind→family, const family, multi-site
   phi merge, user-object negative control, direct-name precedence,
   negative caching, unknown-receiver fall-through, the GetIterator
-  family, the push alias flow, alloc-via-global-provenance).
+  family, the push alias flow, alloc-via-global-provenance), and the
+  t-P4 gap-propagator pins (8: forEach enter, map return wiring, the
+  map-ignore-param negative control, forEach's discarded-return +
+  side-effect proof, exclusive-with-callback, the unresolved-callback
+  fallback counter, nested-gap termination, the mini-gap tag's
+  first-formal binding on direct calls).
 - `tests/probes.rs` (5 + 1 ignored) — the §5.5 precision probe suite.
   Five hand-built mini-modules with FP/FN annotations (the P5b
   ladder-trigger baseline): straight-line local; heap store/load same
@@ -268,7 +363,7 @@ you what to write next.
 
 ## The compiled probe suite (t-P1 — the §5.5 ladder-trigger instrument)
 
-Real-bytecode extension of the mini-module probes: 27 hand-written JS
+Real-bytecode extension of the mini-module probes: 33 hand-written JS
 probes with KNOWN ground truth, one directory per §5.5 precision axis.
 
 **Layout** (repo root):
@@ -319,16 +414,36 @@ regression.
 then run the suite — a NEW probe whose expectations are wrong fails
 loudly with the actual hit lines.
 
-**Current table** (rung 1 + the t-P3 prototype-resolution path, verbatim):
+**Current table** (rung 1 + the t-P3 prototype-resolution path + the
+t-P4 gap propagator, verbatim):
 
 ```text
 PROBE-FAMILY a-heap-alias cases=6 tp=3 fp=0 fn=0
 PROBE-FAMILY b-closure-capture cases=3 tp=2 fp=1 fn=0
 PROBE-FAMILY c-dynamic-dispatch cases=4 tp=2 fp=1 fn=1
 PROBE-FAMILY d-exceptional-flow cases=4 tp=2 fp=0 fn=1
-PROBE-FAMILY e-builtin-summary cases=10 tp=7 fp=1 fn=0
-PROBE-TOTAL tp=16 fp=3 fn=2 violations=0
+PROBE-FAMILY e-builtin-summary cases=16 tp=11 fp=2 fn=0
+PROBE-TOTAL tp=20 fp=4 fn=2 violations=0
 ```
+
+The pre-t-P4 table (rung 1 + t-P3, verbatim): family e
+`cases=10 tp=7 fp=1 fn=0`, `PROBE-TOTAL tp=16 fp=3 fn=2 violations=0`.
+t-P4 added six family-E probes (all existing entries reproduce
+IDENTICALLY): **e11** `forEach`'s callback entered through the gap edge
+(tp), **e12** map's gap return wiring — cb return → the result array's
+`[AnyIndex]` elements (tp), **e13** map's callback ignoring its
+parameter (EXPECTED fp, closes at rung 2 — the gap return channel is
+provably silent, pinned by the mechanism twin
+`gap_map_callback_ignoring_param_no_return_flow`; the hit is the load
+rule's unknown-base may-alias wildcard meeting the SOURCE array's
+`Heap.[AnyIndex]` fact through the VM-allocated result), **e14**
+filter's static element flow (`Field([AnyIndex])` →
+`ReturnField([AnyIndex])`; the predicate's boolean return carries
+nothing) (tp), **e15** the unresolved-callback honest fallback —
+opaque global-load callback, no gap edge, `gap_sites_unresolved`
+records the site (clean), **e16** the param-callee gap — the callback
+AND the receiver resolve through the rung-1 engine's caller fan-out
+(the may-direction arm; the b3 bridge's consumer discipline) (tp).
 
 The t-P2 table (the pre-t-P3 rung-1 baseline): families a 3/0/0, b 2/1/0,
 c 2/1/1, d 2/0/1, e 5→`cases=5 tp=4 fp=0 fn=0` — `tp=13 fp=2 fn=2`.
@@ -365,20 +480,26 @@ store-to-load function resolution). c2 stays structural
 The rung-0 baseline for comparison (t-P1, verbatim): `tp=11 fp=4 fn=4`
 (families: a 3/2/0, b 1/1/1, c 2/1/1, d 2/0/1, e 3/0/1).
 
-## Corpus smoke results (t-P3, verbatim)
+## Corpus smoke results (t-P4, verbatim)
 
 Registered config (source = all `func_main_0` params; sink = `print`; top-20
-builtin summaries + the t-P3 prototype-family set; 1149 runtime-passed
-fixtures; two runs identical). The numbers below moved from the t-P2
-baseline EXACTLY at the sites the prototype path rescued (full
-attribution after the block); `hits=0`, the path-edge total, and
-determinism are unchanged:
+builtin summaries + the t-P3 prototype-family set + the t-P4 gap trio; 1149
+runtime-passed fixtures; two runs identical). **Byte-identical to the t-P3
+numbers** — no runtime-passed fixture exercises the gap trio (a byte scan of
+all 1149 `.abc`s finds neither `forEach` nor `filter` nor `map` string-table
+entries; the corpus' only `forEach` fixture family,
+`test-arrow-function-6-directly-call`, is runtime-`not-applicable` and not in
+the smoke set), and the t-P4 may-direction receiver arm typed no corpus
+receiver differently (`lookups` would have moved otherwise). The gap-wrapper
+counters are both zero — the trio's smoke coverage is entirely the probe
+suite's (by design; probes are the ladder instrument):
 
 ```text
 SMOKE fixtures=1149 fixtures_with_flows=0
 TAINT-FLOWS hits=0
 TAINT-COUNTERS lookups=10254 neg_cache_hits=90 body_step=108 native_keep=942 unknown=69
 TAINT-PATH-EDGES total=198734
+TAINT-GAPS resolved=0 unresolved=0
 TAINT-SUMMARY-MISSES top10=[("foo", 117), ("f", 90), ("A", 69), ("s.next", 54), ("B", 36), ("c", 36), ("count", 36), ("String.prototype.replace", 18), ("add", 18), ("b.value2", 18)]
 TAINT-SUMMARY-HITS top10=[("print", 1437), ("Iterator.prototype.next", 162), ("Iterator.prototype.return", 126), ("Object.is", 36), ("RegExp", 36), ("String.prototype.charCodeAt", 36), ("Array.prototype.pop", 18), ("Number.isNaN", 18), ("Object.setPrototypeOf", 18), ("Proxy", 18)]
 SMOKE-DETERMINISM runs=2 identical=true
@@ -432,11 +553,12 @@ deterministic:
 SMOKE fixtures=1149 fixtures_with_flows=18
 TAINT-FLOWS hits=36
 TAINT-PATH-EDGES total=353569
+TAINT-GAPS resolved=0 unresolved=0
 SMOKE-DETERMINISM runs=2 identical=true
 ```
 
-(re-confirmed byte-identical at t-P3 — the sensitivity control's flows do
-not route through any prototype-rescued site.)
+(re-confirmed byte-identical at t-P3 AND t-P4 — the sensitivity control's
+flows route through neither prototype-rescued nor gap-resolved sites.)
 
 Counters classify only call sites the solver actually processed (a site with
 no incoming fact edge — dead code, or a function body unreachable even by the
@@ -459,8 +581,22 @@ zero fact — is never classified).
   it).
 - **Closure captures**: a tainted capture marks the closure value (empty
   chain), but function-object taint is dropped at the call boundary — capture
-  taint does not enter the body (FN; the mini-gap `[AnyIndex]` channel covers
-  only summary-driven callbacks).
+  taint does not enter the body (FN; summary-driven callbacks are covered by
+  the t-P4 gap propagator's `enter` rules — capture-through-lexenv INTO a
+  gap-entered body works via the LexVar state-base passthrough, but the
+  closure-VALUE mark remains inert).
+- **Unresolved gap callbacks** — a summary callback value that resolves to
+  no user body (global load, unproven parameter, call result) gets no gap
+  edge: taint never enters the callback (documented FN, counted in
+  `TaintReport::gap_sites_unresolved`; probe e15). Inside a gap-entered
+  body, rung-1 alias queries hopping through the gap call find no recorded
+  caller in the base graph and take the rung-0 floor (the calling-context
+  injection is deliberately skipped on gap edges — gap.rs).
+- **Gap results are not allocation-keyed** — a map/filter result is
+  VM-allocated, so an indexed load through it meets the SOURCE array's
+  `Heap.[AnyIndex]` fact via the unknown-base may-alias wildcard (probe
+  e13's expected FP; closes when summary results get call-site-keyed
+  allocations, rung 2).
 - **Prototype methods** — IMPLEMENTED at t-P3 (the prototype-resolution
   path above): alloc-kind / constant / global-provenance families re-key
   `recv.m(...)` to `Family.prototype.m` summaries. Residual limits:
