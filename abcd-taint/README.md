@@ -144,15 +144,88 @@ you what to write next.
   exclusive-kill, every fallback-ladder rung, miss counting, ExceptionParam
   catch binding, weak-vs-strong heap update, global round-trip, clears, the
   base endpoint, negative control, determinism.
-- `tests/probes.rs` (5) — the §5.5 precision probe suite, hand-built
-  mini-modules with FP/FN annotations (the ladder-trigger baseline):
-  straight-line local; heap store/load same alloc site (with a distinct-site
-  FP control); dynamic dispatch (phi of two closures); interprocedural
-  call/return (asserts the reported path crosses `Call` and `Return`);
-  exception-only path (throw→handler is the only route, with a normal-path
-  FP control).
-- `tests/corpus_taint_smoke.rs` (ignored) — the 1149-fixture print-sink smoke
-  with determinism pinned (two runs, identical reports).
+- `tests/probes.rs` (5 + 1 ignored) — the §5.5 precision probe suite.
+  Five hand-built mini-modules with FP/FN annotations (the P5b
+  ladder-trigger baseline): straight-line local; heap store/load same
+  alloc site (with a distinct-site FP control); dynamic dispatch (phi of
+  two closures); interprocedural call/return (asserts the reported path
+  crosses `Call` and `Return`); exception-only path (throw→handler is
+  the only route, with a normal-path FP control). Plus the IGNORED-GATED
+  compiled probe suite (`compiled::probe_suite_compiled`) — see below.
+- `tests/corpus_taint_smoke.rs` (ignored) — the 1149-fixture print-sink
+  smoke with determinism pinned (two runs, identical reports).
+
+## The compiled probe suite (t-P1 — the §5.5 ladder-trigger instrument)
+
+Real-bytecode extension of the mini-module probes: 22 hand-written JS
+probes with KNOWN ground truth, one directory per §5.5 precision axis.
+
+**Layout** (repo root):
+
+- `probes-taint/src/<family>/<case>.js` — committed sources. Every probe
+  declares `var TAINT = "tainted"` at top level (script mode → global
+  record: the VM run is clean AND every read compiles to
+  `TryGetGlobal("TAINT")`, the suite's source). Sinks are `print(...)`.
+- `probes-taint/src/annotations.json` — committed ground truth: per
+  probe, per sink line (1-based), `expect` ∈ `tp` (real flow, must hit)
+  / `clean` (no flow, must not hit) / `fp` (no flow, rung 0 hits —
+  EXPECTED false positive) / `fn` (real flow, rung 0 misses — KNOWN
+  false negative); `fp`/`fn` carry `closes_at_rung` (the ladder rung
+  that should change the outcome, `null` = structural/wontfix) plus
+  optional counter expectations (`summaries_applied`, `named_misses`,
+  `body_step_min`).
+- `probes-taint/out/` — GITIGNORED compiled `.abc` + manifest, produced
+  by `python3 scripts/gen-taint-probes.py` (GHCR image es2abc 24.0.0.0,
+  baseline profile, script mode — pin and rationale in the annotations;
+  baseline still carries the line-number table the runner maps hits
+  with). The generator VALIDATES annotations↔source agreement (every
+  annotated line is a `print(` call; every `print(` call is annotated)
+  and requires every probe to run clean on the image's VM — the ground
+  truth is runtime-checked.
+- The runner: `cargo test -p abcd-taint --test probes --release --
+  --ignored --nocapture probe_suite_compiled`. It FAILS on any deviation
+  in EITHER direction — an expected-fp/fn that stops reproducing means
+  the ladder moved and the annotations must be updated deliberately
+  (this is what makes it a trigger, not a snapshot). Remote:
+  `scripts/remote-test.sh test -p abcd-taint --test probes --release --
+  --ignored --nocapture probe_suite_compiled` — remote-test.sh's rsync
+  excludes only `target/`, `.vscode/`, `decompiled/`, so the gitignored
+  `probes-taint/out/` reaches dabai with no include workaround needed.
+
+**Trigger linkage** (analysis-strategy §5.5): families (a) heap-alias
+and (b) closure-capture gate rung 0→1 (their expected-fp/fn entries —
+unknown-base may-alias, weak-update-through-unproven-alias, LexVar
+cross-function merge, callback registration — are heap-v0's structural
+limits, closing at rung 1); family (c) dynamic-dispatch gates rung 1→2
+(the APAK axis — which function gets called); families (d) exceptional
+flow and (e) builtin summaries pin the T5/summary mechanisms against
+regression.
+
+**Adding a probe**: write `probes-taint/src/<family>/<case>.js` (one
+`print(...)` per sink, keep each on its own line), add its entry to
+`annotations.json` with the runtime ground truth, run
+`python3 scripts/gen-taint-probes.py` (it checks the annotation lines),
+then run the suite — a NEW probe whose expectations are wrong fails
+loudly with the actual hit lines.
+
+**Current table** (rung 0, post-N66 frame-slot binding fix, verbatim):
+
+```text
+PROBE-FAMILY a-heap-alias cases=6 tp=3 fp=2 fn=0
+PROBE-FAMILY b-closure-capture cases=3 tp=1 fp=1 fn=1
+PROBE-FAMILY c-dynamic-dispatch cases=4 tp=2 fp=1 fn=1
+PROBE-FAMILY d-exceptional-flow cases=4 tp=2 fp=0 fn=1
+PROBE-FAMILY e-builtin-summary cases=5 tp=3 fp=0 fn=1
+PROBE-TOTAL tp=11 fp=4 fn=4 violations=0
+```
+
+The four known-FNs are the calibration evidence: b3 (callback
+registration — closes at rung 1 via points_to-fed callee resolution),
+c4 (handler table — rung 2), d4 (throw through a global binding — rung
+2), e5 (Object.assign field taint — rung-1 summary modeling). The four
+expected-FPs: a4/a5 (unknown-base may-alias / weak update — rung 1),
+b2 (LexVar function-agnostic merge — rung 1), c2 (user-defined global
+named `print` — structural cost of name-keyed sinks, no rung).
 
 ## Corpus smoke results (v2-P5b, verbatim)
 
