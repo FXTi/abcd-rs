@@ -850,8 +850,9 @@ fn #1 "af" kind=async params=(this, p1)
 
 /// t13 — lexenv: `NewLexEnvWithName` scope names resolve `{level, slot}`
 /// through the env chain; the UNNAMED `NewLexEnv` (gap G1) gets the
-/// cosmetic `v{level}_{slot}` fallback; an intervening `PopLexEnv` is an
-/// inline barrier (it writes LEX_ENV).
+/// cosmetic `v{abs}_{slot}` fallback keyed by the frame's ABSOLUTE chain
+/// index (capture-consistent across functions — d-P7); an intervening
+/// `PopLexEnv` is an inline barrier (it writes LEX_ENV).
 #[test]
 fn t13_lexenv() {
     let mut m = mk_module();
@@ -906,8 +907,8 @@ fn t13_lexenv() {
     scope-push [x, y]
     lex x = 1.0 /*L0#0*/
     scope-push [<unnamed>]
-    lex v0_0 = 2.0 /*L0#0*/
-    const v7 = (y + v0_0) ; v7
+    lex v1_0 = 2.0 /*L0#0*/
+    const v7 = (y + v1_0) ; v7
     scope-pop
     scope-pop
     return v7
@@ -1265,4 +1266,143 @@ fn t19_unary_forms() {
     return (v6 + v6)
 "#;
     assert_eq!(got, want);
+}
+
+/// t20 — capture-consistent fallback naming (d-P7; dream-gate family
+/// for-update-continue-1): unnamed lexenv slots get the cosmetic
+/// `v{abs}_{slot}` fallback keyed by the frame's ABSOLUTE index in the
+/// seeded chain, so a nested closure's `GetLexVar { level > 0 }` names
+/// the SAME binding the owning ancestor's `PutLexVar` wrote. The legacy
+/// relative `v{level}_{slot}` scheme only coincided when reader and
+/// writer sat at the same depth — f19's `ldlexvar 2,1` (a `v0_1` write
+/// in the ancestor) surfaced as an unassigned orphan ("v2_1 is not a
+/// function").
+#[test]
+fn t20_capture_consistent_fallback() {
+    let mut m = mk_module();
+    // child (#0): own frame + reads of the grand/parent frames.
+    let child = add_func_named(&mut m, "child");
+    {
+        let b = entry_of(&m, child);
+        let _this = add_param(&mut m, child);
+        let _ne = emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
+        let c7 = load_number(&mut m, b, 7.0);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: c7,
+            },
+        );
+        let g1 = emit(&mut m, b, Op::GetLexVar { level: 2, slot: 1 });
+        let g2 = emit(&mut m, b, Op::GetLexVar { level: 1, slot: 0 });
+        let s = add(&mut m, b, g1, g2);
+        emit_void(&mut m, b, Op::PopLexEnv);
+        emit_void(&mut m, b, Op::Return { value: Some(s) });
+    }
+    // parent (#1): own frame, defines child.
+    let parent = add_func_named(&mut m, "parent");
+    {
+        let b = entry_of(&m, parent);
+        let _this = add_param(&mut m, parent);
+        let _ne = emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
+        let c20 = load_number(&mut m, b, 20.0);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: c20,
+            },
+        );
+        let df = emit(
+            &mut m,
+            b,
+            Op::DefineFunc {
+                body: child,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        emit_void(&mut m, b, Op::PopLexEnv);
+        emit_void(&mut m, b, Op::Return { value: Some(df) });
+    }
+    // grand (#2): two unnamed slots, defines parent.
+    let grand = add_func_named(&mut m, "grand");
+    {
+        let b = entry_of(&m, grand);
+        let _this = add_param(&mut m, grand);
+        let _ne = emit(&mut m, b, Op::NewLexEnv { num_vars: 2 });
+        let c10 = load_number(&mut m, b, 10.0);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: c10,
+            },
+        );
+        let c21 = load_number(&mut m, b, 21.0);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 1,
+                value: c21,
+            },
+        );
+        let df = emit(
+            &mut m,
+            b,
+            Op::DefineFunc {
+                body: parent,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        emit_void(&mut m, b, Op::PopLexEnv);
+        emit_void(&mut m, b, Op::Return { value: Some(df) });
+    }
+
+    let got_grand = dump_func(&recover_func(&m, grand));
+    let want_grand = r#"fn #2 "grand" kind=function params=(this)
+  bb B2 preds=[]:
+    scope-push [<unnamed>, <unnamed>]
+    lex v0_0 = 10.0 /*L0#0*/
+    lex v0_1 = 21.0 /*L0#1*/
+    const parent = closure(fn#1 "parent" function captures=[]) ; v14
+    scope-pop
+    return parent
+"#;
+    assert_eq!(got_grand, want_grand);
+
+    let got_parent = dump_func(&recover_func(&m, parent));
+    let want_parent = r#"fn #1 "parent" kind=function params=(this)
+  bb B1 preds=[]:
+    scope-push [<unnamed>]
+    lex v1_0 = 20.0 /*L0#0*/
+    const child = closure(fn#0 "child" function captures=[]) ; v9
+    scope-pop
+    return child
+"#;
+    assert_eq!(got_parent, want_parent);
+
+    // The fix's core: child's reads of the grand/parent frames name the
+    // SAME bindings (`v0_1`, `v1_0`) the ancestors wrote — not the
+    // legacy relative fallbacks (`v2_1`, `v1_0` at the wrong depth).
+    let got_child = dump_func(&recover_func(&m, child));
+    let want_child = r#"fn #0 "child" kind=function params=(this)
+  bb B0 preds=[]:
+    scope-push [<unnamed>]
+    lex v2_0 = 7.0 /*L0#0*/
+    const v5 = (v0_1 + v1_0) ; v5
+    scope-pop
+    return v5
+"#;
+    assert_eq!(got_child, want_child);
 }

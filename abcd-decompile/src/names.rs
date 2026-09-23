@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 
 use abcd_ir::consts::Const;
 use abcd_ir::function::DebugData;
-use abcd_ir::id::{BlockId, FuncId, InstId};
+use abcd_ir::id::{BlockId, ConstId, FuncId, InstId};
 use abcd_ir::module::Module;
 use abcd_ir::op::Op;
 
@@ -45,10 +45,21 @@ pub struct EnvFrame {
 /// pass suffices since NewLexEnv/PopLexEnv discipline is lexical, not
 /// loop-carried, in es2abc output — any residual disagreement degrades
 /// to the cosmetic fallback.
+///
+/// The chain is SEEDED with the function's inherited environment: the
+/// env stack of the parent function at the site that defines this one
+/// (`DefineFunc`/`DefineClass`/`AllocObject` method refs), computed
+/// transitively (`inherited_chain`). This makes cross-function captures
+/// resolve to the SAME name the owning function stores under (dream
+/// gate: for-update-continue-1 — `ldlexvar 2,1` in a nested closure
+/// must name the binding the ancestor wrote, not an orphan).
 #[derive(Debug)]
 pub struct NameScopes {
     /// `(inst, resolved raw name)` for every lexvar/private-name op.
     resolved: BTreeMap<InstId, String>,
+    /// Child function → the env chain captured at its definition site
+    /// (first site in augmented-RPO wins — deterministic).
+    defines: BTreeMap<FuncId, Vec<EnvFrame>>,
 }
 
 impl NameScopes {
@@ -57,10 +68,41 @@ impl NameScopes {
         self.resolved.get(&inst).map(String::as_str)
     }
 
-    /// Build the chain of `func` in `module`.
+    /// Build the chain of `func` in `module`, seeded with the
+    /// function's inherited (captured) environment.
     pub fn build(module: &Module, func_id: FuncId) -> Self {
+        let mut visiting = Vec::new();
+        let seed = Self::inherited_chain(module, func_id, &mut visiting);
+        Self::build_seeded(module, func_id, seed)
+    }
+
+    /// The env chain a function INHERITS: the parent's env stack at the
+    /// definition site. `visiting` guards define-site cycles (a malformed
+    /// module could nest functions mutually; degrade to no seed).
+    fn inherited_chain(module: &Module, func: FuncId, visiting: &mut Vec<FuncId>) -> Vec<EnvFrame> {
+        if visiting.contains(&func) {
+            return Vec::new();
+        }
+        let Some(parent) = parent_of(module, func) else {
+            return Vec::new();
+        };
+        if visiting.contains(&parent) {
+            return Vec::new();
+        }
+        visiting.push(func);
+        let seed = Self::inherited_chain(module, parent, visiting);
+        visiting.pop();
+        let scopes = Self::build_seeded(module, parent, seed);
+        scopes.defines.get(&func).cloned().unwrap_or_default()
+    }
+
+    /// Build with an explicit seed chain (the inherited environment;
+    /// empty for functions with no known definition site).
+    fn build_seeded(module: &Module, func_id: FuncId, seed: Vec<EnvFrame>) -> Self {
+        let seed_len = seed.len();
         let mut scopes = NameScopes {
             resolved: BTreeMap::new(),
+            defines: BTreeMap::new(),
         };
         let Some(func) = module.func(func_id) else {
             return scopes;
@@ -79,10 +121,12 @@ impl NameScopes {
             }
         }
 
-        let mut entry_of: BTreeMap<BlockId, Vec<EnvFrame>> = BTreeMap::new();
         let mut exit_of: BTreeMap<BlockId, Vec<EnvFrame>> = BTreeMap::new();
         for &b in &order {
             // Meet: longest common prefix of the processed preds' exits.
+            // Blocks with no processed predecessor (the entry, loop
+            // headers on the first pass, unreached blocks) start from
+            // the SEED — the inherited chain is every block's floor.
             let mut meet: Option<Vec<EnvFrame>> = None;
             for p in preds.get(&b).into_iter().flatten() {
                 if let Some(exit) = exit_of.get(p) {
@@ -92,16 +136,22 @@ impl NameScopes {
                     });
                 }
             }
-            let mut stack = meet.unwrap_or_default();
+            let mut stack = meet.unwrap_or_else(|| seed.clone());
             if let Some(block) = module.block(b) {
                 for &iid in &block.insts {
                     let Some(inst) = module.inst(iid) else {
                         continue;
                     };
-                    step_inst(module, &mut stack, inst.op.clone(), iid, &mut scopes);
+                    step_inst(
+                        module,
+                        &mut stack,
+                        seed_len,
+                        inst.op.clone(),
+                        iid,
+                        &mut scopes,
+                    );
                 }
             }
-            entry_of.insert(b, stack.clone());
             exit_of.insert(b, stack);
         }
         scopes
@@ -114,14 +164,92 @@ fn common_prefix(a: &[EnvFrame], b: &[EnvFrame]) -> Vec<EnvFrame> {
     a[..n].to_vec()
 }
 
+/// The functions a define op gives a captured environment to:
+/// `DefineFunc`'s body, class ctors + member-buffer `MethodRef`s, and
+/// object-shape `MethodRef`s (all emitted inline at the site, so their
+/// captured chain is the site's env stack).
+fn defined_children(module: &Module, op: &Op) -> Vec<FuncId> {
+    fn method_refs(module: &Module, cid: ConstId, out: &mut Vec<FuncId>) {
+        if let Some(c) = module.consts.get(cid) {
+            method_refs_const(module, c, out);
+        }
+    }
+    fn method_refs_const(module: &Module, c: &Const, out: &mut Vec<FuncId>) {
+        match c {
+            Const::MethodRef(f) => out.push(*f),
+            Const::ArrayLiteral(items) => {
+                for i in items {
+                    method_refs_const(module, i, out);
+                }
+            }
+            Const::ObjectLiteral { keys, values } => {
+                for i in keys.iter().chain(values.iter()) {
+                    method_refs_const(module, i, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    match op {
+        Op::DefineFunc { body, .. } => out.push(*body),
+        Op::DefineClass { ctor, members, .. } | Op::DefineSendableClass { ctor, members, .. } => {
+            out.push(*ctor);
+            method_refs(module, *members, &mut out);
+        }
+        Op::AllocObject { shape } => method_refs(module, *shape, &mut out),
+        _ => {}
+    }
+    out
+}
+
+/// The first function (in module order) whose body defines `func`
+/// (its capture parent). `None` for the entry and for functions whose
+/// define site is unreachable/absent — they get no seed.
+fn parent_of(module: &Module, func: FuncId) -> Option<FuncId> {
+    for i in 0..module.functions.len() {
+        let p = FuncId::new(i as u32);
+        if p == func {
+            continue;
+        }
+        let Some(f) = module.func(p) else {
+            continue;
+        };
+        for &b in &f.blocks {
+            let Some(block) = module.block(b) else {
+                continue;
+            };
+            for &iid in &block.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if defined_children(module, &inst.op).contains(&func) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// One instruction's effect on the env chain (+ name resolution).
+/// `seed_len` marks the inherited prefix: private-name resolution is
+/// scoped to the function's OWN frames (the legacy behavior — the
+/// private-name printing/class-fold pipeline keys on it), and define
+/// ops record the captured chain for their children.
 fn step_inst(
     module: &Module,
     stack: &mut Vec<EnvFrame>,
+    seed_len: usize,
     op: Op,
     iid: InstId,
     scopes: &mut NameScopes,
 ) {
+    // Record the captured chain for defined children BEFORE the op's
+    // own effect (define ops do not push/pop the chain).
+    for child in defined_children(module, &op) {
+        scopes.defines.entry(child).or_insert_with(|| stack.clone());
+    }
     match &op {
         Op::NewLexEnv { num_vars } => {
             stack.push(EnvFrame {
@@ -153,18 +281,38 @@ fn step_inst(
         }
         Op::GetLexVar { level, slot } | Op::PutLexVar { level, slot, .. } => {
             let name = resolve_slot(stack, *level, *slot)
-                .unwrap_or_else(|| format!("v{}_{}", level, slot));
+                .unwrap_or_else(|| lex_fallback(stack.len(), *level, *slot));
             scopes.resolved.insert(iid, name);
         }
         Op::LoadPrivate { level, slot, .. }
         | Op::StorePrivate { level, slot, .. }
         | Op::DefinePrivate { level, slot, .. }
         | Op::TestPrivate { level, slot, .. } => {
-            let name = resolve_priv(stack, *level, *slot)
-                .unwrap_or_else(|| format!("p{}_{}", level, slot));
+            // Private names keep the pre-seeding semantics: resolve
+            // against the function's OWN frames only.
+            let own = &stack[seed_len.min(stack.len())..];
+            let name =
+                resolve_priv(own, *level, *slot).unwrap_or_else(|| format!("p{}_{}", level, slot));
             scopes.resolved.insert(iid, name);
         }
         _ => {}
+    }
+}
+
+/// The cosmetic fallback for an UNNAMED slot (gap G1): keyed by the
+/// frame's ABSOLUTE index in the seeded chain (`v{abs}_{slot}`) so the
+/// owning function and every capturing reader compute the SAME name for
+/// the same frame — the relative `v{level}_{slot}` keyed by the access
+/// site's depth was only self-consistent when reader and writer happened
+/// to sit at the same depth (dream gate: for-update-continue-1,
+/// "v2_1 is not defined"/"v2_1$1 is not a function"). When the chain
+/// was meet-truncated above the target (frame unknown), the legacy
+/// relative form is kept — the module-top orphan predeclarations
+/// (`emit::orphan_lexenv_names`) cover those.
+fn lex_fallback(stack_len: usize, level: u16, slot: u16) -> String {
+    match stack_len.checked_sub(1 + level as usize) {
+        Some(abs) => format!("v{abs}_{slot}"),
+        None => format!("v{level}_{slot}"),
     }
 }
 

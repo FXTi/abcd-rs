@@ -92,8 +92,46 @@ in d-P5 (each proven by the oracle):
   (`exit_phis_bypassed`), and the general `while (true)` form places
   the assigns on the condition-exit edge.
 
-Residual decompile-bugs (36) are the other families:
-private-property-in 15, private-field 3, upstream/bytecode 18.
+Residual decompile-bugs at d-P5 (36) were the other families:
+private-property-in 15, private-field 3, upstream/bytecode 18. d-P6
+cleared the private-member families (18) via the MemberAttrs projection
++ the classfold instance-initializer reversal.
+
+**d-P7 histogram (2026-09-24, floor now 1059)**: **1059 pass** / **0
+decompile-bug** / 0 es2abc-cant / 54 expected-fallback / 36
+fixture-unsupported (of 1149). The last decompile-bug family —
+`upstream/bytecode/js/lexicalEnv/for-update-continue-1` (6 versions ×
+3 profiles) — moved to pass with no regressions. Root cause and fix:
+
+- **RC — relative-level fallback naming broke cross-function captures
+  (G1).** Unnamed lexenv slots got the cosmetic fallback
+  `v{level}_{slot}` keyed by the ACCESS site's relative level. The name
+  of one frame therefore varied with the reader's own-frame depth: f6
+  writes `v31` as `v0_0` (its level 0), but f19 — two own frames deep —
+  reads it as `v1_0`, and reads f5 as `v2_1`; the module-top orphan
+  predeclarations (the G1 safety net) are never assigned, so the call
+  crashed (`TypeError: v2_1$1 is not a function`, oracle stderr
+  "undefined is not callable"). Fix (`names.rs`): the `NameScopes` chain
+  is SEEDED with the function's inherited environment — the parent's
+  env stack at the define site (`DefineFunc`/`DefineClass`/`AllocObject`
+  method refs), computed transitively — and the G1 fallback is keyed by
+  the frame's ABSOLUTE chain index (`v{abs}_{slot}`), which owner and
+  every capturing reader compute identically. Private-name resolution
+  deliberately keeps the legacy own-frames-only semantics (the
+  class-fold pipeline keys on it). Pinned red-first by
+  `golden_expr::t20_capture_consistent_fallback`; the t13 golden moved
+  to the absolute scheme (`v1_0` for a depth-1 unnamed frame).
+  Regression-safety: for currently-passing fixtures a name change only
+  occurs where the old name was an orphan fallback resolving to
+  `undefined` — i.e. dead reads or already-failing fixtures; the
+  empirical proof is the gate itself (1041 → 1059, nothing else moved).
+
+The pre-diagnosis's other two suspicions were NON-issues at runtime:
+the `var vN /* phi */` temps inside `while (true)` hoist to function
+scope, so they alias (not shadow) the outer same-named binding; and the
+finally-style duplicated try wrappers are behavior-preserving for this
+family. The VM-verified before/after: `TypeError … at f19` exit 255 →
+clean exit 0 with empty stdout (matching the baked oracle record).
 
 Gate-found decompiler bugs FIXED in d-P4 (each proven by the oracle):
 N36 operand order at expression construction, value-pure inc/dec,
