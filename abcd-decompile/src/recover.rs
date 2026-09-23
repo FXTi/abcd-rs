@@ -1243,12 +1243,29 @@ impl<'m> Recover<'m> {
             };
         };
         match value.def {
-            ValueDef::Param(i) => Expr::Ident(
-                self.param_names
-                    .get(i as usize)
-                    .cloned()
-                    .unwrap_or_else(|| format!("p{i}")),
-            ),
+            ValueDef::Param(i) => {
+                let i = i as usize;
+                // Hidden es2abc ABI slots read directly (some es2abc
+                // versions read a1 via `mov` instead of ldnewtarget):
+                // map them to their JS surface forms. (Dream gate:
+                // newtarget-this referenced a dropped `p1`.)
+                if self.hidden_params == 3 && i == 1 {
+                    Expr::NewTarget
+                } else if self.hidden_params == 3 && i == 0 {
+                    Expr::Fallback {
+                        op: "Param(funcobj)",
+                        note: "the hidden function-object slot has no JS surface form",
+                        operands: vec![],
+                    }
+                } else {
+                    Expr::Ident(
+                        self.param_names
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("p{i}")),
+                    )
+                }
+            }
             ValueDef::Const(cid) => match lit_of(self.module, cid) {
                 Some(lit) => Expr::Lit(lit),
                 None => Expr::Fallback {

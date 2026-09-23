@@ -376,14 +376,17 @@ fn s06_switch_cascade() {
 
     let want = r#"function f(p1) {
   switch (p1) {
-  case 1.0:
-    v11 = 10.0;
-    break;
-  case 2.0:
-    v11 = 20.0;
-    break;
-  default:
-    v11 = 30.0;
+  case 1.0: {
+      v11 = 10.0;
+      break;
+    }
+  case 2.0: {
+      v11 = 20.0;
+      break;
+    }
+  default: {
+      v11 = 30.0;
+    }
   }
   var v11; /* phi */
   return v11;

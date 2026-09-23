@@ -542,15 +542,21 @@ impl<'m> Emitter<'m> {
                 out.push_str(&format!("{pad}switch ({d}) {{\n"));
                 for case in cases {
                     if case.tests.is_empty() {
-                        out.push_str(&format!("{pad}default:\n"));
+                        out.push_str(&format!("{pad}default: {{\n"));
                     } else {
                         for t in &case.tests {
                             let mut ts = String::new();
                             self.expr(t, 0, &mut ts);
-                            out.push_str(&format!("{pad}case {ts}:\n"));
+                            out.push_str(&format!("{pad}case {ts}: {{\n"));
                         }
                     }
-                    self.emit_nodes(&case.body, indent + 1, out);
+                    // Braced: switch cases share ONE block scope in JS,
+                    // but the fold's arms can carry same-named temporaries
+                    // (cross-arm tail duplication) — `const x` twice in one
+                    // scope is a SyntaxError (dream gate: es2abc rejected
+                    // super-properties with "already declared").
+                    self.emit_nodes(&case.body, indent + 2, out);
+                    out.push_str(&format!("{pad}  }}\n"));
                 }
                 out.push_str(&format!("{pad}}}\n"));
             }
@@ -1317,6 +1323,30 @@ impl<'m> Emitter<'m> {
                 self.sub(done, 0, out);
                 out.push_str(" } /*iter-result*/");
             }
+            Expr::Iter {
+                op: IterOp::GetIterator,
+                obj,
+                ..
+            } => {
+                // The real protocol call (dream gate: the passthrough
+                // left arrays without `.next` — destructuring failed
+                // with "undefined is not callable"). The for-of fold
+                // consumes the AST node pre-print, so only direct
+                // protocol uses (destructuring, spread) land here.
+                self.sub(obj, 19, out);
+                out.push_str("[Symbol.iterator]()");
+            }
+            Expr::Iter {
+                op: IterOp::GetAsyncIterator,
+                obj,
+                ..
+            } => {
+                // Vendor falls back to Symbol.iterator when no async
+                // iterator exists — elided here (comment); corpus
+                // coverage for for-await is via the fold anyway.
+                self.sub(obj, 19, out);
+                out.push_str("[Symbol.asyncIterator]() /*sync-fallback elided*/");
+            }
             Expr::Iter { op, obj, status } => {
                 let name = iter_op_name(*op);
                 match status {
@@ -1419,8 +1449,58 @@ impl<'m> Emitter<'m> {
     ) {
         match kind {
             CallKind::Direct | CallKind::Dynamic => {
-                self.sub(callee, 19, out);
-                self.emit_args(args, out);
+                // `callthis*`: the receiver matters. Method form when
+                // the callee is a property load of the SAME receiver
+                // (`obj.m(…)`); otherwise `.call(this, …)` — dropping
+                // the receiver silently is a bug (dream gate:
+                // destructuring's `iterator.next()` became `next()` —
+                // "undefined is not callable"/wrong this).
+                let mut done = false;
+                if let Some(t) = this {
+                    match callee {
+                        Expr::PropName {
+                            object,
+                            name,
+                            dot_legal: true,
+                        } if object.as_ref() == t => {
+                            self.sub(t, 19, out);
+                            out.push_str(&format!(".{name}"));
+                            self.emit_args(args, out);
+                            done = true;
+                        }
+                        Expr::PropIndex { object, index } if object.as_ref() == t => {
+                            self.sub(t, 19, out);
+                            out.push('[');
+                            self.sub(index, 0, out);
+                            out.push(']');
+                            self.emit_args(args, out);
+                            done = true;
+                        }
+                        Expr::PropDyn { object, key } if object.as_ref() == t => {
+                            self.sub(t, 19, out);
+                            out.push('[');
+                            self.sub(key, 0, out);
+                            out.push(']');
+                            self.emit_args(args, out);
+                            done = true;
+                        }
+                        _ => {
+                            self.sub(callee, 19, out);
+                            out.push_str(".call(");
+                            self.sub(t, 0, out);
+                            for a in args {
+                                out.push_str(", ");
+                                self.sub(a, 0, out);
+                            }
+                            out.push(')');
+                            done = true;
+                        }
+                    }
+                }
+                if !done {
+                    self.sub(callee, 19, out);
+                    self.emit_args(args, out);
+                }
             }
             CallKind::New => {
                 out.push_str("new ");
@@ -1705,48 +1785,70 @@ fn cmpop_sym(op: CmpOp) -> &'static str {
 /// ancestor's own pass. Names already bound as parameters are skipped
 /// (a `let` redeclaration of a parameter is a SyntaxError).
 fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
-    fn walk(nodes: &[SNode], out: &mut Vec<String>, seen: &mut BTreeSet<String>) {
+    fn walk(
+        nodes: &[SNode],
+        out: &mut Vec<String>,
+        seen: &mut BTreeSet<String>,
+        own: usize,
+        pushes: &mut usize,
+    ) {
         for n in nodes {
             match n {
                 SNode::Stmts(leaves) => {
                     for l in leaves {
-                        if let Leaf::Raw(Stmt::LexStore { level: 0, name, .. }) = l {
-                            let name = sanitize(name);
-                            if seen.insert(name.clone()) {
-                                out.push(name);
+                        match l {
+                            Leaf::Raw(Stmt::ScopePush { .. }) => *pushes += 1,
+                            // Only owned frames are declared locally: a
+                            // function without its own lexenv sees its
+                            // CREATION-time environment at level 0 —
+                            // those names are captures declared by an
+                            // ancestor, and a local `let` would SHADOW
+                            // the capture (dream gate: local/closure
+                            // printed NaN from exactly that shadowing).
+                            Leaf::Raw(Stmt::LexStore { level, name, .. })
+                                if (*level as usize) < own =>
+                            {
+                                let name = sanitize(name);
+                                if seen.insert(name.clone()) {
+                                    out.push(name);
+                                }
                             }
+                            _ => {}
                         }
                     }
                 }
                 SNode::If {
                     then, otherwise, ..
                 } => {
-                    walk(then, out, seen);
-                    walk(otherwise, out, seen);
+                    walk(then, out, seen, own, pushes);
+                    walk(otherwise, out, seen, own, pushes);
                 }
                 SNode::While { body, .. }
                 | SNode::DoWhile { body, .. }
                 | SNode::Labeled { body, .. }
                 | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => walk(body, out, seen),
+                | SNode::ForIn { body, .. } => walk(body, out, seen, own, pushes),
                 SNode::Try { body, catches, .. } => {
-                    walk(body, out, seen);
+                    walk(body, out, seen, own, pushes);
                     for c in catches {
-                        walk(&c.body, out, seen);
+                        walk(&c.body, out, seen, own, pushes);
                     }
                 }
                 SNode::Switch { cases, .. } => {
                     for c in cases {
-                        walk(&c.body, out, seen);
+                        walk(&c.body, out, seen, own, pushes);
                     }
                 }
                 SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
             }
         }
     }
+    // Count own lexenv frames first (the collection order pass).
+    let mut pushes = 0usize;
+    walk(nodes, &mut Vec::new(), &mut BTreeSet::new(), 0, &mut pushes);
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = params.iter().cloned().collect();
-    walk(nodes, &mut out, &mut seen);
+    walk(nodes, &mut out, &mut seen, pushes, &mut 0);
     out
 }
 
