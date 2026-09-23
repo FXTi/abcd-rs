@@ -283,6 +283,26 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 
 排序：与 taint 轨道平行（crate 不相交）；d-P0 现在就做，d-P1 起等 FlowDroid 对照结论（若支配树/循环分析落 abcd-dataflow 则受其节奏影响）。
 
+## 清尾队列（2026-09-23 维护者拍板：全部纳入计划，按序执行；E 系列同日入列）
+
+| # | 任务 | 内容 | 状态 |
+|---|------|------|------|
+| d-P5 | B1 try 投影精度 | 72 fixture：try 投影与 es2abc 字节级 try 范围对齐（handler 续体接合点）；门禁=梦想门禁 951→1023 | 未开始 |
+| d-P6 | B2 私有成员缓冲属性 | 18 fixture：class 成员缓冲的属性位（static/实例/private brand）进 IR（abcd-ir+abcd-lift+abcd-decompile） | 未开始 |
+| d-P7 | B3 深 lexenv×try | 18 fixture：for-update-continue-1 族作用域重建 | 未开始 |
+| d-P8 | D 可读性批次 | finally 复制折叠、arrow-vs-function、多 catch 合并、LexStore 作用域重建、--ts | 未开始 |
+| d-P9 | C1 模块 G2 | 36 fixture：lift 用 ModuleData 把槽位解析成名字 + 模块模式完善 | 未开始 |
+| d-P10 | G4 模板 raw | 36 fixture：核实 raw 是否在字面量数组，在则保留 | 未开始 |
+| d-P11 | C2 生成器/异步管道 | 18 fixture：生成器协议状态机重建为 async/function* 体（最贵） | 未开始 |
+| t-P1 | E6 评估基建 | 带人工标注真实污点的 fixture 集（爬级触发器的可信基线） | 未开始 |
+| t-P2 | E1 rung-1 引擎 | Boomerang 形按需别名查询（AliasOracle 接缝后的真引擎） | 未开始（触发器：探针 a+b 族 FN） |
+| t-P3 | E3 原型链摘要查找 | points-to 驱动的接收者类型近似（依赖 t-P2） | 未开始 |
+| t-P4 | E4 mini-gap 完整传播器 | 摘要暂停/回调/恢复（高阶内置函数摘要的前置） | 未开始 |
+| t-P5 | E5 摘要库扩展 | miss 计数器驱动；真实 @ohos.* API（待真实应用语料） | 持续 |
+| t-P6 | E2 rung-2 PTA | APAK 形上下文敏感指针分析（阶段级；触发器：分发误报实证） | 未开始 |
+
+顺序：d-P5→d-P6→d-P7→d-P8→d-P9→d-P10→d-P11→t-P1→t-P2→t-P3→t-P4→t-P5→t-P6（E 系由触发器把关，顺序反映依赖与成本）。
+
 **维护者决策（2026-09-20）**：D2（inline 是否在 v0.2 IR 上重写）**排在 v2-P3 之后**再议——pass 框架落地后才有讨论内联的基座；D3（死 FFI 表面 108/324）**拍板保留**，对账表已核销。v2-P2 启动前按约定暂停，等维护者发话。
 
 **维护者决策（2026-09-21，v2-P3 关门后）**：**D2 = inline 要**——在 v0.2 IR 上重写（v2-P3b 任务，按构造消灭 N44：参数映射/前驱重建/try 区域保留/verifier 洁净）；**P4 = v1 不留档**——swap 时 abcd-ir crate 直接删除（git 历史即留档），parity 对照器/语料 driver 等 v0.1 依赖物随之一并退役。 |
