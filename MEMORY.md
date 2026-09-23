@@ -477,8 +477,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   direct-name > user-body > prototype > conservative keep, additive
   only). Probes tp=16 fp=3 fn=2; smoke: charCodeAt/pop rescued out of
   the miss log, s.next honestly retained (generator receivers opaque),
-  unknown 357->69 via Iterator next/return. Next: d-P8 (readability
-  batch) || t-P4 (mini-gap propagator).
+  unknown 357->69 via Iterator next/return. t-P4 DONE: full gap propagator (eager static scan +
+  GapCallGraph solver-only wrapper; callback enter via frame-slot
+  binding, returns wired per return_to_result; exclusive kills the
+  callee edge but never the gap edge). forEach/map/filter trio
+  registered; probes tp=20 fp=4 fn=2; smoke byte-identical (corpus
+  exercises no trio sites — probes are the coverage by design).
+  IN FLIGHT: d-P8 (readability batch).
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
