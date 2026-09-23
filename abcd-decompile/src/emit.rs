@@ -187,6 +187,13 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         out.push_str(&format!("let {name};\n"));
     }
 
+    // Orphan lexical-slot predeclarations (G1; see
+    // `orphan_lexenv_names`).
+    for name in orphan_lexenv_names(module) {
+        em.fn_names.reserve(&name);
+        out.push_str(&format!("let {name}; /* orphan lexenv slot (G1) */\n"));
+    }
+
     // Consumed functions: closure bodies, class ctors, and every
     // MethodRef in the const pool (emitted inline, never top-level).
     let consumed = consumed_functions(module);
@@ -342,6 +349,59 @@ struct Emitter<'m> {
     hoisted: BTreeSet<String>,
 }
 
+/// Orphan lexical bindings (IR gap G1): unnamed lexenv slots get
+/// fallback names `v{level}_{slot}`; when the slot's OWNING function
+/// never stores to it textually (write-only-from-inner-closure), no
+/// `let` is ever emitted and the capture is a free reference (dream
+/// gate: for-update-continue-1, "v2_1 is not defined"). Declaring the
+/// fallback names at module top is sound under textual nesting:
+/// functions that DO declare the name shadow it locally.
+fn orphan_lexenv_names(module: &Module) -> BTreeSet<String> {
+    fn is_fallback(name: &str) -> bool {
+        let b = name.as_bytes();
+        // v<digits>_<digits>
+        if !b.starts_with(b"v") {
+            return false;
+        }
+        let rest = &name[1..];
+        let Some((a, bb)) = rest.split_once('_') else {
+            return false;
+        };
+        !a.is_empty()
+            && !bb.is_empty()
+            && a.bytes().all(|c| c.is_ascii_digit())
+            && bb.bytes().all(|c| c.is_ascii_digit())
+    }
+    fn walk_expr(e: &Expr, out: &mut BTreeSet<String>) {
+        if let Expr::Ident(name) = e
+            && is_fallback(name)
+        {
+            out.insert(name.clone());
+        }
+        for c in crate::folds::expr_children(e) {
+            walk_expr(c, out);
+        }
+    }
+    let mut out = BTreeSet::new();
+    for i in 0..module.functions.len() {
+        let rf = recover_func(module, FuncId::new(i as u32));
+        for b in &rf.blocks {
+            for st in &b.stmts {
+                if let Stmt::LexStore { name, .. } = st
+                    && is_fallback(&sanitize(name))
+                {
+                    out.insert(sanitize(name));
+                }
+                for e in stmt_exprs(st) {
+                    walk_expr(e, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The full per-function pipeline: Stage A → Stage B → folds.
 impl<'m> Emitter<'m> {
     /// The full per-function pipeline: Stage A → Stage B → folds.
     fn func_nodes(&mut self, func: FuncId) -> (RecoveredFunc, Vec<SNode>) {
@@ -1423,15 +1483,33 @@ impl<'m> Emitter<'m> {
                 getter,
                 setter,
             } => {
-                out.push_str("Object.defineProperties(");
+                // defineProperty with only the PRESENT accessor: an
+                // explicit `get: undefined` would clobber an existing
+                // getter (dream gate: local/class-accessors' setter
+                // definition wiped the getter → NaN).
+                let g = matches!(getter.as_ref(), Expr::Lit(Lit::Undefined));
+                let s = matches!(setter.as_ref(), Expr::Lit(Lit::Undefined));
+                out.push_str("Object.defineProperty(");
                 self.sub(obj, 0, out);
-                out.push_str(", { [");
+                out.push_str(", ");
                 self.sub(key, 0, out);
-                out.push_str("]: { get: ");
-                self.sub(getter, 0, out);
-                out.push_str(", set: ");
-                self.sub(setter, 0, out);
-                out.push_str(" } }) /*DefineGetterSetterByValue: approximate*/");
+                out.push_str(", {");
+                if !g {
+                    out.push_str(" get: ");
+                    self.sub(getter, 0, out);
+                }
+                if !s {
+                    if !g {
+                        out.push(',');
+                    }
+                    out.push_str(" set: ");
+                    self.sub(setter, 0, out);
+                }
+                // Class accessors are configurable — without it the
+                // getter/setter pair can't be defined in two steps
+                // (dream gate: class-accessors on 12.x, "Cannot define
+                // property").
+                out.push_str(", configurable: true }) /*DefineGetterSetterByValue: approximate*/");
             }
             Expr::ModuleNamespace { index } => {
                 out.push_str(&crate::names::namespace_fallback(*index));
@@ -1540,8 +1618,11 @@ impl<'m> Emitter<'m> {
                 out.push(')');
             }
             CallKind::SuperForwardAllArgs => {
+                // `args` is not a real binding — the op forwards the
+                // actual arguments object (dream gate: super-properties
+                // hit "args is not defined").
                 out.push_str(
-                    "super(...args) /*forward-all: default derived ctor elision pending*/",
+                    "super(...arguments) /*forward-all: default derived ctor elision pending*/",
                 );
             }
         }

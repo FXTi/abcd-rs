@@ -174,13 +174,17 @@ def main():
         # Non-pass: exactly one bucket.
         if not comp["compiled"]:
             err = comp.get("error", "")
-            if "SyntaxError" in err:
-                # Our text does not parse — that's ours, not es2abc's.
-                bucket = "decompile-bug"
-            elif row["hard_fallbacks"]:
+            if row["hard_fallbacks"]:
                 bucket = "expected-fallback"
             elif row["module"]:
+                # IR gap G2 + the call-entry wrapper: module top-level
+                # bindings are not module-scoped in our output, so
+                # `export { name }` cannot resolve (a SyntaxError here
+                # is the G2 gap, not a parse bug).
                 bucket = "fixture-unsupported"
+            elif "SyntaxError" in err:
+                # Our text does not parse — that's ours, not es2abc's.
+                bucket = "decompile-bug"
             else:
                 bucket = "es2abc-cant"
             key = f"{bucket}: {err[:120]}"
@@ -189,6 +193,9 @@ def main():
             if row["hard_fallbacks"]:
                 bucket = "expected-fallback"
             elif row["module"]:
+                # IR gap G2: module-var slot↔name correspondence is not
+                # in the IR, so `export { name }` references bindings
+                # the recompiled module cannot provide.
                 bucket = "fixture-unsupported"
             else:
                 bucket = "decompile-bug"

@@ -1076,11 +1076,29 @@ impl<'m> Recover<'m> {
                 setter,
             } => {
                 self.record(op, Outcome::Plumbing);
+                // Resolve an `undefined` constant THROUGH the temp
+                // indirection: the emitter must see the absence
+                // literally, or `get: undefined` clobbers an existing
+                // accessor (dream gate: local/class-accessors).
+                let undef_through = |v: &ValueId| -> Option<Expr> {
+                    let ValueDef::Inst(iid) = self.module.value(*v)?.def else {
+                        return None;
+                    };
+                    let Op::LoadConst(cid) = self.module.inst(iid)?.op else {
+                        return None;
+                    };
+                    match self.module.consts.get(cid)? {
+                        abcd_ir::Const::Undefined => Some(Expr::Lit(Lit::Undefined)),
+                        _ => None,
+                    }
+                };
+                let getter = undef_through(getter).unwrap_or_else(|| self.expr_of(*getter));
+                let setter = undef_through(setter).unwrap_or_else(|| self.expr_of(*setter));
                 out.push(Stmt::Expr(Expr::DefineGetterSetter {
                     obj: Box::new(self.expr_of(*obj)),
                     key: Box::new(self.expr_of(*key)),
-                    getter: Box::new(self.expr_of(*getter)),
-                    setter: Box::new(self.expr_of(*setter)),
+                    getter: Box::new(getter),
+                    setter: Box::new(setter),
                 }));
             }
             Op::CopyDataProps { dst, src } => {

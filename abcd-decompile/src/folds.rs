@@ -1382,10 +1382,22 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
     Some((disc, cases))
 }
 
-/// The `(discriminant, case-literal)` of a `x === lit` condition
-/// (wrappers stripped; the discriminant is a temp or an identifier).
+/// The `(discriminant, case-literal)` of a POSITIVE `x === lit`
+/// condition. Only the truth-preserving `istrue` wrapper may be
+/// stripped — `isfalse`/`!` invert the arms and a `case lit:` body
+/// would run on the WRONG polarity (d-P4 dream gate: `x ?? y`'s
+/// `isfalse(x === undefined)` chain folded into a switch with the
+/// undefined/default arms swapped — local/optional-chain).
 fn switch_test(cond: &Expr) -> Option<(Expr, Expr)> {
-    match strip_cond(cond) {
+    let mut c = cond;
+    while let Expr::Unary {
+        op: abcd_ir::op::UnOp::IsTrue,
+        operand,
+    } = c
+    {
+        c = operand;
+    }
+    match c {
         Expr::Compare {
             op: abcd_ir::op::CmpOp::StrictEq | abcd_ir::op::CmpOp::Eq,
             left,
