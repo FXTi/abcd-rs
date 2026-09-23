@@ -489,7 +489,14 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   RECOVERABLE (NC_FUNCTION file flag; FunctionKind::Arrow/AsyncArrow;
   byte-neutral — kind bits live in the method index, not the
   definefunc instruction). Dream gate UNCHANGED 1059 (the batch's hard
-  constraint). Next: d-P9 (module G2) || t-P5 (summary library).
+  constraint).
+  d-P9 DONE: module G2 CLOSED — dream gate 1095/1149 with
+  fixture-unsupported bucket EMPTY (decompile-side module_slot_names
+  via TDZ-guard names + stored DefineFunc/Class names with 12.0.6+
+  demangling; poison-on-conflict honesty keeps m{index}; zero lift/IR
+  changes). Remaining bucket: ONLY expected-fallback 54 (hard-7
+  async/generator 18 + template raw 36) — d-P10/d-P11's scopes.
+  IN FLIGHT: t-P5 (summary library growth).
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
