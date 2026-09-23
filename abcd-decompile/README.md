@@ -15,8 +15,45 @@ the one structural fact a reader cares most about.
 | Stage | Status | What |
 |---|---|---|
 | **A — expression recovery** | **DONE** (d-P2) | SSA def-use → expression trees, block-local + phi wiring (`src/recover.rs`) |
-| B — control-flow structuring | pending (d-P3) | region-tree consumption (`abcd-analysis::control::regions`), JS desugaring fold rules (for-of/for-in, literal folds, guard elision at region level) |
-| C — emission | pending (d-P4) | precedence-correct printing, modules/classes/functions, the recompile-and-run corpus gate |
+| **B — control-flow structuring** | **DONE** (d-P3) | region-tree consumption, desugar fold rules (`src/structure.rs`, `src/folds.rs`) |
+| **C — emission** | **DONE** (d-P4) | precedence-correct printing, modules/classes/functions, cross-arm tail-duplication fold, the recompile-and-run dream gate |
+
+## The d-P4 dream gate (decompile → es2abc recompile → ark_js_vm)
+
+`tests/dream_gate.rs` (ignored; corpus + local docker) decompiles every
+runtime-passed corpus fixture (1149) to `target/dream-gate/src/…`
+(with `EmitOptions::call_entry` so the program actually executes) plus a
+manifest with module flags and hard-7 fallback markers;
+`scripts/dream-gate.py` recompiles each with the GHCR image's es2abc
+**version-pinned to the fixture's own version directory** (the image
+carries exactly the corpus's six versions — no substitution rule was
+needed), module mode when the IR carries imports/exports/module
+requests, then runs the UNCHANGED `scripts/compare-rewritten-corpus.py`
+behavior oracle and triages every non-pass fixture into exactly one
+bucket: `decompile-bug` / `es2abc-cant` / `expected-fallback` /
+`fixture-unsupported`. `dream_gate_oracle` asserts the acceptance floor
+(pass ≥ 951).
+
+**Acceptance histogram (2026-09-23)**: **951 pass** / 108 decompile-bug
+/ 0 es2abc-cant / 54 expected-fallback / 36 fixture-unsupported (of
+1149). The residual buckets: try-projection approximations in the
+optimizer try-catch families (72), private-field brand + class-member
+static/instance metadata (buffer attribute payloads, not in the IR;
+private-property-in 15 + private-field 3), hard-7 async/generator
+machinery + G4 cooked-only templates (54, by construction), module
+fixtures whose slot↔name correspondence is IR gap G2 (36).
+
+Gate-found decompiler bugs FIXED in d-P4 (each proven by the oracle):
+N36 operand order at expression construction, value-pure inc/dec,
+temporal escape hoisting (`var` at function top when a use leaves the
+def's block), own-frame lexenv declarations (closure capture shadowing),
+receiver-preserving `callthis*` (`obj.m()` / `.call(this, …)`), real
+`GetIterator` protocol calls, braced switch-case bodies, positive-only
+switch-test polarity, accessor descriptors without clobbering,
+`super(...arguments)`, orphan lexenv slot declarations, and N65
+`delobjprop` object/key roles in abcd-lift + abcd-lower (byte-neutral
+double inversion; pinned by `lift_unit::delobjprop_operand_roles` and
+`abcd-lower/tests/lower_delobjprop_roles.rs`).
 
 Stage A is deliberately **block-local**: the conservative v1 inline rule
 requires def and use in the same block (cross-block dominance-based

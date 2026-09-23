@@ -22,19 +22,31 @@
 //! 6). [`EmitStats::fallback_comments`] counts them per op for the
 //! corpus gate.
 //!
-//! ## Known v1 limitations (for d-P4's backlog)
+//! ## Known limitations (post-d-P4 backlog)
 //!
 //! - Arrow vs `function` is not recoverable from the IR — closures
 //!   print as `function` (design §4.3: cosmetic).
-//! - Lexical bindings (`LexStore`) print as plain assignments; scope
-//!   reconstruction (declaration kind and placement) is d-P4 work.
-//! - `SuperForwardAllArgs` prints `super(...args)` with a note; the
+//! - Lexical bindings print as assignments to declarations hoisted to
+//!   the function top (`let`/`var` placement, not per-scope `const`
+//!   reconstruction) — declaration KIND and precise scope extents are
+//!   future scope-reconstruction work.
+//! - `SuperForwardAllArgs` prints `super(...arguments)`; the
 //!   default-derived-ctor elision is a later fold.
 //! - Template literals print cooked-only with placeholders (IR gap
 //!   G4).
 //! - Multiple catch handlers per region (typed catches — no JS
 //!   surface) merge into the first clause with a note.
-//! - `--ts` type annotations are NOT implemented at v1 (the flag in
+//! - Class member-buffer attribute payloads (static vs instance
+//!   placement, `Enumerable`/`Readable` bits) are skipped — methods
+//!   land as instance members (dream-gate registered:
+//!   private-property-in/private-field).
+//! - The try-projection approximation zone (protected-range vs
+//!   structure mismatch: join placement inside a protected span, the
+//!   `cuts`/`splits` families) diverges on the optimizer try-catch
+//!   corpus families (dream-gate registered).
+//! - Vendor bigint inc/dec polymorphism (`5n--` → `4n`) is not
+//!   expressible with the pure `x - 1` form (no corpus coverage).
+//! - `--ts` type annotations are NOT implemented (the flag in
 //!   [`EmitOptions`] is reserved).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2123,9 +2135,6 @@ fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
                 us.len() > ds.len() && us[..ds.len()] == ds[..] && us[ds.len()] > *dn
             };
             if !dpaths.iter().any(visible) {
-                if std::env::var_os("ABCD_ESC_DEBUG").is_some() {
-                    eprintln!("ESC {name} use={u:?} decls={dpaths:?}");
-                }
                 out.insert(name);
             }
         }

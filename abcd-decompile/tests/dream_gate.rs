@@ -109,6 +109,11 @@ fn json_escape(s: &str) -> String {
 #[test]
 #[ignore = "requires exported GHCR corpus and python3"]
 fn dream_gate_generate() {
+    generate();
+}
+
+/// Generate the decompiled tree + manifest; returns the fixture count.
+fn generate() -> usize {
     let root = common::corpus_root();
     let rows = manifest_rows(&root);
     let passed: Vec<_> = rows.iter().filter(|r| r.4 == "passed").cloned().collect();
@@ -185,4 +190,85 @@ fn dream_gate_generate() {
         total_bytes,
         gate.display()
     );
+    passed.len()
+}
+
+/// The full gate: generate, then run `scripts/dream-gate.py`
+/// (es2abc recompile + ark_js_vm behavior compare + triage) and assert
+/// the recorded acceptance floor. Docker is LOCAL-only
+/// (scripts/remote-test.sh).
+///
+/// The histogram at d-P4 acceptance (2026-09-23): pass 951 /
+/// decompile-bug 108 / es2abc-cant 0 / expected-fallback 54 /
+/// fixture-unsupported 36 (of 1149). The floor guards regressions;
+/// raise it when the buckets improve.
+#[test]
+#[ignore = "requires exported GHCR corpus, python3, and LOCAL docker"]
+fn dream_gate_oracle() {
+    generate();
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("scripts")
+        .join("dream-gate.py");
+    let out = std::process::Command::new("python3")
+        .arg(&script)
+        .arg("--jobs")
+        .arg("8")
+        .output()
+        .expect("run dream-gate.py (docker, local only)");
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    eprintln!("{text}");
+    let report = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("dream-gate")
+        .join("dream-gate-report.json");
+    let report: serde_jsonless::Report =
+        serde_jsonless::parse(&std::fs::read_to_string(&report).expect("report"));
+    eprintln!(
+        "DREAM-GATE-ASSERT pass={} decompile-bug={} es2abc-cant={} expected-fallback={} fixture-unsupported={}",
+        report.pass,
+        report.decompile_bug,
+        report.es2abc_cant,
+        report.expected_fallback,
+        report.fixture_unsupported
+    );
+    assert!(
+        report.pass >= 951,
+        "dream gate regression: pass {} < 951 (the d-P4 acceptance floor)",
+        report.pass
+    );
+}
+
+/// Minimal JSON field extraction (no serde dependency in this crate's
+/// tests — the corpus pattern is python3, but the report is small).
+mod serde_jsonless {
+    /// The triage histogram fields.
+    pub struct Report {
+        pub pass: usize,
+        pub decompile_bug: usize,
+        pub es2abc_cant: usize,
+        pub expected_fallback: usize,
+        pub fixture_unsupported: usize,
+    }
+
+    pub fn parse(text: &str) -> Report {
+        let grab = |key: &str| -> usize {
+            let marker = format!("\"{key}\": ");
+            let start = text.find(&marker).expect(key) + marker.len();
+            let end = text[start..]
+                .find(|c: char| !c.is_ascii_digit())
+                .expect("number end")
+                + start;
+            text[start..end].parse().expect("usize")
+        };
+        Report {
+            pass: grab("pass"),
+            decompile_bug: grab("decompile-bug"),
+            es2abc_cant: grab("es2abc-cant"),
+            expected_fallback: grab("expected-fallback"),
+            fixture_unsupported: grab("fixture-unsupported"),
+        }
+    }
 }

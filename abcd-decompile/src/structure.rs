@@ -1040,7 +1040,6 @@ impl<'m> Ctx<'m> {
     ) -> Option<(Vec<SNode>, DupStop, usize)> {
         const MAX_BLOCKS: usize = 8;
         const MAX_STMTS: usize = 128;
-        let debug = std::env::var_os("ABCD_XARM_DEBUG").is_some();
         let site_plan = self.f_mut().plan_of(site);
         let mut segs: Vec<(Option<usize>, Vec<SNode>)> = Vec::new();
         let mut cur = target;
@@ -1049,25 +1048,9 @@ impl<'m> Ctx<'m> {
         let mut stop = None;
         loop {
             if !visited.insert(cur) || visited.len() > MAX_BLOCKS {
-                if debug {
-                    eprintln!(
-                        "XARM-BAIL site=B{} target=B{} cur=B{} reason=cycle-or-budget",
-                        site.index(),
-                        target.index(),
-                        cur.index()
-                    );
-                }
                 return None;
             }
             if self.f().loop_headers.contains(&cur) {
-                if debug {
-                    eprintln!(
-                        "XARM-BAIL site=B{} target=B{} cur=B{} reason=loop-header",
-                        site.index(),
-                        target.index(),
-                        cur.index()
-                    );
-                }
                 return None;
             }
             let cur_plan = self.f_mut().plan_of(cur);
@@ -1089,28 +1072,12 @@ impl<'m> Ctx<'m> {
                     _ => false,
                 };
                 if !ok {
-                    if debug {
-                        eprintln!(
-                            "XARM-BAIL site=B{} target=B{} cur=B{} reason=plan-boundary",
-                            site.index(),
-                            target.index(),
-                            cur.index()
-                        );
-                    }
                     return None;
                 }
             }
             let parts = self.block_parts(cur);
             stmts += parts.main.len() + parts.phi.len();
             if stmts > MAX_STMTS {
-                if debug {
-                    eprintln!(
-                        "XARM-BAIL site=B{} target=B{} cur=B{} reason=stmt-budget",
-                        site.index(),
-                        target.index(),
-                        cur.index()
-                    );
-                }
                 return None;
             }
             let mut blk: Vec<SNode> = Vec::new();
@@ -1139,14 +1106,6 @@ impl<'m> Ctx<'m> {
                 }
                 // A conditional mid-tail is beyond the v1 fold.
                 Term::Cond(..) => {
-                    if debug {
-                        eprintln!(
-                            "XARM-BAIL site=B{} target=B{} cur=B{} reason=cond-mid-tail",
-                            site.index(),
-                            target.index(),
-                            cur.index()
-                        );
-                    }
                     return None;
                 }
             };
@@ -2607,20 +2566,11 @@ fn clean_while_main_ok(main: &[Stmt], cond: &Expr) -> bool {
             _ => stack.extend(crate::folds::expr_children(e)),
         }
     }
-    let ok = main.iter().all(|s| match s {
+    main.iter().all(|s| match s {
         Stmt::PhiAssign { .. } | Stmt::PhiDecl { .. } | Stmt::Elided { .. } => true,
         Stmt::Declare { name, .. } => !refs.contains(name.as_str()),
         _ => false,
-    });
-    if !ok && std::env::var_os("ABCD_WHILE_DEBUG").is_some() {
-        eprintln!(
-            "WHILE-BAIL refs={refs:?} main={:?}",
-            main.iter()
-                .map(|s| format!("{s:?}").chars().take(60).collect::<String>())
-                .collect::<Vec<_>>()
-        );
-    }
-    ok
+    })
 }
 
 /// Negate a condition, simplifying the wrapper forms es2abc produces

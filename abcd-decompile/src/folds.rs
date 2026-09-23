@@ -1332,12 +1332,21 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
     else {
         return None;
     };
-    let (disc, lit) = switch_test(cond)?;
+    // Polarity-aware: a `isfalse(x === lit)` / `!(x === lit)` test puts
+    // the case body in the FALSE arm and the chain continuation in the
+    // true arm (dream gate: the polarity-blind form swapped the arms of
+    // `x ?? y` — local/optional-chain).
+    let (disc, lit, positive) = switch_test(cond)?;
+    let (case_body, cont) = if positive {
+        (then, otherwise)
+    } else {
+        (otherwise, then)
+    };
     let mut cases = vec![SwitchCase {
         tests: vec![lit],
-        body: with_break(then.clone()),
+        body: with_break(case_body.clone()),
     }];
-    let mut rest = otherwise;
+    let mut rest = cont;
     loop {
         match rest.as_slice() {
             [
@@ -1347,15 +1356,16 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
                     otherwise: o2,
                 },
             ] => {
-                let (d2, lit2) = switch_test(c2)?;
+                let (d2, lit2, pos2) = switch_test(c2)?;
                 if d2 != disc {
                     return None;
                 }
+                let (body2, cont2) = if pos2 { (t2, o2) } else { (o2, t2) };
                 cases.push(SwitchCase {
                     tests: vec![lit2],
-                    body: with_break(t2.clone()),
+                    body: with_break(body2.clone()),
                 });
-                rest = o2;
+                rest = cont2;
             }
             [] => break,
             // A nested switch on the SAME discriminant (a chain folded
@@ -1388,14 +1398,24 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
 /// would run on the WRONG polarity (d-P4 dream gate: `x ?? y`'s
 /// `isfalse(x === undefined)` chain folded into a switch with the
 /// undefined/default arms swapped — local/optional-chain).
-fn switch_test(cond: &Expr) -> Option<(Expr, Expr)> {
+fn switch_test(cond: &Expr) -> Option<(Expr, Expr, bool)> {
     let mut c = cond;
-    while let Expr::Unary {
-        op: abcd_ir::op::UnOp::IsTrue,
-        operand,
-    } = c
-    {
-        c = operand;
+    let mut positive = true;
+    loop {
+        match c {
+            Expr::Unary {
+                op: abcd_ir::op::UnOp::IsTrue,
+                operand,
+            } => c = operand,
+            Expr::Unary {
+                op: abcd_ir::op::UnOp::IsFalse | abcd_ir::op::UnOp::LogicalNot,
+                operand,
+            } => {
+                positive = !positive;
+                c = operand;
+            }
+            _ => break,
+        }
     }
     match c {
         Expr::Compare {
@@ -1405,9 +1425,9 @@ fn switch_test(cond: &Expr) -> Option<(Expr, Expr)> {
         } => {
             let is_disc = |e: &Expr| matches!(e, Expr::Temp { .. } | Expr::Ident(_));
             if is_disc(left) && matches!(right.as_ref(), Expr::Lit(_)) {
-                Some((left.as_ref().clone(), right.as_ref().clone()))
+                Some((left.as_ref().clone(), right.as_ref().clone(), positive))
             } else if is_disc(right) && matches!(left.as_ref(), Expr::Lit(_)) {
-                Some((right.as_ref().clone(), left.as_ref().clone()))
+                Some((right.as_ref().clone(), left.as_ref().clone(), positive))
             } else {
                 None
             }
