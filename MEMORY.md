@@ -472,7 +472,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   decompile-bug bucket EMPTY — dream gate 1059/1149 (1059 pass / 0 bug
   / 0 es2abc-cant / 54 expected-fallback / 36 fixture-unsupported);
   root cause = G1 fallback naming keyed by relative level -> absolute
-  chain index seeding. IN FLIGHT: t-P3 (prototype summary walk).
+  chain index seeding. t-P3 DONE: prototype-chain summary lookup (alloc-kind ->
+  prototype family + global-store provenance + GetIterator; precedence
+  direct-name > user-body > prototype > conservative keep, additive
+  only). Probes tp=16 fp=3 fn=2; smoke: charCodeAt/pop rescued out of
+  the miss log, s.next honestly retained (generator receivers opaque),
+  unknown 357->69 via Iterator next/return. Next: d-P8 (readability
+  batch) || t-P4 (mini-gap propagator).
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
