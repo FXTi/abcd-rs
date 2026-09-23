@@ -59,6 +59,11 @@ pub struct EmitOptions {
     pub line_anchors: bool,
     /// Reserved (TypeScript annotations are not implemented at v1).
     pub ts: bool,
+    /// Append a `func_main_0();` call after the top-level functions so
+    /// the module entry point actually executes (the d-P4 recompile
+    /// gate needs it: the abc entry is invoked by the VM, but JS source
+    /// declares it). Off by default — human-facing output stays clean.
+    pub call_entry: bool,
 }
 
 /// Emission counters (the corpus gate prints them verbatim).
@@ -142,6 +147,25 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         }
     }
 
+    // Global-binding predeclarations: `StoreGlobal`/`TryStoreGlobal`
+    // (top-level sloppy-script bindings) are emitted as plain
+    // assignments, which strict mode (es2abc's output mode) rejects
+    // unless the name is declared. A script-top `var name;` creates the
+    // global binding the assignment then sets (d-P4 — the recompile
+    // gate found this: ReferenceError on every global store).
+    let mut globals = BTreeSet::new();
+    for inst in &module.insts {
+        if let Op::StoreGlobal { name, .. } | Op::TryStoreGlobal { name, .. } = &inst.op {
+            let n = sanitize(&sym_str(module, *name));
+            if globals.insert(n.clone()) {
+                em.fn_names.reserve(&n);
+            }
+        }
+    }
+    for g in &globals {
+        out.push_str(&format!("var {g};\n"));
+    }
+
     // Module-slot predeclarations (gap G2 synthetic names; declaring
     // them keeps the output strict-mode-parseable).
     let mut slots = BTreeSet::new();
@@ -167,12 +191,20 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     let consumed = consumed_functions(module);
 
     // Top-level functions.
+    let mut entry_call: Option<String> = None;
     for i in 0..module.functions.len() {
         let f = FuncId::new(i as u32);
         if consumed.contains(&f) {
             continue;
         }
-        em.emit_top_level_function(f, &mut out);
+        let emitted = em.emit_top_level_function(f, &mut out);
+        if opts.call_entry && emitted.1 == "func_main_0" {
+            entry_call = Some(emitted.0);
+        }
+    }
+    // The recompile gate: invoke the module entry point.
+    if let Some(name) = entry_call {
+        out.push_str(&format!("{name}();\n"));
     }
 
     // Exports (1:1 enum mapping).
@@ -310,24 +342,29 @@ impl<'m> Emitter<'m> {
         (rf, structured.body)
     }
 
-    fn emit_top_level_function(&mut self, func: FuncId, out: &mut String) {
+    /// Returns the (legalized, minted) emitted name and the raw name.
+    fn emit_top_level_function(&mut self, func: FuncId, out: &mut String) -> (String, String) {
         let (rf, body) = self.func_nodes(func);
         self.stats.functions += 1;
         self.current_fn_has_fallback = false;
         self.current_kind = rf.kind;
         let raw = rf.name.clone();
         let name = self.fn_names.mint(&raw);
-        let params = rf.params[1.min(rf.params.len())..].join(", ");
+        let params = rf.params[rf.hidden_params.min(rf.params.len())..].join(", ");
         let keyword = fn_decl_keyword(rf.kind);
         if rf.kind == FunctionKind::Constructor {
             out.push_str("/* constructor outside a class context (data shape) */\n");
         }
         out.push_str(&format!("{keyword} {name}({params}) {{\n"));
+        for d in lex_decls(&body, &rf.params) {
+            out.push_str(&format!("  let {d};\n"));
+        }
         self.emit_nodes(&body, 1, out);
         out.push_str("}\n");
         if self.current_fn_has_fallback {
             self.stats.functions_with_fallbacks += 1;
         }
+        (name, raw)
     }
 
     /// A closure/class-member body at a given indent.
@@ -340,6 +377,10 @@ impl<'m> Emitter<'m> {
         let (rf, body) = self.func_nodes(func);
         let prev = self.current_kind;
         self.current_kind = rf.kind;
+        let pad = "  ".repeat(indent);
+        for d in lex_decls(&body, &rf.params) {
+            out.push_str(&format!("{pad}let {d};\n"));
+        }
         self.emit_nodes(&body, indent, out);
         self.current_kind = prev;
         rf
@@ -837,7 +878,7 @@ impl<'m> Emitter<'m> {
             // the signature.
             let mut body = String::new();
             let rf = self.emit_function_body(ctor, indent + 2, &mut body);
-            let params = rf.params[1.min(rf.params.len())..].join(", ");
+            let params = rf.params[rf.hidden_params.min(rf.params.len())..].join(", ");
             out.push_str(&format!("{params}) {{\n{body}"));
             rf
         };
@@ -909,7 +950,7 @@ impl<'m> Emitter<'m> {
         };
         let mut body = String::new();
         let rf = self.emit_function_body(f, indent + 2, &mut body);
-        let params = rf.params[1.min(rf.params.len())..].join(", ");
+        let params = rf.params[rf.hidden_params.min(rf.params.len())..].join(", ");
         out.push_str(&format!("{pad}  {prefix}{key}({params}) {{\n{body}"));
         out.push_str(&format!("{pad}  }}\n"));
     }
@@ -1125,7 +1166,7 @@ impl<'m> Emitter<'m> {
                 }
                 let mut text = String::new();
                 let rf = self.emit_function_body(body, 1, &mut text);
-                let params = rf.params[1.min(rf.params.len())..].join(", ");
+                let params = rf.params[rf.hidden_params.min(rf.params.len())..].join(", ");
                 out.push_str(&format!("{params}) {{\n{text}}}"));
                 out.push_str(&format!(
                     " /* arrow vs function is not recoverable (design §4.3) */"
@@ -1598,6 +1639,60 @@ fn cmpop_sym(op: CmpOp) -> &'static str {
         CmpOp::In => "in",
         CmpOp::InstanceOf => "instanceof",
     }
+}
+
+/// Level-0 lexical bindings (`PutLexVar` stores) anywhere in a function
+/// body, in first-appearance order — emitted as `let name;` at the
+/// function top (d-P4 scope reconstruction v1: declaration placement;
+/// the recompile gate needs bindings to exist — es2abc's output is
+/// strict-mode, where assigning an undeclared name is a ReferenceError).
+/// Level-N>0 stores target ancestor scopes and are declared by the
+/// ancestor's own pass. Names already bound as parameters are skipped
+/// (a `let` redeclaration of a parameter is a SyntaxError).
+fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
+    fn walk(nodes: &[SNode], out: &mut Vec<String>, seen: &mut BTreeSet<String>) {
+        for n in nodes {
+            match n {
+                SNode::Stmts(leaves) => {
+                    for l in leaves {
+                        if let Leaf::Raw(Stmt::LexStore { level: 0, name, .. }) = l {
+                            let name = sanitize(name);
+                            if seen.insert(name.clone()) {
+                                out.push(name);
+                            }
+                        }
+                    }
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    walk(then, out, seen);
+                    walk(otherwise, out, seen);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => walk(body, out, seen),
+                SNode::Try { body, catches, .. } => {
+                    walk(body, out, seen);
+                    for c in catches {
+                        walk(&c.body, out, seen);
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        walk(&c.body, out, seen);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut seen: BTreeSet<String> = params.iter().cloned().collect();
+    walk(nodes, &mut out, &mut seen);
+    out
 }
 
 fn merge_struct_stats(mut a: StructStats, b: &StructStats) -> StructStats {

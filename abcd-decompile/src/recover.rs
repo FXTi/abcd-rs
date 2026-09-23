@@ -319,8 +319,12 @@ pub struct RecoveredFunc {
     pub name: String,
     /// Its kind.
     pub kind: FunctionKind,
-    /// The legalized parameter names (`params[0]` is `this`, T4).
+    /// The legalized parameter names (the `this` slot is named `this`).
     pub params: Vec<String>,
+    /// Hidden leading ABI slots in `params` (3 for es2abc `<static>`
+    /// functions: funcobj/newtarget/this; 1 otherwise, 0 for empty).
+    /// Emitted JS signatures drop them: `params[hidden..]`.
+    pub hidden_params: usize,
     /// The per-block statement lists, in `func.blocks` order.
     pub blocks: Vec<BlockStmts>,
     /// The per-op coverage histogram.
@@ -449,8 +453,10 @@ struct Recover<'m> {
     alias: HashMap<ValueId, ValueId>,
     /// Minted temporary names per SSA value.
     temp_names: HashMap<ValueId, String>,
-    /// Legalized parameter names (`params[0]` = `this`).
+    /// Legalized parameter names (`this` slot named `this`).
+    /// Hidden leading ABI slot count (es2abc `<static>`: 3).
     param_names: Vec<String>,
+    hidden_params: usize,
     /// `ExceptionParam` value → legalized catch binding name.
     catch_names: HashMap<ValueId, String>,
     /// Handler block → catch binding names (block-head markers).
@@ -465,6 +471,7 @@ struct Recover<'m> {
 impl<'m> Recover<'m> {
     fn new(module: &'m Module, func: FuncId) -> Self {
         let mut r = Recover {
+            hidden_params: 0,
             module,
             func,
             chains: UseDefChains::build(module, func),
@@ -532,6 +539,7 @@ impl<'m> Recover<'m> {
                 name: String::new(),
                 kind: FunctionKind::Function,
                 params: Vec::new(),
+                hidden_params: 0,
                 blocks: Vec::new(),
                 histogram: BTreeMap::new(),
             };
@@ -600,6 +608,7 @@ impl<'m> Recover<'m> {
             name,
             kind,
             params: self.param_names.clone(),
+            hidden_params: self.hidden_params,
             blocks,
             histogram: self.histogram.clone(),
         }
@@ -624,19 +633,45 @@ impl<'m> Recover<'m> {
             })
             .unwrap_or_default();
         let n = f.params.len();
+        // The calling convention's hidden leading slots: es2abc marks
+        // every function <static> and frames carry (funcobj, newtarget,
+        // this) — so for static functions with ≥3 params the user
+        // formals start at params[3] and params[2] is `this`. Non-static
+        // functions (hand-crafted IR, the golden suites) follow T4:
+        // params[0] is `this`. (d-P4: the recompile gate found this —
+        // `add(20, 22)` read its args from the wrong slots.)
+        let hidden = if f.modifiers.contains(abcd_ir::Modifiers::STATIC) && n >= 3 {
+            3
+        } else {
+            usize::from(n > 0)
+        };
+        self.hidden_params = hidden;
         for i in 0..n {
-            if i == 0 {
+            let this_idx = hidden - 1;
+            if i == this_idx && hidden == 1 {
                 // T4: params[0] is the `this` binding.
                 self.param_names.push("this".to_string());
                 continue;
             }
-            // The debug param list may or may not include `this`:
-            // equal length → direct index; otherwise assume it excludes
-            // `this` (offset by one).
+            if hidden == 3 && i < 3 {
+                // The hidden es2abc slots: funcobj/newtarget are nearly
+                // never read (bodies use LoadFunction/LoadNewTarget);
+                // `this` gets its JS name so ctor bodies read right.
+                let name = if i == 2 {
+                    "this".to_string()
+                } else {
+                    format!("p{i}")
+                };
+                self.param_names.push(name);
+                continue;
+            }
+            // The debug param list may or may not include the hidden
+            // slots: equal length → direct index; otherwise assume it
+            // holds only the user formals (offset by `hidden`).
             let raw = if debug_param_names.len() == n {
                 debug_param_names.get(i).cloned()
             } else {
-                debug_param_names.get(i - 1).cloned()
+                debug_param_names.get(i - hidden).cloned()
             };
             let fallback = format!("p{i}");
             let name = self.legal.mint(raw.as_deref().unwrap_or(&fallback));
