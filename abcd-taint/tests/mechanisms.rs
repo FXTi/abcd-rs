@@ -1989,6 +1989,60 @@ fn gap_map_return_wires_result_elements() {
     assert_eq!(report.gap_sites_resolved, 1);
 }
 
+/// The negative control for the gap RETURN channel (probe e13's
+/// mechanism-level twin, isolated from the load rule's unknown-base
+/// wildcard): map's callback IGNORES its parameter and returns a
+/// constant — the result value must carry NO `[AnyIndex]` taint (the
+/// result's element taint comes from the callback's return, not from
+/// the base array directly). Prints the result itself (no indexed
+/// load), so the heap fact on the SOURCE array cannot meet the sink
+/// through an unknown-base load.
+#[test]
+fn gap_map_callback_ignoring_param_no_return_flow() {
+    let mut m = mk_module();
+    let (cb, _e, cb_entry) = gap_cb_skeleton(&mut m, "cb");
+    {
+        let zero = load_number(&mut m, cb_entry, 0.0);
+        emit_void(&mut m, cb_entry, Op::Return { value: Some(zero) });
+    }
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let a = alloc_array(&mut m, entry);
+    let idx = load_number(&mut m, entry, 0.0);
+    emit_void(
+        &mut m,
+        entry,
+        Op::StorePropIdx {
+            object: a,
+            index: idx,
+            value: p,
+        },
+    );
+    let def_cb = emit(
+        &mut m,
+        entry,
+        Op::DefineFunc {
+            body: cb,
+            captures: vec![],
+            length: 1,
+        },
+    );
+    let clo_cb = emit(&mut m, entry, Op::AllocClosure { func: def_cb });
+    let r = method_call(&mut m, entry, a, "map", vec![clo_cb]);
+    print_call(&mut m, entry, vec![r]); // the result array itself — clean
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report.hits.is_empty(),
+        "a param-ignoring callback taints nothing: {:?}",
+        report.hits
+    );
+    assert_eq!(report.gap_sites_resolved, 1, "the gap still resolved");
+}
+
 /// forEach's return channel is `None` (the result is undefined): the
 /// callback's RETURN taint dies at the gap return, but the callback
 /// body still RAN — pinned by its side effect (a tainted global store)

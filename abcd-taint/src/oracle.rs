@@ -67,6 +67,29 @@ impl<'m> Oracle<'m> {
         }
     }
 
+    /// The MAY-direction site query (t-P4; the
+    /// `CallGraph::refine_with_points_to` consumer discipline): rung 1
+    /// returns the engine's answer when it is complete modulo the
+    /// recorded call graph (`complete_for_resolution` — the unbalanced
+    /// caller fan-out is ACCEPTED, since callback/receiver resolution
+    /// is may-direction, never a negative decision); anything
+    /// incomplete, and rung 0, falls back to the local def-chain walk
+    /// (the sound floor, partial sites included — the same sites
+    /// `site_info_at` would report at rung 0).
+    pub fn may_sites_at(&self, value: ValueId, at: InstId) -> AllocSiteSet {
+        match self {
+            Oracle::Rung0(o) => o.resolve(value).sites,
+            Oracle::Rung1(o) => {
+                let ans = o.query(value, at);
+                if ans.complete_for_resolution() {
+                    ans.sites
+                } else {
+                    self.resolve(value).sites
+                }
+            }
+        }
+    }
+
     /// The computeAliases analogue: a taint on the store's VALUE, written
     /// through `object.key` at `store`. Rung 1 returns the taint re-keyed
     /// by the REFINED site set of `object` when the engine's answer is

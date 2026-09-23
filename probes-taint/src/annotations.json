@@ -394,6 +394,115 @@
           "String.prototype.repeat"
         ]
       }
+    },
+  {
+    "id": "e-builtin-summary/e11-array-foreach",
+    "family": "e-builtin-summary",
+    "file": "e-builtin-summary/e11-array-foreach.js",
+    "rationale": "t-P4 full gap propagator: forEach's callback resolves to a local closure; the array's [AnyIndex] element taint enters the callback's formal 0 through the gap enter rules and the print inside the body fires. TP.",
+    "sinks": [
+      {
+        "line": 11,
+        "expect": "tp"
+      }
+    ],
+    "expect_counters": {
+      "summaries_applied": [
+        "Array.prototype.push",
+        "Array.prototype.forEach"
+      ]
     }
+  },
+  {
+    "id": "e-builtin-summary/e12-array-map",
+    "family": "e-builtin-summary",
+    "file": "e-builtin-summary/e12-array-map.js",
+    "rationale": "t-P4 gap return channel: map's callback returns its tainted formal; the gap return wires it onto the result array's [AnyIndex] elements and the indexed read fires. TP.",
+    "sinks": [
+      {
+        "line": 12,
+        "expect": "tp"
+      }
+    ],
+    "expect_counters": {
+      "summaries_applied": [
+        "Array.prototype.push",
+        "Array.prototype.map"
+      ]
+    }
+  },
+  {
+    "id": "e-builtin-summary/e13-array-map-ignore-param",
+    "family": "e-builtin-summary",
+    "file": "e-builtin-summary/e13-array-map-ignore-param.js",
+    "rationale": "t-P4 negative control: map's callback ignores its parameter and returns a constant — the result elements carry no REAL taint (result taint comes from the callback RETURN, not the base; the mechanism-level isolation is tests/mechanisms.rs::gap_map_callback_ignoring_param_no_return_flow). EXPECTED FP here: the map result is VM-allocated (no keyed site), so the indexed load through it meets the SOURCE array's Heap(site).[AnyIndex] fact via the load rule's unknown-base may-alias wildcard (either side unknown ⇒ may reach). Closes when summary results get call-site-keyed allocations.",
+    "sinks": [
+      {
+        "line": 12,
+        "expect": "fp",
+        "closes_at_rung": 2
+      }
+    ],
+    "expect_counters": {
+      "summaries_applied": [
+        "Array.prototype.push",
+        "Array.prototype.map"
+      ]
+    }
+  },
+  {
+    "id": "e-builtin-summary/e14-array-filter",
+    "family": "e-builtin-summary",
+    "file": "e-builtin-summary/e14-array-filter.js",
+    "rationale": "t-P4: filter's predicate return taints nothing (return channel None); the result's elements are the base's kept elements via the static Field([AnyIndex])→ReturnField([AnyIndex]) flow. TP.",
+    "sinks": [
+      {
+        "line": 13,
+        "expect": "tp"
+      }
+    ],
+    "expect_counters": {
+      "summaries_applied": [
+        "Array.prototype.push",
+        "Array.prototype.filter"
+      ]
+    }
+  },
+  {
+    "id": "e-builtin-summary/e15-array-foreach-unresolved-cb",
+    "family": "e-builtin-summary",
+    "file": "e-builtin-summary/e15-array-foreach-unresolved-cb.js",
+    "rationale": "t-P4 honest fallback: the callback is an opaque global load — no gap edge, the element taint never enters user code (mini-gap tag only; gap_sites_unresolved records the site). forEach's result is undefined. Clean.",
+    "sinks": [
+      {
+        "line": 13,
+        "expect": "clean"
+      }
+    ],
+    "expect_counters": {
+      "summaries_applied": [
+        "Array.prototype.push",
+        "Array.prototype.forEach"
+      ]
+    }
+  },
+  {
+    "id": "e-builtin-summary/e16-array-foreach-param-cb",
+    "family": "e-builtin-summary",
+    "file": "e-builtin-summary/e16-array-foreach-param-cb.js",
+    "rationale": "t-P4 points-to arm: the callback reaches the gap site through a resolved local helper's parameter — the rung-1 engine's caller fan-out resolves it to the caller's closure alloc, and the receiver param types Array through the same engine. TP.",
+    "sinks": [
+      {
+        "line": 13,
+        "expect": "tp"
+      }
+    ],
+    "expect_counters": {
+      "summaries_applied": [
+        "Array.prototype.push",
+        "Array.prototype.forEach"
+      ]
+    }
+  }
   ]
 }

@@ -77,12 +77,14 @@ use crate::oracle::Oracle;
 ///    unwrap to the function value, `LoadConst(MethodRef)` resolves
 ///    statically (the same walk the base call graph performs on the
 ///    CALLEE value, here applied to the callback ARGUMENT);
-/// 2. **the rung-selected points-to** — `oracle.site_info_at(value,
-///    at)`; at rung 1 the demand-driven engine resolves param-callees
-///    through caller fan-out (the b3 case: `each(a, cb) {
-///    a.forEach(cb) }` with `each` called on a closure). Closure
-///    allocation sites map back to bodies through their `DefineFunc`
-///    chain (the call graph's `trace_alloc_site` discipline).
+/// 2. **the rung-selected points-to** — `oracle.may_sites_at(value,
+///    at)`, the MAY-direction query (the `refine_with_points_to`
+///    consumer discipline: resolution is a may-answer, so the rung-1
+///    engine's resolution-complete caller fan-out is accepted —
+///    `each(a, cb) { a.forEach(cb) }` with `each` called on a closure
+///    is the b3 case). Closure allocation sites map back to bodies
+///    through their `DefineFunc` chain (the call graph's
+///    `trace_alloc_site` discipline).
 ///
 /// Only bodies that exist (non-external, non-empty) are returned —
 /// sorted, deduplicated (determinism). An empty answer is the honest
@@ -97,7 +99,7 @@ pub fn resolve_callback_funcs(
     let mut visiting = HashSet::new();
     trace_value(module, value, &mut visiting, &mut funcs);
     // The points-to arm: closure allocation sites → bodies.
-    for site in oracle.site_info_at(value, at).sites.iter() {
+    for site in oracle.may_sites_at(value, at).iter() {
         let func_value = match module.inst(site).map(|i| &i.op) {
             Some(Op::AllocClosure { func }) | Some(Op::CreateGenerator { func }) => Some(*func),
             _ => None,

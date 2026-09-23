@@ -220,6 +220,23 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
         if info.has_unknown {
             ans.precise = false;
         }
+        // 1b. The MAY-direction arm (t-P4): the engine's
+        //    resolution-complete fan-out answers (unbalanced — a param
+        //    receiver whose callers are all recorded in the call graph)
+        //    type receivers for the ADDITIVE prototype path, exactly the
+        //    consumer discipline of `CallGraph::refine_with_points_to`
+        //    (callee resolution accepts the same answers). Sites the
+        //    precise arm already reported contribute nothing new;
+        //    anything beyond them marks the answer imprecise.
+        for site in self.oracle.may_sites_at(value, at).iter() {
+            if info.sites.iter().any(|s| s == site) {
+                continue;
+            }
+            if let Some(f) = self.module.inst(site).and_then(|i| family_of_alloc(&i.op)) {
+                ans.families.insert(f);
+                ans.precise = false;
+            }
+        }
         // 2. The def-chain walk for the non-site sources (constants,
         //    global-store provenance, GetIterator).
         self.walk(value, visiting, &mut ans);

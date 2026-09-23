@@ -738,7 +738,12 @@ impl<'m> TaintProblem<'m> {
     /// `Array.prototype.pop` / `Iterator.prototype.next`). Returns the
     /// leftover chain and whether the match was heap-sourced (the
     /// substitute then re-keys to `Heap`, keeping the fact
-    /// function-global instead of dying on a local).
+    /// function-global instead of dying on a local). `may = true` (the
+    /// gap enter) reads the endpoint value's sites through the
+    /// MAY-direction query ([`Oracle::may_sites_at`] — the engine's
+    /// resolution-complete caller fan-out is accepted, the
+    /// `refine_with_points_to` discipline); `may = false` keeps the
+    /// keying-precise `site_info_at` answer.
     fn match_flow_endpoint(
         &self,
         endpoint: &Endpoint,
@@ -746,6 +751,7 @@ impl<'m> TaintProblem<'m> {
         args: &[ValueId],
         base: Option<ValueId>,
         at: InstId,
+        may: bool,
     ) -> Option<(FieldChain, bool)> {
         if let Some(leftover) = Self::match_endpoint(endpoint, fact, args, base) {
             return Some((leftover, false));
@@ -762,7 +768,11 @@ impl<'m> TaintProblem<'m> {
             Endpoint::Field(path) => (base?, Some(path)),
             Endpoint::Return | Endpoint::ReturnField(_) => return None,
         };
-        let pts = self.oracle.borrow().site_info_at(value, at).sites;
+        let pts = if may {
+            self.oracle.borrow().may_sites_at(value, at)
+        } else {
+            self.oracle.borrow().site_info_at(value, at).sites
+        };
         if pts.is_empty() || !pts.intersects(sites) {
             return None;
         }
@@ -907,7 +917,7 @@ impl<'m> TaintProblem<'m> {
         let binding = param_binding(self.module, cb_func);
         for enter in &gap.enter {
             let Some((leftover, _from_heap)) =
-                self.match_flow_endpoint(&enter.from, fact, args, base, call)
+                self.match_flow_endpoint(&enter.from, fact, args, base, call, true)
             else {
                 continue;
             };
@@ -1491,7 +1501,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 if !cleared {
                     for flow in &summary.flows {
                         if let Some((leftover, from_heap)) =
-                            self.match_flow_endpoint(&flow.from, fact, args, base, call)
+                            self.match_flow_endpoint(&flow.from, fact, args, base, call, false)
                         {
                             self.substitute(
                                 &flow.to,
