@@ -2347,3 +2347,89 @@ fn s36_multi_catch_merge() {
 "#;
     assert_eq!(decompiled(&m), want);
 }
+
+/// s37 — d-P8 `--ts`: `Signature` metadata (≤11-format files, fact #A7)
+/// drives `function f(x: T): R` annotations. Bare output with the flag
+/// off; bare parameter list when no signature survives (never
+/// fabricated). A `Static(Reference)` type resolves through the
+/// module's class table.
+#[test]
+fn s37_ts_annotations() {
+    use abcd_ir::module::Signature;
+    use abcd_ir::ty::{DynPrim, StaticTy, Ty};
+
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let one = load_number(&mut m, b, 1.0);
+    let s = add(&mut m, b, p1, one);
+    emit_void(&mut m, b, Op::Return { value: Some(s) });
+    // Aligned signature: this=any, p1=number, ret=number.
+    m.func_mut(f).unwrap().sig = Some(Signature {
+        return_ty: Some(Ty::DynPrim(DynPrim::Number)),
+        param_tys: vec![Ty::Any, Ty::DynPrim(DynPrim::Number)],
+    });
+    // g: a reference-typed signature (class 0 is "Ltest;" → name "test"
+    // after sanitize of the descriptor's simple name).
+    let g = add_func_named(&mut m, "g");
+    let gb = entry_of(&m, g);
+    let _this = add_param(&mut m, g);
+    let p2 = add_param(&mut m, g);
+    emit_void(&mut m, gb, Op::Return { value: Some(p2) });
+    m.func_mut(g).unwrap().sig = Some(Signature {
+        return_ty: Some(Ty::Static(StaticTy::Reference(abcd_ir::ClassId::new(0)))),
+        param_tys: vec![
+            Ty::Any,
+            Ty::Static(StaticTy::Reference(abcd_ir::ClassId::new(0))),
+        ],
+    });
+    // h: NO signature (the 12+/24 reality) — bare under the flag.
+    let h = add_func_named(&mut m, "h");
+    let hb = entry_of(&m, h);
+    let _this = add_param(&mut m, h);
+    let p3 = add_param(&mut m, h);
+    emit_void(&mut m, hb, Op::Return { value: Some(p3) });
+
+    let js = decompiled(&m);
+    let want_js = r#"function f(p1) {
+  return p1 + 1.0;
+}
+function g(p1) {
+  return p1;
+}
+function h(p1) {
+  return p1;
+}
+"#;
+    assert_eq!(js, want_js);
+
+    let ts = {
+        let d = decompile_module(
+            &m,
+            &EmitOptions {
+                ts: true,
+                ..Default::default()
+            },
+        );
+        let mut lines: Vec<&str> = d.text.lines().collect();
+        // header: 2 standard lines + 1 TS-mode line
+        let mut out = lines.split_off(3).join("\n");
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out
+    };
+    let want_ts = r#"function f(p1: number): number {
+  return p1 + 1.0;
+}
+function g(p1: test): test {
+  return p1;
+}
+function h(p1) {
+  return p1;
+}
+"#;
+    assert_eq!(ts, want_ts);
+}

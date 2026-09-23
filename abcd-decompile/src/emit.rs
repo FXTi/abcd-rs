@@ -46,14 +46,16 @@
 //!   corpus families (dream-gate registered).
 //! - Vendor bigint inc/dec polymorphism (`5n--` → `4n`) is not
 //!   expressible with the pure `x - 1` form (no corpus coverage).
-//! - `--ts` type annotations are NOT implemented (the flag in
-//!   [`EmitOptions`] is reserved).
+//! - `--ts` annotations reflect only what the format carries: signatures
+//!   exist on ≤11-format files (fact #A7); 12+/24 functions keep bare
+//!   parameter lists under the flag (d-P8).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use abcd_ir::function::Loc;
-use abcd_ir::module::{ExportDecl, FunctionKind, ImportDecl, Module};
+use abcd_ir::module::{ExportDecl, FunctionKind, ImportDecl, Module, Signature};
 use abcd_ir::op::{BinOp, CallKind, CmpOp, UnOp};
+use abcd_ir::ty::{DynPrim, StaticTy, Ty};
 use abcd_ir::{Const, FuncId, Op, ValueDef};
 
 use crate::consts::{lit_of, render_lit, render_string, sym_str};
@@ -69,7 +71,14 @@ pub struct EmitOptions {
     /// Print `// line N` anchors before statements whose SSA value
     /// carries a source location.
     pub line_anchors: bool,
-    /// Reserved (TypeScript annotations are not implemented at v1).
+    /// TypeScript annotations from the IR `Signature` metadata (d-P8).
+    /// Honest scope: the file format carries signatures only on
+    /// ≤11-format files (format fact #A7 — 12+/24 functions emit BARE
+    /// parameter lists under this flag, never fabricated `any`s), and
+    /// JS sources declare `any` everywhere, so on a JS corpus the flag
+    /// only adds `: any` on ≤11 fixtures. Static (ArkTS) annotations —
+    /// including `Reference` types resolved through the module's class
+    /// table — render as their TS names when present.
     pub ts: bool,
     /// Append a `func_main_0();` call after the top-level functions so
     /// the module entry point actually executes (the d-P4 recompile
@@ -129,6 +138,9 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     let mut out = String::new();
     out.push_str("// Decompiled by abcd-decompile (abcd-rs) — Stage B + emission v1.\n");
     out.push_str("// Fallback honesty: `/* fallback Op … */` marks unrecoverable ops; `/* elided … */` marks deliberately dropped compiler guards.\n");
+    if opts.ts {
+        out.push_str("// TypeScript mode: annotations come from IR signatures (≤11-format files only, format fact #A7); functions without signatures keep bare parameter lists.\n");
+    }
 
     // Imports (1:1 enum mapping).
     for imp in &module.imports {
@@ -437,13 +449,13 @@ impl<'m> Emitter<'m> {
         self.current_kind = rf.kind;
         let raw = rf.name.clone();
         let name = self.fn_names.mint(&raw);
-        let params = rf.params[rf.hidden_params.min(rf.params.len())..].join(", ");
+        let (params, ret) = self.params_ret(&rf);
         let keyword = fn_decl_keyword(rf.kind);
         if rf.kind == FunctionKind::Constructor {
             out.push_str("/* constructor outside a class context (data shape) */\n");
         }
         self.hoisted = escaped_temps(&body);
-        out.push_str(&format!("{keyword} {name}({params}) {{\n"));
+        out.push_str(&format!("{keyword} {name}({params}){ret} {{\n"));
         for d in lex_decls(&body, &rf.params) {
             out.push_str(&format!("  let {d};\n"));
         }
@@ -1078,7 +1090,10 @@ impl<'m> Emitter<'m> {
             // the signature.
             let mut body = String::new();
             let rf = self.emit_function_body(ctor, indent + 2, &mut body);
-            let params = rf.params[rf.hidden_params.min(rf.params.len())..].join(", ");
+            // TS forbids a return annotation on a class constructor —
+            // drop it here regardless of the ctor's recorded kind (the
+            // class table's ctor slot is authoritative, not the kind).
+            let (params, _) = self.params_ret(&rf);
             out.push_str(&format!("{params}) {{\n{body}"));
             rf
         };
@@ -1195,9 +1210,9 @@ impl<'m> Emitter<'m> {
         };
         let mut body = String::new();
         let rf = self.emit_function_body(f, indent + 2, &mut body);
-        let params = rf.params[rf.hidden_params.min(rf.params.len())..].join(", ");
+        let (params, ret) = self.params_ret(&rf);
         out.push_str(&format!(
-            "{pad}  {placement}{prefix}{key}({params}) {{\n{body}"
+            "{pad}  {placement}{prefix}{key}({params}){ret} {{\n{body}"
         ));
         out.push_str(&format!("{pad}  }}\n"));
     }
@@ -1413,8 +1428,8 @@ impl<'m> Emitter<'m> {
                 }
                 let mut text = String::new();
                 let rf = self.emit_function_body(body, 1, &mut text);
-                let params = rf.params[rf.hidden_params.min(rf.params.len())..].join(", ");
-                out.push_str(&format!("{params}) {{\n{text}}}"));
+                let (params, ret) = self.params_ret(&rf);
+                out.push_str(&format!("{params}){ret} {{\n{text}}}"));
                 out.push_str(&format!(
                     " /* arrow vs function is not recoverable (design §4.3) */"
                 ));
@@ -1985,6 +2000,90 @@ fn cmpop_sym(op: CmpOp) -> &'static str {
         CmpOp::GreaterEq => ">=",
         CmpOp::In => "in",
         CmpOp::InstanceOf => "instanceof",
+    }
+}
+
+/// Render an IR type as a TypeScript annotation (the `--ts` flag).
+/// `Reference` types resolve through the module's own class table.
+fn ty_ts(module: &Module, ty: &Ty) -> String {
+    match ty {
+        Ty::Any => "any".to_string(),
+        Ty::Unknown => "unknown".to_string(),
+        Ty::DynPrim(p) => match p {
+            DynPrim::Undefined => "undefined".to_string(),
+            DynPrim::Null => "null".to_string(),
+            DynPrim::Bool => "boolean".to_string(),
+            DynPrim::Number => "number".to_string(),
+            DynPrim::String => "string".to_string(),
+            DynPrim::Symbol => "symbol".to_string(),
+            DynPrim::BigInt => "bigint".to_string(),
+            DynPrim::Object => "object".to_string(),
+        },
+        Ty::Union(ts) => ts
+            .iter()
+            .map(|t| ty_ts(module, t))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        Ty::Static(s) => match s {
+            StaticTy::Void => "void".to_string(),
+            StaticTy::Reference(cid) => {
+                let raw = module
+                    .class(*cid)
+                    .map(|c| sym_str(module, c.name))
+                    .unwrap_or_default();
+                // A descriptor `Lfoo/Bar;` unwraps to its simple name.
+                let simple = raw
+                    .strip_prefix('L')
+                    .and_then(|r| r.strip_suffix(';'))
+                    .and_then(|r| r.rsplit('/').next().map(str::to_string))
+                    .unwrap_or(raw);
+                let name = sanitize(&simple);
+                if is_legal_ident(&name) {
+                    name
+                } else {
+                    "object".to_string()
+                }
+            }
+            // The ArkTS numeric statics all surface as TS `number`.
+            _ => "number".to_string(),
+        },
+    }
+}
+
+/// The `(params)` text and the TS return annotation for one function.
+/// Bare (no annotation) when the flag is off, the function carries no
+/// signature (12+/24 files — format fact #A7), or the signature does
+/// not align with the IR parameter list (never fabricate).
+impl<'m> Emitter<'m> {
+    fn params_ret(&self, rf: &RecoveredFunc) -> (String, String) {
+        let visible = &rf.params[rf.hidden_params.min(rf.params.len())..];
+        if !self.opts.ts {
+            return (visible.join(", "), String::new());
+        }
+        let sig: Option<&Signature> = self.module.func(rf.func).and_then(|f| f.sig.as_ref());
+        let Some(sig) = sig else {
+            return (visible.join(", "), String::new());
+        };
+        if sig.param_tys.len() != rf.params.len() {
+            // Misaligned declaration — annotate nothing (honest skip).
+            return (visible.join(", "), String::new());
+        }
+        let params = visible
+            .iter()
+            .enumerate()
+            .map(|(i, p)| format!("{p}: {}", ty_ts(self.module, &sig.param_tys[rf.hidden_params + i])))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ret = match (&sig.return_ty, rf.kind) {
+            // TS forbids a return annotation on constructors.
+            (Some(t), FunctionKind::Constructor) => {
+                let _ = t;
+                String::new()
+            }
+            (Some(t), _) => format!(": {}", ty_ts(self.module, t)),
+            (None, _) => String::new(),
+        };
+        (params, ret)
     }
 }
 

@@ -160,6 +160,7 @@ fn corpus_decompile_gate() {
     let mut bytes = 0usize;
     let mut dead_total = 0usize;
     let mut node_outputs: Vec<(String, String)> = Vec::new();
+    let mut ts_outputs: Vec<(String, String)> = Vec::new();
 
     for relative in &paths {
         let data = std::fs::read(root.join(relative)).expect("read fixture");
@@ -175,6 +176,20 @@ fn corpus_decompile_gate() {
         bytes += d1.text.len();
         if node_outputs.len() < NODE_SAMPLE {
             node_outputs.push((relative.clone(), d1.text.clone()));
+        }
+        // The d-P8 `--ts` flag: signatures survive only on ≤11-format
+        // files (fact #A7) — collect a TS sample from those.
+        if ts_outputs.len() < NODE_SAMPLE
+            && (relative.starts_with("9.0.0.0/") || relative.starts_with("11.0.2.0/"))
+        {
+            let ts = decompile_module(
+                &module,
+                &EmitOptions {
+                    ts: true,
+                    ..Default::default()
+                },
+            );
+            ts_outputs.push((relative.clone(), ts.text));
         }
         // Per-function coverage: every function is either emitted or
         // dead-dropped (its defining op is itself dead) — nothing is
@@ -303,6 +318,50 @@ fn corpus_decompile_gate() {
             );
             for b in &bad {
                 eprintln!("NODE-CHECK-FAIL {b}");
+            }
+            // The d-P8 TS sample: `node --check` does not parse TS, so
+            // validity is proven through node's own type-stripping API
+            // (`node:module.stripTypeScriptTypes` — the annotations are
+            // erasable by construction) plus a `vm.Script` parse of the
+            // stripped output. Reported, non-fatal.
+            if !ts_outputs.is_empty() {
+                let mut ok = 0usize;
+                let mut bad: Vec<String> = Vec::new();
+                let probe = dir.join("ts-probe.mjs");
+                std::fs::write(
+                    &probe,
+                    "import { stripTypeScriptTypes } from 'node:module';\n\
+                     import { Script } from 'node:vm';\n\
+                     import { readFileSync } from 'node:fs';\n\
+                     const src = readFileSync(process.argv[2], 'utf8');\n\
+                     const js = stripTypeScriptTypes(src, { mode: 'strip' });\n\
+                     new Script(js);\n",
+                )
+                .expect("write ts probe");
+                for (rel, text) in &ts_outputs {
+                    let out = dir.join("out.ts");
+                    std::fs::write(&out, text).expect("write ts sample");
+                    let check = std::process::Command::new(&node_path)
+                        .arg(&probe)
+                        .arg(&out)
+                        .output()
+                        .expect("run ts probe");
+                    if check.status.success() {
+                        ok += 1;
+                    } else {
+                        bad.push(format!(
+                            "{rel}: {}",
+                            String::from_utf8_lossy(&check.stderr)
+                                .lines()
+                                .next()
+                                .unwrap_or("?")
+                        ));
+                    }
+                }
+                eprintln!("TS-CHECK ok={ok} bad={} of {}", bad.len(), ts_outputs.len());
+                for b in &bad {
+                    eprintln!("TS-CHECK-FAIL {b}");
+                }
             }
         }
     }
