@@ -1902,10 +1902,7 @@ fn gap_for_each_enters_callback() {
         report.hits
     );
     assert!(
-        report
-            .hits
-            .iter()
-            .all(|h| h.fact.local_base() == Some(e)),
+        report.hits.iter().all(|h| h.fact.local_base() == Some(e)),
         "every hit is on the callback formal: {:?}",
         report.hits
     );
@@ -1971,10 +1968,7 @@ fn gap_map_return_wires_result_elements() {
 
     let report = abcd_taint::run_taint(&m, &builtin_config());
     assert!(
-        report
-            .hits
-            .iter()
-            .any(|h| h.fact.local_base() == Some(x)),
+        report.hits.iter().any(|h| h.fact.local_base() == Some(x)),
         "the callback return wired onto the result's elements: {:?}",
         report.hits
     );
@@ -2173,10 +2167,7 @@ fn gap_exclusive_callback_summary_still_enters() {
         report.hits
     );
     assert!(
-        report
-            .summaries_applied
-            .iter()
-            .any(|(_, n)| n == "collect"),
+        report.summaries_applied.iter().any(|(_, n)| n == "collect"),
         "the custom summary applied: {:?}",
         report.summaries_applied
     );
