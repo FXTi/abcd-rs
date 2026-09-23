@@ -112,6 +112,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         current_fn_has_fallback: false,
         current_kind: FunctionKind::Function,
         class_depth: 0,
+        hoisted: BTreeSet::new(),
     };
     let mut out = String::new();
     out.push_str("// Decompiled by abcd-decompile (abcd-rs) — Stage B + emission v1.\n");
@@ -326,6 +327,14 @@ struct Emitter<'m> {
     /// printable `#x` inside a class body; es2abc's out-of-class
     /// instance initializers print the loud string-key fallback).
     class_depth: usize,
+    /// Temporaries of the CURRENT function whose uses escape their
+    /// declaration's structured block (JS `const`/`let`/`class` are
+    /// block-scoped; SSA dominance is not block-aligned). They are
+    /// hoisted: `var name;` at the function top, `name = value;` at
+    /// the original site. (d-P4 dream gate: `ReferenceError: _funcObj$1
+    /// is not defined` — a class declared inside a `try` block, used
+    /// after it.)
+    hoisted: BTreeSet<String>,
 }
 
 impl<'m> Emitter<'m> {
@@ -355,9 +364,15 @@ impl<'m> Emitter<'m> {
         if rf.kind == FunctionKind::Constructor {
             out.push_str("/* constructor outside a class context (data shape) */\n");
         }
+        self.hoisted = escaped_temps(&body);
         out.push_str(&format!("{keyword} {name}({params}) {{\n"));
         for d in lex_decls(&body, &rf.params) {
             out.push_str(&format!("  let {d};\n"));
+        }
+        for h in self.hoisted.clone() {
+            out.push_str(&format!(
+                "  var {h}; /* hoisted temp: used outside its def's block */\n"
+            ));
         }
         self.emit_nodes(&body, 1, out);
         out.push_str("}\n");
@@ -377,12 +392,19 @@ impl<'m> Emitter<'m> {
         let (rf, body) = self.func_nodes(func);
         let prev = self.current_kind;
         self.current_kind = rf.kind;
+        let prev_hoisted = std::mem::replace(&mut self.hoisted, escaped_temps(&body));
         let pad = "  ".repeat(indent);
         for d in lex_decls(&body, &rf.params) {
             out.push_str(&format!("{pad}let {d};\n"));
         }
+        for h in self.hoisted.clone() {
+            out.push_str(&format!(
+                "{pad}var {h}; /* hoisted temp: used outside its def's block */\n"
+            ));
+        }
         self.emit_nodes(&body, indent, out);
         self.current_kind = prev;
+        self.hoisted = prev_hoisted;
         rf
     }
 
@@ -599,6 +621,9 @@ impl<'m> Emitter<'m> {
                     out.push_str(&format!("{pad}{anchor}\n"));
                 }
                 let kw = if *mutable { "let" } else { "const" };
+                // Hoisted escapee: the `var` declaration is at the
+                // function top; here a plain assignment.
+                let hoisted = self.hoisted.contains(name);
                 // Class declaration form.
                 if let Expr::Class {
                     ctor,
@@ -613,10 +638,20 @@ impl<'m> Emitter<'m> {
                     let heritage = heritage.clone();
                     let members = *members;
                     let sendable = *sendable;
-                    self.emit_class(&pad, indent, name, ctor, heritage, members, sendable, out);
+                    if hoisted {
+                        self.emit_class_assign(
+                            &pad, indent, name, ctor, heritage, members, sendable, out,
+                        );
+                    } else {
+                        self.emit_class(&pad, indent, name, ctor, heritage, members, sendable, out);
+                    }
                     return;
                 }
-                out.push_str(&format!("{pad}{kw} {name} = {};\n", self.estr(value)));
+                if hoisted {
+                    out.push_str(&format!("{pad}{name} = {};\n", self.estr(value)));
+                } else {
+                    out.push_str(&format!("{pad}{kw} {name} = {};\n", self.estr(value)));
+                }
             }
             Stmt::PhiDecl { name, .. } => {
                 // `var`, not `let`: per-edge phi assignments can
@@ -843,6 +878,22 @@ impl<'m> Emitter<'m> {
 
     // ── Classes & closures ───────────────────────────────────────────
 
+    /// Assignment form of a hoisted class (`name = class …`); the
+    /// hoisted check in [`Emitter::emit_class`] does the work.
+    fn emit_class_assign(
+        &mut self,
+        pad: &str,
+        indent: usize,
+        name: &str,
+        ctor: FuncId,
+        heritage: Option<Box<Expr>>,
+        members: abcd_ir::ConstId,
+        sendable: bool,
+        out: &mut String,
+    ) {
+        self.emit_class(pad, indent, name, ctor, heritage, members, sendable, out);
+    }
+
     /// `class Name extends H { constructor(…) {…} …methods… }`.
     fn emit_class(
         &mut self,
@@ -869,7 +920,14 @@ impl<'m> Emitter<'m> {
                 format!(" extends {s}")
             }
         };
-        out.push_str(&format!("{pad}class {name}{ext} {{\n"));
+        if self.hoisted.contains(name) {
+            // Hoisted escapee: `name = class name …` (the `var` is at
+            // the function top; a block-scoped `class` declaration
+            // would not escape this structured block).
+            out.push_str(&format!("{pad}{name} = class {name}{ext} {{\n"));
+        } else {
+            out.push_str(&format!("{pad}class {name}{ext} {{\n"));
+        }
         self.class_depth += 1;
         // The constructor.
         out.push_str(&format!("{pad}  constructor("));
@@ -1452,37 +1510,34 @@ impl<'m> Emitter<'m> {
                 self.sub(operand, 17, out);
                 out.push_str(" /*ToNumeric*/");
             }
-            UnOp::Minus | UnOp::Inc | UnOp::Dec => {
-                let sym = match op {
-                    UnOp::Minus => "-",
-                    UnOp::Inc => "++",
-                    UnOp::Dec => "--",
-                    _ => unreachable!(),
-                };
-                out.push_str(sym);
-                // Inc/Dec: the bytecode operator applies to a reference;
-                // es2abc's ToNumber/ToNumeric coercion of the TARGET is
-                // part of the operation — strip it or the printed
-                // `--(+x)` is not assignable (parse error).
-                let target = if matches!(op, UnOp::Inc | UnOp::Dec) {
-                    match operand {
-                        Expr::Unary {
-                            op: UnOp::ToNumber | UnOp::ToNumeric,
-                            operand: inner,
-                        } => inner.as_ref(),
-                        _ => operand,
-                    }
-                } else {
-                    operand
-                };
+            UnOp::Minus => {
+                out.push('-');
                 // `--x`-style ambiguity: parenthesize unary operands.
-                if matches!(target, Expr::Unary { .. }) {
+                if matches!(operand, Expr::Unary { .. }) {
                     out.push('(');
-                    self.expr_inner(target, out);
+                    self.expr_inner(operand, out);
                     out.push(')');
                 } else {
-                    self.sub(target, 17, out);
+                    self.sub(operand, 17, out);
                 }
+            }
+            UnOp::Inc | UnOp::Dec => {
+                // The vendored inc/dec are VALUE-pure (`acc ± 1` — the
+                // store-back is a separate op); JS `--x` would mutate a
+                // const temporary (dream gate: "Assignment to const
+                // variable") and double-fire property setters. Emit the
+                // pure arithmetic form, keeping the ToNumber/ToNumeric
+                // coercion. Corner: vendor bigint inc/dec polymorphism
+                // (`5n--` → `4n`) is not expressible purely (`5n - 1`
+                // throws) — no corpus fixture exercises it (registered).
+                out.push('(');
+                self.sub(operand, 0, out);
+                out.push_str(if matches!(op, UnOp::Inc) {
+                    " + 1"
+                } else {
+                    " - 1"
+                });
+                out.push(')');
             }
         }
     }
@@ -1692,6 +1747,161 @@ fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen: BTreeSet<String> = params.iter().cloned().collect();
     walk(nodes, &mut out, &mut seen);
+    out
+}
+
+/// All expression nodes of a statement (for the escape analysis).
+fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
+    match s {
+        Stmt::Declare { value, .. } => vec![value],
+        Stmt::PhiAssign { value, .. } => vec![value],
+        Stmt::Expr(e) => vec![e],
+        Stmt::StoreProp { object, value, .. } => vec![object, value],
+        Stmt::StoreIndex {
+            object,
+            index,
+            value,
+            ..
+        } => vec![object, index, value],
+        Stmt::StoreDyn {
+            object, key, value, ..
+        } => vec![object, key, value],
+        Stmt::DefineMethod { object, func, .. } => vec![object, func],
+        Stmt::StorePrivate { object, value, .. } => vec![object, value],
+        Stmt::StoreSuper { key, value, .. } => key.iter().chain(std::iter::once(value)).collect(),
+        Stmt::LexStore { value, .. }
+        | Stmt::GlobalStore { value, .. }
+        | Stmt::ModuleStore { value, .. } => vec![value],
+        Stmt::Throw(e) => vec![e],
+        Stmt::Return(Some(e)) => vec![e],
+        Stmt::CondBranch { cond, .. } => vec![cond],
+        _ => Vec::new(),
+    }
+}
+
+/// Block-escape analysis for one function body: the names of
+/// [`Stmt::Declare`] temporaries referenced from OUTSIDE their
+/// declaration's innermost structured block. Paths are scope vectors
+/// (each block-introducing node appends an index); a use escapes when
+/// the declaration's path is not a prefix of the use's path. Phi
+/// temporaries are already `var`-hoisted and play no role here.
+fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
+    fn collect_uses(e: &Expr, path: &[usize], uses: &mut Vec<(String, Vec<usize>)>) {
+        if let Expr::Temp { name, .. } = e {
+            uses.push((name.clone(), path.to_vec()));
+        }
+        for c in crate::folds::expr_children(e) {
+            collect_uses(c, path, uses);
+        }
+    }
+    fn walk(
+        nodes: &[SNode],
+        path: &mut Vec<usize>,
+        decls: &mut BTreeMap<String, Vec<Vec<usize>>>,
+        uses: &mut Vec<(String, Vec<usize>)>,
+    ) {
+        for n in nodes {
+            match n {
+                SNode::Stmts(leaves) => {
+                    for l in leaves {
+                        match l {
+                            Leaf::Raw(Stmt::Declare { name, value, .. }) => {
+                                collect_uses(value, path, uses);
+                                // A name can be declared in several
+                                // disjoint blocks (the cross-arm fold
+                                // duplicates tails) — a use escapes only
+                                // when it escapes ALL of them.
+                                decls.entry(name.clone()).or_default().push(path.clone());
+                            }
+                            Leaf::Raw(s) => {
+                                for e in stmt_exprs(s) {
+                                    collect_uses(e, path, uses);
+                                }
+                            }
+                            Leaf::Destructure { obj, .. } => collect_uses(obj, path, uses),
+                            Leaf::Decl { value: Some(v), .. } | Leaf::Assign { value: v, .. } => {
+                                collect_uses(v, path, uses)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                SNode::If {
+                    cond,
+                    then,
+                    otherwise,
+                } => {
+                    collect_uses(cond, path, uses);
+                    path.push(0);
+                    walk(then, path, decls, uses);
+                    path.pop();
+                    path.push(1);
+                    walk(otherwise, path, decls, uses);
+                    path.pop();
+                }
+                SNode::While {
+                    cond: Some(c),
+                    body,
+                    ..
+                } => {
+                    collect_uses(c, path, uses);
+                    path.push(0);
+                    walk(body, path, decls, uses);
+                    path.pop();
+                }
+                SNode::While { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => {
+                    path.push(0);
+                    walk(body, path, decls, uses);
+                    path.pop();
+                }
+                SNode::DoWhile { body, cond, .. } => {
+                    // JS scope: the do-while condition is INSIDE the
+                    // loop body's block (`do { const x … } while (x)`
+                    // is legal).
+                    path.push(0);
+                    walk(body, path, decls, uses);
+                    collect_uses(cond, path, uses);
+                    path.pop();
+                }
+                SNode::Try { body, catches, .. } => {
+                    path.push(0);
+                    walk(body, path, decls, uses);
+                    path.pop();
+                    for (k, c) in catches.iter().enumerate() {
+                        path.push(1 + k);
+                        walk(&c.body, path, decls, uses);
+                        path.pop();
+                    }
+                }
+                SNode::Switch { disc, cases } => {
+                    collect_uses(disc, path, uses);
+                    for (k, c) in cases.iter().enumerate() {
+                        for t in &c.tests {
+                            collect_uses(t, path, uses);
+                        }
+                        path.push(k);
+                        walk(&c.body, path, decls, uses);
+                        path.pop();
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    let mut decls: BTreeMap<String, Vec<Vec<usize>>> = BTreeMap::new();
+    let mut uses: Vec<(String, Vec<usize>)> = Vec::new();
+    walk(nodes, &mut Vec::new(), &mut decls, &mut uses);
+    let mut out = BTreeSet::new();
+    for (name, upath) in uses {
+        if let Some(dpaths) = decls.get(&name)
+            && !dpaths.iter().any(|d| upath.starts_with(d.as_slice()))
+        {
+            out.insert(name);
+        }
+    }
     out
 }
 

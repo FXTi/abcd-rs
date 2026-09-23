@@ -149,9 +149,12 @@ fn s02_if_no_else() {
     link(&mut m, b0, b2);
     link(&mut m, b1, b2);
 
+    // The temp escapes the `if` block — hoisted `var` (d-P4 scope fix;
+    // the old expectation was invalid JS: a const used outside its block).
     let want = r#"function f(p1) {
+  var v3; /* hoisted temp: used outside its def's block */
   if (p1) {
-    const v3 = p1();
+    v3 = p1();
   }
   return v3;
 }
@@ -304,8 +307,8 @@ fn s06_switch_cascade() {
         entry,
         Op::Compare {
             op: CmpOp::StrictEq,
-            left: p1,
-            right: one,
+            left: one, // N36: semantic `p1 === one`
+            right: p1,
         },
     );
     let c1 = istrue(&mut m, entry, cmp1);
@@ -321,8 +324,8 @@ fn s06_switch_cascade() {
         d2,
         Op::Compare {
             op: CmpOp::StrictEq,
-            left: p1,
-            right: two,
+            left: two, // N36: semantic `p1 === two`
+            right: p1,
         },
     );
     let c2 = istrue(&mut m, d2, cmp2);
@@ -412,10 +415,12 @@ fn s07_try_catch() {
     link(&mut m, t2, exit);
     add_try(&mut m, f, vec![entry, t2], handler, exc);
 
+    // v3 escapes the try block — hoisted (d-P4 scope fix).
     let want = r#"function f(p1) {
+  var v3; /* hoisted temp: used outside its def's block */
   try {
     const v2 = p1();
-    const v3 = v2();
+    v3 = v2();
   } catch (e) {
     return e;
   }
@@ -453,12 +458,15 @@ fn s08_nested_try_in_handler() {
     add_try(&mut m, f, vec![entry], h0, e0);
     add_try(&mut m, f, vec![h0], h1, e1);
 
+    // v2/v4 escape their try/catch blocks — hoisted (d-P4 scope fix).
     let want = r#"function f(p1) {
+  var v2; /* hoisted temp: used outside its def's block */
+  var v4; /* hoisted temp: used outside its def's block */
   try {
-    const v2 = p1();
+    v2 = p1();
   } catch (e) {
     try {
-      const v4 = e();
+      v4 = e();
     } catch (e$1) {
       return e$1;
     }
@@ -658,8 +666,8 @@ fn s12_for_in_fold() {
         hdr,
         Op::Compare {
             op: CmpOp::Eq,
-            left: undef,
-            right: k,
+            left: k, // N36: semantic `undef == k`
+            right: undef,
         },
     );
     let c = istrue(&mut m, hdr, cmp);
@@ -679,9 +687,11 @@ fn s12_for_in_fold() {
     link(&mut m, body, hdr);
 
     let got = decompiled(&m);
+    // v8 escapes the loop body — hoisted (d-P4 scope fix).
     let want = r#"function f(p1) {
+  var v8; /* hoisted temp: used outside its def's block */
   for (const v4 in p1) {
-    const v8 = v4();
+    v8 = v4();
     continue;
   }
   return v8;
@@ -848,9 +858,11 @@ fn s13_for_of_fold() {
     link(&mut m, back, hdr);
 
     let got = decompiled(&m);
+    // v13 escapes the loop body — hoisted (d-P4 scope fix).
     let want = r#"function f(p1) {
+  var v13; /* hoisted temp: used outside its def's block */
   for (const value of p1) {
-    const v13 = value + value;
+    v13 = value + value;
     continue;
   }
   return v13;

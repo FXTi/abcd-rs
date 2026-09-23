@@ -181,15 +181,17 @@ pub fn const_id(m: &mut Module, c: Const) -> ConstId {
     m.consts.push(c)
 }
 
-/// `left + right`.
+/// `left + right` (semantic order — N36: the IR stores `left` = acc
+/// operand, `right` = vreg operand, and the vendored handlers compute
+/// `vreg OP acc`, so the fields are swapped on construction).
 pub fn add(m: &mut Module, b: BlockId, l: ValueId, r: ValueId) -> ValueId {
     emit(
         m,
         b,
         Op::BinaryOp {
             op: abcd_ir::op::BinOp::Add,
-            left: l,
-            right: r,
+            left: r,
+            right: l,
         },
     )
 }

@@ -226,7 +226,7 @@ fn expr_uses_name(e: &Expr, name: &str) -> bool {
 }
 
 /// All direct child expressions (for the name walker).
-fn expr_children(e: &Expr) -> Vec<&Expr> {
+pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
     let mut out: Vec<&Expr> = Vec::new();
     match e {
         Expr::PropName { object, .. } => out.push(object),
@@ -665,28 +665,65 @@ struct LoopFold {
     extra_internals: Vec<String>,
 }
 
+/// Normalize the two loop-test emission shapes to `(test, body)`:
+/// `while (test) { body }` directly, and the sound d-P4 form
+/// `while (true) { wiring…; if (test) break; body }` (emitted when the
+/// loop header carries statements the condition reads — the clean form
+/// would reference them before their declaration). The `break` node is
+/// consumed by the normalization.
+fn normalize_loop_test(body: &[SNode]) -> Option<(Expr, Vec<SNode>)> {
+    // The header run, then `if (test) break;` (no else), then the rest.
+    let [
+        SNode::Stmts(_),
+        SNode::If {
+            cond,
+            then,
+            otherwise,
+        },
+        rest @ ..,
+    ] = body
+    else {
+        return None;
+    };
+    if !matches!(then.as_slice(), [SNode::Break { label: None }]) || !otherwise.is_empty() {
+        return None;
+    }
+    let mut new_body = body.to_vec();
+    new_body.remove(1);
+    let _ = rest;
+    Some((cond.clone(), new_body))
+}
+
 fn fold_loops(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
     let mut i = 0;
     while i < nodes.len() {
-        let folded = match &nodes[i] {
+        let normalized: Option<(Expr, Vec<SNode>)> = match &nodes[i] {
             SNode::While {
                 label: None,
                 cond: Some(wcond),
                 body,
-            } => {
-                let pre = merged_pre_leaves(nodes, i);
-                match_for_of(&pre, wcond, body).or_else(|| match_for_in(&pre, wcond, body))
-            }
+            } => Some((wcond.clone(), body.clone())),
+            SNode::While {
+                label: None,
+                cond: None,
+                body,
+            } => normalize_loop_test(body),
             _ => None,
         };
-        let Some(folded) = folded else {
+        let folded = normalized.and_then(|(test, body)| {
+            let pre = merged_pre_leaves(nodes, i);
+            match_for_of(&pre, &test, &body)
+                .or_else(|| match_for_in(&pre, &test, &body))
+                .map(|f| (f, body))
+        });
+        let Some((folded, norm_body)) = folded else {
             i += 1;
             continue;
         };
-        let SNode::While { body, .. } = &nodes[i] else {
+        if !matches!(&nodes[i], SNode::While { label: None, .. }) {
             unreachable!()
-        };
-        let Some((binding, new_body)) = rebuild_loop_body(body, &folded) else {
+        }
+        let Some((binding, new_body)) = rebuild_loop_body(&norm_body, &folded) else {
             i += 1;
             continue;
         };

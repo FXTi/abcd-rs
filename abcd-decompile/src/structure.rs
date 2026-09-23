@@ -1877,10 +1877,17 @@ impl<'m> Ctx<'m> {
         // Clean `while (cond)`: the header ends in a conditional whose
         // one edge stays in the body and whose other is a plain break
         // to the continuation, AND the header is the body's
-        // first-emitted block.
+        // first-emitted block. The header must carry NO main statements
+        // of its own: they run on every condition evaluation, so they
+        // can neither hoist (the condition would read stale
+        // temporaries) nor land at the body top (the condition reads
+        // them before they run — the d-P4 dream gate caught this as
+        // `ReferenceError`/stale-value failures, e.g. local/decrement);
+        // the `while (true)` general form stays correct for them.
         if kind == LoopKind::While
             && self.first_block(body_r) == Some(header)
             && let Term::Cond(cond, t, f) = parts.term.clone()
+            && clean_while_main_ok(&parts.main, &cond)
         {
             let t_in = body_blocks.contains(&t);
             let f_in = body_blocks.contains(&f);
@@ -2497,6 +2504,46 @@ pub fn is_terminal_node(n: &SNode) -> bool {
         ),
         _ => false,
     }
+}
+
+/// Clean-`while` precondition (d-P4): the header's main statements run
+/// on EVERY condition evaluation, so the clean form (which emits them
+/// at the body top, AFTER the condition) is only sound when the
+/// condition does not reference any block-scoped temporary they declare
+/// (the dream gate caught the violation as `i$1 is not defined` /
+/// stale-value failures, e.g. local/decrement). Phi wiring (`var`
+/// decls + per-edge assigns) is hoisted and correctly valued at the
+/// condition point, so it is always allowed. The for-of/for-in header
+/// plumbing passes this rule (its condition reads the done-flag phi,
+/// not the body-top temporaries) — the desugar folds keep firing.
+fn clean_while_main_ok(main: &[Stmt], cond: &Expr) -> bool {
+    let mut refs: BTreeSet<&str> = BTreeSet::new();
+    let mut stack = vec![cond];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::Ident(name) => {
+                refs.insert(name.as_str());
+            }
+            Expr::Temp { name, .. } => {
+                refs.insert(name.as_str());
+            }
+            _ => stack.extend(crate::folds::expr_children(e)),
+        }
+    }
+    let ok = main.iter().all(|s| match s {
+        Stmt::PhiAssign { .. } | Stmt::PhiDecl { .. } | Stmt::Elided { .. } => true,
+        Stmt::Declare { name, .. } => !refs.contains(name.as_str()),
+        _ => false,
+    });
+    if !ok && std::env::var_os("ABCD_WHILE_DEBUG").is_some() {
+        eprintln!(
+            "WHILE-BAIL refs={refs:?} main={:?}",
+            main.iter()
+                .map(|s| format!("{s:?}").chars().take(60).collect::<String>())
+                .collect::<Vec<_>>()
+        );
+    }
+    ok
 }
 
 /// Negate a condition, simplifying the wrapper forms es2abc produces

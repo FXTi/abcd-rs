@@ -1240,8 +1240,9 @@ fn t19_unary_forms() {
         b,
         Op::Compare {
             op: CmpOp::StrictEq,
-            left: n,
-            right: null,
+            // N36: semantic `n === null` is stored acc=null/vreg=n.
+            left: null,
+            right: n,
         },
     );
     let num = emit(

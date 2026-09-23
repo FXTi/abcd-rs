@@ -1326,8 +1326,14 @@ impl<'m> Recover<'m> {
         match op {
             Op::BinaryOp { op, left, right } => Expr::Binary {
                 op: *op,
-                left: Box::new(self.expr_of(*left)),
-                right: Box::new(self.expr_of(*right)),
+                // Operand order (N36): the IR stores `left` = the acc
+                // operand and `right` = the vreg operand, but the
+                // vendored two-address handlers compute `vreg OP acc` —
+                // the semantic expression is `right OP left`. (The d-P4
+                // dream gate caught this: `i > 0` decompiled to `0 > i`
+                // and local/decrement printed nothing.)
+                left: Box::new(self.expr_of(*right)),
+                right: Box::new(self.expr_of(*left)),
             },
             Op::UnaryOp { op, operand } => Expr::Unary {
                 op: *op,
@@ -1335,8 +1341,9 @@ impl<'m> Recover<'m> {
             },
             Op::Compare { op, left, right } => Expr::Compare {
                 op: *op,
-                left: Box::new(self.expr_of(*left)),
-                right: Box::new(self.expr_of(*right)),
+                // Operand order (N36) — same swap as BinaryOp.
+                left: Box::new(self.expr_of(*right)),
+                right: Box::new(self.expr_of(*left)),
             },
             Op::Mov { src } => self.expr_of(*src),
             Op::LoadConst(cid) => match lit_of(self.module, *cid) {
