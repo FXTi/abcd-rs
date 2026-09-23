@@ -243,7 +243,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | P3-M1/M2 | v2opt 与 v0.1 opt 的另两类归属字节差异：M1（72 文件）折叠出的 NaN/+∞——v0.1 降级为 fldai，v0.2 保留 ldnan/ldinfinity 身份；M2（12 文件）v0.1 ADCE 手工清单把 DefineFunc 标 essential，v0.2 诚实 effects 表（vendor RuntimeDefinefunc 不跑用户代码）允许删除死 definefunc+闭包链 | ✅ 维护者拍板接受（2026-09-21，与 N63 同批）：v2 严格更好或 VM 中性；v0.1 对齐被否决（不为对齐往 effects 表写假话） |
 | N67 | abcd-lift 的 `this_value()`/`this_param=params[0]` 按帧槽模型（0xF）其实指向 **func 槽**而非 this——**潜伏 bug**：仅被 `Bytecode::Ldthis`（和 N51 硬错误族）消费，而 ldthis 全语料 0 出现（es2abc 永远读槽 2）故所有门禁不可见。修=按 inline.rs 的 slot_roles 模型解析 This 角色槽（params[2] @0xF）。function.rs:210 与 abcd-lift 注释的 params[0]=this 文档同属此 bug 的记载 | 🔲 登记（2026-09-23，N66 调查中坐实；排进 d-P6 批次——该批本就要动 abcd-lift） |
 
-| N66 | abcd-taint call_flow 的 arg→param 绑定沿用 T4 旧约定（params[0]=this、args[i]→params[i+1]），但 vendor 帧槽模型（P3b 坐实）是 [func][newTarget][this][formals…]（callType 注解位，语料全无注解→默认 0xF→3 隐式槽）——真实字节码上 args[0] 错绑到隐式槽，解析调用实参流全 FN（t-P1 探针 c1/d3/e3 实证）。语料冒烟未暴露（命中全是过程内/状态基流 + 通配播种）。连带漂移：T4/§5.3 绑定表与 abcd-lift 注释同为旧理解（inline.rs 持有正确模型） | 🔲 修复中（t-P1 附带：call_flow 应用帧槽模型——隐式槽数从 callType 注解/默认 0xF 推导，this→params[2]、formals 从 params[3] 起（0xF）；Apply/SuperSpread 同步；非静态无注解 callee 走保守全参数过近似而非拒配。设计文档 §5.3/T4/lift 注释更正由 orchestrator 落地。后续候选登记：帧槽模型收敛为共享 helper（inline.rs 与 taint 两处复制）） |
+| N66 | abcd-taint call_flow 的 arg→param 绑定沿用 T4 旧约定（params[0]=this、args[i]→params[i+1]），但 vendor 帧槽模型（P3b 坐实）是 [func][newTarget][this][formals…]（callType 注解位，语料全无注解→默认 0xF→3 隐式槽）——真实字节码上 args[0] 错绑到隐式槽，解析调用实参流全 FN（t-P1 探针 c1/d3/e3 实证）。语料冒烟未暴露（命中全是过程内/状态基流 + 通配播种）。连带漂移：T4/§5.3 绑定表与 abcd-lift 注释同为旧理解（inline.rs 持有正确模型） | ✅ 修复（6da5e03，t-P1 附带：call_flow 全接帧槽模型——0xF 默认 this→params[2]/args[i]→params[3+i]、注解形按位读、非静态无注解走保守全参数过近似不静默丢；3 个双向精度钉测试；探针 c1/d3/e3 由 KNOWN-FN 翻 TP 且 runner 强制更新标注=仪器自证。**orchestrator 独立复验**：probe 表 tp=11 fp=4 fn=4 violations=0 逐字复现、默认冒烟 hits=0 / 正控 36 不变（字节中性）、scoped workspace 114 套件绿；CallType 与 inline.rs 复制一处，共享 helper 收敛已登记） |
 
 | N65 | `delobjprop` 操作数双重反转：vendor 语义 obj=v0/prop=acc/result→acc（isa.yaml:1293-1296 acc:inout），abcd-lift:720 把 acc 读成 object、v0 读成 key，abcd-lower:1136 同形反转写回——**双反相消**，字节恒等/VM oracle 全绿但 IR 语义错（反编译器等语义消费者现形）。源自 v0.1（parity 同反不查），d-P4 发现。语料 18 文件（property-ops 族）runtime-passed 但因字节不变而绿 | ✅ 修复（7fa03cb，d-P4 附带：lift+lower 双边交换；red-first 钉测试 lift_unit/lower_delobjprop_roles/decompile golden s25；acc:inout 族全审计无更多反转（deprecated 形本就正确，无 N66）。**orchestrator 独立复验**：自跑 v2lift 对 P2 基线 **0 差异**（worker 报的 13 个 N55 时代 debug 序差异不复现——字节恒等比其声称更强）、VM oracle 1149/1149（sha256:5e7627bdcb78…）） |
 
@@ -298,7 +298,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 | d-P9 | C1 模块 G2 | 36 fixture：lift 用 ModuleData 把槽位解析成名字 + 模块模式完善 | 未开始 |
 | d-P10 | G4 模板 raw | 36 fixture：核实 raw 是否在字面量数组，在则保留 | 未开始 |
 | d-P11 | C2 生成器/异步管道 | 18 fixture：生成器协议状态机重建为 async/function* 体（最贵） | 未开始 |
-| t-P1 | E6 评估基建 | 带人工标注真实污点的 fixture 集（爬级触发器的可信基线） | 未开始 |
+| t-P1 | E6 评估基建 | 带人工标注真实污点的 fixture 集（爬级触发器的可信基线） | **完成**（0716d7b/4f0a27f/86869b7 等 5 commit：22 探针 5 族 + annotations.json ground truth（VM 实跑校验）+ gen-taint-probes.py 生成器 + probes.rs runner（expected-FN 消失会强制失败=爬级仪器）。基线表 tp=11 fp=4 fn=4：4 个 expected-FP（a4/a5/b2/c2）+ 4 个 known-FN（b3→rung1、c4→rung2、d4→rung2、e5→rung1）全部带 closes_at_rung 标注。附带抓到并修复 N66（orchestrator 复验全绿）） |
 | t-P2 | E1 rung-1 引擎 | Boomerang 形按需别名查询（AliasOracle 接缝后的真引擎） | 未开始（触发器：探针 a+b 族 FN） |
 | t-P3 | E3 原型链摘要查找 | points-to 驱动的接收者类型近似（依赖 t-P2） | 未开始 |
 | t-P4 | E4 mini-gap 完整传播器 | 摘要暂停/回调/恢复（高阶内置函数摘要的前置） | 未开始 |
