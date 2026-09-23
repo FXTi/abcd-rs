@@ -2090,7 +2090,12 @@ impl<'m> Emitter<'m> {
         let params = visible
             .iter()
             .enumerate()
-            .map(|(i, p)| format!("{p}: {}", ty_ts(self.module, &sig.param_tys[rf.hidden_params + i])))
+            .map(|(i, p)| {
+                format!(
+                    "{p}: {}",
+                    ty_ts(self.module, &sig.param_tys[rf.hidden_params + i])
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let ret = match (&sig.return_ty, rf.kind) {

@@ -133,6 +133,74 @@ finally-style duplicated try wrappers are behavior-preserving for this
 family. The VM-verified before/after: `TypeError … at f19` exit 255 →
 clean exit 0 with empty stdout (matching the baked oracle record).
 
+## The d-P8 readability batch (emission quality only)
+
+All five backlog folds landed with the dream gate UNCHANGED at **1059
+pass / 0 decompile-bug / 0 es2abc-cant / 54 expected-fallback / 36
+fixture-unsupported** (histogram verbatim re-verified after each
+item). Corpus fold counters: `finally_fold=18`, `scope_fold=237`,
+multi-catch merge `0` (corpus has no multi-handler regions), arrow
+recovery (no counter — kind-driven), `--ts` (flag, default off).
+
+1. **finally fold** (`folds.rs`, design §4.2 item 5): the es2abc
+   duplicated-finally idiom — a handler-protecting outer `try` whose
+   catch is a phi dispatch (switch on a phi, `case undefined:` runs the
+   finally body, `default:` skips it, rethrow-unless-hole with the
+   thrown temp tracing through the copy chain to the catch binding) —
+   re-factors into `finally { … }`. The inlined copies are stripped
+   only where PROVABLE: every `return`/exiting `break`/`continue` in
+   the protected construct must be preceded by an alpha-equivalent copy
+   (SSA temps unique per function make external names match verbatim;
+   copy-local consts are alpha-renamed by canonicalization), the
+   return-value guard (a copy rebinding the returned temp bails), and
+   the normal-completion fall-through must carry its own copy (sibling
+   tail). Any doubt keeps the duplicated form with its honesty notes
+   (s33). A sole inner try/catch unwraps to `try{…}catch{…}finally{…}`;
+   the dispatch's phi declarations are re-hoisted (module mode is
+   strict). Golden: s32 (fires), s33 (bails, duplication kept). Corpus:
+   18 (local/exception-finally × 6 versions × 3 profiles).
+2. **LexStore scope reconstruction** (`folds.rs::scope_fold`): the slot
+   initializations immediately following a `NewLexEnv*` push (level 0,
+   slot inside the frame) are the source's `let` declarations — the TDZ
+   hole + elided hole-guards prove every read is post-init. Converted
+   only when every store to that name lives in the same statement run
+   after the push, the name is not a parameter, and the name was not
+   already block-declared by the fold; otherwise the
+   `/* scope-push […] */` comment stays (partial consumption lists only
+   undeclared slots — s35). Declarations are uniformly `let` — `const`
+   needs a cross-function reassignment proof (a capturing closure can
+   store the slot), out of scope. Golden: s34/s35. Corpus: 237.
+3. **Multi-catch merge**: JS has one `catch`; extra typed handlers
+   merge into it in dispatch order with each extra exception param
+   BOUND to the clause binding (`const e$1 = e;`) — the file's type
+   table does not reach the IR (`type_idx` is a file entity index), so
+   no `instanceof` dispatch is recoverable and the merge says so.
+   Golden: s36. Corpus: 0 firings (no multi-handler regions).
+4. **`--ts` flag** (`EmitOptions::ts`, previously reserved):
+   `Signature` metadata drives `function f(x: T): R` annotations.
+   Verified BEFORE promising: signatures survive the lift ONLY on
+   ≤11-format files (fact #A7 — corpus: 9.0.0.0 = 1944/1944,
+   11.0.2.0 = 2124/2124 functions, 12+/24 = 0) and every corpus
+   annotation is `Ty::Any` (JS sources declare nothing), so on a JS
+   corpus the flag only adds `: any` on ≤11 fixtures. The full `Ty`
+   mapping renders anyway (DynPrim → primitives, `Static(Reference)` →
+   the class-table name with `L…;` unwrapping, unions, numerics →
+   `number`, `Void` → `void`) for ArkTS-derived modules. Misaligned or
+   absent signatures keep BARE parameter lists (never fabricated).
+   Class constructors never get a return annotation (TS forbids it).
+   `node --check` does not parse TS: the corpus gate validates the TS
+   sample through node's own `stripTypeScriptTypes` + a `vm.Script`
+   parse of the stripped output (TS-CHECK 40/40). Golden: s37.
+5. **Arrow recovery**: the earlier "not recoverable" note was WRONG at
+   the file level — es2abc marks arrows `NC_FUNCTION`/
+   `ASYNC_NC_FUNCTION` while concise methods/getters are `None`
+   (verified on all six corpus versions plus a compiled probe:
+   object-literal methods → `None`, arrows → NC). The lift now maps NC
+   → `FunctionKind::Arrow`/`AsyncArrow` (new IR variants) and closures
+   emit `(x) => { … }` / `async (x) => { … }`; `Function`-kind closures
+   are genuinely function expressions, so the caveat comment is gone
+   everywhere. Golden: s38. Corpus: 396 NC functions (66/version).
+
 Gate-found decompiler bugs FIXED in d-P4 (each proven by the oracle):
 N36 operand order at expression construction, value-pure inc/dec,
 temporal escape hoisting (`var` at function top when a use leaves the

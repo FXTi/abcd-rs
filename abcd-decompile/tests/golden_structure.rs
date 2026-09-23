@@ -1857,13 +1857,7 @@ fn s32_finally_fold() {
     let _c = call_p1(&mut m, b0, p1);
     let three = load_number(&mut m, b0, 3.0);
     let _f1 = call_p1(&mut m, b0, p1);
-    emit_void(
-        &mut m,
-        b0,
-        Op::Return {
-            value: Some(three),
-        },
-    );
+    emit_void(&mut m, b0, Op::Return { value: Some(three) });
     // h0 (R0's catch, itself R1-protected): finally copy, `return e + 1`.
     let exc0 = add_exception_param(&mut m, h0);
     let one = load_number(&mut m, h0, 1.0);
@@ -2005,13 +1999,7 @@ fn s33_finally_fold_bails_without_copy() {
     let _c = call_p1(&mut m, b0, p1);
     let three = load_number(&mut m, b0, 3.0);
     let _f1 = call_p1(&mut m, b0, p1);
-    emit_void(
-        &mut m,
-        b0,
-        Op::Return {
-            value: Some(three),
-        },
-    );
+    emit_void(&mut m, b0, Op::Return { value: Some(three) });
     // h0 (R0's catch, R1-protected): NO finally copy before its return.
     let exc0 = add_exception_param(&mut m, h0);
     let one = load_number(&mut m, h0, 1.0);
@@ -2314,21 +2302,24 @@ fn s36_multi_catch_merge() {
     link(&mut m, b0, h1);
     link(&mut m, b0, h2);
     // One region, two typed catches (type_idx present but unnamed).
-    m.func_mut(f).unwrap().try_regions.push(abcd_ir::function::TryRegion {
-        protected: vec![b0],
-        catches: vec![
-            abcd_ir::function::Catch {
-                handler: h1,
-                exception: e1,
-                type_idx: Some(7),
-            },
-            abcd_ir::function::Catch {
-                handler: h2,
-                exception: e2,
-                type_idx: Some(9),
-            },
-        ],
-    });
+    m.func_mut(f)
+        .unwrap()
+        .try_regions
+        .push(abcd_ir::function::TryRegion {
+            protected: vec![b0],
+            catches: vec![
+                abcd_ir::function::Catch {
+                    handler: h1,
+                    exception: e1,
+                    type_idx: Some(7),
+                },
+                abcd_ir::function::Catch {
+                    handler: h2,
+                    exception: e2,
+                    type_idx: Some(9),
+                },
+            ],
+        });
 
     let want = r#"function f(p1) {
   /* try region 0: 2 catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order */
@@ -2466,11 +2457,7 @@ fn s38_arrow_recovery() {
     );
     let cl = emit(&mut m, b, Op::AllocClosure { func: df });
     let g = intern(&mut m, "g");
-    emit_void(
-        &mut m,
-        b,
-        Op::StoreGlobal { name: g, value: cl },
-    );
+    emit_void(&mut m, b, Op::StoreGlobal { name: g, value: cl });
     emit_void(&mut m, b, Op::Return { value: None });
 
     let want = r#"var g;

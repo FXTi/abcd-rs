@@ -1733,10 +1733,7 @@ fn canon_stmt(s: &mut Stmt, map: &std::collections::HashMap<String, String>) {
             *value_id = abcd_ir::ValueId::new(0);
         }
         Stmt::PhiAssign {
-            target,
-            value,
-            to,
-            ..
+            target, value, to, ..
         } => {
             canon_name(target, map);
             canon_expr(value, map);
@@ -1748,9 +1745,7 @@ fn canon_stmt(s: &mut Stmt, map: &std::collections::HashMap<String, String>) {
                 canon_expr(e, map);
             }
         }
-        Stmt::StoreProp {
-            object, value, ..
-        } => {
+        Stmt::StoreProp { object, value, .. } => {
             canon_expr(object, map);
             canon_expr(value, map);
         }
@@ -1765,10 +1760,7 @@ fn canon_stmt(s: &mut Stmt, map: &std::collections::HashMap<String, String>) {
             canon_expr(value, map);
         }
         Stmt::StoreDyn {
-            object,
-            key,
-            value,
-            ..
+            object, key, value, ..
         } => {
             canon_expr(object, map);
             canon_expr(key, map);
@@ -1946,10 +1938,7 @@ fn ft_extract_dispatch(body: &[SNode], binding: &str) -> Option<FinallyIdiom> {
     // nested nodes (v1 conservatism — copies must match leaf-for-leaf).
     let template_ok = fbody.iter().all(|t| match t {
         FTok::Leaf(Leaf::Raw(
-            Stmt::Return(_)
-            | Stmt::Throw(_)
-            | Stmt::Branch { .. }
-            | Stmt::CondBranch { .. },
+            Stmt::Return(_) | Stmt::Throw(_) | Stmt::Branch { .. } | Stmt::CondBranch { .. },
         )) => false,
         FTok::Leaf(_) => true,
         FTok::Node(_) => false,
@@ -2131,7 +2120,8 @@ fn ft_node_fallthrough(n: &SNode) -> bool {
             ..
         } => {
             let body_ft = ft_list_fallthrough(body);
-            let catch_ft = catches.is_empty() || catches.iter().any(|c| ft_list_fallthrough(&c.body));
+            let catch_ft =
+                catches.is_empty() || catches.iter().any(|c| ft_list_fallthrough(&c.body));
             // An exceptional path is not a NORMAL completion; a
             // finally clause runs either way and changes nothing.
             let _ = finally;
@@ -2270,8 +2260,9 @@ fn ft_strip_exits(
             for t in cand {
                 if let FTok::Leaf(l) = t {
                     match l {
-                        Leaf::Raw(Stmt::PhiAssign { target, .. })
-                        | Leaf::Assign { target, .. } => assigned.push(target),
+                        Leaf::Raw(Stmt::PhiAssign { target, .. }) | Leaf::Assign { target, .. } => {
+                            assigned.push(target)
+                        }
                         _ => {}
                     }
                 }
@@ -2355,7 +2346,8 @@ fn ft_fold_at(nodes: &[SNode], i: usize) -> Option<Vec<SNode>> {
         else {
             unreachable!()
         };
-        let ft = ft_list_fallthrough(&ibody) || icatches.iter().any(|c| ft_list_fallthrough(&c.body));
+        let ft =
+            ft_list_fallthrough(&ibody) || icatches.iter().any(|c| ft_list_fallthrough(&c.body));
         (
             SNode::Try {
                 body: ibody,
@@ -2477,10 +2469,10 @@ pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldSta
                     *runs += 1;
                     for (index, l) in leaves.iter().enumerate() {
                         if let Leaf::Raw(Stmt::LexStore { name, .. }) = l {
-                            stores.entry(name.clone()).or_default().push(LexStoreSite {
-                                run,
-                                index,
-                            });
+                            stores
+                                .entry(name.clone())
+                                .or_default()
+                                .push(LexStoreSite { run, index });
                         }
                     }
                 }
@@ -2647,9 +2639,11 @@ pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldSta
                 // the push (else the block declaration would not cover
                 // it — strict-mode ReferenceError, or a shadowed
                 // binding).
-                let ok = stores.get(&name).into_iter().flatten().all(|s| {
-                    s.run == run && s.index > p
-                });
+                let ok = stores
+                    .get(&name)
+                    .into_iter()
+                    .flatten()
+                    .all(|s| s.run == run && s.index > p);
                 if !ok {
                     continue;
                 }
@@ -2693,12 +2687,5 @@ pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldSta
         }
     }
     let mut runs = 0usize;
-    convert(
-        nodes,
-        &mut runs,
-        &stores,
-        params,
-        &mut converted,
-        stats,
-    );
+    convert(nodes, &mut runs, &stores, params, &mut converted, stats);
 }
