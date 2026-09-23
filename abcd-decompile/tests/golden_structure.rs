@@ -1119,3 +1119,269 @@ fn s19_yield_await() {
     assert!(got.contains("async function af(p1) {"), "async:\n{got}");
     assert!(got.contains("const v6 = await p1;"), "await:\n{got}");
 }
+
+/// s20 — cross-arm fold, terminal shared tail (leaf level): the
+/// es2abc `if (c0) goto shared; else { if (c1) goto shared; … }`
+/// short-circuit shape where the shared arm returns.
+#[test]
+fn s20_cross_arm_terminal_dup() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+    let b1 = add_block(&mut m, f);
+    let b2 = add_block(&mut m, f);
+    let b3 = add_block(&mut m, f);
+    let c0 = istrue(&mut m, b0, p1);
+    cond_on(&mut m, b0, c0, b2, b1);
+    let c1 = istrue(&mut m, b1, p2);
+    cond_on(&mut m, b1, c1, b2, b3);
+    let r = call_p1(&mut m, b2, p1);
+    emit_void(&mut m, b2, Op::Return { value: Some(r) });
+    emit_void(&mut m, b3, Op::Return { value: Some(p2) });
+    link(&mut m, b0, b2);
+    link(&mut m, b0, b1);
+    link(&mut m, b1, b2);
+    link(&mut m, b1, b3);
+
+    let got = decompiled(&m);
+    assert!(
+        !got.contains("cross-arm edges unfolded"),
+        "fold did not fire:\n{got}"
+    );
+    let want = r#"function f(p1, p2) {
+  if (p1) {
+    const v5 = p1();
+    return v5;
+  } else {
+    if (p2) {
+      const v5 = p1();
+      return v5;
+    }
+    return p2;
+  }
+}
+"#;
+    assert_eq!(got, want);
+}
+
+/// s21 — cross-arm fold, rejoining shared tail (leaf level): the
+/// shared arm falls through to the conditional's own merge.
+#[test]
+fn s21_cross_arm_rejoin_dup() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+    let b1 = add_block(&mut m, f);
+    let b2 = add_block(&mut m, f);
+    let b3 = add_block(&mut m, f);
+    let c0 = istrue(&mut m, b0, p1);
+    cond_on(&mut m, b0, c0, b2, b1);
+    let c1 = istrue(&mut m, b1, p2);
+    cond_on(&mut m, b1, c1, b3, b2);
+    let r = call_p1(&mut m, b2, p1);
+    emit_void(&mut m, b2, Op::Branch { dest: b3 });
+    emit_void(&mut m, b3, Op::Return { value: Some(p1) });
+    link(&mut m, b0, b2);
+    link(&mut m, b0, b1);
+    link(&mut m, b1, b3);
+    link(&mut m, b1, b2);
+    link(&mut m, b2, b3);
+    let _ = r;
+
+    let got = decompiled(&m);
+    assert!(
+        !got.contains("cross-arm edges unfolded"),
+        "fold did not fire:\n{got}"
+    );
+    let want = r#"function f(p1, p2) {
+  if (p1) {
+    p1();
+  } else {
+    if (!p2) {
+      p1();
+    }
+  }
+  return p1;
+}
+"#;
+    assert_eq!(got, want);
+}
+
+/// s22 — cross-arm run fold: the shared arm rejoins SEVERAL blocks
+/// later (the optional-chain `if (x == null) goto shared` family), so
+/// the sibling run is consumed as the structural arm.
+#[test]
+fn s22_cross_arm_run_fold() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+    let b1 = add_block(&mut m, f);
+    let b2 = add_block(&mut m, f);
+    let b3 = add_block(&mut m, f);
+    let b4 = add_block(&mut m, f);
+    let b5 = add_block(&mut m, f);
+    let c0 = istrue(&mut m, b0, p1);
+    cond_on(&mut m, b0, c0, b3, b1);
+    let c1 = istrue(&mut m, b1, p2);
+    cond_on(&mut m, b1, c1, b3, b2);
+    let _x = call_p1(&mut m, b2, p1);
+    emit_void(&mut m, b2, Op::Branch { dest: b4 });
+    let _y = call_p1(&mut m, b3, p2);
+    emit_void(&mut m, b3, Op::Branch { dest: b5 });
+    let _z = call_p1(&mut m, b4, p1);
+    emit_void(&mut m, b4, Op::Branch { dest: b5 });
+    emit_void(&mut m, b5, Op::Return { value: Some(p1) });
+    link(&mut m, b0, b3);
+    link(&mut m, b0, b1);
+    link(&mut m, b1, b3);
+    link(&mut m, b1, b2);
+    link(&mut m, b2, b4);
+    link(&mut m, b3, b5);
+    link(&mut m, b4, b5);
+
+    let got = decompiled(&m);
+    assert!(
+        !got.contains("cross-arm edges unfolded"),
+        "fold did not fire:\n{got}"
+    );
+    let want = r#"function f(p1, p2) {
+  if (p1) {
+    p2();
+  } else {
+    if (!p2) {
+      p1();
+      p1();
+    } else {
+      p2();
+    }
+  }
+  return p1;
+}
+"#;
+    assert_eq!(got, want);
+}
+
+/// s23 — skip-guard run fold (no cross-arm edge): a leaf conditional
+/// whose edge skips the next blocks of the run straight to the
+/// continuation — emission v1 dropped it and ran the skipped blocks on
+/// BOTH paths.
+#[test]
+fn s23_skip_guard_run_fold() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+    let b1 = add_block(&mut m, f);
+    let b2 = add_block(&mut m, f);
+    let b3 = add_block(&mut m, f);
+    let b4 = add_block(&mut m, f);
+    let c0 = istrue(&mut m, b0, p1);
+    cond_on(&mut m, b0, c0, b4, b1);
+    let c1 = istrue(&mut m, b1, p2);
+    cond_on(&mut m, b1, c1, b4, b2);
+    let _x = call_p1(&mut m, b2, p1);
+    emit_void(&mut m, b2, Op::Branch { dest: b3 });
+    let _y = call_p1(&mut m, b3, p2);
+    emit_void(&mut m, b3, Op::Branch { dest: b4 });
+    emit_void(&mut m, b4, Op::Return { value: Some(p1) });
+    link(&mut m, b0, b4);
+    link(&mut m, b0, b1);
+    link(&mut m, b1, b4);
+    link(&mut m, b1, b2);
+    link(&mut m, b2, b3);
+    link(&mut m, b3, b4);
+
+    let got = decompiled(&m);
+    let want = r#"function f(p1, p2) {
+  if (!p1) {
+    if (!p2) {
+      p1();
+      p2();
+    }
+  }
+  return p1;
+}
+"#;
+    assert_eq!(got, want);
+}
+
+/// s24 — cross-arm dup across a try boundary: the shared tail is
+/// protected, the site is not; the duplicated code keeps its own
+/// try/catch (protectedness is an instruction property).
+#[test]
+fn s24_cross_arm_try_wrap_dup() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+    let b1 = add_block(&mut m, f);
+    let b2 = add_block(&mut m, f);
+    let b3 = add_block(&mut m, f);
+    let b4 = add_block(&mut m, f);
+    let b5 = add_block(&mut m, f);
+    let handler = add_block(&mut m, f);
+    let c0 = istrue(&mut m, b0, p1);
+    cond_on(&mut m, b0, c0, b3, b1);
+    let c1 = istrue(&mut m, b1, p2);
+    cond_on(&mut m, b1, c1, b3, b2);
+    let _x = call_p1(&mut m, b2, p1);
+    emit_void(&mut m, b2, Op::Branch { dest: b4 });
+    let _y = call_p1(&mut m, b3, p2);
+    emit_void(&mut m, b3, Op::Branch { dest: b5 });
+    let _z = call_p1(&mut m, b4, p1);
+    emit_void(&mut m, b4, Op::Branch { dest: b5 });
+    emit_void(&mut m, b5, Op::Return { value: Some(p1) });
+    let exc = add_exception_param(&mut m, handler);
+    emit_void(&mut m, handler, Op::Return { value: Some(exc) });
+    link(&mut m, b0, b3);
+    link(&mut m, b0, b1);
+    link(&mut m, b1, b3);
+    link(&mut m, b1, b2);
+    link(&mut m, b2, b4);
+    link(&mut m, b3, b5);
+    link(&mut m, b4, b5);
+    add_try(&mut m, f, vec![b3], handler, exc);
+
+    let got = decompiled(&m);
+    assert!(
+        !got.contains("cross-arm edges unfolded"),
+        "fold did not fire:\n{got}"
+    );
+    let want = r#"function f(p1, p2) {
+  if (p1) {
+    try {
+      p2();
+    } catch (e) {
+      return e;
+    }
+  } else {
+    if (!p2) {
+      p1();
+      p1();
+    } else {
+      /* cross-arm tail duplication re-wraps try region 0 (wrapper #2; protectedness is an instruction property, so the duplicated code keeps its own try/catch) */
+      try {
+        p2();
+      } catch (e) {
+        return e;
+      }
+    }
+  }
+  return p1;
+}
+"#;
+    assert_eq!(got, want);
+}

@@ -280,9 +280,15 @@ pub struct StructStats {
     pub handler_shims: usize,
     /// Loop-exit phi assignments placed after the loop.
     pub exit_phi_after_loop: usize,
-    /// Dropped no-op conditional branches (cross-arm condition-merge
-    /// fold pending — d-P1's `cross_arm_edges` hint).
+    /// Dropped no-op conditional branches whose cross-arm edge could
+    /// NOT be repaired by the tail-duplication fold (residual).
     pub cross_arm_notes: usize,
+    /// Cross-arm drop sites repaired by the shared-tail duplication
+    /// fold (d-P4; d-P1's `cross_arm_edges` hint): the dropped edge's
+    /// target tail is emitted inline at the site.
+    pub cross_arm_folds: usize,
+    /// Blocks duplicated by the cross-arm fold.
+    pub cross_arm_dup_blocks: usize,
     /// Unverifiable break targets (defensive; expected 0).
     pub break_target_notes: usize,
 }
@@ -313,6 +319,15 @@ enum Follow {
     /// Unknown (an [`RegionNode::Alternates`] or irreducible node
     /// follows) — clean loop forms disabled.
     Unknown,
+}
+
+/// Where a duplicated cross-arm tail ends ([`Ctx::cross_arm_dup`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DupStop {
+    /// The tail ends in a terminal (return/throw) — never falls through.
+    Terminal,
+    /// The tail rejoins the structural flow at this block.
+    Rejoin(BlockId),
 }
 
 /// A try plan within one frame (main tree or a handler shim).
@@ -379,6 +394,12 @@ struct Frame {
     skip_blocks: HashSet<BlockId>,
     /// How many times each plan was wrapped (>1 = split).
     wrap_counts: HashMap<usize, usize>,
+    /// d-P1's cross-arm edges (arm block → sibling-arm block): the
+    /// edges the acyclic structurer could not honor — the tail-
+    /// duplication fold's work list.
+    cross_arm: HashSet<(BlockId, BlockId)>,
+    /// Loop headers (the tail fold never duplicates into a loop).
+    loop_headers: BTreeSet<BlockId>,
 }
 
 impl Frame {
@@ -400,6 +421,13 @@ impl Frame {
             .into_iter()
             .map(|h| (h, format!("L${}", h.index())))
             .collect();
+        let cross_arm: HashSet<(BlockId, BlockId)> = tree.cross_arm_edges.iter().copied().collect();
+        let mut loop_headers = BTreeSet::new();
+        for node in tree.nodes() {
+            if let RegionNode::Loop { header, .. } = node {
+                loop_headers.insert(*header);
+            }
+        }
         let mut plan_order: Vec<usize> = (0..plans.len()).collect();
         plan_order.sort_by_key(|&i| plans[i].protected.len());
         Frame {
@@ -415,6 +443,8 @@ impl Frame {
             arm_bodies: Vec::new(),
             skip_blocks: HashSet::new(),
             wrap_counts: HashMap::new(),
+            cross_arm,
+            loop_headers,
         }
     }
 
@@ -569,6 +599,9 @@ struct Ctx<'m> {
     alt_counter: usize,
     /// Counter for `s$k` state-machine temporaries (deterministic).
     state_counter: usize,
+    /// Cross-arm edges the tail-duplication fold repaired (the build()
+    /// summary lists only the residual, unfolded ones).
+    folded_xarms: BTreeSet<(BlockId, BlockId)>,
 }
 
 impl<'m> Ctx<'m> {
@@ -590,6 +623,7 @@ impl<'m> Ctx<'m> {
             shim_plans: HashMap::new(),
             alt_counter: 0,
             state_counter: 0,
+            folded_xarms: BTreeSet::new(),
         }
     }
 
@@ -635,15 +669,18 @@ impl<'m> Ctx<'m> {
         } else if let Some(root) = self.f().tree.root {
             self.emit_node(root, None, Follow::Tail, &mut body);
         }
-        // d-P1's cross-arm hint: forward edges from one conditional arm
-        // into its sibling (the condition-merge/duplication fold is
-        // pending). The tree is truthful; the dropped no-op conditional
-        // is noted at the leaf. One summary comment per function.
+        // d-P1's cross-arm hint, d-P4's tail-duplication fold: edges
+        // the fold repaired are gone from the output entirely (the
+        // shared tail is duplicated inline at the drop site); only the
+        // residual — edges whose tail the fold refused (budget, loop
+        // header, mid-tail conditional, try-boundary crossing) — keeps
+        // the summary honesty comment.
         let cross: Vec<String> = self
             .f()
             .tree
             .cross_arm_edges
             .iter()
+            .filter(|e| !self.folded_xarms.contains(e))
             .map(|(a, b)| format!("B{}→B{}", a.index(), b.index()))
             .collect();
         if !cross.is_empty() {
@@ -651,7 +688,7 @@ impl<'m> Ctx<'m> {
             body.insert(
                 0,
                 SNode::Honest(format!(
-                    "cross-arm edges present ({}); the shared tail is NOT duplicated and the conditions are NOT merged (fold pending) — affected flow may read oddly",
+                    "cross-arm edges unfolded ({}); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly",
                     cross.join(", ")
                 )),
             );
@@ -976,7 +1013,257 @@ impl<'m> Ctx<'m> {
         }
     }
 
-    // ── Emission ─────────────────────────────────────────────────────
+    // ── Cross-arm tail-duplication fold (d-P4) ─────────────────────
+
+    /// The es2abc `if (c) goto shared; else {…}` / short-circuit idiom
+    /// leaves a forward edge from one conditional arm into its sibling
+    /// (d-P1's `cross_arm_edges`). Such an edge has no structural
+    /// action, so emission v1 dropped it (loudly). The fold duplicates
+    /// the SHARED TAIL inline at the drop site: the target block's
+    /// statements, then any further blocks chained through *recorded
+    /// cross-arm edges only*, stopping at a terminal (return/throw) or
+    /// at the first non-cross-arm edge, whose destination is reported
+    /// to the caller as the rejoin point ([`DupStop::Rejoin`]) — the
+    /// caller decides whether its emission context actually falls
+    /// through to that block.
+    ///
+    /// Bounded: ≤ 8 blocks, ≤ 128 statements, never into a loop header,
+    /// no conditional terminators mid-tail, and never across a try-plan
+    /// boundary (duplicating protected code into an unprotected context
+    /// would change throw behavior). Returns `None` — the caller keeps
+    /// the honest drop — when any bound trips. On success returns the
+    /// duplicated nodes, the stop mode, and the block count.
+    fn cross_arm_dup(
+        &mut self,
+        site: BlockId,
+        target: BlockId,
+    ) -> Option<(Vec<SNode>, DupStop, usize)> {
+        const MAX_BLOCKS: usize = 8;
+        const MAX_STMTS: usize = 128;
+        let debug = std::env::var_os("ABCD_XARM_DEBUG").is_some();
+        let site_plan = self.f_mut().plan_of(site);
+        let mut segs: Vec<(Option<usize>, Vec<SNode>)> = Vec::new();
+        let mut cur = target;
+        let mut visited = BTreeSet::new();
+        let mut stmts = 0usize;
+        let mut stop = None;
+        loop {
+            if !visited.insert(cur) || visited.len() > MAX_BLOCKS {
+                if debug {
+                    eprintln!(
+                        "XARM-BAIL site=B{} target=B{} cur=B{} reason=cycle-or-budget",
+                        site.index(),
+                        target.index(),
+                        cur.index()
+                    );
+                }
+                return None;
+            }
+            if self.f().loop_headers.contains(&cur) {
+                if debug {
+                    eprintln!(
+                        "XARM-BAIL site=B{} target=B{} cur=B{} reason=loop-header",
+                        site.index(),
+                        target.index(),
+                        cur.index()
+                    );
+                }
+                return None;
+            }
+            let cur_plan = self.f_mut().plan_of(cur);
+            // Try-plan crossing: protectedness is a property of the
+            // executed instruction (the PC range), not of the path — a
+            // segment whose plan differs from the site's must be
+            // wrapped in its own try/catch (below), which is only
+            // possible when the segment IS protected (unprotecting is
+            // impossible) and, when the site is itself protected, the
+            // segment's plan is nested inside the site's (laminar
+            // subset) so the physical nesting matches reality.
+            if cur_plan != site_plan {
+                let ok = match (site_plan, cur_plan) {
+                    (None, Some(_)) => true,
+                    (Some(q), Some(p)) => {
+                        let (pp, qq) = (&self.f().plans[p].protected, &self.f().plans[q].protected);
+                        pp.is_subset(qq)
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    if debug {
+                        eprintln!(
+                            "XARM-BAIL site=B{} target=B{} cur=B{} reason=plan-boundary",
+                            site.index(),
+                            target.index(),
+                            cur.index()
+                        );
+                    }
+                    return None;
+                }
+            }
+            let parts = self.block_parts(cur);
+            stmts += parts.main.len() + parts.phi.len();
+            if stmts > MAX_STMTS {
+                if debug {
+                    eprintln!(
+                        "XARM-BAIL site=B{} target=B{} cur=B{} reason=stmt-budget",
+                        site.index(),
+                        target.index(),
+                        cur.index()
+                    );
+                }
+                return None;
+            }
+            let mut blk: Vec<SNode> = Vec::new();
+            let term = match parts.term {
+                Term::None => {
+                    // Terminal (return/throw) or no out-edge.
+                    Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.main));
+                    Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.phi));
+                    stop = Some(DupStop::Terminal);
+                    None
+                }
+                Term::Branch(dest) => {
+                    Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.main));
+                    Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.phi));
+                    if self.f().cross_arm.contains(&(cur, dest)) {
+                        // The shared tail continues through another
+                        // dropped edge — keep walking.
+                        Some(Some(dest))
+                    } else {
+                        // The tail rejoins the structural flow at
+                        // `dest`; the caller checks its context falls
+                        // through there.
+                        stop = Some(DupStop::Rejoin(dest));
+                        None
+                    }
+                }
+                // A conditional mid-tail is beyond the v1 fold.
+                Term::Cond(..) => {
+                    if debug {
+                        eprintln!(
+                            "XARM-BAIL site=B{} target=B{} cur=B{} reason=cond-mid-tail",
+                            site.index(),
+                            target.index(),
+                            cur.index()
+                        );
+                    }
+                    return None;
+                }
+            };
+            // Append the block's nodes to the current plan segment.
+            match segs.last_mut() {
+                Some((p, nodes)) if *p == cur_plan => nodes.append(&mut blk),
+                _ => segs.push((cur_plan, blk)),
+            }
+            match term {
+                Some(Some(dest)) => {
+                    cur = dest;
+                }
+                Some(None) => unreachable!(),
+                None => break,
+            }
+        }
+        let Some(stop) = stop else {
+            unreachable!("the dup walk only breaks after setting `stop`")
+        };
+        // Assemble: segments whose plan differs from the site's get
+        // their own try/catch wrapper (the catch body duplicates — the
+        // same finally-style duplication es2abc itself uses).
+        let mut out: Vec<SNode> = Vec::new();
+        for (plan, nodes) in segs {
+            if plan != site_plan
+                && let Some(p) = plan
+            {
+                let handlers = self.f().plans[p].handlers.clone();
+                let mut catches = Vec::new();
+                let mut seen = HashSet::new();
+                for h in handlers {
+                    if seen.insert(h) {
+                        catches.push(self.emit_handler(h));
+                    }
+                }
+                let wraps = {
+                    let w = self.f_mut().wrap_counts.entry(p).or_insert(0);
+                    *w += 1;
+                    *w
+                };
+                if wraps > 1 {
+                    self.stats.try_splits += 1;
+                }
+                self.stats.try_catches += 1;
+                out.push(SNode::Try {
+                    body: nodes,
+                    catches,
+                    note: Some(format!(
+                        "cross-arm tail duplication re-wraps try region {p} (wrapper #{wraps}; protectedness is an instruction property, so the duplicated code keeps its own try/catch)"
+                    )),
+                });
+            } else {
+                out.extend(nodes);
+            }
+        }
+        Some((out, stop, visited.len()))
+    }
+
+    /// Whether a duplicated tail stopping at `stop` is correct in an
+    /// emission context whose structural continuation is `follow`:
+    /// terminal tails are always safe (they never fall through);
+    /// rejoining tails must land exactly on the continuation (or the
+    /// ancestor tail, where fall-through is definitionally correct).
+    fn dup_ok_for_follow(stop: DupStop, follow: Follow) -> bool {
+        match stop {
+            DupStop::Terminal => follow != Follow::Unknown,
+            DupStop::Rejoin(dest) => match follow {
+                Follow::Entry(e) => e == dest,
+                Follow::Tail => true,
+                Follow::Unknown => false,
+            },
+        }
+    }
+
+    /// Fold attempt at one dropped edge `site → target` for a context
+    /// whose continuation is `follow`: duplicate the shared tail when
+    /// the walk succeeds AND its rejoin matches the continuation.
+    fn try_cross_arm_fold(
+        &mut self,
+        site: BlockId,
+        target: BlockId,
+        follow: Follow,
+    ) -> Option<Vec<SNode>> {
+        let (nodes, stop, nblocks) = self.cross_arm_dup(site, target)?;
+        if !Self::dup_ok_for_follow(stop, follow) {
+            if std::env::var_os("ABCD_XARM_DEBUG").is_some() {
+                eprintln!(
+                    "XARM-BAIL site=B{} target=B{} reason=follow-mismatch({follow:?}, stop={stop:?})",
+                    site.index(),
+                    target.index()
+                );
+            }
+            return None;
+        }
+        self.stats.cross_arm_folds += 1;
+        self.stats.cross_arm_dup_blocks += nblocks;
+        self.folded_xarms.insert((site, target));
+        Some(nodes)
+    }
+
+    /// Whether the edge `from → to` forces a terminator action (a
+    /// labeled/unlabeled break/continue or an alternates-arm jump) —
+    /// the pure counterpart of [`Ctx::edge_action`] (no stats).
+    fn edge_has_action(&self, from: BlockId, to: BlockId) -> bool {
+        self.f().arm_scopes.iter().any(|s| s.entry == to)
+            || self
+                .f()
+                .arm_bodies
+                .last()
+                .is_some_and(|ab| !ab.slice.contains(&to))
+            || matches!(
+                self.f().eclass.get(&(from, to)),
+                Some(EdgeClass::Break { .. } | EdgeClass::Continue { .. })
+            )
+    }
+
+    // ── Emission ───────────────────────────────────────────────────
 
     fn emit_node(
         &mut self,
@@ -1104,7 +1391,7 @@ impl<'m> Ctx<'m> {
                 });
             }
             RegionNode::Irreducible { .. } => self.emit_irreducible(id, active, out),
-            RegionNode::Block(b) => self.emit_leaf(b, out),
+            RegionNode::Block(b) => self.emit_leaf(b, follow, out),
             RegionNode::Alternates(_) => {
                 // Reached only through the sequence handler; defensive.
                 self.emit_alternates_wrapped(id, Vec::new(), active, out);
@@ -1125,7 +1412,7 @@ impl<'m> Ctx<'m> {
                 if self.f_mut().skip_blocks.remove(&b) {
                     return; // consumed by a loop header/latch
                 }
-                self.emit_leaf(b, out);
+                self.emit_leaf(b, follow, out);
             }
             RegionNode::Seq(children) => self.emit_seq_children(&children, active, follow, out),
             RegionNode::Alternates(_) => self.emit_alternates_wrapped(id, Vec::new(), active, out),
@@ -1143,6 +1430,164 @@ impl<'m> Ctx<'m> {
             }
             RegionNode::Irreducible { .. } => self.emit_irreducible(id, active, out),
         }
+    }
+
+    /// Sequence-run fold (d-P4): a leaf conditional `b` whose one edge
+    /// falls structurally into the NEXT sequence item while the other
+    /// edge either (a) is a cross-arm edge into the sibling arm — the
+    /// `c14 ? X : (c15 ? Y : X)` / `if (c14 || !c15) {X} else {Y}`
+    /// shared-arm diamond — or (b) skips ahead to a later point of the
+    /// run — the ordinary `if (c) { … }` shape the acyclic structurer
+    /// degrades to a plain run when the merge is outside the arm set
+    /// (and the optional-chain `if (x == null) goto shared` family,
+    /// where the shared arm rejoins several blocks later). Dropping
+    /// such a conditional (emission v1) runs the skipped blocks on
+    /// BOTH paths — wrong. The fold emits a real `if (c) { run } else
+    /// { … }`, consuming the skipped run of plain blocks; the else arm
+    /// is the cross-arm tail duplication (a), or just the skip edge's
+    /// phi assigns (b). Returns the number of sequence items consumed
+    /// (0 = no fold, emit normally).
+    fn try_run_fold(
+        &mut self,
+        children: &[RegionId],
+        i: usize,
+        active: Option<usize>,
+        follow: Follow,
+        out: &mut Vec<SNode>,
+    ) -> usize {
+        const MAX_ARM: usize = 8;
+        if i + 1 >= children.len() {
+            return 0;
+        }
+        let RegionNode::Block(b) = self.f().node(children[i]).clone() else {
+            return 0;
+        };
+        if self.f_mut().cov(children[i]) != Cov::Uniform(active) {
+            return 0;
+        }
+        let parts = self.block_parts(b);
+        let Term::Cond(cond, t, f) = parts.term else {
+            return 0;
+        };
+        // Orientation: exactly one edge structural (targets the next
+        // item's first-executed block, no terminator action), the other
+        // the "skip" edge (no action either — breaks/continues emit
+        // normally).
+        let Follow::Entry(next_entry) = self.entry_of(children[i + 1]) else {
+            return 0;
+        };
+        let (skip, swapped) = if t == next_entry && !self.edge_has_action(b, t) {
+            (f, false)
+        } else if f == next_entry && !self.edge_has_action(b, f) {
+            (t, true)
+        } else {
+            return 0;
+        };
+        if skip == next_entry || self.edge_has_action(b, skip) {
+            return 0;
+        }
+        // The skip arm's content: the cross-arm tail duplication when
+        // the edge jumps into a sibling arm, otherwise empty (the plain
+        // skip-ahead guard).
+        let is_dup = self.f().cross_arm.contains(&(b, skip));
+        let (dup, stop, nblocks) = if is_dup {
+            let Some((nodes, stop, nb)) = self.cross_arm_dup(b, skip) else {
+                return 0;
+            };
+            (nodes, stop, nb)
+        } else {
+            (Vec::new(), DupStop::Rejoin(skip), 0)
+        };
+        // Terminal skip arms need no run consumption: the leaf-level
+        // fold already handles them.
+        let DupStop::Rejoin(rejoin) = stop else {
+            return 0;
+        };
+        // Find the arm length: the run of plain blocks after `i` whose
+        // end rejoins at `rejoin` exactly where the sequence continues.
+        let after = |k: usize, ctx: &Self| {
+            if k < children.len() {
+                ctx.entry_of(children[k])
+            } else {
+                follow
+            }
+        };
+        let mut k = i + 1;
+        let mut arm: Vec<BlockId> = Vec::new();
+        let ok = loop {
+            if k >= children.len() || arm.len() >= MAX_ARM {
+                break false;
+            }
+            let RegionNode::Block(sb) = self.f().node(children[k]).clone() else {
+                break false;
+            };
+            if self.f_mut().cov(children[k]) != Cov::Uniform(active) {
+                break false;
+            }
+            let sparts = self.block_parts(sb);
+            arm.push(sb);
+            k += 1;
+            match sparts.term {
+                // The arm's last block rejoins the sequence exactly at
+                // the dup tail's rejoin point.
+                Term::Branch(d)
+                    if !self.edge_has_action(sb, d)
+                        && d == rejoin
+                        && Self::dup_ok_for_follow(stop, after(k, self)) =>
+                {
+                    break true;
+                }
+                // The arm's last block is terminal: only the skip arm
+                // falls through, to the continuation after the run.
+                Term::None if Self::dup_ok_for_follow(stop, after(k, self)) => {
+                    break true;
+                }
+                // Mid-arm block: must fall structurally into the next
+                // sequence item.
+                Term::Branch(d)
+                    if !self.edge_has_action(sb, d)
+                        && k < children.len()
+                        && Follow::Entry(d) == self.entry_of(children[k]) => {}
+                _ => break false,
+            }
+        };
+        if !ok {
+            return 0;
+        }
+        // Commit: head statements, phi partition, arms.
+        Self::push_stmts(out, Self::stmts_leaves(&parts.main));
+        let (phi_t, phi_f, rest) = Self::partition_phi(&parts.phi, t, f);
+        Self::push_stmts(out, Self::stmts_leaves(&rest));
+        let (phi_struct, phi_skip) = if swapped {
+            (phi_f, phi_t)
+        } else {
+            (phi_t, phi_f)
+        };
+        let mut then: Vec<SNode> = Vec::new();
+        Self::push_stmts(&mut then, Self::stmts_leaves(&phi_struct));
+        for (n, &sb) in arm.iter().enumerate() {
+            let fl = if n + 1 < arm.len() {
+                Follow::Entry(arm[n + 1])
+            } else {
+                after(k, self)
+            };
+            self.emit_leaf(sb, fl, &mut then);
+        }
+        let mut otherwise: Vec<SNode> = Vec::new();
+        Self::push_stmts(&mut otherwise, Self::stmts_leaves(&phi_skip));
+        otherwise.extend(dup);
+        if is_dup {
+            self.stats.cross_arm_folds += 1;
+            self.stats.cross_arm_dup_blocks += nblocks;
+            self.folded_xarms.insert((b, skip));
+        }
+        self.stats.ifs += 1;
+        out.push(SNode::If {
+            cond: if swapped { negate(&cond) } else { cond },
+            then,
+            otherwise,
+        });
+        1 + arm.len()
     }
 
     /// Sequence emission with [`RegionNode::Alternates`] pre-registration:
@@ -1182,6 +1627,11 @@ impl<'m> Ctx<'m> {
                     && self.f_mut().cov(children[j]) == Cov::Uniform(active)
             });
             let Some(j) = next_alt else {
+                let consumed = self.try_run_fold(children, i, active, follow, out);
+                if consumed > 0 {
+                    i += consumed;
+                    continue;
+                }
                 let fl = if i + 1 < children.len() {
                     self.entry_of(children[i + 1])
                 } else {
@@ -1209,6 +1659,11 @@ impl<'m> Ctx<'m> {
                 self.f_mut().arm_scopes.push(s);
             }
             while i < j {
+                let consumed = self.try_run_fold(children, i, active, follow, out);
+                if consumed > 0 {
+                    i += consumed;
+                    continue;
+                }
                 let fl = if i + 1 < j {
                     self.entry_of(children[i + 1])
                 } else {
@@ -1247,7 +1702,10 @@ impl<'m> Ctx<'m> {
     }
 
     /// Emit a leaf block: statements, phi placement, terminator actions.
-    fn emit_leaf(&mut self, b: BlockId, out: &mut Vec<SNode>) {
+    /// `follow` is the block's structural continuation (the cross-arm
+    /// tail-duplication fold needs it to know where a duplicated tail
+    /// may fall through).
+    fn emit_leaf(&mut self, b: BlockId, follow: Follow, out: &mut Vec<SNode>) {
         let parts = self.block_parts(b);
         Self::push_stmts(out, Self::stmts_leaves(&parts.main));
         match parts.term {
@@ -1259,6 +1717,12 @@ impl<'m> Ctx<'m> {
                 Self::push_stmts(out, Self::stmts_leaves(&parts.phi));
                 if let Some(act) = self.edge_action(b, dest) {
                     out.push(act);
+                } else if self.f().cross_arm.contains(&(b, dest))
+                    && let Some(dup) = self.try_cross_arm_fold(b, dest, follow)
+                {
+                    // The edge jumps into a sibling arm (the es2abc
+                    // `goto shared` idiom): duplicate the shared tail.
+                    out.extend(dup);
                 }
             }
             Term::Cond(cond, t, f) => {
@@ -1268,20 +1732,39 @@ impl<'m> Ctx<'m> {
                 }
                 let act_t = self.edge_action(b, t);
                 let act_f = self.edge_action(b, f);
+                // Cross-arm edges (the `goto shared` idiom): duplicate
+                // the sibling arm's shared tail into this arm (after
+                // the edge's phi assigns).
+                let dup_t = if act_t.is_none() && self.f().cross_arm.contains(&(b, t)) {
+                    self.try_cross_arm_fold(b, t, follow)
+                } else {
+                    None
+                };
+                let dup_f = if act_f.is_none() && self.f().cross_arm.contains(&(b, f)) {
+                    self.try_cross_arm_fold(b, f, follow)
+                } else {
+                    None
+                };
                 let mut then: Vec<SNode> = Vec::new();
                 Self::push_stmts(&mut then, Self::stmts_leaves(&phi_t));
                 then.extend(act_t);
+                if let Some(dup) = dup_t {
+                    then.extend(dup);
+                }
                 let mut otherwise: Vec<SNode> = Vec::new();
                 Self::push_stmts(&mut otherwise, Self::stmts_leaves(&phi_f));
                 otherwise.extend(act_f);
+                if let Some(dup) = dup_f {
+                    otherwise.extend(dup);
+                }
                 match (then.is_empty(), otherwise.is_empty()) {
                     (true, true) => {
-                        // Both edges are structural — the cross-arm
-                        // idiom (d-P1's hint). The condition has no
+                        // Both edges are structural and neither is a
+                        // foldable cross-arm edge. The condition has no
                         // remaining effect; drop it loudly.
                         self.stats.cross_arm_notes += 1;
                         out.push(SNode::Honest(format!(
-                            "conditional at B{} dropped: both targets are structural (cross-arm condition-merge fold pending)",
+                            "conditional at B{} dropped: both targets are structural (cross-arm tail-duplication fold bailed)",
                             b.index()
                         )));
                     }
@@ -1345,6 +1828,10 @@ impl<'m> Ctx<'m> {
         Self::push_stmts(&mut then, Self::stmts_leaves(&phi_t));
         if let Some(act) = self.edge_action(head, t) {
             then.push(act);
+        } else if self.f().cross_arm.contains(&(head, t))
+            && let Some(dup) = self.try_cross_arm_fold(head, t, follow)
+        {
+            then.extend(dup);
         }
         if let Some(r) = then_r {
             self.emit_node(r, active, follow, &mut then);
@@ -1353,6 +1840,10 @@ impl<'m> Ctx<'m> {
         Self::push_stmts(&mut otherwise, Self::stmts_leaves(&phi_f));
         if let Some(act) = self.edge_action(head, f) {
             otherwise.push(act);
+        } else if self.f().cross_arm.contains(&(head, f))
+            && let Some(dup) = self.try_cross_arm_fold(head, f, follow)
+        {
+            otherwise.extend(dup);
         }
         if let Some(r) = else_r {
             self.emit_node(r, active, follow, &mut otherwise);

@@ -366,6 +366,15 @@ impl<'m> Emitter<'m> {
                 then,
                 otherwise,
             } => {
+                // Presentation: an empty then arm becomes `if (!c)` —
+                // never `if (c) {} else {…}` (readability).
+                let negated;
+                let (cond, then, otherwise) = if then.is_empty() && !otherwise.is_empty() {
+                    negated = crate::structure::negate(cond);
+                    (&negated, otherwise, then)
+                } else {
+                    (cond, then, otherwise)
+                };
                 let mut c = String::new();
                 self.expr(cond, 0, &mut c);
                 if otherwise.is_empty() {
@@ -1607,6 +1616,8 @@ fn merge_struct_stats(mut a: StructStats, b: &StructStats) -> StructStats {
     a.handler_shims += b.handler_shims;
     a.exit_phi_after_loop += b.exit_phi_after_loop;
     a.cross_arm_notes += b.cross_arm_notes;
+    a.cross_arm_folds += b.cross_arm_folds;
+    a.cross_arm_dup_blocks += b.cross_arm_dup_blocks;
     a.break_target_notes += b.break_target_notes;
     a
 }
