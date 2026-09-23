@@ -291,7 +291,7 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 
 | # | 任务 | 内容 | 状态 |
 |---|------|------|------|
-| d-P5 | B1 try 投影精度 | 72 fixture：try 投影与 es2abc 字节级 try 范围对齐（handler 续体接合点）；门禁=梦想门禁 951→1023 | 未开始 |
+| d-P5 | B1 try 投影精度 | 72 fixture：try 投影与 es2abc 字节级 try 范围对齐（handler 续体接合点）；门禁=梦想门禁 951→1023 | **完成**（b9370b6/5495a17/ed8cbe3/62c4460/87e36ad/a4630cb；五个根因全部 IR/VM 级实证：RC1 切断条件吞掉 try 接合点、RC2 异常 phi 冲刷排在 throw 后成死代码、RC3 finally 链止步于 shim 处理过的 plan、shim 区域闭包漏传递包含、循环退出三连（switch 折叠把循环 break 变 switch break=死循环直接机制）。**orchestrator 独立复验**：本地重跑梦想门禁 190s——**1023/36/0/54/36 逐字复现（精确 +72 零回归）**、fmt 净、122 套件绿零 warning、新 6 个 red-first 黄金测试；偏差登记：b9370b6 中间态有两个 red-first 占位黄金测试红（bisect 注意）） |
 | d-P6 | B2 私有成员缓冲属性 | 18 fixture：class 成员缓冲的属性位（static/实例/private brand）进 IR（abcd-ir+abcd-lift+abcd-decompile） | 未开始 |
 | d-P7 | B3 深 lexenv×try | 18 fixture：for-update-continue-1 族作用域重建 | 未开始 |
 | d-P8 | D 可读性批次 | finally 复制折叠、arrow-vs-function、多 catch 合并、LexStore 作用域重建、--ts | 未开始 |
