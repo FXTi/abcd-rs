@@ -1040,6 +1040,10 @@ fn s17_class_reconstruction() {
             ctor,
             heritage: None,
             members,
+            // B2: attrs unknown (hand-built IR predates the
+            // projection) — the conservative instance-placement
+            // fallback is what this golden pins.
+            member_attrs: Vec::new(),
             count: 2,
         },
     );

@@ -206,9 +206,15 @@ pub struct FunctionData {
     /// bodies; taint summaries register against `(name, arity)` keys
     /// outside the IR.
     pub is_external: bool,
-    /// SSA values for the parameters, in argument order. **Convention
-    /// (T4): `params[0]` is the `this` binding** for every non-static
-    /// kind; formals follow.
+    /// SSA values for the parameters, in code-header argument order.
+    /// **Frame-slot model (T4/§5.3, canonical — [`crate::frame`]):** the
+    /// leading slots are the vendored implicit frame slots
+    /// `[func][new.target][this]` (per the callee's
+    /// `L_ESCallTypeAnnotation;` callType bits; absent → the `0xF`
+    /// default, the es2abc shape), then the source formals. The
+    /// this-role slot is [`crate::frame::this_param_index`] — NOT
+    /// `params[0]` (the FUNC slot under the `0xF` default; the earlier
+    /// "`params[0]` = `this`" convention is superseded, N66/N67).
     pub params: Vec<ValueId>,
     /// Blocks owned by this function; `blocks[0]` is the entry block.
     pub blocks: Vec<BlockId>,

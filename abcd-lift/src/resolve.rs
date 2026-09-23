@@ -11,6 +11,8 @@
 //! `File::literal_array_offsets` here).
 
 use abcd_file::{File, LiteralValue, MethodBody};
+use abcd_ir::module::FunctionKind;
+use abcd_ir::op::MemberAttrs;
 use abcd_ir::{Const, ConstId, FuncId, Sym};
 use abcd_isa::{EntityId, EntityKind};
 
@@ -88,6 +90,103 @@ pub fn resolve_literal_const(
 ) -> Result<ConstId, LiftError> {
     let idx = literal_table_index(lf.file, body, id)?;
     const_for_literal_array(lf, idx)
+}
+
+/// Parse the per-member attribute payloads (B2 — [`MemberAttrs`]) out of
+/// a class member buffer (the literal array behind
+/// `defineclasswithbuffer` / `callruntime.definesendableclass`).
+///
+/// Vendor-grounded member form (arkcompiler_ets_runtime-master): each
+/// member is the literal-entry triple `string:<name>`,
+/// `method|getter|setter|generator_method:<ref>`,
+/// `method_affiliate:<length>` — the runtime collapse keeps (name,
+/// value) pairs where the method-kind tag sets the materialized
+/// function's `FunctionKind` and the affiliate materializes it
+/// (`ecmascript/jspandafile/literal_data_extractor.cpp:588-624`). The
+/// trailing `i32` is the count of NON-STATIC members ("hidden in the
+/// last index of Literal buffer",
+/// `ecmascript/jspandafile/class_info_extractor.cpp:36-42`); pairs
+/// at-or-past that count install on the class object (static) —
+/// `class_info_extractor.cpp:78` and `extractBegin = nonStaticNum * 2`.
+///
+/// The result parallels the pooled buffer's `MethodRef` sequence (the
+/// same member order). A buffer outside this grounded form (accessor
+/// payloads, data-valued members, nested arrays, a missing/mismatched
+/// trailing count) yields an EMPTY vector — the documented conservative
+/// fallback: consumers treat the attributes as unknown, never guessed.
+pub fn class_member_attrs(
+    lf: &mut Lifter,
+    body: &MethodBody,
+    id: EntityId,
+) -> Result<Vec<MemberAttrs>, LiftError> {
+    let idx = literal_table_index(lf.file, body, id)?;
+    let values = &lf.file.literal_arrays[idx as usize].values;
+    let conservative = Vec::new();
+    let mut kinds: Vec<FunctionKind> = Vec::new();
+    let mut have_name = false;
+    let mut pending_kind: Option<FunctionKind> = None;
+    let mut non_static: Option<usize> = None;
+    for (pos, v) in values.iter().enumerate() {
+        let last = pos + 1 == values.len();
+        match v {
+            LiteralValue::String(_) => {
+                if have_name || pending_kind.is_some() {
+                    return Ok(conservative);
+                }
+                have_name = true;
+            }
+            LiteralValue::Method(_)
+            | LiteralValue::GeneratorMethod(_)
+            | LiteralValue::AsyncGeneratorMethod(_)
+            | LiteralValue::Getter(_)
+            | LiteralValue::Setter(_) => {
+                if !have_name || pending_kind.is_some() {
+                    return Ok(conservative);
+                }
+                pending_kind = Some(match v {
+                    LiteralValue::Method(_) => FunctionKind::Function,
+                    LiteralValue::GeneratorMethod(_) => FunctionKind::Generator,
+                    LiteralValue::AsyncGeneratorMethod(_) => FunctionKind::AsyncGenerator,
+                    LiteralValue::Getter(_) => FunctionKind::Getter,
+                    LiteralValue::Setter(_) => FunctionKind::Setter,
+                    _ => unreachable!("matched above"),
+                });
+            }
+            LiteralValue::MethodAffiliate(_) => {
+                let Some(kind) = pending_kind.take() else {
+                    return Ok(conservative);
+                };
+                if !have_name {
+                    return Ok(conservative);
+                }
+                have_name = false;
+                kinds.push(kind);
+            }
+            // The trailing non-static member count (the vendor's "last
+            // index" slot). Any other position/shape is ungrounded.
+            LiteralValue::Integer(n) if last && !have_name && pending_kind.is_none() => {
+                non_static = Some(*n as usize);
+            }
+            _ => return Ok(conservative),
+        }
+    }
+    if have_name || pending_kind.is_some() {
+        return Ok(conservative);
+    }
+    let Some(non_static) = non_static else {
+        return Ok(conservative);
+    };
+    if non_static > kinds.len() {
+        return Ok(conservative);
+    }
+    Ok(kinds
+        .into_iter()
+        .enumerate()
+        .map(|(i, kind)| MemberAttrs {
+            is_static: i >= non_static,
+            kind,
+        })
+        .collect())
 }
 
 /// Convert the literal array at `table_idx` into a pooled shape

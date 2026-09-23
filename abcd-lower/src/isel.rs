@@ -1409,6 +1409,10 @@ fn select_inst(
             ctor,
             heritage,
             members,
+            // B2: member_attrs is a lift-time semantic projection of the
+            // buffer — lowering re-emits the RAW buffer (byte fidelity),
+            // so the projection is ignored here by construction.
+            member_attrs: _,
             count,
         } => {
             let Some(base) = heritage else {
@@ -1435,6 +1439,7 @@ fn select_inst(
             ctor,
             heritage,
             members,
+            member_attrs: _,
             count,
         } => {
             // N53: re-emit the SENDABLE opcode

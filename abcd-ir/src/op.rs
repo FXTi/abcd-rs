@@ -12,6 +12,45 @@
 
 use crate::function::Edge;
 use crate::id::{BlockId, ConstId, FuncId, Sym, ValueId};
+use crate::module::FunctionKind;
+
+/// Per-member attribute payloads of a class member buffer (B2 —
+/// `defineclasswithbuffer`'s literal array), one entry per buffer member
+/// in buffer order.
+///
+/// Vendor grounding (arkcompiler_ets_runtime-master):
+///
+/// - **Placement** (`is_static`): the buffer's collapsed runtime array is
+///   `[name0, value0, …, nameK, valueK, i32 nonStaticNum]` — "non static
+///   properties number is hidden in the last index of Literal buffer"
+///   (`ecmascript/jspandafile/class_info_extractor.cpp:36-42`,
+///   `ClassInfoExtractor::BuildClassInfoExtractorFromLiteral`). The first
+///   `nonStaticNum` (name, value) pairs are INSTANCE members; the rest
+///   install on the class object (static) —
+///   `class_info_extractor.cpp:78`
+///   (`staticNum = (valueLength) / 2 - nonStaticNum`) and the static
+///   range's `extractBegin = nonStaticNum * 2`.
+/// - **Callable kind** (`kind`): the buffer entry's method-kind literal
+///   tag (`METHOD`/`GETTER`/`SETTER`/`GENERATORMETHOD`/
+///   `ASYNCGENERATORMETHOD`, `libpandafile/literal_data_accessor.h:33-59`)
+///   sets the materialized function's `FunctionKind` when the following
+///   `METHODAFFILIATE` entry materializes it
+///   (`ecmascript/jspandafile/literal_data_extractor.cpp:588-624`,
+///   `LiteralDataExtractor::DefineFunctionTemplate`).
+///
+/// Derived at lift from the same literal array [`Op::DefineClass::members`]
+/// pools — a semantic PROJECTION, never new content: lowering ignores it
+/// and re-emits the raw buffer, so byte fidelity is unaffected.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemberAttrs {
+    /// `true` when the member installs on the class object (static
+    /// placement — its pair index is at-or-past the buffer's trailing
+    /// `nonStaticNum` count); `false` for prototype (instance) members.
+    pub is_static: bool,
+    /// The callable kind from the buffer entry's method-kind tag
+    /// (`Function`, `Getter`, `Setter`, `Generator`, `AsyncGenerator`).
+    pub kind: FunctionKind,
+}
 
 /// Binary arithmetic/bitwise operator kind. Typed twins
 /// (`add_i32` vs `add_f64`) are `BinaryOp::Add` plus the result value's
@@ -611,6 +650,12 @@ pub enum Op {
         /// shape with [`Const::MethodRef`](crate::consts::Const::MethodRef)
         /// entries).
         members: ConstId,
+        /// Per-member attribute payloads decoded from the buffer (B2 —
+        /// [`MemberAttrs`]), parallel to the buffer's member sequence
+        /// (the `MethodRef` entries in order). Empty when the buffer
+        /// shape is outside the vendor-grounded member form (conservative
+        /// fallback — consumers treat attributes as unknown).
+        member_attrs: Vec<MemberAttrs>,
         /// The class constructor's `.length` (vendor
         /// `defineclasswithbuffer imm2`, isa.yaml) — the runtime consumes
         /// it via RuntimeSetClassConstructorLength (N15); modeled for
@@ -645,6 +690,9 @@ pub enum Op {
         /// The member-buffer constant (same shape as
         /// [`Op::DefineClass::members`]).
         members: ConstId,
+        /// Per-member attribute payloads (same shape as
+        /// [`Op::DefineClass::member_attrs`]).
+        member_attrs: Vec<MemberAttrs>,
         /// The class constructor's `.length` (vendor imm2, isa.yaml) —
         /// `CreateSharedClass` consumes it the way
         /// `CreateClassWithBuffer` consumes the contemporary form's
@@ -1417,12 +1465,14 @@ mod tests {
                 ctor: FuncId::new(0),
                 heritage: Some(v()),
                 members: ConstId::new(0),
+                member_attrs: Vec::new(),
                 count: 2,
             },
             Op::DefineSendableClass {
                 ctor: FuncId::new(0),
                 heritage: Some(v()),
                 members: ConstId::new(0),
+                member_attrs: Vec::new(),
                 count: 2,
             },
             Op::CreatePrivateNames {

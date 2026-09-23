@@ -46,8 +46,8 @@
 //! - **T3** — [`Op::effects`] is the single, mechanically derived source
 //!   of effect truth ([`Effects`]).
 //! - **T4** — one [`Op::Call`] with [`CallKind`] + the §5.3 binding
-//!   table; [`Op::DefineFunc`] carries explicit captures; `params[0]` is
-//!   `this`.
+//!   table; [`Op::DefineFunc`] carries explicit captures; `params` are
+//!   the vendored frame slots (see [`frame`]).
 //! - **T5** — [`EdgeKind::Exceptional`] edges are first-class CFG edges;
 //!   [`ValueDef::ExceptionParam`] is a real SSA value defined by the
 //!   dispatch.
@@ -72,6 +72,7 @@
 
 pub mod consts;
 pub mod effects;
+pub mod frame;
 pub mod function;
 pub mod id;
 pub mod module;
@@ -82,6 +83,7 @@ pub mod verify;
 
 pub use consts::{Const, ConstPool};
 pub use effects::{AllocKind, CallEffect, Effects, MemClasses};
+pub use frame::{FrameSlots, this_param_index};
 pub use function::{
     Block, Catch, ColumnEntry, DebugData, Edge, EdgeKind, FunctionData, Inst, LineEntry, Loc,
     LocalName, LocalScope, TryRegion, Value, ValueDef,

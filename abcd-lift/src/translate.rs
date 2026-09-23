@@ -352,6 +352,15 @@ impl<'l, 'f> FnLift<'l, 'f> {
         resolve::resolve_literal_const(self.lf, self.body, eid)
     }
 
+    /// Parse the per-member attribute payloads (B2) of a class member
+    /// buffer (empty = conservative fallback, attributes unknown).
+    pub fn resolve_class_member_attrs(
+        &mut self,
+        eid: EntityId,
+    ) -> Result<Vec<abcd_ir::op::MemberAttrs>, LiftError> {
+        resolve::class_member_attrs(self.lf, self.body, eid)
+    }
+
     /// Emit a `LoadConst` for a scalar constant (deduplicated pool).
     pub fn load_const(&mut self, block: BlockId, c: Const, pc: Option<u32>) -> ValueId {
         let id = self.lf.const_scalar(c);
@@ -992,6 +1001,7 @@ pub fn translate_bytecode(
         Bytecode::Defineclasswithbuffer(_ic, method_eid, lit_eid, count, base_reg) => {
             let (_name, ctor) = fx.resolve_method(*method_eid)?;
             let members = fx.resolve_literal(*lit_eid)?;
+            let member_attrs = fx.resolve_class_member_attrs(*lit_eid)?;
             let base = fx.read_reg(*base_reg, block);
             let v = fx.emit_val(
                 block,
@@ -999,6 +1009,7 @@ pub fn translate_bytecode(
                     ctor,
                     heritage: Some(base),
                     members,
+                    member_attrs,
                     count: count.0 as u16,
                 },
                 loc,
@@ -1697,6 +1708,7 @@ pub fn translate_bytecode(
             // into DefineClassWithBuffer corrupted the opcode identity.
             let (_name, ctor) = fx.resolve_method(*method_eid)?;
             let members = fx.resolve_literal(*lit_eid)?;
+            let member_attrs = fx.resolve_class_member_attrs(*lit_eid)?;
             let base = fx.read_reg(*base_reg, block);
             let v = fx.emit_val(
                 block,
@@ -1704,6 +1716,7 @@ pub fn translate_bytecode(
                     ctor,
                     heritage: Some(base),
                     members,
+                    member_attrs,
                     count: count.0 as u16,
                 },
                 loc,

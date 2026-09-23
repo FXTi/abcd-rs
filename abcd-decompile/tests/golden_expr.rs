@@ -515,6 +515,7 @@ fn t07_closures_and_classes() {
             ctor: inner,
             heritage: Some(p1),
             members,
+            member_attrs: Vec::new(),
             count: 0,
         },
     );
@@ -532,6 +533,7 @@ fn t07_closures_and_classes() {
             ctor: inner,
             heritage: None,
             members: members2,
+            member_attrs: Vec::new(),
             count: 0,
         },
     );
