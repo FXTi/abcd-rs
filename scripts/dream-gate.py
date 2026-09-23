@@ -174,7 +174,10 @@ def main():
         # Non-pass: exactly one bucket.
         if not comp["compiled"]:
             err = comp.get("error", "")
-            if row["hard_fallbacks"]:
+            if "SyntaxError" in err:
+                # Our text does not parse — that's ours, not es2abc's.
+                bucket = "decompile-bug"
+            elif row["hard_fallbacks"]:
                 bucket = "expected-fallback"
             elif row["module"]:
                 bucket = "fixture-unsupported"

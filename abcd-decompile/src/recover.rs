@@ -43,7 +43,7 @@ use abcd_ir::op::{CallKind, CmpOp, Op, PropKey, SuperKey};
 use abcd_ir::{ConstId, Sym};
 
 use crate::consts::{lit_of, render_regexp_flags, sym_str};
-use crate::expr::{Expr, IterOp, Lit, NodeStatus};
+use crate::expr::{Expr, IterOp, Lit, NodeStatus, ObjEntry};
 use crate::fitness::{Fitness, elision_reason, fallback_note, fitness_of, op_name};
 use crate::legalize::{Legalizer, is_legal_ident, sanitize};
 use crate::names::{
@@ -1338,6 +1338,74 @@ impl<'m> Recover<'m> {
         name
     }
 
+    /// Parse a `createobjectwithbuffer` flat shape buffer: plain
+    /// `[key, value]` pairs, plus `[name, MethodRef, attrs]` method
+    /// entries (attrs dropped — runtime metadata). Pure key/value
+    /// buffers stay [`Expr::ObjectLit`]; method-bearing buffers become
+    /// [`Expr::ObjectBuild`] directly. `None` when the shape is
+    /// unrecognizable (the caller falls back loudly).
+    fn parse_shape_buffer(&mut self, items: &[Lit]) -> Option<Expr> {
+        let mut plain: Vec<(Lit, Lit)> = Vec::new();
+        let mut build: Vec<ObjEntry> = Vec::new();
+        let mut has_methods = false;
+        let mut i = 0;
+        while i < items.len() {
+            let key = match &items[i] {
+                Lit::String(s) => s.clone(),
+                Lit::Number(_) => {
+                    // Numeric key of a plain pair.
+                    if i + 1 < items.len() && !matches!(items[i + 1], Lit::MethodRef(_)) {
+                        plain.push((items[i].clone(), items[i + 1].clone()));
+                        build.push(ObjEntry::KeyValue(
+                            items[i].clone(),
+                            Expr::Lit(items[i + 1].clone()),
+                        ));
+                        i += 2;
+                        continue;
+                    }
+                    return None;
+                }
+                _ => return None,
+            };
+            match items.get(i + 1) {
+                Some(Lit::MethodRef(fid)) => {
+                    has_methods = true;
+                    let (name, kind) = self
+                        .module
+                        .func(*fid)
+                        .map(|f| (sym_str(self.module, f.name), f.kind))
+                        .unwrap_or_else(|| (format!("m${}", fid.index()), FunctionKind::Function));
+                    build.push(ObjEntry::Method(
+                        key,
+                        Expr::Closure {
+                            body: *fid,
+                            name,
+                            kind,
+                            captures: Vec::new(),
+                        },
+                    ));
+                    // Skip the trailing attributes payload when present.
+                    i += if matches!(items.get(i + 2), Some(Lit::Number(_))) {
+                        3
+                    } else {
+                        2
+                    };
+                }
+                Some(v) => {
+                    plain.push((items[i].clone(), v.clone()));
+                    build.push(ObjEntry::KeyValue(items[i].clone(), Expr::Lit(v.clone())));
+                    i += 2;
+                }
+                None => return None,
+            }
+        }
+        if has_methods {
+            Some(Expr::ObjectBuild { entries: build })
+        } else {
+            Some(Expr::ObjectLit { entries: plain })
+        }
+    }
+
     /// Build the expression tree of one instruction's op.
     fn expr_for(&mut self, iid: InstId, op: &Op) -> Expr {
         match op {
@@ -1376,26 +1444,19 @@ impl<'m> Recover<'m> {
                 // `createobjectwithbuffer`'s vendor buffer is a FLAT
                 // array `[k0, v0, k1, v1, …]` (probe-verified on the
                 // corpus, e.g. 9.0.0.0 for-in); interpret pairwise.
-                Some(Lit::Array(items)) => {
-                    if items.len() % 2 == 0
-                        && items
-                            .chunks_exact(2)
-                            .all(|p| matches!(p[0], Lit::String(_) | Lit::Number(_)))
-                    {
-                        Expr::ObjectLit {
-                            entries: items
-                                .chunks_exact(2)
-                                .map(|p| (p[0].clone(), p[1].clone()))
-                                .collect(),
-                        }
-                    } else {
-                        Expr::Fallback {
-                            op: "AllocObject",
-                            note: "shape buffer is not a flat key/value array",
-                            operands: vec![],
-                        }
-                    }
-                }
+                // Method entries pack as `[name, MethodRef, attrs]` —
+                // the numeric attributes payload is runtime metadata
+                // (dropped, like the class member buffer's). (d-P4
+                // dream gate: local/proxy's handler object fell back to
+                // `undefined` — "ProxyCreate: handler is not Object".)
+                Some(Lit::Array(items)) => match self.parse_shape_buffer(&items) {
+                    Some(expr) => expr,
+                    None => Expr::Fallback {
+                        op: "AllocObject",
+                        note: "shape buffer is not a flat key/value array",
+                        operands: vec![],
+                    },
+                },
                 _ => Expr::Fallback {
                     op: "AllocObject",
                     note: "shape constant is not an ObjectLiteral",

@@ -1333,9 +1333,9 @@ impl<'m> Ctx<'m> {
         }
         let mut catches = Vec::new();
         let mut seen = HashSet::new();
-        for h in handlers {
-            if seen.insert(h) {
-                catches.push(self.emit_handler(h));
+        for h in &handlers {
+            if seen.insert(*h) {
+                catches.push(self.emit_handler(*h));
             }
         }
         let note = if catches.len() > 1 {
@@ -1347,11 +1347,88 @@ impl<'m> Ctx<'m> {
         } else {
             None
         };
-        out.push(SNode::Try {
+        let mut node = SNode::Try {
             body,
             catches,
             note,
-        });
+        };
+        // Handlers protected by an OUTER plan (nested try regions whose
+        // protected range includes the inner handler — the es2abc
+        // finally idiom: the inner catch body can itself throw, and the
+        // outer handler runs the finally + rethrow): the whole
+        // try/catch must be wrapped in the outer plan's try, or
+        // exceptions from the inner handler escape unhandled and the
+        // outer handler's body (and its phi temporaries) is silently
+        // dropped (dream gate: local/exception-finally). Laminar plans
+        // form a chain; walk it outward.
+        let mut protected_handlers = handlers.clone();
+        let mut current = p;
+        let mut depth = 0usize;
+        loop {
+            depth += 1;
+            if depth > self.f().plans.len() + 1 {
+                break; // defensive: the laminar chain is finite
+            }
+            // The innermost outer plan protecting any handler. A plan
+            // whose protected set lies INSIDE the handler's own sub-CFG
+            // is already wrapped by the handler shim (nested try in the
+            // catch body) — wrapping it again outside would duplicate
+            // the catch (correct but redundant); skip those.
+            let mut outer: Option<usize> = None;
+            for h in &protected_handlers {
+                if let Some(q) = self.f_mut().plan_of(*h)
+                    && q != current
+                {
+                    let handled_inside = self.shim_plans.get(h).is_some_and(|plans| {
+                        plans
+                            .iter()
+                            .any(|pl| pl.protected == self.f().plans[q].protected)
+                    });
+                    if handled_inside {
+                        continue;
+                    }
+                    if outer.is_none_or(|o| {
+                        self.f().plans[q].protected.len() < self.f().plans[o].protected.len()
+                    }) {
+                        outer = Some(q);
+                    }
+                }
+            }
+            let Some(q) = outer else {
+                break;
+            };
+            current = q;
+            let (qregion, qhandlers) = {
+                let plan = &self.f().plans[q];
+                (plan.region, plan.handlers.clone())
+            };
+            let wraps = {
+                let f = self.f_mut();
+                let n = f.wrap_counts.entry(q).or_insert(0);
+                *n += 1;
+                *n
+            };
+            if wraps > 1 {
+                self.stats.try_splits += 1;
+            }
+            self.stats.try_catches += 1;
+            let mut qcatches = Vec::new();
+            let mut seen = HashSet::new();
+            for h in &qhandlers {
+                if seen.insert(*h) {
+                    qcatches.push(self.emit_handler(*h));
+                }
+            }
+            node = SNode::Try {
+                body: vec![node],
+                catches: qcatches,
+                note: Some(format!(
+                    "try region {qregion}: handler-protecting outer try (finally idiom) — wrapped around region {region}'s try/catch (wrapper #{wraps})"
+                )),
+            };
+            protected_handlers = qhandlers;
+        }
+        out.push(node);
     }
 
     /// A mixed-coverage node: descend (or wrap whole when the head is

@@ -718,8 +718,15 @@ pub fn translate_bytecode(
             fx.emit_void(block, Op::StoreSuper { key, value }, loc);
         }
         Bytecode::Delobjprop(key_reg) => {
-            let obj = fx.read_acc(block);
-            let key = fx.read_reg(*key_reg, block);
+            // Vendor (isa.yaml:1293-1296; N65): `delobjprop v0` takes
+            // the OBJECT in the register v0 and the KEY in acc
+            // (result → acc). The operand ROLES were inverted here
+            // previously — the lower carried the mirror inversion, so
+            // byte round-trips stayed exact while the IR semantics
+            // flipped (found by the d-P4 decompile dream gate:
+            // local/property-ops deleted the wrong property).
+            let obj = fx.read_reg(*key_reg, block);
+            let key = fx.read_acc(block);
             let v = fx.emit_val(block, Op::DeleteProp { object: obj, key }, loc);
             fx.write_acc(block, v);
         }

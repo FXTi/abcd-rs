@@ -680,3 +680,55 @@ fn module_field_wiring_is_as_expected() {
         Some(FieldValue::ModuleData(_))
     ));
 }
+
+// ─── N65: delobjprop operand roles (vendor: object=v0, key=acc) ─────
+
+#[test]
+fn delobjprop_operand_roles() {
+    // [0] ldai 42   (acc := 42 — the KEY)
+    // [1] delobjprop v1   (v1 = frame-initial — the OBJECT)
+    // [2] return
+    let file = build(|b| {
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        let proto = b.create_proto(Type::Tagged, &[]);
+        let (code, _) = encode_bytecodes(&[
+            Bytecode::Ldai(Imm(42)),
+            Bytecode::Delobjprop(Reg(1)),
+            Bytecode::Return,
+        ])
+        .unwrap();
+        b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &code, 2, 0);
+    });
+
+    let m = lift_file(&file).expect("lift");
+    verify_clean(&m);
+    let entry = m.functions[0].blocks[0];
+    let ops: Vec<&Op> = m.blocks[entry.index()]
+        .insts
+        .iter()
+        .map(|&iid| &m.insts[iid.index()].op)
+        .collect();
+    let del = ops
+        .iter()
+        .find_map(|op| match op {
+            Op::DeleteProp { object, key } => Some((*object, *key)),
+            _ => None,
+        })
+        .expect("DeleteProp present");
+    // N65: the OBJECT is the register operand (v1 — a frame-initial
+    // param/undefined), the KEY is the acc (the ldai 42 constant).
+    let key_const = match &m.values[del.1.index()].def {
+        ValueDef::Inst(iid) => match &m.insts[iid.index()].op {
+            Op::LoadConst(c) => *c,
+            other => panic!("key should be the ldai constant, got {other:?}"),
+        },
+        other => panic!("key should be the ldai instruction, got {other:?}"),
+    };
+    assert_eq!(m.consts.get(key_const), Some(&Const::number(42.0)));
+    // The object is NOT the constant (it is v1's frame-initial value).
+    assert!(
+        !matches!(&m.values[del.0.index()].def, ValueDef::Inst(iid) if matches!(m.insts[iid.index()].op, Op::LoadConst(_))),
+        "object must come from the register, not the acc constant"
+    );
+}

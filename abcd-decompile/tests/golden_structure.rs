@@ -1400,3 +1400,25 @@ fn s24_cross_arm_try_wrap_dup() {
 "#;
     assert_eq!(got, want);
 }
+
+/// s25 — `delete obj[key]` emission (N65: the lift's delobjprop roles
+/// were inverted — `delete "x"[o]` instead of `delete o["x"]` — caught
+/// by the dream gate via local/property-ops).
+#[test]
+fn s25_delete_prop() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let key = load_string(&mut m, b, "x");
+    emit(&mut m, b, Op::DeleteProp { object: p1, key });
+    emit_void(&mut m, b, Op::Return { value: None });
+
+    let want = r#"function f(p1) {
+  delete p1["x"];
+  return;
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}

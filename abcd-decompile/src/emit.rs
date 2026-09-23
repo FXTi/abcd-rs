@@ -264,6 +264,11 @@ pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId>
                 consumed.insert(*ctor);
                 collect_method_refs(module, *members, &mut consumed);
             }
+            // Method entries in object shape buffers emit inline too
+            // (`{name: function …}`) — never top-level.
+            Op::AllocObject { shape } => {
+                collect_method_refs(module, *shape, &mut consumed);
+            }
             _ => {}
         }
     }
@@ -1883,46 +1888,57 @@ fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
 
 /// Block-escape analysis for one function body: the names of
 /// [`Stmt::Declare`] temporaries referenced from OUTSIDE their
-/// declaration's innermost structured block. Paths are scope vectors
-/// (each block-introducing node appends an index); a use escapes when
-/// the declaration's path is not a prefix of the use's path. Phi
-/// temporaries are already `var`-hoisted and play no role here.
+/// declaration's visibility region. A `const`/`let`/`class`
+/// declaration is visible from its position to the END of its
+/// innermost block list (including nested blocks of later siblings) —
+/// and nowhere else. Positions are `(block-path, node-index,
+/// leaf-index)` triples; node-level expressions (conditions, the
+/// for-of iterated value) get `leaf-index = usize::MAX` at their node's
+/// position — except the do-while condition, which JS scopes INSIDE
+/// the loop body (after its last position).
+///
+/// (d-P4 dream gate: sibling `try` blocks aliasing to the same scope
+/// path hid destructuring's `next` escape — "next is not defined";
+/// and an earlier leaf-level model broke do-while's in-scope cond.)
 fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
-    fn collect_uses(e: &Expr, path: &[usize], uses: &mut Vec<(String, Vec<usize>)>) {
+    /// A position: scope path + node index within it + leaf index.
+    type Pos = (Vec<usize>, usize, usize);
+    fn collect_uses(e: &Expr, pos: &Pos, uses: &mut Vec<(String, Pos)>) {
         if let Expr::Temp { name, .. } = e {
-            uses.push((name.clone(), path.to_vec()));
+            uses.push((name.clone(), pos.clone()));
         }
         for c in crate::folds::expr_children(e) {
-            collect_uses(c, path, uses);
+            collect_uses(c, pos, uses);
         }
     }
     fn walk(
         nodes: &[SNode],
         path: &mut Vec<usize>,
-        decls: &mut BTreeMap<String, Vec<Vec<usize>>>,
-        uses: &mut Vec<(String, Vec<usize>)>,
+        decls: &mut BTreeMap<String, Vec<Pos>>,
+        uses: &mut Vec<(String, Pos)>,
     ) {
-        for n in nodes {
+        for (i, n) in nodes.iter().enumerate() {
             match n {
                 SNode::Stmts(leaves) => {
-                    for l in leaves {
+                    for (li, l) in leaves.iter().enumerate() {
+                        let pos: Pos = (path.clone(), i, li);
                         match l {
                             Leaf::Raw(Stmt::Declare { name, value, .. }) => {
-                                collect_uses(value, path, uses);
+                                collect_uses(value, &pos, uses);
                                 // A name can be declared in several
                                 // disjoint blocks (the cross-arm fold
                                 // duplicates tails) — a use escapes only
                                 // when it escapes ALL of them.
-                                decls.entry(name.clone()).or_default().push(path.clone());
+                                decls.entry(name.clone()).or_default().push(pos);
                             }
                             Leaf::Raw(s) => {
                                 for e in stmt_exprs(s) {
-                                    collect_uses(e, path, uses);
+                                    collect_uses(e, &pos, uses);
                                 }
                             }
-                            Leaf::Destructure { obj, .. } => collect_uses(obj, path, uses),
+                            Leaf::Destructure { obj, .. } => collect_uses(obj, &pos, uses),
                             Leaf::Decl { value: Some(v), .. } | Leaf::Assign { value: v, .. } => {
-                                collect_uses(v, path, uses)
+                                collect_uses(v, &pos, uses)
                             }
                             _ => {}
                         }
@@ -1933,42 +1949,56 @@ fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
                     then,
                     otherwise,
                 } => {
-                    collect_uses(cond, path, uses);
+                    collect_uses(cond, &(path.clone(), i, usize::MAX), uses);
+                    path.push(i);
                     path.push(0);
                     walk(then, path, decls, uses);
                     path.pop();
                     path.push(1);
                     walk(otherwise, path, decls, uses);
                     path.pop();
+                    path.pop();
                 }
-                SNode::While {
-                    cond: Some(c),
-                    body,
-                    ..
-                } => {
-                    collect_uses(c, path, uses);
+                SNode::While { cond, body, .. } => {
+                    if let Some(c) = cond {
+                        collect_uses(c, &(path.clone(), i, usize::MAX), uses);
+                    }
+                    path.push(i);
                     path.push(0);
                     walk(body, path, decls, uses);
                     path.pop();
-                }
-                SNode::While { body, .. }
-                | SNode::Labeled { body, .. }
-                | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => {
-                    path.push(0);
-                    walk(body, path, decls, uses);
                     path.pop();
                 }
                 SNode::DoWhile { body, cond, .. } => {
-                    // JS scope: the do-while condition is INSIDE the
-                    // loop body's block (`do { const x … } while (x)`
-                    // is legal).
+                    path.push(i);
                     path.push(0);
                     walk(body, path, decls, uses);
-                    collect_uses(cond, path, uses);
+                    // JS scope: the do-while condition is INSIDE the
+                    // loop body's block (`do { const x … } while (x)`
+                    // is legal), after the last body position.
+                    collect_uses(cond, &(path.clone(), usize::MAX, usize::MAX), uses);
+                    path.pop();
+                    path.pop();
+                }
+                SNode::Labeled { body, .. } => {
+                    path.push(i);
+                    walk(body, path, decls, uses);
+                    path.pop();
+                }
+                SNode::ForOf { iter, body, .. } => {
+                    collect_uses(iter, &(path.clone(), i, usize::MAX), uses);
+                    path.push(i);
+                    walk(body, path, decls, uses);
+                    path.pop();
+                }
+                SNode::ForIn { obj, body, .. } => {
+                    collect_uses(obj, &(path.clone(), i, usize::MAX), uses);
+                    path.push(i);
+                    walk(body, path, decls, uses);
                     path.pop();
                 }
                 SNode::Try { body, catches, .. } => {
+                    path.push(i);
                     path.push(0);
                     walk(body, path, decls, uses);
                     path.pop();
@@ -1977,31 +2007,46 @@ fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
                         walk(&c.body, path, decls, uses);
                         path.pop();
                     }
+                    path.pop();
                 }
                 SNode::Switch { disc, cases } => {
-                    collect_uses(disc, path, uses);
+                    collect_uses(disc, &(path.clone(), i, usize::MAX), uses);
+                    for t in cases.iter().flat_map(|c| c.tests.iter()) {
+                        collect_uses(t, &(path.clone(), i, usize::MAX), uses);
+                    }
+                    path.push(i);
                     for (k, c) in cases.iter().enumerate() {
-                        for t in &c.tests {
-                            collect_uses(t, path, uses);
-                        }
                         path.push(k);
                         walk(&c.body, path, decls, uses);
                         path.pop();
                     }
+                    path.pop();
                 }
                 SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
             }
         }
     }
-    let mut decls: BTreeMap<String, Vec<Vec<usize>>> = BTreeMap::new();
-    let mut uses: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut decls: BTreeMap<String, Vec<Pos>> = BTreeMap::new();
+    let mut uses: Vec<(String, Pos)> = Vec::new();
     walk(nodes, &mut Vec::new(), &mut decls, &mut uses);
     let mut out = BTreeSet::new();
-    for (name, upath) in uses {
-        if let Some(dpaths) = decls.get(&name)
-            && !dpaths.iter().any(|d| upath.starts_with(d.as_slice()))
-        {
-            out.insert(name);
+    for (name, u) in uses {
+        if let Some(dpaths) = decls.get(&name) {
+            // Visible: same block list at a later position, or nested
+            // under a LATER sibling of the declaration's list.
+            let visible = |(ds, dn, dl): &Pos| {
+                let (us, un, ul) = &u;
+                if us == ds {
+                    return (un, ul) > (dn, dl);
+                }
+                us.len() > ds.len() && us[..ds.len()] == ds[..] && us[ds.len()] > *dn
+            };
+            if !dpaths.iter().any(visible) {
+                if std::env::var_os("ABCD_ESC_DEBUG").is_some() {
+                    eprintln!("ESC {name} use={u:?} decls={dpaths:?}");
+                }
+                out.insert(name);
+            }
         }
     }
     out

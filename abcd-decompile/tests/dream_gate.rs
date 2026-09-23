@@ -96,6 +96,10 @@ const HARD7: &[&str] = &[
     "AsyncReject",
     "SuspendGenerator(async-machinery)",
     "AsyncFunctionEnter",
+    // Documented fallback families beyond the hard 7: template literals
+    // are cooked-only (IR gap G4) and AllocObject shape buffers had a
+    // registered fallback path — divergence is expected by construction.
+    "GetTemplateObject",
 ];
 
 fn json_escape(s: &str) -> String {

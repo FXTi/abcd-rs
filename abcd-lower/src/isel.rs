@@ -1134,8 +1134,10 @@ fn select_inst(
             codes.push(Bytecode::Stownbyindex(ic.two(), regs[0], imm));
         }
         Op::DeleteProp { object, key } => {
+            // Vendor (N65): `delobjprop v0` takes the OBJECT in the
+            // register operand and the KEY in acc.
             let regs =
-                materialize_operands(tracker, func_id, &[*key], Some(*object), alloc, codes)?;
+                materialize_operands(tracker, func_id, &[*object], Some(*key), alloc, codes)?;
             codes.push(Bytecode::Delobjprop(regs[0]));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
