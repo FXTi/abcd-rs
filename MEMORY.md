@@ -483,7 +483,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   callee edge but never the gap edge). forEach/map/filter trio
   registered; probes tp=20 fp=4 fn=2; smoke byte-identical (corpus
   exercises no trio sites — probes are the coverage by design).
-  IN FLIGHT: d-P8 (readability batch).
+  d-P8 DONE: readability batch — finally fold (18, alpha-equivalence
+  proof), LexStore scope reconstruction (237), multi-catch merge,
+  --ts (honest: sigs survive only on <=11 formats), ARROW IS
+  RECOVERABLE (NC_FUNCTION file flag; FunctionKind::Arrow/AsyncArrow;
+  byte-neutral — kind bits live in the method index, not the
+  definefunc instruction). Dream gate UNCHANGED 1059 (the batch's hard
+  constraint). Next: d-P9 (module G2) || t-P5 (summary library).
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
