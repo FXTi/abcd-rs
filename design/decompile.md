@@ -565,6 +565,19 @@ mismatch triaged and attributed (decompiler bug vs. fixture
 unrecompilable-by-construction, e.g. N51-family opcodes es2abc never
 emits).
 
+**Outcome (2026-09-23, worker d-P4)** — implemented as
+`abcd-decompile/tests/dream_gate.rs` (generator + oracle wrapper
+asserting the acceptance floor) + `scripts/dream-gate.py` (pinned
+es2abc recompile, UNCHANGED `scripts/compare-rewritten-corpus.py`,
+mandatory triage buckets). All 1149 runtime-passed fixtures recompile
+(es2abc-cant = 0 — the N51 worry never materialized). Final histogram:
+**951 pass** / 108 decompile-bug / 54 expected-fallback / 36
+fixture-unsupported. Buckets and the ten gate-proven decompiler bug
+fixes are documented in `abcd-decompile/README.md`. The gate also found
+a real LIFT bug: N65 `delobjprop` operand roles double-inverted in
+lift+lower (byte-canceling — invisible to every byte gate; fixed, VM
+oracle 1149/1149 re-verified on the rewritten tree).
+
 ## 8. Risks & open questions
 
 **R1 — gen1's lessons, restated as standing rules.** (i) Never
