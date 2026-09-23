@@ -496,7 +496,25 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   demangling; poison-on-conflict honesty keeps m{index}; zero lift/IR
   changes). Remaining bucket: ONLY expected-fallback 54 (hard-7
   async/generator 18 + template raw 36) — d-P10/d-P11's scopes.
-  IN FLIGHT: t-P5 (summary library growth).
+  t-P5 DONE: summary-library second tier — replace dual form (string:
+  Base+Param(1)->Return, pattern is control; function: gap with the
+  EMPTY-chain return channel), RegExp.prototype.test no-flow verdict
+  rescued via the NEW constructor-result family arm (es2abc lowers
+  regexp literals to new RegExp(...) in ALL 6 corpus versions —
+  AllocRegExp never fires), canonical split/join/parseInt (reachability
+  checked: zero corpus sources), Object.assign result identity.
+  Gap-scan not-a-callback refinement (constant replacement is not an
+  unresolved gap). Exclusive policy documented (default NO; parseInt
+  NON-exclusive — killSource would FN SSA re-use, body-kill vacuous for
+  natives). Backlog classified: foo/f/A/B/c/count/add/testXxx =
+  body_step user globals, s.next = generator-opaque (rung 2),
+  b.value2/A.has/a.get/a.set = user class-instance CG gaps, #...# =
+  es2abc mangled artifacts — DO NOT CHASE. Probes 40 (e17-e23 added,
+  e4 sentinel parseInt->parseFloat), tp=30 fp=4 fn=2 violations=0;
+  mechanisms 50; smoke: replace + r.test out of the miss log, unknown
+  69->51, native_keep 942->924, lookups +126 (18 candidate + 108
+  per-fact application), edges byte-identical 198734, all-params
+  byte-identical (36/353569), determinism green both configs.
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
