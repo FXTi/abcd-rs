@@ -84,20 +84,23 @@ pub fn source_lang(lang: abcd_file::SourceLang) -> SourceLang {
 /// Semantic function kind: the CONSTRUCTOR access flag selects
 /// `Constructor`; the file's `FunctionKind` selects the generator/async
 /// families. Getter/Setter have no signal in the file model and map to
-/// `Function` (documented gap).
+/// `Function` (documented gap). The NC ("non-constructible") kinds are
+/// arrow functions — d-P8 verified on all six corpus es2abc versions
+/// that concise methods/getters are `None`, never NC (compiled probe:
+/// object-literal methods → `None`, arrows → `NcFunction`/
+/// `AsyncNcFunction`).
 pub fn function_kind(method: &Method) -> FunctionKind {
     if method.access_flags.contains(AccessFlags::CONSTRUCTOR) {
         return FunctionKind::Constructor;
     }
     match method.function_kind {
         abcd_file::FunctionKind::GeneratorFunction => FunctionKind::Generator,
-        abcd_file::FunctionKind::AsyncFunction | abcd_file::FunctionKind::AsyncNcFunction => {
-            FunctionKind::Async
-        }
+        abcd_file::FunctionKind::AsyncFunction => FunctionKind::Async,
         abcd_file::FunctionKind::AsyncGeneratorFunction => FunctionKind::AsyncGenerator,
+        abcd_file::FunctionKind::NcFunction => FunctionKind::Arrow,
+        abcd_file::FunctionKind::AsyncNcFunction => FunctionKind::AsyncArrow,
         abcd_file::FunctionKind::None
         | abcd_file::FunctionKind::Function
-        | abcd_file::FunctionKind::NcFunction
         | abcd_file::FunctionKind::ConcurrentFunction
         | abcd_file::FunctionKind::SendableFunction => FunctionKind::Function,
     }

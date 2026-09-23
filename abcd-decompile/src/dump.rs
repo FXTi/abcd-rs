@@ -52,6 +52,8 @@ fn kind_tag(kind: FunctionKind) -> &'static str {
         FunctionKind::Generator => "generator",
         FunctionKind::Async => "async",
         FunctionKind::AsyncGenerator => "async-generator",
+        FunctionKind::Arrow => "arrow",
+        FunctionKind::AsyncArrow => "async-arrow",
     }
 }
 

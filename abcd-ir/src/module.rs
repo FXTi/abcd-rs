@@ -104,6 +104,12 @@ pub enum FunctionKind {
     Async,
     /// An async generator function.
     AsyncGenerator,
+    /// An arrow function (the file's `NC_FUNCTION` — non-constructible,
+    /// lexical `this`/`arguments`; concise methods are `None` at the
+    /// file level, never NC). d-P8.
+    Arrow,
+    /// An async arrow function (the file's `ASYNC_NC_FUNCTION`). d-P8.
+    AsyncArrow,
 }
 
 /// A declared signature (format fact #A7: absent on 12+/24 files, hence

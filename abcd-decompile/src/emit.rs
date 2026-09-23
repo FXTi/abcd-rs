@@ -1420,19 +1420,36 @@ impl<'m> Emitter<'m> {
                 let kind = *kind;
                 let display = sanitize(name);
                 let named = !display.is_empty() && display != "_" && is_legal_ident(&display);
-                let keyword = closure_prefix(kind);
-                if named {
-                    out.push_str(&format!("{keyword} {display}("));
+                let arrow = matches!(kind, FunctionKind::Arrow | FunctionKind::AsyncArrow);
+                if arrow {
+                    // The arrow signal IS recoverable (the file's
+                    // NC_FUNCTION kind — d-P8); arrows are anonymous,
+                    // the binding name comes from the context.
+                    let prefix = if kind == FunctionKind::AsyncArrow {
+                        "async ("
+                    } else {
+                        "("
+                    };
+                    out.push_str(prefix);
                 } else {
-                    out.push_str(&format!("{keyword} ("));
+                    let keyword = closure_prefix(kind);
+                    if named {
+                        out.push_str(&format!("{keyword} {display}("));
+                    } else {
+                        out.push_str(&format!("{keyword} ("));
+                    }
                 }
                 let mut text = String::new();
                 let rf = self.emit_function_body(body, 1, &mut text);
                 let (params, ret) = self.params_ret(&rf);
-                out.push_str(&format!("{params}){ret} {{\n{text}}}"));
-                out.push_str(&format!(
-                    " /* arrow vs function is not recoverable (design §4.3) */"
-                ));
+                if arrow {
+                    out.push_str(&format!("{params}){ret} => {{\n{text}}}"));
+                } else {
+                    // `FunctionKind::Function` closures ARE function
+                    // expressions (the file marks arrows NC — d-P8), so
+                    // no arrow/function caveat applies.
+                    out.push_str(&format!("{params}){ret} {{\n{text}}}"));
+                }
             }
             Expr::Class {
                 ctor,
@@ -1935,7 +1952,9 @@ fn method_prefix(kind: FunctionKind) -> &'static str {
         FunctionKind::Async => "async ",
         FunctionKind::Generator => "*",
         FunctionKind::AsyncGenerator => "async *",
-        FunctionKind::Function => "",
+        // Arrows never appear in member position (concise methods are
+        // `None` at the file level, not NC); degrade to plain syntax.
+        FunctionKind::Function | FunctionKind::Arrow | FunctionKind::AsyncArrow => "",
     }
 }
 

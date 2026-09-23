@@ -2433,3 +2433,53 @@ function h(p1) {
 "#;
     assert_eq!(ts, want_ts);
 }
+
+/// s38 — d-P8 arrow recovery: the file's `NC_FUNCTION` kind marks arrow
+/// functions (concise methods are `None`, never NC — verified on all
+/// six corpus es2abc versions), lifted as `FunctionKind::Arrow`/
+/// `AsyncArrow` and emitted as `(params) => { … }` /
+/// `async (params) => { … }`. Plain closures keep the
+/// not-recoverable comment.
+#[test]
+fn s38_arrow_recovery() {
+    let mut m = mk_module();
+    let arrow = add_func_kind(&mut m, "arrow", FunctionKind::AsyncArrow);
+    {
+        let b = entry_of(&m, arrow);
+        let _this = add_param(&mut m, arrow);
+        let p1 = add_param(&mut m, arrow);
+        let one = load_number(&mut m, b, 1.0);
+        let s = add(&mut m, b, p1, one);
+        emit_void(&mut m, b, Op::Return { value: Some(s) });
+    }
+    let f = add_func_named(&mut m, "outer");
+    let b = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let df = emit(
+        &mut m,
+        b,
+        Op::DefineFunc {
+            body: arrow,
+            captures: vec![],
+            length: 0,
+        },
+    );
+    let cl = emit(&mut m, b, Op::AllocClosure { func: df });
+    let g = intern(&mut m, "g");
+    emit_void(
+        &mut m,
+        b,
+        Op::StoreGlobal { name: g, value: cl },
+    );
+    emit_void(&mut m, b, Op::Return { value: None });
+
+    let want = r#"var g;
+function outer() {
+  g = async (p1) => {
+  return p1 + 1.0;
+};
+  return;
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}

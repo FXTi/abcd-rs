@@ -331,9 +331,13 @@ edges are dispatch, not dominance):
   inside object literals → method syntax; `DefineGetterSetterByValue`
   → computed-key accessors.
 - **Functions**: `DefineFunc{body, captures, length}` +
-  `AllocClosure` → function expressions (arrow vs `function` is not
-  always recoverable — default `function`, cosmetic); `FunctionKind`
-  picks `function*` / `async function` / `async function*`.
+  `AllocClosure` → function expressions. d-P8: arrow vs `function`
+  IS recoverable — the file marks arrows `NC_FUNCTION`/
+  `ASYNC_NC_FUNCTION` (concise methods are `None`, never NC; verified
+  on all six corpus es2abc versions), lifted as
+  `FunctionKind::Arrow`/`AsyncArrow` and emitted `(x) => { … }` /
+  `async (x) => { … }`; `FunctionKind` picks `function*` /
+  `async function` / `async function*`.
 - **TypeScript**: `Signature` (present only on ≤12-format files —
   format fact #A7) optionally drives `function f(x: any): T`
   annotations behind a `--ts` flag. Default output is JS.
