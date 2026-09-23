@@ -97,6 +97,23 @@ pub fn is_legal_ident(s: &str) -> bool {
     chars.all(is_ident_part) && !is_reserved(s)
 }
 
+/// Whether `s` is a valid JS IdentifierName, reserved words INCLUDED.
+/// Module-facing names (`export { x as NAME }`, `import { NAME as x }`,
+/// `export { NAME } from …`) are IdentifierNames, not bindings — `as
+/// default` is THE default-export spelling, so the reserved-word rule of
+/// [`is_legal_ident`] must NOT apply (d-P9: `export { Box as default_ }`
+/// mangled the module's public interface).
+pub fn is_ident_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !is_ident_start(first) {
+        return false;
+    }
+    chars.all(is_ident_part)
+}
+
 fn is_ident_start(c: char) -> bool {
     c == '_' || c == '$' || c.is_ascii_alphabetic() || (c as u32) > 0x7F && c.is_alphabetic()
 }

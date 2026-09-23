@@ -3,10 +3,13 @@
 //! 1. [`NameScopes`] — the lexical-environment chain, propagated over the
 //!    CFG, resolving `GetLexVar`/`PutLexVar` `{level, slot}` and the
 //!    private-name ops to their `NewLexEnvWithName` scope names /
-//!    `CreatePrivateNames` registrations. IR gaps G1/G2 (registered by
-//!    d-P0): unnamed env slots and module-local slots get *cosmetic*
-//!    synthetic fallbacks (`v{level}_{slot}`, `m{index}`, `ns{index}`) —
-//!    never fabricated names.
+//!    `CreatePrivateNames` registrations. IR gap G1 (registered by
+//!    d-P0): unnamed env slots get *cosmetic* synthetic fallbacks
+//!    (`v{level}_{slot}`, `ns{index}`) — never fabricated names. Gap G2
+//!    (module-local slots) is CLOSED where file evidence exists:
+//!    [`module_slot_names`] resolves slot↔name from the TDZ-guard names
+//!    and stored definition names; only evidence-free slots keep the
+//!    `m{index}` fallback.
 //! 2. [`local_name_in`] — `DebugData.local_names` scope extents (mapped
 //!    onto lifted instructions by the lift) → temporary names.
 //! 3. [`op_name_hint`] — `Sym`s on the defining ops (`LoadProp.name`, …)
@@ -15,15 +18,17 @@
 //! Everything here returns RAW names; legalization/disambiguation is the
 //! [`crate::legalize::Legalizer`]'s job at mint time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use abcd_ir::ValueDef;
 use abcd_ir::consts::Const;
 use abcd_ir::function::DebugData;
-use abcd_ir::id::{BlockId, ConstId, FuncId, InstId};
+use abcd_ir::id::{BlockId, ConstId, FuncId, InstId, ValueId};
 use abcd_ir::module::Module;
 use abcd_ir::op::Op;
 
 use crate::consts::sym_str;
+use crate::legalize::sanitize;
 
 /// One lexical-environment frame (one `NewLexEnv*`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -424,10 +429,177 @@ pub fn op_name_hint(module: &Module, op: &Op) -> Option<String> {
     }
 }
 
-/// The synthetic fallback for a module-local slot (gap G2 — the slot→name
-/// mapping is not in the IR; never fabricate one).
+/// The synthetic fallback for a module-local slot (gap G2 — used only
+/// when [`module_slot_names`] finds no consistent file evidence).
 pub fn module_slot_fallback(index: u32) -> String {
     format!("m{index}")
+}
+
+/// Resolve module-var slot indices to their source-level binding names
+/// (gap G2 closure, d-P9). The format carries no slot↔name table (the
+/// `_ESSlotNumberAnnotation` records per-function lexenv slot COUNTS —
+/// unrelated), but two FILE FACTS pin a slot to its binding name:
+///
+/// 1. **TDZ guard name** — es2abc emits `throw.undefinedifholewithname
+///    "<name>"` on every read of a module-level `let`/`const` binding;
+///    a [`Op::ThrowUndefinedIfHoleWithName`] whose checked value is a
+///    [`Op::LoadModuleVar`] result names that slot. (The runtime-name
+///    form [`Op::ThrowUndefinedIfHole`] resolves likewise when its name
+///    operand is a const string.)
+/// 2. **Stored named definition** — a top-level `function f`/`class C`
+///    compiles to `definefunc`/`defineclass` + `stmodulevar` into the
+///    declaration's OWN slot: a [`Op::StoreModuleVar`] whose value
+///    traces through `Mov`/`AllocClosure` passthroughs to a
+///    `DefineFunc`/`DefineClass`/`DefineSendableClass` binds the slot to
+///    that definition's file name.
+///
+/// Honesty rules (fallback, never fabrication): contradictory names for
+/// one slot poison it; one name claimed by two slots poisons BOTH (one
+/// binding = one slot); names colliding with an import local or a
+/// `StoreGlobal` predeclaration are dropped (the emitted module-scope
+/// `let` would be a duplicate declaration).
+pub fn module_slot_names(module: &Module) -> BTreeMap<u32, String> {
+    // slot → candidate name; `None` = poisoned by contradictory evidence.
+    let mut candidates: BTreeMap<u32, Option<String>> = BTreeMap::new();
+    for inst in &module.insts {
+        match &inst.op {
+            Op::ThrowUndefinedIfHoleWithName { name, value } => {
+                if let Some(slot) = load_module_slot(module, *value) {
+                    consider(&mut candidates, slot, sym_str(module, *name));
+                }
+            }
+            Op::ThrowUndefinedIfHole { name, value } => {
+                if let Some(slot) = load_module_slot(module, *value)
+                    && let Some(n) = const_string(module, *name)
+                {
+                    consider(&mut candidates, slot, n);
+                }
+            }
+            Op::StoreModuleVar { index, value } => {
+                if let Some(name) = defined_value_name(module, *value) {
+                    consider(&mut candidates, *index, name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Names already bound at module scope by other predeclarations
+    // (imports, global-store `var`s): a resolved `let` of the same name
+    // would be a duplicate declaration, so the slot keeps its fallback.
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    for imp in &module.imports {
+        let local = match imp {
+            abcd_ir::module::ImportDecl::Regular { local_name, .. }
+            | abcd_ir::module::ImportDecl::Namespace { local_name, .. } => *local_name,
+        };
+        taken.insert(sanitize(&sym_str(module, local)));
+    }
+    for inst in &module.insts {
+        if let Op::StoreGlobal { name, .. } | Op::TryStoreGlobal { name, .. } = &inst.op {
+            taken.insert(sanitize(&sym_str(module, *name)));
+        }
+    }
+
+    // One binding = one slot: a name claimed by two distinct slots is
+    // contradictory; drop both.
+    let mut name_count: BTreeMap<String, usize> = BTreeMap::new();
+    for cand in candidates.values().flatten() {
+        *name_count.entry(sanitize(cand)).or_insert(0) += 1;
+    }
+
+    let mut resolved = BTreeMap::new();
+    for (slot, cand) in candidates {
+        let Some(name) = cand else { continue };
+        let name = sanitize(&name);
+        if name_count.get(&name).copied().unwrap_or(0) > 1 || taken.contains(&name) {
+            continue;
+        }
+        resolved.insert(slot, name);
+    }
+    resolved
+}
+
+/// Record a slot↔name candidate; a second DISTINCT name poisons the slot.
+fn consider(candidates: &mut BTreeMap<u32, Option<String>>, slot: u32, name: String) {
+    match candidates.entry(slot) {
+        std::collections::btree_map::Entry::Vacant(v) => {
+            v.insert(Some(name));
+        }
+        std::collections::btree_map::Entry::Occupied(mut o) => {
+            if o.get().as_ref() != Some(&name) {
+                o.insert(None);
+            }
+        }
+    }
+}
+
+/// The defining instruction of an SSA value (params/globals have none).
+fn def_inst<'m>(module: &'m Module, v: ValueId) -> Option<&'m abcd_ir::function::Inst> {
+    match module.value(v)?.def {
+        ValueDef::Inst(iid) => module.inst(iid),
+        _ => None,
+    }
+}
+
+/// The module slot loaded by the value's defining op, when it is a
+/// [`Op::LoadModuleVar`].
+fn load_module_slot(module: &Module, v: ValueId) -> Option<u32> {
+    match &def_inst(module, v)?.op {
+        Op::LoadModuleVar { index } => Some(*index),
+        _ => None,
+    }
+}
+
+/// A const-string value's text (for the runtime-name TDZ form).
+fn const_string(module: &Module, v: ValueId) -> Option<String> {
+    match &def_inst(module, v)?.op {
+        Op::LoadConst(cid) => match module.consts.get(*cid)? {
+            Const::String(sym) => Some(sym_str(module, *sym)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The name of the definition a stored value traces to, following
+/// `Mov`/`AllocClosure` passthroughs (bounded, like `closure_of`).
+fn defined_value_name(module: &Module, v: ValueId) -> Option<String> {
+    let mut cur = v;
+    for _ in 0..16 {
+        match &def_inst(module, cur)?.op {
+            Op::Mov { src } => cur = *src,
+            Op::AllocClosure { func } => cur = *func,
+            Op::DefineFunc { body, .. } => {
+                return module
+                    .func(*body)
+                    .map(|f| demangle_internal_name(sym_str(module, f.name)));
+            }
+            Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
+                return module
+                    .func(*ctor)
+                    .map(|f| demangle_internal_name(sym_str(module, f.name)));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Demangle an es2panda internal function name (12.0.6+/13/24 formats):
+/// scope/kind tags are `#`-separated segments (es2panda
+/// `util/helpers.h`: `FUNC_NAME_SEPARATOR` `#`, `FUNCTION_TAG` `*`,
+/// `CLASS_SCOPE_TAG` `~`, `INDEX_NAME_SPICIFIER` `@`, `CTOR_TAG` `=`),
+/// so a module-scope function compiles as `#*#add` and a class ctor as
+/// `#~@0=#Box`. The segment after the LAST `#` is the source name (JS
+/// identifiers never contain `#`). Unmangled names (≤12.0.2) pass
+/// through verbatim. Applied ONLY to the module-slot evidence channel —
+/// display names elsewhere keep the file's verbatim bytes.
+fn demangle_internal_name(raw: String) -> String {
+    match raw.rfind('#') {
+        Some(i) if i + 1 < raw.len() => raw[i + 1..].to_string(),
+        _ => raw,
+    }
 }
 
 /// The synthetic fallback for a module namespace slot (gap G2).

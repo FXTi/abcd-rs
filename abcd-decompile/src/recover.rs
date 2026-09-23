@@ -47,7 +47,8 @@ use crate::expr::{Expr, IterOp, Lit, NodeStatus, ObjEntry};
 use crate::fitness::{Fitness, elision_reason, fallback_note, fitness_of, op_name};
 use crate::legalize::{Legalizer, is_legal_ident, sanitize};
 use crate::names::{
-    NameScopes, local_name_in, module_slot_fallback, namespace_fallback, op_name_hint,
+    NameScopes, local_name_in, module_slot_fallback, module_slot_names, namespace_fallback,
+    op_name_hint,
 };
 
 /// One instruction's Stage-A outcome (the coverage histogram's unit).
@@ -468,6 +469,9 @@ struct Recover<'m> {
     /// B2: the class-field fold plan for THIS function when it is the
     /// ctor of a `DefineClass` (lazily computed on the first `Call`).
     class_fold: Option<Option<crate::classfold::ClassFieldFold>>,
+    /// G2: resolved module-var slot↔name map (computed once, in
+    /// [`Recover::reserve_module_slot_names`], before params mint).
+    slot_names: BTreeMap<u32, String>,
     histogram: BTreeMap<&'static str, OpStat>,
 }
 
@@ -489,6 +493,7 @@ impl<'m> Recover<'m> {
             inst_pos: HashMap::new(),
             barriers: HashMap::new(),
             class_fold: None,
+            slot_names: BTreeMap::new(),
             histogram: BTreeMap::new(),
         };
         r.precompute_positions();
@@ -552,6 +557,7 @@ impl<'m> Recover<'m> {
         let kind = f.kind;
         let block_ids = f.blocks.clone();
 
+        self.reserve_module_slot_names();
         self.mint_params();
         self.mint_catch_names();
         self.reserve_names();
@@ -712,6 +718,26 @@ impl<'m> Recover<'m> {
         }
     }
 
+    /// G2: resolve module-var slot names once and reserve them BEFORE
+    /// params mint — a source param sharing a binding's name would
+    /// otherwise shadow the module-scope `let` the resolved name refers
+    /// to (a `StoreModuleVar` prints the resolved name verbatim).
+    fn reserve_module_slot_names(&mut self) {
+        self.slot_names = module_slot_names(self.module);
+        for n in self.slot_names.values() {
+            self.legal.reserve(n);
+        }
+    }
+
+    /// The emitted name of a module-var slot: the resolved binding name
+    /// when file evidence pinned one (G2), else the synthetic fallback.
+    fn module_slot_name(&self, index: u32) -> String {
+        self.slot_names
+            .get(&index)
+            .cloned()
+            .unwrap_or_else(|| module_slot_fallback(index))
+    }
+
     /// Reserve every name that can appear as a bare identifier in an
     /// expression (globals, resolved lexvars, module slots) so a
     /// later-minted temporary can never shadow one (`const foo = foo`
@@ -744,7 +770,8 @@ impl<'m> Recover<'m> {
                         }
                     }
                     Op::LoadModuleVar { index } | Op::StoreModuleVar { index, .. } => {
-                        self.legal.reserve(&module_slot_fallback(*index));
+                        let n = self.module_slot_name(*index);
+                        self.legal.reserve(&n);
                     }
                     Op::GetModuleNamespace { index } => {
                         self.legal.reserve(&namespace_fallback(*index));
@@ -1199,7 +1226,7 @@ impl<'m> Recover<'m> {
                 self.record(op, Outcome::Expressed);
                 out.push(Stmt::ModuleStore {
                     index: *index,
-                    name: module_slot_fallback(*index),
+                    name: self.module_slot_name(*index),
                     value: self.expr_of(*value),
                 });
             }
@@ -1373,7 +1400,7 @@ impl<'m> Recover<'m> {
                 && let Some(inst) = self.module.inst(*iid)
             {
                 raw = match &inst.op {
-                    Op::LoadModuleVar { index } => Some(module_slot_fallback(*index)),
+                    Op::LoadModuleVar { index } => Some(self.module_slot_name(*index)),
                     Op::GetModuleNamespace { index } => Some(namespace_fallback(*index)),
                     Op::GetLexVar { .. } => self.scopes.name_of(*iid).map(str::to_string),
                     other => op_name_hint(self.module, other),
@@ -1599,7 +1626,7 @@ impl<'m> Recover<'m> {
                     }
                 }
             }
-            Op::LoadModuleVar { index } => Expr::Ident(module_slot_fallback(*index)),
+            Op::LoadModuleVar { index } => Expr::Ident(self.module_slot_name(*index)),
             Op::GetModuleNamespace { index } => Expr::ModuleNamespace { index: *index },
             Op::DynamicImport { specifier } => Expr::DynamicImport {
                 specifier: Box::new(self.expr_of(*specifier)),

@@ -151,7 +151,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
                 module_request,
             } => {
                 let local = sanitize(&sym_str(module, *local_name));
-                let import = sanitize(&sym_str(module, *import_name));
+                let import = module_facing_name(&sym_str(module, *import_name));
                 let spec = render_string(&sym_str(module, *module_request));
                 em.fn_names.reserve(&local);
                 if local == import {
@@ -191,8 +191,13 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         out.push_str(&format!("var {g};\n"));
     }
 
-    // Module-slot predeclarations (gap G2 synthetic names; declaring
-    // them keeps the output strict-mode-parseable).
+    // Module-slot predeclarations (gap G2: `module_slot_names` resolves
+    // the slot↔binding-name correspondence from file evidence — TDZ
+    // guard names and stored definitions; evidence-free slots keep the
+    // synthetic `m{index}` fallback). Declaring them at module scope
+    // keeps the output strict-mode-parseable AND gives the trailing
+    // `export { name }` records a binding to reference.
+    let slot_names = crate::names::module_slot_names(module);
     let mut slots = BTreeSet::new();
     for inst in &module.insts {
         match &inst.op {
@@ -206,7 +211,10 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         }
     }
     for s in &slots {
-        let name = crate::names::module_slot_fallback(*s);
+        let name = slot_names
+            .get(s)
+            .cloned()
+            .unwrap_or_else(|| crate::names::module_slot_fallback(*s));
         em.fn_names.reserve(&name);
         out.push_str(&format!("let {name};\n"));
     }
@@ -239,7 +247,9 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         out.push_str(&format!("{name}();\n"));
     }
 
-    // Exports (1:1 enum mapping).
+    // Exports (1:1 enum mapping). The local side is a module-scope
+    // binding (resolved G2 slot names included); the `as` side is a
+    // ModuleExportName — an IdentifierName, reserved words legal.
     for exp in &module.exports {
         match exp {
             ExportDecl::Local {
@@ -247,7 +257,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
                 export_name,
             } => {
                 let local = sanitize(&sym_str(module, *local_name));
-                let export = sanitize(&sym_str(module, *export_name));
+                let export = module_facing_name(&sym_str(module, *export_name));
                 if local == export {
                     out.push_str(&format!("export {{ {local} }};\n"));
                 } else {
@@ -259,8 +269,8 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
                 import_name,
                 module_request,
             } => {
-                let import = sanitize(&sym_str(module, *import_name));
-                let export = sanitize(&sym_str(module, *export_name));
+                let import = module_facing_name(&sym_str(module, *import_name));
+                let export = module_facing_name(&sym_str(module, *export_name));
                 let spec = render_string(&sym_str(module, *module_request));
                 out.push_str(&format!("export {{ {import} as {export} }} from {spec};\n"));
             }
@@ -274,6 +284,18 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     DecompiledModule {
         text: out,
         stats: em.stats,
+    }
+}
+
+/// A module-facing name (`export { x as NAME }`, `import { NAME as x
+/// }`) is an IdentifierName, not a binding: reserved words are legal
+/// (`as default` is THE default-export spelling). Keep valid
+/// IdentifierNames verbatim; sanitize only genuinely broken shapes.
+fn module_facing_name(raw: &str) -> String {
+    if crate::legalize::is_ident_name(raw) {
+        raw.to_string()
+    } else {
+        sanitize(raw)
     }
 }
 

@@ -198,15 +198,17 @@ fn generate() -> usize {
 /// the recorded acceptance floor. Docker is LOCAL-only
 /// (scripts/remote-test.sh).
 ///
-/// The histogram at d-P7 (2026-09-24): pass 1059 / decompile-bug 0 /
-/// es2abc-cant 0 / expected-fallback 54 / fixture-unsupported 36 (of
-/// 1149). The d-P6 floor was 1041; d-P7 fixed the 18-fixture
-/// for-update-continue-1 family (G1 lexenv capture linkage: unnamed
-/// slots now get ABSOLUTE-chain-index fallback names seeded by the
-/// inherited environment, so a nested closure's `ldlexvar level>0`
-/// names the same binding the ancestor's `stlexvar` wrote — the
-/// relative `v{level}_{slot}` scheme only coincided at equal depths).
-/// The floor guards regressions; raise it when the buckets improve.
+/// The histogram at d-P9 (2026-09-24): pass 1095 / decompile-bug 0 /
+/// es2abc-cant 0 / expected-fallback 54 / fixture-unsupported 0 (of
+/// 1149). d-P9 closed IR gap G2 at the decompile side: module-var slots
+/// resolve to their source binding names from file evidence (TDZ-guard
+/// names + stored DefineFunc/DefineClass names, demangling the 12.0.6+
+/// es2panda internal-name tags `#*#`/`#~@0=#`), so the 36 module
+/// fixtures' `export { … }` records reference module-scope `let`
+/// bindings that now exist; ModuleExportName positions keep reserved
+/// words verbatim (`export { Box as default }`). The d-P7 histogram was
+/// 1059/0/0/54/36. The floor guards regressions; raise it when the
+/// buckets improve.
 #[test]
 #[ignore = "requires exported GHCR corpus, python3, and LOCAL docker"]
 fn dream_gate_oracle() {
@@ -240,8 +242,8 @@ fn dream_gate_oracle() {
         report.fixture_unsupported
     );
     assert!(
-        report.pass >= 1059,
-        "dream gate regression: pass {} < 1059 (the d-P7 acceptance floor)",
+        report.pass >= 1095,
+        "dream gate regression: pass {} < 1095 (the d-P9 acceptance floor)",
         report.pass
     );
 }
