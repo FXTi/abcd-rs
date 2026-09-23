@@ -323,7 +323,8 @@ edges are dispatch, not dominance):
   `import * as ns from "spec"` statements (the `ImportDecl` enum maps
   1:1); `Module.exports` → `export { … }` / `export … from` /
   `export * from`. `LoadModuleVar`/`StoreModuleVar` slots resolve to
-  the local binding names where recoverable (§8, gap G2).
+  the local binding names from file evidence (§8, gap G2 — closed
+  decompile-side by d-P9: TDZ-guard names + stored definition names).
 - **Classes**: `DefineClass{ctor, heritage, members}` →
   `class C extends H { … }` with the member buffer's `MethodRef`
   entries emitted as methods (`FunctionKind` selects
@@ -400,7 +401,7 @@ syntax). Totals: **T=31, N=49, H=7**.
 | 41 | `TryGetGlobal` | T | Global name read (default operand is absence-tolerance plumbing — fold). |
 | 42 | `StoreGlobal` | T | `name = v` at global scope. |
 | 43 | `TryStoreGlobal` | T | Same emission; absence-tolerance invisible. |
-| 44 | `LoadModuleVar` | N | Module-slot → binding name via exports/debug info; unexported slots unnamed (gap G2). |
+| 44 | `LoadModuleVar` | N | Module-slot → binding name via TDZ-guard/stored-definition evidence (d-P9); evidence-free slots keep the `m{index}` fallback (gap G2 residual). |
 | 45 | `StoreModuleVar` | N | Same. |
 | 46 | `GetModuleNamespace` | T | Namespace binding (ties to `import * as`). |
 | 47 | `DynamicImport` | T | `import(spec)`. |
@@ -641,7 +642,13 @@ rule like any other).
   key on `index: u32`; names exist only for exported/imported
   bindings (`ImportDecl`/`ExportDecl` carry `Sym`s) or via debug info.
   Unexported module-locals get synthetic names. Cosmetic; same
-  no-change rationale as G1.
+  no-change rationale as G1. **CLOSED decompile-side by d-P9** (no IR
+  change): `module_slot_names` resolves slot↔name from two file-fact
+  channels — the TDZ-guard name on module-var reads
+  (`throw.undefinedifholewithname`) and the stored definition's name
+  (`definefunc`/`defineclass` → own slot, demangling the 12.0.6+
+  es2panda internal-name tags) — with poison-on-conflict honesty rules;
+  only evidence-free slots keep `m{index}`. Dream gate 1095/0/0/54/0.
 - **G3 — no `Switch` op (by design).** ir-v0.2.md §9 resolution 2
   dropped `Switch` (no ISA opcode; es2abc lowers to compare/branch
   chains). The decompiler must re-detect switches as a structuring

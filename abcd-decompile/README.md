@@ -32,7 +32,7 @@ requests, then runs the UNCHANGED `scripts/compare-rewritten-corpus.py`
 behavior oracle and triages every non-pass fixture into exactly one
 bucket: `decompile-bug` / `es2abc-cant` / `expected-fallback` /
 `fixture-unsupported`. `dream_gate_oracle` asserts the acceptance floor
-(pass ≥ 951).
+(pass ≥ 1095).
 
 **Acceptance histogram (2026-09-23)**: **951 pass** / 108 decompile-bug
 / 0 es2abc-cant / 54 expected-fallback / 36 fixture-unsupported (of
@@ -201,6 +201,52 @@ recovery (no counter — kind-driven), `--ts` (flag, default off).
    are genuinely function expressions, so the caveat comment is gone
    everywhere. Golden: s38. Corpus: 396 NC functions (66/version).
 
+## The d-P9 module gate (G2 closed at the decompile side)
+
+**d-P9 histogram (2026-09-24, floor now 1095)**: **1095 pass** / **0
+decompile-bug** / **0 es2abc-cant** / 54 expected-fallback / **0
+fixture-unsupported** (of 1149). All 36 module fixtures
+(`local/module-exports` + `upstream/optimizer/…/test-constant-propagation`,
+6 versions × 3 profiles each) moved fixture-unsupported → pass.
+
+Diagnosis (per the d-P4 registration): the bucket was ONE failure, not
+two — the call-entry wrapper already emits module-var predeclarations at
+module scope (`let m{i};`), so `export { name }` had module scope to
+bind against; what was missing was the slot↔NAME correspondence: the
+export records' local names (`Box`, `add`, `answer`, `moduleVar`)
+existed nowhere in the emitted text. Fix, evidence-only (never
+fabricated — `names.rs::module_slot_names`):
+
+1. **TDZ-guard names**: es2abc emits `throw.undefinedifholewithname
+   "name"` on every read of a module-level `let`/`const`; a guard whose
+   checked value is a `LoadModuleVar` result names that slot.
+2. **Stored named definitions**: `stmodulevar` of a `DefineFunc`/
+   `DefineClass` (traced through `Mov`/`AllocClosure`) binds the slot to
+   the declaration's file name — demangled for the 12.0.6+/13/24
+   es2panda internal-name scheme (`#*#add` → `add`, `#~@0=#Box` → `Box`;
+   segment after the LAST `#`, es2panda `util/helpers.h` tag constants;
+   ≤12.0.2 formats carry plain names).
+
+Honesty rules: contradictory names for one slot poison it; one name
+claimed by two slots poisons both; collisions with import locals /
+global-store predeclarations drop the slot — all keep the synthetic
+`m{i}` fallback (goldens g03/g04). Resolved names are reserved before
+parameter minting so no param/temp shadows a module binding; a
+function-scope class declared under the same name renames
+(`class Box$1 {…}; Box = Box$1;`). The `export { x as NAME }` /
+`import { NAME as x }` positions are ModuleExportNames (IdentifierName,
+reserved words legal): `export { Box as default }` now prints verbatim
+instead of the mangled `default_` (`legalize::is_ident_name`).
+`EmitOptions::call_entry` needed NO module-aware variant — the existing
+module-scope `let` + entry-call + trailing `export {}` shape recompiles
+and runs with identical behavior. No lift/IR change: resolution is a
+decompile-side projection of facts already in the IR (module records +
+ops), so lowered bytes are untouched by construction. Goldens:
+`tests/golden_module.rs` g01–g05. The dream-gate triage's module
+blanket-amnesty is gone: residual module compile failures of the
+`Export name 'x' is not defined` shape are the (empty) G2-residual
+bucket; anything else is decompile-bug/es2abc-cant like any fixture.
+
 Gate-found decompiler bugs FIXED in d-P4 (each proven by the oracle):
 N36 operand order at expression construction, value-pure inc/dec,
 temporal escape hoisting (`var` at function top when a use leaves the
@@ -250,8 +296,10 @@ inlining and region-tree consumption are d-P3). It does NOT couple to
   over the (augmented) CFG resolving `GetLexVar`/`PutLexVar`/private
   ops to `NewLexEnvWithName`/`CreatePrivateNames` names;
   `DebugData.local_names` scope extents; `Sym` hints from defining ops;
+  module-var slot↔name resolution from file evidence (d-P9, gap G2);
   cosmetic fallbacks `v{n}` / `v{level}_{slot}` / `m{index}` / `ns{index}`
-  (IR gaps G1/G2, registered by d-P0).
+  (IR gap G1, registered by d-P0; `m{index}` only where G2 evidence is
+  absent or contradictory).
 - `src/consts.rs` — `Const` → literal conversion and rendering: f64
   shortest round-trip (`-0.0`, `NaN`, `Infinity`, exponents), JS string
   escaping, RegExp flag bits → `dgimsuy`.
