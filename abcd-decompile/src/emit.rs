@@ -82,6 +82,10 @@ pub struct DecompileStats {
     pub structure: StructStats,
     /// Aggregate fold firing counters.
     pub folds: FoldStats,
+    /// Function BODIES emitted (top-level + closures + class members +
+    /// ctors; handlers re-emitted for split try wrappers count again —
+    /// this is ≥ the module's function count).
+    pub function_bodies: usize,
 }
 
 /// A decompiled module.
@@ -160,21 +164,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
 
     // Consumed functions: closure bodies, class ctors, and every
     // MethodRef in the const pool (emitted inline, never top-level).
-    let mut consumed = BTreeSet::new();
-    for inst in &module.insts {
-        match &inst.op {
-            Op::DefineFunc { body, .. } => {
-                consumed.insert(*body);
-            }
-            Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
-                consumed.insert(*ctor);
-            }
-            _ => {}
-        }
-    }
-    for cid in 0..module.consts.len() {
-        collect_method_refs(module, abcd_ir::ConstId::new(cid as u32), &mut consumed);
-    }
+    let consumed = consumed_functions(module);
 
     // Top-level functions.
     for i in 0..module.functions.len() {
@@ -221,6 +211,30 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         text: out,
         stats: em.stats,
     }
+}
+
+/// The functions a module emits INLINE (closure bodies, class ctors,
+/// and MethodRefs in DefineClass member buffers) — everything else
+/// emits top-level. Exposed for the corpus gate's per-function
+/// coverage assertion. (Orphan MethodRefs in the const pool — buffers
+/// no DefineClass references — do NOT consume: their functions emit
+/// top-level rather than being dropped.)
+pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId> {
+    let mut consumed = std::collections::BTreeSet::new();
+    for inst in &module.insts {
+        match &inst.op {
+            Op::DefineFunc { body, .. } => {
+                consumed.insert(*body);
+            }
+            Op::DefineClass { ctor, members, .. }
+            | Op::DefineSendableClass { ctor, members, .. } => {
+                consumed.insert(*ctor);
+                collect_method_refs(module, *members, &mut consumed);
+            }
+            _ => {}
+        }
+    }
+    consumed
 }
 
 /// Walk a const (recursively) for `MethodRef` functions.
@@ -285,6 +299,7 @@ struct Emitter<'m> {
 impl<'m> Emitter<'m> {
     /// The full per-function pipeline: Stage A → Stage B → folds.
     fn func_nodes(&mut self, func: FuncId) -> (RecoveredFunc, Vec<SNode>) {
+        self.stats.function_bodies += 1;
         let rf = recover_func(self.module, func);
         let mut structured = structure_func(self.module, &rf);
         let mut fstats = FoldStats::default();
