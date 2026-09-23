@@ -1787,3 +1787,65 @@ fn prototype_array_push_alias_flow() {
         report.summaries_applied
     );
 }
+
+/// Nested-hop family resolution: an AllocArray reached through a
+/// GLOBAL STORE (the corpus' `let a = […]; sttoglobalrecord "a"` —
+/// `a.pop()` shape) — the stored value never passes the top-level site
+/// walk, so the def-chain walk must carry the alloc kind itself
+/// (pinned against the smoke-caught regression where `a.pop` stayed a
+/// miss). A second store (the tainted param) exercises the provenance
+/// UNION: families merge to {Array}, the taint rides the global
+/// binding, and pop's Base→Return flow carries it. (Element-precise
+/// matching through a global alias stays out of scope: the unknown-
+/// base heap key and the endpoint's positive-intersection discipline
+/// deliberately do not meet — see local_alias_evidence.)
+#[test]
+fn prototype_family_alloc_via_global_provenance() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&mut m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let a_name = intern(&mut m, "a");
+    let arr = alloc_array(&mut m, entry);
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: a_name,
+            value: arr,
+        },
+    );
+    // A second store of the same global (may-redefinition): the
+    // family union stays {Array} and the global binding is tainted.
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreGlobal {
+            name: a_name,
+            value: p,
+        },
+    );
+    let g = try_get_global(&mut m, entry, "a");
+    let r = method_call(&mut m, entry, g, "pop", vec![]);
+    print_call(&mut m, entry, vec![r]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let report = abcd_taint::run_taint(&m, &builtin_config());
+    assert!(
+        report
+            .summaries_applied
+            .iter()
+            .any(|(_, n)| n == "Array.prototype.pop"),
+        "the global-provenance family applied: {:?}",
+        report.summaries_applied
+    );
+    assert!(
+        !report.summary_misses.contains_key("a.pop"),
+        "the rescued direct name left the backlog log"
+    );
+    assert!(
+        report.hits.len() >= 1,
+        "the may-array receiver's taint rode pop's Base→Return flow"
+    );
+}

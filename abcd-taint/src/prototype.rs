@@ -240,9 +240,10 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
 
     /// The def-chain walk for the families `site_info_at` cannot
     /// carry: constants, global stores, iterator protocol objects.
-    /// `Mov`/`Phi` pass through; keyed allocs contribute nothing here
-    /// (their site already did); everything else marks the answer
-    /// imprecise without inventing a family.
+    /// `Mov`/`Phi` pass through; keyed allocs insert their kind
+    /// directly (values reached through a NESTED hop never pass the
+    /// site walk above); everything else marks the answer imprecise
+    /// without inventing a family.
     fn walk(&self, value: ValueId, visiting: &mut HashSet<ValueId>, ans: &mut FamilyAnswer) {
         if !visiting.insert(value) {
             ans.precise = false;
@@ -295,8 +296,14 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                     self.global_store_families(*name, visiting, ans);
                 }
                 Some(op) if family_of_alloc(op).is_some() => {
-                    // The site walk above already contributed this
-                    // family.
+                    // Insert directly: values reached through a NESTED
+                    // hop (global-store provenance, GetIterator's
+                    // iterable) never pass through the site walk
+                    // above, which runs only on the top-level
+                    // receiver (idempotent for direct receivers).
+                    if let Some(f) = family_of_alloc(op) {
+                        ans.families.insert(f);
+                    }
                 }
                 Some(_) => {
                     ans.precise = false;
