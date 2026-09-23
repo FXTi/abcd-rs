@@ -640,9 +640,11 @@ impl<'m> Recover<'m> {
         // The calling convention's hidden leading slots: es2abc marks
         // every function <static> and frames carry (funcobj, newtarget,
         // this) — so for static functions with ≥3 params the user
-        // formals start at params[3] and params[2] is `this`. Non-static
-        // functions (hand-crafted IR, the golden suites) follow T4:
-        // params[0] is `this`. (d-P4: the recompile gate found this —
+        // formals start at params[3] and params[2] is `this` (the
+        // vendored frame-slot model, abcd_ir::frame). Non-static
+        // functions (hand-crafted IR, the golden suites) keep the
+        // naming heuristic's single hidden slot: params[0] prints as
+        // `this`. (d-P4: the recompile gate found this —
         // `add(20, 22)` read its args from the wrong slots.)
         let hidden = if f.modifiers.contains(abcd_ir::Modifiers::STATIC) && n >= 3 {
             3
@@ -653,7 +655,7 @@ impl<'m> Recover<'m> {
         for i in 0..n {
             let this_idx = hidden - 1;
             if i == this_idx && hidden == 1 {
-                // T4: params[0] is the `this` binding.
+                // The naming heuristic's single hidden slot is `this`.
                 self.param_names.push("this".to_string());
                 continue;
             }

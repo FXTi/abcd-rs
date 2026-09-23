@@ -101,7 +101,8 @@ pub fn emit_void(m: &mut Module, b: BlockId, op: Op) -> InstId {
     push_inst(m, b, op)
 }
 
-/// Append a parameter value (`params[0]` = `this` by convention).
+/// Append a parameter value (hand-built IR: the naming heuristic's
+/// single hidden slot `params[0]` prints as `this`).
 pub fn add_param(m: &mut Module, f: FuncId) -> ValueId {
     let idx = m.func(f).unwrap().params.len() as u16;
     let val = ValueId::new(m.values.len() as u32);

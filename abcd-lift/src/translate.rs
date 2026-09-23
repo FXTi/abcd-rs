@@ -74,8 +74,10 @@
 //! `CopyRestArgs{start_index}`, getunmappedargs → `GetUnmappedArgs`,
 //! ldnewtarget → `LoadNewTarget`, ldglobal → `LoadGlobalObject`,
 //! ldfunction (+deprecated.ldlexenv/ldhomeobject) → `LoadFunction`,
-//! ldthis → the `this` VALUE (`params[0]` for non-static kinds — T4;
-//! `LoadConst(Undefined)` for static/zero-param frames — documented),
+//! ldthis → the `this` VALUE (the this-role frame slot — N67, the
+//! vendored frame-slot model, [`abcd_ir::frame`]: `params[2]` under
+//! the `0xF` default, annotation-aware; `LoadConst(Undefined)` for
+//! shapes the model can't cover — documented),
 //! throw → `Throw`, throw.constassignment → `ThrowConstAssignment`
 //! (runtime name value), throw.undefinedifhole →
 //! `ThrowUndefinedIfHole` (two-reg), throw.undefinedifholewithname →
