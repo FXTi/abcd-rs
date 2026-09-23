@@ -43,6 +43,58 @@ private-property-in 15 + private-field 3), hard-7 async/generator
 machinery + G4 cooked-only templates (54, by construction), module
 fixtures whose slot↔name correspondence is IR gap G2 (36).
 
+**d-P5 histogram (2026-09-23, floor now 1023)**: **1023 pass** / 36
+decompile-bug / 0 es2abc-cant / 54 expected-fallback / 36
+fixture-unsupported (of 1149). The full 72-fixture optimizer
+try-projection family (`branch-elimination/test-under-try-catch`,
+`opt-try-catch-func/test-{nested,passes,raw}-try-catch`; 6 versions ×
+3 profiles) moved to pass with no regressions. Gate-found bugs FIXED
+in d-P5 (each proven by the oracle):
+
+- **RC1 — the try's join buried in a cut conditional.** A
+  mixed-coverage `If` with a protected head was wrapped whole in
+  `try/catch`; when one arm was terminal (throw), the acyclic tree had
+  absorbed the try's continuation into the other arm, making the join
+  unreachable from the catch path (missing post-try output). The
+  join hoist (`emit_cut_try_if`) splits the node into a protected
+  skeleton (inside the try) and an unprotected tail (after the
+  try/catch — where the VM's PC-range dispatch rejoins), guarded by
+  pure phase-1 analysis: clean per-arm prefix/suffix split, one
+  splitting arm, the other terminal-only, every handler continuation
+  targeting the same tail node, no outer finally-chain. A later rejoin
+  index is supported when the skipped prefix is try-path-only phi
+  wiring (it cannot throw, so over-protection is impossible).
+- **RC2 — exception-edge phi flush after the terminal throw.** A
+  `throw`-terminated protected block's exceptional-edge phi assigns
+  are the register state the dispatching handler observes; emitted
+  after the `throw` they were dead, and handlers read `undefined`
+  temporaries. The flush now executes before the `throw`.
+- **RC3 — the finally chain stopped at shim-handled plans.** The
+  handler-protecting outer-try walk consulted only the innermost plan
+  containing a handler and stopped when that plan was already emitted
+  inside the handler's shim; larger finally plans were never
+  considered and their handler bodies were silently dropped. The walk
+  now scans the full laminar chain (visited-set guarded).
+- **Shim region closure.** A finally-idiom outer region also protects
+  the inner handler's (dispatch-entered, never Normal-reachable)
+  blocks, so the shim filter dropped it — its try/catch and its phi
+  temporaries' declarations never emitted (`ReferenceError`). Such
+  regions now ride along transitively.
+- **Loop-exit ordering trio.** (i) `emit_if` placed the head's
+  out-edge action before a non-empty arm — the arm (finally bodies,
+  loop-carried phi assigns) went dead; the action now follows the arm.
+  (ii) The cosmetic switch fold wrapped if-chains whose case arms
+  carry unlabeled loop breaks (the break then exited the switch, not
+  the loop — an infinite loop); the fold now bails on them. (iii) The
+  clean `while`/`do…while` forms place exit-phi assigns after the
+  loop, where any other unlabeled break out of the loop runs (and is
+  clobbered by) them; the clean forms are rejected for that shape
+  (`exit_phis_bypassed`), and the general `while (true)` form places
+  the assigns on the condition-exit edge.
+
+Residual decompile-bugs (36) are the other families:
+private-property-in 15, private-field 3, upstream/bytecode 18.
+
 Gate-found decompiler bugs FIXED in d-P4 (each proven by the oracle):
 N36 operand order at expression construction, value-pure inc/dec,
 temporal escape hoisting (`var` at function top when a use leaves the
