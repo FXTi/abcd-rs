@@ -1295,7 +1295,7 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
     else {
         return None;
     };
-    let (t, lit) = switch_test(cond)?;
+    let (disc, lit) = switch_test(cond)?;
     let mut cases = vec![SwitchCase {
         tests: vec![lit],
         body: with_break(then.clone()),
@@ -1310,8 +1310,8 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
                     otherwise: o2,
                 },
             ] => {
-                let (t2t, lit2) = switch_test(c2)?;
-                if t2t != t {
+                let (d2, lit2) = switch_test(c2)?;
+                if d2 != disc {
                     return None;
                 }
                 cases.push(SwitchCase {
@@ -1321,6 +1321,18 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
                 rest = o2;
             }
             [] => break,
+            // A nested switch on the SAME discriminant (a chain folded
+            // bottom-up, or the state-machine dispatch chain) flattens
+            // into this one's cases.
+            [
+                SNode::Switch {
+                    disc: d2,
+                    cases: c2,
+                },
+            ] if *d2 == disc => {
+                cases.extend(c2.iter().cloned());
+                break;
+            }
             other => {
                 cases.push(SwitchCase {
                     tests: vec![],
@@ -1330,30 +1342,23 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
             }
         }
     }
-    Some((
-        Expr::Temp {
-            value: t.1,
-            name: t.0,
-        },
-        cases,
-    ))
+    Some((disc, cases))
 }
 
-/// The `(temp, case-literal)` of a `temp === lit` condition (wrappers
-/// stripped).
-fn switch_test(cond: &Expr) -> Option<((String, abcd_ir::ValueId), Expr)> {
+/// The `(discriminant, case-literal)` of a `x === lit` condition
+/// (wrappers stripped; the discriminant is a temp or an identifier).
+fn switch_test(cond: &Expr) -> Option<(Expr, Expr)> {
     match strip_cond(cond) {
         Expr::Compare {
             op: abcd_ir::op::CmpOp::StrictEq | abcd_ir::op::CmpOp::Eq,
             left,
             right,
         } => {
-            if let (Expr::Temp { name, value }, Expr::Lit(_)) = (left.as_ref(), right.as_ref()) {
-                Some(((name.clone(), *value), right.as_ref().clone()))
-            } else if let (Expr::Lit(_), Expr::Temp { name, value }) =
-                (left.as_ref(), right.as_ref())
-            {
-                Some(((name.clone(), *value), left.as_ref().clone()))
+            let is_disc = |e: &Expr| matches!(e, Expr::Temp { .. } | Expr::Ident(_));
+            if is_disc(left) && matches!(right.as_ref(), Expr::Lit(_)) {
+                Some((left.as_ref().clone(), right.as_ref().clone()))
+            } else if is_disc(right) && matches!(left.as_ref(), Expr::Lit(_)) {
+                Some((right.as_ref().clone(), left.as_ref().clone()))
             } else {
                 None
             }

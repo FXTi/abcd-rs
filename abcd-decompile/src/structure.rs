@@ -589,7 +589,7 @@ impl<'m> Ctx<'m> {
             shim_trees: HashMap::new(),
             shim_plans: HashMap::new(),
             alt_counter: 0,
-            state_counter: usize::MAX / 2,
+            state_counter: 0,
         }
     }
 
@@ -616,7 +616,23 @@ impl<'m> Ctx<'m> {
             .collect();
         let mut body = Vec::new();
         self.frames.push(Frame::new(tree, plans));
-        if let Some(root) = self.f().tree.root {
+        // Whole-function irreducibility: d-P1 detects irreducible cores
+        // (cycles minus dominance back edges) and records the
+        // unclaimable backward edges as CrossEdge escape hatches, but
+        // the region tree still threads those blocks acyclically — the
+        // back-flow is NOT representable as loops. Fall back to a
+        // state-machine dispatch over the whole reachable function
+        // (design §4.2.4; expected count on the es2abc corpus: zero —
+        // the d-P1 gate proved it; the path exists for crafted input).
+        let has_cross_edge = self
+            .f()
+            .tree
+            .escape_hatches
+            .iter()
+            .any(|e| matches!(e, abcd_analysis::control::EscapeHatch::CrossEdge { .. }));
+        if !self.f().tree.irreducible.is_empty() || has_cross_edge {
+            self.emit_whole_function_state_machine(&mut body);
+        } else if let Some(root) = self.f().tree.root {
             self.emit_node(root, None, Follow::Tail, &mut body);
         }
         // d-P1's cross-arm hint: forward edges from one conditional arm
@@ -991,6 +1007,12 @@ impl<'m> Ctx<'m> {
 
     /// Wrap a node in `try { … } catch …` for plan `p`.
     fn wrap_try(&mut self, id: RegionId, p: usize, follow: Follow, out: &mut Vec<SNode>) {
+        self.wrap_try_run(&[id], p, follow, out);
+    }
+
+    /// Wrap a run of region nodes in ONE `try { … } catch …` (the
+    /// coalesced form — see `emit_seq_children`).
+    fn wrap_try_run(&mut self, ids: &[RegionId], p: usize, follow: Follow, out: &mut Vec<SNode>) {
         let (region, cuts, handlers) = {
             let plan = &self.f().plans[p];
             (plan.region, plan.cuts, plan.handlers.clone())
@@ -1019,7 +1041,9 @@ impl<'m> Ctx<'m> {
                 "try region {region}: protected statements are not contiguous in the structured output — this is wrapper #{wraps} for the same region (catch body duplicated, finally-style)"
             )));
         }
-        self.emit_content(id, Some(p), follow, &mut body);
+        for &id in ids {
+            self.emit_content(id, Some(p), follow, &mut body);
+        }
         let mut catches = Vec::new();
         let mut seen = HashSet::new();
         for h in handlers {
@@ -1133,6 +1157,26 @@ impl<'m> Ctx<'m> {
     ) {
         let mut i = 0;
         while i < children.len() {
+            // Try-run coalescing: a maximal run of consecutive children
+            // uniformly inside the same plan wraps in ONE try/catch
+            // (es2abc protected ranges are contiguous; without
+            // coalescing every block would get its own wrapper).
+            if let Cov::Uniform(Some(p)) = self.f_mut().cov(children[i])
+                && Some(p) != active
+            {
+                let mut j = i + 1;
+                while j < children.len() && self.f_mut().cov(children[j]) == Cov::Uniform(Some(p)) {
+                    j += 1;
+                }
+                let fl = if j < children.len() {
+                    self.entry_of(children[j])
+                } else {
+                    follow
+                };
+                self.wrap_try_run(&children[i..j], p, fl, out);
+                i = j;
+                continue;
+            }
             let next_alt = (i..children.len()).find(|&j| {
                 matches!(self.f().node(children[j]), RegionNode::Alternates(_))
                     && self.f_mut().cov(children[j]) == Cov::Uniform(active)
@@ -1729,6 +1773,144 @@ impl<'m> Ctx<'m> {
                     }
                     body.push(SNode::If {
                         cond: cond.clone(),
+                        then,
+                        otherwise,
+                    });
+                }
+            }
+            arms.push((b, body));
+        }
+        // Build the nested if-chain.
+        let mut chain: Vec<SNode> = vec![SNode::Honest(
+            "dispatch fallthrough (unreachable)".to_string(),
+        )];
+        for (b, body) in arms.into_iter().rev() {
+            chain = vec![SNode::If {
+                cond: Expr::Compare {
+                    op: CmpOp::StrictEq,
+                    left: Box::new(Expr::Ident(state.clone())),
+                    right: Box::new(num_lit(b.index() as f64)),
+                },
+                then: body,
+                otherwise: chain,
+            }];
+        }
+        out.push(SNode::While {
+            label: None,
+            cond: None,
+            body: chain,
+        });
+    }
+
+    /// The whole-function state-machine fallback (see `build`): d-P1
+    /// detects irreducible cores and CrossEdge escape hatches, but the
+    /// region tree still threads those blocks acyclically — the
+    /// back-flow is not representable as loops, so the whole reachable
+    /// function falls back to state-variable dispatch.
+    fn emit_whole_function_state_machine(&mut self, out: &mut Vec<SNode>) {
+        let Some(f) = self.module.func(self.rf.func) else {
+            return;
+        };
+        let Some(entry) = f.blocks.first().copied() else {
+            return;
+        };
+        let mut set = BTreeSet::new();
+        let mut queue = std::collections::VecDeque::from([entry]);
+        set.insert(entry);
+        while let Some(b) = queue.pop_front() {
+            for s in block_succs(self.module, b) {
+                if set.insert(s) {
+                    queue.push_back(s);
+                }
+            }
+        }
+        let blocks: Vec<BlockId> = set.iter().copied().collect();
+        self.stats.irreducible_fallbacks += 1;
+        let cores: Vec<String> = self
+            .f()
+            .tree
+            .irreducible
+            .iter()
+            .map(|c| {
+                format!(
+                    "[{}]",
+                    c.blocks
+                        .iter()
+                        .map(|b| format!("B{}", b.index()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect();
+        let crosses: Vec<String> = self
+            .f()
+            .tree
+            .escape_hatches
+            .iter()
+            .filter_map(|e| match e {
+                abcd_analysis::control::EscapeHatch::CrossEdge { from, to } => {
+                    Some(format!("B{}→B{}", from.index(), to.index()))
+                }
+                _ => None,
+            })
+            .collect();
+        out.push(SNode::Honest(format!(
+            "IRREDUCIBLE CFG escape hatch (design §4.2.4): cores [{}], cross edges [{}] — the WHOLE function is emitted as a state-variable dispatch loop (coarse but honest; expected 0 on the es2abc corpus)",
+            cores.join(", "),
+            crosses.join(", ")
+        )));
+        self.emit_state_machine(&blocks, entry, out);
+    }
+
+    /// State-variable dispatch over `blocks` (entry first, then
+    /// sorted): `let s$k = <entry>; while (true) { if (s$k === …) … }`.
+    fn emit_state_machine(&mut self, blocks: &[BlockId], entry: BlockId, out: &mut Vec<SNode>) {
+        self.stats.state_machine_blocks += blocks.len();
+        let set: BTreeSet<BlockId> = blocks.iter().copied().collect();
+        let state = format!("s${}", self.state_counter);
+        self.state_counter += 1;
+        out.push(SNode::Stmts(vec![Leaf::Decl {
+            name: state.clone(),
+            mutable: true,
+            value: Some(num_lit(entry.index() as f64)),
+        }]));
+        let mut order: Vec<BlockId> = vec![entry];
+        order.extend(blocks.iter().copied().filter(|b| *b != entry));
+        let mut arms: Vec<(BlockId, Vec<SNode>)> = Vec::new();
+        for b in order {
+            let parts = self.block_parts(b);
+            let mut body = Vec::new();
+            Self::push_stmts(&mut body, Self::stmts_leaves(&parts.main));
+            Self::push_stmts(&mut body, Self::stmts_leaves(&parts.phi));
+            match parts.term {
+                Term::None => {}
+                Term::Branch(dest) => {
+                    if set.contains(&dest) {
+                        body.push(SNode::Stmts(vec![Leaf::Assign {
+                            target: state.clone(),
+                            value: num_lit(dest.index() as f64),
+                        }]));
+                        body.push(SNode::Continue { label: None });
+                    } else {
+                        out_exits(self, &mut body, b, dest);
+                    }
+                }
+                Term::Cond(cond, t, f) => {
+                    let mut then = Vec::new();
+                    let mut otherwise = Vec::new();
+                    for (dest, arm) in [(t, &mut then), (f, &mut otherwise)] {
+                        if set.contains(&dest) {
+                            arm.push(SNode::Stmts(vec![Leaf::Assign {
+                                target: state.clone(),
+                                value: num_lit(dest.index() as f64),
+                            }]));
+                            arm.push(SNode::Continue { label: None });
+                        } else {
+                            out_exits(self, arm, b, dest);
+                        }
+                    }
+                    body.push(SNode::If {
+                        cond,
                         then,
                         otherwise,
                     });

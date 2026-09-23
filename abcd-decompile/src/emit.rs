@@ -548,7 +548,7 @@ impl<'m> Emitter<'m> {
                     let heritage = heritage.clone();
                     let members = *members;
                     let sendable = *sendable;
-                    self.emit_class(&pad, name, ctor, heritage, members, sendable, out);
+                    self.emit_class(&pad, indent, name, ctor, heritage, members, sendable, out);
                     return;
                 }
                 out.push_str(&format!("{pad}{kw} {name} = {};\n", self.estr(value)));
@@ -782,6 +782,7 @@ impl<'m> Emitter<'m> {
     fn emit_class(
         &mut self,
         pad: &str,
+        indent: usize,
         name: &str,
         ctor: FuncId,
         heritage: Option<Box<Expr>>,
@@ -811,7 +812,7 @@ impl<'m> Emitter<'m> {
             // Emit the ctor body into a scratch buffer to interleave
             // the signature.
             let mut body = String::new();
-            let rf = self.emit_function_body(ctor, 2, &mut body);
+            let rf = self.emit_function_body(ctor, indent + 2, &mut body);
             let params = rf.params[1.min(rf.params.len())..].join(", ");
             out.push_str(&format!("{params}) {{\n{body}"));
             rf
@@ -843,7 +844,7 @@ impl<'m> Emitter<'m> {
                     Lit::String(s) => pending = Some(s.clone()),
                     Lit::MethodRef(f) => {
                         let mname = pending.take().unwrap_or_else(|| format!("m${}", f.index()));
-                        self.emit_class_method(pad, &mname, *f, out);
+                        self.emit_class_method(pad, indent, &mname, *f, out);
                     }
                     _ => skipped += 1,
                 }
@@ -862,7 +863,14 @@ impl<'m> Emitter<'m> {
         out.push_str(&format!("{pad}}}\n"));
     }
 
-    fn emit_class_method(&mut self, pad: &str, name: &str, f: FuncId, out: &mut String) {
+    fn emit_class_method(
+        &mut self,
+        pad: &str,
+        indent: usize,
+        name: &str,
+        f: FuncId,
+        out: &mut String,
+    ) {
         self.stats.class_methods += 1;
         let kind = self
             .module
@@ -876,7 +884,7 @@ impl<'m> Emitter<'m> {
             render_string(name)
         };
         let mut body = String::new();
-        let rf = self.emit_function_body(f, 2, &mut body);
+        let rf = self.emit_function_body(f, indent + 2, &mut body);
         let params = rf.params[1.min(rf.params.len())..].join(", ");
         out.push_str(&format!("{pad}  {prefix}{key}({params}) {{\n{body}"));
         out.push_str(&format!("{pad}  }}\n"));
@@ -1112,6 +1120,7 @@ impl<'m> Emitter<'m> {
                 let mut s = String::new();
                 self.emit_class(
                     "",
+                    0,
                     &sanitize(&name),
                     ctor,
                     heritage,
@@ -1345,8 +1354,9 @@ impl<'m> Emitter<'m> {
         match op {
             UnOp::IsTrue => {
                 // Truthiness coercion feeding a condition: the bare
-                // operand is equivalent in boolean contexts.
-                self.sub(operand, 17, out);
+                // operand is equivalent in boolean contexts (printed
+                // at context precedence — no coercion node remains).
+                self.sub(operand, 0, out);
             }
             UnOp::IsFalse => {
                 out.push('!');
