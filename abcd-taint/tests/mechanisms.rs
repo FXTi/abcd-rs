@@ -1342,14 +1342,7 @@ fn method_call(
     args: Vec<abcd_ir::ValueId>,
 ) -> abcd_ir::ValueId {
     let name = intern(m, leaf);
-    let f = emit(
-        m,
-        b,
-        Op::LoadProp {
-            object: recv,
-            name,
-        },
-    );
+    let f = emit(m, b, Op::LoadProp { object: recv, name });
     emit(
         m,
         b,
@@ -1424,22 +1417,8 @@ fn prototype_family_const_string_via_global_provenance() {
     let p = add_param(&mut m, f, 1);
     let sg = intern(&mut m, "sg");
     let s = load_string(&mut m, entry, "abc");
-    emit_void(
-        &mut m,
-        entry,
-        Op::StoreGlobal {
-            name: sg,
-            value: s,
-        },
-    );
-    emit_void(
-        &mut m,
-        entry,
-        Op::StoreGlobal {
-            name: sg,
-            value: p,
-        },
-    );
+    emit_void(&mut m, entry, Op::StoreGlobal { name: sg, value: s });
+    emit_void(&mut m, entry, Op::StoreGlobal { name: sg, value: p });
     let g = try_get_global(&mut m, entry, "sg");
     let zero = load_number(&mut m, entry, 0.0);
     let r = method_call(&mut m, entry, g, "charCodeAt", vec![zero]);
@@ -1612,15 +1591,11 @@ fn prototype_precedence_direct_name_wins() {
     config.extra_summaries.push((
         "a.pop".to_owned(),
         Some(1),
-        Summary::new("user override: param → return")
-            .flow(Endpoint::Param(0), Endpoint::Return),
+        Summary::new("user override: param → return").flow(Endpoint::Param(0), Endpoint::Return),
     ));
     let report = abcd_taint::run_taint(&m, &config);
     assert!(
-        report
-            .summaries_applied
-            .iter()
-            .any(|(_, n)| n == "a.pop"),
+        report.summaries_applied.iter().any(|(_, n)| n == "a.pop"),
         "the direct name won: {:?}",
         report.summaries_applied
     );

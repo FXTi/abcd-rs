@@ -81,11 +81,68 @@ callbacks) is NOT implemented.
 2. **no summary, callee has a body** → step into the body (normal IFDS);
    operand taints are killed on the bypass edge (`killIncomingTaint =
    hasActiveBody`);
-3. **no summary, callee external / unknown-but-named** → conservative keep
+3. **no summary, no body, prototype-family match** (t-P3) → apply the
+   prototype-keyed summary ADDITIVELY (never exclusive — see the next
+   section);
+4. **no summary, callee external / unknown-but-named** → conservative keep
    (taint passes through untouched — never sanitizes) + the identity heuristic
    (`tainted operand ⇒ tainted return`; `IdentityTaintWrapper`'s rule,
    `TaintConfig::native_identity`, default on);
-4. **no name resolvable** → same keep, counted separately (`sites_unknown`).
+5. **no name resolvable** → same keep, counted separately (`sites_unknown`).
+
+## The prototype-resolution path (t-P3: receiver-typed builtins)
+
+The corpus' method-call head (`s.next` ×54, `s.charCodeAt` ×36, `a.pop`
+×18) resolves to user-global-qualified names (`TryGetGlobal("a").pop`)
+that no `X.prototype.m` registration can match by name. The t-P3 path
+closes that gap in `classify` AFTER the direct name match and AFTER the
+resolved-body step (the precedence is deliberate — a resolved USER body
+is evidence; the receiver type is a may-answer):
+
+```
+recv.m(...)  →  call_base_value / call_method_leaf
+             →  PrototypeResolver::families_of(recv)   (prototype.rs)
+             →  for each family: lookup "Family.prototype.m"
+             →  hit ⇒ SiteClass::Summary (exclusive forced OFF)
+             →  miss ⇒ synthesized key joins the miss log (the backlog)
+```
+
+`families_of` types the receiver from four sources (prototype.rs has the
+full honesty list): the rung-selected oracle's alloc-site KINDS
+(`AllocArray` ⇒ `Array.prototype`, `AllocObject` ⇒ `Object.prototype`,
+`AllocRegExp` ⇒ `RegExp.prototype`, `AllocClosure` ⇒
+`Function.prototype`), CONSTANT def chains (string/number/bool ⇒ the
+primitive wrappers), GLOBAL-STORE provenance (`TryGetGlobal(name)` ⇒ the
+flow-insensitive union of the module's `StoreGlobal(name, v)` values'
+families — the same discipline as the fact model's never-killed `Global`
+base, always a may-answer), and `GetIterator` over a builtin
+array/string iterable ⇒ `Iterator.prototype` (the for-of protocol
+object). Multi-site receivers merge by family UNION; an empty/unknown
+answer produces NO candidate (never invent). What is NOT recoverable:
+class instances (`new Foo()` is a call result — no keyed alloc, no class
+link), generator objects (`s.next` ×54 stays a named miss — honest),
+prototype-chain walks (families are exact kinds, not hierarchy roots —
+that needs the rung-2 PTA), and own-method shadows (probe e7's expected
+FP: `a.pop = f` is invisible at the method load — the c2 structural
+collision, closes at rung 2).
+
+All prototype-keyed registrations are **non-exclusive by design**: a
+method call never untaints its receiver and the family is a may-answer,
+so application is additive-only (flows are added, incoming taint is
+retained; `exclusive` is forced off at the site class as defense in
+depth). Registered (t-P3): `Array.prototype.pop` (element/whole-array
+taint → popped value), `Array.prototype.push` (args alias-flow → the
+base's `[AnyIndex]` element channel), `String.prototype.charCodeAt`
+(content-derived code unit → number), `String.prototype.repeat` /
+`.slice` (content-derived, the count/index args carry nothing — probe
+e10 pins this against the identity heuristic), `Iterator.prototype.next`
+/ `.return` (the for-of protocol `{value, done}` wrapper — modeled as
+transparently carrying the source's taint, the `[AnyIndex]` "elements
+of" tag included; `done` is a fresh boolean). Supporting machinery: the
+summary schema's `Field(path)` flow endpoints now match HEAP facts by
+site intersection + path prefix (pop/next over a push-tagged array), and
+`GetIterator` re-keys the source's `[AnyIndex]` heap taint onto the
+iterator value (the one builtin op whose element channel is static).
 
 ## Sources, sinks, driver, report
 
@@ -161,11 +218,13 @@ globals (`foo`, `f`, `testXxx`, …). The evidenced builtins are `Object.is` 36,
 `String.raw` 18, `Symbol` 18, `Uint8Array` 18 (each summary's doc comment
 carries its count and flow semantics; see `summary::builtin_summaries`).
 Prototype-method calls (`a.pop`, `s.charCodeAt`, …) resolve to
-user-global-qualified names and cannot match prototype-keyed summaries at rung
-0. Entries 10–20 (`JSON.parse/stringify`, `Object.keys/values/entries/assign/
-create`, `Array.isArray/from`, `Number`, `String`) are reader D's canonical
-namespace set, registered preemptively (corpus-freq 0) as the first backlog
-rung.
+user-global-qualified names; the t-P3 prototype-resolution path (above)
+re-keys them through the receiver's family — the `X.prototype.m`
+registrations at the bottom of `builtin_summaries()` are matched ONLY
+through that path. Entries 10–20 (`JSON.parse/stringify`, `Object.keys/
+values/entries/assign/create`, `Array.isArray/from`, `Number`, `String`)
+are reader D's canonical namespace set, registered preemptively
+(corpus-freq 0) as the first backlog rung.
 
 ### How to add a summary
 
@@ -185,13 +244,17 @@ you what to write next.
 
 ## Tests
 
-- `tests/mechanisms.rs` (22) — one test per mechanism: access-path cutoff,
+- `tests/mechanisms.rs` (32) — one test per mechanism: access-path cutoff,
   exclusive-kill, every fallback-ladder rung, miss counting, ExceptionParam
   catch binding, weak-vs-strong heap update, global round-trip, clears, the
   base endpoint, negative control, determinism, the N66 frame-slot binding
-  (3), and the rung-1 A/B pins (5: store keying through a call result,
+  (3), the rung-1 A/B pins (5: store keying through a call result,
   strong update through a call-result alias, the param-callee bridge,
-  heap-fact summary endpoints, rung-1 determinism).
+  heap-fact summary endpoints, rung-1 determinism), and the t-P3
+  prototype-path pins (10: alloc-kind→family, const family, multi-site
+  phi merge, user-object negative control, direct-name precedence,
+  negative caching, unknown-receiver fall-through, the GetIterator
+  family, the push alias flow, alloc-via-global-provenance).
 - `tests/probes.rs` (5 + 1 ignored) — the §5.5 precision probe suite.
   Five hand-built mini-modules with FP/FN annotations (the P5b
   ladder-trigger baseline): straight-line local; heap store/load same
@@ -205,7 +268,7 @@ you what to write next.
 
 ## The compiled probe suite (t-P1 — the §5.5 ladder-trigger instrument)
 
-Real-bytecode extension of the mini-module probes: 22 hand-written JS
+Real-bytecode extension of the mini-module probes: 27 hand-written JS
 probes with KNOWN ground truth, one directory per §5.5 precision axis.
 
 **Layout** (repo root):
@@ -256,16 +319,29 @@ regression.
 then run the suite — a NEW probe whose expectations are wrong fails
 loudly with the actual hit lines.
 
-**Current table** (rung 1 — the t-P2 on-demand alias engine, verbatim):
+**Current table** (rung 1 + the t-P3 prototype-resolution path, verbatim):
 
 ```text
 PROBE-FAMILY a-heap-alias cases=6 tp=3 fp=0 fn=0
 PROBE-FAMILY b-closure-capture cases=3 tp=2 fp=1 fn=0
 PROBE-FAMILY c-dynamic-dispatch cases=4 tp=2 fp=1 fn=1
 PROBE-FAMILY d-exceptional-flow cases=4 tp=2 fp=0 fn=1
-PROBE-FAMILY e-builtin-summary cases=5 tp=4 fp=0 fn=0
-PROBE-TOTAL tp=13 fp=2 fn=2 violations=0
+PROBE-FAMILY e-builtin-summary cases=10 tp=7 fp=1 fn=0
+PROBE-TOTAL tp=16 fp=3 fn=2 violations=0
 ```
+
+The t-P2 table (the pre-t-P3 rung-1 baseline): families a 3/0/0, b 2/1/0,
+c 2/1/1, d 2/0/1, e 5→`cases=5 tp=4 fp=0 fn=0` — `tp=13 fp=2 fn=2`.
+t-P3 added five family-E probes (all existing entries reproduce
+IDENTICALLY): **e6** local-array `push`/`pop` through the AllocArray
+family (tp), **e7** own-method shadow on a tainted array — the builtin
+`Array.prototype.pop` fires on user code (EXPECTED fp, closes at rung 2
+— the c2 structural collision: the shadow store is invisible at the
+method load), **e8** `charCodeAt` through global-store provenance (tp),
+**e9** the for-of protocol — `Iterator.prototype.next` carries the
+element taint into `next().value` (tp), **e10** `repeat`'s tainted count
+does NOT taint the result (clean guard — pins summary application
+beating the identity heuristic, e2's prototype-path analogue).
 
 Rung-1 flips (t-P2; the A/B control is `ABCD_TAINT_RUNG=0`, which
 reproduces a4/a5's FPs and b3's FN — exactly the three engine-dependent
@@ -282,33 +358,69 @@ problem (PutLexVar/GetLexVar carry no environment operand — separating
 the two environments needs lexenv-object identity, a heap-model
 extension for the rung-2 whole-program PTA), not a heap-alias problem
 rung 1's value points_to can see. Remaining rung-2 entries: c4 (handler
-table), d4 (throw through a global binding). c2 stays structural
+table), d4 (throw through a global binding), e7 (own-method shadow —
+store-to-load function resolution). c2 stays structural
 (name-keyed sinks, no rung).
 
 The rung-0 baseline for comparison (t-P1, verbatim): `tp=11 fp=4 fn=4`
 (families: a 3/2/0, b 1/1/1, c 2/1/1, d 2/0/1, e 3/0/1).
 
-## Corpus smoke results (v2-P5b, verbatim; re-confirmed byte-identical at rung 1, t-P2)
+## Corpus smoke results (t-P3, verbatim)
 
 Registered config (source = all `func_main_0` params; sink = `print`; top-20
-builtin summaries; 1149 runtime-passed fixtures; two runs identical). At rung 1
-(t-P2) every number below reproduced EXACTLY (hits, counters, path edges,
-determinism) — attribution: the corpus' 5,517 unknown call sites are global
-loads, not param-passed closures, so the points_to bridge found ZERO sites to
-bridge (measured over all 1149 fixtures), and no tainted store/load base on the
-smoke's paths needed the interprocedural query. The engine's cost on the corpus
-is its memoized queries at locally-unresolvable bases only; the probes are
-where the precision delta lives:
+builtin summaries + the t-P3 prototype-family set; 1149 runtime-passed
+fixtures; two runs identical). The numbers below moved from the t-P2
+baseline EXACTLY at the sites the prototype path rescued (full
+attribution after the block); `hits=0`, the path-edge total, and
+determinism are unchanged:
 
 ```text
 SMOKE fixtures=1149 fixtures_with_flows=0
 TAINT-FLOWS hits=0
-TAINT-COUNTERS lookups=7626 neg_cache_hits=90 body_step=108 native_keep=996 unknown=357
+TAINT-COUNTERS lookups=10254 neg_cache_hits=90 body_step=108 native_keep=942 unknown=69
 TAINT-PATH-EDGES total=198734
-TAINT-SUMMARY-MISSES top10=[("foo", 117), ("f", 90), ("A", 69), ("s.next", 54), ("B", 36), ("c", 36), ("count", 36), ("s.charCodeAt", 36), ("a.pop", 18), ("add", 18)]
-TAINT-SUMMARY-HITS top10=[("print", 1437), ("Object.is", 36), ("RegExp", 36), ("Number.isNaN", 18), ("Object.setPrototypeOf", 18), ("Proxy", 18), ("String.raw", 18), ("Symbol", 18), ("Uint8Array", 18)]
+TAINT-SUMMARY-MISSES top10=[("foo", 117), ("f", 90), ("A", 69), ("s.next", 54), ("B", 36), ("c", 36), ("count", 36), ("String.prototype.replace", 18), ("add", 18), ("b.value2", 18)]
+TAINT-SUMMARY-HITS top10=[("print", 1437), ("Iterator.prototype.next", 162), ("Iterator.prototype.return", 126), ("Object.is", 36), ("RegExp", 36), ("String.prototype.charCodeAt", 36), ("Array.prototype.pop", 18), ("Number.isNaN", 18), ("Object.setPrototypeOf", 18), ("Proxy", 18)]
 SMOKE-DETERMINISM runs=2 identical=true
 ```
+
+The t-P3 miss-counter movements (baseline → now, each attributed):
+
+- **`s.charCodeAt` 36 → GONE from the miss log, `String.prototype.charCodeAt`
+  36 in the hit log** — the strings fixtures' receiver is a
+  `tryldglobalbyname "s"` whose global-record store is a string literal
+  (constant family through global-store provenance).
+- **`a.pop` 18 → GONE, `Array.prototype.pop` 18 in the hit log** — the
+  array-index fixtures store an AllocArray into the global record
+  (alloc-kind family through provenance).
+- **`s.next` 54 stays** — the generator fixtures' receiver is the result
+  of calling a generator through a global load: opaque to points-to (and
+  even resolved, the VM manufactures the generator object — no keyed
+  alloc). Honest retention, the rung-2 pile.
+- **`Iterator.prototype.next` 162 + `Iterator.prototype.return` 126 in the
+  hit log; `unknown` 357 → 69 (−288 = 162 + 126 exactly)** — every for-of /
+  array-destructuring in the corpus compiles to a `getiterator` result
+  with `next` (and cleanup `return`) method calls; those sites had NO
+  name candidates at all (`sites_unknown`) and now classify as summaries.
+- **`native_keep` 996 → 942 (−54 = 36 + 18)** — the rescued charCodeAt/pop
+  sites.
+- **`lookups` 7626 → 10254** — the prototype-path candidate lookups;
+  `neg_cache_hits` unchanged (90).
+- **New backlog entries** — `String.prototype.replace` 18 and `b.value2`
+  18 are prototype-candidate/direct misses the old log's top-10 cut hid;
+  the synthesized `X.prototype.m` misses are the miss-log-driven backlog
+  working as designed (replace is the next registration candidate).
+- **`TAINT-PATH-EDGES` byte-identical (198734)** — the prototype
+  summaries produce exactly the flows the identity heuristic produced at
+  those sites on the no-taint corpus; `hits=0` and determinism unchanged.
+
+The pre-t-P3 (t-P2) registered-config numbers for the record:
+`lookups=7626 neg_cache_hits=90 body_step=108 native_keep=996 unknown=357`,
+misses top-10 `[("foo", 117), ("f", 90), ("A", 69), ("s.next", 54),
+("B", 36), ("c", 36), ("count", 36), ("s.charCodeAt", 36), ("a.pop", 18),
+("add", 18)]`, hits top-10 `[("print", 1437), ("Object.is", 36),
+("RegExp", 36), ("Number.isNaN", 18), ("Object.setPrototypeOf", 18),
+("Proxy", 18), ("String.raw", 18), ("Symbol", 18), ("Uint8Array", 18)]`.
 
 `hits=0` is a TRUE negative, not a dead pipeline: the corpus fixtures are
 self-contained compiler tests whose entry params never reach a `print`. The
@@ -322,6 +434,9 @@ TAINT-FLOWS hits=36
 TAINT-PATH-EDGES total=353569
 SMOKE-DETERMINISM runs=2 identical=true
 ```
+
+(re-confirmed byte-identical at t-P3 — the sensitivity control's flows do
+not route through any prototype-rescued site.)
 
 Counters classify only call sites the solver actually processed (a site with
 no incoming fact edge — dead code, or a function body unreachable even by the
@@ -346,9 +461,16 @@ zero fact — is never classified).
   chain), but function-object taint is dropped at the call boundary — capture
   taint does not enter the body (FN; the mini-gap `[AnyIndex]` channel covers
   only summary-driven callbacks).
-- **Prototype methods** are unmatchable (receiver types unknown at rung 0);
-  getter/setter/coercion calls (`may_call: UnknownCallee` effects on non-`Call`
-  ops) are not dispatched as calls.
+- **Prototype methods** — IMPLEMENTED at t-P3 (the prototype-resolution
+  path above): alloc-kind / constant / global-provenance families re-key
+  `recv.m(...)` to `Family.prototype.m` summaries. Residual limits:
+  generator and class-instance receivers stay opaque (`s.next` ×54 is
+  the honest retention), families are exact kinds (no hierarchy walk —
+  that is the rung-2 PTA), own-method shadows on a typed receiver still
+  get the builtin summary (probe e7's expected FP — the c2 structural
+  collision, closes at rung 2), and getter/setter/coercion calls
+  (`may_call: UnknownCallee` effects on non-`Call` ops) are not
+  dispatched as calls.
 - **`Apply`/`SuperSpread`** map a tainted argument array onto ALL formals;
   `SuperForwardAllArgs` maps nothing (the forwarded args are the caller's
   formals, not operands of the call).

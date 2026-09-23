@@ -39,11 +39,15 @@
 //! 2. no summary, callee has a body → step into the body (normal IFDS);
 //!    incoming operand taints are killed on the bypass edge because the
 //!    body carries them (`killIncomingTaint = hasActiveBody`);
-//! 3. no summary, callee is native/external/unknown-but-named →
+//! 3. no summary, no body, receiver types to a prototype family (t-P3,
+//!    `crate::prototype`) → apply the `Family.prototype.m` summary
+//!    ADDITIVELY (prototype-path applications are never exclusive — a
+//!    may-typed receiver must not kill);
+//! 4. no summary, callee is native/external/unknown-but-named →
 //!    conservative keep: the incoming taint passes through untouched
 //!    (never sanitizes), plus the identity heuristic `tainted base or
 //!    param ⇒ tainted return` (`IdentityTaintWrapper`'s rule);
-//! 4. no name resolvable at all → same conservative keep, counted
+//! 5. no name resolvable at all → same conservative keep, counted
 //!    separately.
 //!
 //! Miss counters are first-class ([`RegistryStats`]): the named-miss log
@@ -518,9 +522,13 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         // copied). Variadic; params 0–3 modeled (the String.raw
         // convention).
         ("Array.prototype.push", None, {
-            let mut s = Summary::new("corpus-evidenced pair of pop; args → base elements (mutates)");
+            let mut s =
+                Summary::new("corpus-evidenced pair of pop; args → base elements (mutates)");
             for i in 0..4u16 {
-                s = s.alias_flow(Param(i), Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)));
+                s = s.alias_flow(
+                    Param(i),
+                    Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
+                );
             }
             s
         }),

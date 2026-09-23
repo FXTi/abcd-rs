@@ -204,12 +204,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
     /// The unmemoized answer; `visiting` is shared across the whole
     /// recursive walk so phi back-edge cycles terminate (marked
     /// imprecise).
-    fn compute(
-        &self,
-        value: ValueId,
-        at: InstId,
-        visiting: &mut HashSet<ValueId>,
-    ) -> FamilyAnswer {
+    fn compute(&self, value: ValueId, at: InstId, visiting: &mut HashSet<ValueId>) -> FamilyAnswer {
         let mut ans = FamilyAnswer {
             families: BTreeSet::new(),
             precise: true,
@@ -218,11 +213,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
         //    answer when it is precise, else the local walk).
         let info = self.oracle.site_info_at(value, at);
         for site in info.sites.iter() {
-            if let Some(f) = self
-                .module
-                .inst(site)
-                .and_then(|i| family_of_alloc(&i.op))
-            {
+            if let Some(f) = self.module.inst(site).and_then(|i| family_of_alloc(&i.op)) {
                 ans.families.insert(f);
             }
         }
