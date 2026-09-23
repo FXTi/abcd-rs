@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "comment": "Ground truth for the taint precision probe suite (analysis-strategy.md §5.5). One family per precision axis. Lines are 1-BASED source lines of `print(...)` call statements (the lifter's loc.line is 0-based; the runner adds 1). expect: tp = real flow, must hit; clean = no flow, must NOT hit (FP guard); fp = no flow but rung 0 hits (EXPECTED false positive; closes_at_rung says which ladder rung should kill it, null = structural/wontfix); fn = real flow rung 0 misses (KNOWN false negative; closes_at_rung says which rung should catch it). The runner FAILS on any deviation in either direction — an expected-fp/fn that stops reproducing means the ladder moved and this file must be updated deliberately.",
+  "comment": "Ground truth for the taint precision probe suite (analysis-strategy.md §5.5). One family per precision axis. Lines are 1-BASED source lines of `print(...)` call statements (the lifter's loc.line is 0-based; the runner adds 1). expect: tp = real flow, must hit; clean = no flow, must NOT hit (FP guard); fp = no flow but the CURRENT rung hits (EXPECTED false positive; closes_at_rung says which ladder rung should kill it, null = structural/wontfix); fn = real flow the current rung misses (KNOWN false negative; closes_at_rung says which rung should catch it). The runner FAILS on any deviation in either direction — an expected-fp/fn that stops reproducing means the ladder moved and this file must be updated deliberately. HISTORY: annotated at rung 0 (t-P1; tp=11 fp=4 fn=4). Rung 1 (t-P2, the on-demand alias engine + points_to-fed call-graph refinement + heap-fact summary endpoints, default rung now 1) flipped: a4 fp→clean (store base refined to mkobj's alloc site, disjoint from o's), a5 fp→clean (balanced call/return hop proves p===o, strong update kills the taint), b3 fn→tp (param-callee bridged to the caller's AllocClosure body), e5 fn→tp (Object.assign alias-flow endpoint matches heap facts by positive points-to intersection). b2 evaluated honestly and RE-TAGGED rung 1→2 (environment identity, not heap aliasing — see its rationale). New table: tp=13 fp=2 fn=2.",
   "es2abc": {
     "image": "ghcr.io/fxti/arkcompiler-test:latest",
     "version": "24.0.0.0",
@@ -56,12 +56,11 @@
       "id": "a-heap-alias/a4-unknown-base-store",
       "family": "a-heap-alias",
       "file": "a-heap-alias/a4-unknown-base-store.js",
-      "rationale": "Store through a call-result (unknown) base keys the fact with an EMPTY site set, which may-aliases every load of the field (README's documented 'unknown-base heap matching is conservative' FP). Rung 1's points_to refines p to mkobj's alloc site, disjoint from o's — the hit dies.",
+      "rationale": "Store through a call-result (unknown) base keyed the fact with an EMPTY site set at rung 0, may-aliasing every load of the field (the FP this probe recorded at rung 0). FLIPPED clean at rung 1 (t-P2): the engine's memoized backward points_to hops the call into mkobj and keys the store with mkobj's alloc site — disjoint from o's site, so the hit dies.",
       "sinks": [
         {
           "line": 12,
-          "expect": "fp",
-          "closes_at_rung": 1
+          "expect": "clean"
         }
       ]
     },
@@ -69,12 +68,11 @@
       "id": "a-heap-alias/a5-weak-update-alias",
       "family": "a-heap-alias",
       "file": "a-heap-alias/a5-weak-update-alias.js",
-      "rationale": "Sanitizing store through an unproven alias (call result) is a WEAK update — the taint survives even though p === o at runtime and the overwrite is total. Rung 1's must-alias/points_to makes the update strong and kills the taint.",
+      "rationale": "Sanitizing store through an unproven alias (call result) was a WEAK update at rung 0 — the taint survived even though p === o at runtime (the FP this probe recorded at rung 0). FLIPPED clean at rung 1 (t-P2): the balanced call/return hop resolves p's points_to to o's single alloc site (id returns its formal; the context stack binds it to THIS call's argument), so the update is strong and kills the taint.",
       "sinks": [
         {
           "line": 14,
-          "expect": "fp",
-          "closes_at_rung": 1
+          "expect": "clean"
         }
       ]
     },
@@ -106,12 +104,12 @@
       "id": "b-closure-capture/b2-lexvar-cross-function",
       "family": "b-closure-capture",
       "file": "b-closure-capture/b2-lexvar-cross-function.js",
-      "rationale": "Rung-0 LexVar keys are function-agnostic (level, slot) pairs — innocent's slot-(0,0) capture merges with main's tainted slot-(0,0) capture across resolved call edges (the README's documented over-approximation). Rung 1 keys environments by identity/points-to and separates them.",
+      "rationale": "LexVar keys are function-agnostic (level, slot) pairs — innocent's slot-(0,0) capture merges with main's tainted slot-(0,0) capture across resolved call edges. EVALUATED HONESTLY at rung 1 (t-P2): this is an ENVIRONMENT-identity problem, not a heap-alias problem — PutLexVar/GetLexVar carry no environment operand in the IR, so separating the two environments requires keying facts by lexenv-object identity (NewLexEnv sites + the closure-capture linkage), which is a heap-model extension belonging to the rung-2 whole-program PTA, not to rung 1's demand-driven value points_to. RE-TAGGED closes_at_rung 1→2 rather than fake-fixed. The FP still reproduces at rung 1.",
       "sinks": [
         {
           "line": 12,
           "expect": "fp",
-          "closes_at_rung": 1
+          "closes_at_rung": 2
         }
       ]
     },
@@ -119,12 +117,11 @@
       "id": "b-closure-capture/b3-callback-registration",
       "family": "b-closure-capture",
       "file": "b-closure-capture/b3-callback-registration.js",
-      "rationale": "The callback is invoked through a PARAMETER callee (register's cb) — unresolved at rung 0, so no call edge carries the captured taint into cb's body. This is §5.5's family-(b) headline case: capture taint across a callback registration. Rung 1's memoized points_to feeds callee resolution (the AliasOracle::points_to seam doubles as the call-graph oracle, heap.rs trait docs).",
+      "rationale": "The callback is invoked through a PARAMETER callee (register's cb) — unresolved at rung 0, so no call edge carried the captured taint into cb's body (the FN this probe recorded at rung 0). FLIPPED tp at rung 1 (t-P2): CallGraph::refine_with_points_to asks the engine for the callee value's sites; the unbalanced caller fan-out traces register's cb param to main's AllocClosure site, the bridge maps it to cb's DefineFunc body, and the solver steps in (§5.4's one engine, two consumers).",
       "sinks": [
         {
           "line": 12,
-          "expect": "fn",
-          "closes_at_rung": 1
+          "expect": "tp"
         }
       ]
     },
@@ -301,12 +298,11 @@
       "id": "e-builtin-summary/e5-assign-field",
       "family": "e-builtin-summary",
       "file": "e-builtin-summary/e5-assign-field.js",
-      "rationale": "Object.assign's alias_flow matches WHOLE-VALUE taint on param(1) only — the source literal's FIELD taint is heap-keyed and never enters the target. A field-sensitive summary endpoint over heap facts (rung-1 modeling) closes it.",
+      "rationale": "Object.assign's alias_flow matched WHOLE-VALUE taint on param(1) only — the source literal's FIELD taint is heap-keyed and never entered the target (the FN this probe recorded at rung 0). FLIPPED tp (t-P2): summary flow endpoints now match heap facts whose site set positively intersects the endpoint value's site resolution. The match is NOT oracle-gated — it fires whenever site resolution knows the argument's sites (the rung-0 local walk suffices for this locally-allocated literal; the rung-1 engine matters when the argument needs the interprocedural query). A/B evidence: e5 flips at BOTH oracle rungs; a4/a5/b3 flip only at rung 1.",
       "sinks": [
         {
           "line": 10,
-          "expect": "fn",
-          "closes_at_rung": 1
+          "expect": "tp"
         }
       ]
     }

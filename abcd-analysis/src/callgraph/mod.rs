@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use abcd_ir::{CallKind, Const, FuncId, InstId, Module, Op, ValueDef, ValueId};
 
+use crate::dataflow::alias::Rung1AliasOracle;
 use crate::dataflow::ifds::CallGraphOracle;
 
 /// The targets of one call site.
@@ -214,6 +215,115 @@ impl CallGraph {
         }
         h
     }
+
+    /// Rung-1 refinement pass (analysis-strategy §5.4: "one query
+    /// engine, two consumers"): re-resolve call sites the base trace
+    /// marked [`CallTargets::UnknownCallees`] by asking the alias
+    /// engine's `points_to` for the callee VALUE's allocation sites and
+    /// mapping closure sites back to their function bodies
+    /// (`AllocClosure`/`CreateGenerator` → their `DefineFunc` chain).
+    /// This is the b3 case: `register(cb) { cb(); }` — the inner call's
+    /// callee is a parameter, opaque to the base trace, but the engine's
+    /// caller fan-out traces it to the caller's `AllocClosure` site.
+    ///
+    /// Discipline:
+    /// - ONE pass over the base graph, no fixed point (the §5.4
+    ///   co-evolution loop — rebuilt graphs feeding finer queries — is a
+    ///   later-rung architecture; the engine itself reads only `base`).
+    /// - Only fully-unknown sites are candidates; resolved-but-partial
+    ///   edges are left untouched (widening those needs edge merging,
+    ///   deferred with the fixed point).
+    /// - A bridged edge's `resolution_complete` is the engine answer's
+    ///   may-completeness ([`QueryAnswer::complete_for_resolution`] —
+    ///   unbalanced fan-out is acceptable here: callee resolution is a
+    ///   may-direction consumer; the answer is complete modulo the
+    ///   recorded graph, the same contract the base graph has).
+    /// - Sites whose query finds only non-closure allocations
+    ///   (objects/arrays) or nothing stay explicitly unknown.
+    ///
+    /// Returns a fresh graph (the base is immutable).
+    pub fn refine_with_points_to(
+        module: &Module,
+        base: &CallGraph,
+        oracle: &Rung1AliasOracle,
+    ) -> CallGraph {
+        let mut graph = base.clone();
+        let mut bridged: Vec<(FuncId, InstId)> = Vec::new();
+        for (iid, edge) in base.sites() {
+            if edge.edge_kind != CallEdgeKind::UnknownCallees {
+                continue;
+            }
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
+            let Op::Call { callee, kind, .. } = &inst.op else {
+                continue;
+            };
+            let answer = oracle.query(*callee, iid);
+            let mut funcs = BTreeSet::new();
+            for site in answer.sites.iter() {
+                trace_alloc_site(module, site, &mut funcs);
+            }
+            if funcs.is_empty() {
+                continue;
+            }
+            let targets: Vec<FuncId> = funcs.into_iter().collect();
+            for t in &targets {
+                bridged.push((*t, iid));
+            }
+            graph.sites.insert(
+                iid,
+                CallEdge {
+                    caller: edge.caller,
+                    kind: *kind,
+                    edge_kind: CallEdgeKind::ResolvedValueFlow,
+                    targets: CallTargets::Resolved(targets),
+                    resolution_complete: answer.complete_for_resolution(),
+                },
+            );
+        }
+        for (func, call) in bridged {
+            graph.callers.entry(func).or_default().push(call);
+        }
+        for v in graph.callers.values_mut() {
+            v.sort();
+            v.dedup();
+        }
+        graph
+    }
+}
+
+/// Map one allocation site found by the engine back to function bodies:
+/// `AllocClosure`/`CreateGenerator` wrap a function value whose own def
+/// chain leads to a `DefineFunc` body (T4). Other allocation kinds are
+/// not callables.
+fn trace_alloc_site(module: &Module, site: InstId, funcs: &mut BTreeSet<FuncId>) {
+    let op = module.inst(site).map(|i| &i.op);
+    let func_value = match op {
+        Some(Op::AllocClosure { func }) | Some(Op::CreateGenerator { func }) => *func,
+        _ => return,
+    };
+    let mut visiting = HashSet::new();
+    let mut current = func_value;
+    loop {
+        if !visiting.insert(current) {
+            return;
+        }
+        let Some(v) = module.value(current) else {
+            return;
+        };
+        let ValueDef::Inst(iid) = v.def else {
+            return;
+        };
+        match module.inst(iid).map(|i| &i.op) {
+            Some(Op::Mov { src }) => current = *src,
+            Some(Op::DefineFunc { body, .. }) => {
+                funcs.insert(*body);
+                return;
+            }
+            _ => return,
+        }
+    }
 }
 
 impl CallGraphOracle for CallGraph {
@@ -312,7 +422,7 @@ fn trace(
 mod tests {
     use super::*;
     use crate::testutil::*;
-    use abcd_ir::{ClassId, FunctionData, FunctionKind, Op};
+    use abcd_ir::{ClassId, FunctionData, FunctionKind, Modifiers, Op};
 
     /// Direct call through `LoadConst(MethodRef)` resolves statically.
     #[test]
@@ -596,5 +706,138 @@ mod tests {
         emit_void(&mut m, entry, Op::Return { value: None });
 
         assert_eq!(CallGraph::build(&m), CallGraph::build(&m));
+    }
+
+    /// The b3 case (analysis-strategy §5.4, one engine two consumers):
+    /// `register(cb) { cb(); }` — the inner call's param callee is
+    /// unknown to the base trace; the points_to refinement bridges it to
+    /// the caller's closure body, and the refined graph's caller index
+    /// records the new edge.
+    #[test]
+    fn refine_bridges_param_callee() {
+        let mut m = mk_module();
+        let cb = add_func_named(&mut m, "cb");
+        {
+            let b = entry_of(&m, cb);
+            emit_void(&mut m, b, Op::Return { value: None });
+        }
+        let register = add_func_named(&mut m, "register");
+        let inner_call;
+        {
+            let b = entry_of(&m, register);
+            m.func_mut(register).unwrap().modifiers = Modifiers::STATIC;
+            add_param(&mut m, register, 0);
+            add_param(&mut m, register, 1);
+            add_param(&mut m, register, 2);
+            let cb_param = add_param(&mut m, register, 3);
+            inner_call = push_inst(
+                &mut m,
+                b,
+                Op::Call {
+                    callee: cb_param,
+                    this: None,
+                    args: vec![],
+                    kind: CallKind::Dynamic,
+                },
+            );
+            emit_void(&mut m, b, Op::Return { value: None });
+        }
+        let caller = add_func_named(&mut m, "caller");
+        {
+            let b = entry_of(&m, caller);
+            let def_reg = emit(
+                &mut m,
+                b,
+                Op::DefineFunc {
+                    body: register,
+                    captures: vec![],
+                    length: 1,
+                },
+            );
+            let clo_reg = emit(&mut m, b, Op::AllocClosure { func: def_reg });
+            let def_cb = emit(
+                &mut m,
+                b,
+                Op::DefineFunc {
+                    body: cb,
+                    captures: vec![],
+                    length: 0,
+                },
+            );
+            let clo_cb = emit(&mut m, b, Op::AllocClosure { func: def_cb });
+            push_inst(
+                &mut m,
+                b,
+                Op::Call {
+                    callee: clo_reg,
+                    this: None,
+                    args: vec![clo_cb],
+                    kind: CallKind::Dynamic,
+                },
+            );
+            emit_void(&mut m, b, Op::Return { value: None });
+        }
+
+        let base = CallGraph::build(&m);
+        assert_eq!(
+            base.edge_at(inner_call).unwrap().targets,
+            CallTargets::UnknownCallees
+        );
+        assert!(base.callers_of(cb).is_empty());
+
+        let oracle = Rung1AliasOracle::new(&m, &base);
+        let refined = CallGraph::refine_with_points_to(&m, &base, &oracle);
+        let edge = refined.edge_at(inner_call).expect("edge");
+        assert_eq!(edge.edge_kind, CallEdgeKind::ResolvedValueFlow);
+        assert_eq!(edge.targets, CallTargets::Resolved(vec![cb]));
+        assert!(edge.resolution_complete);
+        assert_eq!(refined.callers_of(cb), &[inner_call]);
+        // The base graph is untouched (immutable snapshot).
+        assert_eq!(
+            base.edge_at(inner_call).unwrap().targets,
+            CallTargets::UnknownCallees
+        );
+        // Refinement is deterministic.
+        let oracle2 = Rung1AliasOracle::new(&m, &base);
+        assert_eq!(
+            refined,
+            CallGraph::refine_with_points_to(&m, &base, &oracle2)
+        );
+
+        // Sites that stay unknown: a callee that is a plain global load
+        // (the engine's answer is opaque, no sites).
+        let mut m2 = mk_module();
+        let f = add_func_named(&mut m2, "f");
+        let b = entry_of(&m2, f);
+        let g = {
+            let sym = m2.sym.intern("print");
+            emit(
+                &mut m2,
+                b,
+                Op::TryGetGlobal {
+                    name: sym,
+                    default: None,
+                },
+            )
+        };
+        let call = push_inst(
+            &mut m2,
+            b,
+            Op::Call {
+                callee: g,
+                this: None,
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m2, b, Op::Return { value: None });
+        let base2 = CallGraph::build(&m2);
+        let oracle3 = Rung1AliasOracle::new(&m2, &base2);
+        let refined2 = CallGraph::refine_with_points_to(&m2, &base2, &oracle3);
+        assert_eq!(
+            refined2.edge_at(call).unwrap().targets,
+            CallTargets::UnknownCallees,
+            "opaque callees stay explicitly unknown"
+        );
     }
 }

@@ -166,7 +166,7 @@ pub enum Tribool {
 
 /// The resolution of an SSA value to allocation sites along its def
 /// chain (rung 0: intraprocedural, flow-insensitive along the chain).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SiteInfo {
     /// The sites found.
     pub sites: AllocSiteSet,
@@ -277,6 +277,25 @@ fn resolve_into(
     }
 }
 
+/// Key-level may-alias tri-state over two heap refs, engine-independent
+/// (shared by the rung-0 and rung-1 oracles — climbing the ladder refines
+/// the site sets IN the keys, never this rule): equal refs alias;
+/// incompatible field chains or disjoint non-empty site sets do not
+/// (an empty set means "no keyed site found", not "no object"); anything
+/// else is undecidable.
+pub fn key_may_alias(a: &HeapRef, b: &HeapRef) -> Tribool {
+    if a == b {
+        return Tribool::True;
+    }
+    if !a.fields.compatible_with(&b.fields) {
+        return Tribool::False;
+    }
+    if !a.sites.is_empty() && !b.sites.is_empty() && !a.sites.intersects(&b.sites) {
+        return Tribool::False;
+    }
+    Tribool::Unknown
+}
+
 /// Oracle for heap aliasing, implemented by heap-v0 (rung 0) initially
 /// and by a demand-driven query engine (rung 1) later WITHOUT call-site
 /// changes in the taint engine (analysis-strategy.md §5.2 — this trait's
@@ -355,19 +374,7 @@ impl<'m> Rung0AliasOracle<'m> {
 
 impl<F> AliasOracle<F> for Rung0AliasOracle<'_> {
     fn may_alias(&self, a: &HeapRef, b: &HeapRef) -> Tribool {
-        if a == b {
-            return Tribool::True;
-        }
-        if !a.fields.compatible_with(&b.fields) {
-            return Tribool::False;
-        }
-        // Disjoint non-empty site sets cannot denote the same object;
-        // anything else is undecidable at rung 0 (an empty set means "no
-        // keyed site found", not "no object").
-        if !a.sites.is_empty() && !b.sites.is_empty() && !a.sites.intersects(&b.sites) {
-            return Tribool::False;
-        }
-        Tribool::Unknown
+        key_may_alias(a, b)
     }
 
     fn must_alias(&self, base_a: ValueId, base_b: ValueId, _at: InstId) -> bool {

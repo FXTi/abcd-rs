@@ -32,13 +32,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use abcd_analysis::callgraph::CallGraph;
-use abcd_analysis::dataflow::heap::DEFAULT_MAX_FIELD_CHAIN;
+use abcd_analysis::dataflow::Rung1AliasOracle;
+use abcd_analysis::dataflow::heap::{DEFAULT_MAX_FIELD_CHAIN, Rung0AliasOracle};
 use abcd_analysis::dataflow::ifds::CallGraphOracle;
 use abcd_analysis::dataflow::ifds::{IfdsConfig, IfdsResult, IfdsSolver};
 use abcd_ir::{FuncId, InstId, Loc, Module, Op, ValueId};
 
 use crate::fact::{Fact, TaintFact};
 use crate::names::{call_base_value, callee_name_candidates};
+use crate::oracle::Oracle;
 use crate::problem::TaintProblem;
 use crate::summary::{RegistryStats, Summary, SummaryRegistry};
 
@@ -94,6 +96,12 @@ pub struct TaintConfig {
     /// The access-path k-limit (default
     /// [`DEFAULT_MAX_FIELD_CHAIN`] = 5, FlowDroid's conventional bound).
     pub max_field_chain: usize,
+    /// The alias-oracle rung (analysis-strategy §4.4): 0 = heap-v0 local
+    /// def chains; 1 = the on-demand backward `points_to` engine
+    /// (memoized, depth-capped, rung-0 fallback) plus the points_to-fed
+    /// call-graph refinement. Default 1; 0 stays selectable for A/B
+    /// measurement in the probe runner.
+    pub alias_rung: u8,
 }
 
 impl Default for TaintConfig {
@@ -107,6 +115,7 @@ impl Default for TaintConfig {
             follow_returns_past_seeds: true,
             native_identity: true,
             max_field_chain: DEFAULT_MAX_FIELD_CHAIN,
+            alias_rung: 1,
         }
     }
 }
@@ -199,7 +208,21 @@ pub fn run_taint(module: &Module, config: &TaintConfig) -> TaintReport {
 /// Run the analysis, also returning the raw solver result (for tests
 /// that assert on facts at arbitrary program points).
 pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, IfdsResult<Fact>) {
-    let callgraph = CallGraph::build(module);
+    let base_graph = CallGraph::build(module);
+    // The alias ladder (analysis-strategy §4.4): rung 1 builds the
+    // on-demand engine over the BASE graph, refines the graph once with
+    // the engine's points_to (§5.4 — one engine, two consumers; the
+    // co-evolution fixed point is a later rung), and solves against the
+    // refined graph. Rung 0 solves against the base graph directly.
+    let engine = (config.alias_rung != 0).then(|| Rung1AliasOracle::new(module, &base_graph));
+    let refined = engine
+        .as_ref()
+        .map(|e| CallGraph::refine_with_points_to(module, &base_graph, e));
+    let callgraph: &CallGraph = refined.as_ref().unwrap_or(&base_graph);
+    let oracle = match engine {
+        Some(e) => Oracle::Rung1(e),
+        None => Oracle::Rung0(Rung0AliasOracle::new(module)),
+    };
     let mut registry = if config.builtin_summaries {
         SummaryRegistry::with_builtins()
     } else {
@@ -209,18 +232,18 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         registry.register(name, *arity, summary.clone());
     }
 
-    let problem = TaintProblem::new(module, &callgraph, &registry, config);
+    let problem = TaintProblem::new(module, callgraph, oracle, &registry, config);
     let solver = IfdsSolver::new(
         module,
         &problem,
-        &callgraph,
+        callgraph,
         IfdsConfig {
             follow_returns_past_seeds: config.follow_returns_past_seeds,
         },
     );
     let result = solver.solve();
 
-    let hits = collect_hits(module, config, &callgraph, &result);
+    let hits = collect_hits(module, config, callgraph, &result);
     let applied = problem.applied_summaries();
     let stats = registry.stats();
     let resolve_map = |m: &std::collections::BTreeMap<abcd_ir::Sym, usize>| {
@@ -238,7 +261,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     };
     let path_index = PathIndex::build(module, &result);
     for hit in &mut report.hits {
-        let (seed, path) = reconstruct_path(module, &callgraph, &result, &path_index, hit);
+        let (seed, path) = reconstruct_path(module, callgraph, &result, &path_index, hit);
         hit.seed = seed;
         hit.path = path;
     }

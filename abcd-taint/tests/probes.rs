@@ -398,13 +398,17 @@ fn probe_exception_only_path() {
 // Expectations per sink line (see annotations.json):
 //   tp    — real flow, MUST hit (a miss is a regression);
 //   clean — no flow, MUST NOT hit (a hit is an FP regression);
-//   fp    — no flow, rung 0 HITS (expected FP; closes_at_rung records
-//           the ladder rung that should kill it);
-//   fn    — real flow, rung 0 MISSES (known FN; closes_at_rung records
-//           the rung that should catch it).
+//   fp    — no flow, the CURRENT rung HITS (expected FP; closes_at_rung
+//           records the ladder rung that should kill it);
+//   fn    — real flow, the current rung MISSES (known FN; closes_at_rung
+//           records the rung that should catch it).
 // Deviations in EITHER direction fail the suite: an expected-fp/fn that
 // stops reproducing means the ladder moved and the annotations must be
 // updated deliberately. That is what makes this the ladder TRIGGER.
+//
+// The suite runs at the default alias rung (1 — the on-demand engine,
+// t-P2). ABCD_TAINT_RUNG=0 selects the rung-0 oracle for A/B evidence
+// (against rung-1 annotations it fails loudly — by design).
 //
 // Run:
 //   python3 scripts/gen-taint-probes.py   # once, needs docker
@@ -527,6 +531,14 @@ for p in a["probes"]:
                 name: sink.to_owned(),
             }],
             builtin_summaries: true,
+            // A/B switch: ABCD_TAINT_RUNG=0 runs the suite against the
+            // rung-0 oracle (the annotations encode the CURRENT rung's
+            // expectations, so rung 0 fails loudly — that IS the A/B
+            // evidence of what rung 1 bought).
+            alias_rung: match std::env::var("ABCD_TAINT_RUNG").as_deref() {
+                Ok("0") => 0,
+                _ => 1,
+            },
             ..TaintConfig::default()
         }
     }
@@ -655,7 +667,11 @@ for p in a["probes"]:
             }
         }
 
-        eprintln!("PROBE-SUITE probes={} (rung 0)", probes.len());
+        eprintln!(
+            "PROBE-SUITE probes={} (rung {})",
+            probes.len(),
+            config.alias_rung
+        );
         for (name, cases, tp, fp, fn_) in &families {
             eprintln!("PROBE-FAMILY {name} cases={cases} tp={tp} fp={fp} fn={fn_}");
         }

@@ -38,10 +38,12 @@
 pub mod driver;
 pub mod fact;
 pub mod names;
+pub mod oracle;
 pub mod problem;
 pub mod summary;
 
 pub use driver::{PathStep, SinkHit, SinkSpec, SourceSpec, TaintConfig, TaintReport, run_taint};
 pub use fact::{Fact, TaintBase, TaintFact};
+pub use oracle::Oracle;
 pub use problem::TaintProblem;
 pub use summary::{Endpoint, Flow, RegistryStats, Summary, SummaryRegistry, builtin_summaries};

@@ -12,12 +12,19 @@
 //!   by `(AllocSite, field chain, k-capped)`, strong/weak updates, and the
 //!   [`heap::AliasOracle`] trait seam sized for a Boomerang-shaped rung-1
 //!   engine (§5.2).
+//! - [`alias`] — the rung-1 on-demand alias engine (§4.4 rung 1): a
+//!   memoized, demand-driven backward `points_to(base, at)` query with
+//!   the balanced-parentheses interprocedural discipline, a depth cap
+//!   with rung-0 fallback, and the full [`heap::AliasOracle`] impl
+//!   ([`alias::Rung1AliasOracle`]).
 
+pub mod alias;
 pub mod framework;
 pub mod heap;
 pub mod ifds;
 pub mod usedef;
 
+pub use alias::{AliasEngineStats, QueryAnswer, Rung1AliasOracle};
 pub use framework::{DataflowResult, Direction, MonotoneFramework, SolveConfig, solve};
 pub use heap::{
     AliasOracle, AllocSiteSet, FieldChain, FieldKey, HeapRef, Rung0AliasOracle, Tribool,

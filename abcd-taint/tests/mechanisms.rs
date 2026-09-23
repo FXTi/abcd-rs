@@ -870,3 +870,446 @@ fn call_binding_nonstatic_unannotated_overapprox() {
         "no slot model: conservative over-approximation taints every param"
     );
 }
+
+// ── Rung 1 (t-P2): the on-demand alias engine behind the AliasOracle
+// seam (analysis-strategy §4.4 rung 1). Each test pins the rung-0
+// behavior (the A/B control, `alias_rung: 0`) AND the rung-1 behavior —
+// the delta IS the mechanism.
+
+/// a4 shape: a store through a call-result base keyed the fact with an
+/// EMPTY site set at rung 0 (may-aliasing every load of the field — the
+/// recorded FP); rung 1's memoized backward query hops the call into the
+/// callee and keys the store with the callee's alloc site, disjoint
+/// from the loaded object's.
+#[test]
+fn rung1_store_through_call_result_keys_precisely() {
+    let build = || {
+        let mut m = mk_module();
+        let mkobj = add_func_named(&mut m, "mkobj");
+        m.functions[mkobj.index()].modifiers = abcd_ir::Modifiers::STATIC;
+        {
+            let b = entry_of(&m, mkobj);
+            add_param(&mut m, mkobj, 0);
+            add_param(&mut m, mkobj, 1);
+            add_param(&mut m, mkobj, 2);
+            let obj = alloc_object(&mut m, b);
+            emit_void(&mut m, b, Op::Return { value: Some(obj) });
+        }
+        let f = add_func_named(&mut m, "func_main_0");
+        let entry = entry_of(&m, f);
+        add_param(&mut m, f, 0);
+        let t = add_param(&mut m, f, 1);
+        let def = emit(
+            &mut m,
+            entry,
+            Op::DefineFunc {
+                body: mkobj,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        let clo = emit(&mut m, entry, Op::AllocClosure { func: def });
+        let p = emit(
+            &mut m,
+            entry,
+            Op::Call {
+                callee: clo,
+                this: None,
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let secret = intern(&mut m, "secret");
+        emit_void(
+            &mut m,
+            entry,
+            Op::StoreProp {
+                object: p,
+                name: secret,
+                value: t,
+            },
+        );
+        // A DISTINCT local object, same field name, never stored into.
+        let o = alloc_object(&mut m, entry);
+        let x = emit(
+            &mut m,
+            entry,
+            Op::LoadProp {
+                object: o,
+                name: secret,
+            },
+        );
+        print_call(&mut m, entry, vec![x]);
+        emit_void(&mut m, entry, Op::Return { value: None });
+        m
+    };
+    let rung0 = abcd_taint::run_taint(
+        &build(),
+        &TaintConfig {
+            alias_rung: 0,
+            ..std_config()
+        },
+    );
+    assert_eq!(
+        rung0.hits.len(),
+        1,
+        "rung 0: unknown-base wildcard fires (the recorded FP)"
+    );
+    let rung1 = abcd_taint::run_taint(&build(), &std_config());
+    assert_eq!(
+        rung1.hits.len(),
+        0,
+        "rung 1: the store keys to mkobj's site, disjoint from o's"
+    );
+}
+
+/// a5 shape: a sanitizing store through an unproven alias (call result)
+/// is a WEAK update at rung 0; rung 1's balanced call/return hop proves
+/// the alias (id returns its formal, bound to THIS call's argument) and
+/// the strong update kills the taint.
+#[test]
+fn rung1_strong_update_through_call_result_alias() {
+    let build = || {
+        let mut m = mk_module();
+        let id = add_func_named(&mut m, "id");
+        m.functions[id.index()].modifiers = abcd_ir::Modifiers::STATIC;
+        {
+            let b = entry_of(&m, id);
+            add_param(&mut m, id, 0);
+            add_param(&mut m, id, 1);
+            add_param(&mut m, id, 2);
+            let x = add_param(&mut m, id, 3); // first formal (0xF default)
+            emit_void(&mut m, b, Op::Return { value: Some(x) });
+        }
+        let f = add_func_named(&mut m, "func_main_0");
+        let entry = entry_of(&m, f);
+        add_param(&mut m, f, 0);
+        let t = add_param(&mut m, f, 1);
+        let def = emit(
+            &mut m,
+            entry,
+            Op::DefineFunc {
+                body: id,
+                captures: vec![],
+                length: 1,
+            },
+        );
+        let clo = emit(&mut m, entry, Op::AllocClosure { func: def });
+        let o = alloc_object(&mut m, entry);
+        let p = emit(
+            &mut m,
+            entry,
+            Op::Call {
+                callee: clo,
+                this: None,
+                args: vec![o],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let secret = intern(&mut m, "secret");
+        emit_void(
+            &mut m,
+            entry,
+            Op::StoreProp {
+                object: o,
+                name: secret,
+                value: t,
+            },
+        );
+        let clean = load_string(&mut m, entry, "clean");
+        emit_void(
+            &mut m,
+            entry,
+            Op::StoreProp {
+                object: p,
+                name: secret,
+                value: clean,
+            },
+        );
+        let x = emit(
+            &mut m,
+            entry,
+            Op::LoadProp {
+                object: o,
+                name: secret,
+            },
+        );
+        print_call(&mut m, entry, vec![x]);
+        emit_void(&mut m, entry, Op::Return { value: None });
+        m
+    };
+    let rung0 = abcd_taint::run_taint(
+        &build(),
+        &TaintConfig {
+            alias_rung: 0,
+            ..std_config()
+        },
+    );
+    assert_eq!(
+        rung0.hits.len(),
+        1,
+        "rung 0: weak update — the taint survives (the recorded FP)"
+    );
+    let rung1 = abcd_taint::run_taint(&build(), &std_config());
+    assert_eq!(
+        rung1.hits.len(),
+        0,
+        "rung 1: must-alias proof makes the update strong"
+    );
+}
+
+/// b3 shape: a callback invoked through a PARAMETER callee — the site is
+/// unknown at rung 0 (no call edge, the body never sees the taint);
+/// rung 1's points_to refinement bridges the edge and the body-step
+/// carries the arg taint into the callback.
+#[test]
+fn rung1_param_callee_bridge_enters_callback() {
+    let build = || {
+        let mut m = mk_module();
+        let cb = add_func_named(&mut m, "cb");
+        m.functions[cb.index()].modifiers = abcd_ir::Modifiers::STATIC;
+        {
+            let b = entry_of(&m, cb);
+            add_param(&mut m, cb, 0);
+            add_param(&mut m, cb, 1);
+            add_param(&mut m, cb, 2);
+            let x = add_param(&mut m, cb, 3);
+            print_call(&mut m, b, vec![x]);
+            emit_void(&mut m, b, Op::Return { value: None });
+        }
+        let register = add_func_named(&mut m, "register");
+        m.functions[register.index()].modifiers = abcd_ir::Modifiers::STATIC;
+        {
+            let b = entry_of(&m, register);
+            add_param(&mut m, register, 0);
+            add_param(&mut m, register, 1);
+            add_param(&mut m, register, 2);
+            let cb_param = add_param(&mut m, register, 3);
+            let x_param = add_param(&mut m, register, 4);
+            push_inst(
+                &mut m,
+                b,
+                Op::Call {
+                    callee: cb_param,
+                    this: None,
+                    args: vec![x_param],
+                    kind: CallKind::Dynamic,
+                },
+            );
+            emit_void(&mut m, b, Op::Return { value: None });
+        }
+        let f = add_func_named(&mut m, "func_main_0");
+        let entry = entry_of(&m, f);
+        add_param(&mut m, f, 0);
+        let t = add_param(&mut m, f, 1);
+        let def_reg = emit(
+            &mut m,
+            entry,
+            Op::DefineFunc {
+                body: register,
+                captures: vec![],
+                length: 2,
+            },
+        );
+        let clo_reg = emit(&mut m, entry, Op::AllocClosure { func: def_reg });
+        let def_cb = emit(
+            &mut m,
+            entry,
+            Op::DefineFunc {
+                body: cb,
+                captures: vec![],
+                length: 1,
+            },
+        );
+        let clo_cb = emit(&mut m, entry, Op::AllocClosure { func: def_cb });
+        push_inst(
+            &mut m,
+            entry,
+            Op::Call {
+                callee: clo_reg,
+                this: None,
+                args: vec![clo_cb, t],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, entry, Op::Return { value: None });
+        m
+    };
+    let rung0 = abcd_taint::run_taint(
+        &build(),
+        &TaintConfig {
+            alias_rung: 0,
+            ..std_config()
+        },
+    );
+    assert_eq!(
+        rung0.hits.len(),
+        0,
+        "rung 0: param callee unresolved — the callback is never entered"
+    );
+    let rung1 = abcd_taint::run_taint(&build(), &std_config());
+    assert_eq!(
+        rung1.hits.len(),
+        1,
+        "rung 1: the bridged edge carries the taint into cb"
+    );
+    assert!(
+        rung1.stats.sites_body_step >= 1,
+        "the inner site stepped into a body (not the identity heuristic)"
+    );
+}
+
+/// e5 shape: a summary's alias flow (Object.assign) matches a HEAP-keyed
+/// field taint on the source argument via positive points-to
+/// intersection and re-keys it onto the destination's sites.
+#[test]
+fn rung1_summary_endpoint_matches_heap_field_taint() {
+    let build = || {
+        let mut m = mk_module();
+        let f = add_func_named(&mut m, "func_main_0");
+        let entry = entry_of(&m, f);
+        add_param(&mut m, f, 0);
+        let t = add_param(&mut m, f, 1);
+        let o = alloc_object(&mut m, entry);
+        let lit = alloc_object(&mut m, entry);
+        let secret = intern(&mut m, "secret");
+        emit_void(
+            &mut m,
+            entry,
+            Op::StoreProp {
+                object: lit,
+                name: secret,
+                value: t,
+            },
+        );
+        let obj_global = try_get_global(&mut m, entry, "Object");
+        let assign_name = intern(&mut m, "assign");
+        let assign = emit(
+            &mut m,
+            entry,
+            Op::LoadProp {
+                object: obj_global,
+                name: assign_name,
+            },
+        );
+        push_inst(
+            &mut m,
+            entry,
+            Op::Call {
+                callee: assign,
+                this: None,
+                args: vec![o, lit],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let x = emit(
+            &mut m,
+            entry,
+            Op::LoadProp {
+                object: o,
+                name: secret,
+            },
+        );
+        print_call(&mut m, entry, vec![x]);
+        emit_void(&mut m, entry, Op::Return { value: None });
+        m
+    };
+    let config = |rung: u8| TaintConfig {
+        extra_summaries: vec![(
+            "Object.assign".to_owned(),
+            None,
+            Summary::new("test; srcs → dst").alias_flow(Endpoint::Param(1), Endpoint::Param(0)),
+        )],
+        alias_rung: rung,
+        ..std_config()
+    };
+    // The endpoint match is NOT oracle-gated: it fires whenever
+    // `site_info_at` resolves the argument's sites — the rung-0 local
+    // walk suffices for a locally allocated argument like this one (the
+    // rung-1 engine matters when the endpoint value needs the
+    // interprocedural query; the compiled-probe A/B — e5 flips at both
+    // rungs, a4/a5/b3 only at rung 1 — is in the t-P2 report). What this
+    // test pins is that the match EXISTS at all: the pre-t-P2
+    // `match_endpoint` returned None for heap facts (the e5 FN).
+    let rung0 = abcd_taint::run_taint(&build(), &config(0));
+    assert_eq!(
+        rung0.hits.len(),
+        1,
+        "local allocs: the rung-0 local walk already resolves the sites"
+    );
+    let rung1 = abcd_taint::run_taint(&build(), &config(1));
+    assert_eq!(
+        rung1.hits.len(),
+        1,
+        "rung 1: the heap fact matches param(1) and lands on param(0)'s sites"
+    );
+}
+
+/// Rung 1 is deterministic: two runs over the same module are identical
+/// (the engine's memoization is lookup-only; iteration is B-tree/
+/// insertion-ordered — N20).
+#[test]
+fn rung1_determinism_two_runs_identical() {
+    let mut m = mk_module();
+    let mkobj = add_func_named(&mut m, "mkobj");
+    m.functions[mkobj.index()].modifiers = abcd_ir::Modifiers::STATIC;
+    {
+        let b = entry_of(&m, mkobj);
+        add_param(&mut m, mkobj, 0);
+        add_param(&mut m, mkobj, 1);
+        add_param(&mut m, mkobj, 2);
+        let obj = alloc_object(&mut m, b);
+        emit_void(&mut m, b, Op::Return { value: Some(obj) });
+    }
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&m, f);
+    add_param(&mut m, f, 0);
+    let t = add_param(&mut m, f, 1);
+    let def = emit(
+        &mut m,
+        entry,
+        Op::DefineFunc {
+            body: mkobj,
+            captures: vec![],
+            length: 0,
+        },
+    );
+    let clo = emit(&mut m, entry, Op::AllocClosure { func: def });
+    let p = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: clo,
+            this: None,
+            args: vec![],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let secret = intern(&mut m, "secret");
+    emit_void(
+        &mut m,
+        entry,
+        Op::StoreProp {
+            object: p,
+            name: secret,
+            value: t,
+        },
+    );
+    let x = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: p,
+            name: secret,
+        },
+    );
+    print_call(&mut m, entry, vec![x]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let a = abcd_taint::run_taint(&m, &std_config());
+    let b = abcd_taint::run_taint(&m, &std_config());
+    assert_eq!(a.hits, b.hits);
+    assert_eq!(a.path_edges, b.path_edges);
+    assert_eq!(format!("{:?}", a.stats), format!("{:?}", b.stats));
+    assert_eq!(a.hits.len(), 1, "the refined flow itself is found");
+}

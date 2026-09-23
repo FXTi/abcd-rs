@@ -38,13 +38,14 @@ use std::collections::{HashMap, HashSet};
 
 use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::heap::{AllocSiteSet, UpdateKind};
-use abcd_analysis::dataflow::heap::{FieldChain, FieldKey, Rung0AliasOracle, update_kind};
+use abcd_analysis::dataflow::heap::{FieldChain, FieldKey, update_kind};
 use abcd_analysis::dataflow::ifds::{CallGraphOracle, IfdsProblem};
-use abcd_ir::{AnnValue, CallKind, Const, FuncId, InstId, Modifiers, Module, Op, Sym, ValueId};
+use abcd_ir::{CallKind, FuncId, InstId, Module, Op, Sym, ValueId};
 
 use crate::driver::{SourceSpec, TaintConfig};
 use crate::fact::{Fact, TaintBase, TaintFact};
 use crate::names::{call_base_value, callee_name_candidates};
+use crate::oracle::Oracle;
 use crate::summary::{Endpoint, FallbackStep, SummaryRegistry};
 
 /// How a call site is handled — the fallback ladder, memoized per site.
@@ -62,88 +63,14 @@ enum SiteClass {
     UnknownKeep,
 }
 
-/// The callee's call-type: which leading `params` slots are the
-/// vendored implicit frame slots `[func][newTarget][this]` rather than
-/// source formals (N66; the vendored ground truth is arkcompiler's
-/// `MethodLiteral::Initialize` — slot present iff the corresponding
-/// `L_ESCallTypeAnnotation;` callType bit: HaveThis = 0x1,
-/// HaveNewTarget = 0x2, HaveFunc = 0x8).
+/// How caller operands bind to callee params (N66; the frame-slot model
+/// itself lives in `abcd_analysis::frame` — the alias engine's
+/// interprocedural hops consume the same model).
 ///
 /// When the annotation is ABSENT on a `<static>` callee the vendored
 /// default is `callType = 0xF` — all three implicit slots — which is
 /// exactly the es2abc corpus shape (every corpus function declares
 /// `num_args = 3 + formals` and reads its first formal from `a3`).
-///
-/// This is a deliberate duplicate of `abcd-opt/src/inline.rs`'s
-/// `CallType`: the crate-graph invariant forbids `abcd-taint →
-/// abcd-opt`, and unification into a shared helper is a registered
-/// follow-up.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct CallType {
-    /// The func slot (the closure itself) leads.
-    func: bool,
-    /// The new.target slot follows.
-    new_target: bool,
-    /// The this slot follows.
-    this: bool,
-}
-
-impl CallType {
-    /// The vendored annotation-absent default (`UINT32_MAX & 0xF`).
-    const DEFAULT: Self = Self {
-        func: true,
-        new_target: true,
-        this: true,
-    };
-
-    /// Number of leading implicit slots.
-    fn implicit_slots(self) -> usize {
-        self.func as usize + self.new_target as usize + self.this as usize
-    }
-
-    /// The this-slot index (implicit slots are ordered func, newTarget,
-    /// this), when the this slot is present.
-    fn this_slot(self) -> Option<usize> {
-        self.this
-            .then(|| self.func as usize + self.new_target as usize)
-    }
-
-    /// Read the callee's `L_ESCallTypeAnnotation;` callType bits, when
-    /// the annotation is present.
-    fn from_annotation(module: &Module, callee: FuncId) -> Option<Self> {
-        let func = module.func(callee)?;
-        for ann in &func.annotations {
-            let is_call_type = module
-                .class(ann.class)
-                .and_then(|c| module.sym.resolve(c.descriptor))
-                == Some("L_ESCallTypeAnnotation;");
-            if !is_call_type {
-                continue;
-            }
-            for (name, value) in &ann.elements {
-                if module.sym.resolve(*name) != Some("callType") {
-                    continue;
-                }
-                let AnnValue::Const(cid) = value else {
-                    continue;
-                };
-                let bits = module
-                    .consts
-                    .get(*cid)
-                    .and_then(Const::as_f64)
-                    .map(|x| x as u32)?;
-                return Some(Self {
-                    func: bits & 0b1000 != 0,
-                    new_target: bits & 0b0010 != 0,
-                    this: bits & 0b0001 != 0,
-                });
-            }
-        }
-        None
-    }
-}
-
-/// How caller operands bind to callee params (N66).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ParamBinding {
     /// The frame-slot model resolved: `this` → `this_slot`, args[i] →
@@ -167,26 +94,25 @@ fn param_binding(module: &Module, callee: FuncId) -> ParamBinding {
     let Some(fd) = module.func(callee) else {
         return ParamBinding::OverApproxAll;
     };
-    let call_type = match CallType::from_annotation(module, callee) {
-        Some(ct) => ct,
-        None if fd.modifiers.contains(Modifiers::STATIC) => CallType::DEFAULT,
-        None => return ParamBinding::OverApproxAll,
+    let Some(slots) = abcd_analysis::frame::FrameSlots::of(module, callee) else {
+        return ParamBinding::OverApproxAll;
     };
-    if fd.params.len() < call_type.implicit_slots() {
+    if fd.params.len() < slots.implicit_slots() {
         return ParamBinding::OverApproxAll;
     }
     ParamBinding::Precise {
-        this_slot: call_type.this_slot(),
-        formal_base: call_type.implicit_slots(),
+        this_slot: slots.this_slot(),
+        formal_base: slots.implicit_slots(),
     }
 }
 
-/// The taint problem over a module + call graph + rung-0 alias oracle +
-/// summary registry + source/sink config.
+/// The taint problem over a module + call graph + the rung-selected
+/// alias oracle ([`Oracle`]: rung-0 baseline or the rung-1 demand-driven
+/// engine) + summary registry + source/sink config.
 pub struct TaintProblem<'m> {
     module: &'m Module,
     callgraph: &'m CallGraph,
-    oracle: RefCell<Rung0AliasOracle<'m>>,
+    oracle: RefCell<Oracle<'m>>,
     registry: &'m SummaryRegistry,
     config: &'m TaintConfig,
     /// `(func, param indices)` seeds, resolved from the config's
@@ -213,6 +139,7 @@ impl<'m> TaintProblem<'m> {
     pub fn new(
         module: &'m Module,
         callgraph: &'m CallGraph,
+        oracle: Oracle<'m>,
         registry: &'m SummaryRegistry,
         config: &'m TaintConfig,
     ) -> Self {
@@ -263,7 +190,7 @@ impl<'m> TaintProblem<'m> {
         TaintProblem {
             module,
             callgraph,
-            oracle: RefCell::new(Rung0AliasOracle::new(module)),
+            oracle: RefCell::new(oracle),
             registry,
             config,
             param_seeds,
@@ -397,37 +324,42 @@ impl<'m> TaintProblem<'m> {
     }
 
     /// Whether a load through `object` may pick up a heap fact keyed by
-    /// `sites` (rung 0: positive intersection, or either side unknown —
-    /// the conservative may-alias answer for unknown bases).
-    fn heap_may_reach(&self, sites: &AllocSiteSet, object: ValueId) -> bool {
-        let obj = self.oracle.borrow().resolve(object);
+    /// `sites` (positive intersection, or either side unknown — the
+    /// conservative may-alias answer for unknown bases; rung 1 refines
+    /// `object`'s sites through the on-demand query, rung 0 through the
+    /// local def chain).
+    fn heap_may_reach(&self, sites: &AllocSiteSet, object: ValueId, at: InstId) -> bool {
+        let obj = self.oracle.borrow().site_info_at(object, at);
         sites.is_empty() || obj.sites.is_empty() || sites.intersects(&obj.sites)
     }
 
     /// Whether local fact base `v` has positive-alias evidence with
     /// `object` (same value, or non-empty intersecting site sets).
     /// Unknown-on-either-side is deliberately NOT evidence for locals:
-    /// params/globals would alias every load (documented rung-0 choice).
-    fn local_alias_evidence(&self, v: ValueId, object: ValueId) -> bool {
+    /// params/globals would alias every load (documented rung-0 choice,
+    /// kept under rung 1 — the engine only sharpens the site sets).
+    fn local_alias_evidence(&self, v: ValueId, object: ValueId, at: InstId) -> bool {
         if v == object {
             return true;
         }
         let oracle = self.oracle.borrow();
-        let a = oracle.resolve(v);
-        let b = oracle.resolve(object);
+        let a = oracle.site_info_at(v, at);
+        let b = oracle.site_info_at(object, at);
         !a.sites.is_empty() && a.sites.intersects(&b.sites)
     }
 
-    /// Access-path load rule: `result = object.key`.
+    /// Access-path load rule: `result = object.key` at instruction `at`.
     fn load_rule(
         &self,
         fact: &TaintFact,
         object: ValueId,
         key: FieldKey,
-        result: Option<ValueId>,
+        at: InstId,
         out: &mut Vec<Fact>,
     ) {
-        let Some(result) = result else { return };
+        let Some(result) = self.module.inst(at).and_then(|i| i.result) else {
+            return;
+        };
         let try_cut = |fields: &FieldChain| -> Option<FieldChain> {
             if fields.is_empty() {
                 // Base tainted: any property read is tainted (one step).
@@ -450,14 +382,14 @@ impl<'m> TaintProblem<'m> {
             }
         };
         match &fact.base {
-            TaintBase::Local(v) if self.local_alias_evidence(*v, object) => {
+            TaintBase::Local(v) if self.local_alias_evidence(*v, object, at) => {
                 if let Some(rest) = try_cut(&fact.fields) {
                     out.push(Fact::of(
                         fact.with_fields(rest).rebased(TaintBase::Local(result)),
                     ));
                 }
             }
-            TaintBase::Heap(sites) if self.heap_may_reach(sites, object) => {
+            TaintBase::Heap(sites) if self.heap_may_reach(sites, object, at) => {
                 if let Some(rest) = try_cut(&fact.fields) {
                     out.push(Fact::of(
                         fact.with_fields(rest).rebased(TaintBase::Local(result)),
@@ -468,20 +400,29 @@ impl<'m> TaintProblem<'m> {
         }
     }
 
-    /// Access-path store rule: `object.key = value`. Returns whether the
-    /// incoming fact survives (strong kills return false for the killed
-    /// fact).
+    /// Access-path store rule: `object.key = value` at instruction `at`.
+    /// Returns whether the incoming fact survives (strong kills return
+    /// false for the killed fact).
+    ///
+    /// Rung 1 changes BOTH decisions through the engine's memoized query
+    /// ([`Oracle::site_info_at`] / [`Oracle::aliases_of_store`]): the
+    /// strong-kill proof may come from an interprocedural def chain (the
+    /// a5 case — a sanitizing store through a call-result alias), and the
+    /// stored taint's heap key may be refined from an unknown base to
+    /// precise sites (the a4 case). Any imprecise answer falls back to
+    /// the rung-0 local walk — never silently wrong.
     fn store_rule(
         &self,
         fact: &TaintFact,
         object: ValueId,
         key: FieldKey,
         value: ValueId,
+        at: InstId,
         out: &mut Vec<Fact>,
     ) -> bool {
         let mut survive = true;
         // Strong kill: the old value at exactly this location is dead.
-        let obj_info = self.oracle.borrow().resolve(object);
+        let obj_info = self.oracle.borrow().site_info_at(object, at);
         if update_kind(&obj_info) == UpdateKind::Strong {
             let site = obj_info.sites;
             let at_location = match &fact.base {
@@ -500,17 +441,29 @@ impl<'m> TaintProblem<'m> {
                 }
             }
         }
-        // The stored value's taint is re-keyed into the heap.
+        // The stored value's taint is re-keyed into the heap: the
+        // computeAliases analogue (soot-infoflow §4.2) — rung 1 injects
+        // the REFINED key and the baseline is skipped; otherwise the
+        // rung-0 keying stands (empty-site unknown-base wildcard
+        // included — sound by construction).
         if fact.base == TaintBase::Local(value) {
-            let sites = self.oracle.borrow().resolve(object).sites;
-            let mut chain = FieldChain::new().pushed(key, self.cap());
-            for &k in fact.fields.elements() {
-                chain = chain.pushed(k, self.cap());
+            let injected = {
+                let oracle = self.oracle.borrow();
+                oracle.aliases_of_store(fact, object, key, at, self.cap())
+            };
+            if !injected.is_empty() {
+                out.extend(injected.into_iter().map(Fact::of));
+            } else {
+                let sites = self.oracle.borrow().resolve(object).sites;
+                let mut chain = FieldChain::new().pushed(key, self.cap());
+                for &k in fact.fields.elements() {
+                    chain = chain.pushed(k, self.cap());
+                }
+                out.push(Fact::of(TaintFact {
+                    base: TaintBase::Heap(sites),
+                    fields: chain,
+                }));
             }
-            out.push(Fact::of(TaintFact {
-                base: TaintBase::Heap(sites),
-                fields: chain,
-            }));
         }
         survive
     }
@@ -568,6 +521,47 @@ impl<'m> TaintProblem<'m> {
         }
     }
 
+    /// Match a summary FLOW's source endpoint against an incoming fact
+    /// at call site `at`: the static local match first; otherwise the
+    /// rung-1 heap-fact match — a fact `Heap(sites).chain` where `sites`
+    /// positively intersects the points-to set of the endpoint's value
+    /// (the e5 case: a field-tainted literal passed to `Object.assign`).
+    /// Positive intersection is required on both sides (an unknown side
+    /// is not evidence — the same discipline as
+    /// [`TaintProblem::local_alias_evidence`]), so this adds flows over
+    /// rung 0 without re-keying any existing match. Returns the leftover
+    /// chain and whether the match was heap-sourced (the substitute then
+    /// re-keys to `Heap`, keeping the fact function-global instead of
+    /// dying on a local).
+    fn match_flow_endpoint(
+        &self,
+        endpoint: &Endpoint,
+        fact: &TaintFact,
+        args: &[ValueId],
+        base: Option<ValueId>,
+        at: InstId,
+    ) -> Option<(FieldChain, bool)> {
+        if let Some(leftover) = Self::match_endpoint(endpoint, fact, args, base) {
+            return Some((leftover, false));
+        }
+        let TaintBase::Heap(sites) = &fact.base else {
+            return None;
+        };
+        if sites.is_empty() {
+            return None;
+        }
+        let value = match endpoint {
+            Endpoint::Param(i) => *args.get(*i as usize)?,
+            Endpoint::Base => base?,
+            _ => return None,
+        };
+        let pts = self.oracle.borrow().site_info_at(value, at).sites;
+        if pts.is_empty() || !pts.intersects(sites) {
+            return None;
+        }
+        Some((fact.fields.clone(), true))
+    }
+
     /// Substitute a sink endpoint at the call site.
     fn substitute(
         &self,
@@ -577,6 +571,8 @@ impl<'m> TaintProblem<'m> {
         base: Option<ValueId>,
         result: Option<ValueId>,
         is_handler_site: bool,
+        from_heap: bool,
+        at: InstId,
         out: &mut Vec<Fact>,
     ) {
         let append = |path: &FieldChain| {
@@ -586,11 +582,23 @@ impl<'m> TaintProblem<'m> {
             }
             chain
         };
+        // The target key for a value endpoint: a heap-sourced match
+        // re-keys onto the target's site set (function-global state);
+        // unknown-site targets stay local (rung-0 behavior).
+        let value_key = |v: ValueId| {
+            if from_heap {
+                let sites = self.oracle.borrow().site_info_at(v, at).sites;
+                if !sites.is_empty() {
+                    return TaintBase::Heap(sites);
+                }
+            }
+            TaintBase::Local(v)
+        };
         match endpoint {
             Endpoint::Param(i) => {
                 if let Some(&v) = args.get(*i as usize) {
                     out.push(Fact::of(TaintFact {
-                        base: TaintBase::Local(v),
+                        base: value_key(v),
                         fields: leftover.clone(),
                     }));
                 }
@@ -598,7 +606,7 @@ impl<'m> TaintProblem<'m> {
             Endpoint::Base => {
                 if let Some(b) = base {
                     out.push(Fact::of(TaintFact {
-                        base: TaintBase::Local(b),
+                        base: value_key(b),
                         fields: leftover.clone(),
                     }));
                 }
@@ -616,7 +624,7 @@ impl<'m> TaintProblem<'m> {
             }
             Endpoint::Field(path) => {
                 if let Some(b) = base {
-                    let sites = self.oracle.borrow().resolve(b).sites;
+                    let sites = self.oracle.borrow().site_info_at(b, at).sites;
                     let chain = append(path);
                     let base_key = if sites.is_empty() {
                         TaintBase::Local(b)
@@ -766,15 +774,15 @@ impl IfdsProblem for TaintProblem<'_> {
             }
             // ── Loads (access-path cut) ──────────────────────────────
             Op::LoadProp { object, name } => {
-                self.load_rule(fact, *object, FieldKey::Named(*name), curr_inst.result, out);
+                self.load_rule(fact, *object, FieldKey::Named(*name), curr, out);
                 out.push(source.clone());
             }
             Op::LoadPropIdx { object, .. } => {
-                self.load_rule(fact, *object, FieldKey::AnyIndex, curr_inst.result, out);
+                self.load_rule(fact, *object, FieldKey::AnyIndex, curr, out);
                 out.push(source.clone());
             }
             Op::LoadPropDyn { object, .. } => {
-                self.load_rule(fact, *object, FieldKey::AnyDynamic, curr_inst.result, out);
+                self.load_rule(fact, *object, FieldKey::AnyDynamic, curr, out);
                 out.push(source.clone());
             }
             // ── Stores (heap re-keying + strong/weak kills) ──────────
@@ -788,17 +796,17 @@ impl IfdsProblem for TaintProblem<'_> {
                 name,
                 value,
             } => {
-                if self.store_rule(fact, *object, FieldKey::Named(*name), *value, out) {
+                if self.store_rule(fact, *object, FieldKey::Named(*name), *value, curr, out) {
                     out.push(source.clone());
                 }
             }
             Op::StorePropIdx { object, value, .. } | Op::StoreOwnPropIdx { object, value, .. } => {
-                if self.store_rule(fact, *object, FieldKey::AnyIndex, *value, out) {
+                if self.store_rule(fact, *object, FieldKey::AnyIndex, *value, curr, out) {
                     out.push(source.clone());
                 }
             }
             Op::StorePropDyn { object, value, .. } | Op::StoreOwnPropDyn { object, value, .. } => {
-                if self.store_rule(fact, *object, FieldKey::AnyDynamic, *value, out) {
+                if self.store_rule(fact, *object, FieldKey::AnyDynamic, *value, curr, out) {
                     out.push(source.clone());
                 }
             }
@@ -1100,7 +1108,9 @@ impl IfdsProblem for TaintProblem<'_> {
                     .any(|c| Self::match_endpoint(c, fact, args, base).is_some());
                 if !cleared {
                     for flow in &summary.flows {
-                        if let Some(leftover) = Self::match_endpoint(&flow.from, fact, args, base) {
+                        if let Some((leftover, from_heap)) =
+                            self.match_flow_endpoint(&flow.from, fact, args, base, call)
+                        {
                             self.substitute(
                                 &flow.to,
                                 &leftover,
@@ -1108,6 +1118,8 @@ impl IfdsProblem for TaintProblem<'_> {
                                 base,
                                 result,
                                 is_handler_site,
+                                from_heap,
+                                call,
                                 out,
                             );
                         }
