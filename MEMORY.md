@@ -466,8 +466,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   done. Escalate only genuine design-level ambiguity or a maintainer
   message. Standing order pairs decompile-track and taint-track work
   (disjoint crates, disjoint metrics).
-  IN FLIGHT: d-P6 (private member buffers + N67) || t-P2 (rung-1 alias
-  engine — trigger fired per the probe suite).
+  d-P6+N67 DONE (dream gate 1023->1041; MemberAttrs projection,
+  byte-faithful; canonical abcd-ir::frame). t-P2 DONE (rung-1 engine;
+  probes tp=13 fp=2 fn=2; corpus smoke byte-identical). d-P7 DONE:
+  decompile-bug bucket EMPTY — dream gate 1059/1149 (1059 pass / 0 bug
+  / 0 es2abc-cant / 54 expected-fallback / 36 fixture-unsupported);
+  root cause = G1 fallback naming keyed by relative level -> absolute
+  chain index seeding. IN FLIGHT: t-P3 (prototype summary walk).
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
