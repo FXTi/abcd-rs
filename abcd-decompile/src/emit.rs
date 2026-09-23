@@ -582,9 +582,23 @@ impl<'m> Emitter<'m> {
                         out.push_str(&format!("{pad}}} catch ({binding}) {{\n"));
                         self.emit_nodes(&first.body, indent + 1, out);
                         for extra in rest {
+                            // JS has ONE catch clause: the typed-catch
+                            // handlers merge into it in dispatch order.
+                            // The extra handler's exception param is
+                            // bound to the clause's binding (a typed
+                            // dispatch is unrecoverable — the file's
+                            // type table does not reach the IR — so the
+                            // merge is unconditional and says so).
                             out.push_str(&format!(
                                 "{pad}  /* additional typed-catch handler (no JS surface) — body merged: */\n"
                             ));
+                            if let Some(b) = &extra.binding
+                                && *b != binding
+                            {
+                                out.push_str(&format!(
+                                    "{pad}  const {b} = {binding}; /* merged typed-catch binding */\n"
+                                ));
+                            }
                             self.emit_nodes(&extra.body, indent + 1, out);
                         }
                     }

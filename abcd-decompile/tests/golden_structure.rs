@@ -2284,3 +2284,66 @@ fn s35_scope_fold_partial() {
 "#;
     assert_eq!(decompiled(&m), want);
 }
+
+/// s36 — d-P8 multi-catch merge: JS has ONE catch clause. Multiple
+/// typed handlers merge into it in dispatch order, and each extra
+/// handler's exception param is BOUND to the clause binding (the file
+/// type table does not reach the IR, so no `instanceof` dispatch is
+/// recoverable — the merge is unconditional and says so). Corpus
+/// firing count: 0 (multi_catch=0); pinned here.
+#[test]
+fn s36_multi_catch_merge() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let h1 = add_block(&mut m, f);
+    let h2 = add_block(&mut m, f);
+    // b0 (protected): a throwing call.
+    let x = call_p1(&mut m, b0, p1);
+    emit_void(&mut m, b0, Op::Throw { value: x });
+    // h1: the first typed handler — prints its binding.
+    let e1 = add_exception_param(&mut m, h1);
+    let _a = call_p1(&mut m, h1, e1);
+    emit_void(&mut m, h1, Op::Return { value: None });
+    // h2: the second typed handler — prints its OWN binding.
+    let e2 = add_exception_param(&mut m, h2);
+    let _b = call_p1(&mut m, h2, e2);
+    emit_void(&mut m, h2, Op::Return { value: None });
+    link(&mut m, b0, h1);
+    link(&mut m, b0, h2);
+    // One region, two typed catches (type_idx present but unnamed).
+    m.func_mut(f).unwrap().try_regions.push(abcd_ir::function::TryRegion {
+        protected: vec![b0],
+        catches: vec![
+            abcd_ir::function::Catch {
+                handler: h1,
+                exception: e1,
+                type_idx: Some(7),
+            },
+            abcd_ir::function::Catch {
+                handler: h2,
+                exception: e2,
+                type_idx: Some(9),
+            },
+        ],
+    });
+
+    let want = r#"function f(p1) {
+  /* try region 0: 2 catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order */
+  try {
+    const v2 = p1();
+    throw v2;
+  } catch (e) {
+    e();
+    return;
+    /* additional typed-catch handler (no JS surface) — body merged: */
+    const e$1 = e; /* merged typed-catch binding */
+    e$1();
+    return;
+  }
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}
