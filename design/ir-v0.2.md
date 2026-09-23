@@ -42,7 +42,7 @@ cheap and well-defined:
 | T1 | **Stable value identity** — the taint key is a value; IDs must survive pass pipelines without renumbering | arena indices; passes clone, never renumber; `SymbolTable`/`ConstPool` append-only |
 | T2 | **Semantic property access** — access paths are named-field chains with k-limiting; index/computed access must be distinguishable | `LoadProp{name: Sym}` / `StoreProp{name: Sym}` vs `LoadPropIdx{index: ValueId}` / `LoadPropDyn{key: ValueId}` as separate ops |
 | T3 | **First-class effects per op** — propagation rules need read/write/call/throw/alloc knowledge per instruction, without consulting lowering | `Op::effects() -> Effects` (§4.4): `{ reads: [MemClass], writes: [MemClass], may_throw, may_call, allocs: AllocKind }`; derived from op + operand kinds, never hand-maintained per pass |
-| T4 | **Call semantics complete** — taint flows into callees and back: callee, `this`, args, new-target, result, closures with capture lists | `Call { callee, this, args, kind: CallKind, result }` with `CallKind::{Direct, Dynamic, Super, New}`; `DefineFunc { body: FuncId, captures: Vec<(Sym, ValueId)> }`; `this` is an explicit parameter of every non-static function (params[0]) |
+| T4 | **Call semantics complete** — taint flows into callees and back: callee, `this`, args, new-target, result, closures with capture lists | `Call { callee, this, args, kind: CallKind, result }` with `CallKind::{Direct, Dynamic, Super, New}`; `DefineFunc { body: FuncId, captures: Vec<(Sym, ValueId)> }`. **Frame-slot model (vendored, oracle-proven at v2-P3b):** `params` are the code-header arg slots — implicit leading slots `[func][new.target][this]` (per the callee's `L_ESCallTypeAnnotation;` callType bits; ABSENT → vendored `0xF` default, the es2abc shape) followed by source formals left-aligned, `undefined`-padded |
 | T5 | **Exception flow in the graph** — exceptions propagate taint to handlers | `TryRegion` blocks + **catch edges are first-class CFG edges** (`EdgeKind::Exceptional` alongside `Normal`), so IFDS path edges see them; handler entry value (`ExceptionParam`) is a real SSA value defined by the edge |
 | T6 | **External/native attachment points** — FlowDroid needs summaries for builtins (Array.prototype.push, Proxy traps, …) | `FunctionData.is_external` + `ExternalId(Sym)`; the IR carries no native bodies, so summaries register against `(Sym, Arity)` keys outside the IR |
 | T7 | **Allocation sites** — heap taint and alias analysis need object/array/closure creation points as unique ops | `AllocObject{shape}`, `AllocArray`, `AllocClosure(DefineFunc)`, `AllocRegExp`, each with distinct op kinds and an `alloc_site: InstId` identity |
@@ -187,12 +187,22 @@ no special seeding instructions (v0.1's seeding stays a lift detail).
 
 ### 5.3 Call binding table (T4)
 
-| kind | this binding | new.target | args |
-|---|---|---|---|
-| Direct | `call.this` | undefined | args→params[1..] |
-| Dynamic | computed at callee entry (non-strict=global, strict=undefined) | undefined | args→params[1..] |
-| Super | inherited from enclosing constructor | inherited | args→params[1..] |
-| New | fresh object from callee.prototype | callee itself | args→params[1..] |
+**Frame-slot model (vendored, oracle-proven at v2-P3b — this supersedes the
+earlier "params[0]=this" convention, N66):** the callee's `params` are the
+code-header arg slots. The leading slots are the vendored implicit frame
+slots `[func][new.target][this]` (present per the callee's
+`L_ESCallTypeAnnotation;` callType bits; annotation ABSENT → the vendored
+`0xF` default = all three present, the es2abc shape), followed by the
+source formals LEFT-aligned, `undefined`-padded (interpreter-inl.cpp:488);
+extra arguments are dropped (unreadable for `arguments`-free callees).
+Below, `H` = the hidden-slot count (3 under `0xF`).
+
+| kind | func slot | new.target slot | this slot | formals |
+|---|---|---|---|---|
+| Direct | call-site closure | undefined | explicit receiver | args→params[H..] |
+| Dynamic | call-site closure | undefined | computed at callee entry (non-strict=global, strict=undefined) | args→params[H..] |
+| Super | call-site closure | inherited | inherited from enclosing ctor | args→params[H..] |
+| New | call-site closure | callee itself | fresh object from callee.prototype | args→params[H..] |
 
 `result` is the callee's return value; a throw inside the callee flows to
 the caller's exceptional edges.
