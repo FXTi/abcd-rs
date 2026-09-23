@@ -34,7 +34,7 @@
 //! operand→result rule.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::heap::{AllocSiteSet, UpdateKind};
@@ -44,10 +44,11 @@ use abcd_ir::{CallKind, FuncId, InstId, Module, Op, Sym, ValueId};
 
 use crate::driver::{SourceSpec, TaintConfig};
 use crate::fact::{Fact, TaintBase, TaintFact};
+use crate::gap;
 use crate::names::{call_base_value, call_method_leaf, callee_name_candidates};
 use crate::oracle::Oracle;
 use crate::prototype::{FamilyAnswer, PrototypeResolver};
-use crate::summary::{Endpoint, FallbackStep, SummaryRegistry};
+use crate::summary::{CallbackGap, Endpoint, FallbackStep, SummaryRegistry};
 
 /// How a call site is handled — the fallback ladder, memoized per site.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +132,18 @@ pub struct TaintProblem<'m> {
     /// The t-P3 receiver-family memo (one entry per queried receiver
     /// value; engine answers are point-independent at rung 1).
     proto_memo: RefCell<HashMap<ValueId, FamilyAnswer>>,
+    /// The t-P4 gap edges (eager scan, [`crate::gap`]): summary call
+    /// site → resolved callback bodies. The driver layers them onto
+    /// the solver's call graph (`GapCallGraph`); the flow functions
+    /// consult them to recognize gap edges.
+    gap_edges: BTreeMap<InstId, Vec<FuncId>>,
+    /// Gap-wrapper counters (FlowDroid's gap-hit/miss analogue): call
+    /// sites whose callback summary applied AND the callback value
+    /// resolved to at least one user body.
+    gap_resolved: usize,
+    /// Callback-summary sites whose callback value did NOT resolve —
+    /// the honest fallback (mini-gap tag only; gap.rs module docs).
+    gap_unresolved: usize,
 }
 
 impl<'m> TaintProblem<'m> {
@@ -191,7 +204,7 @@ impl<'m> TaintProblem<'m> {
                 }
             }
         }
-        TaintProblem {
+        let mut problem = TaintProblem {
             module,
             callgraph,
             oracle: RefCell::new(oracle),
@@ -203,7 +216,91 @@ impl<'m> TaintProblem<'m> {
             counted: RefCell::new(HashSet::new()),
             applied: RefCell::new(Vec::new()),
             proto_memo: RefCell::new(HashMap::new()),
+            gap_edges: BTreeMap::new(),
+            gap_resolved: 0,
+            gap_unresolved: 0,
+        };
+        // The eager gap scan (t-P4, gap.rs): static edges, counter-free.
+        let (edges, resolved, unresolved) = problem.scan_gap_edges();
+        problem.gap_edges = edges;
+        problem.gap_resolved = resolved;
+        problem.gap_unresolved = unresolved;
+        problem
+    }
+
+    /// The gap edges (t-P4 eager scan) — the driver layers them onto
+    /// the solver's call graph via [`crate::gap::GapCallGraph`].
+    pub fn gap_edges(&self) -> &BTreeMap<InstId, Vec<FuncId>> {
+        &self.gap_edges
+    }
+
+    /// The gap-wrapper counters: `(sites with resolved callbacks, sites
+    /// with unresolved callbacks)` (the honest fallback count).
+    pub fn gap_counts(&self) -> (usize, usize) {
+        (self.gap_resolved, self.gap_unresolved)
+    }
+
+    /// The eager gap scan (gap.rs §1): for every call site whose
+    /// winning summary declares a full callback gap, resolve the
+    /// callback argument to user bodies. COUNTER-FREE by construction —
+    /// classification peeks (`compute_class(call, true)`), so the
+    /// fallback-ladder counters keep classifying only solver-processed
+    /// sites.
+    fn scan_gap_edges(&self) -> (BTreeMap<InstId, Vec<FuncId>>, usize, usize) {
+        let mut edges = BTreeMap::new();
+        let mut resolved = 0usize;
+        let mut unresolved = 0usize;
+        for (call, _) in self.callgraph.sites() {
+            let Some(inst) = self.module.inst(call) else {
+                continue;
+            };
+            let Op::Call { args, .. } = &inst.op else {
+                continue;
+            };
+            let SiteClass::Summary { name, .. } = self.compute_class(call, true).0 else {
+                continue;
+            };
+            let Some(summary) = self.registry.peek(&name, args.len()) else {
+                continue;
+            };
+            let Some(cb_gap) = &summary.callback else {
+                continue;
+            };
+            if cb_gap.enter.is_empty() {
+                continue; // mini-gap only — nothing to spawn
+            }
+            let Some(&cbv) = args.get(cb_gap.param as usize) else {
+                unresolved += 1; // the callback argument is absent entirely
+                continue;
+            };
+            let funcs = gap::resolve_callback_funcs(self.module, &self.oracle.borrow(), cbv, call);
+            if funcs.is_empty() {
+                unresolved += 1;
+            } else {
+                resolved += 1;
+                edges.insert(call, funcs);
+            }
         }
+        (edges, resolved, unresolved)
+    }
+
+    /// The gap spec when `(call, callee)` is a gap edge: the eager
+    /// scan's map carries the edge; the site's winning summary carries
+    /// the spec. Returns an owned copy (the registry borrow must not
+    /// outlive the caller's flow-function borrows).
+    fn gap_at(&self, call: InstId, callee: FuncId) -> Option<CallbackGap> {
+        let funcs = self.gap_edges.get(&call)?;
+        if !funcs.contains(&callee) {
+            return None;
+        }
+        let SiteClass::Summary { name, .. } = self.classify(call) else {
+            return None;
+        };
+        let argc = match self.module.inst(call).map(|i| &i.op) {
+            Some(Op::Call { args, .. }) => args.len(),
+            _ => return None,
+        };
+        self.registry.peek(&name, argc).and_then(|s| s.callback.clone())
     }
 
     /// The applied-summary log (application order).
@@ -239,11 +336,47 @@ impl<'m> TaintProblem<'m> {
         if let Some(c) = self.site_class.borrow().get(&call) {
             return c.clone();
         }
-        let Some(inst) = self.module.inst(call) else {
+        // Non-call instructions keep the pre-refactor early-return
+        // semantics: never memoized, never counted.
+        let is_call = self
+            .module
+            .inst(call)
+            .is_some_and(|i| matches!(i.op, Op::Call { .. }));
+        if !is_call {
             return SiteClass::UnknownKeep;
+        }
+        let (class, tried) = self.compute_class(call, false);
+        // Counters fire once per site.
+        if self.counted.borrow_mut().insert(call) {
+            match &class {
+                SiteClass::Summary { name, .. } => self.registry.record_hit(name),
+                SiteClass::BodyStep => self.registry.record_fallback(FallbackStep::BodyStep),
+                SiteClass::NativeKeep => self.registry.record_fallback(FallbackStep::NativeKeep),
+                SiteClass::UnknownKeep => self.registry.record_fallback(FallbackStep::Unknown),
+            }
+            if !matches!(&class, SiteClass::Summary { .. }) {
+                for n in &tried {
+                    self.registry.record_miss(n);
+                }
+            }
+        }
+        self.site_class.borrow_mut().insert(call, class.clone());
+        class
+    }
+
+    /// The classification computation (the precedence table of
+    /// [`TaintProblem::classify`]) without memoization or counters.
+    /// `peek = true` routes registry queries through
+    /// [`SummaryRegistry::peek`] — the eager gap scan's discipline, so
+    /// the scan never perturbs the per-site counters. Returns the class
+    /// plus the candidate names that missed (the backlog log's input
+    /// when nothing rescues the site).
+    fn compute_class(&self, call: InstId, peek: bool) -> (SiteClass, Vec<String>) {
+        let Some(inst) = self.module.inst(call) else {
+            return (SiteClass::UnknownKeep, Vec::new());
         };
         let Op::Call { callee, args, .. } = &inst.op else {
-            return SiteClass::UnknownKeep;
+            return (SiteClass::UnknownKeep, Vec::new());
         };
         let argc = args.len();
         let mut names = callee_name_candidates(self.module, *callee);
@@ -264,57 +397,45 @@ impl<'m> TaintProblem<'m> {
         // backlog: `a.pop` resolved through the Array family must not
         // stay in the miss log).
         let mut tried: Vec<String> = Vec::new();
-        let class = {
-            let mut found = None;
-            for n in &names {
-                if let Some(s) = self.registry.lookup(n, argc) {
-                    found = Some((n.clone(), s.exclusive));
-                    break;
-                }
-                tried.push(n.clone());
+        let mut found = None;
+        for n in &names {
+            let hit = if peek {
+                self.registry.peek(n, argc)
+            } else {
+                self.registry.lookup(n, argc)
+            };
+            if let Some(s) = hit {
+                found = Some((n.clone(), s.exclusive));
+                break;
             }
-            match found {
-                Some((name, exclusive)) => SiteClass::Summary { name, exclusive },
-                None => {
-                    let has_body = callees.iter().any(|f| {
-                        self.module
-                            .func(*f)
-                            .is_some_and(|fd| !fd.is_external && !fd.blocks.is_empty())
-                    });
-                    if has_body {
-                        SiteClass::BodyStep
-                    } else if let Some(name) = self.prototype_summary(inst, call, argc, &mut tried)
-                    {
-                        // Prototype-path applications are additive-only
-                        // (exclusive: false) — see the precedence table.
-                        SiteClass::Summary {
-                            name,
-                            exclusive: false,
-                        }
-                    } else if names.is_empty() {
-                        SiteClass::UnknownKeep
-                    } else {
-                        SiteClass::NativeKeep
+            tried.push(n.clone());
+        }
+        let class = match found {
+            Some((name, exclusive)) => SiteClass::Summary { name, exclusive },
+            None => {
+                let has_body = callees.iter().any(|f| {
+                    self.module
+                        .func(*f)
+                        .is_some_and(|fd| !fd.is_external && !fd.blocks.is_empty())
+                });
+                if has_body {
+                    SiteClass::BodyStep
+                } else if let Some(name) = self.prototype_summary(inst, call, argc, &mut tried, peek)
+                {
+                    // Prototype-path applications are additive-only
+                    // (exclusive: false) — see the precedence table.
+                    SiteClass::Summary {
+                        name,
+                        exclusive: false,
                     }
+                } else if names.is_empty() {
+                    SiteClass::UnknownKeep
+                } else {
+                    SiteClass::NativeKeep
                 }
             }
         };
-        // Counters fire once per site.
-        if self.counted.borrow_mut().insert(call) {
-            match &class {
-                SiteClass::Summary { name, .. } => self.registry.record_hit(name),
-                SiteClass::BodyStep => self.registry.record_fallback(FallbackStep::BodyStep),
-                SiteClass::NativeKeep => self.registry.record_fallback(FallbackStep::NativeKeep),
-                SiteClass::UnknownKeep => self.registry.record_fallback(FallbackStep::Unknown),
-            }
-            if !matches!(&class, SiteClass::Summary { .. }) {
-                for n in &tried {
-                    self.registry.record_miss(n);
-                }
-            }
-        }
-        self.site_class.borrow_mut().insert(call, class.clone());
-        class
+        (class, tried)
     }
 
     /// The t-P3 prototype-resolution path: `recv.m(...)` → the
@@ -331,6 +452,7 @@ impl<'m> TaintProblem<'m> {
         call: InstId,
         argc: usize,
         tried: &mut Vec<String>,
+        peek: bool,
     ) -> Option<String> {
         let leaf = call_method_leaf(self.module, call_inst)?;
         let leaf = self.module.sym.resolve(leaf)?.to_owned();
@@ -342,7 +464,12 @@ impl<'m> TaintProblem<'m> {
         let mut hit = None;
         for family in &answer.families {
             let key = format!("{}.{leaf}", family.key());
-            if self.registry.lookup(&key, argc).is_some() {
+            let found = if peek {
+                self.registry.peek(&key, argc).is_some()
+            } else {
+                self.registry.lookup(&key, argc).is_some()
+            };
+            if found {
                 hit = Some(key);
                 break;
             }
@@ -566,7 +693,7 @@ impl<'m> TaintProblem<'m> {
         let (value, path) = match endpoint {
             Endpoint::Param(i) => (*args.get(*i as usize)?, None),
             Endpoint::Base => (base?, None),
-            Endpoint::Return => return None,
+            Endpoint::Return | Endpoint::ReturnField(_) => return None,
             Endpoint::Field(path) => (base?, Some(path)),
         };
         if local != value {
@@ -633,7 +760,7 @@ impl<'m> TaintProblem<'m> {
             Endpoint::Param(i) => (*args.get(*i as usize)?, None),
             Endpoint::Base => (base?, None),
             Endpoint::Field(path) => (base?, Some(path)),
-            Endpoint::Return => return None,
+            Endpoint::Return | Endpoint::ReturnField(_) => return None,
         };
         let pts = self.oracle.borrow().site_info_at(value, at).sites;
         if pts.is_empty() || !pts.intersects(sites) {
@@ -724,6 +851,19 @@ impl<'m> TaintProblem<'m> {
                     }
                 }
             }
+            Endpoint::ReturnField(path) => {
+                // A result-field sink (filter's base-elements →
+                // result-elements flow): the result value with the
+                // declared path ++ leftover.
+                if !is_handler_site {
+                    if let Some(r) = result {
+                        out.push(Fact::of(TaintFact {
+                            base: TaintBase::Local(r),
+                            fields: append(path),
+                        }));
+                    }
+                }
+            }
             Endpoint::Field(path) => {
                 if let Some(b) = base {
                     let sites = self.oracle.borrow().site_info_at(b, at).sites;
@@ -737,6 +877,56 @@ impl<'m> TaintProblem<'m> {
                         base: base_key,
                         fields: chain,
                     }));
+                }
+            }
+        }
+    }
+
+    /// The gap enter mapping (t-P4; [`crate::gap`] §3): at a gap edge
+    /// `(call → cb_func)`, each of the gap's `enter` rules whose source
+    /// endpoint matches the incoming fact seeds the callback's formal
+    /// (the N66 frame-slot binding — formal 0 of an es2abc closure is
+    /// `params[formal_base]`, not `params[1]`). A heap-sourced match
+    /// seeds a LOCAL formal fact: the element VALUE rides the formal —
+    /// the heap key was about the receiver's storage, not the
+    /// extracted element. `OverApproxAll` binding taints every formal
+    /// (never silently drop a flow).
+    fn gap_enter(
+        &self,
+        call: InstId,
+        cb_func: FuncId,
+        gap: &CallbackGap,
+        fact: &TaintFact,
+        args: &[ValueId],
+        base: Option<ValueId>,
+        out: &mut Vec<Fact>,
+    ) {
+        let Some(fd) = self.module.func(cb_func) else {
+            return;
+        };
+        let binding = param_binding(self.module, cb_func);
+        for enter in &gap.enter {
+            let Some((leftover, _from_heap)) =
+                self.match_flow_endpoint(&enter.from, fact, args, base, call)
+            else {
+                continue;
+            };
+            match binding {
+                ParamBinding::OverApproxAll => {
+                    for &p in &fd.params {
+                        out.push(Fact::of(TaintFact {
+                            base: TaintBase::Local(p),
+                            fields: leftover.clone(),
+                        }));
+                    }
+                }
+                ParamBinding::Precise { formal_base, .. } => {
+                    if let Some(&p) = fd.params.get(formal_base + enter.formal as usize) {
+                        out.push(Fact::of(TaintFact {
+                            base: TaintBase::Local(p),
+                            fields: leftover.clone(),
+                        }));
+                    }
                 }
             }
         }
@@ -1019,15 +1209,20 @@ impl IfdsProblem for TaintProblem<'_> {
         source: &Fact,
         out: &mut Vec<Fact>,
     ) {
+        let gap = self.gap_at(call, callee);
         // Exclusive summaries kill the call edge into the callee body —
-        // never merged (summaries.md §2.1).
-        if matches!(
-            self.classify(call),
-            SiteClass::Summary {
-                exclusive: true,
-                ..
-            }
-        ) {
+        // never merged (summaries.md §2.1). The GAP edge into the user
+        // callback is NOT killed (gap.rs §"Interaction with exclusive":
+        // exclusive-with-callback still runs the callback).
+        if gap.is_none()
+            && matches!(
+                self.classify(call),
+                SiteClass::Summary {
+                    exclusive: true,
+                    ..
+                }
+            )
+        {
             return;
         }
         let Fact::Taint(fact) = source else { return };
@@ -1046,6 +1241,26 @@ impl IfdsProblem for TaintProblem<'_> {
         let Some(fd) = module.func(callee) else {
             return;
         };
+
+        // ── The gap edge (t-P4) ──────────────────────────────────────
+        // The summary call site virtually invokes the callback with
+        // (element, index, array) — the summary call's operands are NOT
+        // the callback's arguments, so the normal arg→param binding does
+        // not run here; only the gap's `enter` rules bind. Function-
+        // global state crosses unchanged (same as a normal edge). The
+        // oracle's calling-context injection is deliberately skipped:
+        // the rung-1 engine reads the BASE call graph, which has no gap
+        // edges — a query inside the callback that tries to hop through
+        // the gap call finds no recorded caller and falls back to the
+        // rung-0 floor (sound; documented in gap.rs).
+        if let Some(gap) = &gap {
+            if fact.is_state_base() {
+                out.push(source.clone());
+            }
+            let base = call_base_value(module, call_inst);
+            self.gap_enter(call, callee, gap, fact, args, base, out);
+            return;
+        }
 
         // The oracle learns the calling context (rung 0: no-op; the seam
         // discipline of analysis-strategy §5.2 / infoflow.md §4.3).
@@ -1121,16 +1336,31 @@ impl IfdsProblem for TaintProblem<'_> {
                 // The mini-gap channel: a callback value tagged
                 // `[AnyIndex, ...]` by a summary (forEach-style) seeds
                 // its first formal when user code calls it directly.
+                // N66: the first FORMAL is `params[formal_base]` (the
+                // implicit frame slots lead), not `params[1]`;
+                // OverApproxAll taints every formal (never silently
+                // drop).
                 if *v == *callee_val && !fact.fields.is_empty() {
                     if fact.fields.elements()[0] == FieldKey::AnyIndex {
                         let mut rest = FieldChain::new();
                         for &k in &fact.fields.elements()[1..] {
                             rest = rest.pushed(k, self.cap());
                         }
-                        if let Some(&p1) = fd.params.get(1) {
-                            out.push(Fact::of(
-                                fact.with_fields(rest).rebased(TaintBase::Local(p1)),
-                            ));
+                        match param_binding(module, callee) {
+                            ParamBinding::Precise { formal_base, .. } => {
+                                if let Some(&p1) = fd.params.get(formal_base) {
+                                    out.push(Fact::of(
+                                        fact.with_fields(rest).rebased(TaintBase::Local(p1)),
+                                    ));
+                                }
+                            }
+                            ParamBinding::OverApproxAll => {
+                                for &p in &fd.params {
+                                    out.push(Fact::of(
+                                        fact.with_fields(rest.clone()).rebased(TaintBase::Local(p)),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }
@@ -1148,7 +1378,7 @@ impl IfdsProblem for TaintProblem<'_> {
         &self,
         module: &Module,
         call_site: Option<InstId>,
-        _callee: FuncId,
+        callee: FuncId,
         exit: InstId,
         return_site: Option<InstId>,
         source: &Fact,
@@ -1160,12 +1390,21 @@ impl IfdsProblem for TaintProblem<'_> {
         };
 
         // State bases are function-global: they cross returns unchanged
-        // (also for unbalanced returns with `None` endpoints).
+        // (also for unbalanced returns with `None` endpoints — and
+        // across gap edges: the callback's side effects on heap/global
+        // state persist at the summary call's continuation).
         if fact.is_state_base() {
             out.push(source.clone());
             return;
         }
         let Some(v) = fact.local_base() else { return };
+        // The gap return channel (t-P4; gap.rs §4): at a gap edge the
+        // callback's RETURN value maps per the summary's
+        // `return_to_result` instead of the normal value→result
+        // rebasing (map: the result array's `[AnyIndex]` elements;
+        // forEach: `None` — the callback return dies with the undefined
+        // result).
+        let gap = call_site.and_then(|c| self.gap_at(c, callee));
 
         match &exit_inst.op {
             Op::Return { value } => {
@@ -1178,6 +1417,24 @@ impl IfdsProblem for TaintProblem<'_> {
                 // The return VALUE flows only to the normal continuation,
                 // never to handler entries.
                 if self.handler_exception_at(rs).is_some() {
+                    return;
+                }
+                if let Some(gap) = &gap {
+                    if let Some(chain) = &gap.return_to_result {
+                        if let Some(Some(result)) = module.inst(call).map(|i| i.result) {
+                            let mut fields = FieldChain::new();
+                            for &k in chain.elements() {
+                                fields = fields.pushed(k, self.cap());
+                            }
+                            for &k in fact.fields.elements() {
+                                fields = fields.pushed(k, self.cap());
+                            }
+                            out.push(Fact::of(TaintFact {
+                                base: TaintBase::Local(result),
+                                fields,
+                            }));
+                        }
+                    }
                     return;
                 }
                 if let Some(Some(result)) = module.inst(call).map(|i| i.result) {
@@ -1250,10 +1507,14 @@ impl IfdsProblem for TaintProblem<'_> {
                         }
                     }
                     // Mini-gap: tag the callback value with `[AnyIndex]`
-                    // (the may-call-user-code marker).
-                    if let Some(cb) = summary.callback {
+                    // (the may-call-user-code marker). The FULL gap
+                    // propagator's enter/return channels live on the
+                    // gap call/return edges (gap.rs); this tag remains
+                    // the channel for DIRECT user calls of the callback
+                    // value and the unresolved-callback fallback.
+                    if let Some(cb_gap) = &summary.callback {
                         if Self::match_endpoint(&Endpoint::Base, fact, args, base).is_some() {
-                            if let Some(&cbv) = args.get(cb as usize) {
+                            if let Some(&cbv) = args.get(cb_gap.param as usize) {
                                 out.push(Fact::of(
                                     TaintFact::local(cbv).pushed(FieldKey::AnyIndex, self.cap()),
                                 ));

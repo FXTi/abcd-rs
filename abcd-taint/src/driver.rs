@@ -39,6 +39,7 @@ use abcd_analysis::dataflow::ifds::{IfdsConfig, IfdsResult, IfdsSolver};
 use abcd_ir::{FuncId, InstId, Loc, Module, Op, ValueId};
 
 use crate::fact::{Fact, TaintFact};
+use crate::gap::GapCallGraph;
 use crate::names::{call_base_value, callee_name_candidates};
 use crate::oracle::Oracle;
 use crate::problem::TaintProblem;
@@ -167,6 +168,13 @@ pub struct TaintReport {
     pub summary_misses: std::collections::BTreeMap<String, usize>,
     /// Total propagated path edges (solver work).
     pub path_edges: usize,
+    /// t-P4 gap-wrapper counters: callback-summary call sites whose
+    /// callback value resolved to user bodies (the full gap propagator
+    /// entered them).
+    pub gap_sites_resolved: usize,
+    /// Callback-summary sites whose callback value did NOT resolve —
+    /// the honest fallback (mini-gap tag only; `gap.rs` module docs).
+    pub gap_sites_unresolved: usize,
 }
 
 impl TaintReport {
@@ -233,10 +241,14 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     }
 
     let problem = TaintProblem::new(module, callgraph, oracle, &registry, config);
+    // The t-P4 gap layer: the eager scan's callback edges ride the
+    // solver's call-graph oracle (the base graph itself is untouched —
+    // sink collection and path reconstruction keep consuming it).
+    let gap_graph = GapCallGraph::new(callgraph, problem.gap_edges());
     let solver = IfdsSolver::new(
         module,
         &problem,
-        callgraph,
+        &gap_graph,
         IfdsConfig {
             follow_returns_past_seeds: config.follow_returns_past_seeds,
         },
@@ -245,6 +257,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
 
     let hits = collect_hits(module, config, callgraph, &result);
     let applied = problem.applied_summaries();
+    let (gap_sites_resolved, gap_sites_unresolved) = problem.gap_counts();
     let stats = registry.stats();
     let resolve_map = |m: &std::collections::BTreeMap<abcd_ir::Sym, usize>| {
         m.iter()
@@ -258,6 +271,8 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         stats,
         summaries_applied: applied,
         path_edges: result.path_edges().len(),
+        gap_sites_resolved,
+        gap_sites_unresolved,
     };
     let path_index = PathIndex::build(module, &result);
     for hit in &mut report.hits {

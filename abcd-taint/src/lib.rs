@@ -17,9 +17,15 @@
 //! - [`summary`] — the minimal summary registry (summaries.md §"A
 //!   minimal summary registry for a JS bytecode analyzer"):
 //!   `Map<(Sym, Arity), Summary>` with flows over
-//!   `{param(i), base, return, field(path)}`, clears, `is_alias`,
-//!   a mini-gap `callback` flag, an `exclusive` bit, negative caching,
-//!   and miss counters from day one.
+//!   `{param(i), base, return, field(path), return-field(path)}`,
+//!   clears, `is_alias`, a callback gap specification (the mini-gap tag
+//!   plus the t-P4 full propagator's enter/return rules), an
+//!   `exclusive` bit, negative caching, and miss counters from day one.
+//! - [`gap`] — the full gap propagator (t-P4; FlowDroid's
+//!   `spawnAnalysisIntoClientCode`): callback-summary call sites grow
+//!   synthetic call edges into the resolved callback bodies, the IFDS
+//!   enters them with tainted formals, and the callback's return flows
+//!   back onto the summary call's result per the gap spec.
 //! - [`problem`] — the [`problem::TaintProblem`]: the four flow
 //!   functions, driven by `Op::operands()`/`Op::has_result()` plus
 //!   explicit per-family rules only where semantics demand (property
@@ -44,6 +50,7 @@
 
 pub mod driver;
 pub mod fact;
+pub mod gap;
 pub mod names;
 pub mod oracle;
 pub mod problem;
@@ -52,7 +59,11 @@ pub mod summary;
 
 pub use driver::{PathStep, SinkHit, SinkSpec, SourceSpec, TaintConfig, TaintReport, run_taint};
 pub use fact::{Fact, TaintBase, TaintFact};
+pub use gap::GapCallGraph;
 pub use oracle::Oracle;
 pub use problem::TaintProblem;
 pub use prototype::{FamilyAnswer, ProtoFamily, PrototypeResolver};
-pub use summary::{Endpoint, Flow, RegistryStats, Summary, SummaryRegistry, builtin_summaries};
+pub use summary::{
+    CallbackGap, Endpoint, Flow, GapEnter, RegistryStats, Summary, SummaryRegistry,
+    builtin_summaries,
+};

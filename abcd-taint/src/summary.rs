@@ -20,17 +20,31 @@
 //!   trigger is a no-op (`Rung0AliasOracle::aliases_of_store` injects
 //!   nothing — aliasing is resolved at the fact key); the flag is
 //!   recorded for the rung-1 engine and for documentation.
-//! - `callback`: mini-gap — "invokes `param(i)` with elements of the
-//!   base" (`forEach`/`map`/…). The callback value is tagged with an
-//!   `[AnyIndex]` field chain; if user code calls that value directly
-//!   (resolvable by the call graph), the tag maps onto the callback's
-//!   first formal parameter. A full gap propagator (resuming the summary
-//!   after user-code callbacks) is NOT implemented — documented
-//!   imprecision, ladder pointer in the README.
+//! - `callback`: the gap specification (FlowDroid's gap mechanism,
+//!   summaries.md §1–2 — "invokes `param(i)` with elements of the base",
+//!   `forEach`/`map`/…). Two channels:
+//!   1. the mini-gap tag — the callback value is tagged with an
+//!      `[AnyIndex]` field chain on the call-to-return edge; if user
+//!      code calls that value directly (resolvable by the call graph),
+//!      the tag maps onto the callback's first formal parameter;
+//!   2. the FULL gap propagator (t-P4) — when the callback value
+//!      resolves to user bodies (closure alloc / direct callee /
+//!      points-to), the summary call site grows a synthetic call edge
+//!      into each body ([`crate::gap`]): the gap's `enter` rules map
+//!      matching taint onto the callback's formals, the normal IFDS
+//!      runs the body, and the callback's RETURN flows back onto the
+//!      call result per `return_to_result` (map: the result array's
+//!      `[AnyIndex]` elements; forEach: `None` — the result is
+//!      undefined). An unresolved callback falls back to the tag alone
+//!      (honest documented imprecision — the wrapper counters record
+//!      it).
 //! - `exclusive`: the summary is a COMPLETE model of the callee — the
 //!   call edge into the callee body is killed, never merged
 //!   (summaries.md §2.1: "exclusive summary wins over the callee's
-//!   body; the two are never merged"). Default false.
+//!   body; the two are never merged"). The gap edge into the CALLBACK
+//!   body is NOT killed: exclusive-with-callback still runs the user
+//!   callback (FlowDroid's `spawnAnalysisIntoClientCode` discipline).
+//!   Default false.
 //!
 //! ## The fallback ladder (reader D, summaries.md §4)
 //!
@@ -72,6 +86,46 @@ pub enum Endpoint {
     Return,
     /// A field path below the base object.
     Field(FieldChain),
+    /// A field path below the call's RESULT value (sink-only — never a
+    /// flow source): the filter shape, `base elements → result
+    /// elements`, is `flow(Field([AnyIndex]), ReturnField([AnyIndex]))`.
+    ReturnField(FieldChain),
+}
+
+/// One gap-enter rule of a callback summary (FlowDroid's flows INTO a
+/// gap, summaries.md §1): taint matching `from` at the summary call
+/// site enters the callback body on formal `formal` (0-based over the
+/// callback's declared formals — the implicit frame slots are skipped
+/// by the N66 binding).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GapEnter {
+    /// The source endpoint at the summary call site (e.g.
+    /// `Field([AnyIndex])` = the base's elements, `Base` = the whole
+    /// receiver).
+    pub from: Endpoint,
+    /// The callback formal the taint enters on (0 = the element).
+    pub formal: u16,
+}
+
+/// The full gap specification of a callback summary (FlowDroid's
+/// `GapDefinition` + its flows, summaries.md §1–2). The mini-gap tag
+/// (the callback value's `[AnyIndex]` marker for DIRECT user calls of
+/// the value) keys off `param` alone; `enter`/`return_to_result` drive
+/// the full propagator ([`crate::gap`]) once the callback value
+/// resolves to user bodies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallbackGap {
+    /// Which call argument is the callback value.
+    pub param: u16,
+    /// Taint INTO the callback's formals (empty = mini-gap only).
+    pub enter: Vec<GapEnter>,
+    /// Where the callback's RETURN flows at the summary call site:
+    /// `Some(chain)` = onto the call result with `chain` prepended to
+    /// the returned taint's fields (map: `[AnyIndex]` — the result
+    /// array's elements); `None` = the callback return carries nothing
+    /// (forEach: the result is undefined; filter: the predicate's
+    /// boolean does not taint the result array).
+    pub return_to_result: Option<FieldChain>,
 }
 
 /// One propagation rule of a summary.
@@ -97,9 +151,11 @@ pub struct Summary {
     pub clears: Vec<Endpoint>,
     /// Complete model: kills the call edge into the callee body.
     pub exclusive: bool,
-    /// Mini-gap: `Some(i)` = the builtin invokes argument `i` with
-    /// elements of the base (may-call user code).
-    pub callback: Option<u16>,
+    /// Gap: `Some(_)` = the builtin invokes argument `param` with
+    /// elements of the base (may-call user code). The mini-gap tag
+    /// works off `param` alone; the full propagator (t-P4) consumes
+    /// `enter` / `return_to_result` when the callback value resolves.
+    pub callback: Option<CallbackGap>,
 }
 
 impl Summary {
@@ -146,9 +202,41 @@ impl Summary {
         self
     }
 
-    /// Mark the callback mini-gap.
+    /// Mark the callback gap: the builtin invokes argument `param` with
+    /// elements of the base. On its own this enables only the mini-gap
+    /// tag; add [`Summary::gap_enter`] / [`Summary::gap_return`] rules
+    /// for the full propagator.
     pub fn callback(mut self, param: u16) -> Self {
-        self.callback = Some(param);
+        self.callback = Some(CallbackGap {
+            param,
+            enter: Vec::new(),
+            return_to_result: None,
+        });
+        self
+    }
+
+    /// Add a gap-enter rule: taint matching `from` at the summary call
+    /// site enters the callback body on formal `formal`. Panics without
+    /// a preceding [`Summary::callback`] — the callback argument index
+    /// must be set first.
+    pub fn gap_enter(mut self, from: Endpoint, formal: u16) -> Self {
+        let gap = self
+            .callback
+            .as_mut()
+            .expect("callback(param) before gap_enter");
+        gap.enter.push(GapEnter { from, formal });
+        self
+    }
+
+    /// Set the gap return channel: the callback's return flows onto the
+    /// call result with `chain` prepended (map: `[AnyIndex]`). Panics
+    /// without a preceding [`Summary::callback`].
+    pub fn gap_return(mut self, chain: FieldChain) -> Self {
+        let gap = self
+            .callback
+            .as_mut()
+            .expect("callback(param) before gap_return");
+        gap.return_to_result = Some(chain);
         self
     }
 }
@@ -250,6 +338,17 @@ impl SummaryRegistry {
         self.neg.borrow_mut().insert(exact);
         self.neg.borrow_mut().insert(variadic);
         None
+    }
+
+    /// A counter-free lookup (no stats, no negative-cache mutation) —
+    /// the eager gap scan ([`crate::gap`]) must not perturb the
+    /// fallback-ladder counters, which classify only solver-processed
+    /// sites.
+    pub fn peek(&self, name: &str, argc: usize) -> Option<&Summary> {
+        let sym = self.syms.borrow_mut().intern(name);
+        self.by_key
+            .get(&(sym, Some(argc)))
+            .or_else(|| self.by_key.get(&(sym, None)))
     }
 
     /// Record a named miss (the backlog log) — called by the problem
@@ -596,6 +695,62 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
                     Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
                     Return,
                 ),
+        ),
+        // ── The gap trio (t-P4; Array.prototype.forEach/map/filter) ──
+        // The canonical FlowDroid gap case: the builtin invokes the
+        // callback (param 0) once per element of the base. All three
+        // share the enter rules — the whole-receiver taint (Base) and
+        // the `[AnyIndex]` element taint enter on the callback's formal
+        // 0 (the element; index/array formals 1–2 are unmodeled). They
+        // differ in the RETURN channel:
+        //
+        // forEach: result is undefined — the callback return carries
+        // nothing (`return_to_result: None`). Variadic (thisArg
+        // tolerated, unmodeled). NON-exclusive: forEach neither
+        // sanitizes nor replaces the array.
+        (
+            "Array.prototype.forEach",
+            None,
+            Summary::new("gap: base elements → cb(elem); cb return discarded (undefined result)")
+                .callback(0)
+                .gap_enter(Base, 0)
+                .gap_enter(Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)), 0),
+        ),
+        // map: the result array's elements ARE the callback returns —
+        // the gap return channel writes cb-return taint onto the
+        // result's `[AnyIndex]` chain. A callback that ignores its
+        // parameter taints nothing (the negative-control shape).
+        (
+            "Array.prototype.map",
+            None,
+            Summary::new("gap: base elements → cb(elem); cb return → result[any]")
+                .callback(0)
+                .gap_enter(Base, 0)
+                .gap_enter(Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)), 0)
+                .gap_return(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
+        ),
+        // filter: the callback is a PREDICATE — its boolean return
+        // taints nothing (`return_to_result: None`); the result array's
+        // elements are the base's KEPT elements, a static flow
+        // (Field([AnyIndex]) → ReturnField([AnyIndex]), plus the
+        // whole-array Base fallback).
+        (
+            "Array.prototype.filter",
+            None,
+            Summary::new(
+                "gap: base elements → cb(elem) predicate; result[any] ← base elements (cb return is a fresh boolean)",
+            )
+            .flow(
+                Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
+                ReturnField(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
+            )
+            .flow(
+                Base,
+                ReturnField(FieldChain::new().pushed(FieldKey::AnyIndex, 5)),
+            )
+            .callback(0)
+            .gap_enter(Base, 0)
+            .gap_enter(Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)), 0),
         ),
     ]
 }
