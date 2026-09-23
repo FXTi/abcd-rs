@@ -433,6 +433,34 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   verify.rs's private dominators are polluted by unreachable Normal
   preds (weakens N45 only); fix = treat unreachable preds as absent,
   pending abcd-ir thaw. NEXT: v2-P5b (abcd-taint app).
+  N64 FIXED (b41f643, orchestrator DIY with maintainer's abcd-ir
+  thaw): verify_dominance computes Normal-reachability first and drops
+  unreachable preds. Red-first via worktree at HEAD. PROCESS INCIDENT:
+  the remote shared target cache served STALE binaries twice (false
+  green AND false red) — force freshness with `touch` before evidence
+  runs.
+  t-P1 DONE (2026-09-23): 22-probe taint evaluation suite (5 families,
+  ground truth annotations with closes_at_rung) — baseline tp=11 fp=4
+  fn=4, the ladder-climbing instrument (fails loudly when an expected
+  gap closes). N66 FIXED with it: taint call_flow now uses the vendored
+  frame-slot model (0xF: this=params[2], formals=params[3..]) — the
+  probe suite caught it, proved the fix. N67 registered: lift
+  this_param points at the func slot (latent; ldthis absent from
+  corpus) — slated for the d-P6 batch.
+  d-P5 DONE (2026-09-23): try-projection family closed — dream gate
+  951 -> 1023 (exactly +72, zero regressions). Six root causes fixed
+  (join hoist out of cut mixed Ifs, exception-edge phi flush before
+  throw, finally-chain laminar walk, shim region closure, loop-exit
+  trio incl. the switch-fold loop-break hang).
+  FRAME-SLOT CANONICAL HOME (ruled 2026-09-23): abcd-ir::frame is the
+  canonical module for the vendored frame-slot model (CallType + slot
+  roles) — it is IR semantics. abcd-opt inline.rs, abcd-taint
+  problem.rs, abcd-analysis' stopgap all defer to it once public
+  (absorbs the "unify the copies" follow-up). Parallel-work rule
+  reaffirmed: the shared tree must compile at ALL times (t-P2 was
+  blocked by d-P6's broken WIP; workers commit early).
+  IN FLIGHT: d-P6 (private member buffers + N67) || t-P2 (rung-1 alias
+  engine — trigger fired per the probe suite).
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
