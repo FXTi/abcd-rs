@@ -22,8 +22,9 @@ Pipeline (design/decompile.md §7 d-P4):
    - `expected-fallback`: the decompiled text carries hard-7 fallback
      comments (async/generator machinery, design §5) — behavior
      divergence is expected by construction.
-   - `fixture-unsupported`: module fixtures whose module dependencies
-     the single-file recompile cannot rebuild, and similar.
+   - `fixture-unsupported`: G2 residual only (post-d-P9): module
+     fixtures whose `export { name }` references a binding with no
+     consistent slot-name file evidence (synthetic `m{i}` names).
    - `decompile-bug`: everything else — invalid JS or wrong semantics
      attributable to our emitter.
 
@@ -176,11 +177,15 @@ def main():
             err = comp.get("error", "")
             if row["hard_fallbacks"]:
                 bucket = "expected-fallback"
-            elif row["module"]:
-                # IR gap G2 + the call-entry wrapper: module top-level
-                # bindings are not module-scoped in our output, so
-                # `export { name }` cannot resolve (a SyntaxError here
-                # is the G2 gap, not a parse bug).
+            elif (row["module"] and "SyntaxError" in err
+                  and "Export name" in err and "is not defined" in err):
+                # G2 residual (post-d-P9): a module-var slot whose
+                # binding name has NO consistent file evidence (both
+                # channels — TDZ-guard name, stored definition name —
+                # absent or contradictory) keeps its synthetic `m{i}`
+                # fallback, so the export record's local name cannot
+                # resolve. Sharper than the d-P4 blanket "module" rule:
+                # any OTHER module compile failure is ours/es2abc's.
                 bucket = "fixture-unsupported"
             elif "SyntaxError" in err:
                 # Our text does not parse — that's ours, not es2abc's.
@@ -192,12 +197,10 @@ def main():
             # Compiled but behavior diverged (or the VM run failed).
             if row["hard_fallbacks"]:
                 bucket = "expected-fallback"
-            elif row["module"]:
-                # IR gap G2: module-var slot↔name correspondence is not
-                # in the IR, so `export { name }` references bindings
-                # the recompiled module cannot provide.
-                bucket = "fixture-unsupported"
             else:
+                # Post-d-P9 G2 is closed: a module fixture that compiles
+                # and diverges is a behavior bug in our emitter like any
+                # other — no module-specific amnesty.
                 bucket = "decompile-bug"
             oracle = cmp_res.get("oracle", {})
             key = f"{bucket}: {json.dumps(oracle)[:120]}"
