@@ -1342,6 +1342,16 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
     } else {
         (otherwise, then)
     };
+    // An unlabeled `break` in a case arm changes meaning under the
+    // fold: before the fold it exits the enclosing LOOP; inside a
+    // `switch` it would exit the switch (dream gate:
+    // opt-try-catch-func/test-nested-try-catch hung —
+    // `case 5.0: break` fell back into the loop, d-P5). The fold is
+    // cosmetic; keep the if-chain instead. (Labeled breaks name their
+    // target and `continue` ignores switches, so both are safe.)
+    if arm_has_loop_break(case_body) {
+        return None;
+    }
     let mut cases = vec![SwitchCase {
         tests: vec![lit],
         body: with_break(case_body.clone()),
@@ -1361,6 +1371,9 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
                     return None;
                 }
                 let (body2, cont2) = if pos2 { (t2, o2) } else { (o2, t2) };
+                if arm_has_loop_break(body2) {
+                    return None;
+                }
                 cases.push(SwitchCase {
                     tests: vec![lit2],
                     body: with_break(body2.clone()),
@@ -1381,6 +1394,9 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
                 break;
             }
             other => {
+                if arm_has_loop_break(other) {
+                    return None;
+                }
                 cases.push(SwitchCase {
                     tests: vec![],
                     body: other.to_vec(),
@@ -1390,6 +1406,29 @@ fn match_switch_chain(n: &SNode) -> Option<(Expr, Vec<SwitchCase>)> {
         }
     }
     Some((disc, cases))
+}
+
+/// Whether an arm of a foldable if-chain contains an unlabeled `break`
+/// at case-arm depth — a loop exit that a `switch` wrapper would
+/// reinterpret as a switch exit. Nested loops/switches intercept their
+/// own breaks, so the walk does not descend into them.
+fn arm_has_loop_break(nodes: &[SNode]) -> bool {
+    nodes.iter().any(|n| match n {
+        SNode::Break { label: None } => true,
+        SNode::If {
+            then, otherwise, ..
+        } => arm_has_loop_break(then) || arm_has_loop_break(otherwise),
+        SNode::Labeled { body, .. } => arm_has_loop_break(body),
+        SNode::Try { body, catches, .. } => {
+            arm_has_loop_break(body) || catches.iter().any(|c| arm_has_loop_break(&c.body))
+        }
+        SNode::While { .. }
+        | SNode::DoWhile { .. }
+        | SNode::ForOf { .. }
+        | SNode::ForIn { .. }
+        | SNode::Switch { .. } => false,
+        SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => false,
+    })
 }
 
 /// The `(discriminant, case-literal)` of a POSITIVE `x === lit`

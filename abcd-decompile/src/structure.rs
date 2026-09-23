@@ -904,13 +904,47 @@ impl<'m> Ctx<'m> {
             let mut fd = FunctionData::new(ClassId::new(0), name, self.rf.kind);
             fd.blocks = blocks;
             // Nested try regions fully inside this handler's set ride
-            // along (their handlers get their own shims).
+            // along (their handlers get their own shims). A region
+            // whose protected set ALSO covers an inner handler block
+            // rides along too — transitively, once the inner handler's
+            // own region is included: that is exactly the es2abc
+            // finally idiom (the outer try protects the inner catch
+            // body, whose blocks are dispatch-entered and therefore
+            // never Normal-reachable members of this set), and
+            // excluding it silently drops the outer finally's whole
+            // try/catch — its handler body and its phi temporaries
+            // (dream gate: opt-try-catch-func/test-nested-try-catch
+            // `ReferenceError: v101 is not defined`, d-P5).
             let block_set: BTreeSet<BlockId> = fd.blocks.iter().copied().collect();
-            fd.try_regions = f
-                .try_regions
+            let mut chosen: Vec<usize> = Vec::new();
+            loop {
+                let mut changed = false;
+                for (i, tr) in f.try_regions.iter().enumerate() {
+                    if chosen.contains(&i) {
+                        continue;
+                    }
+                    let ok = tr.protected.iter().all(|b| {
+                        block_set.contains(b)
+                            || chosen.iter().any(|&j| {
+                                f.try_regions[j]
+                                    .catches
+                                    .iter()
+                                    .any(|cc| cc.handler == *b)
+                            })
+                    });
+                    if ok {
+                        chosen.push(i);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            chosen.sort_unstable();
+            fd.try_regions = chosen
                 .iter()
-                .filter(|tr| tr.protected.iter().all(|b| block_set.contains(b)))
-                .cloned()
+                .map(|&i| f.try_regions[i].clone())
                 .collect();
             shim.functions.push(fd);
             let tree = structure_regions(&shim, fid);
@@ -1718,32 +1752,62 @@ impl<'m> Ctx<'m> {
         }
     }
 
-    /// The join-hoist correctness condition: every out-of-shim Normal
-    /// edge of every handler of plan `p` (the handlers' continuations,
-    /// which the shim model cuts) targets exactly the tail entry — the
-    /// point where the VM's PC-range dispatch rejoins. At least one
-    /// such edge must exist (otherwise the hoist is unnecessary churn).
-    fn handler_joins_at(&self, p: usize, d_entry: BlockId) -> bool {
-        let mut any = false;
+    /// The join-hoist correctness condition, generalized: every
+    /// out-of-shim Normal edge of every handler of plan `p` (the
+    /// handlers' continuations, which the shim model cuts) must target
+    /// the entry of one of the deferred tail's nodes, and all such
+    /// edges must target the SAME tail node — the point where the VM's
+    /// PC-range dispatch rejoins. Returns that node's index in
+    /// `defers`. A nonzero index is only usable when the skipped
+    /// prefix is try-path-only and cannot throw (phi wiring) — the
+    /// caller checks [`Ctx::defer_prefix_phi_only`].
+    fn handler_rejoin_index(&self, p: usize, defers: &[RegionId]) -> Option<usize> {
+        let mut index: Option<usize> = None;
         for &h in &self.f().plans[p].handlers {
             let Some(set) = self.shim_sets.get(&h) else {
-                return false; // exotic handler shape — no shim, no hoist
+                return None; // exotic handler shape — no shim, no hoist
             };
             if !set.contains(&h) {
-                return false;
+                return None;
             }
             for &b in set {
                 for s in block_succs(self.module, b) {
                     if !set.contains(&s) {
-                        if s != d_entry {
-                            return false;
+                        let k = defers
+                            .iter()
+                            .position(|&d| self.entry_of(d) == Follow::Entry(s))?;
+                        if index.is_some_and(|i| i != k) {
+                            return None;
                         }
-                        any = true;
+                        index = Some(k);
                     }
                 }
             }
         }
-        any
+        index
+    }
+
+    /// Whether a deferred-tail prefix is pure phi wiring (phi decls /
+    /// assigns, elided guards — nothing that can throw). Only then may
+    /// it stay inline in the try body: it is reachable solely from the
+    /// try path, and over-protection is impossible when no instruction
+    /// can raise (dream gate: test-passes-under-try-catch's B5, d-P5).
+    fn defer_prefix_phi_only(&mut self, prefix: &[RegionId]) -> bool {
+        for &id in prefix {
+            let blocks = self.f_mut().node_blocks(id);
+            for b in blocks {
+                let parts = self.block_parts(b);
+                if !parts.main.iter().all(|s| {
+                    matches!(
+                        s,
+                        Stmt::PhiDecl { .. } | Stmt::PhiAssign { .. } | Stmt::Elided { .. }
+                    )
+                }) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The join-hoist driver: split the cut `If`, emit
@@ -1758,24 +1822,51 @@ impl<'m> Ctx<'m> {
         follow: Follow,
         out: &mut Vec<SNode>,
     ) -> bool {
+        let debug = std::env::var_os("ABCD_CUT_DEBUG").is_some();
         // Phase 1 — pure analysis.
         let Some(split) = self.cut_classify(id, p) else {
+            if debug {
+                eprintln!("CUT-BAIL plan={p}: classify failed");
+            }
             return false;
         };
         if matches!(split, CutSplit::Prot) {
+            if debug {
+                eprintln!("CUT-BAIL plan={p}: all-protected");
+            }
             return false;
         }
         let mut defers = Vec::new();
         self.collect_defers(id, &split, &mut defers);
         let Some(&first) = defers.first() else {
+            if debug {
+                eprintln!("CUT-BAIL plan={p}: no defers");
+            }
             return false;
         };
-        let Follow::Entry(d_entry) = self.entry_of(first) else {
-            return false;
-        };
-        if !self.handler_joins_at(p, d_entry) {
+        if !matches!(self.entry_of(first), Follow::Entry(_)) {
+            if debug {
+                eprintln!("CUT-BAIL plan={p}: tail entry unknown");
+            }
             return false;
         }
+        // The handlers' rejoin point within the tail. A nonzero index
+        // means the handlers rejoin LATER in the tail; the skipped
+        // prefix stays inline in the try body (try-path-only) and must
+        // be pure phi wiring (it would otherwise be over-protected).
+        let Some(rejoin) = self.handler_rejoin_index(p, &defers) else {
+            if debug {
+                eprintln!("CUT-BAIL plan={p}: handler rejoin not in the tail");
+            }
+            return false;
+        };
+        if rejoin > 0 && !self.defer_prefix_phi_only(&defers[..rejoin]) {
+            if debug {
+                eprintln!("CUT-BAIL plan={p}: try-path prefix can throw");
+            }
+            return false;
+        }
+        let hoisted = &defers[rejoin..];
         let handlers = self.f().plans[p].handlers.clone();
         // v1: no outer finally-chain around this plan (the hoisted
         // tail's placement relative to chain wraps needs the generic
@@ -1784,6 +1875,9 @@ impl<'m> Ctx<'m> {
             .outer_wrap_plan(&[p].into_iter().collect(), &handlers)
             .is_some()
         {
+            if debug {
+                eprintln!("CUT-BAIL plan={p}: outer finally-chain present");
+            }
             return false;
         }
 
@@ -1818,10 +1912,16 @@ impl<'m> Ctx<'m> {
                 "try region {region}: protected statements are not contiguous in the structured output — this is wrapper #{wraps} for the same region (catch body duplicated, finally-style)"
             )));
         }
-        body.push(SNode::Honest(format!(
-            "try region {region}: the handler continuation (the try's join) is nested inside a protected conditional arm — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there)"
-        )));
-        let defer_ids: HashSet<RegionId> = defers.iter().copied().collect();
+        if rejoin > 0 {
+            body.push(SNode::Honest(format!(
+                "try region {region}: the handler continuation (the try's join) is nested inside a protected conditional arm — the rejoin suffix is hoisted to after the try/catch; the try-path-only phi prefix stays inline (it cannot throw, so over-protection is impossible)"
+            )));
+        } else {
+            body.push(SNode::Honest(format!(
+                "try region {region}: the handler continuation (the try's join) is nested inside a protected conditional arm — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there)"
+            )));
+        }
+        let defer_ids: HashSet<RegionId> = hoisted.iter().copied().collect();
         self.f_mut().cut_defer = Some(CutDefer { ids: defer_ids });
         self.emit_content(id, Some(p), follow, &mut body);
         let leftover = match self.f_mut().cut_defer.take() {
@@ -1860,9 +1960,9 @@ impl<'m> Ctx<'m> {
 
         // Phase 3 — the hoisted tail: emitted with the caller's active
         // plan, follows threaded through the tail's own entries.
-        for (i, &d) in defers.iter().enumerate() {
-            let fl = if i + 1 < defers.len() {
-                self.entry_of(defers[i + 1])
+        for (i, &d) in hoisted.iter().enumerate() {
+            let fl = if i + 1 < hoisted.len() {
+                self.entry_of(hoisted[i + 1])
             } else {
                 follow
             };
@@ -2351,11 +2451,23 @@ impl<'m> Ctx<'m> {
         };
         let (phi_t, phi_f, rest) = Self::partition_phi(&parts.phi, t, f);
         Self::push_stmts(out, Self::stmts_leaves(&rest));
+        // The head's out-edge action (break/continue) belongs AFTER the
+        // arm's content, not before it: when the acyclic tree threads a
+        // loop-exit TAIL into the arm (the arm's blocks no longer reach
+        // the latch, so the head's edge into them is classified
+        // Break/Continue), the arm still has to RUN — its finally
+        // bodies, loop-carried phi assigns — before the exit happens.
+        // Emitted first, the action makes the whole arm dead code
+        // (dream gate: opt-try-catch-func/test-nested-try-catch's
+        // `j === 5 → break` arm hung the inner loop, d-P5). When the
+        // arm's own exits already carry their actions the head's action
+        // is harmlessly dead after them; when the arm falls through it
+        // is the required exit.
+        let act_t = self.edge_action(head, t);
         let mut then: Vec<SNode> = Vec::new();
         Self::push_stmts(&mut then, Self::stmts_leaves(&phi_t));
-        if let Some(act) = self.edge_action(head, t) {
-            then.push(act);
-        } else if self.f().cross_arm.contains(&(head, t))
+        if act_t.is_none()
+            && self.f().cross_arm.contains(&(head, t))
             && let Some(dup) = self.try_cross_arm_fold(head, t, follow)
         {
             then.extend(dup);
@@ -2363,11 +2475,12 @@ impl<'m> Ctx<'m> {
         if let Some(r) = then_r {
             self.emit_node(r, active, follow, &mut then);
         }
+        then.extend(act_t);
+        let act_f = self.edge_action(head, f);
         let mut otherwise: Vec<SNode> = Vec::new();
         Self::push_stmts(&mut otherwise, Self::stmts_leaves(&phi_f));
-        if let Some(act) = self.edge_action(head, f) {
-            otherwise.push(act);
-        } else if self.f().cross_arm.contains(&(head, f))
+        if act_f.is_none()
+            && self.f().cross_arm.contains(&(head, f))
             && let Some(dup) = self.try_cross_arm_fold(head, f, follow)
         {
             otherwise.extend(dup);
@@ -2375,6 +2488,7 @@ impl<'m> Ctx<'m> {
         if let Some(r) = else_r {
             self.emit_node(r, active, follow, &mut otherwise);
         }
+        otherwise.extend(act_f);
         self.stats.ifs += 1;
         out.push(SNode::If {
             cond: cond.clone(),
@@ -2424,7 +2538,36 @@ impl<'m> Ctx<'m> {
                     self.f().eclass.get(&(header, exit)),
                     Some(EdgeClass::Break { labeled: false, .. })
                 );
+                // The exit-phi assigns of a clean `while (cond)` are
+                // emitted AFTER the loop (exactly-once on condition
+                // termination). Any OTHER unlabeled break out of this
+                // loop lands at exactly that point, so it would run
+                // the header's exit-edge assigns and CLOBBER the values
+                // its own path already delivered — including the
+                // acyclic tree's exit-TAIL arms, whose head-edge
+                // `Break { header }` classification marks them as loop
+                // exits even though the target sits textually inside
+                // the body region (dream gate:
+                // opt-try-catch-func/test-nested-try-catch — the
+                // `j === 5 → break` path re-entered with the
+                // pre-increment j, d-P5). With such a break the general
+                // `while (true)` form is required: it places the
+                // exit-phi assigns on the condition-exit edge itself.
+                let (_, phi_exit, _) = Self::partition_phi(&parts.phi, stay, exit);
+                let exit_phis_bypassed = !phi_exit.is_empty()
+                    && self.f().eclass.iter().any(|(&(from, _), class)| {
+                        from != header
+                            && body_blocks.contains(&from)
+                            && matches!(
+                                class,
+                                EdgeClass::Break {
+                                    labeled: false,
+                                    header: h
+                                } if *h == header
+                            )
+                    });
                 if exit_is_break
+                    && !exit_phis_bypassed
                     && self.plain_break_ok(exit, follow)
                     && self.body_breaks_ok(body_r, &body_blocks, exit, follow)
                 {
@@ -2455,7 +2598,24 @@ impl<'m> Ctx<'m> {
                     self.f().eclass.get(&(latch, exit)),
                     Some(EdgeClass::Break { labeled: false, .. })
                 );
-                if exit_is_break && self.plain_break_ok(exit, follow) {
+                // Same bypass hazard as the clean-while form: the
+                // latch's exit-phi assigns land after the loop, where
+                // any other unlabeled break out of this loop would run
+                // them.
+                let (_, phi_exit, _) = Self::partition_phi(&lp.phi, cont_dest, exit);
+                let exit_phis_bypassed = !phi_exit.is_empty()
+                    && self.f().eclass.iter().any(|(&(from, _), class)| {
+                        from != latch
+                            && body_blocks.contains(&from)
+                            && matches!(
+                                class,
+                                EdgeClass::Break {
+                                    labeled: false,
+                                    header: h
+                                } if *h == header
+                            )
+                    });
+                if exit_is_break && !exit_phis_bypassed && self.plain_break_ok(exit, follow) {
                     self.stats.loops_do_while += 1;
                     self.emit_do_while(
                         label,

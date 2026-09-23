@@ -1517,24 +1517,25 @@ fn s27_try_finally_chain_past_shim_plan() {
     add_try(&mut m, f, vec![hb], hc, ec);
     add_try(&mut m, f, vec![hb, hc], hd, ed);
 
-    // Region 3's try (the outer finally) wraps the whole chain; its
-    // handler body (`e$3(); return;`) is no longer dropped.
+    // Region D's try (the outer finally) wraps hB's body inside hB's
+    // shim — its handler body (`e$3(); return;`) is no longer dropped.
+    // (Region indices in the notes are shim-local.)
     let want = r#"function f(p1) {
-  /* try region 3: handler-protecting outer try (finally idiom) — wrapped around region 0's try/catch (wrapper #1) */
+  /* try region 1: handler-protecting outer try (finally idiom) — wrapped around region 0's try/catch (wrapper #1) */
   try {
+    /* rethrow-only try/catch dissolved (semantic no-op) */
+    const v2 = p1();
+    throw v2;
+  } catch (e$1) {
     /* try region 1: handler-protecting outer try (finally idiom) — wrapped around region 0's try/catch (wrapper #1) */
     try {
       /* rethrow-only try/catch dissolved (semantic no-op) */
-      const v2 = p1();
-      throw v2;
-    } catch (e$1) {
-      /* rethrow-only try/catch dissolved (semantic no-op) */
       e$1();
       throw e$1;
+    } catch (e$3) {
+      e$3();
+      return;
     }
-  } catch (e$3) {
-    e$3();
-    return;
   }
 }
 "#;
@@ -1591,6 +1592,237 @@ fn s28_try_join_hoist() {
   }
   p2();
   return;
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}
+
+
+/// s29 — join hoist with a LATER rejoin: the handler's continuation is
+/// the SECOND unprotected tail node; the first is a try-path-only
+/// phi-merge that cannot throw, so it stays inline in the try body
+/// while the rejoin suffix moves after the try/catch (dream gate:
+/// opt-try-catch-func/test-passes-under-try-catch, d-P5).
+#[test]
+fn s29_try_join_hoist_late_rejoin() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+    let t = add_block(&mut m, f);
+    let e = add_block(&mut m, f);
+    let merge = add_block(&mut m, f);
+    let j = add_block(&mut m, f);
+    let handler = add_block(&mut m, f);
+    let c = istrue(&mut m, b0, p1);
+    cond_on(&mut m, b0, c, t, e);
+    let xv = load_string(&mut m, e, "x");
+    emit_void(&mut m, e, Op::Branch { dest: merge });
+    emit_void(&mut m, t, Op::Throw { value: p2 });
+    // merge: try-path-only phi wiring (cannot throw) → the join.
+    let mphi = emit(
+        &mut m,
+        merge,
+        Op::Phi {
+            entries: vec![(
+                Edge {
+                    from: e,
+                    kind: EdgeKind::Normal,
+                },
+                xv,
+            )],
+        },
+    );
+    emit_void(&mut m, merge, Op::Branch { dest: j });
+    // The join: read by BOTH the try path (via merge) and the handler.
+    let exc = add_exception_param(&mut m, handler);
+    let jphi = emit(
+        &mut m,
+        j,
+        Op::Phi {
+            entries: vec![
+                (
+                    Edge {
+                        from: merge,
+                        kind: EdgeKind::Normal,
+                    },
+                    mphi,
+                ),
+                (
+                    Edge {
+                        from: handler,
+                        kind: EdgeKind::Normal,
+                    },
+                    exc,
+                ),
+            ],
+        },
+    );
+    emit_void(&mut m, handler, Op::Branch { dest: j });
+    let _pr = call_p1(&mut m, j, jphi);
+    emit_void(&mut m, j, Op::Return { value: None });
+    link(&mut m, b0, t);
+    link(&mut m, b0, e);
+    link(&mut m, e, merge);
+    link(&mut m, merge, j);
+    link(&mut m, handler, j);
+    add_try(&mut m, f, vec![b0, t, e], handler, exc);
+
+    // The phi-only merge stays inline (try-path-only); the join
+    // (`v7(); return;`) is reachable from BOTH the try fall-through
+    // and the catch.
+    let want = r#"function f(p1, p2) {
+  try {
+    /* try region 0: the handler continuation (the try's join) is nested inside a protected conditional arm — the rejoin suffix is hoisted to after the try/catch; the try-path-only phi prefix stays inline (it cannot throw, so over-protection is impossible) */
+    if (p1) {
+      throw p2;
+    } else {
+      v5 = "x";
+      /* try region 0: statements inside the protected span are NOT protected (non-contiguous range) — emitted inside the try body regardless */
+      var v5; /* phi */
+      v7 = v5;
+    }
+  } catch (e) {
+    v7 = e;
+  }
+  var v7; /* phi */
+  v7();
+  return;
+}
+"#;
+    assert_eq!(decompiled(&m), want);
+}
+
+/// s30 — folds level: the cosmetic switch re-detection must NOT fold
+/// an if-chain whose case arm carries an unlabeled loop break (inside
+/// a `switch` the break would exit the switch, not the loop — the
+/// dream-gate hang, d-P5).
+#[test]
+fn s30_switch_fold_keeps_loop_break_chain() {
+    use abcd_decompile::expr::Expr;
+    use abcd_decompile::structure::SNode;
+    let cond = |lit: f64| Expr::Compare {
+        op: CmpOp::StrictEq,
+        left: Box::new(Expr::Ident("x".to_string())),
+        right: Box::new(abcd_decompile::expr::Expr::Lit(
+            abcd_decompile::expr::Lit::Number(lit.to_bits()),
+        )),
+    };
+    let break_arm = vec![SNode::Break { label: None }];
+    let continue_arm = vec![SNode::Continue { label: None }];
+    let chain = vec![SNode::If {
+        cond: cond(1.0),
+        then: break_arm,
+        otherwise: vec![SNode::If {
+            cond: cond(2.0),
+            then: continue_arm,
+            otherwise: Vec::new(),
+        }],
+    }];
+    let mut stats = abcd_decompile::folds::FoldStats::default();
+    let mut nodes = chain.clone();
+    abcd_decompile::folds::fold(&mut nodes, &mut stats);
+    assert_eq!(
+        nodes, chain,
+        "the chain carries an unlabeled loop break — it must NOT become a switch"
+    );
+    assert_eq!(stats.switch, 0);
+}
+
+/// s31 — the clean-`while` exit-phi placement is after the loop; an
+/// unlabeled break out of the body would run (and clobber) those
+/// assigns on the break path, so the general `while (true)` form is
+/// required (dream gate: test-nested-try-catch's inner loop, d-P5).
+#[test]
+fn s31_while_exit_phi_break_bypass() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let hdr = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p1 = add_param(&mut m, f);
+    let p2 = add_param(&mut m, f);
+    let p3 = add_param(&mut m, f);
+    let body = add_block(&mut m, f);
+    let tail = add_block(&mut m, f);
+    let mid = add_block(&mut m, f);
+    let tail2 = add_block(&mut m, f);
+    let latch = add_block(&mut m, f);
+    let exit = add_block(&mut m, f);
+    // while (p1) { if (p2) { tail; break } else if (p3) { tail2 } } —
+    // the break tail is threaded into the arm (single-pred chain); the
+    // exit merges the header-exit and break-exit values.
+    let init = load_number(&mut m, hdr, 0.0);
+    let c1 = istrue(&mut m, hdr, p1);
+    cond_on(&mut m, hdr, c1, body, exit);
+    let c2 = istrue(&mut m, body, p2);
+    cond_on(&mut m, body, c2, tail, mid);
+    let _a = call_p1(&mut m, tail, p1);
+    emit_void(&mut m, tail, Op::Branch { dest: exit });
+    let c3 = istrue(&mut m, mid, p3);
+    cond_on(&mut m, mid, c3, tail2, latch);
+    let _b = call_p1(&mut m, tail2, p1);
+    emit_void(&mut m, tail2, Op::Branch { dest: latch });
+    emit_void(&mut m, latch, Op::Branch { dest: hdr });
+    let tv = load_number(&mut m, tail, 9.0);
+    let phi = emit(
+        &mut m,
+        exit,
+        Op::Phi {
+            entries: vec![
+                (
+                    Edge {
+                        from: hdr,
+                        kind: EdgeKind::Normal,
+                    },
+                    init,
+                ),
+                (
+                    Edge {
+                        from: tail,
+                        kind: EdgeKind::Normal,
+                    },
+                    tv,
+                ),
+            ],
+        },
+    );
+    emit_void(&mut m, exit, Op::Return { value: Some(phi) });
+    link(&mut m, hdr, body);
+    link(&mut m, hdr, exit);
+    link(&mut m, body, tail);
+    link(&mut m, body, mid);
+    link(&mut m, tail, exit);
+    link(&mut m, mid, tail2);
+    link(&mut m, mid, latch);
+    link(&mut m, tail2, latch);
+    link(&mut m, latch, hdr);
+
+    // The general `while (true)` form: the header-exit phi assign
+    // (`v11 = 0.0`) rides the condition-exit edge; the break arm's
+    // content runs BEFORE its exit (`p1(); v11 = 9.0; break;`). A
+    // clean `while (p1)` would have placed `v11 = 0.0` after the loop,
+    // where the break path would run (and be clobbered by) it.
+    let want = r#"function f(p1, p2, p3) {
+  while (true) {
+    if (!p1) {
+      v11 = 0.0;
+      break;
+    }
+    if (p2) {
+      p1();
+      v11 = 9.0;
+      break;
+    } else {
+      if (p3) {
+        p1();
+      }
+      continue;
+    }
+  }
+  var v11; /* phi */
+  return v11;
 }
 "#;
     assert_eq!(decompiled(&m), want);
