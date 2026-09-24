@@ -31,8 +31,10 @@ fn built_file_is_dynamic() {
 
 #[test]
 fn static_version_header_is_static() {
-    // Hand-craft a header with magic + STATIC_VERSION {0,0,0,6} and a
+    // Hand-craft a header with magic + STATIC_VERSION {0,1,0,7} and a
     // consistent file_size — the rest of the file is irrelevant for typing.
+    // (OpenHarmony v7.0 detects FILE_STATIC only for this exact version;
+    // master's older {0,0,0,6} legacy marker no longer exists there.)
     let mut data = vec![0u8; 60];
     data[..8].copy_from_slice(b"PANDA\0\0\0");
     data[12..16].copy_from_slice(&[0, 1, 0, 7]);

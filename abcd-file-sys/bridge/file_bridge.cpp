@@ -260,8 +260,11 @@ PandaFileType GetFileType(const uint8_t *data, int32_t size) {
         return PandaFileType::FILE_FORMAT_INVALID;
     }
 
-    if (header->version[File::FILE_TYPE_OFFSET] == File::FILE_TYPE_STATIC_FLAG ||
-        header->version == File::OLD_STATIC_VERSION) {
+    // OpenHarmony v7.0 (submodule pin) dropped master's FILE_TYPE_OFFSET /
+    // FILE_TYPE_STATIC_FLAG / OLD_STATIC_VERSION markers; upstream now treats
+    // exactly STATIC_VERSION {0,1,0,7} as the static-era marker
+    // (libpandafile/file.cpp GetFileType at 4fba38e). Mirrors upstream.
+    if (header->version == File::STATIC_VERSION) {
         return PandaFileType::FILE_STATIC;
     }
     return PandaFileType::FILE_DYNAMIC;
