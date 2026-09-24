@@ -158,8 +158,11 @@ function func_main_0() {
 
 /// (d) the delegate throws: the error propagates through the
 /// delegation to the consumer. The generator folds clean; the
-/// consumer's own try-around-loop fragmentation is the pre-existing
-/// structurer limitation (documented in the node evidence test).
+/// consumer's own try-around-loop projects as ONE try/catch with the
+/// post-try `print` emitted after it — the N69 fix (d-P16): the
+/// region tree nests the unprotected join below the protected run,
+/// and the join hoist wraps the whole protected span in a single
+/// try (post-try statements no longer run on the catch path).
 #[test]
 fn golden_yield_star_delegate_throw() {
     let text = decompiled("delegate-throw.abc");
@@ -169,6 +172,7 @@ var log;
 var outer;
 function func_main_0() {
   try {
+    /* try region 0: the handler continuation (the try's join) is nested below the protected run in the region tree — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there) */
     boom = function* ___boom() {
   /* rethrow-only try/catch dissolved (semantic no-op) */
   yield "before";
@@ -194,15 +198,6 @@ function func_main_0() {
     const next = it$1.next;
     const v161 = next.call(it$1);
     v162 = v161;
-  } catch (e) {
-    const log$3 = log;
-    const push$2 = log$3.push;
-    const v189 = "caught:";
-    const message = e.message;
-    push$2.call(log$3, v189 + message);
-  }
-  try {
-    /* try region 0: protected statements are not contiguous in the structured output — this is wrapper #2 for the same region (catch body duplicated, finally-style) */
     while (true) {
       var v162; /* phi */
       const done = v162.done;
@@ -228,15 +223,6 @@ function func_main_0() {
       v162 = v180;
       continue;
     }
-  } catch (e) {
-    const log$3 = log;
-    const push$2 = log$3.push;
-    const v189 = "caught:";
-    const message = e.message;
-    push$2.call(log$3, v189 + message);
-  }
-  try {
-    /* try region 0: protected statements are not contiguous in the structured output — this is wrapper #3 for the same region (catch body duplicated, finally-style) */
     const log$2 = log;
     const push$1 = log$2.push;
     push$1.call(log$2, "completed");

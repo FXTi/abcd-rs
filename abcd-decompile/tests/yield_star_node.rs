@@ -19,8 +19,9 @@
 //! - (d) `delegate-throw`: a hand-written consumer driver — the
 //!   delegate's throw propagates through the delegation to the
 //!   consumer's try/catch — `before,caught:delegated-boom`. The
-//!   module's own entry is NOT the evidence here (see the pinned
-//!   known-issue test below).
+//!   module's own entry is the N69 regression pin below (pre-fix the
+//!   structurer fragmented the try-around-loop and ran the post-try
+//!   statement on the catch path; fixed in d-P16).
 //! - bail `manual-iterator`: node --check only; its stdout pins the
 //!   loud-fallback form (unfolded iter-result objects), not source
 //!   behavior.
@@ -139,8 +140,9 @@ fn yield_star_node_throw_driver() {
     std::fs::create_dir_all(&dir).expect("tempdir");
     // The module entry must run (it defines `outer`) but its own
     // print goes to a no-op shim — the evidence is the hand-written
-    // driver below (the entry's own try-fragmentation is the pinned
-    // known issue in the next test).
+    // driver below (it isolates the fold's throw delegation from the
+    // entry's own try-around-loop; the entry itself is the N69
+    // regression pin in the next test).
     let body = format!(
         "const print = () => {{}};\n{}\nfunc_main_0();\n\
          const it2 = outer(); const log2 = [];\n\
@@ -158,17 +160,20 @@ fn yield_star_node_throw_driver() {
     );
 }
 
-/// KNOWN PRE-EXISTING ISSUE (NOT d-P15's fold): the (d) module's own
-/// entry wraps its consumer loop in `try { … } catch` spanning a
-/// `while` loop, and the structurer splits the protected region into
-/// sequential "finally-style" fragments (the "protected statements
-/// are not contiguous" note) — so the post-try statement
-/// (`log.push("completed")`) executes even on the catch path. This
-/// reproduces WITHOUT the YieldStar fold (pre-fold output was broken
-/// worse: the unfolded delegation yielded the delegate's raw result
-/// objects). Pinned here so any change in either direction is loud.
+/// N69 REGRESSION PIN (fixed in d-P16): the (d) module's own entry
+/// wraps its consumer loop in `try { … } catch` spanning a `while`
+/// loop. Pre-fix the structurer split the protected region into
+/// sequential "finally-style" fragments (the region tree nests the
+/// unprotected join below the protected run and the per-level
+/// coalescing could not see across the nesting), so the post-try
+/// statement (`log.push("completed")`) executed even on the catch
+/// path (`before,caught:delegated-boom,completed`). The join hoist
+/// now wraps the whole protected span in ONE try/catch and emits the
+/// unprotected tail after it: the post-try statement is UNREACHABLE
+/// from the catch path except through the structured join — the
+/// source behavior `before,caught:delegated-boom`.
 #[test]
-fn yield_star_node_throw_main_known_fragmentation() {
+fn yield_star_node_throw_main_correct() {
     if !node_available() {
         eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
         return;
@@ -180,13 +185,14 @@ fn yield_star_node_throw_main_known_fragmentation() {
         decompiled("delegate-throw.abc")
     );
     let (ok, stdout, stderr) = run_node(&dir, "delegate-throw-main.js", &body);
-    eprintln!("NODE-EVIDENCE(known-issue) delegate-throw main exit={ok} stdout={stdout:?}");
+    eprintln!("NODE-EVIDENCE(N69-fixed) delegate-throw main exit={ok} stdout={stdout:?}");
     assert!(ok, "node run delegate-throw main failed: {stderr}");
-    // The folded generator is exact; the anomalous trailing
-    // `completed` is the structurer's pre-existing fragmentation.
+    // Source behavior: the throw inside the loop routes to the catch;
+    // `completed` (inside the protected span, after the loop) must
+    // NOT run on the catch path.
     assert_eq!(
-        stdout, "before,caught:delegated-boom,completed\n",
-        "delegate-throw main: known fragmentation anomaly changed (investigate!)"
+        stdout, "before,caught:delegated-boom\n",
+        "delegate-throw main: N69 regression — post-try statement reachable from the catch path"
     );
 }
 

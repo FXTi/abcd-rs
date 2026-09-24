@@ -14,9 +14,9 @@ Sources (`src/*.js`, hand-written, Apache-2.0 project origin):
   consumption end); the delegate's return value is used.
 - `delegate-throw.js` — delegation whose delegate THROWS; the error
   propagates through the delegation to the consumer's try/catch.
-  (Consumer-side catch on purpose: an internal-catch variant surfaces
-  the pre-existing structurer fragmentation of try regions spanning
-  loops — see the d-P15 node evidence test's pinned known issue.)
+  (The consumer loop's try-spanning-a-loop also exercises the
+  structurer's try projection: fragmented pre-d-P16 [N69], one
+  coalesced try/catch since.)
 - `manual-iterator.js` — BAIL case: a hand-rolled iterator-protocol
   loop inside a generator (NOT `yield*`); the fold must leave it loud.
 

@@ -1577,6 +1577,25 @@ impl<'m> Ctx<'m> {
     // projection is `try { <protected skeleton> } catch { … }` with
     // the unprotected tail emitted AFTER the try/catch.
 
+    /// The innermost plan of the first protected block in emission
+    /// order (the candidate plan a mixed `Seq`'s join hoist wraps).
+    /// `None` when the node carries no protected content.
+    fn leading_plan(&mut self, id: RegionId) -> Option<usize> {
+        match self.f().node(id).clone() {
+            RegionNode::Block(b) => self.f_mut().plan_of(b),
+            RegionNode::Seq(children) | RegionNode::Alternates(children) => {
+                children.iter().find_map(|&c| self.leading_plan(c))
+            }
+            RegionNode::Labeled { body, .. } | RegionNode::Loop { body, .. } => {
+                self.leading_plan(body)
+            }
+            RegionNode::If { head, .. } => self.f_mut().plan_of(head),
+            RegionNode::Irreducible { blocks, .. } => {
+                blocks.iter().find_map(|&b| self.f_mut().plan_of(b))
+            }
+        }
+    }
+
     /// Phase 1: classify a Mixed node into protected skeleton +
     /// deferred tail for plan `p` (no emission, no mutation).
     fn cut_classify(&mut self, id: RegionId, p: usize) -> Option<CutSplit> {
@@ -1815,11 +1834,11 @@ impl<'m> Ctx<'m> {
         true
     }
 
-    /// The join-hoist driver: split the cut `If`, emit
+    /// The join-hoist driver: split the cut node, emit
     /// `try { skeleton } catch { … }`, then the hoisted tail. Returns
     /// false (the caller falls back to the generic whole-wrap) unless
     /// every guard holds.
-    fn emit_cut_try_if(
+    fn emit_cut_try(
         &mut self,
         id: RegionId,
         p: usize,
@@ -1917,13 +1936,23 @@ impl<'m> Ctx<'m> {
                 "try region {region}: protected statements are not contiguous in the structured output — this is wrapper #{wraps} for the same region (catch body duplicated, finally-style)"
             )));
         }
+        // The note wording names where the join was buried: a
+        // protected conditional arm (the d-P5 `If` case) or below the
+        // protected run in the region tree (the N69 `Seq` case — the
+        // try range spans a loop and its post-loop statements while
+        // the unprotected continuation is nested one level down).
+        let buried = if matches!(self.f().node(id), RegionNode::If { .. }) {
+            "nested inside a protected conditional arm"
+        } else {
+            "nested below the protected run in the region tree"
+        };
         if rejoin > 0 {
             body.push(SNode::Honest(format!(
-                "try region {region}: the handler continuation (the try's join) is nested inside a protected conditional arm — the rejoin suffix is hoisted to after the try/catch; the try-path-only phi prefix stays inline (it cannot throw, so over-protection is impossible)"
+                "try region {region}: the handler continuation (the try's join) is {buried} — the rejoin suffix is hoisted to after the try/catch; the try-path-only phi prefix stays inline (it cannot throw, so over-protection is impossible)"
             )));
         } else {
             body.push(SNode::Honest(format!(
-                "try region {region}: the handler continuation (the try's join) is nested inside a protected conditional arm — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there)"
+                "try region {region}: the handler continuation (the try's join) is {buried} — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there)"
             )));
         }
         let defer_ids: HashSet<RegionId> = hoisted.iter().copied().collect();
@@ -1988,7 +2017,33 @@ impl<'m> Ctx<'m> {
     ) {
         let node = self.f().node(id).clone();
         match node {
-            RegionNode::Seq(children) => self.emit_seq_children(&children, active, follow, out),
+            RegionNode::Seq(children) => {
+                // N69: a try range spanning nested sequence levels (a
+                // protected prefix at THIS level whose continuation
+                // plan keeps going inside a nested child — e.g. a try
+                // over a loop and its post-loop statements while the
+                // unprotected join sits one level down) would fragment
+                // into per-level wrappers, with the catch path falling
+                // through into protected statements. When the cut
+                // split has a protected prefix here AND a nested split
+                // below, route the whole node through the join hoist
+                // (one try/catch; the unprotected tail emitted after
+                // it). Flat protected-prefix + flat-tail sequences are
+                // already handled correctly by the run coalescing in
+                // `emit_seq_children`, so they keep the legacy path.
+                let p = children.iter().find_map(|&c| self.leading_plan(c));
+                if let Some(p) = p
+                    && Some(p) != active
+                    && matches!(
+                        self.cut_classify(id, p),
+                        Some(CutSplit::Seq { inner: Some(_), .. })
+                    )
+                    && self.emit_cut_try(id, p, active, follow, out)
+                {
+                    return;
+                }
+                self.emit_seq_children(&children, active, follow, out)
+            }
             RegionNode::If { head, .. } => {
                 let hp = self.f_mut().plan_of(head);
                 if hp.is_some() && hp != active {
@@ -1996,7 +2051,7 @@ impl<'m> Ctx<'m> {
                     // The d-P5 join hoist: when the try's continuation
                     // is buried in an arm, split instead of wrapping
                     // whole; otherwise the generic wrap.
-                    if !self.emit_cut_try_if(id, p, active, follow, out) {
+                    if !self.emit_cut_try(id, p, active, follow, out) {
                         self.wrap_try(id, p, follow, out);
                     }
                 } else {
