@@ -56,14 +56,18 @@ in d-P5 (each proven by the oracle):
   `try/catch`; when one arm was terminal (throw), the acyclic tree had
   absorbed the try's continuation into the other arm, making the join
   unreachable from the catch path (missing post-try output). The
-  join hoist (`emit_cut_try_if`) splits the node into a protected
+  join hoist (`emit_cut_try`) splits the node into a protected
   skeleton (inside the try) and an unprotected tail (after the
   try/catch — where the VM's PC-range dispatch rejoins), guarded by
   pure phase-1 analysis: clean per-arm prefix/suffix split, one
   splitting arm, the other terminal-only, every handler continuation
   targeting the same tail node, no outer finally-chain. A later rejoin
   index is supported when the skipped prefix is try-path-only phi
-  wiring (it cannot throw, so over-protection is impossible).
+  wiring (it cannot throw, so over-protection is impossible). d-P16
+  (N69) extends the hoist to cut `Seq` nodes (a try spanning a loop
+  whose unprotected join nests below the protected run) — pre-fix the
+  per-level coalescing fragmented such regions into finally-style
+  wrappers and the catch path fell through into protected statements.
 - **RC2 — exception-edge phi flush after the terminal throw.** A
   `throw`-terminated protected block's exceptional-edge phi assigns
   are the register state the dispatching handler observes; emitted
