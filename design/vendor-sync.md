@@ -35,34 +35,58 @@ recorded twice (two gitlinks); both must always move together.
 
 With no copied files, the old `vendor-check` job dissolved. What remains:
 
-- **`common-files-consistency`**: the bridge shims (`platform_compat.h`,
-  `securec.h`, `utils/logger.h`) are OURS and deliberately duplicated across
-  the two `-sys` crates — they must stay byte-identical or CI goes red.
-- Every CI checkout that builds uses `submodules: true`.
+- Every CI checkout that builds uses the sparse submodule-clone recipe in
+  `ci.yml` (blob:none, cone-limited to the consumed subtrees).
+- The `common-files-consistency` job (byte-identical bridge shims across the
+  two `-sys` crates) was **removed 2026-09-24** by maintainer ruling: shim
+  drift between the two crates is acceptable ("不同步也没关系"). The shims are
+  still OURS and still duplicated; they just are no longer CI-enforced.
 
-## Tag radar (planned automation — not yet landed)
+## Tag radar (landed — `.github/workflows/vendor-sync.yml`)
 
 The ruby-based `vendor-sync.rb` daily sync is gone with the copied subsets.
-The replacement — an upstream **tag radar** in `vendor-sync.yml` — is
-plan-first: a CI-rework plan doc will spec it before implementation, and the
-workflow's cron is **currently disabled** (see the comment in
-`.github/workflows/vendor-sync.yml`). The agreed design direction:
+The replacement is an upstream **tag radar** (design: `ci-rework-plan.md` §2
+plus maintainer amendments 2026-09-24; reference implementation `3092de4`):
 
-1. `git ls-remote --tags` upstream → keep only
-   `OpenHarmony-v<numbers>-(BetaN|LTS|Release)` tags;
-2. version-aware sort (numeric components; within a version
-   Release > LTS > Beta) → latest tag;
-3. compare the (peeled) tag commit with the pinned submodule commit;
-4. identical → done. Different → on a branch, checkout the tag commit in
-   BOTH submodules, run `cargo build` + `cargo test` (the outcome is
-   recorded but never gates the PR), and open a PR (label `vendor-bump`)
-   with the drift summary and the build/test verdict.
+1. `git ls-remote --tags` upstream → keep tags **starting with
+   `OpenHarmony-`** — nothing stricter, no version-shape or suffix pattern;
+2. fetch only the matching tags (`--depth 1`) and sort by **tag time** — the
+   peeled commit's committer date — newest wins. No version-number parsing
+   or sorting anywhere;
+3. R1: compare the (peeled) tag commit with **both** pinned submodule
+   gitlinks; the pins disagreeing fails loudly (a half-moved pin is a
+   repo-state bug, not upstream drift). Identical → done;
+4. Different → on branch `vendor-bump/<tag>-<date>`, checkout the tag commit
+   in BOTH submodules (one commit — the pins always move together), run
+   `cargo build` + `cargo test` (exit codes **recorded, never gating**), and
+   open a PR (label `vendor-bump`) with the verdict, a diff summary over the
+   consumed subtrees (`isa libpandafile libpandabase assembler templates`),
+   and the run-log link.
+
+Noise policy (R2-a, approved): **one standing PR per tag** — the dup-check
+covers ALL PR states, so a closed-but-unmerged PR is the human's deliberate
+"won't port" verdict for that tag and it stays dismissed; a newer tag opens
+a NEW PR and the old one stays as history. Radar infra failure before a
+verdict (ls-remote/fetch failure, pin disagreement) opens or updates ONE
+standing issue, label `vendor-radar`.
 
 A **red** bump PR is the radar working as designed — e.g. v7.0-Release
 fails to build because of the legacy-`libpandafile` drift above. The PR
 documents the porting cost; merging requires making it green (shim/bridge
-adaptation, never submodule edits). This replaces the old daily
-copy-and-check flow once the CI-rework plan lands.
+adaptation, never submodule edits).
+
+## Rollback
+
+- **Pin rollback**: the twin gitlinks move in ONE commit by construction, so
+  rollback is `git revert <pin-commit>` + `git submodule update`; git history
+  is the complete pin audit trail.
+- **Radar rollback**: the operational kill switch is commenting out the cron
+  in `vendor-sync.yml` (the `6919592` precedent); full rollback is reverting
+  the workflow commit. No external state exists under R2-a — dismissing the
+  radar is just closing its open PR/issue.
+- **Migration rollback** (emergency-only): the copy-era `vendor/` trees were
+  deleted in the migration commits; reverting those restores the
+  pre-submodule state. Forward-only in practice.
 
 ## Updating the pin manually
 
