@@ -598,6 +598,15 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    (residual = AsyncGenerator kind — registered as d-P14, next natural
    task). Dream gate stays 1149/1149 all-zero. Node behavior evidence
    E:3 F:9 G:109 H:7 D:15.
+   N69+N70 FIXED (d-P16, 2026-09-25): structurer Seq-cut try
+   fragmentation (post-try statements ran on the catch path — the d-P5
+   join-hoist machinery already classified Seq cuts but the driver was
+   never invoked for them; fixed via emit_cut_try routing) + the
+   plain-async for-await driver fold gap (funcObj phi-alias closure +
+   break-routed THROW arm + uses==declares duplicated-handler gate;
+   ALSO fixed: AsyncReject mis-folding to resolve-with-error).
+   Residual registered: no literal `for await` pretty-print (while-loop
+   driver is correct; pretty fold = future readability).
    d-P15 DONE (2026-09-25): yield* (YieldStar delegation) — fixtures
    created from scratch (decompile-fixtures/yield-star/, corpus
    untouched), vendor YieldStar machine modeled + folded
