@@ -52,7 +52,12 @@ jobs:
       # `submodules: true` recurses and dies on upstream's dangling nested
       # gitlink (static_core/tools/plugins/ecmascript has no .gitmodules
       # mapping) — so init only OUR first-level submodules, non-recursively.
-      - run: git submodule update --init
+      # protectNTFS off: upstream has NTFS-illegal paths (e.g. .../test.../a.ets)
+      # that abort the Windows checkout; we never touch those test trees.
+      - shell: bash
+        run: |
+          git config --global core.protectNTFS false
+          git submodule update --init
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
