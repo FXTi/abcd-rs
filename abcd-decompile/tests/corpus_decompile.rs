@@ -144,6 +144,9 @@ fn merge_stats(a: &mut DecompileStats, b: &DecompileStats) {
     a.folds.switch += b.folds.switch;
     a.folds.finally_fold += b.folds.finally_fold;
     a.folds.scope_fold += b.folds.scope_fold;
+    a.folds.gen_driver_sites += b.folds.gen_driver_sites;
+    a.folds.gen_driver_entry += b.folds.gen_driver_entry;
+    a.folds.gen_driver_bound += b.folds.gen_driver_bound;
     a.function_bodies += b.function_bodies;
 }
 
@@ -218,7 +221,7 @@ fn corpus_decompile_gate() {
     );
 
     eprintln!(
-        "FOLDS for_of={} for_await_of={} for_in={} object_lit={} array_lit={} rest={} switch={} finally_fold={} scope_fold={}",
+        "FOLDS for_of={} for_await_of={} for_in={} object_lit={} array_lit={} rest={} switch={} finally_fold={} scope_fold={} gen_driver_sites={} gen_driver_entry={} gen_driver_bound={}",
         stats.folds.for_of,
         stats.folds.for_await_of,
         stats.folds.for_in,
@@ -227,7 +230,10 @@ fn corpus_decompile_gate() {
         stats.folds.rest,
         stats.folds.switch,
         stats.folds.finally_fold,
-        stats.folds.scope_fold
+        stats.folds.scope_fold,
+        stats.folds.gen_driver_sites,
+        stats.folds.gen_driver_entry,
+        stats.folds.gen_driver_bound
     );
     eprintln!(
         "STRUCT ifs={} while={} do_while={} while_true={} labeled_exits={} alternates={}",
