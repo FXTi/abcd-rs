@@ -201,18 +201,26 @@ fn generate() -> usize {
 /// the recorded acceptance floor. Docker is LOCAL-only
 /// (scripts/remote-test.sh).
 ///
-/// The histogram at d-P10 (2026-09-25): pass 1131 / decompile-bug 0 /
-/// es2abc-cant 0 / expected-fallback 18 / fixture-unsupported 0 (of
-/// 1149). d-P10 closed IR gap G4 at the decompile side: the
-/// `gettemplateobject` literal operand is the vendor pair
-/// `[rawStrings, cookedStrings]` (es2panda `compiler/base/literals.cpp`;
-/// runtime `ecmascript/template_string.cpp`), both lists resolve from
-/// the const-pool pair or the imperative `createemptyarray` +
-/// `definefieldbyvalue` build, and template nodes emit as backtick
-/// literals carrying the raw text verbatim (identity tag reconstructs
-/// the template object), so the 36 template/tagged-template fixtures
-/// recompile and behave identically. The d-P9 histogram was
-/// 1095/0/0/54/0. The floor guards regressions; raise it when the
+/// The histogram at d-P11 (2026-09-25): pass 1149 / decompile-bug 0 /
+/// es2abc-cant 0 / expected-fallback 0 / fixture-unsupported 0 (of
+/// 1149) — THE FULL ORACLE SET PASSES. d-P11 closed the last bucket:
+/// the 18 generator fixtures (local/generator × 6 versions × 3
+/// profiles) fold their es2abc state machine back into plain
+/// `function*` bodies (`generator_machine_fold`, R4; vendor lowering
+/// model es2panda `generatorFunctionBuilder.cpp` +
+/// `functionBuilder.cpp` `HandleCompletion`, runtime mode enum
+/// `js_generator_object.h` `GeneratorResumeMode{RETURN=0,THROW=1,NEXT=2}`):
+/// the entry protocol suspend, the `CreateIterResultObj(v,false)`
+/// wrap, the `ResumeGenerator`/`GetResumeMode` completion pair, and
+/// the resume-mode dispatch all elide; a used resumption value binds
+/// as `x = yield v`. Recompiled, es2abc re-lowers the identical state
+/// machine — behavior is identical by construction, proven by the
+/// oracle. The async family (`AsyncResolve`/`AsyncReject` + async
+/// resume machinery) stays documented fallback (IR gap G6: the modern
+/// asyncfunction* bytecodes carry the value in the accumulator, which
+/// the lift does not model) — those fixtures are not-applicable in
+/// this oracle set, so the bucket is empty. The d-P10 histogram was
+/// 1131/0/0/18/0. The floor guards regressions; raise it when the
 /// buckets improve.
 #[test]
 #[ignore = "requires exported GHCR corpus, python3, and LOCAL docker"]
@@ -247,8 +255,8 @@ fn dream_gate_oracle() {
         report.fixture_unsupported
     );
     assert!(
-        report.pass >= 1131,
-        "dream gate regression: pass {} < 1131 (the d-P10 acceptance floor)",
+        report.pass >= 1149,
+        "dream gate regression: pass {} < 1149 (the d-P11 acceptance floor)",
         report.pass
     );
 }
