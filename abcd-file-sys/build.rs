@@ -7,9 +7,9 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
 
     // Phase 1: Ruby code generation (source_lang_enum.h, type.h, file_format_version.h)
-    let gen_rb = format!("{manifest}/vendor/isa/gen.rb");
-    let isa_yaml = format!("{manifest}/vendor/isa/isa.yaml");
-    let tpl = format!("{manifest}/vendor/libpandafile/templates");
+    let gen_rb = format!("{manifest}/arkcompiler_runtime_core/isa/gen.rb");
+    let isa_yaml = format!("{manifest}/arkcompiler_runtime_core/isa/isa.yaml");
+    let tpl = format!("{manifest}/arkcompiler_runtime_core/libpandafile/templates");
 
     // Each template gets only the requires it needs (matching upstream).
     // Ruby's `def` is last-writer-wins, so the final Gen.on_require must
@@ -17,14 +17,14 @@ fn main() {
     run_ruby(
         &gen_rb,
         &isa_yaml,
-        &format!("{manifest}/vendor/libpandafile/plugin_options.rb"),
+        &format!("{manifest}/arkcompiler_runtime_core/templates/plugin_options.rb"),
         &format!("{tpl}/source_lang_enum.h.erb"),
         &format!("{out_dir}/source_lang_enum.h"),
     );
     run_ruby(
         &gen_rb,
-        &format!("{manifest}/vendor/libpandafile/types.yaml"),
-        &format!("{manifest}/vendor/libpandafile/types.rb"),
+        &format!("{manifest}/arkcompiler_runtime_core/libpandafile/types.yaml"),
+        &format!("{manifest}/arkcompiler_runtime_core/libpandafile/types.rb"),
         &format!("{tpl}/type.h.erb"),
         &format!("{out_dir}/type.h"),
     );
@@ -32,12 +32,48 @@ fn main() {
         &gen_rb,
         &isa_yaml,
         &format!(
-            "{manifest}/vendor/isa/isapi.rb,\
-             {manifest}/vendor/libpandafile/pandafile_isapi.rb"
+            "{manifest}/arkcompiler_runtime_core/isa/isapi.rb,\
+             {manifest}/arkcompiler_runtime_core/libpandafile/pandafile_isapi.rb"
         ),
         &format!("{tpl}/file_format_version.h.erb"),
         &format!("{out_dir}/file_format_version.h"),
     );
+
+    // v7.0's bytecode_instruction.h includes bytecode_instruction_enum_gen.h
+    // (generated upstream by the same gen.rb flow; the old flat vendored
+    // snapshot predated that include).
+    run_ruby(
+        &gen_rb,
+        &isa_yaml,
+        &format!(
+            "{manifest}/arkcompiler_runtime_core/isa/isapi.rb,\
+             {manifest}/arkcompiler_runtime_core/libpandafile/pandafile_isapi.rb"
+        ),
+        &format!("{tpl}/bytecode_instruction_enum_gen.h.erb"),
+        &format!("{out_dir}/bytecode_instruction_enum_gen.h"),
+    );
+    for (tpl_name, out_name) in [
+        (
+            "bytecode_instruction-inl_gen.h.erb",
+            "bytecode_instruction-inl_gen.h",
+        ),
+        (
+            "bytecode_emitter_def_gen.h.erb",
+            "bytecode_emitter_def_gen.h",
+        ),
+        ("bytecode_emitter_gen.h.erb", "bytecode_emitter_gen.h"),
+    ] {
+        run_ruby(
+            &gen_rb,
+            &isa_yaml,
+            &format!(
+                "{manifest}/arkcompiler_runtime_core/isa/isapi.rb,\
+                 {manifest}/arkcompiler_runtime_core/libpandafile/pandafile_isapi.rb"
+            ),
+            &format!("{tpl}/{tpl_name}"),
+            &format!("{out_dir}/{out_name}"),
+        );
+    }
 
     // Phase 1b: Generate file_bridge_enums.h from vendor headers
     // Parses modifiers.h to extract ACC_* names, then writes a C++ header
@@ -45,20 +81,39 @@ fn main() {
     generate_enums_header(&manifest, &out_dir);
 
     // Phase 2: Compile C++ library
-    let vendor_pf = format!("{manifest}/vendor/libpandafile");
+    let vendor_pf = format!("{manifest}/arkcompiler_runtime_core/libpandafile");
     let mut cpp_files: Vec<PathBuf> = Vec::new();
 
-    // Collect vendor libpandafile .cpp files
+    // Collect vendor libpandafile .cpp files.
+    //
+    // The bridge needs only the accessor/writer/serializer translation units —
+    // the same set as the old vendored subset.  Excluded upstream files:
+    //   - file_reader.cpp: legacy-tree drift — calls
+    //     MethodParamItem::AddRuntimeAnnotation, which legacy file_items.h
+    //     does not declare (the consistent implementation lives in
+    //     static_core/libarkfile).  Present at every upstream ref we tested,
+    //     including our pinned master commit; unused by the bridge.
+    //   - file.cpp / pgo.cpp: pull in runtime machinery (pgo, ifstream) that
+    //     needs the full upstream build scaffolding; unused by the bridge.
+    //   - method_handle_data_accessor.cpp: not part of the proven subset.
+    const EXCLUDED: [&str; 4] = [
+        "file_reader.cpp",
+        "file.cpp",
+        "pgo.cpp",
+        "method_handle_data_accessor.cpp",
+    ];
     for entry in std::fs::read_dir(&vendor_pf).expect("read vendor/libpandafile") {
         let entry = entry.unwrap();
         let path = entry.path();
-        if path.extension().is_some_and(|e| e == "cpp") {
+        let name = path.file_name().unwrap().to_string_lossy();
+        if path.extension().is_some_and(|e| e == "cpp") && !EXCLUDED.contains(&name.as_ref()) {
             cpp_files.push(path);
         }
     }
 
     // Vendor libpandabase .cpp files
-    cpp_files.push(format!("{manifest}/vendor/libpandabase/utils/utf.cpp").into());
+    cpp_files
+        .push(format!("{manifest}/arkcompiler_runtime_core/libpandabase/utils/utf.cpp").into());
 
     // Our bridge files
     cpp_files.push(format!("{manifest}/bridge/file_bridge.cpp").into());
@@ -76,12 +131,19 @@ fn main() {
         .include(&out_dir)
         .include(&format!("{manifest}/bridge"))
         .include(&vendor_pf)
-        .include(&format!("{manifest}/vendor/libpandabase"))
+        .include(&format!(
+            "{manifest}/arkcompiler_runtime_core/libpandabase/include"
+        ))
+        // Upstream mixes both include forms: "macros.h" (bare, needs the
+        // inner dir) and "libpandabase/utils/timers.h" (needs include/).
+        .include(&format!(
+            "{manifest}/arkcompiler_runtime_core/libpandabase/include/libpandabase"
+        ))
         // assembler headers for annotation value type validation
-        .include(&format!("{manifest}/vendor/assembler"))
+        .include(&format!("{manifest}/arkcompiler_runtime_core/assembler"))
         // vendor root: upstream code uses repo-root-prefixed includes such as
         // "libpandabase/utils/timers.h", resolved by this path in our flat layout
-        .include(&format!("{manifest}/vendor"));
+        .include(&format!("{manifest}/arkcompiler_runtime_core"));
 
     // Force-include missing transitive headers that the upstream build provides
     let fixups = format!("{manifest}/bridge/shim/vendor_fixups.h");
@@ -91,10 +153,19 @@ fn main() {
     if target.contains("windows") {
         build
             .define("PANDA_TARGET_WINDOWS", None)
+            .include(format!("{manifest}/arkcompiler_runtime_core/platforms"))
             .flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"))
             .flag(&format!("/FI{fixups}"))
             .flag("/EHsc");
     } else {
+        // Full-subtree vendoring pulls os/file.h, which requires the
+        // platform macro (the old flat subset never reached it).
+        build.define("PANDA_TARGET_UNIX", None);
+        // macOS has no stat64: upstream gates those paths on this macro.
+        if target.contains("apple") {
+            build.define("PANDA_TARGET_MACOS", None);
+        }
+        build.include(&format!("{manifest}/arkcompiler_runtime_core/platforms"));
         build.flag("-include").flag(&fixups);
     }
 
@@ -139,7 +210,13 @@ fn main() {
         .clang_arg(format!("-I{manifest}/bridge/shim/utils"))
         .clang_arg(format!("-I{out_dir}"))
         .clang_arg(format!("-I{vendor_pf}"))
-        .clang_arg(format!("-I{manifest}/vendor/libpandabase"))
+        .clang_arg(format!(
+            "-I{manifest}/arkcompiler_runtime_core/libpandabase/include"
+        ))
+        .clang_arg(format!(
+            "-I{manifest}/arkcompiler_runtime_core/libpandabase/include/libpandabase"
+        ))
+        .clang_arg(format!("-I{manifest}/arkcompiler_runtime_core"))
         .clang_arg("-DNDEBUG")
         .clang_arg("-DSUPPORT_KNOWN_EXCEPTION")
         // ACC_* re-exported via named enum
@@ -163,7 +240,14 @@ fn main() {
 
     // Rerun triggers
     println!("cargo:rerun-if-changed=bridge/");
-    println!("cargo:rerun-if-changed=vendor/");
+    // Only the subtrees the bridge actually consumes — the full submodule is
+    // hundreds of MB and most of it (static_core, tests) never reaches us.
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/isa/");
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/libpandafile/");
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/libpandabase/");
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/assembler/");
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/platforms/unix/libpandabase/");
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/templates/plugin_options.rb");
 }
 
 fn run_ruby(gen_rb: &str, data: &str, requires: &str, template: &str, output: &str) {
@@ -197,8 +281,10 @@ fn run_ruby(gen_rb: &str, data: &str, requires: &str, template: &str, output: &s
 ///
 /// Only writes the file when content actually changes to avoid unnecessary rebuilds.
 fn generate_enums_header(manifest: &str, out_dir: &str) {
-    let modifiers = std::fs::read_to_string(format!("{manifest}/vendor/libpandafile/modifiers.h"))
-        .expect("read modifiers.h");
+    let modifiers = std::fs::read_to_string(format!(
+        "{manifest}/arkcompiler_runtime_core/libpandafile/modifiers.h"
+    ))
+    .expect("read modifiers.h");
 
     // Extract ACC_* names from any `constexpr` line containing an ACC_ identifier.
     let acc_names: Vec<&str> = modifiers

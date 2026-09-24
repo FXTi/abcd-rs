@@ -1,0 +1,6 @@
+[submodule "abcd-isa-sys/arkcompiler_runtime_core"]
+	path = abcd-isa-sys/arkcompiler_runtime_core
+	url = https://github.com/openharmony/arkcompiler_runtime_core.git
+[submodule "abcd-file-sys/arkcompiler_runtime_core"]
+	path = abcd-file-sys/arkcompiler_runtime_core
+	url = https://github.com/openharmony/arkcompiler_runtime_core.git

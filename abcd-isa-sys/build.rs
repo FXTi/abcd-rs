@@ -17,10 +17,10 @@ fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
 
     // Phase 1: Ruby code generation
-    let gen_rb = format!("{manifest}/vendor/isa/gen.rb");
-    let isa_yaml = format!("{manifest}/vendor/isa/isa.yaml");
-    let isapi = format!("{manifest}/vendor/isa/isapi.rb");
-    let pf_isapi = format!("{manifest}/vendor/libpandafile/pandafile_isapi.rb");
+    let gen_rb = format!("{manifest}/arkcompiler_runtime_core/isa/gen.rb");
+    let isa_yaml = format!("{manifest}/arkcompiler_runtime_core/isa/isa.yaml");
+    let isapi = format!("{manifest}/arkcompiler_runtime_core/isa/isapi.rb");
+    let pf_isapi = format!("{manifest}/arkcompiler_runtime_core/libpandafile/pandafile_isapi.rb");
     let requires = format!("{isapi},{pf_isapi}");
 
     // Generate bytecode_instruction_enum_gen.h
@@ -28,7 +28,9 @@ fn main() {
         &gen_rb,
         &isa_yaml,
         &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/bytecode_instruction_enum_gen.h.erb"),
+        &format!(
+            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/bytecode_instruction_enum_gen.h.erb"
+        ),
         &format!("{out_dir}/bytecode_instruction_enum_gen.h"),
     );
 
@@ -37,7 +39,9 @@ fn main() {
         &gen_rb,
         &isa_yaml,
         &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/bytecode_instruction-inl_gen.h.erb"),
+        &format!(
+            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/bytecode_instruction-inl_gen.h.erb"
+        ),
         &format!("{out_dir}/bytecode_instruction-inl_gen.h"),
     );
 
@@ -46,7 +50,9 @@ fn main() {
         &gen_rb,
         &isa_yaml,
         &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/bytecode_emitter_def_gen.h.erb"),
+        &format!(
+            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/bytecode_emitter_def_gen.h.erb"
+        ),
         &format!("{out_dir}/bytecode_emitter_def_gen.h"),
     );
 
@@ -55,7 +61,9 @@ fn main() {
         &gen_rb,
         &isa_yaml,
         &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/bytecode_emitter_gen.h.erb"),
+        &format!(
+            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/bytecode_emitter_gen.h.erb"
+        ),
         &format!("{out_dir}/bytecode_emitter_gen.h"),
     );
 
@@ -64,7 +72,9 @@ fn main() {
         &gen_rb,
         &isa_yaml,
         &requires,
-        &format!("{manifest}/vendor/libpandafile/templates/file_format_version.h.erb"),
+        &format!(
+            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/file_format_version.h.erb"
+        ),
         &format!("{out_dir}/file_format_version.h"),
     );
 
@@ -105,23 +115,42 @@ fn main() {
         .include(&out_dir)
         .include(&format!("{manifest}/bridge/shim"))
         .include(&format!("{manifest}/bridge"))
-        .include(&format!("{manifest}/vendor/libpandafile"))
-        .include(&format!("{manifest}/vendor/libpandabase"))
+        .include(&format!("{manifest}/arkcompiler_runtime_core/libpandafile"))
+        .include(&format!(
+            "{manifest}/arkcompiler_runtime_core/libpandabase/include"
+        ))
+        // Upstream mixes both include forms: "macros.h" (bare, needs the
+        // inner dir) and "libpandabase/utils/timers.h" (needs include/).
+        .include(&format!(
+            "{manifest}/arkcompiler_runtime_core/libpandabase/include/libpandabase"
+        ))
         .file(&format!("{manifest}/bridge/isa_bridge.cpp"))
         .file(&format!(
-            "{manifest}/vendor/libpandafile/file_format_version.cpp"
+            "{manifest}/arkcompiler_runtime_core/libpandafile/file_format_version.cpp"
         ))
         .file(&format!(
-            "{manifest}/vendor/libpandafile/bytecode_emitter.cpp"
+            "{manifest}/arkcompiler_runtime_core/libpandafile/bytecode_emitter.cpp"
         ));
 
     let target = env::var("TARGET").unwrap_or_default();
     if target.contains("windows") {
         cc_build.define("PANDA_TARGET_WINDOWS", None);
+        cc_build.include(&format!("{manifest}/arkcompiler_runtime_core/platforms"));
         // Force-include MSVC compat header before all source files
         cc_build.flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"));
         // Enable C++ exception handling (vendor code uses <iostream>)
         cc_build.flag("/EHsc");
+    } else {
+        // Full-subtree vendoring pulls os/file.h, which requires the
+        // platform macro (the old flat subset never reached it).
+        cc_build.define("PANDA_TARGET_UNIX", None);
+        // macOS has no stat64: upstream gates those paths on this macro.
+        if target.contains("apple") {
+            cc_build.define("PANDA_TARGET_MACOS", None);
+        }
+        // Platform headers: "unix/libpandabase/file.h" resolves under
+        // platforms/unix (full subtree now present).
+        cc_build.include(&format!("{manifest}/arkcompiler_runtime_core/platforms"));
     }
 
     // Coverage: instrument C++ when running under cargo-llvm-cov
@@ -159,7 +188,12 @@ fn main() {
     // rerun-if-changed
     println!("cargo:rerun-if-changed=bridge/");
     println!("cargo:rerun-if-changed=templates/");
-    println!("cargo:rerun-if-changed=vendor/");
+    // Only the subtrees the bridge actually consumes — the full submodule is
+    // hundreds of MB and most of it (static_core, tests) never reaches us.
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/isa/");
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/libpandafile/");
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/libpandabase/");
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/platforms/unix/libpandabase/");
 }
 
 /// Run a Ruby ERB code-generation step.
