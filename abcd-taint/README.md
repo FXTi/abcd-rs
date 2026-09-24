@@ -752,6 +752,8 @@ The rung-2 movements (rung 1 → rung 2, each attributed):
 - **`TAINT-PATH-EDGES` byte-identical (198734), `TAINT-GAPS` 0/0,
   summary hit log byte-identical** — the 702 rescued sites carry no
   taint in this config, so the solver's fact population is unchanged.
+  The all-params sensitivity control (below) is where the rescued edges
+  become visible: 36 → 234 hits (FNs closing, never regressions).
 - **Cost honesty**: the PTA adds ≈0.1 s to the whole 1149-fixture
   double-run smoke (0.30 s → 0.40 s wall); standalone (callgraph smoke,
   2787 fixtures × 2 runs) the engine totals 1.2 s — ≈0.2 ms/fixture,
@@ -862,7 +864,7 @@ misses top-10 `[("foo", 117), ("f", 90), ("A", 69), ("s.next", 54),
 self-contained compiler tests whose entry params never reach a `print`. The
 sensitivity control (`ABCD_TAINT_SMOKE_SOURCE=all-params` — every function's
 params seeded) finds real flows end-to-end on real bytecode, also
-deterministic:
+deterministic. Rungs 0/1 (byte-identical at t-P3, t-P4, AND t-P5):
 
 ```text
 SMOKE fixtures=1149 fixtures_with_flows=18
@@ -872,9 +874,17 @@ TAINT-GAPS resolved=0 unresolved=0
 SMOKE-DETERMINISM runs=2 identical=true
 ```
 
-(re-confirmed byte-identical at t-P3, t-P4, AND t-P5 — the sensitivity
-control's flows route through neither prototype-rescued nor
-gap-resolved sites.)
+The control MOVES at rung 2 (t-P6) — and this is the rung-2 story in its
+purest form: with every function's params tainted, the newly resolved call
+edges carry taint into bodies the name-based graph never reached (the
+FN direction closing — hits go UP, never down):
+
+```text
+SMOKE fixtures=1149 fixtures_with_flows=126
+TAINT-FLOWS hits=234
+TAINT-PATH-EDGES total=357799
+SMOKE-DETERMINISM runs=2 identical=true
+```
 
 Counters classify only call sites the solver actually processed (a site with
 no incoming fact edge — dead code, or a function body unreachable even by the

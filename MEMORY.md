@@ -543,7 +543,9 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    resolved sites 345->1533 (unknown 10617->9429), PTA ~0.2ms/fixture,
    2 runs byte-identical, capped=0; taint smoke rung2: body_step
    108->810, native_keep 924->222, lookups +369, hits=0 unchanged,
-   path-edges byte-identical 198734; s.next/b.value2 re-evaluated —
+   path-edges byte-identical 198734; all-params control 36->234 hits
+   (FNs closing through the rescued edges, determinism green);
+   s.next/b.value2 re-evaluated —
    sharpened to VM-manufactured-object gaps (not dispatch); miss log
    #...#-mangled names no longer counted (never registerable).
    INFRA HAZARD (hit twice): remote-test's SHARED CARGO_TARGET_DIR is
