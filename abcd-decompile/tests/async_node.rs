@@ -179,6 +179,343 @@ fn async_fold_node_behavior() {
     assert_eq!(stdout, "A:42\nB:7\nC:5\n", "async behavior mismatch");
 }
 
+// ── N68-remainder node evidence: the suspend/resume machinery fold ────
+//
+// Cases D/E/E2 are built DIRECTLY as IR modules (the `common`
+// scaffold, golden_async.rs's shapes): the fold under test is Stage-B,
+// so the IR is the honest input. Each carries the FULL vendor await
+// machinery (es2panda `functionBuilder.cpp` `Await`:
+// `AsyncFunctionAwaitUncaught` + `SuspendGenerator` +
+// `ResumeGenerator`/`GetResumeMode` + the THROW-only `HandleCompletion`
+// dispatch) inside the `AsyncFunctionEnter`/catch-all entry protocol —
+// the decompiled text only parses and runs correctly under node if the
+// fold dissolved the machinery into plain `await` control flow.
+
+use abcd_ir::module::FunctionKind;
+use abcd_ir::op::{BinOp, CmpOp, UnOp};
+use abcd_ir::{Edge, EdgeKind, FuncId, Module, Op, ValueId};
+use common::*;
+
+/// `AsyncFunctionAwaitUncaught(funcobj, acc=v)` + `SuspendGenerator` +
+/// the completion pair; returns (resume, mode).
+fn await_site(m: &mut Module, b: abcd_ir::BlockId, funcobj: ValueId, v: ValueId) -> (ValueId, ValueId) {
+    let aw = emit(m, b, Op::AwaitUncaught { funcobj, value: v });
+    emit(
+        m,
+        b,
+        Op::SuspendGenerator {
+            genobj: funcobj,
+            value: aw,
+        },
+    );
+    let r = emit(m, b, Op::ResumeGenerator { genobj: funcobj });
+    let mode = emit(m, b, Op::GetResumeMode { genobj: funcobj });
+    (r, mode)
+}
+
+/// The ASYNC `HandleCompletion`: `if (mode == THROW) throw resume;`
+/// else continue at the returned block.
+fn await_dispatch(
+    m: &mut Module,
+    b: abcd_ir::BlockId,
+    mode: ValueId,
+    resume: ValueId,
+    throw_b: abcd_ir::BlockId,
+    cont: abcd_ir::BlockId,
+) {
+    let one = load_number(m, b, 1.0);
+    let eq = emit(
+        m,
+        b,
+        Op::Compare {
+            op: CmpOp::Eq,
+            left: mode,
+            right: one,
+        },
+    );
+    let t = emit(
+        m,
+        b,
+        Op::UnaryOp {
+            op: UnOp::IsFalse,
+            operand: eq,
+        },
+    );
+    emit_void(
+        m,
+        b,
+        Op::CondBranch {
+            cond: t,
+            true_dest: cont,
+            false_dest: throw_b,
+        },
+    );
+    emit_void(m, throw_b, Op::Throw { value: resume });
+    emit_void(m, throw_b, Op::Unreachable);
+    link(m, b, cont);
+    link(m, b, throw_b);
+}
+
+/// `AsyncFunctionResolve(funcobj, acc=v)` + return (`DirectReturn`).
+fn async_resolve_return(m: &mut Module, b: abcd_ir::BlockId, funcobj: ValueId, v: ValueId) {
+    let res = emit(m, b, Op::AsyncResolve { funcobj, value: v });
+    emit_void(m, b, Op::Return { value: Some(res) });
+}
+
+/// The catch-all rejection wrapper over the protected blocks.
+fn async_catch_all(m: &mut Module, f: FuncId, funcobj: ValueId, protected: Vec<abcd_ir::BlockId>) {
+    let handler = add_block(m, f);
+    let exc = add_exception_param(m, handler);
+    let rej = emit(m, handler, Op::AsyncReject { funcobj, value: exc });
+    emit_void(m, handler, Op::Return { value: Some(rej) });
+    add_try(m, f, protected, handler, exc);
+}
+
+/// Case D: awaits inside a real loop — `async function d() {
+/// let s = 0; let i = 3; while (i != 0) { s = s + await 5; i = i - 1; }
+/// return s; }` — resolves 15.
+fn case_d() -> abcd_ir::Module {
+    let mut m = mk_module();
+    let f = add_func_kind(&mut m, "d", FunctionKind::Async);
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let funcobj = emit(&mut m, b0, Op::AsyncFunctionEnter);
+    let s0 = load_number(&mut m, b0, 0.0);
+    let i0 = load_number(&mut m, b0, 3.0);
+    let hdr = add_block(&mut m, f);
+    let body = add_block(&mut m, f);
+    let back = add_block(&mut m, f);
+    let exit = add_block(&mut m, f);
+    let throw_b = add_block(&mut m, f);
+    emit_void(&mut m, b0, Op::Branch { dest: hdr });
+    link(&mut m, b0, hdr);
+    let norm = |from| Edge {
+        from,
+        kind: EdgeKind::Normal,
+    };
+    let s_phi = emit(
+        &mut m,
+        hdr,
+        Op::Phi {
+            entries: vec![(norm(b0), s0), (norm(back), s0)], // back: placeholder
+        },
+    );
+    let i_phi = emit(
+        &mut m,
+        hdr,
+        Op::Phi {
+            entries: vec![(norm(b0), i0), (norm(back), i0)], // back: placeholder
+        },
+    );
+    let zero = load_number(&mut m, hdr, 0.0);
+    let eq = emit(
+        &mut m,
+        hdr,
+        Op::Compare {
+            op: CmpOp::Eq,
+            left: i_phi,
+            right: zero,
+        },
+    );
+    let cond = emit(
+        &mut m,
+        hdr,
+        Op::UnaryOp {
+            op: UnOp::IsFalse,
+            operand: eq,
+        },
+    );
+    emit_void(
+        &mut m,
+        hdr,
+        Op::CondBranch {
+            cond,
+            true_dest: body,
+            false_dest: exit,
+        },
+    );
+    link(&mut m, hdr, body);
+    link(&mut m, hdr, exit);
+    // Body: `await 5` with the full machinery.
+    let five = load_number(&mut m, body, 5.0);
+    let (r, mode) = await_site(&mut m, body, funcobj, five);
+    await_dispatch(&mut m, body, mode, r, throw_b, back);
+    // Back edge: accumulate + count down. (N36: the IR's BinaryOp
+    // stores left=acc/right=vreg and the semantic expression is
+    // `right OP left` — the operands below are wired accordingly.)
+    let s2 = emit(
+        &mut m,
+        back,
+        Op::BinaryOp {
+            op: BinOp::Add,
+            left: r,
+            right: s_phi,
+        },
+    );
+    let one = load_number(&mut m, back, 1.0);
+    let i2 = emit(
+        &mut m,
+        back,
+        Op::BinaryOp {
+            op: BinOp::Sub,
+            left: one,
+            right: i_phi,
+        },
+    );
+    emit_void(&mut m, back, Op::Branch { dest: hdr });
+    link(&mut m, back, hdr);
+    // Wire the back-edge phi incomings.
+    for (phi, v) in [(s_phi, s2), (i_phi, i2)] {
+        let iid = match m.value(phi).expect("value").def {
+            abcd_ir::ValueDef::Inst(iid) => iid,
+            _ => panic!("phi must be an inst"),
+        };
+        if let Op::Phi { entries } = &mut m.inst_mut(iid).expect("inst").op {
+            entries[1].1 = v;
+        }
+    }
+    async_resolve_return(&mut m, exit, funcobj, s_phi);
+    async_catch_all(&mut m, f, funcobj, vec![b0, hdr, body, back, exit, throw_b]);
+    m
+}
+
+/// Case E: `async function e(x) { return await x; }` — resolves/rejects
+/// with whatever the awaited promise settles to.
+fn case_e() -> abcd_ir::Module {
+    let mut m = mk_module();
+    let f = add_func_kind(&mut m, "e", FunctionKind::Async);
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let x = add_param(&mut m, f);
+    let funcobj = emit(&mut m, b0, Op::AsyncFunctionEnter);
+    let cont = add_block(&mut m, f);
+    let throw_b = add_block(&mut m, f);
+    let (r, mode) = await_site(&mut m, b0, funcobj, x);
+    await_dispatch(&mut m, b0, mode, r, throw_b, cont);
+    async_resolve_return(&mut m, cont, funcobj, r);
+    async_catch_all(&mut m, f, funcobj, vec![b0, cont, throw_b]);
+    m
+}
+
+/// Case E2: a rejection crossing the dispatch's THROW arm into a USER
+/// catch — `async function e2(x) { try { return await x; } catch (u) {
+/// return u + 100; } }` — `e2(Promise.reject(9))` resolves 109.
+fn case_e2() -> abcd_ir::Module {
+    let mut m = mk_module();
+    let f = add_func_kind(&mut m, "e2", FunctionKind::Async);
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let x = add_param(&mut m, f);
+    let funcobj = emit(&mut m, b0, Op::AsyncFunctionEnter);
+    let cont = add_block(&mut m, f);
+    let throw_b = add_block(&mut m, f);
+    let (r, mode) = await_site(&mut m, b0, funcobj, x);
+    await_dispatch(&mut m, b0, mode, r, throw_b, cont);
+    async_resolve_return(&mut m, cont, funcobj, r);
+    // The user catch: `return u + 100`.
+    let user_h = add_block(&mut m, f);
+    let u = add_exception_param(&mut m, user_h);
+    let hundred = load_number(&mut m, user_h, 100.0);
+    let sum = emit(
+        &mut m,
+        user_h,
+        Op::BinaryOp {
+            op: BinOp::Add,
+            left: u,
+            right: hundred,
+        },
+    );
+    async_resolve_return(&mut m, user_h, funcobj, sum);
+    add_try(&mut m, f, vec![b0, cont, throw_b], user_h, u);
+    // The compiler catch-all wraps everything (including the user
+    // handler).
+    async_catch_all(&mut m, f, funcobj, vec![b0, cont, throw_b, user_h]);
+    m
+}
+
+/// node behavior evidence for the suspend/resume fold: awaits through a
+/// real loop, resolved/rejected promise propagation, and a rejection
+/// caught by a user `catch`.
+#[test]
+fn async_machine_fold_node_behavior() {
+    let texts = [decompile(&case_d()), decompile(&case_e()), decompile(&case_e2())];
+    eprintln!(
+        "── case D ──\n{}\n── case E ──\n{}\n── case E2 ──\n{}",
+        texts[0], texts[1], texts[2]
+    );
+    // Text-shape pins (always run): the machinery is GONE.
+    for (i, text) in texts.iter().enumerate() {
+        assert!(!text.contains("ResumeGenerator"), "case{i}: {text}");
+        assert!(!text.contains("GetResumeMode"), "case{i}: {text}");
+        assert!(!text.contains("async-machinery suspend"), "case{i}: {text}");
+        assert!(
+            !text.contains("fallback AsyncFunctionEnter"),
+            "case{i}: {text}"
+        );
+        assert!(text.contains("await"), "case{i}: {text}");
+    }
+    assert!(texts[0].contains("async function d("), "{}", texts[0]);
+    assert!(texts[0].contains("while"), "a real loop: {}", texts[0]);
+    assert!(texts[1].contains("async function e(p1)"), "{}", texts[1]);
+    assert!(texts[2].contains("async function e2(p1)"), "{}", texts[2]);
+    assert!(texts[2].contains("catch"), "the user catch: {}", texts[2]);
+
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !node_ok {
+        eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join("abcd-n68r-node");
+    std::fs::create_dir_all(&dir).expect("tempdir");
+
+    // Per-case syntax check on the pure decompiled text.
+    for (i, text) in texts.iter().enumerate() {
+        let out = dir.join(format!("case{i}.js"));
+        std::fs::write(&out, text).expect("write case");
+        let check = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&out)
+            .output()
+            .expect("run node --check");
+        assert!(
+            check.status.success(),
+            "node --check case{i}: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+
+    // Behavior, chained sequentially for a deterministic line order:
+    // e(resolve 3)→3, e(reject 9)→reject 9, e2(reject 9)→109 (user
+    // catch), e2(resolve 7)→7, d()→15 (three awaited iterations).
+    let driver = dir.join("driver.js");
+    let mut program = texts.concat();
+    program.push_str(
+        "\ne(Promise.resolve(3)).then(x => console.log(\"E:\" + x))\n\
+         .then(() => e(Promise.reject(9))).catch(x => console.log(\"F:\" + x))\n\
+         .then(() => e2(Promise.reject(9))).then(x => console.log(\"G:\" + x))\n\
+         .then(() => e2(Promise.resolve(7))).then(x => console.log(\"H:\" + x))\n\
+         .then(() => d()).then(x => console.log(\"D:\" + x));\n",
+    );
+    std::fs::write(&driver, &program).expect("write driver");
+    let run = std::process::Command::new("node")
+        .arg(&driver)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    eprintln!(
+        "NODE-EVIDENCE exit={} stdout={:?} stderr={:?}",
+        run.status, stdout, stderr
+    );
+    assert!(run.status.success(), "node run failed: {stderr}");
+    assert_eq!(stdout, "E:3\nF:9\nG:109\nH:7\nD:15\n", "async behavior mismatch");
+}
+
 // ── Corpus async recompile evidence (opt-in) ─────────────────────────
 
 mod common;
