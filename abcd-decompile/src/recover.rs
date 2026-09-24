@@ -1588,11 +1588,10 @@ impl<'m> Recover<'m> {
                 }
             }
             Op::GetTemplateObject { literal } => {
-                // G4 (registered by d-P0): cooked-only fallback. The
-                // cooked strings resolve only when the literal operand is
-                // a const string array.
-                let cooked = self.const_string_array_of(*literal);
-                Expr::TemplateObject { cooked }
+                // G4 RESOLVED (d-P10): the literal operand is the vendor
+                // pair [rawStrings, cookedStrings] — resolve BOTH lists.
+                let (raw, cooked) = self.template_strings_of(*literal);
+                Expr::TemplateObject { raw, cooked }
             }
             Op::CreateIterResultObj { value, done } => Expr::IterResultObj {
                 value: Box::new(self.expr_of(*value)),
@@ -1837,20 +1836,210 @@ impl<'m> Recover<'m> {
         }
     }
 
-    /// Resolve a value to a const string array (template cooked strings).
-    fn const_string_array_of(&self, v: ValueId) -> Option<Vec<Lit>> {
-        let value = self.module.value(v)?;
-        let cid = match value.def {
-            ValueDef::Const(cid) => Some(cid),
-            ValueDef::Inst(iid) => match &self.module.inst(iid)?.op {
-                Op::LoadConst(cid) => Some(*cid),
+    /// Resolve a `gettemplateobject` literal operand to its
+    /// `(raw, cooked)` template-string lists (G4, resolved by d-P10).
+    ///
+    /// Vendor grounding:
+    /// - es2panda `compiler/base/literals.cpp`
+    ///   `Literals::GetTemplateObject` builds `rawArr` (each quasi's
+    ///   `element->Raw()`) and `cookedArr` (`element->Cooked()`), then
+    ///   `templateArg = [rawArr, cookedArr]` — raw at index 0, cooked at
+    ///   index 1 — via `createemptyarray` + `callruntime.definefieldbyvalue`.
+    /// - The runtime `ecmascript/template_string.cpp`
+    ///   `TemplateString::GetTemplateObject` reads `templateLiteral[0]`
+    ///   as the raw strings and `[1]` as the cooked strings.
+    ///
+    /// Two IR shapes carry the pair: a const-pool array constant, or
+    /// the imperative `AllocArray` + integer-keyed own-store build
+    /// sequence (the form es2abc actually emits).
+    fn template_strings_of(&self, literal: ValueId) -> (Option<Vec<Lit>>, Option<Vec<Lit>>) {
+        let v = chase_mov(self.module, literal);
+        // Const-pool form: the whole literal array is one constant.
+        if let Some(cid) = const_id_of(self.module, v) {
+            return match lit_of(self.module, cid) {
+                Some(Lit::Array(items)) => {
+                    // Vendor pair layout [raw, cooked]: both elements are
+                    // themselves arrays. Anything else keeps the pre-d-P10
+                    // interpretation (the flat list is the cooked list).
+                    if items.len() == 2
+                        && let (Lit::Array(raw), Lit::Array(cooked)) = (&items[0], &items[1])
+                    {
+                        return (Some(raw.clone()), Some(cooked.clone()));
+                    }
+                    (None, Some(items))
+                }
+                _ => (None, None),
+            };
+        }
+        // Imperative form: slots 0 (raw) and 1 (cooked) of the literal
+        // array are own-stored element arrays. Lenient about the pair
+        // array's other uses (it is read at the `gettemplateobject`
+        // point regardless); strict about each element array.
+        let mut slots: [Option<ValueId>; 2] = [None, None];
+        for &user in self.chains.users_of(v) {
+            let Some(inst) = self.module.inst(user) else {
+                continue;
+            };
+            let (object, index, value) = match &inst.op {
+                Op::StoreOwnPropDyn { object, key, value }
+                | Op::StorePropDyn { object, key, value } => {
+                    let Some(i) = self.const_index_of(*key) else {
+                        continue;
+                    };
+                    (*object, i, *value)
+                }
+                Op::StoreOwnPropIdx {
+                    object,
+                    index,
+                    value,
+                }
+                | Op::StorePropIdx {
+                    object,
+                    index,
+                    value,
+                } => {
+                    let Some(i) = self.const_index_of(*index) else {
+                        continue;
+                    };
+                    (*object, i, *value)
+                }
+                _ => continue,
+            };
+            if chase_mov(self.module, object) == v && (index as usize) < 2 {
+                slots[index as usize] = Some(value);
+            }
+        }
+        let raw = slots[0].and_then(|a| self.string_elems_of(a));
+        let cooked = slots[1].and_then(|a| self.string_elems_of(a));
+        (raw, cooked)
+    }
+
+    /// Resolve an array value to its element literals — a const-pool
+    /// array, or an `AllocArray` whose every use is accounted for by the
+    /// es2panda template build: integer-keyed own/prop stores into it,
+    /// `Mov` passthroughs, or appearing as a stored VALUE (the literal
+    /// pair array's slot store). Any other use → unresolved (honest
+    /// bail, the cooked-only fallback emits).
+    fn string_elems_of(&self, arr: ValueId) -> Option<Vec<Lit>> {
+        let arr = chase_mov(self.module, arr);
+        if let Some(cid) = const_id_of(self.module, arr) {
+            return match lit_of(self.module, cid)? {
+                Lit::Array(items) => Some(items),
                 _ => None,
-            },
-            _ => None,
-        }?;
+            };
+        }
+        // The array must be a fresh allocation we can fully account for.
+        let is_alloc = matches!(
+            self.module.value(arr)?.def,
+            ValueDef::Inst(iid)
+                if matches!(
+                    self.module.inst(iid).map(|i| &i.op),
+                    Some(Op::AllocArray { .. })
+                )
+        );
+        if !is_alloc {
+            return None;
+        }
+        let mut elems: BTreeMap<u32, Lit> = BTreeMap::new();
+        for &user in self.chains.users_of(arr) {
+            let Some(inst) = self.module.inst(user) else {
+                return None;
+            };
+            match &inst.op {
+                Op::StoreOwnPropDyn { object, key, value }
+                | Op::StorePropDyn { object, key, value } => {
+                    if chase_mov(self.module, *object) == arr {
+                        let i = self.const_index_of(*key)?;
+                        let lit = self.lit_value_of(*value)?;
+                        elems.insert(i, lit);
+                    }
+                    // else: arr is the stored value (the pair-array slot
+                    // store) — accounted for, nothing to record.
+                }
+                Op::StoreOwnPropIdx {
+                    object,
+                    index,
+                    value,
+                }
+                | Op::StorePropIdx {
+                    object,
+                    index,
+                    value,
+                } => {
+                    if chase_mov(self.module, *object) == arr {
+                        let i = self.const_index_of(*index)?;
+                        let lit = self.lit_value_of(*value)?;
+                        elems.insert(i, lit);
+                    }
+                }
+                Op::Mov { .. } => {}
+                _ => return None,
+            }
+        }
+        // Contiguity: elements are exactly indices 0..n.
+        let n = elems.len() as u32;
+        let mut out = Vec::with_capacity(elems.len());
+        for i in 0..n {
+            out.push(elems.get(&i)?.clone());
+        }
+        Some(out)
+    }
+
+    /// Resolve a value to a constant integer index (`ldai` →
+    /// `Const::Number`), through `Mov`s.
+    fn const_index_of(&self, v: ValueId) -> Option<u32> {
+        let cid = const_id_of(self.module, chase_mov(self.module, v))?;
         match lit_of(self.module, cid)? {
-            Lit::Array(items) => Some(items),
+            Lit::Number(bits) => {
+                let x = f64::from_bits(bits);
+                if x.fract() == 0.0 && x >= 0.0 && x <= u32::MAX as f64 {
+                    Some(x as u32)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
+    }
+
+    /// Resolve a value to a constant literal, through `Mov`s.
+    fn lit_value_of(&self, v: ValueId) -> Option<Lit> {
+        let cid = const_id_of(self.module, chase_mov(self.module, v))?;
+        lit_of(self.module, cid)
+    }
+}
+
+/// Chase `Mov` passthroughs to the underlying definition (bounded).
+fn chase_mov(module: &Module, mut v: ValueId) -> ValueId {
+    for _ in 0..16 {
+        let Some(value) = module.value(v) else {
+            break;
+        };
+        match value.def {
+            ValueDef::Inst(iid) => match module.inst(iid) {
+                Some(inst) => match &inst.op {
+                    Op::Mov { src } => {
+                        v = *src;
+                        continue;
+                    }
+                    _ => break,
+                },
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    v
+}
+
+/// Resolve a value to the constant it loads, if any.
+fn const_id_of(module: &Module, v: ValueId) -> Option<ConstId> {
+    match module.value(v)?.def {
+        ValueDef::Const(cid) => Some(cid),
+        ValueDef::Inst(iid) => match &module.inst(iid)?.op {
+            Op::LoadConst(cid) => Some(*cid),
+            _ => None,
+        },
+        _ => None,
     }
 }

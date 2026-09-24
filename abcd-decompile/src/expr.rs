@@ -275,14 +275,26 @@ pub enum Expr {
         /// Index of the first rest argument.
         start_index: u16,
     },
-    /// `GetTemplateObject` — template-literal reconstruction. IR gap G4
-    /// (registered by d-P0): the raw-vs-cooked distinction is not
-    /// verifiably preserved in the const pool, so this node is
-    /// **cooked-only** (semantically equal for the VM gate, cosmetically
-    /// lossy). Cache identity is elided by design.
+    /// `GetTemplateObject` — template-literal reconstruction. G4
+    /// RESOLVED (d-P10): the literal operand is the vendor pair
+    /// `[rawStrings, cookedStrings]` (es2panda
+    /// `compiler/base/literals.cpp` `Literals::GetTemplateObject` builds
+    /// `templateArg = [rawArr, cookedArr]`; the runtime
+    /// `ecmascript/template_string.cpp` `TemplateString::GetTemplateObject`
+    /// reads index 0 as raw, index 1 as cooked), and the raw strings
+    /// survive verbatim in the file's string table. Emission is a
+    /// backtick literal with the raw text (an identity tag reconstructs
+    /// the template object); cooked-only is the documented fallback when
+    /// raw is genuinely absent. Cache identity (the runtime
+    /// `TemplateMap`) is elided by design.
     TemplateObject {
-        /// The cooked template strings, when the literal operand resolved
-        /// to a const string array.
+        /// The raw template strings (vendor literal index 0), when the
+        /// literal operand resolved — either a const-pool pair array or
+        /// the imperative `createemptyarray` + `definefieldbyvalue`
+        /// build sequence the frontend emits.
+        raw: Option<Vec<Lit>>,
+        /// The cooked template strings (vendor literal index 1), when
+        /// resolved. Fallback text source when raw is absent.
         cooked: Option<Vec<Lit>>,
     },
     /// `{ value, done }` — the iterator result object. Invisible in
