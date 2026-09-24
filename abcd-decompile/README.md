@@ -391,11 +391,24 @@ Goldens: `tests/golden_generator.rs` g01–g06 (inline immediates,
 shared mode consts, bound yield result, yield-in-loop, entry-gate
 bail, async folds) and `tests/golden_async.rs` a01–a07 (plain await,
 dead resume value, await-in-loop, chained awaits, entry-gate bail,
-dispatch-mismatch bail, async-generator bail). Corpus fold counters:
+dispatch-mismatch bail, async-generator bail). The N70 residuals closed at d-P17: a
+plain-async `for await` driver decompiles to the LITERAL `for await
+(const x of …)` source form (`folds::match_for_await_driver` — the
+header's folded dispatch await temp, the `next.call(it)` phi call, the
+done arm's absorbed post-loop tail re-homed after the loop,
+loop-carried bookkeeping phis collapsed to their invariant sources),
+and the dead after-loop `throw <resume temp>` the break-routed
+dispatch left behind is swept under a whole-node unreachability proof
+(`folds::sweep_dead_loop_exit_throws` — unlabeled `while (true)`,
+every exit break statically dead, no labeled jumps, exceptional edges
+checked; any doubt keeps the block). Corpus fold counters:
 `gen_driver_sites=54 gen_driver_entry=18 gen_driver_bound=0` (18
 generator functions × entry + 2 yield sites each),
 `async_machine_sites=18 async_machine_bound=18` (all 18 async-await
-fixtures).
+fixtures); d-P17 moves nothing corpus-side (`for_await_of=0
+dead_exit_throw=0` — the driver shape is extra-corpus; its fixture is
+`decompile-fixtures/yield-star/delegate-async.abc`, behavior-pinned by
+`tests/yield_star_node.rs` including the rejection probe).
 
 ## Crate map (Stage A)
 
