@@ -431,6 +431,7 @@ pub fn dump_expr(e: &Expr) -> String {
             )
         }
         Expr::Yield { value } => format!("(yield {})", dump_expr(value)),
+        Expr::YieldStar { value } => format!("(yield* {})", dump_expr(value)),
         Expr::Await { value, uncaught } => {
             if *uncaught {
                 format!("(await {} /*uncaught*/)", dump_expr(value))

@@ -252,6 +252,14 @@ pub enum Expr {
         /// The yielded value.
         value: Box<Expr>,
     },
+    /// `yield* expr` (yield delegation). Never produced by Stage A —
+    /// the es2abc YieldStar driver loop folds back to this form in
+    /// Stage B ([`crate::folds::yield_star_fold`], d-P15). The result
+    /// is the delegate's completion value (`const ret = yield* f()`).
+    YieldStar {
+        /// The delegate iterable/iterator expression.
+        value: Box<Expr>,
+    },
     /// `await value`. `uncaught` records the `AwaitUncaught` form (the
     /// caught-completion wrapper is machine-level and elided).
     Await {
@@ -495,10 +503,10 @@ impl Expr {
                 _ => 12,
             },
             Expr::Unary { .. } | Expr::Delete { .. } | Expr::Await { .. } => 17,
-            // `yield` parses as an AssignmentExpression: as the operand of
-            // any real operator it MUST be parenthesized (`yield v + w`
-            // means `yield (v + w)`).
-            Expr::Yield { .. } => 2,
+            // `yield`/`yield*` parse as AssignmentExpressions: as the
+            // operand of any real operator they MUST be parenthesized
+            // (`yield v + w` means `yield (v + w)`).
+            Expr::Yield { .. } | Expr::YieldStar { .. } => 2,
             // Object literals are not PrimaryExpressions at statement /
             // member position; giving them the lowest precedence makes the
             // printer parenthesize them inside any operator context (the

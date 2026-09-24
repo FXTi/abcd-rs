@@ -476,6 +476,12 @@ impl<'m> Emitter<'m> {
         // never sees the folded ones), and the folded catch-all
         // rejection dissolves in fold()'s rethrow-try pass.
         folds::async_generator_machine_fold(&mut structured.body, rf.kind, &mut fstats);
+        // The YieldStar delegation fold (d-P15) runs after the
+        // generator machine folds (their entry gates already vetted
+        // the genobj plumbing; the YieldStar driver loop's own
+        // suspend sites are not theirs) and before fold() — the
+        // folded `yield*` body then sees the ordinary desugars.
+        folds::yield_star_fold(&mut structured.body, rf.kind, &mut fstats);
         folds::fold(&mut structured.body, &mut fstats);
         folds::scope_fold(&mut structured.body, &rf.params, &mut fstats);
         self.stats.structure =
@@ -1545,6 +1551,13 @@ impl<'m> Emitter<'m> {
                     self.sub(value, 0, out);
                 }
             }
+            Expr::YieldStar { value } => {
+                // Produced only by the YieldStar fold (d-P15), which is
+                // kind-gated to Generator/AsyncGenerator — `yield*`
+                // always parses here.
+                out.push_str("yield* ");
+                self.sub(value, 0, out);
+            }
             Expr::Await { value, .. } => {
                 out.push_str("await ");
                 self.sub(value, 17, out);
@@ -2504,5 +2517,7 @@ fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.agen_awaits += b.agen_awaits;
     a.agen_await_bound += b.agen_await_bound;
     a.agen_returns += b.agen_returns;
+    a.yield_star_sites += b.yield_star_sites;
+    a.yield_star_bound += b.yield_star_bound;
     a
 }
