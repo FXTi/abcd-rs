@@ -572,11 +572,15 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    s.next/b.value2 re-evaluated —
    sharpened to VM-manufactured-object gaps (not dispatch); miss log
    #...#-mangled names no longer counted (never registerable).
-   INFRA HAZARD (hit twice): remote-test's SHARED CARGO_TARGET_DIR is
-   unsound under concurrent workers — a stale abcd-analysis rlib was
-   served as "fresh" for `cargo test --workspace` (phantom
-   "could not find pta in dataflow"); workaround = touch the edited
-   crate's sources so rsync -a's preserved mtimes force a rebuild.
+   INFRA HAZARD FIXED (35e2c75, 2026-09-25): remote-test's shared
+   CARGO_TARGET_DIR is now TREE-CONTENT-KEYED (HEAD + sha256 of tracked
+   diff + untracked-file content hashes; any content change → fresh
+   cache dir, identical trees → warm hits) + flock serializes same-key
+   concurrent runs + newest-8 keys kept (trylock reaping). Verified:
+   cold→warm 10.9s, content change → new key, concurrent same-key green,
+   workspace 132 suites green on the keyed cache; the 22G legacy cache
+   reaped. (Was: stale binaries under alternating trees at N64 + phantom
+   rlib at t-P6; the touch workaround is retired.)
    d-P11 DONE (2026-09-25): DREAM GATE 1149/1149 — the full oracle
    set passes (all buckets zero). generator_machine_fold reconstructs
    the es2abc state machine (entry suspend elided, iter-result
