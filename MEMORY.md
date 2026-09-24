@@ -588,6 +588,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    entry site). Async family stays documented fallback via NEW IR gap
    G6 = N68 registered (async bytecodes carry the value in acc; lift
    drops it). QUEUE COMPLETE: d-P5..d-P11 + t-P1..t-P6 all landed.
+   TAG RADAR LANDED (2026-09-24, maintainer amendments: prefix-only
+   OpenHarmony-* filter + tag-time newest-wins, no version parsing):
+   vendor-sync.yml replaced (weekly Monday + dispatch); drift → ONE
+   standing vendor-bump PR per tag (all-state dup-check; closing =
+   wont-port); PR #20 = the standing v7.0-Release porting-cost
+   document (red by design). common-files-consistency job DELETED
+   (maintainer: shim drift acceptable). CI 6/6 green.
    VENDOR MIGRATION DONE (2026-09-24, V-SUB): ruby-sync + copied
    vendored subsets replaced by git submodules at crate roots
    (abcd-{isa,file}-sys/arkcompiler_runtime_core), pinned to the proven
