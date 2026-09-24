@@ -1,0 +1,699 @@
+# source binary: delegate-async.abc
+
+# ====================
+# LITERALS
+
+
+# ====================
+# RECORDS
+
+.language ECMAScript
+.record _ESExpectedPropertyCountAnnotation {
+}
+
+.language ECMAScript
+.record _ESScopeNamesRecord {
+	u32 delegate-async.js = 0x28f
+}
+
+.language ECMAScript
+.record _ESSlotNumberAnnotation {
+}
+
+# ====================
+# METHODS
+
+L_ESSlotNumberAnnotation:
+	u32 SlotNumber { 0x8 }
+.language ECMAScript
+.function any #*#inner(any a0, any a1, any a2) <static> {
+	mov v0, a0
+	mov v1, a1
+	mov v2, a2
+	createasyncgeneratorobj v0
+	sta v3
+try_begin_label_0:
+	ldundefined
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v5
+	lda v3
+	getresumemode
+	sta v4
+	ldai 0x1
+	asyncfunctionawaituncaught v3
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v8
+	lda v3
+	getresumemode
+	sta v7
+	ldai 0x1
+	eq 0x0, v7
+	jeqz jump_label_3
+	lda v8
+	throw
+jump_label_3:
+	lda v8
+	sta v4
+	lda v3
+	setgeneratorstate 0x2
+	ldfalse
+	sta v7
+	asyncgeneratorresolve v3, v4, v7
+	lda v3
+	resumegenerator
+	sta v6
+	lda v3
+	getresumemode
+	sta v5
+	ldai 0x0
+	eq 0x1, v5
+	jeqz jump_label_4
+	lda v6
+	asyncfunctionawaituncaught v3
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v6
+	lda v3
+	getresumemode
+	sta v5
+	ldai 0x1
+	eq 0x2, v5
+	jeqz jump_label_5
+	lda v6
+	throw
+jump_label_5:
+	lda v6
+	sta v7
+	ldtrue
+	sta v8
+	lda v3
+	setgeneratorstate 0x4
+	asyncgeneratorresolve v3, v7, v8
+	return
+jump_label_4:
+	ldai 0x1
+	eq 0x3, v5
+	jeqz jump_label_6
+	lda v6
+	throw
+jump_label_6:
+	lda v6
+	ldai 0x2
+	asyncfunctionawaituncaught v3
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v8
+	lda v3
+	getresumemode
+	sta v7
+	ldai 0x1
+	eq 0x4, v7
+	jeqz jump_label_7
+	lda v8
+	throw
+jump_label_7:
+	lda v8
+	sta v4
+	lda v3
+	setgeneratorstate 0x2
+	ldfalse
+	sta v7
+	asyncgeneratorresolve v3, v4, v7
+	lda v3
+	resumegenerator
+	sta v6
+	lda v3
+	getresumemode
+	sta v5
+	ldai 0x0
+	eq 0x5, v5
+	jeqz jump_label_8
+	lda v6
+	asyncfunctionawaituncaught v3
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v6
+	lda v3
+	getresumemode
+	sta v5
+	ldai 0x1
+	eq 0x6, v5
+	jeqz jump_label_9
+	lda v6
+	throw
+jump_label_9:
+	lda v6
+	sta v7
+	ldtrue
+	sta v8
+	lda v3
+	setgeneratorstate 0x4
+	asyncgeneratorresolve v3, v7, v8
+	return
+jump_label_8:
+	ldai 0x1
+	eq 0x7, v5
+	jeqz jump_label_10
+	lda v6
+	throw
+jump_label_10:
+	lda v6
+	lda.str "inner-done"
+	asyncfunctionawaituncaught v3
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v5
+	lda v3
+	getresumemode
+	sta v4
+	lda v3
+	setgeneratorstate 0x4
+	ldtrue
+	sta v6
+	asyncgeneratorresolve v3, v5, v6
+	return
+try_end_label_0:
+	sta v4
+	lda v3
+	setgeneratorstate 0x4
+	lda v4
+	asyncgeneratorreject v3
+	return
+:
+
+.catchall try_begin_label_0, try_end_label_0, try_end_label_0, handler_end_label_0_0
+}
+
+L_ESSlotNumberAnnotation:
+	u32 SlotNumber { 0x22 }
+.language ECMAScript
+.function any #*#main(any a0, any a1, any a2) <static> {
+	mov v0, a0
+	mov v1, a1
+	mov v2, a2
+	asyncfunctionenter
+	sta v4
+try_begin_label_3:
+	createemptyarray 0x0
+	sta v5
+	sta v3
+try_begin_label_1:
+	ldglobalvar 0x1, "outer"
+	sta v6
+	lda v6
+	callarg0 0x2
+try_end_label_1:
+	jmp handler_end_label_1_0
+handler_begin_label_1_0:
+	sta v6
+	lda v6
+	throw
+handler_end_label_1_0:
+	getasynciterator 0x4
+	sta v9
+	lda v9
+	ldobjbyname 0x6, "next"
+	sta v8
+	ldfalse
+	sta v7
+jump_label_19:
+	lda v8
+	callthis0 0x8, v9
+	asyncfunctionawaituncaught v4
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v12
+	lda v4
+	getresumemode
+	sta v11
+	ldai 0x1
+	eq 0xa, v11
+	jeqz jump_label_15
+	lda v12
+	throw
+jump_label_15:
+	lda v12
+	sta v10
+	throw.ifnotobject v10
+	lda v10
+	ldobjbyname 0xb, "done"
+	callruntime.istrue 0xd
+	jnez jump_label_16
+	lda v10
+	ldobjbyname 0xe, "value"
+	sta v11
+try_begin_label_2:
+	lda v11
+	sta v12
+	lda v3
+	sta v14
+	lda v14
+	ldobjbyname 0x10, "push"
+	sta v13
+	lda v12
+	sta v15
+	lda v13
+	callthis1 0x12, v14, v15
+try_end_label_2:
+	jmp handler_end_label_2_0
+handler_begin_label_2_0:
+	sta v12
+	lda v7
+	callruntime.istrue 0x14
+	jnez jump_label_17
+	ldtrue
+	sta v7
+	ldundefined
+	sta v13
+	ldhole
+	sta v14
+try_begin_label_0:
+	lda v9
+	ldobjbyname 0x15, "return"
+	sta v8
+	sta v15
+	ldundefined
+	eq 0x17, v15
+	jnez jump_label_17
+	lda v8
+	callthis0 0x18, v9
+	asyncfunctionawaituncaught v4
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v16
+	lda v4
+	getresumemode
+	sta v15
+	ldai 0x1
+	eq 0x1a, v15
+	jeqz jump_label_18
+	lda v16
+	throw
+jump_label_18:
+	lda v16
+	sta v13
+try_end_label_0:
+	jmp handler_end_label_0_0
+handler_begin_label_0_0:
+	sta v14
+handler_end_label_0_0:
+	lda v12
+	throw
+	lda v13
+	throw.ifnotobject v13
+jump_label_17:
+	lda v12
+	throw
+handler_end_label_2_0:
+	jmp jump_label_19
+jump_label_16:
+	tryldglobalbyname 0x1b, "print"
+	sta v5
+	lda v3
+	sta v7
+	lda v7
+	ldobjbyname 0x1c, "join"
+	sta v6
+	lda.str ","
+	sta v8
+	lda v6
+	callthis1 0x1e, v7, v8
+	sta v6
+	lda v5
+	callarg1 0x20, v6
+	ldundefined
+	asyncfunctionresolve v4
+	return
+try_end_label_3:
+	sta v5
+	asyncfunctionreject v4
+	return
+:
+
+.catchall try_begin_label_0, try_end_label_0, handler_begin_label_0_0, handler_end_label_0_0
+.catchall try_begin_label_1, try_end_label_1, handler_begin_label_1_0, handler_end_label_1_0
+.catchall try_begin_label_2, try_end_label_2, handler_begin_label_2_0, handler_end_label_2_0
+.catchall try_begin_label_3, try_end_label_3, try_end_label_3, handler_end_label_3_0
+}
+
+L_ESSlotNumberAnnotation:
+	u32 SlotNumber { 0x2c }
+.language ECMAScript
+.function any #*#outer(any a0, any a1, any a2) <static> {
+	mov v0, a0
+	mov v1, a1
+	mov v2, a2
+	createasyncgeneratorobj v0
+	sta v4
+try_begin_label_1:
+	ldundefined
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v6
+	lda v4
+	getresumemode
+	sta v5
+	ldglobalvar 0x0, "inner"
+	sta v5
+	lda v5
+	callarg0 0x1
+	getasynciterator 0x3
+	sta v7
+	lda v7
+	ldobjbyname 0x5, "next"
+	sta v6
+	ldfalse
+	sta v5
+	ldundefined
+	sta v8
+	ldai 0x2
+	sta v9
+	mov v10, v6
+jump_label_17:
+	ldfalse
+	sta v11
+	ldai 0x2
+	stricteq 0x7, v9
+	jeqz jump_label_7
+	mov v6, v10
+	jmp jump_label_8
+jump_label_7:
+	ldai 0x1
+	stricteq 0x8, v9
+	jeqz jump_label_9
+	lda v7
+	ldobjbyname 0x9, "throw"
+	sta v6
+	sta v13
+	ldundefined
+	eq 0xb, v13
+	jeqz jump_label_8
+	sta v13
+	lda v5
+	callruntime.istrue 0xc
+	jnez jump_label_10
+	ldtrue
+	sta v5
+	ldundefined
+	sta v14
+	ldhole
+	sta v15
+try_begin_label_0:
+	lda v7
+	ldobjbyname 0xd, "return"
+	sta v6
+	sta v16
+	ldundefined
+	eq 0xf, v16
+	jnez jump_label_10
+	lda v6
+	callthis0 0x10, v7
+	asyncfunctionawaituncaught v4
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v17
+	lda v4
+	getresumemode
+	sta v16
+	ldai 0x1
+	eq 0x12, v16
+	jeqz jump_label_11
+	lda v17
+	throw
+jump_label_11:
+	lda v17
+	sta v14
+try_end_label_0:
+	jmp handler_end_label_0_0
+handler_begin_label_0_0:
+	sta v15
+handler_end_label_0_0:
+	lda v15
+	sta v16
+	ldhole
+	sta v17
+	lda v16
+	noteq 0x13, v17
+	jeqz jump_label_12
+	lda v16
+	throw
+jump_label_12:
+	lda v14
+	throw.ifnotobject v14
+jump_label_10:
+	lda v13
+	throw.notexists
+jump_label_9:
+	ldtrue
+	sta v11
+	lda v7
+	ldobjbyname 0x14, "return"
+	sta v6
+	sta v13
+	ldundefined
+	eq 0x16, v13
+	jeqz jump_label_8
+	lda v8
+	asyncfunctionawaituncaught v4
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v14
+	lda v4
+	getresumemode
+	sta v13
+	ldai 0x1
+	eq 0x17, v13
+	jeqz jump_label_13
+	lda v14
+	throw
+jump_label_13:
+	lda v14
+	sta v13
+	ldtrue
+	sta v14
+	lda v4
+	setgeneratorstate 0x4
+	asyncgeneratorresolve v4, v13, v14
+	return
+jump_label_8:
+	lda v6
+	callthis1 0x18, v7, v8
+	asyncfunctionawaituncaught v4
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v14
+	lda v4
+	getresumemode
+	sta v13
+	ldai 0x1
+	eq 0x1a, v13
+	jeqz jump_label_14
+	lda v14
+	throw
+jump_label_14:
+	lda v14
+	sta v8
+	throw.ifnotobject v8
+	lda v8
+	ldobjbyname 0x1b, "done"
+	callruntime.istrue 0x1d
+	jnez jump_label_15
+	lda v8
+	lda v8
+	ldobjbyname 0x1e, "value"
+	asyncfunctionawaituncaught v4
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v14
+	lda v4
+	getresumemode
+	sta v13
+	ldai 0x1
+	eq 0x20, v13
+	jeqz jump_label_16
+	lda v14
+	throw
+jump_label_16:
+	lda v14
+	sta v12
+	lda v4
+	setgeneratorstate 0x2
+	ldfalse
+	sta v13
+	asyncgeneratorresolve v4, v12, v13
+	lda v4
+	resumegenerator
+	sta v8
+	lda v4
+	getresumemode
+	sta v9
+	ldai 0x0
+	eq 0x21, v9
+	jeqz jump_label_17
+	lda v8
+	asyncfunctionawaituncaught v4
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v8
+	lda v4
+	getresumemode
+	sta v9
+	ldai 0x1
+	noteq 0x22, v9
+	jeqz jump_label_17
+	ldai 0x0
+	sta v9
+	jmp jump_label_17
+jump_label_15:
+	lda v11
+	callruntime.isfalse 0x23
+	jnez jump_label_18
+	lda v8
+	ldobjbyname 0x24, "value"
+	sta v13
+	ldtrue
+	sta v14
+	lda v4
+	setgeneratorstate 0x4
+	asyncgeneratorresolve v4, v13, v14
+	return
+jump_label_18:
+	lda v8
+	ldobjbyname 0x26, "value"
+	sta v3
+	lda v3
+	asyncfunctionawaituncaught v4
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v9
+	lda v4
+	getresumemode
+	sta v8
+	ldai 0x1
+	eq 0x28, v8
+	jeqz jump_label_19
+	lda v9
+	throw
+jump_label_19:
+	lda v9
+	sta v5
+	lda v4
+	setgeneratorstate 0x2
+	ldfalse
+	sta v8
+	asyncgeneratorresolve v4, v5, v8
+	lda v4
+	resumegenerator
+	sta v7
+	lda v4
+	getresumemode
+	sta v6
+	ldai 0x0
+	eq 0x29, v6
+	jeqz jump_label_20
+	lda v7
+	asyncfunctionawaituncaught v4
+	suspendgenerator v4
+	lda v4
+	resumegenerator
+	sta v7
+	lda v4
+	getresumemode
+	sta v6
+	ldai 0x1
+	eq 0x2a, v6
+	jeqz jump_label_21
+	lda v7
+	throw
+jump_label_21:
+	lda v7
+	sta v8
+	ldtrue
+	sta v9
+	lda v4
+	setgeneratorstate 0x4
+	asyncgeneratorresolve v4, v8, v9
+	return
+jump_label_20:
+	ldai 0x1
+	eq 0x2b, v6
+	jeqz jump_label_22
+	lda v7
+	throw
+jump_label_22:
+	lda v7
+	ldundefined
+	sta v5
+	ldtrue
+	sta v6
+	lda v4
+	setgeneratorstate 0x4
+	asyncgeneratorresolve v4, v5, v6
+	return
+try_end_label_1:
+	sta v5
+	lda v4
+	setgeneratorstate 0x4
+	lda v5
+	asyncgeneratorreject v4
+	return
+:
+
+.catchall try_begin_label_0, try_end_label_0, handler_begin_label_0_0, handler_end_label_0_0
+.catchall try_begin_label_1, try_end_label_1, try_end_label_1, handler_end_label_1_0
+}
+
+L_ESSlotNumberAnnotation:
+	u32 SlotNumber { 0x9 }
+.language ECMAScript
+.function any func_main_0(any a0, any a1, any a2) <static> {
+	mov v0, a0
+	mov v1, a1
+	mov v2, a2
+	definefunc 0x0, #*#inner:(any,any,any), 0x0
+	stglobalvar 0x1, "inner"
+	definefunc 0x2, #*#main:(any,any,any), 0x0
+	stglobalvar 0x3, "main"
+	definefunc 0x4, #*#outer:(any,any,any), 0x0
+	stglobalvar 0x5, "outer"
+	ldglobalvar 0x6, "main"
+	sta v4
+	lda v4
+	callarg0 0x7
+	ldundefined
+	returnundefined
+}
+
+# ====================
+# STRING
+
+[offset:0xc4, name_value:,]
+[offset:0xe7, name_value:done]
+[offset:0xed, name_value:inner]
+[offset:0xf4, name_value:inner-done]
+[offset:0x100, name_value:join]
+[offset:0x106, name_value:main]
+[offset:0x10c, name_value:next]
+[offset:0x112, name_value:outer]
+[offset:0x119, name_value:print]
+[offset:0x120, name_value:push]
+[offset:0x126, name_value:return]
+[offset:0x12e, name_value:throw]
+[offset:0x135, name_value:value]

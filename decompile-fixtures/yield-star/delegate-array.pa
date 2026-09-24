@@ -1,0 +1,361 @@
+# source binary: delegate-array.abc
+
+# ====================
+# LITERALS
+
+0 0x213 { 3 [ i32:10, i32:20, i32:30, ]}
+
+# ====================
+# RECORDS
+
+.language ECMAScript
+.record _ESExpectedPropertyCountAnnotation {
+}
+
+.language ECMAScript
+.record _ESScopeNamesRecord {
+	u32 delegate-array.js = 0x20f
+}
+
+.language ECMAScript
+.record _ESSlotNumberAnnotation {
+}
+
+# ====================
+# METHODS
+
+L_ESSlotNumberAnnotation:
+	u32 SlotNumber { 0x24 }
+.language ECMAScript
+.function any #*#outer(any a0, any a1, any a2) <static> {
+try_begin_label_1:
+	mov v0, a0
+	mov v1, a1
+	mov v2, a2
+	creategeneratorobj v0
+	sta v3
+	ldundefined
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v5
+	lda v3
+	getresumemode
+	sta v4
+	ldai 0x0
+	eq 0x0, v4
+	jeqz jump_label_7
+	lda v5
+	return
+jump_label_7:
+	ldai 0x1
+	eq 0x1, v4
+	jeqz jump_label_8
+	lda v5
+	throw
+jump_label_8:
+	lda v5
+	ldai 0x0
+	sta v6
+	ldfalse
+	sta v7
+	createiterresultobj v6, v7
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v9
+	lda v3
+	getresumemode
+	sta v8
+	ldai 0x0
+	eq 0x2, v8
+	jeqz jump_label_9
+	lda v9
+	return
+jump_label_9:
+	ldai 0x1
+	eq 0x3, v8
+	jeqz jump_label_10
+	lda v9
+	throw
+jump_label_10:
+	lda v9
+	createarraywithbuffer 0x4, { 3 [ i32:10, i32:20, i32:30, ]}
+	sta v6
+	getiterator 0x5
+	sta v8
+	lda v8
+	ldobjbyname 0x7, "next"
+	sta v7
+	ldfalse
+	sta v6
+	ldundefined
+	sta v9
+	ldai 0x2
+	sta v10
+	mov v11, v7
+jump_label_17:
+	ldfalse
+	sta v12
+	ldai 0x2
+	stricteq 0x9, v10
+	jeqz jump_label_11
+	mov v7, v11
+	jmp jump_label_12
+jump_label_11:
+	ldai 0x1
+	stricteq 0xa, v10
+	jeqz jump_label_13
+	lda v8
+	ldobjbyname 0xb, "throw"
+	sta v7
+	sta v14
+	ldundefined
+	eq 0xd, v14
+	jeqz jump_label_12
+	sta v14
+	lda v6
+	callruntime.istrue 0xe
+	jnez jump_label_14
+	ldtrue
+	sta v6
+	ldundefined
+	sta v15
+	ldhole
+	sta v16
+try_begin_label_0:
+	lda v8
+	ldobjbyname 0xf, "return"
+	sta v7
+	sta v17
+	ldundefined
+	eq 0x11, v17
+	jnez jump_label_14
+	lda v7
+	callthis0 0x12, v8
+	sta v15
+try_end_label_0:
+	jmp handler_end_label_0_0
+handler_begin_label_0_0:
+	sta v16
+handler_end_label_0_0:
+	lda v16
+	sta v17
+	ldhole
+	sta v18
+	lda v17
+	noteq 0x14, v18
+	jeqz jump_label_15
+	lda v17
+	throw
+jump_label_15:
+	lda v15
+	throw.ifnotobject v15
+jump_label_14:
+	lda v14
+	throw.notexists
+jump_label_13:
+	ldtrue
+	sta v12
+	lda v8
+	ldobjbyname 0x15, "return"
+	sta v7
+	sta v14
+	ldundefined
+	eq 0x17, v14
+	jeqz jump_label_12
+	lda v9
+	return
+jump_label_12:
+	lda v7
+	callthis1 0x18, v8, v9
+	sta v9
+	throw.ifnotobject v9
+	lda v9
+	ldobjbyname 0x1a, "done"
+	callruntime.istrue 0x1c
+	jnez jump_label_16
+	lda v9
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v9
+	lda v3
+	getresumemode
+	sta v10
+	jmp jump_label_17
+jump_label_16:
+	lda v12
+	callruntime.isfalse 0x1d
+	jnez jump_label_18
+	lda v9
+	ldobjbyname 0x1e, "value"
+	return
+jump_label_18:
+	lda v9
+	ldobjbyname 0x20, "value"
+	ldai 0x63
+	sta v6
+	ldfalse
+	sta v7
+	createiterresultobj v6, v7
+	suspendgenerator v3
+	lda v3
+	resumegenerator
+	sta v9
+	lda v3
+	getresumemode
+	sta v8
+	ldai 0x0
+	eq 0x22, v8
+	jeqz jump_label_19
+	lda v9
+	return
+jump_label_19:
+	ldai 0x1
+	eq 0x23, v8
+	jeqz jump_label_20
+	lda v9
+	throw
+jump_label_20:
+	lda v9
+	ldundefined
+	return
+try_end_label_1:
+	throw
+:
+
+.catchall try_begin_label_0, try_end_label_0, handler_begin_label_0_0, handler_end_label_0_0
+.catchall try_begin_label_1, try_end_label_1, try_end_label_1, handler_end_label_1_0
+}
+
+L_ESSlotNumberAnnotation:
+	u32 SlotNumber { 0x25 }
+.language ECMAScript
+.function any func_main_0(any a0, any a1, any a2) <static> {
+	mov v0, a0
+	mov v1, a1
+	mov v2, a2
+	definefunc 0x0, #*#outer:(any,any,any), 0x0
+	stglobalvar 0x1, "outer"
+	createemptyarray 0x2
+	sta v5
+	stconsttoglobalrecord 0x3, "log"
+try_begin_label_1:
+	ldglobalvar 0x4, "outer"
+	sta v6
+	lda v6
+	callarg0 0x5
+try_end_label_1:
+	jmp handler_end_label_1_0
+handler_begin_label_1_0:
+	sta v6
+	lda v6
+	throw
+handler_end_label_1_0:
+	getiterator 0x7
+	sta v9
+	lda v9
+	ldobjbyname 0x9, "next"
+	sta v8
+	ldfalse
+	sta v7
+jump_label_14:
+	lda v8
+	callthis0 0xb, v9
+	sta v10
+	throw.ifnotobject v10
+	lda v10
+	ldobjbyname 0xd, "done"
+	callruntime.istrue 0xf
+	jnez jump_label_12
+	lda v10
+	ldobjbyname 0x10, "value"
+	sta v11
+try_begin_label_2:
+	lda v11
+	sta v12
+	tryldglobalbyname 0x12, "log"
+	sta v14
+	lda v14
+	ldobjbyname 0x13, "push"
+	sta v13
+	lda v12
+	sta v15
+	lda v13
+	callthis1 0x15, v14, v15
+try_end_label_2:
+	jmp handler_end_label_2_0
+handler_begin_label_2_0:
+	sta v12
+	lda v7
+	callruntime.istrue 0x17
+	jnez jump_label_13
+	ldtrue
+	sta v7
+	ldundefined
+	sta v13
+	ldhole
+	sta v14
+try_begin_label_0:
+	lda v9
+	ldobjbyname 0x18, "return"
+	sta v8
+	sta v15
+	ldundefined
+	eq 0x1a, v15
+	jnez jump_label_13
+	lda v8
+	callthis0 0x1b, v9
+	sta v13
+try_end_label_0:
+	jmp handler_end_label_0_0
+handler_begin_label_0_0:
+	sta v14
+handler_end_label_0_0:
+	lda v12
+	throw
+	lda v13
+	throw.ifnotobject v13
+jump_label_13:
+	lda v12
+	throw
+handler_end_label_2_0:
+	jmp jump_label_14
+jump_label_12:
+	tryldglobalbyname 0x1d, "print"
+	sta v5
+	tryldglobalbyname 0x1e, "log"
+	sta v7
+	lda v7
+	ldobjbyname 0x1f, "join"
+	sta v6
+	lda.str ","
+	sta v8
+	lda v6
+	callthis1 0x21, v7, v8
+	sta v6
+	lda v5
+	callarg1 0x23, v6
+	ldundefined
+	returnundefined
+
+.catchall try_begin_label_0, try_end_label_0, handler_begin_label_0_0, handler_end_label_0_0
+.catchall try_begin_label_1, try_end_label_1, handler_begin_label_1_0, handler_end_label_1_0
+.catchall try_begin_label_2, try_end_label_2, handler_begin_label_2_0, handler_end_label_2_0
+}
+
+# ====================
+# STRING
+
+[offset:0xb8, name_value:,]
+[offset:0xc6, name_value:done]
+[offset:0xcc, name_value:join]
+[offset:0xd2, name_value:log]
+[offset:0xd7, name_value:next]
+[offset:0xdd, name_value:outer]
+[offset:0xe4, name_value:print]
+[offset:0xeb, name_value:push]
+[offset:0xf1, name_value:return]
+[offset:0xf9, name_value:throw]
+[offset:0x100, name_value:value]
