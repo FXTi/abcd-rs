@@ -577,6 +577,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    served as "fresh" for `cargo test --workspace` (phantom
    "could not find pta in dataflow"); workaround = touch the edited
    crate's sources so rsync -a's preserved mtimes force a rebuild.
+   d-P11 DONE (2026-09-25): DREAM GATE 1149/1149 — the full oracle
+   set passes (all buckets zero). generator_machine_fold reconstructs
+   the es2abc state machine (entry suspend elided, iter-result
+   unwrapped, resume dispatch dissolved; all-or-nothing gated on the
+   entry site). Async family stays documented fallback via NEW IR gap
+   G6 = N68 registered (async bytecodes carry the value in acc; lift
+   drops it). QUEUE COMPLETE: d-P5..d-P11 + t-P1..t-P6 all landed.
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
