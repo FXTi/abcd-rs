@@ -379,7 +379,9 @@ impl<'m> Pta<'m> {
             for &b in &f.blocks {
                 let Some(bb) = module.block(b) else { continue };
                 for &iid in &bb.insts {
-                    let Some(inst) = module.inst(iid) else { continue };
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
                     if let Op::Return { value: Some(v) } = &inst.op {
                         returns.push(*v);
                     }
@@ -503,7 +505,9 @@ impl<'m> Pta<'m> {
             .iter()
             .flat_map(|(id, objs)| {
                 objs.iter().filter_map(move |o| match o {
-                    Obj::Site { site: s, ctx: c, .. } if *s == site && *c == ctx => Some((*id, *o)),
+                    Obj::Site {
+                        site: s, ctx: c, ..
+                    } if *s == site && *c == ctx => Some((*id, *o)),
                     _ => None,
                 })
             })
@@ -647,9 +651,13 @@ impl<'m> Pta<'m> {
         }
         let blocks = fd.blocks.clone();
         for b in blocks {
-            let Some(bb) = self.module.block(b) else { continue };
+            let Some(bb) = self.module.block(b) else {
+                continue;
+            };
             for &iid in &bb.insts {
-                let Some(inst) = self.module.inst(iid) else { continue };
+                let Some(inst) = self.module.inst(iid) else {
+                    continue;
+                };
                 let local = |v: ValueId| Ptr::Local(v, ctx);
                 match &inst.op {
                     op if is_keyed_alloc(op) => {
@@ -776,8 +784,16 @@ impl<'m> Pta<'m> {
                             );
                         }
                     }
-                    Op::StoreProp { object, name, value }
-                    | Op::StoreOwnPropName { object, name, value } => {
+                    Op::StoreProp {
+                        object,
+                        name,
+                        value,
+                    }
+                    | Op::StoreOwnPropName {
+                        object,
+                        name,
+                        value,
+                    } => {
                         self.register(
                             local(*object),
                             Handler::Store {
@@ -935,8 +951,7 @@ pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutc
             .or_default()
             .extend(bodies.iter().copied());
     }
-    let pta_partial: BTreeSet<InstId> =
-        engine.call_unknown.iter().map(|(call, _)| *call).collect();
+    let pta_partial: BTreeSet<InstId> = engine.call_unknown.iter().map(|(call, _)| *call).collect();
     let mut sites: BTreeMap<InstId, CallEdge> = BTreeMap::new();
     for (iid, base_edge) in base.sites() {
         let mut targets: BTreeSet<FuncId> = BTreeSet::new();
@@ -1084,7 +1099,9 @@ fn env_analysis(
         for &b in &f.blocks {
             let Some(bb) = module.block(b) else { continue };
             for &iid in &bb.insts {
-                let Some(inst) = module.inst(iid) else { continue };
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
                 match &inst.op {
                     Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
                         env_sites.insert(iid);
@@ -1110,76 +1127,79 @@ fn env_analysis(
     // elementwise union, padding one-sided positions with unknown
     // entries — genuinely different stack shapes at a join are
     // uncertainty).
-    let compute_stacks = |captured: &BTreeMap<FuncId, Vec<EnvEntry>>| -> BTreeMap<InstId, Vec<EnvEntry>> {
-        let mut stack_at: BTreeMap<InstId, Vec<EnvEntry>> = BTreeMap::new();
-        for (fi, f) in module.functions.iter().enumerate() {
-            let func = FuncId::new(fi as u32);
-            let entry_state = captured.get(&func).cloned().unwrap_or_default();
-            // block → state at block EXIT (successors join on it).
-            let mut out_state: BTreeMap<abcd_ir::BlockId, Vec<EnvEntry>> = BTreeMap::new();
-            let mut changed = true;
-            let mut sweeps = 0usize;
-            while changed && sweeps < 64 {
-                changed = false;
-                sweeps += 1;
-                for &b in &f.blocks {
-                    let Some(bb) = module.block(b) else { continue };
-                    // Join predecessors (a pred-less block starts from
-                    // the captured chain — the function entry).
-                    let mut state: Option<Vec<EnvEntry>> = if bb.preds.is_empty() {
-                        Some(entry_state.clone())
-                    } else {
-                        None
-                    };
-                    for pred in &bb.preds {
-                        if let Some(ps) = out_state.get(&pred.from) {
-                            state = Some(match state.take() {
-                                None => ps.clone(),
-                                Some(cur) => join_stacks(&cur, ps),
-                            });
-                        }
-                    }
-                    let Some(mut state) = state else {
-                        continue; // not reached yet this sweep
-                    };
-                    // Transfer: record per-inst stacks (BEFORE the inst).
-                    for &iid in &bb.insts {
-                        let Some(inst) = module.inst(iid) else { continue };
-                        stack_at.insert(iid, state.clone());
-                        match &inst.op {
-                            Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
-                                state.push(EnvEntry {
-                                    sites: BTreeSet::from([iid]),
-                                    unknown: false,
+    let compute_stacks =
+        |captured: &BTreeMap<FuncId, Vec<EnvEntry>>| -> BTreeMap<InstId, Vec<EnvEntry>> {
+            let mut stack_at: BTreeMap<InstId, Vec<EnvEntry>> = BTreeMap::new();
+            for (fi, f) in module.functions.iter().enumerate() {
+                let func = FuncId::new(fi as u32);
+                let entry_state = captured.get(&func).cloned().unwrap_or_default();
+                // block → state at block EXIT (successors join on it).
+                let mut out_state: BTreeMap<abcd_ir::BlockId, Vec<EnvEntry>> = BTreeMap::new();
+                let mut changed = true;
+                let mut sweeps = 0usize;
+                while changed && sweeps < 64 {
+                    changed = false;
+                    sweeps += 1;
+                    for &b in &f.blocks {
+                        let Some(bb) = module.block(b) else { continue };
+                        // Join predecessors (a pred-less block starts from
+                        // the captured chain — the function entry).
+                        let mut state: Option<Vec<EnvEntry>> = if bb.preds.is_empty() {
+                            Some(entry_state.clone())
+                        } else {
+                            None
+                        };
+                        for pred in &bb.preds {
+                            if let Some(ps) = out_state.get(&pred.from) {
+                                state = Some(match state.take() {
+                                    None => ps.clone(),
+                                    Some(cur) => join_stacks(&cur, ps),
                                 });
-                                // Depth cap: drop the OUTERMOST
-                                // environments (level indexing is from
-                                // the innermost end).
-                                if state.len() > max_depth {
-                                    let overflow = state.len() - max_depth;
-                                    state.drain(0..overflow);
-                                }
                             }
-                            Op::PopLexEnv => {
-                                if state.pop().is_none() {
-                                    state.push(EnvEntry {
-                                        sites: BTreeSet::new(),
-                                        unknown: true,
-                                    });
-                                }
-                            }
-                            _ => {}
                         }
-                    }
-                    if out_state.get(&b) != Some(&state) {
-                        out_state.insert(b, state);
-                        changed = true;
+                        let Some(mut state) = state else {
+                            continue; // not reached yet this sweep
+                        };
+                        // Transfer: record per-inst stacks (BEFORE the inst).
+                        for &iid in &bb.insts {
+                            let Some(inst) = module.inst(iid) else {
+                                continue;
+                            };
+                            stack_at.insert(iid, state.clone());
+                            match &inst.op {
+                                Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
+                                    state.push(EnvEntry {
+                                        sites: BTreeSet::from([iid]),
+                                        unknown: false,
+                                    });
+                                    // Depth cap: drop the OUTERMOST
+                                    // environments (level indexing is from
+                                    // the innermost end).
+                                    if state.len() > max_depth {
+                                        let overflow = state.len() - max_depth;
+                                        state.drain(0..overflow);
+                                    }
+                                }
+                                Op::PopLexEnv => {
+                                    if state.pop().is_none() {
+                                        state.push(EnvEntry {
+                                            sites: BTreeSet::new(),
+                                            unknown: true,
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if out_state.get(&b) != Some(&state) {
+                            out_state.insert(b, state);
+                            changed = true;
+                        }
                     }
                 }
             }
-        }
-        stack_at
-    };
+            stack_at
+        };
 
     // The capture fixed point: captured[body] = union of the stacks at
     // the body's capture points. Monotone over a finite lattice

@@ -527,6 +527,30 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   69->51, native_keep 942->924, lookups +126 (18 candidate + 108
   per-fact application), edges byte-identical 198734, all-params
   byte-identical (36/353569), determinism green both configs.
+   t-P6 DONE (rung-2 whole-module context-sensitive PTA, APAK-shaped):
+   abcd-analysis/dataflow/pta.rs — objects keyed (alloc InstId,
+   1-call-site ctx), per-object field buckets (Named/Index/Dynamic),
+   delta worklist, on-the-fly CG co-evolution (the PTA's graph IS the
+   solver's graph at rung 2), lexenv identity channel (NewLexEnv sites +
+   capture-linkage fixed point, depth 8, context-insensitive). Driver
+   alias_rung default now 2 (0/1 selectable; ABCD_TAINT_RUNG A/B/C);
+   step-budget cut degrades to rung 1 loudly (alias_rung_used).
+   LexVar facts key Heap(env).[AnyIndex] when precise (b2); summary
+   fresh-result call-site keying (e13, taint-side). Probe flips:
+   b2/c4/d4/e7/e13 — rung tables: r0 tp=28 fp=1, r1 tp=30 fp=1,
+   r2 tp=32 fp=1 fn=0 violations=0 (c2 stays fp, wontfix-structural —
+   sink-spec provenance). Corpus: callgraph smoke 2787 fixtures,
+   resolved sites 345->1533 (unknown 10617->9429), PTA ~0.2ms/fixture,
+   2 runs byte-identical, capped=0; taint smoke rung2: body_step
+   108->810, native_keep 924->222, lookups +369, hits=0 unchanged,
+   path-edges byte-identical 198734; s.next/b.value2 re-evaluated —
+   sharpened to VM-manufactured-object gaps (not dispatch); miss log
+   #...#-mangled names no longer counted (never registerable).
+   INFRA HAZARD (hit twice): remote-test's SHARED CARGO_TARGET_DIR is
+   unsound under concurrent workers — a stale abcd-analysis rlib was
+   served as "fresh" for `cargo test --workspace` (phantom
+   "could not find pta in dataflow"); workaround = touch the edited
+   crate's sources so rsync -a's preserved mtimes force a rebuild.
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:

@@ -239,11 +239,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         (refined, Oracle::Rung1(engine), 1u8)
     };
     let (refined, oracle, rung_used) = match config.alias_rung {
-        0 => (
-            None,
-            Oracle::Rung0(Rung0AliasOracle::new(module)),
-            0u8,
-        ),
+        0 => (None, Oracle::Rung0(Rung0AliasOracle::new(module)), 0u8),
         2 => {
             let outcome =
                 abcd_analysis::dataflow::pta::analyze(module, &base_graph, &PtaConfig::default());

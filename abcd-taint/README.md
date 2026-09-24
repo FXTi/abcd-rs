@@ -227,11 +227,13 @@ type through `Oracle::may_sites_at`, the same consumer discipline as the
 call-graph bridge; any family the arm contributes marks the answer
 imprecise (additive-only either way). What is NOT recoverable:
 class instances (`new Foo()` is a call result — no keyed alloc, no class
-link), generator objects (`s.next` ×54 stays a named miss — honest),
-prototype-chain walks (families are exact kinds, not hierarchy roots —
-that needs the rung-2 PTA), and own-method shadows (probe e7's expected
-FP: `a.pop = f` is invisible at the method load — the c2 structural
-collision, closes at rung 2).
+link), generator objects (`s.next` ×54 stays a named miss — re-evaluated
+at rung 2, still honest: the generator call resolves but the generator
+OBJECT is VM-manufactured, not a module allocation),
+prototype-chain walks (families are exact kinds, not hierarchy roots), and
+own-method shadows — CLOSED at rung 2 (probe e7 flipped clean: the shadow
+store resolves the callee to the user body, which beats the prototype
+path by precedence).
 
 All prototype-keyed registrations are **non-exclusive by design**: a
 method call never untaints its receiver and the family is a may-answer,
@@ -273,10 +275,12 @@ let report = abcd_taint::run_taint(&module, &config);
 ```
 
 The driver builds the on-the-fly call graph + the rung-selected alias
-oracle (`TaintConfig::alias_rung`: 1 = the demand-driven engine, default;
-0 = the heap-v0 baseline, selectable for A/B), refines the graph once with
-the engine's `points_to` at rung 1 (`CallGraph::refine_with_points_to` —
-param-callee sites bridged to closure bodies), runs the
+oracle (`TaintConfig::alias_rung`: 2 = the whole-module PTA, default;
+1 = the demand-driven engine; 0 = the heap-v0 baseline — all selectable
+for A/B/C via `ABCD_TAINT_RUNG`). At rung 1 the graph is refined once
+with the engine's `points_to` (`CallGraph::refine_with_points_to` —
+param-callee sites bridged to closure bodies); at rung 2 the solver runs
+against the PTA's OWN co-evolved call graph. Then the
 IFDS solver (`follow_returns_past_seeds` on; `seed_all_functions` on by default
 — dummy-main coverage, so global-source tagging fires in functions unreachable
 through the 97%-unknown call graph), then collects sink hits: each hit carries
@@ -286,12 +290,12 @@ set (heros anchoring: intraprocedural edges of the seed function are
 zero-anchored; the anchor switches to the callee-entry fact at call boundaries
 — the reconstruction follows those switches), and the applied-summary log.
 
-## The alias oracle ladder (t-P2: rung 1 shipped)
+## The alias oracle ladder (t-P2: rung 1 shipped; t-P6: rung 2 shipped)
 
-`oracle::Oracle` selects the rung (`TaintConfig::alias_rung`, default 1):
+`oracle::Oracle` selects the rung (`TaintConfig::alias_rung`, default 2):
 
 - **Rung 0** (`Rung0AliasOracle`) — local def-chain answers; the trivial
-  baseline and the rung-1 fallback.
+  baseline and every higher rung's fallback.
 - **Rung 1** (`abcd_analysis::dataflow::alias::Rung1AliasOracle`) — a
   memoized, demand-driven backward `points_to(base, at)` query fired at
   heap writes/loads whose base the local def chain cannot resolve (the
@@ -304,6 +308,42 @@ zero-anchored; the anchor switches to the callee-entry fact at call boundaries
   the call-graph bridge consumes those, keying/must-alias never do).
   Depth cap 8; any imprecise answer falls back to the rung-0 answer
   (sound floor — never silently wrong).
+- **Rung 2** (`abcd_analysis::dataflow::pta::Rung2AliasOracle`) — the
+  whole-module context-sensitive PTA (APAK-shaped, t-P6): abstract
+  objects keyed by `(alloc InstId, 1-call-site context)`, per-object
+  field buckets, delta worklist propagation, and on-the-fly call-graph
+  co-evolution — the solver runs against the PTA's own graph, which is
+  where the corpus' resolved call sites go from 345 to 1533 (2787
+  fixtures, callgraph smoke). The same completeness rule as rung 1: an
+  incomplete answer degrades to the rung-0 floor. A step-budget cut
+  degrades the whole pipeline to rung 1, recorded in
+  `TaintReport::alias_rung_used` (loud, never silent).
+
+What rung 2 changes beyond rung 1:
+
+- **Dispatch resolution by value flow** (the APAK axis): callees loaded
+  from object fields/elements (probe c4's handler table), from global
+  bindings (probe d4's top-level thrower), and from own-property method
+  stores (probe e7's shadow — the resolved USER BODY beats the
+  prototype-path summary, so the builtin `pop` no longer fires on user
+  code) all resolve through the co-evolution.
+- **Lexical-environment identity** (probe b2): `NewLexEnv` instructions
+  are environment allocation sites; a closure's captured chain is the
+  env stack at its definition site (fixed point over the module).
+  `PutLexVar` facts key by `Heap(env-sites).[AnyIndex]` when the env
+  answer is precise — the function-agnostic `(level, slot)` merge dies;
+  imprecise accesses fall back to the legacy key on write and to a
+  may-direction any-env-site match on read (sound).
+- **Summary fresh-result keying** (probe e13 — t-P4's registered idea,
+  landed taint-side): a summary result no static flow reaches (no
+  `Param/Base/Field → Return*` inflow) is a FRESH container keyed by its
+  call site, so an indexed load through a `map` result no longer meets
+  the source array's heap fact through the unknown-base wildcard.
+  `Object.assign`'s result keeps its aliasing (Param→Return inflow ⇒
+  not fresh), and gap-returned taint (a LOCAL fact) is unaffected.
+- **Miss-log hygiene**: es2abc-mangled `#…#` candidate names (resolved
+  internal callees contribute them now) are never counted as summary
+  misses — they can never be builtins.
 
 What rung 1 changes in the flow functions:
 
@@ -412,13 +452,16 @@ The current tail (full log via `ABCD_TAINT_SMOKE_TOPN=…`):
   result of calling a generator through a global load; the VM
   manufactures the generator object (no keyed alloc, no constructor
   name — the t-P5 arm deliberately covers only the six builtin
-  value constructors). Honest non-fix; the rung-2 PTA pile.
+  value constructors). Re-evaluated at rung 2: the generator call now
+  RESOLVES (the edge exists), but the receiver object is still not a
+  module allocation. Honest non-fix — framework-model territory, no
+  longer a dispatch gap.
 - **`b.value2` ×18 — user class-instance method** (class-accessors.js:
-  `b = new B(5); b.value2()`): a USER method the call graph cannot
-  resolve through a global-stored class instance (`new B` is a
-  user-constructor call — the constructor arm types only KNOWN
-  builtin constructors, never user classes). Not a builtin, not
-  registerable; a call-graph-resolution (rung-2) matter. The
+  `b = new B(5); b.value2()`): a USER method off a constructed instance.
+  Re-evaluated at rung 2: `new B(5)`'s result is the VM-constructed
+  object (not the constructor's return value), so the instance stays
+  Unknown-modeled and the method load resolves nothing — object
+  materialization, not dispatch. Not a builtin, not registerable. The
   `A.has`/`a.get`/`a.set` ×15 entries are the same class (accessor
   calls on user objects).
 - **`#…#` mangled names ×9**: es2abc-internal mangled identifiers —
@@ -534,7 +577,48 @@ regression.
 then run the suite — a NEW probe whose expectations are wrong fails
 loudly with the actual hit lines.
 
-**Current table** (rung 1 + the t-P3 prototype-resolution path + the
+**Current table** (rung 2 — the whole-module PTA, t-P6; verbatim):
+
+```text
+PROBE-FAMILY a-heap-alias cases=6 tp=3 fp=0 fn=0
+PROBE-FAMILY b-closure-capture cases=3 tp=2 fp=0 fn=0
+PROBE-FAMILY c-dynamic-dispatch cases=4 tp=3 fp=1 fn=0
+PROBE-FAMILY d-exceptional-flow cases=4 tp=3 fp=0 fn=0
+PROBE-FAMILY e-builtin-summary cases=23 tp=21 fp=0 fn=0
+PROBE-TOTAL tp=32 fp=1 fn=0 violations=0
+```
+
+Rung-2 flips (t-P6; the A/B/C controls are `ABCD_TAINT_RUNG=0/1`, which
+fail loudly against the rung-2 annotations — the failure tables ARE the
+ladder evidence): **b2** fp→clean (the lexical-environment identity
+channel — NewLexEnv-site-keyed env objects + closure capture linkage
+separate the colliding slot-(0,0) captures), **c4** fn→tp (the stored
+closure's element points-to resolves the call edge through the
+co-evolution), **d4** fn→tp (global-object points-to resolves the
+top-level thrower's edge; the throw rides the d3 return wiring), **e7**
+fp→clean (the own-method store resolves the callee to the USER body —
+body-step precedence over the prototype-path summary; the
+`Array.prototype.pop` summary expectation was removed from the probe's
+counters), **e13** fp→clean (a summary result no static flow reaches
+keys by its call site — the unknown-base wildcard dies). **c2 stays fp**
+— evaluated at rung 2: the PTA resolves the binding to the user `print`,
+but sink semantics are deliberately name-keyed (the corpus' ~97%
+unknown-callee reality is why name keying exists); distinguishing the
+host builtin from a user redefinition is a sink-spec question
+(host-binding provenance), registered beyond the ladder.
+
+The per-rung tables against the rung-2 annotations (verbatim; lower
+rungs fail loudly by design — violations count the entries that rung
+cannot yet produce):
+
+- **Rung 0**: `PROBE-TOTAL tp=28 fp=1 fn=0 violations=10` — a4/a5/b2/
+  e7/e13 FPs reproduce, b3/c4/d4/e16 FNs reproduce.
+- **Rung 1**: `PROBE-TOTAL tp=30 fp=1 fn=0 violations=5` — a4/a5/b3/e16
+  close; b2/c4/d4/e7/e13 remain (exactly the rung-2-tagged entries).
+- **Rung 2**: `PROBE-TOTAL tp=32 fp=1 fn=0 violations=0` — the table
+  above; the strict-superset ladder holds at every rung.
+
+The pre-t-P6 table (rung 1 + the t-P3 prototype-resolution path + the
 t-P4 gap propagator + the t-P5 second tier, verbatim):
 
 ```text
@@ -606,27 +690,77 @@ caller's closure body by `refine_with_points_to`), **e5** fn→tp
 (summary alias-flow endpoints match heap facts by positive site
 intersection — NOT oracle-gated: it fires at both rungs for locally
 allocated arguments). **b2** was evaluated honestly and RE-TAGGED rung
-1→2: the LexVar function-agnostic merge is an ENVIRONMENT-identity
+1→2 at t-P2: the LexVar function-agnostic merge is an ENVIRONMENT-identity
 problem (PutLexVar/GetLexVar carry no environment operand — separating
 the two environments needs lexenv-object identity, a heap-model
 extension for the rung-2 whole-program PTA), not a heap-alias problem
-rung 1's value points_to can see. Remaining rung-2 entries: c4 (handler
-table), d4 (throw through a global binding), e7 (own-method shadow —
-store-to-load function resolution). c2 stays structural
-(name-keyed sinks, no rung).
+rung 1's value points_to can see. **All five rung-2 entries closed at
+t-P6** (b2 env identity, c4 handler table, d4 global binding, e7
+own-method shadow, e13 fresh-result keying — the rung-2 table above);
+c2 stays structural (name-keyed sinks — the t-P6 evaluation is in the
+rung-2 flips above).
 
 The rung-0 baseline for comparison (t-P1, verbatim): `tp=11 fp=4 fn=4`
 (families: a 3/2/0, b 1/1/1, c 2/1/1, d 2/0/1, e 3/0/1).
 
-## Corpus smoke results (t-P5, verbatim)
+## Corpus smoke results (t-P6 rung 2, verbatim)
 
 Registered config (source = all `func_main_0` params; sink = `print`; the
 builtin summary library incl. the t-P3 prototype-family set, the t-P4 gap
 trio, and the t-P5 second tier; 1149
-runtime-passed fixtures; two runs identical). The t-P5 movements, each
-attributed below the table: `String.prototype.replace` and `r.test` left
-the miss log; the counters moved exactly by the rescued sites; path edges
-and the flow count are byte-identical:
+runtime-passed fixtures; two runs identical, `ABCD_TAINT_RUNG` selects the
+rung). Rung 2 is the FIRST rung that moves corpus numbers — the call graph
+gains resolved edges, and the fallback ladder reclassifies the rescued
+sites. Every movement attributed below the table:
+
+```text
+SMOKE fixtures=1149 fixtures_with_flows=0
+TAINT-FLOWS hits=0
+TAINT-COUNTERS lookups=10749 neg_cache_hits=117 body_step=810 native_keep=222 unknown=51
+TAINT-PATH-EDGES total=198734
+TAINT-GAPS resolved=0 unresolved=0
+TAINT-SUMMARY-MISSES top10=[("foo", 117), ("f", 90), ("A", 69), ("s.next", 54), ("B", 36), ("c", 36), ("count", 36), ("add", 18), ("b.value2", 18), ("counter", 18)]
+TAINT-SUMMARY-HITS top10=[("print", 1437), ("Iterator.prototype.next", 162), ("Iterator.prototype.return", 126), ("Object.is", 36), ("RegExp", 36), ("String.prototype.charCodeAt", 36), ("Array.prototype.pop", 18), ("Number.isNaN", 18), ("Object.setPrototypeOf", 18), ("Proxy", 18)]
+SMOKE-DETERMINISM runs=2 identical=true
+```
+
+The rung-2 movements (rung 1 → rung 2, each attributed):
+
+- **`body_step` 108 → 810 (+702), `native_keep` 924 → 222 (−702)** — the
+  call-graph upgrade made concrete: 702 call sites whose callee was
+  named-but-unresolved (global-loaded user functions, stored closures)
+  are now PTA-resolved to user bodies and stepped into. Zero flow-count
+  change (`hits=0` — the corpus' documented reality stands; these
+  fixtures' flows were already handled by summaries/names).
+- **`lookups` 10380 → 10749 (+369), `neg_cache_hits` 90 → 117 (+27)** —
+  newly resolved callees contribute their `FunctionData` names to the
+  candidate list, and each new candidate is a registry lookup (misses go
+  to the negative cache).
+- **Miss log: `#*#foo`/`#*#f`/`#*#count` appeared, then were filtered** —
+  resolved internal callees' es2abc-mangled names entered the candidate
+  list at rung 2; they can never be builtins, so mangled names are no
+  longer counted as summary misses (the backlog log stays actionable).
+- **`s.next` ×54 stays, re-evaluated at rung 2** — the generator call
+  itself now resolves (the edge exists), but the generator OBJECT is
+  VM-manufactured (not a module allocation), so the receiver still types
+  nothing. Honest retention, now for a sharper reason (framework-model
+  territory, not dispatch).
+- **`b.value2` ×18 stays** — `new B(5)`'s constructed result is
+  Unknown-modeled (the `New` call result is not the constructor's return
+  value), so the instance-method load resolves nothing. Same class as
+  `s.next`: object-materialization, not dispatch.
+- **`TAINT-PATH-EDGES` byte-identical (198734), `TAINT-GAPS` 0/0,
+  summary hit log byte-identical** — the 702 rescued sites carry no
+  taint in this config, so the solver's fact population is unchanged.
+- **Cost honesty**: the PTA adds ≈0.1 s to the whole 1149-fixture
+  double-run smoke (0.30 s → 0.40 s wall); standalone (callgraph smoke,
+  2787 fixtures × 2 runs) the engine totals 1.2 s — ≈0.2 ms/fixture,
+  95k facts / 65k flow edges / 14.5k activations corpus-wide, zero
+  budget cuts. The context budget: 1-call-site (k=1), env stack depth 8,
+  step budget 25M (never approached).
+
+The t-P5 table (rung 1, verbatim — rungs 0 and 1 are byte-identical to
+it in the registered config):
 
 ```text
 SMOKE fixtures=1149 fixtures_with_flows=0
@@ -746,48 +880,49 @@ Counters classify only call sites the solver actually processed (a site with
 no incoming fact edge — dead code, or a function body unreachable even by the
 zero fact — is never classified).
 
-## Known imprecisions and the ladder (rung 1 shipped, t-P2)
+## Known imprecisions and the ladder (rung 2 shipped, t-P6)
 
-- **Unknown-base heap matching is conservative** — PARTIALLY CLOSED at
-  rung 1: stores/loads whose base the engine resolves interprocedurally
-  (call results, call-through-param chains) are keyed/matched by the
-  refined site set (probes a4/a5). Bases the query cannot complete
-  (globals, loads, unbalanced fan-out) keep the rung-0 wildcard.
+- **Unknown-base heap matching is conservative** — narrowed at every
+  rung: rung 1 keys stores/loads the engine resolves interprocedurally
+  (probes a4/a5); rung 2 adds store-to-load resolution through object
+  fields (e7) and call-site-keyed fresh summary results (e13). Bases the
+  PTA cannot complete (host globals, reflection-injected properties —
+  the documented reflection gap) keep the rung-0 wildcard.
 - **Local-fact aliasing requires positive evidence** (same value or
-  non-empty intersecting site sets) — the rule stands; rung 1 sharpens
-  the site sets it compares (the engine's interprocedural answers when
-  precise), but unknown-on-either-side is still not evidence.
-- **LexVar keys are function-agnostic** — the b2 cross-function merge is
-  an environment-identity problem, re-tagged rung 2 at t-P2 (lexenv
-  objects need alloc-site identity; rung 1's value points_to cannot see
-  it).
+  non-empty intersecting site sets) — the rule stands; the refined rungs
+  sharpen the site sets it compares, but unknown-on-either-side is still
+  not evidence.
+- **LexVar keys are function-agnostic** — CLOSED at rung 2 (b2 flipped
+  clean): precise `PutLexVar`/`GetLexVar` accesses key by
+  NewLexEnv-site environment objects. Residual: slots within ONE
+  environment merge under `[AnyIndex]`, and imprecise env answers
+  (capture chains past the depth cap, recursion) fall back to the legacy
+  key / the may-direction any-env-site read.
 - **Closure captures**: a tainted capture marks the closure value (empty
   chain), but function-object taint is dropped at the call boundary — capture
   taint does not enter the body (FN; summary-driven callbacks are covered by
   the t-P4 gap propagator's `enter` rules — capture-through-lexenv INTO a
-  gap-entered body works via the LexVar state-base passthrough, but the
-  closure-VALUE mark remains inert).
+  gap-entered body works via the state-base passthrough, now env-keyed at
+  rung 2, but the closure-VALUE mark remains inert).
 - **Unresolved gap callbacks** — a summary callback value that resolves to
   no user body (global load, unproven parameter, call result) gets no gap
   edge: taint never enters the callback (documented FN, counted in
-  `TaintReport::gap_sites_unresolved`; probe e15). Inside a gap-entered
-  body, rung-1 alias queries hopping through the gap call find no recorded
+  `TaintReport::gap_sites_unresolved`; probe e15). Rung 2 narrows the
+  class (stored/global callbacks now resolve through the PTA); the
+  genuinely opaque cases stand. Inside a gap-entered body, rung-1 alias
+  queries hopping through the gap call find no recorded
   caller in the base graph and take the rung-0 floor (the calling-context
   injection is deliberately skipped on gap edges — gap.rs).
-- **Gap results are not allocation-keyed** — a map/filter result is
-  VM-allocated, so an indexed load through it meets the SOURCE array's
-  `Heap.[AnyIndex]` fact via the unknown-base may-alias wildcard (probe
-  e13's expected FP; closes when summary results get call-site-keyed
-  allocations, rung 2).
+- **VM-manufactured objects are not allocations** — generator objects
+  (`s.next` ×54) and `new`-constructed instances (`b.value2` ×18) have no
+  module allocation site; receivers through them type nothing. Sharpened
+  at rung 2 from "dispatch gap" to "object materialization" (the calls
+  themselves resolve; the objects are framework/VM-made).
 - **Prototype methods** — IMPLEMENTED at t-P3 (the prototype-resolution
-  path above): alloc-kind / constant / global-provenance families re-key
-  `recv.m(...)` to `Family.prototype.m` summaries. Residual limits:
-  generator and class-instance receivers stay opaque (`s.next` ×54 is
-  the honest retention), families are exact kinds (no hierarchy walk —
-  that is the rung-2 PTA), own-method shadows on a typed receiver still
-  get the builtin summary (probe e7's expected FP — the c2 structural
-  collision, closes at rung 2), and getter/setter/coercion calls
-  (`may_call: UnknownCallee` effects on non-`Call` ops) are not
+  path above). Residual limits: generator and class-instance receivers
+  stay opaque (above), families are exact kinds (no hierarchy walk),
+  own-method shadows are CLOSED at rung 2 (e7), and getter/setter/coercion
+  calls (`may_call: UnknownCallee` effects on non-`Call` ops) are not
   dispatched as calls.
 - **`Apply`/`SuperSpread`** map a tainted argument array onto ALL formals;
   `SuperForwardAllArgs` maps nothing (the forwarded args are the caller's
@@ -798,7 +933,9 @@ zero fact — is never classified).
   transforming instructions.
 
 Ladder-climbing triggers are evidence-gated (analysis-strategy §5.5): rung
-0→1 FIRED and shipped (t-P2, this README's rung-1 table); rung 1→2 fires
-when FP concentrates at dispatch (probe family c's axis) — b2's re-tag
-(environment identity) and c4/d4 (call-graph-layer FNs) are the current
-rung-2 evidence pile.
+0→1 FIRED and shipped (t-P2); rung 1→2 FIRED and shipped (t-P6 — the
+rung-2-tagged probe pile b2/c4/d4/e7/e13 all closed; the corpus call graph
+went 345 → 1533 resolved sites). What remains honestly beyond rung 2:
+context depth >1, object sensitivity, framework models (ArkUI lifecycle,
+native reflection), VM-manufactured object identity, and sink-spec
+provenance (c2's host-vs-user `print`).

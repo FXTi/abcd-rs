@@ -224,8 +224,18 @@ fn call_site_contexts_separate_factory_callers() {
         "1-call-site contexts keep the two factory results apart"
     );
     // must_alias sees through the call (the a5 shape).
-    assert!(AliasOracle::<()>::must_alias(&oracle, r1, o1, InstId::new(0)));
-    assert!(!AliasOracle::<()>::must_alias(&oracle, r1, o2, InstId::new(0)));
+    assert!(AliasOracle::<()>::must_alias(
+        &oracle,
+        r1,
+        o1,
+        InstId::new(0)
+    ));
+    assert!(!AliasOracle::<()>::must_alias(
+        &oracle,
+        r1,
+        o2,
+        InstId::new(0)
+    ));
 }
 
 // ── Field sensitivity (per abstract object, per bucket) ─────────────

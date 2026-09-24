@@ -369,7 +369,14 @@ impl<'m> TaintProblem<'m> {
             }
             if !matches!(&class, SiteClass::Summary { .. }) {
                 for n in &tried {
-                    self.registry.record_miss(n);
+                    // es2abc-mangled internal names (`#*#…`) can never be
+                    // builtin summaries — counting them would dilute the
+                    // backlog log (rung 2 resolves many more internal
+                    // callees, whose FunctionData names enter the
+                    // candidate list; t-P6 hygiene).
+                    if !n.starts_with('#') {
+                        self.registry.record_miss(n);
+                    }
                 }
             }
         }
@@ -1163,9 +1170,7 @@ impl IfdsProblem for TaintProblem<'_> {
                             sites.iter().any(|s| oracle.is_env_site(s))
                         };
                         if hits {
-                            if let Some(rest) =
-                                self.cut_first(&fact.fields, FieldKey::AnyIndex)
-                            {
+                            if let Some(rest) = self.cut_first(&fact.fields, FieldKey::AnyIndex) {
                                 if let Some(result) = curr_inst.result {
                                     out.push(Fact::of(
                                         fact.with_fields(rest).rebased(TaintBase::Local(result)),
@@ -1195,7 +1200,8 @@ impl IfdsProblem for TaintProblem<'_> {
                         });
                     match keyed_env {
                         Some(sites) => {
-                            let mut chain = FieldChain::new().pushed(FieldKey::AnyIndex, self.cap());
+                            let mut chain =
+                                FieldChain::new().pushed(FieldKey::AnyIndex, self.cap());
                             for &k in fact.fields.elements() {
                                 chain = chain.pushed(k, self.cap());
                             }
@@ -1204,9 +1210,7 @@ impl IfdsProblem for TaintProblem<'_> {
                                 fields: chain,
                             }));
                         }
-                        None => {
-                            out.push(Fact::of(fact.rebased(TaintBase::LexVar(*level, *slot))))
-                        }
+                        None => out.push(Fact::of(fact.rebased(TaintBase::LexVar(*level, *slot)))),
                     }
                 }
                 out.push(source.clone());
