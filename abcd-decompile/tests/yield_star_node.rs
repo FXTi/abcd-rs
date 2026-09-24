@@ -11,11 +11,10 @@
 //!   delegated sequence PLUS the delegate's return value flowing
 //!   through `const ret = yield* inner()` into the next yield).
 //! - (b) `delegate-array`: module entry — `0,10,20,30,99`.
-//! - (c) `delegate-async`: a hand-written `for await` driver over the
-//!   decompiled `outer` (the module's own plain-async `main` keeps
-//!   pre-existing loud machinery from the d-P13/d-P14 coverage of the
-//!   for-await driver shape — it cannot carry the evidence) —
-//!   `1,2,inner-done`.
+//! - (c) `delegate-async`: the module's own plain-async `main` (the
+//!   `for await` driver) — pre-N70 it kept loud machinery and silently
+//!   broke; fixed in d-P16 — PLUS a hand-written `for await` driver
+//!   over the decompiled `outer` — `1,2,inner-done` twice.
 //! - (d) `delegate-throw`: a hand-written consumer driver — the
 //!   delegate's throw propagates through the delegation to the
 //!   consumer's try/catch — `before,caught:delegated-boom`. The
@@ -102,9 +101,11 @@ fn yield_star_node_sync_entries() {
     }
 }
 
-/// (c): the async YieldStar — a hand-written `for await` driver over
-/// the decompiled `outer` reproduces the delegated sequence and the
-/// delegate's return value.
+/// (c): the async YieldStar — the module's OWN plain-async `main`
+/// (the `for await` driver) now decompiles to working code (N70 fix,
+/// d-P16: async_machine_fold covers the loop-driving shape), so the
+/// entry prints the delegated sequence itself; the hand-written
+/// `for await` driver over the decompiled `outer` repeats it.
 #[test]
 fn yield_star_node_async_driver() {
     if !node_available() {
@@ -122,8 +123,8 @@ fn yield_star_node_async_driver() {
     eprintln!("NODE-EVIDENCE delegate-async exit={ok} stdout={stdout:?} stderr={stderr:?}");
     assert!(ok, "node run delegate-async failed: {stderr}");
     assert_eq!(
-        stdout, "1,2,inner-done\n",
-        "delegate-async: behavior mismatch"
+        stdout, "1,2,inner-done\n1,2,inner-done\n",
+        "delegate-async: behavior mismatch (line 1 = the module's own for-await main, N70; line 2 = the hand-written driver)"
     );
 }
 

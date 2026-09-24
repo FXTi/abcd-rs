@@ -247,14 +247,14 @@ function func_main_0() {
 /// (c) the async YieldStar (`async function*`): awaits wrap every
 /// protocol step and the completion dispatch sits inside the loop's
 /// done arm. The folded body is `const value$2 = yield* inner$1()`.
-/// The module's plain-async `main` keeps its own loud machinery —
-/// the pre-existing d-P13/d-P14 coverage of the for-await driver
-/// shape, not this fold's concern.
+/// The module's plain-async `main` (the `for await` driver) folds to
+/// working await code since the N70 fix (d-P16) — the golden above
+/// pins the folded `outer` body only (main's text is long).
 #[test]
 fn golden_yield_star_delegate_async() {
     let text = decompiled("delegate-async.abc");
     // The folded async generator body (the fold's target) — the full
-    // text is long (main's loud machinery); pin the outer body and
+    // text is long (main's for-await driver); pin the outer body and
     // the absence of YieldStar machinery residues inside it.
     let outer = text
         .split("outer = async function* ___outer() {")
@@ -269,8 +269,7 @@ fn golden_yield_star_delegate_async() {
     inner$1 = inner;
   } catch (e$1) {
     var v309; /* phi */
-    const v310 = /*hard-fallback AsyncReject (async driver, R4)*/ e$1;
-    return v310;
+    throw e$1;
   }
   try {
     /* try region 1: protected statements are not contiguous in the structured output — this is wrapper #2 for the same region (catch body duplicated, finally-style) */
@@ -279,11 +278,43 @@ fn golden_yield_star_delegate_async() {
     return undefined;
   } catch (e$1) {
     var v309; /* phi */
-    const v310 = /*hard-fallback AsyncReject (async driver, R4)*/ e$1;
-    return v310;
+    throw e$1;
   }
 "#;
     assert_eq!(outer, expected);
+}
+
+/// (c)-main N70 shape pin: the plain-async `for await` driver folds
+/// its suspend/resume machinery to plain awaits — NO
+/// ResumeGenerator/GetResumeMode hard-fallbacks, NO AsyncFunctionEnter
+/// fallback temp, the resume value bound at the await, and the
+/// catch-all rejection folded to `throw` (not `return <error>`).
+#[test]
+fn golden_yield_star_delegate_async_main_folded() {
+    let text = decompiled("delegate-async.abc");
+    let main = text
+        .split("main = async function ___main() {")
+        .nth(1)
+        .expect("main present");
+    let main = main.split("\n};").next().expect("main body end");
+    for gone in [
+        "ResumeGenerator",
+        "GetResumeMode",
+        "fallback AsyncFunctionEnter",
+        "AsyncReject",
+        "SuspendGenerator",
+    ] {
+        assert!(
+            !main.contains(gone),
+            "folded main keeps {gone} machinery:\n{main}"
+        );
+    }
+    // The loop await binds the iter-result (rejection throws inline).
+    assert!(main.contains("= await v16;"), "the loop await:\n{main}");
+    // The iterator-cleanup await folds too (bare — value unused).
+    assert!(main.contains("await v42;"), "the cleanup await:\n{main}");
+    // The catch-all rejection is a real `throw` (promise rejection).
+    assert!(main.contains("throw e$"), "rejection path:\n{main}");
 }
 
 /// Bail: a hand-rolled iterator-protocol loop inside a generator is

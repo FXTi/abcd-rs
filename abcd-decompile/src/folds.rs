@@ -2889,41 +2889,58 @@ pub fn async_driver_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats: &mut
     // so the counts stay valid across the mutations.
     let mut uses = BTreeMap::new();
     count_temp_uses(nodes, &mut uses);
-    async_fold_seq(nodes, &uses, stats);
+    // N70: whole-tree Declare counts per temp. The structurer's
+    // finally-style try fragmentation DUPLICATES the catch-all handler
+    // body (the copies share SSA value ids), so a folded temp's use
+    // count is N copies × 1 use, not 1 — the temp-form fold pairs each
+    // declare with its adjacent return when uses == declares (each
+    // copy is self-contained).
+    let mut decls: BTreeMap<ValueId, usize> = BTreeMap::new();
+    walk_leaves(nodes, &mut |l| {
+        if let Leaf::Raw(Stmt::Declare { value_id, .. }) = l {
+            *decls.entry(*value_id).or_insert(0) += 1;
+        }
+    });
+    async_fold_seq(nodes, &uses, &decls, stats);
 }
 
-fn async_fold_seq(nodes: &mut Vec<SNode>, uses: &BTreeMap<ValueId, usize>, stats: &mut FoldStats) {
+fn async_fold_seq(
+    nodes: &mut Vec<SNode>,
+    uses: &BTreeMap<ValueId, usize>,
+    decls: &BTreeMap<ValueId, usize>,
+    stats: &mut FoldStats,
+) {
     for n in nodes.iter_mut() {
         match n {
-            SNode::Stmts(run) => fold_async_run(run, uses, stats),
+            SNode::Stmts(run) => fold_async_run(run, uses, decls, stats),
             SNode::If {
                 then, otherwise, ..
             } => {
-                async_fold_seq(then, uses, stats);
-                async_fold_seq(otherwise, uses, stats);
+                async_fold_seq(then, uses, decls, stats);
+                async_fold_seq(otherwise, uses, decls, stats);
             }
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
             | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => async_fold_seq(body, uses, stats),
+            | SNode::ForIn { body, .. } => async_fold_seq(body, uses, decls, stats),
             SNode::Try {
                 body,
                 catches,
                 finally,
                 ..
             } => {
-                async_fold_seq(body, uses, stats);
+                async_fold_seq(body, uses, decls, stats);
                 for c in catches {
-                    async_fold_seq(&mut c.body, uses, stats);
+                    async_fold_seq(&mut c.body, uses, decls, stats);
                 }
                 if let Some(f) = finally {
-                    async_fold_seq(f, uses, stats);
+                    async_fold_seq(f, uses, decls, stats);
                 }
             }
             SNode::Switch { cases, .. } => {
                 for c in cases {
-                    async_fold_seq(&mut c.body, uses, stats);
+                    async_fold_seq(&mut c.body, uses, decls, stats);
                 }
             }
             SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
@@ -2933,7 +2950,12 @@ fn async_fold_seq(nodes: &mut Vec<SNode>, uses: &BTreeMap<ValueId, usize>, stats
 
 /// One leaf run: fold adjacent AsyncDriver declares into their
 /// return/throw consumer.
-fn fold_async_run(run: &mut Vec<Leaf>, uses: &BTreeMap<ValueId, usize>, stats: &mut FoldStats) {
+fn fold_async_run(
+    run: &mut Vec<Leaf>,
+    uses: &BTreeMap<ValueId, usize>,
+    decls: &BTreeMap<ValueId, usize>,
+    stats: &mut FoldStats,
+) {
     let mut i = 0;
     while i < run.len() {
         // Inlined form: `return asyncDriver(v)` directly.
@@ -2961,7 +2983,12 @@ fn fold_async_run(run: &mut Vec<Leaf>, uses: &BTreeMap<ValueId, usize>, stats: &
                 run.get(i + 1),
                 Some(Leaf::Raw(Stmt::Return(Some(e)))) if temp_value(e) == Some(vid)
             );
-            if adjacent_return && uses.get(&vid).copied().unwrap_or(0) == 1 {
+            // uses == declares: exactly one use per declare — each
+            // (possibly duplicated) copy is consumed by its own
+            // adjacent return. The pre-duplication shape is 1 == 1.
+            if adjacent_return
+                && uses.get(&vid).copied().unwrap_or(0) == decls.get(&vid).copied().unwrap_or(0)
+            {
                 run.remove(i);
                 run[i] = Leaf::Raw(if resolve {
                     Stmt::Return(Some(value))
@@ -3474,6 +3501,12 @@ fn gen_fold_seq(nodes: &mut Vec<SNode>, cx: &mut GenDriverCx, stats: &mut FoldSt
 struct AsyncMachineCx {
     /// The unique `AsyncFunctionEnter` fallback temp (the funcObj).
     genobj: ValueId,
+    /// N70: the funcObj plus its loop-header phi aliases (the constant
+    /// funcObj routed through bookkeeping phis in loop-driving bodies).
+    aliases: BTreeSet<ValueId>,
+    /// N70: temps thrown at some loop's structural continuation (the
+    /// verified break-routing targets for the loop-exit dispatch).
+    exit_throws: BTreeSet<ValueId>,
     /// Pure number-constant temps (the mode immediate, when the
     /// profile materializes it) by value id.
     const_env: BTreeMap<ValueId, u64>,
@@ -3512,14 +3545,30 @@ pub fn async_machine_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats: &mu
     let [genobj] = enters[..] else {
         return;
     };
-    // Every visible use of the funcObj must be machinery: a
-    // `GeneratorDriver` genobj operand, or a catch-region context phi
-    // assign (`phi = funcobj` — the es2abc try-region bookkeeping the
-    // rethrow-only handler never reads). Any other use is not the
-    // vendor shape — bail, keeping everything loud.
-    if !funcobj_uses_are_machinery(nodes, genobj) {
+    // N70: the funcObj is a per-invocation constant, but in loop-driving
+    // bodies (the plain-async `for await` driver shape) es2abc's
+    // try-region/loop bookkeeping routes it through header phi temps —
+    // the machinery's genobj operand reads the phi, not the entry temp.
+    // Compute the alias closure: phi temps whose every assign is the
+    // funcObj or another alias (self-assigns are neutral), with at
+    // least one real funcObj-source assign.
+    let aliases = funcobj_aliases(nodes, genobj);
+    // Every visible use of the funcObj (and of each alias) must be
+    // machinery: a `GeneratorDriver` genobj operand, or a catch-region
+    // context phi assign (`phi = funcobj` — the es2abc try-region
+    // bookkeeping the rethrow-only handler never reads). Any other use
+    // is not the vendor shape — bail, keeping everything loud.
+    if !funcobj_uses_are_machinery(nodes, &aliases) {
         return;
     }
+    // N70: the loop-internal await's mode dispatch may exit the loop
+    // (`if (mode == THROW) break;`) to a `throw <resume>` block the
+    // structurer places AFTER the loop (canonical loop-exit emission)
+    // instead of the inline-throw arm the straight-line shape uses.
+    // Pre-verify the routing: the temp thrown at each loop's structural
+    // continuation. A break-routed dispatch matches only when its
+    // resume temp's exit throw is found here.
+    let exit_throws = collect_loop_exit_throws(nodes);
     let mut const_env = BTreeMap::new();
     walk_leaves(nodes, &mut |l| {
         if let Leaf::Raw(Stmt::Declare {
@@ -3535,6 +3584,8 @@ pub fn async_machine_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats: &mu
     count_temp_uses(nodes, &mut uses);
     let mut cx = AsyncMachineCx {
         genobj,
+        aliases,
+        exit_throws,
         const_env,
         consumed_consts: BTreeSet::new(),
         uses,
@@ -3547,21 +3598,175 @@ pub fn async_machine_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats: &mu
     // machinery that consumed the value is gone). A partially folded
     // function keeps the temp — and the surviving sites keep their
     // loud fallbacks.
-    sweep_async_machinery(nodes, genobj, &cx.consumed_consts);
+    sweep_async_machinery(nodes, genobj, &cx.aliases, &cx.consumed_consts);
 }
 
-/// The entry-gate check: every occurrence of the funcObj temp is a
-/// `GeneratorDriver` genobj operand or a phi assign of the temp.
-fn funcobj_uses_are_machinery(nodes: &[SNode], genobj: ValueId) -> bool {
+/// N70: the alias closure of the funcObj temp — phi temps whose every
+/// assign is the funcObj or another alias (loop-header bookkeeping
+/// routing the constant funcObj through phis; self-assigns are
+/// neutral). An alias must have at least one assign from a DIFFERENT
+/// alias (a real funcObj source — a phi fed only by itself is dead
+/// bookkeeping, not the funcObj). The returned set includes `genobj`.
+fn funcobj_aliases(nodes: &[SNode], genobj: ValueId) -> BTreeSet<ValueId> {
+    // Phi temp name → value id (PhiAssign targets are name-linked).
+    let mut phi_ids: BTreeMap<String, ValueId> = BTreeMap::new();
+    // Phi target name → assigned value exprs.
+    let mut assigns: BTreeMap<String, Vec<Expr>> = BTreeMap::new();
+    walk_leaves(nodes, &mut |l| match l {
+        Leaf::Raw(Stmt::PhiDecl { name, value_id }) => {
+            phi_ids.insert(name.clone(), *value_id);
+        }
+        Leaf::Raw(Stmt::PhiAssign { target, value, .. }) => {
+            assigns
+                .entry(target.clone())
+                .or_default()
+                .push(value.clone());
+        }
+        _ => {}
+    });
+    let mut aliases: BTreeSet<ValueId> = [genobj].into_iter().collect();
+    loop {
+        let mut grew = false;
+        for (name, vid) in &phi_ids {
+            if aliases.contains(vid) {
+                continue;
+            }
+            let Some(vals) = assigns.get(name) else {
+                continue; // assign-less phi: dead bookkeeping, not an alias
+            };
+            let mut has_real_source = false;
+            let ok = vals.iter().all(|v| match temp_value(v) {
+                Some(src) if src == *vid => true, // self-assign: neutral
+                Some(src) if aliases.contains(&src) => {
+                    has_real_source = true;
+                    true
+                }
+                _ => false,
+            });
+            if ok && has_real_source {
+                aliases.insert(*vid);
+                grew = true;
+            }
+        }
+        if !grew {
+            return aliases;
+        }
+    }
+}
+
+/// N70: the temps thrown at each loop's structural continuation (the
+/// first significant statement after the loop, descending through
+/// finally-style try wrappers). Used to verify the break-routed
+/// mode==THROW dispatch of the for-await driver shape: the folded
+/// `await`'s implicit rejection throw is equivalent only when the
+/// removed `break` routed to `throw <resume temp>`.
+fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<ValueId> {
+    fn first_significant_stmt(nodes: &[SNode]) -> Option<&Stmt> {
+        for n in nodes {
+            match n {
+                SNode::Honest(_) => continue,
+                SNode::Stmts(run) => {
+                    let sig = run.iter().find(|l| {
+                        !matches!(l, Leaf::Raw(Stmt::PhiAssign { .. } | Stmt::PhiDecl { .. }))
+                    });
+                    match sig {
+                        None => continue,
+                        Some(Leaf::Raw(s)) => return Some(s),
+                        Some(_) => return None, // synthetic leaf: not a throw
+                    }
+                }
+                SNode::Try { body, .. } => match first_significant_stmt(body) {
+                    None => continue, // empty try: fall to next sibling
+                    some => return some,
+                },
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => return first_significant_stmt(body),
+                // If/Switch/Break/Continue: the first executed statement
+                // is not statically unique (or not a fall-through).
+                _ => return None,
+            }
+        }
+        None
+    }
+    fn continuation_throw<'a>(stack: &[&'a [SNode]]) -> Option<ValueId> {
+        for level in stack.iter().rev() {
+            match first_significant_stmt(level) {
+                Some(Stmt::Throw(e)) => return temp_value(e),
+                Some(_) => return None,
+                None => continue, // nothing significant here — one level up
+            }
+        }
+        None
+    }
+    fn visit<'a>(nodes: &'a [SNode], stack: &mut Vec<&'a [SNode]>, out: &mut BTreeSet<ValueId>) {
+        for (k, n) in nodes.iter().enumerate() {
+            stack.push(&nodes[k + 1..]);
+            match n {
+                SNode::While { body, .. } | SNode::DoWhile { body, .. } => {
+                    if let Some(t) = continuation_throw(stack) {
+                        out.insert(t);
+                    }
+                    visit(body, stack, out);
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    visit(then, stack, out);
+                    visit(otherwise, stack, out);
+                }
+                SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => visit(body, stack, out),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    visit(body, stack, out);
+                    for c in catches {
+                        visit(&c.body, stack, out);
+                    }
+                    if let Some(f) = finally {
+                        visit(f, stack, out);
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        visit(&c.body, stack, out);
+                    }
+                }
+                SNode::Stmts(_)
+                | SNode::Break { .. }
+                | SNode::Continue { .. }
+                | SNode::Honest(_) => {}
+            }
+            stack.pop();
+        }
+    }
+    let mut out = BTreeSet::new();
+    visit(nodes, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The entry-gate check: every occurrence of the funcObj temp (and of
+/// each N70 phi alias of it) is a `GeneratorDriver` genobj operand or
+/// a phi assign of the temp.
+fn funcobj_uses_are_machinery(nodes: &[SNode], aliases: &BTreeSet<ValueId>) -> bool {
     /// `in_genobj_slot` marks the `GeneratorDriver::genobj` operand
     /// position (the only legal expression use of the temp).
-    fn expr_ok(e: &Expr, genobj: ValueId, in_genobj_slot: bool) -> bool {
-        if temp_value(e) == Some(genobj) {
+    fn expr_ok(e: &Expr, aliases: &BTreeSet<ValueId>, in_genobj_slot: bool) -> bool {
+        if let Some(v) = temp_value(e)
+            && aliases.contains(&v)
+        {
             return in_genobj_slot;
         }
         match e {
-            Expr::GeneratorDriver { genobj: g, .. } => expr_ok(g, genobj, true),
-            _ => expr_children(e).iter().all(|c| expr_ok(c, genobj, false)),
+            Expr::GeneratorDriver { genobj: g, .. } => expr_ok(g, aliases, true),
+            _ => expr_children(e).iter().all(|c| expr_ok(c, aliases, false)),
         }
     }
     let mut ok = true;
@@ -3570,13 +3775,15 @@ fn funcobj_uses_are_machinery(nodes: &[SNode], genobj: ValueId) -> bool {
             return;
         }
         if let Leaf::Raw(Stmt::PhiAssign { value, .. }) = l {
-            // `phi = funcobj` (the catch-region context phi) is
+            // `phi = funcobj` (the catch-region context phi) and the
+            // N70 alias wiring (`phi = alias`, self-assigns) are
             // machinery bookkeeping; anything richer is not.
-            ok = !expr_uses_value(value, genobj) || temp_value(value) == Some(genobj);
+            ok = !aliases.iter().any(|a| expr_uses_value(value, *a))
+                || temp_value(value).is_some_and(|v| aliases.contains(&v));
             return;
         }
         for e in leaf_exprs(l) {
-            if !expr_ok(e, genobj, false) {
+            if !expr_ok(e, aliases, false) {
                 ok = false;
                 return;
             }
@@ -3637,7 +3844,7 @@ fn match_await_site(nodes: &[SNode], i: usize, cx: &mut AsyncMachineCx) -> Optio
                     },
                 value_id,
                 ..
-            }) if temp_value(mg) == Some(cx.genobj) => {
+            }) if temp_value(mg).is_some_and(|v| cx.aliases.contains(&v)) => {
                 mode = Some(*value_id);
                 remove.push(j);
             }
@@ -3658,7 +3865,7 @@ fn match_await_site(nodes: &[SNode], i: usize, cx: &mut AsyncMachineCx) -> Optio
                     },
                 value_id,
                 ..
-            }) if temp_value(rg) == Some(cx.genobj) => {
+            }) if temp_value(rg).is_some_and(|v| cx.aliases.contains(&v)) => {
                 resume = Some((*value_id, name.clone()));
                 remove.push(j);
             }
@@ -3787,7 +3994,7 @@ fn match_async_dispatch(
     else {
         return None;
     };
-    let genobj = cx.genobj;
+    let genobj = &cx.aliases;
     let is_mode = |e: &Expr| match mode {
         // Declared mode temp: the condition must reference it.
         Some(md) => temp_value(e) == Some(md),
@@ -3797,7 +4004,7 @@ fn match_async_dispatch(
             Expr::GeneratorDriver {
                 resume: false,
                 genobj: mg,
-            } if temp_value(mg) == Some(genobj)
+            } if temp_value(mg).is_some_and(|v| genobj.contains(&v))
         ),
     };
     let bits = if is_mode(left) {
@@ -3816,8 +4023,17 @@ fn match_async_dispatch(
     } else {
         (otherwise, then)
     };
-    check_async_throw_arm(throw_arm, resume, genobj)?;
-    Some(cont.clone())
+    if check_async_throw_arm(throw_arm, resume, genobj).is_some() {
+        return Some(cont.clone());
+    }
+    // N70: the loop-exit routing (break arm) — the continuation arm is
+    // spliced in place exactly as for the inline-throw shape. The exit
+    // throw the `break` routed to stays in place (dead post-fold: the
+    // loop's remaining exits are terminal).
+    if check_async_break_arm(throw_arm, resume, cx).is_some() {
+        return Some(cont.clone());
+    }
+    None
 }
 
 /// The THROW arm: exactly `throw <resume>;` (+ the dead `Unreachable`,
@@ -3826,7 +4042,11 @@ fn match_async_dispatch(
 /// assigns replicate for the folded await's throw), where `<resume>` is
 /// the matched resume temp — or the inlined `ResumeGenerator` when the
 /// result was never declared.
-fn check_async_throw_arm(arm: &[SNode], resume: Option<ValueId>, genobj: ValueId) -> Option<()> {
+fn check_async_throw_arm(
+    arm: &[SNode],
+    resume: Option<ValueId>,
+    genobj: &BTreeSet<ValueId>,
+) -> Option<()> {
     let mut found = false;
     for n in arm {
         match n {
@@ -3855,7 +4075,7 @@ fn check_async_throw_arm(arm: &[SNode], resume: Option<ValueId>, genobj: ValueId
                                 Expr::GeneratorDriver {
                                     resume: true,
                                     genobj: rg,
-                                } if temp_value(rg) == Some(genobj)
+                                } if temp_value(rg).is_some_and(|v| genobj.contains(&v))
                             ),
                         };
                         if !ok {
@@ -3868,6 +4088,35 @@ fn check_async_throw_arm(arm: &[SNode], resume: Option<ValueId>, genobj: ValueId
             }
             // Dead loop-bookkeeping breaks after the diverging throw.
             SNode::Break { .. } => {}
+            _ => return None,
+        }
+    }
+    found.then_some(())
+}
+
+/// N70: the loop-internal dispatch's THROW arm when the structurer
+/// routes the throw out of the loop — exactly one unlabeled `break`
+/// (+ phi partitions). Sound only when the loop's continuation is
+/// verified to be `throw <resume temp>` (the pre-pass
+/// [`collect_loop_exit_throws`]): the folded `await`'s implicit
+/// rejection throw then replaces the routing.
+fn check_async_break_arm(
+    arm: &[SNode],
+    resume: Option<ValueId>,
+    cx: &AsyncMachineCx,
+) -> Option<()> {
+    let r = resume?;
+    if !cx.exit_throws.contains(&r) {
+        return None;
+    }
+    let mut found = false;
+    for n in arm {
+        match n {
+            SNode::Stmts(run)
+                if run
+                    .iter()
+                    .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. }))) => {}
+            SNode::Break { label: None } if !found => found = true,
             _ => return None,
         }
     }
@@ -3967,7 +4216,12 @@ fn async_machine_seq(nodes: &mut Vec<SNode>, cx: &mut AsyncMachineCx, stats: &mu
 /// does not consume). Those phi assigns go with it, and a phi decl
 /// left with no assigns and no reads goes too. Any other surviving
 /// use keeps everything (loud partial fold).
-fn sweep_async_machinery(nodes: &mut Vec<SNode>, genobj: ValueId, consumed: &BTreeSet<ValueId>) {
+fn sweep_async_machinery(
+    nodes: &mut Vec<SNode>,
+    genobj: ValueId,
+    aliases: &BTreeSet<ValueId>,
+    consumed: &BTreeSet<ValueId>,
+) {
     let mut uses: BTreeMap<ValueId, usize> = BTreeMap::new();
     count_temp_uses(nodes, &mut uses);
     // Phi temps by name (PhiAssign targets are name-linked).
@@ -3977,50 +4231,100 @@ fn sweep_async_machinery(nodes: &mut Vec<SNode>, genobj: ValueId, consumed: &BTr
             phi_ids.insert(name.clone(), *value_id);
         }
     });
-    let mut phi_targets: BTreeSet<String> = BTreeSet::new();
-    let mut funcobj_survives = false;
+    // Classify alias uses: a `phi = <alias>` assign FEEDS the phi
+    // target (bookkeeping); any other occurrence is a REAL use. An
+    // alias is dead bookkeeping when it has no real use and every phi
+    // it feeds is dead bookkeeping too (the es2abc try-region chains —
+    // N70: `v62 = v65; v65 = v7` — transitive, so a fixpoint).
+    let mut feeds: BTreeMap<ValueId, Vec<ValueId>> = BTreeMap::new();
+    let mut real_use: BTreeSet<ValueId> = BTreeSet::new();
+    // Alias-valued assigns into DEAD non-alias phi temps lose just the
+    // assign (the temp keeps its other sources) — the pre-N70 behavior.
+    let mut strip_only: BTreeSet<String> = BTreeSet::new();
     walk_leaves(nodes, &mut |l| {
-        if funcobj_survives {
-            return;
-        }
-        if let Leaf::Raw(Stmt::PhiAssign { target, value, .. }) = l
-            && temp_value(value) == Some(genobj)
-        {
-            let dead = phi_ids
-                .get(target)
-                .is_some_and(|vid| uses.get(vid).copied().unwrap_or(0) == 0);
-            if dead {
-                phi_targets.insert(target.clone());
-            } else {
-                funcobj_survives = true;
+        if let Leaf::Raw(Stmt::PhiAssign { target, value, .. }) = l {
+            let Some(v) = temp_value(value) else {
+                // A richer phi-assign value may still read an alias.
+                for a in aliases {
+                    if expr_uses_value(value, *a) {
+                        real_use.insert(*a);
+                    }
+                }
+                return;
+            };
+            if !aliases.contains(&v) {
+                return;
+            }
+            match phi_ids.get(target) {
+                Some(tv) if aliases.contains(tv) => {
+                    feeds.entry(v).or_default().push(*tv);
+                }
+                Some(tv) if uses.get(tv).copied().unwrap_or(0) == 0 => {
+                    strip_only.insert(target.clone());
+                }
+                _ => {
+                    real_use.insert(v);
+                }
             }
             return;
         }
         for e in leaf_exprs(l) {
-            if expr_uses_value(e, genobj) {
-                funcobj_survives = true;
-                return;
+            for a in aliases {
+                if expr_uses_value(e, *a) {
+                    real_use.insert(*a);
+                }
             }
         }
     });
+    // Backward fixpoint: an alias is alive when it has a real use or
+    // feeds an alive alias.
+    let mut alive: BTreeSet<ValueId> = real_use;
+    loop {
+        let mut grew = false;
+        for (a, targets) in &feeds {
+            if !alive.contains(a) && targets.iter().any(|t| alive.contains(t)) {
+                alive.insert(*a);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
     let mut dead: BTreeSet<ValueId> = consumed
         .iter()
         .copied()
         .filter(|v| uses.get(v).copied().unwrap_or(0) == 0)
         .collect();
-    if !funcobj_survives {
+    if alive.is_empty() {
+        // The whole bookkeeping web is dead: strip every assign into a
+        // dead alias (all alias-valued by construction) and the
+        // alias-valued assigns into dead non-alias phi temps, then the
+        // decls left assign-less (and unread).
+        let dead_alias_names: BTreeSet<String> = phi_ids
+            .iter()
+            .filter(|(_, vid)| aliases.contains(*vid) && !alive.contains(*vid))
+            .map(|(n, _)| n.clone())
+            .collect();
+        let mut phi_targets = dead_alias_names.clone();
+        phi_targets.extend(strip_only);
         dead.insert(genobj);
         if !phi_targets.is_empty() {
-            // Remove the `phi = funcobj` assigns, then the phi decls
-            // left assign-less (and unread).
-            strip_genobj_phi_assigns(nodes, genobj, &phi_targets);
+            strip_genobj_phi_assigns(nodes, aliases, &phi_targets);
             let mut remaining: BTreeSet<String> = BTreeSet::new();
             walk_leaves(nodes, &mut |l| {
                 if let Leaf::Raw(Stmt::PhiAssign { target, .. }) = l {
                     remaining.insert(target.clone());
                 }
             });
-            strip_dead_phi_decls(nodes, &phi_targets, &remaining, &uses);
+            // The pre-computed use counts still charge dead aliases
+            // for the (removed) feed assigns — zero them for the decl
+            // sweep.
+            let mut uses_adj = uses.clone();
+            for vid in aliases.iter().filter(|v| !alive.contains(*v)) {
+                uses_adj.insert(*vid, 0);
+            }
+            strip_dead_phi_decls(nodes, &phi_targets, &remaining, &uses_adj);
         }
     }
     if !dead.is_empty() {
@@ -4028,46 +4332,51 @@ fn sweep_async_machinery(nodes: &mut Vec<SNode>, genobj: ValueId, consumed: &BTr
     }
 }
 
-/// Remove `PhiAssign` leaves assigning the funcObj temp to one of the
-/// dead phi targets.
-fn strip_genobj_phi_assigns(nodes: &mut Vec<SNode>, genobj: ValueId, targets: &BTreeSet<String>) {
+/// Remove `PhiAssign` leaves assigning a funcObj-alias temp to one of
+/// the dead phi targets.
+fn strip_genobj_phi_assigns(
+    nodes: &mut Vec<SNode>,
+    aliases: &BTreeSet<ValueId>,
+    targets: &BTreeSet<String>,
+) {
     for n in nodes.iter_mut() {
         match n {
             SNode::Stmts(run) => run.retain(|l| {
                 !matches!(
                     l,
                     Leaf::Raw(Stmt::PhiAssign { target, value, .. })
-                        if targets.contains(target) && temp_value(value) == Some(genobj)
+                        if targets.contains(target)
+                            && temp_value(value).is_some_and(|v| aliases.contains(&v))
                 )
             }),
             SNode::If {
                 then, otherwise, ..
             } => {
-                strip_genobj_phi_assigns(then, genobj, targets);
-                strip_genobj_phi_assigns(otherwise, genobj, targets);
+                strip_genobj_phi_assigns(then, aliases, targets);
+                strip_genobj_phi_assigns(otherwise, aliases, targets);
             }
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
             | SNode::ForOf { body, .. }
-            | SNode::ForIn { body, .. } => strip_genobj_phi_assigns(body, genobj, targets),
+            | SNode::ForIn { body, .. } => strip_genobj_phi_assigns(body, aliases, targets),
             SNode::Try {
                 body,
                 catches,
                 finally,
                 ..
             } => {
-                strip_genobj_phi_assigns(body, genobj, targets);
+                strip_genobj_phi_assigns(body, aliases, targets);
                 for c in catches {
-                    strip_genobj_phi_assigns(&mut c.body, genobj, targets);
+                    strip_genobj_phi_assigns(&mut c.body, aliases, targets);
                 }
                 if let Some(f) = finally {
-                    strip_genobj_phi_assigns(f, genobj, targets);
+                    strip_genobj_phi_assigns(f, aliases, targets);
                 }
             }
             SNode::Switch { cases, .. } => {
                 for c in cases {
-                    strip_genobj_phi_assigns(&mut c.body, genobj, targets);
+                    strip_genobj_phi_assigns(&mut c.body, aliases, targets);
                 }
             }
             SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
@@ -4255,8 +4564,14 @@ pub fn async_generator_machine_fold(
     });
     let mut uses = BTreeMap::new();
     count_temp_uses(nodes, &mut uses);
+    // N70 note: the async-GENERATOR body keeps the d-P14 singleton
+    // genobj (no phi-alias closure, no break-routed dispatch) — its
+    // corpus coverage is exact; extending it is future work if a
+    // loop-driving async-generator body shows the same routing.
     let mut cx = AsyncMachineCx {
         genobj,
+        aliases: [genobj].into_iter().collect(),
+        exit_throws: BTreeSet::new(),
         const_env,
         consumed_consts: BTreeSet::new(),
         uses,
@@ -4267,7 +4582,7 @@ pub fn async_generator_machine_fold(
     // only dead catch-region phi assigns. A partially folded function
     // keeps the temp — and the surviving sites keep their loud
     // fallbacks.
-    sweep_async_machinery(nodes, genobj, &cx.consumed_consts);
+    sweep_async_machinery(nodes, genobj, &cx.aliases, &cx.consumed_consts);
 }
 
 /// The machinery-use gate: every occurrence of the genObj temp is a
@@ -4809,7 +5124,7 @@ fn match_ag_three_way(
                 seen_return = true;
             }
             1.0 if !seen_throw => {
-                check_async_throw_arm(case_arm, Some(ry), cx.genobj)?;
+                check_async_throw_arm(case_arm, Some(ry), &[cx.genobj].into_iter().collect())?;
                 seen_throw = true;
             }
             _ => return None,
