@@ -330,7 +330,7 @@ fn rewrite_branch_target(bc: &mut Bytecode, target: BlockId) {
 ///
 /// Multiple try blocks per code item are native to the format: the vendored
 /// writer stores a `std::vector<TryBlock>` per CodeItem
-/// (abcd-file-sys/vendor/libpandafile/file_items.h:1370-1373,1426), our
+/// (abcd-file-sys/arkcompiler_runtime_core/libpandafile/file_items.h:1370-1373,1426), our
 /// encode path emits one file entry per model TryBlock
 /// (abcd-file/src/encode.rs:1313-1348), and decode enumerates every try
 /// block independently (abcd-file/src/decode.rs:1790-1839), so several

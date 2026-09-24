@@ -15,7 +15,7 @@
 //! Vendor grounding:
 //! - `callruntime.definesendableclass imm1:u16, method_id,
 //!   literalarray_id, imm2:u16, v:in:top`
-//!   (abcd-isa-sys/vendor/isa/isa.yaml:861-866);
+//!   (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:861-866);
 //! - the runtime builds the class through
 //!   `SlowRuntimeStub::CreateSharedClass`
 //!   (arkcompiler_ets_runtime-master/ecmascript/interpreter/

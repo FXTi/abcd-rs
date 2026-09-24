@@ -2,7 +2,7 @@
 //!
 //! First half — the vendored `DebugInfoExtractor::GetSourceFile` /
 //! `GetSourceCode` return "" for MISSING entries
-//! (abcd-file-sys/vendor/libpandafile/debug_info_extractor.cpp:318-333).
+//! (abcd-file-sys/arkcompiler_runtime_core/libpandafile/debug_info_extractor.cpp:318-333).
 //! Decode used to wrap that "" in `Some` unconditionally, surfacing
 //! `debug: Some(MethodDebugInfo { source_file: Some(""), .. })` for
 //! methods that have NO debug info item at all. Now: a method gets

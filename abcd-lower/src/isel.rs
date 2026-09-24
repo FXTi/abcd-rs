@@ -1993,7 +1993,7 @@ fn emit_range_call(
 /// Emit a construct call (`new callee(args...)`) — vendor
 /// `newobjrange imm1:u16, imm2:u8, v:in:top` /
 /// `wide.newobjrange imm:u16, v:in:top`
-/// (abcd-isa-sys/vendor/isa/isa.yaml ~:535/:540).
+/// (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml ~:535/:540).
 ///
 /// The reserved consecutive window is filled [callee, args...] IN ORDER:
 /// the runtime reads the constructor from the FIRST register of the range

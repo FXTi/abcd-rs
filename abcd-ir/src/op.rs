@@ -665,7 +665,7 @@ pub enum Op {
     /// Define a SENDABLE (shared) class with a member buffer — vendor
     /// `callruntime.definesendableclass imm1:u16, method_id,
     /// literalarray_id, imm2:u16, v:in:top`
-    /// (abcd-isa-sys/vendor/isa/isa.yaml:861-866).
+    /// (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:861-866).
     ///
     /// Distinct from [`Op::DefineClass`] (N53): the vendor runtime
     /// builds the class through `SlowRuntimeStub::CreateSharedClass`

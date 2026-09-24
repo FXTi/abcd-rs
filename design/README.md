@@ -12,7 +12,7 @@ These are internal working documents — the knowledge deposit of the project. T
 | [isa.md](isa.md) | ISA layer: code generation pipeline, Bytecode enum, decode/encode, classification and version APIs |
 | [file-format.md](file-format.md) | ABC container layer: file layout, accessor/bridge design, builder, shim strategy |
 | [ir.md](ir.md) | SSA IR: lift / opt / lower end-to-end design, register allocation, paper references |
-| [vendor-sync.md](vendor-sync.md) | Vendor sync system: zero-diff principle, metadata locking, consistency checks |
+| [vendor-sync.md](vendor-sync.md) | Vendoring via git submodules: pin policy, shim-only adaptation, CI tag radar |
 | [ci.md](ci.md) | CI/CD: job rationale, release policy |
 | [roadmap.md](roadmap.md) | Two-phase plan, IR positioning, acceptance criteria, working agreements |
 | [review-isa-file.md](review-isa-file.md) | Quality review of the isa/file layers: findings, severity, fix plan |

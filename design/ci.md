@@ -5,9 +5,8 @@
 | Job | Content | Why it exists |
 |-----|---------|---------------|
 | `fmt` | `cargo fmt --all -- --check` | Format gate, a second door next to `-D warnings` |
-| `vendor-check` | `vendor-sync.rb --check-local` in both crates | Vendor stays identical to the pinned upstream (see vendor-sync.md) |
-| `common-files-consistency` | Cross-crate shared-file diffs | Shared-file drift detection |
-| `build` | `cargo build` + `cargo test` on ubuntu / macos / windows | Cross-platform gate for the FFI + codegen pipeline (Ruby codegen, C++ compilation, MSVC shims) |
+| `common-files-consistency` | Cross-crate shim diffs | The bridge shims are duplicated across the two `-sys` crates and must stay byte-identical |
+| `build` | `cargo build` + `cargo test` on ubuntu / macos / windows | Cross-platform gate for the FFI + codegen pipeline (Ruby codegen, C++ compilation, MSVC shims). Checks out with `submodules: true` |
 | `coverage` | cargo-llvm-cov → Codecov | Coverage trend (build.rs instruments the C++ under `CARGO_LLVM_COV`) |
 
 Global `RUSTFLAGS: "-D warnings"` — warnings are errors. Deliberately **no** actions/cache (commented in ci.yml: the workspace is small and caching causes more problems than it solves — stale artifacts, coverage/build conflicts, quota pressure).
@@ -20,7 +19,11 @@ The second generation distributes via **crates.io** (every crate's `Cargo.toml` 
 
 ## vendor-sync automation
 
-See vendor-sync.md: daily cron pulls upstream → build & test → automatic PR; failures auto-open issues. This relies on GitHub Actions on the repository (branch push + PR/issue permissions) and is the basis of the "upstream update → rebase PR → pull locally" workflow.
+See vendor-sync.md: a weekly tag radar polls upstream `OpenHarmony-*` tags
+(version-aware latest), compares with the pinned submodule commit, and on
+drift opens a `vendor-bump` PR that repins both submodules — with the
+build/test outcome recorded in the PR body. A red PR documents the porting
+cost; merging requires making it green. Checkouts use `submodules: true`.
 
 ## Test conventions
 

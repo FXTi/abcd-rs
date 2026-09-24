@@ -2,7 +2,7 @@
 //! `Op::CopyDataProps` lowering.
 //!
 //! Operand roles follow the vendor signature `copydataproperties v:in:top,
-//! acc: inout:top` (abcd-isa-sys/vendor/isa/isa.yaml): the register operand
+//! acc: inout:top` (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml): the register operand
 //! is the TARGET object, the accumulator carries the SOURCE and receives
 //! the result. The simulator halts at the `Copydataproperties` instruction
 //! (record-and-stop), so the test asserts exactly which value sits in which

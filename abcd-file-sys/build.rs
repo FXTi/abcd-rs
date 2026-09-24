@@ -102,7 +102,7 @@ fn main() {
         "pgo.cpp",
         "method_handle_data_accessor.cpp",
     ];
-    for entry in std::fs::read_dir(&vendor_pf).expect("read vendor/libpandafile") {
+    for entry in std::fs::read_dir(&vendor_pf).expect("read arkcompiler_runtime_core/libpandafile") {
         let entry = entry.unwrap();
         let path = entry.path();
         let name = path.file_name().unwrap().to_string_lossy();

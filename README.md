@@ -62,11 +62,27 @@ Architecture and design decisions are documented in [`design/`](design/README.md
 - [File format](design/file-format.md) — ABC container, FFI bridge, builder
 - [IR](design/ir.md) — SSA lift/optimize/lower, register allocation, references
 - [IR v0.2](design/ir-v0.2.md) — the implemented IR design (as of P4, `abcd-ir` IS this IR; v0.1 deleted)
-- [Vendor sync](design/vendor-sync.md) — upstream consistency system
+- [Vendor sync](design/vendor-sync.md) — submodule pin policy + upstream tag radar
 - [CI/CD](design/ci.md) — jobs rationale, release policy
+
+## Cloning
+
+The `-sys` crates vendor upstream as **git submodules** at the crate roots —
+clone with them:
+
+```sh
+git clone --recurse-submodules https://github.com/FXTi/abcd-rs.git
+# or, in an existing clone:
+git submodule update --init
+```
+
+Building without the submodules fails in `build.rs` (the C++ bridge sources
+live under `abcd-isa-sys/arkcompiler_runtime_core/` and
+`abcd-file-sys/arkcompiler_runtime_core/`).
 
 ## License
 
-Apache-2.0. Vendor files under `*/vendor/` are verbatim copies of
-[OpenHarmony arkcompiler](https://gitee.com/openharmony/arkcompiler_runtime_core)
-(also Apache-2.0) and are kept in sync by CI.
+Apache-2.0. The `arkcompiler_runtime_core` submodules pull in
+[OpenHarmony arkcompiler runtime_core](https://github.com/openharmony/arkcompiler_runtime_core)
+(also Apache-2.0), pinned to a proven upstream commit and tracked by a weekly
+CI tag radar.

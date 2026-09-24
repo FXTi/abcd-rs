@@ -1,6 +1,6 @@
 //! N51 regression (v0.2 lifter): the `this-by-*` family —
 //! `ldthisbyname` / `stthisbyname` / `ldthisbyvalue` / `stthisbyvalue`
-//! (abcd-isa-sys/vendor/isa/isa.yaml:1627-1642) — is IC-fused `this`
+//! (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:1627-1642) — is IC-fused `this`
 //! property access that es2panda NEVER emits (upstream source grep:
 //! zero hits; the 36-compile matrix shows `this[k] = v` always
 //! compiles to `ldthis` + `stobjbyvalue`). Corpus coverage is zero, so

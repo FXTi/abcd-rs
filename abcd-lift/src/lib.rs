@@ -113,7 +113,7 @@ pub enum LiftError {
     )]
     UnsupportedSuperByIndex,
     /// `ldthisbyname` / `stthisbyname` / `ldthisbyvalue` /
-    /// `stthisbyvalue` (abcd-isa-sys/vendor/isa/isa.yaml:1627-1642):
+    /// `stthisbyvalue` (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:1627-1642):
     /// IC-fused `this` property access that es2panda NEVER emits (N51 —
     /// upstream source grep zero hits; the 36-compile matrix shows
     /// `this[k] = v` always compiles to `ldthis` + `stobjbyvalue`).
@@ -125,7 +125,7 @@ pub enum LiftError {
     )]
     UnsupportedThisByAccess(&'static str),
     /// `deprecated.defineclasswithbuffer method_id, imm1:u16, imm2:u16,
-    /// v1:in:top, v2:in:top` (abcd-isa-sys/vendor/isa/isa.yaml:1239-1244):
+    /// v1:in:top, v2:in:top` (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:1239-1244):
     /// the vendor runtime reads v1 as the LEXENV and v2 as the PROTO
     /// (arkcompiler_ets_runtime-master/ecmascript/interpreter/
     /// interpreter_assembly.cpp:4622-4648,

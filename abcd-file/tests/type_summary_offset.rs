@@ -4,7 +4,7 @@
 //!
 //! Vendor facts:
 //! - `TYPE_SUMMARY_FIELD_NAME = "typeSummaryOffset"`
-//!   (abcd-file-sys/vendor/libpandabase/utils/const_value.h:25) sits
+//!   (abcd-file-sys/arkcompiler_runtime_core/libpandabase/include/libpandabase/utils/const_value.h:25) sits
 //!   beside `SCOPE_NAME_RECORD` / `MODULE_REQUEST_PAHSE_IDX` — it is a
 //!   module-record field name.
 //! - Its value is a NESTED file offset (it points to a literal array

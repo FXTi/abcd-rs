@@ -20,7 +20,7 @@ abcd-isa (decode / encode / Version)
 
 ## Code generation
 
-The data source `vendor/isa/isa.yaml` is byte-identical to upstream and locked by the vendor-sync system (see vendor-sync.md). `build.rs` drives 7 templates with Ruby:
+The data source `arkcompiler_runtime_core/isa/isa.yaml` comes from the pinned upstream git submodule (see vendor-sync.md). `build.rs` drives 7 templates with Ruby:
 
 | Template | Output |
 |----------|--------|

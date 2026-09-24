@@ -1,6 +1,6 @@
 //! N54 regression (v0.2 lifter): `deprecated.defineclasswithbuffer
 //! method_id, imm1:u16, imm2:u16, v1:in:top, v2:in:top`
-//! (abcd-isa-sys/vendor/isa/isa.yaml:1239-1244) — the vendor runtime
+//! (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:1239-1244) — the vendor runtime
 //! reads v1 as the LEXENV and v2 as the PROTO
 //! (arkcompiler_ets_runtime-master/ecmascript/interpreter/
 //! interpreter_assembly.cpp:4622-4648,

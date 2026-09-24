@@ -14,7 +14,6 @@ This crate provides ArkCompiler `.abc` file format C FFI bindings for Rust, wrap
 abcd-file-sys/
 ├── build.rs                           # Ruby codegen → enums header → cc compile → bindgen ×2
 ├── Cargo.toml                         # (no `links` key; dependents use the crate directly)
-├── vendor-sync.rb / vendor-sync-files.yml  # Upstream file sync script + file list
 ├── src/
 │   └── lib.rs                         # include!(bindings.rs) + include!(enum_bindings.rs)
 │                                      # + Rust safe-type wrappers (FileType, AnnotationValueType, …)
@@ -23,7 +22,7 @@ abcd-file-sys/
 │   ├── file_bridge.h                  # C wrapper header (extern "C", ~240 functions)
 │   ├── file_bridge.cpp                # C wrapper implementation
 │   └── shim/                          # Minimal shims (10 files, replacing heavy deps)
-│       ├── vendor_fixups.h            # Force-included: 4 missing transitive includes
+│       ├── vendor_fixups.h            # Force-included: missing transitive includes
 │       ├── isa.h                      # Minimal ISA facade for vendored code that includes it
 │       ├── pgo.h                      # ProfileOptimizer stub (no-op)
 │       ├── securec.h                  # Huawei secure C library shim (memcpy_s wrapper)
@@ -33,25 +32,44 @@ abcd-file-sys/
 │       ├── os/filesystem.h            # Empty stub
 │       ├── os/mem.h                   # Non-owning os::mem::MapViewOfFile-style stub
 │       └── utils/logger.h             # LOG macro shim — see "Logger shim" below
-└── vendor/
+└── arkcompiler_runtime_core/          # git submodule (upstream, pinned; read-only)
     ├── isa/                           # gen.rb + isapi.rb + isa.yaml (Ruby codegen engine)
     ├── assembler/                     # annotation value type validation headers
     ├── libpandafile/                  # Core file format library
-    │   ├── *.h / *.cpp                # Data accessors, file items, debug info (13 .cpp)
-    │   ├── templates/                 # ERB templates (3 files)
+    │   ├── *.h / *.cpp                # Data accessors, file items, debug info
+    │   ├── templates/                 # ERB templates
     │   └── *.rb / *.yaml              # Ruby codegen modules + type data
-    └── libpandabase/                  # Base headers + utils/utf.cpp
+    ├── templates/plugin_options.rb    # Common codegen options module
+    └── libpandabase/                  # include/libpandabase/** + utils/utf.cpp
 ```
 
-### Vendor File Origins
+### Upstream code: a pinned git submodule
 
-73 files copied verbatim from arkcompiler runtime_core (tracked in `vendor-sync-files.yml`; `.sync-metadata.yml` records the sync state). All vendor files are kept identical to upstream (zero diff) to minimize sync burden.
+The upstream repo
+([openharmony/arkcompiler_runtime_core](https://github.com/openharmony/arkcompiler_runtime_core))
+is a **git submodule at the crate root** (`abcd-file-sys/arkcompiler_runtime_core`),
+pinned to a proven upstream commit. **Never edit inside the submodule** —
+local adaptation lives in `bridge/shim/` only. After cloning, run
+`git submodule update --init`. See `../design/vendor-sync.md` for the pin
+policy and the weekly upstream tag radar.
 
-4 missing transitive includes that the upstream build provides are injected via `vendor_fixups.h` (force-included with `-include` / `/FI`), avoiding any vendor file modifications.
+Missing transitive includes that the upstream build provides are injected via
+`vendor_fixups.h` (force-included with `-include` / `/FI`), avoiding any
+upstream file modifications.
 
-`pgo.h` (ProfileOptimizer) is stubbed in `bridge/shim/` and shadowed via include path priority — the upstream version depends on runtime infrastructure we don't have.
+`pgo.h` (ProfileOptimizer) is stubbed in `bridge/shim/` and shadowed via
+include path priority — the upstream version depends on runtime
+infrastructure we don't have.
 
-14 files are byte-identical duplicates of files also vendored in `abcd-isa-sys` (`isa.yaml`, `isapi.rb`, `gen.rb`, `pandafile_isapi.rb`, `file_format_version.{h.erb,cpp}`, 8 libpandabase headers). The duplication is intentional — the crates are independent publishable units (maintainer ruling, audit finding #22: leave as is, revisit only if drift ever appears).
+The full upstream subtree is present, but `build.rs` compiles only the
+translation units the bridge needs (the same set as the old vendored
+subset): the `libpandafile` data accessors / item container / writer,
+`libpandabase/utils/utf.cpp`, and `bridge/file_bridge.cpp`. Excluded on
+purpose: `file_reader.cpp` (legacy-tree drift — it calls
+`MethodParamItem::AddRuntimeAnnotation`, which legacy `file_items.h` never
+declares; the consistent implementation lives in `static_core/libarkfile`),
+plus `file.cpp`, `pgo.cpp`, and `method_handle_data_accessor.cpp` (runtime
+machinery the bridge never used).
 
 ## Build Pipeline Overview
 
@@ -70,7 +88,8 @@ build.rs Phase 1b: file_bridge_enums.h — ACC_* names parsed from
 modifiers.h, values referenced from vendor headers (no hand mirrors)
             │
             ▼
-cc compiles 15 C++ sources: 13 vendor libpandafile .cpp +
+cc compiles the bridge + the upstream translation units it needs:
+the libpandafile accessor/container/writer .cpp set (see above),
 libpandabase/utils/utf.cpp + bridge/file_bridge.cpp
             │
             ▼
@@ -200,8 +219,17 @@ Delegates to upstream's `file_format_version.cpp`, avoiding manual reimplementat
 
 ## Statistics
 
-- 73 vendor files (all identical to upstream) + 10 shim files
-- 15 C++ sources compiled: 13 vendor libpandafile `.cpp` + libpandabase `utf.cpp` + `file_bridge.cpp`
+- Upstream code: `arkcompiler_runtime_core` submodule (pinned; read-only) + 10 shim files
+- C++ sources compiled: the bridge-needed libpandafile `.cpp` set + libpandabase `utf.cpp` + `file_bridge.cpp`
 - Ruby generates 3 headers; build.rs generates `file_bridge_enums.h`
 - 2 bindgen passes: `bindings.rs` (C bridge API) + `enum_bindings.rs` (vendor constants)
 - C bridge exports ~240 functions across 10 accessor types + index accessor + builder
+
+## Publishing
+
+This crate is publish-*shaped* but unpublished. Note that `cargo package` /
+`cargo publish` would now drag the full `arkcompiler_runtime_core` submodule
+(hundreds of MB) into the `.crate`. If publishing ever happens, the strategy
+needs an `exclude` for the submodule plus pre-generated sources (vendoring the
+generated headers + the few compiled C++ files into the package). Registered
+decision — no action for now.
