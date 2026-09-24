@@ -25,8 +25,8 @@
 //! loud), the per-site bail (a dispatch whose THROW arm throws the
 //! wrong temp keeps that site loud), and the async-generator bail
 //! (`AsyncGenerator` kind carries no `AsyncFunctionEnter` — its
-//! yield machinery is a separate lowering and stays a documented
-//! fallback).
+//! yield machinery is d-P14's separate fold, so THIS fold is a no-op
+//! for it).
 //!
 //! The expected strings are STABLE emission forms — reviewed,
 //! hand-written expectations, not snapshots.
@@ -393,11 +393,13 @@ fn a06_dispatch_mismatch_keeps_site_loud() {
     );
 }
 
-/// a07 — the async-generator bail: `FunctionKind::AsyncGenerator`
+/// a07 — the async-generator no-op: `FunctionKind::AsyncGenerator`
 /// carries NO `AsyncFunctionEnter` (its entry protocol is the
 /// generator `CreateGeneratorObj` + the AsyncGeneratorResolve/yield
-/// machinery — a separate lowering, still a documented fallback). The
-/// fold's entry gate refuses the whole function.
+/// machinery — d-P14's [`async_generator_machine_fold`] owns it; its
+/// own entry gate also refuses this entry-suspend-less shape, so the
+/// documented fallbacks stay). THIS fold's entry gate refuses the
+/// whole function.
 #[test]
 fn a07_async_generator_kind_bails() {
     let mut m = mk_module();
