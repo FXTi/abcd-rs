@@ -137,6 +137,8 @@ pub struct TaintProblem<'m> {
     /// the solver's call graph (`GapCallGraph`); the flow functions
     /// consult them to recognize gap edges.
     gap_edges: BTreeMap<InstId, Vec<FuncId>>,
+    /// The e13 fresh-result memo (rung 2; [`TaintProblem::fresh_result_site`]).
+    fresh_memo: RefCell<HashMap<ValueId, Option<InstId>>>,
     /// Gap-wrapper counters (FlowDroid's gap-hit/miss analogue): call
     /// sites whose callback summary applied AND the callback value
     /// resolved to at least one user body.
@@ -217,6 +219,7 @@ impl<'m> TaintProblem<'m> {
             applied: RefCell::new(Vec::new()),
             proto_memo: RefCell::new(HashMap::new()),
             gap_edges: BTreeMap::new(),
+            fresh_memo: RefCell::new(HashMap::new()),
             gap_resolved: 0,
             gap_unresolved: 0,
         };
@@ -538,12 +541,71 @@ impl<'m> TaintProblem<'m> {
 
     /// Whether a load through `object` may pick up a heap fact keyed by
     /// `sites` (positive intersection, or either side unknown — the
-    /// conservative may-alias answer for unknown bases; rung 1 refines
-    /// `object`'s sites through the on-demand query, rung 0 through the
-    /// local def chain).
+    /// conservative may-alias answer for unknown bases; the refined
+    /// rungs sharpen `object`'s sites through their engines).
+    ///
+    /// Rung 2 addition (t-P6, the e13 mechanism): when `object`'s sites
+    /// are unknown BUT it is the result of a summary call whose result
+    /// no static flow reaches (a FRESH container — [`TaintProblem`]'s
+    /// `fresh_result_site`), the load base keys by the call site: a
+    /// VM-allocated `map` result no longer may-aliases the source
+    /// array's heap fact through the wildcard.
     fn heap_may_reach(&self, sites: &AllocSiteSet, object: ValueId, at: InstId) -> bool {
+        if sites.is_empty() {
+            return true;
+        }
         let obj = self.oracle.borrow().site_info_at(object, at);
-        sites.is_empty() || obj.sites.is_empty() || sites.intersects(&obj.sites)
+        if !obj.sites.is_empty() {
+            return sites.intersects(&obj.sites);
+        }
+        match self.fresh_result_site(object) {
+            Some(site) => sites.iter().any(|s| s == site),
+            None => true, // the unknown-base wildcard
+        }
+    }
+
+    /// The e13 mechanism (t-P4's registered rung-2 idea, "summary
+    /// results as call-site-keyed allocations" — landed here,
+    /// taint-side): the call instruction of a summary-application whose
+    /// result NO static flow reaches (`Param/Base/Field → Return*`
+    /// would mean the result derives from — may alias — an input, and
+    /// gap return channels key their facts precisely on the local
+    /// result, so they do not count as aliasing either). Rung-2-gated:
+    /// the wildcard discipline of rungs 0/1 is unchanged. Memoized;
+    /// classification is peeked (counter-free).
+    fn fresh_result_site(&self, value: ValueId) -> Option<InstId> {
+        if self.config.alias_rung < 2 {
+            return None;
+        }
+        if let Some(hit) = self.fresh_memo.borrow().get(&value) {
+            return *hit;
+        }
+        let site = self.fresh_result_site_uncached(value);
+        self.fresh_memo.borrow_mut().insert(value, site);
+        site
+    }
+
+    /// The uncached worker of [`TaintProblem::fresh_result_site`].
+    fn fresh_result_site_uncached(&self, value: ValueId) -> Option<InstId> {
+        let abcd_ir::ValueDef::Inst(iid) = self.module.value(value)?.def else {
+            return None;
+        };
+        let inst = self.module.inst(iid)?;
+        if inst.result != Some(value) {
+            return None;
+        }
+        let Op::Call { args, .. } = &inst.op else {
+            return None;
+        };
+        let SiteClass::Summary { name, .. } = self.compute_class(iid, true).0 else {
+            return None;
+        };
+        let summary = self.registry.peek(&name, args.len())?;
+        let result_inflow = summary
+            .flows
+            .iter()
+            .any(|f| matches!(f.to, Endpoint::Return | Endpoint::ReturnField(_)));
+        if result_inflow { None } else { Some(iid) }
     }
 
     /// Whether local fact base `v` has positive-alias evidence with
@@ -561,6 +623,30 @@ impl<'m> TaintProblem<'m> {
         !a.sites.is_empty() && a.sites.intersects(&b.sites)
     }
 
+    /// The access-path cut (`cutFirstField`, soot-infoflow §2.2): what
+    /// remains of `fields` after reading `key`. An empty chain means the
+    /// base itself was tainted — any property read is tainted one step.
+    fn cut_first(&self, fields: &FieldChain, key: FieldKey) -> Option<FieldChain> {
+        if fields.is_empty() {
+            return Some(FieldChain::new().pushed(key, self.cap()));
+        }
+        let first = fields.elements()[0];
+        let compatible = match (first, key) {
+            (FieldKey::Named(a), FieldKey::Named(b)) => a == b,
+            // AnyIndex/AnyDynamic are wildcards (heap.rs discipline).
+            _ => true,
+        };
+        if compatible {
+            let mut rest = FieldChain::new();
+            for &k in &fields.elements()[1..] {
+                rest = rest.pushed(k, self.cap());
+            }
+            Some(rest)
+        } else {
+            None
+        }
+    }
+
     /// Access-path load rule: `result = object.key` at instruction `at`.
     fn load_rule(
         &self,
@@ -573,27 +659,7 @@ impl<'m> TaintProblem<'m> {
         let Some(result) = self.module.inst(at).and_then(|i| i.result) else {
             return;
         };
-        let try_cut = |fields: &FieldChain| -> Option<FieldChain> {
-            if fields.is_empty() {
-                // Base tainted: any property read is tainted (one step).
-                return Some(FieldChain::new().pushed(key, self.cap()));
-            }
-            let first = fields.elements()[0];
-            let compatible = match (first, key) {
-                (FieldKey::Named(a), FieldKey::Named(b)) => a == b,
-                // AnyIndex/AnyDynamic are wildcards (heap.rs discipline).
-                _ => true,
-            };
-            if compatible {
-                let mut rest = FieldChain::new();
-                for &k in &fields.elements()[1..] {
-                    rest = rest.pushed(k, self.cap());
-                }
-                Some(rest)
-            } else {
-                None
-            }
-        };
+        let try_cut = |fields: &FieldChain| self.cut_first(fields, key);
         match &fact.base {
             TaintBase::Local(v) if self.local_alias_evidence(*v, object, at) => {
                 if let Some(rest) = try_cut(&fact.fields) {
@@ -1077,11 +1143,71 @@ impl IfdsProblem for TaintProblem<'_> {
                         out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                     }
                 }
+                // The rung-2 environment-identity channel (b2): a
+                // PRECISE writer keys the slot by its NewLexEnv site's
+                // abstract object (`Heap(env).[AnyIndex]`), so two
+                // functions' colliding (level, slot) captures no longer
+                // merge. A precise reader matches by env-site
+                // intersection; an imprecise reader (env unknown) falls
+                // back to matching ANY env-keyed fact — the
+                // may-direction rule that keeps the channel sound when
+                // the env analysis gives up (the rung-1 unbalanced
+                // discipline's analogue).
+                if let Some(env) = self.oracle.borrow().lex_env_at(curr, *level) {
+                    if let TaintBase::Heap(sites) = &fact.base {
+                        let precise = !env.has_unknown && !env.sites.is_empty();
+                        let hits = if precise {
+                            env.sites.intersects(sites)
+                        } else {
+                            let oracle = self.oracle.borrow();
+                            sites.iter().any(|s| oracle.is_env_site(s))
+                        };
+                        if hits {
+                            if let Some(rest) =
+                                self.cut_first(&fact.fields, FieldKey::AnyIndex)
+                            {
+                                if let Some(result) = curr_inst.result {
+                                    out.push(Fact::of(
+                                        fact.with_fields(rest).rebased(TaintBase::Local(result)),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
                 out.push(source.clone());
             }
             Op::PutLexVar { level, slot, value } => {
                 if fact.base == TaintBase::Local(*value) {
-                    out.push(Fact::of(fact.rebased(TaintBase::LexVar(*level, *slot))));
+                    // Rung 2 keys the slot by the environment's
+                    // abstract object when the env analysis is precise
+                    // (b2 — see the GetLexVar arm); the legacy
+                    // function-agnostic `(level, slot)` keying stands
+                    // otherwise and on rungs 0/1. Slots within one
+                    // environment merge under `AnyIndex` (the b2
+                    // collision is ACROSS environments — documented).
+                    let keyed_env = self
+                        .oracle
+                        .borrow()
+                        .lex_env_at(curr, *level)
+                        .and_then(|env| {
+                            (!env.has_unknown && !env.sites.is_empty()).then_some(env.sites)
+                        });
+                    match keyed_env {
+                        Some(sites) => {
+                            let mut chain = FieldChain::new().pushed(FieldKey::AnyIndex, self.cap());
+                            for &k in fact.fields.elements() {
+                                chain = chain.pushed(k, self.cap());
+                            }
+                            out.push(Fact::of(TaintFact {
+                                base: TaintBase::Heap(sites),
+                                fields: chain,
+                            }));
+                        }
+                        None => {
+                            out.push(Fact::of(fact.rebased(TaintBase::LexVar(*level, *slot))))
+                        }
+                    }
                 }
                 out.push(source.clone());
             }

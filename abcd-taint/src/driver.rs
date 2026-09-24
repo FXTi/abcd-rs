@@ -36,6 +36,7 @@ use abcd_analysis::dataflow::Rung1AliasOracle;
 use abcd_analysis::dataflow::heap::{DEFAULT_MAX_FIELD_CHAIN, Rung0AliasOracle};
 use abcd_analysis::dataflow::ifds::CallGraphOracle;
 use abcd_analysis::dataflow::ifds::{IfdsConfig, IfdsResult, IfdsSolver};
+use abcd_analysis::dataflow::pta::{PtaConfig, Rung2AliasOracle};
 use abcd_ir::{FuncId, InstId, Loc, Module, Op, ValueId};
 
 use crate::fact::{Fact, TaintFact};
@@ -100,7 +101,10 @@ pub struct TaintConfig {
     /// The alias-oracle rung (analysis-strategy §4.4): 0 = heap-v0 local
     /// def chains; 1 = the on-demand backward `points_to` engine
     /// (memoized, depth-capped, rung-0 fallback) plus the points_to-fed
-    /// call-graph refinement. Default 1; 0 stays selectable for A/B
+    /// call-graph refinement; 2 = the whole-module context-sensitive
+    /// PTA (1-call-site contexts, field-sensitive, on-the-fly
+    /// call-graph co-evolution — the call graph the solver runs against
+    /// is the PTA's own). Default 2; 0/1 stay selectable for A/B/C
     /// measurement in the probe runner.
     pub alias_rung: u8,
 }
@@ -116,7 +120,7 @@ impl Default for TaintConfig {
             follow_returns_past_seeds: true,
             native_identity: true,
             max_field_chain: DEFAULT_MAX_FIELD_CHAIN,
-            alias_rung: 1,
+            alias_rung: 2,
         }
     }
 }
@@ -175,6 +179,9 @@ pub struct TaintReport {
     /// Callback-summary sites whose callback value did NOT resolve —
     /// the honest fallback (mini-gap tag only; `gap.rs` module docs).
     pub gap_sites_unresolved: usize,
+    /// The alias rung the analysis actually ran at (rung 2 degrades to
+    /// rung 1 when the PTA's step budget cuts — loud, never silent).
+    pub alias_rung_used: u8,
 }
 
 impl TaintReport {
@@ -217,20 +224,47 @@ pub fn run_taint(module: &Module, config: &TaintConfig) -> TaintReport {
 /// that assert on facts at arbitrary program points).
 pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, IfdsResult<Fact>) {
     let base_graph = CallGraph::build(module);
-    // The alias ladder (analysis-strategy §4.4): rung 1 builds the
-    // on-demand engine over the BASE graph, refines the graph once with
-    // the engine's points_to (§5.4 — one engine, two consumers; the
-    // co-evolution fixed point is a later rung), and solves against the
-    // refined graph. Rung 0 solves against the base graph directly.
-    let engine = (config.alias_rung != 0).then(|| Rung1AliasOracle::new(module, &base_graph));
-    let refined = engine
-        .as_ref()
-        .map(|e| CallGraph::refine_with_points_to(module, &base_graph, e));
-    let callgraph: &CallGraph = refined.as_ref().unwrap_or(&base_graph);
-    let oracle = match engine {
-        Some(e) => Oracle::Rung1(e),
-        None => Oracle::Rung0(Rung0AliasOracle::new(module)),
+    // The alias ladder (analysis-strategy §4.4):
+    // - rung 0 solves against the base graph with def-chain answers;
+    // - rung 1 builds the on-demand engine over the BASE graph and
+    //   refines the graph once with the engine's points_to (§5.4 — one
+    //   engine, two consumers; one pass, no fixed point);
+    // - rung 2 runs the whole-module PTA: its co-evolution fixed point
+    //   IS the call graph the solver runs against, and its fixed-point
+    //   tables are the oracle. A step-budget cut degrades to the rung-1
+    //   pipeline, recorded in `alias_rung_used` (loud, never silent).
+    let rung1_pipeline = || {
+        let engine = Rung1AliasOracle::new(module, &base_graph);
+        let refined = CallGraph::refine_with_points_to(module, &base_graph, &engine);
+        (refined, Oracle::Rung1(engine), 1u8)
     };
+    let (refined, oracle, rung_used) = match config.alias_rung {
+        0 => (
+            None,
+            Oracle::Rung0(Rung0AliasOracle::new(module)),
+            0u8,
+        ),
+        2 => {
+            let outcome =
+                abcd_analysis::dataflow::pta::analyze(module, &base_graph, &PtaConfig::default());
+            if outcome.stats().capped {
+                let (g, o, u) = rung1_pipeline();
+                (Some(g), o, u)
+            } else {
+                let (graph, tables, stats) = outcome.into_parts();
+                (
+                    Some(graph),
+                    Oracle::Rung2(Rung2AliasOracle::new(module, tables, stats)),
+                    2u8,
+                )
+            }
+        }
+        _ => {
+            let (g, o, u) = rung1_pipeline();
+            (Some(g), o, u)
+        }
+    };
+    let callgraph: &CallGraph = refined.as_ref().unwrap_or(&base_graph);
     let mut registry = if config.builtin_summaries {
         SummaryRegistry::with_builtins()
     } else {
@@ -273,6 +307,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         path_edges: result.path_edges().len(),
         gap_sites_resolved,
         gap_sites_unresolved,
+        alias_rung_used: rung_used,
     };
     let path_index = PathIndex::build(module, &result);
     for hit in &mut report.hits {

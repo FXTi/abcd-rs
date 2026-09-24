@@ -531,13 +531,14 @@ for p in a["probes"]:
                 name: sink.to_owned(),
             }],
             builtin_summaries: true,
-            // A/B switch: ABCD_TAINT_RUNG=0 runs the suite against the
-            // rung-0 oracle (the annotations encode the CURRENT rung's
-            // expectations, so rung 0 fails loudly — that IS the A/B
-            // evidence of what rung 1 bought).
+            // A/B/C switch: ABCD_TAINT_RUNG=0/1/2 selects the oracle
+            // rung (the annotations encode the CURRENT rung's
+            // expectations — rung 2 — so lower rungs fail loudly; that
+            // IS the A/B/C evidence of what each rung bought).
             alias_rung: match std::env::var("ABCD_TAINT_RUNG").as_deref() {
                 Ok("0") => 0,
-                _ => 1,
+                Ok("1") => 1,
+                _ => 2,
             },
             ..TaintConfig::default()
         }

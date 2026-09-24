@@ -43,6 +43,13 @@ fn smoke_config() -> TaintConfig {
             name: "print".to_owned(),
         }],
         builtin_summaries: true,
+        // A/B/C switch (the probe runner's knob, mirrored): run the
+        // smoke at a selected oracle rung for per-rung corpus numbers.
+        alias_rung: match std::env::var("ABCD_TAINT_RUNG").as_deref() {
+            Ok("0") => 0,
+            Ok("1") => 1,
+            _ => 2,
+        },
         ..TaintConfig::default()
     }
 }
