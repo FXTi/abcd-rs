@@ -92,6 +92,19 @@
 //!    carries awaits around every protocol step and keeps the
 //!    completion dispatch inside the loop's done arm. All-or-nothing
 //!    per site; non-matching shapes keep their loud fallbacks.
+//! 11. **Plain-async `for await` driver loops → literal `for await
+//!    (const x of …)`** (d-P17, N70 residual 1):
+//!    [`match_for_await_driver`] extends fold 3's iterator-loop
+//!    recovery to the post-N70 driver shape — the header's folded
+//!    dispatch await temp, the `next.call(it)` phi call, the
+//!    break-routed `if (done) { TAIL; break } else { body; continue }`
+//!    dispatch whose done arm absorbed the post-loop tail (re-homed
+//!    AFTER the loop), and loop-carried bookkeeping phis collapsed to
+//!    their invariant sources by substitution. The companion sweep
+//!    [`sweep_dead_loop_exit_throws`] (N70 residual 2) removes the
+//!    dead after-loop `throw <resume temp>` the break-routed dispatch
+//!    left behind, under a whole-node unreachability proof (any doubt
+//!    keeps it).
 
 use crate::expr::{ArrayElem, Expr, IterOp, Lit, ObjEntry};
 use crate::recover::Stmt;
@@ -896,12 +909,7 @@ fn node_flow(n: &SNode) -> SeqFlow {
 /// residue in shapes this pass does not model — doubt keeps the block).
 fn subtree_has_labeled_jump(nodes: &[SNode]) -> bool {
     nodes.iter().any(|n| match n {
-        SNode::Break {
-            label: Some(_),
-        }
-        | SNode::Continue {
-            label: Some(_),
-        } => true,
+        SNode::Break { label: Some(_) } | SNode::Continue { label: Some(_) } => true,
         SNode::If {
             then, otherwise, ..
         } => subtree_has_labeled_jump(then) || subtree_has_labeled_jump(otherwise),
@@ -1033,8 +1041,6 @@ fn residue_match(nodes: &[SNode], i: usize, body: &[SNode]) -> Option<usize> {
     Some(j)
 }
 
-
-
 // ── Folds 3+4: iterator loops ────────────────────────────────────────
 
 /// What the for-of/for-in matcher extracts from a candidate site.
@@ -1107,6 +1113,23 @@ fn fold_loops(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
                 .map(|f| (f, body))
         });
         let Some((folded, norm_body)) = folded else {
+            // d-P17 (N70 residual 1): the plain-async `for await`
+            // driver is not the corpus for-of shape (its loop header
+            // carries the folded dispatch's await temp, and the done
+            // arm absorbed the post-loop tail) — try the driver
+            // sibling matcher.
+            if matches!(
+                &nodes[i],
+                SNode::While {
+                    label: None,
+                    cond: None,
+                    ..
+                }
+            ) && let Some(plan) = match_for_await_driver(nodes, i)
+            {
+                i = apply_for_await_driver(nodes, i, plan, stats);
+                continue;
+            }
             i += 1;
             continue;
         };
@@ -1479,6 +1502,636 @@ fn rebuild_loop_body(body: &[SNode], folded: &LoopFold) -> Option<(String, Vec<S
         return None;
     }
     Some((binding, out))
+}
+
+// ── d-P17 (N70 residual 1): the plain-async `for await` driver ──────
+//
+// A plain-async function driving `for await (const x of …)` lowers to
+// the corpus for-of shape PLUS the async suspend/resume machinery;
+// after [`async_machine_fold`] (N70, d-P16) the loop is a working
+// `while (true)` driver with plain awaits — but not the literal source
+// form. The corpus matcher ([`match_for_of`]) cannot take it from
+// there: the driver's shape differs on every axis:
+//
+// - the header carries the folded dispatch's await temp
+//   (`res = next.call(it); tmp = await res; done = tmp.done`) — the
+//   corpus shape reads `done` off the call result directly;
+// - the header is split across several statement runs (empty runs and
+//   elided guards interleaved);
+// - the call goes through the phis as `next_phi.call(iter_phi)` (a
+//   `this`-carrying call), not a bare `next_phi()`;
+// - the loop test is the break-routed dispatch `if (done) { TAIL;
+//   break } else { body; continue }` whose done arm ABSORBED the
+//   post-loop tail (print + return) — the structurer placed the
+//   loop's nominal continuation (the dead dispatch throw, swept by
+//   [`sweep_dead_loop_exit_throws`]) after the loop instead;
+// - extra loop-carried bookkeeping phis (the accumulated array, the
+//   not-no-iter flag) are USED in the body — they collapse to their
+//   single invariant source by substitution.
+//
+// The fold re-homes the done-arm tail AFTER the loop and emits the
+// literal `for await (const x of …)`. All-or-nothing; any mismatch
+// keeps the working while-loop driver.
+
+/// What [`match_for_await_driver`] extracts from a candidate site.
+struct DriverFold {
+    /// The iterated expression.
+    iter: Expr,
+    /// The iteration binding.
+    binding: String,
+    /// The rebuilt loop body.
+    body: Vec<SNode>,
+    /// The done-arm's absorbed post-loop tail (re-homed after the loop).
+    tail: Vec<SNode>,
+    /// Trailing leaves of the gathered pre-run to consume.
+    pre_cut: usize,
+}
+
+/// The adjacent statement leaves immediately before index `i`,
+/// skipping honesty comments and empty runs (the driver's dissolved
+/// try wrappers sit between the iterator setup and the loop).
+fn gather_driver_pre_leaves(nodes: &[SNode], i: usize) -> Vec<Leaf> {
+    let mut segs: Vec<&[Leaf]> = Vec::new();
+    let mut j = i;
+    while j > 0 {
+        match &nodes[j - 1] {
+            SNode::Honest(_) => j -= 1,
+            SNode::Stmts(leaves) if leaves.is_empty() => j -= 1,
+            SNode::Stmts(leaves) => {
+                segs.push(leaves);
+                j -= 1;
+            }
+            _ => break,
+        }
+    }
+    let mut out = Vec::new();
+    for seg in segs.iter().rev() {
+        out.extend(seg.iter().cloned());
+    }
+    out
+}
+
+/// Drop `cut` trailing leaves of the gathered pre-run (walking
+/// backwards, skipping honesty comments and empty runs); nodes left
+/// empty are removed. Returns how many nodes were removed.
+fn trim_driver_pre_leaves(nodes: &mut Vec<SNode>, i: usize, cut: usize) -> usize {
+    let mut remaining = cut;
+    let mut removed = 0;
+    let mut j = i;
+    while j > 0 && remaining > 0 {
+        match &mut nodes[j - 1] {
+            SNode::Honest(_) => j -= 1,
+            SNode::Stmts(leaves) => {
+                let take = remaining.min(leaves.len());
+                leaves.truncate(leaves.len() - take);
+                remaining -= take;
+                if leaves.is_empty() {
+                    nodes.remove(j - 1);
+                    removed += 1;
+                }
+                j -= 1;
+            }
+            _ => break,
+        }
+    }
+    removed
+}
+
+/// Match the plain-async `for await` driver at `nodes[i]` (an
+/// unlabeled `while (true)`; see the section comment for the shape).
+/// Pure: no mutation until [`apply_for_await_driver`].
+fn match_for_await_driver(nodes: &[SNode], i: usize) -> Option<DriverFold> {
+    let SNode::While {
+        label: None,
+        cond: None,
+        body,
+    } = &nodes[i]
+    else {
+        return None;
+    };
+
+    // ── Pre-loop: trailing phi assigns over `const it =
+    // get-async-iterator(obj)`, `const next = it.next` (the corpus
+    // matcher's plumbing, async-only).
+    let pre = gather_driver_pre_leaves(nodes, i);
+    let mut tail = pre.len();
+    let mut assigns: Vec<(String, Expr)> = Vec::new();
+    while tail > 0 {
+        match &pre[tail - 1] {
+            Leaf::Raw(Stmt::PhiAssign { target, value, .. }) => {
+                assigns.push((target.clone(), value.clone()));
+                tail -= 1;
+            }
+            _ => break,
+        }
+    }
+    if tail < 2 {
+        return None;
+    }
+    let (it_name, iter_expr) = match &pre[tail - 2] {
+        Leaf::Raw(Stmt::Declare {
+            name: it_name,
+            value:
+                Expr::Iter {
+                    op: IterOp::GetAsyncIterator,
+                    obj,
+                    ..
+                },
+            ..
+        }) => (it_name.clone(), obj.as_ref().clone()),
+        _ => return None,
+    };
+    let next_name = match &pre[tail - 1] {
+        Leaf::Raw(Stmt::Declare {
+            name: next_name,
+            value: Expr::PropName { object, name, .. },
+            ..
+        }) if name == "next" && temp_name(object) == Some(it_name.as_str()) => next_name.clone(),
+        _ => return None,
+    };
+    let pre_cut = pre.len() - tail + 2;
+
+    // ── Body: the header statement runs (empty runs / honesty
+    // comments interleaved), then the break-routed dispatch `if
+    // (done) { TAIL; break } else { body; continue }` as the last
+    // significant node.
+    let mut hdr: Vec<Leaf> = Vec::new();
+    let mut k = 0;
+    let (cond, then, otherwise) = loop {
+        match body.get(k) {
+            Some(SNode::Stmts(run)) => {
+                hdr.extend(run.iter().cloned());
+                k += 1;
+            }
+            Some(SNode::Honest(_)) => k += 1,
+            Some(SNode::If {
+                cond,
+                then,
+                otherwise,
+            }) => break (cond, then, otherwise),
+            _ => return None,
+        }
+    };
+    if otherwise.is_empty()
+        || !body[k + 1..].iter().all(|n| {
+            matches!(n, SNode::Honest(_)) || matches!(n, SNode::Stmts(run) if run.is_empty())
+        })
+    {
+        return None;
+    }
+
+    // ── Header: phi decls, `res = next_phi.call(iter_phi)`, the
+    // folded dispatch's `tmp = await res` (REQUIRED — for-await awaits
+    // the `next()` result; a driver without it is not this shape),
+    // elided guards, `done = tmp.done` — and nothing else.
+    let mut h = 0;
+    let mut phi_names: Vec<String> = Vec::new();
+    let mut phi_vids: BTreeMap<String, ValueId> = BTreeMap::new();
+    while let Some(Leaf::Raw(Stmt::PhiDecl { name, value_id })) = hdr.get(h) {
+        phi_names.push(name.clone());
+        phi_vids.insert(name.clone(), *value_id);
+        h += 1;
+    }
+    if phi_names.is_empty() {
+        return None;
+    }
+    // Every trailing pre-loop assign must target a header phi (the
+    // trim consumes them all — an assign to anything else would be
+    // dropped live code).
+    if !assigns.iter().all(|(t, _)| phi_names.contains(t)) {
+        return None;
+    }
+    let (res_name, next_phi, recv_phi) = match hdr.get(h) {
+        Some(Leaf::Raw(Stmt::Declare {
+            name: res,
+            value:
+                Expr::Call {
+                    callee,
+                    this: Some(recv),
+                    args,
+                    kind: abcd_ir::op::CallKind::Dynamic | abcd_ir::op::CallKind::Direct,
+                    ..
+                },
+            ..
+        })) if args.is_empty() => {
+            let callee = temp_name(callee)?.to_string();
+            let recv = temp_name(recv)?.to_string();
+            if !phi_names.contains(&callee) || !phi_names.contains(&recv) {
+                return None;
+            }
+            (res.clone(), callee, recv)
+        }
+        _ => return None,
+    };
+    h += 1;
+    while matches!(hdr.get(h), Some(Leaf::Raw(Stmt::Elided { .. }))) {
+        h += 1;
+    }
+    let await_name = match hdr.get(h) {
+        Some(Leaf::Raw(Stmt::Declare {
+            name,
+            value:
+                Expr::Await {
+                    value,
+                    uncaught: true,
+                },
+            ..
+        })) if temp_name(value) == Some(res_name.as_str()) => name.clone(),
+        _ => return None,
+    };
+    h += 1;
+    while matches!(hdr.get(h), Some(Leaf::Raw(Stmt::Elided { .. }))) {
+        h += 1;
+    }
+    let done_name = match hdr.get(h) {
+        Some(Leaf::Raw(Stmt::Declare {
+            name: done,
+            value: Expr::PropName { object, name, .. },
+            ..
+        })) if name == "done" && temp_name(object) == Some(await_name.as_str()) => done.clone(),
+        _ => return None,
+    };
+    h += 1;
+    if h != hdr.len() {
+        return None;
+    }
+    // The pre-loop assigns wire `next` and `it` into the call's phis.
+    if !assigns
+        .iter()
+        .any(|(t, v)| *t == next_phi && temp_name(v) == Some(next_name.as_str()))
+        || !assigns
+            .iter()
+            .any(|(t, v)| *t == recv_phi && temp_name(v) == Some(it_name.as_str()))
+    {
+        return None;
+    }
+
+    // ── The dispatch: a POSITIVE done test.
+    let mut e = cond;
+    let mut positive = true;
+    loop {
+        match e {
+            Expr::Unary {
+                op: UnOp::IsTrue,
+                operand,
+            } => e = operand,
+            Expr::Unary {
+                op: UnOp::IsFalse | UnOp::LogicalNot,
+                operand,
+            } => {
+                positive = !positive;
+                e = operand;
+            }
+            _ => break,
+        }
+    }
+    if !positive || temp_name(e) != Some(done_name.as_str()) {
+        return None;
+    }
+
+    // ── The done arm: the absorbed post-loop tail, then the exit
+    // break (trailing empty runs tolerated).
+    let mut tail_nodes = then.clone();
+    while matches!(tail_nodes.last(), Some(SNode::Stmts(run)) if run.is_empty()) {
+        tail_nodes.pop();
+    }
+    if !matches!(tail_nodes.pop(), Some(SNode::Break { label: None })) {
+        return None;
+    }
+    tail_nodes.retain(|n| !matches!(n, SNode::Stmts(run) if run.is_empty()));
+
+    // ── The else arm: the loop body, the back-edge self-assigns, and
+    // the (optional — falling through a while(true) body IS the
+    // back-edge) trailing continue.
+    let mut body_nodes = otherwise.clone();
+    if matches!(body_nodes.last(), Some(SNode::Continue { label: None })) {
+        body_nodes.pop();
+    }
+    drop_self_assign_tail(&mut body_nodes);
+    body_nodes.retain(|n| !matches!(n, SNode::Stmts(run) if run.is_empty()));
+
+    // ── The value binding (`const x = tmp.value`), plain or
+    // cleanup-try-wrapped (leading honesty comments tolerated).
+    let mut binding: Option<String> = None;
+    let mut splice_idx: Option<usize> = None;
+    for (bi, n) in body_nodes.iter_mut().enumerate() {
+        match n {
+            SNode::Honest(_) => continue,
+            SNode::Stmts(leaves) => {
+                binding = take_value_declare(leaves, &await_name);
+                break;
+            }
+            SNode::Try {
+                body: tbody,
+                catches,
+                ..
+            } => {
+                for n2 in tbody.iter_mut() {
+                    if let SNode::Stmts(leaves) = n2
+                        && let Some(b) = take_value_declare(leaves, &await_name)
+                    {
+                        binding = Some(b);
+                        break;
+                    }
+                }
+                if binding.is_some() {
+                    if !cleanup_handlers_ok(catches) {
+                        return None;
+                    }
+                    splice_idx = Some(bi);
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    let binding = binding?;
+    if let Some(bi) = splice_idx {
+        // Replace the cleanup try with its body (loudly) — the
+        // for-await protocol runs IteratorClose implicitly.
+        let Some(SNode::Try { body: inner, .. }) = body_nodes.get(bi).cloned() else {
+            unreachable!()
+        };
+        let mut replacement: Vec<SNode> = vec![SNode::Honest(
+            "iterator-cleanup try/catch folded into for-of's implicit cleanup (ECMA-262 §14.7.5)"
+                .to_string(),
+        )];
+        replacement.extend(inner);
+        body_nodes.splice(bi..bi + 1, replacement);
+    }
+
+    // ── Loop-carried bookkeeping phis (everything except the next/iter
+    // plumbing): collapse each to its single invariant source by
+    // substitution. A phi P folds iff EVERY assign to it (pre-loop
+    // entry + back-edges, the only preds a structured natural-loop
+    // header has) is either a self-assign (neutral) or the SAME
+    // side-effect-free source expr X (a temp/identifier/literal), X is
+    // not itself a header phi (no chains), and P is not referenced
+    // after the loop. Phi-less bookkeeping (no real source) folds only
+    // when entirely unused.
+    let mut substs: Vec<(ValueId, Expr)> = Vec::new();
+    for p in phi_names
+        .iter()
+        .filter(|p| **p != next_phi && **p != recv_phi)
+    {
+        let vid = phi_vids[p];
+        let mut source: Option<Expr> = None;
+        let mut ok = true;
+        let visit_assign = |value: &Expr, source: &mut Option<Expr>, ok: &mut bool| {
+            if temp_value(value) == Some(vid) {
+                return; // self-assign: neutral
+            }
+            let legal = matches!(value, Expr::Temp { .. } | Expr::Ident(_) | Expr::Lit(_));
+            match (legal, source.as_ref()) {
+                (false, _) => *ok = false,
+                (true, None) => *source = Some(value.clone()),
+                (true, Some(x)) if *x == *value => {}
+                (true, Some(_)) => *ok = false,
+            }
+        };
+        for (t, v) in &assigns {
+            if t == p {
+                visit_assign(v, &mut source, &mut ok);
+            }
+        }
+        walk_leaves(body, &mut |l| {
+            if let Leaf::Raw(Stmt::PhiAssign { target, value, .. }) = l
+                && target == p
+            {
+                visit_assign(value, &mut source, &mut ok);
+            }
+        });
+        if !ok {
+            return None;
+        }
+        let Some(x) = source else {
+            // No real source: dead bookkeeping — foldable only when the
+            // phi is never read.
+            if nodes_use_any(&body_nodes, std::slice::from_ref(p))
+                || nodes_use_any(&tail_nodes, std::slice::from_ref(p))
+                || nodes_use_any(&nodes[i + 1..], std::slice::from_ref(p))
+            {
+                return None;
+            }
+            continue;
+        };
+        if temp_name(&x).is_some_and(|n| phi_names.iter().any(|pn| pn == n)) {
+            return None;
+        }
+        if nodes_use_temp(&nodes[i + 1..], vid) {
+            return None;
+        }
+        substs.push((vid, x));
+    }
+
+    // ── Apply the substitutions (value positions only), then the
+    // whole-tree plumbing check: after the rebuild no internal temp
+    // may be referenced by the kept body, the re-homed tail, or the
+    // post-loop siblings (their declares are consumed by the fold).
+    for (vid, x) in &substs {
+        subst_temp_in_nodes(&mut body_nodes, *vid, x);
+        subst_temp_in_nodes(&mut tail_nodes, *vid, x);
+    }
+    let mut internals: Vec<String> = phi_names.clone();
+    internals.extend([it_name.clone(), next_name, res_name, await_name, done_name]);
+    internals.retain(|n| *n != binding);
+    if nodes_use_any(&body_nodes, &internals)
+        || nodes_use_any(&tail_nodes, &internals)
+        || nodes_use_any(&nodes[i + 1..], &internals)
+    {
+        return None;
+    }
+    // No residual assigns/decls of the folded phis may survive (a
+    // self-assign outside the dropped back-edge run would print as an
+    // assignment to an undeclared temp).
+    if phi_names.iter().any(|p| {
+        nodes_declare_or_assign(&body_nodes, p)
+            || nodes_declare_or_assign(&tail_nodes, p)
+            || nodes_declare_or_assign(&nodes[i + 1..], p)
+    }) {
+        return None;
+    }
+    Some(DriverFold {
+        iter: iter_expr,
+        binding,
+        body: body_nodes,
+        tail: tail_nodes,
+        pre_cut,
+    })
+}
+
+/// Apply a matched driver fold: replace the loop with the literal
+/// `for await`, re-home the done-arm tail after it, and trim the
+/// consumed pre-loop plumbing. Returns the next scan index.
+fn apply_for_await_driver(
+    nodes: &mut Vec<SNode>,
+    i: usize,
+    plan: DriverFold,
+    stats: &mut FoldStats,
+) -> usize {
+    stats.for_await_of += 1;
+    let tail_len = plan.tail.len();
+    nodes[i] = SNode::ForOf {
+        is_await: true,
+        binding: plan.binding,
+        iter: plan.iter,
+        body: plan.body,
+    };
+    nodes.splice(i + 1..i + 1, plan.tail);
+    let removed = trim_driver_pre_leaves(nodes, i, plan.pre_cut);
+    i - removed + 1 + tail_len
+}
+
+/// Substitute every reference to temp `vid` by a clone of
+/// `replacement` (value positions only — binding sites are names).
+fn subst_temp_in_expr(e: &mut Expr, vid: ValueId, replacement: &Expr) {
+    if temp_value(e) == Some(vid) {
+        *e = replacement.clone();
+        return;
+    }
+    for c in expr_children_mut(e) {
+        subst_temp_in_expr(c, vid, replacement);
+    }
+}
+
+fn subst_temp_in_leaf(l: &mut Leaf, vid: ValueId, replacement: &Expr) {
+    match l {
+        Leaf::Raw(s) => match s {
+            Stmt::Declare { value, .. }
+            | Stmt::PhiAssign { value, .. }
+            | Stmt::Expr(value)
+            | Stmt::Throw(value) => subst_temp_in_expr(value, vid, replacement),
+            Stmt::Return(Some(e)) => subst_temp_in_expr(e, vid, replacement),
+            Stmt::StoreProp { object, value, .. } => {
+                subst_temp_in_expr(object, vid, replacement);
+                subst_temp_in_expr(value, vid, replacement);
+            }
+            Stmt::StoreIndex {
+                object,
+                index,
+                value,
+                ..
+            } => {
+                subst_temp_in_expr(object, vid, replacement);
+                subst_temp_in_expr(index, vid, replacement);
+                subst_temp_in_expr(value, vid, replacement);
+            }
+            Stmt::StoreDyn {
+                object, key, value, ..
+            } => {
+                subst_temp_in_expr(object, vid, replacement);
+                subst_temp_in_expr(key, vid, replacement);
+                subst_temp_in_expr(value, vid, replacement);
+            }
+            Stmt::DefineMethod { object, func, .. } => {
+                subst_temp_in_expr(object, vid, replacement);
+                subst_temp_in_expr(func, vid, replacement);
+            }
+            Stmt::StorePrivate { object, value, .. } => {
+                subst_temp_in_expr(object, vid, replacement);
+                subst_temp_in_expr(value, vid, replacement);
+            }
+            Stmt::StoreSuper { key, value, .. } => {
+                if let Some(k) = key {
+                    subst_temp_in_expr(k, vid, replacement);
+                }
+                subst_temp_in_expr(value, vid, replacement);
+            }
+            Stmt::LexStore { value, .. }
+            | Stmt::GlobalStore { value, .. }
+            | Stmt::ModuleStore { value, .. } => subst_temp_in_expr(value, vid, replacement),
+            Stmt::CondBranch { cond, .. } => subst_temp_in_expr(cond, vid, replacement),
+            _ => {}
+        },
+        Leaf::Destructure { obj, .. } => subst_temp_in_expr(obj, vid, replacement),
+        Leaf::Decl { value: Some(v), .. } => subst_temp_in_expr(v, vid, replacement),
+        Leaf::Decl { value: None, .. } => {}
+        Leaf::Assign { value, .. } => subst_temp_in_expr(value, vid, replacement),
+    }
+}
+
+fn subst_temp_in_nodes(nodes: &mut [SNode], vid: ValueId, replacement: &Expr) {
+    for n in nodes {
+        match n {
+            SNode::Stmts(run) => {
+                for l in run {
+                    subst_temp_in_leaf(l, vid, replacement);
+                }
+            }
+            SNode::If {
+                cond,
+                then,
+                otherwise,
+            } => {
+                subst_temp_in_expr(cond, vid, replacement);
+                subst_temp_in_nodes(then, vid, replacement);
+                subst_temp_in_nodes(otherwise, vid, replacement);
+            }
+            SNode::While { cond, body, .. } => {
+                if let Some(c) = cond {
+                    subst_temp_in_expr(c, vid, replacement);
+                }
+                subst_temp_in_nodes(body, vid, replacement);
+            }
+            SNode::DoWhile { body, cond, .. } => {
+                subst_temp_in_nodes(body, vid, replacement);
+                subst_temp_in_expr(cond, vid, replacement);
+            }
+            SNode::Labeled { body, .. } => subst_temp_in_nodes(body, vid, replacement),
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                subst_temp_in_nodes(body, vid, replacement);
+                for c in catches {
+                    subst_temp_in_nodes(&mut c.body, vid, replacement);
+                }
+                if let Some(f) = finally {
+                    subst_temp_in_nodes(f, vid, replacement);
+                }
+            }
+            SNode::ForOf { iter, body, .. } => {
+                subst_temp_in_expr(iter, vid, replacement);
+                subst_temp_in_nodes(body, vid, replacement);
+            }
+            SNode::ForIn { obj, body, .. } => {
+                subst_temp_in_expr(obj, vid, replacement);
+                subst_temp_in_nodes(body, vid, replacement);
+            }
+            SNode::Switch { disc, cases } => {
+                subst_temp_in_expr(disc, vid, replacement);
+                for c in cases {
+                    for t in &mut c.tests {
+                        subst_temp_in_expr(t, vid, replacement);
+                    }
+                    subst_temp_in_nodes(&mut c.body, vid, replacement);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+}
+
+/// Any surviving declare/phi-decl/phi-assign of `name` (binding sites
+/// of a temp the fold consumed).
+fn nodes_declare_or_assign(nodes: &[SNode], name: &str) -> bool {
+    let mut found = false;
+    walk_leaves(nodes, &mut |l| {
+        if found {
+            return;
+        }
+        found = match l {
+            Leaf::Raw(Stmt::Declare { name: n, .. })
+            | Leaf::Raw(Stmt::PhiDecl { name: n, .. })
+            | Leaf::Raw(Stmt::PhiAssign { target: n, .. })
+            | Leaf::Decl { name: n, .. }
+            | Leaf::Assign { target: n, .. } => n == name,
+            _ => false,
+        };
+    });
+    found
 }
 
 /// Take the leading `const v = res.value` declare out of a leaf list.
