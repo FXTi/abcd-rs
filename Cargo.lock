@@ -18,6 +18,7 @@ dependencies = [
  "abcd-analysis",
  "abcd-file",
  "abcd-ir",
+ "abcd-isa",
  "abcd-lift",
 ]
 

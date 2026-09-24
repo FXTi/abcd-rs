@@ -588,6 +588,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    entry site). Async family stays documented fallback via NEW IR gap
    G6 = N68 registered (async bytecodes carry the value in acc; lift
    drops it). QUEUE COMPLETE: d-P5..d-P11 + t-P1..t-P6 all landed.
+   CI note (2026-09-24): windows-latest broke on async_node.rs probing
+   node via `which` — Git Bash's which prints MSYS paths
+   (/c/Program Files/.../node.exe) that std::process::Command can't
+   spawn. Fixed (6693ea2): probe external tools by SPAWNING them
+   (Command searches PATH+PATHEXT itself), never via `which`. Rule of
+   thumb for future tool-dependent tests: spawn-to-probe, skip when
+   absent.
 Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
    right"): infra/app split generalizes — abcd-analysis stays
    domain-neutral; every DOMAIN app is its own crate (taint=security:
