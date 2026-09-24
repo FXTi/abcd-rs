@@ -469,6 +469,13 @@ impl<'m> Emitter<'m> {
         // folded `return v` / `throw v` forms) and before fold() (the
         // same rethrow-try dissolution applies to the folded body).
         folds::async_machine_fold(&mut structured.body, rf.kind, &mut fstats);
+        // The async-generator machine fold (d-P14) runs after the
+        // async folds (it bails for non-AsyncGenerator kinds, they
+        // bail for it) and before fold() — the resume-mode dispatches
+        // are still plain if-chains here (the switch re-detection
+        // never sees the folded ones), and the folded catch-all
+        // rejection dissolves in fold()'s rethrow-try pass.
+        folds::async_generator_machine_fold(&mut structured.body, rf.kind, &mut fstats);
         folds::fold(&mut structured.body, &mut fstats);
         folds::scope_fold(&mut structured.body, &rf.params, &mut fstats);
         self.stats.structure =
@@ -2491,5 +2498,11 @@ fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.async_driver += b.async_driver;
     a.async_machine_sites += b.async_machine_sites;
     a.async_machine_bound += b.async_machine_bound;
+    a.agen_entry += b.agen_entry;
+    a.agen_yields += b.agen_yields;
+    a.agen_bound += b.agen_bound;
+    a.agen_awaits += b.agen_awaits;
+    a.agen_await_bound += b.agen_await_bound;
+    a.agen_returns += b.agen_returns;
     a
 }

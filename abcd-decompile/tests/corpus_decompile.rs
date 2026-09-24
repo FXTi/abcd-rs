@@ -150,6 +150,12 @@ fn merge_stats(a: &mut DecompileStats, b: &DecompileStats) {
     a.folds.async_driver += b.folds.async_driver;
     a.folds.async_machine_sites += b.folds.async_machine_sites;
     a.folds.async_machine_bound += b.folds.async_machine_bound;
+    a.folds.agen_entry += b.folds.agen_entry;
+    a.folds.agen_yields += b.folds.agen_yields;
+    a.folds.agen_bound += b.folds.agen_bound;
+    a.folds.agen_awaits += b.folds.agen_awaits;
+    a.folds.agen_await_bound += b.folds.agen_await_bound;
+    a.folds.agen_returns += b.folds.agen_returns;
     a.function_bodies += b.function_bodies;
 }
 
@@ -224,7 +230,7 @@ fn corpus_decompile_gate() {
     );
 
     eprintln!(
-        "FOLDS for_of={} for_await_of={} for_in={} object_lit={} array_lit={} rest={} switch={} finally_fold={} scope_fold={} gen_driver_sites={} gen_driver_entry={} gen_driver_bound={} async_driver={} async_machine_sites={} async_machine_bound={}",
+        "FOLDS for_of={} for_await_of={} for_in={} object_lit={} array_lit={} rest={} switch={} finally_fold={} scope_fold={} gen_driver_sites={} gen_driver_entry={} gen_driver_bound={} async_driver={} async_machine_sites={} async_machine_bound={} agen_entry={} agen_yields={} agen_bound={} agen_awaits={} agen_await_bound={} agen_returns={}",
         stats.folds.for_of,
         stats.folds.for_await_of,
         stats.folds.for_in,
@@ -239,7 +245,13 @@ fn corpus_decompile_gate() {
         stats.folds.gen_driver_bound,
         stats.folds.async_driver,
         stats.folds.async_machine_sites,
-        stats.folds.async_machine_bound
+        stats.folds.async_machine_bound,
+        stats.folds.agen_entry,
+        stats.folds.agen_yields,
+        stats.folds.agen_bound,
+        stats.folds.agen_awaits,
+        stats.folds.agen_await_bound,
+        stats.folds.agen_returns
     );
     eprintln!(
         "STRUCT ifs={} while={} do_while={} while_true={} labeled_exits={} alternates={}",
