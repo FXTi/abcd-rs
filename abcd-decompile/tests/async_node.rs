@@ -193,7 +193,7 @@ fn async_fold_node_behavior() {
 
 use abcd_ir::module::FunctionKind;
 use abcd_ir::op::{BinOp, CmpOp, UnOp};
-use abcd_ir::{Edge, EdgeKind, FuncId, Module, Op, ValueId};
+use abcd_ir::{Const, Edge, EdgeKind, FuncId, Module, Op, ValueId};
 use common::*;
 
 /// `AsyncFunctionAwaitUncaught(funcobj, acc=v)` + `SuspendGenerator` +
@@ -533,6 +533,469 @@ fn async_machine_fold_node_behavior() {
         stdout, "E:3\nF:9\nG:109\nH:7\nD:15\n",
         "async behavior mismatch"
     );
+}
+
+// ── d-P14 node evidence: the async-generator machine fold ──────────
+//
+// Cases I/J/K are built DIRECTLY as IR modules in the lifted form of
+// the es2abc `async function*` lowering (es2panda
+// `asyncGeneratorFunctionBuilder.cpp`: `CreateAsyncGeneratorObj` entry
+// + per-yield pre-await + the dead yield-point
+// `AsyncGeneratorResolve` + the three-way resume-mode dispatch + the
+// `AsyncGeneratorResolve(done=true)` completion + the catch-all
+// `AsyncGeneratorReject` — see golden_async_generator.rs's module doc
+// for the full model). The decompiled text only parses and runs
+// correctly under node if the fold dissolved the machinery into a
+// plain `async function*` body.
+
+/// The pieces every es2abc async-generator function shares.
+struct AGScaffold {
+    genobj: ValueId,
+    handler: abcd_ir::BlockId,
+    protected: Vec<abcd_ir::BlockId>,
+}
+
+/// Begin an async-generator function: the hidden funcObj param, the
+/// `CreateAsyncGeneratorObj` temp (lifted to `Op::CreateGenerator`),
+/// and the entry protocol suspend (`Prepare`).
+fn agen_begin(m: &mut Module, name: &str) -> (FuncId, abcd_ir::BlockId, AGScaffold) {
+    let f = add_func_kind(m, name, FunctionKind::AsyncGenerator);
+    let entry = entry_of(&m, f);
+    let funcobj = add_param(m, f);
+    let genobj = emit(m, entry, Op::CreateGenerator { func: funcobj });
+    let undef = load_const(m, entry, Const::Undefined);
+    emit(
+        m,
+        entry,
+        Op::SuspendGenerator {
+            genobj,
+            value: undef,
+        },
+    );
+    emit(m, entry, Op::ResumeGenerator { genobj }); // dead entry resume
+    let handler = add_block(m, f);
+    (
+        f,
+        entry,
+        AGScaffold {
+            genobj,
+            handler,
+            protected: vec![entry],
+        },
+    )
+}
+
+/// Wire the catch-all rejection try region (`CleanUp`:
+/// `AsyncGeneratorReject` — lifted to `Op::AsyncReject` — + return).
+fn agen_finish(m: &mut Module, f: FuncId, sc: &AGScaffold) {
+    let exc = add_exception_param(m, sc.handler);
+    let rej = emit(
+        m,
+        sc.handler,
+        Op::AsyncReject {
+            funcobj: sc.genobj,
+            value: exc,
+        },
+    );
+    emit_void(m, sc.handler, Op::Return { value: Some(rej) });
+    let mut protected = sc.protected.clone();
+    protected.retain(|b| *b != sc.handler);
+    add_try(m, f, protected, sc.handler, exc);
+}
+
+/// An `Await` (`functionBuilder.cpp`): `AsyncFunctionAwaitUncaught` +
+/// `SuspendGenerator` + the resumption pair; returns (resume, mode).
+fn agen_await(
+    m: &mut Module,
+    b: abcd_ir::BlockId,
+    sc: &AGScaffold,
+    v: ValueId,
+) -> (ValueId, ValueId) {
+    let aw = emit(
+        m,
+        b,
+        Op::AwaitUncaught {
+            funcobj: sc.genobj,
+            value: v,
+        },
+    );
+    emit(
+        m,
+        b,
+        Op::SuspendGenerator {
+            genobj: sc.genobj,
+            value: aw,
+        },
+    );
+    let resume = emit(m, b, Op::ResumeGenerator { genobj: sc.genobj });
+    let mode = emit(m, b, Op::GetResumeMode { genobj: sc.genobj });
+    (resume, mode)
+}
+
+/// The THROW-only `HandleCompletion` (the ASYNC_GENERATOR kind emits
+/// no RETURN arm here): `if (!(mode == 1)) cont else throw resume`.
+fn agen_throw_dispatch(
+    m: &mut Module,
+    f: FuncId,
+    sc: &mut AGScaffold,
+    b: abcd_ir::BlockId,
+    mode: ValueId,
+    resume: ValueId,
+) -> abcd_ir::BlockId {
+    let cont = add_block(m, f);
+    let throw_b = add_block(m, f);
+    let one = load_number(m, b, 1.0);
+    let eq = emit(
+        m,
+        b,
+        Op::Compare {
+            op: CmpOp::Eq,
+            left: mode,
+            right: one,
+        },
+    );
+    let t = emit(
+        m,
+        b,
+        Op::UnaryOp {
+            op: UnOp::IsFalse,
+            operand: eq,
+        },
+    );
+    emit_void(
+        m,
+        b,
+        Op::CondBranch {
+            cond: t,
+            true_dest: cont,
+            false_dest: throw_b,
+        },
+    );
+    emit_void(m, throw_b, Op::Throw { value: resume });
+    emit_void(m, throw_b, Op::Unreachable);
+    link(m, b, cont);
+    link(m, b, throw_b);
+    sc.protected.extend([throw_b]);
+    cont
+}
+
+/// The completion (`DirectReturn`): `AsyncGeneratorResolve(gen, v,
+/// true)` + return — in the lifted form `return { value: genobj,
+/// done: v }` (the lift folds v0=generator into the iter-result's
+/// `value` slot and v1=value into the `done` slot; v0.1 parity).
+fn agen_completion(m: &mut Module, b: abcd_ir::BlockId, sc: &AGScaffold, v: ValueId) {
+    let iro = emit(
+        m,
+        b,
+        Op::CreateIterResultObj {
+            value: sc.genobj,
+            done: v,
+        },
+    );
+    emit_void(m, b, Op::Return { value: Some(iro) });
+}
+
+/// A full source `yield v` (`AsyncGeneratorFunctionBuilder::Yield`):
+/// the pre-yield `Await(v)` + THROW dispatch, then `AsyncYield` (the
+/// dead yield-point resolve + the resumption pair) and the three-way
+/// dispatch. Returns (the yield's resumption value, the NEXT
+/// continuation block).
+fn agen_yield(
+    m: &mut Module,
+    f: FuncId,
+    sc: &mut AGScaffold,
+    b: abcd_ir::BlockId,
+    v: ValueId,
+) -> (ValueId, abcd_ir::BlockId) {
+    let (r, mode) = agen_await(m, b, sc, v);
+    let cont = agen_throw_dispatch(m, f, sc, b, mode, r);
+    sc.protected.push(cont);
+    // AsyncYield: the yield-point resolve — dead, drops at Stage A.
+    let _dead = emit(
+        m,
+        cont,
+        Op::CreateIterResultObj {
+            value: sc.genobj,
+            done: r,
+        },
+    );
+    let ry = emit(m, cont, Op::ResumeGenerator { genobj: sc.genobj });
+    let my = emit(m, cont, Op::GetResumeMode { genobj: sc.genobj });
+    let ret_arm = add_block(m, f);
+    let not_ret = add_block(m, f);
+    let zero = load_number(m, cont, 0.0);
+    let eq0 = emit(
+        m,
+        cont,
+        Op::Compare {
+            op: CmpOp::Eq,
+            left: my,
+            right: zero,
+        },
+    );
+    let t0 = emit(
+        m,
+        cont,
+        Op::UnaryOp {
+            op: UnOp::IsFalse,
+            operand: eq0,
+        },
+    );
+    emit_void(
+        m,
+        cont,
+        Op::CondBranch {
+            cond: t0,
+            true_dest: not_ret,
+            false_dest: ret_arm,
+        },
+    );
+    link(m, cont, not_ret);
+    link(m, cont, ret_arm);
+    // RETURN arm: await the resumption value, complete with it.
+    let (rr, rmode) = agen_await(m, ret_arm, sc, ry);
+    let ret_done = agen_throw_dispatch(m, f, sc, ret_arm, rmode, rr);
+    sc.protected.push(ret_done);
+    agen_completion(m, ret_done, sc, rr);
+    // THROW arm / NEXT fallthrough.
+    let next = add_block(m, f);
+    let throw_b = add_block(m, f);
+    let one = load_number(m, not_ret, 1.0);
+    let eq1 = emit(
+        m,
+        not_ret,
+        Op::Compare {
+            op: CmpOp::Eq,
+            left: my,
+            right: one,
+        },
+    );
+    let t1 = emit(
+        m,
+        not_ret,
+        Op::UnaryOp {
+            op: UnOp::IsFalse,
+            operand: eq1,
+        },
+    );
+    emit_void(
+        m,
+        not_ret,
+        Op::CondBranch {
+            cond: t1,
+            true_dest: next,
+            false_dest: throw_b,
+        },
+    );
+    emit_void(m, throw_b, Op::Throw { value: ry });
+    emit_void(m, throw_b, Op::Unreachable);
+    link(m, not_ret, next);
+    link(m, not_ret, throw_b);
+    sc.protected.extend([ret_arm, not_ret, throw_b]);
+    (ry, next)
+}
+
+/// Case I: two plain yields — `async function* agi() { yield 1;
+/// yield 2; }`.
+fn case_i() -> abcd_ir::Module {
+    let mut m = mk_module();
+    let (f, entry, mut sc) = agen_begin(&mut m, "agi");
+    let one = load_number(&mut m, entry, 1.0);
+    let (_r1, next1) = agen_yield(&mut m, f, &mut sc, entry, one);
+    sc.protected.push(next1);
+    let two = load_number(&mut m, next1, 2.0);
+    let (_r2, next2) = agen_yield(&mut m, f, &mut sc, next1, two);
+    sc.protected.push(next2);
+    let undef = load_const(&mut m, next2, Const::Undefined);
+    agen_completion(&mut m, next2, &sc, undef);
+    agen_finish(&mut m, f, &sc);
+    m
+}
+
+/// Case J: a rejection through a yield chain — `async function* agj()
+/// { yield 1; throw 7; }` (the user throw propagates through the
+/// catch-all `AsyncGeneratorReject`).
+fn case_j() -> abcd_ir::Module {
+    let mut m = mk_module();
+    let (f, entry, mut sc) = agen_begin(&mut m, "agj");
+    let one = load_number(&mut m, entry, 1.0);
+    let (_r1, next1) = agen_yield(&mut m, f, &mut sc, entry, one);
+    sc.protected.push(next1);
+    let seven = load_number(&mut m, next1, 7.0);
+    emit_void(&mut m, next1, Op::Throw { value: seven });
+    agen_finish(&mut m, f, &sc);
+    m
+}
+
+/// Case K: a source-level await, a bound yield result, and an
+/// explicit return — `async function* agk(p1) { const a = await p1;
+/// const x = yield a; return x; }`.
+fn case_k() -> abcd_ir::Module {
+    let mut m = mk_module();
+    let (f, entry, mut sc) = agen_begin(&mut m, "agk");
+    let p1 = add_param(&mut m, f);
+    let (r1, mode1) = agen_await(&mut m, entry, &sc, p1);
+    let c1 = agen_throw_dispatch(&mut m, f, &mut sc, entry, mode1, r1);
+    sc.protected.push(c1);
+    let (ry, next) = agen_yield(&mut m, f, &mut sc, c1, r1);
+    sc.protected.push(next);
+    // `return x;` — `ExplicitReturn`: await the value (no
+    // `HandleCompletion`) + the `done=true` resolve + return.
+    let aw = emit(
+        &mut m,
+        next,
+        Op::AwaitUncaught {
+            funcobj: sc.genobj,
+            value: ry,
+        },
+    );
+    emit(
+        &mut m,
+        next,
+        Op::SuspendGenerator {
+            genobj: sc.genobj,
+            value: aw,
+        },
+    );
+    let rv = emit(&mut m, next, Op::ResumeGenerator { genobj: sc.genobj });
+    agen_completion(&mut m, next, &sc, rv);
+    agen_finish(&mut m, f, &sc);
+    m
+}
+
+/// node behavior evidence for the async-generator machine fold:
+/// `for await` accumulation over plain yields, a rejection through a
+/// yield chain, and send-values through a bound yield with an awaited
+/// parameter and an explicit return.
+#[test]
+fn async_generator_machine_fold_node_behavior() {
+    let texts = [
+        decompile(&case_i()),
+        decompile(&case_j()),
+        decompile(&case_k()),
+    ];
+    eprintln!(
+        "── case I ──\n{}\n── case J ──\n{}\n── case K ──\n{}",
+        texts[0], texts[1], texts[2]
+    );
+    // Text-shape pins (always run): the machinery is GONE.
+    for (i, text) in texts.iter().enumerate() {
+        assert!(!text.contains("ResumeGenerator"), "case{i}: {text}");
+        assert!(!text.contains("GetResumeMode"), "case{i}: {text}");
+        assert!(!text.contains("iter-result"), "case{i}: {text}");
+        assert!(
+            !text.contains("CreateGenerator plumbing"),
+            "case{i}: {text}"
+        );
+        assert!(!text.contains("Param(funcobj)"), "case{i}: {text}");
+        assert!(text.contains("async function*"), "case{i}: {text}");
+        assert!(text.contains("yield"), "case{i}: {text}");
+    }
+
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !node_ok {
+        eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join("abcd-dp14-node");
+    std::fs::create_dir_all(&dir).expect("tempdir");
+
+    // Per-case syntax check on the pure decompiled text.
+    for (i, text) in texts.iter().enumerate() {
+        let out = dir.join(format!("case{i}.js"));
+        std::fs::write(&out, text).expect("write case");
+        let check = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&out)
+            .output()
+            .expect("run node --check");
+        assert!(
+            check.status.success(),
+            "node --check case{i}: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+
+    // Behavior, chained sequentially for a deterministic line order:
+    // I: for-await accumulates 1+2=3; J: sees 1 then rejects 7; K:
+    // next() → {5, false}, next(42) → {42, true}.
+    let driver = dir.join("driver.js");
+    let mut program = texts.concat();
+    program.push_str(
+        "\n(async () => { let s = 0; for await (const v of agi()) { s += v; } console.log(\"I:\" + s); })()\n\
+         .then(() => (async () => { let seen = []; try { for await (const v of agj()) { seen.push(v); } console.log(\"J:no-reject\"); } catch (e) { console.log(\"J:\" + seen.join(\",\") + \"/\" + e); } })())\n\
+         .then(async () => { const it = agk(Promise.resolve(5)); const r1 = await it.next(); const r2 = await it.next(42); console.log(\"K:\" + r1.value + \"/\" + r1.done + \"/\" + r2.value + \"/\" + r2.done); });\n",
+    );
+    std::fs::write(&driver, &program).expect("write driver");
+    let run = std::process::Command::new("node")
+        .arg(&driver)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    eprintln!(
+        "NODE-EVIDENCE exit={} stdout={:?} stderr={:?}",
+        run.status, stdout, stderr
+    );
+    assert!(run.status.success(), "node run failed: {stderr}");
+    assert_eq!(
+        stdout, "I:3\nJ:1/7\nK:5/false/42/true\n",
+        "async-generator behavior mismatch"
+    );
+}
+
+/// node --check on the 3 corpus `local/async-generator` outputs (the
+/// fold must leave them syntactically valid JS).
+#[test]
+#[ignore = "requires exported GHCR corpus"]
+fn async_generator_corpus_node_check() {
+    let root = common::corpus_root();
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !node_ok {
+        eprintln!("NODE-CHECK node not found on this host — skipped");
+        return;
+    }
+    let dir = std::env::temp_dir().join("abcd-dp14-corpus-nodecheck");
+    std::fs::create_dir_all(&dir).expect("tempdir");
+    for rel in [
+        "24.0.0.0/local/async-generator/baseline/input.abc",
+        "24.0.0.0/local/async-generator/debug-info/input.abc",
+        "24.0.0.0/local/async-generator/optimized/input.abc",
+    ] {
+        let data = std::fs::read(root.join(rel)).expect("read fixture");
+        let file = abcd_file::decode(&data).expect("decode fixture");
+        let module = lift_file(&file).expect("lift fixture");
+        let d = decompile_module(&module, &EmitOptions::default());
+        // The fold consumed the whole machine: no fallback honesty
+        // comments remain for these fixtures.
+        assert!(
+            !d.text.contains("hard-fallback") && !d.text.contains("Param(funcobj)"),
+            "{rel}: residual fallback:\n{}",
+            d.text
+        );
+        let out = dir.join("out.js");
+        std::fs::write(&out, &d.text).expect("write sample");
+        let check = std::process::Command::new("node")
+            .arg("--check")
+            .arg(&out)
+            .output()
+            .expect("run node --check");
+        assert!(
+            check.status.success(),
+            "node --check {rel}: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+        eprintln!("NODE-CHECK ok {rel}");
+    }
 }
 
 // ── Corpus async recompile evidence (opt-in) ─────────────────────────
