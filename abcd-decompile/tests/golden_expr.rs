@@ -1062,9 +1062,14 @@ fn t15_private_names() {
     assert_eq!(got, want);
 }
 
-/// t16 — template objects: cooked-string resolution from the const pool
-/// (gap G4: cooked-only fallback, documented); unresolved literal
-/// operand → the loud `<unresolved>` form.
+/// t16 — template objects (G4, resolved by d-P10): the vendor literal
+/// pair is `[rawStrings, cookedStrings]` (es2panda
+/// `compiler/base/literals.cpp` `Literals::GetTemplateObject`; runtime
+/// `ecmascript/template_string.cpp`). A flat const array keeps the
+/// cooked-only interpretation (raw genuinely absent — documented
+/// fallback); an unresolved literal operand → the loud `<unresolved>`
+/// form. The vendor pair shape and the imperative build sequence are
+/// covered by golden_template.rs.
 #[test]
 fn t16_template_objects() {
     let mut m = mk_module();
@@ -1087,8 +1092,8 @@ fn t16_template_objects() {
     let got = dump_func(&recover_func(&m, f));
     let want = r#"fn #0 "tmpl" kind=function params=(this, p1)
   bb B0 preds=[]:
-    const v3 = template(["hello ", " world"]) /*cooked-only (G4)*/ ; v3
-    const v4 = template(<unresolved>) /*cooked-only (G4)*/ ; v4
+    const v3 = template(["hello ", " world"]) /*raw absent — cooked-only*/ ; v3
+    const v4 = template(<unresolved>) /*raw+cooked absent*/ ; v4
     return (v3 + v4)
 "#;
     assert_eq!(got, want);
