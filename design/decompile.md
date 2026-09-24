@@ -617,7 +617,22 @@ family: their placement encodes the generator/async state machine,
 and es2abc's exact emission shapes must be confirmed per corpus
 version before the fold rules are written. Fallback (emit driver
 plumbing literally, commented) is correct but ugly; budget for this
-family explicitly in d-P3/d-P4.
+family explicitly in d-P3/d-P4. **RESOLVED at d-P11 for the generator
+family**: the lowering is uniform across all 6 corpus es2abc versions
+(two surface shapes per profile — inline immediates vs. shared const
+temps; es2panda `compiler/function/generatorFunctionBuilder.cpp`
+`Prepare`/`Yield`/`CleanUp` + `functionBuilder.cpp`
+`SuspendResumeExecution`/`resumeGenerator`/`HandleCompletion`; runtime
+`ecmascript/js_generator_object.h`
+`GeneratorResumeMode{RETURN=0,THROW=1,NEXT=2}`), and
+`abcd_decompile::folds::generator_machine_fold` eliminates the whole
+machine (entry protocol suspend, `CreateIterResultObj(v,false)` wrap,
+completion pair, resume-mode dispatch; `x = yield v` binds when the
+resumption value has real uses), all-or-nothing per function gated on
+the entry site. Dream gate 1149/0/0/0/0 — the full oracle set. The
+ASYNC family stays documented fallback (IR gap **G6** below); the
+async fixtures are `not-applicable` in the dream-gate oracle set, so
+this costs no gate rows.
 
 **R5 — `finally` reconstruction** requires duplicate-code detection
 (es2abc duplicates finally bodies); until the fold exists, output is
@@ -682,6 +697,27 @@ rule like any other).
   after the v2-P0.5 growth"; `op.rs` now has **87**. The code is the
   source of truth; the design doc's count could be refreshed at the
   next editorial pass.
+- **G6 — async acc-input dropped at lift (modern `asyncfunction*`
+  forms).** The non-deprecated `asyncfunctionawaituncaught`,
+  `asyncfunctionresolve`, and `asyncfunctionreject` bytecodes carry
+  the awaited/resolved value in the ACCUMULATOR and the async func
+  object in the register operand (isa.yaml `v:in:top, acc:inout:top`;
+  runtime `ecmascript/interpreter/interpreter-inl.cpp`
+  `ASYNCFUNCTIONAWAITUNCAUGHT_V8` reads `value = GET_ACC()`). The lift
+  (`abcd-lift/src/translate.rs` `Asyncfunctionawaituncaught`/
+  `Asyncfunctionresolve`/`Asyncfunctionreject` arms) models only the
+  register operand as `Op::AwaitUncaught`/`AsyncResolve`/`AsyncReject`'s
+  `value` — the acc-carried value never reaches the IR (the deprecated
+  `pref_v8_v8` forms DO read the value register; no corpus fixture
+  uses them). Impact: `async function` bodies decompile with the
+  driver plumbing commenting the func object instead of the real
+  value (e.g. `await v2 /* the funcobj */`) — loud, documented
+  fallback, never silent; behavioral divergence confined to the
+  `not-applicable` async fixtures (no VM oracle). A sound fold of the
+  async machinery (the R4 async half) NEEDS the acc-input edge: an
+  `abcd-lift` change reading `acc` as a second operand of these three
+  ops (decompile requests it; not patched from this track —
+  abcd-lift is outside the decompile scope). Discovered by d-P11.
 
 ## 9. References
 

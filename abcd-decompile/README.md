@@ -32,7 +32,7 @@ requests, then runs the UNCHANGED `scripts/compare-rewritten-corpus.py`
 behavior oracle and triages every non-pass fixture into exactly one
 bucket: `decompile-bug` / `es2abc-cant` / `expected-fallback` /
 `fixture-unsupported`. `dream_gate_oracle` asserts the acceptance floor
-(pass ≥ 1131).
+(pass ≥ 1149 — the full oracle set since d-P11).
 
 **Acceptance histogram (2026-09-23)**: **951 pass** / 108 decompile-bug
 / 0 es2abc-cant / 54 expected-fallback / 36 fixture-unsupported (of
@@ -315,6 +315,60 @@ and bucketed by the dream-gate triage. Goldens:
 `tests/golden_template.rs` g01–g10 (plain, multi-part, escape
 sequences, tagged call, `String.raw` this-call shape, const-pool pair,
 both fallbacks, `$`-junction safety).
+
+## The d-P11 generator gate (R4 closed — THE FULL 1149)
+
+**d-P11 histogram (2026-09-25, floor now 1149)**: **1149 pass** / **0
+decompile-bug** / **0 es2abc-cant** / **0 expected-fallback** / **0
+fixture-unsupported** (of 1149) — the entire runtime-passed oracle set
+decompiles, recompiles, and behaves identically. The last bucket (all
+18 `local/generator` fixtures, 6 versions × 3 profiles) moved
+expected-fallback → pass.
+
+**The lowering model (vendor-pinned).** es2abc lowers a `function*`
+body into an explicit state machine (es2panda
+`compiler/function/generatorFunctionBuilder.cpp` +
+`compiler/function/functionBuilder.cpp`
+`SuspendResumeExecution`/`resumeGenerator`/`HandleCompletion`):
+`Prepare` emits `CreateGeneratorObj(funcobj)` + the entry protocol
+suspend (`SuspendGenerator` of bare `undefined`) + the completion pair
+(`ResumeGenerator` → value, `GetResumeMode` → mode) + the dispatch
+`if (mode == RETURN) return value; if (mode == THROW) throw value;`
+(runtime `ecmascript/js_generator_object.h`
+`GeneratorResumeMode{RETURN=0,THROW=1,NEXT=2}`); each source `yield v`
+emits `CreateIterResultObject(v, false)` + the same suspend/pair/
+dispatch; `CleanUp` wraps the body in a catch-all rethrow. Two surface
+shapes per profile: inline immediates (baseline/debug-info) vs. shared
+const temps (optimized), uniform across all 6 corpus versions.
+
+**The fold** (`folds.rs::generator_machine_fold`, run before the other
+Stage-B folds so every dispatch is still a plain if-chain): per site,
+the iter-result wrap opens up (`yield {value:v, done:false}` →
+`yield v`), the completion pair and the mode dispatch dissolve into
+the dispatch's continuation (the real control flow), and a USED
+resumption value binds at the yield site (`const t = yield v`).
+All-or-nothing per function, gated on the entry site — a generator
+whose entry dispatch is not the vendor shape keeps ALL machinery as
+documented fallbacks (golden g05); with the entry folded, a later
+non-matching site keeps its own loud fallback. The funcObj temp and
+resolved mode-immediate consts are swept only when every use was
+consumed. Recompiled, es2abc re-lowers the identical state machine —
+behavior identical by construction, proven by the oracle.
+
+**The async family stays (IR gap G6).** The modern
+`asyncfunctionawaituncaught`/`asyncfunctionresolve`/
+`asyncfunctionreject` bytecodes carry the awaited/resolved value in
+the ACCUMULATOR (isa.yaml `acc: inout:top`; runtime
+`interpreter-inl.cpp` `ASYNCFUNCTIONAWAITUNCAUGHT_V8`), and the lift
+models only the register operand (the async func object) — the value
+never reaches the IR, so no sound decompile-side fold exists. Those
+fixtures are `not-applicable` in the dream-gate oracle set, so the
+bucket is empty and the honesty floor is pinned by golden g06.
+Goldens: `tests/golden_generator.rs` g01–g06 (inline immediates,
+shared mode consts, bound yield result, yield-in-loop, entry-gate
+bail, async honesty floor). Corpus fold counters:
+`gen_driver_sites=54 gen_driver_entry=18 gen_driver_bound=0` (18
+generator functions × entry + 2 yield sites each).
 
 ## Crate map (Stage A)
 

@@ -508,6 +508,30 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   separator; cooked-only stays the documented raw-absent fallback).
   Zero lift/IR change (byte-identity by construction). Remaining
   bucket: ONLY hard-7 async/generator 18 — d-P11's scope.
+  d-P11 DONE (2026-09-25): generator/async R4 CLOSED for the generator
+  family — dream gate **1149/0/0/0/0, THE FULL ORACLE SET** (all 18
+  local/generator fixtures pass; expected-fallback bucket EMPTY).
+  Vendor lowering pinned: es2panda generatorFunctionBuilder.cpp
+  Prepare/Yield/CleanUp + functionBuilder.cpp SuspendResumeExecution/
+  HandleCompletion; runtime GeneratorResumeMode{RETURN=0,THROW=1,
+  NEXT=2}. folds::generator_machine_fold (runs BEFORE the other
+  Stage-B folds so dispatches are uniform if-chains) eliminates the
+  whole state machine: entry protocol suspend, CreateIterResultObj
+  wrap, ResumeGenerator/GetResumeMode pair, resume-mode dispatch;
+  `x = yield v` binds when the resumption value has real uses;
+  all-or-nothing per function gated on the entry site; funcObj +
+  mode-immediate consts swept only when fully consumed. Corpus fold
+  counters gen_driver_sites=54 entry=18 bound=0. The ASYNC family
+  stays documented fallback — NEW IR GAP **G6**: the modern
+  asyncfunctionawaituncaught/resolve/reject bytecodes carry the value
+  in the ACCUMULATOR (isa.yaml acc:inout:top; interpreter-inl.cpp
+  ASYNCFUNCTIONAWAITUNCAUGHT_V8) and the lift models only the funcobj
+  register — the value never reaches the IR (async fixtures are
+  not-applicable in the gate → costs no rows; an abcd-lift acc-operand
+  change is the honest fix, requested via G6, not patched — lift is
+  out of decompile scope). Goldens g01-g06 (inline/shared-const
+  shapes, bound yield, yield-in-loop, entry-gate bail, async floor).
+  Decompile track COMPLETE: all dream-gate buckets zero.
   t-P5 DONE: summary-library second tier — replace dual form (string:
   Base+Param(1)->Return, pattern is control; function: gap with the
   EMPTY-chain return channel), RegExp.prototype.test no-flow verdict
