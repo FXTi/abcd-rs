@@ -140,6 +140,10 @@ fn main() {
         cc_build.flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"));
         // Enable C++ exception handling (vendor code uses <iostream>)
         cc_build.flag("/EHsc");
+        // Conformance mode: platforms/windows/libpandabase/file.h relies on
+        // C++17 guaranteed copy elision (returns Unexpected temporaries whose
+        // move ctor is deliberately deleted upstream); default MSVC rejects it.
+        cc_build.flag("/permissive-");
     } else {
         // Full-subtree vendoring pulls os/file.h, which requires the
         // platform macro (the old flat subset never reached it).

@@ -157,7 +157,11 @@ fn main() {
             .include(format!("{manifest}/arkcompiler_runtime_core/platforms"))
             .flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"))
             .flag(&format!("/FI{fixups}"))
-            .flag("/EHsc");
+            .flag("/EHsc")
+            // Conformance mode: platforms/windows/libpandabase/file.h relies on
+            // C++17 guaranteed copy elision (returns Unexpected temporaries whose
+            // move ctor is deliberately deleted upstream); default MSVC rejects it.
+            .flag("/permissive-");
     } else {
         // Full-subtree vendoring pulls os/file.h, which requires the
         // platform macro (the old flat subset never reached it).
