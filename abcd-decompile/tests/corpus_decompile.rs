@@ -230,7 +230,7 @@ fn corpus_decompile_gate() {
     );
 
     eprintln!(
-        "FOLDS for_of={} for_await_of={} for_in={} object_lit={} array_lit={} rest={} switch={} finally_fold={} scope_fold={} gen_driver_sites={} gen_driver_entry={} gen_driver_bound={} async_driver={} async_machine_sites={} async_machine_bound={} agen_entry={} agen_yields={} agen_bound={} agen_awaits={} agen_await_bound={} agen_returns={}",
+        "FOLDS for_of={} for_await_of={} for_in={} object_lit={} array_lit={} rest={} switch={} finally_fold={} scope_fold={} gen_driver_sites={} gen_driver_entry={} gen_driver_bound={} async_driver={} async_machine_sites={} async_machine_bound={} agen_entry={} agen_yields={} agen_bound={} agen_awaits={} agen_await_bound={} agen_returns={} yield_star_sites={} yield_star_bound={} dead_exit_throw={}",
         stats.folds.for_of,
         stats.folds.for_await_of,
         stats.folds.for_in,
@@ -251,7 +251,10 @@ fn corpus_decompile_gate() {
         stats.folds.agen_bound,
         stats.folds.agen_awaits,
         stats.folds.agen_await_bound,
-        stats.folds.agen_returns
+        stats.folds.agen_returns,
+        stats.folds.yield_star_sites,
+        stats.folds.yield_star_bound,
+        stats.folds.dead_exit_throw
     );
     eprintln!(
         "STRUCT ifs={} while={} do_while={} while_true={} labeled_exits={} alternates={}",

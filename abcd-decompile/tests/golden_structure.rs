@@ -2470,3 +2470,181 @@ function outer() {
 "#;
     assert_eq!(decompiled(&m), want);
 }
+
+/// s39 — d-P17 (N70 residual 2): the dead loop-exit dispatch throw the
+/// async machine fold leaves after a break-routed driver loop is swept
+/// when the whole-node unreachability proof holds: an unlabeled
+/// `while (true)` (no fall-through), every unlabeled exit `break`
+/// statically dead (here: after a `return`), no labeled jumps, and the
+/// residue throwing the loop header's own uncaught-`await` temp.
+#[test]
+fn s39_dead_loop_exit_throw_swept() {
+    use abcd_decompile::expr::Expr;
+    use abcd_decompile::recover::Stmt;
+    use abcd_decompile::structure::{Leaf, SNode};
+    let temp = |id: u32, name: &str| Expr::Temp {
+        value: abcd_ir::ValueId::new(id),
+        name: name.to_string(),
+    };
+    let header = SNode::Stmts(vec![Leaf::Raw(Stmt::Declare {
+        name: "v2".to_string(),
+        mutable: false,
+        value: Expr::Await {
+            value: Box::new(temp(1, "v1")),
+            uncaught: true,
+        },
+        value_id: abcd_ir::ValueId::new(2),
+    })]);
+    let dispatch = SNode::If {
+        cond: temp(3, "done"),
+        // The done arm diverges (return) — its trailing break is dead.
+        then: vec![
+            SNode::Stmts(vec![Leaf::Raw(Stmt::Return(None))]),
+            SNode::Break { label: None },
+        ],
+        otherwise: vec![SNode::Continue { label: None }],
+    };
+    let residue = SNode::Stmts(vec![
+        Leaf::Raw(Stmt::Throw(temp(2, "v2"))),
+        Leaf::Raw(Stmt::Unreachable),
+    ]);
+    let mut nodes = vec![
+        SNode::While {
+            label: None,
+            cond: None,
+            body: vec![header, dispatch],
+        },
+        residue,
+    ];
+    let mut stats = abcd_decompile::folds::FoldStats::default();
+    abcd_decompile::folds::fold(&mut nodes, &mut stats);
+    assert_eq!(stats.dead_exit_throw, 1, "the residue must be swept");
+    assert!(
+        matches!(nodes.get(1), Some(SNode::Honest(_))),
+        "the residue run is replaced by an honesty comment: {nodes:#?}"
+    );
+    assert!(
+        !format!("{nodes:?}").contains("Throw"),
+        "no throw residue survives: {nodes:#?}"
+    );
+}
+
+/// s40 — keep-pin (d-P17): the same residue shape after a `while
+/// (true)` whose body has a LIVE exit break is NOT provably
+/// unreachable — the sweep must keep it (any doubt keeps the block).
+#[test]
+fn s40_dead_loop_exit_throw_kept_live_break() {
+    use abcd_decompile::expr::Expr;
+    use abcd_decompile::recover::Stmt;
+    use abcd_decompile::structure::{Leaf, SNode};
+    let temp = |id: u32, name: &str| Expr::Temp {
+        value: abcd_ir::ValueId::new(id),
+        name: name.to_string(),
+    };
+    let header = SNode::Stmts(vec![Leaf::Raw(Stmt::Declare {
+        name: "v2".to_string(),
+        mutable: false,
+        value: Expr::Await {
+            value: Box::new(temp(1, "v1")),
+            uncaught: true,
+        },
+        value_id: abcd_ir::ValueId::new(2),
+    })]);
+    let dispatch = SNode::If {
+        cond: temp(3, "done"),
+        // The done arm is a bare LIVE break — the residue is reachable.
+        then: vec![SNode::Break { label: None }],
+        otherwise: vec![SNode::Continue { label: None }],
+    };
+    let residue = SNode::Stmts(vec![
+        Leaf::Raw(Stmt::Throw(temp(2, "v2"))),
+        Leaf::Raw(Stmt::Unreachable),
+    ]);
+    let mut nodes = vec![
+        SNode::While {
+            label: None,
+            cond: None,
+            body: vec![header, dispatch],
+        },
+        residue,
+    ];
+    let before = nodes.clone();
+    let mut stats = abcd_decompile::folds::FoldStats::default();
+    abcd_decompile::folds::fold(&mut nodes, &mut stats);
+    assert_eq!(stats.dead_exit_throw, 0, "a live exit break keeps the block");
+    assert_eq!(nodes, before, "the residue must stay: {nodes:#?}");
+}
+
+/// s41 — keep-pin (d-P17): doubt keeps the block — a residue whose
+/// thrown temp is NOT the loop header's uncaught-`await` temp is out of
+/// the sweep's scope (arbitrary dead code is not touched), and a
+/// labeled jump anywhere in the loop subtree bails the proof.
+#[test]
+fn s41_dead_loop_exit_throw_kept_on_doubt() {
+    use abcd_decompile::expr::Expr;
+    use abcd_decompile::recover::Stmt;
+    use abcd_decompile::structure::{Leaf, SNode};
+    let temp = |id: u32, name: &str| Expr::Temp {
+        value: abcd_ir::ValueId::new(id),
+        name: name.to_string(),
+    };
+    let header = || {
+        SNode::Stmts(vec![Leaf::Raw(Stmt::Declare {
+            name: "v2".to_string(),
+            mutable: false,
+            value: Expr::Await {
+                value: Box::new(temp(1, "v1")),
+                uncaught: true,
+            },
+            value_id: abcd_ir::ValueId::new(2),
+        })])
+    };
+    let dead_break_dispatch = || SNode::If {
+        cond: temp(3, "done"),
+        then: vec![
+            SNode::Stmts(vec![Leaf::Raw(Stmt::Return(None))]),
+            SNode::Break { label: None },
+        ],
+        otherwise: vec![SNode::Continue { label: None }],
+    };
+    // (a) The residue throws a temp the header does NOT await-declare.
+    let mut nodes = vec![
+        SNode::While {
+            label: None,
+            cond: None,
+            body: vec![header(), dead_break_dispatch()],
+        },
+        SNode::Stmts(vec![
+            Leaf::Raw(Stmt::Throw(temp(9, "v9"))),
+            Leaf::Raw(Stmt::Unreachable),
+        ]),
+    ];
+    let before = nodes.clone();
+    let mut stats = abcd_decompile::folds::FoldStats::default();
+    abcd_decompile::folds::fold(&mut nodes, &mut stats);
+    assert_eq!(stats.dead_exit_throw, 0, "non-residue temp: keep");
+    assert_eq!(nodes, before, "out-of-scope dead code stays: {nodes:#?}");
+    // (b) A labeled jump anywhere in the loop subtree bails the proof.
+    let mut nodes = vec![
+        SNode::While {
+            label: None,
+            cond: None,
+            body: vec![
+                header(),
+                dead_break_dispatch(),
+                SNode::Break {
+                    label: Some("L".to_string()),
+                },
+            ],
+        },
+        SNode::Stmts(vec![
+            Leaf::Raw(Stmt::Throw(temp(2, "v2"))),
+            Leaf::Raw(Stmt::Unreachable),
+        ]),
+    ];
+    let before = nodes.clone();
+    let mut stats = abcd_decompile::folds::FoldStats::default();
+    abcd_decompile::folds::fold(&mut nodes, &mut stats);
+    assert_eq!(stats.dead_exit_throw, 0, "a labeled jump bails the proof");
+    assert_eq!(nodes, before, "doubt keeps the block: {nodes:#?}");
+}

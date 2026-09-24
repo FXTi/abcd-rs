@@ -163,6 +163,11 @@ pub struct FoldStats {
     /// Delegation results bound to a temp (`const ret = yield* f()` —
     /// the delegate's completion value has real uses; d-P15).
     pub yield_star_bound: usize,
+    /// Dead loop-exit dispatch throws swept (d-P17, N70 residual 2):
+    /// the after-loop `throw <resume temp>` the async machine fold's
+    /// break-routed dispatch left behind, removed only after a
+    /// whole-node unreachability proof ([`sweep_dead_loop_exit_throws`]).
+    pub dead_exit_throw: usize,
 }
 
 /// Run every fold over a structured body (recursive driver).
@@ -175,6 +180,12 @@ fn fold_seq(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
         fold_children(n, stats);
     }
     dissolve_rethrow_trys(nodes);
+    // d-P17 (N70 residual 2): after dissolution the async machine
+    // fold's dead loop-exit dispatch throw is a direct sibling of its
+    // loop — sweep it when provably unreachable (before the loop
+    // folds, while the header await temp the residue throws is still
+    // visible).
+    sweep_dead_loop_exit_throws(nodes, stats);
     fold_loops(nodes, stats);
     fold_switches(nodes, stats);
     fold_finally(nodes, stats);
@@ -761,6 +772,268 @@ fn key_load_target<'v>(value: &'v Expr, obj: &Expr) -> Option<&'v String> {
         _ => None,
     }
 }
+
+// ── d-P17 (N70 residual 2): dead loop-exit dispatch throw sweep ────
+//
+// The async machine fold's break-routed dispatch (N70: a loop-internal
+// await whose `mode == THROW` arm exits the loop) leaves the after-loop
+// `throw <resume temp>` block in place — d-P16 kept it conservatively.
+// Post-fold it is dead: the folded `await` rejects inline, so the break
+// that routed to the exit block is gone. This pass removes the residue,
+// but only under a whole-node unreachability proof; any doubt keeps it.
+
+/// Termination/divergence facts for the unreachability proof.
+struct SeqFlow {
+    /// A statically LIVE unlabeled `break` exists (one that would exit
+    /// the loop whose body is being analyzed — nested loops'/switches'
+    /// breaks are inner-scoped and never reported).
+    live_break: bool,
+    /// Control can never pass the end of the sequence.
+    diverges: bool,
+}
+
+const FLOW_FALLTHROUGH: SeqFlow = SeqFlow {
+    live_break: false,
+    diverges: false,
+};
+
+/// Sequence flow: nodes after a diverging node are statically dead —
+/// their breaks do not count as live.
+fn seq_flow(nodes: &[SNode]) -> SeqFlow {
+    let mut out = FLOW_FALLTHROUGH;
+    for n in nodes {
+        if out.diverges {
+            continue;
+        }
+        let f = node_flow(n);
+        out.live_break |= f.live_break;
+        out.diverges = f.diverges;
+    }
+    out
+}
+
+fn node_flow(n: &SNode) -> SeqFlow {
+    match n {
+        SNode::Stmts(run) => SeqFlow {
+            live_break: false,
+            // A `throw`/`return` leaf diverges (later leaves in the run
+            // are dead); a bare `unreachable` marker denotes dead code —
+            // control never passes it either.
+            diverges: run
+                .iter()
+                .any(|l| matches!(l, Leaf::Raw(Stmt::Throw(_) | Stmt::Return(_))))
+                || (!run.is_empty()
+                    && run
+                        .iter()
+                        .all(|l| matches!(l, Leaf::Raw(Stmt::Unreachable)))),
+        },
+        SNode::Break { .. } => SeqFlow {
+            live_break: true,
+            diverges: true,
+        },
+        SNode::Continue { .. } => SeqFlow {
+            live_break: false,
+            diverges: true,
+        },
+        SNode::Honest(_) => FLOW_FALLTHROUGH,
+        SNode::If {
+            then, otherwise, ..
+        } => {
+            let t = seq_flow(then);
+            let o = seq_flow(otherwise);
+            SeqFlow {
+                live_break: t.live_break || o.live_break,
+                diverges: !then.is_empty() && !otherwise.is_empty() && t.diverges && o.diverges,
+            }
+        }
+        // A nested `while (true)` never completes when its own body has
+        // no live break; its unlabeled breaks are ITS exits (inner
+        // scope), not the analyzed loop's.
+        SNode::While {
+            cond: None, body, ..
+        } => SeqFlow {
+            live_break: false,
+            diverges: !seq_flow(body).live_break,
+        },
+        // Conditional loops / for-of / for-in / do-while / switch may
+        // complete normally; their unlabeled breaks are inner-scoped.
+        SNode::While { .. }
+        | SNode::DoWhile { .. }
+        | SNode::ForOf { .. }
+        | SNode::ForIn { .. }
+        | SNode::Switch { .. } => FLOW_FALLTHROUGH,
+        // A labeled block does not capture UNLABELED breaks (labeled
+        // jumps are pre-bailed by the caller), so it is transparent.
+        SNode::Labeled { body, .. } => seq_flow(body),
+        // Exceptional edges: a break in the body, any catch, or the
+        // finally is live when reachable there (an exception can
+        // transfer control at any point, so catch/finally sequences
+        // are analyzed from their own entry). The try as a whole may
+        // complete normally — conservative: never diverges.
+        SNode::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
+            let mut live = seq_flow(body).live_break;
+            for c in catches {
+                live |= seq_flow(&c.body).live_break;
+            }
+            if let Some(f) = finally {
+                live |= seq_flow(f).live_break;
+            }
+            SeqFlow {
+                live_break: live,
+                diverges: false,
+            }
+        }
+    }
+}
+
+/// Any labeled break/continue anywhere in the subtree → the caller
+/// bails (a labeled jump could target a label between the loop and the
+/// residue in shapes this pass does not model — doubt keeps the block).
+fn subtree_has_labeled_jump(nodes: &[SNode]) -> bool {
+    nodes.iter().any(|n| match n {
+        SNode::Break {
+            label: Some(_),
+        }
+        | SNode::Continue {
+            label: Some(_),
+        } => true,
+        SNode::If {
+            then, otherwise, ..
+        } => subtree_has_labeled_jump(then) || subtree_has_labeled_jump(otherwise),
+        SNode::While { body, .. }
+        | SNode::DoWhile { body, .. }
+        | SNode::Labeled { body, .. }
+        | SNode::ForOf { body, .. }
+        | SNode::ForIn { body, .. } => subtree_has_labeled_jump(body),
+        SNode::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
+            subtree_has_labeled_jump(body)
+                || catches.iter().any(|c| subtree_has_labeled_jump(&c.body))
+                || finally
+                    .as_ref()
+                    .is_some_and(|f| subtree_has_labeled_jump(f))
+        }
+        SNode::Switch { cases, .. } => cases.iter().any(|c| subtree_has_labeled_jump(&c.body)),
+        SNode::Stmts(_)
+        | SNode::Break { label: None }
+        | SNode::Continue { label: None }
+        | SNode::Honest(_) => false,
+    })
+}
+
+/// Sweep the dead loop-exit dispatch throws. A trailing `throw <t>`
+/// run (optionally followed by the `Unreachable` marker) after a
+/// `while (true)` loop is removed iff ALL of:
+///
+/// 1. **Residue shape**: the next significant sibling (skipping
+///    honesty comments and empty statement runs) is a single run of
+///    exactly `throw <t>` (+ `Unreachable`), where `t` is a temp the
+///    loop's own header declares as an uncaught `await` (the folded
+///    dispatch's resumption temp — this scopes the sweep to the N70
+///    residue; arbitrary dead code is not touched).
+/// 2. **No normal exit**: the loop is an unlabeled `while (true)` (no
+///    condition — it cannot fall through; no label — a labeled break
+///    from inside would land on the residue).
+/// 3. **No live exit break (preds)**: every unlabeled `break` in the
+///    loop body is statically dead (a diverging statement precedes it
+///    in its sequence), and no labeled `break`/`continue` appears
+///    anywhere in the subtree.
+/// 4. **Exceptional edges**: an exception raised inside the loop
+///    propagates to the nearest enclosing CATCH — never to a plain
+///    sibling statement — so the residue (a fall-through sibling in
+///    the same node sequence, not a handler) is unreachable from the
+///    loop's exceptional exits. The region tree is already reflected
+///    in the sibling structure this pass runs on (it runs after
+///    rethrow-try dissolution in [`fold_seq`]).
+///
+/// The removed run is replaced by an honesty comment.
+fn sweep_dead_loop_exit_throws(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
+    let mut i = 0;
+    while i < nodes.len() {
+        let fire = match &nodes[i] {
+            SNode::While {
+                label: None,
+                cond: None,
+                body,
+            } => residue_match(nodes, i, body),
+            _ => None,
+        };
+        let Some(j) = fire else {
+            i += 1;
+            continue;
+        };
+        stats.dead_exit_throw += 1;
+        nodes[j] = SNode::Honest(
+            "dead loop-exit dispatch residue elided (provably unreachable: unlabeled `while (true)` with no live exit break — the folded await rejects inline; N70 residual)"
+                .to_string(),
+        );
+        i += 1;
+    }
+}
+
+/// The residue check for one candidate loop at `nodes[i]`: the index
+/// of the removable throw run when every proof obligation holds.
+fn residue_match(nodes: &[SNode], i: usize, body: &[SNode]) -> Option<usize> {
+    // Obligation 1a: the loop header's own (direct) statement runs
+    // declare an uncaught `await` temp — the folded dispatch's
+    // resumption temp.
+    let mut header_awaits: BTreeSet<ValueId> = BTreeSet::new();
+    for n in body {
+        let SNode::Stmts(run) = n else { break };
+        for l in run {
+            if let Leaf::Raw(Stmt::Declare {
+                value: Expr::Await { uncaught: true, .. },
+                value_id,
+                ..
+            }) = l
+            {
+                header_awaits.insert(*value_id);
+            }
+        }
+    }
+    if header_awaits.is_empty() {
+        return None;
+    }
+    // Obligation 1b: the next significant sibling is exactly the throw
+    // residue run.
+    let mut j = i + 1;
+    while j < nodes.len() {
+        match &nodes[j] {
+            SNode::Honest(_) => j += 1,
+            SNode::Stmts(run) if run.is_empty() => j += 1,
+            _ => break,
+        }
+    }
+    let SNode::Stmts(run) = nodes.get(j)? else {
+        return None;
+    };
+    let thrown = match run.as_slice() {
+        [Leaf::Raw(Stmt::Throw(e))] | [Leaf::Raw(Stmt::Throw(e)), Leaf::Raw(Stmt::Unreachable)] => {
+            temp_value(e)?
+        }
+        _ => return None,
+    };
+    if !header_awaits.contains(&thrown) {
+        return None;
+    }
+    // Obligations 2–3 (the loop shape is checked by the caller): no
+    // labeled jumps anywhere, no live unlabeled exit break.
+    if subtree_has_labeled_jump(body) || seq_flow(body).live_break {
+        return None;
+    }
+    Some(j)
+}
+
+
 
 // ── Folds 3+4: iterator loops ────────────────────────────────────────
 

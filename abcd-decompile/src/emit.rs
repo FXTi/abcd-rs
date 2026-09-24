@@ -2519,5 +2519,6 @@ fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.agen_returns += b.agen_returns;
     a.yield_star_sites += b.yield_star_sites;
     a.yield_star_bound += b.yield_star_bound;
+    a.dead_exit_throw += b.dead_exit_throw;
     a
 }
