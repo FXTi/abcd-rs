@@ -133,11 +133,18 @@ fn main() {
         ));
 
     let target = env::var("TARGET").unwrap_or_default();
+    // Force-include the shim libpandafile/file.h BEFORE everything: with the
+    // full submodule present, upstream's `"file.h"` quote-includes resolve
+    // same-dir to the REAL libpandafile/file.h (which drags in os/mem.h →
+    // the platform layer), but the shim's include guard (LIBPANDAFILE_FILE_H)
+    // matches, so pre-including the shim turns the real file into a no-op —
+    // the old flat subset achieved the same via -I fall-through.
     if target.contains("windows") {
         cc_build.define("PANDA_TARGET_WINDOWS", None);
         cc_build.include(&format!("{manifest}/arkcompiler_runtime_core/platforms"));
         // Force-include MSVC compat header before all source files
         cc_build.flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"));
+        cc_build.flag(&format!("/FI{manifest}/bridge/shim/file.h"));
         // Enable C++ exception handling (vendor code uses <iostream>)
         cc_build.flag("/EHsc");
         // Conformance mode: platforms/windows/libpandabase/file.h relies on
@@ -155,6 +162,9 @@ fn main() {
         // Platform headers: "unix/libpandabase/file.h" resolves under
         // platforms/unix (full subtree now present).
         cc_build.include(&format!("{manifest}/arkcompiler_runtime_core/platforms"));
+        cc_build
+            .flag("-include")
+            .flag(&format!("{manifest}/bridge/shim/file.h"));
     }
 
     // Coverage: instrument C++ when running under cargo-llvm-cov
