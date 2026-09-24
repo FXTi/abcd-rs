@@ -588,6 +588,16 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    entry site). Async family stays documented fallback via NEW IR gap
    G6 = N68 registered (async bytecodes carry the value in acc; lift
    drops it). QUEUE COMPLETE: d-P5..d-P11 + t-P1..t-P6 all landed.
+   VENDOR MIGRATION DONE (2026-09-24, V-SUB): ruby-sync + copied
+   vendored subsets replaced by git submodules at crate roots
+   (abcd-{isa,file}-sys/arkcompiler_runtime_core), pinned to the proven
+   master commit 7303d5c2 (95 deleted-snapshot files blob-match
+   100%). CI: minimal wiring + sparse submodule clones (15MB vs 280MB;
+   submodules:true impossible — dangling nested gitlink + NTFS-illegal
+   paths upstream). Tag radar (weekly OpenHarmony-* latest-tag vs pin
+   compare -> red PR as drift report) descoped to the CI-rework plan
+   (design/ci-rework-plan.md; reference impl at 3092de4). Dream gate
+   1149/1149 + CI 6/6 green verified post-migration.
    CI note (2026-09-24): windows-latest broke on async_node.rs probing
    node via `which` — Git Bash's which prints MSYS paths
    (/c/Program Files/.../node.exe) that std::process::Command can't
