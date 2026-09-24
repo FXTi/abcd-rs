@@ -1537,28 +1537,65 @@ impl<'m> Emitter<'m> {
                     "[...arguments].slice({start_index}) /*CopyRestArgs*/"
                 ));
             }
-            Expr::TemplateObject { cooked } => {
-                *self
-                    .stats
-                    .fallback_comments
-                    .entry("GetTemplateObject")
-                    .or_insert(0) += 1;
-                self.current_fn_has_fallback = true;
-                match cooked {
-                    Some(lits) => {
-                        let joined: Vec<String> = lits
-                            .iter()
-                            .map(|l| match l {
-                                Lit::String(s) => s.clone(),
-                                other => render_lit(other),
-                            })
-                            .collect();
-                        out.push_str(&format!(
-                            "{} /*template: cooked-only, interpolations not recovered (G4)*/",
-                            render_string(&joined.join(""))
-                        ));
+            Expr::TemplateObject { raw, cooked } => {
+                // G4 RESOLVED (d-P10): with the raw strings recovered the
+                // node emits as a real backtick literal carrying the raw
+                // text verbatim — an identity tag `(_=>_)` reconstructs
+                // the (frozen, `.raw`-bearing) template object the
+                // runtime would build, and es2abc re-derives the cooked
+                // strings from the raw source text per spec. Multi-quasi
+                // templates get inert `${0}` separators (a no-substitution
+                // template has exactly one quasi; the tag ignores the
+                // dummy values). The junction is safe: appending `${0}`
+                // after any valid raw text cannot create a spurious
+                // interpolation (only an exact `${` opens one, and raw
+                // ending in `$` yields `…$` + `${0}` = `…$${0}` which
+                // still terminates the quasi at the appended marker).
+                let raw_strings: Option<Vec<&str>> = raw.as_ref().and_then(|lits| {
+                    lits.iter()
+                        .map(|l| match l {
+                            Lit::String(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<&str>>>()
+                });
+                match raw_strings {
+                    Some(parts) if !parts.is_empty() => {
+                        out.push_str("((_=>_)`");
+                        out.push_str(&parts.join("${0}"));
+                        out.push_str("`)");
                     }
-                    None => out.push_str("\"\" /*template unresolved (G4)*/"),
+                    _ => {
+                        // Cooked-only fallback — documented per case: raw
+                        // is genuinely absent (unresolved literal operand
+                        // or non-string quasi). The cooked text is
+                        // emitted as a plain string (its raw form is
+                        // unrecoverable from cooked text).
+                        *self
+                            .stats
+                            .fallback_comments
+                            .entry("GetTemplateObject")
+                            .or_insert(0) += 1;
+                        self.current_fn_has_fallback = true;
+                        match cooked {
+                            Some(lits) => {
+                                let joined: Vec<String> = lits
+                                    .iter()
+                                    .map(|l| match l {
+                                        Lit::String(s) => s.clone(),
+                                        other => render_lit(other),
+                                    })
+                                    .collect();
+                                out.push_str(&format!(
+                                    "{} /*template: raw absent, cooked-only*/",
+                                    render_string(&joined.join(""))
+                                ));
+                            }
+                            None => {
+                                out.push_str("\"\" /*template unresolved (raw+cooked absent)*/")
+                            }
+                        }
+                    }
                 }
             }
             Expr::IterResultObj { value, done } => {

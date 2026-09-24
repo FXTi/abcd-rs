@@ -443,13 +443,18 @@ pub fn dump_expr(e: &Expr) -> String {
         Expr::SelfFunction(name) => name.clone(),
         Expr::Arguments => "arguments".to_string(),
         Expr::RestArgs { start_index } => format!("...rest[from {start_index}]"),
-        Expr::TemplateObject { cooked } => match cooked {
-            Some(lits) => {
+        Expr::TemplateObject { raw, cooked } => {
+            let show = |lits: &[Lit]| {
                 let inner: Vec<String> = lits.iter().map(render_lit).collect();
-                format!("template([{}]) /*cooked-only (G4)*/", inner.join(", "))
+                inner.join(", ")
+            };
+            match (raw, cooked) {
+                (Some(r), Some(c)) => format!("template(raw [{}], cooked [{}])", show(r), show(c)),
+                (Some(r), None) => format!("template(raw [{}], cooked <unresolved>)", show(r)),
+                (None, Some(c)) => format!("template([{}]) /*raw absent — cooked-only*/", show(c)),
+                (None, None) => "template(<unresolved>) /*raw+cooked absent*/".to_string(),
             }
-            None => "template(<unresolved>) /*cooked-only (G4)*/".to_string(),
-        },
+        }
         Expr::IterResultObj { value, done } => format!(
             "{{value: {}, done: {}}} /*iter-result*/",
             dump_expr(value),
