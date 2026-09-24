@@ -588,6 +588,16 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    entry site). Async family stays documented fallback via NEW IR gap
    G6 = N68 registered (async bytecodes carry the value in acc; lift
    drops it). QUEUE COMPLETE: d-P5..d-P11 + t-P1..t-P6 all landed.
+   N68/G6 FULLY CLOSED (d-P12 core + d-P13 remainder, 2026-09-25):
+   async acc-value modeled (AwaitUncaught/AsyncResolve/AsyncReject
+   carry funcobj+value) AND the async suspend/resume state machine
+   folds back to source awaits (async_machine_fold; vendor model =
+   asyncFunctionBuilder + Await/HandleCompletion, ASYNC kind dispatch
+   is THROW-only). Fallback histograms: AsyncFunctionEnter 18->0,
+   SuspendGenerator 18->0, ResumeGenerator 30->12 / GetResumeMode 27->9
+   (residual = AsyncGenerator kind — registered as d-P14, next natural
+   task). Dream gate stays 1149/1149 all-zero. Node behavior evidence
+   E:3 F:9 G:109 H:7 D:15.
    TAG RADAR LANDED (2026-09-24, maintainer amendments: prefix-only
    OpenHarmony-* filter + tag-time newest-wins, no version parsing):
    vendor-sync.yml replaced (weekly Monday + dispatch); drift → ONE
