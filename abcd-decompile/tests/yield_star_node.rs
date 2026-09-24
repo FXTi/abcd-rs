@@ -102,12 +102,20 @@ fn yield_star_node_sync_entries() {
 }
 
 /// (c): the async YieldStar — the module's OWN plain-async `main`
-/// (the `for await` driver) now decompiles to working code (N70 fix,
+/// (the `for await` driver) decompiles to the LITERAL `for await
+/// (const value of v10)` source form (d-P17; N70 fixed behavior in
 /// d-P16: async_machine_fold covers the loop-driving shape), so the
 /// entry prints the delegated sequence itself; the hand-written
 /// `for await` driver over the decompiled `outer` repeats it.
 #[test]
 fn yield_star_node_async_driver() {
+    let text = decompiled("delegate-async.abc");
+    // The literal source form (the exact-segment golden pin lives in
+    // `golden_yield_star.rs`); here the form gates the behavior run.
+    assert!(
+        text.contains("for await (const value of v10) {"),
+        "the driver is the literal for-await form:\n{text}"
+    );
     if !node_available() {
         eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
         return;
@@ -125,6 +133,43 @@ fn yield_star_node_async_driver() {
     assert_eq!(
         stdout, "1,2,inner-done\n1,2,inner-done\n",
         "delegate-async: behavior mismatch (line 1 = the module's own for-await main, N70; line 2 = the hand-written driver)"
+    );
+}
+
+/// (c) rejection probe (d-P17): with the driver in literal `for
+/// await` form, a rejecting async iterator must reject `main()`'s
+/// promise (the for-await's implicit await rethrows; the async
+/// completion rejects) — the SAME behavior the d-P16 working-loop
+/// form had. The probe lets the module entry's own `main()` finish
+/// first (`1,2,inner-done`), rebinds the module-level `outer` to a
+/// rejecting async iterable, and re-invokes `main`.
+#[test]
+fn yield_star_node_async_driver_rejection_probe() {
+    if !node_available() {
+        eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
+        return;
+    }
+    let dir = std::env::temp_dir().join("abcd-dp15-node");
+    std::fs::create_dir_all(&dir).expect("tempdir");
+    let body = format!(
+        "const print = console.log;\n{}\n\
+         (async () => {{\n\
+         \x20 func_main_0();\n\
+         \x20 await new Promise(r => setTimeout(r, 10)); /* the entry's own main() finishes first */\n\
+         \x20 outer = () => ({{ [Symbol.asyncIterator]() {{ return {{ next: () => Promise.reject(\"probe-reject\") }}; }} }});\n\
+         \x20 await main().then(() => console.log(\"main resolved?!\"), e => console.log(\"main rejected: \" + e));\n\
+         }})();\n",
+        decompiled("delegate-async.abc")
+    );
+    let (ok, stdout, stderr) = run_node(&dir, "delegate-async-reject.js", &body);
+    eprintln!("NODE-EVIDENCE delegate-async rejection probe exit={ok} stdout={stdout:?} stderr={stderr:?}");
+    assert!(
+        ok,
+        "node run delegate-async rejection probe failed: {stderr}"
+    );
+    assert_eq!(
+        stdout, "1,2,inner-done\nmain rejected: probe-reject\n",
+        "delegate-async rejection probe: main's promise must reject with the iterator's rejection"
     );
 }
 

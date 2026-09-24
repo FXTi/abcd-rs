@@ -248,8 +248,9 @@ function func_main_0() {
 /// protocol step and the completion dispatch sits inside the loop's
 /// done arm. The folded body is `const value$2 = yield* inner$1()`.
 /// The module's plain-async `main` (the `for await` driver) folds to
-/// working await code since the N70 fix (d-P16) — the golden above
-/// pins the folded `outer` body only (main's text is long).
+/// working await code since the N70 fix (d-P16) and to the literal
+/// `for await (…)` source form since d-P17 — the golden above pins
+/// the folded `outer` body only (main's text is long).
 #[test]
 fn golden_yield_star_delegate_async() {
     let text = decompiled("delegate-async.abc");
@@ -287,8 +288,11 @@ fn golden_yield_star_delegate_async() {
 /// (c)-main N70 shape pin: the plain-async `for await` driver folds
 /// its suspend/resume machinery to plain awaits — NO
 /// ResumeGenerator/GetResumeMode hard-fallbacks, NO AsyncFunctionEnter
-/// fallback temp, the resume value bound at the await, and the
-/// catch-all rejection folded to `throw` (not `return <error>`).
+/// fallback temp, NO AsyncReject/SuspendGenerator residues. Since
+/// d-P17 the driver is the literal `for await (…)` form (the loop
+/// await is the for-await's implicit await; the rejection path is the
+/// implicit rejection of that await — behavior pinned by the node
+/// rejection probe in `yield_star_node.rs`).
 #[test]
 fn golden_yield_star_delegate_async_main_folded() {
     let text = decompiled("delegate-async.abc");
@@ -309,12 +313,63 @@ fn golden_yield_star_delegate_async_main_folded() {
             "folded main keeps {gone} machinery:\n{main}"
         );
     }
-    // The loop await binds the iter-result (rejection throws inline).
-    assert!(main.contains("= await v16;"), "the loop await:\n{main}");
-    // The iterator-cleanup await folds too (bare — value unused).
-    assert!(main.contains("await v42;"), "the cleanup await:\n{main}");
-    // The catch-all rejection is a real `throw` (promise rejection).
-    assert!(main.contains("throw e$"), "rejection path:\n{main}");
+    // The d-P16 working-loop form is superseded by the literal
+    // for-await form (d-P17): no header await temp, no cleanup await.
+    assert!(
+        !main.contains("= await v16;"),
+        "the header await temp is absorbed into `for await`:\n{main}"
+    );
+    assert!(
+        !main.contains("await v42;"),
+        "the iterator-cleanup await folds into for-await's implicit cleanup:\n{main}"
+    );
+}
+
+/// (c)-main d-P17 literal-form pin (N70 residual 1): the driver loop
+/// prints as the LITERAL `for await (const value of v10) {…}` source
+/// form — the header's extra await temp absorbed, the loop-carried
+/// bookkeeping phis substituted back to their sources (`v29`→`v8`),
+/// the iterator-cleanup try folded into the implicit protocol, and
+/// the done-arm's absorbed post-loop tail (print + return) re-homed
+/// AFTER the loop. Exact segment pin:
+#[test]
+fn golden_yield_star_delegate_async_main_for_await() {
+    let text = decompiled("delegate-async.abc");
+    let main = text
+        .split("main = async function ___main() {")
+        .nth(1)
+        .expect("main present");
+    let main = main.split("\n};").next().expect("main body end");
+    let expected = r#"for await (const value of v10) {
+    /* rethrow-only try/catch dissolved (semantic no-op) */
+    /* iterator-cleanup try/catch folded into for-of's implicit cleanup (ECMA-262 §14.7.5) */
+    /* try region 2: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary */
+    const push = v8.push;
+    push.call(v8, value);
+  }
+  const print$1 = print;
+  const join = v8.join;
+  const v58 = join.call(v8, ",");
+  print$1(v58);
+  return undefined;
+"#;
+    assert!(
+        main.contains(expected),
+        "the literal for-await driver form:\n{main}"
+    );
+    // N70 residual 2 (negative pin): the dead loop-exit dispatch
+    // `throw <resume>` the conservative v1 kept is provably
+    // unreachable post-fold and swept — no `throw` residue, and the
+    // resume temp's hoist (it was hoisted ONLY because the dead throw
+    // used it) is gone too.
+    assert!(
+        !main.contains("throw v20"),
+        "dead loop-exit dispatch throw residue:\n{main}"
+    );
+    assert!(
+        !main.contains("var v20"),
+        "the resume temp's hoist is dead with the sweep:\n{main}"
+    );
 }
 
 /// Bail: a hand-rolled iterator-protocol loop inside a generator is
