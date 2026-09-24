@@ -21,4 +21,5 @@ abcd-analysis = { workspace = true }
 
 [dev-dependencies]
 abcd-file = { workspace = true }
+abcd-isa = { workspace = true }
 abcd-lift = { workspace = true }

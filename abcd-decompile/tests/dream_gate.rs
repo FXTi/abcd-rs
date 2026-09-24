@@ -215,11 +215,12 @@ fn generate() -> usize {
 /// the resume-mode dispatch all elide; a used resumption value binds
 /// as `x = yield v`. Recompiled, es2abc re-lowers the identical state
 /// machine — behavior is identical by construction, proven by the
-/// oracle. The async family (`AsyncResolve`/`AsyncReject` + async
-/// resume machinery) stays documented fallback (IR gap G6: the modern
-/// asyncfunction* bytecodes carry the value in the accumulator, which
-/// the lift does not model) — those fixtures are not-applicable in
-/// this oracle set, so the bucket is empty. The d-P10 histogram was
+/// oracle. The async family's completion pair folds too (N68/G6,
+/// `folds::async_driver_fold`: the lift models the acc-carried value,
+/// `AsyncResolve`→`return`, `AsyncReject`→`throw`; the
+/// suspend/resume/mode machinery inside `async function` bodies stays
+/// documented fallback) — those fixtures are not-applicable in this
+/// oracle set, so the bucket stays empty. The d-P10 histogram was
 /// 1131/0/0/18/0. The floor guards regressions; raise it when the
 /// buckets improve.
 #[test]

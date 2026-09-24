@@ -130,8 +130,8 @@ Exceptions: `Throw`, `ThrowIfSuperNotCalled{kind}`, `ThrowUndefinedIfHole`,
 `ThrowIfNotObject`, `ThrowPatternNonCoercible`, `ThrowNotExists`,
 `ThrowDeleteSuperProperty`.
 Generator/async: `CreateGenerator`, `SuspendGenerator`, `ResumeGenerator`,
-`GetResumeMode`, `Await`, `AwaitUncaught{value}`, `AsyncFunctionEnter`,
-`AsyncResolve/Reject`.
+`GetResumeMode`, `Await`, `AwaitUncaught{funcobj, value}` (N68),
+`AsyncFunctionEnter`, `AsyncResolve/Reject{funcobj, value}` (N68).
 Super: `LoadSuper{name|dyn}`, `StoreSuper{name|dyn}`.
 Debug: `Debugger`.
 Control: `Branch`, `CondBranch`, `Return`, `Phi`, `Unreachable`.

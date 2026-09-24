@@ -430,8 +430,8 @@ syntax). Totals: **T=31, N=49, H=7**.
 | 70 | `Await` | T | `await v`. |
 | 71 | `AwaitUncaught` | T | `await v` (uncaught-completion wrapper is machine-level). |
 | 72 | `AsyncFunctionEnter` | N | Async-machinery entry — recognize + elide inside `async function` emission. |
-| 73 | `AsyncResolve` | H | Async promise plumbing — es2abc wraps async bodies in resolve/reject dispatch; folding the wrapper back to plain `return`/implicit resolve is driver-level pattern work. |
-| 74 | `AsyncReject` | H | Same family. |
+| 73 | `AsyncResolve` | H | Async promise plumbing — es2abc wraps async bodies in resolve/reject dispatch. FOLDED (N68/G6, `folds::async_driver_fold`): the completion pair `AsyncResolve(v); return` → `return v`; non-adjacent shapes keep the documented fallback. |
+| 74 | `AsyncReject` | H | Same family — folded to `throw v` (N68/G6). |
 | 75 | `LoadNewTarget` | T | `new.target`. |
 | 76 | `LoadGlobalObject` | T | `globalThis`. |
 | 77 | `LoadFunction` | N | Self-reference to the executing function — emit the function's own name where known; rare. |
@@ -630,9 +630,15 @@ machine (entry protocol suspend, `CreateIterResultObj(v,false)` wrap,
 completion pair, resume-mode dispatch; `x = yield v` binds when the
 resumption value has real uses), all-or-nothing per function gated on
 the entry site. Dream gate 1149/0/0/0/0 — the full oracle set. The
-ASYNC family stays documented fallback (IR gap **G6** below); the
-async fixtures are `not-applicable` in the dream-gate oracle set, so
-this costs no gate rows.
+ASYNC family: **RESOLVED at N68/G6** — the lift now models the
+acc-carried value (`Op::AwaitUncaught`/`AsyncResolve`/`AsyncReject`
+carry `funcobj` + `value`; vendor `acc: inout:top`), and
+`folds::async_driver_fold` rewrites the completion pair to
+`return v` / `throw v` (the `await` operand is the real value since
+Stage A). The suspend/resume/mode machinery inside `async function`
+bodies stays documented fallback (further pattern work; the async
+fixtures are `not-applicable` in the dream-gate oracle set, so this
+costs no gate rows).
 
 **R5 — `finally` reconstruction** requires duplicate-code detection
 (es2abc duplicates finally bodies); until the fold exists, output is
@@ -698,26 +704,25 @@ rule like any other).
   source of truth; the design doc's count could be refreshed at the
   next editorial pass.
 - **G6 — async acc-input dropped at lift (modern `asyncfunction*`
-  forms).** The non-deprecated `asyncfunctionawaituncaught`,
-  `asyncfunctionresolve`, and `asyncfunctionreject` bytecodes carry
-  the awaited/resolved value in the ACCUMULATOR and the async func
-  object in the register operand (isa.yaml `v:in:top, acc:inout:top`;
-  runtime `ecmascript/interpreter/interpreter-inl.cpp`
+  forms).** **RESOLVED (N68, worker d-P12).** The non-deprecated
+  `asyncfunctionawaituncaught`, `asyncfunctionresolve`, and
+  `asyncfunctionreject` bytecodes carry the awaited/resolved value in
+  the ACCUMULATOR and the async func object in the register operand
+  (isa.yaml `v:in:top, acc:inout:top`; runtime
+  `ecmascript/interpreter/interpreter-inl.cpp`
   `ASYNCFUNCTIONAWAITUNCAUGHT_V8` reads `value = GET_ACC()`). The lift
-  (`abcd-lift/src/translate.rs` `Asyncfunctionawaituncaught`/
-  `Asyncfunctionresolve`/`Asyncfunctionreject` arms) models only the
-  register operand as `Op::AwaitUncaught`/`AsyncResolve`/`AsyncReject`'s
-  `value` — the acc-carried value never reaches the IR (the deprecated
-  `pref_v8_v8` forms DO read the value register; no corpus fixture
-  uses them). Impact: `async function` bodies decompile with the
-  driver plumbing commenting the func object instead of the real
-  value (e.g. `await v2 /* the funcobj */`) — loud, documented
-  fallback, never silent; behavioral divergence confined to the
-  `not-applicable` async fixtures (no VM oracle). A sound fold of the
-  async machinery (the R4 async half) NEEDS the acc-input edge: an
-  `abcd-lift` change reading `acc` as a second operand of these three
-  ops (decompile requests it; not patched from this track —
-  abcd-lift is outside the decompile scope). Discovered by d-P11.
+  now reads both (`Op::AwaitUncaught`/`AsyncResolve`/`AsyncReject`
+  carry `funcobj` + `value`; the deprecated resolve/reject arms were
+  additionally misbound to the MIDDLE register — vendor reads the
+  LAST, `GET_VREG_VALUE(v2)`); the lower re-emits `acc := value,
+  v0 := funcobj`. Byte-neutrality proven over the 1149 passed set
+  (pre/post diff EMPTY; the async fixtures' streams change by
+  construction — the pre-fix rewrite left a stale acc at
+  `asyncfunctionresolve`, semantically broken). The decompile fold
+  landed: `AsyncResolve v` → `return v`, `AsyncReject v` → `throw v`,
+  `AwaitUncaught v` → `await v` (Stage A), node-verified on
+  Builder-built mini-cases (`f()→42`, `g() rejects 7`,
+  `h() = await 5 → 5`). Discovered by d-P11.
 
 ## 9. References
 
