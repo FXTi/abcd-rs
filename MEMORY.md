@@ -598,6 +598,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    (residual = AsyncGenerator kind — registered as d-P14, next natural
    task). Dream gate stays 1149/1149 all-zero. Node behavior evidence
    E:3 F:9 G:109 H:7 D:15.
+   d-P15 DONE (2026-09-25): yield* (YieldStar delegation) — fixtures
+   created from scratch (decompile-fixtures/yield-star/, corpus
+   untouched), vendor YieldStar machine modeled + folded
+   (yield* <expr> / const ret = yield*). New findings registered: N69
+   (structurer try-region fragmentation bug — post-try statements run
+   on the catch path; known-issue pin in place) + N70 (plain-async
+   for-await driver gap in d-P13/d14's fold coverage).
    d-P14 DONE (2026-09-25): the AsyncGenerator kind
    (async function*) state machine folds back to a plain async
    generator body (async_generator_machine_fold; vendor model =
