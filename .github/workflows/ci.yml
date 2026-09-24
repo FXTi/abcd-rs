@@ -62,6 +62,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # protectNTFS off BEFORE the clone: git validates every index entry
+          # on clone even in --sparse mode and rejects upstream's
+          # NTFS-illegal paths; the sparse cone then keeps those files from
+          # ever being materialized.
+          git config --global core.protectNTFS false
           git config --global core.longpaths true
           for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
             sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
