@@ -12,8 +12,11 @@ Sources (`src/*.js`, hand-written, Apache-2.0 project origin):
   the delegation result is unused.
 - `delegate-async.js` — `async function*` with `yield*` (for-await
   consumption end); the delegate's return value is used.
-- `delegate-throw.js` — delegation whose delegate THROWS; the delegating
-  generator's own try/catch observes the error.
+- `delegate-throw.js` — delegation whose delegate THROWS; the error
+  propagates through the delegation to the consumer's try/catch.
+  (Consumer-side catch on purpose: an internal-catch variant surfaces
+  the pre-existing structurer fragmentation of try regions spanning
+  loops — see the d-P15 node evidence test's pinned known issue.)
 - `manual-iterator.js` — BAIL case: a hand-rolled iterator-protocol
   loop inside a generator (NOT `yield*`); the fold must leave it loud.
 
