@@ -598,6 +598,13 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    (residual = AsyncGenerator kind — registered as d-P14, next natural
    task). Dream gate stays 1149/1149 all-zero. Node behavior evidence
    E:3 F:9 G:109 H:7 D:15.
+   N70 RESIDUALS DONE (d-P17, 2026-09-25): the for-await driver now
+   emits the literal `for await (…)` form (sibling matcher handles the
+   header await temp + done-arm tail re-homing + loop-carried phi
+   invariant collapse) and the dead loop-exit dispatch throw is swept
+   under a whole-node unreachability proof (keep-pins s40/s41). Corpus
+   counters unmoved (the shapes are extra-corpus); dream gate
+   1149/1149. **The register is fully closed — zero residuals.**
    N69+N70 FIXED (d-P16, 2026-09-25): structurer Seq-cut try
    fragmentation (post-try statements ran on the catch path — the d-P5
    join-hoist machinery already classified Seq cuts but the driver was
