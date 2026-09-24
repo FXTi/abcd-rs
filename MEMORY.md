@@ -598,6 +598,26 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
    (residual = AsyncGenerator kind — registered as d-P14, next natural
    task). Dream gate stays 1149/1149 all-zero. Node behavior evidence
    E:3 F:9 G:109 H:7 D:15.
+   d-P14 DONE (2026-09-25): the AsyncGenerator kind
+   (async function*) state machine folds back to a plain async
+   generator body (async_generator_machine_fold; vendor model =
+   asyncGeneratorFunctionBuilder Prepare/Yield/DirectReturn/
+   ExplicitReturn/CleanUp + functionBuilder Await/AsyncYield/
+   HandleCompletion; ResumeMode RETURN=0/THROW=1/NEXT=2).
+   CreateGeneratorObj entry elided, per-yield pre-await + dead
+   AsyncGeneratorResolve yield point + THREE-way resume-mode dispatch
+   dissolved to plain yield (x = yield v bound when the resumption
+   value has real uses), source awaits folded d-P13-style (yield-point
+   guard: the pre-yield await never folds without its yield
+   machinery), completions (return {value: genobj, done: X} — the
+   lift's v0.1-parity asyncgeneratorresolve fold) -> return X,
+   explicit-return await dissolved, catch-all reject via
+   async_driver_fold. Corpus fallbacks: ResumeGenerator 12->0,
+   GetResumeMode 9->0, Param(funcobj) 3->0 (functions_with_fallbacks
+   51->48); dream gate 1149/1149 all-zero; node evidence
+   I:3/J:1/7/K:5/false/42/true + node --check on all 3 corpus
+   async-generator outputs. yield* delegation (YieldStar) is NOT in
+   the corpus and stays a loud fallback.
    TAG RADAR LANDED (2026-09-24, maintainer amendments: prefix-only
    OpenHarmony-* filter + tag-time newest-wins, no version parsing):
    vendor-sync.yml replaced (weekly Monday + dispatch); drift → ONE
