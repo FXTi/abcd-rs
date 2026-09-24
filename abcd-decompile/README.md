@@ -355,20 +355,43 @@ resolved mode-immediate consts are swept only when every use was
 consumed. Recompiled, es2abc re-lowers the identical state machine —
 behavior identical by construction, proven by the oracle.
 
-**The async family stays (IR gap G6).** The modern
+**The async family (G6 resolved at N68; machinery folded at the N68
+remainder).** The modern
 `asyncfunctionawaituncaught`/`asyncfunctionresolve`/
 `asyncfunctionreject` bytecodes carry the awaited/resolved value in
 the ACCUMULATOR (isa.yaml `acc: inout:top`; runtime
-`interpreter-inl.cpp` `ASYNCFUNCTIONAWAITUNCAUGHT_V8`), and the lift
-models only the register operand (the async func object) — the value
-never reaches the IR, so no sound decompile-side fold exists. Those
-fixtures are `not-applicable` in the dream-gate oracle set, so the
-bucket is empty and the honesty floor is pinned by golden g06.
+`interpreter-inl.cpp` `ASYNCFUNCTIONAWAITUNCAUGHT_V8`); the lift
+models both operands (`Op::AwaitUncaught`/`AsyncResolve`/`AsyncReject`
+carry `funcobj` + `value`, N68/d-P12), the completion pair folds to
+`return v` / `throw v` (`folds::async_driver_fold`), and the
+suspend/resume machinery inside `async function` bodies folds back to
+plain `await` control flow (`folds::async_machine_fold`, the async
+counterpart of the generator fold): per vendor `functionBuilder.cpp`
+`Await`, each `await v` lowers to `AsyncFunctionAwaitUncaught` +
+`SuspendGenerator` + the `ResumeGenerator`/`GetResumeMode` pair + the
+ASYNC `HandleCompletion` dispatch (`if (mode == THROW) throw value;`
+only — no RETURN arm for the ASYNC builder kind). The fold dissolves
+that per site — the resumption value binds at the await site
+(`const t = await v`) when used — all-or-nothing per function, gated
+on the `AsyncFunctionEnter` entry protocol (the funcObj temp's uses
+must all be machinery), with the funcObj fallback temp swept once only
+dead catch-region phi assigns reference it. The `AsyncGenerator` kind
+carries no `AsyncFunctionEnter` (its entry is the generator
+`CreateGeneratorObj` protocol and its yields the
+`AsyncGeneratorResolve` machine — a separate lowering) and stays a
+documented fallback (golden a07). The async fixtures are
+`not-applicable` in the dream-gate oracle set, so behavior evidence is
+node-driven (`tests/async_node.rs`: Builder-built lift pins +
+IR-built loop/resolve/reject cases with exact stdout).
 Goldens: `tests/golden_generator.rs` g01–g06 (inline immediates,
 shared mode consts, bound yield result, yield-in-loop, entry-gate
-bail, async honesty floor). Corpus fold counters:
+bail, async folds) and `tests/golden_async.rs` a01–a07 (plain await,
+dead resume value, await-in-loop, chained awaits, entry-gate bail,
+dispatch-mismatch bail, async-generator bail). Corpus fold counters:
 `gen_driver_sites=54 gen_driver_entry=18 gen_driver_bound=0` (18
-generator functions × entry + 2 yield sites each).
+generator functions × entry + 2 yield sites each),
+`async_machine_sites=18 async_machine_bound=18` (all 18 async-await
+fixtures).
 
 ## Crate map (Stage A)
 

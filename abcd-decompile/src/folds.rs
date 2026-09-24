@@ -3502,9 +3502,7 @@ fn funcobj_uses_are_machinery(nodes: &[SNode], genobj: ValueId) -> bool {
         }
         match e {
             Expr::GeneratorDriver { genobj: g, .. } => expr_ok(g, genobj, true),
-            _ => expr_children(e)
-                .iter()
-                .all(|c| expr_ok(c, genobj, false)),
+            _ => expr_children(e).iter().all(|c| expr_ok(c, genobj, false)),
         }
     }
     let mut ok = true;
@@ -3625,10 +3623,11 @@ fn match_await_site(nodes: &[SNode], i: usize, cx: &mut AsyncMachineCx) -> Optio
             }
             let k = prev_non_phi(run, &mut cur)?;
             let Leaf::Raw(Stmt::Declare {
-                value: Expr::Await {
-                    value: x,
-                    uncaught: true,
-                },
+                value:
+                    Expr::Await {
+                        value: x,
+                        uncaught: true,
+                    },
                 value_id,
                 ..
             }) = &run[k]

@@ -213,7 +213,7 @@ pub fn fallback_note(op: &Op) -> &'static str {
             "ArkTS sendable/shared class (H); no JS surface syntax — emitted as `class` + `/* sendable */` at best (§5 row 51)"
         }
         ResumeGenerator { .. } | GetResumeMode { .. } => {
-            "generator-driver plumbing (H); folds with SuspendGenerator into plain `yield` at Stage B (folds::generator_machine_fold, d-P11; §5 rows 68-69, R4)"
+            "generator/async-driver plumbing (H); folds with SuspendGenerator into plain `yield` at Stage B (folds::generator_machine_fold, d-P11) or into plain `await` control flow in async bodies (folds::async_machine_fold, N68 remainder; §5 rows 68-69, R4)"
         }
         AsyncResolve { .. } | AsyncReject { .. } => {
             "async promise plumbing (H); the es2abc completion pair folds to plain `return`/`throw` at Stage B (folds::async_driver_fold, N68/G6 — the lift now carries the acc value; §5 rows 73-74, R4)"

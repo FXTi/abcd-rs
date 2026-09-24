@@ -198,7 +198,12 @@ use common::*;
 
 /// `AsyncFunctionAwaitUncaught(funcobj, acc=v)` + `SuspendGenerator` +
 /// the completion pair; returns (resume, mode).
-fn await_site(m: &mut Module, b: abcd_ir::BlockId, funcobj: ValueId, v: ValueId) -> (ValueId, ValueId) {
+fn await_site(
+    m: &mut Module,
+    b: abcd_ir::BlockId,
+    funcobj: ValueId,
+    v: ValueId,
+) -> (ValueId, ValueId) {
     let aw = emit(m, b, Op::AwaitUncaught { funcobj, value: v });
     emit(
         m,
@@ -266,7 +271,14 @@ fn async_resolve_return(m: &mut Module, b: abcd_ir::BlockId, funcobj: ValueId, v
 fn async_catch_all(m: &mut Module, f: FuncId, funcobj: ValueId, protected: Vec<abcd_ir::BlockId>) {
     let handler = add_block(m, f);
     let exc = add_exception_param(m, handler);
-    let rej = emit(m, handler, Op::AsyncReject { funcobj, value: exc });
+    let rej = emit(
+        m,
+        handler,
+        Op::AsyncReject {
+            funcobj,
+            value: exc,
+        },
+    );
     emit_void(m, handler, Op::Return { value: Some(rej) });
     add_try(m, f, protected, handler, exc);
 }
@@ -438,7 +450,11 @@ fn case_e2() -> abcd_ir::Module {
 /// caught by a user `catch`.
 #[test]
 fn async_machine_fold_node_behavior() {
-    let texts = [decompile(&case_d()), decompile(&case_e()), decompile(&case_e2())];
+    let texts = [
+        decompile(&case_d()),
+        decompile(&case_e()),
+        decompile(&case_e2()),
+    ];
     eprintln!(
         "── case D ──\n{}\n── case E ──\n{}\n── case E2 ──\n{}",
         texts[0], texts[1], texts[2]
@@ -513,7 +529,10 @@ fn async_machine_fold_node_behavior() {
         run.status, stdout, stderr
     );
     assert!(run.status.success(), "node run failed: {stderr}");
-    assert_eq!(stdout, "E:3\nF:9\nG:109\nH:7\nD:15\n", "async behavior mismatch");
+    assert_eq!(
+        stdout, "E:3\nF:9\nG:109\nH:7\nD:15\n",
+        "async behavior mismatch"
+    );
 }
 
 // ── Corpus async recompile evidence (opt-in) ─────────────────────────

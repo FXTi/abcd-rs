@@ -425,11 +425,11 @@ syntax). Totals: **T=31, N=49, H=7**.
 | 65 | `ThrowIfNotObject` | N | for-in/for-of coercion guard — elided in loop reconstruction. |
 | 66 | `CreateGenerator` | N | Folds with `DefineFunc` + `FunctionKind::Generator` → `function*`; the genobj value is plumbing. |
 | 67 | `SuspendGenerator` | N | `yield v` (result = resume value — needs the `x = yield v` form when used). |
-| 68 | `ResumeGenerator` | H | Generator-driver plumbing (resume value extraction after suspension) — must pattern-fold with 67/69 into plain `yield`; direct emission is meaningless to readers. |
-| 69 | `GetResumeMode` | H | Resume-mode (return/throw/normal) dispatch — driver plumbing; folds with 67/68. |
+| 68 | `ResumeGenerator` | H | Generator-driver plumbing (resume value extraction after suspension) — pattern-folds with 67/69 into plain `yield` (d-P11 `folds::generator_machine_fold`) and, in async bodies, into plain `await` control flow (N68 remainder `folds::async_machine_fold`); direct emission is meaningless to readers. |
+| 69 | `GetResumeMode` | H | Resume-mode (return/throw/normal) dispatch — driver plumbing; folds with 67/68 (the generator two-arm dispatch at d-P11; the ASYNC `HandleCompletion` THROW-only dispatch at the N68 remainder). |
 | 70 | `Await` | T | `await v`. |
 | 71 | `AwaitUncaught` | T | `await v` (uncaught-completion wrapper is machine-level). |
-| 72 | `AsyncFunctionEnter` | N | Async-machinery entry — recognize + elide inside `async function` emission. |
+| 72 | `AsyncFunctionEnter` | N | Async-machinery entry — recognized and elided inside `async function` emission; its result temp (the funcObj) is swept by `folds::async_machine_fold` once the suspend/resume machinery that consumed it is gone (N68 remainder). |
 | 73 | `AsyncResolve` | H | Async promise plumbing — es2abc wraps async bodies in resolve/reject dispatch. FOLDED (N68/G6, `folds::async_driver_fold`): the completion pair `AsyncResolve(v); return` → `return v`; non-adjacent shapes keep the documented fallback. |
 | 74 | `AsyncReject` | H | Same family — folded to `throw v` (N68/G6). |
 | 75 | `LoadNewTarget` | T | `new.target`. |
@@ -636,9 +636,24 @@ carry `funcobj` + `value`; vendor `acc: inout:top`), and
 `folds::async_driver_fold` rewrites the completion pair to
 `return v` / `throw v` (the `await` operand is the real value since
 Stage A). The suspend/resume/mode machinery inside `async function`
-bodies stays documented fallback (further pattern work; the async
-fixtures are `not-applicable` in the dream-gate oracle set, so this
-costs no gate rows).
+bodies: **RESOLVED at the N68 remainder (worker d-P13)** —
+`folds::async_machine_fold` dissolves the per-await
+`AsyncFunctionAwaitUncaught` + `SuspendGenerator` +
+`ResumeGenerator`/`GetResumeMode` pair + the ASYNC `HandleCompletion`
+THROW-only dispatch (es2panda `functionBuilder.cpp` `Await` — no RETURN
+arm for the ASYNC builder kind) back into the source-level `await`
+(the resumption value binds at the await site when used), all-or-
+nothing per function gated on the `AsyncFunctionEnter` entry protocol,
+with the funcObj fallback temp swept once only dead catch-region phi
+assigns reference it. Corpus: `async_machine_sites=18` (all 18
+async-await fixtures); FALLBACK `AsyncFunctionEnter` 18→0,
+`SuspendGenerator(async-machinery)` 18→0, `GetResumeMode` 27→9,
+`ResumeGenerator` 30→12 (the remainders are the 3 async-generator
+fixtures — the `AsyncGenerator` kind carries no `AsyncFunctionEnter`
+and its `CreateGeneratorObj`/`AsyncGeneratorResolve` yield lowering is
+a separate machine, still a documented fallback; the async fixtures
+are `not-applicable` in the dream-gate oracle set, so this costs no
+gate rows).
 
 **R5 — `finally` reconstruction** requires duplicate-code detection
 (es2abc duplicates finally bodies); until the fold exists, output is

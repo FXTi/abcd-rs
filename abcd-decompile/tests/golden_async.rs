@@ -417,14 +417,7 @@ fn a07_async_generator_kind_bails() {
             value: one,
         },
     );
-    emit(
-        &mut m,
-        entry,
-        Op::SuspendGenerator {
-            genobj,
-            value: aw,
-        },
-    );
+    emit(&mut m, entry, Op::SuspendGenerator { genobj, value: aw });
     let r = emit(&mut m, entry, Op::ResumeGenerator { genobj });
     let mode = emit(&mut m, entry, Op::GetResumeMode { genobj });
     let cont = add_block(&mut m, f);
