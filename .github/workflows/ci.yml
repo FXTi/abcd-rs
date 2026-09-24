@@ -49,8 +49,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
+      # `submodules: true` recurses and dies on upstream's dangling nested
+      # gitlink (static_core/tools/plugins/ecmascript has no .gitmodules
+      # mapping) — so init only OUR first-level submodules, non-recursively.
+      - run: git submodule update --init
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
@@ -69,8 +71,8 @@ jobs:
       CXX: clang++
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
+      # See the build job: first-level submodules only, non-recursive.
+      - run: git submodule update --init
 
       - uses: dtolnay/rust-toolchain@stable
         with:
