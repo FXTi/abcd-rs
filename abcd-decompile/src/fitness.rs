@@ -213,10 +213,10 @@ pub fn fallback_note(op: &Op) -> &'static str {
             "ArkTS sendable/shared class (H); no JS surface syntax — emitted as `class` + `/* sendable */` at best (§5 row 51)"
         }
         ResumeGenerator { .. } | GetResumeMode { .. } => {
-            "generator-driver plumbing (H); folds with SuspendGenerator into plain `yield` at d-P3 (§5 rows 68-69, R4)"
+            "generator-driver plumbing (H); folds with SuspendGenerator into plain `yield` at Stage B (folds::generator_machine_fold, d-P11; §5 rows 68-69, R4)"
         }
         AsyncResolve { .. } | AsyncReject { .. } => {
-            "async promise plumbing (H); folding the resolve/reject wrapper back to plain `return` is d-P3 work (§5 rows 73-74, R4)"
+            "async promise plumbing (H); folding the resolve/reject wrapper back to plain `return` needs the lift's dropped acc-input (IR gap G6; §5 rows 73-74, R4)"
         }
         ThrowDeleteSuperProperty => {
             "`delete super.x` reconstruction (N); the throw IS the delete's semantics, but the op carries no object operand — the member expression is unrecoverable at Stage A (§5 row 63)"

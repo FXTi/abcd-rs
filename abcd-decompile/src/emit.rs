@@ -455,6 +455,11 @@ impl<'m> Emitter<'m> {
         let rf = recover_func(self.module, func);
         let mut structured = structure_func(self.module, &rf);
         let mut fstats = FoldStats::default();
+        // The generator driver fold runs FIRST (d-P11, R4): pre-fold the
+        // resume-mode dispatch is a plain if-chain everywhere (the
+        // switch re-detection never sees it), giving one uniform match
+        // shape across all profiles.
+        folds::generator_machine_fold(&mut structured.body, rf.kind, &mut fstats);
         folds::fold(&mut structured.body, &mut fstats);
         folds::scope_fold(&mut structured.body, &rf.params, &mut fstats);
         self.stats.structure =
@@ -2471,5 +2476,8 @@ fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.switch += b.switch;
     a.finally_fold += b.finally_fold;
     a.scope_fold += b.scope_fold;
+    a.gen_driver_sites += b.gen_driver_sites;
+    a.gen_driver_entry += b.gen_driver_entry;
+    a.gen_driver_bound += b.gen_driver_bound;
     a
 }
