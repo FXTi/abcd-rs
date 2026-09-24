@@ -49,15 +49,28 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      # `submodules: true` recurses and dies on upstream's dangling nested
-      # gitlink (static_core/tools/plugins/ecmascript has no .gitmodules
-      # mapping) — so init only OUR first-level submodules, non-recursively.
-      # protectNTFS off: upstream has NTFS-illegal paths (e.g. .../test.../a.ets)
-      # that abort the Windows checkout; we never touch those test trees.
-      - shell: bash
+      # Not actions/checkout's submodules:true: it recurses and dies on
+      # upstream's dangling nested gitlink (static_core/tools/plugins/
+      # ecmascript has no .gitmodules mapping). And a plain submodule update
+      # cannot checkout on Windows at all: upstream's tree contains
+      # NTFS-illegal paths (…/test…/a.ets) and >260-char names under
+      # static_core/ test trees we never compile. So: shallow blob:none
+      # sparse clones limited to the subtrees the bridges actually build
+      # from (isa, libpandafile, libpandabase, assembler, templates,
+      # platforms). Also much faster than a full 280MB checkout.
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
         run: |
-          git config --global core.protectNTFS false
-          git submodule update --init
+          set -euo pipefail
+          git config --global core.longpaths true
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
@@ -76,8 +89,19 @@ jobs:
       CXX: clang++
     steps:
       - uses: actions/checkout@v4
-      # See the build job: first-level submodules only, non-recursive.
-      - run: git submodule update --init
+      # See the build job for why: sparse, non-recursive, blob:none.
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
 
       - uses: dtolnay/rust-toolchain@stable
         with:

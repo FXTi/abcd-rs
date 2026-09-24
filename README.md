@@ -80,6 +80,21 @@ Building without the submodules fails in `build.rs` (the C++ bridge sources
 live under `abcd-isa-sys/arkcompiler_runtime_core/` and
 `abcd-file-sys/arkcompiler_runtime_core/`).
 
+**Windows contributors:** upstream's full tree contains NTFS-illegal paths
+under `static_core/` test trees, so a full submodule checkout fails on
+Windows. Use a sparse checkout of only the subtrees the bridges build from
+(what CI does):
+
+```sh
+git submodule update --init  # clone succeeds; checkout may fail — expected
+for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+  git -C "$sm" sparse-checkout set --cone isa libpandafile libpandabase assembler templates platforms
+  git -C "$sm" checkout -f HEAD
+done
+```
+
+To restore the full tree later: `git -C <sm> sparse-checkout disable`.
+
 ## License
 
 Apache-2.0. The `arkcompiler_runtime_core` submodules pull in
