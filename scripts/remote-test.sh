@@ -11,9 +11,20 @@
 #      dir on dabai;
 #   2. atomically rename staging -> final run dir (a half-uploaded tree never
 #      looks like a runnable one);
-#   3. run cargo test there (shared CARGO_TARGET_DIR across runs so the C++
-#      bridge build is cached even though the source dir is deleted);
+#   3. run cargo test there with a TREE-CONTENT-KEYED CARGO_TARGET_DIR
+#      (shared only across runs of the identical tree state, so the C++
+#      bridge build is cached without cross-contamination);
 #   4. delete the run dir afterwards (resource reclamation).
+#
+# Cache keying (the stale-artifact fix, 2026-09-25): the old single shared
+# target dir served STALE binaries when (a) two trees with different content
+# alternated (rsync -a preserves mtimes; cargo's mtime freshness collided —
+# false red AND false green observed at N64) or (b) two workers built
+# concurrently (phantom rlib reads, hit at t-P6). Now: the key is HEAD +
+# sha256 of the tracked diff + per-file hashes of untracked files, so any
+# content change lands in a fresh cache; same-state runs hit the warm cache;
+# concurrent same-key runs serialize on an flock; keys older than the
+# newest 8 are reaped (trylock — never reap an in-use cache).
 #
 # Usage:
 #   scripts/remote-test.sh                      # cargo test --workspace --offline
@@ -28,7 +39,17 @@ LOCAL_ROOT="$(git rev-parse --show-toplevel)"
 RUN_ID="run-$(date +%Y%m%d-%H%M%S)-$$"
 STAGING="${REMOTE_ROOT}/.staging-${RUN_ID}"
 REMOTE_DIR="${REMOTE_ROOT}/${RUN_ID}"
-SHARED_TARGET="${REMOTE_ROOT}/.shared-target"
+
+# Tree-content cache key: HEAD + tracked diff + untracked file contents.
+# Any content change → fresh cache dir; identical trees → warm hits.
+HEAD_REV="$(git -C "${LOCAL_ROOT}" rev-parse --short HEAD)"
+DIFF_HASH="$(git -C "${LOCAL_ROOT}" diff HEAD | sha256sum | cut -c1-16)"
+UNTRACKED_HASH="$(git -C "${LOCAL_ROOT}" ls-files --others --exclude-standard -z \
+    | sort -z | xargs -0 -I{} sh -c 'echo -n "{} "; sha256sum < "${1}" 2>/dev/null || true' _ {} \
+    | sha256sum | cut -c1-16)"
+CACHE_KEY="${HEAD_REV}-${DIFF_HASH}-${UNTRACKED_HASH}"
+SHARED_TARGET="${REMOTE_ROOT}/.shared-target-${CACHE_KEY}"
+echo "[remote-test] cache key: ${CACHE_KEY}"
 
 if [ "$#" -eq 0 ]; then
     set -- test --workspace
@@ -73,13 +94,24 @@ ENV_PREFIX=""
 if [ "${#REMOTE_ENV[@]}" -gt 0 ]; then
     ENV_PREFIX="$(printf 'export %s\n' "${REMOTE_ENV[@]}")"
 fi
+# flock serializes concurrent runs on the SAME cache key (the t-P6 phantom-
+# rlib race); different keys build in their own dirs and never share.
 ssh "${REMOTE_HOST}" "
     set -e
     source ~/.cargo/env 2>/dev/null || true
     cd '${REMOTE_DIR}'
     ${ENV_PREFIX}
-    CARGO_TARGET_DIR='${SHARED_TARGET}' cargo $*
+    flock '${SHARED_TARGET}.lock' -c \"CARGO_TARGET_DIR='${SHARED_TARGET}' cargo $*\"
 " || rc=$?
+
+# Reap old cache keys (keep newest 8; trylock never reaps an in-use cache).
+ssh "${REMOTE_HOST}" "
+    cd '${REMOTE_ROOT}' || exit 0
+    for d in \$(ls -dt .shared-target-* 2>/dev/null | grep -v '\.lock$' | tail -n +9); do
+        flock -n \"\${d}.lock\" -c \"rm -rf '\$PWD'/\$d\" 2>/dev/null || true
+    done
+    true
+" || true
 
 if [ "${KEEP:-0}" = "1" ]; then
     echo "[remote-test] KEEP=1: leaving ${REMOTE_HOST}:${REMOTE_DIR} in place"
