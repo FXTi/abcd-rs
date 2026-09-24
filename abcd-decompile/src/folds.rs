@@ -31,18 +31,26 @@
 //!    throw v;`) back into the source-level `function*` body.
 //!
 //! `SuspendGenerator`→`yield` and `Await*`→`await` landed in Stage A
-//! ([`Expr::Yield`]/[`Expr::Await`]); the emitter prints them. The
-//! ASYNC driver plumbing (`AsyncResolve`/`AsyncReject`, and the
-//! generator pair inside `async function` bodies) stays documented
-//! fallback: the modern (non-deprecated)
-//! `asyncfunctionawaituncaught`/`asyncfunctionresolve`/
-//! `asyncfunctionreject` bytecodes carry the awaited/resolved value in
-//! the ACCUMULATOR (isa.yaml `acc: inout:top`; runtime
-//! `ecmascript/interpreter/interpreter-inl.cpp`
-//! `ASYNCFUNCTIONAWAITUNCAUGHT_V8`), and the lift models only the
-//! register operand (the async func object) — the acc-carried value
-//! never reaches the IR, so no sound decompile-side fold exists for
-//! the async family (IR gap G6; honesty floor, never hidden).
+//! ([`Expr::Yield`]/[`Expr::Await`]); the emitter prints them.
+//!
+//! 7. **Async driver completion → `return`/`throw`** (N68/G6, R4):
+//!    [`async_driver_fold`] rewrites the es2abc async-completion pair —
+//!    `t = AsyncResolve(v); return t;` becomes `return v` (async
+//!    completion IS the source-level return of an async body) and
+//!    `t = AsyncReject(v); return t;` becomes `throw v` (the catch-all
+//!    rejection wrapper IS the source-level uncaught throw). Sound
+//!    since N68: the modern `asyncfunctionawaituncaught`/
+//!    `asyncfunctionresolve`/`asyncfunctionreject` bytecodes carry the
+//!    value in the ACCUMULATOR (isa.yaml `acc: inout:top`; runtime
+//!    `ecmascript/interpreter/interpreter-inl.cpp`
+//!    `ASYNCFUNCTIONAWAITUNCAUGHT_V8` :5357-5366,
+//!    `ASYNCFUNCTIONRESOLVE_V8` :6577-6589, `ASYNCFUNCTIONREJECT_V8`
+//!    :6605-6617) and the lift now models both operands
+//!    (`Op::AwaitUncaught`/`AsyncResolve`/`AsyncReject` carry `funcobj`
+//!    + `value`). Non-adjacent shapes keep the loud hard-fallback. The
+//!    remaining async machinery (the `AsyncFunctionEnter` elision, the
+//!    suspend/resume pair inside `async function` bodies) stays
+//!    documented elision/fallback per the §5 table.
 
 use crate::expr::{ArrayElem, Expr, IterOp, Lit, ObjEntry};
 use crate::recover::Stmt;
@@ -82,6 +90,9 @@ pub struct FoldStats {
     /// Yield results bound to a temp (`x = yield v` — the resume value
     /// has real uses; d-P11).
     pub gen_driver_bound: usize,
+    /// Async-completion pairs folded to `return v` / `throw v`
+    /// (N68/G6, R4).
+    pub async_driver: usize,
 }
 
 /// Run every fold over a structured body (recursive driver).
@@ -2767,6 +2778,128 @@ struct GenDriverCx {
     /// Const temps a successful dispatch match resolved (sweep
     /// candidates once their uses are gone).
     consumed_consts: BTreeSet<ValueId>,
+}
+
+// ── Fold 7: async driver completion (N68/G6, R4) ─────────────────────
+
+/// Fold the es2abc async-completion pair back to source-level control
+/// flow: an `AsyncResolve(v)` whose result is immediately returned is
+/// the async function's completion — `return v`; an `AsyncReject(v)`
+/// whose result is immediately returned is the catch-all rejection
+/// wrapper — `throw v`. Runs only inside async kinds (the
+/// `AsyncResolve`/`AsyncReject` ops are async-completion semantics; the
+/// kind gate keeps a hypothetical stray op in a non-async body LOUD
+/// rather than folded).
+///
+/// Two shapes are matched (both adjacency-strict, the es2abc shape —
+/// `asyncfunctionresolve v` + `return` are consecutive bytecodes):
+///
+/// - temp form: `const t = asyncDriver(v); return t;` with `t` used
+///   exactly once in the whole tree;
+/// - inlined form: `return asyncDriver(v);` directly.
+///
+/// Everything else (a dead result, a multi-use result, a non-adjacent
+/// use) keeps the documented hard-fallback node. Runs BEFORE
+/// [`fold`]'s `dissolve_rethrow_trys`, so the folded catch-all
+/// (`catch (e) { throw e; }`) dissolves as the semantic no-op it is.
+pub fn async_driver_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats: &mut FoldStats) {
+    if !matches!(
+        kind,
+        FunctionKind::Async | FunctionKind::AsyncArrow | FunctionKind::AsyncGenerator
+    ) {
+        return;
+    }
+    // Whole-tree use counts, computed once up front: the fold moves the
+    // AsyncDriver's value expression from the declare into the
+    // return/throw, which preserves every OTHER temp's reference count,
+    // so the counts stay valid across the mutations.
+    let mut uses = BTreeMap::new();
+    count_temp_uses(nodes, &mut uses);
+    async_fold_seq(nodes, &uses, stats);
+}
+
+fn async_fold_seq(nodes: &mut Vec<SNode>, uses: &BTreeMap<ValueId, usize>, stats: &mut FoldStats) {
+    for n in nodes.iter_mut() {
+        match n {
+            SNode::Stmts(run) => fold_async_run(run, uses, stats),
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                async_fold_seq(then, uses, stats);
+                async_fold_seq(otherwise, uses, stats);
+            }
+            SNode::While { body, .. }
+            | SNode::DoWhile { body, .. }
+            | SNode::Labeled { body, .. }
+            | SNode::ForOf { body, .. }
+            | SNode::ForIn { body, .. } => async_fold_seq(body, uses, stats),
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                async_fold_seq(body, uses, stats);
+                for c in catches {
+                    async_fold_seq(&mut c.body, uses, stats);
+                }
+                if let Some(f) = finally {
+                    async_fold_seq(f, uses, stats);
+                }
+            }
+            SNode::Switch { cases, .. } => {
+                for c in cases {
+                    async_fold_seq(&mut c.body, uses, stats);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+}
+
+/// One leaf run: fold adjacent AsyncDriver declares into their
+/// return/throw consumer.
+fn fold_async_run(run: &mut Vec<Leaf>, uses: &BTreeMap<ValueId, usize>, stats: &mut FoldStats) {
+    let mut i = 0;
+    while i < run.len() {
+        // Inlined form: `return asyncDriver(v)` directly.
+        if let Leaf::Raw(Stmt::Return(Some(Expr::AsyncDriver { resolve, value }))) = &run[i] {
+            let (resolve, value) = (*resolve, (**value).clone());
+            run[i] = Leaf::Raw(if resolve {
+                Stmt::Return(Some(value))
+            } else {
+                Stmt::Throw(value)
+            });
+            stats.async_driver += 1;
+            i += 1;
+            continue;
+        }
+        // Temp form: `const t = asyncDriver(v); return t;` — adjacent,
+        // and `t` used exactly once in the whole tree (the return).
+        if let Leaf::Raw(Stmt::Declare {
+            value: Expr::AsyncDriver { resolve, value },
+            value_id,
+            ..
+        }) = &run[i]
+        {
+            let (resolve, value, vid) = (*resolve, (**value).clone(), *value_id);
+            let adjacent_return = matches!(
+                run.get(i + 1),
+                Some(Leaf::Raw(Stmt::Return(Some(e)))) if temp_value(e) == Some(vid)
+            );
+            if adjacent_return && uses.get(&vid).copied().unwrap_or(0) == 1 {
+                run.remove(i);
+                run[i] = Leaf::Raw(if resolve {
+                    Stmt::Return(Some(value))
+                } else {
+                    Stmt::Throw(value)
+                });
+                stats.async_driver += 1;
+                continue; // re-examine index i
+            }
+        }
+        i += 1;
+    }
 }
 
 /// Fold the es2abc generator state machine back into a plain

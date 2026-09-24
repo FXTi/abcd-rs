@@ -216,7 +216,7 @@ pub fn fallback_note(op: &Op) -> &'static str {
             "generator-driver plumbing (H); folds with SuspendGenerator into plain `yield` at Stage B (folds::generator_machine_fold, d-P11; §5 rows 68-69, R4)"
         }
         AsyncResolve { .. } | AsyncReject { .. } => {
-            "async promise plumbing (H); folding the resolve/reject wrapper back to plain `return` needs the lift's dropped acc-input (IR gap G6; §5 rows 73-74, R4)"
+            "async promise plumbing (H); the es2abc completion pair folds to plain `return`/`throw` at Stage B (folds::async_driver_fold, N68/G6 — the lift now carries the acc value; §5 rows 73-74, R4)"
         }
         ThrowDeleteSuperProperty => {
             "`delete super.x` reconstruction (N); the throw IS the delete's semantics, but the op carries no object operand — the member expression is unrecoverable at Stage A (§5 row 63)"

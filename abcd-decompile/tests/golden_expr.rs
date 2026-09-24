@@ -824,9 +824,33 @@ fn t12_generator_async() {
         let _this = add_param(&mut m, a);
         let p1 = add_param(&mut m, a);
         let ae = emit(&mut m, b, Op::Await { value: p1 });
-        let au = emit(&mut m, b, Op::AwaitUncaught { value: p1 });
-        let _ar = emit(&mut m, b, Op::AsyncResolve { value: ae });
-        let _aj = emit(&mut m, b, Op::AsyncReject { value: au });
+        let au = emit(
+            &mut m,
+            b,
+            Op::AwaitUncaught {
+                funcobj: p1,
+                value: p1,
+            },
+        );
+        // Non-adjacent, multi-use-free results with NO return consumer:
+        // the documented hard-fallback nodes survive (the N68 fold is
+        // adjacency-strict).
+        let _ar = emit(
+            &mut m,
+            b,
+            Op::AsyncResolve {
+                funcobj: p1,
+                value: ae,
+            },
+        );
+        let _aj = emit(
+            &mut m,
+            b,
+            Op::AsyncReject {
+                funcobj: p1,
+                value: au,
+            },
+        );
         emit_void(&mut m, b, Op::Return { value: None });
     }
 

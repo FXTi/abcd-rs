@@ -460,6 +460,10 @@ impl<'m> Emitter<'m> {
         // switch re-detection never sees it), giving one uniform match
         // shape across all profiles.
         folds::generator_machine_fold(&mut structured.body, rf.kind, &mut fstats);
+        // The async-completion fold (N68/G6) runs BEFORE fold()'s
+        // rethrow-try dissolution so a folded `catch (e) { throw e; }`
+        // rejection wrapper dissolves as the no-op it is.
+        folds::async_driver_fold(&mut structured.body, rf.kind, &mut fstats);
         folds::fold(&mut structured.body, &mut fstats);
         folds::scope_fold(&mut structured.body, &rf.params, &mut fstats);
         self.stats.structure =
@@ -2479,5 +2483,6 @@ fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.gen_driver_sites += b.gen_driver_sites;
     a.gen_driver_entry += b.gen_driver_entry;
     a.gen_driver_bound += b.gen_driver_bound;
+    a.async_driver += b.async_driver;
     a
 }

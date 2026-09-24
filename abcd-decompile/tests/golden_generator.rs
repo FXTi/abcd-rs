@@ -18,9 +18,10 @@
 //! materialized as shared const temps), a used resumption value
 //! (`x = yield v`), a yield inside a loop, the entry-gate bail (a
 //! malformed entry dispatch keeps ALL machinery as documented
-//! fallbacks), and the async honesty floor (IR gap G6: the modern
-//! `asyncfunction*` bytecodes carry the value in the accumulator,
-//! which the lift does not model — the async machinery stays loud).
+//! fallbacks), and the async driver fold (N68/G6: the modern
+//! `asyncfunction*` bytecodes carry the value in the accumulator —
+//! the lift now models it, and the resolve/reject completion pair
+//! folds to `return`/`throw`).
 //!
 //! The expected strings are STABLE emission forms — reviewed,
 //! hand-written expectations, not snapshots.
@@ -545,14 +546,18 @@ fn g05_entry_gate_bail_keeps_fallbacks() {
     );
 }
 
-/// g06 — the async honesty floor (IR gap G6): the modern
-/// `asyncfunction*` bytecodes carry the awaited/resolved value in the
-/// accumulator (isa.yaml `acc: inout:top`; runtime interpreter-inl.cpp
-/// `ASYNCFUNCTIONAWAITUNCAUGHT_V8`), which the lift does not model —
-/// the register operand it surfaces is the async func object. No
-/// sound decompile-side fold exists; the machinery stays LOUD.
+/// g06 — the async driver fold (N68/G6): with the acc-carried value
+/// modeled (isa.yaml `acc: inout:top`; runtime interpreter-inl.cpp
+/// `ASYNCFUNCTIONAWAITUNCAUGHT_V8` :5357-5366 / `ASYNCFUNCTIONRESOLVE_V8`
+/// :6577-6589 / `ASYNCFUNCTIONREJECT_V8` :6605-6617), the es2abc
+/// completion pair folds: `AsyncResolve(r); return` → `return r`,
+/// `AsyncReject(e); return` → `throw e` — and the folded rethrow-only
+/// catch-all then dissolves as the semantic no-op it is. The remaining
+/// async machinery (the `AsyncFunctionEnter` elision and the
+/// suspend/resume/mode dispatch inside the `async function` body) stays
+/// documented elision/fallback per the §5 table.
 #[test]
-fn g06_async_stays_documented_fallback() {
+fn g06_async_driver_fold() {
     let mut m = mk_module();
     let f = add_func_kind(&mut m, "value", FunctionKind::Async);
     let b0 = entry_of(&mut m, f);
@@ -561,8 +566,9 @@ fn g06_async_stays_documented_fallback() {
 
     // `Prepare`: AsyncFunctionEnter → funcobj.
     let funcobj = emit(&mut m, b0, Op::AsyncFunctionEnter);
-    // `await p1`: AsyncFunctionAwaitUncaught + suspend + completion pair.
-    let aw = emit(&mut m, b0, Op::AwaitUncaught { value: p1 });
+    // `await p1`: AsyncFunctionAwaitUncaught(funcobj, acc=p1) + suspend
+    // + completion pair.
+    let aw = emit(&mut m, b0, Op::AwaitUncaught { funcobj, value: p1 });
     emit(
         &mut m,
         b0,
@@ -607,20 +613,28 @@ fn g06_async_stays_documented_fallback() {
     emit_void(&mut m, throw_b, Op::Unreachable);
     link(&mut m, b0, cont);
     link(&mut m, b0, throw_b);
-    // `DirectReturn`: AsyncFunctionResolve + return.
-    let res = emit(&mut m, cont, Op::AsyncResolve { value: funcobj });
+    // `DirectReturn`: AsyncFunctionResolve(funcobj, acc=r) + return.
+    let res = emit(&mut m, cont, Op::AsyncResolve { funcobj, value: r });
     emit_void(&mut m, cont, Op::Return { value: Some(res) });
-    // `CleanUp`: catch-all → AsyncFunctionReject + return.
+    // `CleanUp`: catch-all → AsyncFunctionReject(funcobj, acc=exc) +
+    // return.
     let handler = add_block(&mut m, f);
     let exc = add_exception_param(&mut m, handler);
-    let rej = emit(&mut m, handler, Op::AsyncReject { value: funcobj });
+    let rej = emit(
+        &mut m,
+        handler,
+        Op::AsyncReject {
+            funcobj,
+            value: exc,
+        },
+    );
     emit_void(&mut m, handler, Op::Return { value: Some(rej) });
     add_try(&mut m, f, vec![b0, cont, throw_b], handler, exc);
 
     let text = decompiled(&m);
     expect(
         &text,
-        "async function value(p1) {\n  var v2; /* hoisted temp: used outside its def's block */\n  try {\n    /* elided AsyncFunctionEnter: async-machinery entry; recognized and elided inside `async function` emission (§5 row 72) */\n    v2 = undefined /*fallback AsyncFunctionEnter: async-context value used after elided AsyncFunctionEnter*/;\n    const v3 = await p1;\n    /*async-machinery suspend (R4; not a source yield)*/ v3;\n    const v5 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v2;\n    if (!(1.0 == /*hard-fallback GetResumeMode (generator driver, R4)*/ v2)) {\n      const v10 = /*hard-fallback AsyncResolve (async driver, R4)*/ v2;\n      return v10;\n    } else {\n      throw v5;\n      /* unreachable */\n    }\n  } catch (e) {\n    const v12 = /*hard-fallback AsyncReject (async driver, R4)*/ v2;\n    return v12;\n  }\n}\n",
+        "async function value(p1) {\n  /* rethrow-only try/catch dissolved (semantic no-op) */\n  /* elided AsyncFunctionEnter: async-machinery entry; recognized and elided inside `async function` emission (§5 row 72) */\n  const v2 = undefined /*fallback AsyncFunctionEnter: async-context value used after elided AsyncFunctionEnter*/;\n  const v3 = await p1;\n  /*async-machinery suspend (R4; not a source yield)*/ v3;\n  const v5 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v2;\n  if (!(1.0 == /*hard-fallback GetResumeMode (generator driver, R4)*/ v2)) {\n    return v5;\n  } else {\n    throw v5;\n    /* unreachable */\n  }\n}\n",
     );
 }
 
