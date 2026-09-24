@@ -1,12 +1,29 @@
 name: vendor-sync
+
+# Upstream tag radar. The vendored code is a pair of git submodules pinned to
+# a proven upstream commit (see design/vendor-sync.md). This workflow polls
+# upstream release tags and, when the newest OpenHarmony-* tag (by committer
+# date) is not the pinned commit, opens ONE standing PR per tag that re-pins
+# both submodules to it — WITH the build/test outcome recorded.
+# A red PR is not a failure of this job; it IS the radar working: it documents
+# the porting cost of that upstream version. Merging such a PR requires the
+# porting work to make it green.
+#
+# Selection rules (maintainer ruling 2026-09-24):
+#   - tag filter: tags STARTING WITH "OpenHarmony-" — nothing stricter;
+#   - ordering: tag TIME (peeled commit's committer date), newest wins —
+#     deliberately NO version-number parsing;
+#   - both submodule pins must agree, else fail loudly (repo-state bug);
+#   - noise policy R2-a: one standing PR per tag (label vendor-bump), the
+#     dup-check covers ALL PR states so a closed-but-unmerged tag stays
+#     dismissed (closing = the human's "won't port" decision);
+#   - infra failure before a verdict → one standing issue (label vendor-radar).
+# Kill switch: comment out the cron below.
+
 on:
-  # Cron DISABLED (2026-09-24): the ruby vendor-sync script was removed in the
-  # submodule migration, so the scheduled run would fail. The tag-radar
-  # redesign of this workflow is plan-first (pending CI-rework plan doc) —
-  # do not re-enable until that plan lands.
-  # schedule:
-  #   - cron: '0 0 * * *'   # Daily at UTC 00:00 (Beijing 8:00)
-  workflow_dispatch:        # Manual trigger (legacy flow; vendor-sync.rb is gone)
+  schedule:
+    - cron: '0 0 * * 1'   # Weekly, Monday 00:00 UTC (Beijing 8:00)
+  workflow_dispatch:        # Manual trigger
 
 permissions:
   contents: write
@@ -16,86 +33,213 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  UPSTREAM: https://github.com/openharmony/arkcompiler_runtime_core.git
 
 jobs:
-  sync:
+  tag-radar:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        crate: [abcd-isa-sys, abcd-file-sys]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.2'
-
-      - name: Run vendor sync
-        run: ruby ${{ matrix.crate }}/vendor-sync.rb -v --force
-
-      - name: Check for changes
-        id: diff
-        run: |
-          if git diff --quiet ${{ matrix.crate }}/vendor/; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Install Rust toolchain
-        if: steps.diff.outputs.changed == 'true'
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: cargo build
-        if: steps.diff.outputs.changed == 'true'
-        run: cargo build
-
-      - name: cargo test
-        if: steps.diff.outputs.changed == 'true'
-        run: cargo test
-
-      - name: Create PR
-        if: steps.diff.outputs.changed == 'true'
+      - name: Ensure radar labels exist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          gh label create vendor-bump --color 0e8a16 \
+            --description "Automated upstream tag bump proposal (vendor-sync tag radar)" --force
+          gh label create vendor-radar --color d93f0b \
+            --description "vendor-sync tag radar infrastructure failure" --force
+
+      - name: Find newest OpenHarmony-* tag (by committer date, no version parsing)
+        id: tag
+        run: |
+          set -euo pipefail
+          # 1) Tag filter: prefix "OpenHarmony-" ONLY (maintainer: 规则别搞那么严).
+          tags=$(git ls-remote --tags "$UPSTREAM" 'refs/tags/OpenHarmony-*' \
+            | sed 's|.*refs/tags/||' | grep -v '\^{}' | sort -u)
+          if [ -z "$tags" ]; then
+            echo "No OpenHarmony-* tags found upstream — naming scheme changed?" >&2
+            exit 1
+          fi
+          echo "matching tags: $(echo "$tags" | wc -l)"
+          # 2) Fetch ONLY the matching tags (depth 1, commits only — blobs and
+          #    trees are unneeded for dates and this must not pull history).
+          refspecs=()
+          while read -r t; do
+            refspecs+=("refs/tags/$t:refs/tags/radar/$t")
+          done <<< "$tags"
+          git fetch --quiet --filter=tree:0 --depth 1 "$UPSTREAM" "${refspecs[@]}"
+          # 3) Newest wins by the PEELED commit's committer date.
+          best_tag="" best_sha="" best_ct=0
+          while read -r t; do
+            sha=$(git rev-parse "refs/tags/radar/$t^{}")
+            ct=$(git log -1 --format=%ct "$sha")
+            echo "  $(date -u -d "@$ct" +%Y-%m-%d)  $t  $sha"
+            if [ "$ct" -gt "$best_ct" ]; then
+              best_ct=$ct; best_tag=$t; best_sha=$sha
+            fi
+          done <<< "$tags"
+          echo "newest: $best_tag ($best_sha, $(date -u -d "@$best_ct" +%Y-%m-%d))"
+          # 4) R1: BOTH pins must agree; disagreement is a repo-state bug.
+          pin_isa=$(git ls-tree HEAD abcd-isa-sys/arkcompiler_runtime_core | awk '{print $3}')
+          pin_file=$(git ls-tree HEAD abcd-file-sys/arkcompiler_runtime_core | awk '{print $3}')
+          echo "pin abcd-isa-sys : $pin_isa"
+          echo "pin abcd-file-sys: $pin_file"
+          if [ "$pin_isa" != "$pin_file" ]; then
+            echo "FATAL: submodule pins disagree — half-moved pin, not upstream drift" >&2
+            exit 1
+          fi
+          echo "latest=$best_tag" >> "$GITHUB_OUTPUT"
+          echo "tag_sha=$best_sha" >> "$GITHUB_OUTPUT"
+          echo "pinned=$pin_isa" >> "$GITHUB_OUTPUT"
+          if [ "$best_sha" = "$pin_isa" ]; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            echo "Pin already matches the newest tag — nothing to do."
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "DRIFT: pinned $pin_isa != $best_tag ($best_sha)"
+          fi
+
+      - name: Skip if any PR for this tag already exists (open OR closed — R2-a)
+        id: dup
+        if: steps.tag.outputs.drift == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # --state all: a closed-but-unmerged PR is the human's "won't port"
+          # verdict for that tag; it must stay dismissed. A NEWER tag opens a
+          # NEW PR — the old one stays as history.
+          existing=$(gh pr list --state all --label "vendor-bump" \
+            --search "${{ steps.tag.outputs.latest }}" \
+            --json number,state -q '.[0] | "#\(.number) (\(.state))"')
+          if [ -n "$existing" ]; then
+            echo "PR $existing already covers ${{ steps.tag.outputs.latest }}; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Repin both submodules to the tag commit (one commit, twin gitlinks)
+        id: repin
+        if: steps.tag.outputs.drift == 'true' && steps.dup.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          branch="vendor-sync/${{ matrix.crate }}/$(date +%Y%m%d-%H%M)"
+          # Sparse materialization per ci.yml: upstream's tree has NTFS-illegal
+          # and >260-char paths we never build; keep the same cone discipline.
+          git config --global core.protectNTFS false
+          git config --global core.longpaths true
+          branch="vendor-bump/${{ steps.tag.outputs.latest }}-$(date +%Y%m%d)"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
           git checkout -b "$branch"
-          git add ${{ matrix.crate }}/vendor/
-          git commit -m "chore(${{ matrix.crate }}): sync vendor files from upstream"
-          git push -u origin "$branch"
-          gh pr create \
-            --title "chore(${{ matrix.crate }}): sync vendor files from upstream" \
-            --body "Automated daily sync of **${{ matrix.crate }}** vendor files from arkcompiler_runtime_core master. Build & test passed on ubuntu-latest." \
-            --label "vendor-sync"
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "${{ steps.tag.outputs.tag_sha }}"
+            git -C "$sm" checkout --quiet -f "${{ steps.tag.outputs.tag_sha }}"
+            # Old pin too, for the drift summary (best effort — blobs fetch lazily).
+            git -C "$sm" fetch --quiet --depth 1 origin "${{ steps.tag.outputs.pinned }}" || true
+          done
+          git add abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core
+          git commit -m "chore(sys): repin arkcompiler_runtime_core to ${{ steps.tag.outputs.latest }}
 
-      - name: Create issue on failure
+          Automated tag radar: upstream's newest OpenHarmony-* tag (by committer
+          date) is ${{ steps.tag.outputs.latest }} (${{ steps.tag.outputs.tag_sha }}),
+          pinned is ${{ steps.tag.outputs.pinned }}. Both gitlinks move together.
+          Build/test outcome is in the PR body; a red PR documents the porting cost."
+
+      - name: Diff summary of the drift (consumed subtrees only)
+        id: summary
+        if: steps.repin.outcome == 'success'
+        run: |
+          {
+            echo '### Drift summary (consumed subtrees only)'
+            echo '```'
+            git -C abcd-file-sys/arkcompiler_runtime_core diff --stat \
+              "${{ steps.tag.outputs.pinned }}..${{ steps.tag.outputs.tag_sha }}" \
+              -- isa libpandafile libpandabase assembler templates 2>/dev/null \
+              || echo "(diff unavailable in shallow clone)"
+            echo '```'
+          } > drift-summary.md
+
+      - name: cargo build + test (outcome recorded, never gates the PR)
+        id: verify
+        if: steps.repin.outcome == 'success'
+        run: |
+          set +e
+          cargo build > build.log 2>&1; build_rc=$?
+          cargo test > test.log 2>&1; test_rc=$?
+          echo "build_rc=$build_rc" >> "$GITHUB_OUTPUT"
+          echo "test_rc=$test_rc" >> "$GITHUB_OUTPUT"
+          echo "build: exit $build_rc — test: exit $test_rc"
+          exit 0
+
+      - name: Create PR
+        if: steps.repin.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="${{ steps.repin.outputs.branch }}"
+          git push -u origin "$branch"
+          build_rc="${{ steps.verify.outputs.build_rc }}"
+          test_rc="${{ steps.verify.outputs.test_rc }}"
+          verdict="✅ build and test green — repin is free"
+          if [ "$build_rc" != "0" ] || [ "$test_rc" != "0" ]; then
+            verdict="❌ build ($build_rc) / test ($test_rc) — porting work required before merge"
+          fi
+          {
+            echo "Upstream tag radar: repin both submodules from"
+            echo "\`${{ steps.tag.outputs.pinned }}\` to **${{ steps.tag.outputs.latest }}**"
+            echo "(\`${{ steps.tag.outputs.tag_sha }}\`, the newest \`OpenHarmony-*\` tag by committer date)."
+            echo
+            echo "**Verdict: $verdict**"
+            echo
+            echo "This PR was opened automatically by vendor-sync.yml and is the"
+            echo "ONE standing PR for this tag: the radar will not open another"
+            echo "(the dup-check covers all PR states). Closing it unmerged is the"
+            echo "deliberate \"won't port\" decision for this tag; a newer upstream"
+            echo "tag will open a NEW PR. A red build here is the radar working as"
+            echo "designed — it documents the porting cost of this upstream version"
+            echo "(shim/bridge adaptation, never submodule edits)."
+            echo "Do not merge until green. See design/vendor-sync.md."
+            echo
+            cat drift-summary.md
+            echo
+            echo '[Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})'
+          } > pr-body.md
+          gh pr create \
+            --title "chore(sys): repin arkcompiler_runtime_core to ${{ steps.tag.outputs.latest }}" \
+            --body-file pr-body.md \
+            --label "vendor-bump" \
+            --head "$branch"
+
+      - name: Open/update standing issue on radar failure (label vendor-radar)
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Skip if a matching open issue already exists
-          existing=$(gh issue list --label "vendor-sync" --state open --limit 1 --json number -q '.[0].number')
+          existing=$(gh issue list --label "vendor-radar" --state open --limit 1 --json number -q '.[0].number')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" \
-              --body "**${{ matrix.crate }}** still failing as of $(date -u +%Y-%m-%dT%H:%M:%SZ). [Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+              --body "Tag radar still failing as of $(date -u +%Y-%m-%dT%H:%M:%SZ). [Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
             exit 0
           fi
           gh issue create \
-            --title "vendor-sync: ${{ matrix.crate }} upstream sync failed" \
-            --label "vendor-sync" \
+            --title "vendor-sync: upstream tag radar failed" \
+            --label "vendor-radar" \
             --body "$(cat <<'BODY'
-          Automated vendor sync for **${{ matrix.crate }}** encountered an error.
+          The weekly upstream tag radar (vendor-sync.yml) failed before it could
+          produce a verdict.
 
           **Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
 
           Possible causes:
-          - Upstream repo unreachable or files moved/deleted
-          - Upstream changes break the build
-          - Upstream changes break tests
+          - Upstream repo unreachable or the OpenHarmony-* tag scheme changed
+          - Submodule sparse-clone/fetch/checkout failure
+          - Submodule pins disagree (half-moved pin = repo-state bug, R1)
 
           Please investigate the run log above.
           BODY
