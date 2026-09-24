@@ -188,12 +188,9 @@ fn main() {
     // rerun-if-changed
     println!("cargo:rerun-if-changed=bridge/");
     println!("cargo:rerun-if-changed=templates/");
-    // Only the subtrees the bridge actually consumes — the full submodule is
-    // hundreds of MB and most of it (static_core, tests) never reaches us.
-    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/isa/");
-    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/libpandafile/");
-    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/libpandabase/");
-    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/platforms/unix/libpandabase/");
+    // The submodule is read-only between pin bumps (CI tag-radar updates
+    // only), so watch the whole thing — simpler and can't miss a path.
+    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/");
 }
 
 /// Run a Ruby ERB code-generation step.
