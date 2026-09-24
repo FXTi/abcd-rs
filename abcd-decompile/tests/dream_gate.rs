@@ -97,8 +97,11 @@ const HARD7: &[&str] = &[
     "SuspendGenerator(async-machinery)",
     "AsyncFunctionEnter",
     // Documented fallback families beyond the hard 7: template literals
-    // are cooked-only (IR gap G4) and AllocObject shape buffers had a
-    // registered fallback path — divergence is expected by construction.
+    // whose RAW strings are genuinely unrecoverable (G4 was resolved by
+    // d-P10 — raw survives in the file and now emits as backtick text —
+    // so this entry only buckets the honest cooked-only fallback) and
+    // AllocObject shape buffers had a registered fallback path —
+    // divergence is expected by construction.
     "GetTemplateObject",
 ];
 
@@ -198,16 +201,18 @@ fn generate() -> usize {
 /// the recorded acceptance floor. Docker is LOCAL-only
 /// (scripts/remote-test.sh).
 ///
-/// The histogram at d-P9 (2026-09-24): pass 1095 / decompile-bug 0 /
-/// es2abc-cant 0 / expected-fallback 54 / fixture-unsupported 0 (of
-/// 1149). d-P9 closed IR gap G2 at the decompile side: module-var slots
-/// resolve to their source binding names from file evidence (TDZ-guard
-/// names + stored DefineFunc/DefineClass names, demangling the 12.0.6+
-/// es2panda internal-name tags `#*#`/`#~@0=#`), so the 36 module
-/// fixtures' `export { … }` records reference module-scope `let`
-/// bindings that now exist; ModuleExportName positions keep reserved
-/// words verbatim (`export { Box as default }`). The d-P7 histogram was
-/// 1059/0/0/54/36. The floor guards regressions; raise it when the
+/// The histogram at d-P10 (2026-09-25): pass 1131 / decompile-bug 0 /
+/// es2abc-cant 0 / expected-fallback 18 / fixture-unsupported 0 (of
+/// 1149). d-P10 closed IR gap G4 at the decompile side: the
+/// `gettemplateobject` literal operand is the vendor pair
+/// `[rawStrings, cookedStrings]` (es2panda `compiler/base/literals.cpp`;
+/// runtime `ecmascript/template_string.cpp`), both lists resolve from
+/// the const-pool pair or the imperative `createemptyarray` +
+/// `definefieldbyvalue` build, and template nodes emit as backtick
+/// literals carrying the raw text verbatim (identity tag reconstructs
+/// the template object), so the 36 template/tagged-template fixtures
+/// recompile and behave identically. The d-P9 histogram was
+/// 1095/0/0/54/0. The floor guards regressions; raise it when the
 /// buckets improve.
 #[test]
 #[ignore = "requires exported GHCR corpus, python3, and LOCAL docker"]
@@ -242,8 +247,8 @@ fn dream_gate_oracle() {
         report.fixture_unsupported
     );
     assert!(
-        report.pass >= 1095,
-        "dream gate regression: pass {} < 1095 (the d-P9 acceptance floor)",
+        report.pass >= 1131,
+        "dream gate regression: pass {} < 1131 (the d-P10 acceptance floor)",
         report.pass
     );
 }

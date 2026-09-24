@@ -384,7 +384,7 @@ syntax). Totals: **T=31, N=49, H=7**.
 | 24 | `ArraySpread` | N | `...src` inside array literal / call args reconstruction (result = new index is machine plumbing). |
 | 25 | `CreateObjectWithExcludedKeys` | N | Rest destructuring `const {a, b, ...rest} = obj` reconstruction with the sibling excluded-key loads. |
 | 26 | `DefineGetterSetterByValue` | N | `get [k](){}`/`set [k](){}` accessor folding into literals/classes. |
-| 27 | `GetTemplateObject` | N | Template-literal reconstruction; the literal operand's const shape must yield cooked/raw strings (open question G4 — raw-string preservation unverified). Cache identity elided. |
+| 27 | `GetTemplateObject` | N | Template-literal reconstruction; the literal operand is the vendor pair `[rawStrings, cookedStrings]` (G4 RESOLVED by d-P10 — raw survives in the string table and emits as backtick text). Cache identity elided. |
 | 28 | `CreateIterResultObj` | N | Invisible in source — folds into for-of/manual-iterator patterns; `{value, done}` fallback otherwise. |
 | 29 | `GetIterator` | N | for-of reconstruction (with `IteratorNext`, loop shape). |
 | 30 | `GetAsyncIterator` | N | `for await…of` reconstruction. |
@@ -656,15 +656,28 @@ rule like any other).
   resolution — not a re-open request. If switch re-detection proves
   valuable beyond decompilation (it would not — no other consumer
   exists), revisit then.
-- **G4 — template-literal raw/cooked data.** `GetTemplateObject.literal`
-  is a runtime `ValueId`; the template strings live in the const pool
-  behind it. Whether the `Const::ArrayLiteral` shape preserves the
-  raw-vs-cooked distinction needed for faithful template emission is
-  **unverified** (needs vendor literal-format archaeology against the
-  corpus' template fixtures). If raw strings are not preserved,
-  emitted templates are cooked-only (semantically equal for the VM
-  gate, cosmetically lossy). Open question for d-P2, flagged here so
-  it is not discovered late.
+- **G4 — template-literal raw/cooked data. CLOSED decompile-side by
+  d-P10** (no IR change): the raw strings survive verbatim in the file
+  (the string table carries cooked and raw forms as adjacent entries —
+  e.g. `exports/corpus/12.0.2.0/local/template/baseline/reference.pa`
+  has cooked `a⏎b` at 0xa2 and raw `a\nb` at 0xa7). The vendor layout
+  is pinned by two citations: es2panda
+  `compiler/base/literals.cpp` `Literals::GetTemplateObject` builds
+  `rawArr` from each quasi's `element->Raw()` and `cookedArr` from
+  `element->Cooked()`, then `templateArg = [rawArr, cookedArr]` — raw
+  at index 0, cooked at index 1 — and the runtime
+  `ecmascript/template_string.cpp` `TemplateString::GetTemplateObject`
+  reads `templateLiteral[0]` as raw and `[1]` as cooked. es2abc emits
+  the pair imperatively (`createemptyarray` +
+  `callruntime.definefieldbyvalue` → IR `AllocArray` +
+  `StoreOwnPropDyn`), so the decompiler resolves both lists from that
+  build sequence (or the const-pool pair form) at Stage A. Emission is
+  a backtick literal with the raw text verbatim, identity-tagged
+  (`(_=>_)`…``) so the expression evaluates to the template object the
+  runtime would build (frozen, `.raw`-bearing; the `TemplateMap` cache
+  identity stays elided by design); multi-quasi templates use inert
+  `${0}` separators. Cooked-only emission remains as the documented
+  fallback when raw is genuinely absent. Dream gate 1131/0/0/18/0.
 - **G5 — doc drift (cosmetic).** ir-v0.2.md §4.1 says "≈70 variants
   after the v2-P0.5 growth"; `op.rs` now has **87**. The code is the
   source of truth; the design doc's count could be refreshed at the

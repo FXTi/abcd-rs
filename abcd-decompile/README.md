@@ -32,7 +32,7 @@ requests, then runs the UNCHANGED `scripts/compare-rewritten-corpus.py`
 behavior oracle and triages every non-pass fixture into exactly one
 bucket: `decompile-bug` / `es2abc-cant` / `expected-fallback` /
 `fixture-unsupported`. `dream_gate_oracle` asserts the acceptance floor
-(pass ≥ 1095).
+(pass ≥ 1131).
 
 **Acceptance histogram (2026-09-23)**: **951 pass** / 108 decompile-bug
 / 0 es2abc-cant / 54 expected-fallback / 36 fixture-unsupported (of
@@ -264,6 +264,58 @@ requires def and use in the same block (cross-block dominance-based
 inlining and region-tree consumption are d-P3). It does NOT couple to
 `abcd-analysis::control::regions` yet.
 
+## The d-P10 template gate (G4 closed at the decompile side)
+
+**d-P10 histogram (2026-09-25, floor now 1131)**: **1131 pass** / **0
+decompile-bug** / **0 es2abc-cant** / 18 expected-fallback / **0
+fixture-unsupported** (of 1149). All 36 template fixtures
+(`local/template` + `local/tagged-template`, 6 versions × 3 profiles
+each) moved expected-fallback → pass.
+
+**The cooked/raw encoding (vendor-pinned).** es2panda
+`compiler/base/literals.cpp` `Literals::GetTemplateObject` builds the
+literal operand imperatively: `rawArr` from each quasi's
+`element->Raw()`, `cookedArr` from `element->Cooked()`, then
+`templateArg = [rawArr, cookedArr]` — **raw at index 0, cooked at
+index 1** — via `createemptyarray` +
+`callruntime.definefieldbyvalue`. The runtime
+`ecmascript/template_string.cpp`
+`TemplateString::GetTemplateObject` reads `templateLiteral[0]` as the
+raw strings and `[1]` as the cooked strings, builds a frozen array of
+cooked with a frozen `.raw` array, and memoizes on the raw list
+(`TemplateMap`). Both string forms survive verbatim in the file's
+string table (e.g. the 12.0.2.0 template baseline carries cooked
+`a⏎b` at 0xa2 and raw `a\nb` at 0xa7 as adjacent entries).
+
+**Carry-through.** No lift/IR change: the raw strings were never
+dropped below the decompiler — the imperative build sequence is plain
+`AllocArray` + integer-keyed `StoreOwnPropDyn` ops whose string
+constants ARE the raw forms. What dropped raw was Stage A itself: the
+old `const_string_array_of` only recognized a const-pool array and
+kept one list. `recover.rs::template_strings_of` now resolves BOTH
+lists — from the const-pool pair form (`[[raw…],[cooked…]]`) or from
+the imperative build (pair-array slots 0/1, then each element array's
+integer-keyed own-stores, contiguity-checked) — through `Mov`
+passthroughs, honestly bailing to the cooked-only fallback when any
+element-array use is unaccounted for.
+
+**Emission.** A resolved node emits as a real backtick literal with
+the raw text verbatim, identity-tagged: `((_=>_)`a${0}b`)` evaluates
+to exactly the template object the runtime would build (frozen,
+`.raw`-bearing; cache identity elided by design), so the surrounding
+tag-call structure — `tag(tpl, x)`, `String.raw.call(String, tpl)` —
+emits unchanged and behaves identically. Multi-quasi templates get
+inert `${0}` separators (a no-substitution template literal has
+exactly one quasi; the junction is safe — only an exact `${` opens an
+interpolation). Cooked-only emission (`"…" /*template: raw absent,
+cooked-only*/`) remains the documented fallback when raw is genuinely
+absent, and `"" /*template unresolved (raw+cooked absent)*/` when
+neither list resolves — both still counted in the fallback histogram
+and bucketed by the dream-gate triage. Goldens:
+`tests/golden_template.rs` g01–g10 (plain, multi-part, escape
+sequences, tagged call, `String.raw` this-call shape, const-pool pair,
+both fallbacks, `$`-junction safety).
+
 ## Crate map (Stage A)
 
 - `src/expr.rs` — the internal expression tree (NOT final JS text):
@@ -273,7 +325,7 @@ inlining and region-tree consumption are d-P3). It does NOT couple to
   unary/binary/compare with precedence metadata for the Stage-C printer,
   closures/classes as **deferred references** to `FuncId`/member
   `ConstId`, `yield`/`await` nodes, object/array literal builders,
-  template objects (cooked-only, gap G4), iteration/generator/async
+  template objects (raw+cooked resolved, G4 closed by d-P10), iteration/generator/async
   plumbing nodes, and the loud `Fallback` node.
 - `src/recover.rs` — the §4.1 algorithm: per-block def-use walk on the
   `abcd-analysis` `UseDefChains` commodity. Inline iff single use
