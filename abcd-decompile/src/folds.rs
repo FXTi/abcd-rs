@@ -3532,6 +3532,9 @@ fn funcobj_uses_are_machinery(nodes: &[SNode], genobj: ValueId) -> bool {
 struct AsyncSite {
     /// Run leaf indices of the machinery leaves (descending).
     remove: Vec<usize>,
+    /// Offset of the dispatch node from the machinery run (1 + the
+    /// number of intervening phi-partition runs).
+    dispatch_off: usize,
     /// The awaited value expression (moved into the folded `await`).
     awaited: Expr,
     /// The resume temp binding, when the `ResumeGenerator` result was
@@ -3649,14 +3652,29 @@ fn match_await_site(nodes: &[SNode], i: usize, cx: &mut AsyncMachineCx) -> Optio
         }
         _ => return None,
     }
+    // The dispatch follows, separated from the machinery run by any
+    // number of phi-partition runs (the structurer splits block-end phi
+    // materializations into their own `Stmts` runs).
+    let mut dispatch_off = 1;
+    while matches!(
+        nodes.get(i + dispatch_off),
+        Some(SNode::Stmts(run))
+            if !run.is_empty()
+                && run
+                    .iter()
+                    .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })))
+    ) {
+        dispatch_off += 1;
+    }
     let continuation = match_async_dispatch(
-        nodes.get(i + 1)?,
+        nodes.get(i + dispatch_off)?,
         mode,
         resume.as_ref().map(|(r, _)| *r),
         cx,
     )?;
     Some(AsyncSite {
         remove,
+        dispatch_off,
         awaited,
         resume,
         continuation,
@@ -3744,33 +3762,58 @@ fn match_async_dispatch(
     Some(cont.clone())
 }
 
-/// The THROW arm: exactly `throw <resume>;` (+ the dead `Unreachable`
-/// and any dead loop-bookkeeping `break`s), where `<resume>` is the
-/// matched resume temp — or the inlined `ResumeGenerator` when the
+/// The THROW arm: exactly `throw <resume>;` (+ the dead `Unreachable`,
+/// any dead loop-bookkeeping `break`s, and any phi-partition runs — the
+/// es2abc try-region bookkeeping assigns, which the parent block's own
+/// assigns replicate for the folded await's throw), where `<resume>` is
+/// the matched resume temp — or the inlined `ResumeGenerator` when the
 /// result was never declared.
 fn check_async_throw_arm(arm: &[SNode], resume: Option<ValueId>, genobj: ValueId) -> Option<()> {
-    let [SNode::Stmts(run), rest @ ..] = arm else {
-        return None;
-    };
-    if !rest.iter().all(|n| matches!(n, SNode::Break { .. })) {
-        return None;
-    }
-    match run.as_slice() {
-        [Leaf::Raw(Stmt::Throw(value))] | [Leaf::Raw(Stmt::Throw(value)), Leaf::Raw(Stmt::Unreachable)] => {
-            match resume {
-                Some(r) => (temp_value(value) == Some(r)).then_some(()),
-                None => matches!(
-                    value,
-                    Expr::GeneratorDriver {
-                        resume: true,
-                        genobj: rg,
-                    } if temp_value(rg) == Some(genobj)
-                )
-                .then_some(()),
+    let mut found = false;
+    for n in arm {
+        match n {
+            // Phi partitions are block-end bookkeeping — skip.
+            SNode::Stmts(run)
+                if run
+                    .iter()
+                    .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. }))) => {}
+            SNode::Stmts(run) => {
+                if found {
+                    return None;
+                }
+                // (A mixed run with interleaved phi assigns is fine
+                // too.)
+                let significant: Vec<&Leaf> = run
+                    .iter()
+                    .filter(|l| !matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })))
+                    .collect();
+                match significant.as_slice() {
+                    [Leaf::Raw(Stmt::Throw(value))]
+                    | [Leaf::Raw(Stmt::Throw(value)), Leaf::Raw(Stmt::Unreachable)] => {
+                        let ok = match resume {
+                            Some(r) => temp_value(value) == Some(r),
+                            None => matches!(
+                                value,
+                                Expr::GeneratorDriver {
+                                    resume: true,
+                                    genobj: rg,
+                                } if temp_value(rg) == Some(genobj)
+                            ),
+                        };
+                        if !ok {
+                            return None;
+                        }
+                        found = true;
+                    }
+                    _ => return None,
+                }
             }
+            // Dead loop-bookkeeping breaks after the diverging throw.
+            SNode::Break { .. } => {}
+            _ => return None,
         }
-        _ => None,
     }
+    found.then_some(())
 }
 
 /// The rewrite pass: children first (inner sites fold before the
@@ -3848,7 +3891,10 @@ fn async_machine_seq(nodes: &mut Vec<SNode>, cx: &mut AsyncMachineCx, stats: &mu
                     _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
                 }
                 stats.async_machine_sites += 1;
-                nodes.splice(i + 1..i + 2, site.continuation);
+                nodes.splice(
+                    i + site.dispatch_off..i + site.dispatch_off + 1,
+                    site.continuation,
+                );
                 i += 1;
             }
             None => i += 1,

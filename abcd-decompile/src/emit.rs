@@ -2489,5 +2489,7 @@ fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.gen_driver_entry += b.gen_driver_entry;
     a.gen_driver_bound += b.gen_driver_bound;
     a.async_driver += b.async_driver;
+    a.async_machine_sites += b.async_machine_sites;
+    a.async_machine_bound += b.async_machine_bound;
     a
 }
