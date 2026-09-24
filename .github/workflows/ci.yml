@@ -21,35 +21,16 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
-  vendor-check:
-    name: Vendor integrity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.2'
-      - run: ruby abcd-isa-sys/vendor-sync.rb --check-local
-      - run: ruby abcd-file-sys/vendor-sync.rb --check-local
-
   common-files-consistency:
     name: Common files consistency
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify cross-crate common files are identical
+      - name: Verify cross-crate shim files are identical
         run: |
           fail=0
-          # vendor-sync.rb must be identical across crates
-          scripts=$(ls */vendor-sync.rb 2>/dev/null)
-          if [ -n "$scripts" ]; then
-            first=$(echo "$scripts" | head -1)
-            for f in $scripts; do
-              [ "$f" = "$first" ] && continue
-              diff -q "$first" "$f" || { diff -u "$first" "$f"; fail=1; }
-            done
-          fi
-          # Common shim files must be identical across crates
+          # The bridge shims are OURS and deliberately duplicated across the
+          # two -sys crates — they must stay byte-identical.
           for f in platform_compat.h securec.h utils/logger.h; do
             a="abcd-file-sys/bridge/shim/$f"
             b="abcd-isa-sys/bridge/shim/$f"
@@ -62,12 +43,14 @@ jobs:
   build:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: [fmt, vendor-check, common-files-consistency]
+    needs: [fmt, common-files-consistency]
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
@@ -81,11 +64,13 @@ jobs:
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
-    needs: [fmt, vendor-check, common-files-consistency]
+    needs: [fmt, common-files-consistency]
     env:
       CXX: clang++
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
