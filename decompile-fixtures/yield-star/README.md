@@ -44,5 +44,5 @@ Node/ark behavior evidence (identical on both, `print` shimmed to
 - delegate-gen: `1,2,inner-done`
 - delegate-array: `0,10,20,30,99`
 - delegate-async: `1,2,inner-done`
-- delegate-throw: `before,caught:delegated-boom,after`
+- delegate-throw: `before,caught:delegated-boom`
 - manual-iterator: `1,2,3`
