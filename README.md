@@ -84,5 +84,4 @@ live under `abcd-isa-sys/arkcompiler_runtime_core/` and
 
 Apache-2.0. The `arkcompiler_runtime_core` submodules pull in
 [OpenHarmony arkcompiler runtime_core](https://github.com/openharmony/arkcompiler_runtime_core)
-(also Apache-2.0), pinned to a proven upstream commit and tracked by a weekly
-CI tag radar.
+(also Apache-2.0), pinned to a proven upstream commit.

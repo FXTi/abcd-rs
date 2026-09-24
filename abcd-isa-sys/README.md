@@ -39,7 +39,7 @@ abcd-isa-sys/
 The upstream code is a **git submodule** pinned to a proven commit — never
 edit inside it; local adaptation lives in `bridge/shim/` only. After cloning,
 run `git submodule update --init`. See `../design/vendor-sync.md` for the
-pin policy and the weekly upstream tag radar.
+pin policy and the (planned) upstream tag radar.
 
 ## Build Pipeline Overview
 

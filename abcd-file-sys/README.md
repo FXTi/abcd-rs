@@ -51,7 +51,7 @@ is a **git submodule at the crate root** (`abcd-file-sys/arkcompiler_runtime_cor
 pinned to a proven upstream commit. **Never edit inside the submodule** —
 local adaptation lives in `bridge/shim/` only. After cloning, run
 `git submodule update --init`. See `../design/vendor-sync.md` for the pin
-policy and the weekly upstream tag radar.
+policy and the (planned) upstream tag radar.
 
 Missing transitive includes that the upstream build provides are injected via
 `vendor_fixups.h` (force-included with `-include` / `/FI`), avoiding any

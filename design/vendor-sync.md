@@ -40,9 +40,13 @@ With no copied files, the old `vendor-check` job dissolved. What remains:
   the two `-sys` crates — they must stay byte-identical or CI goes red.
 - Every CI checkout that builds uses `submodules: true`.
 
-## Tag radar (automation)
+## Tag radar (planned automation — not yet landed)
 
-`vendor-sync.yml` runs weekly (Monday 00:00 UTC, or on manual dispatch):
+The ruby-based `vendor-sync.rb` daily sync is gone with the copied subsets.
+The replacement — an upstream **tag radar** in `vendor-sync.yml` — is
+plan-first: a CI-rework plan doc will spec it before implementation, and the
+workflow's cron is **currently disabled** (see the comment in
+`.github/workflows/vendor-sync.yml`). The agreed design direction:
 
 1. `git ls-remote --tags` upstream → keep only
    `OpenHarmony-v<numbers>-(BetaN|LTS|Release)` tags;
@@ -58,7 +62,7 @@ A **red** bump PR is the radar working as designed — e.g. v7.0-Release
 fails to build because of the legacy-`libpandafile` drift above. The PR
 documents the porting cost; merging requires making it green (shim/bridge
 adaptation, never submodule edits). This replaces the old daily
-copy-and-check flow.
+copy-and-check flow once the CI-rework plan lands.
 
 ## Updating the pin manually
 

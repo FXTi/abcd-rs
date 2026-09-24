@@ -19,11 +19,11 @@ The second generation distributes via **crates.io** (every crate's `Cargo.toml` 
 
 ## vendor-sync automation
 
-See vendor-sync.md: a weekly tag radar polls upstream `OpenHarmony-*` tags
-(version-aware latest), compares with the pinned submodule commit, and on
-drift opens a `vendor-bump` PR that repins both submodules — with the
-build/test outcome recorded in the PR body. A red PR documents the porting
-cost; merging requires making it green. Checkouts use `submodules: true`.
+The ruby daily sync is retired with the submodule migration; the replacement
+upstream tag radar is plan-first (a CI-rework plan doc will spec it before
+implementation — see vendor-sync.md for the agreed direction). The
+`vendor-sync.yml` cron is disabled until that plan lands. Build-bearing
+checkouts use `submodules: true`.
 
 ## Test conventions
 
