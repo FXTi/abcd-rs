@@ -162,7 +162,9 @@ fn yield_star_node_async_driver_rejection_probe() {
         decompiled("delegate-async.abc")
     );
     let (ok, stdout, stderr) = run_node(&dir, "delegate-async-reject.js", &body);
-    eprintln!("NODE-EVIDENCE delegate-async rejection probe exit={ok} stdout={stdout:?} stderr={stderr:?}");
+    eprintln!(
+        "NODE-EVIDENCE delegate-async rejection probe exit={ok} stdout={stdout:?} stderr={stderr:?}"
+    );
     assert!(
         ok,
         "node run delegate-async rejection probe failed: {stderr}"

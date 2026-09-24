@@ -2571,7 +2571,10 @@ fn s40_dead_loop_exit_throw_kept_live_break() {
     let before = nodes.clone();
     let mut stats = abcd_decompile::folds::FoldStats::default();
     abcd_decompile::folds::fold(&mut nodes, &mut stats);
-    assert_eq!(stats.dead_exit_throw, 0, "a live exit break keeps the block");
+    assert_eq!(
+        stats.dead_exit_throw, 0,
+        "a live exit break keeps the block"
+    );
     assert_eq!(nodes, before, "the residue must stay: {nodes:#?}");
 }
 
