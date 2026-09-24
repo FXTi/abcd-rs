@@ -11,7 +11,12 @@ Sources (`src/*.js`, hand-written, Apache-2.0 project origin):
 - `delegate-array.js` — sync `yield*` over a plain iterable (array);
   the delegation result is unused.
 - `delegate-async.js` — `async function*` with `yield*` (for-await
-  consumption end); the delegate's return value is used.
+  consumption end); the delegate's return value is used. The module's
+  own plain-async `main` (a `for await` driver over `outer()`) is the
+  N70 coverage hole: machinery-folded to a working while-loop driver at
+  d-P16, folded to the literal `for await (const value of v10)` source
+  form at d-P17 (the dead loop-exit dispatch throw swept under a
+  whole-node unreachability proof).
 - `delegate-throw.js` — delegation whose delegate THROWS; the error
   propagates through the delegation to the consumer's try/catch.
   (The consumer loop's try-spanning-a-loop also exercises the
