@@ -1611,23 +1611,34 @@ fn select_inst(
                     .into(),
             });
         }
-        Op::AwaitUncaught { value } => {
-            let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
-            codes.push(Bytecode::Asyncfunctionawaituncaught(val_r));
+        Op::AwaitUncaught { funcobj, value } => {
+            // Vendor `asyncfunctionawaituncaught v:in:top,
+            // acc: inout:top` (isa.yaml:1311-1314): v0 is the async
+            // function object, the acc carries the awaited value (and
+            // receives the result).
+            let regs =
+                materialize_operands(tracker, func_id, &[*funcobj], Some(*value), alloc, codes)?;
+            codes.push(Bytecode::Asyncfunctionawaituncaught(regs[0]));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         Op::AsyncFunctionEnter => {
             codes.push(Bytecode::Asyncfunctionenter);
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
-        Op::AsyncResolve { value } => {
-            let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
-            codes.push(Bytecode::Asyncfunctionresolve(val_r));
+        Op::AsyncResolve { funcobj, value } => {
+            // Vendor `asyncfunctionresolve v:in:top, acc: inout:top`
+            // (isa.yaml:1413-1416): v0 = funcobj, acc = resolution value.
+            let regs =
+                materialize_operands(tracker, func_id, &[*funcobj], Some(*value), alloc, codes)?;
+            codes.push(Bytecode::Asyncfunctionresolve(regs[0]));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
-        Op::AsyncReject { value } => {
-            let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
-            codes.push(Bytecode::Asyncfunctionreject(val_r));
+        Op::AsyncReject { funcobj, value } => {
+            // Vendor `asyncfunctionreject v:in:top, acc: inout:top`
+            // (isa.yaml:1422-1425): v0 = funcobj, acc = rejection reason.
+            let regs =
+                materialize_operands(tracker, func_id, &[*funcobj], Some(*value), alloc, codes)?;
+            codes.push(Bytecode::Asyncfunctionreject(regs[0]));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         Op::CreateIterResultObj { value, done } => {

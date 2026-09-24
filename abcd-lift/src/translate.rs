@@ -1439,19 +1439,37 @@ pub fn translate_bytecode(
             let v = fx.emit_val(block, Op::AsyncFunctionEnter, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::Asyncfunctionawaituncaught(val_reg) => {
-            let value = fx.read_reg(*val_reg, block);
-            let v = fx.emit_val(block, Op::AwaitUncaught { value }, loc);
+        Bytecode::Asyncfunctionawaituncaught(func_reg) => {
+            // Vendor `asyncfunctionawaituncaught v:in:top,
+            // acc: inout:top` (isa.yaml:1311-1314): the register operand
+            // is the async function object, the ACCUMULATOR carries the
+            // awaited value; the result goes back to acc
+            // (interpreter-inl.cpp:5357-5366
+            // HANDLE_OPCODE(ASYNCFUNCTIONAWAITUNCAUGHT_V8):
+            // `value = GET_ACC()`).
+            let funcobj = fx.read_reg(*func_reg, block);
+            let value = fx.read_acc(block);
+            let v = fx.emit_val(block, Op::AwaitUncaught { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::Asyncfunctionresolve(val_reg) => {
-            let value = fx.read_reg(*val_reg, block);
-            let v = fx.emit_val(block, Op::AsyncResolve { value }, loc);
+        Bytecode::Asyncfunctionresolve(func_reg) => {
+            // Vendor `asyncfunctionresolve v:in:top, acc: inout:top`
+            // (isa.yaml:1413-1416; interpreter-inl.cpp:6577-6589
+            // HANDLE_OPCODE(ASYNCFUNCTIONRESOLVE_V8)): v0 = async
+            // function object, acc = resolution value, result → acc.
+            let funcobj = fx.read_reg(*func_reg, block);
+            let value = fx.read_acc(block);
+            let v = fx.emit_val(block, Op::AsyncResolve { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::Asyncfunctionreject(val_reg) => {
-            let value = fx.read_reg(*val_reg, block);
-            let v = fx.emit_val(block, Op::AsyncReject { value }, loc);
+        Bytecode::Asyncfunctionreject(func_reg) => {
+            // Vendor `asyncfunctionreject v:in:top, acc: inout:top`
+            // (isa.yaml:1422-1425; interpreter-inl.cpp:6605-6617
+            // HANDLE_OPCODE(ASYNCFUNCTIONREJECT_V8)): v0 = async
+            // function object, acc = rejection reason, result → acc.
+            let funcobj = fx.read_reg(*func_reg, block);
+            let value = fx.read_acc(block);
+            let v = fx.emit_val(block, Op::AsyncReject { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Asyncgeneratorresolve(val_reg, done_reg, _next_reg) => {
@@ -1462,9 +1480,16 @@ pub fn translate_bytecode(
             let v = fx.emit_val(block, Op::CreateIterResultObj { value, done }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::Asyncgeneratorreject(val_reg) => {
-            let value = fx.read_reg(*val_reg, block);
-            let v = fx.emit_val(block, Op::AsyncReject { value }, loc);
+        Bytecode::Asyncgeneratorreject(gen_reg) => {
+            // Vendor `asyncgeneratorreject v:in:top, acc: inout:top`
+            // (interpreter-inl.cpp:3226-3239
+            // HANDLE_OPCODE(ASYNCGENERATORREJECT_V8)): v0 = async
+            // GENERATOR object, acc = rejection reason, result → acc —
+            // the same acc-value shape as asyncfunctionreject (v0.1
+            // folds both to AsyncReject; parity kept).
+            let funcobj = fx.read_reg(*gen_reg, block);
+            let value = fx.read_acc(block);
+            let v = fx.emit_val(block, Op::AsyncReject { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::Createiterresultobj(val_reg, done_reg) => {
@@ -2084,11 +2109,12 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedAsyncfunctionawaituncaught(async_reg, val_reg) => {
-            // v0.1 reads (and discards) the async object register —
-            // the read is preserved: it drives phi materialization.
-            let _async_obj = fx.read_reg(*async_reg, block);
+            // Vendor: v1 = the async function object, v2 = the awaited
+            // value (interpreter-inl.cpp:5369-5381
+            // HANDLE_OPCODE(DEPRECATED_ASYNCFUNCTIONAWAITUNCAUGHT_PREF_V8_V8)).
+            let funcobj = fx.read_reg(*async_reg, block);
             let value = fx.read_reg(*val_reg, block);
-            let v = fx.emit_val(block, Op::AwaitUncaught { value }, loc);
+            let v = fx.emit_val(block, Op::AwaitUncaught { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCopydataproperties(dst_reg, src_reg) => {
@@ -2134,16 +2160,24 @@ pub fn translate_bytecode(
             );
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedAsyncfunctionresolve(async_reg, val_reg, _can_suspend_reg) => {
-            let _async_obj = fx.read_reg(*async_reg, block);
+        Bytecode::DeprecatedAsyncfunctionresolve(async_reg, _mid_reg, val_reg) => {
+            // Vendor: v1 = the async function object, v3 = the
+            // resolution value; the MIDDLE register is read only for
+            // the log line (interpreter-inl.cpp:6590-6603
+            // HANDLE_OPCODE(DEPRECATED_ASYNCFUNCTIONRESOLVE_PREF_V8_V8_V8)).
+            let funcobj = fx.read_reg(*async_reg, block);
             let value = fx.read_reg(*val_reg, block);
-            let v = fx.emit_val(block, Op::AsyncResolve { value }, loc);
+            let v = fx.emit_val(block, Op::AsyncResolve { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedAsyncfunctionreject(async_reg, val_reg, _can_suspend_reg) => {
-            let _async_obj = fx.read_reg(*async_reg, block);
+        Bytecode::DeprecatedAsyncfunctionreject(async_reg, _mid_reg, val_reg) => {
+            // Vendor: v1 = the async function object, v3 = the
+            // rejection reason; the MIDDLE register is read only for
+            // the log line (interpreter-inl.cpp:6618-6631
+            // HANDLE_OPCODE(DEPRECATED_ASYNCFUNCTIONREJECT_PREF_V8_V8_V8)).
+            let funcobj = fx.read_reg(*async_reg, block);
             let value = fx.read_reg(*val_reg, block);
-            let v = fx.emit_val(block, Op::AsyncReject { value }, loc);
+            let v = fx.emit_val(block, Op::AsyncReject { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedStlexvar(level, slot, val_reg) => {
@@ -2214,9 +2248,12 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedAsyncgeneratorreject(gen_reg, val_reg) => {
-            let _gen = fx.read_reg(*gen_reg, block);
+            // Vendor: v1 = the async generator object, v2 = the
+            // rejection reason (interpreter-inl.cpp:3240-3254
+            // HANDLE_OPCODE(DEPRECATED_ASYNCGENERATORREJECT_PREF_V8_V8)).
+            let funcobj = fx.read_reg(*gen_reg, block);
             let value = fx.read_reg(*val_reg, block);
-            let v = fx.emit_val(block, Op::AsyncReject { value }, loc);
+            let v = fx.emit_val(block, Op::AsyncReject { funcobj, value }, loc);
             fx.write_acc(block, v);
         }
     }

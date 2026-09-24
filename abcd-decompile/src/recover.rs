@@ -1700,15 +1700,18 @@ impl<'m> Recover<'m> {
                 value: Box::new(self.expr_of(*value)),
                 uncaught: false,
             },
-            Op::AwaitUncaught { value } => Expr::Await {
+            Op::AwaitUncaught { value, .. } => Expr::Await {
+                // N68/G6: `value` is the accumulator-carried awaited
+                // value (the funcobj register operand is machinery,
+                // folded away with the async driver).
                 value: Box::new(self.expr_of(*value)),
                 uncaught: true,
             },
-            Op::AsyncResolve { value } => Expr::AsyncDriver {
+            Op::AsyncResolve { value, .. } => Expr::AsyncDriver {
                 resolve: true,
                 value: Box::new(self.expr_of(*value)),
             },
-            Op::AsyncReject { value } => Expr::AsyncDriver {
+            Op::AsyncReject { value, .. } => Expr::AsyncDriver {
                 resolve: false,
                 value: Box::new(self.expr_of(*value)),
             },

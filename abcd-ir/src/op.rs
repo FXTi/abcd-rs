@@ -834,26 +834,45 @@ pub enum Op {
         /// The awaited value.
         value: ValueId,
     },
-    /// Vendor `asyncfunctionawaituncaught v:in:top, acc: out:top`
-    /// (isa.yaml) — the es2abc await form: await `value` without the
-    /// caught-completion wrapper. Distinct from [`Op::Await`]; lift
-    /// emits this op for the (deprecated.)asyncfunctionawaituncaught
-    /// bytecodes.
+    /// Vendor `asyncfunctionawaituncaught v:in:top, acc: inout:top`
+    /// (isa.yaml:1311-1314; runtime interpreter-inl.cpp
+    /// `HANDLE_OPCODE(ASYNCFUNCTIONAWAITUNCAUGHT_V8)` :5357-5366) — the
+    /// es2abc await form: await `value` without the caught-completion
+    /// wrapper. The REGISTER operand is the async function object; the
+    /// ACCUMULATOR carries the awaited value in and receives the result.
+    /// Distinct from [`Op::Await`]; lift emits this op for the
+    /// (deprecated.)asyncfunctionawaituncaught bytecodes.
     AwaitUncaught {
-        /// The awaited value.
+        /// The async function object (the v0 register operand).
+        funcobj: ValueId,
+        /// The awaited value (the accumulator input).
         value: ValueId,
     },
     /// Vendor `asyncfunctionenter` (isa.yaml, `acc: out:top`): enter an
     /// async function, yielding the async context/promise value.
     AsyncFunctionEnter,
-    /// Resolve the async function's promise.
+    /// Vendor `asyncfunctionresolve v:in:top, acc: inout:top`
+    /// (isa.yaml:1413-1416; interpreter-inl.cpp
+    /// `HANDLE_OPCODE(ASYNCFUNCTIONRESOLVE_V8)` :6577-6589) — resolve the
+    /// async function's promise. The register operand is the async
+    /// function object; the accumulator carries the resolution value in
+    /// and receives the result.
     AsyncResolve {
-        /// The resolution value.
+        /// The async function object (the v0 register operand).
+        funcobj: ValueId,
+        /// The resolution value (the accumulator input).
         value: ValueId,
     },
-    /// Reject the async function's promise.
+    /// Vendor `asyncfunctionreject v:in:top, acc: inout:top`
+    /// (isa.yaml:1422-1425; interpreter-inl.cpp
+    /// `HANDLE_OPCODE(ASYNCFUNCTIONREJECT_V8)` :6605-6617) — reject the
+    /// async function's promise. The register operand is the async
+    /// function object; the accumulator carries the rejection reason in
+    /// and receives the result.
     AsyncReject {
-        /// The rejection reason.
+        /// The async function object (the v0 register operand).
+        funcobj: ValueId,
+        /// The rejection reason (the accumulator input).
         value: ValueId,
     },
 
@@ -1034,10 +1053,10 @@ impl Op {
             | ThrowConstAssignment { name: value }
             | ThrowIfNotObject { value }
             | ThrowUndefinedIfHoleWithName { value, .. }
-            | Await { value }
-            | AwaitUncaught { value }
-            | AsyncResolve { value }
-            | AsyncReject { value } => vec![*value],
+            | Await { value } => vec![*value],
+            AwaitUncaught { funcobj, value }
+            | AsyncResolve { funcobj, value }
+            | AsyncReject { funcobj, value } => vec![*funcobj, *value],
             ThrowUndefinedIfHole { name, value } => vec![*name, *value],
             CreateGenerator { func } => vec![*func],
             SuspendGenerator { genobj, value } => vec![*genobj, *value],
@@ -1167,10 +1186,10 @@ impl Op {
             | ThrowConstAssignment { name: value }
             | ThrowIfNotObject { value }
             | ThrowUndefinedIfHoleWithName { value, .. }
-            | Await { value }
-            | AwaitUncaught { value }
-            | AsyncResolve { value }
-            | AsyncReject { value } => vec![value],
+            | Await { value } => vec![value],
+            AwaitUncaught { funcobj, value }
+            | AsyncResolve { funcobj, value }
+            | AsyncReject { funcobj, value } => vec![funcobj, value],
             ThrowUndefinedIfHole { name, value } => vec![name, value],
             CreateGenerator { func } => vec![func],
             SuspendGenerator { genobj, value } => vec![genobj, value],
@@ -1279,12 +1298,9 @@ impl Op {
             | ResumeGenerator { .. }
             | GetResumeMode { .. }
             | Await { .. }
-            | AwaitUncaught { .. }
             | GetAsyncIterator { .. }
             | GetTemplateObject { .. }
-            | ThrowUndefinedIfHoleWithName { .. }
-            | AsyncResolve { .. }
-            | AsyncReject { .. } => Arity::Exact(1),
+            | ThrowUndefinedIfHoleWithName { .. } => Arity::Exact(1),
             LoadConst(_)
             | AllocObject { .. }
             | AllocArray { .. }
@@ -1320,7 +1336,10 @@ impl Op {
             | LoadPropIdx { .. }
             | LoadPropDyn { .. }
             | ThrowUndefinedIfHole { .. }
-            | SuspendGenerator { .. } => Arity::Exact(2),
+            | SuspendGenerator { .. }
+            | AwaitUncaught { .. }
+            | AsyncResolve { .. }
+            | AsyncReject { .. } => Arity::Exact(2),
             StorePropIdx { .. } | StorePropDyn { .. } => Arity::Exact(3),
             StoreOwnPropDyn { .. } | StoreOwnPropIdx { .. } => Arity::Exact(3),
             ArraySpread { .. } => Arity::Exact(3),
@@ -1446,7 +1465,10 @@ mod tests {
             Op::LoadGlobalObject,
             Op::LoadFunction,
             Op::AsyncFunctionEnter,
-            Op::AwaitUncaught { value: v() },
+            Op::AwaitUncaught {
+                funcobj: v(),
+                value: v(),
+            },
             Op::ThrowUndefinedIfHoleWithName {
                 name: s,
                 value: v(),

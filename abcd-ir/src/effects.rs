@@ -692,7 +692,11 @@ mod tests {
         );
 
         // The async forms.
-        let e = Op::AwaitUncaught { value: v }.effects();
+        let e = Op::AwaitUncaught {
+            funcobj: v,
+            value: v,
+        }
+        .effects();
         assert!(e.may_throw);
         assert_eq!(e.may_call, CallEffect::UnknownCallee);
         assert!(Op::AsyncFunctionEnter.effects().is_pure());

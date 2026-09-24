@@ -69,10 +69,16 @@ fn find_op(module: &abcd_ir::Module, pred: impl Fn(&Op) -> bool) -> Op {
 /// be a numeric `LoadConst`).
 fn const_of(module: &abcd_ir::Module, v: ValueId) -> f64 {
     let ValueDef::Inst(iid) = module.values[v.index()].def else {
-        panic!("expected an instruction-defined value, got {:?}", module.values[v.index()].def)
+        panic!(
+            "expected an instruction-defined value, got {:?}",
+            module.values[v.index()].def
+        )
     };
     let Op::LoadConst(cid) = &module.inst(iid).expect("inst").op else {
-        panic!("expected LoadConst, got {:?}", module.inst(iid).expect("inst").op);
+        panic!(
+            "expected LoadConst, got {:?}",
+            module.inst(iid).expect("inst").op
+        );
     };
     match module.consts.get(*cid).expect("const") {
         Const::Number(bits) => f64::from_bits(*bits),
@@ -129,7 +135,8 @@ const VALUE: f64 = 9.0;
 #[test]
 fn awaituncaught_reads_acc_as_value_and_reg_as_funcobj() {
     let module = modern_body(Bytecode::Asyncfunctionawaituncaught);
-    let Op::AwaitUncaught { value } = find_op(&module, |op| matches!(op, Op::AwaitUncaught { .. }))
+    let Op::AwaitUncaught { funcobj, value } =
+        find_op(&module, |op| matches!(op, Op::AwaitUncaught { .. }))
     else {
         panic!("expected Op::AwaitUncaught");
     };
@@ -138,26 +145,51 @@ fn awaituncaught_reads_acc_as_value_and_reg_as_funcobj() {
         VALUE,
         "the value operand is the ACCUMULATOR (isa.yaml:1311-1314 acc: inout:top)"
     );
+    assert_eq!(
+        const_of(&module, funcobj),
+        FUNC,
+        "the register operand is the async function object (interpreter-inl.cpp:5360)"
+    );
 }
 
 #[test]
 fn asyncfunctionresolve_reads_acc_as_value_and_reg_as_funcobj() {
     let module = modern_body(Bytecode::Asyncfunctionresolve);
-    let Op::AsyncResolve { value } = find_op(&module, |op| matches!(op, Op::AsyncResolve { .. }))
+    let Op::AsyncResolve { funcobj, value } =
+        find_op(&module, |op| matches!(op, Op::AsyncResolve { .. }))
     else {
         panic!("expected Op::AsyncResolve");
     };
-    assert_eq!(const_of(&module, value), VALUE, "value = acc (interpreter-inl.cpp:6583)");
+    assert_eq!(
+        const_of(&module, value),
+        VALUE,
+        "value = acc (interpreter-inl.cpp:6583)"
+    );
+    assert_eq!(
+        const_of(&module, funcobj),
+        FUNC,
+        "funcobj = v0 (interpreter-inl.cpp:6582)"
+    );
 }
 
 #[test]
 fn asyncfunctionreject_reads_acc_as_value_and_reg_as_funcobj() {
     let module = modern_body(Bytecode::Asyncfunctionreject);
-    let Op::AsyncReject { value } = find_op(&module, |op| matches!(op, Op::AsyncReject { .. }))
+    let Op::AsyncReject { funcobj, value } =
+        find_op(&module, |op| matches!(op, Op::AsyncReject { .. }))
     else {
         panic!("expected Op::AsyncReject");
     };
-    assert_eq!(const_of(&module, value), VALUE, "value = acc (interpreter-inl.cpp:6611)");
+    assert_eq!(
+        const_of(&module, value),
+        VALUE,
+        "value = acc (interpreter-inl.cpp:6611)"
+    );
+    assert_eq!(
+        const_of(&module, funcobj),
+        FUNC,
+        "funcobj = v0 (interpreter-inl.cpp:6610)"
+    );
 }
 
 #[test]
@@ -175,33 +207,63 @@ fn deprecated_awaituncaught_explicit_regs() {
         4,
     );
     let module = lift_file(&file).expect("lift");
-    let Op::AwaitUncaught { value } = find_op(&module, |op| matches!(op, Op::AwaitUncaught { .. }))
+    let Op::AwaitUncaught { funcobj, value } =
+        find_op(&module, |op| matches!(op, Op::AwaitUncaught { .. }))
     else {
         panic!("expected Op::AwaitUncaught");
     };
-    assert_eq!(const_of(&module, value), VALUE, "value = v2 (interpreter-inl.cpp:5375)");
+    assert_eq!(
+        const_of(&module, value),
+        VALUE,
+        "value = v2 (interpreter-inl.cpp:5375)"
+    );
+    assert_eq!(
+        const_of(&module, funcobj),
+        FUNC,
+        "funcobj = v1 (interpreter-inl.cpp:5374)"
+    );
 }
 
 #[test]
-fn deprecated_resolve_value_is_the_LAST_register() {
+fn deprecated_resolve_value_is_the_last_register() {
     // Vendor reads funcobj = FIRST reg, value = THIRD reg; the middle
     // register is read only for the log line
     // (interpreter-inl.cpp:6590-6603).
     let module = deprecated3_body(Bytecode::DeprecatedAsyncfunctionresolve);
-    let Op::AsyncResolve { value } = find_op(&module, |op| matches!(op, Op::AsyncResolve { .. }))
+    let Op::AsyncResolve { funcobj, value } =
+        find_op(&module, |op| matches!(op, Op::AsyncResolve { .. }))
     else {
         panic!("expected Op::AsyncResolve");
     };
-    assert_eq!(const_of(&module, value), VALUE, "value = v3, NOT the middle register");
+    assert_eq!(
+        const_of(&module, value),
+        VALUE,
+        "value = v3, NOT the middle register"
+    );
+    assert_eq!(
+        const_of(&module, funcobj),
+        FUNC,
+        "funcobj = v1 (interpreter-inl.cpp:6599)"
+    );
 }
 
 #[test]
-fn deprecated_reject_value_is_the_LAST_register() {
+fn deprecated_reject_value_is_the_last_register() {
     // interpreter-inl.cpp:6618-6631.
     let module = deprecated3_body(Bytecode::DeprecatedAsyncfunctionreject);
-    let Op::AsyncReject { value } = find_op(&module, |op| matches!(op, Op::AsyncReject { .. }))
+    let Op::AsyncReject { funcobj, value } =
+        find_op(&module, |op| matches!(op, Op::AsyncReject { .. }))
     else {
         panic!("expected Op::AsyncReject");
     };
-    assert_eq!(const_of(&module, value), VALUE, "value = v3, NOT the middle register");
+    assert_eq!(
+        const_of(&module, value),
+        VALUE,
+        "value = v3, NOT the middle register"
+    );
+    assert_eq!(
+        const_of(&module, funcobj),
+        FUNC,
+        "funcobj = v1 (interpreter-inl.cpp:6627)"
+    );
 }

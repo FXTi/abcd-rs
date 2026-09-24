@@ -222,6 +222,15 @@ pub enum Halt {
     /// `Suspendgenerator` (record-and-inspect): `genobj` the register,
     /// `value` the accumulator (the yield value).
     SuspendGenerator { genobj: i64, value: i64 },
+    /// `Asyncfunctionawaituncaught` (record-and-inspect): `funcobj` the
+    /// register, `value` the accumulator (the awaited value).
+    AsyncAwaitUncaught { funcobj: i64, value: i64 },
+    /// `Asyncfunctionresolve` (record-and-inspect): `funcobj` the
+    /// register, `value` the accumulator (the resolution value).
+    AsyncResolve { funcobj: i64, value: i64 },
+    /// `Asyncfunctionreject` (record-and-inspect): `funcobj` the
+    /// register, `value` the accumulator (the rejection reason).
+    AsyncReject { funcobj: i64, value: i64 },
     /// `Resumegenerator` (record-and-inspect): `genobj` is the acc.
     ResumeGenerator { genobj: i64 },
     /// `Getresumemode` (record-and-inspect): `genobj` is the acc.
@@ -474,6 +483,24 @@ impl Machine {
                 Bytecode::Suspendgenerator(gen_r) => {
                     return Halt::SuspendGenerator {
                         genobj: self.reg(gen_r.0),
+                        value: self.acc,
+                    };
+                }
+                Bytecode::Asyncfunctionawaituncaught(func_r) => {
+                    return Halt::AsyncAwaitUncaught {
+                        funcobj: self.reg(func_r.0),
+                        value: self.acc,
+                    };
+                }
+                Bytecode::Asyncfunctionresolve(func_r) => {
+                    return Halt::AsyncResolve {
+                        funcobj: self.reg(func_r.0),
+                        value: self.acc,
+                    };
+                }
+                Bytecode::Asyncfunctionreject(func_r) => {
+                    return Halt::AsyncReject {
+                        funcobj: self.reg(func_r.0),
                         value: self.acc,
                     };
                 }
