@@ -47,10 +47,21 @@
 //!    `ASYNCFUNCTIONRESOLVE_V8` :6577-6589, `ASYNCFUNCTIONREJECT_V8`
 //!    :6605-6617) and the lift now models both operands
 //!    (`Op::AwaitUncaught`/`AsyncResolve`/`AsyncReject` carry `funcobj`
-//!    + `value`). Non-adjacent shapes keep the loud hard-fallback. The
-//!    remaining async machinery (the `AsyncFunctionEnter` elision, the
-//!    suspend/resume pair inside `async function` bodies) stays
-//!    documented elision/fallback per the §5 table.
+//!    + `value`). Non-adjacent shapes keep the loud hard-fallback.
+//! 8. **Async suspend/resume machinery → plain `await` control flow**
+//!    (N68 remainder, R4): [`async_machine_fold`] eliminates the es2abc
+//!    async-body state-machine plumbing (the entry `AsyncFunctionEnter`
+//!    protocol + per-await `AsyncFunctionAwaitUncaught` +
+//!    `SuspendGenerator` + the `ResumeGenerator`/`GetResumeMode`
+//!    completion pair + the `mode == THROW → throw` dispatch — the
+//!    ASYNC `HandleCompletion` kind, THROW test only) back into the
+//!    source-level `await`: the resumption value binds at the await
+//!    site (`const t = await v`) when used, the dispatch dissolves, and
+//!    the funcObj temp is swept once nothing but dead catch-region phi
+//!    assigns reference it. All-or-nothing per function, gated on the
+//!    entry protocol; `AsyncGenerator` kinds bail (their
+//!    `CreateGeneratorObj`/`AsyncGeneratorResolve` lowering is a
+//!    separate, still-documented fallback).
 
 use crate::expr::{ArrayElem, Expr, IterOp, Lit, ObjEntry};
 use crate::recover::Stmt;
@@ -93,6 +104,12 @@ pub struct FoldStats {
     /// Async-completion pairs folded to `return v` / `throw v`
     /// (N68/G6, R4).
     pub async_driver: usize,
+    /// Async suspend/resume sites folded back to plain `await`
+    /// control flow (N68 remainder, R4).
+    pub async_machine_sites: usize,
+    /// Async resumption values bound to a temp (`const t = await v` —
+    /// the resumed value has real uses; N68 remainder).
+    pub async_machine_bound: usize,
 }
 
 /// Run every fold over a structured body (recursive driver).
@@ -3347,6 +3364,663 @@ fn gen_fold_seq(nodes: &mut Vec<SNode>, cx: &mut GenDriverCx, stats: &mut FoldSt
                 i += 1;
             }
             _ => i += 1,
+        }
+    }
+}
+
+// ── Async suspend/resume fold (N68 remainder, R4) ──────────────────
+//
+// VENDOR LOWERING MODEL (es2panda
+// `compiler/function/asyncFunctionBuilder.cpp` `Prepare`/
+// `DirectReturn`/`CleanUp` + `compiler/function/functionBuilder.cpp`
+// `Await`/`SuspendResumeExecution`/`resumeGenerator`/`HandleCompletion`;
+// `enum class ResumeMode { RETURN=0, THROW=1, NEXT=2 }` in
+// `functionBuilder.h`; runtime `ecmascript/interpreter/
+// interpreter-inl.cpp` `ASYNCFUNCTIONAWAITUNCAUGHT_V8` :5357-5366,
+// `SUSPENDGENERATOR_V8` :5279):
+//
+// - `Prepare` (async function entry): `AsyncFunctionEnter()` → funcObj
+//   (elided at Stage A — §5 row 72; invisible in JS source) + the
+//   catch-all `AsyncFunctionReject` wrapper (folded by
+//   [`async_driver_fold`], N68/G6).
+// - `Await` (per `await v`): `AsyncFunctionAwaitUncaught(funcObj)`
+//   awaiting the acc value; `SuspendGenerator(funcObj)` suspending with
+//   the acc; then the completion pair `ResumeGenerator(funcObj)` →
+//   completionValue, `GetResumeMode(funcObj)` → completionType, and
+//   `HandleCompletion` — for the ASYNC builder kind this is the THROW
+//   test ONLY (no RETURN arm): `if (type == THROW) throw value;`
+//   otherwise `value` is the await's resumption value and the body
+//   continues. Source form: `await v` — the await expression's value
+//   IS the resumption value, and a rejected promise throws.
+//
+// The fold eliminates the plumbing per await site: the await decl +
+// the suspend stmt + the ResumeGenerator/GetResumeMode pair + the
+// mode dispatch dissolve into `await v` (binding the resumption value
+// at the await site when it has real uses); the dispatch's
+// continuation (the real control flow) is spliced in place.
+//
+// SOUNDNESS / HONESTY (design §8 R4 budget, mirroring d-P11): the fold
+// is per-function all-or-nothing gated on the ENTRY protocol — the
+// unique `AsyncFunctionEnter` fallback temp (the funcObj) must exist
+// and every visible use of it must be machinery (the `GeneratorDriver`
+// genobj operand or a catch-region context phi assign). A function
+// failing the gate keeps ALL of its machinery as documented fallbacks
+// (today's behavior); with the gate passed, a non-matching site keeps
+// its own loud fallbacks (counted). `FunctionKind::AsyncGenerator`
+// carries no `AsyncFunctionEnter` (its entry is the generator
+// `CreateGeneratorObj` protocol and its yields the
+// `AsyncGeneratorResolve` machinery — a separate lowering) and bails
+// at the gate by construction.
+
+/// Fold context for one async function body.
+struct AsyncMachineCx {
+    /// The unique `AsyncFunctionEnter` fallback temp (the funcObj).
+    genobj: ValueId,
+    /// Pure number-constant temps (the mode immediate, when the
+    /// profile materializes it) by value id.
+    const_env: BTreeMap<ValueId, u64>,
+    /// Const temps a successful dispatch match resolved.
+    consumed_consts: BTreeSet<ValueId>,
+    /// Whole-tree temp use counts, computed once up front (the fold
+    /// only REMOVES the counted machinery uses, so the counts stay
+    /// valid for the per-site dead-resume decisions).
+    uses: BTreeMap<ValueId, usize>,
+}
+
+/// Fold the es2abc async suspend/resume machinery back into plain
+/// `await` control flow. No-op for non-async kinds; the async-generator
+/// kind bails at the entry gate (no `AsyncFunctionEnter`).
+pub fn async_machine_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats: &mut FoldStats) {
+    if !matches!(kind, FunctionKind::Async | FunctionKind::AsyncArrow) {
+        return;
+    }
+    // The entry gate: exactly one `AsyncFunctionEnter` fallback temp
+    // (the funcObj). Zero: nothing to fold (a hypothetical machinery
+    // user without the temp keeps its fallbacks). More than one: not
+    // the vendor shape — bail entirely.
+    let mut enters = Vec::new();
+    walk_leaves(nodes, &mut |l| {
+        if let Leaf::Raw(Stmt::Declare {
+            value: Expr::Fallback { op, .. },
+            value_id,
+            ..
+        }) = l
+            && *op == "AsyncFunctionEnter"
+        {
+            enters.push(*value_id);
+        }
+    });
+    let [genobj] = enters[..] else {
+        return;
+    };
+    // Every visible use of the funcObj must be machinery: a
+    // `GeneratorDriver` genobj operand, or a catch-region context phi
+    // assign (`phi = funcobj` — the es2abc try-region bookkeeping the
+    // rethrow-only handler never reads). Any other use is not the
+    // vendor shape — bail, keeping everything loud.
+    if !funcobj_uses_are_machinery(nodes, genobj) {
+        return;
+    }
+    let mut const_env = BTreeMap::new();
+    walk_leaves(nodes, &mut |l| {
+        if let Leaf::Raw(Stmt::Declare {
+            value: Expr::Lit(Lit::Number(bits)),
+            value_id,
+            ..
+        }) = l
+        {
+            const_env.insert(*value_id, *bits);
+        }
+    });
+    let mut uses = BTreeMap::new();
+    count_temp_uses(nodes, &mut uses);
+    let mut cx = AsyncMachineCx {
+        genobj,
+        const_env,
+        consumed_consts: BTreeSet::new(),
+        uses,
+    };
+    async_machine_seq(nodes, &mut cx, stats);
+    // Sweep the temps the fold made dead: resolved mode-immediate
+    // consts, and the funcObj fallback temp itself once its remaining
+    // uses are only dead catch-region phi assigns (N68 remainder item:
+    // the `AsyncFunctionEnter` elided-value fallback resolves when the
+    // machinery that consumed the value is gone). A partially folded
+    // function keeps the temp — and the surviving sites keep their
+    // loud fallbacks.
+    sweep_async_machinery(nodes, genobj, &cx.consumed_consts);
+}
+
+/// The entry-gate check: every occurrence of the funcObj temp is a
+/// `GeneratorDriver` genobj operand or a phi assign of the temp.
+fn funcobj_uses_are_machinery(nodes: &[SNode], genobj: ValueId) -> bool {
+    /// `in_genobj_slot` marks the `GeneratorDriver::genobj` operand
+    /// position (the only legal expression use of the temp).
+    fn expr_ok(e: &Expr, genobj: ValueId, in_genobj_slot: bool) -> bool {
+        if temp_value(e) == Some(genobj) {
+            return in_genobj_slot;
+        }
+        match e {
+            Expr::GeneratorDriver { genobj: g, .. } => expr_ok(g, genobj, true),
+            _ => expr_children(e)
+                .iter()
+                .all(|c| expr_ok(c, genobj, false)),
+        }
+    }
+    let mut ok = true;
+    walk_leaves(nodes, &mut |l| {
+        if !ok {
+            return;
+        }
+        if let Leaf::Raw(Stmt::PhiAssign { value, .. }) = l {
+            // `phi = funcobj` (the catch-region context phi) is
+            // machinery bookkeeping; anything richer is not.
+            ok = !expr_uses_value(value, genobj) || temp_value(value) == Some(genobj);
+            return;
+        }
+        for e in leaf_exprs(l) {
+            if !expr_ok(e, genobj, false) {
+                ok = false;
+                return;
+            }
+        }
+    });
+    ok
+}
+
+/// One matched await site (immutable match; applied separately).
+struct AsyncSite {
+    /// Run leaf indices of the machinery leaves (descending).
+    remove: Vec<usize>,
+    /// The awaited value expression (moved into the folded `await`).
+    awaited: Expr,
+    /// The resume temp binding, when the `ResumeGenerator` result was
+    /// a declared temp (always in practice: its uses live in sibling
+    /// blocks, so Stage A never inlines it).
+    resume: Option<(ValueId, String)>,
+    /// The dispatch's continuation (the real control flow).
+    continuation: Vec<SNode>,
+}
+
+/// The index of the previous non-phi-assign leaf before `cur`
+/// (block-end phi materializations interleave with the machinery).
+fn prev_non_phi(run: &[Leaf], cur: &mut usize) -> Option<usize> {
+    while *cur > 0 {
+        *cur -= 1;
+        if !matches!(run[*cur], Leaf::Raw(Stmt::PhiAssign { .. })) {
+            return Some(*cur);
+        }
+    }
+    None
+}
+
+/// Match `nodes[i]` (a `Stmts` run ending in the await site:
+/// `[decl a = AwaitUncaught(v), SuspendGenerator-stmt(a), decl r =
+/// ResumeGenerator(g)?, decl m = GetResumeMode(g)?]`, phi assigns
+/// skipped) + `nodes[i+1]` (the `mode == THROW` dispatch).
+fn match_await_site(nodes: &[SNode], i: usize, cx: &mut AsyncMachineCx) -> Option<AsyncSite> {
+    let SNode::Stmts(run) = &nodes[i] else {
+        return None;
+    };
+    let mut remove: Vec<usize> = Vec::new();
+    let mut cur = run.len();
+    // Optional mode decl (tail-most machinery decl).
+    let mut mode: Option<ValueId> = None;
+    let mut save = cur;
+    if let Some(j) = prev_non_phi(run, &mut cur) {
+        match &run[j] {
+            Leaf::Raw(Stmt::Declare {
+                value:
+                    Expr::GeneratorDriver {
+                        resume: false,
+                        genobj: mg,
+                    },
+                value_id,
+                ..
+            }) if temp_value(mg) == Some(cx.genobj) => {
+                mode = Some(*value_id);
+                remove.push(j);
+            }
+            _ => cur = save,
+        }
+    }
+    // Optional resume decl.
+    let mut resume: Option<(ValueId, String)> = None;
+    save = cur;
+    if let Some(j) = prev_non_phi(run, &mut cur) {
+        match &run[j] {
+            Leaf::Raw(Stmt::Declare {
+                name,
+                value:
+                    Expr::GeneratorDriver {
+                        resume: true,
+                        genobj: rg,
+                    },
+                value_id,
+                ..
+            }) if temp_value(rg) == Some(cx.genobj) => {
+                resume = Some((*value_id, name.clone()));
+                remove.push(j);
+            }
+            _ => cur = save,
+        }
+    }
+    // Required: the suspend stmt (`SuspendGenerator` — recovered as a
+    // `Yield` expression; in an async body that is never a source
+    // yield).
+    let j = prev_non_phi(run, &mut cur)?;
+    let Leaf::Raw(Stmt::Expr(Expr::Yield { value })) = &run[j] else {
+        return None;
+    };
+    let awaited: Expr;
+    match value.as_ref() {
+        // Declared form: `const a = await v;` then the suspend of `a`.
+        Expr::Temp { value: at, .. } => {
+            // The await temp's only use may be the suspend.
+            if cx.uses.get(at).copied().unwrap_or(0) != 1 {
+                return None;
+            }
+            let k = prev_non_phi(run, &mut cur)?;
+            let Leaf::Raw(Stmt::Declare {
+                value: Expr::Await {
+                    value: x,
+                    uncaught: true,
+                },
+                value_id,
+                ..
+            }) = &run[k]
+            else {
+                return None;
+            };
+            if value_id != at {
+                return None;
+            }
+            awaited = (**x).clone();
+            remove.push(j);
+            remove.push(k);
+        }
+        // Inlined form: the suspend carries the `await` directly.
+        Expr::Await {
+            value: x,
+            uncaught: true,
+        } => {
+            awaited = (**x).clone();
+            remove.push(j);
+        }
+        _ => return None,
+    }
+    let continuation = match_async_dispatch(
+        nodes.get(i + 1)?,
+        mode,
+        resume.as_ref().map(|(r, _)| *r),
+        cx,
+    )?;
+    Some(AsyncSite {
+        remove,
+        awaited,
+        resume,
+        continuation,
+    })
+}
+
+/// Match the async resume-mode dispatch (`HandleCompletion`, ASYNC
+/// builder kind): a single `mode == THROW(1)` test (either polarity,
+/// either operand order, the immediate inline or via a pure const
+/// temp, the mode operand a `Temp` of the matched mode decl or an
+/// inlined `GetResumeMode`) whose THROW arm is exactly
+/// `throw <resume>;`; the other arm is the continuation.
+fn match_async_dispatch(
+    n: &SNode,
+    mode: Option<ValueId>,
+    resume: Option<ValueId>,
+    cx: &mut AsyncMachineCx,
+) -> Option<Vec<SNode>> {
+    let SNode::If {
+        cond,
+        then,
+        otherwise,
+    } = n
+    else {
+        return None;
+    };
+    let mut positive = true;
+    let mut e = cond;
+    loop {
+        match e {
+            Expr::Unary {
+                op: UnOp::IsFalse,
+                operand,
+            } => {
+                positive = !positive;
+                e = operand;
+            }
+            Expr::Unary {
+                op: UnOp::IsTrue,
+                operand,
+            } => {
+                e = operand;
+            }
+            _ => break,
+        }
+    }
+    let Expr::Compare {
+        op: CmpOp::Eq,
+        left,
+        right,
+    } = e
+    else {
+        return None;
+    };
+    let genobj = cx.genobj;
+    let is_mode = |e: &Expr| match mode {
+        // Declared mode temp: the condition must reference it.
+        Some(md) => temp_value(e) == Some(md),
+        // Inlined `GetResumeMode` directly in the condition.
+        None => matches!(
+            e,
+            Expr::GeneratorDriver {
+                resume: false,
+                genobj: mg,
+            } if temp_value(mg) == Some(genobj)
+        ),
+    };
+    let bits = if is_mode(left) {
+        resolve_num(right, &cx.const_env, &mut cx.consumed_consts)
+    } else if is_mode(right) {
+        resolve_num(left, &cx.const_env, &mut cx.consumed_consts)
+    } else {
+        None
+    }?;
+    // The ASYNC `HandleCompletion` tests THROW(1) only.
+    if f64::from_bits(bits) != 1.0 {
+        return None;
+    }
+    let (throw_arm, cont) = if positive {
+        (then, otherwise)
+    } else {
+        (otherwise, then)
+    };
+    check_async_throw_arm(throw_arm, resume, genobj)?;
+    Some(cont.clone())
+}
+
+/// The THROW arm: exactly `throw <resume>;` (+ the dead `Unreachable`
+/// and any dead loop-bookkeeping `break`s), where `<resume>` is the
+/// matched resume temp — or the inlined `ResumeGenerator` when the
+/// result was never declared.
+fn check_async_throw_arm(arm: &[SNode], resume: Option<ValueId>, genobj: ValueId) -> Option<()> {
+    let [SNode::Stmts(run), rest @ ..] = arm else {
+        return None;
+    };
+    if !rest.iter().all(|n| matches!(n, SNode::Break { .. })) {
+        return None;
+    }
+    match run.as_slice() {
+        [Leaf::Raw(Stmt::Throw(value))] | [Leaf::Raw(Stmt::Throw(value)), Leaf::Raw(Stmt::Unreachable)] => {
+            match resume {
+                Some(r) => (temp_value(value) == Some(r)).then_some(()),
+                None => matches!(
+                    value,
+                    Expr::GeneratorDriver {
+                        resume: true,
+                        genobj: rg,
+                    } if temp_value(rg) == Some(genobj)
+                )
+                .then_some(()),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The rewrite pass: children first (inner sites fold before the
+/// outer sites whose continuations contain them), then the scan.
+fn async_machine_seq(nodes: &mut Vec<SNode>, cx: &mut AsyncMachineCx, stats: &mut FoldStats) {
+    for n in nodes.iter_mut() {
+        match n {
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                async_machine_seq(then, cx, stats);
+                async_machine_seq(otherwise, cx, stats);
+            }
+            SNode::While { body, .. }
+            | SNode::DoWhile { body, .. }
+            | SNode::Labeled { body, .. }
+            | SNode::ForOf { body, .. }
+            | SNode::ForIn { body, .. } => async_machine_seq(body, cx, stats),
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                async_machine_seq(body, cx, stats);
+                for c in catches {
+                    async_machine_seq(&mut c.body, cx, stats);
+                }
+                if let Some(f) = finally {
+                    async_machine_seq(f, cx, stats);
+                }
+            }
+            SNode::Switch { cases, .. } => {
+                for c in cases {
+                    async_machine_seq(&mut c.body, cx, stats);
+                }
+            }
+            SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+    let mut i = 0;
+    while i + 1 < nodes.len() {
+        let site = match_await_site(nodes, i, cx);
+        match site {
+            Some(site) => {
+                let SNode::Stmts(run) = &mut nodes[i] else {
+                    unreachable!()
+                };
+                // The machinery leaves were collected tail-first
+                // (descending indices) — removal in order is safe.
+                let insert_at = *site.remove.iter().min().expect("the suspend leaf");
+                for &j in &site.remove {
+                    run.remove(j);
+                }
+                let insert_at = insert_at.min(run.len());
+                let aw = Expr::Await {
+                    value: Box::new(site.awaited),
+                    uncaught: true,
+                };
+                match site.resume {
+                    // The resumption value has real uses beyond the
+                    // (removed) throw arm: bind it — `const t = await v`.
+                    Some((r, name)) if cx.uses.get(&r).copied().unwrap_or(0) > 1 => {
+                        run.insert(
+                            insert_at,
+                            Leaf::Raw(Stmt::Declare {
+                                name,
+                                mutable: false,
+                                value: aw,
+                                value_id: r,
+                            }),
+                        );
+                        stats.async_machine_bound += 1;
+                    }
+                    _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
+                }
+                stats.async_machine_sites += 1;
+                nodes.splice(i + 1..i + 2, site.continuation);
+                i += 1;
+            }
+            None => i += 1,
+        }
+    }
+}
+
+/// Post-fold sweep: remove the resolved mode-immediate consts, and the
+/// funcObj fallback temp once its remaining uses are only dead
+/// catch-region phi assigns (`phi = funcobj` where the phi temp is
+/// never read — es2abc try-region bookkeeping the rethrow-only handler
+/// does not consume). Those phi assigns go with it, and a phi decl
+/// left with no assigns and no reads goes too. Any other surviving
+/// use keeps everything (loud partial fold).
+fn sweep_async_machinery(nodes: &mut Vec<SNode>, genobj: ValueId, consumed: &BTreeSet<ValueId>) {
+    let mut uses: BTreeMap<ValueId, usize> = BTreeMap::new();
+    count_temp_uses(nodes, &mut uses);
+    // Phi temps by name (PhiAssign targets are name-linked).
+    let mut phi_ids: BTreeMap<String, ValueId> = BTreeMap::new();
+    walk_leaves(nodes, &mut |l| {
+        if let Leaf::Raw(Stmt::PhiDecl { name, value_id }) = l {
+            phi_ids.insert(name.clone(), *value_id);
+        }
+    });
+    let mut phi_targets: BTreeSet<String> = BTreeSet::new();
+    let mut funcobj_survives = false;
+    walk_leaves(nodes, &mut |l| {
+        if funcobj_survives {
+            return;
+        }
+        if let Leaf::Raw(Stmt::PhiAssign { target, value, .. }) = l
+            && temp_value(value) == Some(genobj)
+        {
+            let dead = phi_ids
+                .get(target)
+                .is_some_and(|vid| uses.get(vid).copied().unwrap_or(0) == 0);
+            if dead {
+                phi_targets.insert(target.clone());
+            } else {
+                funcobj_survives = true;
+            }
+            return;
+        }
+        for e in leaf_exprs(l) {
+            if expr_uses_value(e, genobj) {
+                funcobj_survives = true;
+                return;
+            }
+        }
+    });
+    let mut dead: BTreeSet<ValueId> = consumed
+        .iter()
+        .copied()
+        .filter(|v| uses.get(v).copied().unwrap_or(0) == 0)
+        .collect();
+    if !funcobj_survives {
+        dead.insert(genobj);
+        if !phi_targets.is_empty() {
+            // Remove the `phi = funcobj` assigns, then the phi decls
+            // left assign-less (and unread).
+            strip_genobj_phi_assigns(nodes, genobj, &phi_targets);
+            let mut remaining: BTreeSet<String> = BTreeSet::new();
+            walk_leaves(nodes, &mut |l| {
+                if let Leaf::Raw(Stmt::PhiAssign { target, .. }) = l {
+                    remaining.insert(target.clone());
+                }
+            });
+            strip_dead_phi_decls(nodes, &phi_targets, &remaining, &uses);
+        }
+    }
+    if !dead.is_empty() {
+        sweep_dead_decls(nodes, &dead);
+    }
+}
+
+/// Remove `PhiAssign` leaves assigning the funcObj temp to one of the
+/// dead phi targets.
+fn strip_genobj_phi_assigns(nodes: &mut Vec<SNode>, genobj: ValueId, targets: &BTreeSet<String>) {
+    for n in nodes.iter_mut() {
+        match n {
+            SNode::Stmts(run) => run.retain(|l| {
+                !matches!(
+                    l,
+                    Leaf::Raw(Stmt::PhiAssign { target, value, .. })
+                        if targets.contains(target) && temp_value(value) == Some(genobj)
+                )
+            }),
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                strip_genobj_phi_assigns(then, genobj, targets);
+                strip_genobj_phi_assigns(otherwise, genobj, targets);
+            }
+            SNode::While { body, .. }
+            | SNode::DoWhile { body, .. }
+            | SNode::Labeled { body, .. }
+            | SNode::ForOf { body, .. }
+            | SNode::ForIn { body, .. } => strip_genobj_phi_assigns(body, genobj, targets),
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                strip_genobj_phi_assigns(body, genobj, targets);
+                for c in catches {
+                    strip_genobj_phi_assigns(&mut c.body, genobj, targets);
+                }
+                if let Some(f) = finally {
+                    strip_genobj_phi_assigns(f, genobj, targets);
+                }
+            }
+            SNode::Switch { cases, .. } => {
+                for c in cases {
+                    strip_genobj_phi_assigns(&mut c.body, genobj, targets);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+}
+
+/// Remove `PhiDecl`s for stripped targets that have no remaining
+/// assigns and no reads.
+fn strip_dead_phi_decls(
+    nodes: &mut Vec<SNode>,
+    targets: &BTreeSet<String>,
+    remaining: &BTreeSet<String>,
+    uses: &BTreeMap<ValueId, usize>,
+) {
+    for n in nodes.iter_mut() {
+        match n {
+            SNode::Stmts(run) => run.retain(|l| {
+                !matches!(
+                    l,
+                    Leaf::Raw(Stmt::PhiDecl { name, value_id })
+                        if targets.contains(name)
+                            && !remaining.contains(name)
+                            && uses.get(value_id).copied().unwrap_or(0) == 0
+                )
+            }),
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                strip_dead_phi_decls(then, targets, remaining, uses);
+                strip_dead_phi_decls(otherwise, targets, remaining, uses);
+            }
+            SNode::While { body, .. }
+            | SNode::DoWhile { body, .. }
+            | SNode::Labeled { body, .. }
+            | SNode::ForOf { body, .. }
+            | SNode::ForIn { body, .. } => strip_dead_phi_decls(body, targets, remaining, uses),
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                strip_dead_phi_decls(body, targets, remaining, uses);
+                for c in catches {
+                    strip_dead_phi_decls(&mut c.body, targets, remaining, uses);
+                }
+                if let Some(f) = finally {
+                    strip_dead_phi_decls(f, targets, remaining, uses);
+                }
+            }
+            SNode::Switch { cases, .. } => {
+                for c in cases {
+                    strip_dead_phi_decls(&mut c.body, targets, remaining, uses);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
         }
     }
 }

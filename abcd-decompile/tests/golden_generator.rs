@@ -546,16 +546,20 @@ fn g05_entry_gate_bail_keeps_fallbacks() {
     );
 }
 
-/// g06 — the async driver fold (N68/G6): with the acc-carried value
-/// modeled (isa.yaml `acc: inout:top`; runtime interpreter-inl.cpp
-/// `ASYNCFUNCTIONAWAITUNCAUGHT_V8` :5357-5366 / `ASYNCFUNCTIONRESOLVE_V8`
-/// :6577-6589 / `ASYNCFUNCTIONREJECT_V8` :6605-6617), the es2abc
-/// completion pair folds: `AsyncResolve(r); return` → `return r`,
-/// `AsyncReject(e); return` → `throw e` — and the folded rethrow-only
-/// catch-all then dissolves as the semantic no-op it is. The remaining
-/// async machinery (the `AsyncFunctionEnter` elision and the
-/// suspend/resume/mode dispatch inside the `async function` body) stays
-/// documented elision/fallback per the §5 table.
+/// g06 — the async folds (N68/G6 + the N68 remainder): with the
+/// acc-carried value modeled (isa.yaml `acc: inout:top`; runtime
+/// interpreter-inl.cpp `ASYNCFUNCTIONAWAITUNCAUGHT_V8` :5357-5366 /
+/// `ASYNCFUNCTIONRESOLVE_V8` :6577-6589 / `ASYNCFUNCTIONREJECT_V8`
+/// :6605-6617), the es2abc completion pair folds: `AsyncResolve(r);
+/// return` → `return r`, `AsyncReject(e); return` → `throw e` — and
+/// the folded rethrow-only catch-all then dissolves as the semantic
+/// no-op it is. The suspend/resume/mode machinery around the `await`
+/// then folds too (`folds::async_machine_fold`, the ASYNC
+/// `HandleCompletion` THROW-only dispatch): the resumption value binds
+/// at the await site, and the `AsyncFunctionEnter` fallback temp is
+/// swept once no machinery consumes it (the §5 row-72 elision marker
+/// stays — the entry protocol is invisible in source by design).
+/// `golden_async.rs` owns the full async machine-fold shape matrix.
 #[test]
 fn g06_async_driver_fold() {
     let mut m = mk_module();
@@ -634,7 +638,7 @@ fn g06_async_driver_fold() {
     let text = decompiled(&m);
     expect(
         &text,
-        "async function value(p1) {\n  /* rethrow-only try/catch dissolved (semantic no-op) */\n  /* elided AsyncFunctionEnter: async-machinery entry; recognized and elided inside `async function` emission (§5 row 72) */\n  const v2 = undefined /*fallback AsyncFunctionEnter: async-context value used after elided AsyncFunctionEnter*/;\n  const v3 = await p1;\n  /*async-machinery suspend (R4; not a source yield)*/ v3;\n  const v5 = /*hard-fallback ResumeGenerator (generator driver, R4)*/ v2;\n  if (!(1.0 == /*hard-fallback GetResumeMode (generator driver, R4)*/ v2)) {\n    return v5;\n  } else {\n    throw v5;\n    /* unreachable */\n  }\n}\n",
+        "async function value(p1) {\n  /* rethrow-only try/catch dissolved (semantic no-op) */\n  /* elided AsyncFunctionEnter: async-machinery entry; recognized and elided inside `async function` emission (§5 row 72) */\n  const v5 = await p1;\n  return v5;\n}\n",
     );
 }
 

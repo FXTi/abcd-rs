@@ -464,6 +464,11 @@ impl<'m> Emitter<'m> {
         // rethrow-try dissolution so a folded `catch (e) { throw e; }`
         // rejection wrapper dissolves as the no-op it is.
         folds::async_driver_fold(&mut structured.body, rf.kind, &mut fstats);
+        // The async suspend/resume fold (N68 remainder) runs after the
+        // completion fold (the dispatch continuation then carries the
+        // folded `return v` / `throw v` forms) and before fold() (the
+        // same rethrow-try dissolution applies to the folded body).
+        folds::async_machine_fold(&mut structured.body, rf.kind, &mut fstats);
         folds::fold(&mut structured.body, &mut fstats);
         folds::scope_fold(&mut structured.body, &rf.params, &mut fstats);
         self.stats.structure =
