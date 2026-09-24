@@ -122,16 +122,20 @@ fn async_fold_node_behavior() {
         decompile(&case_c()),
     ];
 
-    let node = std::process::Command::new("which")
-        .arg("node")
+    // Probe node by SPAWNING it (not `which` — `which` is a Git-Bash
+    // idiom that prints MSYS paths like `/c/Program Files/…/node.exe`,
+    // which std::process::Command cannot use on Windows; Command itself
+    // searches PATH+PATHEXT correctly). Windows CI failure N68-followup.
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
         .output()
-        .ok()
-        .filter(|o| o.status.success());
-    let Some(node) = node else {
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !node_ok {
         eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
         return;
-    };
-    let node = String::from_utf8_lossy(&node.stdout).trim().to_string();
+    }
+    let node = "node";
 
     let dir = std::env::temp_dir().join("abcd-n68-node");
     std::fs::create_dir_all(&dir).expect("tempdir");
