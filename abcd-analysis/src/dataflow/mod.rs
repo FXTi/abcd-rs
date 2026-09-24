@@ -17,11 +17,18 @@
 //!   the balanced-parentheses interprocedural discipline, a depth cap
 //!   with rung-0 fallback, and the full [`heap::AliasOracle`] impl
 //!   ([`alias::Rung1AliasOracle`]).
+//! - [`pta`] — the rung-2 whole-module context-sensitive pointer
+//!   analysis (§4.4 rung 2, APAK-shaped): abstract objects keyed by
+//!   `(alloc InstId, 1-call-site context)`, per-object field
+//!   sensitivity, delta worklist propagation, on-the-fly call-graph
+//!   co-evolution, and the lexical-environment identity channel
+//!   ([`pta::Rung2AliasOracle`]).
 
 pub mod alias;
 pub mod framework;
 pub mod heap;
 pub mod ifds;
+pub mod pta;
 pub mod usedef;
 
 pub use alias::{AliasEngineStats, QueryAnswer, Rung1AliasOracle};
@@ -29,4 +36,5 @@ pub use framework::{DataflowResult, Direction, MonotoneFramework, SolveConfig, s
 pub use heap::{
     AliasOracle, AllocSiteSet, FieldChain, FieldKey, HeapRef, Rung0AliasOracle, Tribool,
 };
+pub use pta::{EnvAnswer, PtaConfig, PtaOutcome, PtaStats, Rung2AliasOracle, Rung2Tables};
 pub use usedef::{AnalysisStore, UseDefChains};

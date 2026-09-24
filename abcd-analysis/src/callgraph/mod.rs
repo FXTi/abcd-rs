@@ -176,6 +176,26 @@ impl CallGraph {
         graph
     }
 
+    /// Assemble a graph from a complete site table (the rung-2 PTA's
+    /// co-evolution output, `crate::dataflow::pta`): the callers index is
+    /// rebuilt from the edges, sorted and deduplicated — the same
+    /// deterministic contract as [`CallGraph::build`].
+    pub(crate) fn from_edges(sites: BTreeMap<InstId, CallEdge>) -> CallGraph {
+        let mut callers: BTreeMap<FuncId, Vec<InstId>> = BTreeMap::new();
+        for (iid, edge) in &sites {
+            if let CallTargets::Resolved(targets) = &edge.targets {
+                for t in targets {
+                    callers.entry(*t).or_default().push(*iid);
+                }
+            }
+        }
+        for v in callers.values_mut() {
+            v.sort();
+            v.dedup();
+        }
+        CallGraph { sites, callers }
+    }
+
     /// The edge record of a call instruction.
     pub fn edge_at(&self, call: InstId) -> Option<&CallEdge> {
         self.sites.get(&call)
