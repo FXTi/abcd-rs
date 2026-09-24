@@ -496,6 +496,18 @@ python3 scripts/compare-rewritten-corpus.py exports/corpus/index.jsonl /tmp/abcd
   demangling; poison-on-conflict honesty keeps m{index}; zero lift/IR
   changes). Remaining bucket: ONLY expected-fallback 54 (hard-7
   async/generator 18 + template raw 36) — d-P10/d-P11's scopes.
+  d-P10 DONE (2026-09-25): template G4 CLOSED — dream gate
+  1131/0/0/18/0 (36 template/tagged-template fixtures pass). Vendor
+  layout [rawStrings, cookedStrings] (raw index 0, cooked 1:
+  es2panda literals.cpp Literals::GetTemplateObject + runtime
+  template_string.cpp); raw survives verbatim in the string table.
+  Decompile-side only: recover.rs template_strings_of resolves both
+  lists from the const-pool pair or the imperative AllocArray +
+  StoreOwnPropDyn build; emission = identity-tagged backtick literal
+  with raw text verbatim (((_=>_)`a${0}b`) — ${0} = inert multi-quasi
+  separator; cooked-only stays the documented raw-absent fallback).
+  Zero lift/IR change (byte-identity by construction). Remaining
+  bucket: ONLY hard-7 async/generator 18 — d-P11's scope.
   t-P5 DONE: summary-library second tier — replace dual form (string:
   Base+Param(1)->Return, pattern is control; function: gap with the
   EMPTY-chain return channel), RegExp.prototype.test no-flow verdict
