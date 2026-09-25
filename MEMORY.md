@@ -891,11 +891,13 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   继续吧"). Continue directly into Phase 2+ when Phase 1 lands; no stop
   between phases.
 - MAINTAINER RULINGS (2026-09-25, after the test-quality evaluation,
-  design/test-quality-evaluation.md): (1) bridge C++ is OUT of the 90%
-  coverage denominator (extends D3: the dead FFI surface is kept but not
-  measured); the 90% goal refers to OUR Rust, measured corpus-inclusive
-  (the nightly coverage-true artifact once Track 2 lands; current floor
-  84.38%, orchestrator-reproduced). (2) Commissioned: a detailed bridge
+  design/test-quality-evaluation.md): (1) the 90% goal refers to OUR code measured
+  corpus-inclusive (the nightly coverage-true artifact once Track 2 lands;
+  current floor: OUR Rust 84.38%, orchestrator-reproduced). AMENDED same
+  day: bridge C++ STAYS in the denominator — it is our code and must be
+  covered by driving it through the upper Rust layers; the provably-dead
+  surface gets DELETED (q-P1), not excluded. Only vendored
+  **/arkcompiler_runtime_core/** is out of the denominator (R4). (2) Commissioned: a detailed bridge
   dead-code analysis quantifying the deletable surface AND proving every
   needed vendor-C++ capability is already reachable through the live
   bridge exports (→ design/bridge-surface-analysis.md). (3) Approved: the

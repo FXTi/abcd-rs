@@ -14,8 +14,3 @@ ignore:
   - "**/build.rs"
   # Vendored OpenHarmony submodule sources (R4): not our code, not measured.
   - "**/arkcompiler_runtime_core/**"
-  # Bridge/shim C++ (D3 dead FFI surface): kept by ruling, but excluded from
-  # the coverage denominator — the 90% goal is OUR Rust only (maintainer
-  # ruling 2026-09-25).
-  - "abcd-isa-sys/bridge/**"
-  - "abcd-file-sys/bridge/**"
