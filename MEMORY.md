@@ -922,3 +922,13 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   brace-balance span detection AND baseline brace-parity checking — two
   span-detection bugs (indented-} truncation, catch-close truncation) were
   caught by parity checks before commit.
+- c-P1 (2026-09-26): test-structure migration landed (63d3bc2). Root package
+  `abcd-rs` (package+workspace in one manifest, publish=false, empty
+  src/lib.rs); the 28 cross-crate ignored suites moved to repo-root
+  tests/<data-flow-name>/ (file-isa, file-lift, file-sys-file, lift-lower,
+  lift-analysis, lift-taint, lift-decompile). Member crates keep their L1
+  tests; nested_literal_arrays stays in abcd-file. Workspace totals
+  unchanged (734/0/31). Next: c-P2 (image-side: generate parallelization,
+  test262 P0, probe/yield-star prebuild, gitee-manifest radar — worker
+  running on dabai:~/ark) then c-P3 (per-push CI job graph + image digest
+  pin + yield-star fixtures read from export, corpus 2787->2792 bump).
