@@ -911,3 +911,14 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   first), W9 spawn-to-probe + fatal node --check for JS. The q-P2 worker
   disconnected mid-task with a clean tree; the orchestrator redid and
   verified the fixes in one batched dabai run.
+- q-P4 (2026-09-25): pre-repin action pack landed — the q-P1 dead-surface
+  deletion executed for real (bd62e6a isa 25 exports, 0d566f0 abc 75
+  exports; ~1.1k lines incl. orphan comments/typedefs), V-I1 pins (46f4a3f:
+  three abc_vendor_* exports + vendor_name_pins test; _ESModuleRecord;
+  stays behaviorally pinned — no referenceable vendor constant), V-I8
+  vendor-sync.md refresh with the repin checklist (3c16944). Workspace
+  734/0 green on dabai; corpus gates (lift verify, pandasm, lower oracle
+  1149x3 skipped 0) unchanged. Lesson recorded: scripted C++ deletion needs
+  brace-balance span detection AND baseline brace-parity checking — two
+  span-detection bugs (indented-} truncation, catch-close truncation) were
+  caught by parity checks before commit.
