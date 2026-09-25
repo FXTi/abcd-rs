@@ -301,19 +301,25 @@ fn corpus_decompile_gate() {
         "irreducible fallback fired on the reducible corpus"
     );
 
-    // Bonus sanity: node --check on the sample (reported, non-fatal).
-    let node = std::process::Command::new("which")
-        .arg("node")
+    // W9 (q-P2): probe node by SPAWNING it, not `which` — `which` is a
+    // Git-Bash idiom that prints MSYS paths Command cannot use on Windows
+    // (the N68-followup ruling; same pattern as async_node.rs). JS sample
+    // check failures are now FATAL: invalid JS syntax in decompiled output
+    // is a decompiler bug, not noise. Node ABSENCE stays a reported skip
+    // (bare dev machines); the dream gate owns the full recompile oracle.
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
         .output()
-        .ok()
-        .filter(|o| o.status.success());
-    match node {
-        None => eprintln!(
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !node_ok {
+        eprintln!(
             "NODE-CHECK node not found on this host — skipped (d-P4 owns the recompile gate)"
-        ),
-        Some(which) => {
-            let node_path = String::from_utf8_lossy(&which.stdout).trim().to_string();
-            eprintln!("NODE-CHECK using {node_path}");
+        );
+    } else {
+        {
+            let node_path = "node";
+            eprintln!("NODE-CHECK using spawn-probed `node`");
             let dir = std::env::temp_dir().join("abcd-dp3-nodecheck");
             std::fs::create_dir_all(&dir).expect("tempdir");
             let mut ok = 0usize;
@@ -321,7 +327,7 @@ fn corpus_decompile_gate() {
             for (rel, text) in &node_outputs {
                 let out = dir.join("out.js");
                 std::fs::write(&out, text).expect("write sample");
-                let check = std::process::Command::new(&node_path)
+                let check = std::process::Command::new(node_path)
                     .arg("--check")
                     .arg(&out)
                     .output()
@@ -346,6 +352,10 @@ fn corpus_decompile_gate() {
             for b in &bad {
                 eprintln!("NODE-CHECK-FAIL {b}");
             }
+            assert!(
+                bad.is_empty(),
+                "node --check failed on decompiled JS: {bad:?}"
+            );
             // The d-P8 TS sample: `node --check` does not parse TS, so
             // validity is proven through node's own type-stripping API
             // (`node:module.stripTypeScriptTypes` — the annotations are
