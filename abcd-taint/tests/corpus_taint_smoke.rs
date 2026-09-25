@@ -155,4 +155,12 @@ fn taint_smoke_all_fixtures() {
     );
     eprintln!("SMOKE-DETERMINISM runs=2 identical=true");
     assert!(agg.lookups > 0, "the corpus contains call sites");
+    // W5 (q-P2, maintainer-approved 2026-09-25): the design invariant is
+    // ZERO hits on the self-contained corpus — the fixtures never route
+    // entry params into `print`, so any hit is a false positive. Gate it
+    // (was: printed only, an FP regression would have been silent).
+    assert_eq!(
+        total_hits, 0,
+        "corpus taint smoke: any hit on the self-contained corpus is a false positive"
+    );
 }
