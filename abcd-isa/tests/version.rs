@@ -144,8 +144,11 @@ fn for_api_known_multiple_levels() {
 
 #[test]
 fn for_api_sub_valid() {
-    // Test for_api_sub with a valid sub-API string doesn't panic.
-    let _ = Version::for_api_sub(12, "beta1");
+    // Pin the actual result (W1 fix): API 12 with the vendor default
+    // sub-API "beta1" (SUB_API_VERSION_1, file_format_version.h.erb:30-32)
+    // must resolve to API 12's file version.
+    let v = Version::for_api_sub(12, "beta1").expect("API 12 beta1 should be mapped");
+    assert_eq!(v.major(), 12);
 }
 
 #[test]
