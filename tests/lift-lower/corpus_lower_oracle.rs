@@ -87,10 +87,15 @@
 //!
 //! ```text
 //! ABCD_LOWERED_DIR=/tmp/abcd-lowered-full \
-//!   cargo test -p abcd-lower --test corpus_lower_oracle --offline -- --ignored --nocapture
+//!   cargo test -p abcd-rs --test lift-lower -- --ignored --nocapture corpus_lower_oracle
 //! python3 scripts/compare-rewritten-corpus.py \
 //!   exports/corpus/index.jsonl /tmp/abcd-lowered-full/v2opt --allow-missing
 //! ```
+//!
+//! Migrated from `abcd-lower/tests/corpus_lower_oracle.rs` to the root
+//! package's `tests/lift-lower/` target; the root package's manifest dir
+//! IS the repo root, so the corpus path resolves without the crate-local
+//! `..`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -98,10 +103,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use abcd_file::File;
-use abcd_ir::{FuncId, Module, verify_module};
+use abcd_ir::{verify_module, FuncId, Module};
 use abcd_lift::lift_file;
-use abcd_lower::{LowerError, LowerOptions, lower_function_with_options, to_method_body};
-use abcd_opt::inline::{InlinePolicy, InlineReport, inline_module};
+use abcd_lower::{lower_function_with_options, to_method_body, LowerError, LowerOptions};
+use abcd_opt::inline::{inline_module, InlinePolicy, InlineReport};
 use abcd_opt::optimize_module;
 
 /// The three rewrite variants, in driver order.
@@ -246,12 +251,7 @@ fn guarded<T>(stage: impl FnOnce() -> Result<T, Skip>) -> Result<T, Skip> {
 fn passed_corpus_lowered_bodies_written_for_vm_oracle() {
     let root = std::env::var_os("ABCD_CORPUS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("exports")
-                .join("corpus")
-        });
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("exports/corpus"));
 
     // Selection: every row with runtime.status == "passed", optionally
     // restricted to the comma-separated cases in ABCD_LOWERED_CASE.

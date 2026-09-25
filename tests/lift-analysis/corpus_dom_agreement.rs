@@ -22,10 +22,14 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-analysis --test corpus_dom_agreement --release -- --ignored
+//! cargo test -p abcd-rs --test lift-analysis --release -- --ignored corpus_dom_agreement
 //! ```
+//!
+//! Migrated from `abcd-analysis/tests/corpus_dom_agreement.rs` to the
+//! root package's `tests/lift-analysis/` target; the shared helpers
+//! moved to the root package's `tests/common/`.
 
-mod common;
+use crate::common;
 
 use abcd_ir::FuncId;
 use abcd_lift::lift_file;

@@ -5,10 +5,14 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-taint --test corpus_callee_names --release -- --ignored
+//! cargo test -p abcd-rs --test lift-taint --release -- --ignored corpus_callee_names
 //! ```
+//!
+//! Migrated from `abcd-taint/tests/corpus_callee_names.rs` to the root
+//! package's `tests/lift-taint/` target; the shared helpers moved to the
+//! root package's `tests/common/`.
 
-mod common;
+use crate::common;
 
 use abcd_ir::Op;
 use abcd_taint::names::callee_name_candidates;

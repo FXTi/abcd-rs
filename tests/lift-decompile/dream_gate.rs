@@ -22,21 +22,25 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-decompile --test dream_gate --release -- --ignored --nocapture
+//! cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture dream_gate
 //! python3 scripts/dream-gate.py --jobs 8
 //! ```
+//!
+//! Migrated from `abcd-decompile/tests/dream_gate.rs` to the root
+//! package's `tests/lift-decompile/` target; the root package's manifest
+//! dir IS the repo root, so `target/dream-gate` and
+//! `scripts/dream-gate.py` resolve without the crate-local `..`.
 
-mod common;
+use crate::common;
 
 use std::fmt::Write as _;
 use std::path::Path;
 
-use abcd_decompile::emit::{EmitOptions, decompile_module};
+use abcd_decompile::emit::{decompile_module, EmitOptions};
 
 /// The gate root inside `target/` (never committed).
 fn gate_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
         .join("target")
         .join("dream-gate")
 }
@@ -228,7 +232,6 @@ fn generate() -> usize {
 fn dream_gate_oracle() {
     generate();
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
         .join("scripts")
         .join("dream-gate.py");
     let out = std::process::Command::new("python3")
@@ -241,7 +244,6 @@ fn dream_gate_oracle() {
         String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     eprintln!("{text}");
     let report = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
         .join("target")
         .join("dream-gate")
         .join("dream-gate-report.json");

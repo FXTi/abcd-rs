@@ -22,15 +22,19 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-decompile --test corpus_decompile --release -- --ignored --nocapture
+//! cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture corpus_decompile
 //! ```
+//!
+//! Migrated from `abcd-decompile/tests/corpus_decompile.rs` to the root
+//! package's `tests/lift-decompile/` target; the shared helpers moved to
+//! the root package's `tests/common/`.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 
 use abcd_analysis::dataflow::UseDefChains;
-use abcd_decompile::emit::{DecompileStats, EmitOptions, consumed_functions, decompile_module};
+use abcd_decompile::emit::{consumed_functions, decompile_module, DecompileStats, EmitOptions};
 use abcd_ir::{FuncId, Op};
 
 /// Functions legitimately NOT emitted: their defining
@@ -89,10 +93,12 @@ fn dead_dropped_functions(module: &abcd_ir::Module) -> usize {
                     }
                     _ => None,
                 };
-                if let (Some(body), Some(result)) = (body, inst.result)
-                    && value_dead(&chains, result)
-                {
-                    dead.insert(body);
+                // Nested `if let` (not a let chain): the root package is
+                // edition 2021, where let chains are not available.
+                if let (Some(body), Some(result)) = (body, inst.result) {
+                    if value_dead(&chains, result) {
+                        dead.insert(body);
+                    }
                 }
             }
         }

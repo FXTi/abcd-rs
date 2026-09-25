@@ -15,6 +15,11 @@
 //! `$ABCD_CORPUS_ROOT`) and python3 (the manifest is parsed with its
 //! standard JSON library — the established corpus pattern, no JSON
 //! whitespace/key-order assumptions).
+//!
+//! Migrated from `abcd-lift/tests/corpus_lift_verify.rs` to the root
+//! package's cross-crate integration layout (file → lift data flow); the
+//! root package's manifest dir IS the repo root, so the corpus path
+//! resolves without the crate-local `..`.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -24,12 +29,7 @@ use abcd_file::decode;
 fn corpus_root() -> PathBuf {
     std::env::var_os("ABCD_CORPUS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("exports")
-                .join("corpus")
-        })
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("exports/corpus"))
 }
 
 /// Parse the manifest with python3's standard JSON; print each row's

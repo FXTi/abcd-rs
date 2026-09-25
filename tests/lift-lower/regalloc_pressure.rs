@@ -1,8 +1,13 @@
 //! v0.2 port of `abcd-ir/tests/regalloc_pressure.rs`: the wide-register
 //! corpus fixture must lower without nontermination.
+//!
+//! Migrated from `abcd-lower/tests/regalloc_pressure.rs` to the root
+//! package's `tests/lift-lower/` target; the root package's manifest dir
+//! IS the repo root, so the corpus path resolves without the crate-local
+//! `..`.
 
 use abcd_file::decode;
-use abcd_ir::{FuncId, verify_module};
+use abcd_ir::{verify_module, FuncId};
 use abcd_lift::lift_file;
 use abcd_lower::lower_function;
 
@@ -11,12 +16,7 @@ use abcd_lower::lower_function;
 fn wide_register_fixture_lowers_without_nontermination() {
     let path = std::env::var_os("ABCD_CORPUS_ROOT")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("exports")
-                .join("corpus")
-        })
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("exports/corpus"))
         .join("9.0.0.0/upstream/bytecode/ts/ic/ic-slot-16-overflow/baseline/input.abc");
     let file = decode(&std::fs::read(path).expect("wide fixture")).expect("decode");
     let module = lift_file(&file).expect("lift");

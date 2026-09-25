@@ -17,15 +17,19 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-analysis --test corpus_regions --release -- --ignored --nocapture
+//! cargo test -p abcd-rs --test lift-analysis --release -- --ignored --nocapture corpus_regions
 //! ```
+//!
+//! Migrated from `abcd-analysis/tests/corpus_regions.rs` to the root
+//! package's `tests/lift-analysis/` target; the shared helpers moved to
+//! the root package's `tests/common/`.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 
 use abcd_analysis::control::{
-    EdgeClass, EscapeHatch, LoopKind, RegionNode, RegionTree, reachable_blocks, structure_regions,
+    reachable_blocks, structure_regions, EdgeClass, EscapeHatch, LoopKind, RegionNode, RegionTree,
 };
 use abcd_ir::FuncId;
 use abcd_lift::lift_file;

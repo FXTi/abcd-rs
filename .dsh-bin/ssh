@@ -1,0 +1,3 @@
+#!/bin/sh
+# DSH sandbox can't create the ControlMaster socket under ~/.ssh — disable it.
+exec /usr/bin/ssh -o ControlMaster=no -o ControlPath=none "$@"

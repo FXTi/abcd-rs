@@ -28,13 +28,18 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-lower --test corpus_lower_async --release -- --ignored --nocapture
+//! cargo test -p abcd-rs --test lift-lower --release -- --ignored --nocapture corpus_lower_async
 //! ```
+//!
+//! Migrated from `abcd-lower/tests/corpus_lower_async.rs` to the root
+//! package's `tests/lift-lower/` target; the root package's manifest dir
+//! IS the repo root, so the corpus path resolves without the crate-local
+//! `..`.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-use abcd_ir::{FuncId, verify_module};
+use abcd_ir::{verify_module, FuncId};
 use abcd_lift::lift_file;
 use abcd_lower::{lower_function, to_method_body};
 
@@ -79,12 +84,7 @@ fn rewrite(root: &std::path::Path, relative: &str) -> Vec<u8> {
 fn async_fixtures_lower_and_deterministic() {
     let root = std::env::var_os("ABCD_CORPUS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("exports")
-                .join("corpus")
-        });
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("exports/corpus"));
 
     let output = Command::new("python3")
         .arg("-c")

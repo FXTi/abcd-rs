@@ -14,10 +14,14 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-taint --test corpus_taint_smoke --release -- --ignored --nocapture
+//! cargo test -p abcd-rs --test lift-taint --release -- --ignored --nocapture corpus_taint_smoke
 //! ```
+//!
+//! Migrated from `abcd-taint/tests/corpus_taint_smoke.rs` to the root
+//! package's `tests/lift-taint/` target; the shared helpers moved to the
+//! root package's `tests/common/`.
 
-mod common;
+use crate::common;
 
 use abcd_taint::{SinkSpec, SourceSpec, TaintConfig, TaintReport};
 

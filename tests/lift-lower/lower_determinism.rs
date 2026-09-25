@@ -23,16 +23,21 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-lower --test lower_determinism --offline -- --ignored --nocapture
+//! cargo test -p abcd-rs --test lift-lower -- --ignored --nocapture lower_determinism
 //! ABCD_DETERMINISM_CASES=destructuring,exception-finally \
-//!   cargo test -p abcd-lower --test lower_determinism --offline -- --ignored --nocapture
+//!   cargo test -p abcd-rs --test lift-lower -- --ignored --nocapture lower_determinism
 //! ```
+//!
+//! Migrated from `abcd-lower/tests/lower_determinism.rs` to the root
+//! package's `tests/lift-lower/` target; the root package's manifest dir
+//! IS the repo root, so the corpus path resolves without the crate-local
+//! `..`.
 
 use std::path::PathBuf;
 use std::process::Command;
 
 use abcd_file::File;
-use abcd_ir::{FuncId, Module, verify_module};
+use abcd_ir::{verify_module, FuncId, Module};
 use abcd_lift::lift_file;
 use abcd_lower::{lower_function, to_method_body};
 
@@ -152,12 +157,7 @@ fn pinpoint(module_a: &Module, module_b: &Module, file: &File) -> String {
 fn corpus_lower_is_byte_deterministic() {
     let root = std::env::var_os("ABCD_CORPUS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("exports")
-                .join("corpus")
-        });
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("exports/corpus"));
 
     let output = Command::new("python3")
         .arg("-c")

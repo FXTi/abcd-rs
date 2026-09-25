@@ -27,12 +27,16 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-decompile --test textual_oracle --release -- --ignored --nocapture
+//! cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture textual_oracle
 //! ```
+//!
+//! Migrated from `abcd-decompile/tests/textual_oracle.rs` to the root
+//! package's `tests/lift-decompile/` target; the shared helpers moved to
+//! the root package's `tests/common/`.
 
-mod common;
+use crate::common;
 
-use abcd_decompile::emit::{EmitOptions, decompile_module};
+use abcd_decompile::emit::{decompile_module, EmitOptions};
 
 /// A normalized token: identifiers/literals/punctuation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -236,11 +240,13 @@ fn textual_oracle() {
         }
         let mut covered = 0usize;
         for t in &want {
-            if let Some(n) = pool.get_mut(t)
-                && *n > 0
-            {
-                *n -= 1;
-                covered += 1;
+            // Nested `if let` (not a let chain): the root package is
+            // edition 2021, where let chains are not available.
+            if let Some(n) = pool.get_mut(t) {
+                if *n > 0 {
+                    *n -= 1;
+                    covered += 1;
+                }
             }
         }
         let containment = covered as f64 / want.len().max(1) as f64;

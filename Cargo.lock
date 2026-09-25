@@ -102,6 +102,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "abcd-rs"
+version = "0.0.0"
+dependencies = [
+ "abcd-analysis",
+ "abcd-decompile",
+ "abcd-file",
+ "abcd-file-sys",
+ "abcd-ir",
+ "abcd-isa",
+ "abcd-lift",
+ "abcd-lower",
+ "abcd-opt",
+ "abcd-taint",
+ "serde_json",
+]
+
+[[package]]
 name = "abcd-taint"
 version = "0.1.0"
 dependencies = [

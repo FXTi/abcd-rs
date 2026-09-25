@@ -24,11 +24,16 @@
 //!   `ASSERT(res.IsJSSharedFunction())`), NOT the contemporary
 //!   `defineclasswithbuffer`'s `SlowRuntimeStub::CreateClassWithBuffer`
 //!   (interpreter_assembly.cpp:6007/6033).
+//!
+//! Migrated from `abcd-lower/tests/lower_sendable_class.rs` to the root
+//! package's `tests/lift-lower/` target; the root package's manifest dir
+//! IS the repo root, so the corpus path resolves without the crate-local
+//! `..`.
 
 use std::path::PathBuf;
 
 use abcd_file::File;
-use abcd_ir::{FuncId, Module, Op, verify_module};
+use abcd_ir::{verify_module, FuncId, Module, Op};
 use abcd_isa::Bytecode;
 use abcd_lift::lift_file;
 use abcd_lower::{lower_function, to_method_body};
@@ -36,12 +41,7 @@ use abcd_lower::{lower_function, to_method_body};
 fn corpus_root() -> PathBuf {
     std::env::var_os("ABCD_CORPUS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("exports")
-                .join("corpus")
-        })
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("exports/corpus"))
 }
 
 /// Recursively collect every `input.abc` under `dir` (sorted).

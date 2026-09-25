@@ -13,12 +13,16 @@
 //!
 //! Every probe seeds `func_main_0`'s params and sinks `print`, matching
 //! the corpus smoke configuration so the numbers are comparable.
+//!
+//! Migrated from `abcd-taint/tests/probes.rs` to the root package's
+//! `tests/lift-taint/` target; the IR scaffolding moved to the root
+//! package's `tests/common/taint_scaffold.rs`, and — the root package's
+//! manifest dir IS the repo root — the compiled suite's `probes-taint/`
+//! resolution lost the crate-local `..`.
 
-mod common;
-
+use crate::common::taint_scaffold::*;
 use abcd_ir::{BlockId, CallKind, Edge, EdgeKind, Module, Op};
 use abcd_taint::{SinkSpec, SourceSpec, TaintConfig};
-use common::*;
 
 /// Probe counts: true/false positives and false negatives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,7 +429,7 @@ fn probe_exception_only_path() {
 //
 // Run:
 //   python3 scripts/gen-taint-probes.py   # once, needs docker
-//   cargo test -p abcd-taint --test probes --release -- \
+//   cargo test -p abcd-rs --test lift-taint --release -- \
 //       --ignored --nocapture probe_suite_compiled
 // ────────────────────────────────────────────────────────────────────
 
@@ -453,8 +457,8 @@ mod compiled {
     }
 
     fn repo_root() -> PathBuf {
+        // The root package's manifest dir IS the repo root.
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
             .canonicalize()
             .expect("repo root")
     }

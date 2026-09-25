@@ -21,16 +21,20 @@
 //! Run:
 //!
 //! ```text
-//! cargo test -p abcd-decompile --test corpus_stage_a --release -- --ignored --nocapture
+//! cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture corpus_stage_a
 //! ```
+//!
+//! Migrated from `abcd-decompile/tests/corpus_stage_a.rs` to the root
+//! package's `tests/lift-decompile/` target; the shared helpers moved to
+//! the root package's `tests/common/`.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 
 use abcd_decompile::dump::dump_module;
 use abcd_decompile::fitness::Fitness;
-use abcd_decompile::recover::{OpStat, Outcome, recover_func};
+use abcd_decompile::recover::{recover_func, OpStat, Outcome};
 use abcd_ir::FuncId;
 use abcd_lift::lift_file;
 

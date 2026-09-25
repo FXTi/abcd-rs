@@ -20,10 +20,16 @@
 //! The decompiled text is also `node --check`-ed per case. When node is
 //! absent the behavior assertions skip (reported); the text-shape pins
 //! always run.
+//!
+//! Migrated from `abcd-decompile/tests/async_node.rs` to the root
+//! package's `tests/lift-decompile/` target; the IR scaffolding moved to
+//! the root package's `tests/common/decompile_scaffold.rs`, and — the
+//! root package's manifest dir IS the repo root — the corpus/target
+//! paths lost the crate-local `..`.
 
-use abcd_decompile::emit::{EmitOptions, decompile_module};
-use abcd_file::{AccessFlags, Builder, FunctionKind as FileKind, Type, decode};
-use abcd_isa::{Bytecode, Imm, Reg, encode as encode_bytecodes};
+use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_file::{decode, AccessFlags, Builder, FunctionKind as FileKind, Type};
+use abcd_isa::{encode as encode_bytecodes, Bytecode, Imm, Reg};
 use abcd_lift::lift_file;
 
 /// Build a 12.x file whose global class carries one static ASYNC method
@@ -191,10 +197,10 @@ fn async_fold_node_behavior() {
 // the decompiled text only parses and runs correctly under node if the
 // fold dissolved the machinery into plain `await` control flow.
 
+use crate::common::decompile_scaffold::*;
 use abcd_ir::module::FunctionKind;
 use abcd_ir::op::{BinOp, CmpOp, UnOp};
 use abcd_ir::{Const, Edge, EdgeKind, FuncId, Module, Op, ValueId};
-use common::*;
 
 /// `AsyncFunctionAwaitUncaught(funcobj, acc=v)` + `SuspendGenerator` +
 /// the completion pair; returns (resume, mode).
@@ -954,7 +960,7 @@ fn async_generator_machine_fold_node_behavior() {
 #[test]
 #[ignore = "requires exported GHCR corpus"]
 fn async_generator_corpus_node_check() {
-    let root = common::corpus_root();
+    let root = crate::common::corpus_root();
     let node_ok = std::process::Command::new("node")
         .arg("--version")
         .output()
@@ -1000,8 +1006,6 @@ fn async_generator_corpus_node_check() {
 
 // ── Corpus async recompile evidence (opt-in) ─────────────────────────
 
-mod common;
-
 /// Decompile the 21 corpus async fixtures (`local/async-await`,
 /// `local/async-generator` — the ONLY carriers of the async opcode
 /// family, all runtime `not-applicable`) and write the JS tree to
@@ -1010,7 +1014,7 @@ mod common;
 /// evidence run:
 ///
 /// ```text
-/// cargo test -p abcd-decompile --test async_node --release -- \
+/// cargo test -p abcd-rs --test lift-decompile --release -- \
 ///   --ignored --nocapture async_corpus_emit
 /// python3 scripts/dream-gate.py …  # the recompile step is driven
 /// # ad hoc per scripts/dream-gate.py's compile_one flags
@@ -1018,9 +1022,8 @@ mod common;
 #[test]
 #[ignore = "requires exported GHCR corpus and python3"]
 fn async_corpus_emit() {
-    let root = common::corpus_root();
+    let root = crate::common::corpus_root();
     let out_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
         .join("target")
         .join("dream-gate-async");
     let src_root = out_root.join("src");

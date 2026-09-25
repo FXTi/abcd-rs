@@ -1,3 +1,13 @@
+# Root package: exists so the cross-crate integration suites under tests/
+# (migrated out of the member crates; each target is named in data-flow
+# order of the crates it exercises) have a home. The member crates are
+# unchanged; their own L1 unit/integration tests stay in-tree.
+[package]
+name = "abcd-rs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
 [workspace]
 resolver = "2"
 members = [
@@ -41,3 +51,19 @@ abcd-opt = { path = "abcd-opt" }
 abcd-analysis = { path = "abcd-analysis" }
 abcd-taint = { path = "abcd-taint" }
 abcd-decompile = { path = "abcd-decompile" }
+
+# Dev-dependencies of the root package: exactly the crates the migrated
+# cross-crate suites under tests/ link against (plus serde_json for the
+# corpus-manifest parsing in tests/file-isa, matching abcd-file's dev-dep).
+[dev-dependencies]
+abcd-isa = { workspace = true }
+abcd-file-sys = { workspace = true }
+abcd-file = { workspace = true }
+abcd-ir = { workspace = true }
+abcd-lift = { workspace = true }
+abcd-lower = { workspace = true }
+abcd-opt = { workspace = true }
+abcd-analysis = { workspace = true }
+abcd-taint = { workspace = true }
+abcd-decompile = { workspace = true }
+serde_json = "1"

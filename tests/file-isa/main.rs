@@ -6,30 +6,28 @@
 //! whenever the corpus is present:
 //!
 //! ```text
-//! cargo test --test real_module_abc -- --ignored
+//! cargo test -p abcd-rs --test file-isa -- --ignored
 //! ```
+//!
+//! Migrated from `abcd-file/tests/real_module_abc.rs` to the root
+//! package's cross-crate integration layout (file → isa data flow); the
+//! root package's manifest dir IS the repo root, so the corpus paths
+//! resolve without the crate-local `..`.
 
 use abcd_file::{decode, encode};
 use abcd_isa::{
-    BytecodeFlags, EntityKind, Operand, Version, decode as decode_isa, encode as encode_isa,
+    decode as decode_isa, encode as encode_isa, BytecodeFlags, EntityKind, Operand, Version,
 };
 use std::process::Command;
 
 fn exported_corpus_root() -> std::path::PathBuf {
     std::env::var_os("ABCD_CORPUS_ROOT")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("exports")
-                .join("corpus")
-        })
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("exports/corpus"))
 }
 
 fn corpus_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("modules.abc")
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("modules.abc")
 }
 
 /// Parse the corpus manifest with Python's standard JSON parser — the

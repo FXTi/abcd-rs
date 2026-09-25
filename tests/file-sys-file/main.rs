@@ -7,6 +7,10 @@
 //! constant (in-cone constant is private, collect_util.h:40; the public
 //! abc2program one is outside the CI sparse cone) — it stays behaviorally
 //! pinned by the module-record tests, documented at the constant.
+//!
+//! Migrated from `abcd-file/tests/vendor_name_pins.rs` to the root
+//! package's cross-crate integration layout (file-sys → file data flow:
+//! the pin links abcd-file's constants to the abcd-file-sys bridge).
 
 use abcd_file_sys as sys;
 use std::ffi::CStr;

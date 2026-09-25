@@ -27,15 +27,19 @@
 //!
 //! All five outputs are `node --check`-ed. When node is absent the
 //! behavior assertions skip (reported); the checks always run.
+//!
+//! Migrated from `abcd-decompile/tests/yield_star_node.rs` to the root
+//! package's `tests/lift-decompile/` target; the root package's manifest
+//! dir IS the repo root, so the fixture path resolves without the
+//! crate-local `..`.
 
-use abcd_decompile::emit::{EmitOptions, decompile_module};
+use abcd_decompile::emit::{decompile_module, EmitOptions};
 use abcd_lift::lift_file;
 use std::path::PathBuf;
 
 /// The fixture root (standalone — deliberately outside exports/corpus).
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
         .join("decompile-fixtures")
         .join("yield-star")
         .join(name)
