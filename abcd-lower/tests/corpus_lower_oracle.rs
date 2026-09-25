@@ -23,9 +23,9 @@
 //!   change observable behavior) plus determinism. Aggregate inline
 //!   statistics (sites inlined, instructions cloned, skip-reason
 //!   histogram) are printed at the end as `INLINE-STATS`/`INLINE-SKIP`
-//!   lines. Setting `ABCD_INLINE_DETERMINISM=1` re-runs the whole
-//!   v2inline rewrite per fixture from a fresh front-end and asserts
-//!   the two encodes are byte-identical.
+//!   lines. The v2inline determinism double-run (re-run the whole rewrite
+//!   per fixture from a fresh front-end, assert byte-identical encodes)
+//!   is ON by default (W6, q-P2); `ABCD_INLINE_DETERMINISM=0` opts out.
 //!
 //! ## Gate 2 (v2opt vs v0.1 opt byte-identity) — ACCEPTED form
 //!
@@ -320,7 +320,10 @@ for path in sorted(paths):
     let mut histograms: [BTreeMap<String, usize>; 3] =
         [BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
     let mut inline_stats = InlineReport::default();
-    let determinism = std::env::var("ABCD_INLINE_DETERMINISM").as_deref() == Ok("1");
+    // W6 (q-P2): the inline determinism double-run is ON by default — it
+    // is the only in-cargo guard against a nondeterministic inline pass.
+    // ABCD_INLINE_DETERMINISM=0 opts out (debugging speed).
+    let determinism = std::env::var("ABCD_INLINE_DETERMINISM").as_deref() != Ok("0");
 
     let record_skip = |variant: usize,
                        name: &str,
@@ -500,5 +503,18 @@ for path in sorted(paths):
     eprintln!("INLINE-SKIP-HISTOGRAM:");
     for (reason, count) in &inline_stats.skips {
         eprintln!("  {}: {count}", reason.label());
+    }
+    if full_run {
+        // W8 (q-P2, maintainer-approved 2026-09-25): a lowering regression
+        // that starts SKIPPING fixtures must fail here — not only two steps
+        // later in the python VM oracle (missing-candidate). The skip
+        // histograms stay printed above for forensics; zero is now gated.
+        for (variant, name) in VARIANTS.iter().enumerate() {
+            let skipped: usize = histograms[variant].values().sum();
+            assert_eq!(
+                skipped, 0,
+                "{name}: {skipped} fixture(s) skipped lowering — a skip is a regression, not data"
+            );
+        }
     }
 }
