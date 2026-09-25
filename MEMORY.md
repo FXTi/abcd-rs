@@ -932,3 +932,16 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   test262 P0, probe/yield-star prebuild, gitee-manifest radar — worker
   running on dabai:~/ark) then c-P3 (per-push CI job graph + image digest
   pin + yield-star fixtures read from export, corpus 2787->2792 bump).
+- c-P2 (2026-09-26): arkcompiler-test image repo rework merged to main
+  (91e78c7). Parallel generate (12.5x, byte-identical), test262 P0 (pin
+  747bed2, arkcompiler CI list 3963-deduped, bucketed: 2685 compiled + 224
+  negative-parse (agreement 100%) + 1 cant; skips counted not dropped),
+  45 new structural cases (40 taint probes + 5 yield-star at
+  24.0.0.0/baseline), gitee-manifest weekly radar (branches+tags by
+  committer date, standing PR with human build/publish checklist), README
+  radar-only-CI + digest discipline. Baseline correction: image corpus was
+  2757 baked (abcd-rs adds 30 via gen-opcode-fixtures.py = the 2787 our
+  suites assert); runtime_checked stays 1119. NEXT (maintainer act):
+  make build && make test && make push on dabai -> new digest -> c-P3
+  (abcd-rs CI job graph + digest pin + yield-star-from-export, corpus
+  2787->2832 deliberate bump: 2802 baked + 30 script).
