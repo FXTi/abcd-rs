@@ -47,21 +47,6 @@ try {
 }
 }
 
-size_t isa_get_size(uint8_t format) {
-try {
-    return Inst::Size(static_cast<Inst::Format>(format));
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_is_prefixed(uint16_t opcode) {
-try {
-    return (opcode & 0xFF) >= Inst::GetMinPrefixOpcodeIndex() ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
 
 uint16_t isa_get_opcode(const uint8_t* bytes) {
 try {
@@ -72,15 +57,6 @@ try {
 }
 }
 
-uint8_t isa_get_format_from_bytes(const uint8_t* bytes) {
-try {
-    Inst inst(bytes);
-    if (!opcode_is_valid(static_cast<uint16_t>(inst.GetOpcode()))) return ISA_FORMAT_INVALID;
-    return static_cast<uint8_t>(inst.GetFormat());
-} catch (...) {
-    return ISA_FORMAT_INVALID;
-}
-}
 
 size_t isa_get_size_from_bytes(const uint8_t* bytes) {
 try {
@@ -131,21 +107,6 @@ try {
 }
 }
 
-int isa_has_vreg(uint8_t format, size_t idx) {
-try {
-    return Inst::HasVReg(static_cast<Inst::Format>(format), idx) ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_has_imm(uint8_t format, size_t idx) {
-try {
-    return Inst::HasImm(static_cast<Inst::Format>(format), idx) ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
 
 int isa_has_id(uint8_t format, size_t idx) {
 try {
@@ -155,85 +116,6 @@ try {
 }
 }
 
-int isa_can_throw(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.CanThrow() ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_is_terminator(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.IsTerminator() ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_is_return_or_throw(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.IsReturnOrThrowInstruction() ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_has_flag(const uint8_t* bytes, uint32_t flag) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.HasFlag(static_cast<Inst::Flags>(flag)) ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_is_throw_ex(const uint8_t* bytes, uint32_t exception_mask) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.IsThrow(static_cast<Inst::Exceptions>(exception_mask)) ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_is_jump(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.IsJumpInstruction() ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_is_range(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.IsRangeInstruction() ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_is_suspend(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.IsSuspend() ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
 
 /* Helper: construct a zero-filled instruction buffer from an opcode.
  * Classification methods only inspect the opcode, not operand bytes. */
@@ -320,65 +202,6 @@ try {
 }
 }
 
-size_t isa_format_opcode_name(uint16_t opcode, char* buf, size_t buf_len) {
-try {
-    if (buf_len == 0) return 0;
-    if (!opcode_is_valid(opcode)) return 0;
-    auto op = static_cast<Inst::Opcode>(opcode);
-    std::ostringstream oss;
-    panda::operator<< <panda::BytecodeInstMode::FAST>(oss, op);
-    std::string s = oss.str();
-    size_t copy_len = s.size() < buf_len - 1 ? s.size() : buf_len - 1;
-    std::memcpy(buf, s.c_str(), copy_len);
-    buf[copy_len] = '\0';
-    return copy_len;
-} catch (...) {
-    return 0;
-}
-}
-
-size_t isa_format_instruction(const uint8_t* bytes, size_t len,
-                               char* buf, size_t buf_len) {
-try {
-    if (len == 0 || buf_len == 0) return 0;
-    // Validate before constructing Inst: a lone prefix byte at the end of
-    // the buffer must not read bytes[1], and an invalid opcode must not
-    // reach GetSize (audit findings: latent 1-byte over-read + abort).
-    uint8_t primary = bytes[0];
-    if (primary >= Inst::GetMinPrefixOpcodeIndex() && len < 2) return 0;
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    if (inst.GetSize() > len) return 0;
-    std::ostringstream oss;
-    oss << inst;
-    std::string s = oss.str();
-    size_t copy_len = s.size() < buf_len - 1 ? s.size() : buf_len - 1;
-    std::memcpy(buf, s.c_str(), copy_len);
-    buf[copy_len] = '\0';
-    return copy_len;
-} catch (...) {
-    return 0;
-}
-}
-
-size_t isa_format_opcode(const uint8_t* bytes, char* buf, size_t buf_len) {
-try {
-    if (buf_len == 0) return 0;
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    auto op = inst.GetOpcode();
-    std::ostringstream oss;
-    // operator<< for Opcode has non-deducible Mode; call explicitly.
-    panda::operator<< <panda::BytecodeInstMode::FAST>(oss, op);
-    std::string s = oss.str();
-    size_t copy_len = s.size() < buf_len - 1 ? s.size() : buf_len - 1;
-    std::memcpy(buf, s.c_str(), copy_len);
-    buf[copy_len] = '\0';
-    return copy_len;
-} catch (...) {
-    return 0;
-}
-}
 
 /* === Constants and prefix queries === */
 
@@ -390,16 +213,6 @@ try {
 }
 }
 
-
-int isa_is_primary_opcode_valid(uint8_t primary) {
-try {
-    uint8_t buf[1] = { primary };
-    Inst inst(buf);
-    return inst.IsPrimaryOpcodeValid() ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
 
 /* === Additional operand methods === */
 
@@ -413,25 +226,6 @@ try {
 }
 }
 
-size_t isa_get_imm_count(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.GetImmCount();
-} catch (...) {
-    return 0;
-}
-}
-
-size_t isa_get_literal_index(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return ISA_NO_LITERAL_INDEX;
-    Inst inst(bytes);
-    return inst.GetLiteralIndex();
-} catch (...) {
-    return ISA_NO_LITERAL_INDEX;
-}
-}
 
 void isa_update_id(uint8_t* bytes, uint32_t new_id, uint32_t idx) {
 try {
@@ -447,57 +241,6 @@ try {
 }
 }
 
-int64_t isa_get_last_vreg(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return -1;
-    Inst inst(bytes);
-    auto result = inst.GetLastVReg();
-    return result.has_value() ? static_cast<int64_t>(result.value()) : -1;
-} catch (...) {
-    return -1;
-}
-}
-
-int64_t isa_get_range_last_reg_idx(const uint8_t* bytes) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return -1;
-    Inst inst(bytes);
-    auto result = inst.GetRangeInsLastRegIdx();
-    return result.has_value() ? static_cast<int64_t>(result.value()) : -1;
-} catch (...) {
-    return -1;
-}
-}
-
-int isa_is_id_string(const uint8_t* bytes, size_t idx) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.IsIdMatchFlag(idx, Inst::Flags::STRING_ID) ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_is_id_method(const uint8_t* bytes, size_t idx) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.IsIdMatchFlag(idx, Inst::Flags::METHOD_ID) ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
-
-int isa_is_id_literal_array(const uint8_t* bytes, size_t idx) {
-try {
-    if (!inst_opcode_is_valid(bytes)) return 0;
-    Inst inst(bytes);
-    return inst.IsIdMatchFlag(idx, Inst::Flags::LITERALARRAY_ID) ? 1 : 0;
-} catch (...) {
-    return 0;
-}
-}
 
 /* === Version API === */
 
@@ -519,13 +262,6 @@ try {
 }
 }
 
-size_t isa_get_api_version_count(void) {
-try {
-    return panda::panda_file::api_version_map.size();
-} catch (...) {
-    return 0;
-}
-}
 
 int isa_get_version_by_api(uint8_t api_level, uint8_t out[4]) {
 try {
