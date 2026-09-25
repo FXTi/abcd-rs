@@ -546,10 +546,15 @@ fn decode_param_annotations(
 /// blobs (upstream name `_ESModuleRecord`: abc2program/common/
 /// abc_file_utils.h `ES_MODULE_RECORD`; collection policy:
 /// libpandafile/util/collect_util.h `ES_MODULE_RECORD`).
-const ES_MODULE_RECORD_DESCRIPTOR: &str = "L_ESModuleRecord;";
+/// PIN STATUS (V-I1): the only in-cone vendor constant is private
+/// (collect_util.h:40) and the public one (abc_file_utils.h) sits outside
+/// the CI sparse cone, so no bridge export exists — this stays behaviorally
+/// pinned by the module-record tests. The other three names are pinned via
+/// `abc_vendor_*` exports (vendor_name_pins.rs).
+pub const ES_MODULE_RECORD_DESCRIPTOR: &str = "L_ESModuleRecord;";
 /// Descriptor of the record class whose u32 fields reference scope-names
 /// literal arrays (upstream `_ESScopeNamesRecord`, same sources).
-const ES_SCOPE_NAMES_RECORD_DESCRIPTOR: &str = "L_ESScopeNamesRecord;";
+pub const ES_SCOPE_NAMES_RECORD_DESCRIPTOR: &str = "L_ESScopeNamesRecord;";
 
 /// Name of the u32 field whose value is the file offset of an untagged
 /// module-request-phase blob (one u8 lazy-import flag per module request).
@@ -559,7 +564,7 @@ const ES_SCOPE_NAMES_RECORD_DESCRIPTOR: &str = "L_ESScopeNamesRecord;";
 /// vendored runtime/disassembler key on the name too
 /// (js_pandafile.cpp:217 `LAZY_IMPORT`, disassembler.cpp:1007
 /// `MODULE_REQUEST_PAHSE_IDX`).
-const MODULE_REQUEST_PHASE_FIELD: &str = "moduleRequestPhaseIdx";
+pub const MODULE_REQUEST_PHASE_FIELD: &str = "moduleRequestPhaseIdx";
 
 /// Name of the upstream-DEAD module-record field whose value is a NESTED
 /// file offset — it points to a literal array whose elements are
@@ -573,7 +578,7 @@ const MODULE_REQUEST_PHASE_FIELD: &str = "moduleRequestPhaseIdx";
 /// indirection, so decode is a HARD ERROR on the name alone (N8,
 /// maintainer ruling 2026-09-20) — never a warning, never a silent raw
 /// `FieldValue::I32` pass-through that a rewrite would leave dangling.
-const TYPE_SUMMARY_OFFSET_FIELD: &str = "typeSummaryOffset";
+pub const TYPE_SUMMARY_OFFSET_FIELD: &str = "typeSummaryOffset";
 
 /// Decode a module-record blob through the vendored ModuleDataAccessor.
 ///

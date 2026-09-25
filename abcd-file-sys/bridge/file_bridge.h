@@ -37,6 +37,14 @@ extern "C" {
  * wrappers always collect-all and never rely on early stop. */
 typedef int (*AbcAnnotationCb)(uint32_t annotation_off, void *ctx);
 
+/* ========== Vendor name constants (V-I1 pins) ==========
+ * The vendor's own values for names abcd-file hardcodes in decode.rs.
+ * Compared against the Rust constants by abcd-file/tests/vendor_name_pins.rs
+ * — a vendor rename breaks the bridge build, a value change fails the test. */
+const char *abc_vendor_type_summary_field_name(void);
+const char *abc_vendor_module_request_phase_idx(void);
+const char *abc_vendor_scope_names_record(void);
+
 /* ========== File handle ========== */
 
 typedef struct AbcFileHandle AbcFileHandle;
