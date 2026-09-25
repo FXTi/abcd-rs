@@ -42,8 +42,10 @@ fn probe_config() -> TaintConfig {
     }
 }
 
-/// Evaluate a module against `(expected_tainted_sinks, expected_clean_sinks)`.
-fn evaluate(module: &Module, family: &str, expected: Counts) {
+/// Evaluate a module against `(expected_tainted_sinks, expected_clean_sinks)`
+/// plus the exact set of expected hit marker lines (W4: hit IDENTITY, not
+/// just the count — a wrong-sink hit with the right count must fail).
+fn evaluate(module: &Module, family: &str, expected: Counts, expected_lines: &[u32]) {
     let report = abcd_taint::run_taint(module, &probe_config());
     let actual = Counts {
         tp: report.hits.len(),
@@ -61,6 +63,15 @@ fn evaluate(module: &Module, family: &str, expected: Counts) {
         expected.tp + expected.fp,
         "{family}: hits = tp+fp"
     );
+    let mut lines: Vec<u32> = report
+        .hits
+        .iter()
+        .filter_map(|h| h.loc.map(|l| l.line))
+        .collect();
+    lines.sort_unstable();
+    let mut want: Vec<u32> = expected_lines.to_vec();
+    want.sort_unstable();
+    assert_eq!(lines, want, "{family}: hit identity (sink marker lines)");
 }
 
 /// `print(x)` over `value` in block `b`, with a distinguishing marker
@@ -111,6 +122,7 @@ fn probe_straight_line_local() {
             fp: 0,
             fn_: 0,
         },
+        &[10],
     );
 }
 
@@ -285,6 +297,7 @@ fn probe_dynamic_dispatch() {
             fp: 0,
             fn_: 0,
         },
+        &[30],
     );
 }
 
