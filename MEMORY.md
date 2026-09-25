@@ -890,3 +890,15 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   for code review after Phase 1, then withdrew it ("Phase 1 完成后不用停了，
   继续吧"). Continue directly into Phase 2+ when Phase 1 lands; no stop
   between phases.
+- MAINTAINER RULINGS (2026-09-25, after the test-quality evaluation,
+  design/test-quality-evaluation.md): (1) bridge C++ is OUT of the 90%
+  coverage denominator (extends D3: the dead FFI surface is kept but not
+  measured); the 90% goal refers to OUR Rust, measured corpus-inclusive
+  (the nightly coverage-true artifact once Track 2 lands; current floor
+  84.38%, orchestrator-reproduced). (2) Commissioned: a detailed bridge
+  dead-code analysis quantifying the deletable surface AND proving every
+  needed vendor-C++ capability is already reachable through the live
+  bridge exports (→ design/bridge-surface-analysis.md). (3) Approved: the
+  six cheap weak-test fixes W1/W4/W5/W6/W8/W9 (evaluation §3) — red-first
+  discipline: W5 (hits==0) and W8 (zero-skip) gates may only land after
+  the invariant is verified to currently hold.

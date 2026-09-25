@@ -320,8 +320,10 @@ under coverage):**
 
 **Class C — documented, not a gap:** bridge C++ 58.9% (D3 ruling; 108/324
 exports deliberately dead). Vendored C++ 59.3%: exclude via codecov.yml
-(`**/arkcompiler_runtime_core/**` — planned as R4 in ci-rework-plan §3.4,
-**not yet applied**).
+(`**/arkcompiler_runtime_core/**` — planned as R4 in ci-rework-plan §3.4).
+*Update 2026-09-25: R4 landed (`ddd9491`), and the bridge/shim C++ was
+excluded from the denominator in the same commit (maintainer ruling: the
+90% goal is OUR Rust only).*
 
 ### 4.3 What the future corpus sources would/wouldn't close
 
