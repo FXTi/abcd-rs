@@ -15,14 +15,25 @@
    (`-DNDEBUG`, `-DSUPPORT_KNOWN_EXCEPTION`, `-DPANDA_TARGET_UNIX`,
    `-DPANDA_TARGET_MACOS` on Apple targets).
 3. **The pin is content-chosen, not tag-chosen.** Both submodules are pinned
-   to `7303d5c2` (upstream `master`), identified by blob-matching the exact
-   content our bridge is proven against (VM oracle 1149/1149 + the pandasm
-   per-instruction corpus). Release tags are NOT automatically safe:
-   `OpenHarmony-v7.0-Release`'s legacy root `libpandafile/` is
-   self-inconsistent (`file_reader.cpp` calls
+   to `4fba38e` (`OpenHarmony-v7.0-Release`, PR #20 merged `c6e41cc`), moved
+   from the former master pin `7303d5c2`. The measured porting cost of that
+   repin was exactly ONE bridge fix (`4d586cb`: the ported `GetFileType`
+   referenced master-only constants `FILE_TYPE_OFFSET`/
+   `FILE_TYPE_STATIC_FLAG`/`OLD_STATIC_VERSION`, deleted at v7.0; now
+   references `File::STATIC_VERSION` symbolically) — zero Rust changes, loud
+   compile-time failure (q-P3 audit, design/bridge-vendor-isolation.md §A.3).
+   Release tags are NOT automatically safe: v7.0's legacy root
+   `libpandafile/` is self-inconsistent (`file_reader.cpp` calls
    `MethodParamItem::AddRuntimeAnnotation`, which legacy `file_items.h`
    never declares; the consistent implementation lives in
-   `static_core/libarkfile`). Repins are deliberate, gated work.
+   `static_core/libarkfile`). Our build does not compile that TU
+   (abcd-file-sys/build.rs EXCLUDED list). Repins are deliberate, gated
+   work — per-repin checklist: (a) expect loud compile breaks where the
+   bridge references renamed/deleted vendor API (by design); (b) re-diff
+   `ParamAnnotationsItem`'s ctor semantics (V-I4 — a future branch on
+   `is_runtime_annotations` would silently empty the runtime bucket; the
+   `runtime_only_bucket_seals_as_runtime` tripwire test catches it);
+   (c) watch the q-P3 watch list (design/bridge-vendor-isolation.md §C).
 
 ## Why two submodules of the same repo
 
@@ -70,10 +81,11 @@ a NEW PR and the old one stays as history. Radar infra failure before a
 verdict (ls-remote/fetch failure, pin disagreement) opens or updates ONE
 standing issue, label `vendor-radar`.
 
-A **red** bump PR is the radar working as designed — e.g. v7.0-Release
-fails to build because of the legacy-`libpandafile` drift above. The PR
-documents the porting cost; merging requires making it green (shim/bridge
-adaptation, never submodule edits).
+A **red** bump PR is the radar working as designed (PR #20 was the
+example: v7.0-Release initially broke the build on the
+legacy-`libpandafile` drift above; one bridge port later it merged green).
+The PR documents the porting cost; merging requires making it green
+(shim/bridge adaptation, never submodule edits).
 
 ## Rollback
 
