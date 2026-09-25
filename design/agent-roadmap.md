@@ -329,5 +329,5 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 
 **维护者决策（2026-09-25，测试质量评估后）**：① **90% 口径 = 我们的代码、含语料全量**（nightly coverage-true artifact；当前地板：我们的 Rust 84.38% 已经 orchestrator 复现）；**同日修正：桥接 C++ 留在分母**——自己写的代码自然要测，靠上层 Rust 驱动覆盖；可证死的面走 q-P1 删除而非排除；分母只排除 vendored `**/arkcompiler_runtime_core/**`（R4）；② 委托桥接死代码详析（量化可删面 + 证明厂商必要逻辑已全部经活导出可达 → q-P1）；③ 批准六个廉价弱测试修复（W1/W4/W5/W6/W8/W9 → q-P2；红先行纪律：W5 的 hits==0 与 W8 的零-skip 门须先验证不变量当前成立方可落地）。
 
-| q-P1 | 桥接 C++ 死面详析 | 只读分析：逐符号盘点两 -sys 桥接导出 × Rust FFI 引用映射；区分"Rust 不引用"（可删）与"引用但罕执行"（保留）；量化删除面；证明厂商必要逻辑全覆盖 | worker q-P1 (k3) | **进行中** |
+| q-P1 | 桥接 C++ 死面详析 | 只读分析：逐符号盘点两 -sys 桥接导出 × Rust FFI 引用映射；区分"Rust 不引用"（可删）与"引用但罕执行"（保留）；量化删除面；证明厂商必要逻辑全覆盖 | worker q-P1 (k3) | **完成**（571cbbb，design/bridge-surface-analysis.md：332 导出=LIVE 226+TEST-ONLY 6+DEAD 100（isa 25+abc 75）；可删 ≈852-950 行（isa 248/abc 604；行距边界系统性少计 1 行已勘正）；历史 108/324 漂移对账（+8 活导出、8 旧死转活/转测试钉）；完备性双向证明：37 组必需 vendor 能力全有活导出链、Rust 仅经 bindgen 白名单触达 vendor、零缺失；file.cpp 排除后 File 方法并入 file_bridge.cpp:137-309=链接必需不可删；TEST-ONLY 6 保留钉 #A8/#B3/#16。删后桥接覆盖率估算 59%→~76%CI/~77%含语料。**orchestrator 独立复验**：导出计数/分类抽查/行数求和/build.rs 排除与白名单/无 feature 逐项复现） |
 | q-P2 | 六弱测试修复 | W1 version 断言 / W4 探针命中行号 / W5 hits==0 门（先验当前零命中）/ W6 inline 确定性默认开 / W8 零-skip 门（先验当前零 skip）/ W9 spawn-to-probe + node --check 转致命 | worker q-P2 (k3) | **进行中** |
