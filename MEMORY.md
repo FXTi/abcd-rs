@@ -904,3 +904,10 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   six cheap weak-test fixes W1/W4/W5/W6/W8/W9 (evaluation §3) — red-first
   discipline: W5 (hits==0) and W8 (zero-skip) gates may only land after
   the invariant is verified to currently hold.
+- q-P2 (2026-09-25): the six cheap weak-test fixes landed
+  (a7c3be1/92e342f/ca0c93d/32c0ae4/9316a1f) — W1 version pin, W4 probe hit
+  line identity, W5 corpus hits==0 gate (verified 0 first), W6 inline
+  determinism default-on (+0.36 s), W8 zero-skip gate (verified 0/0/0
+  first), W9 spawn-to-probe + fatal node --check for JS. The q-P2 worker
+  disconnected mid-task with a clean tree; the orchestrator redid and
+  verified the fixes in one batched dabai run.
