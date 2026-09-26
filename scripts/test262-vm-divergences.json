@@ -21,6 +21,7 @@
   "24.0.0.0/test262/built-ins/Reflect/set/set-value-on-accessor-descriptor-with-receiver/baseline/input.abc",
   "24.0.0.0/test262/built-ins/String/fromCharCode/S15.5.3.2_A3_T1/baseline/input.abc",
   "24.0.0.0/test262/built-ins/String/raw/substitutions-are-appended-on-same-index/baseline/input.abc",
+  "24.0.0.0/test262/built-ins/StringIteratorPrototype/next/next-iteration-surrogate-pairs/baseline/input.abc",
   "24.0.0.0/test262/language/expressions/class/params-dflt-gen-meth-ref-arguments/baseline/input.abc",
   "24.0.0.0/test262/language/expressions/class/params-dflt-gen-meth-static-ref-arguments/baseline/input.abc",
   "24.0.0.0/test262/language/expressions/class/params-dflt-meth-static-ref-arguments/baseline/input.abc",
@@ -29,7 +30,6 @@
   "24.0.0.0/test262/language/statements/class/subclass/builtin-objects/Error/regular-subclassing/baseline/input.abc",
   "24.0.0.0/test262/language/statements/class/subclass/builtin-objects/TypedArray/regular-subclassing/baseline/input.abc",
   "24.0.0.0/test262/language/statements/class/subclass/builtin-objects/WeakSet/regular-subclassing/baseline/input.abc",
-  "24.0.0.0/test262/language/statements/for-of/next-iteration-surrogate-pairs/baseline/input.abc",
   "24.0.0.0/test262/language/statements/for-of/string-astral-truncated/baseline/input.abc"
  ]
 }
