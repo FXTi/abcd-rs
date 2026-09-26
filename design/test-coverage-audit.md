@@ -127,6 +127,8 @@ Local export at audit time: **2 787 fixtures / 6 versions × 3 profiles,
 | 14 | `abcd-taint/tests/corpus_taint_smoke.rs:63` | Print-sink smoke on 1 149 fixtures, run twice, byte-identical reports; `ABCD_TAINT_SMOKE_SOURCE=all-params` positive control | L2 (+L5 control) | corpus, python3 |
 | 15 | `abcd-taint/tests/corpus_callee_names.rs:17` | Global-name call-site frequency counter — the top-20 summary-set evidence base | L2 | corpus, python3 |
 | 16 | `abcd-taint/tests/probes.rs:563` | **Compiled probe ladder**: 40 ground-truthed probes (`probes-taint/out`, annotations.json) with tp/fp/fn assertions in BOTH directions — an expected-FN closing fails the suite (the ladder-climbing instrument; caught N66) | **L5** | probes-taint/out (docker regen), python3, --release |
+
+> **Update (c-P3)**: the probe .abc files now come from the corpus export (`24.0.0.0/local/probes/<family>/<id>/baseline/input.abc`, image-prebuilt — no docker regen); the annotations moved to `tests/lift-taint/probes_annotations.json`; `probes-taint/` and `scripts/gen-taint-probes.py` are deleted. The suite is `tests/lift-taint/probes.rs::compiled::probe_suite_compiled`.
 | 17 | `abcd-decompile/tests/corpus_stage_a.rs:54` | Stage-A expression recovery accounting: 1 398 139 instructions 1:1, fallbacks only in the documented hard-7+N set, determinism | L2 | corpus, python3 |
 | 18 | `abcd-decompile/tests/corpus_decompile.rs:155` | Stage-B + emission over the whole corpus: per-function success, determinism, fallback/fold histograms, irreducible-zero, node --check sample | L2 | corpus, python3, (node optional) |
 | 19 | `abcd-decompile/tests/textual_oracle.rs:202` | Token-stream similarity vs recorded original sources (exact-match rate, multiset containment, LCS, divergence classes) — **deliberately non-gating** | L5 | corpus, python3 |
@@ -155,6 +157,8 @@ Local export at audit time: **2 787 fixtures / 6 versions × 3 profiles,
   with `annotations.json` ground truth) to gitignored `probes-taint/out`;
   validates annotation↔source sink-line correspondence and VM-clean
   behavior before accepting a probe (scripts/gen-taint-probes.py:16-22).
+  **Superseded (c-P3)**: deleted — the probes are prebuilt into the corpus
+  image; see the row-16 update above.
 - `scripts/gen-corpus.sh` — **historical/deferred** (design/test-plan.md:73-91);
   the image is the corpus source of truth, not this script.
 - Image subcommands (probed): `info, list, export, inspect, verify,
@@ -328,8 +332,8 @@ gating — noise that trains reviewers to ignore the signal.
    *(measured 0.6 s/fixture sequential → ~2 min at jobs 8 for 1 149)*;
    dream gate end-to-end *(recorded 177–219 s on macOS+qemu across 7
    MEMORY.md runs; native linux docker should be faster)*; taint compiled
-   probes (regen via `gen-taint-probes.py`); textual oracle as a
-   non-gating artifact.
+   probes *(c-P3: no regen — the corpus export carries them)*; textual
+   oracle as a non-gating artifact.
 3. **P1 — Restate the coverage metric.** Add `**/vendor/**` to
    codecov.yml ignores (upstream's code, upstream's responsibility) and
    consider excluding the D3-dead bridge surface or accepting bridge as
@@ -384,7 +388,7 @@ suites are ubuntu-only.
 | lower_determinism / async / regalloc / sendable (7–10) | ✅ | L2 | minutes | none |
 | analysis corpus trio (11–13) | ✅ | L2 | minutes | none |
 | taint smoke + callee names (14,15) | ✅ | L2 | minutes | none |
-| taint compiled probes (16) | ✅ | L5 | +2–3 min probe regen (docker) | probes-taint/out regen or cache |
+| taint compiled probes (16) | ✅ | L5 | +2–3 min probe regen (docker) *(c-P3: gone — corpus-exported)* | probes-taint/out regen or cache *(c-P3: corpus export)* |
 | decompile stage_a / corpus / textual (17–19) | ✅ | L2/L5 | minutes–tens of minutes (TBD) | textual = report-only |
 | dream_gate generate (20) | ✅ | L2 | minutes | none |
 | dream_gate oracle (21) | ✅ ubuntu-only | L4 | ~3–5 min *(recorded 177–219 s mac+qemu)* | docker |
@@ -444,7 +448,7 @@ When green, in order:
 docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" \
   ghcr.io/fxti/arkcompiler-test:latest export /work
 python3 scripts/gen-opcode-fixtures.py     # +30 opcode fixtures
-python3 scripts/gen-taint-probes.py        # probes-taint/out
+# (c-P3: gen-taint-probes.py deleted — probes are corpus-exported)
 
 # remote cargo (dabai) — ALL cargo test runs
 scripts/remote-test.sh test --workspace

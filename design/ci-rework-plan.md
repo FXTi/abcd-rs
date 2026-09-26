@@ -36,9 +36,9 @@ exists in history at commit `3092de4`. This plan is the gate for landing it.
    `file_reader.cpp` inconsistency class — `design/vendor-sync.md:20-25`).
 5. **Pins are content-chosen and bumped deliberately** — submodule pins
    (`7303d5c2`), the corpus image (by digest, not `:latest`), and the
-   corpus itself (the corpus suites hard-assert 2 787 fixtures / 1 149
-   passed; an image change altering the baked corpus is a deliberate,
-   reviewed bump).
+   corpus itself (the corpus suites hard-assert 5 517 fixtures / 1 149
+   passed — pre-c-P3: 2 787 / 1 149; an image change altering the baked
+   corpus is a deliberate, reviewed bump).
 6. **Evidence layers, not line %, are the quality currency** (audit §4.1:
    every serious N-series bug was caught by a stronger oracle in already
    line-covered code). CI must run the oracles; coverage numbers are
@@ -114,16 +114,43 @@ Replace `vendor-sync.yml` with the tag radar:
 - **R4 — codecov path for the submodule era** (lands with §3.4):
   `**/arkcompiler_runtime_core/**`.
 
-## 3. Track 2 — coverage-driven CI expansion
+## 3. Track 2 — the per-push corpus job graph (LANDED, c-P3)
 
-Data and rationale: audit §3.3 (the 28 off-CI tests), §6 (priorities),
-§7 (feasibility matrix). Measured figures (dabai = 16-core Ubuntu x86_64
-remote, per `scripts/remote-test.sh`; GH = GitHub ubuntu runner):
+**Status: LANDED (c-P3, 2026-09-26), in the form decided below with one
+deliberate change: there is NO nightly workflow.** The measured suite
+times (table below) made the split unnecessary — every corpus suite is
+seconds-to-minutes of release-mode Rust, and the docker oracles fit the
+per-push wall-time budget, so the whole graph runs per-push on
+`ci.yml`. The earlier §3.2 `corpus-smoke`-vs-nightly split and §3.3
+`nightly-oracle` design are SUPERSEDED (kept in git history; the
+feasibility math that produced them is unchanged and still justifies
+the per-push placement).
+
+Corpus context (the c-P3 image switch): the corpus image
+`ghcr.io/fxti/arkcompiler-test` is pinned ONCE by digest in the
+workflow env (`ARK_TEST_IMAGE`,
+`@sha256:125fc858a49880395ecb065db58e59812b6a6e3ba9f88923c5f5debd013fb2b8`)
+and referenced by every corpus job. The baked corpus is now **5 487
+rows** = 2 802 project/upstream/local (incl. the 40 `local/probes/*`
+taint probes and the 5 `local/yield-star/*` fixtures, both prebuilt
+into the image) + 2 685 compiled `test262/*` rows (all
+`runtime.status=="recorded"`); abcd-rs adds the 30 gen-opcode fixtures
+on top → **5 517 rows / 1 149 runtime-passed** (the passed set is
+unchanged). test262 P0 status: the 2 685 rows gate lift+verify
+(`corpus_lift_verify`, zero lift failures / zero verifier errors);
+decompile (Stage A/B) stays scoped to the 2 832 non-test262 rows —
+test262 decompile is a later phase per `design/test262-feasibility.md`.
+
+Measured figures (dabai = 16-core Ubuntu x86_64 remote, per
+`scripts/remote-test.sh`; GH = GitHub ubuntu runner). Corpus-dependent
+rows are pre-c-P3 numbers (2 787-row corpus); c-P3 re-measured the
+moved gates at the 5 517/2 832 counts — same order of magnitude, the
+table's argument stands:
 
 | Input | Value | Source |
 |---|---|---|
 | GHCR image pull | 255 MB, ~30–60 s on a runner | measured size; GH↔GHCR bandwidth est. |
-| Corpus export (2 757 fixtures, 119 MB) | **8.4 s** | measured (audit §7) |
+| Corpus export (2 757 fixtures, 119 MB; c-P3: 5 487 rows) | **8.4 s** | measured (audit §7) |
 | `gen-opcode-fixtures.py` (+30 fixtures) | ~1–2 min | est. 30 docker compile+disasm+run cycles |
 | VM oracle compare | 0.6 s/fixture seq → **~2 min @ jobs 8** for 1 149 | measured 18 fx in 10.7 s |
 | Dream gate end-to-end | 177–219 s | recorded ×7 in MEMORY.md (macOS+qemu; native linux faster) |
@@ -138,97 +165,69 @@ remote, per `scripts/remote-test.sh`; GH = GitHub ubuntu runner):
 The corpus suites are fast because the corpus is small (tiny es2abc test
 programs) and release Rust processes ~13 k functions in tens of
 microseconds each — the expensive layers are the docker oracles
-(compare/dream-gate/probe regen), not the cargo runs. The one new and
+(compare/dream-gate), not the cargo runs. The one new and
 unmeasured CI cost is the **submodule fetch**: every building checkout
 now pulls two shallow clones of upstream runtime_core (~280 MB working
 copy each; `actions/checkout` default `fetch-depth: 1` keeps it to the
 pinned snapshot). Watch the first post-migration GH run for its cost.
 
-### 3.1 The per-push vs nightly decision rule
+### 3.1 The wall-time decision rule (landed form)
 
-A new `corpus-smoke` job runs **per-push** iff, on a cache-free GitHub
-runner, its added wall time stays within ~15 min:
+Every per-push corpus job must stay within ~12 min wall on a cache-free
+GitHub runner:
 
 ```
-T_ADDED_gh = setup (checkout+submodule fetch+toolchains+image pull+export)
-           + T_REL_gh + T_SMOKE_gh ≤ 15 min
-T_REL_gh   ≈ 19.9 s × 3–4 ≈ 60–80 s      (16-core dabai → 4-vCPU derate;
-             cross-check: copy-era GH cold build+test was 1 m 40 s total)
-T_SMOKE_gh ≈ (0.8+1.8+0.7+ ~5 s misc) × 2 ≈ ~20 s
-setup      ≈ 2–4 min (submodule fetch is the unknown — see §3 table)
-→ T_ADDED_gh ≈ 4–6 min  ⇒  WITHIN BUDGET
+T_JOB = setup (checkout + submodule fetch + toolchains + image pull + export
+              + gen-opcode-fixtures)
+      + T_RELEASE_BUILD + T_SUITES ≤ 12 min
+setup  ≈ 3–5 min  (image pull ~1 min + export ~10 s + gen-opcode ~1–2 min
+                   + submodule fetch, the least-pinned number)
+build  ≈ 1–2 min  (4-vCPU derate of the 19.9 s dabai cold release build)
 ```
 
-**Verdict (pre-GH-calibration): `corpus-smoke` goes per-push.** The
-decision rule stays in place as the safety mechanism: if the first real
-runs show the submodule fetch or the release build blowing the estimate,
-`corpus-smoke` moves into the nightly workflow **whole** — never filtered
-to a fixture subset (the suites hard-assert the full 2 787/1 149 counts;
-weakening assertions to fit CI inverts the evidence contract — audit §6
-item 1).
+If a real run blows the budget, the OFFENDING job moves off per-push
+**whole** — never filtered to a fixture subset (the suites hard-assert
+the full 5 517/2 832/1 149 counts; weakening assertions to fit CI
+inverts the evidence contract — audit §6 item 1). (Superseded text: the
+15-min `corpus-smoke` estimate and the nightly fallback; the rule's
+spirit is kept with the landed 12-min target.)
 
-**Measurement basis (executed on dabai alongside this plan, tree green at
-`d72a142`):** a guaranteed-cold release build (fresh content-keyed remote
-target dir, `scripts/remote-test.sh:43-52`), then warm-cache suite runs
-— numbers in the §3 table. GH calibration happens once, from the first
-real `nightly.yml`/`corpus-smoke` runs (§4 step 4).
+### 3.2 The landed per-push job graph (ci.yml)
 
-### 3.2 Job: `corpus-smoke` (candidate per-push job)
+All jobs `needs: [fmt]`; the `build` matrix (ubuntu/macos/windows, L1
+workspace tests) is unchanged. Each corpus job: checkout → sparse
+blob:none submodule clone (the `build` job's recipe) → rust toolchain +
+ruby (build.rs codegen) → `docker pull "$ARK_TEST_IMAGE"` (by digest) →
+corpus export (`docker run … export /work`) → `gen-opcode-fixtures.py`
+(the 30 fixtures every count pin includes) → the suites. Docker is used
+for corpus acquisition and the docker oracles only, never for the cargo
+runs. No `actions/cache` (standing per-push policy).
 
-- Trigger: push/PR to main, after `fmt`. Runner: `ubuntu-latest`.
-- Steps: checkout (`submodules: true`) → rust toolchain + ruby (build.rs
-  codegen, same as `build`) → docker pull image **by digest** → export
-  corpus (8.4 s) → `gen-opcode-fixtures.py` → `cargo test --release`
-  for the L2 structural gates:
-  - `abcd-lift --test corpus_lift_verify`
-  - `abcd-file --test real_module_abc` corpus tests (the modules.abc one
-    skips by absence) and `--test nested_literal_arrays`
-  - `abcd-analysis` corpus trio (callgraph/dom/regions)
-  - `abcd-lower` determinism, async, regalloc pressure, sendable class
-  - `abcd-decompile --test corpus_stage_a`
-- Docker is used only for corpus acquisition (export + fixture regen),
-  never for the test runs themselves; no cache (per-push policy).
-- Why this set: the cheap, deterministic, non-behavioral spine — a broken
-  lift arm or region-structuring regression fails here in minutes
-  (audit §4, gap G-A).
+| Job | Target | Suites | Corpus scope |
+|---|---|---|---|
+| `file-isa` | `tests/file-isa` | pandasm per-instruction comparison, corpus decode + ISA re-encode round trips, module-record identity rewrites | all 5 517 rows (`modules.abc` Group J skips by absence — local-only) |
+| `file-lift` | `tests/file-lift` | `corpus_lift_verify` — zero lift failures / zero verifier errors | all 5 517 rows (2 832 non-test262 + 2 685 test262, split-asserted) |
+| `lift-lower` | `tests/lift-lower` | `corpus_lower_oracle` (3 variants), determinism, async, regalloc pressure, sendable class; **then** the python VM oracle compare per variant (`compare-rewritten-corpus.py --jobs 4`, exit-gating) | 1 149 runtime-passed |
+| `lift-analysis` | `tests/lift-analysis` | callgraph smoke, dominator agreement, region structuring | all 5 517 rows |
+| `lift-taint` | `tests/lift-taint` | compiled probe ladder (`probe_suite_compiled`, 40 corpus-exported probes) + `corpus_taint_smoke` | 1 149 passed (smoke) / 40 probes |
+| `lift-decompile` | `tests/lift-decompile` | `corpus_stage_a` + `corpus_decompile` (2 832 non-test262), `dream_gate` generate+oracle (docker on the runner), `yield_star_node`/`async_node` node evidence (node preinstalled), `golden_yield_star` | mixed per suite |
+| `coverage` | workspace | `cargo llvm-cov --workspace --release -- --include-ignored` **with the corpus export present** — the corpus-inclusive ("90%") metric; codecov upload unchanged | everything |
 
-### 3.3 Job: `nightly-oracle` (new workflow `nightly.yml`)
+Deliberate exclusions (local-only instruments, not gates):
+`textual_oracle` (report-only token-similarity instrument) and
+`corpus_callee_names` (frequency counter — the summary-set evidence
+base) stay off CI; the `lift-taint` job `--skip`s the latter and
+`lift-decompile` `--skip`s the former.
 
-- Trigger: `schedule: cron '0 18 * * *'` (02:00 Beijing, off-peak) +
-  `workflow_dispatch`. Runner: `ubuntu-latest` throughout (docker suites
-  are ubuntu-only — audit §7).
-- Cache policy (nightly exemption; content-keyed):
-  - `target-nightly-<gitlink-sha>-${{ hashFiles('Cargo.lock') }}` for the
-    cargo target dir (gitlink via `git ls-tree HEAD
-    abcd-isa-sys/arkcompiler_runtime_core | awk '{print $3}'`);
-  - `corpus-${{ env.IMAGE_DIGEST }}` for `exports/corpus` (on miss: pull
-    + export + `gen-opcode-fixtures.py`).
-- Jobs (sequential within one workflow to share the build):
-  1. **full-corpus**: everything in `corpus-smoke` **plus** the pandasm
-     per-instruction suite (2.69 M instructions), `corpus_decompile`,
-     `textual_oracle` (report-only artifact), taint corpus smoke +
-     callee names, `dream_gate_generate`.
-  2. **vm-oracle**: `corpus_lower_oracle` rewrite (v2lift/v2opt/v2inline;
-     `ABCD_LOWERED_DIR` absolute) + `compare-rewritten-corpus.py
-     --jobs 4` per variant (~2 min each at jobs 8 locally; jobs 4 on the
-     4-vCPU runner — N24 container-reaping hygiene is built into the
-     script).
-  3. **dream-gate**: `dream-gate.py --jobs 4` end-to-end (recorded
-     177–219 s on macOS+qemu; native linux expected faster). Upload
-     `dream-gate-report.json`.
-  4. **taint-probes**: `gen-taint-probes.py` (docker regen, ~2–3 min) +
-     `probes.rs probe_suite_compiled --release -- --ignored` — the
-     ladder instrument (audit §3.3 #16).
-  5. **async-node**: `async_node -- --ignored` corpus emit (node is
-     preinstalled on runners; pin via `actions/setup-node` only if the
-     preinstalled version drifts).
-  6. **coverage-true** (informational): `cargo llvm-cov --workspace
-     --release -- --include-ignored` against the exported corpus →
-     `lcov-true.info` artifact. This is the corpus-inclusive floor the
-     73% discussion is missing (audit §5). Do NOT upload to Codecov
-     initially; revisit as a separate flag later.
-- Failure handling: nightly failures open/update ONE standing issue
-  (same pattern as the radar) instead of mailing on every run.
+### 3.3 Coverage job (landed form)
+
+The old L1-only `coverage` job became the full-estate one: same runner,
+same codecov upload, but the corpus acquisition steps run first and the
+collection is `cargo llvm-cov --workspace --release --lcov
+--output-path lcov.info -- --include-ignored`. This IS the
+corpus-inclusive floor the 73% discussion was missing (audit §5) —
+there is no separate nightly `coverage-true` artifact anymore
+(superseded; the per-push job covers it).
 
 ### 3.4 Coverage metric restatement
 
@@ -240,14 +239,16 @@ real `nightly.yml`/`corpus-smoke` runs (§4 step 4).
   threshold — the 80% target misfires on the CI-dark arms
   (`translate.rs` 35.7%, `isel.rs` 56.6% on CI; fully corpus-gated
   off-CI), training reviewers to ignore the signal (audit §5).
-- The nightly `coverage-true` artifact (§3.3 job 6) is the honest
-  companion number; quote both ("CI floor" / "corpus-inclusive floor").
+- The full-estate coverage job (§3.3) IS the honest number; the
+  "CI floor vs corpus-inclusive floor" distinction is gone with the
+  nightly.
 
 ### 3.5 What stays local-only, and why
 
 | Suite/data | Why never on CI |
 |---|---|
-| `modules.abc` Group J (`real_module_abc.rs:81`) | Huawei distribution restriction — the file can be neither committed nor fetched by CI. Permanent local-only (audit §6 item 9). |
+| `modules.abc` Group J (`tests/file-isa/main.rs`, skips by absence) | Huawei distribution restriction — the file can be neither committed nor fetched by CI. Permanent local-only (audit §6 item 9). |
+| `textual_oracle` / `corpus_callee_names` | Report-only instruments, not gates (§3.2 exclusions). |
 | Real-app `@ohos.*` taint corpus (future) | Same legal class; prerequisite for the next taint evidence layer (audit §4 G-B). |
 | Vendor repin validation | The radar proposes; humans port and validate with the full local gate set (workspace + corpus + dream gate) before merge (`design/vendor-sync.md`). |
 | Dev-machine docker oracle runs | Convenience protocol (`scripts/remote-test.sh:4-7`), not a gate. |
@@ -259,37 +260,43 @@ real `nightly.yml`/`corpus-smoke` runs (§4 step 4).
    (restore from `3092de4` + R1/R2 fixes), re-enable the weekly cron,
    R3 rollback section in `design/vendor-sync.md`, R4 codecov path.
    Independent of Track 2.
-2. **Measurement** (done alongside this plan — §3.1 numbers; dabai tree
+2. **Measurement** (done alongside this plan — §3 numbers; dabai tree
    is green at `d72a142`).
-3. **`nightly.yml` + coverage restatement** (§3.3, §3.4). Zero per-push
-   risk; the first runs supply GitHub-runner-real timings.
-4. **`corpus-smoke` lands per-push** (§3.2 — the §3.1 verdict is
-   within-budget at 4–6 min estimated). The first real runs calibrate the
-   submodule-fetch and release-build costs; if the estimate is wrong, the
-   §3.1 rule demotes the job to nightly (whole, never filtered).
-5. Ongoing: radar PRs reviewed weekly; nightly failures triaged from the
-   standing issue.
+3. ~~**`nightly.yml` + coverage restatement** (§3.3, §3.4)~~ — SUPERSEDED
+   (c-P3): no nightly; the coverage restatement landed as the
+   full-estate per-push `coverage` job (§3.3/§3.4 landed form).
+4. **The per-push corpus job graph LANDED at c-P3** (§3.2 landed form) —
+   not just `corpus-smoke`: every corpus suite measured within budget,
+   so the whole graph (file-isa / file-lift / lift-lower / lift-analysis
+   / lift-taint / lift-decompile + full-estate coverage) runs per-push.
+   The first real runs calibrate the submodule-fetch, image-pull, and
+   release-build costs; if the §3.1 12-min rule is blown, the offending
+   job demotes (whole, never filtered).
+5. Ongoing: radar PRs reviewed weekly; per-push corpus failures triaged
+   in review.
 
 ## 5. Risks
 
-- **Corpus image drift breaks nightly**: the suites hard-assert
-  2 787/1 149; a republished image changing the baked corpus fails every
-  corpus job at once. Mitigation: pin by digest in the workflows; bump
-  deliberately with fixture counts updated in the same PR (principle 5).
-- **Nightly flakiness**: qemu VM core-dump timeouts exist in the oracle's
-  history (N24; the compare script reaps labeled containers and records
-  timeouts as failures, not aborts). `--jobs 4` limits contention. A
-  single timed-out fixture is a red nightly — acceptable; no flake-retry
-  logic (it would hide real hangs like the V6 for-in loop).
-- **Runner-minute quota**: nightly est. 30–60 min cold. Unlimited for a
-  public repo; if private, 2 000 free min/month get tight (nightly alone
-  ≈ 900–1 800) — check before enabling the schedule.
+- **Corpus image drift breaks the corpus jobs**: the suites hard-assert
+  5 517/2 832/1 149; a republished image changing the baked corpus fails
+  every corpus job at once. Mitigation: pinned by digest once in
+  `ci.yml`'s `ARK_TEST_IMAGE`; bump deliberately with fixture counts
+  updated in the same PR (principle 5).
+- **Docker-oracle flakiness per-push**: qemu VM core-dump timeouts exist
+  in the oracle's history (N24; the compare script reaps labeled
+  containers and records timeouts as failures, not aborts). `--jobs 4`
+  limits contention. A single timed-out fixture is a red job —
+  acceptable; no flake-retry logic (it would hide real hangs like the
+  V6 for-in loop).
+- **Runner-minute quota**: the corpus graph adds ~6 jobs × ~5–12 min per
+  push. Unlimited for a public repo; if private, 2 000 free min/month
+  get tight — check before relying on it.
 - **Release-build cost may blow the per-push budget**: handled by the
-  §3.1 decision rule — demote to nightly, never filter fixtures.
+  §3.1 decision rule — demote the offending job, never filter fixtures.
 - **Radar noise** (R2): without the closed-PR dedup, dismissing a tag's
   red PR reopens it next Monday. Fixed in step 1.
 - **`--include-ignored` coverage job needs the corpus** present in the
-  coverage job itself — same export step; documented in §3.3 job 6.
+  coverage job itself — same export step; landed in §3.3.
 - **Submodule fetch cost on every checkout** (new with the migration):
   two shallow clones of upstream runtime_core (~280 MB working copy
   each). `d72a142` already fixed first-level init (upstream has a

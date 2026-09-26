@@ -406,9 +406,11 @@ checked; any doubt keeps the block). Corpus fold counters:
 generator functions × entry + 2 yield sites each),
 `async_machine_sites=18 async_machine_bound=18` (all 18 async-await
 fixtures); d-P17 moves nothing corpus-side (`for_await_of=0
-dead_exit_throw=0` — the driver shape is extra-corpus; its fixture is
-`decompile-fixtures/yield-star/delegate-async.abc`, behavior-pinned by
-`tests/yield_star_node.rs` including the rejection probe).
+dead_exit_throw=0` — the driver shape was extra-corpus until c-P3; its
+fixture is the corpus export's
+`24.0.0.0/local/yield-star/delegate-async/baseline/input.abc`,
+behavior-pinned by `tests/lift-decompile/yield_star_node.rs` including
+the rejection probe).
 
 ## Crate map (Stage A)
 
@@ -454,9 +456,10 @@ dead_exit_throw=0` — the driver shape is extra-corpus; its fixture is
 - `tests/golden_expr.rs` — 19 golden expression-tree dumps, one per
   taxonomy family (trivial + needs-work + guard elision + phi/handler-phi
   + the hard-7 fallbacks).
-- `tests/corpus_stage_a.rs` — the ignored-gated corpus gate (2,787
-  fixtures / 12,996 functions): per-op coverage histogram, hard-7
-  report, byte-identical determinism, zero panics.
+- `tests/corpus_stage_a.rs` — the ignored-gated corpus gate (moved to
+  the root package's `tests/lift-decompile/` at c-P1; 2,832 non-test262
+  fixtures since the c-P3 corpus switch): per-op coverage histogram,
+  hard-7 report, byte-identical determinism, zero panics.
 
 ## The fallback-honesty rule
 

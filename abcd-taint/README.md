@@ -529,37 +529,40 @@ cut — check it before declaring a miss actionable).
 Real-bytecode extension of the mini-module probes: 40 hand-written JS
 probes with KNOWN ground truth, one directory per §5.5 precision axis.
 
-**Layout** (repo root):
+**Layout** (c-P3 — test data zero-in-repo):
 
-- `probes-taint/src/<family>/<case>.js` — committed sources. Every probe
-  declares `var TAINT = "tainted"` at top level (script mode → global
-  record: the VM run is clean AND every read compiles to
-  `TryGetGlobal("TAINT")`, the suite's source). Sinks are `print(...)`.
-- `probes-taint/src/annotations.json` — committed ground truth: per
-  probe, per sink line (1-based), `expect` ∈ `tp` (real flow, must hit)
-  / `clean` (no flow, must not hit) / `fp` (no flow, the current rung
-  hits — EXPECTED false positive) / `fn` (real flow, the current rung misses — KNOWN
-  false negative); `fp`/`fn` carry `closes_at_rung` (the ladder rung
-  that should change the outcome, `null` = structural/wontfix) plus
-  optional counter expectations (`summaries_applied`, `named_misses`,
-  `body_step_min`).
-- `probes-taint/out/` — GITIGNORED compiled `.abc` + manifest, produced
-  by `python3 scripts/gen-taint-probes.py` (GHCR image es2abc 24.0.0.0,
-  baseline profile, script mode — pin and rationale in the annotations;
-  baseline still carries the line-number table the runner maps hits
-  with). The generator VALIDATES annotations↔source agreement (every
-  annotated line is a `print(` call; every `print(` call is annotated)
-  and requires every probe to run clean on the image's VM — the ground
-  truth is runtime-checked.
-- The runner: `cargo test -p abcd-taint --test probes --release --
+- Sources: live in the arkcompiler-test image repo's `cases/probes/`
+  (`<family>/<case>.js`) and arrive PRECOMPILED in the corpus export at
+  `24.0.0.0/local/probes/<family>/<case>/baseline/input.abc` (es2abc
+  24.0.0.0, baseline profile, script mode — pin and rationale in the
+  annotations; baseline still carries the line-number table the runner
+  maps hits with). The image build VALIDATES annotations↔source
+  agreement and requires every probe to run clean on the image's VM —
+  the ground truth is runtime-checked. Every probe declares
+  `var TAINT = "tainted"` at top level (script mode → global record: the
+  VM run is clean AND every read compiles to `TryGetGlobal("TAINT")`,
+  the suite's source). Sinks are `print(...)`.
+- `tests/lift-taint/probes_annotations.json` — committed ground truth
+  (hand-written config, not built data): per probe, per sink line
+  (1-based), `expect` ∈ `tp` (real flow, must hit) / `clean` (no flow,
+  must not hit) / `fp` (no flow, the current rung hits — EXPECTED false
+  positive) / `fn` (real flow, the current rung misses — KNOWN false
+  negative); `fp`/`fn` carry `closes_at_rung` (the ladder rung that
+  should change the outcome, `null` = structural/wontfix) plus optional
+  counter expectations (`summaries_applied`, `named_misses`,
+  `body_step_min`). (Pre-c-P3 this lived at
+  `probes-taint/src/annotations.json`; the compiled `probes-taint/out/`
+  tree and `scripts/gen-taint-probes.py` are deleted — superseded by
+  the image prebuild.)
+- The runner: `cargo test -p abcd-rs --test lift-taint --release --
   --ignored --nocapture probe_suite_compiled`. It FAILS on any deviation
   in EITHER direction — an expected-fp/fn that stops reproducing means
   the ladder moved and the annotations must be updated deliberately
   (this is what makes it a trigger, not a snapshot). Remote:
-  `scripts/remote-test.sh test -p abcd-taint --test probes --release --
+  `scripts/remote-test.sh test -p abcd-rs --test lift-taint --release --
   --ignored --nocapture probe_suite_compiled` — remote-test.sh's rsync
   excludes only `target/`, `.vscode/`, `decompiled/`, so the gitignored
-  `probes-taint/out/` reaches dabai with no include workaround needed.
+  `exports/corpus` reaches dabai with no include workaround needed.
 
 **Trigger linkage** (analysis-strategy §5.5): families (a) heap-alias
 and (b) closure-capture gate rung 0→1 (their expected-fp/fn entries —
@@ -570,12 +573,14 @@ limits, closing at rung 1); family (c) dynamic-dispatch gates rung 1→2
 flow and (e) builtin summaries pin the T5/summary mechanisms against
 regression.
 
-**Adding a probe**: write `probes-taint/src/<family>/<case>.js` (one
-`print(...)` per sink, keep each on its own line), add its entry to
-`annotations.json` with the runtime ground truth, run
-`python3 scripts/gen-taint-probes.py` (it checks the annotation lines),
-then run the suite — a NEW probe whose expectations are wrong fails
-loudly with the actual hit lines.
+**Adding a probe**: add `cases/probes/<family>/<case>.js` in the
+arkcompiler-test image repo (one `print(...)` per sink, keep each on
+its own line — the image build checks the annotation lines and the
+VM-clean ground truth), rebuild/republish the image, re-export the
+corpus, and add the probe's entry to
+`tests/lift-taint/probes_annotations.json`; then run the suite — a NEW
+probe whose expectations are wrong fails loudly with the actual hit
+lines.
 
 **Current table** (rung 2 — the whole-module PTA, t-P6; verbatim):
 
