@@ -966,3 +966,59 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   compiled 5517. Once published, abcd-rs deletes gen-opcode-fixtures.py —
   ZERO local test-data generation remains. NEXT (maintainer act): dabai
   make build && make test && make push -> final digest for c-P3's CI pin.
+- c-P3 (2026-09-26, worker branch state, NOT yet committed): corpus switched
+  to image digest 125fc858 (pinned once as ARK_TEST_IMAGE in ci.yml;
+  dream-gate.py / gen-opcode-fixtures.py honor the env). Corpus 2787 →
+  **5517** (2832 non-test262 + 2685 test262, split-asserted; functions
+  12996 → 45592, cross-checked == pandasm method count), runtime-passed
+  1149 unchanged. Zero lift failures / zero verifier errors over ALL rows
+  incl. test262 (no STOP findings). Test data zero-in-repo:
+  decompile-fixtures/ and probes-taint/ DELETED (sources live in the image
+  repo; .abc arrive via the corpus export); golden_yield_star.rs moved
+  abcd-decompile/tests → tests/lift-decompile (corpus-dependent, #[ignore],
+  assertion text unchanged); probes ladder reads
+  24.0.0.0/local/probes/<family>/<id>/baseline/input.abc with ground truth
+  at tests/lift-taint/probes_annotations.json; gen-taint-probes.py deleted.
+  Harness findings fixed (test-side, in scope): the pandasm per-instruction
+  parser could not handle test262's raw-printed strings — now string-table-
+  oracle disambiguation with bounded lookahead (embedded quotes/newlines/CR),
+  no \r stripping, leading-only trim; es2abc-24 literal tags
+  accessor/generator_method/getter/setter mapped; lossy pandasm float prints
+  (std::scientific immediates, %g literal doubles) reconciled by
+  print+parse on both sides; corpus_decompile's merge_stats was missing
+  yield_star_sites/yield_star_bound/dead_exit_throw (fold fired but printed
+  0 — now yield_star_sites=4 yield_star_bound=2 dead_exit_throw=1 fire
+  in-corpus). REGISTERED lossy class (pinned ==4 fixtures/8 strings):
+  test262 MUTF-8 lone-surrogate string operands (unrepresentable in Rust
+  String; decode stores from_utf8_lossy; compared in that form). Evidence
+  (all green): pandasm 5517 fx / 45592 methods / 4,557,285 instr 0
+  mismatches; file-lift 5517 (2685 test262) 0/0; analysis trio 5517
+  (regions 0 irreducible/0 try-errors, dom 179,414 blocks 0 disagreements,
+  callgraph 80,397 sites rung-2 56,199 resolved, deterministic); stage_a
+  2832 (hard-7 only); corpus_decompile 2832 irreducible=0 node-check 40/40;
+  taint: probe ladder 40/40 vs export (tp=32 fp=1 fn=0 violations=0
+  unchanged), smoke/callee-names 1149 byte-identical to recorded; lower
+  1149/1149 ×3 zero-skip; dream gate LOCAL docker **1149/1149 all-zero**
+  (267 s, digest image); VM oracle compare ×3 variants 1149/1149 each
+  (digest image); L1 workspace all suites ok; fmt clean. CI rewritten
+  (per-push job graph: fmt → build ×3 + file-isa/file-lift/lift-lower(+VM
+  compare ×3)/lift-analysis/lift-taint/lift-decompile(+dream gate)+
+  coverage full-estate `--include-ignored`; no nightly; textual_oracle and
+  corpus_callee_names stay local-only instruments; modules.abc test now
+  skips by absence). design/ci-rework-plan.md Track 2 rewritten to the
+  landed reality.
+- c-P3 (2026-09-26): corpus switch + per-push CI landed
+  (f0e1252..7b56a94). Suites read the digest-pinned image corpus
+  (5517 rows = 2832 project incl. baked probes/yield-star + 2685 test262
+  compiled); runtime-passed 1149 unchanged; test262 rows gate lift+verify
+  (zero failures first contact). CI: per-push job graph over
+  tests/<flow>/ targets, image pinned by digest (ARK_TEST_IMAGE),
+  coverage job now full-estate (--include-ignored with corpus export —
+  the 90% metric), NO nightly. textual_oracle/callee_names stay local
+  instruments; modules.abc stays license-local (now skip-by-absence).
+  Process incident recorded: e5afe62 swept the worker's staged Part-1
+  deletions into a docs commit (shared-index hazard) — content correct,
+  label wrong; rule: check the staging area before every commit when a
+  worker is mid-flight. Pending: c-P4 image (5742 baked, no gen-opcode
+  script) digest from the maintainer's push -> swap pin, delete
+  gen-opcode-fixtures.py, drop the gen step from CI jobs.
