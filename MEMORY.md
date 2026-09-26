@@ -1044,3 +1044,10 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   failure reasons no longer truncated (the truncation had hidden this
   root cause). Full-estate CI green: wall ~= 10m13s (lift-lower),
   coverage 8m5s.
+- Track 2 tail (2026-09-26): codecov patch.target 80% -> auto±5% (the
+  misfire class it was for is largely gone since the coverage job is
+  full-estate, but the maintainer ruled to switch); CI coverage-summary
+  profile bug fixed (report needs --release to match the collect step).
+  test262 P1 de-facto landed (pandasm covers all 5517 rows incl. test262,
+  4.56M instructions, 0 mismatch, per-push). P2 (VM oracle over the 2685
+  recorded test262 rows) in flight; P3 (dream-gate sample) next.
