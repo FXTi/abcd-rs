@@ -16,4 +16,7 @@ mod corpus_lower_async;
 mod corpus_lower_oracle;
 mod lower_determinism;
 mod lower_sendable_class;
+mod n71_ic_slots;
 mod regalloc_pressure;
+mod rewrite_pipeline;
+mod test262_vm;

@@ -175,9 +175,11 @@ jobs:
           docker pull "$ARK_TEST_IMAGE"
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-      # corpus_lower_oracle + determinism + async + regalloc + sendable.
+      # corpus_lower_oracle + determinism + async + regalloc + sendable
+      # (test262_vm is excluded — it runs in the dedicated test262-vm job
+      # below with its own compare).
       - name: Corpus rewrite suites
-        run: cargo test -p abcd-rs --test lift-lower --release -- --ignored --nocapture
+        run: cargo test -p abcd-rs --test lift-lower --release -- --ignored --nocapture --skip test262_vm
         env:
           ABCD_LOWERED_DIR: ${{ github.workspace }}/target/lowered-out
       # The python VM oracle compare for all three variants (the script
@@ -194,6 +196,63 @@ jobs:
               | tee "target/oracle-$v.json" \
               | jq -r '"selected=\(.selected) compared=\(.runtime_compared) passed=\(.passed)"'
           done
+
+  test262-vm:
+    name: test262-vm (test262 rewrite + recorded-behavior VM oracle)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Acquire the corpus (image export + opcode fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+      # Rewrites all 2685 test262 rows through the v2lift pipeline and
+      # writes candidates + the filtered index to target/test262-vm/
+      # (suite default). The suite hard-gates the row count (2685) and
+      # the exact 24-row documented encode-skip set (suite header).
+      - name: test262 rewrite suite
+        run: cargo test -p abcd-rs --test lift-lower --release -- --ignored --nocapture test262_vm
+      # VM oracle against the baked runtime records: exit_code/stdout/
+      # timeout exact, stderr by error-name normalization (upstream's
+      # rule; empirical justification in tests/lift-lower/test262_vm.rs).
+      # The gate is pass + documented == total: the 53 documented
+      # divergences (24 encode skips + 29 behavior) are checked per-row
+      # against scripts/test262-vm-divergences.json — a new undocumented
+      # divergence or a stale entry fails the job. Full 2685 rows (no
+      # sampling): the compare measured 5m28s at --jobs 4 locally
+      # (arm64 docker/qemu — an upper bound for native-amd64 runners),
+      # inside the 12-minute budget.
+      - name: test262 VM oracle compare (v2lift)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/compare-rewritten-corpus.py \
+            target/test262-vm/index.jsonl target/test262-vm/v2lift \
+            --recorded --recorded-stderr error-name --allow-missing \
+            --expect-divergences scripts/test262-vm-divergences.json \
+            --image "$ARK_TEST_IMAGE" --jobs 4 \
+            | tee target/oracle-test262.json \
+            | jq -r '"selected=\(.selected) compared=\(.runtime_compared) passed=\(.passed) missing=\(.missing) divergences=\(.divergences.classes) undocumented=\(.divergences.undocumented | length) stale=\(.divergences.stale | length)"'
 
   lift-analysis:
     name: lift-analysis (callgraph smoke + dom agreement + regions)
