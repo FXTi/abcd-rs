@@ -79,8 +79,12 @@ const SELECT_ABC_PANDASM: &str = r#"        assert all("\n" not in row[key] and 
 #[ignore = "requires local-only modules.abc (gitignored)"]
 fn modules_abc_decodes_fully_with_v24_table() {
     let path = corpus_path();
-    let data = std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("corpus missing at {}: {e}", path.display()));
+    // Local-only input (Huawei distribution restriction): absent on CI
+    // runners — skip by absence instead of failing the corpus batch.
+    let Ok(data) = std::fs::read(&path) else {
+        eprintln!("modules.abc absent at {} — skipped", path.display());
+        return;
+    };
 
     let file = decode(&data).expect("decode modules.abc without errors");
 
@@ -204,9 +208,11 @@ fn exported_corpus_method_bytecodes_roundtrip_through_isa() {
 // local/strings fixtures), so our side re-encodes the decoded string to
 // MUTF-8 and both sides compare as hex. Literal-array items use the same
 // token forms (`s:`/`m:`/`f64:` plus `i32:{n}`/`u1:{n}`/`null_value:{n}`/
-// `method_affiliate:{n}`/`lit:0x{offset}`); the corpus exercises exactly
-// these seven tags (grep-verified), other `LiteralValue` variants render
-// best-effort as `raw:{debug}` and would surface as mismatches.
+// `method_affiliate:{n}`/`lit:0x{offset}`; c-P3 added the es2abc-24 tags
+// the test262 rows exercise: `gm:{hex}` (generator_method),
+// `getter:`/`setter:` by name, `accessor:{n}`) — other `LiteralValue`
+// variants render best-effort as `raw:{debug}` and would surface as
+// mismatches.
 
 /// One parsed pandasm instruction line.
 struct PaInsn {
@@ -256,29 +262,91 @@ fn mutf8_bytes(s: &str) -> Vec<u8> {
     out
 }
 
-/// Split a pandasm operand list at top-level commas, respecting quoted
-/// strings (pandasm does not escape string contents) and `()`/`{}`/`[]`
-/// groups (method signatures, literal arrays).
-fn split_operands(rest: &[u8]) -> Vec<Vec<u8>> {
+/// Split a pandasm operand list at top-level commas, respecting
+/// `()`/`{}`/`[]` groups (method signatures, literal arrays) and quoted
+/// strings.
+///
+/// String disambiguation is ORACLE-based (c-P3): pandasm prints string
+/// contents RAW (no escaping), so the content may itself contain `"`
+/// and `,` bytes (the test262 assertion strings do) — a quote-parity
+/// split misparses those. At each `"` the closing quote is the LATEST
+/// candidate whose enclosed bytes are an entry of the fixture's string
+/// table and which is followed by a top-level `,`, a `]`/`}` group
+/// close, or the end of the text. Returns `None` when an opened string
+/// has no valid close — the caller appends the next physical line (the
+/// content spans lines) and retries.
+fn split_operands(
+    rest: &[u8],
+    strings: &std::collections::HashSet<Vec<u8>>,
+) -> Option<(Vec<Vec<u8>>, usize, Option<usize>)> {
     let mut out = Vec::new();
-    let mut cur = Vec::new();
-    let mut in_string = false;
+    let mut cur: Vec<u8> = Vec::new();
+    // Total bytes of string-table-matched string content — the
+    // longest-match signal for multi-line disambiguation — plus the
+    // rest-relative offset of the LAST string's opening quote (the
+    // premature-close tail starts right after it).
+    let mut string_bytes = 0usize;
+    let mut last_open = None;
     let mut depth = 0i32;
-    for &b in rest {
-        match b {
-            b'"' => {
-                in_string = !in_string;
-                cur.push(b);
+    let mut i = 0usize;
+    while i < rest.len() {
+        let b = rest[i];
+        if b == b'"' {
+            // Oracle close: latest `"` whose content is a string-table
+            // entry, followed by a separator or the end of the text.
+            let mut close = None;
+            for j in (i + 1..rest.len()).rev() {
+                if rest[j] != b'"' {
+                    continue;
+                }
+                if !strings.contains(&rest[i + 1..j]) {
+                    continue;
+                }
+                let mut k = j + 1;
+                while k < rest.len() && rest[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k == rest.len() || matches!(rest[k], b',' | b']' | b'}') {
+                    close = Some(j);
+                    break;
+                }
             }
-            b'{' | b'[' | b'(' if !in_string => {
+            let close = match close {
+                Some(c) => c,
+                None => {
+                    // The registered lossy class (c-P3): the content
+                    // carries MUTF-8 lone surrogates, unrepresentable in
+                    // Rust String, so the string-table oracle cannot
+                    // match it. These strings are simple (no embedded
+                    // quotes/newlines) — fall back to the NEXT quote as
+                    // the close. A multi-line lossy string would surface
+                    // as a loud unterminated-string panic.
+                    match rest[i + 1..].iter().position(|&b| b == b'"') {
+                        Some(off) if !rest[i + 1..i + 1 + off].contains(&b'\n') => i + 1 + off,
+                        // The string spans physical lines — signal the
+                        // caller to append the next line.
+                        _ => return None,
+                    }
+                }
+            };
+            cur.push(b'"');
+            cur.extend_from_slice(&rest[i + 1..close]);
+            cur.push(b'"');
+            string_bytes += close - (i + 1);
+            last_open = Some(i);
+            i = close + 1;
+            continue;
+        }
+        match b {
+            b'{' | b'[' | b'(' => {
                 depth += 1;
                 cur.push(b);
             }
-            b'}' | b']' | b')' if !in_string => {
+            b'}' | b']' | b')' => {
                 depth -= 1;
                 cur.push(b);
             }
-            b',' if !in_string && depth == 0 => {
+            b',' if depth == 0 => {
                 let token = trim_bytes(&cur);
                 if !token.is_empty() {
                     out.push(token.to_vec());
@@ -287,22 +355,17 @@ fn split_operands(rest: &[u8]) -> Vec<Vec<u8>> {
             }
             _ => cur.push(b),
         }
+        i += 1;
     }
     let token = trim_bytes(&cur);
     if !token.is_empty() {
         out.push(token.to_vec());
     }
-    out
+    Some((out, string_bytes, last_open))
 }
 
 fn trim_bytes(mut b: &[u8]) -> &[u8] {
-    while let [first, rest @ ..] = b {
-        if first.is_ascii_whitespace() {
-            b = rest;
-        } else {
-            break;
-        }
-    }
+    b = trim_start_bytes(b);
     while let [rest @ .., last] = b {
         if last.is_ascii_whitespace() {
             b = rest;
@@ -313,23 +376,47 @@ fn trim_bytes(mut b: &[u8]) -> &[u8] {
     b
 }
 
-/// Whether every quoted string in a partial pandasm line is closed
-/// (pandasm prints string contents raw, so a string containing a newline
-/// — e.g. template literals — spans multiple physical lines).
-fn strings_closed(bytes: &[u8]) -> bool {
-    bytes.iter().filter(|&&b| b == b'"').count() % 2 == 0
+fn trim_start_bytes(mut b: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = b {
+        if first.is_ascii_whitespace() {
+            b = rest;
+        } else {
+            break;
+        }
+    }
+    b
 }
 
 /// Parse ark_disasm output into per-function instruction streams.
 /// The parse is byte-level: reference.pa is raw (not UTF-8-safe) text.
-fn parse_pandasm(bytes: &[u8]) -> Vec<PaFunction> {
-    let mut functions = Vec::new();
-    let mut current: Option<PaFunction> = None;
-    // Accumulates an instruction whose string operand spans lines.
-    let mut continuation: Option<Vec<u8>> = None;
-    for raw in bytes.split(|&b| b == b'\n') {
-        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
-        let Some(fun) = current.as_mut() else {
+/// `strings` is the fixture's string table as raw MUTF-8 bytes — the
+/// disambiguation oracle for raw-printed string operands (see
+/// [`split_operands`]).
+///
+/// Multi-line strings (c-P3): pandasm prints string content RAW, so a
+/// string may span physical lines AND a physical line's text may be a
+/// prefix-ambiguous opener (e.g. `lda.str ""` opening the string
+/// `"\nabc".trim()"` — the empty string is ALSO a table entry, so a
+/// one-line parse closes prematurely). Resolution: bounded lookahead —
+/// a parse that consumed more lines wins iff its matched string-table
+/// content is STRICTLY longer (a false trigger needs the file to
+/// contain a string whose bytes are exactly `<short content>"\n<more
+/// lines>`, vanishingly unlikely, and any mistake still surfaces as an
+/// instruction mismatch below).
+///
+/// No `\r` stripping anywhere: string content may end a physical line
+/// with CR (test262 String/raw special-characters) — the bytes are
+/// content; reference.pa is image-generated (LF line endings).
+fn parse_pandasm(
+    bytes: &[u8],
+    strings: &std::collections::HashSet<Vec<u8>>,
+    multi: &[Vec<u8>],
+) -> Vec<PaFunction> {
+    // Pass 1: group the raw lines into function blocks.
+    let mut blocks: Vec<(Vec<u8>, Vec<&[u8]>)> = Vec::new();
+    let mut current: Option<usize> = None;
+    for line in bytes.split(|&b| b == b'\n') {
+        let Some(idx) = current else {
             if line.starts_with(b".function ") && line.ends_with(b"{") {
                 let head = &line[b".function ".len()..line.len() - 1];
                 let paren = head
@@ -344,64 +431,139 @@ fn parse_pandasm(bytes: &[u8]) -> Vec<PaFunction> {
                     .skip(1)
                     .collect::<Vec<_>>()
                     .join(&b' ');
-                current = Some(PaFunction {
-                    name,
-                    instrs: Vec::new(),
-                    labels: std::collections::HashMap::new(),
-                });
+                blocks.push((name, Vec::new()));
+                current = Some(blocks.len() - 1);
             }
             continue;
         };
         if line == b"}" {
-            assert!(
-                continuation.is_none(),
-                "unterminated string at function end"
-            );
-            functions.push(current.take().unwrap());
+            current = None;
             continue;
         }
-        if let Some(mut acc) = continuation.take() {
-            acc.push(b'\n');
-            acc.extend_from_slice(line);
-            if strings_closed(&acc) {
-                push_pa_insn(fun, &acc);
-            } else {
-                continuation = Some(acc);
-            }
-            continue;
-        }
-        if line.is_empty() || line[0] == b'.' {
-            continue; // blank lines and directives (.catchall, …)
-        }
-        if line[0] != b'\t' && line[0] != b' ' {
-            // Label definition: binds to the next instruction's index.
-            assert!(
-                line.ends_with(b":"),
-                "unexpected pandasm line: {}",
-                String::from_utf8_lossy(line)
-            );
-            fun.labels
-                .insert(line[..line.len() - 1].to_vec(), fun.instrs.len());
-            continue;
-        }
-        let text = trim_bytes(line);
-        if strings_closed(text) {
-            push_pa_insn(fun, text);
-        } else {
-            continuation = Some(text.to_vec());
-        }
+        blocks[idx].1.push(line);
     }
     assert!(current.is_none(), "unterminated pandasm .function block");
+
+    /// Multi-line string lookahead bound (physical lines).
+    const MAX_MULTILINE: usize = 64;
+
+    // Pass 2: per block, parse instructions with the bounded lookahead.
+    let mut functions = Vec::new();
+    for (name, lines) in blocks {
+        let mut fun = PaFunction {
+            name,
+            instrs: Vec::new(),
+            labels: std::collections::HashMap::new(),
+        };
+        let mut i = 0usize;
+        while i < lines.len() {
+            let line = lines[i];
+            if line.is_empty() || line[0] == b'.' {
+                i += 1;
+                continue; // blank lines and directives (.catchall, …)
+            }
+            if line[0] != b'\t' && line[0] != b' ' {
+                // Label definition: binds to the next instruction's index.
+                assert!(
+                    line.ends_with(b":"),
+                    "unexpected pandasm line: {}",
+                    String::from_utf8_lossy(line)
+                );
+                fun.labels
+                    .insert(line[..line.len() - 1].to_vec(), fun.instrs.len());
+                i += 1;
+                continue;
+            }
+            // Instruction. Leading trim only: trailing bytes may be
+            // string CONTENT when the line opens a multi-line string.
+            let mut acc = trim_start_bytes(line).to_vec();
+            let mut best: Option<(usize, Vec<u8>, usize)> = None; // (end-exclusive, acc, string_bytes)
+            let limit = (i + MAX_MULTILINE).min(lines.len());
+            let mut j = i + 1;
+            loop {
+                match insn_parse(&acc, strings) {
+                    Some((string_bytes, last_open)) => {
+                        let better = match &best {
+                            None => true,
+                            Some((_, _, prev)) => string_bytes > *prev,
+                        };
+                        if better {
+                            best = Some((j, acc.clone(), string_bytes));
+                        }
+                        // A resolved parse may still be a premature close
+                        // (the "close" quote is actually content). An
+                        // extension can only win if the tail after the
+                        // last string's open is a prefix of a multi-line /
+                        // quote-bearing table string (the stolen close
+                        // quote makes that true content quote-bearing by
+                        // construction); otherwise stop.
+                        let tail = last_open.map(|o| &acc[o + 1..]);
+                        if j >= limit || !tail.is_some_and(|t| has_string_prefix(multi, t)) {
+                            break;
+                        }
+                    }
+                    // Unresolved: extension can only help while the open
+                    // string's content-so-far prefixes some table string.
+                    None => {
+                        let open = acc.iter().rposition(|&b| b == b'"');
+                        if j >= limit
+                            || !open.is_some_and(|o| has_string_prefix(multi, &acc[o + 1..]))
+                        {
+                            break;
+                        }
+                    }
+                }
+                acc.push(b'\n');
+                acc.extend_from_slice(lines[j]);
+                j += 1;
+            }
+            let Some((end, acc, _)) = best else {
+                panic!(
+                    "unterminated pandasm string: {:?}",
+                    String::from_utf8_lossy(&acc[..acc.len().min(300)])
+                );
+            };
+            push_pa_insn(&mut fun, &acc, strings);
+            i = end;
+        }
+        functions.push(fun);
+    }
     functions
 }
 
-fn push_pa_insn(fun: &mut PaFunction, text: &[u8]) {
+/// Try one accumulated instruction text; on success return the total
+/// matched string-content bytes (the longest-match signal) and the
+/// operand-text-relative offset of the last string's opening quote —
+/// mapped to the full text.
+fn insn_parse(
+    text: &[u8],
+    strings: &std::collections::HashSet<Vec<u8>>,
+) -> Option<(usize, Option<usize>)> {
+    let split = text
+        .iter()
+        .position(|b| b.is_ascii_whitespace())
+        .unwrap_or(text.len());
+    split_operands(&text[split..], strings)
+        .map(|(_, n, last_open)| (n, last_open.map(|o| split + o)))
+}
+
+/// Does any string in the (sorted) `multi` set start with `prefix`?
+fn has_string_prefix(multi: &[Vec<u8>], prefix: &[u8]) -> bool {
+    let idx = multi.partition_point(|s| s.as_slice() < prefix);
+    idx < multi.len() && multi[idx].starts_with(prefix)
+}
+
+/// Split the mnemonic/operands and push one parsed instruction. The
+/// caller (parse_pandasm's lookahead) already resolved all strings.
+fn push_pa_insn(fun: &mut PaFunction, text: &[u8], strings: &std::collections::HashSet<Vec<u8>>) {
     let split = text
         .iter()
         .position(|b| b.is_ascii_whitespace())
         .unwrap_or(text.len());
     let mnemonic = String::from_utf8_lossy(&text[..split]).into_owned();
-    let operands = split_operands(&text[split..]);
+    let operands = split_operands(&text[split..], strings)
+        .expect("lookahead-resolved instruction")
+        .0;
     fun.instrs.push(PaInsn {
         mnemonic,
         operands,
@@ -409,13 +571,105 @@ fn push_pa_insn(fun: &mut PaFunction, text: &[u8]) {
     });
 }
 
+/// The comparison form of a pandasm string operand's raw content:
+/// the content verbatim when it is a fixture string-table entry;
+/// otherwise the content is in the registered lossy class (MUTF-8 lone
+/// surrogates — unrepresentable in Rust `String`, so our decode stores
+/// the `from_utf8_lossy` form) and the token is that form's MUTF-8
+/// re-encode, exactly what the decoded side produces (counted loudly).
+fn string_token_content(
+    content: &[u8],
+    strings: &std::collections::HashSet<Vec<u8>>,
+    lossy: &std::cell::Cell<usize>,
+) -> Vec<u8> {
+    if strings.contains(content) {
+        content.to_vec()
+    } else {
+        lossy.set(lossy.get() + 1);
+        mutf8_bytes(&String::from_utf8_lossy(content))
+    }
+}
+
+/// The value of a double after pandasm's LOSSY print round trip
+/// (c-P3): instruction immediates print `std::scientific` (precision 6
+/// — assembler/assembly-ins.cpp:53,128), literal-array DOUBLE items
+/// print the iostream default (`%g`, 6 significant digits —
+/// disassembler.cpp SerializeLiterals). Doubles needing more digits
+/// than that (test262 surfaces them: 4294967296 prints `4.294967e+09`
+/// as an immediate and `4.29497e+09` as a literal item) cannot be
+/// recovered from the text; both sides compare through the same
+/// print+parse, so a divergence here is a REAL mismatch, loudly
+/// counted.
+fn pandasm_imm_f64(v: f64) -> f64 {
+    if !v.is_finite() {
+        return v;
+    }
+    format!("{v:.6e}").parse().expect("imm float round trip")
+}
+
+/// See [`pandasm_imm_f64`]: the `%g` (6 significant digits) form.
+fn pandasm_lit_f64(v: f64) -> f64 {
+    if !v.is_finite() {
+        return v;
+    }
+    format_g6(v).parse().expect("literal float round trip")
+}
+
+/// C `printf("%g")` / iostream-default double formatting, precision 6:
+/// `%e` when the post-rounding exponent is outside [-4, 6), else `%f`;
+/// trailing zeros stripped. The result is parsed back, so exponent
+/// rendering differences (`e+09` vs `e9`) do not matter.
+fn format_g6(v: f64) -> String {
+    const P: i32 = 6;
+    if v == 0.0 {
+        return if v.is_sign_negative() {
+            "-0".to_owned()
+        } else {
+            "0".to_owned()
+        };
+    }
+    // X = the %e-form exponent AFTER rounding to P significant digits —
+    // Rust's `{:.5e}` performs exactly that rounding.
+    let e = format!("{v:.5e}");
+    let x: i32 = e[e.find('e').unwrap() + 1..].parse().unwrap();
+    let mut s = if (-4..P).contains(&x) {
+        let prec = (P - 1 - x).max(0) as usize;
+        format!("{v:.prec$}")
+    } else {
+        e
+    };
+    // Strip trailing zeros (and a trailing point) from the mantissa.
+    match s.find('e') {
+        Some(epos) => {
+            let mantissa = s[..epos].trim_end_matches('0').trim_end_matches('.');
+            s = format!("{}{}", mantissa, &s[epos..]);
+        }
+        None => {
+            s = s.trim_end_matches('0').trim_end_matches('.').to_owned();
+        }
+    }
+    s
+}
+
 /// Canonical token for one pandasm operand.
-fn pa_operand_token(fun: &PaFunction, token: &[u8]) -> String {
+fn pa_operand_token(
+    fun: &PaFunction,
+    token: &[u8],
+    strings: &std::collections::HashSet<Vec<u8>>,
+    lossy: &std::cell::Cell<usize>,
+) -> String {
     if token.len() >= 2 && token[0] == b'"' && token[token.len() - 1] == b'"' {
-        return format!("s:{}", hex(&token[1..token.len() - 1]));
+        return format!(
+            "s:{}",
+            hex(&string_token_content(
+                &token[1..token.len() - 1],
+                strings,
+                lossy
+            ))
+        );
     }
     if token[0] == b'{' {
-        return pa_literal_token(token);
+        return pa_literal_token(token, strings, lossy);
     }
     if let Some(&index) = fun.labels.get(token) {
         return format!("@{index}");
@@ -436,12 +690,15 @@ fn pa_operand_token(fun: &PaFunction, token: &[u8]) -> String {
             return format!("m:{}", hex(name.as_bytes()));
         }
         if let Some(digits) = text.strip_prefix("0x") {
-            let value = u64::from_str_radix(digits, 16).expect("pandasm hex immediate");
+            let value = u64::from_str_radix(digits, 16)
+                .unwrap_or_else(|e| panic!("pandasm hex immediate {text:?}: {e}"));
             return format!("0x{value:x}");
         }
         if text.contains('.') || text.contains('e') || text.contains("inf") || text.contains("nan")
         {
-            let value: f64 = text.parse().expect("pandasm float immediate");
+            let value: f64 = text
+                .parse()
+                .unwrap_or_else(|e| panic!("pandasm float immediate {text:?}: {e}"));
             return format!("f64:0x{:016x}", value.to_bits());
         }
         if let Ok(value) = text.parse::<i64>() {
@@ -453,7 +710,11 @@ fn pa_operand_token(fun: &PaFunction, token: &[u8]) -> String {
 }
 
 /// Canonical token for one pandasm literal-array operand (`{ N [ … ]}`).
-fn pa_literal_token(token: &[u8]) -> String {
+fn pa_literal_token(
+    token: &[u8],
+    strings: &std::collections::HashSet<Vec<u8>>,
+    lossy: &std::cell::Cell<usize>,
+) -> String {
     let open = token
         .iter()
         .position(|&b| b == b'[')
@@ -462,12 +723,21 @@ fn pa_literal_token(token: &[u8]) -> String {
         .iter()
         .rposition(|&b| b == b']')
         .expect("literal items");
-    let items = split_operands(&token[open + 1..close]);
-    let rendered: Vec<String> = items.iter().map(|item| pa_literal_item(item)).collect();
+    let items = split_operands(&token[open + 1..close], strings)
+        .expect("literal-array items parse on one line")
+        .0;
+    let rendered: Vec<String> = items
+        .iter()
+        .map(|item| pa_literal_item(item, strings, lossy))
+        .collect();
     format!("la:{}", rendered.join(","))
 }
 
-fn pa_literal_item(item: &[u8]) -> String {
+fn pa_literal_item(
+    item: &[u8],
+    strings: &std::collections::HashSet<Vec<u8>>,
+    lossy: &std::cell::Cell<usize>,
+) -> String {
     let colon = item
         .iter()
         .position(|&b| b == b':')
@@ -477,9 +747,29 @@ fn pa_literal_item(item: &[u8]) -> String {
     match tag {
         b"string" => {
             assert!(value.len() >= 2 && value[0] == b'"' && value[value.len() - 1] == b'"');
-            format!("s:{}", hex(&value[1..value.len() - 1]))
+            format!(
+                "s:{}",
+                hex(&string_token_content(
+                    &value[1..value.len() - 1],
+                    strings,
+                    lossy
+                ))
+            )
         }
         b"method" => format!("m:{}", hex(value)),
+        // es2abc 24 literal tags beyond the old corpus' seven (c-P3
+        // test262): generator methods print by name like `method`;
+        // accessor is a u8 flag word.
+        b"generator_method" => format!("gm:{}", hex(value)),
+        b"getter" => format!("getter:{}", hex(value)),
+        b"setter" => format!("setter:{}", hex(value)),
+        b"accessor" => {
+            let number: u8 = std::str::from_utf8(value)
+                .unwrap()
+                .parse()
+                .expect("pandasm accessor flag");
+            format!("accessor:{number}")
+        }
         b"f64" | b"f32" => {
             let value: f64 = std::str::from_utf8(value)
                 .unwrap()
@@ -524,7 +814,12 @@ fn our_canonical(
             Operand::Imm(i) => {
                 if bc.has_flag(BytecodeFlags::FLOAT) {
                     // fldai: the immediate carries the f64 value bits.
-                    format!("f64:0x{:016x}", i as u64)
+                    // pandasm's `std::scientific` print is lossy —
+                    // reconcile through the same print+parse (c-P3).
+                    format!(
+                        "f64:0x{:016x}",
+                        pandasm_imm_f64(f64::from_bits(i as u64)).to_bits()
+                    )
                 } else {
                     format!("0x{i:x}")
                 }
@@ -567,7 +862,9 @@ fn our_literal_item(file: &abcd_file::File, value: &abcd_file::LiteralValue) -> 
         Integer8(v) => format!("i8:{}", *v as i8),
         Integer(v) => format!("i32:{}", *v as i32),
         Float(v) => format!("f32:0x{:08x}", v.to_bits()), // best-effort; not in corpus
-        Double(v) => format!("f64:0x{:016x}", v.to_bits()),
+        // pandasm prints literal doubles lossy (`%g`) — reconcile
+        // through the same print+parse (c-P3).
+        Double(v) => format!("f64:0x{:016x}", pandasm_lit_f64(*v).to_bits()),
         String(sid) => format!(
             "s:{}",
             hex(&mutf8_bytes(
@@ -582,6 +879,29 @@ fn our_literal_item(file: &abcd_file::File, value: &abcd_file::LiteralValue) -> 
         ),
         NullValue(v) => format!("null_value:{v}"),
         MethodAffiliate(v) => format!("method_affiliate:{v}"),
+        // The es2abc 24 tags (c-P3, test262): same renderings as the
+        // pandasm side (`gm:`/`getter:`/`setter:` by name, accessor by
+        // flag value).
+        GeneratorMethod(offset) => format!(
+            "gm:{}",
+            hex(&mutf8_bytes(
+                file.resolve_entity_str(*offset)
+                    .expect("literal generator method")
+            ))
+        ),
+        Getter(offset) => format!(
+            "getter:{}",
+            hex(&mutf8_bytes(
+                file.resolve_entity_str(*offset).expect("literal getter")
+            ))
+        ),
+        Setter(offset) => format!(
+            "setter:{}",
+            hex(&mutf8_bytes(
+                file.resolve_entity_str(*offset).expect("literal setter")
+            ))
+        ),
+        Accessor(v) => format!("accessor:{v}"),
         LiteralArray(idx) => {
             // pandasm prints the nested array's source-file offset. Decode
             // rewrites the reference to a table index only when the target
@@ -605,6 +925,9 @@ struct PaStats {
     methods: usize,
     instructions: usize,
     mismatched: usize,
+    /// String operands reconciled under the registered lossy class
+    /// (MUTF-8 lone surrogates; c-P3).
+    lossy_strings: usize,
 }
 
 /// Compare every decoded method of one fixture against its reference.pa,
@@ -618,8 +941,24 @@ fn compare_fixture_with_pandasm(
 ) -> PaStats {
     let data = std::fs::read(root.join(rel)).expect("fixture");
     let file = decode(&data).unwrap_or_else(|e| panic!("{rel}: {e}"));
+    // The string-table oracle for the pandasm string disambiguation
+    // (pandasm prints string contents raw; see split_operands).
+    let strings: std::collections::HashSet<Vec<u8>> =
+        file.strings.iter().map(|(_, s)| mutf8_bytes(s)).collect();
+    // Lossy-class string tokens (MUTF-8 lone surrogates) used by this
+    // fixture — counted and reported per fixture by the caller.
+    let lossy = std::cell::Cell::new(0usize);
+    // Multi-line / quote-bearing table strings: the only contents that
+    // can make an instruction span physical lines or prefix-collide —
+    // the lookahead's extension filter (sorted for the prefix probe).
+    let mut multi: Vec<Vec<u8>> = strings
+        .iter()
+        .filter(|s| s.contains(&b'"') || s.contains(&b'\n'))
+        .cloned()
+        .collect();
+    multi.sort();
     let pa_bytes = std::fs::read(root.join(pandasm)).expect("reference.pa");
-    let functions = parse_pandasm(&pa_bytes);
+    let functions = parse_pandasm(&pa_bytes, &strings, &multi);
     // Method names are not unique across classes: pool unconsumed pandasm
     // functions per name and pair by (name, instruction count).
     let mut pool: std::collections::HashMap<Vec<u8>, Vec<PaFunction>> =
@@ -659,7 +998,7 @@ fn compare_fixture_with_pandasm(
                             insn.mnemonic.clone(),
                             insn.operands
                                 .iter()
-                                .map(|token| pa_operand_token(cand, token))
+                                .map(|token| pa_operand_token(cand, token, &strings, &lossy))
                                 .collect(),
                         )
                     })
@@ -708,6 +1047,7 @@ fn compare_fixture_with_pandasm(
             ));
         }
     }
+    stats.lossy_strings = lossy.get();
     stats
 }
 
@@ -724,9 +1064,16 @@ fn exported_corpus_instructions_match_upstream_pandasm() {
     let mut matrix: std::collections::BTreeMap<(String, String), PaStats> =
         std::collections::BTreeMap::new();
     let mut total = PaStats::default();
+    let mut lossy_fixtures: Vec<String> = Vec::new();
+    let mut lossy_strings = 0usize;
     for line in &rows {
         let (rel, pandasm) = line.split_once('\t').expect("manifest paths");
         let stats = compare_fixture_with_pandasm(&root, rel, pandasm, &mut register);
+        if stats.lossy_strings > 0 {
+            eprintln!("LOSSY-STRING {rel}: {} reconciled", stats.lossy_strings);
+            lossy_fixtures.push(rel.to_owned());
+            lossy_strings += stats.lossy_strings;
+        }
         let version = rel.split('/').next().expect("version path").to_owned();
         let profile = std::path::Path::new(rel)
             .parent()
@@ -758,6 +1105,22 @@ fn exported_corpus_instructions_match_upstream_pandasm() {
     eprintln!(
         "  TOTAL fixtures {} methods {} instructions {} mismatched {}",
         total.fixtures, total.methods, total.instructions, total.mismatched
+    );
+    eprintln!(
+        "  LOSSY-STRING-CLASS fixtures {} strings {} (MUTF-8 lone surrogates; registered c-P3)",
+        lossy_fixtures.len(),
+        lossy_strings
+    );
+    // The registered lossy class is pinned (c-P3): exactly these four
+    // test262 fixtures carry MUTF-8 lone-surrogate string operands
+    // (unrepresentable in Rust String; both sides reconcile through the
+    // from_utf8_lossy form). A NEW entry here means either the corpus
+    // gained such a fixture (update the pin deliberately) or decode's
+    // string handling changed (investigate).
+    assert_eq!(
+        lossy_fixtures.len(),
+        4,
+        "lossy string class grew/shrank: {lossy_fixtures:?}"
     );
     for record in register.iter().take(50) {
         eprintln!("MISMATCH: {record}");
