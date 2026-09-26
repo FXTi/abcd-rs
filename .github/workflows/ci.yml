@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # The corpus image, pinned by digest ONCE here and referenced by every
+  # corpus job (design/ci-rework-plan.md Track 2). Bump deliberately: the
+  # corpus suites hard-assert fixture counts (5517 rows / 1149 passed).
+  ARK_TEST_IMAGE: ghcr.io/fxti/arkcompiler-test@sha256:125fc858a49880395ecb065db58e59812b6a6e3ba9f88923c5f5debd013fb2b8
 
 jobs:
   fmt:
@@ -67,8 +71,247 @@ jobs:
       - run: cargo build
       - run: cargo test
 
+  # ── Per-push corpus jobs (the c-P3 job graph) ──────────────────────
+  # One job per data-flow test target (tests/<flow>/). Every corpus job
+  # shares the same acquisition recipe: sparse submodule clone + rust +
+  # ruby + `docker pull` of the digest-pinned image + corpus export +
+  # the 30 gen-opcode fixtures (the suites' 5517/2832/1149 hard counts
+  # include them). Docker is used only for corpus acquisition and the
+  # docker oracles (VM compare, dream gate), never for the cargo runs.
+  # Wall-time target: ≤12 min per job (measured suites are seconds-to-
+  # minutes; the dream gate is the heavyweight at ~3-5 min).
+
+  file-isa:
+    name: file-isa (pandasm per-instruction + corpus decode/re-encode)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Acquire the corpus (image export + opcode fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+          python3 scripts/gen-opcode-fixtures.py
+      # modules.abc (Group J) is local-only by license; its test skips by
+      # absence.
+      - run: cargo test -p abcd-rs --test file-isa --release -- --ignored --nocapture
+
+  file-lift:
+    name: file-lift (corpus lift+verify, 5517 incl. test262)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Acquire the corpus (image export + opcode fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+          python3 scripts/gen-opcode-fixtures.py
+      - run: cargo test -p abcd-rs --test file-lift --release -- --ignored --nocapture
+
+  lift-lower:
+    name: lift-lower (rewrite suites + VM oracle ×3 variants)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Acquire the corpus (image export + opcode fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+          python3 scripts/gen-opcode-fixtures.py
+      # corpus_lower_oracle + determinism + async + regalloc + sendable.
+      - name: Corpus rewrite suites
+        run: cargo test -p abcd-rs --test lift-lower --release -- --ignored --nocapture
+        env:
+          ABCD_LOWERED_DIR: ${{ github.workspace }}/target/lowered-out
+      # The python VM oracle compare for all three variants (the script
+      # exits nonzero on any behavior mismatch).
+      - name: VM oracle compare (v2lift / v2opt / v2inline)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for v in v2lift v2opt v2inline; do
+            echo "== variant $v"
+            python3 scripts/compare-rewritten-corpus.py \
+              exports/corpus/index.jsonl "target/lowered-out/$v" \
+              --image "$ARK_TEST_IMAGE" --jobs 4 \
+              | tee "target/oracle-$v.json" | python3 -c \
+              'import json,sys; r=json.load(sys.stdin); print(f"{v}: selected={r[\"selected\"]} compared={r[\"runtime_compared\"]} passed={r[\"passed\"]}")'
+          done
+
+  lift-analysis:
+    name: lift-analysis (callgraph smoke + dom agreement + regions)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Acquire the corpus (image export + opcode fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+          python3 scripts/gen-opcode-fixtures.py
+      - run: cargo test -p abcd-rs --test lift-analysis --release -- --ignored --nocapture
+
+  lift-taint:
+    name: lift-taint (probe ladder + corpus smoke)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Acquire the corpus (image export + opcode fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+          python3 scripts/gen-opcode-fixtures.py
+      # corpus_callee_names is a frequency-count instrument, not a gate —
+      # local-only by design.
+      - run: cargo test -p abcd-rs --test lift-taint --release -- --ignored --nocapture --skip corpus_callee_names
+
+  lift-decompile:
+    name: lift-decompile (stage A/B gates + dream gate + node evidence)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Acquire the corpus (image export + opcode fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+          python3 scripts/gen-opcode-fixtures.py
+      # corpus_stage_a + corpus_decompile (2832 non-test262 rows) +
+      # dream_gate generate+oracle (docker on the runner) + the node
+      # behavior suites (node is preinstalled on runners). textual_oracle
+      # is a report-only instrument — local-only by design.
+      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --skip textual_oracle
+      - name: Upload the dream-gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dream-gate-report
+          path: target/dream-gate/dream-gate-report.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # Full-estate coverage: the corpus-inclusive metric (the "90%" number)
+  # — everything, including the ignored corpus suites, with the corpus
+  # export present.
   coverage:
-    name: Coverage
+    name: Coverage (full estate)
     runs-on: ubuntu-latest
     needs: [fmt]
     env:
@@ -97,12 +340,21 @@ jobs:
         with:
           ruby-version: '3.2'
 
+      - name: Acquire the corpus (image export + opcode fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+          python3 scripts/gen-opcode-fixtures.py
+
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Collect coverage
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+      - name: Collect coverage (full estate incl. the corpus suites)
+        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored
 
       - name: Coverage summary
         run: |
