@@ -191,8 +191,8 @@ jobs:
             python3 scripts/compare-rewritten-corpus.py \
               exports/corpus/index.jsonl "target/lowered-out/$v" \
               --image "$ARK_TEST_IMAGE" --jobs 4 \
-              | tee "target/oracle-$v.json" | python3 -c \
-              'import json,sys; r=json.load(sys.stdin); print(f"{v}: selected={r[\"selected\"]} compared={r[\"runtime_compared\"]} passed={r[\"passed\"]}")'
+              | tee "target/oracle-$v.json" \
+              | jq -r '"selected=\(.selected) compared=\(.runtime_compared) passed=\(.passed)"'
           done
 
   lift-analysis:

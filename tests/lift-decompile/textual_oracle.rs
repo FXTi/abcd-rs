@@ -122,11 +122,14 @@ fn tokenize(src: &str) -> Vec<Tok> {
             out.push(Tok::Num(v.to_bits()));
             continue;
         }
-        // Identifiers/keywords.
-        if c.is_alphabetic() || c == '_' || c == '$' {
+        // Identifiers/keywords. ASCII only (c-P3 CI fix): `b[i] as char`
+        // maps high bytes to Latin-1 — e.g. 0xE2 ('â') IS alphabetic, so a
+        // multi-byte codepoint (U+2028 in test262 sources) would enter this
+        // branch and then slice `src` mid-codepoint (panic). Non-ASCII bytes
+        // fall through to the punct arm (byte-wise, no slicing).
+        if c.is_ascii_alphabetic() || c == '_' || c == '$' {
             let start = i;
-            while i < b.len() && ((b[i] as char).is_alphanumeric() || b[i] == b'_' || b[i] == b'$')
-            {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
                 i += 1;
             }
             out.push(Tok::Ident(src[start..i].to_string()));
@@ -179,6 +182,12 @@ import json, sys
 with open(sys.argv[1], encoding="utf-8") as manifest:
     for line in manifest:
         row = json.loads(line)
+        # c-P3: the textual oracle compares decompiled text against the
+        # ORIGINAL source — test262 rows carry inlined harness prefixes,
+        # so they are meaningless here (and a later phase regardless);
+        # scope to the project corpus like corpus_decompile/stage_a.
+        if (row.get("origin") or {}).get("kind") == "test262":
+            continue
         abc, src = row["abc"], row.get("source") or ""
         assert "\t" not in abc and "\t" not in src
         print(f"{abc}\t{src}")

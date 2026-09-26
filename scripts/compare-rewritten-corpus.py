@@ -74,6 +74,12 @@ def main():
         command = [
             "docker", "run", "--rm", "--platform", "linux/amd64",
             "--network", "none", "--label", label,
+            # Pin the stack ulimit to the VM's expected 8 MiB (the baked
+            # runtime records were produced under it): GH runners' docker
+            # default is 16 MiB, which makes ark_js_vm WARN on stderr
+            # ("Get current thread stack size exceed 8388608") — a pure
+            # environment difference that must not fail the comparison.
+            "--ulimit", "stack=8388608:8388608",
             "-v", f"{candidates}:/work:ro", args.image,
             "compare", f"/work/{relative}", "--case", row["case"],
             "--version", row["version"], "--profile", row["profile"],
@@ -104,6 +110,8 @@ def main():
                 run = subprocess.run(
                     ["docker", "run", "--rm", "--platform", "linux/amd64",
                      "--network", "none", "--label", label,
+                     # See the compare path above: pin the VM stack ulimit.
+                     "--ulimit", "stack=8388608:8388608",
                      "-v", f"{candidates}:/work:ro", args.image,
                      "run", f"/work/{relative}"],
                     capture_output=True, text=True, timeout=120)

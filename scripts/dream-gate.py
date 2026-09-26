@@ -196,7 +196,7 @@ def main():
                 bucket = "decompile-bug"
             else:
                 bucket = "es2abc-cant"
-            key = f"{bucket}: {err[:120]}"
+            key = f"{bucket}: {err}"
         else:
             # Compiled but behavior diverged (or the VM run failed).
             if row["hard_fallbacks"]:
@@ -207,7 +207,7 @@ def main():
                 # other — no module-specific amnesty.
                 bucket = "decompile-bug"
             oracle = cmp_res.get("oracle", {})
-            key = f"{bucket}: {json.dumps(oracle)[:120]}"
+            key = f"{bucket}: {json.dumps(oracle)}"
         buckets[bucket].append(abc)
         reasons.setdefault(key, []).append(abc)
 
