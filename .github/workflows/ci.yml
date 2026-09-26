@@ -292,16 +292,6 @@ jobs:
       # dream_gate generate+oracle (docker on the runner) + the node
       # behavior suites (node is preinstalled on runners). textual_oracle
       # is a report-only instrument — local-only by design.
-      # TEMP (ci-fixes): direct VM smoke on GH runners — the dream gate
-      # failed 1149/1149 on GH while green locally and on dabai; this shows
-      # the raw VM behavior of one baked fixture and one recompiled
-      # candidate.
-      - name: VM smoke diagnostic
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker run --rm --platform linux/amd64 "$ARK_TEST_IMAGE" \
-            run /opt/arkcompiler-test/corpus/24.0.0.0/local/arithmetic/baseline/input.abc
       - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --skip textual_oracle
       - name: Upload the dream-gate report
         if: always()
