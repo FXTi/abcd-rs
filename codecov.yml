@@ -6,7 +6,12 @@ coverage:
         threshold: 2%
     patch:
       default:
-        target: 80%
+        # auto (baseline-following, ±5%): the CI-dark arms that made a
+        # hard 80% misfire are gone since the coverage job is full-estate,
+        # but auto keeps the signal honest without training reviewers to
+        # ignore red (maintainer ruling 2026-09-26).
+        target: auto
+        threshold: 5%
 comment:
   layout: "reach,diff,flags,files"
   behavior: default
