@@ -945,3 +945,10 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   make build && make test && make push on dabai -> new digest -> c-P3
   (abcd-rs CI job graph + digest pin + yield-star-from-export, corpus
   2787->2832 deliberate bump: 2802 baked + 30 script).
+- test262 acquisition switched to a git submodule (arkcompiler-test@9d13f6b):
+  gitlink pinned at tc39/test262@747bed2 (tree 108f9239...), prepare.py is
+  verify-only (HEAD/tree/clean-worktree checks with a proxychains hint);
+  dabai github access goes through proxychains4 (maintainer ruling). Zero
+  lock diff; image buckets identical (5712). The dabai worktree had a
+  stray bogus uncommitted lock edit ("∂") on the old branch checkout —
+  discarded, never reached any branch.
