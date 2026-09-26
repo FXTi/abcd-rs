@@ -33,15 +33,16 @@
   `ssh dabai rm -rf` the kept run dir.
 - `exports/corpus` is local and ignored. Read `index.jsonl`; do not infer cases
   by walking directories. Image (c-P3 digest pin):
-  `ghcr.io/fxti/arkcompiler-test@sha256:125fc858a49880395ecb065db58e59812b6a6e3ba9f88923c5f5debd013fb2b8`.
+  `ghcr.io/fxti/arkcompiler-test@sha256:45f4daf6e422d67a26dd55a524c7c32246e8adf40145523a615e0ae344ae3ea3`.
 - Local export (c-P3, supersedes the 2757-fixture export of image
   sha256:5e7627…): 5487 exported rows = 2802 project corpus (incl. the 40
   `local/probes/*` taint probes + 5 `local/yield-star/*` fixtures, both
   prebuilt into the image) + 2685 `test262/*` compiled rows (all
-  `runtime.status=="recorded"`); +30 gen-opcode fixtures → **5517 rows /
-  1149 runtime-passed** (unchanged). Split: 2832 non-test262 + 2685
-  test262 (`origin.kind`). Regenerate the +30 with
-  `python3 scripts/gen-opcode-fixtures.py`.
+  `runtime.status=="recorded"`); the +30 opcode fixtures (stprivateproperty/
+  testin) are BAKED since the c-P4 image → **5517 rows / 1149
+  runtime-passed** (unchanged). Split: 2832 non-test262 + 2685 test262
+  (`origin.kind`). Regenerate: image export ALONE — zero local generation
+  (gen-opcode-fixtures.py retired).
 - `tests/file-isa/main.rs` has the opt-in corpus decode and ISA tests.
   Since P4-T6 (48cddf4) the manifest is parsed via python3 standard JSON
   everywhere, and `exported_corpus_instructions_match_upstream_pandasm`

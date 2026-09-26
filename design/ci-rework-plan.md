@@ -134,7 +134,7 @@ and referenced by every corpus job. The baked corpus is now **5 487
 rows** = 2 802 project/upstream/local (incl. the 40 `local/probes/*`
 taint probes and the 5 `local/yield-star/*` fixtures, both prebuilt
 into the image) + 2 685 compiled `test262/*` rows (all
-`runtime.status=="recorded"`); abcd-rs adds the 30 gen-opcode fixtures
+`runtime.status=="recorded"`); the 30 opcode fixtures (stprivateproperty/testin) were baked into the image at c-P4 (arkcompiler-test@d4a56d0) — abcd-rs's local `gen-opcode-fixtures.py` is RETIRED
 on top → **5 517 rows / 1 149 runtime-passed** (the passed set is
 unchanged). test262 P0 status: the 2 685 rows gate lift+verify
 (`corpus_lift_verify`, zero lift failures / zero verifier errors);
@@ -151,7 +151,7 @@ table's argument stands:
 |---|---|---|
 | GHCR image pull | 255 MB, ~30–60 s on a runner | measured size; GH↔GHCR bandwidth est. |
 | Corpus export (2 757 fixtures, 119 MB; c-P3: 5 487 rows) | **8.4 s** | measured (audit §7) |
-| `gen-opcode-fixtures.py` (+30 fixtures) | ~1–2 min | est. 30 docker compile+disasm+run cycles |
+| ~~`gen-opcode-fixtures.py` (+30 fixtures)~~ baked into the image since c-P4 | 0 (image side) | retired |
 | VM oracle compare | 0.6 s/fixture seq → **~2 min @ jobs 8** for 1 149 | measured 18 fx in 10.7 s |
 | Dream gate end-to-end | 177–219 s | recorded ×7 in MEMORY.md (macOS+qemu; native linux faster) |
 | Existing CI, cold, copy era (build+test+3 OS+coverage) | ubuntu 1 m 40 s, macOS 1 m 46 s, windows 3 m 45 s | GH API, run 35969107636 jobs |
@@ -178,9 +178,9 @@ GitHub runner:
 
 ```
 T_JOB = setup (checkout + submodule fetch + toolchains + image pull + export
-              + gen-opcode-fixtures)
+              (the 30 opcode fixtures are baked into the image since c-P4)
       + T_RELEASE_BUILD + T_SUITES ≤ 12 min
-setup  ≈ 3–5 min  (image pull ~1 min + export ~10 s + gen-opcode ~1–2 min
+setup  ≈ 2–4 min  (image pull ~1 min + export ~10 s
                    + submodule fetch, the least-pinned number)
 build  ≈ 1–2 min  (4-vCPU derate of the 19.9 s dabai cold release build)
 ```
@@ -198,7 +198,7 @@ All jobs `needs: [fmt]`; the `build` matrix (ubuntu/macos/windows, L1
 workspace tests) is unchanged. Each corpus job: checkout → sparse
 blob:none submodule clone (the `build` job's recipe) → rust toolchain +
 ruby (build.rs codegen) → `docker pull "$ARK_TEST_IMAGE"` (by digest) →
-corpus export (`docker run … export /work`) → `gen-opcode-fixtures.py`
+corpus export (`docker run … export /work`) — the 30 opcode fixtures are baked since c-P4
 (the 30 fixtures every count pin includes) → the suites. Docker is used
 for corpus acquisition and the docker oracles only, never for the cargo
 runs. No `actions/cache` (standing per-push policy).

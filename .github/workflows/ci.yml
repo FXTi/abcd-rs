@@ -12,7 +12,8 @@ env:
   # The corpus image, pinned by digest ONCE here and referenced by every
   # corpus job (design/ci-rework-plan.md Track 2). Bump deliberately: the
   # corpus suites hard-assert fixture counts (5517 rows / 1149 passed).
-  ARK_TEST_IMAGE: ghcr.io/fxti/arkcompiler-test@sha256:125fc858a49880395ecb065db58e59812b6a6e3ba9f88923c5f5debd013fb2b8
+  # This digest bakes the 30 opcode fixtures — no local generation step.
+  ARK_TEST_IMAGE: ghcr.io/fxti/arkcompiler-test@sha256:45f4daf6e422d67a26dd55a524c7c32246e8adf40145523a615e0ae344ae3ea3
 
 jobs:
   fmt:
@@ -74,9 +75,9 @@ jobs:
   # ── Per-push corpus jobs (the c-P3 job graph) ──────────────────────
   # One job per data-flow test target (tests/<flow>/). Every corpus job
   # shares the same acquisition recipe: sparse submodule clone + rust +
-  # ruby + `docker pull` of the digest-pinned image + corpus export +
-  # the 30 gen-opcode fixtures (the suites' 5517/2832/1149 hard counts
-  # include them). Docker is used only for corpus acquisition and the
+  # ruby + `docker pull` of the digest-pinned image + corpus export (the
+  # image bakes everything, incl. the 30 opcode fixtures). Docker is used
+  # only for corpus acquisition and the
   # docker oracles (VM compare, dream gate), never for the cargo runs.
   # Wall-time target: ≤12 min per job (measured suites are seconds-to-
   # minutes; the dream gate is the heavyweight at ~3-5 min).
@@ -110,7 +111,6 @@ jobs:
           docker pull "$ARK_TEST_IMAGE"
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-          python3 scripts/gen-opcode-fixtures.py
       # modules.abc (Group J) is local-only by license; its test skips by
       # absence.
       - run: cargo test -p abcd-rs --test file-isa --release -- --ignored --nocapture
@@ -144,7 +144,6 @@ jobs:
           docker pull "$ARK_TEST_IMAGE"
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-          python3 scripts/gen-opcode-fixtures.py
       - run: cargo test -p abcd-rs --test file-lift --release -- --ignored --nocapture
 
   lift-lower:
@@ -176,7 +175,6 @@ jobs:
           docker pull "$ARK_TEST_IMAGE"
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-          python3 scripts/gen-opcode-fixtures.py
       # corpus_lower_oracle + determinism + async + regalloc + sendable.
       - name: Corpus rewrite suites
         run: cargo test -p abcd-rs --test lift-lower --release -- --ignored --nocapture
@@ -226,7 +224,6 @@ jobs:
           docker pull "$ARK_TEST_IMAGE"
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-          python3 scripts/gen-opcode-fixtures.py
       - run: cargo test -p abcd-rs --test lift-analysis --release -- --ignored --nocapture
 
   lift-taint:
@@ -258,7 +255,6 @@ jobs:
           docker pull "$ARK_TEST_IMAGE"
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-          python3 scripts/gen-opcode-fixtures.py
       # corpus_callee_names is a frequency-count instrument, not a gate —
       # local-only by design.
       - run: cargo test -p abcd-rs --test lift-taint --release -- --ignored --nocapture --skip corpus_callee_names
@@ -292,7 +288,6 @@ jobs:
           docker pull "$ARK_TEST_IMAGE"
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-          python3 scripts/gen-opcode-fixtures.py
       # corpus_stage_a + corpus_decompile (2832 non-test262 rows) +
       # dream_gate generate+oracle (docker on the runner) + the node
       # behavior suites (node is preinstalled on runners). textual_oracle
@@ -347,7 +342,6 @@ jobs:
           docker pull "$ARK_TEST_IMAGE"
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-          python3 scripts/gen-opcode-fixtures.py
 
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
       - name: Install cargo-llvm-cov
