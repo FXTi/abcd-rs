@@ -32,19 +32,25 @@
   that subtree back to local /tmp, run the oracle locally, then
   `ssh dabai rm -rf` the kept run dir.
 - `exports/corpus` is local and ignored. Read `index.jsonl`; do not infer cases
-  by walking directories. Image: `ghcr.io/fxti/arkcompiler-test:latest`.
-- Local export: 2757 fixtures, 1119 runtime `passed`, 1638 `not-applicable`;
-  +30 P4-T6 opcode-coverage fixtures → 2787 / 1149 (regenerate with
-  `python3 scripts/gen-opcode-fixtures.py`).
-  Image ID at export: `sha256:5e7627bdcb78e6ddfc36ea45f6ed0a306928b11ca3adfde7203b82e86c64759f`.
-- `abcd-file/tests/real_module_abc.rs` has opt-in decode and ISA tests.
+  by walking directories. Image (c-P3 digest pin):
+  `ghcr.io/fxti/arkcompiler-test@sha256:125fc858a49880395ecb065db58e59812b6a6e3ba9f88923c5f5debd013fb2b8`.
+- Local export (c-P3, supersedes the 2757-fixture export of image
+  sha256:5e7627…): 5487 exported rows = 2802 project corpus (incl. the 40
+  `local/probes/*` taint probes + 5 `local/yield-star/*` fixtures, both
+  prebuilt into the image) + 2685 `test262/*` compiled rows (all
+  `runtime.status=="recorded"`); +30 gen-opcode fixtures → **5517 rows /
+  1149 runtime-passed** (unchanged). Split: 2832 non-test262 + 2685
+  test262 (`origin.kind`). Regenerate the +30 with
+  `python3 scripts/gen-opcode-fixtures.py`.
+- `tests/file-isa/main.rs` has the opt-in corpus decode and ISA tests.
   Since P4-T6 (48cddf4) the manifest is parsed via python3 standard JSON
   everywhere, and `exported_corpus_instructions_match_upstream_pandasm`
   compares EVERY method's decoded instruction stream against each
   fixture's reference.pa (upstream ark_disasm output) per instruction
   (mnemonic + canonical operands; mapping documented in the test):
-  2787 fixtures / 12996 methods / 2,691,470 instructions, zero
-  mismatches across 6 versions × 3 profiles.
+  pre-c-P3: 2787 fixtures / 12996 methods / 2,691,470 instructions, zero
+  mismatches across 6 versions × 3 profiles (c-P3 rebaseline: see the
+  c-P3 entry).
 - `abcd-ir/tests/corpus_entities.rs` selects arithmetic rows through Python's
   standard JSON parser, then compares resolved function names to `row.pandasm`.
   It covers 6 versions × 3 profiles. It checks entity resolution and lifting,
@@ -952,3 +958,11 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   lock diff; image buckets identical (5712). The dabai worktree had a
   stray bogus uncommitted lock edit ("∂") on the old branch checkout —
   discarded, never reached any branch.
+- c-P4 (2026-09-26): the 30 opcode-coverage fixtures (private-property-store /
+  private-property-in, stprivateproperty/testin) are now baked into the image
+  (arkcompiler-test@d4a56d0): cases/ sources + local-cases.json entries
+  (5 versions, 9.0.0.0 excluded — syntax rejected there; expected_stdout
+  "42\n", all runtime-passed). Image: 5742 fixtures / runtime_checked 1149 /
+  compiled 5517. Once published, abcd-rs deletes gen-opcode-fixtures.py —
+  ZERO local test-data generation remains. NEXT (maintainer act): dabai
+  make build && make test && make push -> final digest for c-P3's CI pin.
