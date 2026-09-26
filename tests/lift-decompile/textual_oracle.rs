@@ -129,9 +129,7 @@ fn tokenize(src: &str) -> Vec<Tok> {
         // fall through to the punct arm (byte-wise, no slicing).
         if c.is_ascii_alphabetic() || c == '_' || c == '$' {
             let start = i;
-            while i < b.len()
-                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$')
-            {
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
                 i += 1;
             }
             out.push(Tok::Ident(src[start..i].to_string()));
