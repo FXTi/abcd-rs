@@ -42,11 +42,14 @@ histogram verbatim.
 import argparse
 import concurrent.futures
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 
-IMAGE = "ghcr.io/fxti/arkcompiler-test:latest"
+# The corpus image; CI pins it by digest via ARK_TEST_IMAGE
+# (.github/workflows/ci.yml). Local default stays :latest.
+IMAGE = os.environ.get("ARK_TEST_IMAGE", "ghcr.io/fxti/arkcompiler-test:latest")
 REPO = Path(__file__).resolve().parent.parent
 GATE = REPO / "target" / "dream-gate"
 MANIFEST = REPO / "exports" / "corpus" / "index.jsonl"
@@ -140,6 +143,7 @@ def main():
         compare_cmd = [
             "python3", str(REPO / "scripts" / "compare-rewritten-corpus.py"),
             str(MANIFEST), str(GATE / "abc"),
+            "--image", IMAGE,
             "--allow-missing", "--jobs", str(args.jobs),
         ]
         for case in args.cases:

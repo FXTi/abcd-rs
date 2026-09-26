@@ -24,13 +24,16 @@ Idempotent: existing rows for the generated cases are replaced.
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 
-IMAGE = "ghcr.io/fxti/arkcompiler-test:latest"
+# The corpus image; CI pins it by digest via ARK_TEST_IMAGE
+# (.github/workflows/ci.yml). Local default stays :latest.
+IMAGE = os.environ.get("ARK_TEST_IMAGE", "ghcr.io/fxti/arkcompiler-test:latest")
 VERSIONS = ["9.0.0.0", "11.0.2.0", "12.0.2.0", "12.0.6.0", "13.0.1.0", "24.0.0.0"]
 PROFILES = ["baseline", "debug-info", "optimized"]
 
