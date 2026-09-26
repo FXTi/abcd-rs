@@ -409,15 +409,6 @@ jobs:
       - name: Collect coverage (full estate incl. the corpus suites)
         run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored
 
-      - name: Coverage summary
-        # Summarize from lcov.info (the exact artifact uploaded to Codecov)
-        # instead of `cargo llvm-cov report`: regenerating from profraw in
-        # the full-estate configuration degrades to an empty table (6000+
-        # "mismatched data" functions across the many instrumented test
-        # binaries — reproduced on dabai). The lcov itself is valid.
-        run: |
-          echo '## Coverage Report (from lcov.info — the Codecov upload)' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
           python3 .github/scripts/lcov-summary.py lcov.info >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
