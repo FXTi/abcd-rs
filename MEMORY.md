@@ -1051,3 +1051,19 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   test262 P1 de-facto landed (pandasm covers all 5517 rows incl. test262,
   4.56M instructions, 0 mismatch, per-push). P2 (VM oracle over the 2685
   recorded test262 rows) in flight; P3 (dream-gate sample) next.
+- N71 FIXED (0f8c52d, red-first n71_ic_slots.rs): IC-slot 8-bit immediate
+  overflow on >256-slot methods (isel single-counter dense allocation);
+  fix mirrors es2panda PandaGen::ReArrangeIc as an isel post-pass
+  (eight-bit slots reallocate from 0, sixteen-bit follow, overflow ->
+  0xFF INVALID_IC_SLOT, behavior-preserving; fires only on overflow ->
+  byte-identical elsewhere). The initial "vreg>=256" diagnosis was wrong
+  (neg/tonumber have no register operands) — corrected with vendor
+  evidence. test262_vm: 2685/2685 rewrite, zero skips.
+- N72 registered + gated (8d1ff4f, maintainer ruling = ledger-and-gate,
+  option B): 30 test262 rows diverge behaviorally under v2lift (exit
+  0->255; arguments/bind/splice/Reflect.set/builtin-subclassing/
+  astral-string clusters). scripts/test262-vm-divergences.json is the
+  self-cleaning ledger (pass+documented==total; new divergence = red;
+  fixed-not-delisted = red). Cluster fixes queue as follow-up tasks.
+  test262-vm CI job live per-push. Also note: the N71 fix unmasked the
+  30th row (surrogate-pairs, formerly encode-skipped).
