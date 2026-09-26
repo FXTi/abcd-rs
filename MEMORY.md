@@ -1031,3 +1031,16 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   export. Spot-verified against the baked corpus: file-lift 5517 green,
   corpus_lower_oracle 1149 green. TRACK 2 FULLY LANDED (no nightly, all
   per-push).
+- CI GH-only failure root-caused and fixed (PR #21, aaf21d5): GH runners'
+  docker default stack ulimit is 16 MiB vs 8 MiB on dabai/mac — ark_js_vm
+  warns on stderr ("thread stack size exceed 8388608"), and the
+  behavior-record comparison includes stderr, so every VM compare failed
+  on GH while the actual behavior (exit/stdout) was correct. Fix: pin
+  --ulimit stack=8388608:8388608 in compare-rewritten-corpus.py (proven by
+  a controlled local experiment: 16M reproduces, 8M silences). Also in the
+  same PR: lift-lower report pipe python->jq (YAML quoting bug);
+  textual_oracle tokenizer byte-as-char panic on U+2028 (test262
+  triggers) fixed to ASCII-only + scoped to project rows; dream-gate
+  failure reasons no longer truncated (the truncation had hidden this
+  root cause). Full-estate CI green: wall ~= 10m13s (lift-lower),
+  coverage 8m5s.
