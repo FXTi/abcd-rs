@@ -1023,3 +1023,11 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   worker is mid-flight. Pending: c-P4 image (5742 baked, no gen-opcode
   script) digest from the maintainer's push -> swap pin, delete
   gen-opcode-fixtures.py, drop the gen step from CI jobs.
+- c-P5 (2026-09-26): final image digest landed (e20ef9b). The maintainer's
+  build/test/push produced sha256:45f4daf6... (5742 in-image, 5517
+  exported, runtime_checked 1149 — every suite's counts unchanged);
+  gen-opcode-fixtures.py + scripts/corpus-fixtures/ DELETED — abcd-rs now
+  generates ZERO test data locally; acquisition is one digest-pinned
+  export. Spot-verified against the baked corpus: file-lift 5517 green,
+  corpus_lower_oracle 1149 green. TRACK 2 FULLY LANDED (no nightly, all
+  per-push).
