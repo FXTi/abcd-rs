@@ -168,6 +168,30 @@ pub enum LowerError {
         /// The successor.
         succ: BlockId,
     },
+    /// The method consumes more IC slots than the u16 slot-immediate space
+    /// even after one-byte-slot-first rearrangement (N71) — no vendored
+    /// encoding exists.
+    #[error(
+        "function {0:?}: IC slot consumption exceeds the u16 slot-immediate space even after \
+         ReArrangeIc-style rearrangement — no vendored encoding exists"
+    )]
+    IcSlotOverflow(FuncId),
+    /// isel's IC-immediate operand map disagrees with the vendor property
+    /// tables (internal invariant: the map must cover exactly the
+    /// `ic_slot`/`jit_ic_slot` instructions isel emits — a gap would leave
+    /// a stale slot immediate after the N71 rearrangement).
+    #[error(
+        "function {func:?}: internal IC-operand map gap for {mnemonic} (vendor ic_slot flag: \
+         {vendor_ic})"
+    )]
+    IcOperandMapGap {
+        /// The owning function.
+        func: FuncId,
+        /// The instruction whose coverage disagrees.
+        mnemonic: String,
+        /// Whether the vendor tables mark the instruction IC-carrying.
+        vendor_ic: bool,
+    },
     /// A block emitted zero bytecodes (N49).
     #[error(
         "function {func:?}: block {block:?} emitted zero bytecodes — inconsistent input (a \

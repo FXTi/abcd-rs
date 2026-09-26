@@ -27,7 +27,7 @@ use abcd_ir::{
     BinOp, BlockId, CallKind, CmpOp, Const, ConstId, FuncId, InstId, Module, Op, SuperCheck,
     SuperKey, Sym, UnOp, ValueDef, ValueId,
 };
-use abcd_isa::{Bytecode, EntityId, EntityKind, Imm, Label, Reg};
+use abcd_isa::{Bytecode, BytecodeFlags, EntityId, EntityKind, Imm, Label, Reg};
 
 use crate::LowerError;
 use crate::fusion::Suppression;
@@ -123,6 +123,218 @@ impl IcAllocator {
     fn two(&mut self) -> Imm {
         self.alloc(2)
     }
+}
+
+/// The runtime's "no inline cache" sentinel for a one-byte IC-slot
+/// immediate: `MethodLiteral::INVALID_IC_SLOT`
+/// (arkcompiler_ets_runtime-master/ecmascript/jspandafile/method_literal.h:40).
+/// Slot 0xFF is never a real slot — the runtime reserves it even in its
+/// slot sizing (method_literal.h:431-434) — so an `eight_bit_ic`
+/// instruction that no longer fits the one-byte region DEGRADES to it:
+/// the VM runs the uncached slow path and behavior is preserved. This is
+/// exactly what upstream output looks like on IC-heavy methods (the N71
+/// shift-operator fixtures carry hundreds of `shl2 0xff`).
+const IC_SLOT_INVALID: u32 = 0xFF;
+
+/// The vendor IC-slot count of an IC-carrying instruction: the isa.yaml
+/// generator derives `one_slot ? 1 : 2` (es2panda
+/// compiler/templates/isa.h.erb — `SetIcSlot`'s `ret`).
+fn ic_slot_count(bc: &Bytecode) -> u32 {
+    if bc.has_flag(BytecodeFlags::ONE_SLOT) {
+        1
+    } else {
+        2
+    }
+}
+
+/// Mutable access to the IC-slot immediate (always operand 0) of every
+/// bytecode variant isel emits an IC slot for — exactly the `ic.one()` /
+/// `ic.two()` consumers in this file. Totality against the vendor
+/// property tables is enforced at lower time by [`rearrange_ic_slots`]'
+/// cross-check, so a missed or stale arm is a hard error, never silent
+/// misassignment.
+fn ic_slot_imm_mut(bc: &mut Bytecode) -> Option<&mut Imm> {
+    use Bytecode::*;
+    Some(match bc {
+        Add2(i, _)
+        | Sub2(i, _)
+        | Mul2(i, _)
+        | Div2(i, _)
+        | Mod2(i, _)
+        | Exp(i, _)
+        | Shl2(i, _)
+        | Shr2(i, _)
+        | Ashr2(i, _)
+        | And2(i, _)
+        | Or2(i, _)
+        | Xor2(i, _)
+        | Eq(i, _)
+        | Noteq(i, _)
+        | Stricteq(i, _)
+        | Strictnoteq(i, _)
+        | Less(i, _)
+        | Lesseq(i, _)
+        | Greater(i, _)
+        | Greatereq(i, _)
+        | Isin(i, _)
+        | Instanceof(i, _) => i,
+        Neg(i) | Not(i) | Inc(i) | Dec(i) | Typeof(i) | Tonumber(i) | Tonumeric(i) => i,
+        Createobjectwithbuffer(i, _) | Createarraywithbuffer(i, _) => i,
+        Createemptyarray(i) | Gettemplateobject(i) | Getiterator(i) | Getasynciterator(i) => i,
+        Createregexpwithliteral(i, ..) | Definefunc(i, ..) | Definemethod(i, ..) => i,
+        Defineclasswithbuffer(i, ..) | CallruntimeDefinesendableclass(i, ..) => i,
+        Ldglobalvar(i, _)
+        | Tryldglobalbyname(i, _)
+        | Stglobalvar(i, _)
+        | Trystglobalbyname(i, _) => i,
+        Ldprivateproperty(i, ..)
+        | Stprivateproperty(i, ..)
+        | CallruntimeDefineprivateproperty(i, ..)
+        | Testin(i, ..) => i,
+        Setobjectwithproto(i, _)
+        | Ldobjbyname(i, _)
+        | Ldobjbyvalue(i, _)
+        | Ldobjbyindex(i, _)
+        | Ldsuperbyname(i, _)
+        | Ldsuperbyvalue(i, _)
+        | Closeiterator(i, _) => i,
+        Stobjbyname(i, ..)
+        | Stobjbyvalue(i, ..)
+        | Stobjbyindex(i, ..)
+        | Stownbyname(i, ..)
+        | Stownbyvalue(i, ..)
+        | Stownbyindex(i, ..)
+        | Stsuperbyname(i, ..)
+        | Stsuperbyvalue(i, ..) => i,
+        Callarg0(i) => i,
+        Callarg1(i, _)
+        | Callargs2(i, ..)
+        | Callargs3(i, ..)
+        | Callthis0(i, _)
+        | Callthis1(i, ..)
+        | Callthis2(i, ..)
+        | Callthis3(i, ..)
+        | Apply(i, ..)
+        | Supercallspread(i, _) => i,
+        Callrange(i, ..)
+        | Callthisrange(i, ..)
+        | Supercallthisrange(i, ..)
+        | Newobjrange(i, ..) => i,
+        _ => return None,
+    })
+}
+
+/// N71: mirror of upstream es2panda's `PandaGen::ReArrangeIc()`
+/// (arkcompiler_ets_frontend-master/es2panda/compiler/core/pandagen.cpp:2278,
+/// overflow trigger regAllocator.cpp:56-64, per-instruction semantics
+/// templates/isa.h.erb `SetIcSlot`).
+///
+/// The dense per-function [`IcAllocator`] assigns IC slots in emission
+/// order from a single counter. When a method's total IC-slot consumption
+/// exceeds the one-byte region, an `eight_bit_ic` instruction (isa.yaml:
+/// `imm:u8`, no wide form — add2/shr2/ashr2/strictnoteq/tonumber/neg/
+/// callarg1/callthis0-3, …) ends up with a slot immediate the encoder
+/// cannot store (`operand out of range`, the N71 encode failure on 24
+/// test262 fixtures). Upstream survives by REARRANGING the slot space
+/// after the fact, and so do we:
+///
+/// - Pass A: the one-byte-slot-only (`eight_bit_ic`) instructions
+///   re-allocate densely from slot 0, in emission order. An instruction
+///   that no longer fits (or straddles the boundary — a two-slot
+///   instruction needs both slots below 0xFF) degrades to
+///   [`IC_SLOT_INVALID`], the runtime's "no IC" sentinel, exactly like
+///   upstream.
+/// - Pass B: every other IC instruction (`sixteen_bit_ic` /
+///   `eight_sixteen_bit_ic`) continues from where pass A ended; a
+///   two-slot instruction straddling 0xFF skips to 0x100 (upstream's
+///   exact rule). Consumption beyond the u16 slot-immediate space is a
+///   hard error — no vendored encoding exists.
+///
+/// The rearrangement fires ONLY when the dense assignment actually
+/// overflowed (an `eight_bit_ic` immediate above 0xFF), so every
+/// non-overflowing function keeps its dense assignment byte-for-byte.
+/// Returns the total IC-slot consumption (for `IselResult::ic_size`).
+fn rearrange_ic_slots(
+    func_id: FuncId,
+    block_codes: &mut [(BlockId, Vec<Bytecode>)],
+    dense_total: u32,
+) -> Result<u32, LowerError> {
+    // Cross-check isel's IC-immediate operand map against the vendor
+    // property tables (an unmapped IC instruction would keep a stale slot
+    // — silent misassignment) and detect the overflow.
+    let mut overflow = false;
+    for (_, codes) in block_codes.iter_mut() {
+        for bc in codes {
+            let vendor_ic =
+                bc.has_flag(BytecodeFlags::IC_SLOT) || bc.has_flag(BytecodeFlags::JIT_IC_SLOT);
+            if vendor_ic != ic_slot_imm_mut(bc).is_some() {
+                return Err(LowerError::IcOperandMapGap {
+                    func: func_id,
+                    mnemonic: bc.mnemonic().to_string(),
+                    vendor_ic,
+                });
+            }
+            if vendor_ic && bc.has_flag(BytecodeFlags::EIGHT_BIT_IC) {
+                let imm = ic_slot_imm_mut(bc).expect("cross-checked above");
+                if !(0..=i64::from(IC_SLOT_INVALID)).contains(&imm.0) {
+                    overflow = true;
+                }
+            }
+        }
+    }
+    if !overflow {
+        return Ok(dense_total);
+    }
+
+    // Pass A: one-byte-slot-only instructions first, densely from 0.
+    let mut counter: u32 = 0;
+    for (_, codes) in block_codes.iter_mut() {
+        for bc in codes {
+            if !bc.has_flag(BytecodeFlags::EIGHT_BIT_IC) {
+                continue;
+            }
+            let slots = ic_slot_count(bc);
+            let imm = ic_slot_imm_mut(bc).expect("cross-checked above");
+            if counter + slots <= IC_SLOT_INVALID {
+                *imm = Imm(i64::from(counter));
+                counter += slots;
+            } else if counter <= IC_SLOT_INVALID {
+                // Boundary straddle: jump the counter past the region and
+                // degrade this instruction to no-IC (upstream's exact
+                // `return 0x100 - slot` behavior).
+                *imm = Imm(i64::from(IC_SLOT_INVALID));
+                counter = IC_SLOT_INVALID + 1;
+            } else {
+                // One-byte region exhausted: degrade to no-IC.
+                *imm = Imm(i64::from(IC_SLOT_INVALID));
+            }
+        }
+    }
+
+    // Pass B: the sixteen-bit-capable IC instructions continue.
+    for (_, codes) in block_codes.iter_mut() {
+        for bc in codes {
+            let vendor_ic =
+                bc.has_flag(BytecodeFlags::IC_SLOT) || bc.has_flag(BytecodeFlags::JIT_IC_SLOT);
+            if !vendor_ic || bc.has_flag(BytecodeFlags::EIGHT_BIT_IC) {
+                continue;
+            }
+            let slots = ic_slot_count(bc);
+            let imm = ic_slot_imm_mut(bc).expect("cross-checked above");
+            if counter <= IC_SLOT_INVALID && counter + slots > IC_SLOT_INVALID {
+                // Boundary straddle: skip to 0x100 (upstream's exact
+                // `imm = 0x100; return ret + (0x100 - slot)` behavior).
+                *imm = Imm(i64::from(IC_SLOT_INVALID + 1));
+                counter = IC_SLOT_INVALID + 1 + slots;
+            } else if counter + slots <= 0x1_0000 {
+                *imm = Imm(i64::from(counter));
+                counter += slots;
+            } else {
+                return Err(LowerError::IcSlotOverflow(func_id));
+            }
+        }
+    }
+    Ok(counter)
 }
 
 /// Emission-time model of the PHYSICAL accumulator content (B4:
@@ -452,10 +664,15 @@ pub fn select_with_options(
         block_codes.push((bb, codes));
     }
 
+    // N71: an over-256-slot method's `eight_bit_ic` immediates do not fit
+    // their u8 operand — rearrange the slot space one-byte-first, exactly
+    // like upstream's `ReArrangeIc` (no-op for non-overflowing functions).
+    let ic_size = rearrange_ic_slots(func_id, &mut block_codes, ic.counter)?;
+
     Ok(IselResult {
         block_codes,
         entity_traces: tracer.traces,
-        ic_size: ic.counter,
+        ic_size,
         unsupported: None,
     })
 }
