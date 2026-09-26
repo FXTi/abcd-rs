@@ -1,7 +1,7 @@
 //! Opt-in corpus smoke test for the on-the-fly call graph
 //! (design/analysis-strategy.md §5.4; gate 3 of v2-P5a):
 //!
-//! 1. build the call graph for every fixture (all 2787 rows) — no panics,
+//! 1. build the call graph for every fixture (all 5517 rows) — no panics,
 //!    and every call site is recorded (resolved OR explicitly unknown);
 //! 2. build it TWICE per module and assert the graphs are equal
 //!    (deterministic construction);
@@ -29,7 +29,7 @@ use abcd_lift::lift_file;
 fn callgraph_smoke_all_fixtures() {
     let root = common::corpus_root();
     let paths = common::manifest_paths(&root);
-    assert_eq!(paths.len(), 2787, "expected the full 2787-fixture corpus");
+    assert_eq!(paths.len(), 5517, "expected the full 5517-fixture corpus");
 
     let mut fixtures = 0usize;
     let mut functions = 0usize;

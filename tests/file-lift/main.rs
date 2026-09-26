@@ -1,11 +1,15 @@
-//! Corpus lift-verify harness (opt-in, all 2787 fixtures):
+//! Corpus lift-verify harness (opt-in, all 5517 fixtures — the c-P3
+//! corpus switch: 2832 non-test262 rows (2802 project/upstream/local
+//! baked + 30 gen-opcode fixtures) + 2685 compiled test262 rows whose
+//! `runtime.status` is `recorded`):
 //!
 //! (a) the v0.2 lift succeeds on every fixture;
 //! (b) `abcd_ir::verify_module` reports ZERO errors on the result.
 //!
 //! History: parity against the v0.1 crate was proven at v2-P1/v2-P2c
 //! (2787 fixtures / 12,996 functions / 1,434,154 canonical tokens /
-//! 0 mismatches). The v0.1-vs-v0.2 canonical comparator
+//! 0 mismatches — pre-test262 corpus). The v0.1-vs-v0.2 canonical
+//! comparator
 //! (`tests/common/compare.rs`) was retired together with the v0.1 crate
 //! at v2-P4 (the swap: abcd-ir becomes abcd-ir, v0.1 deleted; git
 //! history is the archive). This harness keeps the corpus lift+verify
@@ -33,8 +37,8 @@ fn corpus_root() -> PathBuf {
 }
 
 /// Parse the manifest with python3's standard JSON; print each row's
-/// `abc`/`version`/`profile` tab-separated.
-fn manifest_rows(root: &PathBuf) -> Vec<(String, String, String)> {
+/// `abc`/`version`/`profile`/`origin.kind` tab-separated.
+fn manifest_rows(root: &PathBuf) -> Vec<(String, String, String, String)> {
     let output = Command::new("python3")
         .arg("-c")
         .arg(
@@ -45,7 +49,7 @@ with open(sys.argv[1], encoding="utf-8") as manifest:
         row = json.loads(line)
         for key in ("abc", "version", "profile"):
             assert "\n" not in row[key] and "\t" not in row[key]
-        print(row["abc"] + "\t" + row["version"] + "\t" + row["profile"])
+        print(row["abc"] + "\t" + row["version"] + "\t" + row["profile"] + "\t" + row["origin"]["kind"])
 "#,
         )
         .arg(root.join("index.jsonl"))
@@ -64,7 +68,8 @@ with open(sys.argv[1], encoding="utf-8") as manifest:
             let abc = parts.next().expect("abc path").to_owned();
             let version = parts.next().expect("version").to_owned();
             let profile = parts.next().expect("profile").to_owned();
-            (abc, version, profile)
+            let kind = parts.next().expect("origin kind").to_owned();
+            (abc, version, profile, kind)
         })
         .collect()
 }
@@ -82,15 +87,19 @@ fn exported_corpus_lifts_and_verifies_v2() {
     let root = corpus_root();
     let rows = manifest_rows(&root);
     let mut fixtures = 0usize;
+    let mut fixtures_test262 = 0usize;
     let mut functions = 0usize;
     let mut lift_failures = 0usize;
     let mut pending = 0usize;
     let mut verify_failures = 0usize;
     let mut verify_errors_total = 0usize;
-    for (relative, version, profile) in &rows {
+    for (relative, version, profile, kind) in &rows {
         let data = std::fs::read(root.join(relative)).expect("fixture");
         let file = decode(&data).unwrap_or_else(|e| panic!("decode {relative}: {e}"));
         fixtures += 1;
+        if kind == "test262" {
+            fixtures_test262 += 1;
+        }
         let module = match abcd_lift::lift_file(&file) {
             Ok(m) => m,
             Err(abcd_lift::LiftError::LiteralArrayOutOfRange(idx)) => {
@@ -118,14 +127,26 @@ fn exported_corpus_lifts_and_verifies_v2() {
         }
     }
     eprintln!(
-        "corpus v2 lift+verify: {fixtures} fixtures, {functions} functions, \
+        "corpus v2 lift+verify: {fixtures} fixtures (test262: {fixtures_test262}), \
+         {functions} functions, \
          {lift_failures} lift failures, {pending} registered-pending, \
          {verify_failures} fixtures with verifier errors ({verify_errors_total} errors)"
     );
-    // 2757 exported fixtures + 30 P4-T6 opcode-coverage fixtures.
-    assert_eq!(fixtures, 2787);
-    // Function-count pin (12,996) proven at v2-P2c parity close-out.
-    assert_eq!(functions, 12996);
+    // 5487 exported rows (2802 project/upstream/local incl. the 40
+    // local/probes + 5 local/yield-star + 2685 test262 compiled rows)
+    // + 30 gen-opcode fixtures = 5517 (the c-P3 image switch).
+    assert_eq!(fixtures, 5517);
+    assert_eq!(fixtures_test262, 2685, "test262 split (origin.kind)");
+    assert_eq!(
+        fixtures - fixtures_test262,
+        2832,
+        "non-test262 split (origin.kind)"
+    );
+    // Function-count pin: 12,996 on the pre-test262 2787-row corpus
+    // (v2-P2c parity close-out); rebaselined to 45,592 at c-P3 with the
+    // 5517-row corpus (measured; cross-checked against the pandasm
+    // suite's method count — they agree).
+    assert_eq!(functions, 45592);
     assert_eq!(
         lift_failures, 0,
         "lift failures outside the pending register"

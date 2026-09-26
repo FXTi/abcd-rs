@@ -17,11 +17,12 @@
 //! `Complete`/`Value`); `enum class ResumeMode { RETURN=0, THROW=1,
 //! NEXT=2 }` in `functionBuilder.h`.
 //!
-//! Unlike the other goldens these load the REAL fixtures
-//! (`decompile-fixtures/yield-star/*.abc`, es2abc 24.0.0.0 baseline —
-//! the corpus has zero `yield*` coverage, which is exactly why this
-//! was a loud fallback): the pandasm dumps sit next to them
-//! (`*.pa`). Shapes:
+//! These load the REAL fixtures from the exported corpus
+//! (`24.0.0.0/local/yield-star/<case>/baseline/input.abc`, es2abc
+//! 24.0.0.0 baseline — the sources live in the image repo's
+//! `cases/yield-star/`; before c-P3 the corpus had zero `yield*`
+//! coverage, which is exactly why this was a loud fallback): the
+//! pandasm dumps sit next to them (`baseline/reference.pa`). Shapes:
 //!
 //! - (a) `delegate-gen`: sync `function*` delegating to another
 //!   generator; the delegate's RETURN value is used
@@ -39,19 +40,29 @@
 //!
 //! The expected strings are STABLE emission forms — reviewed,
 //! hand-written expectations, not snapshots.
+//!
+//! Moved from `abcd-decompile/tests/` to the root package's
+//! `tests/lift-decompile/` target at c-P3 (the fixtures moved into the
+//! corpus export, so the suite became corpus-dependent and
+//! `#[ignore]`d); every expected string is unchanged.
 
-use abcd_decompile::emit::{EmitOptions, decompile_module};
+use abcd_decompile::emit::{decompile_module, EmitOptions};
 use abcd_lift::lift_file;
 use std::path::PathBuf;
 
-/// The fixture root (standalone — deliberately outside exports/corpus;
-/// the corpus gates hard-assert fixture counts).
+/// The fixture path inside the exported corpus (c-P3: the standalone
+/// `decompile-fixtures/` tree is deleted — the sources live in the
+/// image repo's `cases/yield-star/` and arrive precompiled in the
+/// corpus; test data is zero-in-repo). `name` is the bare case name
+/// (`delegate-gen`, …).
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("decompile-fixtures")
+    crate::common::corpus_root()
+        .join("24.0.0.0")
+        .join("local")
         .join("yield-star")
         .join(name)
+        .join("baseline")
+        .join("input.abc")
 }
 
 /// Decompile one fixture and strip the two-line header comment.
@@ -72,8 +83,9 @@ fn decompiled(name: &str) -> String {
 /// (a) sync generator delegation; the delegate's return value is the
 /// `yield*` expression's value and feeds the next `yield`.
 #[test]
+#[ignore = "requires exported corpus"]
 fn golden_yield_star_delegate_gen() {
-    let text = decompiled("delegate-gen.abc");
+    let text = decompiled("delegate-gen");
     let expected = r#"var inner;
 var log;
 var outer;
@@ -119,8 +131,9 @@ function func_main_0() {
 /// (b) sync `yield*` over a plain iterable (array); unused result →
 /// a bare `yield*` statement.
 #[test]
+#[ignore = "requires exported corpus"]
 fn golden_yield_star_delegate_array() {
-    let text = decompiled("delegate-array.abc");
+    let text = decompiled("delegate-array");
     let expected = r#"var log;
 var outer;
 function func_main_0() {
@@ -164,8 +177,9 @@ function func_main_0() {
 /// and the join hoist wraps the whole protected span in a single
 /// try (post-try statements no longer run on the catch path).
 #[test]
+#[ignore = "requires exported corpus"]
 fn golden_yield_star_delegate_throw() {
-    let text = decompiled("delegate-throw.abc");
+    let text = decompiled("delegate-throw");
     let expected = r#"var boom;
 var it;
 var log;
@@ -252,8 +266,9 @@ function func_main_0() {
 /// `for await (…)` source form since d-P17 — the golden above pins
 /// the folded `outer` body only (main's text is long).
 #[test]
+#[ignore = "requires exported corpus"]
 fn golden_yield_star_delegate_async() {
-    let text = decompiled("delegate-async.abc");
+    let text = decompiled("delegate-async");
     // The folded async generator body (the fold's target) — the full
     // text is long (main's for-await driver); pin the outer body and
     // the absence of YieldStar machinery residues inside it.
@@ -294,8 +309,9 @@ fn golden_yield_star_delegate_async() {
 /// implicit rejection of that await — behavior pinned by the node
 /// rejection probe in `yield_star_node.rs`).
 #[test]
+#[ignore = "requires exported corpus"]
 fn golden_yield_star_delegate_async_main_folded() {
-    let text = decompiled("delegate-async.abc");
+    let text = decompiled("delegate-async");
     let main = text
         .split("main = async function ___main() {")
         .nth(1)
@@ -333,8 +349,9 @@ fn golden_yield_star_delegate_async_main_folded() {
 /// the done-arm's absorbed post-loop tail (print + return) re-homed
 /// AFTER the loop. Exact segment pin:
 #[test]
+#[ignore = "requires exported corpus"]
 fn golden_yield_star_delegate_async_main_for_await() {
-    let text = decompiled("delegate-async.abc");
+    let text = decompiled("delegate-async");
     let main = text
         .split("main = async function ___main() {")
         .nth(1)
@@ -375,8 +392,9 @@ fn golden_yield_star_delegate_async_main_for_await() {
 /// Bail: a hand-rolled iterator-protocol loop inside a generator is
 /// NOT `yield*` — the fold must not fire; the machinery stays loud.
 #[test]
+#[ignore = "requires exported corpus"]
 fn golden_yield_star_bail_manual_iterator() {
-    let text = decompiled("manual-iterator.abc");
+    let text = decompiled("manual-iterator");
     assert!(
         !text.contains("yield*"),
         "the bail shape must not produce yield*:\n{text}"

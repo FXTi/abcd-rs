@@ -1,6 +1,8 @@
 //! lift → decompile integration suites, migrated from
-//! `abcd-decompile/tests/` (the crate-local golden tests stay in
-//! `abcd-decompile/tests/`).
+//! `abcd-decompile/tests/` (the crate-local golden tests on hand-built
+//! IR stay in `abcd-decompile/tests/`; `golden_yield_star.rs` moved
+//! here at c-P3 because its fixtures now live in the corpus export,
+//! not in the repo).
 //!
 //! Layout choice: one Cargo target per data-flow chain
 //! (`tests/lift-decompile/main.rs` + one module per former standalone
@@ -24,5 +26,6 @@ mod async_node;
 mod corpus_decompile;
 mod corpus_stage_a;
 mod dream_gate;
+mod golden_yield_star;
 mod textual_oracle;
 mod yield_star_node;

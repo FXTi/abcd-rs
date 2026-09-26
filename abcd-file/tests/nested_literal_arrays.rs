@@ -95,7 +95,7 @@ fn unresolved_nested_refs(file: &abcd_file::File) -> Vec<u32> {
 fn corpus_nested_literal_refs_resolve() {
     let root = exported_corpus_root();
     let rows = manifest_rows(&root);
-    assert_eq!(rows.len(), 2787, "corpus manifest row count");
+    assert_eq!(rows.len(), 5517, "corpus manifest row count");
     let mut offenders = Vec::new();
     for (rel, _case) in &rows {
         let data = std::fs::read(root.join(rel))

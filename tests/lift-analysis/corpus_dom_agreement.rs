@@ -39,7 +39,7 @@ use abcd_lift::lift_file;
 fn dominators_agree_with_verifier_on_corpus() {
     let root = common::corpus_root();
     let paths = common::manifest_paths(&root);
-    assert_eq!(paths.len(), 2787, "expected the full 2787-fixture corpus");
+    assert_eq!(paths.len(), 5517, "expected the full 5517-fixture corpus");
 
     let mut fixtures = 0usize;
     let mut functions = 0usize;

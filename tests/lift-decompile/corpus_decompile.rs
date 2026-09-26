@@ -1,6 +1,8 @@
 //! Opt-in corpus gate for Stage B + emission v1 (d-P3,
-//! design/decompile.md §7): decompile every function of every corpus
-//! fixture to JS text.
+//! design/decompile.md §7): decompile every function of every
+//! NON-test262 corpus fixture (2832 rows — the c-P3 scope; test262
+//! decompile is a later phase per design/test262-feasibility.md) to JS
+//! text.
 //!
 //! Assertions:
 //!
@@ -162,6 +164,9 @@ fn merge_stats(a: &mut DecompileStats, b: &DecompileStats) {
     a.folds.agen_awaits += b.folds.agen_awaits;
     a.folds.agen_await_bound += b.folds.agen_await_bound;
     a.folds.agen_returns += b.folds.agen_returns;
+    a.folds.yield_star_sites += b.folds.yield_star_sites;
+    a.folds.yield_star_bound += b.folds.yield_star_bound;
+    a.folds.dead_exit_throw += b.folds.dead_exit_throw;
     a.function_bodies += b.function_bodies;
 }
 
@@ -169,8 +174,15 @@ fn merge_stats(a: &mut DecompileStats, b: &DecompileStats) {
 #[ignore = "requires exported GHCR corpus and python3"]
 fn corpus_decompile_gate() {
     let root = common::corpus_root();
-    let paths = common::manifest_paths(&root);
-    assert_eq!(paths.len(), 2787, "expected the full 2787-fixture corpus");
+    // Scoped to the NON-test262 rows (c-P3): test262 decompile is a
+    // later phase per design/test262-feasibility.md — the 2685 test262
+    // rows gate lift+verify (tests/file-lift) only.
+    let paths = common::project_manifest_paths(&root);
+    assert_eq!(
+        paths.len(),
+        2832,
+        "expected the 2832-fixture non-test262 corpus"
+    );
 
     let mut stats = DecompileStats::default();
     let mut fixtures = 0usize;

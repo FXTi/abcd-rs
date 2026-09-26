@@ -6385,7 +6385,8 @@ fn leaf_exprs(l: &Leaf) -> Vec<&Expr> {
 // :177-342 + the `Iterator` helper (`GetMethod`/`Close`/
 // `CallMethodWithValue`/`Complete`/`Value`); `enum class ResumeMode {
 // RETURN=0, THROW=1, NEXT=2 }` in `functionBuilder.h`; probe-verified
-// on the d-P15 fixtures `decompile-fixtures/yield-star/*.pa`):
+// on the d-P15 fixtures (now corpus-exported:
+// `24.0.0.0/local/yield-star/*/baseline/reference.pa`):
 //
 //   iter = GetIterator(expr)        // async kind: GetAsyncIterator
 //   next = iter.next

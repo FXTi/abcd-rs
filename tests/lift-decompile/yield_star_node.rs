@@ -1,6 +1,8 @@
 //! d-P15 node evidence for the YieldStar (`yield*`) fold: the REAL
-//! fixtures (`decompile-fixtures/yield-star/*.abc`, es2abc 24.0.0.0
-//! baseline) are decompiled and executed under `node`, and the exact
+//! fixtures (corpus export `24.0.0.0/local/yield-star/<case>/baseline/
+//! input.abc`, es2abc 24.0.0.0 baseline — sources live in the image
+//! repo's `cases/yield-star/`) are decompiled and executed under
+//! `node`, and the exact
 //! stdout is compared against the source-level behavior (verified
 //! identical on ark_js_vm at fixture-generation time).
 //!
@@ -31,18 +33,26 @@
 //! Migrated from `abcd-decompile/tests/yield_star_node.rs` to the root
 //! package's `tests/lift-decompile/` target; the root package's manifest
 //! dir IS the repo root, so the fixture path resolves without the
-//! crate-local `..`.
+//! crate-local `..`. Since c-P3 the fixtures are corpus-exported (test
+//! data zero-in-repo), so the suite is corpus-dependent and
+//! `#[ignore]`d.
 
 use abcd_decompile::emit::{decompile_module, EmitOptions};
 use abcd_lift::lift_file;
 use std::path::PathBuf;
 
-/// The fixture root (standalone — deliberately outside exports/corpus).
+/// The fixture path inside the exported corpus (c-P3: the standalone
+/// `decompile-fixtures/` tree is deleted — the sources live in the
+/// image repo's `cases/yield-star/` and arrive precompiled in the
+/// corpus). `name` keeps its historical `.abc` suffix.
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("decompile-fixtures")
+    crate::common::corpus_root()
+        .join("24.0.0.0")
+        .join("local")
         .join("yield-star")
-        .join(name)
+        .join(name.strip_suffix(".abc").expect("fixture name"))
+        .join("baseline")
+        .join("input.abc")
 }
 
 /// Decompile one fixture to JS text (header comment kept — it is
@@ -80,6 +90,7 @@ fn run_node(dir: &std::path::Path, name: &str, body: &str) -> (bool, String, Str
 /// (a)+(b): the module entry reproduces the source stdout exactly —
 /// the delegated sequence and the delegation return value.
 #[test]
+#[ignore = "requires exported corpus"]
 fn yield_star_node_sync_entries() {
     if !node_available() {
         eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
@@ -112,6 +123,7 @@ fn yield_star_node_sync_entries() {
 /// entry prints the delegated sequence itself; the hand-written
 /// `for await` driver over the decompiled `outer` repeats it.
 #[test]
+#[ignore = "requires exported corpus"]
 fn yield_star_node_async_driver() {
     let text = decompiled("delegate-async.abc");
     // The literal source form (the exact-segment golden pin lives in
@@ -148,6 +160,7 @@ fn yield_star_node_async_driver() {
 /// first (`1,2,inner-done`), rebinds the module-level `outer` to a
 /// rejecting async iterable, and re-invokes `main`.
 #[test]
+#[ignore = "requires exported corpus"]
 fn yield_star_node_async_driver_rejection_probe() {
     if !node_available() {
         eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
@@ -183,6 +196,7 @@ fn yield_star_node_async_driver_rejection_probe() {
 /// consumer's try/catch — a hand-written consumer driver (the
 /// module's own entry is the pre-existing fragmentation case below).
 #[test]
+#[ignore = "requires exported corpus"]
 fn yield_star_node_throw_driver() {
     if !node_available() {
         eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
@@ -225,6 +239,7 @@ fn yield_star_node_throw_driver() {
 /// from the catch path except through the structured join — the
 /// source behavior `before,caught:delegated-boom`.
 #[test]
+#[ignore = "requires exported corpus"]
 fn yield_star_node_throw_main_correct() {
     if !node_available() {
         eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
@@ -253,6 +268,7 @@ fn yield_star_node_throw_main_correct() {
 /// honest fallback, not source behavior). This is the shape the fold
 /// deliberately refuses to touch.
 #[test]
+#[ignore = "requires exported corpus"]
 fn yield_star_node_bail_loud_fallback() {
     if !node_available() {
         eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
@@ -276,6 +292,7 @@ fn yield_star_node_bail_loud_fallback() {
 /// node --check on ALL five outputs: the fold (and the preserved
 /// fallbacks) must leave syntactically valid JS.
 #[test]
+#[ignore = "requires exported corpus"]
 fn yield_star_node_check_all() {
     if !node_available() {
         eprintln!("NODE-CHECK node not found on this host — skipped");

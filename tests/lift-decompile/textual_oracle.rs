@@ -7,7 +7,7 @@
 //! practice es2abc bakes the literal placeholder `"not supported"`
 //! there (verified across the corpus: 929 fixtures carry exactly that
 //! placeholder). The corpus manifest's `source` field points at the
-//! tracked true original (`exports/corpus/sources/…`) for all 2787
+//! tracked true original (`exports/corpus/sources/…`) for all 5517
 //! fixtures, so the oracle uses it instead.
 //!
 //! Comparison is a whitespace-insensitive token-stream match (a small

@@ -31,7 +31,7 @@ pub fn corpus_root() -> PathBuf {
         })
 }
 
-/// Every fixture path in the manifest (all 2787 rows, sorted for
+/// Every fixture path in the manifest (all 5517 rows, sorted for
 /// determinism), parsed with python3's standard JSON library.
 pub fn manifest_paths(root: &PathBuf) -> Vec<String> {
     let output = Command::new("python3")

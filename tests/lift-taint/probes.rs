@@ -17,7 +17,7 @@
 //! Migrated from `abcd-taint/tests/probes.rs` to the root package's
 //! `tests/lift-taint/` target; the IR scaffolding moved to the root
 //! package's `tests/common/taint_scaffold.rs`, and — the root package's
-//! manifest dir IS the repo root — the compiled suite's `probes-taint/`
+//! manifest dir IS the repo root — the compiled suite's corpus
 //! resolution lost the crate-local `..`.
 
 use crate::common::taint_scaffold::*;
@@ -402,17 +402,22 @@ fn probe_exception_only_path() {
 
 // ────────────────────────────────────────────────────────────────────
 // The COMPILED probe suite (t-P1; analysis-strategy.md §5.5 — the
-// ladder-trigger instrument). Hand-written JS sources with known ground
-// truth live in probes-taint/src/ (+ annotations.json); they are
-// compiled by scripts/gen-taint-probes.py into the GITIGNORED
-// probes-taint/out/ with the GHCR image's es2abc (24.0.0.0, baseline,
-// script mode — the pin and rationale are in annotations.json).
+// ladder-trigger instrument). The hand-written JS sources with known
+// ground truth live in the arkcompiler-test image repo's
+// `cases/probes/` and arrive PRECOMPILED in the corpus export
+// (`24.0.0.0/local/probes/<family>/<id>/baseline/input.abc`, es2abc
+// 24.0.0.0 baseline, script mode); the hand-written ground truth
+// (config — not built data) lives next to this suite as
+// `tests/lift-taint/probes_annotations.json` (the c-P3 switch; before
+// it the sources sat in `probes-taint/src/` and
+// `scripts/gen-taint-probes.py` compiled them locally into the
+// gitignored `probes-taint/out/` — both deleted).
 //
 // The suite EXTENDS the five hand-built mini-module families above:
-// same axes, real bytecode. Its ground truth is runtime-checked by the
-// generator (every probe runs clean on the image's VM).
+// same axes, real bytecode. Its ground truth is runtime-checked at
+// image build time (every probe runs clean on the image's VM).
 //
-// Expectations per sink line (see annotations.json):
+// Expectations per sink line (see probes_annotations.json):
 //   tp    — real flow, MUST hit (a miss is a regression);
 //   clean — no flow, MUST NOT hit (a hit is an FP regression);
 //   fp    — no flow, the CURRENT rung HITS (expected FP; closes_at_rung
@@ -428,7 +433,6 @@ fn probe_exception_only_path() {
 // (against rung-1 annotations it fails loudly — by design).
 //
 // Run:
-//   python3 scripts/gen-taint-probes.py   # once, needs docker
 //   cargo test -p abcd-rs --test lift-taint --release -- \
 //       --ignored --nocapture probe_suite_compiled
 // ────────────────────────────────────────────────────────────────────
@@ -492,7 +496,7 @@ for p in a["probes"]:
         let out = std::process::Command::new("python3")
             .arg("-c")
             .arg(script)
-            .arg(root.join("probes-taint/src/annotations.json"))
+            .arg(root.join("tests/lift-taint/probes_annotations.json"))
             .output()
             .expect("python3 is required by corpus tooling");
         assert!(
@@ -577,14 +581,18 @@ for p in a["probes"]:
     }
 
     #[test]
-    #[ignore = "requires probes-taint/out (run scripts/gen-taint-probes.py first) and python3"]
+    #[ignore = "requires the exported corpus (24.0.0.0/local/probes rows) and python3"]
     fn probe_suite_compiled() {
         let root = repo_root();
         let (probes, source, sink) = load_annotations(&root);
         assert_eq!((source.as_str(), sink.as_str()), ("TAINT", "print"));
+        let probe_root = crate::common::corpus_root()
+            .join("24.0.0.0")
+            .join("local")
+            .join("probes");
         assert!(
-            root.join("probes-taint/out/manifest.json").is_file(),
-            "probes-taint/out missing — run `python3 scripts/gen-taint-probes.py` first"
+            probe_root.is_dir(),
+            "corpus export missing (24.0.0.0/local/probes) — export the GHCR image corpus first"
         );
         let config = compiled_config(&source, &sink);
 
@@ -594,8 +602,10 @@ for p in a["probes"]:
 
         for probe in &probes {
             let data = std::fs::read(
-                root.join("probes-taint/out")
-                    .join(format!("{}.abc", probe.id)),
+                probe_root
+                    .join(&probe.id)
+                    .join("baseline")
+                    .join("input.abc"),
             )
             .unwrap_or_else(|e| panic!("{}: read compiled probe: {e}", probe.id));
             let file = abcd_file::decode(&data).expect("decode probe");
