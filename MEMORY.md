@@ -1079,3 +1079,12 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   now holds exactly ONE row (decl-lex-configurable-global -> l-P2). N73
   registered (pre-existing SEGV rewriting call_this_range_with_name
   fixtures, ungated input; investigation queued).
+- N72 FULLY CLOSED (ae3e35e): the last ledger row
+  (decl-lex-configurable-global) fixed with a new IR op
+  Op::StoreGlobalRecord (global lexical vs object store, vendor
+  runtime_stubs-inl.h:1793/780). test262 VM oracle is now 2685/2685;
+  the divergences ledger is EMPTY and stays armed (unlisted divergence =
+  red; stale entry = red). The 681-fixture opcode flip (0x7f ->
+  0x47/0x48) is the rewrite moving back to the original opcodes —
+  attributed, length-preserving, behavior-equivalent. Open: N73
+  (withname SEGV) investigation.
