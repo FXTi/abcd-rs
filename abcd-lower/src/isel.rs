@@ -2125,20 +2125,35 @@ fn select_call(
             codes.push(Bytecode::Supercallspread(ic.two(), arg_r));
         }
         CallKind::SuperForwardAllArgs => {
-            // v0.1's representation kept verbatim (N58): a default derived
-            // constructor forwarding all args lowers through the
-            // supercallthisrange form with the window holding the
-            // forwarded args (args = [this] at the lift).
-            emit_range_call(
-                RangeForm::SuperCallThis,
-                callee,
-                args,
-                func_id,
-                alloc,
-                codes,
-                ic,
-                tracker,
-            )?;
+            // Vendor `callruntime.supercallforwardallargs v:in:top`
+            // (isa.yaml:944 — `acc: out:top`, the register operand is the
+            // ONLY input; interpreter-inl.cpp:3814-3830): the register
+            // operand holds thisFunc; newTarget and the FULL actual
+            // argument list come from the CURRENT frame
+            // (`GetNewTarget(thread, sp)` / `GetNumArgs(thread, sp, …)`),
+            // forwarded verbatim to the super constructor
+            // (`RuntimeSuperCallForwardAllArgs`, runtime_stubs-inl.h:299).
+            // There is NO explicit argument window. The lift (N58) keeps
+            // the vendor register operand as args[0]. The previous
+            // approximation — supercallthisrange argc=1 with window
+            // [func] — Construct'ed the super constructor with ONE
+            // argument, the function object itself (N72-C2: Error(func)
+            // → message "Cannot get source code", Int8Array(func) →
+            // length 0, WeakSet(func) → "TypeError: Callable is false",
+            // DataView(func, …) → "TypeError: buffer is not
+            // ArrayBuffer").
+            let [this_func] = args else {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: format!(
+                        "supercallforwardallargs requires exactly the lifted register operand \
+                         (thisFunc), got {} args",
+                        args.len()
+                    ),
+                });
+            };
+            let regs = materialize_operands(tracker, func_id, &[*this_func], None, alloc, codes)?;
+            codes.push(Bytecode::CallruntimeSupercallforwardallargs(regs[0]));
         }
         CallKind::New => {
             emit_construct(callee, args, func_id, alloc, codes, ic)?;
@@ -2193,7 +2208,23 @@ fn emit_range_call(
 
     ensure_acc(tracker, func_id, callee, alloc, codes)?;
 
-    let argc = args.len();
+    // Vendor argc-immediate conventions differ per range family
+    // (arkcompiler_ets_runtime interpreter-inl.cpp): callrange and
+    // supercallthisrange encode the FULL window count (`CALL_PUSH_ARGS_RANGE`
+    // pushes `sp[startReg + i]` for `i = actualNumArgs - 1 ..= 0`; the
+    // supercall builtin path copies `range` vregs from v0, :3292-3295).
+    // Modern callthisrange encodes the argument count EXCLUDING this —
+    // `actualNumArgs = READ_INST_8_1()` then `CALL_PUSH_ARGS_THISRANGE`
+    // pushes `sp[startReg + i]` for `i = actualNumArgs ..= 1` ("1: skip
+    // this", :1349-1356/:375-383; es2panda emits `actualArgs =
+    // argCount - 1`, pandagen.cpp:1357-1366). The window fill above
+    // always covers ALL `args` slots — for CallThis that is
+    // [this, args...] (select_call pushes `this` first).
+    let window = args.len();
+    let argc = match form {
+        RangeForm::CallThis => window.saturating_sub(1),
+        RangeForm::Call | RangeForm::SuperCallThis => window,
+    };
     let argc_imm = Imm(argc as i64);
     let bc = match (form, argc <= 255) {
         (RangeForm::Call, true) => Bytecode::Callrange(ic.two(), argc_imm, start),

@@ -1188,7 +1188,7 @@ pub fn translate_bytecode(
         }
         Bytecode::Callthisrange(_, argc, start) | Bytecode::WideCallthisrange(argc, start) => {
             let callee = fx.read_acc(block);
-            let args = call_this_args(fx, start.0, argc.0 as u16, block);
+            let args = call_this_args(fx, start.0, argc.0, block);
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -1206,7 +1206,7 @@ pub fn translate_bytecode(
             // callthis*withname: the method name is only a JIT IC hint;
             // folds into the plain callthis form (v0.1 parity).
             let callee = fx.read_acc(block);
-            let args = call_this_args(fx, start.0, argc.0 as u16, block);
+            let args = call_this_args(fx, start.0, argc.0, block);
             let v = fx.emit_val(
                 block,
                 Op::Call {
@@ -2048,14 +2048,28 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedCallthisrange(argc, start) => {
-            let callee = fx.read_acc(block);
-            let args = call_this_args(fx, start.0, argc.0 as u16, block);
+            // Vendor DEPRECATED_CALLTHISRANGE_PREF_IMM16_V8
+            // (interpreter-inl.cpp:1365-1371): the encoded imm16 is
+            // actualNumArgs + 1 (real args EXCLUDING this), the acc is
+            // OUT-only (`acc: out:top`, isa.yaml:1145) and the FUNC is
+            // the FIRST window slot — DEPRECATED_CALL_INITIALIZE reads
+            // `funcTagged = sp[startReg]`; the window layout is
+            // [func, this, args...] with args pushed from
+            // sp[startReg+2 .. startReg+imm]
+            // (DEPRECATED_CALL_PUSH_ARGS_THISRANGE: `for (i =
+            // actualNumArgs + 1; i > 1; i--) push sp[startReg + i]`).
+            // Zero corpus coverage (no deprecated.callthisrange in any
+            // exported fixture) — vendor-derived.
+            let argc = argc.0 as u16;
+            let callee = fx.read_reg(Reg(start.0), block);
+            let this = fx.read_reg(Reg(start.0.saturating_add(1)), block);
+            let args = fx.read_reg_range(start.0.saturating_add(2), argc.saturating_sub(1), block);
             let v = fx.emit_val(
                 block,
                 Op::Call {
                     callee,
-                    this: args.0,
-                    args: args.1,
+                    this: Some(this),
+                    args,
                     kind: CallKind::Dynamic,
                 },
                 loc,
@@ -2286,15 +2300,24 @@ fn unary_op(fx: &mut FnLift, op: UnOp, block: BlockId, loc: Option<u32>) {
     fx.write_acc(block, v);
 }
 
-/// Read a callthis-family register window: the first register is
-/// `this`, the rest are the call arguments. An empty window (degenerate
-/// argc = 0) yields `this: None` (no operand invented).
+/// Read a MODERN callthisrange-family register window. The encoded
+/// `argc` immediate counts the REAL arguments only — `this` rides the
+/// window's FIRST slot on top of that, so the window spans `argc + 1`
+/// registers `[this, args...]` (vendor `CALLTHISRANGE_IMM8_IMM8_V8`:
+/// `actualNumArgs = READ_INST_8_1()` then `CALL_PUSH_ARGS_THISRANGE`
+/// pushes `sp[startReg + i]` for `i = actualNumArgs ..= 1` — "1: skip
+/// this", interpreter-inl.cpp:1349-1356/:375-383; es2panda emits
+/// `actualArgs = argCount - 1`, pandagen.cpp:1357-1366). argc = 0 still
+/// yields a one-slot window (`this` only). `argc` saturates at u16: a
+/// hypothetical 0xFFFF-arg call would need a 65536-register frame,
+/// impossible under the u16 register space.
 fn call_this_args(
     fx: &mut FnLift,
     start: u16,
-    count: u16,
+    argc: i64,
     block: BlockId,
 ) -> (Option<ValueId>, Vec<ValueId>) {
+    let count = (argc as u16).saturating_add(1);
     let range = fx.read_reg_range(start, count, block);
     match range.split_first() {
         Some((&this, rest)) => (Some(this), rest.to_vec()),

@@ -23,13 +23,13 @@ macro_rules! handle_type {
     };
 }
 
-/// Convert a Rust UTF-8 string to MUTF-8 (modified UTF-8) bytes in a CString.
+/// Convert a Rust UTF-8 string to MUTF-8 (modified UTF-8) bytes.
 ///
 /// MUTF-8 encodes U+0000 as the two-byte overlong sequence `C0 80`, so the
 /// result never contains a `0x00` byte regardless of the input; astral
 /// characters keep their standard 4-byte UTF-8 encoding (panda's MUTF-8
 /// differs from UTF-8 only in the NUL rule — upstream utf.cpp:131-138).
-fn c_mutf8(s: &str) -> CString {
+pub(crate) fn mutf8_bytes(s: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(s.len());
     for ch in s.chars() {
         if ch == '\0' {
@@ -39,8 +39,13 @@ fn c_mutf8(s: &str) -> CString {
             bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
         }
     }
-    // Unreachable: MUTF-8 output contains no 0x00 byte by construction.
-    CString::new(bytes).expect("MUTF-8 contains no NUL")
+    bytes
+}
+
+/// `mutf8_bytes` as a `CString` (always succeeds: MUTF-8 output contains
+/// no 0x00 byte by construction).
+fn c_mutf8(s: &str) -> CString {
+    CString::new(mutf8_bytes(s)).expect("MUTF-8 contains no NUL")
 }
 
 handle_type!(StringHandle);
@@ -210,6 +215,13 @@ impl ModuleRecordDef {
 /// ABC file builder.
 pub struct Builder {
     raw: *mut sys::AbcBuilder,
+    /// Original MUTF-8 bytes of decoded strings that have no lossless Rust
+    /// `String` form (MUTF-8 lone surrogates), keyed by their decoded
+    /// (lossy) content — re-emitted verbatim by [`Builder::mutf8_of`]
+    /// instead of re-encoding the lossy form (N72; see
+    /// [`crate::model::File::string_raw_bytes`]). Empty for files that
+    /// carry no such strings and for programmatically built files.
+    raw_strings: std::collections::HashMap<String, Box<[u8]>>,
 }
 
 impl Builder {
@@ -218,12 +230,31 @@ impl Builder {
         // SAFETY: no preconditions.
         let raw = unsafe { sys::abc_builder_new() };
         assert!(!raw.is_null(), "abc_builder_new returned null");
-        Self { raw }
+        Self {
+            raw,
+            raw_strings: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Install the decoded file's raw-MUTF-8 side table (N72 lone-surrogate
+    /// lossless round-trip; see [`crate::model::File::string_raw_bytes`]).
+    pub fn set_raw_strings(&mut self, raw_strings: std::collections::HashMap<String, Box<[u8]>>) {
+        self.raw_strings = raw_strings;
+    }
+
+    /// MUTF-8 bytes for emission: the recorded original bytes when this
+    /// content was decoded from a lone-surrogate MUTF-8 string, otherwise
+    /// the standard UTF-8 → MUTF-8 conversion.
+    fn mutf8_of(&self, s: &str) -> CString {
+        if let Some(raw) = self.raw_strings.get(s) {
+            return CString::new(raw.to_vec()).expect("MUTF-8 contains no NUL");
+        }
+        c_mutf8(s)
     }
 
     /// Set the API policy before adding items.
     pub fn set_api(&mut self, version: u8, sub_api: &str) {
-        let c_sub = c_mutf8(sub_api);
+        let c_sub = self.mutf8_of(sub_api);
         unsafe { sys::abc_builder_set_api(self.raw, version, c_sub.as_ptr()) };
     }
 
@@ -243,7 +274,7 @@ impl Builder {
 
     /// Add a string, returning its handle.
     pub fn add_string(&mut self, s: &str) -> StringHandle {
-        let c_str = c_mutf8(s);
+        let c_str = self.mutf8_of(s);
         StringHandle(unsafe { sys::abc_builder_add_string(self.raw, c_str.as_ptr()) })
     }
 
@@ -251,13 +282,13 @@ impl Builder {
 
     /// Add a class with the given descriptor (e.g. `"LMyClass;"`).
     pub fn add_class(&mut self, descriptor: &str) -> ClassHandle {
-        let c_desc = c_mutf8(descriptor);
+        let c_desc = self.mutf8_of(descriptor);
         ClassHandle(unsafe { sys::abc_builder_add_class(self.raw, c_desc.as_ptr()) })
     }
 
     /// Add a foreign (external) class.
     pub fn add_foreign_class(&mut self, descriptor: &str) -> ClassHandle {
-        let c_desc = c_mutf8(descriptor);
+        let c_desc = self.mutf8_of(descriptor);
         ClassHandle(unsafe { sys::abc_builder_add_foreign_class(self.raw, c_desc.as_ptr()) })
     }
 
@@ -349,7 +380,7 @@ impl Builder {
         num_vregs: u32,
         num_args: u32,
     ) -> MethodHandle {
-        let c_name = c_mutf8(name);
+        let c_name = self.mutf8_of(name);
         MethodHandle(unsafe {
             sys::abc_builder_class_add_method_with_proto(
                 self.raw,
@@ -373,7 +404,7 @@ impl Builder {
         proto: ProtoHandle,
         flags: AccessFlags,
     ) -> MethodHandle {
-        let c_name = c_mutf8(name);
+        let c_name = self.mutf8_of(name);
         MethodHandle(unsafe {
             sys::abc_builder_add_foreign_method(
                 self.raw,
@@ -440,7 +471,7 @@ impl Builder {
         ty: Type,
         flags: AccessFlags,
     ) -> FieldHandle {
-        let c_name = c_mutf8(name);
+        let c_name = self.mutf8_of(name);
         FieldHandle(unsafe {
             sys::abc_builder_class_add_field(
                 self.raw,
@@ -461,7 +492,7 @@ impl Builder {
         ref_class: ClassHandle,
         flags: AccessFlags,
     ) -> FieldHandle {
-        let c_name = c_mutf8(name);
+        let c_name = self.mutf8_of(name);
         FieldHandle(unsafe {
             sys::abc_builder_class_add_field_ex(
                 self.raw,
@@ -476,7 +507,7 @@ impl Builder {
 
     /// Add a foreign field.
     pub fn add_foreign_field(&mut self, cls: ClassHandle, name: &str, ty: Type) -> FieldHandle {
-        let c_name = c_mutf8(name);
+        let c_name = self.mutf8_of(name);
         FieldHandle(unsafe {
             sys::abc_builder_add_foreign_field(self.raw, cls.0, c_name.as_ptr(), ty.as_raw_u8())
         })
@@ -565,7 +596,7 @@ impl Builder {
 
     /// Create a literal array with the given ID string.
     pub fn add_literal_array(&mut self, id: &str) -> LiteralArrayHandle {
-        let c_id = c_mutf8(id);
+        let c_id = self.mutf8_of(id);
         LiteralArrayHandle(unsafe { sys::abc_builder_add_literal_array(self.raw, c_id.as_ptr()) })
     }
 
@@ -1185,6 +1216,8 @@ impl EntityHandles {
 pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     validate_annotation_arrays(file)?;
     let mut b = Builder::new();
+    // N72: lone-surrogate strings re-emit their original MUTF-8 bytes.
+    b.set_raw_strings(file.string_raw_bytes.clone());
     b.set_file_version(file.version)?;
     let pool = &file.strings;
 

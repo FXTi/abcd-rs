@@ -240,6 +240,11 @@ fn hex(bytes: &[u8]) -> String {
 /// (embedded NUL as C0 80, astral chars as surrogate pairs), matching
 /// pandasm's raw print byte-exactly.
 fn mutf8_bytes(s: &str) -> Vec<u8> {
+    // N72-C3: a disambiguated lossy-string pool identity is
+    // `<lossy content><U+E000><hex(raw)>` (abcd-file's RAW_ID_SENTINEL).
+    // The suffix is OUR bookkeeping for byte-exact re-emission and is
+    // invisible to the upstream comparison — compare only the content.
+    let s = s.find('\u{E000}').map_or(s, |i| &s[..i]);
     let mut out = Vec::new();
     for c in s.chars() {
         let c = c as u32;

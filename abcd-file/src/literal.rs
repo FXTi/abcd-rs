@@ -167,7 +167,40 @@ pub enum LiteralValue {
 pub(crate) struct LiteralCollectCtx {
     pub file: *const sys::AbcFileHandle,
     pub strings: *mut crate::StringPool,
+    /// N72: raw MUTF-8 capture + collision disambiguation for lossy
+    /// (lone-surrogate) string items — see
+    /// [`crate::model::File::string_raw_bytes`] and
+    /// [`crate::file::intern_string`]. NULL on the annotation-metadata
+    /// path (`decode_literal_array_at`), which keeps the plain
+    /// (pre-N72) interning behavior there.
+    pub string_raw_bytes: *mut std::collections::HashMap<String, Box<[u8]>>,
+    /// First hard interning error (the N72 genuine-collision guard) —
+    /// the C callback cannot unwind, so the error rides the context and
+    /// the caller propagates it after enumeration.
+    pub error: Option<Error>,
     pub values: Vec<LiteralValue>,
+}
+
+/// Intern a literal-array string item: full N72 lossy-string handling
+/// (raw capture + collision disambiguation) when the context carries the
+/// side table; plain interning on the annotation-metadata path (NULL).
+fn intern_literal_string(ctx: &mut LiteralCollectCtx, off: u32) -> crate::StringId {
+    if ctx.string_raw_bytes.is_null() {
+        let s = read_string(ctx.file, off).unwrap_or_default();
+        return unsafe { &mut *ctx.strings }.get_or_intern(&s);
+    }
+    match crate::file::intern_string(ctx.file, off, unsafe { &mut *ctx.strings }, unsafe {
+        &mut *ctx.string_raw_bytes
+    }) {
+        Ok(Some(sid)) => sid,
+        Ok(None) => unsafe { &mut *ctx.strings }.get_or_intern(""),
+        Err(e) => {
+            if ctx.error.is_none() {
+                ctx.error = Some(e);
+            }
+            unsafe { &mut *ctx.strings }.get_or_intern("")
+        }
+    }
 }
 
 /// Callback for collecting literal values from the C API.
@@ -186,13 +219,13 @@ pub(crate) unsafe extern "C" fn collect_literal_val_cb(
         LiteralTag::Float => LiteralValue::Float(unsafe { v.data.f32_val }),
         LiteralTag::Double => LiteralValue::Double(unsafe { v.data.f64_val }),
         LiteralTag::String => {
-            let s = read_string(ctx.file, unsafe { v.data.u32_val }).unwrap_or_default();
-            let sid = unsafe { &mut *ctx.strings }.get_or_intern(&s);
+            let off = unsafe { v.data.u32_val };
+            let sid = intern_literal_string(ctx, off);
             LiteralValue::String(sid)
         }
         LiteralTag::EtsImplements => {
-            let s = read_string(ctx.file, unsafe { v.data.u32_val }).unwrap_or_default();
-            let sid = unsafe { &mut *ctx.strings }.get_or_intern(&s);
+            let off = unsafe { v.data.u32_val };
+            let sid = intern_literal_string(ctx, off);
             LiteralValue::EtsImplements(sid)
         }
         LiteralTag::Method => LiteralValue::Method(unsafe { v.data.u32_val }),

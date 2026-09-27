@@ -46,6 +46,12 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     let file_type = crate::file::file_type(data);
 
     let mut strings = StringPool::new();
+    // N72: original MUTF-8 bytes for strings with no lossless Rust
+    // `String` form (lone surrogates — see File::string_raw_bytes),
+    // populated by [`crate::file::intern_string`] wherever a string is
+    // interned through an offset-bearing path (entity operands, literal
+    // tables). Metadata-only paths (names, annotations) intern plain.
+    let mut string_raw_bytes: HashMap<String, Box<[u8]>> = HashMap::new();
 
     // Open debug info (file-level, lives for entire decode).
     //
@@ -290,9 +296,16 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                 if entity_map.contains_key(&offset) {
                     continue;
                 }
-                let name = if kind == EntityKind::StringId {
-                    read_string(f, offset)
-                } else {
+                if kind == EntityKind::StringId {
+                    // N72: lossy-string raw capture + collision
+                    // disambiguation (crate::file::intern_string).
+                    let sid =
+                        crate::file::intern_string(f, offset, &mut strings, &mut string_raw_bytes)?
+                            .ok_or_else(invalid)?;
+                    entity_map.insert(offset, sid);
+                    continue;
+                }
+                let name = {
                     let accessor = unsafe { sys::abc_method_open(f, offset) };
                     if accessor.is_null() {
                         return Err(invalid());
@@ -325,10 +338,11 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     let (literal_arrays, literal_array_offsets) = decode_literal_arrays(
         f,
         &mut strings,
+        &mut string_raw_bytes,
         &referenced_literal_offsets,
         &module_data_offsets,
         &phase_blob_offsets,
-    );
+    )?;
 
     Ok(File {
         version,
@@ -340,6 +354,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         literal_arrays,
         literal_array_offsets,
         entity_map,
+        string_raw_bytes,
     })
 }
 
@@ -1497,9 +1512,14 @@ fn decode_literal_array_at(
     }
     let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
 
+    // N72: annotation-embedded literal arrays are compile-time metadata;
+    // their strings intern plain (no raw-bytes capture — NULL side
+    // table), exactly the pre-N72 behavior on this path.
     let mut ctx = crate::literal::LiteralCollectCtx {
         file: f,
         strings: strings as *mut StringPool,
+        string_raw_bytes: std::ptr::null_mut(),
+        error: None,
         values: Vec::new(),
     };
     unsafe {
@@ -1516,10 +1536,11 @@ fn decode_literal_array_at(
 fn decode_literal_arrays(
     f: *const sys::AbcFileHandle,
     strings: &mut StringPool,
+    string_raw_bytes: &mut HashMap<String, Box<[u8]>>,
     referenced_offsets: &HashSet<u32>,
     module_data_offsets: &HashSet<u32>,
     phase_blob_offsets: &HashSet<u32>,
-) -> (Vec<LiteralArray>, HashMap<u32, u32>) {
+) -> Result<(Vec<LiteralArray>, HashMap<u32, u32>), Error> {
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
     let mut offsets = Vec::new();
     if n != 0 {
@@ -1554,7 +1575,7 @@ fn decode_literal_arrays(
     referenced.sort_unstable();
     offsets.extend(referenced);
     if offsets.is_empty() {
-        return (Vec::new(), HashMap::new());
+        return Ok((Vec::new(), HashMap::new()));
     }
 
     // Collect file offsets first so nested LiteralArray references (which
@@ -1568,7 +1589,7 @@ fn decode_literal_arrays(
     let first_off = offsets[0];
     let lr = unsafe { sys::abc_literal_open(f, first_off) };
     if lr.is_null() {
-        return (Vec::new(), offset_to_index);
+        return Ok((Vec::new(), offset_to_index));
     }
     let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
 
@@ -1592,6 +1613,8 @@ fn decode_literal_arrays(
             let mut ctx = crate::literal::LiteralCollectCtx {
                 file: f,
                 strings: strings as *mut StringPool,
+                string_raw_bytes: string_raw_bytes as *mut HashMap<String, Box<[u8]>>,
+                error: None,
                 values: Vec::new(),
             };
             unsafe {
@@ -1601,6 +1624,11 @@ fn decode_literal_arrays(
                     Some(crate::literal::collect_literal_val_cb),
                     &mut ctx as *mut crate::literal::LiteralCollectCtx as *mut c_void,
                 );
+            }
+            // The N72 genuine-collision guard rode the context out of
+            // the (non-unwinding) C callback — propagate loudly.
+            if let Some(error) = ctx.error.take() {
+                return Err(error);
             }
             for value in &ctx.values {
                 if let LiteralValue::LiteralArray(idx) = value {
@@ -1635,7 +1663,7 @@ fn decode_literal_arrays(
             }
         }
     }
-    (arrays, offset_to_index)
+    Ok((arrays, offset_to_index))
 }
 
 /// Intermediate struct for collecting debug info strings before interning.

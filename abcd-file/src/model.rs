@@ -47,6 +47,22 @@ pub struct File {
     pub literal_array_offsets: HashMap<u32, u32>,
     /// offset → interned name/descriptor, for resolving bytecode `EntityId` operands.
     pub entity_map: HashMap<u32, StringId>,
+    /// Original MUTF-8 bytes of strings that have NO lossless Rust `String`
+    /// form (MUTF-8 lone surrogates, `ED A0-BF xx xx` — the file-isa
+    /// "registered lossy class"). Keyed by the pool identity of the
+    /// string: the decoded (lossy) content for the first raw form seen,
+    /// or its disambiguated `content + SENTINEL + hex(raw)` identity on a
+    /// raw-form collision (see `file::intern_string` — two distinct
+    /// surrogate byte strings whose lossy forms are equal MUST keep
+    /// distinct pool identities or encode could re-emit only one of
+    /// them). Populated at decode from the strings' source bytes and
+    /// consulted at encode, which re-emits these bytes verbatim instead
+    /// of re-encoding the lossy form (N72 — without this, every
+    /// lone-surrogate string literal round-trips as three U+FFFD per
+    /// surrogate, changing runtime behavior). Only lossy strings are
+    /// recorded; a genuine file string colliding with a synthesized
+    /// identity is a loud decode error, never a silent corruption.
+    pub string_raw_bytes: HashMap<String, Box<[u8]>>,
 }
 
 /// A decoded class with nested methods, fields, and annotations.
