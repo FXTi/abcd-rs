@@ -1122,7 +1122,9 @@ impl IfdsProblem for TaintProblem<'_> {
                 self.generic_propagate(curr_inst, fact, out); // the `default` operand
                 out.push(source.clone());
             }
-            Op::StoreGlobal { name, value } | Op::TryStoreGlobal { name, value } => {
+            Op::StoreGlobal { name, value }
+            | Op::StoreGlobalRecord { name, value, .. }
+            | Op::TryStoreGlobal { name, value } => {
                 if fact.base == TaintBase::Local(*value) {
                     out.push(Fact::of(fact.rebased(TaintBase::Global(*name))));
                 }

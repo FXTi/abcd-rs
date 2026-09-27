@@ -40,8 +40,12 @@
 //! `CreatePrivateNames{count, names}`, ldglobalvar →
 //! `TryGetGlobal{name, default: None}` (the THROWING form: `None` =
 //! no fallback), tryldglobalbyname → `TryGetGlobal{name, default:
-//! Some(undefined)}` (the tolerant form), stglobalvar/
-//! st(const)toglobalrecord → `StoreGlobal` (the throwing form),
+//! Some(undefined)}` (the tolerant form), stglobalvar → `StoreGlobal`
+//! (the global-OBJECT property store, throwing form),
+//! stto/stconsttoglobalrecord (+ the deprecated
+//! stlet-/stclass-/stconstto-globalrecord trio) → `StoreGlobalRecord`
+//! (the global LEXICAL record declaration — N72-C4: never folds to
+//! `StoreGlobal`; vendor `RuntimeStGlobalRecord(name, value, isConst)`),
 //! trystglobalbyname → `TryStoreGlobal` (the tolerant form — no
 //! ReferenceError when the global is absent, N61; v0.1
 //! `InstData::TryStoreGlobalByName`), ld/stlexvar → `GetLexVar`/
@@ -858,10 +862,37 @@ pub fn translate_bytecode(
             let value = fx.read_acc(block);
             fx.emit_void(block, Op::TryStoreGlobal { name, value }, loc);
         }
-        Bytecode::Stconsttoglobalrecord(_ic, eid) | Bytecode::Sttoglobalrecord(_ic, eid) => {
+        Bytecode::Sttoglobalrecord(_ic, eid) => {
+            // N72-C4: the global LEXICAL record store — NOT a
+            // global-object property store (that is `StoreGlobal` /
+            // stglobalvar). Vendor `RuntimeStGlobalRecord(name, value,
+            // isConst=false)` (runtime_stubs-inl.h:780).
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
-            fx.emit_void(block, Op::StoreGlobal { name, value }, loc);
+            fx.emit_void(
+                block,
+                Op::StoreGlobalRecord {
+                    name,
+                    value,
+                    is_const: false,
+                },
+                loc,
+            );
+        }
+        Bytecode::Stconsttoglobalrecord(_ic, eid) => {
+            // The const form: `RuntimeStGlobalRecord(name, value,
+            // isConst=true)`.
+            let name = fx.resolve_str(*eid)?;
+            let value = fx.read_acc(block);
+            fx.emit_void(
+                block,
+                Op::StoreGlobalRecord {
+                    name,
+                    value,
+                    is_const: true,
+                },
+                loc,
+            );
         }
 
         // ── Lexical variables ────────────────────────────────────────
@@ -2244,12 +2275,37 @@ pub fn translate_bytecode(
             let v = fx.emit_val(block, Op::LoadModuleVar { index: name.0 }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedStconsttoglobalrecord(eid)
-        | Bytecode::DeprecatedStlettoglobalrecord(eid)
-        | Bytecode::DeprecatedStclasstoglobalrecord(eid) => {
+        Bytecode::DeprecatedStconsttoglobalrecord(eid) => {
+            // Vendor: `SlowRuntimeStub::StGlobalRecord(..., isConst =
+            // true)` (interpreter-inl.cpp:6260-6345) — the const global
+            // LEXICAL record declaration.
             let name = fx.resolve_str(*eid)?;
             let value = fx.read_acc(block);
-            fx.emit_void(block, Op::StoreGlobal { name, value }, loc);
+            fx.emit_void(
+                block,
+                Op::StoreGlobalRecord {
+                    name,
+                    value,
+                    is_const: true,
+                },
+                loc,
+            );
+        }
+        Bytecode::DeprecatedStlettoglobalrecord(eid)
+        | Bytecode::DeprecatedStclasstoglobalrecord(eid) => {
+            // Vendor: `SlowRuntimeStub::StGlobalRecord(..., isConst =
+            // false)` — the mutable (let/class) record declaration.
+            let name = fx.resolve_str(*eid)?;
+            let value = fx.read_acc(block);
+            fx.emit_void(
+                block,
+                Op::StoreGlobalRecord {
+                    name,
+                    value,
+                    is_const: false,
+                },
+                loc,
+            );
         }
         Bytecode::DeprecatedCreateobjecthavingmethod(idx) => {
             let shape = resolve::const_for_literal_array(fx.lf, idx.0 as u32)?;

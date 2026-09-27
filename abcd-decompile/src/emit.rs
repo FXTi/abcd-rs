@@ -172,15 +172,23 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         }
     }
 
-    // Global-binding predeclarations: `StoreGlobal`/`TryStoreGlobal`
-    // (top-level sloppy-script bindings) are emitted as plain
-    // assignments, which strict mode (es2abc's output mode) rejects
+    // Global-binding predeclarations: `StoreGlobal`/`StoreGlobalRecord`/
+    // `TryStoreGlobal` (top-level sloppy-script bindings and global
+    // lexical record declarations) are emitted as plain assignments,
+    // which strict mode (es2abc's output mode) rejects
     // unless the name is declared. A script-top `var name;` creates the
     // global binding the assignment then sets (d-P4 — the recompile
-    // gate found this: ReferenceError on every global store).
+    // gate found this: ReferenceError on every global store). N72-C4:
+    // record stores (source-level `let`/`const`/`class` at global
+    // scope) share this story — the module-scope `var` shadows the
+    // global object inside the emitted module exactly like the lexical
+    // record did (recover.rs `Stmt::GlobalStore` fold).
     let mut globals = BTreeSet::new();
     for inst in &module.insts {
-        if let Op::StoreGlobal { name, .. } | Op::TryStoreGlobal { name, .. } = &inst.op {
+        if let Op::StoreGlobal { name, .. }
+        | Op::StoreGlobalRecord { name, .. }
+        | Op::TryStoreGlobal { name, .. } = &inst.op
+        {
             let n = sanitize(&sym_str(module, *name));
             if globals.insert(n.clone()) {
                 em.fn_names.reserve(&n);

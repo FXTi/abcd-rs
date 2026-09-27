@@ -822,7 +822,12 @@ impl<'m> Pta<'m> {
                             },
                         );
                     }
-                    Op::StoreGlobal { name, value } | Op::TryStoreGlobal { name, value } => {
+                    Op::StoreGlobal { name, value }
+                    | Op::StoreGlobalRecord { name, value, .. }
+                    | Op::TryStoreGlobal { name, value } => {
+                        // The record store (N72-C4) and the object store
+                        // feed the same named-global pointer — reads model
+                        // both through `Ptr::Global`.
                         self.add_edge(local(*value), Ptr::Global(*name));
                     }
                     Op::TryGetGlobal { name, .. } => {

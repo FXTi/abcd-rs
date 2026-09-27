@@ -186,6 +186,8 @@ fn ic_slot_imm_mut(bc: &mut Bytecode) -> Option<&mut Imm> {
         Ldglobalvar(i, _)
         | Tryldglobalbyname(i, _)
         | Stglobalvar(i, _)
+        | Sttoglobalrecord(i, _)
+        | Stconsttoglobalrecord(i, _)
         | Trystglobalbyname(i, _) => i,
         Ldprivateproperty(i, ..)
         | Stprivateproperty(i, ..)
@@ -1518,6 +1520,23 @@ fn select_inst(
         Op::StoreGlobal { name, value } => {
             ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Stglobalvar(ic.one(), tracer.eid(*name)));
+        }
+        Op::StoreGlobalRecord {
+            name,
+            value,
+            is_const,
+        } => {
+            // The global LEXICAL record store (N72-C4): vendor
+            // sttoglobalrecord / stconsttoglobalrecord (isa.yaml:1585/
+            // :1574 — same op_imm_16_id_16 / one_slot / sixteen_bit_ic
+            // profile as stglobalvar, so the IC allocation is unchanged).
+            ensure_acc(tracker, func_id, *value, alloc, codes)?;
+            let eid = tracer.eid(*name);
+            codes.push(if *is_const {
+                Bytecode::Stconsttoglobalrecord(ic.one(), eid)
+            } else {
+                Bytecode::Sttoglobalrecord(ic.one(), eid)
+            });
         }
         Op::TryStoreGlobal { name, value } => {
             // The tolerant store (N61; v0.1 `TryStoreGlobalByName`):

@@ -32,8 +32,11 @@
 //!    hop below reaches the literal store.
 //! 3. **Global-store provenance** — a `TryGetGlobal(name)` receiver is
 //!    opaque to points-to (globals are mutable across scripts), but
-//!    top-level script code stores locals into the global record
-//!    (`sttoglobalrecord` → `Op::StoreGlobal`) and reads them back at
+//!    top-level script code stores locals into global bindings
+//!    (`sttoglobalrecord`/`stconsttoglobalrecord` →
+//!    `Op::StoreGlobalRecord` — the global LEXICAL record (N72-C4);
+//!    `stglobalvar` → `Op::StoreGlobal` — the global OBJECT property)
+//!    and reads them back at
 //!    every use site. The resolver scans the module's stores of
 //!    `name` and unions the stored values' families — the SAME
 //!    flow-insensitive discipline the fact model already applies to
@@ -416,6 +419,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                 for &iid in &self.module.blocks[b.index()].insts {
                     match &self.module.insts[iid.index()].op {
                         Op::StoreGlobal { name: n, value }
+                        | Op::StoreGlobalRecord { name: n, value, .. }
                         | Op::TryStoreGlobal { name: n, value }
                             if *n == name =>
                         {

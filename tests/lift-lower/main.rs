@@ -18,6 +18,7 @@ mod lower_determinism;
 mod lower_sendable_class;
 mod n71_ic_slots;
 mod n72_args_array;
+mod n72_property;
 mod n72_subclass;
 mod n72_unicode;
 mod regalloc_pressure;

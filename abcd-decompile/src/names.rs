@@ -420,6 +420,7 @@ pub fn op_name_hint(module: &Module, op: &Op) -> Option<String> {
         | Op::StoreOwnPropName { name, .. }
         | Op::TryGetGlobal { name, .. }
         | Op::StoreGlobal { name, .. }
+        | Op::StoreGlobalRecord { name, .. }
         | Op::TryStoreGlobal { name, .. } => Some(sym_str(module, *name)),
         Op::DefineFunc { body, .. } => module.func(*body).map(|f| sym_str(module, f.name)),
         Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
@@ -496,7 +497,10 @@ pub fn module_slot_names(module: &Module) -> BTreeMap<u32, String> {
         taken.insert(sanitize(&sym_str(module, local)));
     }
     for inst in &module.insts {
-        if let Op::StoreGlobal { name, .. } | Op::TryStoreGlobal { name, .. } = &inst.op {
+        if let Op::StoreGlobal { name, .. }
+        | Op::StoreGlobalRecord { name, .. }
+        | Op::TryStoreGlobal { name, .. } = &inst.op
+        {
             taken.insert(sanitize(&sym_str(module, *name)));
         }
     }

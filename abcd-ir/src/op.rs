@@ -578,6 +578,28 @@ pub enum Op {
         /// The stored value.
         value: ValueId,
     },
+    /// Store into the global LEXICAL record (vendor `sttoglobalrecord` /
+    /// `stconsttoglobalrecord`, isa.yaml:1585/:1574): declares a global
+    /// lexical binding in the GlobalDictionary (`RuntimeStGlobalRecord`,
+    /// arkcompiler_ets_runtime-master/ecmascript/stubs/
+    /// runtime_stubs-inl.h:780 — `PutIfAbsent`, SyntaxError "Duplicate
+    /// identifier" on collision) — NOT a property store on the global
+    /// OBJECT (that is [`Op::StoreGlobal`] / `RuntimeStGlobalVar`,
+    /// runtime_stubs-inl.h:1793). The deprecated trio
+    /// (stlet-/stclass-/stconstto-globalrecord, interpreter-inl.cpp
+    /// :6260-6345, all `SlowRuntimeStub::StGlobalRecord`) lifts here too:
+    /// stconst→`is_const: true`, stlet/stclass→`false`. N72-C4: folding
+    /// this into `StoreGlobal` turned a top-level `let Array` into
+    /// `globalThis.Array = undefined`, clobbering the builtin.
+    StoreGlobalRecord {
+        /// The binding's name.
+        name: Sym,
+        /// The stored value.
+        value: ValueId,
+        /// `stconsttoglobalrecord` when true, `sttoglobalrecord` when
+        /// false.
+        is_const: bool,
+    },
     /// Store a global by name, TOLERANT of absence (vendor
     /// `trystglobalbyname`): no ReferenceError when the global does not
     /// exist — unlike the throwing [`Op::StoreGlobal`] (N61; v0.1
@@ -1026,6 +1048,7 @@ impl Op {
             PutLexVar { value, .. } => vec![*value],
             TryGetGlobal { default, .. } => default.iter().copied().collect(),
             StoreGlobal { value, .. }
+            | StoreGlobalRecord { value, .. }
             | TryStoreGlobal { value, .. }
             | StoreModuleVar { value, .. } => {
                 vec![*value]
@@ -1159,6 +1182,7 @@ impl Op {
             PutLexVar { value, .. } => vec![value],
             TryGetGlobal { default, .. } => default.iter_mut().collect(),
             StoreGlobal { value, .. }
+            | StoreGlobalRecord { value, .. }
             | TryStoreGlobal { value, .. }
             | StoreModuleVar { value, .. } => {
                 vec![value]
@@ -1232,6 +1256,7 @@ impl Op {
                 | PutLexVar { .. }
                 | PopLexEnv
                 | StoreGlobal { .. }
+                | StoreGlobalRecord { .. }
                 | TryStoreGlobal { .. }
                 | StoreModuleVar { .. }
                 | Throw { .. }
@@ -1285,6 +1310,7 @@ impl Op {
             | NextPropName { .. }
             | PutLexVar { .. }
             | StoreGlobal { .. }
+            | StoreGlobalRecord { .. }
             | TryStoreGlobal { .. }
             | StoreModuleVar { .. }
             | DynamicImport { .. }

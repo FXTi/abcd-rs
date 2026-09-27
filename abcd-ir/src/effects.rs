@@ -434,6 +434,15 @@ impl Op {
                 may_throw: true, // unresolved reference in strict mode
                 ..Effects::PURE
             },
+            // Vendor `stto/stconsttoglobalrecord`: declares the binding in
+            // the GlobalDictionary (the global LEXICAL record,
+            // RuntimeStGlobalRecord, runtime_stubs-inl.h:780) — SyntaxError
+            // "Duplicate identifier" on collision, so may_throw.
+            StoreGlobalRecord { .. } => Effects {
+                writes: MemClasses::GLOBAL,
+                may_throw: true, // duplicate-identifier declaration
+                ..Effects::PURE
+            },
             // Vendor `trystglobalbyname`: the TOLERANT store — no
             // ReferenceError when the global is absent (mirrors
             // TryGetGlobal's "never throws").

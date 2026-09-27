@@ -71,6 +71,7 @@ pub fn op_name(op: &Op) -> &'static str {
         PutLexVar { .. } => "PutLexVar",
         TryGetGlobal { .. } => "TryGetGlobal",
         StoreGlobal { .. } => "StoreGlobal",
+        StoreGlobalRecord { .. } => "StoreGlobalRecord",
         TryStoreGlobal { .. } => "TryStoreGlobal",
         LoadModuleVar { .. } => "LoadModuleVar",
         StoreModuleVar { .. } => "StoreModuleVar",
@@ -139,6 +140,10 @@ pub fn fitness_of(op: &Op) -> Fitness {
         | TestProp { .. }
         | TryGetGlobal { .. }
         | StoreGlobal { .. }
+        // N72-C4: recovers to the same GlobalStore statement as
+        // StoreGlobal (documented fold — recover.rs Stmt::GlobalStore),
+        // so the same Trivial class applies.
+        | StoreGlobalRecord { .. }
         | TryStoreGlobal { .. }
         | GetModuleNamespace { .. }
         | DynamicImport { .. }

@@ -216,7 +216,14 @@ pub enum Stmt {
         value: Expr,
     },
     /// `name = value` at global scope (`tolerant`: the `TryStoreGlobal`
-    /// absence-tolerant form — invisible in source).
+    /// absence-tolerant form — invisible in source). N72-C4 fold:
+    /// `StoreGlobalRecord` (the global LEXICAL record declaration)
+    /// also recovers here — the emitted module-scope
+    /// `var name; name = value;` (emit.rs predeclaration) is the
+    /// validated honest surface: inside the emitted module the binding
+    /// shadows the global object exactly like the source-level lexical
+    /// record did, and the const/let/object distinction has no
+    /// execution-observable module-scope spelling (dream gate).
     GlobalStore {
         /// The raw global name.
         name: String,
@@ -428,6 +435,7 @@ fn is_statement_op(op: &Op) -> bool {
             | Op::StoreSuper { .. }
             | Op::PutLexVar { .. }
             | Op::StoreGlobal { .. }
+            | Op::StoreGlobalRecord { .. }
             | Op::TryStoreGlobal { .. }
             | Op::StoreModuleVar { .. }
             | Op::Throw { .. }
@@ -760,6 +768,7 @@ impl<'m> Recover<'m> {
                 match &inst.op {
                     Op::TryGetGlobal { name, .. }
                     | Op::StoreGlobal { name, .. }
+                    | Op::StoreGlobalRecord { name, .. }
                     | Op::TryStoreGlobal { name, .. } => {
                         let n = sym_str(self.module, *name);
                         self.legal.reserve(&sanitize(&n));
@@ -1213,7 +1222,9 @@ impl<'m> Recover<'m> {
                     value: self.expr_of(*value),
                 });
             }
-            Op::StoreGlobal { name, value } | Op::TryStoreGlobal { name, value } => {
+            Op::StoreGlobal { name, value }
+            | Op::StoreGlobalRecord { name, value, .. }
+            | Op::TryStoreGlobal { name, value } => {
                 self.record(op, Outcome::Expressed);
                 let tolerant = matches!(op, Op::TryStoreGlobal { .. });
                 out.push(Stmt::GlobalStore {
