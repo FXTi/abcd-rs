@@ -26,6 +26,7 @@ mod async_node;
 mod corpus_decompile;
 mod corpus_stage_a;
 mod dream_gate;
+mod dream_gate_t262;
 mod golden_yield_star;
 mod textual_oracle;
 mod yield_star_node;

@@ -254,6 +254,68 @@ jobs:
             | tee target/oracle-test262.json \
             | jq -r '"selected=\(.selected) compared=\(.runtime_compared) passed=\(.passed) missing=\(.missing) divergences=\(.divergences.classes) undocumented=\(.divergences.undocumented | length) stale=\(.divergences.stale | length)"'
 
+  test262-dream:
+    name: test262-dream (test262 decompile → es2abc recompile → recorded VM oracle)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      - name: Acquire the corpus (image export + opcode fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+      # test262 P3: decompile all 2685 recorded test262 rows (asserts
+      # the row count and ZERO decompile panics), then recompile each
+      # via the image's es2abc (24.0.0.0/baseline, script mode) and
+      # compare against the baked runtime record (exit/stdout/timeout
+      # exact, stderr by error-name — the upstream test262 rule).
+      # Gate form: B-plan ledger (scripts/test262-dream-divergences.json
+      # — pass + documented == total; a new undocumented divergence or a
+      # stale entry fails the job) + the 2451 pass floor asserted by the
+      # oracle test. First-contact histogram (2026-09-27, local qemu
+      # --jobs 8): pass 2451 / decompile-bug 225 / es2abc-cant 0 /
+      # expected-fallback 9 / fixture-unsupported 0 — the 225 are REAL
+      # findings, registered per-row under 15 named classes (suite
+      # header in tests/lift-decompile/dream_gate_t262.rs).
+      # Wall time: separate job (NOT folded into test262-vm, whose own
+      # 2685-row compare already fills its budget). Measured locally
+      # (qemu, --jobs 8): generate 6.1s, es2abc recompile ~3m46s, VM
+      # compare ~8m6s (inflated by the 86 hang rows' VM timeouts;
+      # native-amd64 runners are several times faster and pay no qemu
+      # toll) — same shape as the test262-vm job, inside 12 min. Full
+      # 2685 rows, no sampling; if a runner regression pushes this over
+      # budget, the lever is compare-rewritten-corpus.py --sample N
+      # (deterministic every-Nth) — document the sampling decision here.
+      - name: test262 dream gate (generate + recompile + recorded compare)
+        run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture dream_gate_t262_oracle
+      - name: Upload the test262 dream-gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-dream-gate-report
+          path: target/dream-gate-t262/dream-gate-report.json
+          retention-days: 30
+          if-no-files-found: ignore
+
   lift-analysis:
     name: lift-analysis (callgraph smoke + dom agreement + regions)
     runs-on: ubuntu-latest

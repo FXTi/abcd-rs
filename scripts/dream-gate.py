@@ -34,8 +34,16 @@ Usage:
     python3 scripts/dream-gate.py [--jobs 8] [--case local/arithmetic] \
         [--skip-compare] [--skip-compile]
 
+test262 mode (test262 P3): `--gate-dir target/dream-gate-t262 --index
+target/dream-gate-t262/index.jsonl --recorded --recorded-stderr
+error-name [--expect-divergences scripts/test262-dream-divergences.json]`
+reuses THIS pipeline against the test262 gate root and its filtered
+index; the compare flags pass straight through to
+compare-rewritten-corpus.py (recorded-behavior comparison + the
+B-plan ledger gate). `--gate-dir` also reads `ABCD_DREAM_GATE_DIR`.
+
 `--skip-compile`/`--skip-compare` reuse prior artifacts (iteration).
-Writes `target/dream-gate/dream-gate-report.json` and prints the
+Writes `<gate-dir>/dream-gate-report.json` and prints the
 histogram verbatim.
 """
 
@@ -51,7 +59,12 @@ import sys
 # (.github/workflows/ci.yml). Local default stays :latest.
 IMAGE = os.environ.get("ARK_TEST_IMAGE", "ghcr.io/fxti/arkcompiler-test:latest")
 REPO = Path(__file__).resolve().parent.parent
-GATE = REPO / "target" / "dream-gate"
+# Set in main() from --gate-dir / ABCD_DREAM_GATE_DIR (the test262 gate
+# passes its own root); read by load_rows/compile_one and the compare
+# step. Default: the project-corpus dream gate root.
+GATE = Path(
+    os.environ.get("ABCD_DREAM_GATE_DIR", REPO / "target" / "dream-gate")
+)
 MANIFEST = REPO / "exports" / "corpus" / "index.jsonl"
 
 
@@ -107,12 +120,41 @@ def compile_one(row):
 
 
 def main():
+    global GATE
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--case", action="append", dest="cases", default=[])
     ap.add_argument("--skip-compile", action="store_true")
     ap.add_argument("--skip-compare", action="store_true")
+    ap.add_argument(
+        "--gate-dir",
+        type=Path,
+        default=None,
+        help="dream-gate root with src/ + decompile-manifest.jsonl "
+        "(default: $ABCD_DREAM_GATE_DIR or target/dream-gate)",
+    )
+    ap.add_argument(
+        "--index",
+        type=Path,
+        default=None,
+        help="manifest index for the compare step (default: "
+        "exports/corpus/index.jsonl; the test262 gate passes its "
+        "filtered index.jsonl)",
+    )
+    # Passthroughs to compare-rewritten-corpus.py (test262 mode).
+    ap.add_argument("--recorded", action="store_true",
+                    help="compare runtime.status=='recorded' rows "
+                    "(test262) against the manifest runtime record")
+    ap.add_argument("--recorded-stderr", choices=["exact", "error-name"],
+                    default="exact")
+    ap.add_argument("--expect-divergences", type=Path, default=None,
+                    help="documented-divergence ledger passthrough")
+    ap.add_argument("--sample", type=int, default=1,
+                    help="deterministic every-Nth compare sampling")
     args = ap.parse_args()
+    if args.gate_dir is not None:
+        GATE = args.gate_dir.resolve()
+    index = args.index.resolve() if args.index else MANIFEST
 
     rows = load_rows()
     if args.cases:
@@ -139,16 +181,26 @@ def main():
     print(f"dream-gate: recompiled {compiled}/{len(rows)}", flush=True)
 
     # ── Step 3: behavior comparison (UNCHANGED oracle script) ────────
+    compare_rc = 0
     if not args.skip_compare:
         compare_cmd = [
             "python3", str(REPO / "scripts" / "compare-rewritten-corpus.py"),
-            str(MANIFEST), str(GATE / "abc"),
+            str(index), str(GATE / "abc"),
             "--image", IMAGE,
             "--allow-missing", "--jobs", str(args.jobs),
         ]
+        if args.recorded:
+            compare_cmd += ["--recorded", "--recorded-stderr",
+                            args.recorded_stderr]
+        if args.sample > 1:
+            compare_cmd += ["--sample", str(args.sample)]
+        if args.expect_divergences:
+            compare_cmd += ["--expect-divergences",
+                            str(args.expect_divergences)]
         for case in args.cases:
             compare_cmd += ["--case", case]
         proc = subprocess.run(compare_cmd, capture_output=True, text=True)
+        compare_rc = proc.returncode
         (GATE / "compare-stdout.json").write_text(proc.stdout, encoding="utf-8")
         if proc.stderr:
             (GATE / "compare-stderr.txt").write_text(proc.stderr, encoding="utf-8")
@@ -227,6 +279,13 @@ def main():
     (GATE / "dream-gate-report.json").write_text(
         json.dumps(full, indent=1), encoding="utf-8")
     print(f"report: {GATE / 'dream-gate-report.json'}")
+    if args.expect_divergences and compare_rc != 0:
+        # The B-plan ledger gate (test262 P3): an undocumented or stale
+        # divergence fails THIS script too — the histogram above is
+        # informational, the ledger is the gate.
+        print("dream-gate: ledger gate FAILED (undocumented or stale "
+              "divergence — see compare output above)", file=sys.stderr)
+        return 1
     return 0
 
 

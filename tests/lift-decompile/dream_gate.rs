@@ -266,7 +266,8 @@ fn dream_gate_oracle() {
 
 /// Minimal JSON field extraction (no serde dependency in this crate's
 /// tests — the corpus pattern is python3, but the report is small).
-mod serde_jsonless {
+/// `pub(crate)` so `dream_gate_t262` reuses the same report parser.
+pub(crate) mod serde_jsonless {
     /// The triage histogram fields.
     pub struct Report {
         pub pass: usize,
