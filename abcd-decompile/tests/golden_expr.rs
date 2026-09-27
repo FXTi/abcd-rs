@@ -556,7 +556,10 @@ fn #1 "outer" kind=function params=(this, p1, p2)
 /// t08 — the `Throw*` guard family is elided ON PURPOSE (each with its
 /// documented §5 reason); `ThrowDeleteSuperProperty` is a loud fallback
 /// (its member expression is not recoverable from the op); `Throw` is a
-/// real statement.
+/// real statement. N74-W4 exception: `ThrowConstAssignment` is NOT
+/// elided — it fires unconditionally when reached, and d-P8's `let`
+/// reconstruction does not make the binding const, so the guard
+/// materializes as a real `throw new TypeError(…)`.
 #[test]
 fn t08_guard_elision() {
     let mut m = mk_module();
@@ -603,7 +606,7 @@ fn t08_guard_elision() {
     ; elided ThrowNotExists: ReferenceError guard; elided in normal-flow reconstruction (§5 row 61)
     ; elided ThrowPatternNonCoercible: destructuring coercion guard; elided in destructuring reconstruction (§5 row 62)
     ; fallback ThrowDeleteSuperProperty: `delete super.x` reconstruction (N); the throw IS the delete's semantics, but the op carries no object operand — the member expression is unrecoverable at Stage A (§5 row 63)
-    ; elided ThrowConstAssignment: const-violation guard; elided — the const binding is reconstructed (§5 row 64)
+    throw (new TypeError("Assignment to constant variable."))
     ; elided ThrowIfNotObject: for-in/for-of coercion guard; elided in loop reconstruction (§5 row 65)
     ; elided AsyncFunctionEnter: async-machinery entry; recognized and elided inside `async function` emission (§5 row 72)
     throw p1
@@ -1159,6 +1162,7 @@ fn t17_frame_specials() {
         b,
         Op::LoadSuper {
             key: SuperKey::Name(foo),
+            this_value: p1,
         },
     );
     let bar = intern(&mut m, "bar");
@@ -1167,6 +1171,7 @@ fn t17_frame_specials() {
         b,
         Op::StoreSuper {
             key: SuperKey::Name(bar),
+            this_value: p1,
             value: ls,
         },
     );
@@ -1176,6 +1181,7 @@ fn t17_frame_specials() {
         b,
         Op::StoreSuper {
             key: SuperKey::Dynamic(k),
+            this_value: p1,
             value: ls,
         },
     );

@@ -2187,10 +2187,12 @@ fn s34_scope_fold() {
 }
 
 /// s35 — the scope fold's provability boundary: `y`'s only store is the
-/// post-push initialization (converted to `let y = …`), but `x` is
-/// REASSIGNED inside a conditional arm (a store outside the push's
-/// run), so `x` keeps the plain-assignment form with the scope-push
-/// comment listing only its slot (partial consumption).
+/// post-push initialization (converted to `let y = …`), and `x` is
+/// reassigned inside a conditional arm (a store outside the push's run)
+/// — d-P8's scope_fold leaves that shape alone, but the N74-W4
+/// late-decl fold still proves the FIRST store is the root-level
+/// declaration, so `x` becomes `let x = 1.0` at that position (the
+/// scope-push comment stays as the boundary record).
 #[test]
 fn s35_scope_fold_partial() {
     let mut m = mk_module();
@@ -2260,9 +2262,8 @@ fn s35_scope_fold_partial() {
     link(&mut m, e, j);
 
     let want = r#"function f(p1) {
-  let x;
   /* scope-push [x] (lexical binding scope not provably reconstructable — plain assignments, d-P8) */
-  x = 1.0;
+  let x = 1.0;
   let y = 2.0;
   if (p1) {
     x = 3.0;
@@ -2462,7 +2463,7 @@ fn s38_arrow_recovery() {
 
     let want = r#"var g;
 function outer() {
-  g = async (p1) => {
+  let g = async (p1) => {
   return p1 + 1.0;
 };
   return;

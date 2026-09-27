@@ -80,10 +80,14 @@ pub struct EmitOptions {
     /// including `Reference` types resolved through the module's class
     /// table — render as their TS names when present.
     pub ts: bool,
-    /// Append a `func_main_0();` call after the top-level functions so
-    /// the module entry point actually executes (the d-P4 recompile
-    /// gate needs it: the abc entry is invoked by the VM, but JS source
-    /// declares it). Off by default — human-facing output stays clean.
+    /// Append a `func_main_0.call(this);` call after the top-level
+    /// functions so the module entry point actually executes (the d-P4
+    /// recompile gate needs it: the abc entry is invoked by the VM, but
+    /// JS source declares it). The `.call(this)` passes the emitted
+    /// file's own top-level receiver — the VM binds a script main's
+    /// `this` to the global object, and a plain call would rebind it to
+    /// `undefined` under es2abc's strict functions (N74). Off by
+    /// default — human-facing output stays clean.
     pub call_entry: bool,
 }
 
@@ -172,17 +176,16 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         }
     }
 
-    // Global-binding predeclarations: `StoreGlobal`/`StoreGlobalRecord`/
-    // `TryStoreGlobal` (top-level sloppy-script bindings and global
-    // lexical record declarations) are emitted as plain assignments,
-    // which strict mode (es2abc's output mode) rejects
-    // unless the name is declared. A script-top `var name;` creates the
-    // global binding the assignment then sets (d-P4 — the recompile
-    // gate found this: ReferenceError on every global store). N72-C4:
-    // record stores (source-level `let`/`const`/`class` at global
-    // scope) share this story — the module-scope `var` shadows the
-    // global object inside the emitted module exactly like the lexical
-    // record did (recover.rs `Stmt::GlobalStore` fold).
+    // Global-binding name RESERVATION (the hoist itself is now
+    // module-only — see below): `StoreGlobal`/`StoreGlobalRecord`/
+    // `TryStoreGlobal` names must not collide with minted temporaries.
+    // Module outputs still hoist `var name;` per name: undeclared
+    // stores are an early error under es2abc's module mode (d-P4 — the
+    // recompile gate found this: ReferenceError on every global store).
+    // N72-C4: record stores (source-level `let`/`const`/`class` at
+    // global scope) share this story — the module-scope `var` shadows
+    // the global object inside the emitted module exactly like the
+    // lexical record did (recover.rs `Stmt::GlobalStore` fold).
     let mut globals = BTreeSet::new();
     for inst in &module.insts {
         if let Op::StoreGlobal { name, .. }
@@ -198,6 +201,15 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     for g in &globals {
         out.push_str(&format!("var {g};\n"));
     }
+    // N74-W4: the hoisted `var` initializes the binding at module
+    // evaluation, destroying the undeclared-read/TDZ windows (a sloppy
+    // store creates the global AT the store; es2abc compiles function
+    // bodies STRICT, so an undeclared STORE is itself a ReferenceError
+    // — the hoist cannot simply be dropped, probe probe2.js). The
+    // window is instead restored per-binding by
+    // [`folds::late_decl_fold`], which converts the first root-level
+    // store into the declaration (a function-scope `let` shadowing the
+    // module `var`: reads before it throw the same ReferenceError).
 
     // Module-slot predeclarations (gap G2: `module_slot_names` resolves
     // the slot↔binding-name correspondence from file evidence — TDZ
@@ -250,9 +262,17 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
             entry_call = Some(emitted.0);
         }
     }
-    // The recompile gate: invoke the module entry point.
+    // The recompile gate: invoke the module entry point WITH the
+    // script-level receiver. The VM binds a script main's `this` to
+    // the global object at entry (ark sloppy script semantics; the
+    // this-role frame slot, abcd_ir::frame) — a plain call would give
+    // the wrapper `undefined` under es2abc's strict functions (N74:
+    // test262 dream-gate class `top-level-this-undefined`). The
+    // emitted file's own top-level `this` is exactly that receiver:
+    // globalThis in a script, undefined in a module (matching module
+    // semantics — the plain call already behaved correctly there).
     if let Some(name) = entry_call {
-        out.push_str(&format!("{name}();\n"));
+        out.push_str(&format!("{name}.call(this);\n"));
     }
 
     // Exports (1:1 enum mapping). The local side is a module-scope
@@ -458,9 +478,9 @@ fn orphan_lexenv_names(module: &Module) -> BTreeSet<String> {
 /// The full per-function pipeline: Stage A → Stage B → folds.
 impl<'m> Emitter<'m> {
     /// The full per-function pipeline: Stage A → Stage B → folds.
-    fn func_nodes(&mut self, func: FuncId) -> (RecoveredFunc, Vec<SNode>) {
+    fn func_nodes(&mut self, func: FuncId, top_level: bool) -> (RecoveredFunc, Vec<SNode>) {
         self.stats.function_bodies += 1;
-        let rf = recover_func(self.module, func);
+        let mut rf = recover_func(self.module, func);
         let mut structured = structure_func(self.module, &rf);
         let mut fstats = FoldStats::default();
         // The generator driver fold runs FIRST (d-P11, R4): pre-fold the
@@ -492,6 +512,24 @@ impl<'m> Emitter<'m> {
         folds::yield_star_fold(&mut structured.body, rf.kind, &mut fstats);
         folds::fold(&mut structured.body, &mut fstats);
         folds::scope_fold(&mut structured.body, &rf.params, &mut fstats);
+        // N74-W4: after scope_fold, restore the TDZ/undeclared-read
+        // window of bindings whose first store is a root-level
+        // statement (a hoisted `let`/`var` reads `undefined` where the
+        // original threw ReferenceError). Global stores convert only at
+        // the top level — inside a nested function a `let` would
+        // SHADOW the global binding (dream gate: params-dflt-gen-meth's
+        // `callCount` counter died to exactly that).
+        folds::late_decl_fold(&mut structured.body, &rf.params, top_level, &mut fstats);
+        // N74-W4: `CopyRestArgs` → a real `...rest` parameter (the
+        // vendor staging slot reads as a spurious trailing visible
+        // param; the `[...arguments]` approximation reads the OUTER
+        // function's arguments in arrows).
+        folds::rest_param_fold(
+            &mut structured.body,
+            &mut rf.params,
+            rf.hidden_params,
+            &mut fstats,
+        );
         self.stats.structure =
             merge_struct_stats(std::mem::take(&mut self.stats.structure), &structured.stats);
         self.stats.folds = merge_fold_stats(std::mem::take(&mut self.stats.folds), &fstats);
@@ -500,7 +538,7 @@ impl<'m> Emitter<'m> {
 
     /// Returns the (legalized, minted) emitted name and the raw name.
     fn emit_top_level_function(&mut self, func: FuncId, out: &mut String) -> (String, String) {
-        let (rf, body) = self.func_nodes(func);
+        let (rf, body) = self.func_nodes(func, true);
         self.stats.functions += 1;
         self.current_fn_has_fallback = false;
         self.current_kind = rf.kind;
@@ -536,7 +574,7 @@ impl<'m> Emitter<'m> {
         indent: usize,
         out: &mut String,
     ) -> RecoveredFunc {
-        let (rf, body) = self.func_nodes(func);
+        let (rf, body) = self.func_nodes(func, false);
         let prev = self.current_kind;
         self.current_kind = rf.kind;
         let prev_hoisted = std::mem::replace(&mut self.hoisted, escaped_temps(&body));
@@ -1124,7 +1162,11 @@ impl<'m> Emitter<'m> {
             ));
         }
         let ext = match heritage.as_deref() {
-            Some(Expr::Lit(Lit::Hole | Lit::Undefined)) | None => String::new(),
+            // The hole is es2abc's "no extends" marker (suppressed
+            // upstream at recover — belt here for direct Lit heritage).
+            // An explicit `extends undefined` (Lit::Undefined) is real
+            // source semantics and must survive (N74-W4).
+            Some(Expr::Lit(Lit::Hole)) | None => String::new(),
             Some(h) => {
                 let mut s = String::new();
                 self.expr(h, 0, &mut s);
@@ -1254,6 +1296,28 @@ impl<'m> Emitter<'m> {
                 .map(|d| d.kind)
                 .unwrap_or(FunctionKind::Function)
         });
+        // N74-W4: the 24.0.0.0 member buffer tags generator and async
+        // methods as plain `method` (probe: methods-gen-yield-as-statement's
+        // buffer reads `method:#~A>#g1` while the function body carries
+        // `creategeneratorobj`), so a buffer `Function` kind must yield to
+        // the member function's own lifted kind when that is more specific
+        // — otherwise the `*`/`async` marker is lost (`yield` outside a
+        // generator is an es2abc SyntaxError; a plain method returns
+        // undefined where the source returned an iterator). Getter/Setter
+        // are accessor kinds the FUNCTION metadata does not carry — the
+        // buffer tag stays authoritative for them.
+        let kind = if matches!(kind, FunctionKind::Function) {
+            match self.module.func(f).map(|d| d.kind) {
+                Some(
+                    k @ (FunctionKind::Generator
+                    | FunctionKind::AsyncGenerator
+                    | FunctionKind::Async),
+                ) => k,
+                _ => kind,
+            }
+        } else {
+            kind
+        };
         let placement = if attrs.is_some_and(|a| a.is_static) {
             "static "
         } else {
@@ -1437,13 +1501,60 @@ impl<'m> Emitter<'m> {
                                 self.expr(x, 0, &mut s);
                             }
                             ObjEntry::Method(n, f) => {
-                                if is_legal_ident(n) {
-                                    s.push_str(n);
+                                // N74-W4: a `key: function` property
+                                // value has NO [[HomeObject]] — a body
+                                // referencing `super` is a SyntaxError
+                                // there (es2abc: "Unexpected super
+                                // keyword"), and a generator body loses
+                                // its `yield` legality the same way.
+                                // Both MUST print as the concise method
+                                // form (`key() {…}` / `*key() {…}`),
+                                // which carries both.
+                                let concise = match f {
+                                    Expr::Closure { body, kind, .. } => {
+                                        matches!(
+                                            kind,
+                                            FunctionKind::Generator | FunctionKind::AsyncGenerator
+                                        ) || fn_uses_super(self.module, *body)
+                                    }
+                                    _ => false,
+                                };
+                                if concise {
+                                    let Expr::Closure { body, kind, .. } = f else {
+                                        unreachable!()
+                                    };
+                                    s.push_str(&self.concise_method(
+                                        method_prefix(*kind),
+                                        &crate::expr::ObjKey::Name(n.clone()),
+                                        *body,
+                                    ));
                                 } else {
-                                    s.push_str(&render_string(n));
+                                    if is_legal_ident(n) {
+                                        s.push_str(n);
+                                    } else {
+                                        s.push_str(&render_string(n));
+                                    }
+                                    s.push_str(": ");
+                                    self.expr(f, 0, &mut s);
                                 }
-                                s.push_str(": ");
-                                self.expr(f, 0, &mut s);
+                            }
+                            // N74-W4: accessors folded from
+                            // `DefineGetterSetterByValue` (folds.rs) —
+                            // always the concise form (HomeObject,
+                            // enumerability).
+                            ObjEntry::Getter(k, f) => {
+                                if let Expr::Closure { body, .. } = f {
+                                    s.push_str(&self.concise_method("get ", k, *body));
+                                } else {
+                                    s.push_str("/* getter: non-closure (data shape) */");
+                                }
+                            }
+                            ObjEntry::Setter(k, f) => {
+                                if let Expr::Closure { body, .. } = f {
+                                    s.push_str(&self.concise_method("set ", k, *body));
+                                } else {
+                                    s.push_str("/* setter: non-closure (data shape) */");
+                                }
                             }
                         }
                         s
@@ -1928,11 +2039,26 @@ impl<'m> Emitter<'m> {
             }
             UnOp::ToNumber => {
                 out.push('+');
-                self.sub(operand, 17, out);
+                // `++x`-style ambiguity (N74-W4: `+(+1)` printed as
+                // `++1.0` — an invalid pre-increment LHS): parenthesize
+                // unary operands, the same rule as `Minus` below.
+                if matches!(operand, Expr::Unary { .. }) {
+                    out.push('(');
+                    self.expr_inner(operand, out);
+                    out.push(')');
+                } else {
+                    self.sub(operand, 17, out);
+                }
             }
             UnOp::ToNumeric => {
                 out.push('+');
-                self.sub(operand, 17, out);
+                if matches!(operand, Expr::Unary { .. }) {
+                    out.push('(');
+                    self.expr_inner(operand, out);
+                    out.push(')');
+                } else {
+                    self.sub(operand, 17, out);
+                }
                 out.push_str(" /*ToNumeric*/");
             }
             UnOp::Minus => {
@@ -1951,12 +2077,24 @@ impl<'m> Emitter<'m> {
                 // store-back is a separate op); JS `--x` would mutate a
                 // const temporary (dream gate: "Assignment to const
                 // variable") and double-fire property setters. Emit the
-                // pure arithmetic form, keeping the ToNumber/ToNumeric
-                // coercion. Corner: vendor bigint inc/dec polymorphism
-                // (`5n--` → `4n`) is not expressible purely (`5n - 1`
-                // throws) — no corpus fixture exercises it (registered).
+                // pure arithmetic form, keeping the ToNumber coercion:
+                // N74-W4 — a bare `x + 1` STRING-concatenates a
+                // non-number operand (test262 S8.6_A3_T1: `++{foo:'bar'}
+                // .foo` must be NaN, never "bar1"); the unary `+` first
+                // restores the vendor's ToNumber. Corner: vendor bigint
+                // inc/dec polymorphism (`5n--` → `4n`) is not expressible
+                // purely (`+5n` throws) — no corpus fixture exercises it
+                // (registered).
                 out.push('(');
-                self.sub(operand, 0, out);
+                out.push('+');
+                // Same `++x` ambiguity rule as `ToNumber` above.
+                if matches!(operand, Expr::Unary { .. }) {
+                    out.push('(');
+                    self.expr_inner(operand, out);
+                    out.push(')');
+                } else {
+                    self.sub(operand, 17, out);
+                }
                 out.push_str(if matches!(op, UnOp::Inc) {
                     " + 1"
                 } else {
@@ -1985,6 +2123,70 @@ impl<'m> Emitter<'m> {
             other => render_lit(other),
         }
     }
+}
+
+impl<'m> Emitter<'m> {
+    /// A concise object-literal member: `get [k]() {…}` / `*name() {…}`
+    /// (N74-W4). The ONLY member form carrying a [[HomeObject]] (super)
+    /// — and the only legal spelling for generator members.
+    fn concise_method(&mut self, prefix: &str, key: &crate::expr::ObjKey, body: FuncId) -> String {
+        let mut s = String::from(prefix);
+        match key {
+            crate::expr::ObjKey::Name(n) => {
+                if is_legal_ident(n) {
+                    s.push_str(n);
+                } else {
+                    s.push_str(&render_string(n));
+                }
+            }
+            crate::expr::ObjKey::Computed(e) => {
+                s.push('[');
+                let mut k = String::new();
+                self.expr(e, 0, &mut k);
+                s.push_str(&k);
+                s.push(']');
+            }
+        }
+        let mut text = String::new();
+        let rf = self.emit_function_body(body, 1, &mut text);
+        let (params, ret) = self.params_ret(&rf);
+        s.push_str(&format!("({params}){ret} {{\n{text}}}"));
+        s
+    }
+}
+
+/// Whether a function's own instructions reference `super`
+/// (`LoadSuper`/`StoreSuper`/`super(...)` calls). Nested closures are
+/// NOT descended into — their super binds to their own home object.
+/// (N74-W4: drives the concise-method choice for object literals —
+/// only concise methods carry a [[HomeObject]].)
+fn fn_uses_super(module: &Module, func: FuncId) -> bool {
+    let Some(f) = module.func(func) else {
+        return false;
+    };
+    for &b in &f.blocks {
+        let Some(block) = module.block(b) else {
+            continue;
+        };
+        for &iid in &block.insts {
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
+            match &inst.op {
+                Op::LoadSuper { .. } | Op::StoreSuper { .. } => return true,
+                Op::Call { kind, .. }
+                    if matches!(
+                        kind,
+                        CallKind::Super | CallKind::SuperSpread | CallKind::SuperForwardAllArgs
+                    ) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Collect private names referenced by a function's private-name ops
@@ -2513,6 +2715,8 @@ fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.switch += b.switch;
     a.finally_fold += b.finally_fold;
     a.scope_fold += b.scope_fold;
+    a.late_decl += b.late_decl;
+    a.rest_param += b.rest_param;
     a.gen_driver_sites += b.gen_driver_sites;
     a.gen_driver_entry += b.gen_driver_entry;
     a.gen_driver_bound += b.gen_driver_bound;

@@ -923,11 +923,22 @@ pub enum Op {
     LoadSuper {
         /// The property key.
         key: SuperKey,
+        /// The thisValue of the super reference (N74-W4: the vendor
+        /// `ldsuperbyvalue imm, v` carries it in the register operand —
+        /// es2abc stages the current `this` there — while the KEY is the
+        /// acc; the byname form passes no register, so the lift reads
+        /// the frame's this-role value). Kept as a real operand so the
+        /// byte round-trip can restore the register.
+        this_value: ValueId,
     },
     /// Super-property store.
     StoreSuper {
         /// The property key.
         key: SuperKey,
+        /// The thisValue of the super reference (vendor
+        /// `stsuperbyvalue imm, v1, v2`: v1 = this, v2 = key, acc =
+        /// value — N74-W4).
+        this_value: ValueId,
         /// The stored value.
         value: ValueId,
     },
@@ -1084,12 +1095,16 @@ impl Op {
             CreateGenerator { func } => vec![*func],
             SuspendGenerator { genobj, value } => vec![*genobj, *value],
             ResumeGenerator { genobj } | GetResumeMode { genobj } => vec![*genobj],
-            LoadSuper { key } => match key {
-                SuperKey::Name(_) => vec![],
-                SuperKey::Dynamic(k) => vec![*k],
+            LoadSuper { key, this_value } => match key {
+                SuperKey::Name(_) => vec![*this_value],
+                SuperKey::Dynamic(k) => vec![*k, *this_value],
             },
-            StoreSuper { key, value } => {
-                let mut v = vec![*value];
+            StoreSuper {
+                key,
+                this_value,
+                value,
+            } => {
+                let mut v = vec![*value, *this_value];
                 if let SuperKey::Dynamic(k) = key {
                     v.push(*k);
                 }
@@ -1218,12 +1233,16 @@ impl Op {
             CreateGenerator { func } => vec![func],
             SuspendGenerator { genobj, value } => vec![genobj, value],
             ResumeGenerator { genobj } | GetResumeMode { genobj } => vec![genobj],
-            LoadSuper { key } => match key {
-                SuperKey::Name(_) => vec![],
-                SuperKey::Dynamic(k) => vec![k],
+            LoadSuper { key, this_value } => match key {
+                SuperKey::Name(_) => vec![this_value],
+                SuperKey::Dynamic(k) => vec![k, this_value],
             },
-            StoreSuper { key, value } => {
-                let mut v = vec![value];
+            StoreSuper {
+                key,
+                this_value,
+                value,
+            } => {
+                let mut v = vec![value, this_value];
                 if let SuperKey::Dynamic(k) = key {
                     v.push(k);
                 }

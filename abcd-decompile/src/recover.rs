@@ -388,6 +388,53 @@ fn observable(op: &Op) -> bool {
     e.may_throw || e.may_call != abcd_ir::effects::CallEffect::None || !e.writes.is_empty()
 }
 
+/// JS-dynamic observability beyond the IR effects table (effects.rs
+/// deliberately marks the compute ops PURE — "coercion effects of the
+/// dynamic operators are a type-refined extension"): on non-primitive
+/// operands every `BinaryOp`, every non-strict `Compare` (`in` /
+/// `instanceof` included — proxy traps and `Symbol.hasInstance` are user
+/// code), and the numeric `UnaryOp`s can invoke user code
+/// (ToPrimitive/ToNumeric) or throw. A userless occurrence is an
+/// expression STATEMENT, never dead code (test262's coercion-order and
+/// throw-on-primitive tests — N74-W4). Strict equality and the
+/// boolean/typeof/void unaries are genuinely free of user code.
+fn js_dynamic_observable(op: &Op) -> bool {
+    match op {
+        Op::BinaryOp { .. } => true,
+        Op::Compare { op, .. } => !matches!(op, CmpOp::StrictEq | CmpOp::StrictNotEq),
+        Op::UnaryOp { op, .. } => matches!(
+            op,
+            abcd_ir::op::UnOp::Minus
+                | abcd_ir::op::UnOp::BitNot
+                | abcd_ir::op::UnOp::Inc
+                | abcd_ir::op::UnOp::Dec
+                | abcd_ir::op::UnOp::ToNumber
+                | abcd_ir::op::UnOp::ToNumeric
+        ),
+        _ => false,
+    }
+}
+
+/// A synthetic `new ErrorKind("message")` expression for the
+/// materialized unconditional guards (N74-W4).
+fn new_error(kind: &str, message: String) -> Expr {
+    Expr::Call {
+        callee: Box::new(Expr::Ident(kind.to_string())),
+        this: None,
+        args: vec![Expr::Lit(Lit::String(message))],
+        kind: CallKind::New,
+    }
+}
+
+/// Whether `v` is provably the TDZ hole constant (through `Mov`s).
+fn provably_hole(module: &Module, v: ValueId) -> bool {
+    let v = chase_mov(module, v);
+    match const_id_of(module, v).and_then(|cid| module.consts.get(cid)) {
+        Some(abcd_ir::Const::Hole) => true,
+        _ => false,
+    }
+}
+
 /// The base outcome of a result-producing op (before the dead-pure
 /// adjustment): hard-7 → Fallback; the desugaring-plumbing set →
 /// Plumbing; everything else → Expressed.
@@ -887,6 +934,59 @@ impl<'m> Recover<'m> {
         out: &mut Vec<Stmt>,
         phi_tail: &mut Vec<(BlockId, Stmt)>,
     ) {
+        // 0. Guards that must stay EXECUTABLE (N74-W4): the blanket
+        //    elision below is only sound when the emitted source
+        //    reproduces the guard's semantics, which fails for:
+        //    - `ThrowConstAssignment`: es2abc emits it at a const-store
+        //      site; it fires unconditionally when reached. The elision
+        //      reason claims "the const binding is reconstructed", but
+        //      d-P8 reconstructs lexical bindings as `let`, so the store
+        //      would silently succeed (test262 class/name-binding/const).
+        //    - `ThrowUndefinedIfHole{,WithName}` whose checked value is
+        //      PROVABLY the hole constant: the read IS the TDZ
+        //      violation, firing unconditionally (test262 let/const
+        //      *-before-initialization rows). A guard whose value is not
+        //      provably the hole keeps the §5 elision (the common case:
+        //      reads es2abc could not prove post-init statically).
+        match op {
+            Op::ThrowConstAssignment { name } => {
+                self.record(op, Outcome::Expressed);
+                let label = match self.expr_of(*name) {
+                    Expr::Lit(Lit::String(s)) => format!(" '{s}'"),
+                    _ => String::new(),
+                };
+                out.push(Stmt::Throw(new_error(
+                    "TypeError",
+                    format!("Assignment to constant variable{label}."),
+                )));
+                return;
+            }
+            Op::ThrowUndefinedIfHoleWithName { name, value }
+                if provably_hole(self.module, *value) =>
+            {
+                self.record(op, Outcome::Expressed);
+                let n = sym_str(self.module, *name);
+                out.push(Stmt::Throw(new_error(
+                    "ReferenceError",
+                    format!("Cannot access '{n}' before initialization"),
+                )));
+                return;
+            }
+            Op::ThrowUndefinedIfHole { name, value } if provably_hole(self.module, *value) => {
+                self.record(op, Outcome::Expressed);
+                let label = match self.expr_of(*name) {
+                    Expr::Lit(Lit::String(s)) => s,
+                    _ => "binding".to_string(),
+                };
+                out.push(Stmt::Throw(new_error(
+                    "ReferenceError",
+                    format!("Cannot access '{label}' before initialization"),
+                )));
+                return;
+            }
+            _ => {}
+        }
+
         // 1. Deliberately elided ops (guards, async entry).
         if let Some(reason) = elision_reason(op) {
             self.record(op, Outcome::Elided);
@@ -982,7 +1082,12 @@ impl<'m> Recover<'m> {
         }
         let users = self.chains.all_users(result);
         if users.is_empty() {
-            if observable(op) {
+            // `CopyRestArgs` is never dead: it carries the rest-param
+            // evidence (`...rest` reconstruction, N74-W4) even when the
+            // rest array itself is unused (`function(...args) {}` —
+            // `.length` still observes it).
+            if observable(op) || js_dynamic_observable(op) || matches!(op, Op::CopyRestArgs { .. })
+            {
                 self.record(op, base_outcome(op));
                 let value = self.expr_for(iid, op);
                 out.push(Stmt::Expr(value));
@@ -1196,7 +1301,7 @@ impl<'m> Recover<'m> {
                     define,
                 });
             }
-            Op::StoreSuper { key, value } => {
+            Op::StoreSuper { key, value, .. } => {
                 self.record(op, Outcome::Expressed);
                 let (name, key) = match key {
                     SuperKey::Name(s) => (Some(sym_str(self.module, *s)), None),
@@ -1740,7 +1845,7 @@ impl<'m> Recover<'m> {
             Op::CopyRestArgs { start_index } => Expr::RestArgs {
                 start_index: *start_index,
             },
-            Op::LoadSuper { key } => match key {
+            Op::LoadSuper { key, .. } => match key {
                 SuperKey::Name(s) => Expr::SuperProp {
                     name: Some(sym_str(self.module, *s)),
                     key: None,
@@ -1840,10 +1945,22 @@ impl<'m> Recover<'m> {
             .func(ctor)
             .map(|f| sym_str(self.module, f.name))
             .unwrap_or_else(|| format!("<fn#{}>", ctor.index()));
+        // N74-W4: es2abc loads the heritage register with the TDZ hole
+        // for a class WITHOUT `extends` (CreateClassWithBuffer treats
+        // the hole as "no parent"). Emitting `extends <hole-temp>` runs
+        // `extends undefined` — a runtime TypeError ("parent class is
+        // not constructor"). Suppress the hole; an explicit
+        // `extends undefined` (a real Undefined constant) is NOT the
+        // hole and must survive.
+        let suppress = heritage.is_some_and(|h| provably_hole(self.module, h));
         Expr::Class {
             ctor,
             name,
-            heritage: heritage.map(|h| Box::new(self.expr_of(h))),
+            heritage: if suppress {
+                None
+            } else {
+                heritage.map(|h| Box::new(self.expr_of(h)))
+            },
             members,
             member_attrs,
             sendable,

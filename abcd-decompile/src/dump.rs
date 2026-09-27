@@ -549,6 +549,12 @@ pub fn dump_expr(e: &Expr) -> String {
                     crate::expr::ObjEntry::Spread(s) => format!("...{}", dump_expr(s)),
                     crate::expr::ObjEntry::Proto(p) => format!("__proto__: {}", dump_expr(p)),
                     crate::expr::ObjEntry::Method(n, f) => format!("{n}: {}", dump_expr(f)),
+                    crate::expr::ObjEntry::Getter(k, f) => {
+                        format!("get {k:?}: {}", dump_expr(f))
+                    }
+                    crate::expr::ObjEntry::Setter(k, f) => {
+                        format!("set {k:?}: {}", dump_expr(f))
+                    }
                 })
                 .collect();
             format!("build-object({{{}}})", inner.join(", "))

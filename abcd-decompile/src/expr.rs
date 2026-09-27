@@ -447,6 +447,23 @@ pub enum ObjEntry {
     Proto(Expr),
     /// `name() { … }` (`DefineMethod`; `func` is the closure node).
     Method(String, Expr),
+    /// `get [key]() { … }` / `set [key](v) { … }` — an accessor absorbed
+    /// from a `DefineGetterSetterByValue` statement (N74-W4: only the
+    /// concise accessor form carries a [[HomeObject]] — a getter whose
+    /// body references `super` cannot print as `Object.defineProperty`).
+    /// The key is a literal name or a computed expression.
+    Getter(ObjKey, Expr),
+    /// The setter counterpart of [`ObjEntry::Getter`].
+    Setter(ObjKey, Expr),
+}
+
+/// An object-literal key: a source name or a computed expression.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ObjKey {
+    /// A plain name (`get name() {}`).
+    Name(String),
+    /// A computed key (`get [expr]() {}`).
+    Computed(Box<Expr>),
 }
 
 /// One element of a Stage-B folded array literal ([`Expr::ArrayBuild`]).

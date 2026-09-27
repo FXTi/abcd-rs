@@ -149,8 +149,9 @@ fn adce_keeps_n50_observable_loads_with_dead_results() {
         ),
         (
             "LoadSuper (super getter call)",
-            Box::new(|b, _p0| Op::LoadSuper {
+            Box::new(|b, p0| Op::LoadSuper {
                 key: SuperKey::Name(b.sym("p")),
+                this_value: p0,
             }),
         ),
     ];

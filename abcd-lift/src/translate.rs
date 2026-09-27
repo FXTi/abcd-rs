@@ -715,26 +715,58 @@ pub fn translate_bytecode(
         Bytecode::Ldsuperbyname(_ic, eid) => {
             let name = fx.resolve_str(*eid)?;
             let key = super_key(SuperKeyForm::Name(name))?;
-            let v = fx.emit_val(block, Op::LoadSuper { key }, loc);
+            // No register operand (isa.yaml: `ldsuperbyname imm,
+            // string_id; acc: inout`) — the thisValue is the frame's
+            // this-role value (N74-W4).
+            let this_value = fx.this_value(block, loc);
+            let v = fx.emit_val(block, Op::LoadSuper { key, this_value }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::Stsuperbyname(_ic, eid, val_reg) => {
+        Bytecode::Stsuperbyname(_ic, eid, this_reg) => {
             let name = fx.resolve_str(*eid)?;
             let key = super_key(SuperKeyForm::Name(name))?;
-            let value = fx.read_reg(*val_reg, block);
-            fx.emit_void(block, Op::StoreSuper { key, value }, loc);
+            // Vendor `stsuperbyname imm, string_id, v; acc: in`
+            // (isa.yaml:1545-1548): v = thisValue, acc = the stored
+            // value (N74-W4 — the register was misread as the value).
+            let this_value = fx.read_reg(*this_reg, block);
+            let value = fx.read_acc(block);
+            fx.emit_void(
+                block,
+                Op::StoreSuper {
+                    key,
+                    this_value,
+                    value,
+                },
+                loc,
+            );
         }
-        Bytecode::Ldsuperbyvalue(_ic, key_reg) => {
-            let k = fx.read_reg(*key_reg, block);
+        Bytecode::Ldsuperbyvalue(_ic, this_reg) => {
+            // Vendor `ldsuperbyvalue imm, v; acc: inout` (isa.yaml:
+            // 1363-1367): v = thisValue, acc = the KEY (N74-W4 — the
+            // register was misread as the key; test262 super/*
+            // decompiled to `super[this]`).
+            let this_value = fx.read_reg(*this_reg, block);
+            let k = fx.read_acc(block);
             let key = super_key(SuperKeyForm::Dynamic(k))?;
-            let v = fx.emit_val(block, Op::LoadSuper { key }, loc);
+            let v = fx.emit_val(block, Op::LoadSuper { key, this_value }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::Stsuperbyvalue(_ic, key_reg, val_reg) => {
+        Bytecode::Stsuperbyvalue(_ic, this_reg, key_reg) => {
+            // Vendor `stsuperbyvalue imm, v1, v2; acc: in` (isa.yaml:
+            // 1373-1377): v1 = thisValue, v2 = key, acc = value.
+            let this_value = fx.read_reg(*this_reg, block);
             let k = fx.read_reg(*key_reg, block);
             let key = super_key(SuperKeyForm::Dynamic(k))?;
-            let value = fx.read_reg(*val_reg, block);
-            fx.emit_void(block, Op::StoreSuper { key, value }, loc);
+            let value = fx.read_acc(block);
+            fx.emit_void(
+                block,
+                Op::StoreSuper {
+                    key,
+                    this_value,
+                    value,
+                },
+                loc,
+            );
         }
         Bytecode::Delobjprop(key_reg) => {
             // Vendor (isa.yaml:1293-1296; N65): `delobjprop v0` takes
@@ -2185,11 +2217,12 @@ pub fn translate_bytecode(
         }
         Bytecode::DeprecatedLdsuperbyvalue(obj_reg, key_reg) => {
             // v0.1 reads (and discards) the receiver register — the
-            // read is preserved.
-            let _obj = fx.read_reg(*obj_reg, block);
+            // read is preserved (as the super reference's thisValue,
+            // N74-W4).
+            let this_value = fx.read_reg(*obj_reg, block);
             let k = fx.read_reg(*key_reg, block);
             let key = super_key(SuperKeyForm::Dynamic(k))?;
-            let v = fx.emit_val(block, Op::LoadSuper { key }, loc);
+            let v = fx.emit_val(block, Op::LoadSuper { key, this_value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedLdobjbyindex(obj_reg, index) => {
@@ -2264,10 +2297,13 @@ pub fn translate_bytecode(
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedLdsuperbyname(eid, _obj_reg) => {
-            // v0.1 does NOT read the receiver register here (parity).
+            // v0.1 does NOT read the receiver register here (parity);
+            // the thisValue operand is the frame's this-role value
+            // (N74-W4 — the field exists on the op now).
             let name = fx.resolve_str(*eid)?;
             let key = super_key(SuperKeyForm::Name(name))?;
-            let v = fx.emit_val(block, Op::LoadSuper { key }, loc);
+            let this_value = fx.this_value(block, loc);
+            let v = fx.emit_val(block, Op::LoadSuper { key, this_value }, loc);
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedLdmodulevar(eid, _flag) => {

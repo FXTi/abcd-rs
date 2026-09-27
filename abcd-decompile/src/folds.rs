@@ -136,6 +136,14 @@ pub struct FoldStats {
     /// Lexenv slot initializations reconstructed as block-scoped
     /// `let` declarations (d-P8).
     pub scope_fold: usize,
+    /// Late declaration-site reconstructions (N74-W4): a binding whose
+    /// textually first store sits in a root-level statement run becomes
+    /// `let n = v;` AT that store, restoring the TDZ/undeclared window
+    /// the function-top hoisted `let`/`var` destroyed.
+    pub late_decl: usize,
+    /// Rest-parameter reconstructions (N74-W4): `CopyRestArgs` → a real
+    /// `...rest` parameter.
+    pub rest_param: usize,
     /// Generator resume-mode dispatch sites folded away (d-P11, R4;
     /// includes the entry site).
     pub gen_driver_sites: usize,
@@ -450,6 +458,12 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
                     }
                     ObjEntry::Spread(s) | ObjEntry::Proto(s) => out.push(s),
                     ObjEntry::Method(_, f) => out.push(f),
+                    ObjEntry::Getter(k, f) | ObjEntry::Setter(k, f) => {
+                        if let crate::expr::ObjKey::Computed(c) = k {
+                            out.push(c);
+                        }
+                        out.push(f);
+                    }
                 }
             }
         }
@@ -510,12 +524,43 @@ fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mut FoldStats) {
             }
         };
         // Absorb the consecutive builder sequence at i+1…
+        // N74-W4: the array shape's own element count seeds the
+        // contiguity index — a store to index N is absorbable only when
+        // N is exactly the next slot (a gap would silently drop the
+        // hole and shift every later element left: test262 `[, 1, 2]`
+        // decompiled to `[1, 2]`).
+        let shape_len = match &leaves[i] {
+            Leaf::Raw(Stmt::Declare {
+                value: Expr::ArrayLit { elements },
+                ..
+            }) => elements.len() as u64,
+            _ => 0,
+        };
         let mut absorbed: Vec<Absorb> = Vec::new();
+        let mut absorbed_idx: Vec<usize> = Vec::new();
+        let mut skipped_idx: Vec<usize> = Vec::new();
+        // N74-W4: pure-literal declares interleaved in the builder
+        // sequence (the computed-key temporaries of an accessor
+        // definition) do not end it — they are RE-EMITTED above the
+        // folded declaration (pure, so the reorder is free).
+        let mut skipped: Vec<Leaf> = Vec::new();
         let mut j = i + 1;
         while j < leaves.len() {
-            match absorb_one(&leaves[j], vid, is_array, &absorbed) {
+            match absorb_one(&leaves[j], vid, is_array, &absorbed, shape_len) {
                 Some(a) => {
                     absorbed.push(a);
+                    absorbed_idx.push(j);
+                    j += 1;
+                }
+                // N74-W4: a declare interleaved in the builder sequence
+                // (an accessor's computed-key temporary, possibly a
+                // call — key evaluation order inside the literal matches
+                // the original statement order) does not end the
+                // sequence; single-use temps inline into the entries at
+                // rebuild, unused pure ones drop.
+                None if matches!(&leaves[j], Leaf::Raw(Stmt::Declare { .. })) => {
+                    skipped.push(leaves[j].clone());
+                    skipped_idx.push(j);
                     j += 1;
                 }
                 None => break,
@@ -524,6 +569,80 @@ fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mut FoldStats) {
         if absorbed.is_empty() {
             i += 1;
             continue;
+        }
+        // N74-W4: resolve the skipped interleaved declares BEFORE
+        // rebuilding: a temp used exactly ONCE across the absorbed
+        // entries (or another skipped declare's value) inlines at that
+        // use — inside the literal the computed-key evaluation order is
+        // the original statement order; an unused pure-literal declare
+        // drops; any other shape re-seats ABOVE the folded declaration.
+        let mut bail = false;
+        {
+            // (vid, value, keep?) per skipped declare.
+            let mut skip_vals: Vec<(abcd_ir::ValueId, Expr, bool)> = Vec::new();
+            for leaf in &skipped {
+                let Leaf::Raw(Stmt::Declare {
+                    value, value_id, ..
+                }) = leaf
+                else {
+                    unreachable!()
+                };
+                skip_vals.push((*value_id, value.clone(), true));
+            }
+            let count_uses =
+                |vid: abcd_ir::ValueId,
+                 absorbed: &[Absorb],
+                 skip_vals: &[(abcd_ir::ValueId, Expr, bool)]| {
+                    let mut n = 0usize;
+                    for a in absorbed {
+                        for e in absorb_exprs(a) {
+                            n += expr_count_value(e, vid);
+                        }
+                    }
+                    for (_, v, _) in skip_vals {
+                        n += expr_count_value(v, vid);
+                    }
+                    n
+                };
+            let mut inline: Vec<(abcd_ir::ValueId, Expr)> = Vec::new();
+            for k in 0..skip_vals.len() {
+                let (vid, value, _) = &skip_vals[k];
+                let (vid, is_lit, value) = (*vid, matches!(value, Expr::Lit(_)), value.clone());
+                match count_uses(vid, &absorbed, &skip_vals) {
+                    0 if is_lit => skip_vals[k].2 = false, // dead pure: drop
+                    1 => {
+                        inline.push((vid, value));
+                        skip_vals[k].2 = false;
+                    }
+                    // Multi-use or used elsewhere: reordering the
+                    // declare is unprovable — bail the WHOLE fold
+                    // (nothing is mutated yet).
+                    _ => {
+                        bail = true;
+                    }
+                }
+            }
+            // Inline in decision order: an earlier inline may feed a
+            // later one (temp chains), so substitute into the later
+            // inline values too.
+            for pos in 0..inline.len() {
+                let (vid, value) = inline[pos].clone();
+                for later in inline.iter_mut().skip(pos + 1) {
+                    subst_temp_in_expr(&mut later.1, vid, &value);
+                }
+                for (_, v, _) in skip_vals.iter_mut() {
+                    subst_temp_in_expr(v, vid, &value);
+                }
+                for a in absorbed.iter_mut() {
+                    for e in absorb_exprs_mut(a) {
+                        subst_temp_in_expr(e, vid, &value);
+                    }
+                }
+            }
+            if bail {
+                i += 1;
+                continue;
+            }
         }
         if is_array {
             stats.array_lit += 1;
@@ -550,6 +669,22 @@ fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mut FoldStats) {
                                 Absorb::ObjSpread(s) => out.push(ObjEntry::Spread(s)),
                                 Absorb::ObjProto(p) => out.push(ObjEntry::Proto(p)),
                                 Absorb::ObjMethod(n, f) => out.push(ObjEntry::Method(n, f)),
+                                Absorb::ObjAccessors {
+                                    key,
+                                    getter,
+                                    setter,
+                                } => {
+                                    let k = match key {
+                                        Expr::Lit(Lit::String(s)) => crate::expr::ObjKey::Name(s),
+                                        other => crate::expr::ObjKey::Computed(Box::new(other)),
+                                    };
+                                    if let Some(g) = getter {
+                                        out.push(ObjEntry::Getter(k.clone(), g));
+                                    }
+                                    if let Some(st) = setter {
+                                        out.push(ObjEntry::Setter(k, st));
+                                    }
+                                }
                                 Absorb::ArrItem(_) | Absorb::ArrSpread(_) => {
                                     unreachable!("object fold absorbed an array entry")
                                 }
@@ -582,8 +717,20 @@ fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mut FoldStats) {
             }
             other => other,
         };
+        // Remove the absorbed AND skipped statements by index
+        // (descending; the `leaves.remove(i)` above shifted everything
+        // past `i` down by one), then re-seat the skipped declares that
+        // survived immediately above the folded declaration.
+        let mut gone: Vec<usize> = absorbed_idx
+            .iter()
+            .chain(skipped_idx.iter())
+            .map(|x| x - 1)
+            .collect();
+        gone.sort_unstable_by(|a, b| b.cmp(a));
+        for idx in gone {
+            leaves.remove(idx);
+        }
         leaves.insert(i, new_value);
-        leaves.drain(i + 1..i + 1 + (j - i - 1));
         i += 1;
     }
 }
@@ -595,17 +742,83 @@ enum Absorb {
     ObjSpread(Expr),
     ObjProto(Expr),
     ObjMethod(String, Expr),
+    /// A `DefineGetterSetterByValue` against the object being built
+    /// (N74-W4) — key + optional getter/setter closures. Folding it
+    /// into the literal is BOTH more idiomatic and the only form whose
+    /// accessors carry a [[HomeObject]] (super-using bodies) — and the
+    /// literal's accessors are enumerable like the source's (the
+    /// defineProperty emission's `enumerable: false` default was not).
+    ObjAccessors {
+        key: Expr,
+        getter: Option<Expr>,
+        setter: Option<Expr>,
+    },
     ArrItem(Expr),
     ArrSpread(Expr),
 }
 
+/// The expression positions of an absorbed builder statement
+/// (immutable — the use census).
+fn absorb_exprs(a: &Absorb) -> Vec<&Expr> {
+    match a {
+        Absorb::ObjKV(_, v) => vec![v],
+        Absorb::ObjComputed(k, v) => vec![k, v],
+        Absorb::ObjSpread(s) | Absorb::ObjProto(s) => vec![s],
+        Absorb::ObjMethod(_, f) => vec![f],
+        Absorb::ObjAccessors {
+            key,
+            getter,
+            setter,
+        } => {
+            let mut out = vec![key];
+            out.extend(getter.iter());
+            out.extend(setter.iter());
+            out
+        }
+        Absorb::ArrItem(v) | Absorb::ArrSpread(v) => vec![v],
+    }
+}
+
+/// The mutable counterpart of [`absorb_exprs`] (the inline rewrite).
+fn absorb_exprs_mut(a: &mut Absorb) -> Vec<&mut Expr> {
+    match a {
+        Absorb::ObjKV(_, v) => vec![v],
+        Absorb::ObjComputed(k, v) => vec![k, v],
+        Absorb::ObjSpread(s) | Absorb::ObjProto(s) => vec![s],
+        Absorb::ObjMethod(_, f) => vec![f],
+        Absorb::ObjAccessors {
+            key,
+            getter,
+            setter,
+        } => {
+            let mut out = vec![key];
+            out.extend(getter.iter_mut());
+            out.extend(setter.iter_mut());
+            out
+        }
+        Absorb::ArrItem(v) | Absorb::ArrSpread(v) => vec![v],
+    }
+}
+
+/// How often an expression references a temp by SSA value.
+fn expr_count_value(e: &Expr, vid: abcd_ir::ValueId) -> usize {
+    let mut n = usize::from(expr_uses_value(e, vid) && temp_value(e) == Some(vid));
+    for c in expr_children(e) {
+        n += expr_count_value(c, vid);
+    }
+    n
+}
+
 /// Whether leaf `l` is a builder statement targeting temp `vid` that
-/// can be absorbed (self-reference-free).
+/// can be absorbed (self-reference-free). `shape_len` is the array
+/// shape's own element count (0 for objects) — the array absorb index
+/// is checked against `shape_len + <absorbed items>` exactly.
 fn absorb_one(
     l: &Leaf,
     vid: abcd_ir::ValueId,
     is_array: bool,
     so_far: &[Absorb],
+    shape_len: u64,
 ) -> Option<Absorb> {
     let is_target = |e: &Expr| temp_value(e) == Some(vid);
     let clean = |e: &Expr| !expr_uses_value(e, vid);
@@ -637,8 +850,13 @@ fn absorb_one(
             own,
         }) if is_target(object) && clean(index) && clean(value) => {
             if is_array {
-                // Contiguous integer index required (the shape may
-                // already carry leading elements).
+                // Strict contiguity (N74-W4): the store's integer index
+                // must be EXACTLY the next slot — shape elements plus
+                // already-absorbed items. Anything else (a hole gap, an
+                // out-of-order store) stays a statement, which preserves
+                // the sparse semantics the literal form would destroy.
+                // A spread makes the running index unknowable — absorb
+                // no items after one.
                 let base = match &index {
                     Expr::Lit(Lit::Number(bits)) => {
                         let v = f64::from_bits(*bits);
@@ -646,16 +864,19 @@ fn absorb_one(
                     }
                     _ => None,
                 };
-                let prior = so_far
-                    .iter()
-                    .filter(|a| matches!(a, Absorb::ArrItem(_) | Absorb::ArrSpread(_)))
-                    .count() as u64;
-                // The shape's own length is not visible here;
-                // monotonic contiguity is enforced relative to the
-                // absorbed prefix (documented approximation).
-                let _ = prior;
+                let next = if so_far.iter().any(|a| matches!(a, Absorb::ArrSpread(_))) {
+                    None
+                } else {
+                    Some(
+                        shape_len
+                            + so_far
+                                .iter()
+                                .filter(|a| matches!(a, Absorb::ArrItem(_)))
+                                .count() as u64,
+                    )
+                };
                 match base {
-                    Some(_idx) if *own => Some(Absorb::ArrItem(value.clone())),
+                    Some(idx) if *own && Some(idx) == next => Some(Absorb::ArrItem(value.clone())),
                     _ => None,
                 }
             } else if *own {
@@ -688,6 +909,45 @@ fn absorb_one(
             object, name, func, ..
         }) if !is_array && is_target(object) && clean(func) => {
             Some(Absorb::ObjMethod(name.clone(), func.clone()))
+        }
+        // Accessor definition against the object being built. The
+        // getter/setter slots must be closures or the `undefined`
+        // absence marker (the recover.rs undef-through resolution).
+        Leaf::Raw(Stmt::Expr(Expr::DefineGetterSetter {
+            obj,
+            key,
+            getter,
+            setter,
+        })) if !is_array
+            && is_target(obj)
+            && clean(key)
+            && clean(getter)
+            && clean(setter)
+            && matches!(
+                getter.as_ref(),
+                Expr::Closure { .. } | Expr::Lit(Lit::Undefined)
+            )
+            && matches!(
+                setter.as_ref(),
+                Expr::Closure { .. } | Expr::Lit(Lit::Undefined)
+            ) =>
+        {
+            let getter = match getter.as_ref() {
+                Expr::Lit(Lit::Undefined) => None,
+                g => Some(g.clone()),
+            };
+            let setter = match setter.as_ref() {
+                Expr::Lit(Lit::Undefined) => None,
+                st => Some(st.clone()),
+            };
+            if getter.is_none() && setter.is_none() {
+                return None;
+            }
+            Some(Absorb::ObjAccessors {
+                key: key.as_ref().clone(),
+                getter,
+                setter,
+            })
         }
         _ => None,
     }
@@ -1057,8 +1317,13 @@ struct LoopFold {
     res_name: Option<String>,
     /// The `done` temp (for-of only).
     done_name: Option<String>,
-    /// Further internal temps (`it`, `next`, the for-in iterator phi).
+    /// Further internal temps (`it`, `next`, the for-in header phis).
     extra_internals: Vec<String>,
+    /// Extra header-phi wiring to hoist ABOVE the folded loop (for-in
+    /// only, N74): `let`-less `var` decl + the pre-loop assign of each
+    /// loop-invariant pass-through phi, emitted as one `Stmts` node
+    /// immediately before the `ForIn`.
+    hoisted: Vec<Leaf>,
 }
 
 /// Normalize the two loop-test emission shapes to `(test, body)`:
@@ -1147,24 +1412,38 @@ fn fold_loops(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
         } else {
             stats.for_of += 1;
         }
-        nodes[i] = if folded.is_in {
-            SNode::ForIn {
+        // N74: a for-in with extra pass-through header phis re-emits
+        // their (loop-invariant) wiring as one `Stmts` node ABOVE the
+        // folded loop (LICM — see `match_for_in`).
+        let advanced = if folded.is_in && !folded.hoisted.is_empty() {
+            let for_in = SNode::ForIn {
                 binding,
                 obj: folded.iter,
                 body: new_body,
-            }
+            };
+            nodes.splice(i..i + 1, [SNode::Stmts(folded.hoisted.clone()), for_in]);
+            2
         } else {
-            SNode::ForOf {
-                is_await: folded.is_await,
-                binding,
-                iter: folded.iter,
-                body: new_body,
-            }
+            nodes[i] = if folded.is_in {
+                SNode::ForIn {
+                    binding,
+                    obj: folded.iter,
+                    body: new_body,
+                }
+            } else {
+                SNode::ForOf {
+                    is_await: folded.is_await,
+                    binding,
+                    iter: folded.iter,
+                    body: new_body,
+                }
+            };
+            1
         };
         // Trim the consumed tail of the pre-loop run (this may remove
         // nodes BEFORE i, shifting it left).
         let removed = trim_pre_leaves(nodes, i, folded.pre_cut);
-        i = i + 1 - removed;
+        i = i + advanced - removed;
     }
 }
 
@@ -1341,16 +1620,74 @@ fn match_for_of(pre: &[Leaf], wcond: &Expr, body: &[SNode]) -> Option<LoopFold> 
         res_name: Some(res_name),
         done_name: Some(done_name),
         extra_internals: extra,
+        hoisted: Vec::new(),
     })
 }
 
 /// for-in: `it = get-prop-iterator(obj)` (phi at the header),
 /// `k = next-prop-name(it)`, `undefined == k` exit test.
+///
+/// N74: the header may carry EXTRA phis besides the iterator — any
+/// register live across the loop gets a pass-through phi (e.g. the
+/// OUTER for-in's iterator in nested loops: its value never changes
+/// inside, so the back-edge is a self-assign). Those extra phis are
+/// loop-invariant bindings: the fold hoists their decl + pre-loop
+/// wiring assign ABOVE the folded `for…in` (LICM — the value is the
+/// same on every iteration), so no use of them can dangle afterwards.
 fn match_for_in(pre: &[Leaf], wcond: &Expr, body: &[SNode]) -> Option<LoopFold> {
-    // The LAST leaf of the pre-run must be the iterator phi-assign.
-    let (it_phi, obj) = match pre.last() {
+    // The header: one or more phi decls, then `const k = next-prop-name(it)`
+    // reading one of them — and nothing else.
+    let SNode::Stmts(hdr) = body.first()? else {
+        return None;
+    };
+    let mut k = 0;
+    let mut phi_names: Vec<String> = Vec::new();
+    while let Some(Leaf::Raw(Stmt::PhiDecl { name, .. })) = hdr.get(k) {
+        phi_names.push(name.clone());
+        k += 1;
+    }
+    if phi_names.is_empty() || k + 1 != hdr.len() {
+        return None;
+    }
+    let (binding, it_phi) = match &hdr[k] {
+        Leaf::Raw(Stmt::Declare {
+            name,
+            value:
+                Expr::Iter {
+                    op: IterOp::NextPropName,
+                    obj: it,
+                    ..
+                },
+            ..
+        }) => {
+            let it = temp_name(it)?.to_string();
+            if !phi_names.contains(&it) {
+                return None;
+            }
+            (name.clone(), it)
+        }
+        _ => return None,
+    };
+    // The pre-loop tail: exactly one wiring phi-assign per header phi
+    // (any order). The iterator's value must be the `GetPropIterator`.
+    let mut tail = pre.len();
+    let mut wiring: BTreeMap<String, Leaf> = BTreeMap::new();
+    while tail > 0 {
+        match &pre[tail - 1] {
+            Leaf::Raw(Stmt::PhiAssign { target, .. })
+                if phi_names.contains(target) && !wiring.contains_key(target) =>
+            {
+                wiring.insert(target.clone(), pre[tail - 1].clone());
+                tail -= 1;
+            }
+            _ => break,
+        }
+    }
+    if wiring.len() != phi_names.len() {
+        return None;
+    }
+    let obj = match wiring.remove(&it_phi) {
         Some(Leaf::Raw(Stmt::PhiAssign {
-            target,
             value:
                 Expr::Iter {
                     op: IterOp::GetPropIterator,
@@ -1358,32 +1695,30 @@ fn match_for_in(pre: &[Leaf], wcond: &Expr, body: &[SNode]) -> Option<LoopFold> 
                     ..
                 },
             ..
-        })) => (target.clone(), obj.as_ref().clone()),
+        })) => obj.as_ref().clone(),
         _ => return None,
     };
-    // The header: `let it;` (the phi) then `const k = next-prop-name(it)`.
-    let SNode::Stmts(hdr) = body.first()? else {
-        return None;
-    };
-    if hdr.len() != 2 {
+    // The extra phis' initial values must not reference any header
+    // internal — the hoisted assign is emitted ABOVE the loop, where
+    // those temps no longer exist (the fold consumes their decls).
+    if wiring.values().any(|l| {
+        let Leaf::Raw(Stmt::PhiAssign { value, .. }) = l else {
+            unreachable!()
+        };
+        phi_names.iter().any(|n| expr_uses_name(value, n))
+    }) {
         return None;
     }
-    let binding = match (&hdr[0], &hdr[1]) {
-        (
-            Leaf::Raw(Stmt::PhiDecl { name: p, .. }),
-            Leaf::Raw(Stmt::Declare {
-                name: k,
-                value:
-                    Expr::Iter {
-                        op: IterOp::NextPropName,
-                        obj: it,
-                        ..
-                    },
-                ..
-            }),
-        ) if *p == it_phi && temp_name(it) == Some(it_phi.as_str()) => k.clone(),
-        _ => return None,
-    };
+    // The hoisted wiring, in header order: the phi decl + its pre-loop
+    // assign (the iterator's own wiring is consumed by the fold).
+    let mut hoisted: Vec<Leaf> = Vec::new();
+    for (idx, name) in phi_names.iter().enumerate() {
+        if *name == it_phi {
+            continue;
+        }
+        hoisted.push(hdr[idx].clone());
+        hoisted.push(wiring[name].clone());
+    }
     // The condition: `undefined == k` (any wrapper depth, any equality).
     let eq_ok = match strip_cond(wcond) {
         Expr::Compare {
@@ -1409,11 +1744,12 @@ fn match_for_in(pre: &[Leaf], wcond: &Expr, body: &[SNode]) -> Option<LoopFold> 
         is_await: false,
         is_in: true,
         iter: obj,
-        pre_cut: 1,
-        phi_names: vec![it_phi.clone()],
+        pre_cut: pre.len() - tail,
+        phi_names: phi_names.clone(),
         res_name: None,
         done_name: None,
-        extra_internals: vec![it_phi],
+        extra_internals: phi_names,
+        hoisted,
     })
 }
 
@@ -1422,15 +1758,40 @@ fn match_for_in(pre: &[Leaf], wcond: &Expr, body: &[SNode]) -> Option<LoopFold> 
 /// the iterator-cleanup try. Returns `(binding, new_body)`.
 fn rebuild_loop_body(body: &[SNode], folded: &LoopFold) -> Option<(String, Vec<SNode>)> {
     if folded.is_in {
-        let binding = match &body.first() {
-            Some(SNode::Stmts(hdr)) => match &hdr[1] {
-                Leaf::Raw(Stmt::Declare { name, .. }) => name.clone(),
-                _ => return None,
-            },
+        let Some(SNode::Stmts(hdr)) = &body.first() else {
+            return None;
+        };
+        // The header phi temps (the iterator + any pass-through phis)
+        // with their SSA provenance — the copy-elimination roots.
+        let mut roots: BTreeMap<String, Expr> = BTreeMap::new();
+        for l in hdr.iter() {
+            if let Leaf::Raw(Stmt::PhiDecl { name, value_id }) = l {
+                roots.insert(
+                    name.clone(),
+                    Expr::Temp {
+                        name: name.clone(),
+                        value: *value_id,
+                    },
+                );
+            }
+        }
+        let binding = match hdr.last() {
+            Some(Leaf::Raw(Stmt::Declare { name, .. })) => name.clone(),
             _ => return None,
         };
         let mut out: Vec<SNode> = body.to_vec();
         out.remove(0);
+        // N74: the for-in iterator is a stateful, loop-invariant object
+        // (`NextPropName` advances it internally) and any extra header
+        // phi is a loop-invariant pass-through by construction — but
+        // es2abc merges their registers through the loop body's branch
+        // joins, leaving redundant copy phis (`v335 = phi(v325, v325)`)
+        // and self-assign back-edges (`v325 = v325`, possibly nested in
+        // an early-continue arm). Their assigns veto the fold via the
+        // internal-temp use check below, and the fallback emission's
+        // self-assign back-edge stalls the loop forever. Eliminate the
+        // identity copies and no-op self-assigns first.
+        elim_internal_copy_phis(&mut out, &roots);
         drop_self_assign_tail(&mut out);
         if nodes_use_any(&out, &folded.extra_internals) {
             return None;
@@ -2173,6 +2534,158 @@ fn drop_self_assign_tail(out: &mut Vec<SNode>) {
     }
 }
 
+/// N74: eliminate the redundant identity copies of the for-in loop's
+/// header-internal temps inside the loop body. The header internals
+/// (`roots`: the iterator phi + any pass-through phis) are loop-
+/// invariant by construction — the iterator is a stateful object that
+/// `NextPropName` advances INTERNALLY (its register value never
+/// changes), and a pass-through phi's only in-body assigns are
+/// self-assigns. es2abc keeps those registers live across the loop
+/// body's branch joins, and out-of-SSA recovery renders each join as a
+/// merge phi (`v335 = phi(v325, v325)`) — an identity copy of a root.
+///
+/// A body phi whose EVERY incoming value resolves (transitively) to the
+/// SAME root is such an identity copy: every use of it is substituted
+/// by the root temp (sound for ANY use position), then the plumbing is
+/// stripped — the copy phis' assigns/decls and the roots' (post-
+/// substitution) self-assigns, which are no-ops at ANY position (a
+/// branch arm's early-continue back-edge included, not just the loop
+/// tail). A phi whose incoming values are anything else (a real merge)
+/// keeps its uses; remaining assigns/uses of an internal likewise keep
+/// the caller's `nodes_use_any` veto authoritative. Everything runs on
+/// the caller's CLONE of the body, so a rejected fold leaves the tree
+/// untouched.
+fn elim_internal_copy_phis(out: &mut Vec<SNode>, roots: &BTreeMap<String, Expr>) {
+    // Collect the body's phi decls and phi-assign sources.
+    let mut decls: Vec<(String, ValueId)> = Vec::new();
+    let mut sources: Vec<(String, Option<String>)> = Vec::new();
+    walk_leaves(out, &mut |l| match l {
+        Leaf::Raw(Stmt::PhiDecl { name, value_id }) => decls.push((name.clone(), *value_id)),
+        Leaf::Raw(Stmt::PhiAssign { target, value, .. }) => {
+            sources.push((target.clone(), temp_name(value).map(str::to_string)))
+        }
+        _ => {}
+    });
+    // Fixpoint: a phi joins the copy set when it has at least one
+    // assign and EVERY assign source resolves to the SAME root (a root
+    // temp, or an already-classified copy of it). A non-temp source — a
+    // real value — or sources resolving to different roots disqualify
+    // the phi.
+    let mut copy_root: BTreeMap<String, (ValueId, String)> = BTreeMap::new();
+    loop {
+        let mut grew = false;
+        for (name, vid) in &decls {
+            if roots.contains_key(name.as_str()) || copy_root.contains_key(name.as_str()) {
+                continue;
+            }
+            let feeds: Vec<Option<&str>> = sources
+                .iter()
+                .filter(|(t, _)| t == name)
+                .map(|(_, s)| s.as_deref())
+                .collect();
+            if feeds.is_empty() {
+                continue;
+            }
+            let mut root: Option<&str> = None;
+            let mut ok = true;
+            for f in feeds {
+                let r = match f {
+                    Some(s) if roots.contains_key(s) => Some(s),
+                    Some(s) => match copy_root.get(s) {
+                        Some((_, r)) => Some(r.as_str()),
+                        None => None,
+                    },
+                    None => None,
+                };
+                match r {
+                    Some(r) if root.is_none() || root == Some(r) => root = Some(r),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok && let Some(r) = root {
+                copy_root.insert(name.clone(), (*vid, r.to_string()));
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    for (vid, r) in copy_root.values() {
+        subst_temp_in_nodes(out, *vid, &roots[r]);
+    }
+    let copy_names: BTreeSet<&str> = copy_root.keys().map(String::as_str).collect();
+    let root_names: BTreeSet<&str> = roots.keys().map(String::as_str).collect();
+    strip_internal_phi_plumbing(out, &root_names, &copy_names);
+}
+
+/// Strip the plumbing leaves of the eliminated internal-copy phis
+/// (N74): the copy phis' own assigns and decls, plus the internal
+/// temps' self-assigns (no-op back-edges at ANY body position). Nested
+/// bodies are recursed into (the branch joins feeding a copy phi sit
+/// inside the body's if/switch arms); statement runs left empty are
+/// removed.
+fn strip_internal_phi_plumbing(
+    out: &mut Vec<SNode>,
+    roots: &BTreeSet<&str>,
+    copies: &BTreeSet<&str>,
+) {
+    out.retain_mut(|n| match n {
+        SNode::Stmts(run) => {
+            run.retain(|l| match l {
+                Leaf::Raw(Stmt::PhiAssign { target, value, .. }) => {
+                    !copies.contains(target.as_str())
+                        && !(roots.contains(target.as_str())
+                            && temp_name(value) == Some(target.as_str()))
+                }
+                Leaf::Raw(Stmt::PhiDecl { name, .. }) => !copies.contains(name.as_str()),
+                _ => true,
+            });
+            !run.is_empty()
+        }
+        SNode::If {
+            then, otherwise, ..
+        } => {
+            strip_internal_phi_plumbing(then, roots, copies);
+            strip_internal_phi_plumbing(otherwise, roots, copies);
+            true
+        }
+        SNode::While { body, .. }
+        | SNode::DoWhile { body, .. }
+        | SNode::Labeled { body, .. }
+        | SNode::ForOf { body, .. }
+        | SNode::ForIn { body, .. } => {
+            strip_internal_phi_plumbing(body, roots, copies);
+            true
+        }
+        SNode::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
+            strip_internal_phi_plumbing(body, roots, copies);
+            for c in catches {
+                strip_internal_phi_plumbing(&mut c.body, roots, copies);
+            }
+            if let Some(f) = finally {
+                strip_internal_phi_plumbing(f, roots, copies);
+            }
+            true
+        }
+        SNode::Switch { cases, .. } => {
+            for c in cases {
+                strip_internal_phi_plumbing(&mut c.body, roots, copies);
+            }
+            true
+        }
+        SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => true,
+    });
+}
+
 /// Whether any node mentions any of the temp names.
 fn nodes_use_any(nodes: &[SNode], names: &[String]) -> bool {
     nodes.iter().any(|n| node_uses_any(n, names))
@@ -2721,6 +3234,12 @@ fn expr_children_mut(e: &mut Expr) -> Vec<&mut Expr> {
                     }
                     ObjEntry::Spread(s) | ObjEntry::Proto(s) => out.push(s),
                     ObjEntry::Method(_, f) => out.push(f),
+                    ObjEntry::Getter(k, f) | ObjEntry::Setter(k, f) => {
+                        if let crate::expr::ObjKey::Computed(c) = k {
+                            out.push(c);
+                        }
+                        out.push(f);
+                    }
                 }
             }
         }
@@ -3727,6 +4246,888 @@ pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldSta
     }
     let mut runs = 0usize;
     convert(nodes, &mut runs, &stores, params, &mut converted, stats);
+}
+
+// ── N74-W4: late declaration-site reconstruction (TDZ honesty) ─────
+//
+// The v1 scope model hoists every lexical/global binding: `let n;`
+// from emit's `lex_decls`, `var g;` at module top for global stores
+// (es2abc compiles function bodies STRICT — an undeclared STORE is a
+// ReferenceError, so the hoist cannot simply be dropped). Hoisting is
+// sound for value flow but DESTROYS the initialization window: a read
+// or closure call between scope entry and the first store sees
+// `undefined` where the original program's binding was still the TDZ
+// hole (lexical: `ldlexvar` + `ThrowUndefinedIfHoleWithName` →
+// ReferenceError) or did not exist at all (sloppy global:
+// undeclared-read ReferenceError). test262's `*-before-initialization`
+// rows and the "undeclared variable" operator rows (`x > (x = 1)`)
+// observe exactly this window.
+//
+// This fold reconstructs the window when it is PROVABLY faithful: the
+// binding's textually first store sits in a DECLARATION-CAPABLE run —
+// the function body's root statement run, or the root run of a `try`
+// BODY (a try body executes unconditionally up to the first throw, and
+// block-scope is safe there only when nothing references the name
+// outside that try body — checked). The first store becomes
+// `let n = <value>;` at that exact position; all other stores become
+// plain assignments; the hoisted `let n;` vanishes because
+// `lex_decls` only counts remaining `LexStore` leaves (the module-top
+// `var g;` stays — a function-scope `let` legally shadows it, and the
+// shadow IS the binding every in-function reference resolves to).
+// Every access executing before the declaration line then hits the JS
+// TDZ — the same ReferenceError the original program produced — and
+// every access after sees the stored value. Stores in nested functions
+// are capture-assignments to the same binding and stay assignments
+// (each function body is folded separately; their stores fail the
+// level/ownership check).
+//
+// Provable means ALL of:
+//   - the name is stored by exactly one KIND of store (lexical or
+//     global — a mix means the scope model is inconsistent);
+//   - for lexical stores, every store targets an OWN frame slot
+//     (level < own-push count, the `lex_decls` rule) — a capture store
+//     at level ≥ own belongs to an ancestor's binding;
+//   - global stores convert only at the TOP LEVEL (a `let` inside a
+//     nested function would shadow the global — dream gate:
+//     params-dflt-gen-meth's `callCount` died to exactly that);
+//   - the textually first store sits in a declaration-capable run, and
+//     when that run is inside a `try` body, NO reference to the name
+//     exists outside that try body (an outside reference would
+//     silently read the module-top `var` instead);
+//   - the name is not a parameter, was not already declared by
+//     [`scope_fold`], and is not a read-only global name
+//     (`undefined`/`NaN`/`Infinity` — the read-only-global collision
+//     lane owns those).
+//
+// Where the shape is unprovable the hoisted-`let`/hoisted-`var`
+// emission stays, unchanged (the honesty rule).
+
+/// One store occurrence for the late-decl fold.
+struct LateStore {
+    /// Sanitized binding name.
+    name: String,
+    /// Lexical store (vs global store).
+    lexical: bool,
+    /// The scope-chain level (lexical only; 0 for globals).
+    level: u16,
+    /// The innermost DECLARATION-CAPABLE region: `Some(0)` at the root
+    /// list, `Some(try-id)` inside a chain of `try` bodies; `None` when
+    /// the store sits in a run no declaration may occupy (an `if` arm,
+    /// a loop body, a `catch`/`finally`, …).
+    region: Option<usize>,
+    /// The enclosing try-body ids (innermost last) — the nesting check.
+    stack: Vec<usize>,
+    /// Whole-tree pre-order sequence number.
+    seq: usize,
+}
+
+/// The fold's whole-tree context.
+struct LateDeclCx {
+    /// Own lexenv pushes (the `lex_decls` ownership rule).
+    pushes: usize,
+    /// Names already declared (`scope_fold` conversions, params).
+    declared: std::collections::HashSet<String>,
+    /// Store sites, in pre-order.
+    stores: Vec<LateStore>,
+    /// `(name, try-stack-membership)`: a name read (or store target)
+    /// that appears OUTSIDE some try body — per try-id disqualifiers.
+    /// We record for every name-use the full try-stack; a candidate
+    /// with `try_id = Some(t)` dies if any use's stack lacks `t`.
+    uses: Vec<(String, Vec<usize>)>,
+    /// Monotonic try-body ids.
+    next_try: usize,
+    /// Pre-order counter.
+    seq: usize,
+    /// Sequence positions of every ScopePush/ScopePop (a name whose
+    /// use/store SPAN contains one may be re-pushed mid-span — a
+    /// different binding with the same name; N74-W4 corpus regression
+    /// for-update-continue-1: `let v2_0` declared twice for two
+    /// iterations' slots, the inner shadowing the outer's read).
+    scope_edges: Vec<usize>,
+}
+
+impl LateDeclCx {
+    fn new() -> Self {
+        Self {
+            pushes: 0,
+            declared: std::collections::HashSet::new(),
+            stores: Vec::new(),
+            uses: Vec::new(),
+            next_try: 1,
+            seq: 0,
+            scope_edges: Vec::new(),
+        }
+    }
+}
+
+/// Whether `e` mentions `name` as an identifier (a read of the
+/// binding; declaration sites and store targets are recorded by the
+/// caller).
+fn collect_ident_uses(e: &Expr, try_stack: &[usize], out: &mut Vec<(String, Vec<usize>)>) {
+    if let Expr::Ident(name) = e {
+        out.push((name.clone(), try_stack.to_vec()));
+    }
+    for c in expr_children(e) {
+        collect_ident_uses(c, try_stack, out);
+    }
+}
+
+/// Census for the late-decl fold. `region_stack` = enclosing
+/// DECLARATION-CAPABLE region ids (root list, try bodies, `if` arms,
+/// catch/finally bodies, labeled blocks — innermost last; loops and
+/// switch cases are NOT capable: a `let` there is per-iteration /
+/// fallthrough-unsafe). A store may become a declaration only when its
+/// run sits directly in a capable container (`capable_here`).
+fn late_decl_census(
+    nodes: &[SNode],
+    capable_here: bool,
+    region_stack: &mut Vec<usize>,
+    cx: &mut LateDeclCx,
+) {
+    for n in nodes {
+        match n {
+            SNode::Stmts(leaves) => {
+                for l in leaves {
+                    cx.seq += 1;
+                    match l {
+                        Leaf::Raw(Stmt::ScopePush { .. }) => {
+                            cx.pushes += 1;
+                            cx.scope_edges.push(cx.seq);
+                        }
+                        Leaf::Raw(Stmt::LexStore {
+                            level, name, value, ..
+                        }) => {
+                            let name = crate::legalize::sanitize(name);
+                            collect_ident_uses(value, region_stack, &mut cx.uses);
+                            cx.uses.push((name.clone(), region_stack.clone()));
+                            cx.stores.push(LateStore {
+                                name,
+                                lexical: true,
+                                level: *level,
+                                region: capable_here
+                                    .then(|| region_stack.last().copied().unwrap_or(0)),
+                                stack: region_stack.clone(),
+                                seq: cx.seq,
+                            });
+                        }
+                        Leaf::Raw(Stmt::GlobalStore { name, value, .. }) => {
+                            let name = crate::legalize::sanitize(name);
+                            collect_ident_uses(value, region_stack, &mut cx.uses);
+                            cx.uses.push((name.clone(), region_stack.clone()));
+                            cx.stores.push(LateStore {
+                                name,
+                                lexical: false,
+                                level: 0,
+                                region: capable_here
+                                    .then(|| region_stack.last().copied().unwrap_or(0)),
+                                stack: region_stack.clone(),
+                                seq: cx.seq,
+                            });
+                        }
+                        Leaf::Decl { name, value, .. } => {
+                            cx.declared.insert(name.clone());
+                            if let Some(v) = value {
+                                collect_ident_uses(v, region_stack, &mut cx.uses);
+                            }
+                        }
+                        Leaf::Raw(Stmt::ScopePop) => {
+                            cx.scope_edges.push(cx.seq);
+                        }
+                        Leaf::Assign { target, value } => {
+                            collect_ident_uses(value, region_stack, &mut cx.uses);
+                            cx.uses.push((target.clone(), region_stack.clone()));
+                        }
+                        Leaf::Raw(s) => {
+                            for e in stmt_exprs_of(s) {
+                                collect_ident_uses(e, region_stack, &mut cx.uses);
+                            }
+                        }
+                        Leaf::Destructure { obj, .. } => {
+                            collect_ident_uses(obj, region_stack, &mut cx.uses);
+                        }
+                    }
+                }
+            }
+            SNode::If {
+                cond,
+                then,
+                otherwise,
+            } => {
+                collect_ident_uses(cond, region_stack, &mut cx.uses);
+                for arm in [then, otherwise] {
+                    let id = cx.next_try;
+                    cx.next_try += 1;
+                    region_stack.push(id);
+                    late_decl_census(arm, true, region_stack, cx);
+                    region_stack.pop();
+                }
+            }
+            SNode::While { cond, body, .. } => {
+                if let Some(c) = cond {
+                    collect_ident_uses(c, region_stack, &mut cx.uses);
+                }
+                late_decl_census(body, false, region_stack, cx);
+            }
+            SNode::DoWhile { body, cond, .. } => {
+                late_decl_census(body, false, region_stack, cx);
+                collect_ident_uses(cond, region_stack, &mut cx.uses);
+            }
+            SNode::Labeled { body, .. } => {
+                let id = cx.next_try;
+                cx.next_try += 1;
+                region_stack.push(id);
+                late_decl_census(body, true, region_stack, cx);
+                region_stack.pop();
+            }
+            SNode::ForOf { iter, body, .. } => {
+                collect_ident_uses(iter, region_stack, &mut cx.uses);
+                late_decl_census(body, false, region_stack, cx);
+            }
+            SNode::ForIn { obj, body, .. } => {
+                collect_ident_uses(obj, region_stack, &mut cx.uses);
+                late_decl_census(body, false, region_stack, cx);
+            }
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                // Body, catches, and finally are all capable regions
+                // (a `let` confined to any of them is scoped to it).
+                let id = cx.next_try;
+                cx.next_try += 1;
+                region_stack.push(id);
+                late_decl_census(body, true, region_stack, cx);
+                region_stack.pop();
+                for c in catches {
+                    let id = cx.next_try;
+                    cx.next_try += 1;
+                    region_stack.push(id);
+                    late_decl_census(&c.body, true, region_stack, cx);
+                    region_stack.pop();
+                }
+                if let Some(f) = finally {
+                    let id = cx.next_try;
+                    cx.next_try += 1;
+                    region_stack.push(id);
+                    late_decl_census(f, true, region_stack, cx);
+                    region_stack.pop();
+                }
+            }
+            SNode::Switch { disc, cases } => {
+                collect_ident_uses(disc, region_stack, &mut cx.uses);
+                for c in cases {
+                    for t in &c.tests {
+                        collect_ident_uses(t, region_stack, &mut cx.uses);
+                    }
+                    late_decl_census(&c.body, false, region_stack, cx);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+}
+
+/// All expression positions of a raw statement (for the use census).
+fn stmt_exprs_of(s: &Stmt) -> Vec<&Expr> {
+    match s {
+        Stmt::Declare { value, .. } => vec![value],
+        Stmt::PhiAssign { value, .. } => vec![value],
+        Stmt::Expr(e) => vec![e],
+        Stmt::StoreProp { object, value, .. } => vec![object, value],
+        Stmt::StoreIndex {
+            object,
+            index,
+            value,
+            ..
+        } => vec![object, index, value],
+        Stmt::StoreDyn {
+            object, key, value, ..
+        } => vec![object, key, value],
+        Stmt::DefineMethod { object, func, .. } => vec![object, func],
+        Stmt::StorePrivate { object, value, .. } => vec![object, value],
+        Stmt::StoreSuper { key, value, .. } => key.iter().chain(std::iter::once(value)).collect(),
+        Stmt::LexStore { value, .. }
+        | Stmt::GlobalStore { value, .. }
+        | Stmt::ModuleStore { value, .. } => vec![value],
+        Stmt::Throw(e) => vec![e],
+        Stmt::Return(Some(e)) => vec![e],
+        Stmt::CondBranch { cond, .. } => vec![cond],
+        _ => Vec::new(),
+    }
+}
+
+/// See the section comment. Runs AFTER [`scope_fold`] (it consumes the
+/// stores scope_fold could not turn into declarations). `top_level`
+/// gates the global-store half (nested functions would shadow).
+pub fn late_decl_fold(
+    nodes: &mut Vec<SNode>,
+    params: &[String],
+    top_level: bool,
+    stats: &mut FoldStats,
+) {
+    let mut cx = LateDeclCx::new();
+    late_decl_census(nodes, true, &mut Vec::new(), &mut cx);
+
+    // Group by name; the qualifying set.
+    let mut names: Vec<String> = cx.stores.iter().map(|s| s.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    let mut convert: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for name in names {
+        let sites: Vec<&LateStore> = cx.stores.iter().filter(|s| s.name == name).collect();
+        // One store kind only (a lexical/global mix means the scope
+        // model is inconsistent — the honest fallback stays).
+        if sites.iter().any(|s| s.lexical) && sites.iter().any(|s| !s.lexical) {
+            continue;
+        }
+        // Lexical stores must all target OWN frame slots (the
+        // `lex_decls` rule); a capture store belongs to an ancestor.
+        if sites
+            .iter()
+            .any(|s| s.lexical && s.level as usize >= cx.pushes)
+        {
+            continue;
+        }
+        // Global stores convert only at the top level.
+        if sites.iter().any(|s| !s.lexical) && !top_level {
+            continue;
+        }
+        // Not a parameter, not already declared by scope_fold, not a
+        // read-only global name (the sister lane's collision class).
+        if params.iter().any(|p| *p == name)
+            || cx.declared.contains(&name)
+            || matches!(name.as_str(), "undefined" | "NaN" | "Infinity")
+        {
+            continue;
+        }
+        // Coverage model (N74-W4). When the root run holds a store the
+        // declaration goes to the root (a function-scope `let` covering
+        // everything; nested stores stay assignments). Otherwise each
+        // declaration-capable region holding a store gets its own `let`
+        // (sibling `try` bodies etc. — S13.2.1_A7_T4's independent
+        // `x = x` probes), provided:
+        //   - every OTHER store and every READ of the name is COVERED
+        //     by a converted region — the reference's region stack
+        //     contains the region id (region 0, the root, covers
+        //     everything) — otherwise that reference would silently
+        //     read the module-top `var`/outer binding instead;
+        //   - no converted region nests inside another (an inner `let`
+        //     would shadow the outer region's binding mid-window).
+        let root_has = sites.iter().any(|s| s.region == Some(0));
+        if root_has {
+            // Same-name re-push mid-span → distinct bindings; bail.
+            let span_lo = sites.iter().map(|s| s.seq).min().unwrap_or(0);
+            let mut span_hi = span_lo;
+            for (n, _) in cx.uses.iter().filter(|(n, _)| *n == name) {
+                let _ = n;
+            }
+            for s in sites.iter() {
+                span_hi = span_hi.max(s.seq);
+            }
+            if cx.scope_edges.iter().any(|e| *e > span_lo && *e < span_hi) {
+                continue;
+            }
+            convert.insert(name, vec![0]);
+            continue;
+        }
+        let store_regions: std::collections::HashSet<usize> =
+            sites.iter().filter_map(|s| s.region).collect();
+        if store_regions.is_empty() {
+            continue;
+        }
+        let nested = cx.stores.iter().filter(|st| st.name == name).any(|st| {
+            st.region.is_some()
+                && st
+                    .stack
+                    .iter()
+                    .any(|t| store_regions.contains(t) && Some(*t) != st.region)
+        });
+        if nested {
+            continue;
+        }
+        let covered = |stack: &Vec<usize>| {
+            store_regions.contains(&0) || stack.iter().any(|t| store_regions.contains(t))
+        };
+        if cx
+            .uses
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .any(|(_, stack)| !covered(stack))
+        {
+            continue;
+        }
+        // Same-name re-push mid-span → distinct bindings; bail.
+        let span_lo = sites.iter().map(|s| s.seq).min().unwrap_or(0);
+        let mut span_hi = span_lo;
+        for s in sites.iter() {
+            span_hi = span_hi.max(s.seq);
+        }
+        if cx.scope_edges.iter().any(|e| *e > span_lo && *e < span_hi) {
+            continue;
+        }
+        convert.insert(name, store_regions.iter().copied().collect());
+    }
+    if convert.is_empty() {
+        return;
+    }
+
+    // Rewrite: per (name, region), the first store becomes the `let`;
+    // every other store becomes a plain assignment. Region ids are
+    // recomputed with the census's traversal (same walk, same ids).
+    let mut declared_now: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite(
+        nodes: &mut Vec<SNode>,
+        capable_here: bool,
+        region_stack: &mut Vec<usize>,
+        next_try: &mut usize,
+        convert: &std::collections::HashMap<String, Vec<usize>>,
+        declared_now: &mut std::collections::HashSet<(String, usize)>,
+        stats: &mut FoldStats,
+    ) {
+        for n in nodes.iter_mut() {
+            match n {
+                SNode::Stmts(leaves) => {
+                    let region = capable_here.then(|| region_stack.last().copied().unwrap_or(0));
+                    for l in leaves.iter_mut() {
+                        let name_regions = match l {
+                            Leaf::Raw(Stmt::LexStore { name, .. })
+                            | Leaf::Raw(Stmt::GlobalStore { name, .. }) => convert
+                                .get(&crate::legalize::sanitize(name))
+                                .map(|r| (crate::legalize::sanitize(name), r)),
+                            _ => None,
+                        };
+                        let Some((name, regions)) = name_regions else {
+                            continue;
+                        };
+                        let value = match l {
+                            Leaf::Raw(Stmt::LexStore { value, .. })
+                            | Leaf::Raw(Stmt::GlobalStore { value, .. }) => value.clone(),
+                            _ => unreachable!(),
+                        };
+                        // A declaration only in the name's DECL regions;
+                        // other capable stores (and non-capable runs)
+                        // stay plain assignments to it.
+                        let key = region.map(|r| (name.clone(), r));
+                        if let Some(key) = key
+                            && regions.contains(&key.1)
+                            && !declared_now.contains(&key)
+                        {
+                            declared_now.insert(key);
+                            *l = Leaf::Decl {
+                                name,
+                                mutable: true,
+                                value: Some(value),
+                            };
+                            stats.late_decl += 1;
+                        } else {
+                            *l = Leaf::Assign {
+                                target: name,
+                                value,
+                            };
+                        }
+                    }
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    for arm in [then, otherwise] {
+                        let id = *next_try;
+                        *next_try += 1;
+                        region_stack.push(id);
+                        rewrite(
+                            arm,
+                            true,
+                            region_stack,
+                            next_try,
+                            convert,
+                            declared_now,
+                            stats,
+                        );
+                        region_stack.pop();
+                    }
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => rewrite(
+                    body,
+                    false,
+                    region_stack,
+                    next_try,
+                    convert,
+                    declared_now,
+                    stats,
+                ),
+                SNode::Labeled { body, .. } => {
+                    let id = *next_try;
+                    *next_try += 1;
+                    region_stack.push(id);
+                    rewrite(
+                        body,
+                        true,
+                        region_stack,
+                        next_try,
+                        convert,
+                        declared_now,
+                        stats,
+                    );
+                    region_stack.pop();
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    let id = *next_try;
+                    *next_try += 1;
+                    region_stack.push(id);
+                    rewrite(
+                        body,
+                        true,
+                        region_stack,
+                        next_try,
+                        convert,
+                        declared_now,
+                        stats,
+                    );
+                    region_stack.pop();
+                    for c in catches {
+                        let id = *next_try;
+                        *next_try += 1;
+                        region_stack.push(id);
+                        rewrite(
+                            &mut c.body,
+                            true,
+                            region_stack,
+                            next_try,
+                            convert,
+                            declared_now,
+                            stats,
+                        );
+                        region_stack.pop();
+                    }
+                    if let Some(f) = finally {
+                        let id = *next_try;
+                        *next_try += 1;
+                        region_stack.push(id);
+                        rewrite(
+                            f,
+                            true,
+                            region_stack,
+                            next_try,
+                            convert,
+                            declared_now,
+                            stats,
+                        );
+                        region_stack.pop();
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        rewrite(
+                            &mut c.body,
+                            false,
+                            region_stack,
+                            next_try,
+                            convert,
+                            declared_now,
+                            stats,
+                        );
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    let mut next_try = 1usize;
+    rewrite(
+        nodes,
+        true,
+        &mut Vec::new(),
+        &mut next_try,
+        &convert,
+        &mut declared_now,
+        stats,
+    );
+}
+
+// ── N74-W4: rest-parameter reconstruction ──────────────────────────
+//
+// es2abc lowers `(...rest)` / `(a, ...rest)` to `copyrestargs k` (k =
+// the named-parameter count) plus ONE extra frame slot past the named
+// params (the rest array's staging slot — recover sees it as a spurious
+// trailing visible parameter `pN`). The generic emission prints
+// `[...arguments].slice(k) /*CopyRestArgs*/` — wrong in arrows and
+// closures (`arguments` is the OUTER function's; test262's
+// arrowparameters-cover-rest rows read the outer script's empty
+// arguments) and wrong for `.length` (the spurious slot inflates it —
+// rest-parameters/expected-argument-count). When the body holds exactly
+// one `CopyRestArgs` shape, rewrite it to a real rest parameter: every
+// `Expr::RestArgs` becomes the rest name, the visible params at-or-past
+// `k` drop (the staging slot), and `...<name>` joins the printed
+// signature. Bails — keeping the loud approximation — when any dropped
+// parameter is referenced in the body.
+
+/// Apply `f` to every expression position in the tree (leaves AND
+/// node conditions — the mutation counterpart of the use-census walk).
+fn map_exprs_mut(nodes: &mut [SNode], f: &mut impl FnMut(&mut Expr)) {
+    fn one_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+        f(e);
+        for c in expr_children_mut(e) {
+            one_expr(c, f);
+        }
+    }
+    fn one_leaf(l: &mut Leaf, f: &mut impl FnMut(&mut Expr)) {
+        match l {
+            Leaf::Raw(s) => match s {
+                Stmt::Declare { value, .. }
+                | Stmt::PhiAssign { value, .. }
+                | Stmt::Expr(value)
+                | Stmt::Throw(value) => one_expr(value, f),
+                Stmt::Return(Some(e)) => one_expr(e, f),
+                Stmt::StoreProp { object, value, .. } => {
+                    one_expr(object, f);
+                    one_expr(value, f);
+                }
+                Stmt::StoreIndex {
+                    object,
+                    index,
+                    value,
+                    ..
+                } => {
+                    one_expr(object, f);
+                    one_expr(index, f);
+                    one_expr(value, f);
+                }
+                Stmt::StoreDyn {
+                    object, key, value, ..
+                } => {
+                    one_expr(object, f);
+                    one_expr(key, f);
+                    one_expr(value, f);
+                }
+                Stmt::DefineMethod { object, func, .. } => {
+                    one_expr(object, f);
+                    one_expr(func, f);
+                }
+                Stmt::StorePrivate { object, value, .. } => {
+                    one_expr(object, f);
+                    one_expr(value, f);
+                }
+                Stmt::StoreSuper { key, value, .. } => {
+                    if let Some(k) = key {
+                        one_expr(k, f);
+                    }
+                    one_expr(value, f);
+                }
+                Stmt::LexStore { value, .. }
+                | Stmt::GlobalStore { value, .. }
+                | Stmt::ModuleStore { value, .. } => one_expr(value, f),
+                Stmt::CondBranch { cond, .. } => one_expr(cond, f),
+                _ => {}
+            },
+            Leaf::Destructure { obj, .. } => one_expr(obj, f),
+            Leaf::Decl { value: Some(v), .. } => one_expr(v, f),
+            Leaf::Decl { value: None, .. } => {}
+            Leaf::Assign { value, .. } => one_expr(value, f),
+        }
+    }
+    for n in nodes {
+        match n {
+            SNode::Stmts(run) => {
+                for l in run {
+                    one_leaf(l, f);
+                }
+            }
+            SNode::If {
+                cond,
+                then,
+                otherwise,
+            } => {
+                one_expr(cond, f);
+                map_exprs_mut(then, f);
+                map_exprs_mut(otherwise, f);
+            }
+            SNode::While { cond, body, .. } => {
+                if let Some(c) = cond {
+                    one_expr(c, f);
+                }
+                map_exprs_mut(body, f);
+            }
+            SNode::DoWhile { body, cond, .. } => {
+                map_exprs_mut(body, f);
+                one_expr(cond, f);
+            }
+            SNode::Labeled { body, .. } => map_exprs_mut(body, f),
+            SNode::ForOf { iter, body, .. } => {
+                one_expr(iter, f);
+                map_exprs_mut(body, f);
+            }
+            SNode::ForIn { obj, body, .. } => {
+                one_expr(obj, f);
+                map_exprs_mut(body, f);
+            }
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                map_exprs_mut(body, f);
+                for c in catches {
+                    map_exprs_mut(&mut c.body, f);
+                }
+                if let Some(fin) = finally {
+                    map_exprs_mut(fin, f);
+                }
+            }
+            SNode::Switch { disc, cases } => {
+                one_expr(disc, f);
+                for c in cases {
+                    for t in &mut c.tests {
+                        one_expr(t, f);
+                    }
+                    map_exprs_mut(&mut c.body, f);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+}
+
+/// See the section comment. Mutates `params` (drops the staging slots,
+/// appends `...<rest>`) and rewrites the body's `RestArgs` exprs.
+/// `hidden` is the ABI-slot count (`params[hidden..]` are visible).
+pub fn rest_param_fold(
+    nodes: &mut Vec<SNode>,
+    params: &mut Vec<String>,
+    hidden: usize,
+    stats: &mut FoldStats,
+) {
+    // Exactly one CopyRestArgs shape?
+    let mut starts = BTreeSet::new();
+    map_exprs_mut(nodes, &mut |e| {
+        if let Expr::RestArgs { start_index } = e {
+            starts.insert(*start_index);
+        }
+    });
+    let collected: Vec<u16> = starts.into_iter().collect();
+    let [k] = collected[..] else {
+        return;
+    };
+    let k = k as usize;
+    let visible = params.len() - hidden.min(params.len());
+    if visible < k {
+        return; // shape mismatch — keep the approximation
+    }
+    // The dropped slots (the staging slot + anything past it) must be
+    // unreferenced.
+    let dropped: Vec<String> = params[hidden + k..].to_vec();
+    let mut dropped_used = false;
+    map_exprs_mut(nodes, &mut |e| {
+        if let Expr::Ident(n) = e
+            && dropped.iter().any(|d| d == n)
+        {
+            dropped_used = true;
+        }
+    });
+    if dropped_used {
+        return;
+    }
+    // Mint a collision-free rest name over every name the body knows.
+    let mut taken: BTreeSet<String> = params.iter().cloned().collect();
+    map_exprs_mut(nodes, &mut |e| match e {
+        Expr::Ident(n) => {
+            taken.insert(n.clone());
+        }
+        Expr::Temp { name, .. } => {
+            taken.insert(name.clone());
+        }
+        _ => {}
+    });
+    walk_leaves(nodes, &mut |l| match l {
+        Leaf::Raw(Stmt::Declare { name, .. }) | Leaf::Raw(Stmt::PhiDecl { name, .. }) => {
+            taken.insert(name.clone());
+        }
+        Leaf::Raw(Stmt::PhiAssign { target, .. }) => {
+            taken.insert(target.clone());
+        }
+        Leaf::Raw(Stmt::LexStore { name, .. }) | Leaf::Raw(Stmt::GlobalStore { name, .. }) => {
+            taken.insert(crate::legalize::sanitize(name));
+        }
+        Leaf::Decl { name, .. } => {
+            taken.insert(name.clone());
+        }
+        Leaf::Assign { target, .. } => {
+            taken.insert(target.clone());
+        }
+        _ => {}
+    });
+    let mut rest = "rest".to_string();
+    let mut i = 1usize;
+    while taken.contains(&rest) {
+        rest = format!("rest${i}");
+        i += 1;
+    }
+    // Rewrite. A bare `rest;` expression-statement (an unused
+    // CopyRestArgs result — keep-alive evidence, recover.rs) is
+    // consumed, not rewritten.
+    let rest_expr = Expr::Ident(rest.clone());
+    fn strip_bare_rest(nodes: &mut Vec<SNode>) {
+        for n in nodes.iter_mut() {
+            match n {
+                SNode::Stmts(run) => {
+                    run.retain(|l| !matches!(l, Leaf::Raw(Stmt::Expr(Expr::RestArgs { .. }))));
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    strip_bare_rest(then);
+                    strip_bare_rest(otherwise);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => strip_bare_rest(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    strip_bare_rest(body);
+                    for c in catches {
+                        strip_bare_rest(&mut c.body);
+                    }
+                    if let Some(f) = finally {
+                        strip_bare_rest(f);
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        strip_bare_rest(&mut c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    strip_bare_rest(nodes);
+    map_exprs_mut(nodes, &mut |e| {
+        if matches!(e, Expr::RestArgs { .. }) {
+            *e = rest_expr.clone();
+        }
+    });
+    params.truncate(hidden + k);
+    params.push(format!("...{rest}"));
+    stats.rest_param += 1;
 }
 
 // ── Generator driver fold (R4, d-P11) ──────────────────────────────
@@ -6258,6 +7659,10 @@ fn walk_leaves(nodes: &[SNode], f: &mut impl FnMut(&Leaf)) {
 }
 
 /// Does any expression in the tree reference the given temp value?
+/// N74-W4: node CONDITION/discriminant expressions count too —
+/// `walk_leaves` never visits them, which dropped the `const t = yield
+/// v` binding when the resumption value was only read by an `if`/`while`
+/// test (test262 methods-gen-yield-as-expression-*: `if (!v388)`).
 fn nodes_use_temp(nodes: &[SNode], id: ValueId) -> bool {
     fn expr_uses(e: &Expr, id: ValueId) -> bool {
         if temp_value(e) == Some(id) {
@@ -6265,19 +7670,43 @@ fn nodes_use_temp(nodes: &[SNode], id: ValueId) -> bool {
         }
         expr_children(e).iter().any(|c| expr_uses(c, id))
     }
-    let mut found = false;
-    walk_leaves(nodes, &mut |l| {
-        if found {
-            return;
-        }
-        for e in leaf_exprs(l) {
-            if expr_uses(e, id) {
-                found = true;
-                return;
+    fn node_uses(n: &SNode, id: ValueId) -> bool {
+        match n {
+            SNode::Stmts(run) => run
+                .iter()
+                .any(|l| leaf_exprs(l).iter().any(|e| expr_uses(e, id))),
+            SNode::If {
+                cond,
+                then,
+                otherwise,
+            } => expr_uses(cond, id) || nodes_use_temp(then, id) || nodes_use_temp(otherwise, id),
+            SNode::While { cond, body, .. } => {
+                cond.as_ref().is_some_and(|c| expr_uses(c, id)) || nodes_use_temp(body, id)
             }
+            SNode::DoWhile { body, cond, .. } => nodes_use_temp(body, id) || expr_uses(cond, id),
+            SNode::Labeled { body, .. } => nodes_use_temp(body, id),
+            SNode::ForOf { iter, body, .. } => expr_uses(iter, id) || nodes_use_temp(body, id),
+            SNode::ForIn { obj, body, .. } => expr_uses(obj, id) || nodes_use_temp(body, id),
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                nodes_use_temp(body, id)
+                    || catches.iter().any(|c| nodes_use_temp(&c.body, id))
+                    || finally.as_ref().is_some_and(|f| nodes_use_temp(f, id))
+            }
+            SNode::Switch { disc, cases } => {
+                expr_uses(disc, id)
+                    || cases.iter().any(|c| {
+                        c.tests.iter().any(|t| expr_uses(t, id)) || nodes_use_temp(&c.body, id)
+                    })
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => false,
         }
-    });
-    found
+    }
+    nodes.iter().any(|n| node_uses(n, id))
 }
 
 /// Count temp references over the whole tree (for the dead-decl sweep).

@@ -11,6 +11,17 @@
 //! 2. **No reserved words** (full ES2022 keyword + future-reserved +
 //!    strict-reserved set, plus `undefined`/`arguments`/`eval` which are
 //!    legal but shadow-hostile): a trailing `_` is appended.
+//! 2b. **No non-writable globals** (ECMA-262 §19.1 — the global object's
+//!    VALUE properties with [[Writable]]: false are exactly `undefined`,
+//!    `NaN`, `Infinity`; `undefined` is already in rule 2). A local
+//!    declaration under one of these names is legal JS per spec (Node
+//!    accepts `const NaN = …` in function scope) but es2abc resolves the
+//!    identifier to the global RECORD and compiles the initializer as a
+//!    STORE to the read-only global — `TypeError: Cannot assign to read
+//!    only property` at runtime (N74, the test262
+//!    read-only-global-name-collision class). So these names are never
+//!    used as declared bindings; property ACCESSES (`Number.NaN`) are
+//!    unaffected — [`is_legal_ident`] still accepts them.
 //! 3. **Collision-disambiguated per scope**: a [`Legalizer`] owns a
 //!    used-name set (one per function); collisions get `$1`, `$2`, …
 //!    suffixes in first-come-first-served order (deterministic).
@@ -85,6 +96,21 @@ pub fn is_reserved(s: &str) -> bool {
     RESERVED.contains(&s)
 }
 
+/// The non-writable, non-configurable VALUE properties of the global
+/// object (ECMA-262 §19.1; the complete list is `undefined`, `NaN`,
+/// `Infinity` — `undefined` is already covered by [`RESERVED`]). Every
+/// other global property (writable) can be shadowed by a local binding
+/// without es2abc miscompiling the declaration; these cannot.
+const NONWRITABLE_GLOBALS: &[&str] = &["Infinity", "NaN"];
+
+/// Whether `s` names a non-writable global value property — legal to
+/// REFERENCE (`Number.NaN`, a bare `NaN` read), never legal to DECLARE
+/// under es2abc (the binding's initializer compiles as a store to the
+/// read-only global → runtime TypeError; N74).
+pub fn is_nonwritable_global(s: &str) -> bool {
+    NONWRITABLE_GLOBALS.contains(&s)
+}
+
 /// Whether `s` is already a valid, non-reserved JS identifier.
 pub fn is_legal_ident(s: &str) -> bool {
     let mut chars = s.chars();
@@ -124,7 +150,8 @@ fn is_ident_part(c: char) -> bool {
 
 /// Sanitize `raw` into a valid, non-reserved identifier shape (rule 1+2,
 /// WITHOUT collision handling): invalid characters become `_`, an empty
-/// result becomes `"_"`, a reserved word gets a trailing `_`.
+/// result becomes `"_"`, a reserved word or non-writable global
+/// ([`is_nonwritable_global`], rule 2b) gets a trailing `_`.
 pub fn sanitize(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 1);
     for (i, c) in raw.chars().enumerate() {
@@ -144,7 +171,7 @@ pub fn sanitize(raw: &str) -> String {
     if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         out.insert(0, '_');
     }
-    if is_reserved(&out) {
+    if is_reserved(&out) || is_nonwritable_global(&out) {
         out.push('_');
     }
     out
@@ -205,8 +232,28 @@ mod tests {
         assert_eq!(sanitize("a-b.c"), "a_b_c");
         assert_eq!(sanitize("let"), "let_");
         assert_eq!(sanitize("yield"), "yield_");
+        // N74: non-writable globals are renamed for BINDINGS …
+        assert_eq!(sanitize("NaN"), "NaN_");
+        assert_eq!(sanitize("Infinity"), "Infinity_");
+        assert_eq!(sanitize("undefined"), "undefined_");
+        assert_eq!(sanitize("NaN_"), "NaN_"); // idempotent
+        assert_eq!(sanitize("NaN1"), "NaN1"); // prefix, not the name
         assert_eq!(sanitize("$ok"), "$ok");
         assert_eq!(sanitize("_ok_2"), "_ok_2");
+    }
+
+    #[test]
+    fn nonwritable_globals_stay_legal_idents() {
+        // … but property access (`Number.NaN`) is not a binding:
+        // `is_legal_ident`/`is_reserved` are unchanged so member/key
+        // rendering keeps the dot form.
+        assert!(is_legal_ident("NaN"));
+        assert!(is_legal_ident("Infinity"));
+        assert!(!is_reserved("NaN"));
+        assert!(is_nonwritable_global("NaN"));
+        assert!(is_nonwritable_global("Infinity"));
+        assert!(!is_nonwritable_global("undefined")); // already RESERVED
+        assert!(!is_nonwritable_global("NaN_"));
     }
 
     #[test]

@@ -1245,8 +1245,10 @@ fn forbidden_callee_ops_are_skipped() {
     {
         let mut b = V2Builder::new(&mut module, g);
         let name = b.sym("x");
+        let this_value = b.create_param();
         b.emit(Op::LoadSuper {
             key: SuperKey::Name(name),
+            this_value,
         });
         b.emit_void(Op::Return { value: None });
     }

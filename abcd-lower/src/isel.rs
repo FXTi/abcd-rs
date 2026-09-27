@@ -1462,26 +1462,60 @@ fn select_inst(
                 tracer.literal_eid(*names),
             ));
         }
-        Op::LoadSuper { key } => {
+        Op::LoadSuper { key, this_value } => {
             match key {
                 SuperKey::Name(name) => {
                     codes.push(Bytecode::Ldsuperbyname(ic.two(), tracer.eid(*name)));
                 }
                 SuperKey::Dynamic(k) => {
-                    let key_r = val_reg(func_id, *k, alloc, codes, 0)?;
-                    codes.push(Bytecode::Ldsuperbyvalue(ic.two(), key_r));
+                    // Vendor `ldsuperbyvalue imm, v; acc: inout`:
+                    // v = thisValue, acc = the KEY (N74-W4).
+                    let regs = materialize_operands(
+                        tracker,
+                        func_id,
+                        &[*this_value],
+                        Some(*k),
+                        alloc,
+                        codes,
+                    )?;
+                    codes.push(Bytecode::Ldsuperbyvalue(ic.two(), regs[0]));
                 }
             }
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
-        Op::StoreSuper { key, value } => match key {
+        Op::StoreSuper {
+            key,
+            this_value,
+            value,
+        } => match key {
             SuperKey::Name(name) => {
-                let val_r = val_reg(func_id, *value, alloc, codes, 0)?;
-                codes.push(Bytecode::Stsuperbyname(ic.two(), tracer.eid(*name), val_r));
+                // Vendor `stsuperbyname imm, string_id, v; acc: in`:
+                // v = thisValue, acc = the value (N74-W4).
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[*this_value],
+                    Some(*value),
+                    alloc,
+                    codes,
+                )?;
+                codes.push(Bytecode::Stsuperbyname(
+                    ic.two(),
+                    tracer.eid(*name),
+                    regs[0],
+                ));
             }
             SuperKey::Dynamic(k) => {
-                let regs =
-                    materialize_operands(tracker, func_id, &[*k, *value], None, alloc, codes)?;
+                // Vendor `stsuperbyvalue imm, v1, v2; acc: in`: v1 =
+                // thisValue, v2 = key, acc = value (N74-W4).
+                let regs = materialize_operands(
+                    tracker,
+                    func_id,
+                    &[*this_value, *k],
+                    Some(*value),
+                    alloc,
+                    codes,
+                )?;
                 codes.push(Bytecode::Stsuperbyvalue(ic.two(), regs[0], regs[1]));
             }
         },

@@ -292,11 +292,14 @@ fn generate() -> usize {
 ///   Number.NaN`); es2abc compiles a local named NaN/undefined as an
 ///   ASSIGNMENT TO THE READ-ONLY GLOBAL → TypeError. Minimal repro
 ///   verified against the image (`function f(){ const NaN = 5; ... }`).
-/// - decompile-bug-top-level-this-undefined (9): the call_entry wrapper
-///   rebinds script-level `this` from globalThis to undefined under
-///   es2abc/ark_js_vm (plain function call = undefined receiver; Node
-///   sloppy mode gives globalThis — the decompiled text is correct
-///   under Node, wrong under ark). Minimal repro verified.
+/// - decompile-bug-top-level-this-undefined (9): FIXED (N74-W3,
+///   delisted). The call_entry wrapper rebound script-level `this`
+///   from globalThis to undefined under es2abc/ark_js_vm (a plain
+///   function call has an undefined receiver under es2abc's strict
+///   functions; Node's sloppy mode masked it). The entry call now
+///   emits `func_main_0.call(this)` — the emitted file's own top-level
+///   receiver is exactly what the VM bound for the original entry:
+///   globalThis for a script main, undefined for a module.
 ///
 /// The pass floor below guards regressions; raise it as ledger classes
 /// are fixed and delisted.
@@ -355,8 +358,8 @@ fn dream_gate_t262_oracle() {
 }
 
 /// The measured first-contact pass floor (test262 P3, 2026-09-27):
-/// 2451/2685 = 2425 exact + 26 stderr-path-only rows reconciled by
-/// error-name normalization; the remaining 234 divergences are all
-/// ledgered. Raise this as classes are fixed and delisted; NEVER lower
-/// it without a registered finding.
-const T262_PASS_FLOOR: usize = 2451;
+/// N74 wave (2026-09-27): pass 2666 / decompile-bug 10 / expected-fallback 9
+/// (the misc-assertion class holds the 10 documented residuals; the
+/// expected-fallback class is the generator-machinery loud fallbacks).
+/// The floor pins the post-wave state; the ledger gates the 19.
+const T262_PASS_FLOOR: usize = 2666;

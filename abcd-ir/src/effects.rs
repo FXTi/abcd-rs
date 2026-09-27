@@ -776,6 +776,7 @@ mod tests {
             },
             Op::LoadSuper {
                 key: crate::op::SuperKey::Name(name),
+                this_value: v,
             },
         ];
         for op in cases {
