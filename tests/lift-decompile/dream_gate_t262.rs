@@ -361,5 +361,7 @@ fn dream_gate_t262_oracle() {
 /// N74 wave (2026-09-27): pass 2666 / decompile-bug 10 / expected-fallback 9
 /// (the misc-assertion class holds the 10 documented residuals; the
 /// expected-fallback class is the generator-machinery loud fallbacks).
-/// The floor pins the post-wave state; the ledger gates the 19.
-const T262_PASS_FLOOR: usize = 2666;
+/// N74 residual (2026-09-28): the labeled for-in row
+/// (statements/labeled/S12.12_A1_T1) fixed + delisted — 2667.
+/// The floor pins the post-wave state; the ledger gates the rest.
+const T262_PASS_FLOOR: usize = 2675;
