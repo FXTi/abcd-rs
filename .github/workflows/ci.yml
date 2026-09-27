@@ -409,9 +409,6 @@ jobs:
       - name: Collect coverage (full estate incl. the corpus suites)
         run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored
 
-          python3 .github/scripts/lcov-summary.py lcov.info >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
         with:
