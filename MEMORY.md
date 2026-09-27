@@ -1109,3 +1109,13 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   read-only global name collisions (26), top-level this (9), plus smaller
   classes. dream-gate.py's ledger-exit-code swallow fixed. CI job
   test262-dream live per-push (676s native, within budget).
+- N74 wave landed (fe9bc93 + 08d598c): 215 of the 225 test262-dream
+  divergences fixed across four parallel workers (for-in stall 85 /
+  read-only globals 26 / top-level this 9 / long-tail 95 with 12 distinct
+  mechanisms incl. DeadPure deleting user-visible operator effects, the
+  late_decl_fold TDZ family, member-kind restoration, super operand-role
+  fixes in IR+lift+lower). Gate now 2666/2685 with 19 documented rows.
+  Registered follow-ups: N75 (WTF-8 string fidelity, 3 rows — decode/IR/
+  emit-level), N76 (structurer try/switch deep water, 5 rows), plus two
+  single rows to chase (labeled for-in, decl-lex in the DREAM gate — the
+  VM-ledger row was fixed by l-P2 but the dream-gate instance persists).
