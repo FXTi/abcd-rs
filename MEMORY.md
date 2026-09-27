@@ -1127,3 +1127,46 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   skip the conversion for Closure/Class-valued bindings at module top
   level; function-local closures keep it. 1149 gate green (198s), t262
   gate unchanged (2666/2685), workspace 726/0.
+- N76 structurer wave (uncommitted at write time): 4 of the 5 deep-water
+  test262 rows fixed. Mechanisms: (1) multi-entry continuation sets with
+  overlapping entry slices decompose into tail-arm-first Alternates
+  (regions.rs structure_shared_tail) instead of the state-variable escape
+  hatch — the hatch ran unconditionally inline and clobbered results
+  (switch/S12.11_A1_T2); plus the sequence-run fold now accepts an arm
+  that DIVERGES via a terminator action (previously bailed → the leaf
+  emitter silently dropped the skip edge's jump). (2) The finally idiom's
+  outer regions protect inner-handler BODY blocks, not just heads — the
+  shim ride-along missed them, so outer_wrap_plan now falls back to the
+  root frame's full plan list; pending_wraps suppresses re-wrapping the
+  in-flight chain (without it the nesting duplicates exponentially:
+  A7_T2 hit 12MB before), and verified_fallout proves handler cut-edge
+  fall-outs against the try/catch's known physical continuation
+  (A7_T1's `ReferenceError: v384`, A7_T2's escaping ex3). (3) Blocks with
+  handler-side Normal preds (handler rejoin targets) are demoted out of
+  conditional arms into the continuation (regions.rs external_preds), and
+  cross_arm_dup grew a tree form for conditional tails (nested if/else,
+  bounded by the sibling arm's region) + handler cut edges duplicate
+  small terminal tails when fall-out is unverified (A15). LESSON: the
+  sibling arm-entry re-entry demotion (cross edge → sibling entry ⇒
+  demote sibling to continuation) is sound and prettier but BREAKS the
+  generator/async machine folds' vendor-shape pattern match (yield* rows
+  regressed to hard-fallbacks) — reverted; the d-P3 duplication fold owns
+  that shape. Residual: try/S12.14_A9_T5 (try range cuts a do-while;
+  needs in-loop try placement + join-hoist rejoin into nested tails —
+  design note in the ledger $comment). Known wart: A7_T2's emission is
+  ~12MB (correct; the absorbed-continuation duplication model); the
+  de-absorption refactor (handler sets stop at shared joins) is the
+  follow-up.
+- N75 + N76 + N74-residuals landed (a59b0ff/824c788/1053252): lone
+  surrogates emit as \uXXXX escapes (raw-aware string rendering through a
+  Module string_raw_bytes side-table); record-only global names hoist as
+  `let` not `var` (the var predecl compiled to a real global store under
+  es2abc script mode and clobbered builtins); structurer deep water 4/5
+  (shared-tail alternates, outer-wrap root fallback, pending_wraps,
+  handler-rejoin demotion); labeled for-in single-pass fold. The ledger
+  holds ONE row (A9_T5, design noted); t262 dream gate 2675/2685 with
+  floor pinned. Remaining registered: A9_T5 (needs the continuation
+  de-absorption refactor — also the fix for A7_T2's 12MB emission wart).
+  CI budget note: lift-decompile ~19min and test262-dream ~15min on GH
+  exceed the 12-min target — pending maintainer decision (accept /
+  split jobs / sample lever).
