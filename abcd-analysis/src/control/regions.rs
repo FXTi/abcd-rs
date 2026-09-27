@@ -427,6 +427,14 @@ pub fn structure_regions(module: &Module, func: FuncId) -> RegionTree {
     // terminator order, deduped; predecessors sorted, deduped).
     let mut succs: Vec<Vec<BlockId>> = vec![Vec::new(); module.blocks.len()];
     let mut preds: Vec<Vec<BlockId>> = vec![Vec::new(); module.blocks.len()];
+    // Blocks with a Normal predecessor OUTSIDE the universe (the N45
+    // model: handler sub-CFGs are structured separately, so their
+    // Normal out-edges into the shared continuation are invisible in
+    // the filtered tables). Such a block is a handler-path rejoin
+    // target: the handler side can only reach it by falling out of a
+    // catch clause onto it, so it must never be buried inside a
+    // conditional arm (N76).
+    let mut external_preds: BTreeSet<BlockId> = BTreeSet::new();
     for &b in &universe {
         let mut seen = BTreeSet::new();
         succs[b.index()] = block_succs(module, b)
@@ -434,6 +442,13 @@ pub fn structure_regions(module: &Module, func: FuncId) -> RegionTree {
             .filter(|s| universe.contains(s) && seen.insert(*s))
             .collect();
         if let Some(bb) = module.block(b) {
+            if bb
+                .preds
+                .iter()
+                .any(|e| e.kind == EdgeKind::Normal && !universe.contains(&e.from))
+            {
+                external_preds.insert(b);
+            }
             preds[b.index()] = bb
                 .preds
                 .iter()
@@ -515,6 +530,23 @@ pub fn structure_regions(module: &Module, func: FuncId) -> RegionTree {
         });
     }
 
+    // Innermost natural loop per block (the tail-arm decomposition's
+    // fold-compatibility bail — see `Builder::structure_shared_tail`).
+    let mut block_loop: Vec<Option<usize>> = vec![None; module.blocks.len()];
+    for (i, l) in loops.iter().enumerate() {
+        let set: BTreeSet<BlockId> = l.blocks.iter().copied().collect();
+        for &b in &l.blocks {
+            block_loop[b.index()] = match block_loop[b.index()] {
+                Some(j) if loops[j].blocks.len() <= set.len() => Some(j),
+                _ => Some(i),
+            };
+        }
+    }
+    let loop_sets: Vec<BTreeSet<BlockId>> = loops
+        .iter()
+        .map(|l| l.blocks.iter().copied().collect())
+        .collect();
+
     // Build the tree.
     let mut builder = Builder {
         succs,
@@ -524,6 +556,9 @@ pub fn structure_regions(module: &Module, func: FuncId) -> RegionTree {
         nodes: Vec::new(),
         escape_hatches: Vec::new(),
         cross_arms: Vec::new(),
+        external_preds,
+        block_loop,
+        loop_sets,
     };
     let root = if universe.is_empty() {
         None
@@ -586,6 +621,13 @@ struct Builder {
     nodes: Vec<RegionNode>,
     escape_hatches: Vec<EscapeHatch>,
     cross_arms: Vec<(BlockId, BlockId)>,
+    /// Universe blocks with a Normal predecessor outside the universe
+    /// (handler-side rejoin targets — see `structure_regions`).
+    external_preds: BTreeSet<BlockId>,
+    /// Innermost natural loop per block (index into `loop_sets`).
+    block_loop: Vec<Option<usize>>,
+    /// Natural-loop block sets, indexed by `block_loop`.
+    loop_sets: Vec<BTreeSet<BlockId>>,
 }
 
 impl Builder {
@@ -844,7 +886,9 @@ impl Builder {
 
     /// Structure a remainder set entered by handoff from already-structured
     /// siblings. Single entry: plain recursion. Multiple entries: disjoint
-    /// per-entry slices become labeled alternates; anything else escapes.
+    /// per-entry slices become labeled alternates; overlapping slices with
+    /// a shared fall-through tail become a tail-arm alternates
+    /// ([`Builder::structure_shared_tail`]); anything else escapes.
     fn structure_continuation(
         &mut self,
         set: BTreeSet<BlockId>,
@@ -879,11 +923,21 @@ impl Builder {
                     }
                 }
                 if !disjoint || covered != set {
-                    self.escape_hatches.push(EscapeHatch::MultiEntry {
-                        blocks: set.iter().copied().collect(),
-                        entries,
-                    });
-                    self.irreducible_node(&set)
+                    // Overlapping slices: the es2abc switch fall-through
+                    // shape — several entries converge on a SHARED TAIL
+                    // (case bodies falling into each other). Try the
+                    // tail-arm decomposition before escaping.
+                    if let Some(node) =
+                        self.structure_shared_tail(&set, &entries, &slices, disabled)
+                    {
+                        node
+                    } else {
+                        self.escape_hatches.push(EscapeHatch::MultiEntry {
+                            blocks: set.iter().copied().collect(),
+                            entries,
+                        });
+                        self.irreducible_node(&set)
+                    }
                 } else {
                     let arms: Vec<RegionId> = entries
                         .iter()
@@ -897,6 +951,131 @@ impl Builder {
                 }
             }
         }
+    }
+
+    /// Shared-tail decomposition of a multi-entry set whose per-entry
+    /// slices OVERLAP (the switch fall-through shape: `case A: …` falls
+    /// into `case B: …`, and `B` is also a direct dispatch target).
+    ///
+    /// `tail` = the blocks reachable from EVERY entry. When the tail is
+    /// non-empty, suffix-closed within the set (no edge loops back into
+    /// an exclusive prefix), the exclusive prefixes are pairwise
+    /// disjoint, and every edge into the tail — from the prefixes or
+    /// from outside the set — lands on ONE block `t0`, the set
+    /// structures as
+    ///
+    /// ```text
+    /// Alternates([Labeled(t0, tail), Labeled(e1, prefix1), …])
+    /// ```
+    ///
+    /// with the TAIL AS THE FIRST ARM: the labeled-alternates emission
+    /// nests the prefix arms inside the tail arm's label, so a prefix
+    /// arm's out-edge to `t0` emits as `break L$t0` — landing exactly
+    /// at the tail's start — and the tail arm itself falls through to
+    /// the continuation. This is the source-shaped form the state-
+    /// variable escape hatch (design §4.2.4) previously flattened.
+    ///
+    /// Returns `None` (caller escapes to the hatch) when any
+    /// precondition fails.
+    fn structure_shared_tail(
+        &mut self,
+        set: &BTreeSet<BlockId>,
+        entries: &[BlockId],
+        slices: &[BTreeSet<BlockId>],
+        disabled: &BTreeSet<BlockId>,
+    ) -> Option<RegionId> {
+        // The tail: reachable from every entry.
+        let mut tail = slices.first()?.clone();
+        for slice in &slices[1..] {
+            tail = tail.intersection(slice).copied().collect();
+        }
+        if tail.is_empty() {
+            return None;
+        }
+        // Suffix-closed: no edge from the tail back into an exclusive
+        // prefix (that would be a cycle crossing the split — genuinely
+        // irreducible).
+        for &b in &tail {
+            for &s in &self.succs[b.index()] {
+                if set.contains(&s) && !tail.contains(&s) {
+                    return None;
+                }
+            }
+        }
+        // Exclusive prefixes: pairwise disjoint, and with the tail they
+        // cover the set exactly.
+        let prefixes: Vec<BTreeSet<BlockId>> = slices
+            .iter()
+            .map(|s| s.difference(&tail).copied().collect())
+            .collect();
+        let mut seen: BTreeSet<BlockId> = BTreeSet::new();
+        for prefix in &prefixes {
+            for &b in prefix {
+                if !seen.insert(b) {
+                    return None;
+                }
+            }
+        }
+        if seen.len() + tail.len() != set.len() {
+            return None;
+        }
+        // Single tail entry `t0`: every edge into the tail — from a
+        // prefix or from outside the set — targets it. (An outside edge
+        // landing mid-tail has no label to break to; mid-tail entries
+        // from prefixes would need multiple tail labels.)
+        let mut t0: Option<BlockId> = None;
+        for &b in &tail {
+            for &p in &self.preds[b.index()] {
+                if tail.contains(&p) {
+                    continue;
+                }
+                match t0 {
+                    None => t0 = Some(b),
+                    Some(t) if t == b => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        let t0 = t0?;
+        // Fold-compatibility bail: an arm entry targeted by an edge
+        // from a loop that is not wholly inside this set would force a
+        // LABELED break/continue at that loop's exit — but the
+        // vendor-machinery folds (the for-in driver, the generator
+        // state machines) pattern-match the es2abc plumbing WITH plain
+        // unlabeled exits, and restructuring them into the alternates
+        // breaks the fold (the loop then emits raw self-assigning
+        // plumbing that never advances — a HANG, dream gate: test262
+        // built-ins/Object/keys/15.2.3.14-5-12). Keep the honest
+        // state-machine escape hatch for those; the hatch is what the
+        // folds have always tolerated.
+        let arm_entry_has_loop_pred = std::iter::once(&t0).chain(entries.iter()).any(|&e| {
+            self.preds[e.index()]
+                .iter()
+                .any(|p| match self.block_loop[p.index()] {
+                    Some(l) => !self.loop_sets[l].is_subset(set),
+                    None => false,
+                })
+        });
+        if arm_entry_has_loop_pred {
+            return None;
+        }
+        // Arms: the tail first (it falls through to the continuation),
+        // then one arm per entry with a non-empty exclusive prefix.
+        // Entries that ARE `t0` need no prefix arm — `break L$t0` from
+        // the preceding siblings lands at the tail directly.
+        let tail_body = self.structure_set(tail.clone(), t0, disabled);
+        let mut arms: Vec<RegionId> = vec![self.push_node(RegionNode::Labeled {
+            label: t0,
+            body: tail_body,
+        })];
+        for (&e, prefix) in entries.iter().zip(prefixes.iter()) {
+            if prefix.is_empty() {
+                continue;
+            }
+            let body = self.structure_set(prefix.clone(), e, disabled);
+            arms.push(self.push_node(RegionNode::Labeled { label: e, body }));
+        }
+        Some(self.push_node(RegionNode::Alternates(arms)))
     }
 
     /// Acyclic structuring: iterative straight-line runs, conditional
@@ -965,15 +1144,98 @@ impl Builder {
                     // goto-shared idiom) are recorded as cross-arm hints:
                     // the tree is truthful, and emission duplicates the
                     // shared block or merges the conditions (d-P3).
+                    let mut cross: Vec<(BlockId, BlockId)> = Vec::new();
                     for (arm, sibling) in [(&then_set, &else_set), (&else_set, &then_set)] {
                         for &b in arm {
                             for &s in &self.succs[b.index()] {
                                 if sibling.contains(&s) {
-                                    self.cross_arms.push((b, s));
+                                    cross.push((b, s));
                                 }
                             }
                         }
                     }
+                    // Handler-rejoin demotion (N76): an arm entry with a
+                    // Normal predecessor OUTSIDE the universe is a
+                    // handler sub-CFG's continuation target — reachable
+                    // from the handler path only by falling out of a
+                    // catch clause onto it, which is physically
+                    // impossible while the block sits inside a
+                    // conditional arm. That side is therefore not a
+                    // conditional arm at all: it is the continuation
+                    // (test262 try/S12.14_A7_T1's B101 finally-dispatch
+                    // epilogue, A15's switch tails). Only when there is
+                    // no merge (a real merge already places the join
+                    // correctly) and at most one side is affected.
+                    //
+                    // (The sibling arm-entry re-entry shape — every
+                    // cross edge landing on the sibling's entry — is
+                    // deliberately NOT demoted: in loop-carried dispatch
+                    // chains it is the es2abc state-machine idiom the
+                    // generator/async machine folds pattern-match, and
+                    // restructuring it breaks them; the d-P3
+                    // tail-duplication fold owns that shape.)
+                    let mut demote: Option<bool> = None;
+                    if merge.is_none()
+                        && self.external_preds.contains(&t) != self.external_preds.contains(&f)
+                    {
+                        demote = Some(self.external_preds.contains(&f));
+                    }
+                    // …and only when the conditional arm's exits are
+                    // EXACTLY the demoted entry (or leave the region
+                    // entirely — those carry structural break/continue
+                    // actions): an arm exit landing PAST the demoted
+                    // entry would have to skip part of the continuation,
+                    // which the `if (c) { arm } <continuation>` shape
+                    // cannot express (the d-P3 duplication fold keeps
+                    // those — golden_structure s24's arm rejoins two
+                    // blocks later). The demoted side also must not
+                    // reach back INTO the arm.
+                    let demote = demote.filter(|&cond_arm_is_then| {
+                        let (arm_set, demoted_set, demoted_entry) = if cond_arm_is_then {
+                            (&then_set, &else_set, f)
+                        } else {
+                            (&else_set, &then_set, t)
+                        };
+                        let exits_ok = arm_set.iter().all(|&b| {
+                            self.succs[b.index()].iter().all(|s| {
+                                arm_set.contains(s) || *s == demoted_entry || !rest.contains(s)
+                            })
+                        });
+                        let no_reentry = demoted_set
+                            .iter()
+                            .all(|&b| self.succs[b.index()].iter().all(|s| !arm_set.contains(s)));
+                        exits_ok && no_reentry
+                    });
+                    if let Some(cond_arm_is_then) = demote {
+                        let (arm_set, arm_entry) = if cond_arm_is_then {
+                            (then_set, t)
+                        } else {
+                            (else_set, f)
+                        };
+                        for b in &arm_set {
+                            rest.remove(b);
+                        }
+                        let arm_r = (!arm_set.is_empty())
+                            .then(|| self.structure_set(arm_set, arm_entry, disabled));
+                        let (then_r, else_r) = if cond_arm_is_then {
+                            (arm_r, None)
+                        } else {
+                            (None, arm_r)
+                        };
+                        items.push(self.push_node(RegionNode::If {
+                            head: cur,
+                            then: then_r,
+                            otherwise: else_r,
+                            merge: None,
+                        }));
+                        if rest.is_empty() {
+                            break;
+                        }
+                        let cont = self.structure_continuation(rest, disabled);
+                        items.push(cont);
+                        return self.wrap_seq(items);
+                    }
+                    self.cross_arms.extend(cross);
                     for b in &then_set {
                         rest.remove(b);
                     }

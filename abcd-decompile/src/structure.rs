@@ -298,6 +298,11 @@ pub struct StructStats {
     pub cross_arm_dup_blocks: usize,
     /// Unverifiable break targets (defensive; expected 0).
     pub break_target_notes: usize,
+    /// Handler-shim cut edges repaired by duplicating the small
+    /// terminal main-universe tail inline (N76).
+    pub handler_tail_dups: usize,
+    /// Blocks duplicated by the handler-tail fold.
+    pub handler_tail_dup_blocks: usize,
 }
 
 /// The Stage-B result for one function.
@@ -460,6 +465,10 @@ struct Frame {
     /// The in-flight join hoist (d-P5, RC1), when a cut `If` skeleton
     /// is being emitted.
     cut_defer: Option<CutDefer>,
+    /// When this frame is a HANDLER SHIM: the handler entry (its
+    /// sub-CFG block set is `Ctx::shim_sets[handler]`). Drives the
+    /// handler-tail duplication at cut (out-of-set) terminator edges.
+    shim_of: Option<BlockId>,
 }
 
 impl Frame {
@@ -506,6 +515,7 @@ impl Frame {
             cross_arm,
             loop_headers,
             cut_defer: None,
+            shim_of: None,
         }
     }
 
@@ -667,6 +677,26 @@ struct Ctx<'m> {
     /// Cross-arm edges the tail-duplication fold repaired (the build()
     /// summary lists only the residual, unfolded ones).
     folded_xarms: BTreeSet<(BlockId, BlockId)>,
+    /// Protected sets of the outer-finally wrappers currently being
+    /// assembled ABOVE the emission point (the wrap_try_run chain,
+    /// threads through `emit_handler` frames). Nested emissions must
+    /// not re-wrap these plans: the wrappers physically enclose
+    /// everything emitted while they are pending.
+    pending_wraps: Vec<BTreeSet<BlockId>>,
+    /// Rejoin entries of in-flight join hoists (`emit_cut_try`): while
+    /// a hoisted try/catch's catch clauses are being emitted, the
+    /// hoisted tail's entry block IS physically emitted right after the
+    /// try/catch, so handler cut edges to it are safe fall-outs and the
+    /// shim-tail duplication must stand down (N76 follow-up: golden
+    /// s28/s29's join tail was duplicated into the catch body).
+    hoist_rejoins: Vec<BlockId>,
+    /// Verified fall-out targets (N76): while a `try/catch` whose
+    /// physical continuation is KNOWN (the caller's `follow` resolves
+    /// to a concrete next block) is being emitted, handler cut edges to
+    /// that block are sound as plain catch-clause fall-outs — the
+    /// run-fold may use them (`if/else` with the skip arm falling
+    /// through) and the shim-tail duplication must stand down.
+    verified_fallout: Vec<BlockId>,
 }
 
 impl<'m> Ctx<'m> {
@@ -690,6 +720,9 @@ impl<'m> Ctx<'m> {
             alt_counter: 0,
             state_counter: 0,
             folded_xarms: BTreeSet::new(),
+            pending_wraps: Vec::new(),
+            hoist_rejoins: Vec::new(),
+            verified_fallout: Vec::new(),
         }
     }
 
@@ -943,6 +976,15 @@ impl<'m> Ctx<'m> {
                 }
             }
             chosen.sort_unstable();
+            if std::env::var_os("ABCD_SHIM_DEBUG").is_some() {
+                eprintln!(
+                    "SHIM B{} (fn {}): set={:?} chosen={:?}",
+                    h.index(),
+                    fid.index(),
+                    fd.blocks.iter().map(|b| b.index()).collect::<Vec<_>>(),
+                    chosen
+                );
+            }
             fd.try_regions = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
             shim.functions.push(fd);
             let tree = structure_regions(&shim, fid);
@@ -1165,10 +1207,11 @@ impl<'m> Ctx<'m> {
     /// through to that block.
     ///
     /// Bounded: ≤ 8 blocks, ≤ 128 statements, never into a loop header,
-    /// no conditional terminators mid-tail, and never across a try-plan
-    /// boundary (duplicating protected code into an unprotected context
-    /// would change throw behavior). Returns `None` — the caller keeps
-    /// the honest drop — when any bound trips. On success returns the
+    /// and never across a try-plan boundary (duplicating protected code
+    /// into an unprotected context would change throw behavior).
+    /// Conditional mid-tail blocks hand off to the tree form
+    /// ([`Ctx::dup_tree`], N76). Returns `None` — the caller keeps the
+    /// honest drop — when any bound trips. On success returns the
     /// duplicated nodes, the stop mode, and the block count.
     fn cross_arm_dup(
         &mut self,
@@ -1177,7 +1220,23 @@ impl<'m> Ctx<'m> {
     ) -> Option<(Vec<SNode>, DupStop, usize)> {
         const MAX_BLOCKS: usize = 8;
         const MAX_STMTS: usize = 128;
+        let xdebug = std::env::var_os("ABCD_XARM_DEBUG").is_some();
         let site_plan = self.f_mut().plan_of(site);
+        // The walk's universe: when the target enters a sibling ARM
+        // region, the whole arm region is the tail (its blocks run
+        // exactly on the path being repaired) — the walk follows any
+        // in-region edge and stops at the region's exit (N76: the
+        // cross-edge-only chain stopped mid-arm at try/S12.14_A15's
+        // nested dispatch, whose continuation sat in a sibling arm and
+        // was NOT fall-through-reachable). A recorded cross-arm edge
+        // OUT of the current region chains into the NEXT arm, whose
+        // blocks join the boundary (N76 follow-up: the corpus's
+        // unused-ldhole IteratorClose dispatch chains two arms —
+        // stopping at the first arm's exit trusted a fall-through that
+        // does not exist there). Without an arm region (the
+        // short-circuit chains of the d-P4 corpus), the legacy
+        // discipline holds: recorded cross-arm edges only.
+        let mut boundary = self.arm_region_blocks(target);
         let mut segs: Vec<(Option<usize>, Vec<SNode>)> = Vec::new();
         let mut cur = target;
         let mut visited = BTreeSet::new();
@@ -1186,6 +1245,9 @@ impl<'m> Ctx<'m> {
         loop {
             if !visited.insert(cur) || visited.len() > MAX_BLOCKS {
                 return None;
+            }
+            if boundary.as_ref().is_some_and(|b| !b.contains(&cur)) {
+                return None; // defensive: the walk stays in the arm
             }
             if self.f().loop_headers.contains(&cur) {
                 return None;
@@ -1228,9 +1290,26 @@ impl<'m> Ctx<'m> {
                 Term::Branch(dest) => {
                     Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.main));
                     Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.phi));
-                    if self.f().cross_arm.contains(&(cur, dest)) {
-                        // The shared tail continues through another
-                        // dropped edge — keep walking.
+                    let in_boundary = boundary.as_ref().is_some_and(|b| b.contains(&dest));
+                    let is_cross = self.f().cross_arm.contains(&(cur, dest));
+                    if in_boundary || is_cross {
+                        if !in_boundary {
+                            // Chaining into the NEXT arm through a
+                            // recorded cross edge: its region joins the
+                            // boundary (a bare target at least).
+                            let extra = self
+                                .arm_region_blocks(dest)
+                                .unwrap_or_else(|| BTreeSet::from([dest]));
+                            boundary = match boundary {
+                                Some(mut b) => {
+                                    b.extend(extra);
+                                    Some(b)
+                                }
+                                None => Some(extra),
+                            };
+                        }
+                        // The arm region's content continues — keep
+                        // walking (its blocks run on this path).
                         Some(Some(dest))
                     } else {
                         // The tail rejoins the structural flow at
@@ -1240,9 +1319,80 @@ impl<'m> Ctx<'m> {
                         None
                     }
                 }
-                // A conditional mid-tail is beyond the v1 fold.
-                Term::Cond(..) => {
-                    return None;
+                // A conditional mid-tail: switch to the tree form —
+                // the nested dispatch duplicates as a nested `if/else`
+                // (N76, try/S12.14_A15's finally-dispatch epilogue).
+                // Only with a trivial plan prefix: the tree form keeps
+                // the site's plan uniform (no segment wrapping).
+                Term::Cond(cond, t, f) => {
+                    if segs.len() > 1 || cur_plan != site_plan {
+                        return None;
+                    }
+                    let Some(boundary) = boundary.clone() else {
+                        // No arm region: the legacy walk never enters a
+                        // conditional (it stops at the first ordinary
+                        // edge), so this is unreachable — bail anyway.
+                        return None;
+                    };
+                    // `cur`'s prologue was already accounted by the
+                    // linear walk above; the tree walk owns the rest.
+                    let (cond, t, f) = (cond.clone(), t, f);
+                    let mut tree_nodes: Vec<SNode> = Vec::new();
+                    Self::push_stmts(&mut tree_nodes, Self::stmts_leaves(&parts.main));
+                    let (phi_t, phi_f, rest) = Self::partition_phi(&parts.phi, t, f);
+                    Self::push_stmts(&mut tree_nodes, Self::stmts_leaves(&rest));
+                    let local_stop = self.tail_merge(t, f, &boundary, None);
+                    let mut walk_arm = |entry: BlockId,
+                                        phi: Vec<Stmt>,
+                                        visited: &mut BTreeSet<BlockId>,
+                                        stmts: &mut usize|
+                     -> Option<(Vec<SNode>, DupStop)> {
+                        let mut head: Vec<SNode> = Vec::new();
+                        Self::push_stmts(&mut head, Self::stmts_leaves(&phi));
+                        if Some(entry) == local_stop {
+                            return Some((head, DupStop::Rejoin(entry)));
+                        }
+                        let (mut nodes, stop) = self
+                            .dup_tree(entry, &boundary, site_plan, local_stop, visited, stmts, 1)?;
+                        head.append(&mut nodes);
+                        Some((head, stop))
+                    };
+                    let (then, then_stop) = walk_arm(t, phi_t, &mut visited, &mut stmts)?;
+                    let (otherwise, else_stop) = walk_arm(f, phi_f, &mut visited, &mut stmts)?;
+                    let cont = match (then_stop, else_stop) {
+                        (DupStop::Terminal, DupStop::Terminal) => None,
+                        (DupStop::Rejoin(a), DupStop::Rejoin(b)) if a == b => Some(a),
+                        (DupStop::Terminal, DupStop::Rejoin(b)) => Some(b),
+                        (DupStop::Rejoin(a), DupStop::Terminal) => Some(a),
+                        _ => return None,
+                    };
+                    tree_nodes.push(SNode::If {
+                        cond: cond.clone(),
+                        then,
+                        otherwise,
+                    });
+                    let tree_stop = match cont {
+                        None => DupStop::Terminal,
+                        Some(m) => {
+                            let (mut tail, stop) = self.dup_tree(
+                                m,
+                                &boundary,
+                                site_plan,
+                                None,
+                                &mut visited,
+                                &mut stmts,
+                                0,
+                            )?;
+                            tree_nodes.append(&mut tail);
+                            stop
+                        }
+                    };
+                    match segs.last_mut() {
+                        Some((_, nodes)) => nodes.append(&mut tree_nodes),
+                        _ => segs.push((site_plan, tree_nodes)),
+                    }
+                    stop = Some(tree_stop);
+                    break;
                 }
             };
             // Append the block's nodes to the current plan segment.
@@ -1261,6 +1411,15 @@ impl<'m> Ctx<'m> {
         let Some(stop) = stop else {
             unreachable!("the dup walk only breaks after setting `stop`")
         };
+        if xdebug {
+            eprintln!(
+                "XARM-DUP site=B{} target=B{} stop={:?} blocks={}",
+                site.index(),
+                target.index(),
+                stop,
+                visited.len()
+            );
+        }
         // Assemble: segments whose plan differs from the site's get
         // their own try/catch wrapper (the catch body duplicates — the
         // same finally-style duplication es2abc itself uses).
@@ -1299,6 +1458,214 @@ impl<'m> Ctx<'m> {
             }
         }
         Some((out, stop, visited.len()))
+    }
+
+    /// The block set of the tightest conditional ARM whose
+    /// first-executed block is `entry` — the sibling-arm content a
+    /// cross-arm edge jumps into. The tree-form tail duplication stays
+    /// inside this boundary: it is exactly the content the sibling arm
+    /// would have run. (Leaf `Block` nodes with the same entry are NOT
+    /// arms; without one the edge's tail is not region-bounded and the
+    /// caller keeps the legacy cross-edge-chain walk.)
+    fn arm_region_blocks(&mut self, entry: BlockId) -> Option<BTreeSet<BlockId>> {
+        let mut best: Option<BTreeSet<BlockId>> = None;
+        for id in 0..self.f().tree.nodes().len() {
+            let id = RegionId(id as u32);
+            let children: [Option<RegionId>; 2] = match self.f().node(id) {
+                RegionNode::If {
+                    then, otherwise, ..
+                } => [*then, *otherwise],
+                _ => [None, None],
+            };
+            for child in children.into_iter().flatten() {
+                if self.entry_of(child) != Follow::Entry(entry) {
+                    continue;
+                }
+                let blocks = self.f_mut().node_blocks(child);
+                if best.as_ref().is_none_or(|b| blocks.len() < b.len()) {
+                    best = Some(blocks);
+                }
+            }
+        }
+        best
+    }
+
+    /// The merge of a conditional tail's arms within `boundary`: the
+    /// earliest block reachable from both — an intersection member not
+    /// reachable from any OTHER intersection member. `None` when the
+    /// arms never reconverge inside the boundary (both must then be
+    /// terminal). `stop_at` (an enclosing merge) is excluded: arms stop
+    /// there, they do not merge there.
+    fn tail_merge(
+        &self,
+        t: BlockId,
+        f: BlockId,
+        boundary: &BTreeSet<BlockId>,
+        stop_at: Option<BlockId>,
+    ) -> Option<BlockId> {
+        let reach = |from: BlockId| {
+            let mut seen = BTreeSet::from([from]);
+            let mut queue = std::collections::VecDeque::from([from]);
+            while let Some(b) = queue.pop_front() {
+                if Some(b) == stop_at {
+                    continue; // do not expand past the enclosing merge
+                }
+                for s in block_succs(self.module, b) {
+                    if boundary.contains(&s) && Some(s) != stop_at && seen.insert(s) {
+                        queue.push_back(s);
+                    }
+                }
+                if seen.len() > 32 {
+                    break; // bounded: the tree dup's own budget guards
+                }
+            }
+            seen
+        };
+        let rt = reach(t);
+        let rf = reach(f);
+        let inter: Vec<BlockId> = rt.intersection(&rf).copied().collect();
+        inter
+            .iter()
+            .copied()
+            .find(|&m| inter.iter().all(|&x| x == m || !reach(x).contains(&m)))
+    }
+
+    /// The tree form of the tail duplication (N76): a shared tail whose
+    /// head is CONDITIONAL (the es2abc nested dispatch — test262
+    /// try/S12.14_A15's finally-dispatch epilogue) duplicates as a
+    /// nested `if/else`. Each arm is walked until it terminates
+    /// (throw/return — no fall-through) or reaches its merge block (the
+    /// walk then continues once after the `if`); `stop_at` is an
+    /// ENCLOSING merge whose content belongs to the caller — reaching
+    /// it stops the walk with [`DupStop::Rejoin`] without emitting it.
+    /// Every block must stay inside the sibling arm's region
+    /// (`boundary`) and share the site's plan; budgets are shared
+    /// across the whole tree via `visited`/`stmts`.
+    fn dup_tree(
+        &mut self,
+        cur: BlockId,
+        boundary: &BTreeSet<BlockId>,
+        site_plan: Option<usize>,
+        stop_at: Option<BlockId>,
+        visited: &mut BTreeSet<BlockId>,
+        stmts: &mut usize,
+        depth: usize,
+    ) -> Option<(Vec<SNode>, DupStop)> {
+        const MAX_BLOCKS: usize = 12;
+        const MAX_STMTS: usize = 128;
+        const MAX_DEPTH: usize = 3;
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        if !visited.insert(cur) || visited.len() > MAX_BLOCKS {
+            return None;
+        }
+        if self.f().loop_headers.contains(&cur) {
+            return None;
+        }
+        if !boundary.contains(&cur) {
+            return None;
+        }
+        let parts = self.block_parts(cur);
+        *stmts += parts.main.len() + parts.phi.len();
+        if *stmts > MAX_STMTS {
+            return None;
+        }
+        match &parts.term {
+            Term::None => {
+                // Terminal only on a real return/throw (a plain
+                // fall-off end would silently truncate the path).
+                let last = parts
+                    .main
+                    .iter()
+                    .rposition(|s| !matches!(s, Stmt::Unreachable));
+                match last {
+                    Some(i) if matches!(parts.main[i], Stmt::Return(_) | Stmt::Throw(_)) => {}
+                    _ => return None,
+                }
+                let mut blk = Vec::new();
+                Self::push_main_phi(&mut blk, &parts.main, &parts.phi);
+                Some((blk, DupStop::Terminal))
+            }
+            Term::Branch(d) => {
+                let mut blk: Vec<SNode> = Vec::new();
+                Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.main));
+                Self::push_stmts(&mut blk, Self::stmts_leaves(&parts.phi));
+                if Some(*d) == stop_at {
+                    // The enclosing merge: the caller's walk resumes it.
+                    return Some((blk, DupStop::Rejoin(*d)));
+                }
+                if !boundary.contains(d) {
+                    // The arm region's own exit edge: the tail rejoins
+                    // the structural flow here; the caller checks its
+                    // context falls through.
+                    return Some((blk, DupStop::Rejoin(*d)));
+                }
+                let (mut tail, stop) =
+                    self.dup_tree(*d, boundary, site_plan, stop_at, visited, stmts, depth)?;
+                blk.append(&mut tail);
+                Some((blk, stop))
+            }
+            Term::Cond(cond, t, f) => {
+                let (phi_t, phi_f, rest) = Self::partition_phi(&parts.phi, *t, *f);
+                let merge = self.tail_merge(*t, *f, boundary, stop_at);
+                let local_stop = merge.or(stop_at);
+                let mut walk_arm = |entry: BlockId,
+                                    phi: Vec<Stmt>,
+                                    visited: &mut BTreeSet<BlockId>,
+                                    stmts: &mut usize|
+                 -> Option<(Vec<SNode>, DupStop)> {
+                    let mut head: Vec<SNode> = Vec::new();
+                    Self::push_stmts(&mut head, Self::stmts_leaves(&phi));
+                    if Some(entry) == local_stop {
+                        return Some((head, DupStop::Rejoin(entry)));
+                    }
+                    let (mut nodes, stop) = self.dup_tree(
+                        entry,
+                        boundary,
+                        site_plan,
+                        local_stop,
+                        visited,
+                        stmts,
+                        depth + 1,
+                    )?;
+                    head.append(&mut nodes);
+                    Some((head, stop))
+                };
+                let (then, then_stop) = walk_arm(*t, phi_t, visited, stmts)?;
+                let (otherwise, else_stop) = walk_arm(*f, phi_f, visited, stmts)?;
+                // Combine: a terminal arm does not fall through; a
+                // rejoining arm routes the continuation after the `if`.
+                // Both arms rejoining must agree on the merge.
+                let cont = match (then_stop, else_stop) {
+                    (DupStop::Terminal, DupStop::Terminal) => None,
+                    (DupStop::Rejoin(a), DupStop::Rejoin(b)) if a == b => Some(a),
+                    (DupStop::Terminal, DupStop::Rejoin(b)) => Some(b),
+                    (DupStop::Rejoin(a), DupStop::Terminal) => Some(a),
+                    _ => return None,
+                };
+                let mut nodes: Vec<SNode> = Vec::new();
+                Self::push_stmts(&mut nodes, Self::stmts_leaves(&parts.main));
+                Self::push_stmts(&mut nodes, Self::stmts_leaves(&rest));
+                nodes.push(SNode::If {
+                    cond: cond.clone(),
+                    then,
+                    otherwise,
+                });
+                match cont {
+                    None => Some((nodes, DupStop::Terminal)),
+                    // The enclosing merge: hand back to the caller.
+                    Some(r) if Some(r) == stop_at => Some((nodes, DupStop::Rejoin(r))),
+                    // The local merge: continue the walk past the `if`.
+                    Some(m) => {
+                        let (mut tail, stop) =
+                            self.dup_tree(m, boundary, site_plan, stop_at, visited, stmts, depth)?;
+                        nodes.append(&mut tail);
+                        Some((nodes, stop))
+                    }
+                }
+            }
+        }
     }
 
     /// Whether a duplicated tail stopping at `stop` is correct in an
@@ -1341,6 +1708,117 @@ impl<'m> Ctx<'m> {
         self.stats.cross_arm_dup_blocks += nblocks;
         self.folded_xarms.insert((site, target));
         Some(nodes)
+    }
+
+    /// Handler-shim cut-edge tail duplication (N76). A handler
+    /// sub-CFG's Normal edge leaving the shim's block set targets the
+    /// try's continuation in the MAIN universe. Falling out of the
+    /// catch clause reaches it only when the enclosing emission placed
+    /// the continuation right after the try/catch (the d-P5 join
+    /// hoist); when the region tree buried the continuation in a
+    /// sibling conditional arm (a terminal sibling poisons the
+    /// post-dominator merge), the fall-out lands at the end of the
+    /// enclosing construct instead and the path silently returns
+    /// `undefined` (test262 try/S12.14_A15's `SwitchTest3` — the
+    /// finally's `break` path must still reach `return result`).
+    ///
+    /// Duplicate the target's tail inline when it is small, acyclic,
+    /// try-plan-clean in the main frame, and ends in a terminal
+    /// (return/throw) — the same finally-style duplication es2abc
+    /// itself uses. Returns `None` (keep the structural fall-out) when
+    /// any bound trips or the tail rejoins live control flow (then the
+    /// enclosing emission may still route to it).
+    fn shim_tail_dup(&mut self, target: BlockId) -> Option<(Vec<SNode>, usize)> {
+        const MAX_BLOCKS: usize = 8;
+        const MAX_STMTS: usize = 64;
+        let debug = std::env::var_os("ABCD_TAIL_DEBUG").is_some();
+        macro_rules! bail {
+            ($why:expr) => {{
+                if debug {
+                    eprintln!("TAIL-BAIL target=B{}: {}", target.index(), $why);
+                }
+                return None;
+            }};
+        }
+        let Some(h) = self.f().shim_of else {
+            return None;
+        };
+        let Some(set) = self.shim_sets.get(&h).cloned() else {
+            return None;
+        };
+        if debug {
+            eprintln!("TAIL-TRY handler=B{} target=B{}", h.index(), target.index());
+        }
+        if set.contains(&target) {
+            bail!("target in set");
+        }
+        // A cut edge to an in-flight join hoist's rejoin entry is a
+        // SAFE fall-out (the hoisted tail is emitted right after the
+        // try/catch being built) — duplicating it would emit the tail
+        // twice. The same holds when the enclosing try/catch's physical
+        // continuation is verified to be the target.
+        if self.hoist_rejoins.contains(&target) || self.verified_fallout.contains(&target) {
+            return None;
+        }
+        let mut out: Vec<SNode> = Vec::new();
+        let mut cur = target;
+        let mut visited = BTreeSet::new();
+        let mut stmts = 0usize;
+        loop {
+            if !visited.insert(cur) || visited.len() > MAX_BLOCKS {
+                bail!("cycle/budget");
+            }
+            // Never duplicate into a loop (either frame's view)…
+            if self.f().loop_headers.contains(&cur) || self.frames[0].loop_headers.contains(&cur) {
+                bail!("loop header");
+            }
+            // …and never duplicate a block protected by a main-frame
+            // try plan: its throw routing is a PC-range property the
+            // duplication cannot reproduce.
+            if self
+                .frames
+                .first_mut()
+                .expect("root frame")
+                .plan_of(cur)
+                .is_some()
+            {
+                bail!("protected in main frame");
+            }
+            let parts = self.block_parts(cur);
+            stmts += parts.main.len() + parts.phi.len();
+            if stmts > MAX_STMTS {
+                bail!("stmt budget");
+            }
+            match &parts.term {
+                Term::None => {
+                    // Terminal only when the block really returns or
+                    // throws (a plain fall-off end would silently
+                    // truncate the path).
+                    let last = parts
+                        .main
+                        .iter()
+                        .rposition(|s| !matches!(s, Stmt::Unreachable));
+                    match last {
+                        Some(i) if matches!(parts.main[i], Stmt::Return(_) | Stmt::Throw(_)) => {}
+                        _ => bail!("not terminal"),
+                    }
+                    Self::push_main_phi(&mut out, &parts.main, &parts.phi);
+                    self.stats.handler_tail_dups += 1;
+                    self.stats.handler_tail_dup_blocks += visited.len();
+                    return Some((out, visited.len()));
+                }
+                Term::Branch(d) => {
+                    if set.contains(d) {
+                        bail!("re-enters handler set");
+                    }
+                    Self::push_main_phi(&mut out, &parts.main, &parts.phi);
+                    cur = *d;
+                }
+                // A conditional mid-tail is beyond this fold (the same
+                // bound as the cross-arm fold).
+                Term::Cond(..) => bail!("conditional mid-tail"),
+            }
+        }
     }
 
     /// Whether the edge `from → to` forces a terminator action (a
@@ -1409,6 +1887,38 @@ impl<'m> Ctx<'m> {
             let plan = &self.f().plans[p];
             (plan.region, plan.cuts, plan.handlers.clone())
         };
+        // When the physical continuation after this try/catch is a
+        // known block, handler cut edges to it are sound plain
+        // fall-outs (the catch clause ends exactly where the
+        // continuation begins) — record it for the run-fold /
+        // shim-tail-duplication decisions inside the handler bodies.
+        // Pure trampolines are transparent to a fall-out: an empty
+        // block that only branches runs nothing, so the whole chain is
+        // the continuation (test262 if/S12.5_A3: the handler's cut edge
+        // targets B75 past the empty B72 jump block).
+        let mut verified_chain: Vec<BlockId> = Vec::new();
+        if let Follow::Entry(fb) = follow {
+            let mut cur = fb;
+            loop {
+                if !verified_chain.contains(&cur) {
+                    verified_chain.push(cur);
+                }
+                let parts = self.block_parts(cur);
+                if !parts.main.is_empty() || !parts.phi.is_empty() {
+                    break;
+                }
+                match parts.term {
+                    Term::Branch(d) if !verified_chain.contains(&d) => cur = d,
+                    _ => break,
+                }
+                if verified_chain.len() > 16 {
+                    break; // defensive bound
+                }
+            }
+            for &b in &verified_chain {
+                self.verified_fallout.push(b);
+            }
+        }
         let wraps = {
             let f = self.f_mut();
             let n = f.wrap_counts.entry(p).or_insert(0);
@@ -1467,24 +1977,49 @@ impl<'m> Ctx<'m> {
         // outer handler's body (and its phi temporaries) is silently
         // dropped (dream gate: local/exception-finally). Laminar plans
         // form a chain; walk it outward.
+        //
+        // Two phases: SELECT the whole outward chain first, then EMIT
+        // the handler bodies with the entire chain on
+        // `self.pending_wraps`. Every construct emitted while the chain
+        // is pending lands physically inside these wrappers, so nested
+        // emissions must NOT re-wrap the same plans — otherwise each
+        // handler body re-wraps the chain around its own inner trys and
+        // the output grows exponentially (N76 try/S12.14_A7_T2).
         let mut protected_handlers = handlers.clone();
-        let mut visited: HashSet<usize> = [p].into_iter().collect();
+        // `visited` tracks protected-SET identity: the laminar chain may
+        // step from a shim frame's plans to the root frame's (the shim
+        // ride-along list is only an approximation — see
+        // `outer_wrap_plan`), so plan indices are not comparable across
+        // frames.
+        let mut visited: HashSet<BTreeSet<BlockId>> =
+            [self.f().plans[p].protected.clone()].into_iter().collect();
+        let mut chain: Vec<(usize, usize)> = Vec::new(); // (frame, plan)
         let mut depth = 0usize;
         loop {
             depth += 1;
-            if depth > self.f().plans.len() + 1 {
+            if depth > self.frames[0].plans.len() + self.f().plans.len() + 1 {
                 break; // defensive: the laminar chain is finite
             }
-            let Some(q) = self.outer_wrap_plan(&visited, &protected_handlers) else {
+            let Some((fq, q)) = self.outer_wrap_plan(&visited, &protected_handlers) else {
                 break;
             };
-            visited.insert(q);
+            let plan = &self.frames[fq].plans[q];
+            visited.insert(plan.protected.clone());
+            protected_handlers = plan.handlers.clone();
+            chain.push((fq, q));
+        }
+        let pending_mark = self.pending_wraps.len();
+        for &(fq, q) in &chain {
+            let protected = self.frames[fq].plans[q].protected.clone();
+            self.pending_wraps.push(protected);
+        }
+        for (fq, q) in chain {
             let (qregion, qhandlers) = {
-                let plan = &self.f().plans[q];
+                let plan = &self.frames[fq].plans[q];
                 (plan.region, plan.handlers.clone())
             };
             let wraps = {
-                let f = self.f_mut();
+                let f = &mut self.frames[fq];
                 let n = f.wrap_counts.entry(q).or_insert(0);
                 *n += 1;
                 *n
@@ -1508,7 +2043,10 @@ impl<'m> Ctx<'m> {
                 )),
                 finally: None,
             };
-            protected_handlers = qhandlers;
+        }
+        self.pending_wraps.truncate(pending_mark);
+        for _ in &verified_chain {
+            self.verified_fallout.pop();
         }
         out.push(node);
     }
@@ -1516,47 +2054,91 @@ impl<'m> Ctx<'m> {
     /// The next outer plan whose try must wrap a construct whose
     /// handlers are `protected_handlers` (the es2abc finally idiom):
     /// the smallest plan — not already wrapped in this chain
-    /// (`visited`) and not already emitted inside the handler's own
-    /// shim — whose protected set contains a handler. This deliberately
-    /// keeps scanning PAST shim-handled plans: the innermost plan
-    /// containing a handler is often that handler's own nested try
-    /// (already emitted by the shim), while a LARGER plan (the outer
-    /// finally) still protects the handler and must wrap here, or its
-    /// handler body is silently dropped (dream gate:
-    /// opt-try-catch-func/test-nested-try-catch, d-P5).
+    /// (`visited`, by protected-set identity) and not already emitted
+    /// inside the handler's own shim — whose protected set contains a
+    /// handler. This deliberately keeps scanning PAST shim-handled
+    /// plans: the innermost plan containing a handler is often that
+    /// handler's own nested try (already emitted by the shim), while a
+    /// LARGER plan (the outer finally) still protects the handler and
+    /// must wrap here, or its handler body is silently dropped (dream
+    /// gate: opt-try-catch-func/test-nested-try-catch, d-P5).
+    ///
+    /// Frames searched: the current (innermost) frame first, then the
+    /// ROOT frame (the function's full plan list). The shim ride-along
+    /// list (`build_shims`) only admits a region when every protected
+    /// block is in the shim's own set or is a chosen handler HEAD, so
+    /// an outer finally region whose range also covers inner-handler
+    /// BODY blocks is absent from the shim's plan list — but the shim
+    /// still emits the inner try/catch the region must wrap
+    /// (test262 try/S12.14_A7_T1's `ReferenceError: v384 is not
+    /// defined` and A7_T2's escaping `ex3`, N76). Physical soundness
+    /// is preserved: the wrapper encloses exactly the inner try body
+    /// (laminar-nested in the outer range) plus the catch clause whose
+    /// blocks the outer range covers.
+    ///
+    /// Returns `(frame index, plan index)`.
     fn outer_wrap_plan(
         &self,
-        visited: &HashSet<usize>,
+        visited: &HashSet<BTreeSet<BlockId>>,
         protected_handlers: &[BlockId],
-    ) -> Option<usize> {
-        let f = self.f();
-        let mut outer: Option<usize> = None;
+    ) -> Option<(usize, usize)> {
+        let debug = std::env::var_os("ABCD_WRAP_DEBUG").is_some();
+        let cur = self.frames.len() - 1;
+        // Current frame first, then the root frame (skip when equal).
+        let frame_ids = if cur == 0 { &[0][..] } else { &[cur, 0][..] };
+        let mut outer: Option<(usize, usize)> = None;
         for h in protected_handlers {
             // plan_order is ascending by protected-set size: the first
             // eligible hit for this handler is its smallest outer plan.
-            let mut cand: Option<usize> = None;
-            for &q in &f.plan_order {
-                if visited.contains(&q) || !f.plans[q].protected.contains(h) {
-                    continue;
+            let mut cand: Option<(usize, usize)> = None;
+            'frames: for &fi in frame_ids {
+                let f = &self.frames[fi];
+                for &q in &f.plan_order {
+                    let plan = &f.plans[q];
+                    if visited.contains(&plan.protected) || !plan.protected.contains(h) {
+                        continue;
+                    }
+                    // A plan whose wrapper is already being assembled
+                    // above this emission point (the outer-finally
+                    // chain of an enclosing wrap_try_run) physically
+                    // encloses this construct — re-wrapping it here
+                    // duplicates its handler body at every nested site
+                    // (exponential blowup, N76).
+                    if self.pending_wraps.contains(&plan.protected) {
+                        continue;
+                    }
+                    // A plan whose protected set lies INSIDE the
+                    // handler's own sub-CFG is already wrapped by the
+                    // handler shim (nested try in the catch body) —
+                    // wrapping it again outside would duplicate the
+                    // catch (correct but redundant); skip those, but
+                    // keep scanning outward.
+                    let handled_inside = self
+                        .shim_plans
+                        .get(h)
+                        .is_some_and(|plans| plans.iter().any(|pl| pl.protected == plan.protected));
+                    if handled_inside {
+                        continue;
+                    }
+                    cand = Some((fi, q));
+                    break 'frames;
                 }
-                // A plan whose protected set lies INSIDE the handler's
-                // own sub-CFG is already wrapped by the handler shim
-                // (nested try in the catch body) — wrapping it again
-                // outside would duplicate the catch (correct but
-                // redundant); skip those, but keep scanning outward.
-                let handled_inside = self.shim_plans.get(h).is_some_and(|plans| {
-                    plans.iter().any(|pl| pl.protected == f.plans[q].protected)
-                });
-                if handled_inside {
-                    continue;
-                }
-                cand = Some(q);
-                break;
             }
-            if let Some(q) = cand
-                && outer.is_none_or(|o| f.plans[q].protected.len() < f.plans[o].protected.len())
+            if let Some((fi, q)) = cand
+                && outer.is_none_or(|(fo, o)| {
+                    self.frames[fi].plans[q].protected.len()
+                        < self.frames[fo].plans[o].protected.len()
+                })
             {
-                outer = Some(q);
+                outer = Some((fi, q));
+            }
+            if debug {
+                eprintln!(
+                    "WRAP fn={} handler=B{} cand={:?}",
+                    self.frames[cur].tree.func.index(),
+                    h.index(),
+                    cand.map(|(fi, q)| (fi, self.frames[fi].plans[q].region)),
+                );
             }
         }
         outer
@@ -1896,7 +2478,10 @@ impl<'m> Ctx<'m> {
         // tail's placement relative to chain wraps needs the generic
         // path).
         if self
-            .outer_wrap_plan(&[p].into_iter().collect(), &handlers)
+            .outer_wrap_plan(
+                &[self.f().plans[p].protected.clone()].into_iter().collect(),
+                &handlers,
+            )
             .is_some()
         {
             if debug {
@@ -1970,12 +2555,26 @@ impl<'m> Ctx<'m> {
                 "try region {region}: join-hoist analysis/emission mismatch — part of the tail stayed inline (phase-3 tail remains authoritative)"
             )));
         }
+        // While the catch clauses are emitted, the hoisted tail's entry
+        // is the verified physical fall-out target of every handler cut
+        // edge (handler_rejoin_index proved it) — record it so the
+        // shim-tail duplication stands down for those edges.
+        let rejoin_entry = hoisted.first().and_then(|&d| match self.entry_of(d) {
+            Follow::Entry(b) => Some(b),
+            _ => None,
+        });
+        if let Some(b) = rejoin_entry {
+            self.hoist_rejoins.push(b);
+        }
         let mut catches = Vec::new();
         let mut seen = HashSet::new();
         for h in &handlers {
             if seen.insert(*h) {
                 catches.push(self.emit_handler(*h));
             }
+        }
+        if rejoin_entry.is_some() {
+            self.hoist_rejoins.pop();
         }
         let note = if catches.len() > 1 {
             self.stats.multi_catch += 1;
@@ -2170,6 +2769,21 @@ impl<'m> Ctx<'m> {
         if skip == next_entry || self.edge_has_action(b, skip) {
             return 0;
         }
+        // Handler-shim cut edge: the skip target is outside the shim's
+        // block set, so it is reachable only by falling out of the
+        // catch clause onto it. That is sound when the try/catch's
+        // physical continuation IS that block (a verified fall-out —
+        // the enclosing wrap_try_run saw a concrete `follow`, or a
+        // join hoist hoisted the tail there); otherwise bail to the
+        // leaf emitter, whose shim-tail duplication inlines the small
+        // terminal tail into the skip arm instead (N76).
+        if let Some(h) = self.f().shim_of
+            && self.shim_sets.get(&h).is_some_and(|s| !s.contains(&skip))
+            && !self.verified_fallout.contains(&skip)
+            && !self.hoist_rejoins.contains(&skip)
+        {
+            return 0;
+        }
         // The skip arm's content: the cross-arm tail duplication when
         // the edge jumps into a sibling arm, otherwise empty (the plain
         // skip-ahead guard).
@@ -2224,6 +2838,21 @@ impl<'m> Ctx<'m> {
                 // The arm's last block is terminal: only the skip arm
                 // falls through, to the continuation after the run.
                 Term::None if Self::dup_ok_for_follow(stop, after(k, self)) => {
+                    break true;
+                }
+                // The arm's last block DIVERGES from the local run:
+                // its out-edge carries a terminator action (an
+                // alternates-arm `break L$…` from the shared-tail
+                // decomposition, a loop break/continue, …), so the arm
+                // never falls through and the skip path alone must
+                // land on the continuation. Without this case the fold
+                // bails and the leaf emitter silently drops the skip
+                // edge's jump (N76: switch/S12.11_A1_T2's
+                // `case 1:`/`default:` split).
+                Term::Branch(d)
+                    if self.edge_has_action(sb, d)
+                        && Self::dup_ok_for_follow(stop, after(k, self)) =>
+                {
                     break true;
                 }
                 // Mid-arm block: must fall structurally into the next
@@ -2411,6 +3040,11 @@ impl<'m> Ctx<'m> {
                     // The edge jumps into a sibling arm (the es2abc
                     // `goto shared` idiom): duplicate the shared tail.
                     out.extend(dup);
+                } else if let Some((tail, _)) = self.shim_tail_dup(dest) {
+                    // A handler-shim cut edge whose continuation is not
+                    // physically reachable by fall-out: duplicate the
+                    // (small, terminal) tail inline (N76).
+                    out.extend(tail);
                 }
             }
             Term::Cond(cond, t, f) => {
@@ -2433,17 +3067,36 @@ impl<'m> Ctx<'m> {
                 } else {
                     None
                 };
+                // Handler-shim cut edges (out-of-set targets whose
+                // continuation fall-out is not guaranteed): duplicate
+                // the small terminal tail into the matching arm.
+                let tail_t = if act_t.is_none() && dup_t.is_none() {
+                    self.shim_tail_dup(t).map(|(nodes, _)| nodes)
+                } else {
+                    None
+                };
+                let tail_f = if act_f.is_none() && dup_f.is_none() {
+                    self.shim_tail_dup(f).map(|(nodes, _)| nodes)
+                } else {
+                    None
+                };
                 let mut then: Vec<SNode> = Vec::new();
                 Self::push_stmts(&mut then, Self::stmts_leaves(&phi_t));
                 then.extend(act_t);
                 if let Some(dup) = dup_t {
                     then.extend(dup);
                 }
+                if let Some(tail) = tail_t {
+                    then.extend(tail);
+                }
                 let mut otherwise: Vec<SNode> = Vec::new();
                 Self::push_stmts(&mut otherwise, Self::stmts_leaves(&phi_f));
                 otherwise.extend(act_f);
                 if let Some(dup) = dup_f {
                     otherwise.extend(dup);
+                }
+                if let Some(tail) = tail_f {
+                    otherwise.extend(tail);
                 }
                 match (then.is_empty(), otherwise.is_empty()) {
                     (true, true) => {
@@ -2525,31 +3178,56 @@ impl<'m> Ctx<'m> {
         // is harmlessly dead after them; when the arm falls through it
         // is the required exit.
         let act_t = self.edge_action(head, t);
+        let no_act_t = act_t.is_none();
         let mut then: Vec<SNode> = Vec::new();
         Self::push_stmts(&mut then, Self::stmts_leaves(&phi_t));
+        let mut duped_t = false;
         if act_t.is_none()
             && self.f().cross_arm.contains(&(head, t))
             && let Some(dup) = self.try_cross_arm_fold(head, t, follow)
         {
             then.extend(dup);
+            duped_t = true;
         }
         if let Some(r) = then_r {
             self.emit_node(r, active, follow, &mut then);
         }
         then.extend(act_t);
+        // A handler-shim head whose out-edge was CUT at the set
+        // boundary (no arm region, no structural action): the target's
+        // small terminal tail is duplicated into the arm, or the path
+        // falls out of the catch clause to nowhere (N76,
+        // try/S12.14_A15's finally-break dispatch).
+        if no_act_t
+            && then_r.is_none()
+            && !duped_t
+            && let Some((tail, _)) = self.shim_tail_dup(t)
+        {
+            then.extend(tail);
+        }
         let act_f = self.edge_action(head, f);
+        let no_act_f = act_f.is_none();
         let mut otherwise: Vec<SNode> = Vec::new();
         Self::push_stmts(&mut otherwise, Self::stmts_leaves(&phi_f));
+        let mut duped_f = false;
         if act_f.is_none()
             && self.f().cross_arm.contains(&(head, f))
             && let Some(dup) = self.try_cross_arm_fold(head, f, follow)
         {
             otherwise.extend(dup);
+            duped_f = true;
         }
         if let Some(r) = else_r {
             self.emit_node(r, active, follow, &mut otherwise);
         }
         otherwise.extend(act_f);
+        if no_act_f
+            && else_r.is_none()
+            && !duped_f
+            && let Some((tail, _)) = self.shim_tail_dup(f)
+        {
+            otherwise.extend(tail);
+        }
         self.stats.ifs += 1;
         out.push(SNode::If {
             cond: cond.clone(),
@@ -3206,7 +3884,16 @@ impl<'m> Ctx<'m> {
         };
         let plans = self.shim_plans.get(&h).cloned().unwrap_or_default();
         let mut body = Vec::new();
-        self.frames.push(Frame::new(tree, plans));
+        let mut frame = Frame::new(tree, plans);
+        frame.shim_of = Some(h);
+        if std::env::var_os("ABCD_SHIM_TREE_DEBUG").is_some() {
+            eprintln!("--- shim tree for handler B{}", h.index());
+            for (j, node) in frame.tree.nodes().iter().enumerate() {
+                eprintln!("  R{j}: {:?}", node);
+            }
+            eprintln!("  cross_arms: {:?}", frame.tree.cross_arm_edges);
+        }
+        self.frames.push(frame);
         if let Some(root) = self.f().tree.root {
             self.emit_node(root, None, Follow::Tail, &mut body);
         }

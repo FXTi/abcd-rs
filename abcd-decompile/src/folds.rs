@@ -208,6 +208,7 @@ fn fold_seq(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
     // visible).
     sweep_dead_loop_exit_throws(nodes, stats);
     fold_loops(nodes, stats);
+    fold_single_pass_for_ins(nodes, stats);
     fold_switches(nodes, stats);
     fold_finally(nodes, stats);
 }
@@ -1445,6 +1446,249 @@ fn fold_loops(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
         let removed = trim_pre_leaves(nodes, i, folded.pre_cut);
         i = i + advanced - removed;
     }
+}
+
+/// N74 residual (test262 `language/statements/labeled/S12.12_A1_T1`):
+/// the DEGENERATE for-in. `L: for (k in obj) { body; break L; }` — an
+/// unconditional break at the body's tail — compiles (opt-level 0) to
+/// a loop head whose ONLY back-edge is unreachable, so the structurer
+/// sees an acyclic region and builds no `While` node at all. The
+/// iterator machinery is left in straight-line code as siblings:
+///
+/// ```text
+/// … it = GetPropIterator(obj) /* phi-assign ending its Stmts run */
+/// var it; /* phi */  const k = NextPropName(it);
+/// if (k == undefined) {} else { body }
+/// ```
+///
+/// and the plumbing fallback binds `k` to the OBJECT, not the first
+/// key — the body then computes garbage (the labeled row's
+/// `result += object[i]` became `0 + object[object]` = NaN and the
+/// test's assertion threw). The region provably runs the body AT MOST
+/// ONCE, for the FIRST enumerated key (a live back-edge would have
+/// produced a `While` — that is exactly why none exists here), so the
+/// faithful reconstruction is a for-in whose body breaks at the tail:
+/// `for (const k in obj) { body; break; }`.
+fn fold_single_pass_for_ins(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
+    let mut i = 0;
+    while i < nodes.len() {
+        if let Some(plan) = match_single_pass_for_in(nodes, i) {
+            let SinglePassForIn {
+                assign,
+                binding,
+                obj,
+                body,
+            } = plan;
+            // Consume the plumbing phi-assign from its run (drop the
+            // run itself when it held only that leaf).
+            let SNode::Stmts(pre) = &mut nodes[assign] else {
+                unreachable!()
+            };
+            pre.pop();
+            let mut body = body;
+            if !seq_flow(&body).diverges {
+                body.push(SNode::Break { label: None });
+            }
+            let for_in = SNode::ForIn { binding, obj, body };
+            nodes.splice(i..i + 2, [for_in]);
+            if matches!(&nodes[assign], SNode::Stmts(pre) if pre.is_empty()) {
+                nodes.remove(assign);
+                i = assign;
+            } else {
+                i = assign + 1;
+            }
+            stats.for_in += 1;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+/// The extracted pieces of one degenerate for-in match.
+struct SinglePassForIn {
+    /// Index of the `Stmts` run whose LAST leaf is the
+    /// `GetPropIterator` phi-assign (the leaf is consumed).
+    assign: usize,
+    /// The key binding (the `NextPropName` result temp).
+    binding: String,
+    /// The enumerated object.
+    obj: Expr,
+    /// The single-pass body (the non-taken exit arm of the test).
+    body: Vec<SNode>,
+}
+
+/// Match the degenerate for-in with the header `Stmts` at index `i`:
+/// `[PhiDecl it, const k = NextPropName(it)]` at `i`, the
+/// `it = GetPropIterator(obj)` phi-assign as the LAST leaf of the
+/// nearest previous non-`Honest` `Stmts` run, and the
+/// `if (k == undefined) {} else { body }` exit test at `i + 1`.
+fn match_single_pass_for_in(nodes: &[SNode], i: usize) -> Option<SinglePassForIn> {
+    let SNode::Stmts(hdr) = &nodes[i] else {
+        return None;
+    };
+    let [
+        Leaf::Raw(Stmt::PhiDecl { name: it, .. }),
+        Leaf::Raw(Stmt::Declare {
+            name: k,
+            value:
+                Expr::Iter {
+                    op: IterOp::NextPropName,
+                    obj: it_ref,
+                    ..
+                },
+            ..
+        }),
+    ] = hdr.as_slice()
+    else {
+        return None;
+    };
+    if temp_name(it_ref) != Some(it.as_str()) {
+        return None;
+    }
+    // The iterator wiring: the last leaf of the nearest previous
+    // non-`Honest` node (a dissolved rethrow-only try leaves an
+    // `Honest` marker between the pre-leaves and the assign).
+    let mut a = i;
+    while a > 0 && matches!(&nodes[a - 1], SNode::Honest(_)) {
+        a -= 1;
+    }
+    a = a.checked_sub(1)?;
+    let SNode::Stmts(pre) = &nodes[a] else {
+        return None;
+    };
+    let Some(Leaf::Raw(Stmt::PhiAssign {
+        target,
+        value:
+            Expr::Iter {
+                op: IterOp::GetPropIterator,
+                obj,
+                ..
+            },
+        ..
+    })) = pre.last()
+    else {
+        return None;
+    };
+    if target != it {
+        return None;
+    }
+    // The exit test: `k == undefined` (any polarity/wrapping) with the
+    // body on the not-done arm and the other arm empty.
+    let Some(SNode::If {
+        cond,
+        then,
+        otherwise,
+    }) = nodes.get(i + 1)
+    else {
+        return None;
+    };
+    let mut e = cond;
+    let mut inverted = false;
+    loop {
+        match e {
+            Expr::Unary {
+                op: UnOp::IsTrue,
+                operand,
+            } => e = operand,
+            Expr::Unary {
+                op: UnOp::IsFalse | UnOp::LogicalNot,
+                operand,
+            } => {
+                inverted = !inverted;
+                e = operand;
+            }
+            _ => break,
+        }
+    }
+    let Expr::Compare { op, left, right } = e else {
+        return None;
+    };
+    let eq = matches!(op, CmpOp::Eq | CmpOp::StrictEq);
+    let neq = matches!(op, CmpOp::NotEq | CmpOp::StrictNotEq);
+    let tests_undef = (matches!(left.as_ref(), Expr::Lit(Lit::Undefined))
+        && temp_name(right) == Some(k.as_str()))
+        || (matches!(right.as_ref(), Expr::Lit(Lit::Undefined))
+            && temp_name(left) == Some(k.as_str()));
+    if !tests_undef || !(eq || neq) {
+        return None;
+    }
+    // The body runs when the key is NOT undefined.
+    let body_on_otherwise = eq != inverted;
+    let (body, empty_arm) = if body_on_otherwise {
+        (otherwise, then)
+    } else {
+        (then, otherwise)
+    };
+    if !empty_arm.is_empty() {
+        return None;
+    }
+    let internals = [it.clone(), k.clone()];
+    // The iterated expression must not reference the internals…
+    if internals.iter().any(|n| expr_uses_name(obj, n)) {
+        return None;
+    }
+    // …and NOTHING outside the three matched nodes may use them (the
+    // phi-decl/plumbing temps die with the fold; the binding lives on
+    // as the for-in binding, so uses inside the body stay valid).
+    for (j, n) in nodes.iter().enumerate() {
+        if j == a || j == i || j == i + 1 {
+            continue;
+        }
+        if node_uses_any(n, &internals) {
+            return None;
+        }
+    }
+    // The assign run's remaining leaves must not use the internals
+    // either (they precede the assign, so only a pathological
+    // re-declaration could).
+    if pre[..pre.len() - 1]
+        .iter()
+        .any(|l| internals.iter().any(|n| leaf_uses_name(l, n)))
+    {
+        return None;
+    }
+    if nodes_use_any(body, &internals[..1]) {
+        return None;
+    }
+    // A stray `continue` would bind to the NEW loop and re-iterate —
+    // the acyclic region this shape comes from cannot contain one.
+    if subtree_has_continue(body) {
+        return None;
+    }
+    Some(SinglePassForIn {
+        assign: a,
+        binding: k.clone(),
+        obj: obj.as_ref().clone(),
+        body: body.clone(),
+    })
+}
+
+/// A `continue` anywhere in the subtree (the degenerate for-in's body
+/// must not grow one — see the matcher's guard).
+fn subtree_has_continue(nodes: &[SNode]) -> bool {
+    nodes.iter().any(|n| match n {
+        SNode::Continue { .. } => true,
+        SNode::If {
+            then, otherwise, ..
+        } => subtree_has_continue(then) || subtree_has_continue(otherwise),
+        // A nested loop's continues target THAT loop — stop the walk.
+        SNode::While { .. } | SNode::DoWhile { .. } | SNode::ForOf { .. } | SNode::ForIn { .. } => {
+            false
+        }
+        SNode::Labeled { body, .. } => subtree_has_continue(body),
+        SNode::Try {
+            body,
+            catches,
+            finally,
+            ..
+        } => {
+            subtree_has_continue(body)
+                || catches.iter().any(|c| subtree_has_continue(&c.body))
+                || finally.as_ref().is_some_and(|f| subtree_has_continue(f))
+        }
+        SNode::Switch { cases, .. } => cases.iter().any(|c| subtree_has_continue(&c.body)),
+        SNode::Stmts(_) | SNode::Break { .. } | SNode::Honest(_) => false,
+    })
 }
 
 /// The concatenated leaf run of the adjacent `Stmts` nodes immediately
