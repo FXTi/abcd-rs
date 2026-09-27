@@ -2463,7 +2463,7 @@ fn s38_arrow_recovery() {
 
     let want = r#"var g;
 function outer() {
-  let g = async (p1) => {
+  g = async (p1) => {
   return p1 + 1.0;
 };
   return;
