@@ -17,3 +17,8 @@ exports/
 probes-taint/out/
 /flowdroid
 /ArkAnalyzer
+
+# Local tooling/editor state (never commit)
+.tmp-bin/
+.dsh-bin/
+.vscode/

@@ -80,10 +80,10 @@ skiplists), but toolchain availability and source-set choice need a
 separate discussion at that time. This script remains a placeholder; current
 local validation uses the GHCR export described above:
 
-- Sources: `scripts/corpus-src/*.js|ts` — 11 small ES6 programs covering
-  classes/inheritance, closures/rest/arrows, generators/async, modules,
-  object/array literals, literal taxonomy, try/catch/finally, typed
-  ArkTS constructs, control flow, unicode strings, global/lexical scopes.
+- Sources: SUPERSEDED (2026-09-27) — the former `scripts/corpus-src/*.js|ts`
+  ES6 set is retired; the corpus source of truth is now the
+  arkcompiler-test image (its `cases/` local sources carry equivalent
+  coverage). Git history keeps the old set.
 - Run with `ES2ABC=/path/to/es2abc` from any arkcompiler release
   (OpenHarmony 3.2 → 9.0.0.0, 4.0/4.1 → 11.0.2.0/12.0.6.0, master →
   24.0.0.0) to stamp each version family.
