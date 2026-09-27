@@ -1100,3 +1100,12 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   not-applicable fixtures (1152x3, zero skips). Caught in review: the
   worker's regression test missed its #[ignore] (would have red-broken
   the no-corpus CI build jobs) — fixed before landing.
+- test262 P3 landed (92e6faa): the dream gate now covers the 2685 test262
+  rows (decompile -> es2abc recompile -> VM recorded-behavior compare).
+  First contact: pass 2451 / decompile-bug 225 / es2abc-cant 0 /
+  expected-fallback 9 — the 225 are REAL decompiler bugs registered in the
+  new self-cleaning ledger (test262-dream-divergences.json), N74: for-in
+  iterator stall (85 rows, a latent HANG invisible to the 1149 gate),
+  read-only global name collisions (26), top-level this (9), plus smaller
+  classes. dream-gate.py's ledger-exit-code swallow fixed. CI job
+  test262-dream live per-push (676s native, within budget).
