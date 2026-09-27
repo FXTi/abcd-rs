@@ -106,7 +106,7 @@ function func_main_0() {
   yield value$1;
   return undefined;
 };
-  log = [];
+  let log = [];
   const outer$1 = outer;
   const v166 = outer$1();
   for (const value of v166) {
@@ -147,7 +147,7 @@ function func_main_0() {
   yield 99.0;
   return undefined;
 };
-  log = [];
+  let log = [];
   const outer$1 = outer;
   const v136 = outer$1();
   for (const value of v136) {
@@ -206,7 +206,7 @@ function func_main_0() {
 };
     const outer$1 = outer;
     const v156 = outer$1();
-    it = v156;
+    let it = v156;
     log = [];
     const it$1 = it;
     const next = it$1.next;

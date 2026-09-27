@@ -4306,6 +4306,12 @@ pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldSta
 struct LateStore {
     /// Sanitized binding name.
     name: String,
+    /// The store's value defines a function/class (the module's PUBLIC
+    /// surface: an external reader — e.g. a test driver appended after
+    /// `func_main_0.call(this)` — reads the module-scope binding, so the
+    /// store must NOT become a shadowing local `let`; N74 yield-star
+    /// golden/node regression).
+    func_valued: bool,
     /// Lexical store (vs global store).
     lexical: bool,
     /// The scope-chain level (lexical only; 0 for globals).
@@ -4401,6 +4407,10 @@ fn late_decl_census(
                             collect_ident_uses(value, region_stack, &mut cx.uses);
                             cx.uses.push((name.clone(), region_stack.clone()));
                             cx.stores.push(LateStore {
+                                func_valued: matches!(
+                                    value,
+                                    Expr::Closure { .. } | Expr::Class { .. }
+                                ),
                                 name,
                                 lexical: true,
                                 level: *level,
@@ -4415,6 +4425,10 @@ fn late_decl_census(
                             collect_ident_uses(value, region_stack, &mut cx.uses);
                             cx.uses.push((name.clone(), region_stack.clone()));
                             cx.stores.push(LateStore {
+                                func_valued: matches!(
+                                    value,
+                                    Expr::Closure { .. } | Expr::Class { .. }
+                                ),
                                 name,
                                 lexical: false,
                                 level: 0,
@@ -4593,6 +4607,15 @@ pub fn late_decl_fold(
         }
         // Global stores convert only at the top level.
         if sites.iter().any(|s| !s.lexical) && !top_level {
+            continue;
+        }
+        // A function/class-valued binding AT THE MODULE TOP is the
+        // module's public surface: converting its first store to a local
+        // `let` shadows the module-scope `var` hoist and external readers
+        // (e.g. a test driver appended after `func_main_0.call(this)`)
+        // see `undefined` (the yield-star golden/node regression).
+        // Function-local closures keep the `let` conversion (s38).
+        if top_level && sites.iter().any(|s| s.func_valued) {
             continue;
         }
         // Not a parameter, not already declared by scope_fold, not a
