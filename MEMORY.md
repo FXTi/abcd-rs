@@ -1088,3 +1088,15 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   0x47/0x48) is the rewrite moving back to the original opcodes —
   attributed, length-preserving, behavior-equivalent. Open: N73
   (withname SEGV) investigation.
+- N73 FIXED (d76b63f): the call_this_range_with_name SEGV was NOT our
+  pipeline — the rewritten file crashed the VM because the lowerer's dense
+  IC reallocation can consume MORE IC slots than the source (wide->narrow
+  callthisrange fold, +6 slots) while the SlotNumber annotation stayed
+  stale; the VM sizes the IC profile array from the annotation and indexes
+  it unchecked (heap OOB, delayed SIGSEGV). Fix: plumb ic_size through
+  LayoutResult -> MethodBody (Option; None on decode keeps byte identity)
+  and sync the annotation at encode (mirrors upstream
+  GenSlotNumberAnnotation). corpus_lower_oracle now covers the 3
+  not-applicable fixtures (1152x3, zero skips). Caught in review: the
+  worker's regression test missed its #[ignore] (would have red-broken
+  the no-corpus CI build jobs) — fixed before landing.
