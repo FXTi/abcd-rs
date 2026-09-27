@@ -1,5 +1,7 @@
 //! Opt-in corpus test (requires the exported GHCR corpus): for every
-//! manifest row with `runtime.status == "passed"` (1149 fixtures),
+//! manifest row with `runtime.status == "passed"` (1149 fixtures) plus
+//! the three runtime-not-applicable N73 `call_this_range_with_name`
+//! fixtures (the rewrite is their only gate; 1152 candidates),
 //! decode → `abcd_lift::lift_file` (v0.2 lift) → ir2 verify → lower →
 //! encode, writing the result to `$ABCD_LOWERED_DIR/<variant>/` for the
 //! black-box VM oracle (`scripts/compare-rewritten-corpus.py`).
@@ -120,8 +122,10 @@ fn passed_corpus_lowered_bodies_written_for_vm_oracle() {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("exports/corpus"));
 
-    // Selection: every row with runtime.status == "passed", optionally
-    // restricted to the comma-separated cases in ABCD_LOWERED_CASE.
+    // Selection: every row with runtime.status == "passed" plus the three
+    // N73 call_this_range_with_name rows (not-applicable; see the embedded
+    // query), optionally restricted to the comma-separated cases in
+    // ABCD_LOWERED_CASE.
     // Paths are sorted so reports are deterministic. (Same python3 JSON
     // pattern as the v0.1 driver.)
     let output = Command::new("python3")
@@ -130,11 +134,17 @@ fn passed_corpus_lowered_bodies_written_for_vm_oracle() {
             r#"
 import json, os, sys
 cases = set(filter(None, (c.strip() for c in os.environ.get("ABCD_LOWERED_CASE", "").split(","))))
+# N73: the three call_this_range_with_name fixtures are runtime
+# not-applicable (their accepted withname->plain fold changes the error
+# text, so the VM behavior oracle can never gate them), but the rewrite
+# itself IS the N73 regression surface — include them as rewrite
+# candidates so the gate covers their lift/lower/encode.
+N73_CASE = "upstream/version_control/API24/bytecode_feature/call_this_range_with_name"
 paths = []
 with open(sys.argv[1], encoding="utf-8") as manifest:
     for line in manifest:
         row = json.loads(line)
-        if row["runtime"]["status"] != "passed":
+        if row["runtime"]["status"] != "passed" and row["case"] != N73_CASE:
             continue
         if cases and row["case"] not in cases:
             continue
@@ -342,8 +352,10 @@ for path in sorted(paths):
 
     if full_run {
         // 1119 original runtime-passed fixtures + 30 P4-T6 opcode-coverage
-        // fixtures (private-property-store/-in, 5 versions x 3 profiles).
-        assert_eq!(fixtures, 1149, "expected 1149 runtime-passed fixtures");
+        // fixtures (private-property-store/-in, 5 versions x 3 profiles)
+        // + 3 N73 call_this_range_with_name fixtures (runtime
+        // not-applicable, but rewrite-covered since the N73 fix).
+        assert_eq!(fixtures, 1152, "expected 1152 rewrite-covered fixtures");
     }
     assert!(fixtures > 0, "no fixtures selected");
     eprintln!(

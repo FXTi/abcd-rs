@@ -1437,6 +1437,25 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
 
             // Method annotations
             {
+                // N73: a lowered body carries its recomputed IC-slot
+                // consumption (`MethodBody::ic_size`); the source file's
+                // `_ESSlotNumberAnnotation`/`SlotNumber` is then STALE
+                // (the runtime sizes the method's ProfileTypeInfo array
+                // from it and indexes the array with the unchecked slot
+                // immediate — a shortfall is an out-of-bounds heap
+                // access, the N73 VM SIGSEGV). Sync the annotation to
+                // the lowered count. Decoded bodies carry `ic_size:
+                // None`, so plain decode → encode keeps the source
+                // annotation byte-identical.
+                let synced_annotations;
+                let annotations = match method.body.as_ref().and_then(|b| b.ic_size) {
+                    Some(ic_size) => {
+                        synced_annotations =
+                            sync_slot_number_annotation(&method.annotations, pool, ic_size);
+                        &synced_annotations
+                    }
+                    None => &method.annotations,
+                };
                 let mut ctx = AnnotationEncodeCtx {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
@@ -1450,7 +1469,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 encode_annotations_on(
                     &mut b,
                     &mut ctx,
-                    &method.annotations,
+                    annotations,
                     AnnotationTarget::Method(method_h),
                 )?;
             }
@@ -1868,6 +1887,66 @@ struct AnnotationEncodeCtx<'a> {
     ann_la_base: u32,
     literal_array_count: usize,
     pool: &'a StringPool,
+}
+
+/// N73: re-synchronize the `_ESSlotNumberAnnotation`/`SlotNumber` value
+/// with a lowered body's actual IC-slot consumption.
+///
+/// The runtime reads the slot count from this annotation
+/// (arkcompiler_ets_runtime-master/ecmascript/jspandafile/
+/// method_literal.cpp:51-77, `KSLOT_NUMBER_ANNOTATION` →
+/// `SetSlotSize`), allocates the method's `ProfileTypeInfo` array with
+/// exactly that many slots (`RuntimeNotifyInlineCache` →
+/// `NewProfileTypeInfo(icSlotSize)`, runtime_stubs-inl.h:1242), and the
+/// interpreter's IC paths index it with the instruction's slot
+/// immediate without a bounds check (interpreter-inl.cpp:2235-2253,
+/// :2556-2565). A rewrite that consumes more IC slots than the source
+/// bytecode did (the N73 case: three `wide.callthisrangewithname` — no
+/// IC — folded to narrow `callthisrange` — a 2-slot IC each, +6 slots
+/// over the annotated 319) leaves the VM indexing past the array:
+/// heap corruption and a delayed SIGSEGV.
+///
+/// Upstream regenerates the annotation from the post-rearrangement slot
+/// count for every function (`FunctionEmitter::GenSlotNumberAnnotation`,
+/// es2panda/compiler/core/emitter/emitter.cpp:614-632), which is
+/// exactly what this sync reproduces.
+///
+/// The update is in-place over every bucket. When the method carries no
+/// `_ESSlotNumberAnnotation` the sync is skipped: adding one requires the
+/// annotation RECORD (`L_ESSlotNumberAnnotation;`) to exist in the file,
+/// and fabricating records is out of encode's scope. Every
+/// frontend-produced (es2abc/es2panda) method carries the annotation —
+/// `GenSlotNumberAnnotation` is unconditional — so all
+/// decode → lift → lower → encode corpus paths are covered; only
+/// hand-built models without the record (encode-only unit tests) take the
+/// skip, and their pre-N73 behavior is unchanged.
+fn sync_slot_number_annotation(
+    anns: &Annotations,
+    pool: &crate::StringPool,
+    ic_size: u32,
+) -> Annotations {
+    const ANNOTATION_CLASS: &str = "L_ESSlotNumberAnnotation;";
+    const ELEMENT_NAME: &str = "SlotNumber";
+
+    let mut synced = anns.clone();
+    for bucket in [
+        &mut synced.compile_time,
+        &mut synced.runtime,
+        &mut synced.compile_time_type,
+        &mut synced.runtime_type,
+    ] {
+        for ann in bucket.iter_mut() {
+            if pool.resolve(ann.class_descriptor) != Some(ANNOTATION_CLASS) {
+                continue;
+            }
+            for elem in &mut ann.elements {
+                if pool.resolve(elem.name) == Some(ELEMENT_NAME) {
+                    elem.value = AnnotationValue::U32(ic_size);
+                }
+            }
+        }
+    }
+    synced
 }
 
 #[allow(clippy::type_complexity)]

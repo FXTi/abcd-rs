@@ -52,6 +52,13 @@ pub struct LayoutResult {
     /// which carry entity operands — so the selection-time records
     /// stay valid for the flattened sequence.
     pub entity_traces: HashMap<(EntityKind, u32), EntityTrace>,
+    /// Total IC-slot consumption of the flattened sequence (after the
+    /// N71 rearrangement, when it fired). Every IC-slot immediate in
+    /// `bytecodes` is `< ic_size` (or the 0xFF no-IC sentinel). Encode
+    /// syncs the method's `_ESSlotNumberAnnotation`/`SlotNumber` to this
+    /// value (N73 — the runtime sizes the method's ProfileTypeInfo array
+    /// from the annotation and indexes it unchecked).
+    pub ic_size: u32,
 }
 
 /// Lay out blocks and resolve jump targets.
@@ -272,6 +279,7 @@ pub fn layout(
         try_blocks,
         num_regs: alloc.num_regs,
         entity_traces: isel.entity_traces.clone(),
+        ic_size: isel.ic_size,
     })
 }
 

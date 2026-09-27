@@ -170,6 +170,26 @@ pub struct MethodBody {
     /// Literal-array operands require separate version-dependent handling.
     pub entity_offsets: HashMap<(abcd_isa::EntityKind, u32), u32>,
     pub try_blocks: Vec<TryBlock>,
+    /// Total IC-slot consumption of this bytecode, as computed by the
+    /// lower that produced it (N73). The runtime sizes each method's
+    /// `ProfileTypeInfo` array from the method's
+    /// `_ESSlotNumberAnnotation`/`SlotNumber` value
+    /// (arkcompiler_ets_runtime-master/ecmascript/jspandafile/
+    /// method_literal.cpp:51-77 — the annotation IS the slot count), and
+    /// the interpreter's IC fast paths index that array with the
+    /// instruction's slot immediate WITHOUT a bounds check
+    /// (interpreter-inl.cpp:2556-2565 `profileTypeArray->Get(slotId)`).
+    /// A rewritten body can consume MORE slots than the source bytecode
+    /// did (e.g. a `wide.callthisrangewithname` — no IC — folding to a
+    /// narrow `callthisrange` — 2-slot IC), so a body-replacing rewrite
+    /// must re-synchronize the annotation or the VM reads/writes out of
+    /// bounds (N73: SIGSEGV on `call_this_range_with_name`).
+    ///
+    /// `None` for decoded bodies: a plain decode → encode round-trip
+    /// keeps the source annotation verbatim (byte identity). `Some(n)`
+    /// tells [`crate::encode`] to sync the method's `SlotNumber` element
+    /// to `n`.
+    pub ic_size: Option<u32>,
 }
 
 /// Four kinds of annotations grouped by retention policy.

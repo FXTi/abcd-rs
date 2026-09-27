@@ -21,6 +21,7 @@ mod n72_args_array;
 mod n72_property;
 mod n72_subclass;
 mod n72_unicode;
+mod n73_segv;
 mod regalloc_pressure;
 mod rewrite_pipeline;
 mod test262_vm;

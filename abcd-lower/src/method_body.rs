@@ -115,6 +115,12 @@ pub fn to_method_body(
         bytecodes: result.bytecodes.clone(),
         entity_offsets,
         try_blocks: result.try_blocks.clone(),
+        // N73: hand the lowered IC-slot consumption to encode so the
+        // method's `_ESSlotNumberAnnotation`/`SlotNumber` is synced —
+        // the source annotation goes stale whenever the lowering's
+        // dense IC assignment consumes more slots than the source
+        // bytecode did (wide→narrow folds add IC slots).
+        ic_size: Some(result.ic_size),
     })
 }
 

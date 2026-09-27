@@ -219,6 +219,7 @@ mod tests {
             num_args: 0,
             bytecodes,
             try_blocks: Vec::new(),
+            ic_size: None,
         }
     }
 
@@ -283,6 +284,7 @@ mod tests {
                     len: 2,
                 }],
             }],
+            ic_size: None,
         };
         let cfg = build_cfg(&body).unwrap();
         let b0 = &cfg.blocks[0];

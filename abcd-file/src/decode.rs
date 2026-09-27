@@ -1049,6 +1049,10 @@ fn decode_code_at(
             bytecodes,
             entity_offsets: HashMap::new(),
             try_blocks,
+            // Decoded bodies keep the source file's SlotNumber annotation
+            // verbatim on re-encode (byte identity); only lowered bodies
+            // carry a recomputed count (model.rs `ic_size` doc, N73).
+            ic_size: None,
         },
         byte_offsets,
     ))
