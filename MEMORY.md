@@ -1067,3 +1067,15 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   fixed-not-delisted = red). Cluster fixes queue as follow-up tasks.
   test262-vm CI job live per-push. Also note: the N71 fix unmasked the
   30th row (surrogate-pairs, formerly encode-skipped).
+- N72 cluster wave landed (9ce05a0 + 62a01cd): 29 of 30 test262 behavior
+  divergences fixed by three vendor-verified root causes — callthisrange
+  argc off-by-one (24 rows shared it; lift+lower self-consistent double
+  inversion, byte-transparent to all corpus gates), SuperForwardAllArgs
+  lowered to the wrong shape (4 rows), MUTF-8 lone-surrogate lossy decay
+  in decode (raw-bytes capture + sentinel-disambiguated pool identities;
+  decompiler now emits sentinel content for collided strings — documented
+  residual, beats U+FFFD garbage). The B-plan ledger proved itself twice:
+  caught my hand-entry path error AND forced the stale-row cleanup. Ledger
+  now holds exactly ONE row (decl-lex-configurable-global -> l-P2). N73
+  registered (pre-existing SEGV rewriting call_this_range_with_name
+  fixtures, ungated input; investigation queued).
