@@ -1119,3 +1119,11 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   emit-level), N76 (structurer try/switch deep water, 5 rows), plus two
   single rows to chase (labeled for-in, decl-lex in the DREAM gate — the
   VM-ledger row was fixed by l-P2 but the dream-gate instance persists).
+- N74 follow-up fix (c214a17): W4's late_decl_fold shadowed module-scope
+  FUNCTION bindings (yield-star 'outer') with a local let — external
+  readers (node driver) saw undefined; caught by the yield-star goldens/
+  node evidence on CI (my name-filtered verification had missed those
+  suites — lesson: verify the whole target, never a name subset). Guard:
+  skip the conversion for Closure/Class-valued bindings at module top
+  level; function-local closures keep it. 1149 gate green (198s), t262
+  gate unchanged (2666/2685), workspace 726/0.
