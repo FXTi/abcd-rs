@@ -217,9 +217,14 @@ enum ScalarKey {
 
 impl<'f> Lifter<'f> {
     fn new(file: &'f File) -> Self {
+        let mut module = Module::new();
+        // N75: plumb the file's lone-surrogate raw-bytes side table so
+        // the decompiler can render those strings as `\uXXXX` escapes
+        // (keyed by the same pool identity the symbols intern as).
+        module.string_raw_bytes = file.string_raw_bytes.clone();
         Self {
             file,
-            module: Module::new(),
+            module,
             method_to_func: HashMap::new(),
             class_to_id: HashMap::new(),
             field_to_id: HashMap::new(),

@@ -85,33 +85,164 @@ pub fn render_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            '\u{0B}' => out.push_str("\\v"),
-            '\0' => out.push_str("\\0"),
-            c if (c as u32) < 0x20 || (0x7F..0xA0).contains(&(c as u32)) => {
-                out.push_str(&format!("\\u{{{:X}}}", c as u32));
-            }
-            // Line/paragraph separators are valid in string literals since
-            // ES2019 but escaped for maximal parser compatibility.
-            '\u{2028}' => out.push_str("\\u{2028}"),
-            '\u{2029}' => out.push_str("\\u{2029}"),
-            c => out.push(c),
-        }
+        push_js_char(&mut out, c);
     }
     out.push('"');
     out
 }
 
+/// One scalar value inside a JS double-quoted string literal, per
+/// [`render_string`]'s escaping contract (shared with the raw-bytes
+/// renderer below so both spellings stay in lockstep).
+fn push_js_char(out: &mut String, c: char) {
+    match c {
+        '"' => out.push_str("\\\""),
+        '\\' => out.push_str("\\\\"),
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        '\u{08}' => out.push_str("\\b"),
+        '\u{0C}' => out.push_str("\\f"),
+        '\u{0B}' => out.push_str("\\v"),
+        '\0' => out.push_str("\\0"),
+        c if (c as u32) < 0x20 || (0x7F..0xA0).contains(&(c as u32)) => {
+            out.push_str(&format!("\\u{{{:X}}}", c as u32));
+        }
+        // Line/paragraph separators are valid in string literals since
+        // ES2019 but escaped for maximal parser compatibility.
+        '\u{2028}' => out.push_str("\\u{2028}"),
+        '\u{2029}' => out.push_str("\\u{2029}"),
+        c => out.push(c),
+    }
+}
+
+/// Decode MUTF-8 bytes (CESU-8: every UTF-16 code unit encoded as up to
+/// three bytes; U+0000 as `C0 80`) to UTF-16 code units. A 4-byte UTF-8
+/// sequence (not MUTF-8-canonical; defensive) decodes to its scalar's
+/// UTF-16 units; a truncated/invalid lead degrades to U+FFFD — data,
+/// never a panic.
+pub fn mutf8_units(raw: &[u8]) -> Vec<u16> {
+    let mut units = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b < 0x80 {
+            units.push(b as u16);
+            i += 1;
+        } else if b >> 5 == 0b110 && i + 1 < raw.len() {
+            units.push((((b as u16) & 0x1F) << 6) | ((raw[i + 1] as u16) & 0x3F));
+            i += 2;
+        } else if b >> 4 == 0b1110 && i + 2 < raw.len() {
+            units.push(
+                (((b as u16) & 0x0F) << 12)
+                    | (((raw[i + 1] as u16) & 0x3F) << 6)
+                    | ((raw[i + 2] as u16) & 0x3F),
+            );
+            i += 3;
+        } else if b >> 3 == 0b11110 && i + 3 < raw.len() {
+            let cp = (((b as u32) & 0x07) << 18)
+                | (((raw[i + 1] as u32) & 0x3F) << 12)
+                | (((raw[i + 2] as u32) & 0x3F) << 6)
+                | ((raw[i + 3] as u32) & 0x3F);
+            match char::from_u32(cp) {
+                Some(c) => {
+                    let mut buf = [0u16; 2];
+                    units.extend_from_slice(c.encode_utf16(&mut buf));
+                }
+                None => units.push(0xFFFD),
+            }
+            i += 4;
+        } else {
+            units.push(0xFFFD);
+            i += 1;
+        }
+    }
+    units
+}
+
+/// Render UTF-16 code units as the BODY of a JS double-quoted string
+/// literal: a well-formed surrogate pair renders as its astral
+/// character (es2abc's CESU-8 re-encode is byte-identical to the
+/// original pair), a LONE surrogate unit — which has no valid UTF-8
+/// spelling — renders as a `\uXXXX` escape (valid JS that es2abc
+/// recompiles to exactly the original MUTF-8 bytes, N75); every other
+/// unit follows [`render_string`]'s escaping contract.
+fn push_units_string_body(out: &mut String, units: &[u16]) {
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..0xDC00).contains(&u)
+            && i + 1 < units.len()
+            && (0xDC00..0xE000).contains(&units[i + 1])
+        {
+            let cp = 0x10000 + (((u as u32) - 0xD800) << 10) + ((units[i + 1] as u32) - 0xDC00);
+            // A well-formed pair always decodes to a scalar value.
+            if let Some(c) = char::from_u32(cp) {
+                push_js_char(out, c);
+            }
+            i += 2;
+        } else if (0xD800..0xE000).contains(&u) {
+            out.push_str(&format!("\\u{u:04X}"));
+            i += 1;
+        } else {
+            // A BMP unit is always a scalar value.
+            if let Some(c) = char::from_u32(u as u32) {
+                push_js_char(out, c);
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Render raw MUTF-8 string bytes as a JS double-quoted string literal
+/// (see [`push_units_string_body`]).
+pub fn render_mutf8_string(raw: &[u8]) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    push_units_string_body(&mut out, &mutf8_units(raw));
+    out.push('"');
+    out
+}
+
+/// Render raw MUTF-8 bytes of a REGEXP pattern (N75): like
+/// [`render_mutf8_string`] but for the `/…/` body — no quotes, `/`
+/// escaped (mirroring the non-raw `pattern.replace('/', "\\/")` path),
+/// line terminators always escaped (they are illegal in a regexp
+/// literal even though [`push_js_char`] would pass `\n` as `\\n`, which
+/// is also fine here), and lone surrogates as `\uXXXX` escapes.
+pub fn render_mutf8_regexp(raw: &[u8]) -> String {
+    let mut body = String::new();
+    push_units_string_body(&mut body, &mutf8_units(raw));
+    body.replace('/', "\\/")
+}
+
+/// Render a pooled string as a JS string literal, honoring the module's
+/// raw-bytes side table (N75): a string whose pool identity carries
+/// original MUTF-8 bytes (lone surrogates have no lossless Rust
+/// `String` form — and a colliding identity carries a disambiguation
+/// sentinel that must never reach the output) renders from those bytes;
+/// anything else renders verbatim.
+pub fn render_pool_string(module: &Module, s: &str) -> String {
+    match module.string_raw_bytes.get(s) {
+        Some(raw) => render_mutf8_string(raw),
+        None => render_string(s),
+    }
+}
+
 /// Render a [`Lit`] as its JS literal text (used by the dump; Stage C
 /// reuses the same renderer).
 pub fn render_lit(lit: &Lit) -> String {
+    render_lit_inner(None, lit)
+}
+
+/// [`render_lit`] with the module's raw-bytes side table consulted for
+/// string leaves (N75) — the Stage C emission path uses this one.
+pub fn render_lit_m(module: &Module, lit: &Lit) -> String {
+    render_lit_inner(Some(module), lit)
+}
+
+/// The shared [`render_lit`]/[`render_lit_m`] walker.
+fn render_lit_inner(module: Option<&Module>, lit: &Lit) -> String {
     match lit {
         Lit::Undefined => "undefined".to_string(),
         // The hole has no JS spelling (see expr.rs); annotated.
@@ -119,16 +250,25 @@ pub fn render_lit(lit: &Lit) -> String {
         Lit::Null => "null".to_string(),
         Lit::Bool(b) => b.to_string(),
         Lit::Number(bits) => render_number(*bits),
-        Lit::String(s) => render_string(s),
+        Lit::String(s) => match module {
+            Some(m) => render_pool_string(m, s),
+            None => render_string(s),
+        },
         Lit::BigInt(s) => format!("{s}n"),
         Lit::Array(items) => {
-            let inner: Vec<String> = items.iter().map(render_lit).collect();
+            let inner: Vec<String> = items.iter().map(|i| render_lit_inner(module, i)).collect();
             format!("[{}]", inner.join(", "))
         }
         Lit::Object(entries) => {
             let inner: Vec<String> = entries
                 .iter()
-                .map(|(k, v)| format!("{}: {}", render_lit_key(k), render_lit(v)))
+                .map(|(k, v)| {
+                    format!(
+                        "{}: {}",
+                        render_lit_key_inner(module, k),
+                        render_lit_inner(module, v)
+                    )
+                })
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
@@ -136,15 +276,15 @@ pub fn render_lit(lit: &Lit) -> String {
     }
 }
 
-/// An object-literal key: identifier form when legal, string form
-/// otherwise.
-fn render_lit_key(lit: &Lit) -> String {
+/// [`render_lit_key_inner`]: an object-literal key: identifier form
+/// when legal, string form otherwise.
+fn render_lit_key_inner(module: Option<&Module>, lit: &Lit) -> String {
     if let Lit::String(s) = lit
         && crate::legalize::is_legal_ident(s)
     {
         return s.clone();
     }
-    render_lit(lit)
+    render_lit_inner(module, lit)
 }
 
 /// Map the vendor RegExp flag bits (arkcompiler

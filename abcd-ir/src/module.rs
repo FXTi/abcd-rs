@@ -279,6 +279,16 @@ pub struct Module {
     pub blocks: Vec<Block>,
     /// SSA value arena.
     pub values: Vec<Value>,
+    /// Original MUTF-8 bytes of pooled strings that have NO lossless
+    /// Rust `String` form (MUTF-8 lone surrogates), plumbed verbatim
+    /// from `abcd_file::model::File::string_raw_bytes` at lift (N75) so
+    /// the decompiler can render them as `\uXXXX` escapes — valid JS
+    /// that es2abc recompiles to the same bytes — instead of degrading
+    /// them to U+FFFD. Keyed by pool identity (the lossy content, or
+    /// its sentinel-disambiguated `content + U+E000 + hex(raw)` form on
+    /// a raw-form collision); consult it by the resolved symbol text.
+    /// Empty for hand-built modules.
+    pub string_raw_bytes: std::collections::HashMap<String, Box<[u8]>>,
 }
 
 impl Module {

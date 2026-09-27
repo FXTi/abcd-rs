@@ -58,7 +58,7 @@ use abcd_ir::op::{BinOp, CallKind, CmpOp, UnOp};
 use abcd_ir::ty::{DynPrim, StaticTy, Ty};
 use abcd_ir::{Const, FuncId, Op, ValueDef};
 
-use crate::consts::{lit_of, render_lit, render_string, sym_str};
+use crate::consts::{lit_of, render_lit_m, render_mutf8_regexp, render_pool_string, sym_str};
 use crate::expr::{ArrayElem, Expr, IterOp, Lit, NodeStatus, ObjEntry};
 use crate::folds::{self, FoldStats};
 use crate::legalize::{Legalizer, is_legal_ident, sanitize};
@@ -156,7 +156,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
             } => {
                 let local = sanitize(&sym_str(module, *local_name));
                 let import = module_facing_name(&sym_str(module, *import_name));
-                let spec = render_string(&sym_str(module, *module_request));
+                let spec = render_pool_string(module, &sym_str(module, *module_request));
                 em.fn_names.reserve(&local);
                 if local == import {
                     out.push_str(&format!("import {{ {local} }} from {spec};\n"));
@@ -169,7 +169,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
                 module_request,
             } => {
                 let local = sanitize(&sym_str(module, *local_name));
-                let spec = render_string(&sym_str(module, *module_request));
+                let spec = render_pool_string(module, &sym_str(module, *module_request));
                 em.fn_names.reserve(&local);
                 out.push_str(&format!("import * as {local} from {spec};\n"));
             }
@@ -187,19 +187,37 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     // the global object inside the emitted module exactly like the
     // lexical record did (recover.rs `Stmt::GlobalStore` fold).
     let mut globals = BTreeSet::new();
+    let mut record_globals = BTreeSet::new();
     for inst in &module.insts {
-        if let Op::StoreGlobal { name, .. }
-        | Op::StoreGlobalRecord { name, .. }
-        | Op::TryStoreGlobal { name, .. } = &inst.op
-        {
-            let n = sanitize(&sym_str(module, *name));
-            if globals.insert(n.clone()) {
-                em.fn_names.reserve(&n);
+        match &inst.op {
+            Op::StoreGlobal { name, .. } | Op::TryStoreGlobal { name, .. } => {
+                let n = sanitize(&sym_str(module, *name));
+                if globals.insert(n.clone()) {
+                    em.fn_names.reserve(&n);
+                }
             }
+            Op::StoreGlobalRecord { name, .. } => {
+                let n = sanitize(&sym_str(module, *name));
+                if record_globals.insert(n.clone()) {
+                    em.fn_names.reserve(&n);
+                }
+            }
+            _ => {}
         }
     }
     for g in &globals {
         out.push_str(&format!("var {g};\n"));
+    }
+    // N74 residual (decl-lex-configurable-global): a name stored ONLY
+    // via StoreGlobalRecord is a source-level LEXICAL global
+    // (let/const/class at script top level). A `var` hoist lowers to
+    // `stglobalvar` under es2abc script mode — a REAL store that
+    // clobbers a same-named configurable global-object property
+    // (ark_js_vm overwrites it: `var Array;` made `this.Array` read
+    // undefined). Hoist as `let` instead: `sttoglobalrecord`, the
+    // declarative record — the global object stays untouched.
+    for g in record_globals.difference(&globals) {
+        out.push_str(&format!("let {g};\n"));
     }
     // N74-W4: the hoisted `var` initializes the binding at module
     // evaluation, destroying the undeclared-read/TDZ windows (a sloppy
@@ -299,11 +317,11 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
             } => {
                 let import = module_facing_name(&sym_str(module, *import_name));
                 let export = module_facing_name(&sym_str(module, *export_name));
-                let spec = render_string(&sym_str(module, *module_request));
+                let spec = render_pool_string(module, &sym_str(module, *module_request));
                 out.push_str(&format!("export {{ {import} as {export} }} from {spec};\n"));
             }
             ExportDecl::Star { module_request } => {
-                let spec = render_string(&sym_str(module, *module_request));
+                let spec = render_pool_string(module, &sym_str(module, *module_request));
                 out.push_str(&format!("export * from {spec};\n"));
             }
         }
@@ -917,7 +935,7 @@ impl<'m> Emitter<'m> {
                 let member = if *dot_legal {
                     format!(".{name}")
                 } else {
-                    format!("[{}]", render_string(name))
+                    format!("[{}]", render_pool_string(self.module, name))
                 };
                 let tag = if *own { " /*own*/" } else { "" };
                 out.push_str(&format!(
@@ -955,7 +973,7 @@ impl<'m> Emitter<'m> {
                 let member = if is_legal_ident(name) {
                     format!(".{name}")
                 } else {
-                    format!("[{}]", render_string(name))
+                    format!("[{}]", render_pool_string(self.module, name))
                 };
                 out.push_str(&format!(
                     "{pad}{}{member} = {}; /*method (length={length})*/\n",
@@ -989,7 +1007,7 @@ impl<'m> Emitter<'m> {
                     out.push_str(&format!(
                         "{pad}{}[{}] = {}; /*private #{name} — out-of-class instance initializer (class-field fold pending)*/\n",
                         self.member_base(object),
-                        render_string(name),
+                        render_pool_string(self.module, name),
                         self.estr(value)
                     ));
                 }
@@ -1013,7 +1031,7 @@ impl<'m> Emitter<'m> {
                 let target = if is_legal_ident(name) {
                     name.clone()
                 } else {
-                    format!("globalThis[{}]", render_string(name))
+                    format!("globalThis[{}]", render_pool_string(self.module, name))
                 };
                 out.push_str(&format!("{pad}{target} = {};\n", self.estr(value)));
             }
@@ -1327,7 +1345,7 @@ impl<'m> Emitter<'m> {
         let key = if is_legal_ident(name) {
             name.to_string()
         } else {
-            render_string(name)
+            render_pool_string(self.module, name)
         };
         let mut body = String::new();
         let rf = self.emit_function_body(f, indent + 2, &mut body);
@@ -1372,7 +1390,7 @@ impl<'m> Emitter<'m> {
                 if *dot_legal {
                     out.push_str(&format!(".{name}"));
                 } else {
-                    out.push_str(&format!("[{}]", render_string(name)));
+                    out.push_str(&format!("[{}]", render_pool_string(self.module, name)));
                 }
             }
             Expr::PropIndex { object, index } | Expr::PropDyn { object, key: index } => {
@@ -1395,7 +1413,7 @@ impl<'m> Emitter<'m> {
                     self.sub(object, 19, out);
                     out.push_str(&format!(
                         "[{}] /*private #{name} — out-of-class*/",
-                        render_string(name)
+                        render_pool_string(self.module, name)
                     ));
                 }
             }
@@ -1410,7 +1428,7 @@ impl<'m> Emitter<'m> {
                         .entry("TestPrivate(out-of-class)")
                         .or_insert(0) += 1;
                     self.current_fn_has_fallback = true;
-                    out.push_str(&format!("({} in ", render_string(name)));
+                    out.push_str(&format!("({} in ", render_pool_string(self.module, name)));
                     self.sub(object, 0, out);
                     out.push_str(") /*private test — out-of-class*/");
                 }
@@ -1466,13 +1484,21 @@ impl<'m> Emitter<'m> {
                 self.sub(right, prec + 1, out);
             }
             Expr::RegExp { pattern, flags } => {
-                out.push_str(&format!("/{}/{flags}", pattern.replace('/', "\\/")));
+                // N75: a pattern with a raw-bytes record (lone
+                // surrogates) renders from those bytes — the lossy pool
+                // identity (or its sentinel-disambiguated form) is not
+                // valid JS text.
+                let body = match self.module.string_raw_bytes.get(pattern) {
+                    Some(raw) => render_mutf8_regexp(raw),
+                    None => pattern.replace('/', "\\/"),
+                };
+                out.push_str(&format!("/{body}/{flags}"));
             }
             Expr::ObjectLit { entries } => {
-                out.push_str(&render_lit(&Lit::Object(entries.clone())));
+                out.push_str(&render_lit_m(self.module, &Lit::Object(entries.clone())));
             }
             Expr::ArrayLit { elements } => {
-                out.push_str(&render_lit(&Lit::Array(elements.clone())));
+                out.push_str(&render_lit_m(self.module, &Lit::Array(elements.clone())));
             }
             Expr::ObjectBuild { entries } => {
                 out.push('{');
@@ -1482,7 +1508,7 @@ impl<'m> Emitter<'m> {
                         let mut s = String::new();
                         match en {
                             ObjEntry::KeyValue(k, v) => {
-                                s.push_str(&render_lit_key_pub(k));
+                                s.push_str(&render_lit_key_pub(self.module, k));
                                 s.push_str(": ");
                                 self.expr(v, 0, &mut s);
                             }
@@ -1532,7 +1558,7 @@ impl<'m> Emitter<'m> {
                                     if is_legal_ident(n) {
                                         s.push_str(n);
                                     } else {
-                                        s.push_str(&render_string(n));
+                                        s.push_str(&render_pool_string(self.module, n));
                                     }
                                     s.push_str(": ");
                                     self.expr(f, 0, &mut s);
@@ -1736,12 +1762,12 @@ impl<'m> Emitter<'m> {
                                     .iter()
                                     .map(|l| match l {
                                         Lit::String(s) => s.clone(),
-                                        other => render_lit(other),
+                                        other => render_lit_m(self.module, other),
                                     })
                                     .collect();
                                 out.push_str(&format!(
                                     "{} /*template: raw absent, cooked-only*/",
-                                    render_string(&joined.join(""))
+                                    render_pool_string(self.module, &joined.join(""))
                                 ));
                             }
                             None => {
@@ -2116,11 +2142,17 @@ impl<'m> Emitter<'m> {
             Lit::Object(entries) => {
                 let inner: Vec<String> = entries
                     .iter()
-                    .map(|(k, v)| format!("{}: {}", render_lit_key_pub(k), self.render_lit_js(v)))
+                    .map(|(k, v)| {
+                        format!(
+                            "{}: {}",
+                            render_lit_key_pub(self.module, k),
+                            self.render_lit_js(v)
+                        )
+                    })
                     .collect();
                 format!("{{{}}}", inner.join(", "))
             }
-            other => render_lit(other),
+            other => render_lit_m(self.module, other),
         }
     }
 }
@@ -2136,7 +2168,7 @@ impl<'m> Emitter<'m> {
                 if is_legal_ident(n) {
                     s.push_str(n);
                 } else {
-                    s.push_str(&render_string(n));
+                    s.push_str(&render_pool_string(self.module, n));
                 }
             }
             crate::expr::ObjKey::Computed(e) => {
@@ -2274,13 +2306,13 @@ fn iter_op_name(op: IterOp) -> &'static str {
 }
 
 /// Object-literal key rendering (identifier form when legal).
-fn render_lit_key_pub(lit: &Lit) -> String {
+fn render_lit_key_pub(module: &Module, lit: &Lit) -> String {
     if let Lit::String(s) = lit
         && is_legal_ident(s)
     {
         return s.clone();
     }
-    render_lit(lit)
+    render_lit_m(module, lit)
 }
 
 fn fmt_loc(loc: Option<Loc>) -> String {
