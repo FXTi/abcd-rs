@@ -6,6 +6,7 @@
 # Upstream reference source trees (local research only, not committed)
 /arkcompiler
 /hermes-main
+/developtools_packing_tool
 
 # Decompilation output (contains third-party closed source; never commit)
 /decompiled
