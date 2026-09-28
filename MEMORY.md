@@ -1271,3 +1271,17 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   -> Vec<AbcModule> feeding abcd-file. Tests: synthesize ZIP bytes in
   code (zero binary fixtures); real signed haps go to the corpus image
   in phase 2. Awaiting maintainer ruling to implement.
+- q-P6 ruling (2026-09-28): abcd-hap approved to implement per
+  design/abcd-hap-research.md. ZIP strategy deliberated with the
+  maintainer: hand-written CD parser + miniz_oxide WINS over the `zip`
+  crate — zip 8.6.0 is 12.3k lines + heavy default features
+  (aes/bzip2/lzma/xz/zstd/ppmd/time; even trimmed `deflate` pulls
+  zopfli), its Read+Seek streaming API can't lend STORED slices from
+  &[u8], and the repo rule is auditable owned byte-format layers.
+  Recorded for the same reason: the MUTF-8 layer could NOT have used a
+  library — cesu8 (126M downloads, 230 lines, stable since 2016) and
+  mutf8 (37k downloads) are both String-oriented, and Rust String
+  cannot hold lone surrogates, while the dream gate requires
+  byte-lossless re-encode (N75). If wild haps ever defeat the
+  hand-written reader, swapping in zip 2.x (default-features=false)
+  costs one ZipArchive layer.
