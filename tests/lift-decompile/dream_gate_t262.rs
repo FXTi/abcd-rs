@@ -143,7 +143,11 @@ fn generate() -> usize {
     let root = common::corpus_root();
     let gate = gate_root();
     let rows = t262_rows(&root, &gate);
-    assert_eq!(rows.len(), 2684, "the recorded test262 corpus minus the N77-excluded A7_T2");
+    assert_eq!(
+        rows.len(),
+        2684,
+        "the recorded test262 corpus minus the N77-excluded A7_T2"
+    );
     assert!(
         rows.iter()
             .all(|(_, _, v, p)| v == "24.0.0.0" && p == "baseline"),
