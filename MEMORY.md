@@ -1243,3 +1243,31 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   2676/2685. The test262 campaign is fully closed: P1 pandasm 4.56M
   instructions 0 mismatch; P2 VM oracle 2685/2685; P3 dream gate with
   the decompile-bug ledger at ZERO. N-register N1..N78 all terminal.
+- q-P5 (2026-09-28): full-estate test audit (design/test-dedup-audit.md;
+  812 tests: 709 per-crate + 103 root integration). Findings: exactly
+  TWO verbatim case-level duplicates — n77_deabsorb.rs a7_t1_still_fixed
+  and a15_still_fixed, both strict subsets of n76_structurer.rs pins —
+  DELETED (verified same fixture/assertions/literals). Two stale
+  "not registered in main.rs" headers fixed (n74_readonly_globals,
+  n74_top_level_this — both ARE registered at main.rs:32,34). Four
+  NEEDS-RULING items surfaced (n71_ic_slots, n72_args_array, the
+  n76/n77 a7_t2 overlap pair, abcd-isa 4 zero-operand roundtrip dups)
+  — all proven gate-subsumed but kept pending maintainer call
+  (residual value = fast focused repro). Adjacent CI findings:
+  F1 = coverage job re-runs both docker dream oracles (~17min
+  duplicated compute; lever: --skip dream_gate on llvm-cov);
+  F2 = build×3 bare `cargo test` runs root-package 18 tests only,
+  709 per-crate tests are CI-dark outside coverage (lever:
+  cargo test --workspace). Net test-time saving from deletions: ~0.2s —
+  the real time lever is CI scheduling (F1), not test deletion.
+- q-P6 (2026-09-28): abcd-hap research done (design/abcd-hap-research.md).
+  developtools_packing_tool @ b2aa3f6 audited (Java unpack mainline;
+  C++ is pack-only per its own AGENTS.md). All six containers
+  (hap/hsp/app/har/hqf/appqf) are ZIP; abc lives at the fixed entry
+  ets/modules.abc (one per hap; multi-module = .app nesting, nested
+  haps DEFLATEd); NO 4K-alignment guarantee (verified on a real hap);
+  signing blocks are EOCD-scan-immune. Design: hand-written CD parser
+  (~300-400 lines) + miniz_oxide, in-memory unpack-only, abc_modules()
+  -> Vec<AbcModule> feeding abcd-file. Tests: synthesize ZIP bytes in
+  code (zero binary fixtures); real signed haps go to the corpus image
+  in phase 2. Awaiting maintainer ruling to implement.

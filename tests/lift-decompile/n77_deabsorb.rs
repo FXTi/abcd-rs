@@ -76,24 +76,7 @@ fn a7_t2_emission_is_linear() {
     );
 }
 
-/// 2a. A7_T1 stays fixed: the outer handler's phi declaration and the
-/// finally dispatch handler survive the de-absorption.
-#[test]
-#[ignore]
-fn a7_t1_still_fixed() {
-    let text =
-        decompile("24.0.0.0/test262/language/statements/try/S12.14_A7_T1/baseline/input.abc");
-    assert!(
-        text.contains("var v384; /* phi */"),
-        "the outer handler's phi declaration must be emitted (its body must exist)"
-    );
-    assert!(
-        text.contains("catch (e$16)"),
-        "the outer finally dispatch handler must be emitted"
-    );
-}
-
-/// 2b. A7_T2 stays fixed: the outer catches receiving the replaced
+/// 2. A7_T2 stays fixed: the outer catches receiving the replaced
 /// exception are all still emitted, and the outer-catch GUARDS survive
 /// (the first de-absorption cut dropped B116's `#3.2`/`#7.3` guard
 /// conditionals — the fall-out target sat past the join head's
@@ -117,24 +100,5 @@ fn a7_t2_still_fixed() {
     assert!(
         !text.contains("conditional at B116 dropped"),
         "B116's guard conditional must not be dropped"
-    );
-}
-
-/// 2c. A15 stays fixed: SwitchTest3's finally-`break` dispatch folds
-/// to a switch whose `case undefined` returns the accumulated result,
-/// and SwitchTest1's epilogue follows the inner dispatch switch.
-#[test]
-#[ignore]
-fn a15_still_fixed() {
-    let text = decompile("24.0.0.0/test262/language/statements/try/S12.14_A15/baseline/input.abc");
-    let st3 = &text[text.find("___SwitchTest3").expect("SwitchTest3")..];
-    assert!(
-        st3.contains("switch (v514) {\n      case undefined: {\n"),
-        "SwitchTest3's dispatch must fold to a switch over the completion marker"
-    );
-    let st1 = &text[text.find("___SwitchTest1").expect("SwitchTest1")..];
-    assert!(
-        st1.contains("            }\n            var v440; /* phi */\n            var v449; /* phi */\n            v439 = v440;"),
-        "the epilogue must follow the inner dispatch switch, not hide in an arm"
     );
 }

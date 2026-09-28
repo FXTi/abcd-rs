@@ -17,8 +17,7 @@
 //! shadow-hostile set; N74 adds the other two. Property ACCESSES
 //! (`Number.NaN`) are unaffected.
 //!
-//! Not registered in `main.rs` (concurrent N74 workers); run
-//! stand-alone by temporarily adding `mod n74_readonly_globals;`.
+//! Registered in `main.rs` as `mod n74_readonly_globals;`.
 
 use abcd_decompile::emit::{decompile_module, EmitOptions};
 use abcd_file::{decode, AccessFlags, Builder, CodeEntity, Type};

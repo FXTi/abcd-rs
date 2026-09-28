@@ -19,9 +19,7 @@
 //! Ledger class: `scripts/test262-dream-divergences.json`
 //! `decompile-bug-top-level-this-undefined` (9 rows).
 //!
-//! NOT registered in `main.rs` (N74 worker protocol: parallel workers
-//! must not contend on the shared module list); run standalone by
-//! temporarily adding `mod n74_top_level_this;`.
+//! Registered in `main.rs` as `mod n74_top_level_this;`.
 
 use abcd_decompile::emit::{decompile_module, EmitOptions};
 use abcd_ir::Op;
