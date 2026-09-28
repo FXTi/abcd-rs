@@ -217,7 +217,9 @@ except the three verbatim n77 overlaps (D1–D3).
    (n77's keeper value is `a7_t2_emission_is_linear` — the 32 KiB bound, unique
    — and `a7_t2_still_fixed`'s two extra guard assertions, D3.)
 
-### NEEDS-MAINTAINER-RULING (proven subsumed by a per-push gate at the same layer; residual value = fast focused repro)
+### RULED 2026-09-28 — ALL KEPT (maintainer rejected deletion: focused-repro value outweighs ~2s)
+
+(Proven subsumed by a per-push gate at the same layer; residual value = fast focused repro.)
 
 3. `tests/lift-lower/n71_ic_slots.rs` (D5) — subsumed by `test262_vm`'s
    zero-skip gate over the same 24 rows, same layer, per push. Saves ~0.3s.
@@ -251,7 +253,7 @@ except the three verbatim n77 overlaps (D1–D3).
 - `textual_oracle`, `corpus_callee_names`: declared instruments, CI-skipped,
   zero cost.
 
-### Out-of-scope-but-adjacent CI findings (no test deletion implied)
+### Out-of-scope-but-adjacent CI findings — RULED 2026-09-28: BOTH REJECTED (no --skip dream_gate in coverage; no --workspace in build jobs). CI wall time accepted as-is.
 
 - **F1**: coverage job re-runs both docker dream oracles per push (~17 min of
   duplicated oracle compute inside the longest job). Lever: `--skip dream_gate`

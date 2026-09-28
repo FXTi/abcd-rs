@@ -1285,3 +1285,13 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   byte-lossless re-encode (N75). If wild haps ever defeat the
   hand-written reader, swapping in zip 2.x (default-features=false)
   costs one ZipArchive layer.
+- q-P5 ruling (2026-09-28): ALL THREE audit recommendations REJECTED
+  by the maintainer. F1 (coverage job --skip dream_gate): NO — the
+  duplicated docker oracle compute stays; coverage fidelity of the
+  dream paths is worth the 12-13min. F2 (build jobs cargo test
+  --workspace): NO — build jobs keep running root-package tests only.
+  The 4 NEEDS-RULING test clusters (n71_ic_slots, n72_args_array,
+  n76/n77 a7_t2 pair, abcd-isa zero-operand dups): ALL KEPT — their
+  fast focused-repro value outweighs the ~2s cost. Consequence: CI
+  wall time stays as-is (~17min); the earlier wall-time budget item
+  is thereby RESOLVED as "accepted". Nothing further to do on q-P5.
