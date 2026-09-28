@@ -87,8 +87,8 @@ fn decompiled(name: &str) -> String {
 fn golden_yield_star_delegate_gen() {
     let text = decompiled("delegate-gen");
     let expected = r#"var inner;
-var log;
 var outer;
+let log;
 function func_main_0() {
   /* rethrow-only try/catch dissolved (semantic no-op) */
   inner = function* ___inner() {
@@ -134,8 +134,8 @@ function func_main_0() {
 #[ignore = "requires exported corpus"]
 fn golden_yield_star_delegate_array() {
     let text = decompiled("delegate-array");
-    let expected = r#"var log;
-var outer;
+    let expected = r#"var outer;
+let log;
 function func_main_0() {
   /* rethrow-only try/catch dissolved (semantic no-op) */
   outer = function* ___outer() {
@@ -181,9 +181,9 @@ function func_main_0() {
 fn golden_yield_star_delegate_throw() {
     let text = decompiled("delegate-throw");
     let expected = r#"var boom;
-var it;
-var log;
 var outer;
+let it;
+let log;
 function func_main_0() {
   try {
     /* try region 0: the handler continuation (the try's join) is nested below the protected run in the region tree — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there) */

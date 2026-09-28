@@ -93,7 +93,12 @@ def compile_one(row):
         cmd += ["--mode", "module"]
     cmd += [f"/work/src/{rel}.js", f"/work/abc/{rel}"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            # 900s: GH runners are slow, and N76's A7_T2 currently emits a
+            # ~12MB JS (the absorbed-continuation wart; de-absorption is
+            # the registered follow-up) — es2abc needs minutes on it.
+            timeout=900)
     except subprocess.TimeoutExpired:
         return {"abc": rel, "compiled": False, "error": "compile timeout"}
     if proc.returncode == 0 and out.is_file():
