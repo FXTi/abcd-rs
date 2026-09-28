@@ -2734,6 +2734,11 @@ fn merge_struct_stats(mut a: StructStats, b: &StructStats) -> StructStats {
     a.cross_arm_folds += b.cross_arm_folds;
     a.cross_arm_dup_blocks += b.cross_arm_dup_blocks;
     a.break_target_notes += b.break_target_notes;
+    a.handler_tail_dups += b.handler_tail_dups;
+    a.handler_tail_dup_blocks += b.handler_tail_dup_blocks;
+    a.tower_deabsorbs += b.tower_deabsorbs;
+    a.deabsorb_bails += b.deabsorb_bails;
+    a.deabsorb_join_blocks += b.deabsorb_join_blocks;
     a
 }
 

@@ -303,6 +303,16 @@ pub struct StructStats {
     pub handler_tail_dups: usize,
     /// Blocks duplicated by the handler-tail fold.
     pub handler_tail_dup_blocks: usize,
+    /// Try/catch towers emitted with de-absorbed continuations (N77):
+    /// handler bodies stopped at the shared joins; the joins were
+    /// emitted once per tower level.
+    pub tower_deabsorbs: usize,
+    /// Towers that bailed back to the legacy absorbed emission (N77
+    /// verification failure — the honest fallback).
+    pub deabsorb_bails: usize,
+    /// Shared-join blocks emitted once per tower (they would have been
+    /// duplicated into every absorbing catch clause).
+    pub deabsorb_join_blocks: usize,
 }
 
 /// The Stage-B result for one function.
@@ -469,6 +479,12 @@ struct Frame {
     /// sub-CFG block set is `Ctx::shim_sets[handler]`). Drives the
     /// handler-tail duplication at cut (out-of-set) terminator edges.
     shim_of: Option<BlockId>,
+    /// N77: this frame is a UNIQUE-prefix handler shim (its block set
+    /// is `Ctx::uniq_sets[handler]`, not `Ctx::shim_sets[handler]`).
+    shim_uniq: bool,
+    /// N77: this frame is a tower-JOIN shim (its out-of-set edges are
+    /// verified inter-level fall-outs; `shim_of` stays `None`).
+    join_shim: bool,
 }
 
 impl Frame {
@@ -516,6 +532,8 @@ impl Frame {
             loop_headers,
             cut_defer: None,
             shim_of: None,
+            shim_uniq: false,
+            join_shim: false,
         }
     }
 
@@ -697,6 +715,39 @@ struct Ctx<'m> {
     /// run-fold may use them (`if/else` with the skip arm falling
     /// through) and the shim-tail duplication must stand down.
     verified_fallout: Vec<BlockId>,
+    /// N77 de-absorption: blocks Normal-reachable from >= 2 handler
+    /// entries (shared joins — see [`Ctx::build_deabsorb`]).
+    shared_join: BTreeSet<BlockId>,
+    /// Handler entry -> its UNIQUE prefix (reachable set minus the
+    /// shared joins).
+    uniq_sets: HashMap<BlockId, BTreeSet<BlockId>>,
+    /// Handler entry -> region tree over its unique prefix.
+    uniq_trees: HashMap<BlockId, RegionTree>,
+    /// Handler entry -> plans nested inside its unique prefix.
+    uniq_plans: HashMap<BlockId, Vec<Plan>>,
+    /// De-absorption shim module (unique-set boundary edges cut; join
+    /// sets patched on demand in [`Ctx::join_tree`]).
+    deabsorb_module: Option<Module>,
+    /// Join block set -> its structured tree (None = failed; memoized).
+    join_memo: HashMap<BTreeSet<BlockId>, Option<(RegionTree, Vec<Plan>)>>,
+    /// Join sets currently being emitted by enclosing de-absorbed
+    /// towers (nested towers must not re-emit them).
+    pending_joins: Vec<BTreeSet<BlockId>>,
+    /// Protected sets whose try wrapper PHYSICALLY encloses the current
+    /// emission point with no intervening catch (a de-absorbed tower's
+    /// clause/join contexts): wraps of these plans are suppressed —
+    /// the wrapper already exists above.
+    suppress_wraps: Vec<BTreeSet<BlockId>>,
+    /// Every handler entry of the function (region order, deduped).
+    all_handlers: Vec<BlockId>,
+    /// Handler entry -> its raw Normal-reachable set (pre-trim), for
+    /// the de-absorption foreign-reach check.
+    handler_approx: HashMap<BlockId, BTreeSet<BlockId>>,
+    /// Handler entry -> the root-frame plan indices it catches.
+    handler_root_plans: HashMap<BlockId, Vec<usize>>,
+    /// Shared-join blocks already emitted by a de-absorbed tower (a
+    /// re-wrapped plan's tower must not emit them twice).
+    emitted_joins: BTreeSet<BlockId>,
 }
 
 impl<'m> Ctx<'m> {
@@ -723,6 +774,18 @@ impl<'m> Ctx<'m> {
             pending_wraps: Vec::new(),
             hoist_rejoins: Vec::new(),
             verified_fallout: Vec::new(),
+            shared_join: BTreeSet::new(),
+            uniq_sets: HashMap::new(),
+            uniq_trees: HashMap::new(),
+            uniq_plans: HashMap::new(),
+            deabsorb_module: None,
+            join_memo: HashMap::new(),
+            pending_joins: Vec::new(),
+            suppress_wraps: Vec::new(),
+            all_handlers: Vec::new(),
+            handler_approx: HashMap::new(),
+            handler_root_plans: HashMap::new(),
+            emitted_joins: BTreeSet::new(),
         }
     }
 
@@ -732,6 +795,25 @@ impl<'m> Ctx<'m> {
 
     fn f_mut(&mut self) -> &mut Frame {
         self.frames.last_mut().expect("a frame is always active")
+    }
+
+    /// The active frame's handler-shim block set (the legacy absorbed
+    /// set or the N77 unique prefix, per the frame kind).
+    fn frame_shim_set(&self) -> Option<&BTreeSet<BlockId>> {
+        let h = self.f().shim_of?;
+        if self.f().shim_uniq {
+            self.uniq_sets.get(&h)
+        } else {
+            self.shim_sets.get(&h)
+        }
+    }
+
+    /// Whether plan `p`'s wrapper is being suppressed at the current
+    /// emission point (its physical wrapper encloses the point with no
+    /// intervening catch — [`Ctx::suppress_wraps`]).
+    fn is_suppressed(&mut self, p: usize) -> bool {
+        let protected = self.f().plans[p].protected.clone();
+        self.suppress_wraps.contains(&protected)
     }
 
     fn build(mut self) -> Structured {
@@ -1004,6 +1086,155 @@ impl<'m> Ctx<'m> {
             self.stats.handler_shims += 1;
         }
         self.shim_module = Some(shim);
+        self.build_deabsorb(&approx_sets);
+    }
+
+    /// N77: the continuation de-absorption analysis. The legacy handler
+    /// sets (above) ABSORB every Normal-reachable block up to the main
+    /// universe, so a continuation Normal-reachable from several
+    /// handler entries (a shared join — the es2abc finally idiom's
+    /// dispatcher/rethrow tails and, transitively, everything
+    /// downstream of them) is emitted inside every one of those
+    /// handlers' catch clauses, and the outer-wrap chain re-emits the
+    /// enclosing towers at every nested site: the emission is
+    /// multiplicative in the finally nesting depth (test262
+    /// try/S12.14_A7_T2 emitted ~12 MB from a 3,152-byte source).
+    ///
+    /// The de-absorption computes the shared joins J (blocks
+    /// Normal-reachable from >= 2 handler entries) and each handler's
+    /// UNIQUE prefix (its reachable set minus J). A try/catch tower
+    /// (a plan plus its outer-wrap chain) then emits each handler's
+    /// unique prefix in its catch clause and the shared joins ONCE:
+    /// the blocks protected by a chain level inside that level's try
+    /// body, the unprotected continuation after the outermost
+    /// try/catch — exactly where the handlers' cut edges fall out
+    /// (see [`Ctx::wrap_try_run`]).
+    fn build_deabsorb(&mut self, approx_sets: &HashMap<BlockId, BTreeSet<BlockId>>) {
+        let Some(f) = self.module.func(self.rf.func) else {
+            return;
+        };
+        // J: blocks reachable from >= 2 handler entries.
+        let mut reach_count: HashMap<BlockId, usize> = HashMap::new();
+        for set in approx_sets.values() {
+            for &b in set {
+                *reach_count.entry(b).or_default() += 1;
+            }
+        }
+        let shared: BTreeSet<BlockId> = reach_count
+            .iter()
+            .filter(|&(_, &n)| n >= 2)
+            .map(|(&b, _)| b)
+            .collect();
+        if shared.is_empty() {
+            return;
+        }
+        self.shared_join = shared;
+        self.all_handlers = approx_sets.keys().copied().collect();
+        self.handler_approx = approx_sets.clone();
+        for (i, tr) in f.try_regions.iter().enumerate() {
+            for c in &tr.catches {
+                self.handler_root_plans
+                    .entry(c.handler)
+                    .or_default()
+                    .push(i);
+            }
+        }
+        // Unique prefixes. Handler entries are dispatch-only (no
+        // Normal preds), so an entry is never shared and every unique
+        // set contains its handler. Unique sets are pairwise disjoint:
+        // a block in two of them would be shared.
+        let mut uniq: HashMap<BlockId, BTreeSet<BlockId>> = HashMap::new();
+        for (&h, set) in approx_sets {
+            uniq.insert(h, set.difference(&self.shared_join).copied().collect());
+        }
+        // The de-absorption shim module: unique-set boundary edges cut
+        // (join-set boundaries are patched on demand in `join_tree`).
+        let mut dmod = self.module.clone();
+        for set in uniq.values() {
+            for &b in set {
+                let Some(block) = dmod.block(b).cloned() else {
+                    continue;
+                };
+                let Some(&last) = block.insts.last() else {
+                    continue;
+                };
+                let new_op = match &dmod.inst(last).expect("inst").op {
+                    Op::Branch { dest } if !set.contains(dest) => Some(Op::Return { value: None }),
+                    Op::CondBranch {
+                        true_dest,
+                        false_dest,
+                        ..
+                    } => {
+                        let t_in = set.contains(true_dest);
+                        let f_in = set.contains(false_dest);
+                        match (t_in, f_in) {
+                            (true, true) => None,
+                            (true, false) => Some(Op::Branch { dest: *true_dest }),
+                            (false, true) => Some(Op::Branch { dest: *false_dest }),
+                            (false, false) => Some(Op::Return { value: None }),
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(op) = new_op {
+                    dmod.inst_mut(last).expect("inst").op = op;
+                }
+            }
+        }
+        // Unique-handler shim functions + trees (the same ride-along
+        // rule as the legacy shims).
+        for (&h, set) in &uniq {
+            if !set.contains(&h) {
+                continue;
+            }
+            let mut blocks: Vec<BlockId> = vec![h];
+            blocks.extend(set.iter().copied().filter(|b| *b != h));
+            let name: Sym = dmod.sym.intern(&format!("$uhandler${}", h.index()));
+            let fid = FuncId::new(dmod.functions.len() as u32);
+            let mut fd = FunctionData::new(ClassId::new(0), name, self.rf.kind);
+            fd.blocks = blocks;
+            let block_set: BTreeSet<BlockId> = fd.blocks.iter().copied().collect();
+            let mut chosen: Vec<usize> = Vec::new();
+            loop {
+                let mut changed = false;
+                for (i, tr) in f.try_regions.iter().enumerate() {
+                    if chosen.contains(&i) {
+                        continue;
+                    }
+                    let ok = tr.protected.iter().all(|b| {
+                        block_set.contains(b)
+                            || chosen.iter().any(|&j| {
+                                f.try_regions[j].catches.iter().any(|cc| cc.handler == *b)
+                            })
+                    });
+                    if ok {
+                        chosen.push(i);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            chosen.sort_unstable();
+            fd.try_regions = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
+            dmod.functions.push(fd);
+            let tree = structure_regions(&dmod, fid);
+            let plans = tree
+                .try_plans
+                .iter()
+                .map(|p| Plan {
+                    region: p.region,
+                    protected: p.protected.iter().copied().collect(),
+                    handlers: p.handlers.clone(),
+                    cuts: p.cuts_structured_region,
+                })
+                .collect();
+            self.uniq_trees.insert(h, tree);
+            self.uniq_plans.insert(h, plans);
+            self.uniq_sets.insert(h, set.clone());
+        }
+        self.deabsorb_module = Some(dmod);
     }
 
     // ── Block parts ──────────────────────────────────────────────────
@@ -1743,7 +1974,12 @@ impl<'m> Ctx<'m> {
         let Some(h) = self.f().shim_of else {
             return None;
         };
-        let Some(set) = self.shim_sets.get(&h).cloned() else {
+        let shim_uniq = self.f().shim_uniq;
+        let Some(set) = (if shim_uniq {
+            self.uniq_sets.get(&h).cloned()
+        } else {
+            self.shim_sets.get(&h).cloned()
+        }) else {
             return None;
         };
         if debug {
@@ -1849,6 +2085,12 @@ impl<'m> Ctx<'m> {
         let cov = self.f_mut().cov(id);
         match cov {
             Cov::Uniform(p) if p == active => self.emit_content(id, active, follow, out),
+            Cov::Uniform(Some(p)) if self.is_suppressed(p) => {
+                // N77: p's try wrapper physically encloses this
+                // emission point (a de-absorbed tower's clause/join
+                // context) with no intervening catch — emit plain.
+                self.emit_content(id, Some(p), follow, out)
+            }
             Cov::Uniform(Some(p)) => self.wrap_try(id, p, follow, out),
             Cov::Uniform(None) => {
                 // The d-P5 join hoist: this node is the unprotected
@@ -1883,10 +2125,44 @@ impl<'m> Ctx<'m> {
     /// Wrap a run of region nodes in ONE `try { … } catch …` (the
     /// coalesced form — see `emit_seq_children`).
     fn wrap_try_run(&mut self, ids: &[RegionId], p: usize, follow: Follow, out: &mut Vec<SNode>) {
+        // N77: the de-absorbed tower path (handler unique prefixes +
+        // joins emitted once per level). Falls through to the legacy
+        // absorbed emission whenever a guard fails.
+        if self.emit_deabsorb_tower(ids, p, follow, out) {
+            return;
+        }
         let (region, cuts, handlers) = {
             let plan = &self.f().plans[p];
             (plan.region, plan.cuts, plan.handlers.clone())
         };
+        // Handlers protected by an OUTER plan (nested try regions whose
+        // protected range includes the inner handler — the es2abc
+        // finally idiom: the inner catch body can itself throw, and the
+        // outer handler runs the finally + rethrow): the whole
+        // try/catch must be wrapped in the outer plan's try, or
+        // exceptions from the inner handler escape unhandled and the
+        // outer handler's body (and its phi temporaries) is silently
+        // dropped (dream gate: local/exception-finally). Laminar plans
+        // form a chain; walk it outward.
+        //
+        // Two phases: SELECT the whole outward chain first (pure
+        // analysis — the pending state is unchanged by the body
+        // emission), then EMIT the handler bodies with the entire chain
+        // on `self.pending_wraps`/`self.suppress_wraps`. Every
+        // construct emitted while the chain is pending lands
+        // physically inside these wrappers, so nested emissions must
+        // NOT re-wrap the same plans — otherwise each handler body
+        // re-wraps the chain around its own inner trys and the output
+        // grows exponentially (N76 try/S12.14_A7_T2). N77 extends the
+        // coverage to `p`'s OWN handlers (their clauses sit inside
+        // every chain try body — without it, an absorbed handler body
+        // re-wraps a chain plan around its chain-protected blocks and
+        // re-emits the chain's handlers, the second-cascade wart).
+        let chain = self.select_wrap_chain(p, &handlers);
+        let chain_prots: Vec<BTreeSet<BlockId>> = chain
+            .iter()
+            .map(|&(fq, q)| self.frames[fq].plans[q].protected.clone())
+            .collect();
         // When the physical continuation after this try/catch is a
         // known block, handler cut edges to it are sound plain
         // fall-outs (the catch clause ends exactly where the
@@ -1946,6 +2222,15 @@ impl<'m> Ctx<'m> {
         for &id in ids {
             self.emit_content(id, Some(p), follow, &mut body);
         }
+        // `p`'s handlers: emitted with the whole chain pending (their
+        // clauses land inside every chain try body — chain-protected
+        // blocks in the handler body need no re-wrap; N77).
+        let pending_mark = self.pending_wraps.len();
+        let suppress_mark = self.suppress_wraps.len();
+        for cp in &chain_prots {
+            self.pending_wraps.push(cp.clone());
+            self.suppress_wraps.push(cp.clone());
+        }
         let mut catches = Vec::new();
         let mut seen = HashSet::new();
         for h in &handlers {
@@ -1953,6 +2238,7 @@ impl<'m> Ctx<'m> {
                 catches.push(self.emit_handler(*h));
             }
         }
+        self.suppress_wraps.truncate(suppress_mark);
         let note = if catches.len() > 1 {
             self.stats.multi_catch += 1;
             Some(format!(
@@ -1968,52 +2254,8 @@ impl<'m> Ctx<'m> {
             note,
             finally: None,
         };
-        // Handlers protected by an OUTER plan (nested try regions whose
-        // protected range includes the inner handler — the es2abc
-        // finally idiom: the inner catch body can itself throw, and the
-        // outer handler runs the finally + rethrow): the whole
-        // try/catch must be wrapped in the outer plan's try, or
-        // exceptions from the inner handler escape unhandled and the
-        // outer handler's body (and its phi temporaries) is silently
-        // dropped (dream gate: local/exception-finally). Laminar plans
-        // form a chain; walk it outward.
-        //
-        // Two phases: SELECT the whole outward chain first, then EMIT
-        // the handler bodies with the entire chain on
-        // `self.pending_wraps`. Every construct emitted while the chain
-        // is pending lands physically inside these wrappers, so nested
-        // emissions must NOT re-wrap the same plans — otherwise each
-        // handler body re-wraps the chain around its own inner trys and
-        // the output grows exponentially (N76 try/S12.14_A7_T2).
-        let mut protected_handlers = handlers.clone();
-        // `visited` tracks protected-SET identity: the laminar chain may
-        // step from a shim frame's plans to the root frame's (the shim
-        // ride-along list is only an approximation — see
-        // `outer_wrap_plan`), so plan indices are not comparable across
-        // frames.
-        let mut visited: HashSet<BTreeSet<BlockId>> =
-            [self.f().plans[p].protected.clone()].into_iter().collect();
-        let mut chain: Vec<(usize, usize)> = Vec::new(); // (frame, plan)
-        let mut depth = 0usize;
-        loop {
-            depth += 1;
-            if depth > self.frames[0].plans.len() + self.f().plans.len() + 1 {
-                break; // defensive: the laminar chain is finite
-            }
-            let Some((fq, q)) = self.outer_wrap_plan(&visited, &protected_handlers) else {
-                break;
-            };
-            let plan = &self.frames[fq].plans[q];
-            visited.insert(plan.protected.clone());
-            protected_handlers = plan.handlers.clone();
-            chain.push((fq, q));
-        }
-        let pending_mark = self.pending_wraps.len();
-        for &(fq, q) in &chain {
-            let protected = self.frames[fq].plans[q].protected.clone();
-            self.pending_wraps.push(protected);
-        }
-        for (fq, q) in chain {
+        for (k, (fq, q)) in chain.iter().enumerate() {
+            let (fq, q) = (*fq, *q);
             let (qregion, qhandlers) = {
                 let plan = &self.frames[fq].plans[q];
                 (plan.region, plan.handlers.clone())
@@ -2030,11 +2272,19 @@ impl<'m> Ctx<'m> {
             self.stats.try_catches += 1;
             let mut qcatches = Vec::new();
             let mut seen = HashSet::new();
+            // Chain step k's handlers: their clauses land inside the
+            // try bodies of the steps ABOVE k only — suppress those
+            // (and only those) primary re-wraps (N77).
+            let qsuppress_mark = self.suppress_wraps.len();
+            for cp in &chain_prots[k + 1..] {
+                self.suppress_wraps.push(cp.clone());
+            }
             for h in &qhandlers {
                 if seen.insert(*h) {
                     qcatches.push(self.emit_handler(*h));
                 }
             }
+            self.suppress_wraps.truncate(qsuppress_mark);
             node = SNode::Try {
                 body: vec![node],
                 catches: qcatches,
@@ -2144,7 +2394,871 @@ impl<'m> Ctx<'m> {
         outer
     }
 
+    /// The outward handler-protecting chain for plan `p` (the es2abc
+    /// finally idiom — see `wrap_try_run`). Extracted so the N77
+    /// de-absorbed tower path shares the selection. Pure analysis: no
+    /// emission, no mutation.
+    fn select_wrap_chain(&mut self, p: usize, handlers: &[BlockId]) -> Vec<(usize, usize)> {
+        let mut protected_handlers = handlers.to_vec();
+        // `visited` tracks protected-SET identity: the laminar chain may
+        // step from a shim frame's plans to the root frame's (the shim
+        // ride-along list is only an approximation — see
+        // `outer_wrap_plan`), so plan indices are not comparable across
+        // frames.
+        let mut visited: HashSet<BTreeSet<BlockId>> =
+            [self.f().plans[p].protected.clone()].into_iter().collect();
+        let mut chain: Vec<(usize, usize)> = Vec::new(); // (frame, plan)
+        let mut depth = 0usize;
+        loop {
+            depth += 1;
+            if depth > self.frames[0].plans.len() + self.f().plans.len() + 1 {
+                break; // defensive: the laminar chain is finite
+            }
+            let Some((fq, q)) = self.outer_wrap_plan(&visited, &protected_handlers) else {
+                break;
+            };
+            let plan = &self.frames[fq].plans[q];
+            visited.insert(plan.protected.clone());
+            protected_handlers = plan.handlers.clone();
+            chain.push((fq, q));
+        }
+        chain
+    }
+
     // ── The d-P5 join hoist (RC1) ──────────────────────────────────
+
+    /// Root-frame innermost plan of `b` (None = unprotected).
+    fn root_plan_of(&mut self, b: BlockId) -> Option<usize> {
+        self.frames.first_mut().expect("root frame").plan_of(b)
+    }
+
+    /// Pure trampoline: no statements, one unconditional branch.
+    fn is_trampoline(&self, b: BlockId) -> bool {
+        let parts = self.block_parts(b);
+        parts.main.is_empty() && parts.phi.is_empty() && matches!(parts.term, Term::Branch(_))
+    }
+
+    /// `t` is reachable from `head` within the shared join, and every
+    /// block on every such path (endpoints excluded) is a pure
+    /// trampoline — falling out at `head` is then equivalent to falling
+    /// out at `t`.
+    fn trampoline_only_path(&self, head: BlockId, t: BlockId) -> bool {
+        let mut seen = BTreeSet::from([head]);
+        let mut queue = std::collections::VecDeque::from([head]);
+        let mut reaches = false;
+        while let Some(b) = queue.pop_front() {
+            for s in block_succs(self.module, b) {
+                if s == t {
+                    reaches = true;
+                    continue;
+                }
+                if self.shared_join.contains(&s) && seen.insert(s) {
+                    queue.push_back(s);
+                }
+            }
+        }
+        reaches && seen.iter().all(|&x| x == head || self.is_trampoline(x))
+    }
+
+    /// Whether a foreign (nested-tower) handler `hp`'s cut to join
+    /// block `j` routes soundly through this tower's emission: `hp`'s
+    /// plan's protected set has a wrap site inside a tower handler's
+    /// unique body or a join set, and only trampolines lie between the
+    /// site and the fall-out target. For a unique-body site, `j` must
+    /// be the body's fall-out head; for a join-set site, `j` must sit
+    /// at that join tree's top level (the caller checks the latter).
+    fn foreign_cut_ok(
+        &mut self,
+        hp: BlockId,
+        j: BlockId,
+        tower: &[BlockId],
+        clause: &[usize],
+        joins: &[Option<(BlockId, BTreeSet<BlockId>)>],
+        m: usize,
+    ) -> bool {
+        let Some(qs) = self.handler_root_plans.get(&hp).cloned() else {
+            return false;
+        };
+        qs.iter().any(|&q| {
+            let prot = self.frames[0].plans[q].protected.clone();
+            // Site inside a tower handler's unique body: the fall-out
+            // unwinds to the body end — the body's own fall-out head.
+            for (hi, &h) in tower.iter().enumerate() {
+                let Some(uset) = self.uniq_sets.get(&h) else {
+                    continue;
+                };
+                let site: BTreeSet<BlockId> = prot.intersection(uset).copied().collect();
+                if site.is_empty() || !self.trampoline_tail(&site, j, uset, &prot) {
+                    continue;
+                }
+                let c = clause[hi];
+                let Some(first) = (c..=m).find(|&lvl_x| joins[lvl_x].is_some()) else {
+                    return false;
+                };
+                let Some((head, set)) = &joins[first] else {
+                    return false;
+                };
+                if set.contains(&j) && (*head == j || self.trampoline_only_path(*head, j)) {
+                    return true;
+                }
+            }
+            // Site inside a join set: the fall-out lands mid-tree; the
+            // top-level check (the caller's tree walk) owns the rest.
+            for jl in joins.iter().flatten() {
+                let site: BTreeSet<BlockId> = prot.intersection(&jl.1).copied().collect();
+                if !site.is_empty()
+                    && jl.1.contains(&j)
+                    && self.trampoline_tail(&site, j, &jl.1, &prot)
+                {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
+    /// Every block reachable from `site` within `within` without
+    /// passing `j` is a pure trampoline or part of the nested tower's
+    /// own protected set — the fall-out from the nested tower runs
+    /// nothing the bytecode path wouldn't.
+    fn trampoline_tail(
+        &self,
+        site: &BTreeSet<BlockId>,
+        j: BlockId,
+        within: &BTreeSet<BlockId>,
+        prot: &BTreeSet<BlockId>,
+    ) -> bool {
+        let mut seen: BTreeSet<BlockId> = site.iter().copied().collect();
+        let mut queue: std::collections::VecDeque<BlockId> = site.iter().copied().collect();
+        while let Some(b) = queue.pop_front() {
+            for s in block_succs(self.module, b) {
+                if s == j || !within.contains(&s) {
+                    continue;
+                }
+                if seen.insert(s) {
+                    queue.push_back(s);
+                }
+            }
+        }
+        seen.iter()
+            .all(|&x| prot.contains(&x) || self.is_trampoline(x))
+    }
+
+    /// Structure a tower-join block set: a shim function over the set
+    /// in the de-absorption module (out-of-set edges cut), with the
+    /// usual ride-along plans. The set must be exactly the tree's
+    /// universe and `head` its entry. Memoized per set (None = failed).
+    fn join_tree(
+        &mut self,
+        head: BlockId,
+        set: &BTreeSet<BlockId>,
+    ) -> Option<(RegionTree, Vec<Plan>)> {
+        if let Some(r) = self.join_memo.get(set) {
+            return r.clone();
+        }
+        let r = self.build_join_tree(head, set);
+        self.join_memo.insert(set.clone(), r.clone());
+        r
+    }
+
+    fn build_join_tree(
+        &mut self,
+        head: BlockId,
+        set: &BTreeSet<BlockId>,
+    ) -> Option<(RegionTree, Vec<Plan>)> {
+        // A FRESH clone per join set (only the set's own boundary is
+        // cut — join blocks never branch into unique handler prefixes,
+        // so the uniq patching is irrelevant here). A tower that bails
+        // after its sets were patched therefore cannot poison a later
+        // tower's join trees.
+        let mut dmod = self.module.clone();
+        for &b in set {
+            let Some(block) = dmod.block(b).cloned() else {
+                continue;
+            };
+            let Some(&last) = block.insts.last() else {
+                continue;
+            };
+            let new_op = match &dmod.inst(last).expect("inst").op {
+                Op::Branch { dest } if !set.contains(dest) => Some(Op::Return { value: None }),
+                Op::CondBranch {
+                    true_dest,
+                    false_dest,
+                    ..
+                } => {
+                    let t_in = set.contains(true_dest);
+                    let f_in = set.contains(false_dest);
+                    match (t_in, f_in) {
+                        (true, true) => None,
+                        (true, false) => Some(Op::Branch { dest: *true_dest }),
+                        (false, true) => Some(Op::Branch { dest: *false_dest }),
+                        (false, false) => Some(Op::Return { value: None }),
+                    }
+                }
+                _ => None,
+            };
+            if let Some(op) = new_op {
+                dmod.inst_mut(last).expect("inst").op = op;
+            }
+        }
+        let f = self.module.func(self.rf.func)?;
+        let mut blocks: Vec<BlockId> = vec![head];
+        blocks.extend(set.iter().copied().filter(|b| *b != head));
+        let name: Sym = dmod.sym.intern(&format!("$join${}", head.index()));
+        let fid = FuncId::new(dmod.functions.len() as u32);
+        let mut fd = FunctionData::new(ClassId::new(0), name, self.rf.kind);
+        fd.blocks = blocks;
+        let block_set = set.clone();
+        let mut chosen: Vec<usize> = Vec::new();
+        loop {
+            let mut changed = false;
+            for (i, tr) in f.try_regions.iter().enumerate() {
+                if chosen.contains(&i) {
+                    continue;
+                }
+                let ok = tr.protected.iter().all(|b| {
+                    block_set.contains(b)
+                        || chosen
+                            .iter()
+                            .any(|&j| f.try_regions[j].catches.iter().any(|cc| cc.handler == *b))
+                });
+                if ok {
+                    chosen.push(i);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        chosen.sort_unstable();
+        fd.try_regions = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
+        dmod.functions.push(fd);
+        let tree = structure_regions(&dmod, fid);
+        // The set must be exactly the tree's universe (no strays).
+        if tree_blocks(&tree) != *set {
+            return None;
+        }
+        // The head must be the tree's entry.
+        let root = tree.root?;
+        if tree_entry(&tree, root) != Some(head) {
+            return None;
+        }
+        let plans = tree
+            .try_plans
+            .iter()
+            .map(|p| Plan {
+                region: p.region,
+                protected: p.protected.iter().copied().collect(),
+                handlers: p.handlers.clone(),
+                cuts: p.cuts_structured_region,
+            })
+            .collect();
+        Some((tree, plans))
+    }
+
+    /// Emit one verified tower-join level through its join shim tree.
+    fn emit_join_level(&mut self, head: BlockId, set: &BTreeSet<BlockId>, out: &mut Vec<SNode>) {
+        if std::env::var_os("ABCD_DEAB_DEBUG").is_some() {
+            eprintln!(
+                "DEAB-JOIN fn={} head=B{} set={:?}",
+                self.rf.func.index(),
+                head.index(),
+                set.iter().map(|b| b.index()).collect::<Vec<_>>()
+            );
+        }
+        let Some((tree, plans)) = self.join_tree(head, set) else {
+            out.push(SNode::Honest(
+                "N77: tower-join tree vanished between analysis and emission (defensive)".into(),
+            ));
+            return;
+        };
+        let mut frame = Frame::new(tree, plans);
+        frame.join_shim = true;
+        self.frames.push(frame);
+        if let Some(root) = self.f().tree.root {
+            self.emit_node(root, None, Follow::Tail, out);
+        }
+        self.frames.pop();
+    }
+
+    /// The de-absorbed tower fast path. Returns false (the caller takes
+    /// the legacy absorbed path) unless every guard holds.
+    fn emit_deabsorb_tower(
+        &mut self,
+        ids: &[RegionId],
+        p: usize,
+        follow: Follow,
+        out: &mut Vec<SNode>,
+    ) -> bool {
+        let debug = std::env::var_os("ABCD_DEAB_DEBUG").is_some();
+        macro_rules! bail {
+            ($($arg:tt)*) => {{
+                if debug {
+                    eprintln!(
+                        "DEAB-BAIL fn={} region={}: {}",
+                        self.rf.func.index(),
+                        self.f().plans[p].region,
+                        format!($($arg)*)
+                    );
+                }
+                self.stats.deabsorb_bails += 1;
+                return false;
+            }};
+        }
+        if self.deabsorb_module.is_none() {
+            return false;
+        }
+        let handlers = self.f().plans[p].handlers.clone();
+        let chain = self.select_wrap_chain(p, &handlers);
+        if chain.is_empty() {
+            return false; // v1: towers (handler-protecting chains) only
+        }
+        if debug {
+            eprintln!(
+                "DEAB-TRY fn={} region={} chain={} shim={:?} join={}",
+                self.rf.func.index(),
+                self.f().plans[p].region,
+                chain.len(),
+                self.f().shim_of.map(|h| h.index()),
+                self.f().join_shim
+            );
+        }
+        let m = chain.len();
+        let chain_prots: Vec<BTreeSet<BlockId>> = chain
+            .iter()
+            .map(|&(fq, q)| self.frames[fq].plans[q].protected.clone())
+            .collect();
+        // Tower handlers in clause order with their clause levels:
+        // p's handlers sit in chain[0]'s try body (level 0); chain[k]'s
+        // handlers sit in chain[k+1]'s try body (level k+1; the last
+        // step's handlers sit at the AFTER level m).
+        let mut tower: Vec<BlockId> = Vec::new();
+        let mut clause: Vec<usize> = Vec::new();
+        for h in &handlers {
+            if !tower.contains(h) {
+                tower.push(*h);
+                clause.push(0);
+            }
+        }
+        for (k, &(fq, q)) in chain.iter().enumerate() {
+            for h in self.frames[fq].plans[q].handlers.clone() {
+                if !tower.contains(&h) {
+                    tower.push(h);
+                    clause.push(if k + 1 < m { k + 1 } else { m });
+                }
+            }
+        }
+        // Cut edges from the handlers' unique prefixes into the shared
+        // join (block_succs reads the ORIGINAL module — the patched
+        // modules only shaped trees).
+        let mut cuts: Vec<(BlockId, BlockId)> = Vec::new(); // (handler, target)
+        for &h in &tower {
+            let Some(set) = self.uniq_sets.get(&h) else {
+                return false; // exotic entry shape — legacy
+            };
+            for &b in set {
+                for s in block_succs(self.module, b) {
+                    if !set.contains(&s) && self.shared_join.contains(&s) {
+                        cuts.push((h, s));
+                    }
+                }
+            }
+        }
+        if cuts.is_empty() {
+            return false; // no shared continuation — legacy is identical
+        }
+        if tower.iter().any(|h| !self.uniq_trees.contains_key(h)) {
+            return false;
+        }
+        // The join level of a shared-join block: the smallest chain
+        // level whose protected set contains its innermost plan's
+        // protected set (the block runs inside that level's try body);
+        // `m` (AFTER) when unprotected or outside the outermost plan.
+        let level_of = |ctx: &mut Self, j: BlockId| -> usize {
+            let Some(pi) = ctx.root_plan_of(j) else {
+                return m;
+            };
+            let prot = ctx.frames[0].plans[pi].protected.clone();
+            for (k, cp) in chain_prots.iter().enumerate() {
+                if prot.is_subset(cp) {
+                    return k;
+                }
+            }
+            m
+        };
+        // Partition the cuts: targets already covered by an enclosing
+        // tower's join emission (`pending_joins`) are verified against
+        // that emission instead of producing joins here.
+        let mut pools: Vec<BTreeSet<BlockId>> = vec![BTreeSet::new(); m + 1];
+        let mut enclosed: Vec<(BlockId, BlockId)> = Vec::new(); // (handler, target)
+        let mut local: Vec<(BlockId, BlockId, usize)> = Vec::new(); // (handler, target, level)
+        for &(h, s) in &cuts {
+            if self.pending_joins.iter().any(|js| js.contains(&s)) {
+                enclosed.push((h, s));
+                continue;
+            }
+            if self.emitted_joins.contains(&s) {
+                bail!(
+                    "cut target B{} already emitted by an earlier tower (plan re-wrap)",
+                    s.index()
+                );
+            }
+            let c = clause[tower.iter().position(|&x| x == h).expect("tower handler")];
+            let lvl = level_of(self, s);
+            if lvl < c {
+                bail!("cut flows inward (target level {lvl} < clause level {c})");
+            }
+            pools[lvl].insert(s);
+            local.push((h, s, lvl));
+        }
+        // A handler mixing local and enclosed cuts has two fall-out
+        // positions — beyond v1.
+        for &h in &tower {
+            let has_local = local.iter().any(|&(x, _, _)| x == h);
+            let has_encl = enclosed.iter().any(|&(x, _)| x == h);
+            if has_local && has_encl {
+                bail!("handler mixes local and enclosed cut targets");
+            }
+        }
+        // Per level (ascending): pick the head (reaches every pool
+        // target through trampoline-only paths), close over the level's
+        // blocks, and feed boundary targets to outer levels' pools.
+        let mut joins: Vec<Option<(BlockId, BTreeSet<BlockId>)>> = (0..=m).map(|_| None).collect();
+        for lvl in 0..=m {
+            if pools[lvl].is_empty() {
+                continue;
+            }
+            let targets = pools[lvl].clone();
+            let mut head: Option<BlockId> = None;
+            for &cand in &targets {
+                if targets
+                    .iter()
+                    .all(|&t| t == cand || self.trampoline_only_path(cand, t))
+                {
+                    head = Some(cand);
+                    break;
+                }
+            }
+            let Some(head) = head else {
+                bail!("no common join head for level {lvl} targets {targets:?}");
+            };
+            // The level's block set: everything reachable from the head
+            // within the shared join, staying at this level (AFTER takes
+            // everything remaining); out-of-level edges are boundary
+            // targets for outer pools.
+            let mut set = BTreeSet::from([head]);
+            let mut queue = std::collections::VecDeque::from([head]);
+            let mut boundary: Vec<BlockId> = Vec::new();
+            while let Some(b) = queue.pop_front() {
+                for s in block_succs(self.module, b) {
+                    if !self.shared_join.contains(&s) {
+                        continue;
+                    }
+                    if self.pending_joins.iter().any(|js| js.contains(&s)) {
+                        continue; // enclosed — covered by an outer tower
+                    }
+                    if self.emitted_joins.contains(&s) {
+                        bail!("join reaches an already-emitted join block");
+                    }
+                    let ls = level_of(self, s);
+                    if ls == lvl {
+                        if set.insert(s) {
+                            queue.push_back(s);
+                        }
+                    } else {
+                        if ls < lvl {
+                            bail!("join boundary flows inward (level {ls} from {lvl})");
+                        }
+                        boundary.push(s);
+                    }
+                }
+            }
+            // Every pool target must be inside the closure.
+            if !targets.iter().all(|t| set.contains(t)) {
+                bail!("join closure from B{} missed a pool target", head.index());
+            }
+            for bt in boundary {
+                let ls = level_of(self, bt);
+                pools[ls].insert(bt);
+            }
+            joins[lvl] = Some((head, set));
+        }
+        let non_empty = |lvl_x: usize| joins[lvl_x].is_some();
+        // Every local cut must target the first non-empty level at or
+        // above its clause level (its fall-out position).
+        for &(h, _s, lvl) in &local {
+            let c = clause[tower.iter().position(|&x| x == h).expect("tower handler")];
+            let Some(first) = (c..=m).find(|&lvl_x| non_empty(lvl_x)) else {
+                bail!("local cut with no local join level");
+            };
+            if first != lvl {
+                bail!("cut target level {lvl} is not the fall-out level {first}");
+            }
+        }
+        let join_union: BTreeSet<BlockId> = joins
+            .iter()
+            .flatten()
+            .flat_map(|(_, s)| s.iter().copied())
+            .collect();
+        // Foreign cut edges into this tower's joins (a NESTED tower's
+        // handler — its plan's protected set sits inside a tower
+        // handler's unique body or inside a join set, so its tower is
+        // emitted within this one). Sound when (a) the nested wrap's
+        // site has only trampolines between it and the cut target (the
+        // fall-out runs nothing the bytecode path wouldn't) and (b)
+        // the target is at the fall-out position: for a site in a
+        // unique body, the head of the body's fall-out level; for a
+        // site in a join set, a top-level block of that join's tree
+        // (checked below).
+        let all_handlers = self.all_handlers.clone();
+        let mut foreign: Vec<BlockId> = Vec::new(); // targets needing top-level
+        for hp in all_handlers {
+            if tower.contains(&hp) {
+                continue;
+            }
+            let Some(uset) = self.uniq_sets.get(&hp).cloned() else {
+                if self
+                    .handler_approx
+                    .get(&hp)
+                    .is_some_and(|a| a.iter().any(|b| join_union.contains(b)))
+                {
+                    bail!("exotic foreign handler reaches a join block");
+                }
+                continue;
+            };
+            for &b in &uset {
+                for s in block_succs(self.module, b) {
+                    if !join_union.contains(&s) {
+                        continue;
+                    }
+                    let nested = self.foreign_cut_ok(hp, s, &tower, &clause, &joins, m);
+                    if !nested {
+                        bail!(
+                            "foreign cut B{}→B{} into the tower's joins",
+                            b.index(),
+                            s.index()
+                        );
+                    }
+                    foreign.push(s);
+                }
+            }
+        }
+        // Tower-handler cuts into non-head join blocks also need the
+        // top-level guarantee (their fall-out lands at the level head
+        // and must reach the target by fall-through alone).
+        for &(h, s, _) in &local {
+            let _ = h;
+            foreign.push(s);
+        }
+        // Structure every join level; every member with an external
+        // Normal predecessor (a rejoin target) must sit at the tree's
+        // top level, and the foreign/enclosed targets must be top-level
+        // in their sets.
+        let mut join_blocks_total = 0usize;
+        for lvl in 0..=m {
+            let Some((head, set)) = &joins[lvl] else {
+                continue;
+            };
+            // Loops inside a join are beyond v1 (the fall-out physics
+            // of a join that iterates).
+            if set.iter().any(|b| {
+                self.frames[0].loop_headers.contains(b) || self.f().loop_headers.contains(b)
+            }) {
+                bail!("loop header inside a join level");
+            }
+            let Some((tree, _plans)) = self.join_tree(*head, set) else {
+                bail!("join set did not structure");
+            };
+            let top = tree_top_blocks(&tree);
+            for &b in set {
+                // The head is the tree's entry (verified by
+                // `build_join_tree`): cut edges to it land at the
+                // tree's start by construction.
+                if b == *head {
+                    continue;
+                }
+                let has_external_pred = self.module.block(b).is_some_and(|bb| {
+                    bb.preds
+                        .iter()
+                        .any(|e| e.kind == abcd_ir::EdgeKind::Normal && !set.contains(&e.from))
+                });
+                if has_external_pred && !top.contains(&b) {
+                    if debug {
+                        eprintln!("JOIN-TREE head=B{} set={:?}:", head.index(), set);
+                        for (j, node) in tree.nodes().iter().enumerate() {
+                            eprintln!("  R{j}: {node:?}");
+                        }
+                    }
+                    bail!(
+                        "rejoin target B{} buried below the join tree's top level",
+                        b.index()
+                    );
+                }
+            }
+            join_blocks_total += set.len();
+        }
+        // Enclosed targets: top-level in their pending join tree.
+        for &(_, s) in &enclosed {
+            let Some(js) = self.pending_joins.iter().find(|js| js.contains(&s)) else {
+                continue;
+            };
+            let Some(Some((tree, _))) = self.join_memo.get(js) else {
+                bail!("enclosed cut target in an unverified pending join");
+            };
+            if !tree_top_blocks(tree).contains(&s) {
+                bail!("enclosed cut target not at the pending join's top level");
+            }
+        }
+        // The AFTER join's boundary edges into the main universe must
+        // land on the caller's verified continuation (the legacy
+        // fall-out rule).
+        let mut follow_chain: Vec<BlockId> = Vec::new();
+        if let Follow::Entry(fb) = follow {
+            let mut cur = fb;
+            loop {
+                if !follow_chain.contains(&cur) {
+                    follow_chain.push(cur);
+                }
+                let parts = self.block_parts(cur);
+                if !parts.main.is_empty() || !parts.phi.is_empty() {
+                    break;
+                }
+                match parts.term {
+                    Term::Branch(d) if !follow_chain.contains(&d) => cur = d,
+                    _ => break,
+                }
+                if follow_chain.len() > 16 {
+                    break;
+                }
+            }
+        }
+        if let Some((_, aset)) = &joins[m] {
+            for &b in aset {
+                for s in block_succs(self.module, b) {
+                    if self.shared_join.contains(&s) {
+                        continue;
+                    }
+                    if !follow_chain.contains(&s) {
+                        bail!(
+                            "after-join boundary to B{} is not the verified continuation",
+                            s.index()
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── Emission ────────────────────────────────────────────────
+        let (region, cuts_flag) = {
+            let plan = &self.f().plans[p];
+            (plan.region, plan.cuts)
+        };
+        {
+            let f = self.f_mut();
+            *f.wrap_counts.entry(p).or_insert(0) += 1;
+        }
+        if cuts_flag {
+            self.stats.try_cuts += 1;
+        }
+        self.stats.try_catches += 1;
+        self.stats.tower_deabsorbs += 1;
+        self.stats.deabsorb_join_blocks += join_blocks_total;
+        if debug {
+            eprintln!(
+                "DEAB-OK fn={} region={} chain={} joins={}",
+                self.rf.func.index(),
+                region,
+                m,
+                join_blocks_total
+            );
+        }
+        let mut body = Vec::new();
+        if cuts_flag {
+            body.push(SNode::Honest(format!(
+                "try region {region}: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary"
+            )));
+        }
+        for &id in ids {
+            self.emit_content(id, Some(p), follow, &mut body);
+        }
+        let pending_mark = self.pending_wraps.len();
+        let joins_mark = self.pending_joins.len();
+        for cp in &chain_prots {
+            self.pending_wraps.push(cp.clone());
+        }
+        for j in joins.iter().flatten() {
+            self.pending_joins.push(j.1.clone());
+        }
+        for &b in &follow_chain {
+            self.verified_fallout.push(b);
+        }
+        // The fall-out head for a clause level: the first non-empty
+        // join level at or above it. Pure trampolines past the head
+        // are transparent to a fall-out (the legacy verified-chain
+        // rule), so the whole chain is verified — a handler guard
+        // whose cut targets the chain end (A7_T2's B116 → B118 past
+        // the B115 trampoline) keeps its conditional.
+        let chain_at = |ctx: &Self, c: usize| -> Vec<BlockId> {
+            let Some(lvl_x) = (c..=m).find(|&lvl_x| non_empty(lvl_x)) else {
+                return Vec::new();
+            };
+            let Some((head, set)) = &joins[lvl_x] else {
+                return Vec::new();
+            };
+            let mut out = vec![*head];
+            let mut cur = *head;
+            loop {
+                let parts = ctx.block_parts(cur);
+                if !parts.main.is_empty() || !parts.phi.is_empty() {
+                    break;
+                }
+                match parts.term {
+                    Term::Branch(d) if set.contains(&d) && !out.contains(&d) => {
+                        out.push(d);
+                        cur = d;
+                    }
+                    _ => break,
+                }
+                if out.len() > 16 {
+                    break;
+                }
+            }
+            out
+        };
+        // p's handlers (clause level 0): suppressed wraps are the whole
+        // chain (their clauses sit inside every chain try body).
+        let mut catches = Vec::new();
+        {
+            let suppress_mark = self.suppress_wraps.len();
+            for cp in &chain_prots {
+                self.suppress_wraps.push(cp.clone());
+            }
+            let vf = chain_at(self, 0);
+            for &b in &vf {
+                self.verified_fallout.push(b);
+            }
+            let encl: Vec<BlockId> = enclosed
+                .iter()
+                .filter(|(x, _)| handlers.contains(x))
+                .map(|&(_, s)| s)
+                .collect();
+            for &s in &encl {
+                self.verified_fallout.push(s);
+            }
+            let mut seen = HashSet::new();
+            for h in &handlers {
+                if seen.insert(*h) {
+                    catches.push(self.emit_handler_unique(*h));
+                }
+            }
+            for _ in &encl {
+                self.verified_fallout.pop();
+            }
+            for _ in &vf {
+                self.verified_fallout.pop();
+            }
+            self.suppress_wraps.truncate(suppress_mark);
+        }
+        let note = if catches.len() > 1 {
+            self.stats.multi_catch += 1;
+            Some(format!(
+                "try region {region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                catches.len()
+            ))
+        } else {
+            None
+        };
+        let mut node = SNode::Try {
+            body,
+            catches,
+            note,
+            finally: None,
+        };
+        for (k, &(fq, q)) in chain.iter().enumerate() {
+            let (qregion, qhandlers) = {
+                let plan = &self.frames[fq].plans[q];
+                (plan.region, plan.handlers.clone())
+            };
+            {
+                let f = &mut self.frames[fq];
+                *f.wrap_counts.entry(q).or_insert(0) += 1;
+            }
+            self.stats.try_catches += 1;
+            // The join for this level lands inside chain[k]'s try body,
+            // right after the inner construct (both the inner node's
+            // fall-outs and its normal completion reach it).
+            let mut inner = vec![node];
+            if let Some((jhead, jset)) = &joins[k] {
+                self.emit_join_level(*jhead, jset, &mut inner);
+            }
+            let mut qcatches = Vec::new();
+            {
+                let suppress_mark = self.suppress_wraps.len();
+                for cp in &chain_prots[k + 1..] {
+                    self.suppress_wraps.push(cp.clone());
+                }
+                let vf = chain_at(self, k + 1);
+                for &b in &vf {
+                    self.verified_fallout.push(b);
+                }
+                let encl: Vec<BlockId> = enclosed
+                    .iter()
+                    .filter(|(x, _)| qhandlers.contains(x))
+                    .map(|&(_, s)| s)
+                    .collect();
+                for &s in &encl {
+                    self.verified_fallout.push(s);
+                }
+                let mut seen = HashSet::new();
+                for h in &qhandlers {
+                    if seen.insert(*h) {
+                        qcatches.push(self.emit_handler_unique(*h));
+                    }
+                }
+                for _ in &encl {
+                    self.verified_fallout.pop();
+                }
+                for _ in &vf {
+                    self.verified_fallout.pop();
+                }
+                self.suppress_wraps.truncate(suppress_mark);
+            }
+            let qnote = if qcatches.len() > 1 {
+                self.stats.multi_catch += 1;
+                Some(format!(
+                    "try region {qregion}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                    qcatches.len()
+                ))
+            } else {
+                None
+            };
+            node = SNode::Try {
+                body: inner,
+                catches: qcatches,
+                note: qnote,
+                finally: None,
+            };
+        }
+        self.pending_wraps.truncate(pending_mark);
+        out.push(node);
+        // The unprotected continuation: emitted once, after the
+        // outermost try/catch.
+        if let Some((ahead, aset)) = &joins[m] {
+            self.emit_join_level(*ahead, aset, out);
+        }
+        self.pending_joins.truncate(joins_mark);
+        for _ in &follow_chain {
+            self.verified_fallout.pop();
+        }
+        // Record the emitted joins: a re-wrapped plan's tower must not
+        // emit them twice (its analysis bails to the legacy path).
+        for s in join_union {
+            self.emitted_joins.insert(s);
+        }
+        true
+    }
+
     //
     // A Mixed-coverage `If` whose head is protected is wrapped whole by
     // the generic path (the condition evaluation must stay protected).
@@ -2645,7 +3759,7 @@ impl<'m> Ctx<'m> {
             }
             RegionNode::If { head, .. } => {
                 let hp = self.f_mut().plan_of(head);
-                if hp.is_some() && hp != active {
+                if hp.is_some() && hp != active && !self.is_suppressed(hp.expect("checked")) {
                     let p = hp.expect("checked");
                     // The d-P5 join hoist: when the try's continuation
                     // is buried in an arm, split instead of wrapping
@@ -2659,7 +3773,7 @@ impl<'m> Ctx<'m> {
             }
             RegionNode::Loop { header, kind, body } => {
                 let hp = self.f_mut().plan_of(header);
-                if hp.is_some() && hp != active {
+                if hp.is_some() && hp != active && !self.is_suppressed(hp.expect("checked")) {
                     self.wrap_try(id, hp.expect("checked"), follow, out);
                 } else {
                     self.emit_loop(id, header, kind, body, active, follow, out);
@@ -2777,8 +3891,8 @@ impl<'m> Ctx<'m> {
         // join hoist hoisted the tail there); otherwise bail to the
         // leaf emitter, whose shim-tail duplication inlines the small
         // terminal tail into the skip arm instead (N76).
-        if let Some(h) = self.f().shim_of
-            && self.shim_sets.get(&h).is_some_and(|s| !s.contains(&skip))
+        if self.f().shim_of.is_some()
+            && self.frame_shim_set().is_some_and(|s| !s.contains(&skip))
             && !self.verified_fallout.contains(&skip)
             && !self.hoist_rejoins.contains(&skip)
         {
@@ -3900,6 +5014,117 @@ impl<'m> Ctx<'m> {
         self.frames.pop();
         CatchClause { binding, body }
     }
+
+    /// N77: emit one catch handler's UNIQUE prefix through its
+    /// de-absorption shim tree (the shared-join continuation is left
+    /// to the enclosing tower's join emission; the cut edges fall out
+    /// to it — verified by [`Ctx::emit_deabsorb_tower`]).
+    fn emit_handler_unique(&mut self, h: BlockId) -> CatchClause {
+        let binding = self
+            .bmap
+            .get(&h)
+            .and_then(|&bi| self.rf.blocks[bi].stmts.first())
+            .and_then(|s| match s {
+                Stmt::CatchBind { name } => Some(name.clone()),
+                _ => None,
+            });
+        let Some(tree) = self.uniq_trees.get(&h).cloned() else {
+            return CatchClause {
+                binding,
+                body: vec![SNode::Honest(format!(
+                    "handler B{}: unique-prefix body unavailable (no shim)",
+                    h.index()
+                ))],
+            };
+        };
+        let plans = self.uniq_plans.get(&h).cloned().unwrap_or_default();
+        let mut body = Vec::new();
+        let mut frame = Frame::new(tree, plans);
+        frame.shim_of = Some(h);
+        frame.shim_uniq = true;
+        self.frames.push(frame);
+        if let Some(root) = self.f().tree.root {
+            self.emit_node(root, None, Follow::Tail, &mut body);
+        }
+        self.frames.pop();
+        CatchClause { binding, body }
+    }
+}
+
+/// Every block of a raw region tree (N77 join-shim verification).
+fn tree_blocks(tree: &RegionTree) -> BTreeSet<BlockId> {
+    fn walk(tree: &RegionTree, id: RegionId, out: &mut BTreeSet<BlockId>) {
+        match tree.node(id) {
+            RegionNode::Block(b) => {
+                out.insert(*b);
+            }
+            RegionNode::Irreducible { blocks, .. } => out.extend(blocks.iter().copied()),
+            RegionNode::Seq(children) | RegionNode::Alternates(children) => {
+                for &c in children {
+                    walk(tree, c, out);
+                }
+            }
+            RegionNode::Labeled { body, .. } | RegionNode::Loop { body, .. } => {
+                walk(tree, *body, out)
+            }
+            RegionNode::If {
+                head,
+                then,
+                otherwise,
+                ..
+            } => {
+                out.insert(*head);
+                for c in [then, otherwise].into_iter().flatten() {
+                    walk(tree, *c, out);
+                }
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    if let Some(root) = tree.root {
+        walk(tree, root, &mut out);
+    }
+    out
+}
+
+/// The first-executed block of a raw region tree (N77 join-shim
+/// verification; mirrors [`Ctx::entry_of`]).
+fn tree_entry(tree: &RegionTree, id: RegionId) -> Option<BlockId> {
+    match tree.node(id) {
+        RegionNode::Block(b) => Some(*b),
+        RegionNode::If { head, .. } => Some(*head),
+        RegionNode::Loop { header, .. } => Some(*header),
+        RegionNode::Labeled { label, .. } => Some(*label),
+        RegionNode::Seq(children) => children.first().and_then(|&c| tree_entry(tree, c)),
+        RegionNode::Alternates(_) | RegionNode::Irreducible { .. } => None,
+    }
+}
+
+/// The ENTRY blocks of a tree's top-level emission positions
+/// (reachable from the root through `Seq` nesting only): falling out
+/// of anything inside the construct lands on the next top-level
+/// construct's entry, so a handler-rejoin target must be one of these
+/// (the N76 external-pred demotion guarantees it; N77 verifies it).
+fn tree_top_blocks(tree: &RegionTree) -> BTreeSet<BlockId> {
+    fn walk(tree: &RegionTree, id: RegionId, out: &mut BTreeSet<BlockId>) {
+        match tree.node(id) {
+            RegionNode::Seq(children) => {
+                for &c in children {
+                    walk(tree, c, out);
+                }
+            }
+            _ => {
+                if let Some(e) = tree_entry(tree, id) {
+                    out.insert(e);
+                }
+            }
+        }
+    }
+    let mut out = BTreeSet::new();
+    if let Some(root) = tree.root {
+        walk(tree, root, &mut out);
+    }
+    out
 }
 
 /// An out-of-set edge inside the irreducible fallback: emit a plain

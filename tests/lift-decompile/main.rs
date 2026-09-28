@@ -35,5 +35,6 @@ mod n74_top_level_this;
 mod n74_w4;
 mod n75_lone_surrogates;
 mod n76_structurer;
+mod n77_deabsorb;
 mod textual_oracle;
 mod yield_star_node;

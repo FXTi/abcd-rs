@@ -143,6 +143,11 @@ fn merge_stats(a: &mut DecompileStats, b: &DecompileStats) {
     a.structure.cross_arm_folds += b.structure.cross_arm_folds;
     a.structure.cross_arm_dup_blocks += b.structure.cross_arm_dup_blocks;
     a.structure.break_target_notes += b.structure.break_target_notes;
+    a.structure.handler_tail_dups += b.structure.handler_tail_dups;
+    a.structure.handler_tail_dup_blocks += b.structure.handler_tail_dup_blocks;
+    a.structure.tower_deabsorbs += b.structure.tower_deabsorbs;
+    a.structure.deabsorb_bails += b.structure.deabsorb_bails;
+    a.structure.deabsorb_join_blocks += b.structure.deabsorb_join_blocks;
     a.folds.for_of += b.folds.for_of;
     a.folds.for_await_of += b.folds.for_await_of;
     a.folds.for_in += b.folds.for_in;
@@ -294,13 +299,18 @@ fn corpus_decompile_gate() {
         stats.structure.exit_phi_after_loop
     );
     eprintln!(
-        "STRUCT irreducible_fallbacks={} state_machine_blocks={} cross_arm_notes={} cross_arm_folds={} cross_arm_dup_blocks={} break_target_notes={}",
+        "STRUCT irreducible_fallbacks={} state_machine_blocks={} cross_arm_notes={} cross_arm_folds={} cross_arm_dup_blocks={} break_target_notes={} handler_tail_dups={} handler_tail_dup_blocks={} tower_deabsorbs={} deabsorb_bails={} deabsorb_join_blocks={}",
         stats.structure.irreducible_fallbacks,
         stats.structure.state_machine_blocks,
         stats.structure.cross_arm_notes,
         stats.structure.cross_arm_folds,
         stats.structure.cross_arm_dup_blocks,
-        stats.structure.break_target_notes
+        stats.structure.break_target_notes,
+        stats.structure.handler_tail_dups,
+        stats.structure.handler_tail_dup_blocks,
+        stats.structure.tower_deabsorbs,
+        stats.structure.deabsorb_bails,
+        stats.structure.deabsorb_join_blocks
     );
 
     eprintln!("FALLBACK-COMMENT histogram (op=count):");
