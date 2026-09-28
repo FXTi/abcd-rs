@@ -1,6 +1,7 @@
 # abcd-hap: HAP/HSP/APP container parsing — upstream research + design proposal
 
-Status: research + design only (no implementation code).
+Status: phase 1 IMPLEMENTED (a8aa214, crate `abcd-hap/`; 39 tests green,
+real-hap byte-exact cross-check passed). This document remains the design reference.
 Upstream evidence base: `developtools_packing_tool` @ commit `b2aa3f6` ("!1568 merge master into master"),
 read-only at `developtools_packing_tool/`. All file:line citations below refer to that checkout.
 

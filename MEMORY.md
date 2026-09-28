@@ -1295,3 +1295,24 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   fast focused-repro value outweighs the ~2s cost. Consequence: CI
   wall time stays as-is (~17min); the earlier wall-time budget item
   is thereby RESOLVED as "accepted". Nothing further to do on q-P5.
+- q-P7 (2026-09-28, a8aa214): abcd-hap phase 1 LANDED. New workspace
+  crate: hand-written ZIP CD reader (zip.rs 459 lines: EOCD backscan
+  with position+CD-consistency validation so comment-hidden fake EOCDs
+  cannot hijack; CD walk must consume the declared range exactly;
+  local-header name/extra lengths are authoritative for data range),
+  container.rs (sniff by entry set, .app recursion depth<=2 with
+  provenance chain, nested payloads forced Owned), error.rs (10-variant
+  thiserror enum). Runtime deps: thiserror + miniz_oxide 0.9 only.
+  38 synthesized-byte integration tests + 1 doctest, all green on
+  dabai; red-first evidence /tmp/abcd-hap-red.txt (32 reds under the
+  stub). Orchestrator independently re-verified: 39/39 green, fmt
+  clean, workspace build green, AND a byte-exact extraction check
+  against the real wild ClashNEXT hap (python-zipfile reference, test
+  not committed). Design deviations (accepted): patch_json field, 4
+  extra Error variants, empty extraction => Err(NoAbcEntry). One
+  deliberate semantic to remember: a CORRUPT or abc-less nested hap
+  fails the whole .app extraction (hard-errors rule) — revisit if wild
+  apps ever carry resource-only modules. CI: abcd-hap is exercised
+  per-push by the coverage job (--workspace --include-ignored); build
+  jobs do not run it (root-package-only `cargo test`, per the q-P5 F2
+  ruling).
