@@ -3393,7 +3393,7 @@ fn canon_name(name: &mut String, map: &std::collections::HashMap<String, String>
 }
 
 /// Mutable child walk mirroring [`expr_children`].
-fn expr_children_mut(e: &mut Expr) -> Vec<&mut Expr> {
+pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<&mut Expr> {
     let mut out: Vec<&mut Expr> = Vec::new();
     match e {
         Expr::PropName { object, .. } => out.push(object),

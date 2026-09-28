@@ -2739,6 +2739,8 @@ fn merge_struct_stats(mut a: StructStats, b: &StructStats) -> StructStats {
     a.tower_deabsorbs += b.tower_deabsorbs;
     a.deabsorb_bails += b.deabsorb_bails;
     a.deabsorb_join_blocks += b.deabsorb_join_blocks;
+    a.loop_cut_rewrites += b.loop_cut_rewrites;
+    a.loop_cut_bails += b.loop_cut_bails;
     a
 }
 

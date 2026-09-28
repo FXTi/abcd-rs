@@ -313,6 +313,13 @@ pub struct StructStats {
     /// Shared-join blocks emitted once per tower (they would have been
     /// duplicated into every absorbing catch clause).
     pub deabsorb_join_blocks: usize,
+    /// Loops re-emitted as do-while with a cut try/catch INSIDE the
+    /// body (the catch's `continue` targets the in-loop test — N78,
+    /// test262 try/S12.14_A9_T5).
+    pub loop_cut_rewrites: usize,
+    /// Loop-cut candidates that failed a guard and kept the legacy
+    /// whole-loop wrap (the honest fallback).
+    pub loop_cut_bails: usize,
 }
 
 /// The Stage-B result for one function.
@@ -2082,6 +2089,17 @@ impl<'m> Ctx<'m> {
         follow: Follow,
         out: &mut Vec<SNode>,
     ) {
+        // The d-P5 join hoist: this node is part of the deferred tail
+        // of a cut region — suppressed here; the driver emits it after
+        // the try/catch (the handlers' rejoin point). The interception
+        // is coverage-agnostic (the N78 loop-cut driver defers MIXED
+        // tails — e.g. the unprotected continuation below a cut
+        // do-while body may contain chain-plan blocks).
+        if let Some(cd) = self.f_mut().cut_defer.as_mut()
+            && cd.ids.remove(&id)
+        {
+            return;
+        }
         let cov = self.f_mut().cov(id);
         match cov {
             Cov::Uniform(p) if p == active => self.emit_content(id, active, follow, out),
@@ -2093,15 +2111,6 @@ impl<'m> Ctx<'m> {
             }
             Cov::Uniform(Some(p)) => self.wrap_try(id, p, follow, out),
             Cov::Uniform(None) => {
-                // The d-P5 join hoist: this node is the unprotected
-                // tail of a cut `If` — suppressed here; the driver
-                // emits it after the try/catch (the handlers' rejoin
-                // point).
-                if let Some(cd) = self.f_mut().cut_defer.as_mut()
-                    && cd.ids.remove(&id)
-                {
-                    return;
-                }
                 // Unprotected node inside plan `active`'s span
                 // (non-contiguous protected range).
                 self.stats.try_splits += 1;
@@ -3719,6 +3728,642 @@ impl<'m> Ctx<'m> {
         true
     }
 
+    /// N78 (test262 try/S12.14_A9_T5): a try range CUTS a loop — the
+    /// protected region is the loop header plus a body prefix, and the
+    /// catch's continuation is the IN-LOOP test (es2abc lowers
+    /// `do { … try {…} catch (e) { …; continue; } … } while (c)` with
+    /// the catch body's `jmp` aimed at the test block). The legacy
+    /// `emit_mixed` Loop rule wraps the WHOLE loop in the try; the
+    /// catch clause then falls out PAST the loop (the in-loop rejoin
+    /// is unreachable from there) — A9_T5's `#1.4` failure: one caught
+    /// iteration, then `fin !== 10`. The d-P5 join hoist cannot repair
+    /// it either: the rejoin sits behind a try-path-only prefix two
+    /// nested `If`s deep, not at a flat Seq tail entry.
+    ///
+    /// When every guard below holds, emit the source shape instead:
+    ///
+    /// ```text
+    /// do {
+    ///   try {                        // the outer chain plan (finally idiom), when present
+    ///     try { <protected skeleton> }              // p0
+    ///     catch (e0) { …; continue; }               // continue → the do-while test
+    ///     <prefix: chain-protected or phi-only>     // normal-path only
+    ///   } catch (e1) { … }         // falls out at its own rejoin (mid tail)
+    ///   <unprotected mid tail>
+    ///   <test statements>
+    /// } while (<test cond>);
+    /// ```
+    ///
+    /// Soundness sketch: a `continue` in a do-while body evaluates the
+    /// test next — exactly the handler's bytecode rejoin — and skips
+    /// the prefix/mid-tail (the handler inlined the finally body). The
+    /// normal path runs skeleton → prefix → mid tail → test. The chain
+    /// plan's catch falls out at the mid tail's head (its handler's
+    /// rejoin). The prefix may sit inside the chain plan's try only
+    /// because every one of its blocks is chain-protected or pure phi
+    /// wiring (over-protection is then impossible). All guards are
+    /// structural; any deviation returns false and the caller keeps
+    /// the legacy whole-loop wrap.
+    fn try_loop_cut_do_while(
+        &mut self,
+        header: BlockId,
+        body_r: RegionId,
+        p0: usize,
+        active: Option<usize>,
+        follow: Follow,
+        out: &mut Vec<SNode>,
+    ) -> bool {
+        let debug = std::env::var_os("ABCD_LOOPCUT_DEBUG").is_some();
+        macro_rules! bail {
+            ($($arg:tt)*) => {{
+                if debug {
+                    eprintln!(
+                        "LOOPCUT-BAIL fn={} plan={p0}: {}",
+                        self.rf.func.index(),
+                        format!($($arg)*)
+                    );
+                }
+                self.stats.loop_cut_bails += 1;
+                return false;
+            }};
+        }
+        // v1 scope: the main frame, no enclosing plan, no labeled loop
+        // (a labeled exit's form is fine, but the label bookkeeping is
+        // the legacy path's).
+        if self.frames.len() != 1 || active.is_some() {
+            bail!("nested emission context");
+        }
+        if self.f().loop_labels.contains_key(&header) {
+            bail!("labeled loop");
+        }
+        if self.entry_of(body_r) != Follow::Entry(header) {
+            bail!("the body does not start at the header (not body-first)");
+        }
+        let handlers0 = self.f().plans[p0].handlers.clone();
+        if handlers0.is_empty() {
+            bail!("no handlers");
+        }
+        // The outward handler-protecting chain: at most one outer plan,
+        // in THIS frame (the es2abc finally idiom over the cut try).
+        let chain = self.select_wrap_chain(p0, &handlers0);
+        if chain.len() > 1 {
+            bail!("outer chain longer than 1");
+        }
+        let p1 = match chain.first() {
+            Some(&(0, q)) => Some(q),
+            Some(_) => bail!("chain step in another frame"),
+            None => None,
+        };
+        let body_blocks = self.f_mut().node_blocks(body_r);
+        // No nested loops inside the body (their header/latch
+        // consumption interplays with the tail deferral).
+        {
+            let mut stack = vec![body_r];
+            while let Some(id) = stack.pop() {
+                match self.f().node(id) {
+                    RegionNode::Loop { .. } => bail!("nested loop in the cut body"),
+                    RegionNode::Seq(c) | RegionNode::Alternates(c) => {
+                        stack.extend(c.iter().copied())
+                    }
+                    RegionNode::If {
+                        then, otherwise, ..
+                    } => stack.extend([then, otherwise].into_iter().flatten().copied()),
+                    RegionNode::Labeled { body, .. } => stack.push(*body),
+                    _ => {}
+                }
+            }
+        }
+        // No third plan touches the loop body.
+        for (q, plan) in self.f().plans.iter().enumerate() {
+            if q == p0 || Some(q) == p1 {
+                continue;
+            }
+            if plan.protected.iter().any(|b| body_blocks.contains(b)) {
+                bail!(
+                    "a third plan (region {}) intersects the loop body",
+                    plan.region
+                );
+            }
+        }
+        // p0's handlers must ALL rejoin at ONE block T inside the loop
+        // (their only continuation — the catch clause gets a
+        // `continue`). A handler that never leaves the shim needs no
+        // repair but breaks the uniform shape — v1 bails.
+        let mut test: Option<BlockId> = None;
+        for &h in &handlers0 {
+            let Some(set) = self.shim_sets.get(&h) else {
+                bail!("handler B{} has no shim", h.index());
+            };
+            if !set.contains(&h) {
+                bail!("handler B{} entry outside its shim", h.index());
+            }
+            for &b in set {
+                for s in block_succs(self.module, b) {
+                    if set.contains(&s) {
+                        continue;
+                    }
+                    if test.is_some_and(|t| t != s) {
+                        bail!("handlers rejoin at more than one block");
+                    }
+                    test = Some(s);
+                }
+            }
+        }
+        let Some(test) = test else {
+            bail!("no handler cut edge");
+        };
+        if test == header {
+            bail!("the rejoin is the header (a while-shape — not body-first)");
+        }
+        if !body_blocks.contains(&test) {
+            // The rejoin is outside the loop: the legacy whole-wrap's
+            // fall-out is already correct.
+            bail!("rejoin B{} is outside the loop", test.index());
+        }
+        // The chain plan's handlers rejoin at ONE block r1 inside the
+        // body (the finally-dispatch fall-out), distinct from T.
+        let mut rejoin1: Option<BlockId> = None;
+        if let Some(q1) = p1 {
+            let handlers1 = self.f().plans[q1].handlers.clone();
+            if handlers1.is_empty() {
+                bail!("chain plan without handlers");
+            }
+            for &h in &handlers1 {
+                let Some(set) = self.shim_sets.get(&h) else {
+                    bail!("chain handler B{} has no shim", h.index());
+                };
+                if !set.contains(&h) {
+                    bail!("chain handler B{} entry outside its shim", h.index());
+                }
+                for &b in set {
+                    for s in block_succs(self.module, b) {
+                        if set.contains(&s) {
+                            continue;
+                        }
+                        if rejoin1.is_some_and(|r| r != s) {
+                            bail!("chain handlers rejoin at more than one block");
+                        }
+                        rejoin1 = Some(s);
+                    }
+                }
+            }
+            let r1 = rejoin1.expect("checked non-empty handlers");
+            if r1 == test || !body_blocks.contains(&r1) {
+                bail!("chain rejoin B{} not a distinct in-loop block", r1.index());
+            }
+            rejoin1 = Some(r1);
+        }
+        // No FOREIGN handler cuts into the loop body (its fall-out
+        // position is not this driver's to place).
+        let own: HashSet<BlockId> = handlers0.iter().copied().collect();
+        let own1: HashSet<BlockId> = p1
+            .map(|q| self.f().plans[q].handlers.iter().copied().collect())
+            .unwrap_or_default();
+        for (&h, set) in &self.shim_sets {
+            if own.contains(&h) || own1.contains(&h) {
+                continue;
+            }
+            for &b in set {
+                for s in block_succs(self.module, b) {
+                    if !set.contains(&s) && body_blocks.contains(&s) {
+                        bail!("foreign handler B{} cuts into the loop body", h.index());
+                    }
+                }
+            }
+        }
+        // T is the do-while test: a conditional whose one edge reaches
+        // the header through pure trampolines (the latch) and whose
+        // other is the loop exit at the structural continuation. No phi
+        // wiring on the test/latch edges (v1).
+        let tparts = self.block_parts(test);
+        let Term::Cond(cond, tb, fb) = tparts.term.clone() else {
+            bail!("rejoin B{} is not a conditional", test.index());
+        };
+        if !tparts.phi.is_empty() {
+            bail!("the test block carries phi wiring");
+        }
+        let latch_chain = |ctx: &Self, start: BlockId| -> Option<Vec<BlockId>> {
+            let mut chain = Vec::new();
+            let mut cur = start;
+            loop {
+                if cur == header {
+                    return Some(chain);
+                }
+                if chain.len() >= 4 || !ctx.is_trampoline(cur) {
+                    return None;
+                }
+                chain.push(cur);
+                cur = match ctx.block_parts(cur).term {
+                    Term::Branch(d) => d,
+                    _ => return None,
+                };
+            }
+        };
+        let (cond_true_continues, exit, tramps) =
+            match (latch_chain(self, tb), latch_chain(self, fb)) {
+                (Some(ch), None) => (true, fb, ch),
+                (None, Some(ch)) => (false, tb, ch),
+                _ => bail!("the test edges do not split into stay/exit"),
+            };
+        if body_blocks.contains(&exit) {
+            bail!("the test's exit edge stays in the loop");
+        }
+        if !matches!(
+            self.f().eclass.get(&(test, exit)),
+            Some(EdgeClass::Break { labeled: false, .. })
+        ) {
+            bail!("the exit edge is not a plain break");
+        }
+        if !self.plain_break_ok(exit, follow) {
+            bail!("the exit is not the structural continuation");
+        }
+        let latch_from = tramps.last().copied().unwrap_or(test);
+        if !matches!(
+            self.f().eclass.get(&(latch_from, header)),
+            Some(EdgeClass::Continue { labeled: false, .. })
+        ) {
+            bail!("the latch edge is not a plain continue");
+        }
+        // The ONLY unlabeled loop-flow edges out of body blocks are this
+        // loop's own: in the do-while form an unlabeled `continue` lands
+        // at the TEST (not the header top) and an unlabeled `break`
+        // exits THIS loop, so any other classification would misroute.
+        for (&(from, to), class) in self.f().eclass.iter() {
+            if !body_blocks.contains(&from) {
+                continue;
+            }
+            match class {
+                EdgeClass::Continue { labeled: false, .. } => {
+                    if !(to == header && from == latch_from) {
+                        bail!("extra unlabeled continue B{}→B{}", from.index(), to.index());
+                    }
+                }
+                EdgeClass::Break {
+                    labeled: false,
+                    header: h2,
+                } => {
+                    if *h2 != header {
+                        bail!("unlabeled break owned by an outer loop B{}", h2.index());
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The spine walk: from the body region down to the test region.
+        // `If` levels stay in the skeleton (the head must be protected
+        // by p0 — the condition evaluation is protected — and the
+        // non-spine arm protected by p0 and terminal-only: falling out
+        // of it would route through the tail the try path owns). The
+        // tail below the deepest `If` is a Seq spine whose items before
+        // the test are the prefix/mid tail.
+        let mut spine = body_r;
+        let defer_root = loop {
+            match self.f().node(spine).clone() {
+                RegionNode::If {
+                    head,
+                    then,
+                    otherwise,
+                    ..
+                } => {
+                    if self.f_mut().plan_of(head) != Some(p0) {
+                        bail!(
+                            "spine If head B{} not protected by the cut plan",
+                            head.index()
+                        );
+                    }
+                    let then_has =
+                        then.is_some_and(|a| self.f_mut().node_blocks(a).contains(&test));
+                    let else_has =
+                        otherwise.is_some_and(|a| self.f_mut().node_blocks(a).contains(&test));
+                    if then_has == else_has {
+                        bail!("the test is not on exactly one arm of B{}", head.index());
+                    }
+                    let (arm, other) = if then_has {
+                        (then.expect("checked"), otherwise)
+                    } else {
+                        (otherwise.expect("checked"), then)
+                    };
+                    // A missing non-spine arm means the head's other
+                    // edge falls out of the `If` — with the spine arm
+                    // deferred, that fall-out would land inside the
+                    // try body at an unverified target. Bail.
+                    let Some(o) = other else {
+                        bail!("spine If B{} has a missing arm", head.index());
+                    };
+                    {
+                        let ok = matches!(self.f_mut().cov(o), Cov::Uniform(Some(q)) if q == p0);
+                        if !ok || !self.arm_exits_terminal(o) {
+                            bail!(
+                                "non-spine arm of B{} is not protected+terminal",
+                                head.index()
+                            );
+                        }
+                    }
+                    // The head's edge into the spine arm must be
+                    // structural: an action (break/continue) would be
+                    // emitted inside the try while the arm is deferred.
+                    match self.entry_of(arm) {
+                        Follow::Entry(se) if !self.edge_has_action(head, se) => {}
+                        _ => bail!("spine edge out of B{} carries an action", head.index()),
+                    }
+                    spine = arm;
+                }
+                _ => break spine,
+            }
+        };
+        if defer_root == body_r {
+            bail!("no protected If above the tail (a flat sequence — the d-P5 hoist owns it)");
+        }
+        // The tail: nested Seqs from defer_root down to the test region
+        // ({test} + the latch trampolines). The items before the test,
+        // in emission order, are the prefix/mid tail.
+        let tramp_set: BTreeSet<BlockId> = tramps.iter().copied().collect();
+        let mut items: Vec<RegionId> = Vec::new();
+        let mut cur = defer_root;
+        let test_region = loop {
+            let blocks = self.f_mut().node_blocks(cur);
+            if blocks.contains(&test) && blocks.iter().all(|&b| b == test || tramp_set.contains(&b))
+            {
+                if self.entry_of(cur) != Follow::Entry(test) {
+                    bail!("the test is not the entry of its region");
+                }
+                break cur;
+            }
+            match self.f().node(cur).clone() {
+                RegionNode::Seq(children) => {
+                    let Some(pos) = children
+                        .iter()
+                        .position(|&c| self.f_mut().node_blocks(c).contains(&test))
+                    else {
+                        bail!("the test is not below the deferred tail");
+                    };
+                    if pos + 1 != children.len() {
+                        bail!("content after the loop test in the tail");
+                    }
+                    items.extend_from_slice(&children[..pos]);
+                    cur = children[pos];
+                }
+                _ => bail!("the tail spine is not a plain sequence"),
+            }
+        };
+        // Split the items at the chain plan's rejoin: the prefix sits
+        // inside the chain plan's try body (each block chain-protected
+        // or pure phi wiring — anything else would be over-protected),
+        // the mid tail follows the chain try/catch unprotected.
+        let split = match rejoin1 {
+            Some(r1) => {
+                let Some(k) = items
+                    .iter()
+                    .position(|&i| self.entry_of(i) == Follow::Entry(r1))
+                else {
+                    bail!("chain rejoin B{} is not a tail item entry", r1.index());
+                };
+                if k == 0 {
+                    bail!("chain rejoin at the tail head");
+                }
+                k
+            }
+            None => 0,
+        };
+        let (prefix, midtail) = (&items[..split], &items[split..]);
+        for &item in prefix {
+            for b in self.f_mut().node_blocks(item) {
+                if self.f_mut().plan_of(b) == Some(p0) {
+                    bail!("prefix block B{} is protected by the cut plan", b.index());
+                }
+                let by_chain = p1.is_some_and(|q| self.f().plans[q].protected.contains(&b));
+                if !by_chain {
+                    let parts = self.block_parts(b);
+                    let phi_only = parts.main.iter().all(|s| {
+                        matches!(
+                            s,
+                            Stmt::PhiDecl { .. } | Stmt::PhiAssign { .. } | Stmt::Elided { .. }
+                        )
+                    });
+                    if !phi_only {
+                        bail!("prefix block B{} can throw (over-protection)", b.index());
+                    }
+                }
+            }
+        }
+        for &item in midtail.iter().chain(std::iter::once(&test_region)) {
+            for b in self.f_mut().node_blocks(item) {
+                if self.f_mut().plan_of(b).is_some() {
+                    bail!("tail block B{} is protected", b.index());
+                }
+            }
+        }
+        // The do-while condition cannot see body-scoped `const`/`let`
+        // temporaries (the block scope ends before `while (…)`): inline
+        // the test block's pure-atom temporaries into the condition;
+        // anything else keeps the legacy whole-wrap.
+        let mut cond = cond;
+        let mut kept_main: Vec<Stmt> = Vec::new();
+        for s in &tparts.main {
+            match s {
+                Stmt::Declare {
+                    name,
+                    mutable: false,
+                    value,
+                    ..
+                } if matches!(value, Expr::Lit(_) | Expr::Ident(_) | Expr::Temp { .. }) => {
+                    subst_expr(&mut cond, name, value);
+                }
+                _ => kept_main.push(s.clone()),
+            }
+        }
+        if !clean_while_main_ok(&kept_main, &cond) {
+            bail!("the test condition reads a body-scoped temporary");
+        }
+
+        // ── Emission ────────────────────────────────────────────────
+        let (region0, cuts0) = {
+            let plan = &self.f().plans[p0];
+            (plan.region, plan.cuts)
+        };
+        let wraps = {
+            let f = self.f_mut();
+            let n = f.wrap_counts.entry(p0).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if wraps > 1 {
+            self.stats.try_splits += 1;
+        }
+        if cuts0 {
+            self.stats.try_cuts += 1;
+        }
+        self.stats.try_catches += 1;
+        let mut skel = Vec::new();
+        if cuts0 {
+            skel.push(SNode::Honest(format!(
+                "try region {region0}: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary"
+            )));
+        }
+        if wraps > 1 {
+            skel.push(SNode::Honest(format!(
+                "try region {region0}: protected statements are not contiguous in the structured output — this is wrapper #{wraps} for the same region (catch body duplicated, finally-style)"
+            )));
+        }
+        skel.push(SNode::Honest(format!(
+            "try region {region0}: the protected range cuts a do-while loop — the try/catch is placed INSIDE the loop body and the catch's `continue` targets the in-loop test (the handlers' bytecode rejoin)"
+        )));
+        // The skeleton with the tail deferred (intercepted in
+        // `emit_node`, emitted below by this driver).
+        let skeleton_follow = prefix
+            .first()
+            .or_else(|| midtail.first())
+            .map(|&i| self.entry_of(i))
+            .unwrap_or(Follow::Entry(test));
+        self.f_mut().cut_defer = Some(CutDefer {
+            ids: [defer_root].into_iter().collect(),
+        });
+        self.emit_content(body_r, Some(p0), skeleton_follow, &mut skel);
+        let leftover = match self.f_mut().cut_defer.take() {
+            Some(cd) => !cd.ids.is_empty(),
+            None => false,
+        };
+        if leftover {
+            // Defensive: the deferred tail was never intercepted (the
+            // spine walk above proved the path is If-arms all the way,
+            // so this cannot happen). Nothing was pushed to `out`.
+            bail!("the deferred tail stayed inline (analysis/emission mismatch)");
+        }
+        // p0's handlers: emitted with the chain pending/suppressed
+        // (legacy parity — their clauses sit inside the chain's try
+        // body), each gaining the `continue` that targets the loop test
+        // (in a do-while the test is exactly what `continue` runs next).
+        let pending_mark = self.pending_wraps.len();
+        let suppress_mark = self.suppress_wraps.len();
+        if let Some(q1) = p1 {
+            let prot = self.f().plans[q1].protected.clone();
+            self.pending_wraps.push(prot.clone());
+            self.suppress_wraps.push(prot);
+        }
+        let mut catches0 = Vec::new();
+        let mut seen = HashSet::new();
+        for &h in &handlers0 {
+            if seen.insert(h) {
+                let mut c = self.emit_handler(h);
+                c.body.push(SNode::Continue { label: None });
+                catches0.push(c);
+            }
+        }
+        self.suppress_wraps.truncate(suppress_mark);
+        let note0 = if catches0.len() > 1 {
+            self.stats.multi_catch += 1;
+            Some(format!(
+                "try region {region0}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                catches0.len()
+            ))
+        } else {
+            None
+        };
+        let node0 = SNode::Try {
+            body: skel,
+            catches: catches0,
+            note: note0,
+            finally: None,
+        };
+        let mut loop_body: Vec<SNode> = Vec::new();
+        if let Some(q1) = p1 {
+            let (region1, cuts1) = {
+                let plan = &self.f().plans[q1];
+                (plan.region, plan.cuts)
+            };
+            let wraps = {
+                let f = self.f_mut();
+                let n = f.wrap_counts.entry(q1).or_insert(0);
+                *n += 1;
+                *n
+            };
+            if wraps > 1 {
+                self.stats.try_splits += 1;
+            }
+            if cuts1 {
+                self.stats.try_cuts += 1;
+            }
+            self.stats.try_catches += 1;
+            let mut p1_body = Vec::new();
+            if cuts1 {
+                p1_body.push(SNode::Honest(format!(
+                    "try region {region1}: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary"
+                )));
+            }
+            p1_body.push(SNode::Honest(format!(
+                "try region {region1}: handler-protecting outer try (finally idiom) — wrapped around region {region0}'s in-loop try/catch"
+            )));
+            p1_body.push(node0);
+            // The normal-path-only prefix (chain-protected or pure phi
+            // wiring — verified above): the chain plan's catch must NOT
+            // run it, so it sits inside the chain try body and the
+            // catch's fall-out is the mid tail's head.
+            for (i, &item) in prefix.iter().enumerate() {
+                let fl = if i + 1 < prefix.len() {
+                    self.entry_of(prefix[i + 1])
+                } else {
+                    self.entry_of(midtail[0])
+                };
+                self.emit_node(item, Some(q1), fl, &mut p1_body);
+            }
+            // The chain plan's handlers fall out at the mid tail's head
+            // (verified: it is emitted right after this try/catch).
+            let r1 = rejoin1.expect("p1 implies rejoin1");
+            self.hoist_rejoins.push(r1);
+            let handlers1 = self.f().plans[q1].handlers.clone();
+            let mut catches1 = Vec::new();
+            let mut seen = HashSet::new();
+            for &h in &handlers1 {
+                if seen.insert(h) {
+                    catches1.push(self.emit_handler(h));
+                }
+            }
+            self.hoist_rejoins.pop();
+            let note1 = if catches1.len() > 1 {
+                self.stats.multi_catch += 1;
+                Some(format!(
+                    "try region {region1}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                    catches1.len()
+                ))
+            } else {
+                None
+            };
+            loop_body.push(SNode::Try {
+                body: p1_body,
+                catches: catches1,
+                note: note1,
+                finally: None,
+            });
+        } else {
+            loop_body.push(node0);
+        }
+        self.pending_wraps.truncate(pending_mark);
+        // The unprotected mid tail (headed by the chain handler's
+        // rejoin), then the test block's statements.
+        for (i, &item) in midtail.iter().enumerate() {
+            let fl = if i + 1 < midtail.len() {
+                self.entry_of(midtail[i + 1])
+            } else {
+                Follow::Entry(test)
+            };
+            self.emit_node(item, None, fl, &mut loop_body);
+        }
+        Self::push_stmts(&mut loop_body, Self::stmts_leaves(&kept_main));
+        let while_cond = if cond_true_continues {
+            cond
+        } else {
+            negate(&cond)
+        };
+        self.stats.loops_do_while += 1;
+        self.stats.loop_cut_rewrites += 1;
+        out.push(SNode::DoWhile {
+            label: None,
+            body: loop_body,
+            cond: while_cond,
+        });
+        true
+    }
+
     /// A mixed-coverage node: descend (or wrap whole when the head is
     /// protected — the documented cut approximation).
     fn emit_mixed(
@@ -3774,7 +4419,16 @@ impl<'m> Ctx<'m> {
             RegionNode::Loop { header, kind, body } => {
                 let hp = self.f_mut().plan_of(header);
                 if hp.is_some() && hp != active && !self.is_suppressed(hp.expect("checked")) {
-                    self.wrap_try(id, hp.expect("checked"), follow, out);
+                    let p = hp.expect("checked");
+                    // N78: a try range cutting the loop whose handlers
+                    // rejoin at the in-loop test emits as the source
+                    // do-while (the try/catch inside the body, the
+                    // catch's `continue` targeting the test). Any guard
+                    // failure keeps the legacy whole-loop wrap.
+                    if self.try_loop_cut_do_while(header, body, p, active, follow, out) {
+                        return;
+                    }
+                    self.wrap_try(id, p, follow, out);
                 } else {
                     self.emit_loop(id, header, kind, body, active, follow, out);
                 }
@@ -5193,6 +5847,25 @@ fn clean_while_main_ok(main: &[Stmt], cond: &Expr) -> bool {
         Stmt::Declare { name, .. } => !refs.contains(name.as_str()),
         _ => false,
     })
+}
+
+/// Replace every `Ident`/`Temp` named `name` in `e` with `value` (the
+/// N78 loop-cut driver inlines the do-while test block's pure-atom
+/// temporaries into the condition — a block-scoped `const` is invisible
+/// to `while (…)`).
+fn subst_expr(e: &mut Expr, name: &str, value: &Expr) {
+    let hit = match e {
+        Expr::Ident(n) => n == name,
+        Expr::Temp { name: n, .. } => n == name,
+        _ => false,
+    };
+    if hit {
+        *e = value.clone();
+        return;
+    }
+    for c in crate::folds::expr_children_mut(e) {
+        subst_expr(c, name, value);
+    }
 }
 
 /// Negate a condition, simplifying the wrapper forms es2abc produces

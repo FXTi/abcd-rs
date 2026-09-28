@@ -367,4 +367,7 @@ fn dream_gate_t262_oracle() {
 /// de-absorption (its emission dropped ~12MB -> ~29KB) — the gate is
 /// back to the full 2685 rows; the floor pins the post-wave state and
 /// the ledger gates the rest.
-const T262_PASS_FLOOR: usize = 2675;
+/// N78 (2026-09-28): try/S12.14_A9_T5 fixed (the loop-cut do-while
+/// driver, `Ctx::try_loop_cut_do_while`) and delisted — the
+/// decompile-bug ledger bucket is EMPTY — 2676.
+const T262_PASS_FLOOR: usize = 2676;

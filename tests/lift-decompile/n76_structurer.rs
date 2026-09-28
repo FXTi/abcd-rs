@@ -38,6 +38,16 @@
 //!    (`structure_acyclic`'s external-pred demotion), and the emitter
 //!    duplicates small terminal tails at handler cut edges when the
 //!    fall-out is not verified to reach them.
+//! 5. `try/S12.14_A9_T5` (N78) — a try range cuts a do-while: the
+//!    protected region is the loop header + body prefix, and the
+//!    catch's `continue` rejoins the IN-LOOP test. Whole-wrapping the
+//!    loop (the legacy `emit_mixed` Loop rule) made the catch clause
+//!    fall out PAST the loop — one caught iteration, then `#1.4`.
+//!    `Ctx::try_loop_cut_do_while` emits the source shape: the
+//!    try/catch (plus its finally chain) inside a `do {…} while (…)`
+//!    body, the catch ending in `continue` (which targets the loop
+//!    test), the normal-path-only prefix verified chain-protected or
+//!    pure phi wiring.
 //!
 //! Corpus-fixture tests (`#[ignore]`d like `n74_w4.rs`); run:
 //!
@@ -161,4 +171,65 @@ fn try_switch_inside_finally_reconstruction() {
         "the epilogue must follow the inner dispatch switch, not hide in an arm:\n{}",
         &st1[..st1.len().min(3500)]
     );
+}
+
+/// 5. try/S12.14_A9_T5: the try range CUTS a do-while — the protected
+/// region is the loop header + the body prefix, and the catch's
+/// `continue` targets the IN-LOOP test (`i < 10`). Wrapping the whole
+/// loop in the try (the legacy `emit_mixed` Loop rule) makes the catch
+/// clause fall out PAST the loop: after one caught iteration the
+/// `fin !== 10` check throws `#1.4`. The only sound projection is the
+/// source shape: `do { try { … } catch (er1) { …; continue; } …
+/// finally dispatch … } while (i < 10)` — a do-while continue targets
+/// the loop test, which is exactly the handler's bytecode rejoin.
+#[test]
+#[ignore]
+fn try_cuts_do_while_catch_continue() {
+    let text =
+        decompile("24.0.0.0/test262/language/statements/try/S12.14_A9_T5/baseline/input.abc");
+    let main = &text[text.find("function func_main_0").expect("func_main_0")..];
+    // The try/catch sits INSIDE a do-whose body, before the test.
+    let do_at = main
+        .find("do {")
+        .expect("the cut loop must emit as a do-while with the try inside");
+    let rest = &main[do_at..];
+    let try_at = rest.find("try {").expect("try inside the loop body");
+    let catch_at = rest.find("} catch (").expect("catch clause");
+    let while_at = rest.find("} while (").expect("do-while test");
+    assert!(
+        try_at < catch_at && catch_at < while_at,
+        "the try/catch must precede the loop test inside the do-while body:\n{rest}"
+    );
+    // The catch's continuation IS the loop test: the inlined finally
+    // (`fin += 1`) is followed by `continue` — not by a fall-out past
+    // the loop (the HEAD bug: one caught iteration, then #1.4).
+    let catch_clause = &rest[catch_at..while_at];
+    assert!(
+        catch_clause.contains("continue;"),
+        "the catch must `continue` to the in-loop test:\n{catch_clause}"
+    );
+    // Behavior pin (the ledger row's failure mode): the module runs
+    // clean — 10 iterations, `fin === 10`, no `#1.4` throw.
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        let dir = std::env::temp_dir().join("abcd-n76-a9t5");
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let file = dir.join("a9t5.js");
+        std::fs::write(&file, &text).expect("write");
+        let run = std::process::Command::new("node")
+            .arg(&file)
+            .output()
+            .expect("run node");
+        assert!(
+            run.status.success(),
+            "the decompiled module must run clean (HEAD throws #1.4):\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    } else {
+        eprintln!("NODE-EVIDENCE node not found on this host — behavior run skipped");
+    }
 }
