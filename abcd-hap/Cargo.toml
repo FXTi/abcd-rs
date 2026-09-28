@@ -1,0 +1,15 @@
+[package]
+name = "abcd-hap"
+description = "In-memory, unpack-only reader for OpenHarmony HAP/HSP/APP/HQF containers (restricted ZIP dialect)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+keywords = ["harmonyos", "openharmony", "hap", "zip", "abc"]
+categories = ["parser-implementations"]
+
+[dependencies]
+thiserror.workspace = true
+miniz_oxide.workspace = true
+
+[dev-dependencies]
+miniz_oxide.workspace = true
