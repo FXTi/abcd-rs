@@ -1170,3 +1170,9 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   CI budget note: lift-decompile ~19min and test262-dream ~15min on GH
   exceed the 12-min target — pending maintainer decision (accept /
   split jobs / sample lever).
+- N77 registered: the continuation de-absorption refactor (N76's wart —
+  A7_T2's 12MB emission times es2abc out on GH). Until it lands, A7_T2 is
+  excluded IN-SUITE from the t262 dream gate (environment-dependent
+  outcomes cannot sit in the self-cleaning ledger). Also fixed: the
+  lift-decompile job double-ran dream_gate_t262 alongside the dedicated
+  test262-dream job (--skip added).
