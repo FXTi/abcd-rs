@@ -345,3 +345,5 @@ P3-T19 新登记（2026-09-20；原编号 N29-N34 与 P3-T20 撞号，重排为 
 
 | N75 | 孤代理字符串保真（3 行） | 反编译输出孤代理改发 \uXXXX 转义（合法 JS，重编译同字节）；Module 加 string_raw_bytes 侧表透传，emit 全字符串渲染点 raw 感知化 | worker N75 (k3) | **完成**（a59b0ff；另含 N74 残余行2：记录类全局名预声明 let 化——var 预声明在 script 模式会真写全局对象砸内建；3+1 行摘账） |
 | N76 | 结构器 try/switch 深水区（5 行） | 4/5 修复（switch 共享尾分解、外层 finally 计划回退、pending_wraps 抑重复、handler 重入降级+树形复制+verified_fallout）；A9_T5 留档带设计（try 横切 do-while 需循环内 try 发射+深层 join hoist）；A7_T2 12MB 瑕疵登记的后续=continuation 去吸收重构 | worker N76 (k3) | **完成**（824c788；中途三个交互回归全部抓获并回退/修复；orchestrator 复验 fmt/workspace 728 绿、1149 门 231s 绿、t262 门 2675/2685 账簿咬合） |
+
+| N77 | continuation 去吸收重构（A7_T2 12MB wart + 收编 A9_T5 前置） | handler 集合停共享 join、join 只发一次；去吸收后 A7_T2 归队 t262 门 | worker n77 (k3) | **完成**（bb9e79a：共享交汇点 J 分析 + emit_deabsorb_tower（层内一次、最外层后一次、跳板链 verified fall-out、疑虑即回退旧路——90 塔成功/157 回退）；A7_T2 11.8MB→28KB（411×）、try 包装 5496→34；t262 门回满编 2685（pass 2675=floor、账簿咬合 undocumented=0）；1149 门 203s 绿；orchestrator 全量复验。A9_T5 留账簿（需切环工作流，正交）。**附教训**：N76 曾 revert 的"漂亮但破坏 generator fold"路径，本重构绕开了） |

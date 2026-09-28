@@ -1176,3 +1176,61 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   outcomes cannot sit in the self-cleaning ledger). Also fixed: the
   lift-decompile job double-ran dream_gate_t262 alongside the dedicated
   test262-dream job (--skip added).
+- N77 LANDED (uncommitted at write time): the continuation
+  de-absorption refactor. Root cause of A7_T2's 12MB: the whole
+  program was a handler-side Russian doll (main universe = 1 block —
+  every CHECK's code lives inside the previous CHECK's catch
+  sub-CFGs); handler shim sets ABSORBED every Normal-reachable block
+  to the main universe, so continuations shared by >= 2 handlers were
+  emitted inside every absorbing catch clause and the outer-wrap
+  chain re-emitted the enclosing towers at every nested site
+  (factorial cascade: same handler emitted up to 720x).
+  Fix (abcd-decompile/structure.rs): (1) shared-join analysis in
+  build_deabsorb — J = blocks Normal-reachable from >= 2 handler
+  entries; handler UNIQUE prefixes = reach minus J (pairwise
+  disjoint, one de-absorption shim module). (2)
+  emit_deabsorb_tower in wrap_try_run: a plan + its outer-wrap chain
+  emits each handler's unique prefix in its clause, chain-level joins
+  ONCE inside that level's try body, and the unprotected
+  continuation after the outermost try/catch; cut edges into joins
+  are verified fall-outs (rejoin targets must sit at the join tree's
+  top level — the N76 external-pred demotion provides it; foreign
+  cuts from nested towers need trampoline-only tails; everything else
+  bails to the legacy absorbed path, 157 bails vs 90 towers on the
+  2832 corpus). (3) The legacy path now also emits a plan's OWN
+  handlers under full-chain pending + suppression (the second-cascade
+  wart: an absorbed handler body re-wrapped a chain plan around its
+  chain-protected blocks — A7_T2's e82 re-wrapped T26 around B83 and
+  re-emitted e95 + the whole cascade). (4) Verified fall-outs must
+  cover the join head's TRAMPOLINE chain (A7_T2's B116 guard cut to
+  B118 past the B115 trampoline; without it the #3.2/#7.3 guard
+  conditionals were dropped and the rows failed semantically while
+  looking structurally fine — caught only by the t262 oracle; the n77
+  string pins were insufficient — lesson: pins must include behavior,
+  not just text presence).
+  Evidence: A7_T2 emission 11,820,631 -> 28,471 bytes (411x; 34 try
+  wrappers vs 5496); corpus_decompile 2832 green + determinism +
+  node/ts 40/40 (counter deltas vs HEAD baseline: output_bytes
+  26,648,855 -> 26,557,571, switch 600 -> 546, async_driver 53 -> 51,
+  ifs 5097 -> 4953, try_catches 3171 -> 3132, try_splits 1426 ->
+  1422, try_join_hoists 37 -> 38 — suppression of redundant chain
+  re-wraps; new counters tower_deabsorbs=90 deabsorb_bails=157
+  deabsorb_join_blocks=198); 1149 dream gate 1149/1149; t262 gate
+  back to the FULL 2685 rows (A7_T2 re-included): 2685/2685
+  recompiled, pass 2675 = floor, ledger bite green (undocumented=0;
+  ledger holds A9_T5 + 9 expected-fallback); workspace 126 test
+  binaries green; yield*/generator/async goldens green. A7_T1/T2/A15
+  stay fixed and are now byte-verified (both A7 rows pass the
+  recorded-VM oracle). A9_T5 unchanged (tower count 0 there; needs
+  the loop-cutting workstream — note refreshed in the ledger).
+- N77 FIXED (bb9e79a): the continuation de-absorption refactor —
+  handler shim sets used to absorb ALL Normal-reachable blocks, so shared
+  continuations duplicated into every absorbing catch and outer-wrap
+  chains re-emitted towers at every nesting level (factorial cascade:
+  one handler emitted 720x). Now: shared-join analysis (J = reachable
+  from >=2 handler entries) + per-level join emission + verified
+  trampoline-chain fall-outs + bail-on-doubt to the legacy path.
+  A7_T2 emission 11.8MB -> 28KB (411x); the t262 dream gate is back to
+  the full 2685 rows (pass 2675 = floor). The decompiler's dream-gate
+  ledger holds exactly ONE row (A9_T5 — needs cut-plan-aware loop
+  emission, orthogonal follow-up).
