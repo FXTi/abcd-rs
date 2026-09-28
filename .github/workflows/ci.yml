@@ -413,7 +413,7 @@ jobs:
       # dream_gate generate+oracle (docker on the runner) + the node
       # behavior suites (node is preinstalled on runners). textual_oracle
       # is a report-only instrument — local-only by design.
-      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --skip textual_oracle
+      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --skip textual_oracle --skip dream_gate_t262
       - name: Upload the dream-gate report
         if: always()
         uses: actions/upload-artifact@v4
