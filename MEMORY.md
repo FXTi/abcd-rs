@@ -1234,3 +1234,12 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   the full 2685 rows (pass 2675 = floor). The decompiler's dream-gate
   ledger holds exactly ONE row (A9_T5 — needs cut-plan-aware loop
   emission, orthogonal follow-up).
+- N78 FIXED (ee2f85e): A9_T5 (try range cutting a do-while) closed with
+  try_loop_cut_do_while — handlers rejoining one in-loop do-while test
+  now emit as do{try{..}catch{..;continue}..}while(..) instead of the
+  loop wrapped whole (which dropped the catch out of the loop). The
+  t262 dream-gate ledger's decompile-bug bucket is EMPTY (only 9
+  expected-fallback generator rows by design). test262 dream gate:
+  2676/2685. The test262 campaign is fully closed: P1 pandasm 4.56M
+  instructions 0 mismatch; P2 VM oracle 2685/2685; P3 dream gate with
+  the decompile-bug ledger at ZERO. N-register N1..N78 all terminal.
