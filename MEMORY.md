@@ -1316,3 +1316,17 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   per-push by the coverage job (--workspace --include-ignored); build
   jobs do not run it (root-package-only `cargo test`, per the q-P5 F2
   ruling).
+- q-P8 (2026-09-28): CLI plan drafted (design/cli-plan.md) after the
+  maintainer asked to plan the external command surface. Eight
+  commands mapped from existing public entry points: unpack (abcd-hap),
+  info/--verify (abcd-file), dis (isa), asm (writer), rewrite
+  (lift->opt->lower), decompile, analyze (abcd-analysis), taint
+  (run_taint). Proposal: ONE `abcd` binary with clap subcommands in a
+  new abcd-cli crate (root package stays the test container); shared
+  input layer sniffs bare-abc vs container (PK magic -> abcd-hap;
+  multi-module .app requires --module/--all, no silent picking);
+  phasing P1 read-only (unpack/info/dis/decompile) -> P2 writers
+  (asm/rewrite with --check re-decode) -> P3 analysis (needs report
+  format design). Tests: clap parse tests + synthesized-abc golden
+  outputs (abcd_file::Builder precedent from N74), zero binary
+  fixtures. Six decision points listed in the doc, awaiting ruling.
