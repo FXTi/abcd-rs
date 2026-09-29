@@ -1407,3 +1407,14 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   forwards only ABCD_* env vars, so local -D warnings verification
   needs a manual ssh pass (KEEP=1 + explicit RUSTFLAGS). Fixed in one
   line; re-verified -D warnings workspace build green on dabai.
+- q-P10 ruling A (2026-09-30): coverage job --skip pandasm_asm. The two
+  new asm round-trip gates are byte-loop-heavy (parse+encode+decode+emit
+  per fixture, twice) and llvm-cov instrumentation multiplies them
+  pathologically: plain release 67s for the whole file-isa target vs
+  30min+ instrumented on dabai (16-core) — on GH's 4-vCPU runner the
+  coverage step never finished (2h25m observed, twice; first time
+  misdiagnosed as infra flake by the orchestrator — lesson: a repeated
+  hang at the same step is a pattern, not a flake). Behavioral gating
+  stays per-push in the file-isa job; parser coverage keeps its unit
+  tests (incl. the 4000-case fuzz). Compare F1 (rejected): that was
+  17min of duplicated-but-working compute; this was CI-breaking.

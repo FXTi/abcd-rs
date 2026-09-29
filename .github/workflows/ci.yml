@@ -469,7 +469,13 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Collect coverage (full estate incl. the corpus suites)
-        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored
+        # --skip pandasm_asm: the two asm round-trip gates are byte-loop-heavy
+        # (parse+encode+decode+emit x5517 x2) and llvm-cov instrumentation
+        # multiplies them past 2h on a 4-vCPU runner (measured: 67s plain
+        # release -> 30min+ instrumented on a 16-core box). Their behavioral
+        # gating is owned per-push by the file-isa job; the parser keeps its
+        # unit-test (incl. fuzz) coverage. (q-P10 ruling A, 2026-09-30)
+        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
