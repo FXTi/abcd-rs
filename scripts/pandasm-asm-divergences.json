@@ -1,0 +1,20 @@
+{
+ "$comment": "pandasm asm round-trip documented divergences (tests/file-isa/pandasm_asm.rs). TWO gates share this ledger, class names are prefixed by gate: 'text:' = parse_file -> emit_file byte-identity against reference.pa; 'binary:' = parse_file -> encode -> decode -> emit_file under layout-offset normalization (literal-table keys / STRING offsets / field offset values / lit_offset are layout data the .pa text cannot carry into a fresh writer layout — upstream ark_asm has the same property, its own asm->disasm round-trip renumbers offsets too). ZERO entries is the healthy state: an undocumented failure is red; a listed fixture that starts passing is stale and also fails. Each entry must cite the upstream evidence and why the parser cannot recover the information from the .pa text.",
+ "text:literal-index-order-underdetermined": [
+  "13.0.1.0/upstream/bytecode/ts/api18/sendable-class-export-1/baseline/input.abc",
+  "13.0.1.0/upstream/bytecode/ts/api18/sendable-class-export-1/debug-info/input.abc",
+  "13.0.1.0/upstream/bytecode/ts/api18/sendable-class-export-1/optimized/input.abc",
+  "24.0.0.0/upstream/bytecode/ts/api18/sendable-class-export-1/baseline/input.abc",
+  "24.0.0.0/upstream/bytecode/ts/api18/sendable-class-export-1/debug-info/input.abc",
+  "24.0.0.0/upstream/bytecode/ts/api18/sendable-class-export-1/optimized/input.abc",
+  "24.0.0.0/test262/built-ins/String/prototype/localeCompare/15.5.4.9_CE/baseline/input.abc",
+  "24.0.0.0/test262/language/expressions/bitwise-and/S11.10.1_A2.2_T1/baseline/input.abc",
+  "24.0.0.0/test262/language/expressions/bitwise-or/S11.10.3_A2.2_T1/baseline/input.abc",
+  "24.0.0.0/test262/language/expressions/bitwise-xor/S11.10.2_A2.2_T1/baseline/input.abc",
+  "24.0.0.0/test262/language/expressions/equals/S11.9.1_A7.8/baseline/input.abc",
+  "24.0.0.0/test262/language/expressions/less-than-or-equal/S11.8.3_A2.2_T1/baseline/input.abc",
+  "24.0.0.0/test262/language/expressions/subtraction/S11.6.2_A2.2_T1/baseline/input.abc",
+  "24.0.0.0/test262/language/expressions/unsigned-right-shift/S11.7.3_A2.2_T1/baseline/input.abc"
+ ],
+ "$class:text:literal-index-order-underdetermined": "13.x/24.x LITERALS index assignment is a libstdc++ unordered_set iteration artifact of the source file's byte offsets AND method order (upstream CollectUtil::CollectLiteralArray -> GetLiteralArrays; reproduced bit-exactly by the emitter's sim::U32Set). The pandasm text underdetermines both: functions print signature-sorted (method order lost) and literal operands print inline CONTENT (the source-offset identity of each same-content array reference is lost — upstream ark_asm cannot even parse this rendering: its ParseOperandLiteralArray expects a declared array NAME, assembly-parser.cpp). When several literal arrays share identical content (es2abc emits one template array per call site), no assignment of text references to offsets reproduces the printed index order without solving the hash-order preimage; the parser's rank-ordered binding + method reorder covers the common cases, these 14 do not. The BINARY gate passes all of them (the assembled .abc is semantically correct; only the text-level parse->emit index ordering differs)."
+}

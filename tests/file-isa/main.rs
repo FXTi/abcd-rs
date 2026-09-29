@@ -20,6 +20,7 @@ use abcd_isa::{
 };
 use std::process::Command;
 
+mod pandasm_asm;
 mod pandasm_dis;
 
 fn exported_corpus_root() -> std::path::PathBuf {

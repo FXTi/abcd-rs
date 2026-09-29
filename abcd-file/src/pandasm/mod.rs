@@ -36,6 +36,14 @@
 //! The emitter never panics on any [`File`] model: unresolvable entities
 //! render as deterministic `!invalid:…` placeholders. (Corpus-driven tests
 //! panic on mismatch by design — that is the gate's job, not the emitter's.)
+//!
+//! The inverse direction — whole-file pandasm text back to a [`File`]
+//! model, the `abcd asm` foundation — lives in [`parse`].
+
+mod insn_ctor;
+mod parse;
+
+pub use parse::{DEFAULT_VERSION, ParseError, parse_file, parse_file_with_version};
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -1632,6 +1640,35 @@ impl<'f> Emitter<'f> {
 /// First-name-wins label allocation (upstream `LabelTable` insert).
 fn alloc_label(labels: &mut BTreeMap<u32, String>, idx: u32, name: String) -> String {
     labels.entry(idx).or_insert(name).clone()
+}
+
+/// The 13.x/24.x literal-table assignment for a model: the `(index,
+/// offset)` pairs the emitter's collection would print, in index order.
+/// Exposed to the parser (crate-internal): the method ORDER within a class
+/// is invisible in pandasm text (functions print in signature-sorted
+/// order), so the parser may sort methods to make this assignment reproduce
+/// the parsed LITERALS keys. Pure query — no emission behavior change.
+pub(crate) fn simulated_literal_assignment(file: &File) -> Vec<(u32, u32)> {
+    if file.version <= LAST_HEADER_LITERAL_VERSION {
+        return Vec::new();
+    }
+    let mut emitter = Emitter::new(file);
+    emitter.classify_field_offsets();
+    let (regular, modules) = emitter.collect_literal_tables();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    let read_key = |key: &[u8], out: &mut Vec<(u32, u32)>| {
+        if let Some((index, offset, _)) = parse::parse_literal_key(key) {
+            out.push((index, offset));
+        }
+    };
+    for key in regular.keys() {
+        read_key(key, &mut out);
+    }
+    for key in modules.keys() {
+        read_key(key, &mut out);
+    }
+    out.sort_by_key(|(index, _)| *index);
+    out
 }
 
 /// The u32 wire value of a field's initial value, abstracting over the
