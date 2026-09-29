@@ -1,9 +1,10 @@
 # abcd CLI plan — external command-line surface
 
-Status: P1 LANDED (2026-09-28): `abcd` binary (abcd-cli) ships extract /
-info / dis / decompile; `dis` is byte-identical to ark_disasm over the full
-5517-fixture corpus (gate: tests/file-isa/pandasm_dis.rs, empty ledger).
-All six §6 points ruled 2026-09-28 (see §6).
+Status: ALL PHASES LANDED (2026-09-28). The `abcd` binary ships all eight
+commands: extract / info / dis / asm / rewrite / analyze / taint /
+decompile. `dis` is byte-identical to ark_disasm over the full corpus
+(5517/5517); `asm` closes the text loop (binary gate 5517/5517, text gate
+5503 + 14 documented). All six §6 points ruled 2026-09-28 (see §6).
 
 ## 1. Why now
 

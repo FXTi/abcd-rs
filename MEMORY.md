@@ -1374,3 +1374,29 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   the new field; lesson recorded: verification must compile tests
   (cargo test --workspace), check is insufficient. Also removed an
   examples/ dir the CLI worker created (examples stay banned).
+- q-P10 (2026-09-28): CLI P2+P3 LANDED — all eight planned commands now
+  ship in the `abcd` binary: extract / info / dis / asm / rewrite /
+  analyze / taint / decompile. asm rides the new
+  abcd_file::pandasm::parse_file (parse .pa -> File -> encode), gated
+  per-push by two corpus round-trip gates: text-layer 5503 byte-exact
+  + 14 documented (text:literal-index-order-underdetermined — the .pa
+  text cannot recover the libstdc++ hash-order binding of same-content
+  literal arrays; upstream ark_asm cannot even parse these renderings)
+  and binary-layer 5517/5517 under layout-offset normalization. The
+  originally specified 4-step byte gate was proven unachievable (not an
+  implementation gap): vendored writer relayouts the string pool and
+  .pa does not carry non-code string order — information-theoretic,
+  upstream's own asm->disasm round-trip renumbers too. rewrite wires
+  decode -> lift -> abcd_ir::verify_module -> [opt] -> lower -> encode
+  with --check re-decode. taint config = TOML (ruled), kind-tagged
+  serde mapping, Field endpoints deliberately inexpressible (need the
+  module symbol table). Latent bug found by the rewrite worker and
+  FIXED same-day (red-first): abcd-lower frame_init_consts
+  anchor-attribution hole on degenerate functions (0-arg bare-Return)
+  -> UnallocatedOperand; fixed by use-based attribution for used consts
+  (only cross-function source is the inliner's verbatim transplant);
+  corpus+VM oracle 1149x3 green. 101 abcd-cli tests; 143 workspace
+  suites green; fmt clean. An untracked maintainer file
+  hap_collect/collect_haps.py (OHOS multi-version rk3568 hap
+  collector) sits in the workspace — NOT committed, awaiting the
+  maintainer's call (feeds abcd-hap phase 2).
