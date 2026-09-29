@@ -19,7 +19,7 @@ in `[workspace.dependencies]` (currently unused — reserved for this).
 
 | Command | Capability source | Direction | Notes |
 |---|---|---|---|
-| `abcd unpack` | abcd-hap | .hap/.hsp/.app/.hqf → .abc file(s) + module.json | First real consumer of abcd-hap. |
+| `abcd extract` | abcd-hap | .hap/.hsp/.app/.hqf → .abc file(s) + module.json | First real consumer of abcd-hap. (Ruled name: `extract`, not `unpack`.) |
 | `abcd info` | abcd-file | .abc → header/entity summary | readelf-style: format version, counts (classes/methods/strings/literal arrays), index regions. `--verify` = full decode + structural checks, exit code carries the verdict. |
 | `abcd dis` | abcd-file + abcd-isa | .abc → pandasm text | Backed by the 4,557,285-instruction 0-mismatch corpus evidence. Options: whole file / single method / raw byte offsets. **Ruled 2026-09-28: output must be BYTE-IDENTICAL to upstream ark_disasm — see §4.1.** |
 | `abcd asm` | abcd-isa + abcd-file | pandasm text → .abc | The round-trip direction of `dis`. A **writer** — phase 2. |
@@ -84,7 +84,7 @@ on everything; nothing depends on abcd-cli).
 ## 4. Phasing
 
 **P1 — read-only tools (zero writer risk):**
-`unpack`, `info` (+`--verify`), `dis`, `decompile`.
+`extract`, `info` (+`--verify`), `dis`, `decompile`.
 These only read abc / write text. They exercise abcd-hap in production shape.
 
 **P2 — writers:**
@@ -136,15 +136,16 @@ not exist at all. Both commands therefore require a new library layer:
   corpus gates — but only if the maintainer wants CLI-level corpus coverage;
   the library-level gates already exist.
 
-## 6. Decision points for the maintainer
+## 6. Decision points for the maintainer — ALL RULED 2026-09-28
 
-1. **Single `abcd` binary with subcommands** (recommended) vs per-tool
-   binaries.
-2. **New `abcd-cli` crate** (recommended) vs putting the binary in the root
-   package.
-3. **Phase 1 scope**: unpack / info / dis / decompile — confirm or trim.
-4. **Command names**: `unpack` vs `extract`; `dis`/`asm` vs `disassemble`/
-   `assemble` (short names recommended, git-style).
-5. **Distribution**: for now local `cargo install --path abcd-cli`;
-   crates.io / GitHub release binaries deferred until someone asks.
-6. **Config file for `taint`** (phase 3): JSON vs TOML vs flags-only.
+1. **Single `abcd` binary with subcommands** — RULED: yes.
+2. **New `abcd-cli` crate** — RULED: yes (root package stays the test
+   container).
+3. **Phase 1 scope** — RULED: extract / info / dis / decompile.
+4. **Command names** — RULED: `extract` (not `unpack`), `dis`/`asm` short
+   forms.
+5. **Distribution** — RULED: local `cargo install --path abcd-cli` for now;
+   crates.io / GitHub releases deferred.
+6. **`taint` config** — RULED: TOML file (phase 3).
+
+Additional fidelity ruling in §4.1: `dis` byte-identical to ark_disasm.

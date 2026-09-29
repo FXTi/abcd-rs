@@ -1340,3 +1340,9 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   only in the file-isa test harness and no whole-file text emitter
   exists — dis/asm require a new library text layer (lift-and-harden
   from test code, not from scratch).
+- q-P8 rulings, all six (2026-09-28): single `abcd` binary + clap
+  subcommands; new abcd-cli crate (root package untouched); P1 scope =
+  extract/info/dis/decompile; command names = `extract` (not unpack)
+  and short `dis`/`asm`; distribution = local cargo install --path for
+  now (crates.io/releases deferred); taint config = TOML (phase 3).
+  P1 implementation started same day.
