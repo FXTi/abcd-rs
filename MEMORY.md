@@ -1418,3 +1418,16 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   stays per-push in the file-isa job; parser coverage keeps its unit
   tests (incl. the 4000-case fuzz). Compare F1 (rejected): that was
   17min of duplicated-but-working compute; this was CI-breaking.
+- q-P11 (2026-09-30): backlog triage rulings. test262 expansion DECLINED
+  ("跟随上游就好" — the curated 2685 subset stays; the ~13k es2015+
+  es2021+es2022 main body is not adopted). V-I7 design refined in
+  discussion: the codegen-table alternative was rejected by the
+  maintainer (a hand-written special case in upstream's template would
+  silently diverge — the N65 self-consistent-inversion lesson);
+  runtime-init caching (OnceLock table filled by one FFI sweep at first
+  use) and the build.rs-probe variant (compile a tiny C++ probe that
+  calls the real vendor classification functions at BUILD time and
+  prints a Rust const table) both keep vendor behavior authoritative —
+  build-time probing strictly dominates on the perf axis (true const).
+  Discipline unchanged: MEASURE FIRST (no benches exist in-tree);
+  benchmark running now, decision by numbers.
