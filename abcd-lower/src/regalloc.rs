@@ -208,17 +208,44 @@ fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir::Ins
 ///   "used by a live instruction" — ADCE's survival criterion.)
 ///
 /// v0.2's `ValueDef::Const` values carry no owning-function back-pointer,
-/// but the lift creates values function-by-function in function-table
-/// order, so each function's values form a contiguous id range. A const
-/// value is attributed to the function whose range contains it: the
-/// function with the greatest anchor minimum ≤ the const's id, where a
-/// function's anchors are its params, exception params, and instruction
-/// results (all function-scoped by construction).
+/// so attribution is two-tier:
 ///
-/// Boundary note: a const created as a 0-parameter function's VERY FIRST
-/// value (before any anchor) sorts into the previous function's range —
-/// the only placement ambiguity the id ranges cannot resolve; v0.1 would
-/// place it in the owning function. Never observed in the corpus.
+/// - A USED const belongs to the function(s) whose instructions reference
+///   it (phi entries are operands). This is exact, not heuristic: the
+///   lift creates const values function-by-function (each `FnLift` owns
+///   its `SsaBuilder`) and wires each one into its own function's
+///   instructions, so the using function IS the owning function — v0.1's
+///   placement of the seed instruction. A cross-function use arises only
+///   from abcd-opt's inliner, which transplants const values verbatim
+///   into the caller exactly like v0.1 cloned the callee's entry seed
+///   instructions; every user then materializes its own seed copy, which
+///   is sound because a constant is pure (rematerializable).
+/// - An UNUSED const has no use to reverse-lookup, so it keeps the
+///   id-range attribution: the lift creates values function-by-function
+///   in function-table order, so each function's values form a
+///   contiguous id range, and the const is attributed to the function
+///   with the greatest anchor minimum ≤ the const's id (anchors: params,
+///   exception params, instruction results — all function-scoped by
+///   construction). v0.1-lift emits even unused seed loads, so the
+///   placement still matters under `used_only == false`.
+///
+/// The id range alone cannot see a DEGENERATE function — no params, no
+/// result-carrying instructions, no try regions (e.g. a 0-argument
+/// static method whose only bytecode is a bare `return`: the lift
+/// resolves the `Return` operand to the frame-initial constant without
+/// creating any anchor). Its used consts found no owner at all, or
+/// sorted into a neighboring function's range, and register allocation
+/// never colored them (`LowerError::UnallocatedOperand`). es2abc output
+/// never produces the shape — every method carries the implicit
+/// [func][newtarget][this] frame slots as params — so the corpus never
+/// tripped it; use-based attribution closes it.
+///
+/// Residual boundary: an UNUSED const of an anchor-less function has
+/// neither a use nor a range and stays unowned (never materialized).
+/// The placement is positionally unrecoverable — trailing consts of
+/// consecutive anchor-less functions are indistinguishable by id — and
+/// the lift does not produce the shape (a lazily created frame-initial
+/// const is wired into the instruction whose read created it).
 pub fn frame_init_consts(module: &Module, func_id: FuncId, used_only: bool) -> Vec<ValueId> {
     // The use gate (opt parity): constants with at least one operand use
     // in the owning function (phi entries are operands). Fusion
@@ -241,8 +268,11 @@ pub fn frame_init_consts(module: &Module, func_id: FuncId, used_only: bool) -> V
         }
     }
 
-    // Each function's anchor minimum, in function-table order.
+    // One module-wide pass, in function-table order: each function's
+    // anchor minimum (the id-range fallback) plus the const-defined
+    // operand uses (the primary, exact attribution).
     let mut starts: Vec<(FuncId, u32)> = Vec::new();
+    let mut users: HashMap<ValueId, Vec<FuncId>> = HashMap::new();
     for (i, f) in module.functions.iter().enumerate() {
         let mut lo = u32::MAX;
         for v in &f.params {
@@ -258,8 +288,22 @@ pub fn frame_init_consts(module: &Module, func_id: FuncId, used_only: bool) -> V
                 continue;
             };
             for &iid in &block.insts {
-                if let Some(result) = module.inst(iid).and_then(|inst| inst.result) {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if let Some(result) = inst.result {
                     lo = lo.min(result.0);
+                }
+                for operand in inst.op.operands() {
+                    if module
+                        .value(operand)
+                        .is_some_and(|v| matches!(v.def, ValueDef::Const(_)))
+                    {
+                        users
+                            .entry(operand)
+                            .or_default()
+                            .push(FuncId::new(i as u32));
+                    }
                 }
             }
         }
@@ -273,11 +317,22 @@ pub fn frame_init_consts(module: &Module, func_id: FuncId, used_only: bool) -> V
             continue;
         }
         let id = vid as u32;
-        // The owning function: the last one whose anchor minimum is <= id.
-        if let Some((owner, _)) = starts.iter().rev().find(|(_, lo)| *lo <= id) {
-            if *owner == func_id && (!used_only || used.contains(&ValueId::new(id))) {
-                out.push(ValueId::new(id));
-            }
+        let vid = ValueId::new(id);
+        let owned = match users.get(&vid) {
+            // A used const belongs to its using function(s) — see the
+            // doc comment. This also covers anchor-less functions, which
+            // the id ranges cannot see.
+            Some(us) => us.contains(&func_id),
+            // An unused const: the id-range attribution — the owning
+            // function is the last one whose anchor minimum is <= id.
+            None => starts
+                .iter()
+                .rev()
+                .find(|(_, lo)| *lo <= id)
+                .is_some_and(|(owner, _)| *owner == func_id),
+        };
+        if owned && (!used_only || used.contains(&vid)) {
+            out.push(vid);
         }
     }
     out
