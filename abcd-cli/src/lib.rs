@@ -25,8 +25,7 @@ pub mod taint_config;
 use std::path::PathBuf;
 
 use cli::{
-    AnalyzeArgs, AsmArgs, Command, DecompileArgs, DisArgs, ExtractArgs, InfoArgs, RewriteArgs,
-    TaintArgs,
+    AnalyzeArgs, Command, DecompileArgs, DisArgs, ExtractArgs, InfoArgs, RewriteArgs, TaintArgs,
 };
 use decompile::DecompileOptions;
 use input::ModuleSelection;
