@@ -1400,3 +1400,10 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   hap_collect/collect_haps.py (OHOS multi-version rk3568 hap
   collector) sits in the workspace — NOT committed, awaiting the
   maintainer's call (feeds abcd-hap phase 2).
+  Postscript: first P2+P3 CI run failed on the coverage job —
+  abcd-cli imported AsmArgs but only used the Command::Asm VARIANT
+  (the type name never appears in a signature), so -D warnings
+  (coverage job's RUSTFLAGS) denied the unused import. remote-test.sh
+  forwards only ABCD_* env vars, so local -D warnings verification
+  needs a manual ssh pass (KEEP=1 + explicit RUSTFLAGS). Fixed in one
+  line; re-verified -D warnings workspace build green on dabai.
