@@ -21,7 +21,7 @@ in `[workspace.dependencies]` (currently unused — reserved for this).
 |---|---|---|---|
 | `abcd unpack` | abcd-hap | .hap/.hsp/.app/.hqf → .abc file(s) + module.json | First real consumer of abcd-hap. |
 | `abcd info` | abcd-file | .abc → header/entity summary | readelf-style: format version, counts (classes/methods/strings/literal arrays), index regions. `--verify` = full decode + structural checks, exit code carries the verdict. |
-| `abcd dis` | abcd-file + abcd-isa | .abc → pandasm text | Backed by the 4,557,285-instruction 0-mismatch corpus evidence. Options: whole file / single method / raw byte offsets. |
+| `abcd dis` | abcd-file + abcd-isa | .abc → pandasm text | Backed by the 4,557,285-instruction 0-mismatch corpus evidence. Options: whole file / single method / raw byte offsets. **Ruled 2026-09-28: output must be BYTE-IDENTICAL to upstream ark_disasm — see §4.1.** |
 | `abcd asm` | abcd-isa + abcd-file | pandasm text → .abc | The round-trip direction of `dis`. A **writer** — phase 2. |
 | `abcd rewrite` | file→lift→opt→lower→file | .abc → rewritten .abc | Identity or optimizing rewrite (normalization, future instrumentation hook). A **writer** — phase 2. |
 | `abcd decompile` | abcd-decompile | .abc → .js | EmitOptions surfaced as flags (`--line-anchors`, `--ts`, entry-call toggle). |
@@ -98,6 +98,29 @@ in JSON, how paths are rendered). Also the config-file question for taint.
 
 Each phase lands behind the same red-first + synthesized-fixture testing
 discipline as abcd-hap.
+
+### 4.1 The pandasm text layer (scope correction, 2026-09-28)
+
+`dis`/`asm` are **not** pure wiring: abcd-isa's decoder/emitter handle the
+*binary* instruction stream; the pandasm **text** parser lives only in the
+test harness (`tests/file-isa/main.rs: parse_pandasm`) and a whole-file text
+emitter (banner sections, `.record`/`.function` declarations, layout) does
+not exist at all. Both commands therefore require a new library layer:
+
+- `abcd-isa` (or a small `abcd-pa` crate): `.pa` whole-file **emitter** and
+  **parser** (the parser promoted from test code).
+- **Fidelity ruling (maintainer, 2026-09-28)**: the pandasm layer in general
+  needs *same format, same semantics* — normalization-level equality is
+  enough wherever the text is an intermediate (asm input, round-trips).
+  **Exception: `abcd dis` itself must be BYTE-IDENTICAL to upstream
+  `ark_disasm`.** Enforced by a per-push byte-diff gate over the corpus
+  (image-provided reference .pa files already exist), with any intentional
+  divergence going through the self-cleaning ledger pattern (N72 option B),
+  not silent tolerance.
+- Effort note: the banner/record/annotation layout is the new surface; the
+  instruction rendering core already exists in canonical form in the test
+  harness (`our_canonical`), so this is a lift-and-harden, not a from-scratch
+  format implementation.
 
 ## 5. Testing strategy (consistent with the repo's zero-binary-fixture rule)
 

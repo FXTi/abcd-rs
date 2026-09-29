@@ -1330,3 +1330,13 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   format design). Tests: clap parse tests + synthesized-abc golden
   outputs (abcd_file::Builder precedent from N74), zero binary
   fixtures. Six decision points listed in the doc, awaiting ruling.
+- q-P8 ruling (2026-09-28): pandasm fidelity bar set. The pandasm TEXT
+  layer needs same-format + same-semantics everywhere EXCEPT `abcd dis`
+  itself, which must be BYTE-IDENTICAL to upstream ark_disasm —
+  enforced by a per-push byte-diff gate over the corpus reference .pa
+  files (self-cleaning ledger for intentional divergences, N72-B
+  pattern). Scope correction recorded in cli-plan.md §4.1: abcd-isa's
+  decoder/emitter are the BINARY stream; the .pa text parser lives
+  only in the file-isa test harness and no whole-file text emitter
+  exists — dis/asm require a new library text layer (lift-and-harden
+  from test code, not from scratch).
