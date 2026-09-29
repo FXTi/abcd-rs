@@ -10,16 +10,24 @@
 //! Output conventions (§3.4): results on stdout, diagnostics on stderr,
 //! exit codes 0 ok / 1 user error / 2 tool error, no panics on data.
 
+pub mod analyze;
+pub mod asm;
 pub mod cli;
 pub mod decompile;
 pub mod dis;
 pub mod extract;
 pub mod info;
 pub mod input;
+pub mod rewrite;
+pub mod taint;
+pub mod taint_config;
 
 use std::path::PathBuf;
 
-use cli::{Command, DecompileArgs, DisArgs, ExtractArgs, InfoArgs};
+use cli::{
+    AnalyzeArgs, AsmArgs, Command, DecompileArgs, DisArgs, ExtractArgs, InfoArgs, RewriteArgs,
+    TaintArgs,
+};
 use decompile::DecompileOptions;
 use input::ModuleSelection;
 
@@ -60,8 +68,95 @@ pub fn run(cli: cli::Cli) -> Result<(), CliError> {
         Command::Extract(args) => run_extract(&args),
         Command::Info(args) => run_info(&args),
         Command::Dis(args) => run_dis(&args),
+        Command::Asm(args) => {
+            asm::run_asm(&args.input, args.output.as_ref(), args.version, args.check)
+        }
         Command::Decompile(args) => run_decompile(&args),
+        Command::Rewrite(args) => run_rewrite(&args),
+        Command::Analyze(args) => run_analyze(&args),
+        Command::Taint(args) => run_taint(&args),
     }
+}
+
+fn run_rewrite(args: &RewriteArgs) -> Result<(), CliError> {
+    let opts = rewrite::RewriteOptions {
+        optimize: args.opt,
+        check: args.check,
+    };
+    let selection = selection_of(&args.select.module, args.select.all);
+    let modules = input::load(&args.input, selection)?;
+
+    if args.select.all {
+        // Per-module artifacts: -o is the output directory and required.
+        let out_dir = match &args.output {
+            Some(dir) => dir.clone(),
+            None => {
+                return Err(CliError::User(
+                    "--all requires -o <dir> (one <module>.abc per module)".to_string(),
+                ));
+            }
+        };
+        let written = rewrite::write_all(&modules, &out_dir, opts)?;
+        for (name, path, size) in &written {
+            println!("{name}: {size} bytes -> {}", path.display());
+        }
+        return Ok(());
+    }
+
+    let module = modules
+        .first()
+        .expect("input layer guarantees at least one module");
+    let out = rewrite::rewrite(module, opts)?;
+    match &args.output {
+        Some(path) => {
+            std::fs::write(path, &out.abc)
+                .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
+            println!(
+                "{}: {} bytes -> {} ({} methods, {} lowered, instructions {} -> {}{})",
+                module.name,
+                out.abc.len(),
+                path.display(),
+                out.stats.methods,
+                out.stats.lowered,
+                out.stats.input_instructions,
+                out.stats.output_instructions,
+                if out.stats.optimized_changed {
+                    ", optimized"
+                } else {
+                    ""
+                },
+            );
+        }
+        None => dis::print_raw(&out.abc)?,
+    }
+    Ok(())
+}
+
+fn run_analyze(args: &AnalyzeArgs) -> Result<(), CliError> {
+    let opts = analyze::AnalyzeOptions {
+        callgraph: args.callgraph,
+        dominators: args.dominators,
+    };
+    let selection = selection_of(&args.select.module, args.select.all);
+    let modules = input::load(&args.input, selection)?;
+    let reports: Vec<analyze::AnalyzeReport> = modules
+        .iter()
+        .map(|m| analyze::report(m, opts))
+        .collect::<Result<_, _>>()?;
+    println!("{}", analyze::render(&reports, args.json)?);
+    Ok(())
+}
+
+fn run_taint(args: &TaintArgs) -> Result<(), CliError> {
+    let config = taint::load_config(&args.config)?;
+    let selection = selection_of(&args.select.module, args.select.all);
+    let modules = input::load(&args.input, selection)?;
+    let reports: Vec<taint::TaintCliReport> = modules
+        .iter()
+        .map(|m| taint::report(m, &config))
+        .collect::<Result<_, _>>()?;
+    println!("{}", taint::render(&reports, args.json)?);
+    Ok(())
 }
 
 fn run_dis(args: &DisArgs) -> Result<(), CliError> {

@@ -30,8 +30,16 @@ pub enum Command {
     Info(InfoArgs),
     /// Disassemble to pandasm .pa text (byte-identical to ark_disasm).
     Dis(DisArgs),
+    /// Assemble pandasm .pa text into .abc (round-trip direction of dis).
+    Asm(AsmArgs),
     /// Decompile bytecode to JavaScript.
     Decompile(DecompileArgs),
+    /// Rewrite bytecode through the lift→[opt]→lower pipeline.
+    Rewrite(RewriteArgs),
+    /// Static analysis report (call graph, dominators).
+    Analyze(AnalyzeArgs),
+    /// Taint analysis driven by a TOML config file.
+    Taint(TaintArgs),
 }
 
 /// Module-selection flags shared by commands that consume bytecode.
@@ -86,6 +94,100 @@ pub struct DisArgs {
     /// <module-name>.pa per module and is required.
     #[arg(short = 'o', long = "output", value_name = "PATH")]
     pub output: Option<PathBuf>,
+    /// Module selection for multi-module containers.
+    #[command(flatten)]
+    pub select: SelectArgs,
+}
+
+/// `abcd asm <input.pa> [-o out.abc] [--version M.m.p.b] [--check]`.
+#[derive(Debug, Args)]
+pub struct AsmArgs {
+    /// Pandasm text file to assemble.
+    pub input: PathBuf,
+    /// Output .abc path (stdout if omitted).
+    #[arg(short = 'o', long = "output", value_name = "PATH")]
+    pub output: Option<PathBuf>,
+    /// .abc format version to write (a .pa carries no version; defaults to
+    /// the current version, matching upstream ark_asm).
+    #[arg(long, value_name = "M.m.p.b", value_parser = parse_version)]
+    pub version: Option<abcd_file::Version>,
+    /// Re-decode the emitted bytes before they leave the process
+    /// (writer self-check; a failure is a tool error and nothing is
+    /// written).
+    #[arg(long)]
+    pub check: bool,
+}
+
+/// Parse a `major.minor.patch.build` version string.
+fn parse_version(s: &str) -> Result<abcd_file::Version, String> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return Err(format!("expected four dot-separated numbers, got {s:?}"));
+    }
+    let mut bytes = [0u8; 4];
+    for (slot, part) in bytes.iter_mut().zip(parts) {
+        *slot = part
+            .parse::<u8>()
+            .map_err(|_| format!("{part:?} is not a number in 0..=255"))?;
+    }
+    Ok(abcd_file::Version::new(
+        bytes[0], bytes[1], bytes[2], bytes[3],
+    ))
+}
+
+/// `abcd rewrite <input> [-o out.abc] [--opt] [--check]`.
+#[derive(Debug, Args)]
+pub struct RewriteArgs {
+    /// Input file: bare .abc or a container (.hap/.hsp/.app/.hqf).
+    pub input: PathBuf,
+    /// Output path. With a single module this is the .abc file (stdout if
+    /// omitted); with --all this is a directory receiving
+    /// <module-name>.abc per module and is required.
+    #[arg(short = 'o', long = "output", value_name = "PATH")]
+    pub output: Option<PathBuf>,
+    /// Run the abcd-opt optimization pipeline between lift and lower.
+    #[arg(long)]
+    pub opt: bool,
+    /// Re-decode the emitted bytes before they leave the process
+    /// (writer self-check; a failure is a tool error and nothing is
+    /// written).
+    #[arg(long)]
+    pub check: bool,
+    /// Module selection for multi-module containers.
+    #[command(flatten)]
+    pub select: SelectArgs,
+}
+
+/// `abcd analyze <input> [--callgraph] [--dominators] [--json]`.
+#[derive(Debug, Args)]
+pub struct AnalyzeArgs {
+    /// Input file: bare .abc or a container (.hap/.hsp/.app/.hqf).
+    pub input: PathBuf,
+    /// Include the per-function call-site listing with resolved targets.
+    #[arg(long)]
+    pub callgraph: bool,
+    /// Include the per-function immediate-dominator tree.
+    #[arg(long)]
+    pub dominators: bool,
+    /// Emit a machine-readable JSON report instead of text.
+    #[arg(long)]
+    pub json: bool,
+    /// Module selection for multi-module containers.
+    #[command(flatten)]
+    pub select: SelectArgs,
+}
+
+/// `abcd taint <input> --config <PATH> [--json]`.
+#[derive(Debug, Args)]
+pub struct TaintArgs {
+    /// Input file: bare .abc or a container (.hap/.hsp/.app/.hqf).
+    pub input: PathBuf,
+    /// TOML taint configuration (sources, sinks, summaries).
+    #[arg(long, value_name = "PATH")]
+    pub config: PathBuf,
+    /// Emit a machine-readable JSON report instead of text.
+    #[arg(long)]
+    pub json: bool,
     /// Module selection for multi-module containers.
     #[command(flatten)]
     pub select: SelectArgs,
@@ -291,5 +393,114 @@ mod tests {
         };
         assert!(a.select.all);
         assert_eq!(a.output, Some(PathBuf::from("outdir")));
+    }
+
+    // ---- rewrite ----
+
+    #[test]
+    fn rewrite_minimal() {
+        let cli = parse(&["abcd", "rewrite", "m.abc"]).unwrap();
+        let Command::Rewrite(a) = cli.command else {
+            panic!("expected rewrite");
+        };
+        assert_eq!(a.input, PathBuf::from("m.abc"));
+        assert!(!a.opt && !a.check);
+        assert_eq!(a.output, None);
+    }
+
+    #[test]
+    fn rewrite_all_flags() {
+        let cli = parse(&[
+            "abcd", "rewrite", "m.abc", "--opt", "--check", "-o", "out.abc",
+        ])
+        .unwrap();
+        let Command::Rewrite(a) = cli.command else {
+            panic!("expected rewrite");
+        };
+        assert!(a.opt && a.check);
+        assert_eq!(a.output, Some(PathBuf::from("out.abc")));
+    }
+
+    // ---- analyze ----
+
+    #[test]
+    fn analyze_minimal() {
+        let cli = parse(&["abcd", "analyze", "m.abc"]).unwrap();
+        let Command::Analyze(a) = cli.command else {
+            panic!("expected analyze");
+        };
+        assert!(!a.callgraph && !a.dominators && !a.json);
+    }
+
+    #[test]
+    fn analyze_all_flags() {
+        let cli = parse(&[
+            "abcd",
+            "analyze",
+            "m.abc",
+            "--callgraph",
+            "--dominators",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Analyze(a) = cli.command else {
+            panic!("expected analyze");
+        };
+        assert!(a.callgraph && a.dominators && a.json);
+    }
+
+    // ---- taint ----
+
+    #[test]
+    fn taint_requires_config() {
+        assert!(parse(&["abcd", "taint", "m.abc"]).is_err());
+        let cli = parse(&["abcd", "taint", "m.abc", "--config", "t.toml", "--json"]).unwrap();
+        let Command::Taint(a) = cli.command else {
+            panic!("expected taint");
+        };
+        assert_eq!(a.config, PathBuf::from("t.toml"));
+        assert!(a.json);
+    }
+
+    // ---- asm ----
+
+    #[test]
+    fn asm_minimal() {
+        let cli = parse(&["abcd", "asm", "input.pa"]).unwrap();
+        let Command::Asm(a) = cli.command else {
+            panic!("expected asm");
+        };
+        assert_eq!(a.input, PathBuf::from("input.pa"));
+        assert_eq!(a.output, None);
+        assert_eq!(a.version, None);
+        assert!(!a.check);
+    }
+
+    #[test]
+    fn asm_version_and_check() {
+        let cli = parse(&[
+            "abcd",
+            "asm",
+            "x.pa",
+            "--version",
+            "12.0.6.0",
+            "--check",
+            "-o",
+            "x.abc",
+        ])
+        .unwrap();
+        let Command::Asm(a) = cli.command else {
+            panic!("expected asm");
+        };
+        assert_eq!(a.version, Some(abcd_file::Version::new(12, 0, 6, 0)));
+        assert!(a.check);
+        assert_eq!(a.output, Some(PathBuf::from("x.abc")));
+    }
+
+    #[test]
+    fn asm_bad_version_is_error() {
+        assert!(parse(&["abcd", "asm", "x.pa", "--version", "12.0"]).is_err());
+        assert!(parse(&["abcd", "asm", "x.pa", "--version", "a.b.c.d"]).is_err());
+        assert!(parse(&["abcd", "asm", "x.pa", "--version", "1.2.3.256"]).is_err());
     }
 }
