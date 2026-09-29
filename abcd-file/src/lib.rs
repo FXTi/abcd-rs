@@ -69,6 +69,8 @@ pub use file::file_type;
 mod literal;
 mod module;
 
+pub mod pandasm;
+
 mod encode;
 pub use encode::{
     AnnotationElemDef, AnnotationElemDefEx, AnnotationElemValue, AnnotationHandle, Builder,

@@ -335,14 +335,15 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         })
         .chain(scope_names_offsets.iter().copied())
         .collect();
-    let (literal_arrays, literal_array_offsets) = decode_literal_arrays(
-        f,
-        &mut strings,
-        &mut string_raw_bytes,
-        &referenced_literal_offsets,
-        &module_data_offsets,
-        &phase_blob_offsets,
-    )?;
+    let (literal_arrays, literal_array_offsets, literal_array_header_offsets) =
+        decode_literal_arrays(
+            f,
+            &mut strings,
+            &mut string_raw_bytes,
+            &referenced_literal_offsets,
+            &module_data_offsets,
+            &phase_blob_offsets,
+        )?;
 
     Ok(File {
         version,
@@ -353,6 +354,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         classes,
         literal_arrays,
         literal_array_offsets,
+        literal_array_header_offsets,
         entity_map,
         string_raw_bytes,
     })
@@ -1544,12 +1546,19 @@ fn decode_literal_arrays(
     referenced_offsets: &HashSet<u32>,
     module_data_offsets: &HashSet<u32>,
     phase_blob_offsets: &HashSet<u32>,
-) -> Result<(Vec<LiteralArray>, HashMap<u32, u32>), Error> {
+) -> Result<(Vec<LiteralArray>, HashMap<u32, u32>, Vec<u32>), Error> {
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
+    // The raw header table, unfiltered: the pandasm emitter's byte-identity
+    // with upstream ark_disasm needs the original header positions of the
+    // module/phase blobs that the decoded table excludes.
+    let mut header_offsets = Vec::new();
     let mut offsets = Vec::new();
     if n != 0 {
         for i in 0..n {
             let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
+            if off != ABSENT {
+                header_offsets.push(off);
+            }
             // Module-record and module-request-phase blobs ride the legacy
             // header table on <=12.x but are NOT tagged literal arrays; they
             // are modeled structurally (FieldValue::ModuleData /
@@ -1579,7 +1588,7 @@ fn decode_literal_arrays(
     referenced.sort_unstable();
     offsets.extend(referenced);
     if offsets.is_empty() {
-        return Ok((Vec::new(), HashMap::new()));
+        return Ok((Vec::new(), HashMap::new(), header_offsets));
     }
 
     // Collect file offsets first so nested LiteralArray references (which
@@ -1593,7 +1602,7 @@ fn decode_literal_arrays(
     let first_off = offsets[0];
     let lr = unsafe { sys::abc_literal_open(f, first_off) };
     if lr.is_null() {
-        return Ok((Vec::new(), offset_to_index));
+        return Ok((Vec::new(), offset_to_index, header_offsets));
     }
     let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
 
@@ -1667,7 +1676,7 @@ fn decode_literal_arrays(
             }
         }
     }
-    Ok((arrays, offset_to_index))
+    Ok((arrays, offset_to_index, header_offsets))
 }
 
 /// Intermediate struct for collecting debug info strings before interning.

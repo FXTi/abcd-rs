@@ -342,6 +342,7 @@ fn module_request_phase_flags_become_lazy_requests() {
         literal_arrays: vec![],
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
+        literal_array_header_offsets: Vec::new(),
         string_raw_bytes: Default::default(),
     };
 
@@ -449,6 +450,7 @@ fn annotation_buckets_merge_in_documented_order() {
         literal_arrays: vec![],
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
+        literal_array_header_offsets: Vec::new(),
         string_raw_bytes: Default::default(),
     };
 

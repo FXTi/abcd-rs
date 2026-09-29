@@ -45,6 +45,17 @@ pub struct File {
     /// `LiteralValue::LiteralArray` slot is resolvable whenever its target
     /// was decodable.
     pub literal_array_offsets: HashMap<u32, u32>,
+    /// The raw header literal-array index table, in header order and
+    /// INCLUDING the module-record / module-request-phase blob slots that
+    /// [`File::literal_arrays`] excludes (they are untagged blobs, not
+    /// literal arrays). Only populated for files whose header carries the
+    /// table (version ≤ 12.0.6.0 — vendored
+    /// `LAST_CONTAINS_LITERAL_IN_HEADER_VERSION`); empty for 13.x+/24.x
+    /// (no header table) and for hand-built models. The pandasm emitter's
+    /// byte-identity with upstream `ark_disasm` depends on the original
+    /// header positions, which are otherwise unrecoverable once the
+    /// excluded slots are dropped.
+    pub literal_array_header_offsets: Vec<u32>,
     /// offset → interned name/descriptor, for resolving bytecode `EntityId` operands.
     pub entity_map: HashMap<u32, StringId>,
     /// Original MUTF-8 bytes of strings that have NO lossless Rust `String`

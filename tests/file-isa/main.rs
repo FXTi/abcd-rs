@@ -20,6 +20,8 @@ use abcd_isa::{
 };
 use std::process::Command;
 
+mod pandasm_dis;
+
 fn exported_corpus_root() -> std::path::PathBuf {
     std::env::var_os("ABCD_CORPUS_ROOT")
         .map(std::path::PathBuf::from)
@@ -236,36 +238,10 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Re-encode a decoded string to the MUTF-8 bytes the file stores
-/// (embedded NUL as C0 80, astral chars as surrogate pairs), matching
-/// pandasm's raw print byte-exactly.
-fn mutf8_bytes(s: &str) -> Vec<u8> {
-    // N72-C3: a disambiguated lossy-string pool identity is
-    // `<lossy content><U+E000><hex(raw)>` (abcd-file's RAW_ID_SENTINEL).
-    // The suffix is OUR bookkeeping for byte-exact re-emission and is
-    // invisible to the upstream comparison — compare only the content.
-    let s = s.find('\u{E000}').map_or(s, |i| &s[..i]);
-    let mut out = Vec::new();
-    for c in s.chars() {
-        let c = c as u32;
-        if c == 0 {
-            out.extend_from_slice(&[0xC0, 0x80]);
-        } else if c >= 0x10000 {
-            let c = c - 0x10000;
-            for unit in [0xD800 + (c >> 10), 0xDC00 + (c & 0x3FF)] {
-                out.extend_from_slice(&[
-                    0xE0 | (unit >> 12) as u8,
-                    0x80 | ((unit >> 6) & 0x3F) as u8,
-                    0x80 | (unit & 0x3F) as u8,
-                ]);
-            }
-        } else {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(char::from_u32(c).unwrap().encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    out
-}
+// The MUTF-8 re-encode and both pandasm float renderings live in the
+// library emitter (abcd_file::pandasm); this harness calls them, no
+// second copy.
+use abcd_file::pandasm::{format_g6, format_scientific6, mutf8_bytes};
 
 /// Split a pandasm operand list at top-level commas, respecting
 /// `()`/`{}`/`[]` groups (method signatures, literal arrays) and quoted
@@ -609,7 +585,7 @@ fn pandasm_imm_f64(v: f64) -> f64 {
     if !v.is_finite() {
         return v;
     }
-    format!("{v:.6e}").parse().expect("imm float round trip")
+    format_scientific6(v).parse().expect("imm float round trip")
 }
 
 /// See [`pandasm_imm_f64`]: the `%g` (6 significant digits) form.
@@ -618,42 +594,6 @@ fn pandasm_lit_f64(v: f64) -> f64 {
         return v;
     }
     format_g6(v).parse().expect("literal float round trip")
-}
-
-/// C `printf("%g")` / iostream-default double formatting, precision 6:
-/// `%e` when the post-rounding exponent is outside [-4, 6), else `%f`;
-/// trailing zeros stripped. The result is parsed back, so exponent
-/// rendering differences (`e+09` vs `e9`) do not matter.
-fn format_g6(v: f64) -> String {
-    const P: i32 = 6;
-    if v == 0.0 {
-        return if v.is_sign_negative() {
-            "-0".to_owned()
-        } else {
-            "0".to_owned()
-        };
-    }
-    // X = the %e-form exponent AFTER rounding to P significant digits —
-    // Rust's `{:.5e}` performs exactly that rounding.
-    let e = format!("{v:.5e}");
-    let x: i32 = e[e.find('e').unwrap() + 1..].parse().unwrap();
-    let mut s = if (-4..P).contains(&x) {
-        let prec = (P - 1 - x).max(0) as usize;
-        format!("{v:.prec$}")
-    } else {
-        e
-    };
-    // Strip trailing zeros (and a trailing point) from the mantissa.
-    match s.find('e') {
-        Some(epos) => {
-            let mantissa = s[..epos].trim_end_matches('0').trim_end_matches('.');
-            s = format!("{}{}", mantissa, &s[epos..]);
-        }
-        None => {
-            s = s.trim_end_matches('0').trim_end_matches('.').to_owned();
-        }
-    }
-    s
 }
 
 /// Canonical token for one pandasm operand.
