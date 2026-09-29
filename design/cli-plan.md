@@ -1,7 +1,9 @@
 # abcd CLI plan — external command-line surface
 
-Status: PLAN, awaiting maintainer ruling on the decision points in §6.
-Written 2026-09-28 after q-P7 (abcd-hap phase 1). No code yet.
+Status: P1 LANDED (2026-09-28): `abcd` binary (abcd-cli) ships extract /
+info / dis / decompile; `dis` is byte-identical to ark_disasm over the full
+5517-fixture corpus (gate: tests/file-isa/pandasm_dis.rs, empty ledger).
+All six §6 points ruled 2026-09-28 (see §6).
 
 ## 1. Why now
 

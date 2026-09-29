@@ -1346,3 +1346,31 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   and short `dis`/`asm`; distribution = local cargo install --path for
   now (crates.io/releases deferred); taint config = TOML (phase 3).
   P1 implementation started same day.
+- q-P9 (2026-09-28): CLI P1 LANDED — the `abcd` binary (new abcd-cli
+  crate) ships extract / info / dis / decompile with the shared input
+  layer (PK-magic container sniff via abcd-hap; multi-module .app
+  requires --module/--all; exit codes 0/1/2). 53 abcd-cli tests green.
+  `abcd dis` rides the new abcd_file::pandasm whole-file emitter that
+  is BYTE-IDENTICAL to upstream ark_disasm over ALL 5517 corpus
+  fixtures (orchestrator-verified: matched 5517 documented 0
+  undocumented 0), enforced per-push by
+  tests/file-isa/pandasm_dis.rs + the empty armed ledger
+  scripts/pandasm-dis-divergences.json (B-plan). Emitter replicates
+  upstream quirks: std::map string-key ordering ("10" < "2"),
+  libstdc++ unordered_set iteration for 13/24 literal indexes (in-tree
+  sim::U32Set), try/catch-before-jump label numbering, bare-":" try
+  quirk, scientific-6 vs %g float printing, raw MUTF-8 string output
+  (emit_file returns Vec<u8> — valid .pa can be non-UTF-8).
+  Additive model change: File::literal_array_header_offsets keeps the
+  raw <=12.x header offset sequence (module/phase blob slots) that
+  decode used to discard — needed for LITERALS-section byte identity.
+  Orchestrator review caught two things workers missed: (1) a
+  Zip-Slip-class hole in `abcd extract` — module names come from
+  container-controlled module.json and were joined into output paths
+  unsanitized; fixed with safe_module_name() (rejects separators,
+  drive letters, dot-specials, control chars) + hostile-container
+  tests; (2) worker B verified with `cargo check` which does NOT
+  compile test code — abcd-lift's manual File constructors broke on
+  the new field; lesson recorded: verification must compile tests
+  (cargo test --workspace), check is insufficient. Also removed an
+  examples/ dir the CLI worker created (examples stay banned).
