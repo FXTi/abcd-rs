@@ -1431,3 +1431,16 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   build-time probing strictly dominates on the perf axis (true const).
   Discipline unchanged: MEASURE FIRST (no benches exist in-tree);
   benchmark running now, decision by numbers.
+- V-I7 RESOLVED by measurement (2026-09-30): NOT worth changing. dabai
+  R9 9950X release single-thread: one FFI classification call ≈2.2ns;
+  full-corpus lift issues 9,395,154 such queries (≈2.06/instruction —
+  cfg.rs asks is_jump AND is_terminator per non-jump instruction, plus
+  once per block tail); FFI total ≈21ms ≈ 2.4% of the 848–856ms lift.
+  A OnceLock-snapshot prototype saved 22–45ms e2e — inside the ±6%
+  build-layout noise band and far below the 1%/100ms action threshold.
+  Design evolution recorded in the V-I7 entry: IF this is ever
+  revisited, use a build.rs probe (execute the real vendor
+  classification at build time, emit a Rust const table), NOT a
+  yaml-codegen mirror (silent divergence if upstream hand-edits its
+  template). Instrument kept: abcd-lift/tests/bench_ffi.rs
+  (#[ignore]d, local-only, zero new deps).
