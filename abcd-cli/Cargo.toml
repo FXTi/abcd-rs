@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 abcd-file.workspace = true
 abcd-hap.workspace = true
+abcd-ir.workspace = true
 abcd-lift.workspace = true
 abcd-opt.workspace = true
 abcd-lower.workspace = true
