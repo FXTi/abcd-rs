@@ -1503,3 +1503,19 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   A can mask B. dabai's stable now 1.99.0 — fine for the normal dev
   loop, but local llvm-cov runs there will segfault until downgraded
   or upstream-fixed.
+- q-P12 corpus intake (2026-10-01): wild-hap selection finalized at 156
+  packages / 218MB (not the first-draft 25; the maintainer asked for
+  more and the weight math allowed it): 145 decode-ok + 11
+  negative-invalid-opcode; layouts merged 120 / per-ability 28 /
+  FA-assets 8; versions 3.2-Release..7.0-Beta1 with the 5.0.x patch
+  series collapsed to 5.0.3 and 6.1-Release folded into 6.1-LTS.
+  Image-side intake PR: FXTi/arkcompiler-test#2 (branch
+  wild-haps-intake, commit 619725a on dabai:~/ark) — wild-haps/
+  verbatim tree + sha256-pinned manifest.json; prepare.py stages and
+  re-verifies hashes; arktest.py gains `export-wild`; smoke.py checks
+  the channel. HUMAN ACT NEXT (maintainer on dabai): review PR #2,
+  merge, `make build && make test && make push`, then hand me the new
+  digest for the deliberate abcd-rs PR (digest bump + per-push wild
+  gates: extract+decode over all 156, negative-11 pinned to invalid
+  opcode; core-25 lift/decompile smoke is a separate later item).
+  Note: gh is NOT installed on dabai (PR opened from the mac).
