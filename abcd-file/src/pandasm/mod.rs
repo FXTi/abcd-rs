@@ -1679,6 +1679,10 @@ fn field_u32_offset(field: &crate::model::Field) -> Option<u32> {
         Some(FieldValue::ModuleData(md)) => Some(md.source_offset),
         Some(FieldValue::LiteralArrayRef(off)) => Some(*off),
         Some(FieldValue::ModuleRequestPhase(p)) => Some(p.source_offset),
+        // Upstream prints the offset (disassembler.cpp GetMetadataFieldValue
+        // SetValue) and only EXCLUDES it from module-literal classification
+        // — classify_field_offsets drops it by field name.
+        Some(FieldValue::TypeSummaryOffset(off)) => Some(*off),
         _ => None,
     }
 }

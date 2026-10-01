@@ -249,6 +249,12 @@ fn lift_field<'f>(lf: &mut Lifter<'f>, field: &'f Field) -> Result<FieldData, Li
             lf.scope_name_fields.push((name, konst));
             None
         }
+        Some(abcd_file::FieldValue::TypeSummaryOffset(_)) => {
+            // Nested file offset (2022-08-18 ISA changelog item 5) with no
+            // runtime consumer — there is no constant to lift, same as the
+            // other offset-valued field models above.
+            None
+        }
         None => None,
     };
     Ok(FieldData {

@@ -1570,6 +1570,14 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 Some(FieldValue::I64(v)) => b.field_set_value_i64(field_h, *v),
                 Some(FieldValue::F32(v)) => b.field_set_value_f32(field_h, *v),
                 Some(FieldValue::F64(v)) => b.field_set_value_f64(field_h, *v),
+                // N8 write side stays honest: the value is a nested file
+                // offset with no relocation support — never emit it stale.
+                Some(FieldValue::TypeSummaryOffset(_)) => {
+                    return Err(Error::TypeSummaryOffset {
+                        class_descriptor: rs(cls.descriptor)?.to_owned(),
+                        field_off: field.offset,
+                    });
+                }
                 Some(FieldValue::ModuleData(_))
                 | Some(FieldValue::LiteralArrayRef(_))
                 | Some(FieldValue::ModuleRequestPhase(_)) => deferred_field_values.push((

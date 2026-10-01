@@ -166,6 +166,18 @@ pub enum FieldValue {
     /// blob structurally; encode re-emits it and relocates the field value,
     /// exactly like [`FieldValue::ModuleData`].
     ModuleRequestPhase(ModuleRequestPhase),
+    /// `typeSummaryOffset` field (any class — 4.x–5.x-era es2abc emits it
+    /// on AbilityStage/Application records): the u32 wire value is the
+    /// source-file offset of a literal array whose elements are THEMSELVES
+    /// offsets of the type literal arrays (arkcompiler_runtime_core
+    /// docs/changelogs/2022-08-18-isa-changelog.md item 5; field name from
+    /// vendored libpandabase/utils/const_value.h:25
+    /// `TYPE_SUMMARY_FIELD_NAME`). Decode stores the nested offset
+    /// OPAQUELY — no runtime consumer exists
+    /// (`TYPE_SUMMARY_OFFSET_NOT_FOUND` is a dead constant). Encode
+    /// HARD-ERRORS: the rewriter has no relocation support for the nested
+    /// indirection, so rewriting would leave a dangling offset.
+    TypeSummaryOffset(u32),
 }
 
 /// Decoded method body (bytecodes + exception handlers).

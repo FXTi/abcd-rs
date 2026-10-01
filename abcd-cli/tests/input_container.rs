@@ -107,3 +107,21 @@ fn hostile_module_json_name_is_a_hard_error() {
     assert!(msg.contains("safe"), "message: {msg}");
     assert_eq!(err.exit_code(), 2, "hostile content is a tool error");
 }
+
+#[test]
+fn per_ability_hap_disambiguates_module_names() {
+    // A per-ability hap (no ets/modules.abc; one abc per ability) yields
+    // several modules that all share the module.json name — the input layer
+    // must hand out unique, deterministic names.
+    let hap = common::zip(&[
+        ("module.json", &common::module_json("systemui")),
+        ("ets/Application/AbilityStage.abc", &common::tiny_abc()),
+        (
+            "ets/ServiceExtension/ServiceExtension.abc",
+            &common::tiny_abc(),
+        ),
+    ]);
+    let modules = input::load_bytes(&hap, "SystemUI.hap", ModuleSelection::All).unwrap();
+    let names: Vec<&str> = modules.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["systemui", "systemui__ServiceExtension"]);
+}

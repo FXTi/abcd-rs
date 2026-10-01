@@ -1463,3 +1463,22 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   SHELVED — fix both, analyze with our own tooling, THEN curate ~3
   per formal version (Release preferred; versions with small deltas
   dropped). Selection happens after the fixes, evidence-driven.
+- q-P12 fixes landed (2026-09-30): both wild-corpus gaps FIXED. (1)
+  abcd-hap now enumerates ALL .abc entries (case-insensitive ext;
+  ets/modules.abc always first, others in CD order; sniff widened to
+  "any .abc entry"; 44/44 green; container-parse 512 -> 930/985, the
+  55 remaining are true resource-only packages). (2) typeSummaryOffset
+  N8 second ruling: decode UNLOCKED — FieldValue::TypeSummaryOffset(u32)
+  captures the nested offset (name guard stays first to protect the
+  _ESModuleRecord catch-all; "no consumer" still true, upstream only
+  excludes it from module-literal classification); writer side keeps
+  the honest hard error (nested indirection is not a simple remap).
+  One necessary out-of-scope arm: abcd-lift metadata.rs lift_field
+  exhaustive match (returns None, consistent with other offset values).
+  abcd-cli input layer now disambiguates per-ability module names
+  (<base>__<entry-stem>) since a per-ability hap yields several
+  same-named modules. Orchestrator-verified wild sweep: 930/985
+  containers, 3298/3332 abc decode; remaining 34 = 3.2/4.0-era
+  'invalid opcode' (ancient opcodes absent from the v7.0-pinned ISA —
+  next candidate decode gap, unscheduled). Workspace 145 suites green,
+  fmt clean. N8 roadmap entry updated to the second ruling.

@@ -583,18 +583,20 @@ pub const ES_SCOPE_NAMES_RECORD_DESCRIPTOR: &str = "L_ESScopeNamesRecord;";
 /// `MODULE_REQUEST_PAHSE_IDX`).
 pub const MODULE_REQUEST_PHASE_FIELD: &str = "moduleRequestPhaseIdx";
 
-/// Name of the upstream-DEAD module-record field whose value is a NESTED
-/// file offset — it points to a literal array whose elements are
-/// themselves offsets (arkcompiler_runtime_core
-/// docs/changelogs/2022-08-18-isa-changelog.md item 5; name from vendored
-/// libpandabase/utils/const_value.h:25 `TYPE_SUMMARY_FIELD_NAME`). No
-/// producer (es2panda never emits it), no runtime consumer
-/// (`TYPE_SUMMARY_OFFSET_NOT_FOUND` is a dead constant), the disassembler
-/// excludes it (disassembler.cpp:1009), and the corpus has zero
-/// occurrences. Our relocation machinery has no support for the nested
-/// indirection, so decode is a HARD ERROR on the name alone (N8,
-/// maintainer ruling 2026-09-20) — never a warning, never a silent raw
-/// `FieldValue::I32` pass-through that a rewrite would leave dangling.
+/// Name of the field whose value is a NESTED file offset — it points to a
+/// literal array whose elements are themselves offsets of the type literal
+/// arrays (arkcompiler_runtime_core docs/changelogs/2022-08-18-isa-changelog.md
+/// item 5; name from vendored libpandabase/utils/const_value.h:25
+/// `TYPE_SUMMARY_FIELD_NAME`). No runtime consumer
+/// (`TYPE_SUMMARY_OFFSET_NOT_FOUND` is a dead constant) and the
+/// disassembler excludes the offset from its literal classification
+/// (disassembler.cpp:1015), but the 2026-09-20 "no producer" assumption
+/// was WILD-DISPROVED: 4.x–5.x-era es2abc emits the field on
+/// AbilityStage/Application records (219/512 wild OpenHarmony haps).
+/// Decode reads the value as a fact and models it as
+/// [`FieldValue::TypeSummaryOffset`]; ENCODE is the hard error (N8
+/// revised): the nested indirection cannot be relocated, so a rewrite must
+/// never silently emit the stale offset.
 pub const TYPE_SUMMARY_OFFSET_FIELD: &str = "typeSummaryOffset";
 
 /// Decode a module-record blob through the vendored ModuleDataAccessor.
@@ -849,17 +851,23 @@ fn decode_field_at(
     //   collect the offset for literal-array decoding (13.x+ has no header
     //   table entry for it).
     let initial_value = match (class_descriptor, type_id, initial_value) {
-        // N8: `typeSummaryOffset` (any class, any type, valued or not) is a
-        // hard error — see TYPE_SUMMARY_OFFSET_FIELD. This arm must come
-        // FIRST: upstream attaches the field to the module record itself,
-        // so the `_ESModuleRecord` catch-all u32 arm below would otherwise
-        // win and mis-route the nested offset into the module-data blob
-        // decoder.
-        (_, _, _) if strings.resolve(name) == Some(TYPE_SUMMARY_OFFSET_FIELD) => {
-            return Err(Error::TypeSummaryOffset {
-                class_descriptor: class_descriptor.to_owned(),
-                field_off,
-            });
+        // N8 (revised after the wild-OHOS sweep): a valued u32 field named
+        // `typeSummaryOffset` (any class — wild es2abc 4.x–5.x hangs it on
+        // AbilityStage/Application records) carries a nested file offset;
+        // model it opaquely as FieldValue::TypeSummaryOffset — see
+        // TYPE_SUMMARY_OFFSET_FIELD. This arm must come FIRST: upstream
+        // also attaches the field to the module record itself, so the
+        // `_ESModuleRecord` catch-all u32 arm below would otherwise win
+        // and mis-route the nested offset into the module-data blob
+        // decoder. A valueless field of this name carries no offset (nothing
+        // can dangle) and falls through to the scalar default as None.
+        (_, TypeId::U32, Some(FieldValue::I32(off)))
+            if strings.resolve(name) == Some(TYPE_SUMMARY_OFFSET_FIELD) =>
+        {
+            // Bit-cast, not try_from: the wire value is a u32 and the
+            // bridge ABI reads it through an i32 out-param, so offsets
+            // above 0x7fff_ffff arrive negative — preserve the bits.
+            Some(FieldValue::TypeSummaryOffset(off as u32))
         }
         // `moduleRequestPhaseIdx` u32 fields (any class — merge-abc emits
         // them on the module's own record) reference untagged

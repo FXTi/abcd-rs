@@ -58,18 +58,19 @@ pub enum Error {
     /// Module-record blob decode/encode failure (never a silent fallback).
     #[error("module data error: {0}")]
     ModuleData(String),
-    /// A field named `typeSummaryOffset` was encountered (N8). Upstream
-    /// (`libpandabase/utils/const_value.h:25` `TYPE_SUMMARY_FIELD_NAME`)
-    /// defines the name, but its value is a NESTED file offset — it points
-    /// to a literal array whose elements are themselves offsets
-    /// (arkcompiler_runtime_core 2022-08-18 ISA changelog item 5) — and
-    /// upstream has no producer (es2panda never emits it) and no consumer
-    /// (`TYPE_SUMMARY_OFFSET_NOT_FOUND` is a dead constant; the
-    /// disassembler excludes it). Relocation of the nested indirection is
-    /// unsupported, so decode fails loudly instead of passing a raw scalar
-    /// through to a dangling rewrite.
+    /// A field named `typeSummaryOffset` cannot be REWRITTEN (N8, revised
+    /// after the wild-OHOS sweep). Its value is a NESTED file offset — it
+    /// points to a literal array whose elements are themselves offsets of
+    /// the type literal arrays (arkcompiler_runtime_core 2022-08-18 ISA
+    /// changelog item 5; name from vendored
+    /// `libpandabase/utils/const_value.h:25` `TYPE_SUMMARY_FIELD_NAME`).
+    /// Wild 4.x–5.x es2abc emits the field on AbilityStage/Application
+    /// records, so DECODE models it opaquely
+    /// ([`crate::FieldValue::TypeSummaryOffset`]); but relocation of the
+    /// nested indirection is unsupported, so encode fails loudly instead
+    /// of emitting a stale offset that would dangle in the rewritten file.
     #[error(
-        "unsupported `typeSummaryOffset` field on {class_descriptor} at {field_off:#x}: value is a nested file offset (2022-08-18 ISA changelog item 5) with no upstream producer or consumer and relocation is unsupported — please report this file to the abcd-rs maintainers"
+        "cannot rewrite `typeSummaryOffset` field on {class_descriptor} at {field_off:#x}: value is a nested file offset (2022-08-18 ISA changelog item 5) and relocation is unsupported — decode reads it opaquely, but the rewritten file would carry a dangling offset"
     )]
     TypeSummaryOffset {
         class_descriptor: String,

@@ -96,10 +96,28 @@ fn container_modules(bytes: &[u8], source_name: &str) -> Result<Vec<InputModule>
     let modules = abcd_hap::abc_modules(bytes)
         .map_err(|e| CliError::Tool(format!("failed to read container {source_name}: {e}")))?;
     let mut out = Vec::with_capacity(modules.len());
+    let mut used_names: Vec<String> = Vec::with_capacity(modules.len());
     for m in modules {
         let abc = m.data.as_slice().to_vec();
         let module_json = m.module_json.as_ref().map(|d| d.as_slice().to_vec());
-        let name = resolve_module_name(module_json.as_deref(), &m.container_path, source_name);
+        let base = resolve_module_name(module_json.as_deref(), &m.container_path, source_name);
+        // A per-ability hap (ets/<Ability>/<Name>.abc …) yields several
+        // modules that all resolve to the SAME base name (the shared
+        // module.json's name). Names land in output paths, so disambiguate
+        // deterministically: first occurrence keeps the base, collisions get
+        // `<base>__<entry-stem>`, then `__N` on the rare repeat.
+        let name = if used_names.contains(&base) {
+            let stem = file_stem(&m.entry_name);
+            let mut candidate = format!("{base}__{stem}");
+            let mut n = 2;
+            while used_names.contains(&candidate) {
+                candidate = format!("{base}__{stem}{n}");
+                n += 1;
+            }
+            candidate
+        } else {
+            base
+        };
         // Module names end up in OUTPUT PATHS (`extract`, `decompile --all`),
         // and they come from container content — an attacker-controlled
         // module.json `name` like "../../tmp/x" must not escape the output
@@ -110,6 +128,7 @@ fn container_modules(bytes: &[u8], source_name: &str) -> Result<Vec<InputModule>
                 "{source_name}: module name {name:?} is not a safe output path component"
             ))
         })?;
+        used_names.push(name.clone());
         let mut provenance = source_name.to_string();
         for hop in &m.container_path {
             provenance.push_str("::");

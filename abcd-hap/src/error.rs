@@ -54,8 +54,9 @@ pub enum Error {
         /// Failure detail.
         reason: String,
     },
-    /// The container (or its nested modules) carries no `ets/modules.abc`.
-    #[error("no ets/modules.abc entry found")]
+    /// The container (or its nested modules) carries no `.abc` entry at all
+    /// (neither `ets/modules.abc` nor any per-ability bytecode).
+    #[error("no .abc entry found")]
     NoAbcEntry,
     /// `read()` was asked for an entry that does not exist.
     #[error("entry not found: {0}")]

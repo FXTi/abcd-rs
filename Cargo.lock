@@ -66,6 +66,7 @@ dependencies = [
 name = "abcd-hap"
 version = "0.1.0"
 dependencies = [
+ "abcd-file",
  "miniz_oxide",
  "thiserror",
 ]

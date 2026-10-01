@@ -1642,7 +1642,9 @@ impl Parser {
             Some(text) => {
                 let name_str = lossy(&pf.name);
                 if name_str == crate::TYPE_SUMMARY_OFFSET_FIELD {
-                    // Mirrors decode's hard error (N8).
+                    // Mirrors encode's hard error (N8 revised): assembling a
+                    // raw nested offset would dangle — the write side never
+                    // emits it.
                     return err(
                         pf.line,
                         "typeSummaryOffset fields are not representable".to_owned(),

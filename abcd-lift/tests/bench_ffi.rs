@@ -211,14 +211,32 @@ fn bench_micro_ffi_vs_table() {
 
     let paths = corpus_paths();
     let pool = bytecode_pool(&paths, 200_000);
-    println!("[bench] micro real-bytecode pool: {} instructions", pool.len());
+    println!(
+        "[bench] micro real-bytecode pool: {} instructions",
+        pool.len()
+    );
     let bc_loop = ns_per_call(&time_bytecode_loop(&pool));
 
-    println!("[bench] micro iters per rep: {MICRO_ITERS}, reps: {}", reps());
-    println!("[bench] micro baseline loop-only ns/call: {baseline:.3?} (median {:.3})", median(baseline.clone()));
-    println!("[bench] micro FFI isa_is_jump_opcode ns/call: {ffi:.3?} (median {:.3})", median(ffi.clone()));
-    println!("[bench] micro table-read ns/call: {tbl:.3?} (median {:.3})", median(tbl.clone()));
-    println!("[bench] micro Bytecode::is_jump (match + classify) ns/call: {bc_loop:.3?} (median {:.3})", median(bc_loop.clone()));
+    println!(
+        "[bench] micro iters per rep: {MICRO_ITERS}, reps: {}",
+        reps()
+    );
+    println!(
+        "[bench] micro baseline loop-only ns/call: {baseline:.3?} (median {:.3})",
+        median(baseline.clone())
+    );
+    println!(
+        "[bench] micro FFI isa_is_jump_opcode ns/call: {ffi:.3?} (median {:.3})",
+        median(ffi.clone())
+    );
+    println!(
+        "[bench] micro table-read ns/call: {tbl:.3?} (median {:.3})",
+        median(tbl.clone())
+    );
+    println!(
+        "[bench] micro Bytecode::is_jump (match + classify) ns/call: {bc_loop:.3?} (median {:.3})",
+        median(bc_loop.clone())
+    );
     println!(
         "[bench] micro net FFI ~= {:.3} ns/call, net table ~= {:.3} ns/call",
         median(ffi) - median(baseline.clone()),
@@ -275,7 +293,6 @@ fn bench_e2e_lift_corpus() {
     let mut lift_fail = 0u64;
 
     for pass in 0..passes {
-
         let mut lift_total = Duration::ZERO;
         let mut decode_total = Duration::ZERO;
         let mut insns = 0u64;
@@ -326,7 +343,10 @@ fn bench_e2e_lift_corpus() {
     }
 
     let lifts: Vec<f64> = lift_passes.iter().map(|d| d.as_secs_f64() * 1e3).collect();
-    let decodes: Vec<f64> = decode_passes.iter().map(|d| d.as_secs_f64() * 1e3).collect();
+    let decodes: Vec<f64> = decode_passes
+        .iter()
+        .map(|d| d.as_secs_f64() * 1e3)
+        .collect();
     println!("[bench] e2e lift totals ms: {lifts:.1?}");
     println!("[bench] e2e lift median: {:.1} ms", median(lifts.clone()));
     println!(
