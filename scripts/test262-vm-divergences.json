@@ -1,4 +1,4 @@
 {
- "$comment": "test262 VM oracle documented divergences (test262 P2, image sha256:45f4daf6). ZERO as of 2026-09-27 (N72 fully closed: callthisrange argc, supercallforwardallargs, MUTF-8 lossless round-trip, StoreGlobalRecord). Hard-error discipline is ARMED: any row that starts missing/failing must be listed here (unlisted = red); any listed row must still be missing/failing (fixed-not-delisted = red). Compare verified at zero: passed=2685/2685, no undocumented, no stale.",
+ "$comment": "test262 VM oracle documented divergences (test262 P2, image sha256:6dcea81c). ZERO as of 2026-09-27 (N72 fully closed: callthisrange argc, supercallforwardallargs, MUTF-8 lossless round-trip, StoreGlobalRecord). Hard-error discipline is ARMED: any row that starts missing/failing must be listed here (unlisted = red); any listed row must still be missing/failing (fixed-not-delisted = red). Compare verified at zero: passed=2685/2685, no undocumented, no stale.",
  "behavior-exit-code": []
 }

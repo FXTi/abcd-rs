@@ -1519,3 +1519,16 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   gates: extract+decode over all 156, negative-11 pinned to invalid
   opcode; core-25 lift/decompile smoke is a separate later item).
   Note: gh is NOT installed on dabai (PR opened from the mac).
+- q-P12 landed (2026-10-01): the wild-OHOS corpus is now a per-push
+  gate. New image digest 6dcea81c (built+tested+pushed by the
+  maintainer from arkcompiler-test#2). abcd-rs side: tests/hap-file/
+  suite (manifest-as-oracle, no ledger — expected totals 145+11
+  hard-asserted; decode-ok = every module of all 145 packages decodes
+  (242/242); negative = each of the 11 packages parses as a container
+  and hits >=1 invalid-opcode decode failure (34 modules)); skip-by-
+  absence off-CI. New 14th CI job hap-file (export-wild acquisition);
+  coverage job also acquires the wild corpus. Root Cargo.toml dev-deps
+  +abcd-hap +serde (workspace inheritance). Orchestrator independently
+  re-ran the gate on dabai: exact 145/242/11. Three ledger $comment
+  digests refreshed. The OHOS real-world corpus line is now fully
+  inside the four-layer evidence system.

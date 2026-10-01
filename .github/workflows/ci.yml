@@ -12,8 +12,9 @@ env:
   # The corpus image, pinned by digest ONCE here and referenced by every
   # corpus job (design/ci-rework-plan.md Track 2). Bump deliberately: the
   # corpus suites hard-assert fixture counts (5517 rows / 1149 passed).
-  # This digest bakes the 30 opcode fixtures — no local generation step.
-  ARK_TEST_IMAGE: ghcr.io/fxti/arkcompiler-test@sha256:45f4daf6e422d67a26dd55a524c7c32246e8adf40145523a615e0ae344ae3ea3
+  # This digest bakes the 30 opcode fixtures — no local generation step —
+  # plus the 156-package wild OHOS hap set behind `export-wild` (hap-file).
+  ARK_TEST_IMAGE: ghcr.io/fxti/arkcompiler-test@sha256:6dcea81c55929e9650c566fc3ddfe2fb6d703aeef6b4c217ac7ea6e21ac466f5
 
 jobs:
   fmt:
@@ -126,6 +127,48 @@ jobs:
       # modules.abc (Group J) is local-only by license; its test skips by
       # absence.
       - run: cargo test -p abcd-rs --test file-isa --release -- --ignored --nocapture
+
+  hap-file:
+    name: hap-file (wild OHOS hap container + decode gates)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@1.98.1
+        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
+        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
+        # and dabai; plain build/test unaffected). Revert to @stable once the
+        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+      # The wild hap corpus lives behind the image's `export-wild` command
+      # (NOT the plain `export`): 156 packages (145 decode-ok + 11
+      # negative-invalid-opcode) with a manifest.json oracle. export-wild
+      # requires an empty target directory.
+      - name: Acquire the wild hap corpus (image export-wild)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus/wild
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export-wild /work/wild
+      # The gate is self-contained: the manifest pins 145/11 and the suite
+      # hard-asserts both totals, so corpus drift goes red without a ledger.
+      # Skips silently where the corpus is absent (local checkouts).
+      - run: cargo test -p abcd-rs --test hap-file --release -- --ignored --nocapture
 
   file-lift:
     name: file-lift (corpus lift+verify, 5517 incl. test262)
@@ -507,6 +550,11 @@ jobs:
           docker pull "$ARK_TEST_IMAGE"
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+          # The wild hap corpus too: --include-ignored runs the hap-file
+          # gate, and it must not silently skip here. export-wild requires
+          # an empty target directory.
+          mkdir -p exports/corpus/wild
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export-wild /work/wild
 
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
       - name: Install cargo-llvm-cov
