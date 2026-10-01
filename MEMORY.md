@@ -1444,3 +1444,22 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   yaml-codegen mirror (silent divergence if upstream hand-edits its
   template). Instrument kept: abcd-lift/tests/bench_ffi.rs
   (#[ignore]d, local-only, zero new deps).
+- q-P12 (2026-09-30): OHOS wild hap collection analyzed. hap_collect
+  (dabai:/home/zjx/hap_collect) finished: 985 haps / 2.8GB across 18
+  versions (3.2-Release .. 7.0-Beta1; 9 download_failed, 3.1-Release
+  and 7.0-Release build_failed). 630 unique abc payloads (92 cross-
+  version dup clusters), ALL 985 signed (signing-block fixtures
+  solved). Compatibility sweep (new instrument
+  abcd-hap/tests/wild_ohos.rs, ABCD_HAP_WILD_DIR-gated, local-only):
+  container 512/985, abc decode 293/512. TWO gaps found and assigned
+  same-day: (1) per-ability abc layout (ets/<Ability>/<Name>.abc x473,
+  plus FA-era assets/js/**/*.abc) — abcd-hap must enumerate ALL .abc
+  entries, not just ets/modules.abc (worker c8b43481); (2)
+  typeSummaryOffset hard error blocks 219/512 (43%) — "no upstream
+  producer" assumption disproven by the wild (4.x-5.x es2abc emits it
+  on AbilityStage/Application classes); fix = decode captures the fact,
+  writer side keeps honest hard error unless relocation turns out
+  trivial (worker a0fd44e4). Maintainer rulings: two-tier corpus idea
+  SHELVED — fix both, analyze with our own tooling, THEN curate ~3
+  per formal version (Release preferred; versions with small deltas
+  dropped). Selection happens after the fixes, evidence-driven.

@@ -13,3 +13,5 @@ miniz_oxide.workspace = true
 
 [dev-dependencies]
 miniz_oxide.workspace = true
+# Wild-OHOS instrument only (tests/wild_ohos.rs): decode extracted bytecode.
+abcd-file.workspace = true
