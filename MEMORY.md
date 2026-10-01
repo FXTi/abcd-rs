@@ -1482,3 +1482,20 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   'invalid opcode' (ancient opcodes absent from the v7.0-pinned ISA —
   next candidate decode gap, unscheduled). Workspace 145 suites green,
   fmt clean. N8 roadmap entry updated to the second ruling.
+- q-P13 (2026-10-01): CI coverage SIGSEGV root-caused to the rustc 1.99.0
+  toolchain (released 2026-09-28; GH runners auto-updated mid-day and
+  every coverage run since died). Symptom: instrumented test binary
+  prints "N passed; 0 failed" then exits signal 11 in teardown —
+  twice on GH (abcd_cli --lib), then REPRODUCED on dabai after
+  rustup update stable (1.94.0 -> 1.99.0 flipped dabai from green to
+  the same SIGSEGV, in a different binary — analyze). Plain
+  build/test unaffected (GH build jobs green on 1.99.0 same day).
+  Mitigation: ALL 11 dtolnay/rust-toolchain steps in ci.yml pinned to
+  @1.98.1 with a revert note. Follow-ups (unscheduled): minimal-repro
+  + upstream report (crash is in teardown of binaries linking the
+  C++ bridge under -C instrument-coverage; likely LLVM covrt or
+  __cxa_atexit ordering change). dabai's stable now 1.99.0 — fine for
+  the normal dev loop, but local llvm-cov runs there will segfault
+  the same way until downgraded or upstream-fixed. Orchestrator
+  lesson logged: a red run must be root-caused before being rerun —
+  the first SIGSEGV run was initially treated as flake.
