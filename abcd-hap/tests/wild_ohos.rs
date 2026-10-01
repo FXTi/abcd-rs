@@ -35,7 +35,13 @@ fn wild_ohos_hap_and_abc_compatibility_sweep() {
     let mut haps = Vec::new();
     collect(Path::new(&root), &mut haps);
     haps.sort();
-    assert!(!haps.is_empty(), "no haps under {root}");
+    if haps.is_empty() {
+        // Local instrument: SKIP (not fail) where the collection does not
+        // exist — the coverage job runs every #[ignore]d test with
+        // --include-ignored on runners that have no wild haps.
+        eprintln!("wild_ohos: no haps under {root}, skipping (local-only instrument)");
+        return;
+    }
 
     let mut hap_ok = 0usize;
     let mut abc_ok = 0usize;

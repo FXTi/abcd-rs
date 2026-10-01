@@ -1491,11 +1491,15 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   the same SIGSEGV, in a different binary — analyze). Plain
   build/test unaffected (GH build jobs green on 1.99.0 same day).
   Mitigation: ALL 11 dtolnay/rust-toolchain steps in ci.yml pinned to
-  @1.98.1 with a revert note. Follow-ups (unscheduled): minimal-repro
-  + upstream report (crash is in teardown of binaries linking the
-  C++ bridge under -C instrument-coverage; likely LLVM covrt or
-  __cxa_atexit ordering change). dabai's stable now 1.99.0 — fine for
-  the normal dev loop, but local llvm-cov runs there will segfault
-  the same way until downgraded or upstream-fixed. Orchestrator
-  lesson logged: a red run must be root-caused before being rerun —
-  the first SIGSEGV run was initially treated as flake.
+  @1.98.1 with a revert note. CORRECTION (same day): the pinned run
+  then failed on a SECOND, independent bug — the wild_ohos instrument
+  asserted non-empty input, and the coverage job runs every
+  #[ignore]d test via --include-ignored on runners with no haps.
+  Two concurrent failures: (a) 1.99.0 teardown SIGSEGV (real,
+  reproduced twice on GH and once on dabai after rustup update;
+  pin stays), (b) the instrument's missing CI no-op gate (fixed —
+  now skips silently when the directory is absent). Lesson refined:
+  after fixing failure A, re-verify before declaring the run green —
+  A can mask B. dabai's stable now 1.99.0 — fine for the normal dev
+  loop, but local llvm-cov runs there will segfault until downgraded
+  or upstream-fixed.
