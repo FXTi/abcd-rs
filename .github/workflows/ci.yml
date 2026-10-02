@@ -44,14 +44,9 @@ jobs:
           - ubuntu-22.04 # oldest x86_64 Linux glibc GH offers
           - ubuntu-22.04-arm # aarch64 Linux (OpenHarmony's home turf)
           - macos-14 # oldest Apple Silicon label
-          - macos-13 # Intel Mac, while it lasts
+          - macos-15-intel # Intel Mac (macos-13 label retired — jobs queued forever)
           - windows-2022 # oldest Windows label
           - windows-11-arm # aarch64 Windows
-        include:
-          # ruby/setup-ruby has no 3.2 build for windows ARM64 (RubyInstaller
-          # added arm64 in 3.4); the erb codegen only needs the stdlib.
-          - os: windows-11-arm
-            ruby: "3.4"
     steps:
       - uses: actions/checkout@v4
       # Not actions/checkout's submodules:true: it recurses and dies on
@@ -84,7 +79,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: ${{ matrix.ruby || '3.2' }}
+          ruby-version: '3.4'
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
       # The workspace is small and cache causes more problems than it solves
       # (stale artifacts, coverage/build conflicts, 10GB quota pressure).
@@ -122,7 +117,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -155,7 +150,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
       # The wild hap corpus lives behind the image's `export-wild` command
       # (NOT the plain `export`): 156 packages (145 decode-ok + 11
       # negative-invalid-opcode) with a manifest.json oracle. export-wild
@@ -193,7 +188,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -224,7 +219,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -275,7 +270,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -332,7 +327,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -394,7 +389,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -425,7 +420,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -458,7 +453,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -515,7 +510,7 @@ jobs:
 
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: '3.4'
 
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
