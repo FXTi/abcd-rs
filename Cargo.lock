@@ -138,12 +138,14 @@ dependencies = [
  "abcd-decompile",
  "abcd-file",
  "abcd-file-sys",
+ "abcd-hap",
  "abcd-ir",
  "abcd-isa",
  "abcd-lift",
  "abcd-lower",
  "abcd-opt",
  "abcd-taint",
+ "serde",
  "serde_json",
 ]
 
