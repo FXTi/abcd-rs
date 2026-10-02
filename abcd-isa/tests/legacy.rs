@@ -191,6 +191,13 @@ fn legacy_decode_never_panics_on_random_bytes() {
 fn legacy_wild_stream_sweep() {
     let dir = std::env::var("ANCIENT_PROBE_DIR").unwrap_or_else(|_| "/tmp/ancient-probe".into());
     let dump = std::path::Path::new(&dir).join("dump");
+    // Local archaeology instrument: skip (never fail) without the probe
+    // dump — the coverage job runs #[ignore]d tests on runners that have
+    // none.
+    if !dump.is_dir() {
+        eprintln!("legacy sweep: no dump at {dump:?}, skipping (local-only instrument)");
+        return;
+    }
     let mut total = 0usize;
     let mut insns = 0usize;
     let mut failures = Vec::new();
