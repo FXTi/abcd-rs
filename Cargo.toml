@@ -60,7 +60,8 @@ abcd-taint = { path = "abcd-taint" }
 abcd-decompile = { path = "abcd-decompile" }
 abcd-hap = { path = "abcd-hap" }
 
-[dependencies]
+# (The root package has no runtime dependencies by design: it exists only
+# as the cross-crate test container; the shippable binary is abcd-cli.)
 
 # Dev-dependencies of the root package: exactly the crates the migrated
 # cross-crate suites under tests/ link against (plus serde_json for the
