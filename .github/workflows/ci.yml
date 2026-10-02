@@ -290,6 +290,47 @@ jobs:
               apk add -q --no-cache $(apk search -q | grep -E "^clang[0-9]+-libclang$" | sort -V | tail -1)
               cargo test --workspace'
 
+
+  # TEMP PROBE (never merge): allocator comparison on Windows. Reads like a
+  # job, lives only on the probe branch.
+  alloc-probe:
+    name: alloc-probe (windows-2022, synthetic)
+    runs-on: windows-2022
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.protectNTFS false
+          git config --global core.longpaths true
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - name: bench default allocator
+        shell: bash
+        env: { ABCD_BENCH_SCALE: "2000000", ABCD_BENCH_PASSES: "5" }
+        run: cargo test -p abcd-rs --release --test bench-alloc -- --ignored --nocapture bench_synthetic
+      - name: bench mimalloc
+        shell: bash
+        env: { ABCD_BENCH_SCALE: "2000000", ABCD_BENCH_PASSES: "5" }
+        run: cargo test -p abcd-rs --release --test bench-alloc --features alloc-mimalloc -- --ignored --nocapture bench_synthetic
+      - name: bench jemalloc (expected to fail to BUILD on MSVC — that is the data point)
+        shell: bash
+        continue-on-error: true
+        env: { ABCD_BENCH_SCALE: "2000000", ABCD_BENCH_PASSES: "5" }
+        run: cargo test -p abcd-rs --release --test bench-alloc --features alloc-jemalloc -- --ignored --nocapture bench_synthetic
+
   # ── Per-push corpus jobs (the c-P3 job graph) ──────────────────────
   # One job per data-flow test target (tests/<flow>/). Every corpus job
   # shares the same acquisition recipe: sparse submodule clone + rust +
