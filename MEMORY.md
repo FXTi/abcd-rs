@@ -1763,3 +1763,9 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   per-platform CLI compile coverage is an accepted gap. If abcd-gui
   ever appears: each final binary declares its own #[global_allocator]
   in its own main.rs — one line each, no shared machinery.
+- Orchestrator lesson (2026-10-02): repeated string-surgery on ci.yml
+  produced a duplicate env: key that PyYAML silently accepts (last wins)
+  — "YAML OK" was not OK. The build step also lost its -m32 env in the
+  same edit. Rule: after ANY ci.yml surgery, validate structurally AND
+  diff-review the touched job block by eye; better, edit via anchors of
+  whole blocks, never sed-adjacent line edits.
