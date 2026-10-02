@@ -154,12 +154,20 @@ fn ancient_files_decode_green() {
     let dir = PathBuf::from(
         std::env::var("ANCIENT_PROBE_DIR").unwrap_or_else(|_| "/tmp/ancient-probe".to_string()),
     );
-    let mut entries: Vec<_> = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "abc"))
-        .collect();
+    // Local archaeology instrument: skip (never fail) where the probe
+    // directory is absent — the coverage job runs #[ignore]d tests with
+    // --include-ignored on runners that have no probe data.
+    let mut entries: Vec<_> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "abc"))
+            .collect(),
+        Err(_) => {
+            eprintln!("ancient probe: no dir at {dir:?}, skipping (local-only instrument)");
+            return;
+        }
+    };
     entries.sort();
 
     let mut failures = Vec::new();
