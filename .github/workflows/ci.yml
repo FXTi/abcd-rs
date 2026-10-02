@@ -259,12 +259,19 @@ jobs:
   # docker oracles (VM compare, dream gate), never for the cargo runs.
   # Wall-time target: ≤12 min per job (measured suites are seconds-to-
   # minutes; the dream gate is the heavyweight at ~3-5 min).
+  #
+  # `needs: [build, build32, win32, arm32]` — deliberately NOT `[fmt, …]`:
+  # all three front gates (fmt ∥ clippy ∥ deny) already gate `build`, and
+  # naming one gate alone here gave that job a different dependent set — the
+  # run page's job graph then drew Rustfmt as its own box instead of one box
+  # holding the three parallel gates (the stale `fmt` was a leftover from
+  # when fmt was the only gate, c7783c9). Keep this list to the build lanes.
 
   file-isa:
     name: file-isa (pandasm per-instruction + corpus decode/re-encode)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -298,7 +305,7 @@ jobs:
     name: hap-file (wild OHOS hap container + decode gates)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -337,7 +344,7 @@ jobs:
     name: file-lift (corpus lift+verify, 5517 incl. test262)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -369,7 +376,7 @@ jobs:
     name: lift-lower (rewrite suites + VM oracle ×3 variants)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -421,7 +428,7 @@ jobs:
     name: test262-vm (test262 rewrite + recorded-behavior VM oracle)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -479,7 +486,7 @@ jobs:
     name: test262-dream (test262 decompile → es2abc recompile → recorded VM oracle)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -542,7 +549,7 @@ jobs:
     name: lift-analysis (callgraph smoke + dom agreement + regions)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -574,7 +581,7 @@ jobs:
     name: lift-taint (probe ladder + corpus smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -608,7 +615,7 @@ jobs:
     name: lift-decompile (stage A/B gates + dream gate + node evidence)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -655,7 +662,7 @@ jobs:
     name: Coverage (full estate)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     env:
       # clang-23, matching the LLVM bundled by rustc >=1.99 (LLVM 23 changed
       # the __llvm_profile_data record layout; an older clang's instrumented
@@ -756,7 +763,7 @@ jobs:
     name: ASan (nightly, address sanitizer, corpus-compute suites)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [fmt, build, build32, win32, arm32]
+    needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
