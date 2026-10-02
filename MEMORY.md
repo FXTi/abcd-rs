@@ -1532,3 +1532,9 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   re-ran the gate on dabai: exact 145/242/11. Three ledger $comment
   digests refreshed. The OHOS real-world corpus line is now fully
   inside the four-layer evidence system.
+- q-P12 follow-up rulings (2026-10-01): (a) Real third-party preinstalled
+  app corpus ABANDONED — legal risk (proprietary apps; the maintainer
+  will not touch them). The 156-package wild set is legally clean by
+  construction: built from OpenHarmony's public Apache-2.0 source by
+  hap_collect itself. (b) The 90% coverage goal IS on, but sequenced
+  LAST among open items.
