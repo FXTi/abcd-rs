@@ -14,7 +14,7 @@ env:
   # corpus suites hard-assert fixture counts (5517 rows / 1149 passed).
   # This digest bakes the 30 opcode fixtures — no local generation step —
   # plus the 156-package wild OHOS hap set behind `export-wild` (hap-file).
-  ARK_TEST_IMAGE: ghcr.io/fxti/arkcompiler-test@sha256:6dcea81c55929e9650c566fc3ddfe2fb6d703aeef6b4c217ac7ea6e21ac466f5
+  ARK_TEST_IMAGE: ghcr.io/fxti/arkcompiler-test@sha256:a39526126a10b9bc5fdde3f1560ad41c66403ca046d36157d7b771e16690f70b
 
 jobs:
   fmt:
