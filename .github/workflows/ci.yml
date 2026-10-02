@@ -6,6 +6,12 @@ on:
   push:
     branches: [main]
 
+# A new push makes every in-flight run of the same ref obsolete
+# (today's stuck-2.4h-coverage incident burned a runner for nothing).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -20,6 +26,7 @@ jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,10 +34,50 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # See the build job for why: sparse, non-recursive, blob:none.
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      # Zero-warning estate since the 2026-10-02 debt cleanup; gate it so
+      # new lints never get in.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  deny:
+    name: cargo deny (licenses + advisories)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command-arguments: check
+
   build:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    needs: [fmt]
+    timeout-minutes: 15
+    needs: [fmt, clippy, deny]
     strategy:
       matrix:
         # Platform-compatibility lanes (2026-10-02 ruling): OS x arch cross,
@@ -93,7 +140,8 @@ jobs:
   build32:
     name: Build & Test (i686-linux)
     runs-on: ubuntu-22.04
-    needs: [fmt]
+    timeout-minutes: 20
+    needs: [fmt, clippy, deny]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -136,7 +184,8 @@ jobs:
   win32:
     name: Build & Test (i686-windows)
     runs-on: windows-2022
-    needs: [fmt]
+    timeout-minutes: 20
+    needs: [fmt, clippy, deny]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -169,7 +218,8 @@ jobs:
   arm32:
     name: Build & Test (armv7-linux)
     runs-on: ubuntu-22.04
-    needs: [fmt]
+    timeout-minutes: 25
+    needs: [fmt, clippy, deny]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -217,6 +267,7 @@ jobs:
   file-isa:
     name: file-isa (pandasm per-instruction + corpus decode/re-encode)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -250,6 +301,7 @@ jobs:
   hap-file:
     name: hap-file (wild OHOS hap container + decode gates)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -288,6 +340,7 @@ jobs:
   file-lift:
     name: file-lift (corpus lift+verify, 5517 incl. test262)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -319,6 +372,7 @@ jobs:
   lift-lower:
     name: lift-lower (rewrite suites + VM oracle ×3 variants)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -370,6 +424,7 @@ jobs:
   test262-vm:
     name: test262-vm (test262 rewrite + recorded-behavior VM oracle)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -427,6 +482,7 @@ jobs:
   test262-dream:
     name: test262-dream (test262 decompile → es2abc recompile → recorded VM oracle)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -489,6 +545,7 @@ jobs:
   lift-analysis:
     name: lift-analysis (callgraph smoke + dom agreement + regions)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -520,6 +577,7 @@ jobs:
   lift-taint:
     name: lift-taint (probe ladder + corpus smoke)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -553,6 +611,7 @@ jobs:
   lift-decompile:
     name: lift-decompile (stage A/B gates + dream gate + node evidence)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -599,6 +658,7 @@ jobs:
   coverage:
     name: Coverage (full estate)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [fmt, build, build32, win32, arm32]
     env:
       # clang-23, matching the LLVM bundled by rustc >=1.99 (LLVM 23 changed
@@ -684,3 +744,43 @@ jobs:
           name: coverage-report
           path: lcov.info
           retention-days: 30
+
+  # AddressSanitizer at coverage's level (2026-10-02 ruling): one dedicated
+  # heavy job, off the critical path. Sanitizers are nightly-only in Rust
+  # (-Zsanitizer), ~2x slower, incompatible with -C instrument-coverage,
+  # and unavailable on the Windows lanes — hence a lane, not "everywhere".
+  asan:
+    name: ASan (nightly, address sanitizer)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [fmt, build, build32, win32, arm32]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      # Workspace default tests under ASan: the C++ bridge is instrumented
+      # too (CXXFLAGS), so the FFI boundary is covered along with Rust.
+      # -Zbuild-std is the documented requirement for a clean ASan run.
+      - name: cargo test under ASan
+        env:
+          CFLAGS: -fsanitize=address
+          CXXFLAGS: -fsanitize=address
+          ASAN_OPTIONS: detect_leaks=1
+        # Sanitizer builds must not inherit the warning elevation.
+        run: RUSTFLAGS="-Zsanitizer=address" cargo test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std
