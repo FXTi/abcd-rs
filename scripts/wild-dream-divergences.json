@@ -1,0 +1,69 @@
+{
+ "$comment": "wild core-25 fallback ledger (corpus image sha256:a3952612…, first list 2026-10-03, design/wild-gate-evaluation.md §6.B). Values: [functions_with_fallbacks, ir_functions] per PACKAGE (summed over ALL the package's abc modules; packages with zero fallbacks are absent, same convention as the empty buckets in scripts/test262-dream-divergences.json). Hard-error both directions: a package whose pair drifts without a relist = red (undocumented); a listed row that no longer matches = red (stale — fixing fallbacks forces the delist, the self-cleaning property). Plus the gate's global tripwire: total fallbacks <= 1% of lifted functions (measured 76/65530 = 0.116% at first list). Regenerate: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture wild_gate writes the observed map to target/wild-gate/fallback-observed.json on every run; copy it here deliberately.",
+ "fallback-counts": {
+  "OpenHarmony-3.2-Release/Launcher.hap": [
+   6,
+   10460
+  ],
+  "OpenHarmony-3.2-Release/adminprovisioning.hap": [
+   10,
+   706
+  ],
+  "OpenHarmony-4.0-Release/Settings.hap": [
+   1,
+   4113
+  ],
+  "OpenHarmony-4.0-Release/dlp_manager.hap": [
+   4,
+   1355
+  ],
+  "OpenHarmony-4.1-Release/Contacts_DataAbility.hap": [
+   1,
+   29
+  ],
+  "OpenHarmony-4.1-Release/Photos.hap": [
+   3,
+   7136
+  ],
+  "OpenHarmony-5.0.3-Release/Settings.hap": [
+   1,
+   5512
+  ],
+  "OpenHarmony-5.0.3-Release/power_dialog.hap": [
+   8,
+   351
+  ],
+  "OpenHarmony-5.1.0-Release/AuthWidget.hap": [
+   2,
+   1073
+  ],
+  "OpenHarmony-5.1.0-Release/Photos.hap": [
+   13,
+   7294
+  ],
+  "OpenHarmony-6.0-Release/AuthWidget.hap": [
+   2,
+   1122
+  ],
+  "OpenHarmony-6.0-Release/Contacts.hap": [
+   1,
+   3605
+  ],
+  "OpenHarmony-6.1-LTS/Contacts.hap": [
+   1,
+   3901
+  ],
+  "OpenHarmony-6.1-LTS/Photos.hap": [
+   14,
+   7300
+  ],
+  "OpenHarmony-7.0-Beta1/Launcher.hap": [
+   4,
+   3450
+  ],
+  "OpenHarmony-7.0-Beta1/Settings.hap": [
+   5,
+   5841
+  ]
+ }
+}

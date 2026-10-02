@@ -1769,3 +1769,14 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   same edit. Rule: after ANY ci.yml surgery, validate structurally AND
   diff-review the touched job block by eye; better, edit via anchors of
   whole blocks, never sed-adjacent line edits.
+- wild-gate LANDED (2026-10-03): the core-25 wild-OHOS subset is now a
+  per-push gate (tests/lift-decompile/wild_gate.rs + CI job wild-gate,
+  ~4min). A: decompile → docker es2abc must accept (the N79/N80 silent-
+  emitter capture surface) → recompiled artifact decodes with function
+  count >= original. B: per-package fallback ledger
+  (scripts/wild-dream-divergences.json, 16 rows, 76/65530 = 0.116%,
+  1% global tripwire, hard-error both directions). Red-proofed twice:
+  injected broken JS gets SyntaxError'd by the channel; a doctored
+  ledger row goes red both ways. Orchestrator ran the gate
+  independently: green in 243s, ledger matches. Also: Cargo.lock
+  hygiene (one stale mimalloc root-dep line removed).

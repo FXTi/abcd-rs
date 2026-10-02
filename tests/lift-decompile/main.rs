@@ -37,5 +37,6 @@ mod n75_lone_surrogates;
 mod n76_structurer;
 mod n77_deabsorb;
 mod textual_oracle;
+mod wild_gate;
 mod wild_smoke;
 mod yield_star_node;

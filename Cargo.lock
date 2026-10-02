@@ -146,7 +146,6 @@ dependencies = [
  "abcd-lower",
  "abcd-opt",
  "abcd-taint",
- "mimalloc",
  "rayon",
  "serde",
  "serde_json",

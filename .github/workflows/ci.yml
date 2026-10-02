@@ -340,6 +340,56 @@ jobs:
       # Skips silently where the corpus is absent (local checkouts).
       - run: cargo test -p abcd-rs --test hap-file --release -- --ignored --nocapture
 
+  # The wild gate (design/wild-gate-evaluation.md, form (a) standalone
+  # job): the core-25 wild-OHOS subset promoted from the local smoke
+  # instrument to a per-push gate — A: decompile (call_entry) → docker
+  # es2abc recompile MUST accept (the N79/N80 silent-emitter-bug capture
+  # surface) → recompiled artifact decodes with function count >=
+  # original; B: the per-package fallback ledger
+  # (scripts/wild-dream-divergences.json, hard-error both directions) +
+  # the 1% global fallback tripwire; plus the standing laws (panic/lift/
+  # verify = red, hard-asserted 25 packages / 64 modules). Acquisition
+  # is the proven hap-file recipe (export-wild). GH estimate 4–6.5 min
+  # (evaluation §5); timeout 15 leaves headroom over the 12-min budget
+  # rule for the decompile-heavy tail.
+  wild-gate:
+    name: wild-gate (core-25 wild recompile acceptance + fallback ledger)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build, build32, win32, arm32]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - name: Acquire the wild hap corpus (image export-wild)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus/wild
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export-wild /work/wild
+      # The gate test itself drives scripts/dream-gate.py --skip-compare
+      # --jobs 4 for the docker es2abc recompile (the dream gate's exact
+      # invocation), then asserts acceptance + the ledger. The
+      # red-proof test runs here too: it feeds es2abc a deliberately
+      # broken JS and asserts the rejection surfaces as a SyntaxError —
+      # the signal the main gate turns red on.
+      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture wild_gate
+
   file-lift:
     name: file-lift (corpus lift+verify, 5517 incl. test262)
     runs-on: ubuntu-latest
@@ -730,7 +780,12 @@ jobs:
         # instrument (decompile-heavy: p95 18s per module x242) owned by the
         # hap-file job's cheap gate; under instrumentation it dominates the
         # job for zero coverage value. (2026-10-01 maintainer ruling)
-        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_smoke
+        # --skip wild_gate: the core-25 wild gate is a docker-es2abc
+        # recompile gate owned per-push by the wild-gate job; under
+        # instrumentation its decompile phase (the p95+ tail of the wild
+        # set by construction) multiplies past the job budget for zero
+        # coverage value. (2026-10-03 wild-gate promotion)
+        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_smoke --skip wild_gate
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
