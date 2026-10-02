@@ -1538,3 +1538,11 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   construction: built from OpenHarmony's public Apache-2.0 source by
   hap_collect itself. (b) The 90% coverage goal IS on, but sequenced
   LAST among open items.
+- q-P13 sequenced (2026-10-01): maintainer ruling — item order is wild
+  big-abc lift/decompile smoke (2) THEN ancient opcodes (3); the rustc
+  1.99.0 SIGSEGV (1) runs in PARALLEL but narrowed to root-cause only
+  ("实际上和我们无关，只要找出来 root cause 就好" — no minimal repro
+  dance, no upstream report for now). Two workers: e019e60c (root
+  cause, dabai is already on 1.99.0), 5871493e (wild smoke sweep over
+  all 156 gated packages — decode/lift/verify/decompile/recompile,
+  report + bug list in design/wild-smoke-report.md).
