@@ -532,7 +532,11 @@ jobs:
         # release -> 30min+ instrumented on a 16-core box). Their behavioral
         # gating is owned per-push by the file-isa job; the parser keeps its
         # unit-test (incl. fuzz) coverage. (q-P10 ruling A, 2026-09-30)
-        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm
+        # --skip wild_smoke: the wild big-abc smoke sweep is a local
+        # instrument (decompile-heavy: p95 18s per module x242) owned by the
+        # hap-file job's cheap gate; under instrumentation it dominates the
+        # job for zero coverage value. (2026-10-01 maintainer ruling)
+        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_smoke
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
