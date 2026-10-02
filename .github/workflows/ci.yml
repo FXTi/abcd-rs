@@ -798,6 +798,10 @@ jobs:
           CFLAGS: -fsanitize=address
           CXXFLAGS: -fsanitize=address
           ASAN_OPTIONS: detect_leaks=1
+          # ASan's instrumented frames are ~2-3x fatter; the analysis
+          # suite's finite-but-deep CFG recursion fits an 8MiB stack
+          # uninstrumented but overflows under instrumentation. 64MiB.
+          RUST_MIN_STACK: "67108864"
         # Sanitizer builds must not inherit the warning elevation. Doctests
         # are out: rustdoc's separate link step misses rustc's bundled ASan
         # runtime (undefined __asan_* from the instrumented bridge objects);
