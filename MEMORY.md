@@ -1646,3 +1646,14 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   artifacts all decode, zero function loss. dream gates unchanged.
   Item 2 (wild smoke line) CLOSED: both P1 silent emitter bugs fixed;
   the recompile channel caught what all corpus gates missed.
+- 32-bit support PROVEN (2026-10-02, zero code changes): the vendored
+  C++ bridge + full workspace compile and pass tests on i686-linux
+  (multilib, native exec), i686-windows (MSVC, WoW64) and armv7-linux
+  (cross gcc + qemu-user) — all green on first contact (run
+  36999991006). Three new lanes gate the corpus jobs alongside the
+  6-lane 64-bit matrix. macOS has no 32-bit at all (Apple removed it
+  in 2019); Windows ARM32 is extinct (Windows RT era) — the 32-bit
+  matrix is complete by construction. Alignment fix f5e3c61: 32-bit
+  lanes moved to ubuntu-22.04 (oldest-label rule; also pins the
+  gcc-versioned cross package name) and the inert LDFLAGS=-m32 dropped
+  (rustc never reads it; the target spec carries -m32).
