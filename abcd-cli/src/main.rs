@@ -9,6 +9,14 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+// The final binary owns the global allocator (libraries never set one).
+// mimalloc everywhere (2026-10-02 ruling, revised: one allocator for all
+// platforms — measured -43% vs the Windows CRT allocator, -26%/-42% vs
+// macOS libmalloc; jemalloc has no MSVC support anyway). Numbers:
+// tests/bench-alloc + MEMORY.md.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     let cli = match abcd_cli::cli::Cli::try_parse() {
         Ok(cli) => cli,

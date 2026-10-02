@@ -26,8 +26,10 @@ dependencies = [
  "abcd-opt",
  "abcd-taint",
  "clap",
+ "mimalloc",
  "serde",
  "serde_json",
+ "tikv-jemallocator",
  "toml",
 ]
 

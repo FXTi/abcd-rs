@@ -25,6 +25,12 @@ abcd-taint.workspace = true
 abcd-decompile.workspace = true
 toml.workspace = true
 
+# Final-binary allocator (2026-10-02 ruling, revised same-day): mimalloc
+# EVERYWHERE — one allocator, every platform. Libraries never set a global
+# allocator; only this binary does.
+[dependencies.mimalloc]
+workspace = true
+
 [dev-dependencies]
 # Synthetic-fixture construction for tests (zero binary fixtures rule).
 abcd-isa.workspace = true

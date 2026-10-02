@@ -1747,3 +1747,11 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   516ms). Applies to final binaries only (abcd-cli sets
   #[global_allocator] per target_os at release time; libraries never
   set one). Probe PR #25 closed after collecting the numbers.
+- Allocator ruling REVISED (2026-10-02, same day): mimalloc EVERYWHERE
+  (supersedes "jemalloc on unix") — one allocator for all platforms,
+  simplicity wins; musl is the Linux distribution target but gets NO CI
+  lane (ruling: the source-level switch is the guarantee; musl build
+  verification happens at release time, not per-push). abcd-cli now sets
+  mimalloc as #[global_allocator] unconditionally; the three 32-bit
+  lanes also build -p abcd-cli so mimalloc-on-32-bit is CI-verified.
+  Cargo.lock synced (mimalloc 0.1.52).
