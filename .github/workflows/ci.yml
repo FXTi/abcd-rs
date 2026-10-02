@@ -47,6 +47,11 @@ jobs:
           - macos-13 # Intel Mac, while it lasts
           - windows-2022 # oldest Windows label
           - windows-11-arm # aarch64 Windows
+        include:
+          # ruby/setup-ruby has no 3.2 build for windows ARM64 (RubyInstaller
+          # added arm64 in 3.4); the erb codegen only needs the stdlib.
+          - os: windows-11-arm
+            ruby: "3.4"
     steps:
       - uses: actions/checkout@v4
       # Not actions/checkout's submodules:true: it recurses and dies on
@@ -79,7 +84,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: '3.2'
+          ruby-version: ${{ matrix.ruby || '3.2' }}
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
       # The workspace is small and cache causes more problems than it solves
       # (stale artifacts, coverage/build conflicts, 10GB quota pressure).
