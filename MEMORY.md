@@ -1585,3 +1585,25 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   at the exact cited lines. Fix order ruled: A then B (emit.rs/folds.rs
   overlap — sequential to avoid races), then re-run the sweep, then
   evaluate promoting core-25 to a real gate. Both bugs are P1 silent.
+- N79 FIXED (Bug A of the wild smoke): 3.2-era abc (format 9.0.0.0) does
+  NOT mark async functions in method metadata — the body carries full
+  async machinery (AsyncFunctionEnter + suspend/resume) but kind reads
+  plain Function, so R4 folds never started, no async keyword was
+  emitted, and Expr::Await printed `await` in a non-async function =>
+  SyntaxError under es2abc/node (146 modules / 16 apps silently
+  affected — invisible to every corpus gate). Fix (abcd-decompile):
+  recover::effective_kind() upgrades Function->Async / Arrow->AsyncArrow
+  on decisive body evidence (es2abc only emits AsyncFunctionEnter for
+  async functions), wired into Recover::run / closure_node / MethodRef /
+  emit_class_method; PLUS defense-in-depth at the Await emit arm (loud
+  comment + operand, fallback-counted, unreachable in vendor shapes).
+  Corrected root cause beats the brief's closure-nesting hypothesis
+  (node --check + disasm proved the await sat in a class METHOD whose
+  metadata gapped, not in a nested closure). Orchestrator verified the
+  regenerated CallUI site: `async addSubscriber()`, machinery folded.
+  Red-first test async_kind_evidence_upgrades_metadata_gap pins the
+  metadata-gap shape (IR + Builder + negative pin). Wild rerun: Bug A
+  class 146 -> 0 (98 parse clean; 48 unmasked Bug B dup-lets — the
+  await error had been hiding them). Dream gates unchanged
+  (1149/1149, t262 2676+9). Lesson registered: gates alone could not
+  see this — silent emitter bugs need the recompile channel.

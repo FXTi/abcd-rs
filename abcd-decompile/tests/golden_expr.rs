@@ -598,7 +598,10 @@ fn t08_guard_elision() {
     emit_void(&mut m, b, Op::Throw { value: p1 });
 
     let got = dump_func(&recover_func(&m, f));
-    let want = r#"fn #0 "guards" kind=function params=(this, p1)
+    // kind=async: the body carries `AsyncFunctionEnter`, so the
+    // evidence-based effective kind (Bug A) upgrades the synthetic
+    // plain kind — the dump reports the decompilation kind.
+    let want = r#"fn #0 "guards" kind=async params=(this, p1)
   bb B0 preds=[]:
     ; elided ThrowIfSuperNotCalled: derived-ctor `this` guard; emitted source proves the condition can't fire (§5 row 58)
     ; elided ThrowUndefinedIfHole: TDZ guard; emitted source has no TDZ-hole reads (§5 row 59)

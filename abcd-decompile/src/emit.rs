@@ -1308,12 +1308,9 @@ impl<'m> Emitter<'m> {
         // by the entry's method-kind tag; the conservative fallback
         // (attrs unknown) is instance placement + the lifted
         // FunctionData kind (the pre-B2 behavior).
-        let kind = attrs.map(|a| a.kind.clone()).unwrap_or_else(|| {
-            self.module
-                .func(f)
-                .map(|d| d.kind)
-                .unwrap_or(FunctionKind::Function)
-        });
+        let kind = attrs
+            .map(|a| a.kind.clone())
+            .unwrap_or_else(|| crate::recover::effective_kind(self.module, f));
         // N74-W4: the 24.0.0.0 member buffer tags generator and async
         // methods as plain `method` (probe: methods-gen-yield-as-statement's
         // buffer reads `method:#~A>#g1` while the function body carries
@@ -1323,14 +1320,16 @@ impl<'m> Emitter<'m> {
         // generator is an es2abc SyntaxError; a plain method returns
         // undefined where the source returned an iterator). Getter/Setter
         // are accessor kinds the FUNCTION metadata does not carry — the
-        // buffer tag stays authoritative for them.
+        // buffer tag stays authoritative for them. The lifted kind here is
+        // the EVIDENCE kind (Bug A: 3.2-era files do not tag async
+        // functions in the metadata; the body's `AsyncFunctionEnter` is
+        // decisive — an `await` in a non-async body is the es2abc
+        // SyntaxError the wild smoke hit).
         let kind = if matches!(kind, FunctionKind::Function) {
-            match self.module.func(f).map(|d| d.kind) {
-                Some(
-                    k @ (FunctionKind::Generator
-                    | FunctionKind::AsyncGenerator
-                    | FunctionKind::Async),
-                ) => k,
+            match crate::recover::effective_kind(self.module, f) {
+                k @ (FunctionKind::Generator
+                | FunctionKind::AsyncGenerator
+                | FunctionKind::Async) => k,
                 _ => kind,
             }
         } else {
@@ -1704,8 +1703,30 @@ impl<'m> Emitter<'m> {
                 self.sub(value, 0, out);
             }
             Expr::Await { value, .. } => {
-                out.push_str("await ");
-                self.sub(value, 17, out);
+                if matches!(
+                    self.current_kind,
+                    FunctionKind::Async | FunctionKind::AsyncArrow | FunctionKind::AsyncGenerator
+                ) {
+                    out.push_str("await ");
+                    self.sub(value, 17, out);
+                } else {
+                    // Defensive (Bug A residual): `await` parses only in
+                    // an async body. The effective-kind evidence upgrade
+                    // makes this unreachable for the vendor shape
+                    // (`AwaitUncaught` always pairs with
+                    // `AsyncFunctionEnter`); a stray await in a
+                    // metadata-plain body degrades LOUDLY to its operand
+                    // instead of emitting unparseable text (mirrors the
+                    // `SuspendGenerator` arm above).
+                    *self
+                        .stats
+                        .fallback_comments
+                        .entry("Await(non-async context)")
+                        .or_insert(0) += 1;
+                    self.current_fn_has_fallback = true;
+                    out.push_str("/*await outside async context (operand kept)*/ ");
+                    self.sub(value, 0, out);
+                }
             }
             Expr::NewTarget => out.push_str("new.target"),
             Expr::GlobalThis => out.push_str("globalThis"),

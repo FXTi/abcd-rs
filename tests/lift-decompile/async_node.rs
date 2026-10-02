@@ -1078,3 +1078,154 @@ with open(sys.argv[1], encoding="utf-8") as manifest:
     std::fs::write(out_root.join("manifest.tsv"), manifest).expect("write manifest");
     eprintln!("ASYNC-EMIT fixtures=21 -> {}", src_root.display());
 }
+
+// ── Bug A (wild smoke, P1): the metadata-kind gap on 3.2-era files ──
+//
+// OHOS 3.2-Release files (format 9.0.0.0) do not tag async functions
+// in the method metadata: the kind reads `Function` while the body
+// carries the full es2abc async machinery (`AsyncFunctionEnter` + the
+// per-await `AwaitUncaught`/`SuspendGenerator`/`ResumeGenerator`/
+// `GetResumeMode` plumbing). Pre-fix the decompiler trusted the
+// metadata: the R4 async folds (kind-gated) never ran and
+// `Expr::Await` printed `await` into a NON-async function body —
+// unparseable text. Wild evidence: 146/242 modules rejected by the
+// es2abc recompile channel, all `SyntaxError: await is only valid in
+// async functions` (minimal repro `OpenHarmony-3.2-Release/
+// CallUI.hap#ets/modules.abc` → emitted js:318 inside the plain
+// `addSubscriber()` class method; see design/wild-smoke-report.md).
+//
+// The fix derives the decompilation kind from the definitive BODY
+// evidence: es2abc emits `AsyncFunctionEnter` only for async
+// functions, so a metadata-plain function carrying the entry op IS
+// async. The upgrade restores the source truth (the `async` keyword)
+// and unblocks the kind-gated R4 folds. These cases pin the red
+// shape: same bodies as the metadata-correct cases, kind forced to
+// plain `Function`.
+
+/// Case F: case E's full await machinery (`return await x`) with the
+/// metadata kind forced to plain `Function` — the exact wild shape.
+fn case_f() -> abcd_ir::Module {
+    let mut m = mk_module();
+    let f = add_func_kind(&mut m, "f_gap", FunctionKind::Function);
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let x = add_param(&mut m, f);
+    let funcobj = emit(&mut m, b0, Op::AsyncFunctionEnter);
+    let cont = add_block(&mut m, f);
+    let throw_b = add_block(&mut m, f);
+    let (r, mode) = await_site(&mut m, b0, funcobj, x);
+    await_dispatch(&mut m, b0, mode, r, throw_b, cont);
+    async_resolve_return(&mut m, cont, funcobj, r);
+    async_catch_all(&mut m, f, funcobj, vec![b0, cont, throw_b]);
+    m
+}
+
+/// Case G: case C's bytecodes (`return await 5`) built through the
+/// `abcd_file::Builder` WITHOUT the async metadata tag — the
+/// end-to-end decode → lift → decompile path the wild pipeline runs.
+fn case_g() -> abcd_ir::Module {
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    let proto = b.create_proto(Type::Void, &[]);
+    let (code, _offsets) = encode_bytecodes(&[
+        Bytecode::Asyncfunctionenter,
+        Bytecode::Sta(Reg(0)), // v0 = async funcobj (context)
+        Bytecode::Ldai(Imm(5)),
+        Bytecode::Asyncfunctionawaituncaught(Reg(0)), // awaits acc (5)
+        Bytecode::Asyncfunctionresolve(Reg(0)),       // resolves with the awaited value
+        Bytecode::Return,
+    ])
+    .unwrap();
+    // No `method_set_function_kind` — the metadata kind stays `None`
+    // (the 3.2-era gap shape; `None` lifts to `FunctionKind::Function`).
+    b.class_add_method(cls, "g_gap", proto, AccessFlags::STATIC, &code, 4, 0);
+    let file = decode(&b.finalize().unwrap()).unwrap();
+    lift_file(&file).expect("lift")
+}
+
+/// Case H (negative pin): a plain function WITHOUT `AsyncFunctionEnter`
+/// must NOT be upgraded — no spurious `async` keyword.
+fn case_h() -> abcd_ir::Module {
+    let mut m = mk_module();
+    let f = add_func_kind(&mut m, "h_plain", FunctionKind::Function);
+    let b0 = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let one = load_number(&mut m, b0, 1.0);
+    emit_void(&mut m, b0, Op::Return { value: Some(one) });
+    m
+}
+
+#[test]
+fn async_kind_evidence_upgrades_metadata_gap() {
+    let f_text = decompile(&case_f());
+    let g_text = decompile(&case_g());
+    let h_text = decompile(&case_h());
+    eprintln!(
+        "── case F (IR, kind gap) ──\n{f_text}\n── case G (Builder, kind gap) ──\n{g_text}\n── case H (plain negative) ──\n{h_text}"
+    );
+    // The kind is restored from the body evidence and the R4 folds
+    // land exactly as in the metadata-correct cases (D/E/C above).
+    assert!(f_text.contains("async function f_gap("), "{f_text}");
+    assert!(f_text.contains("await"), "{f_text}");
+    assert!(!f_text.contains("ResumeGenerator"), "{f_text}");
+    assert!(!f_text.contains("GetResumeMode"), "{f_text}");
+    assert!(!f_text.contains("async-machinery suspend"), "{f_text}");
+    assert!(!f_text.contains("fallback AsyncFunctionEnter"), "{f_text}");
+    assert!(g_text.contains("async function g_gap("), "{g_text}");
+    assert!(g_text.contains("await 5"), "{g_text}");
+    // The negative pin: no evidence, no upgrade.
+    assert!(h_text.contains("function h_plain("), "{h_text}");
+    assert!(!h_text.contains("async"), "{h_text}");
+
+    // The core regression assertion: the emitted text PARSES (the
+    // wild channel's failure was `await` in a non-async body).
+    let node_ok = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !node_ok {
+        eprintln!("NODE-EVIDENCE node not found on this host — syntax/behavior run skipped");
+        return;
+    }
+    let node = "node";
+    let dir = std::env::temp_dir().join("abcd-bugA-node");
+    std::fs::create_dir_all(&dir).expect("tempdir");
+    for (i, text) in [&f_text, &g_text, &h_text].iter().enumerate() {
+        let out = dir.join(format!("case{i}.js"));
+        std::fs::write(&out, text).expect("write case");
+        let check = std::process::Command::new(node)
+            .arg("--check")
+            .arg(&out)
+            .output()
+            .expect("run node --check");
+        assert!(
+            check.status.success(),
+            "node --check case{i}: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+    }
+    // Behavior: the upgraded bodies still MEAN async — f_gap resolves
+    // the awaited value, g_gap resolves 5.
+    let driver = dir.join("driver.js");
+    let mut program = f_text.clone();
+    program.push_str(&g_text);
+    program.push_str(
+        "\nf_gap(Promise.resolve(3)).then(x => console.log(\"F:\" + x))\n\
+         .then(() => g_gap()).then(x => console.log(\"G:\" + x));\n",
+    );
+    std::fs::write(&driver, &program).expect("write driver");
+    let run = std::process::Command::new(node)
+        .arg(&driver)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&run.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&run.stderr).to_string();
+    eprintln!(
+        "NODE-EVIDENCE exit={} stdout={:?} stderr={:?}",
+        run.status, stdout, stderr
+    );
+    assert!(run.status.success(), "node run failed: {stderr}");
+    assert_eq!(stdout, "F:3\nG:5\n", "metadata-gap async behavior mismatch");
+}
