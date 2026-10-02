@@ -33,7 +33,20 @@ jobs:
     needs: [fmt]
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Platform-compatibility lanes (2026-10-02 ruling): OS x arch cross,
+        # each at the OLDEST label GitHub still offers — the point is that
+        # artifacts built here keep running for ordinary users on old
+        # systems. ubuntu-latest is deliberately NOT a lane: every other job
+        # covers the current baseline. (The focal container lane was
+        # considered and dropped; MSRV deliberately not tracked — we follow
+        # the latest Rust, old-toolchain builders are on their own.)
+        os:
+          - ubuntu-22.04 # oldest x86_64 Linux glibc GH offers
+          - ubuntu-22.04-arm # aarch64 Linux (OpenHarmony's home turf)
+          - macos-14 # oldest Apple Silicon label
+          - macos-13 # Intel Mac, while it lasts
+          - windows-2022 # oldest Windows label
+          - windows-11-arm # aarch64 Windows
     steps:
       - uses: actions/checkout@v4
       # Not actions/checkout's submodules:true: it recurses and dies on
