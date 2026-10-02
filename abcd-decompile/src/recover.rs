@@ -381,6 +381,44 @@ pub fn recover_func(module: &Module, func: FuncId) -> RecoveredFunc {
     Recover::new(module, func).run()
 }
 
+/// The decompilation kind of a function: the file-metadata kind,
+/// upgraded on definitive BODY evidence (Bug A, wild smoke).
+///
+/// OHOS 3.2-era files (format 9.0.0.0) do not tag async functions in
+/// the method metadata — an async method reads `FunctionKind::Function`
+/// while its body carries the full es2abc async machinery
+/// (`AsyncFunctionEnter` + the per-await suspend/resume plumbing).
+/// Trusting the metadata emitted `await` into a non-async body (an
+/// unparseable text; 146/242 wild modules rejected by the es2abc
+/// recompile channel — design/wild-smoke-report.md). es2abc emits
+/// `AsyncFunctionEnter` ONLY for async functions (es2panda
+/// `asyncFunctionBuilder.cpp` `Prepare`), so its presence is decisive:
+/// a metadata-plain function carrying the entry op IS async. The
+/// upgrade restores the source truth (the `async` keyword) and
+/// unblocks the kind-gated R4 async folds. Generator kinds are never
+/// rewritten (the async-generator entry protocol carries NO
+/// `AsyncFunctionEnter` — d-P14); a missing body keeps the metadata.
+pub fn effective_kind(module: &Module, func: FuncId) -> FunctionKind {
+    let Some(f) = module.func(func) else {
+        return FunctionKind::Function;
+    };
+    let upgraded = match f.kind {
+        FunctionKind::Function => FunctionKind::Async,
+        FunctionKind::Arrow => FunctionKind::AsyncArrow,
+        _ => return f.kind,
+    };
+    let has_enter = f.blocks.iter().any(|b| {
+        module.block(*b).is_some_and(|bl| {
+            bl.insts.iter().any(|iid| {
+                module
+                    .inst(*iid)
+                    .is_some_and(|i| matches!(i.op, Op::AsyncFunctionEnter))
+            })
+        })
+    });
+    if has_enter { upgraded } else { f.kind }
+}
+
 /// Whether an op has observable effects for the inline barrier
 /// (`Effects.may_call`/`may_throw`/`writes` — §4.1).
 fn observable(op: &Op) -> bool {
@@ -609,7 +647,9 @@ impl<'m> Recover<'m> {
             };
         };
         let name = sym_str(self.module, f.name);
-        let kind = f.kind;
+        // Bug A: the body evidence wins over the metadata gap (3.2-era
+        // files do not tag async functions) — see [`effective_kind`].
+        let kind = effective_kind(self.module, self.func);
         let block_ids = f.blocks.clone();
 
         self.reserve_module_slot_names();
@@ -1561,11 +1601,13 @@ impl<'m> Recover<'m> {
             match items.get(i + 1) {
                 Some(Lit::MethodRef(fid)) => {
                     has_methods = true;
-                    let (name, kind) = self
+                    let name = self
                         .module
                         .func(*fid)
-                        .map(|f| (sym_str(self.module, f.name), f.kind))
-                        .unwrap_or_else(|| (format!("m${}", fid.index()), FunctionKind::Function));
+                        .map(|f| sym_str(self.module, f.name))
+                        .unwrap_or_else(|| format!("m${}", fid.index()));
+                    // Bug A: body evidence over the metadata gap.
+                    let kind = effective_kind(self.module, *fid);
                     build.push(ObjEntry::Method(
                         key,
                         Expr::Closure {
@@ -1915,11 +1957,13 @@ impl<'m> Recover<'m> {
 
     /// The deferred closure node.
     fn closure_node(&mut self, body: FuncId, captures: Vec<(Sym, ValueId)>) -> Expr {
-        let (name, kind) = self
+        let name = self
             .module
             .func(body)
-            .map(|f| (sym_str(self.module, f.name), f.kind))
-            .unwrap_or_else(|| (format!("<fn#{}>", body.index()), FunctionKind::Function));
+            .map(|f| sym_str(self.module, f.name))
+            .unwrap_or_else(|| format!("<fn#{}>", body.index()));
+        // Bug A: body evidence over the metadata gap.
+        let kind = effective_kind(self.module, body);
         Expr::Closure {
             body,
             name,
