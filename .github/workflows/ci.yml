@@ -22,11 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -67,11 +63,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -109,11 +101,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -146,11 +134,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -188,11 +172,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -223,11 +203,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -278,11 +254,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -339,11 +311,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -405,11 +373,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -440,11 +404,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -477,11 +437,7 @@ jobs:
             git -C "$sm" fetch --quiet --depth 1 origin "$sha"
             git -C "$sm" checkout --quiet -f "$sha"
           done
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.2'
@@ -514,7 +470,11 @@ jobs:
     runs-on: ubuntu-latest
     needs: [fmt]
     env:
-      CXX: clang++
+      # clang-23, matching the LLVM bundled by rustc >=1.99 (LLVM 23 changed
+      # the __llvm_profile_data record layout; an older clang's instrumented
+      # bridge objects mixed into the same profraw section SIGSEGV the test
+      # binary at exit — q-P13 root cause). Pinned rustc remains @stable.
+      CXX: clang++-23
     steps:
       - uses: actions/checkout@v4
       # See the build job for why: sparse, non-recursive, blob:none.
@@ -531,11 +491,7 @@ jobs:
             git -C "$sm" checkout --quiet -f "$sha"
           done
 
-      - uses: dtolnay/rust-toolchain@1.98.1
-        # Pinned 2026-10-01: rustc 1.99.0 (released 2026-09-28) SIGSEGVs our
-        # instrumented test binaries under cargo-llvm-cov (reproduced on GH
-        # and dabai; plain build/test unaffected). Revert to @stable once the
-        # upstream toolchain issue is understood/fixed. (q-P13)
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
 
@@ -557,6 +513,15 @@ jobs:
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export-wild /work/wild
 
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
+      - name: Install clang-23 (LLVM version parity with rustc's bundled LLVM)
+        shell: bash
+        run: |
+          set -euo pipefail
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 23
+          clang++-23 --version
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
