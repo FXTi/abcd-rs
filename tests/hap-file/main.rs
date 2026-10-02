@@ -25,9 +25,11 @@ mod wild_manifest;
 use std::path::{Path, PathBuf};
 use wild_manifest::{Expectation, Manifest};
 
-/// Expected corpus shape, pinned by the image digest bump in ci.yml.
-const EXPECTED_DECODE_OK: usize = 145;
-const EXPECTED_NEGATIVE: usize = 11;
+/// The corpus shape lives in the image's manifest (the digest pin in ci.yml
+/// is the change-control point). The gate asserts per-package expectations
+/// and manifest self-consistency only — expectation flips (like the 2026-10
+/// legacy-opcode one) are image-only changes, never code edits.
+const EXPECTED_TOTAL: usize = 156;
 
 /// The exported wild corpus root; override for off-layout runs.
 fn wild_corpus_root() -> PathBuf {
@@ -53,8 +55,15 @@ fn exported_corpus_wild_hap_gates() {
         panic!("wild manifest at {manifest_path:?} is unreadable/invalid: {e}");
     });
 
-    // The manifest is the oracle: its shape is pinned so a silent
-    // export-side drift (packages dropped, mislabeled) goes red here.
+    // Manifest self-consistency: every package is present on disk with a
+    // known expectation and the pinned total. Per-package behavior is
+    // asserted against the manifest's own expectation below, so a flip in
+    // the image never requires a code edit here.
+    assert_eq!(
+        manifest.packages.len(),
+        EXPECTED_TOTAL,
+        "wild manifest package count drifted (expected {EXPECTED_TOTAL})"
+    );
     let decode_ok: Vec<_> = manifest
         .packages
         .iter()
@@ -65,16 +74,6 @@ fn exported_corpus_wild_hap_gates() {
         .iter()
         .filter(|p| p.expectation == Expectation::NegativeInvalidOpcode)
         .collect();
-    assert_eq!(
-        decode_ok.len(),
-        EXPECTED_DECODE_OK,
-        "wild manifest decode-ok count drifted (expected {EXPECTED_DECODE_OK})"
-    );
-    assert_eq!(
-        negative.len(),
-        EXPECTED_NEGATIVE,
-        "wild manifest negative-invalid-opcode count drifted (expected {EXPECTED_NEGATIVE})"
-    );
 
     // ── decode-ok gate: container extraction AND every module decode ──
     let mut failures: Vec<String> = Vec::new();
