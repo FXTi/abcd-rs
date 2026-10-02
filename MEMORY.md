@@ -1755,3 +1755,11 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   mimalloc as #[global_allocator] unconditionally; the three 32-bit
   lanes also build -p abcd-cli so mimalloc-on-32-bit is CI-verified.
   Cargo.lock synced (mimalloc 0.1.52).
+- CI lane scope ruling (2026-10-02): platform lanes run root-package
+  build+test ONLY — no per-lane abcd-cli steps (maintainer: "我不想看到
+  cargo build -p abcd-cli"). Consequence accepted in the open: the CLI
+  bin target (incl. the mimalloc global_allocator in main.rs) compiles
+  per-push only on ubuntu-latest (clippy --all-targets + coverage);
+  per-platform CLI compile coverage is an accepted gap. If abcd-gui
+  ever appears: each final binary declares its own #[global_allocator]
+  in its own main.rs — one line each, no shared machinery.
