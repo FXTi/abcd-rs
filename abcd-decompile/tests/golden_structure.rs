@@ -2652,3 +2652,89 @@ fn s41_dead_loop_exit_throw_kept_on_doubt() {
     assert_eq!(stats.dead_exit_throw, 0, "a labeled jump bails the proof");
     assert_eq!(nodes, before, "doubt keeps the block: {nodes:#?}");
 }
+
+/// s42 — Bug B (wild smoke): when the scope-push comment SURVIVES (an
+/// unprovable slot keeps it), a converted slot's same-run re-store must
+/// NOT also hoist a duplicate `let x;` to the function top. scope_fold
+/// converts the first store to `let x = …`; the re-store stays a plain
+/// assignment in the text — but as a raw LexStore leaf it still counted
+/// toward emit's hoisted `lex_decls` (the surviving push keeps
+/// `own > level`), printing a second `let x;` at the function top (the
+/// wild output had both `let v0_4;` and, after the scope-push comment,
+/// `let v0_4 = undefined;` — a same-scope redeclaration, a
+/// SyntaxError).
+#[test]
+fn s42_scope_fold_restore_no_redeclare() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "f");
+    let b = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let x = intern(&mut m, "x");
+    let y = intern(&mut m, "y");
+    // Three slots, two named — the unnamed slot keeps the scope-push
+    // comment (the wild shape: `/* scope-push [<unnamed>] … */`).
+    let names = const_id(
+        &mut m,
+        Const::ArrayLiteral(vec![Const::String(x), Const::String(y)]),
+    );
+    let _ne = emit(
+        &mut m,
+        b,
+        Op::NewLexEnvWithName {
+            num_vars: 3,
+            scope_names: names,
+        },
+    );
+    let c1 = load_number(&mut m, b, 1.0);
+    emit_void(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 0,
+            value: c1,
+        },
+    );
+    let c2 = load_number(&mut m, b, 2.0);
+    emit_void(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 1,
+            value: c2,
+        },
+    );
+    // A re-store to x in the SAME statement run (the wild shape: the
+    // enum-table assignments after the slot initializations).
+    let c3 = load_number(&mut m, b, 3.0);
+    emit_void(
+        &mut m,
+        b,
+        Op::PutLexVar {
+            level: 0,
+            slot: 0,
+            value: c3,
+        },
+    );
+    let g1 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+    let g2 = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 1 });
+    let s = add(&mut m, b, g1, g2);
+    emit_void(&mut m, b, Op::Return { value: Some(s) });
+
+    let text = decompiled(&m);
+    assert_eq!(
+        text.matches("let x").count(),
+        1,
+        "x declared exactly once:\n{text}"
+    );
+    let want = r#"function f() {
+  /* scope-push [<unnamed>] (lexical binding scope not provably reconstructable — plain assignments, d-P8) */
+  let x = 1.0;
+  let y = 2.0;
+  x = 3.0;
+  return x + y;
+}
+"#;
+    assert_eq!(text, want);
+}

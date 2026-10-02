@@ -1632,3 +1632,17 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   concurrency group cancel-in-progress (today's 2.4h stuck-coverage
   incident proved both). Why sanitizers are not "everywhere": nightly
   flag, 2x corpus wall-clock, coverage-incompatible, no Windows.
+- N80 FIXED (Bug B of the wild smoke): scope_fold convert_run left
+  residual bare LexStore leaves for names already promoted to
+  Leaf::Decl earlier in the same statement run; when a scope-push
+  comment survived (an unprovable sibling slot like <unnamed>), emit's
+  lex_decls count (own > level) re-hoisted a duplicate `let n;` ->
+  same-scope redeclaration SyntaxError. Fix (folds.rs +25): after
+  decl_edits apply, rewrite same-run residual LexStores of the
+  promoted name to Leaf::Assign (the ok check already proved all its
+  stores are in this run post-push). Output text is byte-identical
+  minus the duplicate let. Wild final: es2abc recompile 242/242 (was
+  82 pre-N79, 180 post-N79) + node --check 242/242 + recompiled
+  artifacts all decode, zero function loss. dream gates unchanged.
+  Item 2 (wild smoke line) CLOSED: both P1 silent emitter bugs fixed;
+  the recompile channel caught what all corpus gates missed.

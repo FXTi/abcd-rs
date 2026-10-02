@@ -4466,9 +4466,34 @@ pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldSta
             if decl_edits.is_empty() {
                 continue;
             }
+            let mut declared_raw: Vec<String> = Vec::new();
             for (idx, leaf) in decl_edits {
+                if let Leaf::Decl { name, .. } = &leaf {
+                    declared_raw.push(name.clone());
+                }
                 leaves[idx] = leaf;
                 stats.scope_fold += 1;
+            }
+            // The name's OTHER stores in this run (the `ok` check above
+            // proved they all live here, after the push) print as plain
+            // assignments — but left as raw `LexStore` leaves they still
+            // count toward emit's hoisted `lex_decls` whenever the push
+            // comment survives (an unprovable sibling slot keeps
+            // `own > level`), printing a second `let n;` at the function
+            // top — a same-scope redeclaration (SyntaxError; wild-smoke
+            // Bug B). Rewrite them to plain assignment leaves so the
+            // block declaration is the ONLY declaration of the name.
+            for l in leaves.iter_mut().skip(p + 1) {
+                if let Leaf::Raw(Stmt::LexStore { name, value, .. }) = l
+                    && declared_raw
+                        .iter()
+                        .any(|d| *d == crate::legalize::sanitize(name))
+                {
+                    *l = Leaf::Assign {
+                        target: crate::legalize::sanitize(name),
+                        value: value.clone(),
+                    };
+                }
             }
             // The push comment: consumed when every slot was declared;
             // otherwise it stays, listing the undeclared slots only.
