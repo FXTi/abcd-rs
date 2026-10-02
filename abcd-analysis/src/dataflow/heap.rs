@@ -238,42 +238,48 @@ fn resolve_into(
     info: &mut SiteInfo,
     visiting: &mut HashSet<ValueId>,
 ) {
-    if !visiting.insert(value) {
-        // A def-chain cycle (only possible through phis): treat as a phi
-        // merge and stop.
-        info.has_phi = true;
-        return;
-    }
-    let Some(v) = module.value(value) else {
-        info.has_unknown = true;
-        return;
-    };
-    match v.def {
-        ValueDef::Param(_) | ValueDef::ExceptionParam(_) => {
+    // Explicit work stack: the def-chain depth is input-driven, so this
+    // must not recurse. All side effects are set unions / monotone flags,
+    // so the visit order is unobservable.
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        if !visiting.insert(value) {
+            // A def-chain cycle (only possible through phis): treat as a
+            // phi merge and stop.
+            info.has_phi = true;
+            continue;
+        }
+        let Some(v) = module.value(value) else {
             info.has_unknown = true;
-        }
-        ValueDef::Const(_) => {
-            // Constants are not heap allocations: they contribute no site
-            // and are not "unknown heap" either.
-        }
-        ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
-            Some(Op::Mov { src }) => resolve_into(module, *src, info, visiting),
-            Some(Op::Phi { entries }) => {
-                info.has_phi = true;
-                for (_, v) in entries {
-                    resolve_into(module, *v, info, visiting);
+            continue;
+        };
+        match v.def {
+            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => {
+                info.has_unknown = true;
+            }
+            ValueDef::Const(_) => {
+                // Constants are not heap allocations: they contribute no
+                // site and are not "unknown heap" either.
+            }
+            ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
+                Some(Op::Mov { src }) => stack.push(*src),
+                Some(Op::Phi { entries }) => {
+                    info.has_phi = true;
+                    for (_, v) in entries {
+                        stack.push(*v);
+                    }
                 }
-            }
-            Some(op) if is_keyed_alloc(op) => {
-                info.sites.union_with(&AllocSiteSet::one(iid));
-            }
-            Some(_) => {
-                info.has_unknown = true;
-            }
-            None => {
-                info.has_unknown = true;
-            }
-        },
+                Some(op) if is_keyed_alloc(op) => {
+                    info.sites.union_with(&AllocSiteSet::one(iid));
+                }
+                Some(_) => {
+                    info.has_unknown = true;
+                }
+                None => {
+                    info.has_unknown = true;
+                }
+            },
+        }
     }
 }
 

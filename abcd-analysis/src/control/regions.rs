@@ -97,6 +97,7 @@
 //! determinism check).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::rc::Rc;
 
 use abcd_ir::{BlockId, EdgeKind, FuncId, Module};
 
@@ -612,7 +613,7 @@ pub fn structure_regions(module: &Module, func: FuncId) -> RegionTree {
     }
 }
 
-/// The recursive structurer's working state.
+/// The iterative structurer's working state.
 struct Builder {
     succs: Vec<Vec<BlockId>>,
     preds: Vec<Vec<BlockId>>,
@@ -744,16 +745,309 @@ impl Builder {
             edges,
         })
     }
+}
 
+/// Pending labeled arms of an alternates decomposition: per-entry block
+/// sets in entry order.
+type ArmSets = VecDeque<(BlockId, BTreeSet<BlockId>)>;
+
+/// The shared-tail decomposition plan: tail entry, tail set, pending
+/// prefix arms.
+type SharedTailPlan = (BlockId, BTreeSet<BlockId>, ArmSets);
+
+/// One work item of the iterative structuring driver.
+///
+/// Region structuring used to be a mutual recursion (`structure_set` ⇄
+/// `peel_loop` ⇄ `structure_continuation` ⇄ `structure_acyclic`) whose
+/// depth tracked the input CFG's nesting — an ASan corpus run overflowed
+/// an 8 MiB native stack on a deeply nested fixture. The driver keeps the
+/// exact same node-push, escape-hatch and child-call order (the corpus
+/// determinism gate pins it) on this explicit heap stack instead.
+///
+/// Protocol: every task leaves exactly one result in the driver's `child`
+/// slot — the [`RegionId`] it produced, or `None` for an empty
+/// conditional arm (a child that was never scheduled). Resume frames read
+/// `child` when popped; because a resume frame is always pushed before
+/// the child task it waits for, the value it reads is its own child's.
+enum Task {
+    /// `structure_set(set, entry, disabled)`.
+    Set {
+        set: BTreeSet<BlockId>,
+        entry: BlockId,
+        disabled: Rc<BTreeSet<BlockId>>,
+    },
+    /// `structure_continuation(set, disabled)`.
+    Cont {
+        set: BTreeSet<BlockId>,
+        disabled: Rc<BTreeSet<BlockId>>,
+    },
+    /// `peel_loop` resume after the body is structured; `child` is the
+    /// body region.
+    LoopBody {
+        entry: BlockId,
+        kind: LoopKind,
+        remainder: BTreeSet<BlockId>,
+        disabled: Rc<BTreeSet<BlockId>>,
+    },
+    /// `peel_loop` resume after the continuation is structured; `child`
+    /// is the continuation region.
+    LoopCont { loop_r: RegionId },
+    /// Shared-tail resume after the tail is structured; `child` is the
+    /// tail body. `pending` holds the per-entry non-empty exclusive
+    /// prefixes, in entry order.
+    TailBody {
+        t0: BlockId,
+        pending: ArmSets,
+        disabled: Rc<BTreeSet<BlockId>>,
+    },
+    /// Labeled-arm accumulation (disjoint alternates arms and shared-tail
+    /// prefix arms alike): on entry `child` is the body of the arm
+    /// entered by `last` (`None` before the first arm).
+    Arms {
+        pending: ArmSets,
+        arms: Vec<RegionId>,
+        last: Option<BlockId>,
+        disabled: Rc<BTreeSet<BlockId>>,
+    },
+    /// `structure_acyclic` resume after a child region that simply gets
+    /// appended to `items`: the loop-header handoff and the continuation
+    /// share this shape.
+    AcycAppend { items: Vec<RegionId> },
+    /// `structure_acyclic` resume after the then arm; `child` is the then
+    /// region (`None` for an empty arm).
+    AcycThen {
+        items: Vec<RegionId>,
+        head: BlockId,
+        merge: Option<BlockId>,
+        rest: BTreeSet<BlockId>,
+        else_set: BTreeSet<BlockId>,
+        else_entry: BlockId,
+        disabled: Rc<BTreeSet<BlockId>>,
+    },
+    /// `structure_acyclic` resume after the else arm; `child` is the else
+    /// region (`None` for an empty arm).
+    AcycElse {
+        items: Vec<RegionId>,
+        head: BlockId,
+        merge: Option<BlockId>,
+        rest: BTreeSet<BlockId>,
+        then_r: Option<RegionId>,
+        disabled: Rc<BTreeSet<BlockId>>,
+    },
+    /// `structure_acyclic` handler-rejoin demotion resume; `child` is the
+    /// single conditional arm (`None` when empty).
+    AcycDemote {
+        items: Vec<RegionId>,
+        head: BlockId,
+        cond_arm_is_then: bool,
+        rest: BTreeSet<BlockId>,
+        disabled: Rc<BTreeSet<BlockId>>,
+    },
+}
+
+impl Builder {
     /// Structure `set` (a single-entry subset of the universe) with `entry`
     /// as its unique handoff. `disabled` holds loop headers already peeled
     /// by an ancestor (their incoming edges are continues, not loops).
+    ///
+    /// Iterative driver over the explicit [`Task`] stack — see the enum
+    /// docs for why this is not recursion.
     fn structure_set(
         &mut self,
         set: BTreeSet<BlockId>,
         entry: BlockId,
         disabled: &BTreeSet<BlockId>,
     ) -> RegionId {
+        let mut stack: Vec<Task> = vec![Task::Set {
+            set,
+            entry,
+            disabled: Rc::new(disabled.clone()),
+        }];
+        let mut child: Option<RegionId> = None;
+        while let Some(task) = stack.pop() {
+            match task {
+                Task::Set {
+                    set,
+                    entry,
+                    disabled,
+                } => self.start_set(&mut stack, &mut child, set, entry, disabled),
+                Task::Cont { set, disabled } => {
+                    self.start_continuation(&mut stack, &mut child, set, disabled)
+                }
+                Task::LoopBody {
+                    entry,
+                    kind,
+                    remainder,
+                    disabled,
+                } => {
+                    let body_r = child.expect("loop body region");
+                    let loop_r = self.push_node(RegionNode::Loop {
+                        header: entry,
+                        kind,
+                        body: body_r,
+                    });
+                    if remainder.is_empty() {
+                        child = Some(loop_r);
+                    } else {
+                        stack.push(Task::LoopCont { loop_r });
+                        stack.push(Task::Cont {
+                            set: remainder,
+                            disabled,
+                        });
+                    }
+                }
+                Task::LoopCont { loop_r } => {
+                    let cont = child.expect("loop continuation region");
+                    child = Some(self.push_node(RegionNode::Seq(vec![loop_r, cont])));
+                }
+                Task::TailBody {
+                    t0,
+                    pending,
+                    disabled,
+                } => {
+                    let tail_body = child.expect("shared-tail body region");
+                    let arms = vec![self.push_node(RegionNode::Labeled {
+                        label: t0,
+                        body: tail_body,
+                    })];
+                    stack.push(Task::Arms {
+                        pending,
+                        arms,
+                        last: None,
+                        disabled,
+                    });
+                }
+                Task::Arms {
+                    mut pending,
+                    mut arms,
+                    last,
+                    disabled,
+                } => {
+                    if let Some(e) = last {
+                        let body = child.expect("alternates arm region");
+                        arms.push(self.push_node(RegionNode::Labeled { label: e, body }));
+                    }
+                    match pending.pop_front() {
+                        Some((e, set)) => {
+                            stack.push(Task::Arms {
+                                pending,
+                                arms,
+                                last: Some(e),
+                                disabled: disabled.clone(),
+                            });
+                            stack.push(Task::Set {
+                                set,
+                                entry: e,
+                                disabled,
+                            });
+                        }
+                        None => {
+                            child = Some(self.push_node(RegionNode::Alternates(arms)));
+                        }
+                    }
+                }
+                Task::AcycAppend { mut items } => {
+                    let r = child.expect("acyclic child region");
+                    items.push(r);
+                    child = Some(self.wrap_seq(items));
+                }
+                Task::AcycThen {
+                    items,
+                    head,
+                    merge,
+                    rest,
+                    else_set,
+                    else_entry,
+                    disabled,
+                } => {
+                    let then_r = child;
+                    stack.push(Task::AcycElse {
+                        items,
+                        head,
+                        merge,
+                        rest,
+                        then_r,
+                        disabled: disabled.clone(),
+                    });
+                    if else_set.is_empty() {
+                        child = None;
+                    } else {
+                        stack.push(Task::Set {
+                            set: else_set,
+                            entry: else_entry,
+                            disabled,
+                        });
+                    }
+                }
+                Task::AcycElse {
+                    mut items,
+                    head,
+                    merge,
+                    rest,
+                    then_r,
+                    disabled,
+                } => {
+                    let else_r = child;
+                    items.push(self.push_node(RegionNode::If {
+                        head,
+                        then: then_r,
+                        otherwise: else_r,
+                        merge,
+                    }));
+                    if rest.is_empty() {
+                        child = Some(self.wrap_seq(items));
+                    } else {
+                        stack.push(Task::AcycAppend { items });
+                        stack.push(Task::Cont {
+                            set: rest,
+                            disabled,
+                        });
+                    }
+                }
+                Task::AcycDemote {
+                    mut items,
+                    head,
+                    cond_arm_is_then,
+                    rest,
+                    disabled,
+                } => {
+                    let arm_r = child;
+                    let (then_r, else_r) = if cond_arm_is_then {
+                        (arm_r, None)
+                    } else {
+                        (None, arm_r)
+                    };
+                    items.push(self.push_node(RegionNode::If {
+                        head,
+                        then: then_r,
+                        otherwise: else_r,
+                        merge: None,
+                    }));
+                    if rest.is_empty() {
+                        child = Some(self.wrap_seq(items));
+                    } else {
+                        stack.push(Task::AcycAppend { items });
+                        stack.push(Task::Cont {
+                            set: rest,
+                            disabled,
+                        });
+                    }
+                }
+            }
+        }
+        child.expect("the root task always produces a region")
+    }
+
+    /// The `structure_set` prologue: multi-entry escape, loop-peel
+    /// dispatch, else acyclic structuring.
+    fn start_set(
+        &mut self,
+        stack: &mut Vec<Task>,
+        child: &mut Option<RegionId>,
+        set: BTreeSet<BlockId>,
+        entry: BlockId,
+        disabled: Rc<BTreeSet<BlockId>>,
+    ) {
         debug_assert!(set.contains(&entry));
         // Single-entry invariant: only `entry` may have predecessors
         // outside the set. Violations are irreducible/multi-entry shapes.
@@ -767,16 +1061,19 @@ impl Builder {
                 blocks: set.iter().copied().collect(),
                 entries: extra,
             });
-            return self.irreducible_node(&set);
+            *child = Some(self.irreducible_node(&set));
+            return;
         }
         // Loop peel: any in-set predecessor of the entry is a latch.
         if !disabled.contains(&entry) && self.preds[entry.index()].iter().any(|p| set.contains(p)) {
-            return self.peel_loop(set, entry, disabled);
+            self.start_loop(stack, set, entry, disabled);
+            return;
         }
-        self.structure_acyclic(set, entry, disabled)
+        self.start_acyclic(stack, child, set, entry, disabled);
     }
 
-    /// Peel the loop headed by `entry` out of `set`.
+    /// Peel the loop headed by `entry` out of `set`: schedule the body
+    /// and continuation, resuming at [`Task::LoopBody`].
     ///
     /// The body starts as the natural loop (entry plus everything reaching
     /// a latch without passing entry) and is then grown by **exit-tail
@@ -787,12 +1084,13 @@ impl Builder {
     /// termination/after-point (reconverging with break tails there), not
     /// exit paths. Absorption is what keeps break/continue tails from
     /// surfacing as bogus multi-entry continuations.
-    fn peel_loop(
+    fn start_loop(
         &mut self,
+        stack: &mut Vec<Task>,
         set: BTreeSet<BlockId>,
         entry: BlockId,
-        disabled: &BTreeSet<BlockId>,
-    ) -> RegionId {
+        disabled: Rc<BTreeSet<BlockId>>,
+    ) {
         let latches: Vec<BlockId> = self.preds[entry.index()]
             .iter()
             .copied()
@@ -865,35 +1163,38 @@ impl Builder {
             LoopKind::While
         };
 
-        let mut disabled2 = disabled.clone();
+        let mut disabled2 = (*disabled).clone();
         disabled2.insert(entry);
+        let disabled2 = Rc::new(disabled2);
         let mut remainder = set;
         for b in &body {
             remainder.remove(b);
         }
-        let body_r = self.structure_set(body, entry, &disabled2);
-        let loop_r = self.push_node(RegionNode::Loop {
-            header: entry,
+        stack.push(Task::LoopBody {
+            entry,
             kind,
-            body: body_r,
+            remainder,
+            disabled: disabled2.clone(),
         });
-        if remainder.is_empty() {
-            return loop_r;
-        }
-        let cont = self.structure_continuation(remainder, &disabled2);
-        self.push_node(RegionNode::Seq(vec![loop_r, cont]))
+        stack.push(Task::Set {
+            set: body,
+            entry,
+            disabled: disabled2,
+        });
     }
 
     /// Structure a remainder set entered by handoff from already-structured
-    /// siblings. Single entry: plain recursion. Multiple entries: disjoint
+    /// siblings. Single entry: plain dispatch. Multiple entries: disjoint
     /// per-entry slices become labeled alternates; overlapping slices with
-    /// a shared fall-through tail become a tail-arm alternates
-    /// ([`Builder::structure_shared_tail`]); anything else escapes.
-    fn structure_continuation(
+    /// a shared fall-through tail become a tail-arm alternates (see
+    /// [`Builder::shared_tail_plan`]); anything else escapes.
+    fn start_continuation(
         &mut self,
+        stack: &mut Vec<Task>,
+        child: &mut Option<RegionId>,
         set: BTreeSet<BlockId>,
-        disabled: &BTreeSet<BlockId>,
-    ) -> RegionId {
+        disabled: Rc<BTreeSet<BlockId>>,
+    ) {
         let entries: Vec<BlockId> = set
             .iter()
             .copied()
@@ -904,9 +1205,13 @@ impl Builder {
                 self.escape_hatches.push(EscapeHatch::Stranded {
                     blocks: set.iter().copied().collect(),
                 });
-                self.irreducible_node(&set)
+                *child = Some(self.irreducible_node(&set));
             }
-            1 => self.structure_set(set, entries[0], disabled),
+            1 => stack.push(Task::Set {
+                set,
+                entry: entries[0],
+                disabled,
+            }),
             _ => {
                 let avoid = BTreeSet::new();
                 let slices: Vec<BTreeSet<BlockId>> = entries
@@ -927,27 +1232,35 @@ impl Builder {
                     // shape — several entries converge on a SHARED TAIL
                     // (case bodies falling into each other). Try the
                     // tail-arm decomposition before escaping.
-                    if let Some(node) =
-                        self.structure_shared_tail(&set, &entries, &slices, disabled)
-                    {
-                        node
-                    } else {
-                        self.escape_hatches.push(EscapeHatch::MultiEntry {
-                            blocks: set.iter().copied().collect(),
-                            entries,
-                        });
-                        self.irreducible_node(&set)
+                    match self.shared_tail_plan(&set, &entries, &slices) {
+                        Some((t0, tail, pending)) => {
+                            stack.push(Task::TailBody {
+                                t0,
+                                pending,
+                                disabled: disabled.clone(),
+                            });
+                            stack.push(Task::Set {
+                                set: tail,
+                                entry: t0,
+                                disabled,
+                            });
+                        }
+                        None => {
+                            self.escape_hatches.push(EscapeHatch::MultiEntry {
+                                blocks: set.iter().copied().collect(),
+                                entries,
+                            });
+                            *child = Some(self.irreducible_node(&set));
+                        }
                     }
                 } else {
-                    let arms: Vec<RegionId> = entries
-                        .iter()
-                        .zip(slices)
-                        .map(|(&e, slice)| {
-                            let body = self.structure_set(slice, e, disabled);
-                            self.push_node(RegionNode::Labeled { label: e, body })
-                        })
-                        .collect();
-                    self.push_node(RegionNode::Alternates(arms))
+                    let pending: ArmSets = entries.iter().copied().zip(slices).collect();
+                    stack.push(Task::Arms {
+                        pending,
+                        arms: Vec::new(),
+                        last: None,
+                        disabled,
+                    });
                 }
             }
         }
@@ -975,15 +1288,17 @@ impl Builder {
     /// the continuation. This is the source-shaped form the state-
     /// variable escape hatch (design §4.2.4) previously flattened.
     ///
-    /// Returns `None` (caller escapes to the hatch) when any
-    /// precondition fails.
-    fn structure_shared_tail(
-        &mut self,
+    /// This is the pure precondition half of the decomposition (the
+    /// structuring itself is scheduled by [`Task::TailBody`] /
+    /// [`Task::Arms`]): it returns the tail entry, the tail set, and the
+    /// per-entry non-empty exclusive prefixes in entry order, or `None`
+    /// (the caller escapes to the hatch) when any precondition fails.
+    fn shared_tail_plan(
+        &self,
         set: &BTreeSet<BlockId>,
         entries: &[BlockId],
         slices: &[BTreeSet<BlockId>],
-        disabled: &BTreeSet<BlockId>,
-    ) -> Option<RegionId> {
+    ) -> Option<SharedTailPlan> {
         // The tail: reachable from every entry.
         let mut tail = slices.first()?.clone();
         for slice in &slices[1..] {
@@ -1063,30 +1378,27 @@ impl Builder {
         // then one arm per entry with a non-empty exclusive prefix.
         // Entries that ARE `t0` need no prefix arm — `break L$t0` from
         // the preceding siblings lands at the tail directly.
-        let tail_body = self.structure_set(tail.clone(), t0, disabled);
-        let mut arms: Vec<RegionId> = vec![self.push_node(RegionNode::Labeled {
-            label: t0,
-            body: tail_body,
-        })];
-        for (&e, prefix) in entries.iter().zip(prefixes.iter()) {
-            if prefix.is_empty() {
-                continue;
-            }
-            let body = self.structure_set(prefix.clone(), e, disabled);
-            arms.push(self.push_node(RegionNode::Labeled { label: e, body }));
-        }
-        Some(self.push_node(RegionNode::Alternates(arms)))
+        let pending: ArmSets = entries
+            .iter()
+            .copied()
+            .zip(prefixes)
+            .filter(|(_, prefix)| !prefix.is_empty())
+            .collect();
+        Some((t0, tail, pending))
     }
 
     /// Acyclic structuring: iterative straight-line runs, conditional
     /// splits at two-successor heads, loop headers handed back to
-    /// [`Builder::structure_set`].
-    fn structure_acyclic(
+    /// [`Task::Set`]. Child structurings suspend the run through resume
+    /// frames on `stack`.
+    fn start_acyclic(
         &mut self,
+        stack: &mut Vec<Task>,
+        child: &mut Option<RegionId>,
         set: BTreeSet<BlockId>,
         entry: BlockId,
-        disabled: &BTreeSet<BlockId>,
-    ) -> RegionId {
+        disabled: Rc<BTreeSet<BlockId>>,
+    ) {
         let mut items: Vec<RegionId> = Vec::new();
         let mut rest = set;
         let mut cur = entry;
@@ -1095,9 +1407,13 @@ impl Builder {
             // (the peel structures it and its continuation).
             if !disabled.contains(&cur) && self.preds[cur.index()].iter().any(|p| rest.contains(p))
             {
-                let r = self.structure_set(rest, cur, disabled);
-                items.push(r);
-                return self.wrap_seq(items);
+                stack.push(Task::AcycAppend { items });
+                stack.push(Task::Set {
+                    set: rest,
+                    entry: cur,
+                    disabled,
+                });
+                return;
             }
             rest.remove(&cur);
             let succs_in: Vec<BlockId> = self.succs[cur.index()]
@@ -1215,25 +1531,25 @@ impl Builder {
                         for b in &arm_set {
                             rest.remove(b);
                         }
-                        let arm_r = (!arm_set.is_empty())
-                            .then(|| self.structure_set(arm_set, arm_entry, disabled));
-                        let (then_r, else_r) = if cond_arm_is_then {
-                            (arm_r, None)
-                        } else {
-                            (None, arm_r)
-                        };
-                        items.push(self.push_node(RegionNode::If {
+                        stack.push(Task::AcycDemote {
+                            items,
                             head: cur,
-                            then: then_r,
-                            otherwise: else_r,
-                            merge: None,
-                        }));
-                        if rest.is_empty() {
-                            break;
+                            cond_arm_is_then,
+                            rest,
+                            disabled: disabled.clone(),
+                        });
+                        if arm_set.is_empty() {
+                            // An empty arm structures to `None` without a
+                            // child task.
+                            *child = None;
+                        } else {
+                            stack.push(Task::Set {
+                                set: arm_set,
+                                entry: arm_entry,
+                                disabled,
+                            });
                         }
-                        let cont = self.structure_continuation(rest, disabled);
-                        items.push(cont);
-                        return self.wrap_seq(items);
+                        return;
                     }
                     self.cross_arms.extend(cross);
                     for b in &then_set {
@@ -1242,22 +1558,27 @@ impl Builder {
                     for b in &else_set {
                         rest.remove(b);
                     }
-                    let then_r =
-                        (!then_set.is_empty()).then(|| self.structure_set(then_set, t, disabled));
-                    let else_r =
-                        (!else_set.is_empty()).then(|| self.structure_set(else_set, f, disabled));
-                    items.push(self.push_node(RegionNode::If {
+                    stack.push(Task::AcycThen {
+                        items,
                         head: cur,
-                        then: then_r,
-                        otherwise: else_r,
                         merge,
-                    }));
-                    if rest.is_empty() {
-                        break;
+                        rest,
+                        else_set,
+                        else_entry: f,
+                        disabled: disabled.clone(),
+                    });
+                    if then_set.is_empty() {
+                        // An empty arm structures to `None` without a
+                        // child task.
+                        *child = None;
+                    } else {
+                        stack.push(Task::Set {
+                            set: then_set,
+                            entry: t,
+                            disabled,
+                        });
                     }
-                    let cont = self.structure_continuation(rest, disabled);
-                    items.push(cont);
-                    return self.wrap_seq(items);
+                    return;
                 }
             }
         }
@@ -1270,7 +1591,7 @@ impl Builder {
             let r = self.irreducible_node(&rest);
             items.push(r);
         }
-        self.wrap_seq(items)
+        *child = Some(self.wrap_seq(items));
     }
 }
 
@@ -1502,75 +1823,107 @@ fn project_try_regions(
     (plans, errors)
 }
 
-/// Recursive containment walk: returns `(protected blocks inside, total
-/// blocks inside)` for the subtree, records the smallest node containing
-/// the whole protected set in `span`, and sets `cuts` when a Loop or
-/// Irreducible node is partially protected (see
-/// [`TryPlan::cuts_structured_region`]).
+/// Iterative containment walk (post-order over an explicit stack — the
+/// tree depth is input-driven, so this must not recurse): returns
+/// `(protected blocks inside, total blocks inside)` for the subtree,
+/// records the smallest node containing the whole protected set in `span`,
+/// and sets `cuts` when a Loop or Irreducible node is partially protected
+/// (see [`TryPlan::cuts_structured_region`]).
 fn walk_region(
     nodes: &[RegionNode],
-    id: RegionId,
+    root: RegionId,
     p: &BTreeSet<BlockId>,
     span: &mut Option<RegionId>,
     cuts: &mut bool,
 ) -> (usize, usize) {
-    let node = &nodes[id.index()];
-    let (in_p, total) = match node {
-        RegionNode::Block(b) => (usize::from(p.contains(b)), 1),
-        RegionNode::Irreducible { blocks, .. } => (
-            blocks.iter().filter(|b| p.contains(b)).count(),
-            blocks.len(),
-        ),
-        RegionNode::Seq(children) | RegionNode::Alternates(children) => {
-            walk_children(nodes, children, p, span, cuts)
-        }
-        RegionNode::Labeled { body, .. } | RegionNode::Loop { body, .. } => {
-            walk_region(nodes, *body, p, span, cuts)
-        }
-        RegionNode::If {
-            head,
-            then,
-            otherwise,
-            ..
-        } => {
-            let mut total = (usize::from(p.contains(head)), 1);
-            for child in [then, otherwise].into_iter().flatten() {
-                let c = walk_region(nodes, *child, p, span, cuts);
-                total.0 += c.0;
-                total.1 += c.1;
+    /// Post-order scheduling: `Enter` pushes the node's `Exit` marker
+    /// followed by its children (in reverse, so they run in order);
+    /// `Exit` folds the children's results from `results` and applies the
+    /// node-local bookkeeping, exactly the recursive post-order.
+    enum W {
+        Enter(RegionId),
+        Exit(RegionId),
+    }
+    let mut stack = vec![W::Enter(root)];
+    let mut results: Vec<(usize, usize)> = Vec::new();
+    while let Some(w) = stack.pop() {
+        match w {
+            W::Enter(id) => {
+                stack.push(W::Exit(id));
+                match &nodes[id.index()] {
+                    RegionNode::Block(_) | RegionNode::Irreducible { .. } => {}
+                    RegionNode::Seq(children) | RegionNode::Alternates(children) => {
+                        for &c in children.iter().rev() {
+                            stack.push(W::Enter(c));
+                        }
+                    }
+                    RegionNode::Labeled { body, .. } | RegionNode::Loop { body, .. } => {
+                        stack.push(W::Enter(*body));
+                    }
+                    RegionNode::If {
+                        then, otherwise, ..
+                    } => {
+                        // Child order: then, then otherwise.
+                        if let Some(o) = otherwise {
+                            stack.push(W::Enter(*o));
+                        }
+                        if let Some(t) = then {
+                            stack.push(W::Enter(*t));
+                        }
+                    }
+                }
             }
-            total
+            W::Exit(id) => {
+                let node = &nodes[id.index()];
+                let (in_p, total) = match node {
+                    RegionNode::Block(b) => (usize::from(p.contains(b)), 1),
+                    RegionNode::Irreducible { blocks, .. } => (
+                        blocks.iter().filter(|b| p.contains(b)).count(),
+                        blocks.len(),
+                    ),
+                    RegionNode::Seq(children) | RegionNode::Alternates(children) => {
+                        let mut total = (0, 0);
+                        for r in results.drain(results.len() - children.len()..) {
+                            total.0 += r.0;
+                            total.1 += r.1;
+                        }
+                        total
+                    }
+                    RegionNode::Labeled { .. } | RegionNode::Loop { .. } => {
+                        results.pop().expect("child result")
+                    }
+                    RegionNode::If {
+                        head,
+                        then,
+                        otherwise,
+                        ..
+                    } => {
+                        let n = usize::from(then.is_some()) + usize::from(otherwise.is_some());
+                        let mut total = (usize::from(p.contains(head)), 1);
+                        for r in results.drain(results.len() - n..) {
+                            total.0 += r.0;
+                            total.1 += r.1;
+                        }
+                        total
+                    }
+                };
+                if matches!(
+                    node,
+                    RegionNode::Loop { .. } | RegionNode::Irreducible { .. }
+                ) && in_p > 0
+                    && in_p < total
+                {
+                    *cuts = true;
+                }
+                // Deepest node containing the whole protected set wins.
+                if in_p == p.len() && span.is_none() {
+                    *span = Some(id);
+                }
+                results.push((in_p, total));
+            }
         }
-    };
-    if matches!(
-        node,
-        RegionNode::Loop { .. } | RegionNode::Irreducible { .. }
-    ) && in_p > 0
-        && in_p < total
-    {
-        *cuts = true;
     }
-    // Deepest node containing the whole protected set wins.
-    if in_p == p.len() && span.is_none() {
-        *span = Some(id);
-    }
-    (in_p, total)
-}
-
-fn walk_children(
-    nodes: &[RegionNode],
-    children: &[RegionId],
-    p: &BTreeSet<BlockId>,
-    span: &mut Option<RegionId>,
-    cuts: &mut bool,
-) -> (usize, usize) {
-    let mut total = (0, 0);
-    for &c in children {
-        let r = walk_region(nodes, c, p, span, cuts);
-        total.0 += r.0;
-        total.1 += r.1;
-    }
-    total
+    results.pop().expect("root result")
 }
 
 #[cfg(test)]
@@ -2167,5 +2520,190 @@ mod tests {
         assert_eq!(tree.root_node(), Some(&RegionNode::Block(entry)));
         assert!(tree.edges.is_empty());
         assert!(tree.loops.is_empty());
+    }
+
+    /// Stack-depth regression guard for the ASan corpus stack-overflow
+    /// (lift-analysis gate, rayon worker thread): region structuring must
+    /// be driven by an explicit heap stack, never by native recursion with
+    /// input-driven depth. Deeply nested shapes must structure on a
+    /// 256 KiB stack.
+    ///
+    /// `if (c1) { if (c2) { … } }` nesting, N levels deep: every level is
+    /// a two-successor head whose then-arm contains the whole inner nest
+    /// (an empty else, the merge chained to the outer merge).
+    #[test]
+    fn deep_nested_ifs_structure_on_small_stack() {
+        const N: usize = 1000;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut m = mk_module();
+                let f = add_func(&mut m);
+                let h: Vec<BlockId> = (0..N)
+                    .map(|i| {
+                        if i == 0 {
+                            entry_of(&m, f)
+                        } else {
+                            add_block(&mut m, f)
+                        }
+                    })
+                    .collect();
+                let leaf = add_block(&mut m, f);
+                let merges: Vec<BlockId> = (0..N).map(|_| add_block(&mut m, f)).collect();
+                let exit = add_block(&mut m, f);
+                for i in 0..N - 1 {
+                    cond_branch(&mut m, h[i], h[i + 1], merges[i]);
+                    link(&mut m, h[i], h[i + 1]);
+                    link(&mut m, h[i], merges[i]);
+                }
+                cond_branch(&mut m, h[N - 1], leaf, merges[N - 1]);
+                link(&mut m, h[N - 1], leaf);
+                link(&mut m, h[N - 1], merges[N - 1]);
+                branch(&mut m, leaf, merges[N - 1]);
+                link(&mut m, leaf, merges[N - 1]);
+                for i in (1..N).rev() {
+                    branch(&mut m, merges[i], merges[i - 1]);
+                    link(&mut m, merges[i], merges[i - 1]);
+                }
+                branch(&mut m, merges[0], exit);
+                link(&mut m, merges[0], exit);
+                ret(&mut m, exit);
+
+                let tree = structure_regions(&m, f);
+                assert!(tree.errors.is_empty(), "{:?}", tree.errors);
+                assert!(tree.root.is_some());
+                assert!(tree.loops.is_empty());
+                // Every block structured: 2N+2 block-carrying nodes.
+                let covered = tree
+                    .nodes()
+                    .iter()
+                    .filter(|n| matches!(n, RegionNode::Block(_) | RegionNode::If { .. }))
+                    .count();
+                assert_eq!(covered, 2 * N + 2);
+            })
+            .expect("spawn");
+        handle
+            .join()
+            .expect("structuring must not overflow the stack");
+    }
+
+    /// Same guard through the loop-peel path: N nested `while` loops, each
+    /// level's body being the next inner loop, exits chaining to the outer
+    /// latch.
+    #[test]
+    fn deep_nested_loops_structure_on_small_stack() {
+        const N: usize = 400;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut m = mk_module();
+                let f = add_func(&mut m);
+                let entry = entry_of(&m, f);
+                let h: Vec<BlockId> = (0..N).map(|_| add_block(&mut m, f)).collect();
+                let body = add_block(&mut m, f);
+                let latches: Vec<BlockId> = (0..N).map(|_| add_block(&mut m, f)).collect();
+                let exits: Vec<BlockId> = (0..N).map(|_| add_block(&mut m, f)).collect();
+                let exit = add_block(&mut m, f);
+                branch(&mut m, entry, h[0]);
+                link(&mut m, entry, h[0]);
+                for i in 0..N - 1 {
+                    cond_branch(&mut m, h[i], h[i + 1], exits[i]);
+                    link(&mut m, h[i], h[i + 1]);
+                    link(&mut m, h[i], exits[i]);
+                }
+                cond_branch(&mut m, h[N - 1], body, exits[N - 1]);
+                link(&mut m, h[N - 1], body);
+                link(&mut m, h[N - 1], exits[N - 1]);
+                branch(&mut m, body, latches[N - 1]);
+                link(&mut m, body, latches[N - 1]);
+                for i in 0..N {
+                    branch(&mut m, latches[i], h[i]);
+                    link(&mut m, latches[i], h[i]);
+                }
+                // An exit out of loop i lands on the outer latch (still
+                // inside loop i-1's body); the outermost exit returns.
+                for i in 1..N {
+                    branch(&mut m, exits[i], latches[i - 1]);
+                    link(&mut m, exits[i], latches[i - 1]);
+                }
+                branch(&mut m, exits[0], exit);
+                link(&mut m, exits[0], exit);
+                ret(&mut m, exit);
+
+                let tree = structure_regions(&m, f);
+                assert!(tree.errors.is_empty(), "{:?}", tree.errors);
+                assert!(tree.root.is_some());
+                assert_eq!(tree.loops.len(), N);
+                // Determinism on the deep shape too.
+                assert_eq!(tree, structure_regions(&m, f));
+            })
+            .expect("spawn");
+        handle
+            .join()
+            .expect("structuring must not overflow the stack");
+    }
+
+    /// Same guard through the TryRegion projection walk: a protected set
+    /// covering a deeply nested tree makes `walk_region` descend the full
+    /// tree depth.
+    #[test]
+    fn deep_nested_tree_try_projection_on_small_stack() {
+        const N: usize = 1000;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let mut m = mk_module();
+                let f = add_func(&mut m);
+                let h: Vec<BlockId> = (0..N)
+                    .map(|i| {
+                        if i == 0 {
+                            entry_of(&m, f)
+                        } else {
+                            add_block(&mut m, f)
+                        }
+                    })
+                    .collect();
+                let leaf = add_block(&mut m, f);
+                let merges: Vec<BlockId> = (0..N).map(|_| add_block(&mut m, f)).collect();
+                let exit = add_block(&mut m, f);
+                for i in 0..N - 1 {
+                    cond_branch(&mut m, h[i], h[i + 1], merges[i]);
+                    link(&mut m, h[i], h[i + 1]);
+                    link(&mut m, h[i], merges[i]);
+                }
+                cond_branch(&mut m, h[N - 1], leaf, merges[N - 1]);
+                link(&mut m, h[N - 1], leaf);
+                link(&mut m, h[N - 1], merges[N - 1]);
+                branch(&mut m, leaf, merges[N - 1]);
+                link(&mut m, leaf, merges[N - 1]);
+                for i in (1..N).rev() {
+                    branch(&mut m, merges[i], merges[i - 1]);
+                    link(&mut m, merges[i], merges[i - 1]);
+                }
+                branch(&mut m, merges[0], exit);
+                link(&mut m, merges[0], exit);
+                ret(&mut m, exit);
+                // One try region protecting every structured block.
+                let handler = add_block(&mut m, f);
+                let exc = add_exception_param(&mut m, handler);
+                ret(&mut m, handler);
+                let protected: Vec<BlockId> = h
+                    .iter()
+                    .chain(std::iter::once(&leaf))
+                    .chain(merges.iter())
+                    .chain(std::iter::once(&exit))
+                    .copied()
+                    .collect();
+                add_try(&mut m, f, protected, handler, exc);
+
+                let tree = structure_regions(&m, f);
+                assert!(tree.errors.is_empty(), "{:?}", tree.errors);
+                assert_eq!(tree.try_plans.len(), 1);
+                assert_eq!(tree.try_plans[0].span, tree.root);
+            })
+            .expect("spawn");
+        handle
+            .join()
+            .expect("projection must not overflow the stack");
     }
 }

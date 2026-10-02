@@ -380,7 +380,11 @@ fn resolve_callee(module: &Module, current: FuncId, callee: ValueId) -> Resoluti
     Resolution { funcs, complete }
 }
 
-/// The recursive worker; returns whether the trace was complete.
+/// The trace worker; returns whether the trace was complete. Iterative
+/// (explicit stack): the def-chain depth is input-driven, so this must
+/// not recurse. The result is the AND of every visited leaf's
+/// completeness and `funcs` is a set, so the visit order is
+/// unobservable — the worklist reproduces the recursive walk exactly.
 fn trace(
     module: &Module,
     current: FuncId,
@@ -388,54 +392,55 @@ fn trace(
     funcs: &mut BTreeSet<FuncId>,
     visiting: &mut HashSet<ValueId>,
 ) -> bool {
-    if !visiting.insert(value) {
-        // Phi cycles: the value is already being traced; its contribution
-        // arrives through the in-progress visit. Complete.
-        return true;
-    }
-    let Some(v) = module.value(value) else {
-        return false;
-    };
-    match v.def {
-        ValueDef::Param(_) | ValueDef::ExceptionParam(_) => false,
-        ValueDef::Const(c) => match module.consts.get(c) {
-            Some(Const::MethodRef(f)) => {
-                funcs.insert(*f);
-                true
-            }
-            _ => false,
-        },
-        ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
-            Some(Op::Mov { src }) => trace(module, current, *src, funcs, visiting),
-            Some(Op::LoadConst(c)) => match module.consts.get(*c) {
-                // A pooled method reference is a function value (class
-                // member buffers use the same constant kind).
+    let mut complete = true;
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        if !visiting.insert(value) {
+            // Phi cycles: the value is already being traced; its
+            // contribution arrives through the in-progress visit.
+            // Complete.
+            continue;
+        }
+        let Some(v) = module.value(value) else {
+            complete = false;
+            continue;
+        };
+        match v.def {
+            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => complete = false,
+            ValueDef::Const(c) => match module.consts.get(c) {
                 Some(Const::MethodRef(f)) => {
                     funcs.insert(*f);
-                    true
                 }
-                _ => false,
+                _ => complete = false,
             },
-            Some(Op::Phi { entries }) => {
-                let mut complete = true;
-                for (_, v) in entries {
-                    complete &= trace(module, current, *v, funcs, visiting);
+            ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
+                Some(Op::Mov { src }) => stack.push(*src),
+                Some(Op::LoadConst(c)) => match module.consts.get(*c) {
+                    // A pooled method reference is a function value (class
+                    // member buffers use the same constant kind).
+                    Some(Const::MethodRef(f)) => {
+                        funcs.insert(*f);
+                    }
+                    _ => complete = false,
+                },
+                Some(Op::Phi { entries }) => {
+                    for (_, v) in entries {
+                        stack.push(*v);
+                    }
                 }
-                complete
-            }
-            Some(Op::AllocClosure { func }) => trace(module, current, *func, funcs, visiting),
-            Some(Op::CreateGenerator { func }) => trace(module, current, *func, funcs, visiting),
-            Some(Op::DefineFunc { body, .. }) => {
-                funcs.insert(*body);
-                true
-            }
-            Some(Op::LoadFunction) => {
-                funcs.insert(current);
-                true
-            }
-            _ => false,
-        },
+                Some(Op::AllocClosure { func }) => stack.push(*func),
+                Some(Op::CreateGenerator { func }) => stack.push(*func),
+                Some(Op::DefineFunc { body, .. }) => {
+                    funcs.insert(*body);
+                }
+                Some(Op::LoadFunction) => {
+                    funcs.insert(current);
+                }
+                _ => complete = false,
+            },
+        }
     }
+    complete
 }
 
 #[cfg(test)]

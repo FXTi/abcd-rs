@@ -32,22 +32,28 @@ pub fn compute_rpo(module: &Module, func_id: FuncId) -> Vec<BlockId> {
     let mut visited = HashSet::new();
     let mut post_order = Vec::new();
 
-    fn dfs(
-        block: BlockId,
-        module: &Module,
-        visited: &mut HashSet<BlockId>,
-        post_order: &mut Vec<BlockId>,
-    ) {
-        if !visited.insert(block) {
-            return;
+    // Iterative DFS (explicit stack — the DFS depth is input-driven, so
+    // this must not recurse). The visit order is the recursive one:
+    // a node is marked visited on discovery, its successors are scanned
+    // in `block_succs` order, and it is appended to `post_order` after
+    // all its children complete.
+    visited.insert(entry);
+    let mut stack: Vec<(BlockId, std::vec::IntoIter<BlockId>)> =
+        vec![(entry, block_succs(module, entry).into_iter())];
+    while let Some((node, succs)) = stack.last_mut() {
+        let node = *node;
+        match succs.next() {
+            Some(succ) => {
+                if visited.insert(succ) {
+                    stack.push((succ, block_succs(module, succ).into_iter()));
+                }
+            }
+            None => {
+                post_order.push(node);
+                stack.pop();
+            }
         }
-        for succ in block_succs(module, block) {
-            dfs(succ, module, visited, post_order);
-        }
-        post_order.push(block);
     }
-
-    dfs(entry, module, &mut visited, &mut post_order);
 
     // Reverse the reachable post-order: entry lands at index 0.
     post_order.reverse();

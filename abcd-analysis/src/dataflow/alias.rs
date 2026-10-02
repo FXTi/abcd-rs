@@ -74,7 +74,7 @@
 //!   `(value, context)` pair is walked once.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use abcd_ir::{BlockId, FuncId, InstId, Module, Op, ValueDef, ValueId};
 
@@ -168,6 +168,59 @@ pub struct AliasEngineStats {
 struct QueryKey {
     value: ValueId,
     context: Vec<InstId>,
+}
+
+/// One work item of the alias engine's explicit-stack machine (see
+/// [`Rung1AliasOracle::resolve`]).
+enum QueryTask {
+    /// `resolve(value, func)` under the machine's current context stack.
+    Enter { value: ValueId, func: FuncId },
+    /// The epilogue of a `Mov` pass-through: fold the child answer (top
+    /// of the results stack) into the memo / in-progress bookkeeping and
+    /// leave it as this task's result.
+    Leave { key: QueryKey },
+    /// Phi accumulation: fold one incoming answer per resume, then
+    /// schedule the next incoming value.
+    Phi {
+        key: QueryKey,
+        func: FuncId,
+        pending: VecDeque<ValueId>,
+        acc: QueryAnswer,
+    },
+    /// Call-result accumulation (`ctx` carries `call` until the frame
+    /// completes): fold one callee-return answer per resume, then
+    /// schedule the next `(callee, returned value)` hop.
+    Call {
+        key: QueryKey,
+        call: InstId,
+        pending: VecDeque<(FuncId, ValueId)>,
+        acc: QueryAnswer,
+    },
+    /// Balanced-parameter resume: the bind child ran with `call` popped
+    /// off `ctx`; restore it and fold the answer.
+    ParamBal { key: QueryKey, call: InstId },
+    /// Unbalanced caller fan-out: fold one caller binding per resume.
+    ParamUnbal(UnbalFanout),
+}
+
+/// The state of an unbalanced caller fan-out ([`QueryTask::ParamUnbal`]).
+/// Children run with an EMPTY context stack; the caller's is restored
+/// from `saved_ctx` when the fan-out completes.
+struct UnbalFanout {
+    key: QueryKey,
+    param: ValueId,
+    func: FuncId,
+    pending: VecDeque<InstId>,
+    acc: QueryAnswer,
+    saved_ctx: Vec<InstId>,
+}
+
+/// The child-less classification of a parameter-to-argument binding (see
+/// [`Rung1AliasOracle::bind_at_call_plan`]): either a leaf answer or the
+/// single caller-side value to resolve.
+enum Bind {
+    Leaf(QueryAnswer),
+    Resolve { value: ValueId, func: FuncId },
 }
 
 /// The rung-1 oracle: a memoized demand-driven backward points-to engine
@@ -318,164 +371,366 @@ impl<'m> Rung1AliasOracle<'m> {
         self.block_func.get(block.index()).copied().flatten()
     }
 
-    /// The memoized recursive worker.
+    /// The memoized worker: an explicit-stack machine (the def-chain /
+    /// context depth is input-driven — a long `Mov` chain or a deep phi
+    /// web must not blow the native stack). Mirrors the recursive walk
+    /// exactly: `Enter` carries the memo key / in-progress bookkeeping,
+    /// `ctx` is the shared context stack every task leaves as it found
+    /// it, and `results` carries child answers up to their resume frames
+    /// (one answer per `Enter`, popped by the frame that scheduled it).
     fn resolve(&self, value: ValueId, func: FuncId, ctx: &mut Vec<InstId>) -> QueryAnswer {
+        let mut stack = vec![QueryTask::Enter { value, func }];
+        let mut results: Vec<QueryAnswer> = Vec::new();
+        while let Some(task) = stack.pop() {
+            match task {
+                QueryTask::Enter { value, func } => {
+                    self.enter_query(value, func, ctx, &mut stack, &mut results)
+                }
+                QueryTask::Leave { key } => {
+                    let ans = results.pop().expect("child answer");
+                    self.finish_query(key, ans, &mut results);
+                }
+                QueryTask::Phi {
+                    key,
+                    func,
+                    mut pending,
+                    mut acc,
+                } => {
+                    acc.union_with(&results.pop().expect("phi incoming answer"));
+                    match pending.pop_front() {
+                        Some(v) => {
+                            stack.push(QueryTask::Phi {
+                                key,
+                                func,
+                                pending,
+                                acc,
+                            });
+                            stack.push(QueryTask::Enter { value: v, func });
+                        }
+                        None => self.finish_query(key, acc, &mut results),
+                    }
+                }
+                QueryTask::Call {
+                    key,
+                    call,
+                    mut pending,
+                    mut acc,
+                } => {
+                    acc.union_with(&results.pop().expect("callee return answer"));
+                    match pending.pop_front() {
+                        Some((callee, v)) => {
+                            stack.push(QueryTask::Call {
+                                key,
+                                call,
+                                pending,
+                                acc,
+                            });
+                            stack.push(QueryTask::Enter {
+                                value: v,
+                                func: callee,
+                            });
+                        }
+                        None => {
+                            ctx.pop();
+                            self.finish_query(key, acc, &mut results);
+                        }
+                    }
+                }
+                QueryTask::ParamBal { key, call } => {
+                    ctx.push(call);
+                    let ans = results.pop().expect("bind answer");
+                    self.finish_query(key, ans, &mut results);
+                }
+                QueryTask::ParamUnbal(mut fan) => {
+                    fan.acc
+                        .union_with(&results.pop().expect("caller bind answer"));
+                    if fan.pending.is_empty() {
+                        *ctx = fan.saved_ctx;
+                        // `acc.unbalanced` was set when the fan-out
+                        // started (the original's final assignment is
+                        // idempotent with it).
+                        self.finish_query(fan.key, fan.acc, &mut results);
+                    } else {
+                        self.schedule_unbal_bind(fan, &mut stack, &mut results);
+                    }
+                }
+            }
+        }
+        results.pop().expect("root answer")
+    }
+
+    /// `Enter` dispatch: memo hit / in-progress cycle cut, else the def
+    /// dispatch (scheduling children through the task stack).
+    fn enter_query(
+        &self,
+        value: ValueId,
+        func: FuncId,
+        ctx: &mut Vec<InstId>,
+        stack: &mut Vec<QueryTask>,
+        results: &mut Vec<QueryAnswer>,
+    ) {
         let key = QueryKey {
             value,
             context: ctx.clone(),
         };
         if let Some(hit) = self.memo.borrow().get(&key) {
             self.memo_hits.set(self.memo_hits.get() + 1);
-            return hit.clone();
+            results.push(hit.clone());
+            return;
         }
         if !self.in_progress.borrow_mut().insert(key.clone()) {
             // A def-chain/query cycle (phi cycles, recursion): cut
             // conservatively. NOT cached — the answer is a function of
             // the in-progress set; caching a completed key is the
             // deterministic thing (see module docs).
-            return QueryAnswer::unknown();
+            results.push(QueryAnswer::unknown());
+            return;
         }
-        let ans = self.resolve_uncached(value, func, ctx);
+        let Some(v) = self.module.value(value) else {
+            return self.finish_query(key, QueryAnswer::unknown(), results);
+        };
+        match v.def {
+            ValueDef::Param(_) => self.enter_param(key, value, func, ctx, stack, results),
+            ValueDef::ExceptionParam(_) => self.finish_query(key, QueryAnswer::unknown(), results),
+            ValueDef::Const(_) => {
+                // Constants are not heap allocations: no site, no unknown.
+                self.finish_query(key, QueryAnswer::default(), results)
+            }
+            ValueDef::Inst(iid) => match self.module.inst(iid).map(|i| &i.op) {
+                Some(Op::Mov { src }) => {
+                    stack.push(QueryTask::Leave { key });
+                    stack.push(QueryTask::Enter { value: *src, func });
+                }
+                Some(Op::Phi { entries }) => {
+                    let acc = QueryAnswer {
+                        has_phi: true,
+                        ..QueryAnswer::default()
+                    };
+                    let mut pending: VecDeque<ValueId> = entries.iter().map(|(_, v)| *v).collect();
+                    match pending.pop_front() {
+                        Some(v) => {
+                            stack.push(QueryTask::Phi {
+                                key,
+                                func,
+                                pending,
+                                acc,
+                            });
+                            stack.push(QueryTask::Enter { value: v, func });
+                        }
+                        None => self.finish_query(key, acc, results),
+                    }
+                }
+                Some(op) if is_keyed_alloc(op) => self.finish_query(
+                    key,
+                    QueryAnswer {
+                        sites: AllocSiteSet::one(iid),
+                        ..QueryAnswer::default()
+                    },
+                    results,
+                ),
+                Some(Op::Call { .. }) => self.enter_call_result(key, iid, ctx, stack, results),
+                Some(_) => self.finish_query(key, QueryAnswer::unknown(), results),
+                None => self.finish_query(key, QueryAnswer::unknown(), results),
+            },
+        }
+    }
+
+    /// The `resolve` epilogue: unmark in-progress, count cap cuts,
+    /// memoize, and leave the answer on `results`.
+    fn finish_query(&self, key: QueryKey, ans: QueryAnswer, results: &mut Vec<QueryAnswer>) {
         self.in_progress.borrow_mut().remove(&key);
         if ans.capped {
             self.capped.set(self.capped.get() + 1);
         }
         self.memo.borrow_mut().insert(key, ans.clone());
-        ans
-    }
-
-    fn resolve_uncached(&self, value: ValueId, func: FuncId, ctx: &mut Vec<InstId>) -> QueryAnswer {
-        let Some(v) = self.module.value(value) else {
-            return QueryAnswer::unknown();
-        };
-        match v.def {
-            ValueDef::Param(_) => self.resolve_param(value, func, ctx),
-            ValueDef::ExceptionParam(_) => QueryAnswer::unknown(),
-            ValueDef::Const(_) => {
-                // Constants are not heap allocations: no site, no unknown.
-                QueryAnswer::default()
-            }
-            ValueDef::Inst(iid) => match self.module.inst(iid).map(|i| &i.op) {
-                Some(Op::Mov { src }) => self.resolve(*src, func, ctx),
-                Some(Op::Phi { entries }) => {
-                    let mut ans = QueryAnswer {
-                        has_phi: true,
-                        ..QueryAnswer::default()
-                    };
-                    for (_, incoming) in entries {
-                        ans.union_with(&self.resolve(*incoming, func, ctx));
-                    }
-                    ans
-                }
-                Some(op) if is_keyed_alloc(op) => QueryAnswer {
-                    sites: AllocSiteSet::one(iid),
-                    ..QueryAnswer::default()
-                },
-                Some(Op::Call { .. }) => self.resolve_call_result(iid, ctx),
-                Some(_) => QueryAnswer::unknown(),
-                None => QueryAnswer::unknown(),
-            },
-        }
+        results.push(ans);
     }
 
     /// A call result: hop into every resolved callee's returned values,
-    /// pushing the call site (the balanced-discipline anchor).
-    fn resolve_call_result(&self, call: InstId, ctx: &mut Vec<InstId>) -> QueryAnswer {
+    /// pushing the call site (the balanced-discipline anchor). The hops
+    /// accumulate through [`QueryTask::Call`]; `ctx` carries `call` until
+    /// the frame completes.
+    fn enter_call_result(
+        &self,
+        key: QueryKey,
+        call: InstId,
+        ctx: &mut Vec<InstId>,
+        stack: &mut Vec<QueryTask>,
+        results: &mut Vec<QueryAnswer>,
+    ) {
         if ctx.len() >= self.max_depth {
             let mut ans = QueryAnswer::unknown();
             ans.capped = true;
-            return ans;
+            return self.finish_query(key, ans, results);
         }
         let Some(edge) = self.graph.edge_at(call) else {
-            return QueryAnswer::unknown();
+            return self.finish_query(key, QueryAnswer::unknown(), results);
         };
         let CallTargets::Resolved(targets) = &edge.targets else {
-            return QueryAnswer::unknown();
+            return self.finish_query(key, QueryAnswer::unknown(), results);
         };
-        let mut ans = QueryAnswer::default();
+        let mut acc = QueryAnswer::default();
         if !edge.resolution_complete {
             // The base trace gave up partway: there may be more callees.
-            ans.has_unknown = true;
+            acc.has_unknown = true;
         }
-        ctx.push(call);
+        // The (callee, returned value) hops, in target order. Union order
+        // is unobservable (set union + monotone flags), so missing /
+        // external / bodyless callees fold into `acc` up front; a callee
+        // with no returned value contributes undefined — precise-empty,
+        // not unknown.
+        let mut pending: VecDeque<(FuncId, ValueId)> = VecDeque::new();
         for callee in targets {
             let Some(fd) = self.module.func(*callee) else {
-                ans.union_with(&QueryAnswer::unknown());
+                acc.union_with(&QueryAnswer::unknown());
                 continue;
             };
             if fd.is_external || fd.blocks.is_empty() {
                 // Native/bodyless callees: the result's provenance is
                 // opaque (a native may allocate anything).
-                ans.union_with(&QueryAnswer::unknown());
+                acc.union_with(&QueryAnswer::unknown());
                 continue;
             }
             let returns = self.returns_of.get(callee).cloned().unwrap_or_default();
-            // A callee with no returned value contributes undefined —
-            // precise-empty, not unknown.
             for v in returns {
-                ans.union_with(&self.resolve(v, *callee, ctx));
+                pending.push_back((*callee, v));
             }
         }
-        ctx.pop();
-        ans
+        ctx.push(call);
+        match pending.pop_front() {
+            Some((callee, v)) => {
+                stack.push(QueryTask::Call {
+                    key,
+                    call,
+                    pending,
+                    acc,
+                });
+                stack.push(QueryTask::Enter {
+                    value: v,
+                    func: callee,
+                });
+            }
+            None => {
+                ctx.pop();
+                self.finish_query(key, acc, results);
+            }
+        }
     }
 
     /// A parameter: balanced pop when the walk entered through a known
     /// call site, else the unbalanced caller fan-out.
-    fn resolve_param(&self, value: ValueId, func: FuncId, ctx: &mut Vec<InstId>) -> QueryAnswer {
+    fn enter_param(
+        &self,
+        key: QueryKey,
+        value: ValueId,
+        func: FuncId,
+        ctx: &mut Vec<InstId>,
+        stack: &mut Vec<QueryTask>,
+        results: &mut Vec<QueryAnswer>,
+    ) {
         // Balanced: the top of the context stack is a call site that
         // calls THIS function — the argument binding is exact.
         if let Some(&call) = ctx.last()
             && self.graph.callees_of_call_at(call).contains(&func)
         {
             ctx.pop();
-            let ans = self.bind_at_call(func, value, call, ctx);
-            ctx.push(call);
-            return ans;
+            match self.bind_at_call_plan(func, value, call) {
+                Bind::Leaf(ans) => {
+                    ctx.push(call);
+                    self.finish_query(key, ans, results);
+                }
+                Bind::Resolve {
+                    value,
+                    func: caller,
+                } => {
+                    stack.push(QueryTask::ParamBal { key, call });
+                    stack.push(QueryTask::Enter {
+                        value,
+                        func: caller,
+                    });
+                }
+            }
+            return;
         }
         // Unbalanced (heros.md §1.7's followReturnsPastSeeds analogue):
         // fan out to every caller the graph records. Complete only
         // modulo the recorded graph — marked so negative-decision
-        // consumers fall back (module docs).
+        // consumers fall back (module docs). The fan-out children run
+        // with an EMPTY context stack (the original passed a fresh one),
+        // so the caller's is saved and restored by the resume frame.
         let callers = self.graph.callers_of(func).to_vec();
         if callers.is_empty() {
-            return QueryAnswer::unknown();
+            return self.finish_query(key, QueryAnswer::unknown(), results);
         }
-        let mut ans = QueryAnswer {
+        let acc = QueryAnswer {
             unbalanced: true,
             ..QueryAnswer::default()
         };
-        for call in callers {
-            ans.union_with(&self.bind_at_call(func, value, call, &mut Vec::new()));
+        let saved_ctx = std::mem::take(ctx);
+        self.schedule_unbal_bind(
+            UnbalFanout {
+                key,
+                param: value,
+                func,
+                pending: callers.into(),
+                acc,
+                saved_ctx,
+            },
+            stack,
+            results,
+        );
+    }
+
+    /// Schedule one caller binding of an unbalanced parameter fan-out:
+    /// pops the next caller off `pending`, pushes the resume frame, and
+    /// either lands a leaf answer on `results` directly or schedules the
+    /// caller-side value as an `Enter` child.
+    fn schedule_unbal_bind(
+        &self,
+        mut fan: UnbalFanout,
+        stack: &mut Vec<QueryTask>,
+        results: &mut Vec<QueryAnswer>,
+    ) {
+        let call = fan.pending.pop_front().expect("a caller to bind");
+        match self.bind_at_call_plan(fan.func, fan.param, call) {
+            Bind::Leaf(ans) => {
+                results.push(ans);
+                stack.push(QueryTask::ParamUnbal(fan));
+            }
+            Bind::Resolve {
+                value,
+                func: caller,
+            } => {
+                stack.push(QueryTask::ParamUnbal(fan));
+                stack.push(QueryTask::Enter {
+                    value,
+                    func: caller,
+                });
+            }
         }
-        ans.unbalanced = true;
-        ans
     }
 
     /// Map a parameter of `func` to its caller-side value at `call`
-    /// through the vendored frame-slot model (N66) and resolve it in the
-    /// caller.
-    fn bind_at_call(
-        &self,
-        func: FuncId,
-        param: ValueId,
-        call: InstId,
-        ctx: &mut Vec<InstId>,
-    ) -> QueryAnswer {
+    /// through the vendored frame-slot model (N66). The child-less half
+    /// of the binding: classifies to a leaf answer or the single
+    /// caller-side value to resolve (resolved in the caller, under the
+    /// context the caller passes — the machine's `ctx` discipline carries
+    /// it).
+    fn bind_at_call_plan(&self, func: FuncId, param: ValueId, call: InstId) -> Bind {
         let Some(slots) = frame_slots_of(self.module, func) else {
             // No reliable slot model: the conservative answer (taint's
             // ParamBinding::OverApproxAll analogue) is "could be
             // anything" for a points-to query.
-            return QueryAnswer::unknown();
+            return Bind::Leaf(QueryAnswer::unknown());
         };
         let Some(fd) = self.module.func(func) else {
-            return QueryAnswer::unknown();
+            return Bind::Leaf(QueryAnswer::unknown());
         };
         let Some(pos) = fd.params.iter().position(|&p| p == param) else {
-            return QueryAnswer::unknown();
+            return Bind::Leaf(QueryAnswer::unknown());
         };
         let Some(call_inst) = self.module.inst(call) else {
-            return QueryAnswer::unknown();
+            return Bind::Leaf(QueryAnswer::unknown());
         };
         let Op::Call {
             callee,
@@ -484,44 +739,53 @@ impl<'m> Rung1AliasOracle<'m> {
             kind,
         } = &call_inst.op
         else {
-            return QueryAnswer::unknown();
+            return Bind::Leaf(QueryAnswer::unknown());
         };
         let Some(caller) = self.func_of_inst(call) else {
-            return QueryAnswer::unknown();
+            return Bind::Leaf(QueryAnswer::unknown());
         };
         let implicit = slots.implicit_count();
         if pos < implicit {
             // Implicit slots, ordered func, newTarget, this.
             if slots.func && pos == 0 {
-                return self.resolve(*callee, caller, ctx);
+                return Bind::Resolve {
+                    value: *callee,
+                    func: caller,
+                };
             }
             if slots.this_index() == Some(pos) {
                 return match this {
-                    Some(t) => self.resolve(*t, caller, ctx),
+                    Some(t) => Bind::Resolve {
+                        value: *t,
+                        func: caller,
+                    },
                     // No explicit receiver: `this` is undefined at the
                     // source level, but for the `obj.m()` shape the IR
                     // carries no `this` while the runtime receiver is the
                     // load's object — opaque rather than wrong.
-                    None => QueryAnswer::unknown(),
+                    None => Bind::Leaf(QueryAnswer::unknown()),
                 };
             }
             // newTarget: constructed per call, not an aliased heap value
             // we track.
-            return QueryAnswer::unknown();
+            return Bind::Leaf(QueryAnswer::unknown());
         }
         let formal = pos - implicit;
         match kind {
             abcd_ir::CallKind::Apply | abcd_ir::CallKind::SuperSpread => {
                 // Formals come out of an argument ARRAY — the element
                 // relation is opaque at rung 1.
-                QueryAnswer::unknown()
+                Bind::Leaf(QueryAnswer::unknown())
             }
-            abcd_ir::CallKind::SuperForwardAllArgs => QueryAnswer::unknown(),
+            abcd_ir::CallKind::SuperForwardAllArgs => Bind::Leaf(QueryAnswer::unknown()),
             _ => match args.get(formal) {
-                Some(&a) => self.resolve(a, caller, ctx),
+                Some(&a) => Bind::Resolve {
+                    value: a,
+                    func: caller,
+                },
                 // Fewer args than formals: the formal is undefined —
                 // precise-empty (undefined is not a heap object).
-                None => QueryAnswer::default(),
+                None => Bind::Leaf(QueryAnswer::default()),
             },
         }
     }
