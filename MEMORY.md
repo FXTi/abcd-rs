@@ -1716,3 +1716,12 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   NOT the bottleneck (musl must pair jemalloc/mimalloc if adopted);
   mimalloc on macOS is a free double win; Windows pending a GH
   experiment.
+- Hygiene pack merged (PR #23, 2026-10-02): fmt ∥ clippy ∥ deny front
+  gates; ASan lane (nightly, corpus-compute suites, no doctest link,
+  no stack workaround after the iteration fix); timeout-minutes on
+  every job + concurrency cancel-in-progress per ref. musl lane landed
+  green on first run (841b8f5, Alpine docker from the ubuntu host —
+  GH container jobs can't run musl): musl is now the default Linux
+  platform per ruling; fully-static distribution profile remains a
+  release-time task (bindgen static or -crt-static tradeoff). Job
+  count now 24.
