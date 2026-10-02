@@ -162,17 +162,15 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.4'
-      # cc picks up CXXFLAGS/CFLAGS for the bridge; tests run natively
-      # (i686 binaries execute on the x86_64 kernel once multilib exists).
-      # cc reads CFLAGS/CXXFLAGS for the bridge C++ (it also auto-adds -m32
-      # for i686 targets; explicit is belt-and-braces). No LDFLAGS: rustc's
-      # linker driver never reads it, and the i686 target spec carries -m32
-      # at link time on its own.
+      # The bridge C++ needs -m32 on both steps (cc reads CFLAGS/CXXFLAGS;
+      # the i686 target spec carries -m32 at link time itself, so no LDFLAGS
+      # anywhere — rustc's linker driver never reads it). i686 binaries
+      # execute natively on the x86_64 kernel once multilib exists.
       - run: cargo build --target i686-unknown-linux-gnu
-      - run: cargo test --target i686-unknown-linux-gnu
         env:
           CFLAGS: -m32
           CXXFLAGS: -m32
+      - run: cargo test --target i686-unknown-linux-gnu
         env:
           CFLAGS: -m32
           CXXFLAGS: -m32
