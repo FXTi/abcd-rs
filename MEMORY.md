@@ -1739,3 +1739,11 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   floor), not speed. Both allocator crates build clean on musl (cmake /
   configure paths). Recommendation recorded for the distribution
   profile: musl+mimalloc (speed-first at acceptable RSS).
+- Allocator final ruling (2026-10-02): jemalloc where supported (memory
+  wins: steady RSS < half of mimalloc's), mimalloc on Windows (the ONLY
+  option there — tikv-jemalloc-sys fails to build on MSVC, "untested
+  upstream" — and the probe showed mimalloc -43% vs the system CRT
+  allocator on windows-2022 with the synthetic workload: 912ms ->
+  516ms). Applies to final binaries only (abcd-cli sets
+  #[global_allocator] per target_os at release time; libraries never
+  set one). Probe PR #25 closed after collecting the numbers.
