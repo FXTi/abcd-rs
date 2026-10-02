@@ -1566,3 +1566,22 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   misaligned read lands on. Fix paths when unpinning: clang-23 for the
   bridge, or stop instrumenting C++ under 1.99+. The 1.98.1 pin stays
   until then. Upstream report deferred per ruling (root cause only).
+- q-P13 item 2 first contact (2026-10-01): wild big-abc smoke sweep done
+  (instrument tests/lift-decompile/wild_smoke.rs, report
+  design/wild-smoke-report.md). 156/156 containers extract, 242/242
+  modules decode->lift->verify->decompile clean (0 panics — the rule
+  holds on wild files), 276,028 functions lifted, 423.9MB JS emitted,
+  0.41% fallback functions (all async/generator machinery). es2abc
+  recompile channel: 82/242 accepted; 160 rejected, ALL SyntaxError
+  from exactly TWO silent emitter bugs (only recompilation can see
+  them): Bug A — R4 async-driver fallback emits `await` inside NON-async
+  arrow closures (146 modules / 16 apps; min repro
+  3.2-Release/CallUI.hap js:318); Bug B — the d-P8 scope-push escape
+  hatch redeclares `let v0_4 = undefined;` over an existing in-scope
+  declaration (14 modules / 4 apps; min repro
+  5.1.0/SystemUI-NavigationBar.hap js:9593). Perf healthy: decompile
+  p50 69ms, p95 18.2s, max 56.8s (Photos 6.1-LTS 2.4MB -> 12.3MB JS);
+  3.8MB Settings 4.0 in 14s. Orchestrator re-verified both bug shapes
+  at the exact cited lines. Fix order ruled: A then B (emit.rs/folds.rs
+  overlap — sequential to avoid races), then re-run the sweep, then
+  evaluate promoting core-25 to a real gate. Both bugs are P1 silent.
