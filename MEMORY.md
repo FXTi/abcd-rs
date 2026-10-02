@@ -1671,3 +1671,13 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   fuzz deliberately excludes string-operand instructions until this
   lands (TODO cross-reference). Lesson: bridge string conversion must
   be prefix-bounded by construction.
+- q-P13 item 3 CLOSED (2026-10-02): legacy 0.0.0.2 opcode decode landed
+  (23bc17a) + fixture ruling B executed (legacy_decode.rs fully
+  synthesized, fixtures/ dropped, c983513) + manifest flip (image
+  a3952612, arkcompiler-test#3) + gate now manifest-driven (PR #24,
+  1df227b/83eafd7) — main green on 1efde2c with hap-file 156/156
+  decode-ok. Transition reds along the way (instrument absence panics,
+  volume assert on empty probe dump) all fixed with the standing rule:
+  every #[ignore]d local instrument must no-op off-host. N81 (bridge
+  heap overflow, afd9574) landed the same day — found by the rewrite
+  worker's fuzz, fixed with span-bounded conversion at all 5 sites.
