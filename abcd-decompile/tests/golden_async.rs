@@ -2,9 +2,9 @@
 //! counterpart of d-P11's generator fold, design/decompile.md §8 R4):
 //! the es2abc async-body machinery (`AsyncFunctionEnter` entry protocol
 //! + per-await `AsyncFunctionAwaitUncaught` + `SuspendGenerator` +
-//! the `ResumeGenerator`/`GetResumeMode` completion pair + the
-//! `mode == THROW → throw` dispatch) folds back into the source-level
-//! `await` control flow of a plain `async function` body.
+//!   the `ResumeGenerator`/`GetResumeMode` completion pair + the
+//!   `mode == THROW → throw` dispatch) folds back into the source-level
+//!   `await` control flow of a plain `async function` body.
 //!
 //! Vendor lowering model: es2panda
 //! `compiler/function/asyncFunctionBuilder.cpp` (`Prepare`:
@@ -404,7 +404,7 @@ fn a06_dispatch_mismatch_keeps_site_loud() {
 fn a07_async_generator_kind_bails() {
     let mut m = mk_module();
     let f = add_func_kind(&mut m, "g", FunctionKind::AsyncGenerator);
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     let funcobj = add_param(&mut m, f);
     let genobj = emit(&mut m, entry, Op::CreateGenerator { func: funcobj });
 

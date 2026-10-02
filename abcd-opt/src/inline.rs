@@ -418,17 +418,17 @@ fn resolve_callee(module: &Module, callee_val: ValueId) -> Option<FuncId> {
 /// Vendored ground truth (arkcompiler_ets_runtime-master
 /// ecmascript/jspandafile/method_literal.cpp `MethodLiteral::Initialize`
 /// + ecmascript/method.h:459-464): the runtime builds the frame as
-/// `[func?][newTarget?][this?][formals...]` inside the code header's
-/// `num_args`, with the three implicit slots present iff the
-/// corresponding `L_ESCallTypeAnnotation;` `callType` bits
-/// (HaveThis = bit 0, HaveNewTarget = bit 1, HaveFunc = bit 3;
-/// HaveExtra = bit 2 changes only the un-named actualNumArgs push, not
-/// a param slot). When the annotation is ABSENT the vendored default is
-/// `callType = 0xF` — all three implicit slots — which is exactly the
-/// es2abc corpus shape (every corpus function is `<static>` with
-/// `num_args = 3 + formals`; verified empirically against the VM: a
-/// 4-formal function declares `num_args = 7` and reads its first formal
-/// from `a3`).
+///   `[func?][newTarget?][this?][formals...]` inside the code header's
+///   `num_args`, with the three implicit slots present iff the
+///   corresponding `L_ESCallTypeAnnotation;` `callType` bits
+///   (HaveThis = bit 0, HaveNewTarget = bit 1, HaveFunc = bit 3;
+///   HaveExtra = bit 2 changes only the un-named actualNumArgs push, not
+///   a param slot). When the annotation is ABSENT the vendored default is
+///   `callType = 0xF` — all three implicit slots — which is exactly the
+///   es2abc corpus shape (every corpus function is `<static>` with
+///   `num_args = 3 + formals`; verified empirically against the VM: a
+///   4-formal function declares `num_args = 7` and reads its first formal
+///   from `a3`).
 ///
 /// Arguments fill the formal slots LEFT-aligned; missing formals are
 /// `undefined` (interpreter-inl.cpp:488 `CALL_PUSH_UNDEFINED`), extra
@@ -617,10 +617,10 @@ fn eligibility(
                         return Err(SkipReason::CalleeForeignValue);
                     }
                 }
-                Op::Phi { entries } => {
-                    if entries.iter().any(|(edge, _)| !blocks.contains(&edge.from)) {
-                        return Err(SkipReason::CalleeForeignValue);
-                    }
+                Op::Phi { entries }
+                    if entries.iter().any(|(edge, _)| !blocks.contains(&edge.from)) =>
+                {
+                    return Err(SkipReason::CalleeForeignValue);
                 }
                 _ => {}
             }
@@ -1141,12 +1141,12 @@ fn inline_site(
             })
             .unwrap_or_default();
         for phi_id in phi_ids {
-            if let Some(phi) = module.inst_mut(phi_id) {
-                if let Op::Phi { entries } = &mut phi.op {
-                    for (edge, _) in entries.iter_mut() {
-                        if edge.from == call_block && edge.kind == EdgeKind::Normal {
-                            edge.from = cont;
-                        }
+            if let Some(phi) = module.inst_mut(phi_id)
+                && let Op::Phi { entries } = &mut phi.op
+            {
+                for (edge, _) in entries.iter_mut() {
+                    if edge.from == call_block && edge.kind == EdgeKind::Normal {
+                        edge.from = cont;
                     }
                 }
             }
@@ -1241,10 +1241,10 @@ fn inline_site(
             cont_block.preds = preds;
         }
     }
-    if let Some(result) = call_result {
-        if result != replacement {
-            crate::analysis::replace_uses_in_func(module, caller, result, replacement);
-        }
+    if let Some(result) = call_result
+        && result != replacement
+    {
+        crate::analysis::replace_uses_in_func(module, caller, result, replacement);
     }
 
     // ── Step H: exception participation (the module-docs rule) ───────
@@ -1303,28 +1303,28 @@ fn inline_site(
                 })
                 .unwrap_or_default();
             for phi_id in phi_ids {
-                if let Some(phi) = module.inst_mut(phi_id) {
-                    if let Op::Phi { entries } = &mut phi.op {
-                        // The value the original call-block edge
-                        // carried — the caller register state
-                        // visible at the call. Verified input
-                        // guarantees the entry; stay defensive.
-                        let Some(v) = entries
-                            .iter()
-                            .find(|(edge, _)| *edge == call_edge)
-                            .map(|(_, v)| *v)
-                        else {
-                            continue;
-                        };
-                        for &x in &new_protected {
-                            entries.push((
-                                Edge {
-                                    from: x,
-                                    kind: EdgeKind::Exceptional,
-                                },
-                                v,
-                            ));
-                        }
+                if let Some(phi) = module.inst_mut(phi_id)
+                    && let Op::Phi { entries } = &mut phi.op
+                {
+                    // The value the original call-block edge
+                    // carried — the caller register state
+                    // visible at the call. Verified input
+                    // guarantees the entry; stay defensive.
+                    let Some(v) = entries
+                        .iter()
+                        .find(|(edge, _)| *edge == call_edge)
+                        .map(|(_, v)| *v)
+                    else {
+                        continue;
+                    };
+                    for &x in &new_protected {
+                        entries.push((
+                            Edge {
+                                from: x,
+                                kind: EdgeKind::Exceptional,
+                            },
+                            v,
+                        ));
                     }
                 }
             }

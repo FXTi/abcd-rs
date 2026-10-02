@@ -113,22 +113,22 @@ fn main() {
         .warnings(false)
         .define("NDEBUG", None)
         .include(&out_dir)
-        .include(&format!("{manifest}/bridge/shim"))
-        .include(&format!("{manifest}/bridge"))
-        .include(&format!("{manifest}/arkcompiler_runtime_core/libpandafile"))
-        .include(&format!(
+        .include(format!("{manifest}/bridge/shim"))
+        .include(format!("{manifest}/bridge"))
+        .include(format!("{manifest}/arkcompiler_runtime_core/libpandafile"))
+        .include(format!(
             "{manifest}/arkcompiler_runtime_core/libpandabase/include"
         ))
         // Upstream mixes both include forms: "macros.h" (bare, needs the
         // inner dir) and "libpandabase/utils/timers.h" (needs include/).
-        .include(&format!(
+        .include(format!(
             "{manifest}/arkcompiler_runtime_core/libpandabase/include/libpandabase"
         ))
-        .file(&format!("{manifest}/bridge/isa_bridge.cpp"))
-        .file(&format!(
+        .file(format!("{manifest}/bridge/isa_bridge.cpp"))
+        .file(format!(
             "{manifest}/arkcompiler_runtime_core/libpandafile/file_format_version.cpp"
         ))
-        .file(&format!(
+        .file(format!(
             "{manifest}/arkcompiler_runtime_core/libpandafile/bytecode_emitter.cpp"
         ));
 
@@ -141,10 +141,10 @@ fn main() {
     // the old flat subset achieved the same via -I fall-through.
     if target.contains("windows") {
         cc_build.define("PANDA_TARGET_WINDOWS", None);
-        cc_build.include(&format!("{manifest}/arkcompiler_runtime_core/platforms"));
+        cc_build.include(format!("{manifest}/arkcompiler_runtime_core/platforms"));
         // Force-include MSVC compat header before all source files
-        cc_build.flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"));
-        cc_build.flag(&format!("/FI{manifest}/bridge/shim/file.h"));
+        cc_build.flag(format!("/FI{manifest}/bridge/shim/platform_compat.h"));
+        cc_build.flag(format!("/FI{manifest}/bridge/shim/file.h"));
         // Enable C++ exception handling (vendor code uses <iostream>)
         cc_build.flag("/EHsc");
         // Conformance mode: platforms/windows/libpandabase/file.h relies on
@@ -161,10 +161,10 @@ fn main() {
         }
         // Platform headers: "unix/libpandabase/file.h" resolves under
         // platforms/unix (full subtree now present).
-        cc_build.include(&format!("{manifest}/arkcompiler_runtime_core/platforms"));
+        cc_build.include(format!("{manifest}/arkcompiler_runtime_core/platforms"));
         cc_build
             .flag("-include")
-            .flag(&format!("{manifest}/bridge/shim/file.h"));
+            .flag(format!("{manifest}/bridge/shim/file.h"));
     }
 
     // Coverage: instrument C++ when running under cargo-llvm-cov

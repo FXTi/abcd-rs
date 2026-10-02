@@ -564,11 +564,11 @@ pub fn select_with_options(
         // value is then uncolored). After the store the tracker knows the
         // acc holds the exception value (a `sta` reads but never writes
         // acc — vendor `acc: in`).
-        if let Some(&exc) = handler_exc.get(&bb) {
-            if let Some(&RegSlot::Reg(home)) = alloc.allocation.get(&exc) {
-                emit_sta_home(func_id, home, alloc, &mut codes)?;
-                tracker = AccContent::Holds(exc);
-            }
+        if let Some(&exc) = handler_exc.get(&bb)
+            && let Some(&RegSlot::Reg(home)) = alloc.allocation.get(&exc)
+        {
+            emit_sta_home(func_id, home, alloc, &mut codes)?;
+            tracker = AccContent::Holds(exc);
         }
 
         // N21 pinned stores at block start (phi-result / exception /
@@ -649,14 +649,14 @@ pub fn select_with_options(
 
             // N21 pinned stores right after the defining instruction (see
             // the ordering argument at `after_def_stores`). Pure `Mov`s.
-            if let Some(v) = node.result {
-                if let Some(stores) = after_def_stores.get(&v) {
-                    for &(_, dst) in stores {
-                        let d = home_of(func_id, dst, alloc)?;
-                        let s = home_of(func_id, v, alloc)?;
-                        if s != d {
-                            codes.push(Bytecode::Mov(Reg(d), Reg(s)));
-                        }
+            if let Some(v) = node.result
+                && let Some(stores) = after_def_stores.get(&v)
+            {
+                for &(_, dst) in stores {
+                    let d = home_of(func_id, dst, alloc)?;
+                    let s = home_of(func_id, v, alloc)?;
+                    if s != d {
+                        codes.push(Bytecode::Mov(Reg(d), Reg(s)));
                     }
                 }
             }
@@ -1094,13 +1094,13 @@ fn select_inst(
             // Pure register copy: no accumulator involvement (vendor
             // `mov` is `acc: none`). Never produced by the lift (v0.1
             // has no Mov either); lowered for robustness.
-            if let Some(v) = result {
-                if used.contains(&v) {
-                    let d = home_of(func_id, v, alloc)?;
-                    let s = home_of(func_id, *src, alloc)?;
-                    if s != d {
-                        codes.push(Bytecode::Mov(Reg(d), Reg(s)));
-                    }
+            if let Some(v) = result
+                && used.contains(&v)
+            {
+                let d = home_of(func_id, v, alloc)?;
+                let s = home_of(func_id, *src, alloc)?;
+                if s != d {
+                    codes.push(Bytecode::Mov(Reg(d), Reg(s)));
                 }
             }
         }
@@ -2482,10 +2482,10 @@ fn try_fuse_cmp_branch(
     // between the comparison and the branch, by precondition 1) must not
     // occupy an operand slot.
     for result in [cmp_node.result, cond_node.result].into_iter().flatten() {
-        if let Some(RegSlot::Reg(r)) = alloc.allocation.get(&result).copied() {
-            if r == left_r || r == right_r {
-                return Ok(None);
-            }
+        if let Some(RegSlot::Reg(r)) = alloc.allocation.get(&result).copied()
+            && (r == left_r || r == right_r)
+        {
+            return Ok(None);
         }
     }
 

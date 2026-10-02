@@ -176,20 +176,20 @@ fn common_prefix(a: &[EnvFrame], b: &[EnvFrame]) -> Vec<EnvFrame> {
 fn defined_children(module: &Module, op: &Op) -> Vec<FuncId> {
     fn method_refs(module: &Module, cid: ConstId, out: &mut Vec<FuncId>) {
         if let Some(c) = module.consts.get(cid) {
-            method_refs_const(module, c, out);
+            method_refs_const(c, out);
         }
     }
-    fn method_refs_const(module: &Module, c: &Const, out: &mut Vec<FuncId>) {
+    fn method_refs_const(c: &Const, out: &mut Vec<FuncId>) {
         match c {
             Const::MethodRef(f) => out.push(*f),
             Const::ArrayLiteral(items) => {
                 for i in items {
-                    method_refs_const(module, i, out);
+                    method_refs_const(i, out);
                 }
             }
             Const::ObjectLiteral { keys, values } => {
                 for i in keys.iter().chain(values.iter()) {
-                    method_refs_const(module, i, out);
+                    method_refs_const(i, out);
                 }
             }
             _ => {}
@@ -539,7 +539,7 @@ fn consider(candidates: &mut BTreeMap<u32, Option<String>>, slot: u32, name: Str
 }
 
 /// The defining instruction of an SSA value (params/globals have none).
-fn def_inst<'m>(module: &'m Module, v: ValueId) -> Option<&'m abcd_ir::function::Inst> {
+fn def_inst(module: &Module, v: ValueId) -> Option<&abcd_ir::function::Inst> {
     match module.value(v)?.def {
         ValueDef::Inst(iid) => module.inst(iid),
         _ => None,

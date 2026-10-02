@@ -77,10 +77,10 @@ impl FuncPass for Adce {
             let Some(inst) = module.inst(inst_id) else {
                 continue;
             };
-            if let Some(result) = inst.result {
-                if matches!(module.value(result).map(|v| v.def), Some(ValueDef::Inst(_))) {
-                    def_inst.insert(result, inst_id);
-                }
+            if let Some(result) = inst.result
+                && matches!(module.value(result).map(|v| v.def), Some(ValueDef::Inst(_)))
+            {
+                def_inst.insert(result, inst_id);
             }
         }
 
@@ -90,10 +90,10 @@ impl FuncPass for Adce {
                 continue;
             };
             for val in inst.op.operands() {
-                if let Some(&def) = def_inst.get(&val) {
-                    if live.insert(def) {
-                        worklist.push_back(def);
-                    }
+                if let Some(&def) = def_inst.get(&val)
+                    && live.insert(def)
+                {
+                    worklist.push_back(def);
                 }
             }
         }
@@ -176,11 +176,9 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
         return false;
     };
 
-    loop {
-        let Some(func_data) = module.func(func) else {
-            break;
-        };
-        let blocks: Vec<BlockId> = func_data.blocks.clone();
+    // `while let` over the block-list snapshot: the clone ends the
+    // borrow of `module` before the body (edition 2024 let-scope drop).
+    while let Some(blocks) = module.func(func).map(|f| f.blocks.clone()) {
         let mut merged_any = false;
 
         for &bb in &blocks {
@@ -260,14 +258,14 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
                     };
                     (inst.result, incoming)
                 };
-                if let (Some(result), Some(value)) = (result, incoming) {
-                    if value != result {
-                        replace_uses_in_func(module, func, result, value);
-                    }
-                    // Self-referential single-entry phis (dead cycles)
-                    // need no rewrite: uses already name the phi result,
-                    // and ADCE sweeps them when the result is unused.
+                if let (Some(result), Some(value)) = (result, incoming)
+                    && value != result
+                {
+                    replace_uses_in_func(module, func, result, value);
                 }
+                // Self-referential single-entry phis (dead cycles)
+                // need no rewrite: uses already name the phi result,
+                // and ADCE sweeps them when the result is unused.
             }
 
             // Remove the terminator from bb.
@@ -299,12 +297,12 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
                 }
                 let phi_ids = block_phis(module, s);
                 for phi_id in phi_ids {
-                    if let Some(inst) = module.inst_mut(phi_id) {
-                        if let Op::Phi { entries } = &mut inst.op {
-                            for (edge, _) in entries.iter_mut() {
-                                if edge.from == succ {
-                                    edge.from = bb;
-                                }
+                    if let Some(inst) = module.inst_mut(phi_id)
+                        && let Op::Phi { entries } = &mut inst.op
+                    {
+                        for (edge, _) in entries.iter_mut() {
+                            if edge.from == succ {
+                                edge.from = bb;
                             }
                         }
                     }
@@ -408,17 +406,17 @@ fn eliminate_empty_jumps(module: &mut Module, func: FuncId) -> bool {
                 from: pred,
                 kind: EdgeKind::Normal,
             };
-            if let Some(target_block) = module.block_mut(target) {
+            if let Some(target_block) = module.block_mut(target)
+                && !target_block.preds.contains(&pred_edge)
+            {
+                // Replace bb with pred in target's preds.
+                for p in target_block.preds.iter_mut() {
+                    if p.from == bb {
+                        *p = pred_edge;
+                    }
+                }
                 if !target_block.preds.contains(&pred_edge) {
-                    // Replace bb with pred in target's preds.
-                    for p in target_block.preds.iter_mut() {
-                        if p.from == bb {
-                            *p = pred_edge;
-                        }
-                    }
-                    if !target_block.preds.contains(&pred_edge) {
-                        target_block.preds.push(pred_edge);
-                    }
+                    target_block.preds.push(pred_edge);
                 }
             }
         }
@@ -532,10 +530,10 @@ fn rebuild_predecessors(module: &mut Module, func: FuncId) {
     for &block in &blocks {
         for (succ, kind) in augmented_succs(module, func, block) {
             let edge = Edge { from: block, kind };
-            if let Some(succ_block) = module.block_mut(succ) {
-                if !succ_block.preds.contains(&edge) {
-                    succ_block.preds.push(edge);
-                }
+            if let Some(succ_block) = module.block_mut(succ)
+                && !succ_block.preds.contains(&edge)
+            {
+                succ_block.preds.push(edge);
             }
         }
     }
@@ -713,10 +711,10 @@ fn rewrite_try_regions(
         protected.dedup();
         region.protected = protected;
         for catch in &mut region.catches {
-            if catch.handler == removed {
-                if let Some(&replacement) = replacements.first() {
-                    catch.handler = replacement;
-                }
+            if catch.handler == removed
+                && let Some(&replacement) = replacements.first()
+            {
+                catch.handler = replacement;
             }
         }
     }
@@ -765,10 +763,10 @@ fn remove_unreachable_blocks(module: &mut Module, func: FuncId) -> bool {
     for &bb in &unreachable {
         let succs = normal_succs(module, bb);
         for s in succs {
-            if reachable.contains(&s) {
-                if let Some(s_block) = module.block_mut(s) {
-                    s_block.preds.retain(|p| p.from != bb);
-                }
+            if reachable.contains(&s)
+                && let Some(s_block) = module.block_mut(s)
+            {
+                s_block.preds.retain(|p| p.from != bb);
             }
         }
     }

@@ -52,13 +52,13 @@ fn very_long_conditional_jump() {
 #[test]
 fn multiple_long_jumps() {
     let filler_count = 150;
-    let mut program = Vec::new();
-
     // Short forward jump (index 0 → index 3)
-    program.push(insn::Jmp::new(Label(3)));
-    program.push(insn::Ldundefined::new());
-    program.push(insn::Ldundefined::new());
-    program.push(insn::Ldundefined::new()); // target of short jump
+    let mut program = vec![
+        insn::Jmp::new(Label(3)),
+        insn::Ldundefined::new(),
+        insn::Ldundefined::new(),
+        insn::Ldundefined::new(), // target of short jump
+    ];
 
     // Long forward conditional jump (index 4 → index 4+filler_count+1)
     let long_target = (4 + filler_count + 1) as u32;

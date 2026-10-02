@@ -25,7 +25,7 @@
 //! root package's manifest dir IS the repo root, so the corpus path
 //! resolves without the crate-local `..`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use abcd_file::decode;
@@ -38,7 +38,7 @@ fn corpus_root() -> PathBuf {
 
 /// Parse the manifest with python3's standard JSON; print each row's
 /// `abc`/`version`/`profile`/`origin.kind` tab-separated.
-fn manifest_rows(root: &PathBuf) -> Vec<(String, String, String, String)> {
+fn manifest_rows(root: &Path) -> Vec<(String, String, String, String)> {
     let output = Command::new("python3")
         .arg("-c")
         .arg(

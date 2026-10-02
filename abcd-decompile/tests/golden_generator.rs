@@ -564,7 +564,7 @@ fn g05_entry_gate_bail_keeps_fallbacks() {
 fn g06_async_driver_fold() {
     let mut m = mk_module();
     let f = add_func_kind(&mut m, "value", FunctionKind::Async);
-    let b0 = entry_of(&mut m, f);
+    let b0 = entry_of(&m, f);
     let _this = add_param(&mut m, f);
     let p1 = add_param(&mut m, f);
 

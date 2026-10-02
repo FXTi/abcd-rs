@@ -1296,11 +1296,11 @@ impl<'f> Emitter<'f> {
             let key = format!("{index} 0x{offset:x}").into_bytes();
             // Upstream routes by module_literals_ membership
             // (GetMetadataFieldValue's u32-field classification).
-            if self.module_literals.contains(&offset) {
-                if let Some(md) = self.module_data_at(offset) {
-                    modules.insert(key, md);
-                    continue;
-                }
+            if self.module_literals.contains(&offset)
+                && let Some(md) = self.module_data_at(offset)
+            {
+                modules.insert(key, md);
+                continue;
             }
             regular.insert(key, offset);
         }
@@ -1461,7 +1461,7 @@ impl<'f> Emitter<'f> {
 
     /// `SerializeModuleLiteralArray` over the decoded module data.
     fn serialize_module_array(&self, md: &ModuleData, out: &mut Vec<u8>) {
-        let _ = write!(out, "{{ {} [\n", md.records.len());
+        let _ = writeln!(out, "{{ {} [", md.records.len());
         out.extend_from_slice(b"\tMODULE_REQUEST_ARRAY: {\n");
         for (i, req) in md.requests.iter().enumerate() {
             let _ = write!(out, "\t\t{i} : ");

@@ -410,7 +410,7 @@ fn corpus_decompile_gate() {
                 for (rel, text) in &ts_outputs {
                     let out = dir.join("out.ts");
                     std::fs::write(&out, text).expect("write ts sample");
-                    let check = std::process::Command::new(&node_path)
+                    let check = std::process::Command::new(node_path)
                         .arg(&probe)
                         .arg(&out)
                         .output()

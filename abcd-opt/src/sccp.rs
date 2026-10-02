@@ -289,10 +289,10 @@ impl FuncPass for Sccp {
                                 } else {
                                     None
                                 };
-                            if let Some(insert_at) = insert_at {
-                                if let Some(block) = module.block_mut(bb) {
-                                    block.insts.insert(insert_at, inst_id);
-                                }
+                            if let Some(insert_at) = insert_at
+                                && let Some(block) = module.block_mut(bb)
+                            {
+                                block.insts.insert(insert_at, inst_id);
                             }
                         }
                     }
@@ -354,10 +354,10 @@ impl FuncPass for Sccp {
                             })
                             .unwrap_or_default();
                         for phi_id in dead_phis {
-                            if let Some(inst) = module.inst_mut(phi_id) {
-                                if let Op::Phi { entries } = &mut inst.op {
-                                    entries.retain(|(edge, _)| *edge != dead_edge);
-                                }
+                            if let Some(inst) = module.inst_mut(phi_id)
+                                && let Op::Phi { entries } = &mut inst.op
+                            {
+                                entries.retain(|(edge, _)| *edge != dead_edge);
                             }
                         }
                     }
@@ -427,9 +427,7 @@ fn evaluate_inst(
 ) -> Option<LatticeVal> {
     let inst = module.inst(inst_id)?;
     // If the instruction doesn't produce a result, nothing to evaluate.
-    if inst.result.is_none() {
-        return None;
-    }
+    inst.result?;
 
     match &inst.op {
         Op::LoadConst(cid) => match module.consts.get(*cid) {

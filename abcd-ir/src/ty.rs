@@ -15,9 +15,10 @@ use crate::id::ClassId;
 ///
 /// `Union` members are flat (no nested unions) and deduplicated; neither
 /// `Any` nor `Unknown` ever appears inside a `Union`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Ty {
     /// The full dynamic JS type (v0.1 `Tagged` folds into this).
+    #[default]
     Any,
     /// A single dynamic primitive class.
     DynPrim(DynPrim),
@@ -81,12 +82,6 @@ pub enum StaticTy {
     Reference(ClassId),
     /// No value (void methods).
     Void,
-}
-
-impl Default for Ty {
-    fn default() -> Self {
-        Ty::Any
-    }
 }
 
 /// Integer/float shape of a numeric static type:
@@ -209,7 +204,7 @@ impl Ty {
             flatten(m, &mut flat);
         }
         flat.retain(|m| *m != Ty::Unknown);
-        if flat.iter().any(|m| *m == Ty::Any) {
+        if flat.contains(&Ty::Any) {
             return Some(Ty::Any);
         }
         flat.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));

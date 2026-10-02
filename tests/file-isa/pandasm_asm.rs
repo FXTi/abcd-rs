@@ -112,11 +112,15 @@ fn first_diff(rel: &str, ours: &[u8], reference: &[u8]) -> String {
 // Layout-offset normalization for the binary round-trip gate
 // ---------------------------------------------------------------------------
 
+/// The five pandasm section bodies: (header, literals, records,
+/// methods, strings).
+type Sections = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
 /// Split pandasm text into (header, literals, records, methods, strings)
 /// section bodies. Sections are delimited by the `# ====================`
 /// banners; missing sections yield empty bodies (the normalizer is
 /// deliberately tolerant — it runs on gate failures too).
-fn split_sections(pa: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+fn split_sections(pa: &[u8]) -> Sections {
     const BANNER: &[u8] = b"# ====================\n";
     let mut marks = Vec::new();
     let mut pos = 0usize;

@@ -60,8 +60,8 @@ fn decompile(abc: &str) -> String {
 const A7_T2_MAX_BYTES: usize = 32 * 1024;
 
 /// 1. A7_T2: the nested-finally chain emits its shared continuations
-/// ONCE — the output is linear in the input, not exponential in the
-/// finally nesting depth.
+///    ONCE — the output is linear in the input, not exponential in the
+///    finally nesting depth.
 #[test]
 #[ignore]
 fn a7_t2_emission_is_linear() {
@@ -77,11 +77,11 @@ fn a7_t2_emission_is_linear() {
 }
 
 /// 2. A7_T2 stays fixed: the outer catches receiving the replaced
-/// exception are all still emitted, and the outer-catch GUARDS survive
-/// (the first de-absorption cut dropped B116's `#3.2`/`#7.3` guard
-/// conditionals — the fall-out target sat past the join head's
-/// trampoline chain; the row then failed semantically while looking
-/// structurally fine. Pin the regression mode, not just the text).
+///    exception are all still emitted, and the outer-catch GUARDS survive
+///    (the first de-absorption cut dropped B116's `#3.2`/`#7.3` guard
+///    conditionals — the fall-out target sat past the join head's
+///    trampoline chain; the row then failed semantically while looking
+///    structurally fine. Pin the regression mode, not just the text).
 #[test]
 #[ignore]
 fn a7_t2_still_fixed() {

@@ -77,9 +77,9 @@ fn decompile(abc: &str) -> String {
 }
 
 /// 1. switch/S12.11_A1_T2: the fall-through switch with a duplicate
-/// `case 0` no longer escapes to the state-machine hatch; the shared
-/// tails structure as tail-arm alternates and every dispatch path
-/// reaches `return v568` with the right accumulator value.
+///    `case 0` no longer escapes to the state-machine hatch; the shared
+///    tails structure as tail-arm alternates and every dispatch path
+///    reaches `return v568` with the right accumulator value.
 #[test]
 #[ignore]
 fn switch_fallthrough_shared_tail() {
@@ -106,9 +106,9 @@ fn switch_fallthrough_shared_tail() {
 }
 
 /// 2. try/S12.14_A7_T1: the outer finally region whose protected range
-/// covers the inner catch BODY must wrap the inner try/catch even when
-/// the shim ride-along approximation dropped it — the outer handler
-/// holds the phi temporaries (`var v384`) the inner blocks flush to.
+///    covers the inner catch BODY must wrap the inner try/catch even when
+///    the shim ride-along approximation dropped it — the outer handler
+///    holds the phi temporaries (`var v384`) the inner blocks flush to.
 #[test]
 #[ignore]
 fn try_nested_finally_phi_temps_declared() {
@@ -126,9 +126,9 @@ fn try_nested_finally_phi_temps_declared() {
 }
 
 /// 3. try/S12.14_A7_T2: nested-finally exception replacement — the
-/// outer catches that receive the replaced exception (`#2.3`, `#3.2`,
-/// `#4.2`, `#5.1` …) must all be emitted, so `throw "ex3"` from the
-/// inner finally is dispatched instead of escaping.
+///    outer catches that receive the replaced exception (`#2.3`, `#3.2`,
+///    `#4.2`, `#5.1` …) must all be emitted, so `throw "ex3"` from the
+///    inner finally is dispatched instead of escaping.
 #[test]
 #[ignore]
 fn try_nested_finally_exception_replacement() {
@@ -143,9 +143,9 @@ fn try_nested_finally_exception_replacement() {
 }
 
 /// 4. try/S12.14_A15: switch-inside-try reconstruction — the
-/// finally-dispatch epilogue must follow the dispatch (not hide in a
-/// switch arm), and a handler's cut edge to the return tail must reach
-/// it (tail duplication at the cut edge when fall-out is not verified).
+///    finally-dispatch epilogue must follow the dispatch (not hide in a
+///    switch arm), and a handler's cut edge to the return tail must reach
+///    it (tail duplication at the cut edge when fall-out is not verified).
 #[test]
 #[ignore]
 fn try_switch_inside_finally_reconstruction() {
@@ -174,14 +174,14 @@ fn try_switch_inside_finally_reconstruction() {
 }
 
 /// 5. try/S12.14_A9_T5: the try range CUTS a do-while — the protected
-/// region is the loop header + the body prefix, and the catch's
-/// `continue` targets the IN-LOOP test (`i < 10`). Wrapping the whole
-/// loop in the try (the legacy `emit_mixed` Loop rule) makes the catch
-/// clause fall out PAST the loop: after one caught iteration the
-/// `fin !== 10` check throws `#1.4`. The only sound projection is the
-/// source shape: `do { try { … } catch (er1) { …; continue; } …
+///    region is the loop header + the body prefix, and the catch's
+///    `continue` targets the IN-LOOP test (`i < 10`). Wrapping the whole
+///    loop in the try (the legacy `emit_mixed` Loop rule) makes the catch
+///    clause fall out PAST the loop: after one caught iteration the
+///    `fin !== 10` check throws `#1.4`. The only sound projection is the
+///    source shape: `do { try { … } catch (er1) { …; continue; } …
 /// finally dispatch … } while (i < 10)` — a do-while continue targets
-/// the loop test, which is exactly the handler's bytecode rejoin.
+///    the loop test, which is exactly the handler's bytecode rejoin.
 #[test]
 #[ignore]
 fn try_cuts_do_while_catch_continue() {

@@ -467,10 +467,10 @@ fn new_error(kind: &str, message: String) -> Expr {
 /// Whether `v` is provably the TDZ hole constant (through `Mov`s).
 fn provably_hole(module: &Module, v: ValueId) -> bool {
     let v = chase_mov(module, v);
-    match const_id_of(module, v).and_then(|cid| module.consts.get(cid)) {
-        Some(abcd_ir::Const::Hole) => true,
-        _ => false,
-    }
+    matches!(
+        const_id_of(module, v).and_then(|cid| module.consts.get(cid)),
+        Some(abcd_ir::Const::Hole)
+    )
 }
 
 /// The base outcome of a result-producing op (before the dead-pure
@@ -2117,9 +2117,7 @@ impl<'m> Recover<'m> {
         }
         let mut elems: BTreeMap<u32, Lit> = BTreeMap::new();
         for &user in self.chains.users_of(arr) {
-            let Some(inst) = self.module.inst(user) else {
-                return None;
-            };
+            let inst = self.module.inst(user)?;
             match &inst.op {
                 Op::StoreOwnPropDyn { object, key, value }
                 | Op::StorePropDyn { object, key, value } => {

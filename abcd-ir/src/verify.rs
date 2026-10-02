@@ -557,12 +557,12 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
     }
 
     // Entry predecessors: only a self-loop back-edge is legal.
-    if let Some(entry_block) = module.block(entry) {
-        if entry_block.preds.iter().any(|e| e.from != entry) {
-            report
-                .errors
-                .push(err(Some(entry), None, VerifyErrorKind::EntryHasPred));
-        }
+    if let Some(entry_block) = module.block(entry)
+        && entry_block.preds.iter().any(|e| e.from != entry)
+    {
+        report
+            .errors
+            .push(err(Some(entry), None, VerifyErrorKind::EntryHasPred));
     }
 
     // ── Per-block structural checks ──────────────────────────────────
@@ -904,10 +904,10 @@ fn verify_dominance(
         };
         let i = index[&bb];
         for edge in &block.preds {
-            if edge.kind == EdgeKind::Normal {
-                if let Some(&p) = index.get(&edge.from) {
-                    npreds[i].push(p);
-                }
+            if edge.kind == EdgeKind::Normal
+                && let Some(&p) = index.get(&edge.from)
+            {
+                npreds[i].push(p);
             }
         }
     }

@@ -11,7 +11,7 @@
 //! 2. **No reserved words** (full ES2022 keyword + future-reserved +
 //!    strict-reserved set, plus `undefined`/`arguments`/`eval` which are
 //!    legal but shadow-hostile): a trailing `_` is appended.
-//! 2b. **No non-writable globals** (ECMA-262 §19.1 — the global object's
+//!    2b. **No non-writable globals** (ECMA-262 §19.1 — the global object's
 //!    VALUE properties with [[Writable]]: false are exactly `undefined`,
 //!    `NaN`, `Infinity`; `undefined` is already in rule 2). A local
 //!    declaration under one of these names is legal JS per spec (Node

@@ -520,7 +520,7 @@ impl Op {
             // Vendor `debugger`: a breakpoint can invoke the attached
             // debugger's hook — kept non-pure so DCE preserves it (v0.1's
             // is_essential parity).
-            Debugger { .. } => Effects {
+            Debugger => Effects {
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },

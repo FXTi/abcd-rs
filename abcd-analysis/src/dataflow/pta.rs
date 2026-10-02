@@ -706,18 +706,18 @@ impl<'m> Pta<'m> {
                         }
                     }
                     Op::LoadConst(c) => {
-                        if let Some(Const::MethodRef(f)) = self.module.consts.get(*c) {
-                            if let Some(r) = inst.result {
-                                self.add_fact(
-                                    local(r),
-                                    Obj::Site {
-                                        site: iid,
-                                        ctx,
-                                        callable: Some(*f),
-                                        keyed: false,
-                                    },
-                                );
-                            }
+                        if let Some(Const::MethodRef(f)) = self.module.consts.get(*c)
+                            && let Some(r) = inst.result
+                        {
+                            self.add_fact(
+                                local(r),
+                                Obj::Site {
+                                    site: iid,
+                                    ctx,
+                                    callable: Some(*f),
+                                    keyed: false,
+                                },
+                            );
                         }
                     }
                     Op::LoadFunction => {
@@ -913,7 +913,7 @@ impl<'m> Pta<'m> {
             let mut added = false;
             let results = self.load_results.clone();
             for result in results {
-                if self.pts.get(&result).map_or(true, |s| s.is_empty()) {
+                if self.pts.get(&result).is_none_or(|s| s.is_empty()) {
                     self.add_fact(result, Obj::Unknown);
                     added = true;
                 }
@@ -1185,13 +1185,11 @@ fn env_analysis(
                                         state.drain(0..overflow);
                                     }
                                 }
-                                Op::PopLexEnv => {
-                                    if state.pop().is_none() {
-                                        state.push(EnvEntry {
-                                            sites: BTreeSet::new(),
-                                            unknown: true,
-                                        });
-                                    }
+                                Op::PopLexEnv if state.pop().is_none() => {
+                                    state.push(EnvEntry {
+                                        sites: BTreeSet::new(),
+                                        unknown: true,
+                                    });
                                 }
                                 _ => {}
                             }

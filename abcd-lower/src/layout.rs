@@ -191,10 +191,9 @@ pub fn layout(
             };
             // False edge: route to its trampoline when it has copies;
             // otherwise keep the fall-through / explicit-Jmp behavior.
-            let false_target = match edge_codes.get(&(bb, false_dest)) {
-                Some(copies) => Some(add_trampoline(&mut trampolines, copies, false_dest)),
-                None => None,
-            };
+            let false_target = edge_codes
+                .get(&(bb, false_dest))
+                .map(|copies| add_trampoline(&mut trampolines, copies, false_dest));
 
             let Some(codes) = block_codes.get_mut(&bb) else {
                 continue;
@@ -449,7 +448,7 @@ fn reconstruct_try_blocks(
 fn resolve_labels(bc: &mut Bytecode, offsets: &HashMap<BlockId, usize>) {
     match bc {
         Bytecode::Jmp(label) => {
-            if let Some(&off) = offsets.get(&BlockId::new(label.0 as u32)) {
+            if let Some(&off) = offsets.get(&BlockId::new(label.0)) {
                 *label = Label(off as u32);
             }
         }
@@ -465,7 +464,7 @@ fn resolve_labels(bc: &mut Bytecode, offsets: &HashMap<BlockId, usize>) {
         | Bytecode::Jneundefined(label)
         | Bytecode::Jstrictequndefined(label)
         | Bytecode::Jnstrictequndefined(label) => {
-            if let Some(&off) = offsets.get(&BlockId::new(label.0 as u32)) {
+            if let Some(&off) = offsets.get(&BlockId::new(label.0)) {
                 *label = Label(off as u32);
             }
         }
@@ -473,7 +472,7 @@ fn resolve_labels(bc: &mut Bytecode, offsets: &HashMap<BlockId, usize>) {
         | Bytecode::Jne(_, label)
         | Bytecode::Jstricteq(_, label)
         | Bytecode::Jnstricteq(_, label) => {
-            if let Some(&off) = offsets.get(&BlockId::new(label.0 as u32)) {
+            if let Some(&off) = offsets.get(&BlockId::new(label.0)) {
                 *label = Label(off as u32);
             }
         }

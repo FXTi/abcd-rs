@@ -234,10 +234,10 @@ pub fn empty_phis(module: &Module) -> Vec<String> {
     for (fi, func) in module.functions.iter().enumerate() {
         for &bb in &func.blocks {
             for &inst_id in &module.blocks[bb.index()].insts {
-                if let Op::Phi { entries } = &module.insts[inst_id.index()].op {
-                    if entries.is_empty() {
-                        out.push(format!("FuncId({fi}) {bb} {inst_id}"));
-                    }
+                if let Op::Phi { entries } = &module.insts[inst_id.index()].op
+                    && entries.is_empty()
+                {
+                    out.push(format!("FuncId({fi}) {bb} {inst_id}"));
                 }
             }
         }

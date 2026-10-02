@@ -11,7 +11,7 @@
 // Each test binary uses a different subset.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use abcd_ir::consts::Const;
@@ -37,7 +37,7 @@ pub fn corpus_root() -> PathBuf {
 
 /// The 1149 runtime-passed fixture paths (sorted for determinism),
 /// parsed with python3's standard JSON library.
-pub fn runtime_passed_paths(root: &PathBuf) -> Vec<String> {
+pub fn runtime_passed_paths(root: &Path) -> Vec<String> {
     let output = Command::new("python3")
         .arg("-c")
         .arg(
@@ -69,7 +69,7 @@ for path in sorted(paths):
 }
 
 /// Decode + lift one corpus fixture to a module.
-pub fn lift_fixture(root: &PathBuf, relative: &str) -> Module {
+pub fn lift_fixture(root: &Path, relative: &str) -> Module {
     let data = std::fs::read(root.join(relative)).expect("read fixture");
     let file = abcd_file::decode(&data).expect("decode fixture");
     abcd_lift::lift_file(&file).expect("lift fixture")

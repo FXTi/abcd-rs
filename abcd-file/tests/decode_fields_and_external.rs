@@ -46,10 +46,12 @@ fn foreign_class_decode() {
     assert!(file.entity_map.values().any(|&v| v == external.descriptor));
 }
 
+// (builder type, expected decoded type)
+type TypeCase = (Type, fn() -> Type);
+
 #[test]
 fn primitive_field_types_decode() {
-    // (builder type, expected decoded type)
-    let cases: &[(Type, fn() -> Type)] = &[
+    let cases: &[TypeCase] = &[
         (Type::Bool, || Type::Bool),
         (Type::I8, || Type::I8),
         (Type::U8, || Type::U8),

@@ -179,10 +179,10 @@ impl<'m> TaintProblem<'m> {
         if !global_names.is_empty() {
             for i in 0..module.sym.len() {
                 let sym = Sym::new(i as u32);
-                if let Some(s) = module.sym.resolve(sym) {
-                    if global_names.contains(s) {
-                        global_sources.insert(sym);
-                    }
+                if let Some(s) = module.sym.resolve(sym)
+                    && global_names.contains(s)
+                {
+                    global_sources.insert(sym);
                 }
             }
         }
@@ -404,12 +404,11 @@ impl<'m> TaintProblem<'m> {
         // resolved internal functions named like a builtin match too).
         let callees = self.callgraph.callees_of_call_at(call);
         for f in callees {
-            if let Some(fd) = self.module.func(*f) {
-                if let Some(n) = self.module.sym.resolve(fd.name) {
-                    if !names.iter().any(|x| x == n) {
-                        names.push(n.to_owned());
-                    }
-                }
+            if let Some(fd) = self.module.func(*f)
+                && let Some(n) = self.module.sym.resolve(fd.name)
+                && !names.iter().any(|x| x == n)
+            {
+                names.push(n.to_owned());
             }
         }
         // Candidate names that missed — the backlog log counts them
@@ -792,10 +791,10 @@ impl<'m> TaintProblem<'m> {
                     return None;
                 }
                 for (a, b) in elems.iter().zip(p.iter()) {
-                    if let (FieldKey::Named(x), FieldKey::Named(y)) = (a, b) {
-                        if x != y {
-                            return None;
-                        }
+                    if let (FieldKey::Named(x), FieldKey::Named(y)) = (a, b)
+                        && x != y
+                    {
+                        return None;
                     }
                 }
                 let mut rest = FieldChain::new();
@@ -869,10 +868,10 @@ impl<'m> TaintProblem<'m> {
                     return None;
                 }
                 for (a, b) in elems.iter().zip(want.iter()) {
-                    if let (FieldKey::Named(x), FieldKey::Named(y)) = (a, b) {
-                        if x != y {
-                            return None;
-                        }
+                    if let (FieldKey::Named(x), FieldKey::Named(y)) = (a, b)
+                        && x != y
+                    {
+                        return None;
                     }
                 }
                 let mut rest = FieldChain::new();
@@ -886,6 +885,9 @@ impl<'m> TaintProblem<'m> {
     }
 
     /// Substitute a sink endpoint at the call site.
+    // Each parameter is a distinct facet of the call-site context;
+    // grouping them would obscure the flow logic.
+    #[allow(clippy::too_many_arguments)]
     fn substitute(
         &self,
         endpoint: &Endpoint,
@@ -936,26 +938,22 @@ impl<'m> TaintProblem<'m> {
             }
             Endpoint::Return => {
                 // A return value exists only on the normal continuation.
-                if !is_handler_site {
-                    if let Some(r) = result {
-                        out.push(Fact::of(TaintFact {
-                            base: TaintBase::Local(r),
-                            fields: leftover.clone(),
-                        }));
-                    }
+                if !is_handler_site && let Some(r) = result {
+                    out.push(Fact::of(TaintFact {
+                        base: TaintBase::Local(r),
+                        fields: leftover.clone(),
+                    }));
                 }
             }
             Endpoint::ReturnField(path) => {
                 // A result-field sink (filter's base-elements →
                 // result-elements flow): the result value with the
                 // declared path ++ leftover.
-                if !is_handler_site {
-                    if let Some(r) = result {
-                        out.push(Fact::of(TaintFact {
-                            base: TaintBase::Local(r),
-                            fields: append(path),
-                        }));
-                    }
+                if !is_handler_site && let Some(r) = result {
+                    out.push(Fact::of(TaintFact {
+                        base: TaintBase::Local(r),
+                        fields: append(path),
+                    }));
                 }
             }
             Endpoint::Field(path) => {
@@ -985,6 +983,7 @@ impl<'m> TaintProblem<'m> {
     /// the heap key was about the receiver's storage, not the
     /// extracted element. `OverApproxAll` binding taints every formal
     /// (never silently drop a flow).
+    #[allow(clippy::too_many_arguments)] // gap-edge context facets; see substitute()
     fn gap_enter(
         &self,
         call: InstId,
@@ -1069,12 +1068,11 @@ impl IfdsProblem for TaintProblem<'_> {
         // ── Source generation fires on EVERY incoming edge, including
         // the zero fact's (FlowDroid's SourcePropagationRule: a source
         // statement produces taint from Λ).
-        if let Op::TryGetGlobal { name, .. } = &curr_inst.op {
-            if self.global_sources.contains(name) {
-                if let Some(result) = curr_inst.result {
-                    out.push(Fact::of(TaintFact::local(result)));
-                }
-            }
+        if let Op::TryGetGlobal { name, .. } = &curr_inst.op
+            && self.global_sources.contains(name)
+            && let Some(result) = curr_inst.result
+        {
+            out.push(Fact::of(TaintFact::local(result)));
         }
 
         let Fact::Taint(fact) = source else { return };
@@ -1088,10 +1086,11 @@ impl IfdsProblem for TaintProblem<'_> {
         if let Op::Phi { entries } = &succ_inst.op {
             if let Some(v) = fact.local_base() {
                 for (edge, val) in entries {
-                    if *val == v && edge.from == curr_inst.block {
-                        if let Some(result) = succ_inst.result {
-                            out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
-                        }
+                    if *val == v
+                        && edge.from == curr_inst.block
+                        && let Some(result) = succ_inst.result
+                    {
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                     }
                 }
             }
@@ -1102,10 +1101,10 @@ impl IfdsProblem for TaintProblem<'_> {
         // ── Exception dispatch: `throw v` taints the catch binding (T5).
         if let Op::Throw { value } = &curr_inst.op {
             out.push(source.clone());
-            if fact.base == TaintBase::Local(*value) {
-                if let Some(exc) = self.handler_exception_for(curr_inst.block, succ_inst.block) {
-                    out.push(Fact::of(fact.rebased(TaintBase::Local(exc))));
-                }
+            if fact.base == TaintBase::Local(*value)
+                && let Some(exc) = self.handler_exception_for(curr_inst.block, succ_inst.block)
+            {
+                out.push(Fact::of(fact.rebased(TaintBase::Local(exc))));
             }
             return;
         }
@@ -1114,10 +1113,10 @@ impl IfdsProblem for TaintProblem<'_> {
             // ── Global bindings ──────────────────────────────────────
             Op::TryGetGlobal { name, .. } => {
                 // Pick up a previously stored global taint.
-                if fact.base == TaintBase::Global(*name) {
-                    if let Some(result) = curr_inst.result {
-                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
-                    }
+                if fact.base == TaintBase::Global(*name)
+                    && let Some(result) = curr_inst.result
+                {
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
                 self.generic_propagate(curr_inst, fact, out); // the `default` operand
                 out.push(source.clone());
@@ -1132,10 +1131,10 @@ impl IfdsProblem for TaintProblem<'_> {
             }
             // ── Module variables ─────────────────────────────────────
             Op::LoadModuleVar { index } => {
-                if fact.base == TaintBase::ModuleVar(*index) {
-                    if let Some(result) = curr_inst.result {
-                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
-                    }
+                if fact.base == TaintBase::ModuleVar(*index)
+                    && let Some(result) = curr_inst.result
+                {
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
                 out.push(source.clone());
             }
@@ -1147,10 +1146,10 @@ impl IfdsProblem for TaintProblem<'_> {
             }
             // ── Lexical environment slots ────────────────────────────
             Op::GetLexVar { level, slot } => {
-                if fact.base == TaintBase::LexVar(*level, *slot) {
-                    if let Some(result) = curr_inst.result {
-                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
-                    }
+                if fact.base == TaintBase::LexVar(*level, *slot)
+                    && let Some(result) = curr_inst.result
+                {
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
                 // The rung-2 environment-identity channel (b2): a
                 // PRECISE writer keys the slot by its NewLexEnv site's
@@ -1162,24 +1161,23 @@ impl IfdsProblem for TaintProblem<'_> {
                 // may-direction rule that keeps the channel sound when
                 // the env analysis gives up (the rung-1 unbalanced
                 // discipline's analogue).
-                if let Some(env) = self.oracle.borrow().lex_env_at(curr, *level) {
-                    if let TaintBase::Heap(sites) = &fact.base {
-                        let precise = !env.has_unknown && !env.sites.is_empty();
-                        let hits = if precise {
-                            env.sites.intersects(sites)
-                        } else {
-                            let oracle = self.oracle.borrow();
-                            sites.iter().any(|s| oracle.is_env_site(s))
-                        };
-                        if hits {
-                            if let Some(rest) = self.cut_first(&fact.fields, FieldKey::AnyIndex) {
-                                if let Some(result) = curr_inst.result {
-                                    out.push(Fact::of(
-                                        fact.with_fields(rest).rebased(TaintBase::Local(result)),
-                                    ));
-                                }
-                            }
-                        }
+                if let Some(env) = self.oracle.borrow().lex_env_at(curr, *level)
+                    && let TaintBase::Heap(sites) = &fact.base
+                {
+                    let precise = !env.has_unknown && !env.sites.is_empty();
+                    let hits = if precise {
+                        env.sites.intersects(sites)
+                    } else {
+                        let oracle = self.oracle.borrow();
+                        sites.iter().any(|s| oracle.is_env_site(s))
+                    };
+                    if hits
+                        && let Some(rest) = self.cut_first(&fact.fields, FieldKey::AnyIndex)
+                        && let Some(result) = curr_inst.result
+                    {
+                        out.push(Fact::of(
+                            fact.with_fields(rest).rebased(TaintBase::Local(result)),
+                        ));
                     }
                 }
                 out.push(source.clone());
@@ -1230,12 +1228,11 @@ impl IfdsProblem for TaintProblem<'_> {
                 // this is the one builtin op whose element channel is
                 // static): `Heap(site(a)).[AnyIndex]` ⇒
                 // `Local(it).[AnyIndex]`.
-                if let Some(result) = curr_inst.result {
-                    if let TaintBase::Heap(sites) = &fact.base {
-                        if self.heap_may_reach(sites, *obj, curr) {
-                            out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
-                        }
-                    }
+                if let Some(result) = curr_inst.result
+                    && let TaintBase::Heap(sites) = &fact.base
+                    && self.heap_may_reach(sites, *obj, curr)
+                {
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
                 self.generic_propagate(curr_inst, fact, out);
                 out.push(source.clone());
@@ -1339,10 +1336,8 @@ impl IfdsProblem for TaintProblem<'_> {
                     .operands()
                     .iter()
                     .any(|&v| fact.base == TaintBase::Local(v));
-                if is_capture {
-                    if let Some(result) = curr_inst.result {
-                        out.push(Fact::of(TaintFact::local(result)));
-                    }
+                if is_capture && let Some(result) = curr_inst.result {
+                    out.push(Fact::of(TaintFact::local(result)));
                 }
                 out.push(source.clone());
             }
@@ -1448,12 +1443,10 @@ impl IfdsProblem for TaintProblem<'_> {
                         this_slot: Some(slot),
                         ..
                     } = binding
+                        && this.is_some_and(|t| t == *v)
+                        && let Some(&p) = fd.params.get(slot)
                     {
-                        if this.is_some_and(|t| t == *v) {
-                            if let Some(&p) = fd.params.get(slot) {
-                                out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
-                            }
-                        }
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
                     }
                     let formal_base = match binding {
                         ParamBinding::Precise { formal_base, .. } => formal_base,
@@ -1462,10 +1455,10 @@ impl IfdsProblem for TaintProblem<'_> {
                     match kind {
                         CallKind::Direct | CallKind::Dynamic | CallKind::New | CallKind::Super => {
                             for (i, &a) in args.iter().enumerate() {
-                                if a == *v {
-                                    if let Some(&p) = fd.params.get(formal_base + i) {
-                                        out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
-                                    }
+                                if a == *v
+                                    && let Some(&p) = fd.params.get(formal_base + i)
+                                {
+                                    out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
                                 }
                             }
                         }
@@ -1493,26 +1486,27 @@ impl IfdsProblem for TaintProblem<'_> {
                 // implicit frame slots lead), not `params[1]`;
                 // OverApproxAll taints every formal (never silently
                 // drop).
-                if *v == *callee_val && !fact.fields.is_empty() {
-                    if fact.fields.elements()[0] == FieldKey::AnyIndex {
-                        let mut rest = FieldChain::new();
-                        for &k in &fact.fields.elements()[1..] {
-                            rest = rest.pushed(k, self.cap());
-                        }
-                        match param_binding(module, callee) {
-                            ParamBinding::Precise { formal_base, .. } => {
-                                if let Some(&p1) = fd.params.get(formal_base) {
-                                    out.push(Fact::of(
-                                        fact.with_fields(rest).rebased(TaintBase::Local(p1)),
-                                    ));
-                                }
+                if *v == *callee_val
+                    && !fact.fields.is_empty()
+                    && fact.fields.elements()[0] == FieldKey::AnyIndex
+                {
+                    let mut rest = FieldChain::new();
+                    for &k in &fact.fields.elements()[1..] {
+                        rest = rest.pushed(k, self.cap());
+                    }
+                    match param_binding(module, callee) {
+                        ParamBinding::Precise { formal_base, .. } => {
+                            if let Some(&p1) = fd.params.get(formal_base) {
+                                out.push(Fact::of(
+                                    fact.with_fields(rest).rebased(TaintBase::Local(p1)),
+                                ));
                             }
-                            ParamBinding::OverApproxAll => {
-                                for &p in &fd.params {
-                                    out.push(Fact::of(
-                                        fact.with_fields(rest.clone()).rebased(TaintBase::Local(p)),
-                                    ));
-                                }
+                        }
+                        ParamBinding::OverApproxAll => {
+                            for &p in &fd.params {
+                                out.push(Fact::of(
+                                    fact.with_fields(rest.clone()).rebased(TaintBase::Local(p)),
+                                ));
                             }
                         }
                     }
@@ -1573,20 +1567,20 @@ impl IfdsProblem for TaintProblem<'_> {
                     return;
                 }
                 if let Some(gap) = &gap {
-                    if let Some(chain) = &gap.return_to_result {
-                        if let Some(Some(result)) = module.inst(call).map(|i| i.result) {
-                            let mut fields = FieldChain::new();
-                            for &k in chain.elements() {
-                                fields = fields.pushed(k, self.cap());
-                            }
-                            for &k in fact.fields.elements() {
-                                fields = fields.pushed(k, self.cap());
-                            }
-                            out.push(Fact::of(TaintFact {
-                                base: TaintBase::Local(result),
-                                fields,
-                            }));
+                    if let Some(chain) = &gap.return_to_result
+                        && let Some(Some(result)) = module.inst(call).map(|i| i.result)
+                    {
+                        let mut fields = FieldChain::new();
+                        for &k in chain.elements() {
+                            fields = fields.pushed(k, self.cap());
                         }
+                        for &k in fact.fields.elements() {
+                            fields = fields.pushed(k, self.cap());
+                        }
+                        out.push(Fact::of(TaintFact {
+                            base: TaintBase::Local(result),
+                            fields,
+                        }));
                     }
                     return;
                 }
@@ -1665,27 +1659,21 @@ impl IfdsProblem for TaintProblem<'_> {
                     // gap call/return edges (gap.rs); this tag remains
                     // the channel for DIRECT user calls of the callback
                     // value and the unresolved-callback fallback.
-                    if let Some(cb_gap) = &summary.callback {
-                        if Self::match_endpoint(&Endpoint::Base, fact, args, base).is_some() {
-                            if let Some(&cbv) = args.get(cb_gap.param as usize) {
-                                out.push(Fact::of(
-                                    TaintFact::local(cbv).pushed(FieldKey::AnyIndex, self.cap()),
-                                ));
-                            }
-                        }
+                    if let Some(cb_gap) = &summary.callback
+                        && Self::match_endpoint(&Endpoint::Base, fact, args, base).is_some()
+                        && let Some(&cbv) = args.get(cb_gap.param as usize)
+                    {
+                        out.push(Fact::of(
+                            TaintFact::local(cbv).pushed(FieldKey::AnyIndex, self.cap()),
+                        ));
                     }
                 }
                 // The incoming taint is RETAINED unless cleared
                 // (summaries.md §2.2:813-820); exclusive summaries
                 // additionally kill incoming operand taints the flows
-                // did not re-add (WrapperPropagationRule's killSource).
-                let retain = if cleared {
-                    false
-                } else if exclusive && on_operand {
-                    false // the summary is the complete model of the operands' fate
-                } else {
-                    true
-                };
+                // did not re-add (WrapperPropagationRule's killSource):
+                // the summary is the complete model of the operands' fate.
+                let retain = !cleared && !(exclusive && on_operand);
                 if retain {
                     out.push(source.clone());
                 }
@@ -1708,10 +1696,12 @@ impl IfdsProblem for TaintProblem<'_> {
                 // never sanitizes. Plus the identity heuristic (reader D
                 // ladder rung 3): tainted operand ⇒ tainted return.
                 out.push(source.clone());
-                if self.config.native_identity && on_operand && !is_handler_site {
-                    if let Some(result) = call_inst.result {
-                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
-                    }
+                if self.config.native_identity
+                    && on_operand
+                    && !is_handler_site
+                    && let Some(result) = call_inst.result
+                {
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
             }
         }

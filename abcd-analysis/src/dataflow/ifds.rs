@@ -53,13 +53,13 @@
 //!
 //! `abcd-taint` (v2-P5b) plugs in its fact type + the four flow functions
 //! + seeds WITHOUT touching internals. The solver owns: the worklist,
-//! anchoring, zero-fact propagation (when the source is the zero fact the
-//! zero fact is always among the targets — the `autoAddZero`/`ZeroedFlow
+//!   anchoring, zero-fact propagation (when the source is the zero fact the
+//!   zero fact is always among the targets — the `autoAddZero`/`ZeroedFlow
 //! Functions` pattern, here unconditional), summary wiring, and
-//! determinism. Flow functions receive the [`Module`] and push results
-//! into a caller-provided `Vec` (no per-edge allocation); they must be
-//! deterministic and must not treat `None` call/return-site arguments
-//! (unbalanced returns) as unreachable.
+//!   determinism. Flow functions receive the [`Module`] and push results
+//!   into a caller-provided `Vec` (no per-edge allocation); they must be
+//!   deterministic and must not treat `None` call/return-site arguments
+//!   (unbalanced returns) as unreachable.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
@@ -229,10 +229,10 @@ impl<'m> Supergraph<'m> {
                     // a protected block may dispatch to a handler.
                     if inst.op.effects().may_throw {
                         for h in exc_succs(func, b) {
-                            if let Some(first) = first_inst(h) {
-                                if !succs.contains(&first) {
-                                    succs.push(first);
-                                }
+                            if let Some(first) = first_inst(h)
+                                && !succs.contains(&first)
+                            {
+                                succs.push(first);
                             }
                         }
                     }
@@ -340,6 +340,9 @@ pub trait IfdsProblem {
     /// returns of caller-less functions (heros.md §1.7: the flow function
     /// is still invoked — it may have side effects such as registering a
     /// taint — and must null-tolerate the arguments).
+    // Each argument is a distinct heros flow-function input; a bundling
+    // struct would only rename the plumbing.
+    #[allow(clippy::too_many_arguments)]
     fn return_flow(
         &self,
         module: &Module,
@@ -415,6 +418,10 @@ impl<D: Clone + Eq + Hash> IfdsResult<D> {
     }
 }
 
+/// Fact-to-fact index shared by `incoming` and `end_summary`:
+/// `(callee start point, fact)` → `(other node, other fact)` pairs.
+type FactPairIndex<F> = HashMap<(InstId, F), VecSet<(InstId, F)>>;
+
 /// The solver. Construct over a module + problem + call-graph oracle,
 /// then [`IfdsSolver::solve`].
 pub struct IfdsSolver<'m, 'p, P: IfdsProblem, C: CallGraphOracle> {
@@ -432,10 +439,10 @@ pub struct IfdsSolver<'m, 'p, P: IfdsProblem, C: CallGraphOracle> {
     by_target: HashMap<(InstId, P::Fact), VecSet<P::Fact>>,
     /// `(callee start point, callee entry fact)` → `(call site, fact at
     /// the call)` — the summary-wiring key (heros.md §1.4 item 2).
-    incoming: HashMap<(InstId, P::Fact), VecSet<(InstId, P::Fact)>>,
+    incoming: FactPairIndex<P::Fact>,
     /// `(callee start point, anchor fact)` → `(exit node, exit fact)` —
     /// computed summaries awaiting replay (heros.md §1.5 item 1).
-    end_summary: HashMap<(InstId, P::Fact), VecSet<(InstId, P::Fact)>>,
+    end_summary: FactPairIndex<P::Fact>,
     /// The worklist (FIFO — deterministic; heros' executor queue,
     /// single-threaded).
     worklist: VecDeque<PathEdge<P::Fact>>,

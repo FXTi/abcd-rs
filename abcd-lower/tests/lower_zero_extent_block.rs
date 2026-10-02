@@ -6,7 +6,7 @@
 //! `[own offset, next greater offset)`. That formula is only sound when
 //! block offsets strictly increase. On verified IR they do — every block
 //! ends in a terminator and every terminator arm of `select_inst` emits
-//! >= 1 bytecode. But `lower_function` also accepts UNVERIFIED input (the
+//! `>= 1` bytecode. But `lower_function` also accepts UNVERIFIED input (the
 //! `UnallocatedOperand` precedent), and a terminator-less block emits
 //! nothing: its offset aliases the next block's, and its extent would
 //! swallow the following block into this one's try/handler range —

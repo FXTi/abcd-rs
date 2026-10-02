@@ -154,10 +154,10 @@ fn resolve_module_name(
     container_path: &[String],
     source_name: &str,
 ) -> String {
-    if let Some(json) = module_json {
-        if let Some(name) = module_json_name(json) {
-            return name;
-        }
+    if let Some(json) = module_json
+        && let Some(name) = module_json_name(json)
+    {
+        return name;
     }
     if let Some(entry) = container_path.last() {
         return file_stem(entry);

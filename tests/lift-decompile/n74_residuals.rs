@@ -42,8 +42,8 @@ fn decompile(abc: &str) -> String {
 }
 
 /// 1. The labeled for-in folds to a real `for (… in …)` loop and the
-/// labeled break survives as a break out of the loop (no iterator
-/// plumbing, no self-assign back-edge).
+///    labeled break survives as a break out of the loop (no iterator
+///    plumbing, no self-assign back-edge).
 #[test]
 #[ignore = "requires exported corpus"]
 fn n74_residual_labeled_for_in() {
@@ -66,13 +66,13 @@ fn n74_residual_labeled_for_in() {
 }
 
 /// 2. The global LEXICAL binding (source-level `let Array = undefined`
-/// at script top level — `StoreGlobalRecord`) must be predeclared as
-/// `let Array;`, NOT `var Array;`: under es2abc script compilation the
-/// `var` hoist lowers to `stglobalvar` — a REAL store that clobbers
-/// the global object's built-in `Array` (ark_js_vm overwrites the
-/// existing configurable property), so `this.Array` read undefined.
-/// The `let` hoist lowers to `sttoglobalrecord` (the declarative
-/// record), leaving the global object untouched.
+///    at script top level — `StoreGlobalRecord`) must be predeclared as
+///    `let Array;`, NOT `var Array;`: under es2abc script compilation the
+///    `var` hoist lowers to `stglobalvar` — a REAL store that clobbers
+///    the global object's built-in `Array` (ark_js_vm overwrites the
+///    existing configurable property), so `this.Array` read undefined.
+///    The `let` hoist lowers to `sttoglobalrecord` (the declarative
+///    record), leaving the global object untouched.
 #[test]
 #[ignore = "requires exported corpus"]
 fn n74_residual_decl_lex_configurable_global() {

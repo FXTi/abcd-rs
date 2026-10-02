@@ -1315,6 +1315,9 @@ fn classify_edge(
     EdgeClass::Internal
 }
 
+/// A cycle witness: the cycle's blocks (sorted) and edges (cycle order).
+type CycleWitness = (Vec<BlockId>, Vec<(BlockId, BlockId)>);
+
 /// Find one cycle in the graph minus `removed` edges, deterministically
 /// (start nodes in sorted order, successors in terminator order). Returns
 /// the cycle's blocks (sorted) and edges (cycle order).
@@ -1322,7 +1325,7 @@ fn find_cycle(
     universe: &BTreeSet<BlockId>,
     succs: &[Vec<BlockId>],
     removed: &BTreeSet<(BlockId, BlockId)>,
-) -> Option<(Vec<BlockId>, Vec<(BlockId, BlockId)>)> {
+) -> Option<CycleWitness> {
     #[derive(Clone, Copy, PartialEq)]
     enum Color {
         Gray,

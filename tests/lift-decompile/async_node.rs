@@ -150,7 +150,7 @@ fn async_fold_node_behavior() {
     for (i, text) in texts.iter().enumerate() {
         let out = dir.join(format!("case{i}.js"));
         std::fs::write(&out, text).expect("write case");
-        let check = std::process::Command::new(&node)
+        let check = std::process::Command::new(node)
             .arg("--check")
             .arg(&out)
             .output()
@@ -171,7 +171,7 @@ fn async_fold_node_behavior() {
          h().then(x => console.log(\"C:\" + x));\n",
     );
     std::fs::write(&driver, &program).expect("write driver");
-    let run = std::process::Command::new(&node)
+    let run = std::process::Command::new(node)
         .arg(&driver)
         .output()
         .expect("run node");
@@ -566,7 +566,7 @@ struct AGScaffold {
 /// and the entry protocol suspend (`Prepare`).
 fn agen_begin(m: &mut Module, name: &str) -> (FuncId, abcd_ir::BlockId, AGScaffold) {
     let f = add_func_kind(m, name, FunctionKind::AsyncGenerator);
-    let entry = entry_of(&m, f);
+    let entry = entry_of(m, f);
     let funcobj = add_param(m, f);
     let genobj = emit(m, entry, Op::CreateGenerator { func: funcobj });
     let undef = load_const(m, entry, Const::Undefined);

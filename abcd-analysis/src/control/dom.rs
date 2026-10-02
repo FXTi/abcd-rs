@@ -166,8 +166,7 @@ fn compute_tree(
         }
         let real_idom: Vec<Option<usize>> = real_rpo
             .iter()
-            .enumerate()
-            .map(|(_, &n)| {
+            .map(|&n| {
                 let old_pos = rpo_index[n].expect("reachable");
                 idom[old_pos].and_then(|d| {
                     let d_node = rpo[d];

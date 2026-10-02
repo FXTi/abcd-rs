@@ -1590,8 +1590,8 @@ impl<'m> Ctx<'m> {
                         if Some(entry) == local_stop {
                             return Some((head, DupStop::Rejoin(entry)));
                         }
-                        let (mut nodes, stop) = self
-                            .dup_tree(entry, &boundary, site_plan, local_stop, visited, stmts, 1)?;
+                        let (mut nodes, stop) =
+                            self.dup_tree(entry, &boundary, local_stop, visited, stmts, 1)?;
                         head.append(&mut nodes);
                         Some((head, stop))
                     };
@@ -1612,15 +1612,8 @@ impl<'m> Ctx<'m> {
                     let tree_stop = match cont {
                         None => DupStop::Terminal,
                         Some(m) => {
-                            let (mut tail, stop) = self.dup_tree(
-                                m,
-                                &boundary,
-                                site_plan,
-                                None,
-                                &mut visited,
-                                &mut stmts,
-                                0,
-                            )?;
+                            let (mut tail, stop) =
+                                self.dup_tree(m, &boundary, None, &mut visited, &mut stmts, 0)?;
                             tree_nodes.append(&mut tail);
                             stop
                         }
@@ -1783,7 +1776,6 @@ impl<'m> Ctx<'m> {
         &mut self,
         cur: BlockId,
         boundary: &BTreeSet<BlockId>,
-        site_plan: Option<usize>,
         stop_at: Option<BlockId>,
         visited: &mut BTreeSet<BlockId>,
         stmts: &mut usize,
@@ -1840,7 +1832,7 @@ impl<'m> Ctx<'m> {
                     return Some((blk, DupStop::Rejoin(*d)));
                 }
                 let (mut tail, stop) =
-                    self.dup_tree(*d, boundary, site_plan, stop_at, visited, stmts, depth)?;
+                    self.dup_tree(*d, boundary, stop_at, visited, stmts, depth)?;
                 blk.append(&mut tail);
                 Some((blk, stop))
             }
@@ -1858,15 +1850,8 @@ impl<'m> Ctx<'m> {
                     if Some(entry) == local_stop {
                         return Some((head, DupStop::Rejoin(entry)));
                     }
-                    let (mut nodes, stop) = self.dup_tree(
-                        entry,
-                        boundary,
-                        site_plan,
-                        local_stop,
-                        visited,
-                        stmts,
-                        depth + 1,
-                    )?;
+                    let (mut nodes, stop) =
+                        self.dup_tree(entry, boundary, local_stop, visited, stmts, depth + 1)?;
                     head.append(&mut nodes);
                     Some((head, stop))
                 };
@@ -1897,7 +1882,7 @@ impl<'m> Ctx<'m> {
                     // The local merge: continue the walk past the `if`.
                     Some(m) => {
                         let (mut tail, stop) =
-                            self.dup_tree(m, boundary, site_plan, stop_at, visited, stmts, depth)?;
+                            self.dup_tree(m, boundary, stop_at, visited, stmts, depth)?;
                         nodes.append(&mut tail);
                         Some((nodes, stop))
                     }
@@ -1978,17 +1963,13 @@ impl<'m> Ctx<'m> {
                 return None;
             }};
         }
-        let Some(h) = self.f().shim_of else {
-            return None;
-        };
+        let h = self.f().shim_of?;
         let shim_uniq = self.f().shim_uniq;
-        let Some(set) = (if shim_uniq {
+        let set = if shim_uniq {
             self.uniq_sets.get(&h).cloned()
         } else {
             self.shim_sets.get(&h).cloned()
-        }) else {
-            return None;
-        };
+        }?;
         if debug {
             eprintln!("TAIL-TRY handler=B{} target=B{}", h.index(), target.index());
         }
@@ -2965,10 +2946,7 @@ impl<'m> Ctx<'m> {
         // top level, and the foreign/enclosed targets must be top-level
         // in their sets.
         let mut join_blocks_total = 0usize;
-        for lvl in 0..=m {
-            let Some((head, set)) = &joins[lvl] else {
-                continue;
-            };
+        for (head, set) in joins.iter().flatten() {
             // Loops inside a join are beyond v1 (the fall-out physics
             // of a join that iterates).
             if set.iter().any(|b| {
@@ -4001,10 +3979,8 @@ impl<'m> Ctx<'m> {
                 EdgeClass::Break {
                     labeled: false,
                     header: h2,
-                } => {
-                    if *h2 != header {
-                        bail!("unlabeled break owned by an outer loop B{}", h2.index());
-                    }
+                } if *h2 != header => {
+                    bail!("unlabeled break owned by an outer loop B{}", h2.index());
                 }
                 _ => {}
             }
@@ -4404,8 +4380,10 @@ impl<'m> Ctx<'m> {
             }
             RegionNode::If { head, .. } => {
                 let hp = self.f_mut().plan_of(head);
-                if hp.is_some() && hp != active && !self.is_suppressed(hp.expect("checked")) {
-                    let p = hp.expect("checked");
+                if let Some(p) = hp
+                    && active != Some(p)
+                    && !self.is_suppressed(p)
+                {
                     // The d-P5 join hoist: when the try's continuation
                     // is buried in an arm, split instead of wrapping
                     // whole; otherwise the generic wrap.
@@ -4418,8 +4396,10 @@ impl<'m> Ctx<'m> {
             }
             RegionNode::Loop { header, kind, body } => {
                 let hp = self.f_mut().plan_of(header);
-                if hp.is_some() && hp != active && !self.is_suppressed(hp.expect("checked")) {
-                    let p = hp.expect("checked");
+                if let Some(p) = hp
+                    && active != Some(p)
+                    && !self.is_suppressed(p)
+                {
                     // N78: a try range cutting the loop whose handlers
                     // rejoin at the in-loop test emits as the source
                     // do-while (the try/catch inside the body, the
@@ -5007,6 +4987,9 @@ impl<'m> Ctx<'m> {
     /// Emit a `Loop` node: clean `while`/`do…while` forms when the
     /// header/latch test is a clean split to the structural
     /// continuation; `while (true)` + leaf rules otherwise.
+    // Emission context facets (region/block ids, active plan, follow,
+    // sink); a bundling struct would only rename the plumbing.
+    #[allow(clippy::too_many_arguments)]
     fn emit_loop(
         &mut self,
         id: RegionId,
@@ -5152,6 +5135,7 @@ impl<'m> Ctx<'m> {
     }
 
     /// The clean `while (cond)` form (preconditions checked by the caller).
+    #[allow(clippy::too_many_arguments)] // loop-shape facets; see emit_loop
     fn emit_clean_while(
         &mut self,
         label: Option<String>,
@@ -5190,6 +5174,7 @@ impl<'m> Ctx<'m> {
     }
 
     /// The clean `do { … } while (cond)` form (preconditions checked).
+    #[allow(clippy::too_many_arguments)] // loop-shape facets; see emit_loop
     fn emit_do_while(
         &mut self,
         label: Option<String>,

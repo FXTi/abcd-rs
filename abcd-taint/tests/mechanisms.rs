@@ -1362,7 +1362,7 @@ fn method_call(
 fn prototype_family_alloc_array_pop() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a = alloc_array(&mut m, entry);
@@ -1412,7 +1412,7 @@ fn prototype_family_alloc_array_pop() {
 fn prototype_family_const_string_via_global_provenance() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let sg = intern(&mut m, "sg");
@@ -1445,7 +1445,7 @@ fn prototype_family_const_string_via_global_provenance() {
 fn prototype_multi_site_phi_merge() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let left = add_block(&mut m, f);
@@ -1531,7 +1531,7 @@ fn prototype_multi_site_phi_merge() {
 fn prototype_negative_control_user_object_pop() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let _p = add_param(&mut m, f, 1);
     let o = alloc_object(&mut m, entry);
@@ -1566,7 +1566,7 @@ fn prototype_negative_control_user_object_pop() {
 fn prototype_precedence_direct_name_wins() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     // The receiver is a global whose store is an array (family Array)
@@ -1614,7 +1614,7 @@ fn prototype_precedence_direct_name_wins() {
 fn prototype_negative_caching() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let _p = add_param(&mut m, f, 1);
     let o1 = alloc_object(&mut m, entry);
@@ -1646,7 +1646,7 @@ fn prototype_negative_caching() {
 fn prototype_unknown_receiver_no_lookup() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let r = method_call(&mut m, entry, p, "pop", vec![]);
@@ -1681,7 +1681,7 @@ fn prototype_unknown_receiver_no_lookup() {
 fn prototype_iterator_next_family() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a = alloc_array(&mut m, entry);
@@ -1734,7 +1734,7 @@ fn prototype_iterator_next_family() {
 fn prototype_array_push_alias_flow() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a = alloc_array(&mut m, entry);
@@ -1778,7 +1778,7 @@ fn prototype_array_push_alias_flow() {
 fn prototype_family_alloc_via_global_provenance() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a_name = intern(&mut m, "a");
@@ -1820,7 +1820,7 @@ fn prototype_family_alloc_via_global_provenance() {
         "the rescued direct name left the backlog log"
     );
     assert!(
-        report.hits.len() >= 1,
+        !report.hits.is_empty(),
         "the may-array receiver's taint rode pop's Base→Return flow"
     );
 }
@@ -1868,7 +1868,7 @@ fn gap_for_each_enters_callback() {
         emit_void(&mut m, cb_entry, Op::Return { value: None });
     }
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a = alloc_array(&mut m, entry);
@@ -1930,7 +1930,7 @@ fn gap_map_return_wires_result_elements() {
         emit_void(&mut m, cb_entry, Op::Return { value: Some(e) });
     }
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a = alloc_array(&mut m, entry);
@@ -2000,7 +2000,7 @@ fn gap_map_callback_ignoring_param_no_return_flow() {
         emit_void(&mut m, cb_entry, Op::Return { value: Some(zero) });
     }
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a = alloc_array(&mut m, entry);
@@ -2060,7 +2060,7 @@ fn gap_for_each_discards_callback_return_but_runs_body() {
         emit_void(&mut m, cb_entry, Op::Return { value: Some(e) });
     }
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a = alloc_array(&mut m, entry);
@@ -2117,7 +2117,7 @@ fn gap_exclusive_callback_summary_still_enters() {
         emit_void(&mut m, cb_entry, Op::Return { value: None });
     }
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let def_cb = emit(
@@ -2182,7 +2182,7 @@ fn gap_exclusive_callback_summary_still_enters() {
 fn gap_unresolved_callback_falls_back() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a = alloc_array(&mut m, entry);
@@ -2270,7 +2270,7 @@ fn gap_nested_callbacks_terminate() {
         emit_void(&mut m, cb1_entry, Op::Return { value: None });
     }
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let a = alloc_array(&mut m, entry);
@@ -2333,7 +2333,7 @@ fn gap_mini_gap_tag_binds_first_formal_on_direct_call() {
         emit_void(&mut m, cb_entry, Op::Return { value: None });
     }
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let t = add_block(&mut m, f);
@@ -2481,7 +2481,7 @@ fn tainted_string_global(
 fn replace_string_form_flows() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     // s.replace("a", "!") — Base→Return.
@@ -2568,7 +2568,7 @@ fn replace_function_form_gap_return() {
         emit_void(&mut m, cb_entry, Op::Return { value: Some(g) });
     }
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     // A CLEAN string receiver (one store — the family types String,
@@ -2636,7 +2636,7 @@ fn replace_function_form_gap_enter() {
         emit_void(&mut m, cb_entry, Op::Return { value: None });
     }
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let s = tainted_string_global(&mut m, entry, p);
@@ -2672,7 +2672,7 @@ fn replace_function_form_gap_enter() {
 fn regexp_test_constructor_result_family() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     // r = new RegExp("a+") — the callee is a bare global load.
@@ -2718,7 +2718,7 @@ fn regexp_test_constructor_result_family() {
 fn regexp_test_via_global_provenance_constructor_arm() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let r_name = intern(&mut m, "r");
@@ -2770,7 +2770,7 @@ fn regexp_test_via_global_provenance_constructor_arm() {
 fn constructor_arm_never_invents_user_families() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let ctor = try_get_global(&mut m, entry, "Foo");
@@ -2815,7 +2815,7 @@ fn constructor_arm_never_invents_user_families() {
 fn split_base_flow_separator_is_control() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     // s.split(",") — tainted base.
@@ -2881,7 +2881,7 @@ fn split_base_flow_separator_is_control() {
 fn join_element_and_separator_flows() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     // a.push(p); a.join("-") — the element channel.
@@ -2932,7 +2932,7 @@ fn join_element_and_separator_flows() {
 fn parseint_content_derived_radix_is_control() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let pi = try_get_global(&mut m, entry, "parseInt");
@@ -3023,7 +3023,7 @@ fn parseint_content_derived_radix_is_control() {
 fn assign_result_carries_source_taint() {
     let mut m = mk_module();
     let f = add_func_named(&mut m, "func_main_0");
-    let entry = entry_of(&mut m, f);
+    let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     let o = alloc_object(&mut m, entry);

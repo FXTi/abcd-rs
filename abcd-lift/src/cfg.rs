@@ -97,8 +97,8 @@ pub fn build_cfg(body: &MethodBody) -> Option<RawCfg> {
     }
 
     // Phase 3: Compute successor edges.
-    for bi in 0..blocks.len() {
-        let block_end = blocks[bi].end;
+    for block in &mut blocks {
+        let block_end = block.end;
         if block_end == 0 {
             continue;
         }
@@ -106,23 +106,24 @@ pub fn build_cfg(body: &MethodBody) -> Option<RawCfg> {
         let last_bc = &bytecodes[last_idx];
 
         if last_bc.is_jump() {
-            if let Some(target) = jump_target(last_bc) {
-                if let Some(&target_bi) = leader_to_block.get(&target) {
-                    blocks[bi].succs.push(target_bi);
-                }
+            if let Some(target) = jump_target(last_bc)
+                && let Some(&target_bi) = leader_to_block.get(&target)
+            {
+                block.succs.push(target_bi);
             }
             // Conditional jumps also fall through.
-            if is_conditional_jump(last_bc) && block_end < bytecodes.len() {
-                if let Some(&fall_bi) = leader_to_block.get(&block_end) {
-                    blocks[bi].succs.push(fall_bi);
-                }
+            if is_conditional_jump(last_bc)
+                && block_end < bytecodes.len()
+                && let Some(&fall_bi) = leader_to_block.get(&block_end)
+            {
+                block.succs.push(fall_bi);
             }
         } else if !last_bc.is_terminator() {
             // Non-terminator: implicit fall-through.
-            if block_end < bytecodes.len() {
-                if let Some(&fall_bi) = leader_to_block.get(&block_end) {
-                    blocks[bi].succs.push(fall_bi);
-                }
+            if block_end < bytecodes.len()
+                && let Some(&fall_bi) = leader_to_block.get(&block_end)
+            {
+                block.succs.push(fall_bi);
             }
         }
         // return/throw have no successors.
@@ -141,14 +142,14 @@ pub fn build_cfg(body: &MethodBody) -> Option<RawCfg> {
             .collect();
 
         // For each block that overlaps the try region, add catch edges.
-        for bi in 0..blocks.len() {
-            let bs = blocks[bi].start;
-            let be = blocks[bi].end;
+        for block in &mut blocks {
+            let bs = block.start;
+            let be = block.end;
             // Block overlaps try region if [bs..be) ∩ [try_start..try_end) ≠ ∅
             if bs < try_end && be > try_start {
                 for &ct in &catch_targets {
-                    if !blocks[bi].catch_succs.contains(&ct) {
-                        blocks[bi].catch_succs.push(ct);
+                    if !block.catch_succs.contains(&ct) {
+                        block.catch_succs.push(ct);
                     }
                 }
             }

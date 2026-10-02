@@ -32,7 +32,7 @@ fn verify_clean(m: &abcd_ir::Module) {
     );
 }
 
-fn resolve<'m>(m: &'m abcd_ir::Module, s: abcd_ir::Sym) -> &'m str {
+fn resolve(m: &abcd_ir::Module, s: abcd_ir::Sym) -> &str {
     m.sym.resolve(s).expect("dangling sym")
 }
 
@@ -412,7 +412,7 @@ fn annotation_buckets_merge_in_documented_order() {
     let mut strings = abcd_file::StringPool::default();
     let desc = strings.get_or_intern("Lglobal;");
     let ann_desc =
-        |strings: &mut abcd_file::StringPool, i: u32| strings.get_or_intern(&format!("LAnn{i};"));
+        |strings: &mut abcd_file::StringPool, i: u32| strings.get_or_intern(format!("LAnn{i};"));
     let level = |strings: &mut abcd_file::StringPool| strings.get_or_intern("level");
     let mk_ann = |strings: &mut abcd_file::StringPool, i: u32| abcd_file::Annotation {
         class_descriptor: ann_desc(strings, i),

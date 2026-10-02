@@ -183,10 +183,10 @@ fn endpoint(text: &str) -> Result<Endpoint, CliError> {
         "return" => return Ok(Endpoint::Return),
         _ => {}
     }
-    if let Some(rest) = text.strip_prefix("param:") {
-        if let Ok(i) = rest.parse::<u16>() {
-            return Ok(Endpoint::Param(i));
-        }
+    if let Some(rest) = text.strip_prefix("param:")
+        && let Ok(i) = rest.parse::<u16>()
+    {
+        return Ok(Endpoint::Param(i));
     }
     Err(CliError::User(format!(
         "invalid summary endpoint {text:?} (expected \"param:N\", \"base\", or \"return\")"

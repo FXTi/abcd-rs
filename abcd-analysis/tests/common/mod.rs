@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use abcd_analysis::control::Dominators;
@@ -33,7 +33,7 @@ pub fn corpus_root() -> PathBuf {
 
 /// Every fixture path in the manifest (all 5517 rows, sorted for
 /// determinism), parsed with python3's standard JSON library.
-pub fn manifest_paths(root: &PathBuf) -> Vec<String> {
+pub fn manifest_paths(root: &Path) -> Vec<String> {
     let output = Command::new("python3")
         .arg("-c")
         .arg(
@@ -86,10 +86,10 @@ pub fn verify_reference_dom_sets(module: &Module, func_id: FuncId) -> Vec<HashSe
         };
         let i = index[&bb];
         for edge in &block.preds {
-            if edge.kind == EdgeKind::Normal {
-                if let Some(&p) = index.get(&edge.from) {
-                    npreds[i].push(p);
-                }
+            if edge.kind == EdgeKind::Normal
+                && let Some(&p) = index.get(&edge.from)
+            {
+                npreds[i].push(p);
             }
         }
     }

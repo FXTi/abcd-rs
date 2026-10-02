@@ -78,33 +78,33 @@
 //!    the entry protocol; non-matching sites keep their loud
 //!    fallbacks.
 //! 10. **YieldStar driver loops → `yield* <expr>`** (d-P15, R4):
-//!    [`yield_star_fold`] eliminates the es2abc yield-delegation
-//!    machinery (`FunctionBuilder::YieldStar`): the
-//!    `GetIterator`/`GetAsyncIterator` setup, the resume-mode
-//!    dispatch (`NEXT`/`THROW`/`RETURN` with the delegate `throw`/
-//!    `return` method lookups and the IteratorClose plumbing), the
-//!    `method.call(iter, received)`, the pass-through suspend (the
-//!    delegate's result object yields AS-IS — no iter-result wrap),
-//!    the `done` test, and the completion dispatch (the delegation
-//!    value vs the `.return()` propagation) — back into
-//!    `yield* <expr>` (`const ret = yield* <expr>` when the
-//!    delegate's completion value is used). Async (`async function*`)
-//!    carries awaits around every protocol step and keeps the
-//!    completion dispatch inside the loop's done arm. All-or-nothing
-//!    per site; non-matching shapes keep their loud fallbacks.
+//!     [`yield_star_fold`] eliminates the es2abc yield-delegation
+//!     machinery (`FunctionBuilder::YieldStar`): the
+//!     `GetIterator`/`GetAsyncIterator` setup, the resume-mode
+//!     dispatch (`NEXT`/`THROW`/`RETURN` with the delegate `throw`/
+//!     `return` method lookups and the IteratorClose plumbing), the
+//!     `method.call(iter, received)`, the pass-through suspend (the
+//!     delegate's result object yields AS-IS — no iter-result wrap),
+//!     the `done` test, and the completion dispatch (the delegation
+//!     value vs the `.return()` propagation) — back into
+//!     `yield* <expr>` (`const ret = yield* <expr>` when the
+//!     delegate's completion value is used). Async (`async function*`)
+//!     carries awaits around every protocol step and keeps the
+//!     completion dispatch inside the loop's done arm. All-or-nothing
+//!     per site; non-matching shapes keep their loud fallbacks.
 //! 11. **Plain-async `for await` driver loops → literal `for await
 //!    (const x of …)`** (d-P17, N70 residual 1):
-//!    [`match_for_await_driver`] extends fold 3's iterator-loop
-//!    recovery to the post-N70 driver shape — the header's folded
-//!    dispatch await temp, the `next.call(it)` phi call, the
-//!    break-routed `if (done) { TAIL; break } else { body; continue }`
-//!    dispatch whose done arm absorbed the post-loop tail (re-homed
-//!    AFTER the loop), and loop-carried bookkeeping phis collapsed to
-//!    their invariant sources by substitution. The companion sweep
-//!    [`sweep_dead_loop_exit_throws`] (N70 residual 2) removes the
-//!    dead after-loop `throw <resume temp>` the break-routed dispatch
-//!    left behind, under a whole-node unreachability proof (any doubt
-//!    keeps it).
+//!     [`match_for_await_driver`] extends fold 3's iterator-loop
+//!     recovery to the post-N70 driver shape — the header's folded
+//!     dispatch await temp, the `next.call(it)` phi call, the
+//!     break-routed `if (done) { TAIL; break } else { body; continue }`
+//!     dispatch whose done arm absorbed the post-loop tail (re-homed
+//!     AFTER the loop), and loop-carried bookkeeping phis collapsed to
+//!     their invariant sources by substitution. The companion sweep
+//!     [`sweep_dead_loop_exit_throws`] (N70 residual 2) removes the
+//!     dead after-loop `throw <resume temp>` the break-routed dispatch
+//!     left behind, under a whole-node unreachability proof (any doubt
+//!     keeps it).
 
 use crate::expr::{ArrayElem, Expr, IterOp, Lit, ObjEntry};
 use crate::recover::Stmt;
@@ -444,11 +444,9 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
             out.push(setter);
         }
         Expr::Closure { captures, .. } => out.extend(captures.iter().map(|(_, v)| v)),
-        Expr::Class { heritage, .. } => {
-            if let Some(h) = heritage {
-                out.push(h);
-            }
-        }
+        Expr::Class {
+            heritage: Some(h), ..
+        } => out.push(h),
         Expr::ObjectBuild { entries } => {
             for e in entries {
                 match e {
@@ -1225,7 +1223,7 @@ fn subtree_has_labeled_jump(nodes: &[SNode]) -> bool {
 ///    rethrow-try dissolution in [`fold_seq`]).
 ///
 /// The removed run is replaced by an honesty comment.
-fn sweep_dead_loop_exit_throws(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
+fn sweep_dead_loop_exit_throws(nodes: &mut [SNode], stats: &mut FoldStats) {
     let mut i = 0;
     while i < nodes.len() {
         let fire = match &nodes[i] {
@@ -2835,10 +2833,7 @@ fn elim_internal_copy_phis(out: &mut Vec<SNode>, roots: &BTreeMap<String, Expr>)
             for f in feeds {
                 let r = match f {
                     Some(s) if roots.contains_key(s) => Some(s),
-                    Some(s) => match copy_root.get(s) {
-                        Some((_, r)) => Some(r.as_str()),
-                        None => None,
-                    },
+                    Some(s) => copy_root.get(s).map(|(_, r)| r.as_str()),
                     None => None,
                 };
                 match r {
@@ -3105,7 +3100,7 @@ fn expr_has_return_load(e: &Expr) -> bool {
 
 // ── Fold 5: switch re-detection ──────────────────────────────────────
 
-fn fold_switches(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
+fn fold_switches(nodes: &mut [SNode], stats: &mut FoldStats) {
     let mut i = 0;
     while i < nodes.len() {
         let Some((disc, cases)) = match_switch_chain(&nodes[i]) else {
@@ -3463,11 +3458,9 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<&mut Expr> {
             out.push(setter);
         }
         Expr::Closure { captures, .. } => out.extend(captures.iter_mut().map(|(_, v)| v)),
-        Expr::Class { heritage, .. } => {
-            if let Some(h) = heritage {
-                out.push(h);
-            }
-        }
+        Expr::Class {
+            heritage: Some(h), ..
+        } => out.push(h),
         Expr::ObjectBuild { entries } => {
             for e in entries {
                 match e {
@@ -3542,11 +3535,7 @@ fn canon_stmt(s: &mut Stmt, map: &std::collections::HashMap<String, String>) {
             *to = abcd_ir::BlockId::new(0);
         }
         Stmt::Expr(e) | Stmt::Throw(e) => canon_expr(e, map),
-        Stmt::Return(v) => {
-            if let Some(e) = v {
-                canon_expr(e, map);
-            }
-        }
+        Stmt::Return(Some(e)) => canon_expr(e, map),
         Stmt::StoreProp { object, value, .. } => {
             canon_expr(object, map);
             canon_expr(value, map);
@@ -3885,9 +3874,7 @@ fn ft_rethrow_temp(cond: &Expr, then: &[SNode], otherwise: &[SNode]) -> Option<S
         Some(thrown)
     };
     arm_ok(ret_arm, false)?;
-    let Some(thrown) = arm_ok(throw_arm, true)? else {
-        return None;
-    };
+    let thrown = arm_ok(throw_arm, true)??;
     if thrown != x {
         return None; // the hole-guard and the rethrow must agree
     }
@@ -4060,13 +4047,11 @@ fn ft_strip_exits(
         if let FTok::Leaf(Leaf::Raw(Stmt::Return(Some(v)))) = &toks[j] {
             let mut assigned: Vec<&str> = Vec::new();
             for t in cand {
-                if let FTok::Leaf(l) = t {
-                    match l {
-                        Leaf::Raw(Stmt::PhiAssign { target, .. }) | Leaf::Assign { target, .. } => {
-                            assigned.push(target)
-                        }
-                        _ => {}
-                    }
+                if let FTok::Leaf(
+                    Leaf::Raw(Stmt::PhiAssign { target, .. }) | Leaf::Assign { target, .. },
+                ) = t
+                {
+                    assigned.push(target);
                 }
             }
             if assigned.iter().any(|n| expr_uses_name(v, n)) {
@@ -4257,7 +4242,7 @@ struct LexStoreSite {
 
 /// Reconstruct block-scoped declarations at provable lexenv push
 /// sites. Runs AFTER the desugar folds (it consumes their output).
-pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldStats) {
+pub fn scope_fold(nodes: &mut [SNode], params: &[String], stats: &mut FoldStats) {
     // Pass 1: census of every LexStore name → its sites.
     fn census(
         nodes: &[SNode],
@@ -4426,7 +4411,7 @@ pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldSta
                     unreachable!()
                 };
                 let name = name.clone();
-                if params.iter().any(|p| *p == name) || converted.contains(&name) {
+                if params.contains(&name) || converted.contains(&name) {
                     continue;
                 }
                 // Same-name slots within this push: only the first may
@@ -4503,7 +4488,8 @@ pub fn scope_fold(nodes: &mut Vec<SNode>, params: &[String], stats: &mut FoldSta
             let remaining: Vec<Option<String>> = names
                 .iter()
                 .enumerate()
-                .filter_map(|(i, n)| (!declared_slots.contains(&(i as u16))).then(|| n.clone()))
+                .filter(|&(i, _)| !declared_slots.contains(&(i as u16)))
+                .map(|(_, n)| n.clone())
                 .collect();
             if remaining.is_empty() {
                 // Back-to-front push processing makes removal safe.
@@ -4845,7 +4831,7 @@ fn stmt_exprs_of(s: &Stmt) -> Vec<&Expr> {
 /// stores scope_fold could not turn into declarations). `top_level`
 /// gates the global-store half (nested functions would shadow).
 pub fn late_decl_fold(
-    nodes: &mut Vec<SNode>,
+    nodes: &mut [SNode],
     params: &[String],
     top_level: bool,
     stats: &mut FoldStats,
@@ -4889,7 +4875,7 @@ pub fn late_decl_fold(
         }
         // Not a parameter, not already declared by scope_fold, not a
         // read-only global name (the sister lane's collision class).
-        if params.iter().any(|p| *p == name)
+        if params.contains(&name)
             || cx.declared.contains(&name)
             || matches!(name.as_str(), "undefined" | "NaN" | "Infinity")
         {
@@ -4973,7 +4959,7 @@ pub fn late_decl_fold(
         std::collections::HashSet::new();
     #[allow(clippy::too_many_arguments)]
     fn rewrite(
-        nodes: &mut Vec<SNode>,
+        nodes: &mut [SNode],
         capable_here: bool,
         region_stack: &mut Vec<usize>,
         next_try: &mut usize,
@@ -5297,7 +5283,7 @@ fn map_exprs_mut(nodes: &mut [SNode], f: &mut impl FnMut(&mut Expr)) {
 /// appends `...<rest>`) and rewrites the body's `RestArgs` exprs.
 /// `hidden` is the ABI-slot count (`params[hidden..]` are visible).
 pub fn rest_param_fold(
-    nodes: &mut Vec<SNode>,
+    nodes: &mut [SNode],
     params: &mut Vec<String>,
     hidden: usize,
     stats: &mut FoldStats,
@@ -5371,7 +5357,7 @@ pub fn rest_param_fold(
     // CopyRestArgs result — keep-alive evidence, recover.rs) is
     // consumed, not rewritten.
     let rest_expr = Expr::Ident(rest.clone());
-    fn strip_bare_rest(nodes: &mut Vec<SNode>) {
+    fn strip_bare_rest(nodes: &mut [SNode]) {
         for n in nodes.iter_mut() {
             match n {
                 SNode::Stmts(run) => {
@@ -5495,7 +5481,7 @@ struct GenDriverCx {
 /// use) keeps the documented hard-fallback node. Runs BEFORE
 /// [`fold`]'s `dissolve_rethrow_trys`, so the folded catch-all
 /// (`catch (e) { throw e; }`) dissolves as the semantic no-op it is.
-pub fn async_driver_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats: &mut FoldStats) {
+pub fn async_driver_fold(nodes: &mut [SNode], kind: FunctionKind, stats: &mut FoldStats) {
     if !matches!(
         kind,
         FunctionKind::Async | FunctionKind::AsyncArrow | FunctionKind::AsyncGenerator
@@ -5524,7 +5510,7 @@ pub fn async_driver_fold(nodes: &mut Vec<SNode>, kind: FunctionKind, stats: &mut
 }
 
 fn async_fold_seq(
-    nodes: &mut Vec<SNode>,
+    nodes: &mut [SNode],
     uses: &BTreeMap<ValueId, usize>,
     decls: &BTreeMap<ValueId, usize>,
     stats: &mut FoldStats,
@@ -6310,7 +6296,7 @@ fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<ValueId> {
         }
         None
     }
-    fn continuation_throw<'a>(stack: &[&'a [SNode]]) -> Option<ValueId> {
+    fn continuation_throw(stack: &[&[SNode]]) -> Option<ValueId> {
         for level in stack.iter().rev() {
             match first_significant_stmt(level) {
                 Some(Stmt::Throw(e)) => return temp_value(e),
@@ -6836,7 +6822,7 @@ fn async_machine_seq(nodes: &mut Vec<SNode>, cx: &mut AsyncMachineCx, stats: &mu
 /// left with no assigns and no reads goes too. Any other surviving
 /// use keeps everything (loud partial fold).
 fn sweep_async_machinery(
-    nodes: &mut Vec<SNode>,
+    nodes: &mut [SNode],
     genobj: ValueId,
     aliases: &BTreeSet<ValueId>,
     consumed: &BTreeSet<ValueId>,
@@ -6954,7 +6940,7 @@ fn sweep_async_machinery(
 /// Remove `PhiAssign` leaves assigning a funcObj-alias temp to one of
 /// the dead phi targets.
 fn strip_genobj_phi_assigns(
-    nodes: &mut Vec<SNode>,
+    nodes: &mut [SNode],
     aliases: &BTreeSet<ValueId>,
     targets: &BTreeSet<String>,
 ) {
@@ -7006,7 +6992,7 @@ fn strip_genobj_phi_assigns(
 /// Remove `PhiDecl`s for stripped targets that have no remaining
 /// assigns and no reads.
 fn strip_dead_phi_decls(
-    nodes: &mut Vec<SNode>,
+    nodes: &mut [SNode],
     targets: &BTreeSet<String>,
     remaining: &BTreeSet<String>,
     uses: &BTreeMap<ValueId, usize>,
@@ -7250,7 +7236,7 @@ fn agen_uses_are_machinery(nodes: &[SNode], genobj: ValueId) -> bool {
 /// the optional dead entry resume/mode expression statements must
 /// follow. Elide them. Returns false (no fold at all) when the site
 /// does not match.
-fn agen_entry_elide(nodes: &mut Vec<SNode>, genobj: ValueId, stats: &mut FoldStats) -> bool {
+fn agen_entry_elide(nodes: &mut [SNode], genobj: ValueId, stats: &mut FoldStats) -> bool {
     for n in nodes.iter_mut() {
         match n {
             SNode::Stmts(run) => {
@@ -7914,7 +7900,7 @@ fn match_ag_await(nodes: &[SNode], i: usize, cx: &mut AsyncMachineCx) -> Option<
 fn walk_leaves(nodes: &[SNode], f: &mut impl FnMut(&Leaf)) {
     for n in nodes {
         match n {
-            SNode::Stmts(run) => run.iter().for_each(|l| f(l)),
+            SNode::Stmts(run) => run.iter().for_each(&mut *f),
             SNode::If {
                 then, otherwise, ..
             } => {
@@ -8020,7 +8006,7 @@ fn count_temp_uses(nodes: &[SNode], uses: &mut BTreeMap<ValueId, usize>) {
 
 /// Remove `Declare` leaves whose SSA value is in `dead` (callers prove
 /// zero remaining uses first).
-fn sweep_dead_decls(nodes: &mut Vec<SNode>, dead: &BTreeSet<ValueId>) {
+fn sweep_dead_decls(nodes: &mut [SNode], dead: &BTreeSet<ValueId>) {
     for n in nodes.iter_mut() {
         match n {
             SNode::Stmts(run) => run.retain(|l| {
@@ -8628,20 +8614,19 @@ fn ys_match_return_arm(
                         if matches!(value, Expr::Lit(Lit::Bool(true))) {
                             true_decl = Some(id);
                         }
-                        if let Some(base) = ys_prop(value, "return") {
-                            if in_phis(&base) {
-                                it_id = Some((base, id));
-                            }
+                        if let Some(base) = ys_prop(value, "return")
+                            && in_phis(&base)
+                        {
+                            it_id = Some((base, id));
                         }
                     }
                 }
                 // The propagation return: `return received`.
-                if !async_ {
-                    if let [Leaf::Raw(Stmt::Return(Some(e)))] = run.as_slice() {
-                        if let Some(t) = temp_value(e).filter(in_phis) {
-                            rv_id = Some(t);
-                        }
-                    }
+                if !async_
+                    && let [Leaf::Raw(Stmt::Return(Some(e)))] = run.as_slice()
+                    && let Some(t) = temp_value(e).filter(in_phis)
+                {
+                    rv_id = Some(t);
                 }
                 let _ = idx;
             }
@@ -8860,9 +8845,7 @@ fn ys_match_loop_tail_sync(
         return None;
     };
     let pre_phis = ys_phi_decls(precall)?;
-    let Some(exit_id) = pre_phis.get(&exit_phi.1).copied() else {
-        return None;
-    };
+    let exit_id = pre_phis.get(&exit_phi.1).copied()?;
     let exit_phi = (exit_id, exit_phi.1);
     let SNode::Stmts(prun) = precall else {
         return None;
@@ -9031,9 +9014,7 @@ fn ys_match_loop_tail_async(
         return None;
     };
     let pre_phis = ys_phi_decls(precall)?;
-    let Some(exit_id) = pre_phis.get(&exit_phi.1).copied() else {
-        return None;
-    };
+    let exit_id = pre_phis.get(&exit_phi.1).copied()?;
     let exit_phi = (exit_id, exit_phi.1);
     let SNode::Stmts(prun) = precall else {
         return None;
@@ -9602,15 +9583,15 @@ fn ys_loopback(
 
 // ── the completion dispatch (sync sibling) ─────────────────────────
 
+/// The completion-dispatch match result: the optional completion-value
+/// binding (name, id) and the continuation nodes.
+type ExitMatch = (Option<(String, ValueId)>, Vec<SNode>);
+
 /// Match the sync completion dispatch sitting right after the loop:
 /// `if (!exitReturn) { value = res.value; <continuation> } else {
 /// v2 = res.value; return v2 }`. Returns the binding (when the
 /// completion value is used) and the continuation.
-fn ys_match_exit(
-    n: &SNode,
-    exit_phi: ValueId,
-    res: ValueId,
-) -> Option<(Option<(String, ValueId)>, Vec<SNode>)> {
+fn ys_match_exit(n: &SNode, exit_phi: ValueId, res: ValueId) -> Option<ExitMatch> {
     let SNode::If {
         cond,
         then,
@@ -9927,7 +9908,7 @@ fn ys_innermost_body(t: &SNode) -> Option<&Vec<SNode>> {
 /// Arrangement B: try fragments `[Try(setup+init), Try(While),
 /// Try(exit)]` (the structurer's non-contiguous-region split).
 fn ys_apply_fragments(
-    nodes: &mut Vec<SNode>,
+    nodes: &mut [SNode],
     i: usize,
     async_: bool,
     uses: &BTreeMap<ValueId, usize>,

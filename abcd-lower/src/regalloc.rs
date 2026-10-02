@@ -253,16 +253,14 @@ pub fn frame_init_consts(module: &Module, func_id: FuncId, used_only: bool) -> V
     // instructions are the fused-away LoadConst/constant-index producers,
     // which carry no SSA operands of their own.
     let mut used: HashSet<ValueId> = HashSet::new();
-    if used_only {
-        if let Some(func) = module.func(func_id) {
-            for &bb in &func.blocks {
-                let Some(block) = module.block(bb) else {
-                    continue;
-                };
-                for &iid in &block.insts {
-                    if let Some(inst) = module.inst(iid) {
-                        used.extend(inst.op.operands());
-                    }
+    if used_only && let Some(func) = module.func(func_id) {
+        for &bb in &func.blocks {
+            let Some(block) = module.block(bb) else {
+                continue;
+            };
+            for &iid in &block.insts {
+                if let Some(inst) = module.inst(iid) {
+                    used.extend(inst.op.operands());
                 }
             }
         }
@@ -500,7 +498,7 @@ pub fn allocate_with_options(
     let param_count = func.params.len() as u64;
     let n_values = all_values.len() as u64;
     // Low mode must also fit the copy_temp top reservation (+ 1).
-    let low_mode_fits = param_count + window + n_values + 1 <= 256;
+    let low_mode_fits = param_count + window + n_values < 256;
     let low_scratches = if low_mode_fits {
         0
     } else {

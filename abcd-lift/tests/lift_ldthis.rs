@@ -65,7 +65,7 @@ fn return_value_def(module: &abcd_ir::Module) -> ValueDef {
         for &iid in &module.blocks[b.index()].insts {
             if let Op::Return { value: Some(v) } = &module.insts[iid.index()].op {
                 assert!(found.is_none(), "single Return in the body");
-                found = Some(module.values[v.index()].def.clone());
+                found = Some(module.values[v.index()].def);
             }
         }
     }

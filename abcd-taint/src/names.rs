@@ -41,8 +41,8 @@ fn resolve_into(
     let Some(v) = module.value(value) else {
         return;
     };
-    match v.def {
-        ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
+    if let ValueDef::Inst(iid) = v.def {
+        match module.inst(iid).map(|i| &i.op) {
             Some(Op::Mov { src }) => resolve_into(module, *src, visiting, out),
             Some(Op::Phi { entries }) => {
                 for (_, incoming) in entries {
@@ -66,27 +66,25 @@ fn resolve_into(
                 }
             }
             Some(Op::LoadConst(c)) => {
-                if let Some(Const::MethodRef(f)) = module.consts.get(*c) {
-                    if let Some(fd) = module.func(*f) {
-                        if let Some(s) = module.sym.resolve(fd.name) {
-                            push_unique(out, s.to_owned());
-                        }
-                    }
+                if let Some(Const::MethodRef(f)) = module.consts.get(*c)
+                    && let Some(fd) = module.func(*f)
+                    && let Some(s) = module.sym.resolve(fd.name)
+                {
+                    push_unique(out, s.to_owned());
                 }
             }
             Some(Op::DefineFunc { body, .. }) => {
-                if let Some(fd) = module.func(*body) {
-                    if let Some(s) = module.sym.resolve(fd.name) {
-                        push_unique(out, s.to_owned());
-                    }
+                if let Some(fd) = module.func(*body)
+                    && let Some(s) = module.sym.resolve(fd.name)
+                {
+                    push_unique(out, s.to_owned());
                 }
             }
             Some(Op::AllocClosure { func }) | Some(Op::CreateGenerator { func }) => {
                 resolve_into(module, *func, visiting, out)
             }
             _ => {}
-        },
-        _ => {}
+        }
     }
 }
 

@@ -208,7 +208,7 @@ mod tests {
             let m = abc_builder_class_add_method_with_proto(
                 b,
                 cls,
-                b"f\0".as_ptr() as *const std::ffi::c_char,
+                c"f".as_ptr(),
                 proto,
                 0x1,
                 code.as_ptr(),
@@ -463,12 +463,7 @@ mod tests {
             // One foreign field ("fx") hanging off the global class.
             let cls = abc_builder_add_global_class(b);
             assert_ne!(cls, u32::MAX);
-            let ff = abc_builder_add_foreign_field(
-                b,
-                cls,
-                b"fx\0".as_ptr() as *const std::ffi::c_char,
-                Type_TypeId_I32 as u8,
-            );
+            let ff = abc_builder_add_foreign_field(b, cls, c"fx".as_ptr(), Type_TypeId_I32);
             assert_ne!(ff, u32::MAX);
 
             let mut out_len: u32 = 0;
@@ -534,7 +529,7 @@ mod tests {
         unsafe {
             let b = abc_builder_new();
             assert!(!b.is_null());
-            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as *const std::ffi::c_char);
+            abc_builder_set_api(b, 12, c"beta1".as_ptr());
 
             let cls = abc_builder_add_global_class(b);
             assert_ne!(cls, u32::MAX);
@@ -543,7 +538,7 @@ mod tests {
             let m = abc_builder_class_add_method_with_proto(
                 b,
                 cls,
-                b"func\0".as_ptr() as *const std::ffi::c_char,
+                c"func".as_ptr(),
                 proto,
                 0x1, // ACC_PUBLIC
                 code.as_ptr(),
@@ -558,9 +553,9 @@ mod tests {
             assert_eq!(abc_builder_method_add_param(b, m, Type_TypeId_TAGGED), 1);
 
             // Two annotations, one U32 ('6') element each.
-            let ann_cls = abc_builder_add_class(b, b"LParamAnn;\0".as_ptr() as *const _);
+            let ann_cls = abc_builder_add_class(b, c"LParamAnn;".as_ptr() as *const _);
             assert_ne!(ann_cls, u32::MAX);
-            let name = abc_builder_add_string(b, b"value\0".as_ptr() as *const _);
+            let name = abc_builder_add_string(b, c"value".as_ptr() as *const _);
             assert_ne!(name, u32::MAX);
             let mk_ann = |value: u32| {
                 let elems = [AbcAnnotationElemDef {
@@ -592,7 +587,7 @@ mod tests {
             assert!(!f.is_null(), "should open the built ABC file");
 
             // Locate the method and its two ParamAnnotationsItems.
-            let class_off = abc_file_get_class_id(f, b"L_GLOBAL;\0".as_ptr() as *const _);
+            let class_off = abc_file_get_class_id(f, c"L_GLOBAL;".as_ptr() as *const _);
             assert_ne!(class_off, u32::MAX);
             let ca = abc_class_open(f, class_off);
             assert!(!ca.is_null());
@@ -687,14 +682,14 @@ mod tests {
 
         unsafe {
             let b = abc_builder_new();
-            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as *const std::ffi::c_char);
+            abc_builder_set_api(b, 12, c"beta1".as_ptr());
             let cls = abc_builder_add_global_class(b);
             let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
             let code: [u8; 1] = [0xa0];
             abc_builder_class_add_method_with_proto(
                 b,
                 cls,
-                b"f\0".as_ptr() as *const std::ffi::c_char,
+                c"f".as_ptr(),
                 proto,
                 0x1,
                 code.as_ptr(),
@@ -746,11 +741,11 @@ mod tests {
         unsafe {
             let b = abc_builder_new();
             assert!(!b.is_null());
-            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as *const std::ffi::c_char);
+            abc_builder_set_api(b, 12, c"beta1".as_ptr());
 
             let cls = abc_builder_add_global_class(b);
             assert_ne!(cls, u32::MAX);
-            let rec = abc_builder_add_foreign_class(b, b"LRec;\0".as_ptr() as *const _);
+            let rec = abc_builder_add_foreign_class(b, c"LRec;".as_ptr() as *const _);
             assert_ne!(rec, u32::MAX);
             assert_ne!(rec & 0x8000_0000, 0, "foreign class handle must be tagged");
 
@@ -759,7 +754,7 @@ mod tests {
             let m = abc_builder_class_add_method_with_proto(
                 b,
                 cls,
-                b"func\0".as_ptr() as *const std::ffi::c_char,
+                c"func".as_ptr(),
                 proto,
                 0x1, // ACC_PUBLIC
                 code.as_ptr(),
@@ -791,8 +786,8 @@ mod tests {
             );
 
             // Annotate the reference-typed param and seal compile-time.
-            let ann_cls = abc_builder_add_class(b, b"LRefParamAnn;\0".as_ptr() as *const _);
-            let name = abc_builder_add_string(b, b"value\0".as_ptr() as *const _);
+            let ann_cls = abc_builder_add_class(b, c"LRefParamAnn;".as_ptr() as *const _);
+            let name = abc_builder_add_string(b, c"value".as_ptr() as *const _);
             let elems = [AbcAnnotationElemDef {
                 name_string_handle: name,
                 tag: b'6' as std::ffi::c_char,
@@ -810,7 +805,7 @@ mod tests {
             let f = abc_file_open(data.as_ptr(), data.len());
             assert!(!f.is_null(), "should open the built ABC file");
 
-            let class_off = abc_file_get_class_id(f, b"L_GLOBAL;\0".as_ptr() as *const _);
+            let class_off = abc_file_get_class_id(f, c"L_GLOBAL;".as_ptr() as *const _);
             assert_ne!(class_off, u32::MAX);
             let ca = abc_class_open(f, class_off);
             assert!(!ca.is_null());
@@ -859,26 +854,26 @@ mod tests {
         unsafe {
             let b = abc_builder_new();
             assert!(!b.is_null());
-            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as *const std::ffi::c_char);
+            abc_builder_set_api(b, 12, c"beta1".as_ptr());
 
-            let rec_cls = abc_builder_add_class(b, b"L_ESModuleRecord;\0".as_ptr() as _);
+            let rec_cls = abc_builder_add_class(b, c"L_ESModuleRecord;".as_ptr() as _);
             assert_ne!(rec_cls, u32::MAX);
             let field = abc_builder_class_add_field(
                 b,
                 rec_cls,
-                b"test.js\0".as_ptr() as _,
-                Type_TypeId_U32 as u8,
+                c"test.js".as_ptr() as _,
+                Type_TypeId_U32,
                 1, // ACC_PUBLIC
             );
             assert_ne!(field, u32::MAX);
 
             // A global class with an entry method so the file is well-formed.
-            let global = abc_builder_add_class(b, b"L_GLOBAL;\0".as_ptr() as _);
-            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED as u8, std::ptr::null(), 0);
+            let global = abc_builder_add_class(b, c"L_GLOBAL;".as_ptr() as _);
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
             let m = abc_builder_class_add_method_with_proto(
                 b,
                 global,
-                b"func_main_0\0".as_ptr() as _,
+                c"func_main_0".as_ptr() as _,
                 proto,
                 1,
                 [0x65u8].as_ptr(),
@@ -889,21 +884,21 @@ mod tests {
             assert_ne!(m, u32::MAX);
 
             // Strings referenced by the blob.
-            let s_dep = abc_builder_add_string(b, b"dep1\0".as_ptr() as _);
-            let s_local1 = abc_builder_add_string(b, b"local1\0".as_ptr() as _);
-            let s_imp1 = abc_builder_add_string(b, b"imp1\0".as_ptr() as _);
-            let s_ns1 = abc_builder_add_string(b, b"ns1\0".as_ptr() as _);
-            let s_local2 = abc_builder_add_string(b, b"local2\0".as_ptr() as _);
-            let s_exp2 = abc_builder_add_string(b, b"export2\0".as_ptr() as _);
-            let s_exp3 = abc_builder_add_string(b, b"export3\0".as_ptr() as _);
-            let s_imp3 = abc_builder_add_string(b, b"imp3\0".as_ptr() as _);
+            let s_dep = abc_builder_add_string(b, c"dep1".as_ptr() as _);
+            let s_local1 = abc_builder_add_string(b, c"local1".as_ptr() as _);
+            let s_imp1 = abc_builder_add_string(b, c"imp1".as_ptr() as _);
+            let s_ns1 = abc_builder_add_string(b, c"ns1".as_ptr() as _);
+            let s_local2 = abc_builder_add_string(b, c"local2".as_ptr() as _);
+            let s_exp2 = abc_builder_add_string(b, c"export2".as_ptr() as _);
+            let s_exp3 = abc_builder_add_string(b, c"export3".as_ptr() as _);
+            let s_imp3 = abc_builder_add_string(b, c"imp3".as_ptr() as _);
             for h in [
                 s_dep, s_local1, s_imp1, s_ns1, s_local2, s_exp2, s_exp3, s_imp3,
             ] {
                 assert_ne!(h, u32::MAX);
             }
 
-            let la = abc_builder_add_literal_array(b, b"module\0".as_ptr() as _);
+            let la = abc_builder_add_literal_array(b, c"module".as_ptr() as _);
             assert_ne!(la, u32::MAX);
 
             let records = [
@@ -1067,9 +1062,9 @@ mod tests {
         unsafe {
             let b = abc_builder_new();
             assert!(!b.is_null());
-            abc_builder_set_api(b, 12, b"beta1\0".as_ptr() as _);
-            let s = abc_builder_add_string(b, b"dep\0".as_ptr() as _);
-            let la = abc_builder_add_literal_array(b, b"module\0".as_ptr() as _);
+            abc_builder_set_api(b, 12, c"beta1".as_ptr() as _);
+            let s = abc_builder_add_string(b, c"dep".as_ptr() as _);
+            let la = abc_builder_add_literal_array(b, c"module".as_ptr() as _);
             let ok_record = AbcModuleRecordDef {
                 tag: ModuleTag_STAR_EXPORT,
                 export_name_handle: u32::MAX,

@@ -111,10 +111,10 @@ impl IfdsProblem for MicroTaint {
             Fact::Zero => {
                 // Source generation: the seed is the zero fact flowing
                 // over the source instruction.
-                if self.is_source(module, curr) {
-                    if let Some(v) = module.inst(curr).and_then(|i| i.result) {
-                        out.push(Fact::V(v));
-                    }
+                if self.is_source(module, curr)
+                    && let Some(v) = module.inst(curr).and_then(|i| i.result)
+                {
+                    out.push(Fact::V(v));
                 }
             }
             Fact::V(v) => {
@@ -124,10 +124,9 @@ impl IfdsProblem for MicroTaint {
                 // Exception dispatch: `throw v` taints the handler's
                 // exception parameter along the exceptional edge.
                 if matches!(module.inst(curr).map(|i| &i.op), Some(Op::Throw { value }) if *value == v)
+                    && let Some(exc) = Self::handler_param(module, succ)
                 {
-                    if let Some(exc) = Self::handler_param(module, succ) {
-                        out.push(Fact::V(exc));
-                    }
+                    out.push(Fact::V(exc));
                 }
             }
         }
@@ -152,16 +151,16 @@ impl IfdsProblem for MicroTaint {
             return;
         };
         // T10 binding table: params[0] is `this`, formals follow.
-        if *this == Some(v) {
-            if let Some(&p) = cf.params.first() {
-                out.push(Fact::V(p));
-            }
+        if *this == Some(v)
+            && let Some(&p) = cf.params.first()
+        {
+            out.push(Fact::V(p));
         }
         for (i, &a) in args.iter().enumerate() {
-            if a == v {
-                if let Some(&p) = cf.params.get(i + 1) {
-                    out.push(Fact::V(p));
-                }
+            if a == v
+                && let Some(&p) = cf.params.get(i + 1)
+            {
+                out.push(Fact::V(p));
             }
         }
     }
@@ -210,7 +209,7 @@ impl IfdsProblem for MicroTaint {
         out: &mut Vec<Fact>,
     ) {
         // The bypass is the identity: caller-local facts survive the call.
-        out.push(source.clone());
+        out.push(*source);
     }
 }
 
@@ -369,13 +368,13 @@ fn call_return_summary_both_call_sites() {
         // The id(...) call inst is the one with a result; find both calls.
         let entry = entry_of(&m, f);
         for &iid in &m.block(entry).unwrap().insts {
-            if let Some(inst) = m.inst(iid) {
-                if matches!(inst.op, Op::Call { .. }) {
-                    if inst.result.is_some() {
-                        cg.add(iid, id);
-                    } else {
-                        cg.add(iid, sink);
-                    }
+            if let Some(inst) = m.inst(iid)
+                && matches!(inst.op, Op::Call { .. })
+            {
+                if inst.result.is_some() {
+                    cg.add(iid, id);
+                } else {
+                    cg.add(iid, sink);
                 }
             }
         }

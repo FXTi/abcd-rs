@@ -160,11 +160,17 @@ fn inst_survives_pipeline(make: impl FnOnce(&mut V2Builder, ValueId, FuncId) -> 
         .any(|&bb| module.blocks[bb.index()].insts.contains(&inst_id))
 }
 
+/// A named op constructor: `(label, build the op)`.
+type OpCase = (
+    &'static str,
+    Box<dyn FnOnce(&mut V2Builder, ValueId, FuncId) -> Op>,
+);
+
 /// N57–N61: the taxonomy-growth ops are conservatively respected — the
 /// observable ones are never deleted, even with dead results.
 #[test]
 fn pipeline_keeps_observable_v02_ops() {
-    let cases: Vec<(&str, Box<dyn FnOnce(&mut V2Builder, ValueId, FuncId) -> Op>)> = vec![
+    let cases: Vec<OpCase> = vec![
         // N60: own-property stores are define-semantics heap writes —
         // never confused with plain stores, never deletable.
         (

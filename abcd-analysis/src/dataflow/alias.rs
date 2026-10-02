@@ -239,14 +239,13 @@ impl<'m> Rung1AliasOracle<'m> {
             returns_of.insert(func, returns);
         }
         // Exception params: defined at handler blocks.
-        for v in 0..module.values.len() {
+        for (v, slot) in value_func.iter_mut().enumerate() {
             let vid = ValueId::new(v as u32);
-            if value_func[v].is_none() {
-                if let Some(val) = module.value(vid) {
-                    if let ValueDef::ExceptionParam(b) = val.def {
-                        value_func[v] = block_func[b.index()];
-                    }
-                }
+            if slot.is_none()
+                && let Some(val) = module.value(vid)
+                && let ValueDef::ExceptionParam(b) = val.def
+            {
+                *slot = block_func[b.index()];
             }
         }
         Rung1AliasOracle {
@@ -426,13 +425,13 @@ impl<'m> Rung1AliasOracle<'m> {
     fn resolve_param(&self, value: ValueId, func: FuncId, ctx: &mut Vec<InstId>) -> QueryAnswer {
         // Balanced: the top of the context stack is a call site that
         // calls THIS function — the argument binding is exact.
-        if let Some(&call) = ctx.last() {
-            if self.graph.callees_of_call_at(call).contains(&func) {
-                ctx.pop();
-                let ans = self.bind_at_call(func, value, call, ctx);
-                ctx.push(call);
-                return ans;
-            }
+        if let Some(&call) = ctx.last()
+            && self.graph.callees_of_call_at(call).contains(&func)
+        {
+            ctx.pop();
+            let ans = self.bind_at_call(func, value, call, ctx);
+            ctx.push(call);
+            return ans;
         }
         // Unbalanced (heros.md §1.7's followReturnsPastSeeds analogue):
         // fan out to every caller the graph records. Complete only

@@ -71,10 +71,13 @@ fn inst_survives_adce(make: impl FnOnce(&mut V2Builder, ValueId) -> Op) -> bool 
         .any(|&bb| module.blocks[bb.index()].insts.contains(&inst_id))
 }
 
+/// A named observable-load constructor: `(label, build the op)`.
+type LoadCase = (&'static str, Box<dyn FnOnce(&mut V2Builder, ValueId) -> Op>);
+
 /// N48 red pins: every observable load in the list must be kept.
 #[test]
 fn adce_keeps_observable_loads_with_dead_results() {
-    let cases: Vec<(&str, Box<dyn FnOnce(&mut V2Builder, ValueId) -> Op>)> = vec![
+    let cases: Vec<LoadCase> = vec![
         (
             "GetIterator (user @@iterator call)",
             Box::new(|_b, p0| Op::GetIterator { obj: p0 }),
@@ -136,7 +139,7 @@ fn adce_keeps_observable_loads_with_dead_results() {
 /// N50 red pins: the two global/super load forms the N48 list missed.
 #[test]
 fn adce_keeps_n50_observable_loads_with_dead_results() {
-    let cases: Vec<(&str, Box<dyn FnOnce(&mut V2Builder, ValueId) -> Op>)> = vec![
+    let cases: Vec<LoadCase> = vec![
         (
             "TryGetGlobal default:Some (v0.1 TryLoadGlobalByName — proto getters)",
             Box::new(|b, _p0| {
@@ -211,7 +214,7 @@ fn adce_keeps_operand_chain_of_observable_load() {
 /// (v0.1 parity — they were NOT on the v0.1 essential list).
 #[test]
 fn adce_still_deletes_pure_reads_and_allocs() {
-    let cases: Vec<(&str, Box<dyn FnOnce(&mut V2Builder, ValueId) -> Op>)> = vec![
+    let cases: Vec<LoadCase> = vec![
         (
             "GetLexVar",
             Box::new(|_b, _p0| Op::GetLexVar { level: 0, slot: 0 }),

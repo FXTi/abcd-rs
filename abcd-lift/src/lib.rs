@@ -551,9 +551,8 @@ pub(crate) fn lift_method<'f>(
             let raw = &fx.raw_cfg.blocks[bi];
             (raw.start, raw.end)
         };
-        for idx in start..end {
-            let bc = &bytecodes[idx];
-            translate::translate_bytecode(&mut fx, bc, idx, ir_block)?;
+        for (off, bc) in bytecodes[start..end].iter().enumerate() {
+            translate::translate_bytecode(&mut fx, bc, start + off, ir_block)?;
         }
 
         // Every block must end in an explicit terminator; bytecode
@@ -648,10 +647,11 @@ fn build_try_regions(
         // All IR blocks overlapping the try region are protected.
         let mut protected = Vec::new();
         for (bi, raw_block) in raw_cfg.blocks.iter().enumerate() {
-            if raw_block.start < try_end && raw_block.end > try_start {
-                if let Some(&ir_block) = block_map.get(&bi) {
-                    protected.push(ir_block);
-                }
+            if raw_block.start < try_end
+                && raw_block.end > try_start
+                && let Some(&ir_block) = block_map.get(&bi)
+            {
+                protected.push(ir_block);
             }
         }
 
@@ -697,22 +697,21 @@ fn sweep_dead_blocks(fx: &mut translate::FnLift) {
 
     let augmented_succs = |module: &Module, func_id: FuncId, bb: BlockId| -> Vec<BlockId> {
         let mut out = Vec::new();
-        if let Some(block) = module.blocks.get(bb.index()) {
-            if let Some(&last) = block.insts.last() {
-                if let Some(inst) = module.insts.get(last.index()) {
-                    match &inst.op {
-                        abcd_ir::Op::Branch { dest } => out.push(*dest),
-                        abcd_ir::Op::CondBranch {
-                            true_dest,
-                            false_dest,
-                            ..
-                        } => {
-                            out.push(*true_dest);
-                            out.push(*false_dest);
-                        }
-                        _ => {}
-                    }
+        if let Some(block) = module.blocks.get(bb.index())
+            && let Some(&last) = block.insts.last()
+            && let Some(inst) = module.insts.get(last.index())
+        {
+            match &inst.op {
+                abcd_ir::Op::Branch { dest } => out.push(*dest),
+                abcd_ir::Op::CondBranch {
+                    true_dest,
+                    false_dest,
+                    ..
+                } => {
+                    out.push(*true_dest);
+                    out.push(*false_dest);
                 }
+                _ => {}
             }
         }
         for region in &module.functions[func_id.index()].try_regions {

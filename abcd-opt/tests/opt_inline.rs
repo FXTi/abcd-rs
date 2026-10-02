@@ -975,7 +975,7 @@ fn multi_return_callee_flows_through_phi() {
         entries
             .iter()
             .all(|(e, _)| e.kind == EdgeKind::Normal
-                && module.blocks[e.from.index()].preds.len() >= 1),
+                && !module.blocks[e.from.index()].preds.is_empty()),
         "phi edges come from cloned return blocks: {entries:?}"
     );
     // f's Return uses the phi.

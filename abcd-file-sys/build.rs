@@ -127,24 +127,24 @@ fn main() {
         .define("NDEBUG", None)
         .define("SUPPORT_KNOWN_EXCEPTION", None)
         // Include path priority: shim > shim/utils (for bare "logger.h") > OUT_DIR > bridge > vendor
-        .include(&format!("{manifest}/bridge/shim"))
-        .include(&format!("{manifest}/bridge/shim/utils"))
+        .include(format!("{manifest}/bridge/shim"))
+        .include(format!("{manifest}/bridge/shim/utils"))
         .include(&out_dir)
-        .include(&format!("{manifest}/bridge"))
+        .include(format!("{manifest}/bridge"))
         .include(&vendor_pf)
-        .include(&format!(
+        .include(format!(
             "{manifest}/arkcompiler_runtime_core/libpandabase/include"
         ))
         // Upstream mixes both include forms: "macros.h" (bare, needs the
         // inner dir) and "libpandabase/utils/timers.h" (needs include/).
-        .include(&format!(
+        .include(format!(
             "{manifest}/arkcompiler_runtime_core/libpandabase/include/libpandabase"
         ))
         // assembler headers for annotation value type validation
-        .include(&format!("{manifest}/arkcompiler_runtime_core/assembler"))
+        .include(format!("{manifest}/arkcompiler_runtime_core/assembler"))
         // vendor root: upstream code uses repo-root-prefixed includes such as
         // "libpandabase/utils/timers.h", resolved by this path in our flat layout
-        .include(&format!("{manifest}/arkcompiler_runtime_core"));
+        .include(format!("{manifest}/arkcompiler_runtime_core"));
 
     // Force-include missing transitive headers that the upstream build provides
     let fixups = format!("{manifest}/bridge/shim/vendor_fixups.h");
@@ -155,8 +155,8 @@ fn main() {
         build
             .define("PANDA_TARGET_WINDOWS", None)
             .include(format!("{manifest}/arkcompiler_runtime_core/platforms"))
-            .flag(&format!("/FI{manifest}/bridge/shim/platform_compat.h"))
-            .flag(&format!("/FI{fixups}"))
+            .flag(format!("/FI{manifest}/bridge/shim/platform_compat.h"))
+            .flag(format!("/FI{fixups}"))
             .flag("/EHsc")
             // Conformance mode: platforms/windows/libpandabase/file.h relies on
             // C++17 guaranteed copy elision (returns Unexpected temporaries whose
@@ -170,7 +170,7 @@ fn main() {
         if target.contains("apple") {
             build.define("PANDA_TARGET_MACOS", None);
         }
-        build.include(&format!("{manifest}/arkcompiler_runtime_core/platforms"));
+        build.include(format!("{manifest}/arkcompiler_runtime_core/platforms"));
         build.flag("-include").flag(&fixups);
     }
 
@@ -193,7 +193,7 @@ fn main() {
     // file_bridge.h is a pure C header (only <stddef.h> + <stdint.h>, opaque types),
     // so no extra include paths are needed.
     let bindings = bindgen::Builder::default()
-        .header(&format!("{manifest}/bridge/file_bridge.h"))
+        .header(format!("{manifest}/bridge/file_bridge.h"))
         .allowlist_function("abc_.*")
         .allowlist_type("Abc.*")
         .allowlist_var("ABC_.*")
@@ -208,7 +208,7 @@ fn main() {
     // Parses C++ vendor headers directly so constants come from vendor code,
     // not hand-maintained #define mirrors.
     let enum_bindings = bindgen::Builder::default()
-        .header(&format!("{out_dir}/file_bridge_enums.h"))
+        .header(format!("{out_dir}/file_bridge_enums.h"))
         .clang_args(["-x", "c++", "-std=c++17"])
         .clang_arg(format!("-include{fixups}"))
         .clang_arg(format!("-I{manifest}/bridge/shim"))

@@ -89,8 +89,8 @@ fn tdz_provable_hole_throws() {
 }
 
 /// 2. A userless dynamic `add` survives as an expression statement
-/// (addition/coerce-symbol-to-prim-err — the `thrower + counter`
-/// coercion calls Symbol.toPrimitive getters).
+///    (addition/coerce-symbol-to-prim-err — the `thrower + counter`
+///    coercion calls Symbol.toPrimitive getters).
 #[test]
 #[ignore]
 fn dead_dynamic_op_is_an_expression_statement() {
@@ -106,7 +106,7 @@ fn dead_dynamic_op_is_an_expression_statement() {
 }
 
 /// 3. A class WITHOUT extends must not grow `extends <hole-temp>`
-/// (class/accessor-name-inst-computed-in).
+///    (class/accessor-name-inst-computed-in).
 #[test]
 #[ignore]
 fn heritage_hole_is_suppressed() {
@@ -125,7 +125,7 @@ fn heritage_hole_is_suppressed() {
 }
 
 /// 4. Class generator methods keep their `*`
-/// (class/definition/methods-gen-yield-as-statement).
+///    (class/definition/methods-gen-yield-as-statement).
 #[test]
 #[ignore]
 fn class_generator_methods_keep_star() {
@@ -140,7 +140,7 @@ fn class_generator_methods_keep_star() {
 }
 
 /// 5. A super-using object-literal method prints as a concise method
-/// (super/prop-expr-obj-ref-strict).
+///    (super/prop-expr-obj-ref-strict).
 #[test]
 #[ignore]
 fn super_object_method_is_concise() {
@@ -169,7 +169,7 @@ fn unary_plus_adjacency_is_parenthesized() {
 }
 
 /// 7. A holey array literal's out-of-contiguity stores stay statements
-/// (for-of/Array.prototype.keys — `[0,'a',true,false,null, /* hole */,
+///    (for-of/Array.prototype.keys — `[0,'a',true,false,null, /* hole */,
 /// undefined, NaN]` must keep length 8).
 #[test]
 #[ignore]
@@ -187,8 +187,8 @@ fn holey_array_stores_are_not_packed() {
 }
 
 /// 8. `ldsuperbyvalue`/`stsuperbyvalue` operand roles (lift+isel): the
-/// KEY is the accumulator, the register is thisValue, the store's value
-/// is the accumulator (super/prop-expr-cls-val).
+///    KEY is the accumulator, the register is thisValue, the store's value
+///    is the accumulator (super/prop-expr-cls-val).
 #[test]
 #[ignore]
 fn super_byvalue_key_is_the_acc() {
@@ -204,8 +204,8 @@ fn super_byvalue_key_is_the_acc() {
 }
 
 /// 9. `CopyRestArgs` reconstructs a real `...rest` parameter (arrow
-/// bodies have no own `arguments`; rest-parameters/expected-argument-count
-/// reads `.length`).
+///    bodies have no own `arguments`; rest-parameters/expected-argument-count
+///    reads `.length`).
 #[test]
 #[ignore]
 fn rest_param_reconstructed() {
@@ -221,7 +221,7 @@ fn rest_param_reconstructed() {
 }
 
 /// 10. `++x` keeps the ToNumber coercion (S8.6_A3_T1: `++{foo:'bar'}.foo`
-/// is NaN, not "bar1").
+///     is NaN, not "bar1").
 #[test]
 #[ignore]
 fn inc_preserves_to_number() {
@@ -234,8 +234,8 @@ fn inc_preserves_to_number() {
 }
 
 /// 11. The TDZ window survives for a binding stored late at the root
-/// run (const/function-local-closure-get-before-initialization: the
-/// closure read must ReferenceError).
+///     run (const/function-local-closure-get-before-initialization: the
+///     closure read must ReferenceError).
 #[test]
 #[ignore]
 fn late_decl_restores_tdz_window() {
@@ -255,8 +255,8 @@ fn late_decl_restores_tdz_window() {
 }
 
 /// 12. An object-literal accessor with a super-using body folds into
-/// the literal as `get [k]() {…}` (computed-property-names/object/
-/// accessor/getter-super).
+///     the literal as `get [k]() {…}` (computed-property-names/object/
+///     accessor/getter-super).
 #[test]
 #[ignore]
 fn super_getter_folds_into_literal() {
@@ -272,9 +272,9 @@ fn super_getter_folds_into_literal() {
 }
 
 /// 13. The corpus regression guard for the late-decl fold:
-/// for-update-continue-1 re-pushes a same-named slot per loop iteration
-/// (distinct bindings!) — the fold must NOT declare `let v2_0` twice
-/// (the inner shadow TDZ-trapped the outer's copy-read).
+///     for-update-continue-1 re-pushes a same-named slot per loop iteration
+///     (distinct bindings!) — the fold must NOT declare `let v2_0` twice
+///     (the inner shadow TDZ-trapped the outer's copy-read).
 #[test]
 #[ignore]
 fn late_decl_never_shadows_repushed_slots() {

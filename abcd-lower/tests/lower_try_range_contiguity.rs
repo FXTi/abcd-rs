@@ -375,11 +375,11 @@ fn nested_regions_keep_first_match_dispatch_order() {
 
     // Entry block: covered only by the outer region.
     assert!(
-        !dispatches(&[inner_tb.clone()], entry_start),
+        !dispatches(std::slice::from_ref(inner_tb), entry_start),
         "the entry block is outside the inner region"
     );
     assert!(
-        dispatches(&[outer_tb.clone()], entry_start),
+        dispatches(std::slice::from_ref(outer_tb), entry_start),
         "the entry block is protected by the outer region"
     );
 }

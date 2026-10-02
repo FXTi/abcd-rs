@@ -385,31 +385,31 @@ fn collect_method_refs(module: &Module, cid: abcd_ir::ConstId, out: &mut BTreeSe
         }
         Const::ArrayLiteral(items) => {
             for i in items {
-                collect_method_refs_const(module, i, out);
+                collect_method_refs_const(i, out);
             }
         }
         Const::ObjectLiteral { keys, values } => {
             for i in keys.iter().chain(values.iter()) {
-                collect_method_refs_const(module, i, out);
+                collect_method_refs_const(i, out);
             }
         }
         _ => {}
     }
 }
 
-fn collect_method_refs_const(module: &Module, c: &Const, out: &mut BTreeSet<FuncId>) {
+fn collect_method_refs_const(c: &Const, out: &mut BTreeSet<FuncId>) {
     match c {
         Const::MethodRef(f) => {
             out.insert(*f);
         }
         Const::ArrayLiteral(items) => {
             for i in items {
-                collect_method_refs_const(module, i, out);
+                collect_method_refs_const(i, out);
             }
         }
         Const::ObjectLiteral { keys, values } => {
             for i in keys.iter().chain(values.iter()) {
-                collect_method_refs_const(module, i, out);
+                collect_method_refs_const(i, out);
             }
         }
         _ => {}
@@ -1135,6 +1135,9 @@ impl<'m> Emitter<'m> {
 
     /// Assignment form of a hoisted class (`name = class …`); the
     /// hoisted check in [`Emitter::emit_class`] does the work.
+    // Signature mirrors `emit_class` (it is a thin forwarder): every
+    // parameter is a distinct facet of the class IR node.
+    #[allow(clippy::too_many_arguments)]
     fn emit_class_assign(
         &mut self,
         pad: &str,
@@ -1161,6 +1164,9 @@ impl<'m> Emitter<'m> {
     }
 
     /// `class Name extends H { constructor(…) {…} …methods… }`.
+    // Every parameter is a distinct facet of the class IR node; a
+    // bundling struct would only rename the plumbing.
+    #[allow(clippy::too_many_arguments)]
     fn emit_class(
         &mut self,
         pad: &str,
@@ -1309,7 +1315,7 @@ impl<'m> Emitter<'m> {
         // (attrs unknown) is instance placement + the lifted
         // FunctionData kind (the pre-B2 behavior).
         let kind = attrs
-            .map(|a| a.kind.clone())
+            .map(|a| a.kind)
             .unwrap_or_else(|| crate::recover::effective_kind(self.module, f));
         // N74-W4: the 24.0.0.0 member buffer tags generator and async
         // methods as plain `method` (probe: methods-gen-yield-as-statement's
@@ -2227,12 +2233,10 @@ fn fn_uses_super(module: &Module, func: FuncId) -> bool {
             };
             match &inst.op {
                 Op::LoadSuper { .. } | Op::StoreSuper { .. } => return true,
-                Op::Call { kind, .. }
-                    if matches!(
-                        kind,
-                        CallKind::Super | CallKind::SuperSpread | CallKind::SuperForwardAllArgs
-                    ) =>
-                {
+                Op::Call {
+                    kind: CallKind::Super | CallKind::SuperSpread | CallKind::SuperForwardAllArgs,
+                    ..
+                } => {
                     return true;
                 }
                 _ => {}

@@ -338,12 +338,11 @@ fn collect_hits(
         };
         let mut names = callee_name_candidates(module, *callee);
         for f in callgraph.callees_of_call_at(iid) {
-            if let Some(fd) = module.func(*f) {
-                if let Some(n) = module.sym.resolve(fd.name) {
-                    if !names.iter().any(|x| x == n) {
-                        names.push(n.to_owned());
-                    }
-                }
+            if let Some(fd) = module.func(*f)
+                && let Some(n) = module.sym.resolve(fd.name)
+                && !names.iter().any(|x| x == n)
+            {
+                names.push(n.to_owned());
             }
         }
         for sink in &config.sinks {
@@ -402,17 +401,17 @@ fn inst_preds(module: &Module, inst: InstId) -> Vec<InstId> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    if let Some(pos) = block.insts.iter().position(|&x| x == inst) {
-        if pos > 0 {
-            out.push(block.insts[pos - 1]);
-            return out;
-        }
+    if let Some(pos) = block.insts.iter().position(|&x| x == inst)
+        && pos > 0
+    {
+        out.push(block.insts[pos - 1]);
+        return out;
     }
     for pred in &block.preds {
-        if let Some(pb) = module.block(pred.from) {
-            if let Some(&last) = pb.insts.last() {
-                out.push(last);
-            }
+        if let Some(pb) = module.block(pred.from)
+            && let Some(&last) = pb.insts.last()
+        {
+            out.push(last);
         }
     }
     out
@@ -440,22 +439,21 @@ fn return_sites_of(module: &Module, call: InstId) -> Vec<InstId> {
             }
         }
     }
-    if inst.op.effects().may_throw {
-        if let Some(f) = module
+    if inst.op.effects().may_throw
+        && let Some(f) = module
             .functions
             .iter()
             .find(|f| f.blocks.contains(&inst.block))
-        {
-            for region in &f.try_regions {
-                if !region.protected.contains(&inst.block) {
-                    continue;
-                }
-                for catch in &region.catches {
-                    if let Some(first) = module.block(catch.handler).and_then(|b| b.insts.first()) {
-                        if !out.contains(first) {
-                            out.push(*first);
-                        }
-                    }
+    {
+        for region in &f.try_regions {
+            if !region.protected.contains(&inst.block) {
+                continue;
+            }
+            for catch in &region.catches {
+                if let Some(first) = module.block(catch.handler).and_then(|b| b.insts.first())
+                    && !out.contains(first)
+                {
+                    out.push(*first);
                 }
             }
         }
@@ -594,14 +592,14 @@ fn reconstruct_path(
         let e = &edges[ei];
         let n = e.target_node;
         // Terminal: a seed edge (Zero, sp, non-zero fact).
-        if e.source_fact == Fact::Zero {
-            if let Some(&func) = index.func_of_sp.get(&n) {
-                if e.target_fact != Fact::Zero {
-                    seed_edge = Some((ei, func));
-                    break;
-                }
-                continue; // the zero self-loop root: do not expand
+        if e.source_fact == Fact::Zero
+            && let Some(&func) = index.func_of_sp.get(&n)
+        {
+            if e.target_fact != Fact::Zero {
+                seed_edge = Some((ei, func));
+                break;
             }
+            continue; // the zero self-loop root: do not expand
         }
         if parent.len() > 4096 {
             break; // cap: report the partial path
@@ -738,8 +736,6 @@ fn reconstruct_path(
 /// list to maintain — reporting only, never semantics).
 fn op_tag(op: &Op) -> String {
     let s = format!("{op:?}");
-    let end = s
-        .find(|c: char| c == ' ' || c == '{' || c == '(')
-        .unwrap_or(s.len());
+    let end = s.find([' ', '{', '(']).unwrap_or(s.len());
     s[..end].to_owned()
 }
