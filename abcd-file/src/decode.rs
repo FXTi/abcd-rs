@@ -41,6 +41,19 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     let abc = AbcFile::open(data)?;
     let f = abc.raw;
     let version = abc.version();
+    // Legacy ISA gate: files written by the pre-2022-08-18 toolchain
+    // (OpenHarmony 3.0/3.1-era, header version 0.0.0.2 — seen in the wild on
+    // 3.2/4.0 devices) use the old opcode numbering (0xff-prefixed ecma
+    // instructions) and old operand encoding (32-bit string file offsets,
+    // 16-bit global literal-array indices). Their bytecode is decoded via
+    // abcd_isa::decode_legacy and their entity operands resolved with legacy
+    // rules below.
+    let legacy = version == abcd_isa::Version::new(0, 0, 0, 2);
+    let legacy_lit_table = if legacy {
+        legacy_literalarray_table(data)
+    } else {
+        None
+    };
     let checksum = abc.checksum();
     let size = abc.size();
     let file_type = crate::file::file_type(data);
@@ -192,7 +205,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
 
         let methods: Result<Vec<_>, _> = collect_offsets_void(cr, sys::abc_class_enumerate_methods)
             .into_iter()
-            .map(|off| decode_method_at(f, off, debug_raw, &entity_map, &mut strings))
+            .map(|off| decode_method_at(f, off, debug_raw, &entity_map, &mut strings, legacy))
             .collect();
         let methods = methods?;
 
@@ -284,6 +297,79 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                         id.0
                     ),
                 };
+                if legacy {
+                    // Legacy (0.0.0.2) operand encoding: string operands are
+                    // direct 32-bit file offsets (the string index region did
+                    // not exist yet); method operands are 16-bit indices into
+                    // the method's index region (same layout as today);
+                    // literal-array operands are 16-bit indices into the
+                    // header's global literal-array table (deprecated by the
+                    // 2022-08-18 refactoring).
+                    let offset = match kind {
+                        EntityKind::StringId => {
+                            let off = id.0;
+                            if off == 0 || off as usize >= data.len() {
+                                return Err(invalid());
+                            }
+                            off
+                        }
+                        EntityKind::MethodId => {
+                            let index = u16::try_from(id.0).map_err(|_| invalid())?;
+                            let offset = unsafe {
+                                sys::abc_resolve_offset_by_index(f, method.offset, index)
+                            };
+                            if offset == ABSENT {
+                                return Err(invalid());
+                            }
+                            offset
+                        }
+                        EntityKind::LiteralarrayId => {
+                            let Some((count, table_off)) = legacy_lit_table else {
+                                return Err(invalid());
+                            };
+                            if id.0 >= count {
+                                return Err(invalid());
+                            }
+                            let entry = table_off as usize + id.0 as usize * 4;
+                            let bytes: [u8; 4] = data
+                                .get(entry..entry + 4)
+                                .and_then(|s| s.try_into().ok())
+                                .ok_or_else(invalid)?;
+                            let off = u32::from_le_bytes(bytes);
+                            if off == 0 || off as usize >= data.len() {
+                                return Err(invalid());
+                            }
+                            off
+                        }
+                    };
+                    body.entity_offsets.insert((kind, id.0), offset);
+                    if kind == EntityKind::LiteralarrayId || entity_map.contains_key(&offset) {
+                        continue;
+                    }
+                    if kind == EntityKind::StringId {
+                        let sid = crate::file::intern_string(
+                            f,
+                            offset,
+                            &mut strings,
+                            &mut string_raw_bytes,
+                        )?
+                        .ok_or_else(invalid)?;
+                        entity_map.insert(offset, sid);
+                        continue;
+                    }
+                    let name = {
+                        let accessor = unsafe { sys::abc_method_open(f, offset) };
+                        if accessor.is_null() {
+                            return Err(invalid());
+                        }
+                        let _guard =
+                            HandleGuard(Some(|| unsafe { sys::abc_method_close(accessor) }));
+                        read_method_name(accessor)
+                    }
+                    .ok_or_else(invalid)?;
+                    entity_map.insert(offset, strings.get_or_intern(&name));
+                    continue;
+                }
                 let index = u16::try_from(id.0).map_err(|_| invalid())?;
                 let offset = unsafe { sys::abc_resolve_offset_by_index(f, method.offset, index) };
                 if offset == ABSENT {
@@ -315,6 +401,57 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                 }
                 .ok_or_else(invalid)?;
                 entity_map.insert(offset, strings.get_or_intern(&name));
+            }
+        }
+    }
+
+    // Legacy (0.0.0.2): the create*withbuffer family carries the literal
+    // array as a plain 16-bit immediate (a global index into the header
+    // table), not as a typed id operand, so the entity_operands pass above
+    // never sees it. Collect those references here so the literal arrays
+    // enter the model exactly like modern ones.
+    if legacy {
+        for method in classes.values_mut().flat_map(|class| &mut class.methods) {
+            let Some(body) = &mut method.body else {
+                continue;
+            };
+            for bytecode in &body.bytecodes {
+                use abcd_isa::Bytecode as B;
+                let global_idx = match bytecode {
+                    B::DeprecatedCreateobjectwithbuffer(abcd_isa::Imm(i))
+                    | B::DeprecatedCreatearraywithbuffer(abcd_isa::Imm(i))
+                    | B::DeprecatedCreateobjecthavingmethod(abcd_isa::Imm(i))
+                    | B::DeprecatedDefineclasswithbuffer(_, abcd_isa::Imm(i), _, _, _) => *i,
+                    _ => continue,
+                };
+                let invalid = || Error::Malformed {
+                    field: "legacy literal-array reference",
+                    context: format!(
+                        "{} in method {:#x}: global index {global_idx}",
+                        bytecode.mnemonic(),
+                        method.offset,
+                    ),
+                };
+                let Ok(idx) = u32::try_from(global_idx) else {
+                    return Err(invalid());
+                };
+                let Some((count, table_off)) = legacy_lit_table else {
+                    return Err(invalid());
+                };
+                if idx >= count {
+                    return Err(invalid());
+                }
+                let entry = table_off as usize + idx as usize * 4;
+                let bytes: [u8; 4] = data
+                    .get(entry..entry + 4)
+                    .and_then(|s| s.try_into().ok())
+                    .ok_or_else(invalid)?;
+                let off = u32::from_le_bytes(bytes);
+                if off == 0 || off as usize >= data.len() {
+                    return Err(invalid());
+                }
+                body.entity_offsets
+                    .insert((abcd_isa::EntityKind::LiteralarrayId, idx), off);
             }
         }
     }
@@ -364,12 +501,31 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
 // Internal decode helpers
 // ---------------------------------------------------------------------------
 
+/// Legacy (0.0.0.2) literal-array global table: `(num_literalarrays,
+/// literalarray_idx_off)` read from the file header (`File::Header` field
+/// layout is unchanged since 3.1: u32 fields start at offset 16, these two
+/// are the 8th and 9th). Returns `None` if the header is truncated.
+fn legacy_literalarray_table(data: &[u8]) -> Option<(u32, u32)> {
+    let read = |off: usize| -> Option<u32> {
+        let bytes: [u8; 4] = data.get(off..off + 4)?.try_into().ok()?;
+        Some(u32::from_le_bytes(bytes))
+    };
+    let count = read(44)?;
+    let table_off = read(48)?;
+    let end = table_off as usize + count as usize * 4;
+    if end > data.len() {
+        return None;
+    }
+    Some((count, table_off))
+}
+
 fn decode_method_at(
     f: *const sys::AbcFileHandle,
     method_off: u32,
     debug_raw: *mut sys::AbcDebugInfo,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    legacy: bool,
 ) -> Result<Method, Error> {
     let mr = unsafe { sys::abc_method_open(f as *mut _, method_off) };
     if mr.is_null() {
@@ -401,7 +557,7 @@ fn decode_method_at(
         if code_off == ABSENT {
             (None, Vec::new())
         } else {
-            let (b, bo) = decode_code_at(f, method_off, code_off)?;
+            let (b, bo) = decode_code_at(f, method_off, code_off, legacy)?;
             (Some(b), bo)
         }
     };
@@ -743,6 +899,10 @@ fn decode_module_request_phase_at(
     })
 }
 
+// Each argument is a distinct decode-context facet (the three offset
+// sets are independent discovery channels); a bundling struct would
+// only rename the plumbing.
+#[allow(clippy::too_many_arguments)]
 fn decode_field_at(
     f: *const sys::AbcFileHandle,
     field_off: u32,
@@ -989,6 +1149,7 @@ fn decode_code_at(
     f: *const sys::AbcFileHandle,
     method_off: u32,
     code_off: u32,
+    legacy: bool,
 ) -> Result<(MethodBody, Vec<u32>), Error> {
     let cr = unsafe { sys::abc_code_open(f as *mut _, code_off) };
     if cr.is_null() {
@@ -1005,7 +1166,12 @@ fn decode_code_at(
             unsafe { std::slice::from_raw_parts(ptr, len) }
         }
     };
-    let decoded = abcd_isa::decode(raw_insns).map_err(|source| Error::BytecodeDecode {
+    let decoded = if legacy {
+        abcd_isa::decode_legacy(raw_insns)
+    } else {
+        abcd_isa::decode(raw_insns)
+    }
+    .map_err(|source| Error::BytecodeDecode {
         method_offset: method_off,
         source,
     })?;
@@ -1547,6 +1713,11 @@ fn decode_literal_array_at(
     ctx.values
 }
 
+/// The literal-array table decode result: the decoded arrays, the
+/// file-offset → table-index map, and the raw header offsets (kept for
+/// the pandasm emitter's byte-identity with upstream ark_disasm).
+type LiteralArrayTable = (Vec<LiteralArray>, HashMap<u32, u32>, Vec<u32>);
+
 fn decode_literal_arrays(
     f: *const sys::AbcFileHandle,
     strings: &mut StringPool,
@@ -1554,7 +1725,7 @@ fn decode_literal_arrays(
     referenced_offsets: &HashSet<u32>,
     module_data_offsets: &HashSet<u32>,
     phase_blob_offsets: &HashSet<u32>,
-) -> Result<(Vec<LiteralArray>, HashMap<u32, u32>, Vec<u32>), Error> {
+) -> Result<LiteralArrayTable, Error> {
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
     // The raw header table, unfiltered: the pandasm emitter's byte-identity
     // with upstream ark_disasm needs the original header positions of the
@@ -1677,10 +1848,10 @@ fn decode_literal_arrays(
     // Rewrite nested references (file offset → table index).
     for arr in &mut arrays {
         for v in &mut arr.values {
-            if let LiteralValue::LiteralArray(idx) = v {
-                if let Some(&table_idx) = offset_to_index.get(&idx.0) {
-                    idx.0 = table_idx;
-                }
+            if let LiteralValue::LiteralArray(idx) = v
+                && let Some(&table_idx) = offset_to_index.get(&idx.0)
+            {
+                idx.0 = table_idx;
             }
         }
     }
