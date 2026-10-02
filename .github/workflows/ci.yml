@@ -747,10 +747,17 @@ jobs:
   # heavy job, off the critical path. Sanitizers are nightly-only in Rust
   # (-Zsanitizer), ~2x slower, incompatible with -C instrument-coverage,
   # and unavailable on the Windows lanes — hence a lane, not "everywhere".
+  #
+  # Scope (same ruling, option 2): the corpus-compute suites that actually
+  # hammer the FFI boundary (decode/encode/lift/lower over 5517 fixtures +
+  # the 156 wild packages) run under ASan — ASan's ~2x tax is affordable
+  # there (unlike llvm-cov's 50x). Excluded: the docker oracles (the VM and
+  # es2abc live in the image, not our code — ASan has nothing to check) and
+  # the two local instruments (pandasm_asm / wild_smoke, same as coverage).
   asan:
-    name: ASan (nightly, address sanitizer)
+    name: ASan (nightly, address sanitizer, corpus-compute suites)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
@@ -772,13 +779,31 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.4'
-      # Workspace default tests under ASan: the C++ bridge is instrumented
-      # too (CXXFLAGS), so the FFI boundary is covered along with Rust.
-      # -Zbuild-std is the documented requirement for a clean ASan run.
+
+      - name: Acquire the corpus (image export + wild haps)
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$ARK_TEST_IMAGE"
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+          mkdir -p exports/corpus/wild
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export-wild /work/wild
+
+      # Default (non-ignored) tests first, then the corpus-compute targets.
+      # lift-lower skips test262_vm (docker VM compare — nothing for ASan).
+      # lift-decompile and test262-dream are docker-oracle suites: out.
       - name: cargo test under ASan
         env:
           CFLAGS: -fsanitize=address
           CXXFLAGS: -fsanitize=address
           ASAN_OPTIONS: detect_leaks=1
         # Sanitizer builds must not inherit the warning elevation.
-        run: RUSTFLAGS="-Zsanitizer=address" cargo test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-Zsanitizer=address"
+          cargo test --workspace --target x86_64-unknown-linux-gnu -Zbuild-std
+          for t in file-isa file-lift hap-file lift-analysis lift-taint; do
+            cargo test -p abcd-rs --test "$t" --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip pandasm_asm --skip wild_smoke
+          done
+          cargo test -p abcd-rs --test lift-lower --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip test262_vm
