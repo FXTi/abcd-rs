@@ -1692,3 +1692,15 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   ASan lane keeps no stack workaround — its green run is the proof.
   Lesson (orchestrator, recorded): widening a resource limit is never
   the fix for input-driven depth; iterate.
+- Allocator/musl track opened (2026-10-02, maintainer): "glibc 也是地狱，
+  想换 musl" + ruling — BENCH FIRST: Linux glibc/jemalloc/mimalloc and
+  mac default/mimalloc and Windows default/mimalloc on speed + peak RSS
+  before any switch (worker 371b0858, harness tests/bench-alloc with
+  cargo-feature allocator selection). musl viability probe: Alpine
+  container full-workspace build on dabai (rust:alpine + build-base +
+  ruby + clang16-libclang for bindgen). Note: folklore confirmed in
+  research — Windows CRT malloc is the weak one (mimalloc is MSR's own
+  answer), musl's malloc is the weak point of musl (hence musl+jemalloc
+  pairings), macOS libmalloc is a decent zone/magazine allocator and
+  macOS has no static-linking culture — that's why there's no macOS
+  saying.
