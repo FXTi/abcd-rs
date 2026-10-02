@@ -1607,3 +1607,14 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   await error had been hiding them). Dream gates unchanged
   (1149/1149, t262 2676+9). Lesson registered: gates alone could not
   see this — silent emitter bugs need the recompile channel.
+- CI platform matrix expanded (2026-10-02, ruling): the Build & Test
+  matrix is now six OS-x-arch compatibility lanes, each the OLDEST
+  label GH still offers: ubuntu-22.04, ubuntu-22.04-arm, macos-14,
+  macos-13 (Intel, while it lasts), windows-2022, windows-11-arm.
+  ubuntu-latest is deliberately NOT a lane (covered by all other jobs).
+  Purpose per maintainer: artifacts must keep running for ordinary
+  users on old systems. Dropped: focal-container lane (dabai-level
+  glibc), MSRV tracking (we follow latest Rust on purpose; builders on
+  old toolchains are on their own). PR #22 (clang-23 LLVM-parity fix)
+  was merged by the maintainer — rustc is back on @stable with the
+  coverage job on clang++-23.
