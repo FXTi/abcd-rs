@@ -1657,3 +1657,17 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   lanes moved to ubuntu-22.04 (oldest-label rule; also pins the
   gcc-versioned cross package name) and the inert LDFLAGS=-m32 dropped
   (rustc never reads it; the target spec carries -m32).
+- N81 (P0, found 2026-10-02 by the legacy-rewrite worker's one-byte
+  mutation fuzz): bridge heap overflow WRITE — file_bridge.cpp
+  abc_file_get_string_utf16 / abc_method_get_name_utf16 size the Rust
+  buffer from the StringData length prefix but drive ConvertMUtf8ToUtf16
+  with strlen(); a corrupt/absent NUL terminator (or an entity offset
+  pointing at non-string bytes) makes the conversion overrun the
+  Rust-side vec![u16; utf16_length] (corrupts hashbrown control bytes /
+  SIGABRT). Any malformed .abc triggers it. vendor-audit.md #B5's
+  "strlen drives the conversion: safe" verdict held only for intact
+  files. Fix in flight (worker d3969d49): bound by the length prefix,
+  never strlen; sweep for同款 call sites. The legacy-rewrite worker's
+  fuzz deliberately excludes string-operand instructions until this
+  lands (TODO cross-reference). Lesson: bridge string conversion must
+  be prefix-bounded by construction.
