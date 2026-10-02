@@ -65,15 +65,21 @@ uint32_t abc_file_size(const AbcFileHandle *f);
 /* Version from header */
 void abc_file_version(const AbcFileHandle *f, uint8_t out[4]);
 
-/* String access: returns bytes written, 0 on error */
+/* String access: raw MUTF-8 bytes. The terminator scan is bounded by the
+ * file span; an unterminated item reports 0. Returns the payload length
+ * (query with buf=null) / bytes written (excluding the appended NUL),
+ * 0 on error. */
 size_t abc_file_get_string(const AbcFileHandle *f, uint32_t offset,
                            char *buf, size_t buf_len);
 
 /* String access via MUTF-8 → UTF-16 conversion (lossless for the whole
  * Unicode range, unlike the raw-byte view). Returns the number of UTF-16
- * units (excluding any terminator); SIZE_MAX on error. Zero is a valid
- * empty string. Query with buf=null.
- * buf must hold at least the returned unit count. */
+ * units (excluding any terminator); SIZE_MAX on error OR on a malformed
+ * item (no terminator inside the file span, or a payload that does not
+ * decode to exactly the tag-declared unit count). Zero is a valid empty
+ * string. Query with buf=null: the query VALIDATES the item, so the
+ * returned count is trustworthy for sizing the destination buffer, and
+ * the fill never writes more units than the query reported. */
 size_t abc_file_get_string_utf16(const AbcFileHandle *f, uint32_t offset,
                                  uint16_t *buf, size_t buf_len);
 
@@ -222,7 +228,10 @@ void abc_method_enumerate_runtime_type_annotations(AbcMethodAccessor *a, AbcAnno
 uint32_t abc_method_get_method_id(const AbcMethodAccessor *a);
 int abc_method_has_valid_proto(const AbcMethodAccessor *a);
 
-/* Method name via MUTF-8 -> UTF-16 (lossless; query with buf=null) */
+/* Method name via MUTF-8 -> UTF-16 (lossless; query with buf=null).
+ * Same validated contract as abc_file_get_string_utf16, but the error /
+ * malformed sentinel is 0 (a method never has an empty name in practice,
+ * and 0 was this function's pre-existing error return). */
 size_t abc_method_get_name_utf16(const AbcMethodAccessor *a, uint16_t *buf, size_t buf_len);
 
 /* ========== Code Data Accessor ========== */

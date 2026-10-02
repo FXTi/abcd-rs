@@ -156,6 +156,76 @@ static_assert(sizeof(float) == sizeof(uint32_t), "float size assumption for Lite
 static_assert(sizeof(double) == sizeof(uint64_t), "double size assumption for LiteralItem");
 static_assert(static_cast<uint8_t>(Type::TypeId::U32) == 0x08, "U32 type id changed upstream");
 
+/* ========== Bounded string-item helpers (P0 heap-overflow fix) ==========
+ *
+ * A string item is [ULEB128 tag][MUTF-8 payload][NUL]: the tag declares
+ * the UTF-16 length but NOT the byte length. Sizing a caller's destination
+ * buffer from the tag while driving the conversion with strlen() let a
+ * corrupted NUL terminator (or a bogus entity offset) make the unbounded
+ * vendor converter run into neighboring items and write PAST the
+ * tag-sized buffer (audit #B5 revisited; repro: single-byte mutation of a
+ * method-name terminator). Every string-item reader below bounds BOTH
+ * sides instead: the terminator must lie inside the file span, and the
+ * conversion must produce exactly the tag-declared unit count, never more.
+ */
+
+// Length of a NUL-terminated payload, bounded by the file span. Returns
+// false when no terminator exists before the end of the file.
+static bool bounded_cstr_len(const File &file, const uint8_t *data, size_t *len) {
+    const uint8_t *base = file.GetBase();
+    size_t file_size = file.GetHeader()->file_size;
+    if (data == nullptr || data < base || static_cast<size_t>(data - base) >= file_size) {
+        return false;
+    }
+    size_t max_len = file_size - static_cast<size_t>(data - base);
+    const void *nul = std::memchr(data, 0, max_len);
+    if (nul == nullptr) {
+        return false;
+    }
+    *len = static_cast<size_t>(static_cast<const uint8_t *>(nul) - data);
+    return true;
+}
+
+// Validate a string item's payload and convert it to UTF-16. `out` may be
+// null to only validate; otherwise at most min(out_cap, sd.utf16_length)
+// units are written. Returns true only when the payload is NUL-terminated
+// inside the file span AND decodes to EXACTLY the tag-declared
+// sd.utf16_length units — the format's own consistency rule. Decoding uses
+// the vendor pair decoder, so well-formed items convert identically to the
+// old strlen-driven path (invalid sequences keep the vendor's
+// first-byte fallback semantics).
+static bool convert_string_utf16_bounded(const File &file, const File::StringData &sd,
+                                         uint16_t *out, size_t out_cap) {
+    size_t mutf8_len = 0;
+    if (!bounded_cstr_len(file, sd.data, &mutf8_len)) {
+        return false;
+    }
+    size_t cap = sd.utf16_length;
+    if (out != nullptr && out_cap < cap) {
+        cap = out_cap;
+    }
+    size_t in_pos = 0;
+    size_t out_pos = 0;
+    while (in_pos < mutf8_len) {
+        auto [pair, nbytes] =
+            panda::utf::ConvertMUtf8ToUtf16Pair(sd.data + in_pos, mutf8_len - in_pos);
+        auto [p_hi, p_lo] = panda::utf::SplitUtf16Pair(pair);
+        size_t units = p_hi != 0 ? 2 : 1;
+        if (units > cap - out_pos) {
+            return false;  // payload decodes past the tag-declared length
+        }
+        if (out != nullptr) {
+            if (p_hi != 0) {
+                out[out_pos] = p_hi;
+            }
+            out[out_pos + (p_hi != 0 ? 1 : 0)] = p_lo;
+        }
+        out_pos += units;
+        in_pos += nbytes;
+    }
+    return out_pos == sd.utf16_length;
+}
+
 /* ========== File method implementations (merged from file_impl.cpp) ========== */
 namespace panda::panda_file {
 
@@ -195,11 +265,15 @@ File::EntityId File::GetLiteralArraysId() const {
 // GetClassId — linear scan (sufficient for our use case)
 File::EntityId File::GetClassId(const uint8_t *mutf8_name) const {
     auto classes = GetClasses();
+    // The query name is caller-provided and NUL-terminated by contract;
+    // the item payload is bounded by the file span (never strcmp on it).
+    size_t name_len = std::strlen(reinterpret_cast<const char *>(mutf8_name));
     for (size_t i = 0; i < classes.Size(); i++) {
         auto id = EntityId(classes[i]);
         auto sd = GetStringData(id);
-        if (sd.data && std::strcmp(reinterpret_cast<const char *>(sd.data),
-                                   reinterpret_cast<const char *>(mutf8_name)) == 0) {
+        size_t sd_len = 0;
+        if (sd.data && bounded_cstr_len(*this, sd.data, &sd_len) && sd_len == name_len &&
+            std::memcmp(sd.data, mutf8_name, sd_len) == 0) {
             return id;
         }
     }
@@ -527,8 +601,11 @@ size_t abc_file_get_string(const AbcFileHandle *f, uint32_t offset,
 try {
     auto sd = f->file->GetStringData(File::EntityId(offset));
     if (!sd.data) return 0;
-    // Find null terminator
-    size_t len = std::strlen(reinterpret_cast<const char *>(sd.data));
+    // Bound the terminator scan by the file span (never strlen): a
+    // corrupted terminator must not stretch the reported length into the
+    // neighboring items.
+    size_t len = 0;
+    if (!bounded_cstr_len(*f->file, sd.data, &len)) return 0;
     if (buf && buf_len > 0) {
         size_t copy = len < buf_len - 1 ? len : buf_len - 1;
         std::memcpy(buf, sd.data, copy);
@@ -546,10 +623,18 @@ size_t abc_file_get_string_utf16(const AbcFileHandle *f, uint32_t offset,
 try {
     auto sd = f->file->GetStringData(File::EntityId(offset));
     if (!sd.data) return SIZE_MAX;
-    if (!buf || buf_len == 0) return sd.utf16_length;
+    if (!buf || buf_len == 0) {
+        // Query: VALIDATE the item, then report the tag-declared unit
+        // count. A malformed item (no terminator inside the file span, or
+        // a payload inconsistent with the tag) reports SIZE_MAX so the
+        // caller never sizes a destination buffer from an untrusted tag.
+        return convert_string_utf16_bounded(*f->file, sd, nullptr, 0)
+                   ? sd.utf16_length
+                   : SIZE_MAX;
+    }
     if (buf_len < sd.utf16_length) return SIZE_MAX;  // caller must size the buffer
-    size_t mutf8_len = std::strlen(reinterpret_cast<const char *>(sd.data));
-    panda::utf::ConvertMUtf8ToUtf16(sd.data, mutf8_len, buf);
+    // Fill: same bounded conversion; writes at most sd.utf16_length units.
+    if (!convert_string_utf16_bounded(*f->file, sd, buf, buf_len)) return SIZE_MAX;
     return sd.utf16_length;
 } catch (...) {
     return SIZE_MAX;
@@ -903,7 +988,9 @@ size_t abc_class_get_name(const AbcClassAccessor *a, char *buf, size_t buf_len) 
 try {
     auto sd = a->accessor.GetName();
     if (!sd.data) return 0;
-    size_t len = std::strlen(reinterpret_cast<const char *>(sd.data));
+    // Bound the terminator scan by the file span (never strlen).
+    size_t len = 0;
+    if (!bounded_cstr_len(a->accessor.GetPandaFile(), sd.data, &len)) return 0;
     if (buf && buf_len > 0) {
         size_t copy = len < buf_len - 1 ? len : buf_len - 1;
         std::memcpy(buf, sd.data, copy);
@@ -1090,10 +1177,15 @@ size_t abc_method_get_name_utf16(const AbcMethodAccessor *a, uint16_t *buf, size
 try {
     auto sd = a->accessor.GetName();
     if (!sd.data) return 0;
-    if (!buf || buf_len == 0) return sd.utf16_length;
+    const File &file = a->accessor.GetPandaFile();
+    if (!buf || buf_len == 0) {
+        // Query: VALIDATE the item, then report the tag-declared unit
+        // count; 0 on malformed (this function's existing error sentinel).
+        return convert_string_utf16_bounded(file, sd, nullptr, 0) ? sd.utf16_length : 0;
+    }
     if (buf_len < sd.utf16_length) return 0;
-    size_t mutf8_len = std::strlen(reinterpret_cast<const char *>(sd.data));
-    panda::utf::ConvertMUtf8ToUtf16(sd.data, mutf8_len, buf);
+    // Fill: same bounded conversion; writes at most sd.utf16_length units.
+    if (!convert_string_utf16_bounded(file, sd, buf, buf_len)) return 0;
     return sd.utf16_length;
 } catch (...) {
     return 0;

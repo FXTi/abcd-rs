@@ -268,6 +268,13 @@ mod tests {
     /// caller's Rust buffer has no trailing slack. This test places a
     /// string item whose bytes run to the very end of the buffer (no NUL),
     /// then reads it through the bridge.
+    ///
+    /// Under the P0 string-bounds fix the deliberately inconsistent item
+    /// (tag claims 4 units; the payload holds 2 bytes and no terminator
+    /// inside the file span) is REJECTED: both the query and the fill
+    /// report SIZE_MAX and the fill writes nothing. The invariant under
+    /// test is that reading such a string neither crashes nor reads or
+    /// writes past the padded copy.
     #[test]
     fn string_at_buffer_end_reads_safely() {
         unsafe {
@@ -296,18 +303,110 @@ mod tests {
             let f = abc_file_open(data.as_ptr(), data.len());
             assert!(!f.is_null(), "open should succeed");
 
-            // Reading the string at the end scans for the NUL past the
-            // buffer; the padded copy keeps the scan in bounds.
+            // The item has no terminator inside the file span: rejected on
+            // both the query and the fill, and the fill writes nothing.
             let n = abc_file_get_string_utf16(f, str_off, std::ptr::null_mut(), 0);
-            assert_eq!(n, 4, "utf16 length from the tag");
+            assert_eq!(n, usize::MAX, "unterminated item must fail the query");
             let mut buf = [0u16; 4];
             let written = abc_file_get_string_utf16(f, str_off, buf.as_mut_ptr(), buf.len());
-            assert_eq!(written, 4);
-            // The scan hits the padding NULs, so the string is "ta"; the
-            // tag claims 4 units but the data only holds 2 (deliberately
-            // inconsistent) — the trailing units are the padding NULs.
-            assert_eq!(String::from_utf16_lossy(&buf).trim_end_matches('\0'), "ta");
+            assert_eq!(written, usize::MAX, "unterminated item must fail the fill");
+            assert_eq!(buf, [0u16; 4], "a failed fill must not write");
+            // The raw-byte view rejects it too.
+            assert_eq!(
+                abc_file_get_string(f, str_off, std::ptr::null_mut(), 0),
+                0,
+                "unterminated item must fail the raw-byte query"
+            );
 
+            abc_file_close(f);
+        }
+    }
+
+    /// P0 regression (heap overflow via strlen-driven MUTF-8 conversion,
+    /// audit #B5 revisited): a string item whose NUL terminator is
+    /// corrupted must be reported as SIZE_MAX by abc_file_get_string_utf16
+    /// — on BOTH the query and the fill — and the fill must never write
+    /// past the tag-sized buffer. Before the fix the query trusted the tag
+    /// (6 units) while the fill converted the strlen-length payload into
+    /// the 6-unit destination, overflowing the Rust heap buffer.
+    #[test]
+    fn corrupted_string_terminator_reports_error() {
+        unsafe {
+            let b = abc_builder_new();
+            assert!(!b.is_null());
+            abc_builder_set_api(b, 12, c"beta1".as_ptr());
+            let cls = abc_builder_add_global_class(b);
+            assert_ne!(cls, u32::MAX);
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
+            let code: [u8; 1] = [0x65];
+            let m = abc_builder_class_add_method_with_proto(
+                b,
+                cls,
+                c"target".as_ptr(),
+                proto,
+                0x1, // ACC_PUBLIC
+                code.as_ptr(),
+                1,
+                1,
+                0,
+            );
+            assert_ne!(m, u32::MAX);
+            let mut out_len: u32 = 0;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null(), "builder finalize should succeed");
+            let mut data = std::slice::from_raw_parts(ptr, out_len as usize).to_vec();
+            abc_builder_free(b);
+
+            // Locate the unique "target" string item: [ULEB tag][payload][NUL].
+            // "target" is 6 ASCII units, so the tag is (6 << 1) | 1 = 13.
+            let needle = b"target\0";
+            let hits: Vec<usize> = data
+                .windows(needle.len())
+                .enumerate()
+                .filter_map(|(i, w)| (w == needle).then_some(i))
+                .collect();
+            assert_eq!(hits.len(), 1, "the string item must be unique");
+            let payload = hits[0];
+            assert_eq!(data[payload - 1], 13, "ULEB tag precedes the payload");
+            let str_off = (payload - 1) as u32;
+
+            // Control: the unmutated item reads back as "target".
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null());
+            let n = abc_file_get_string_utf16(f, str_off, std::ptr::null_mut(), 0);
+            assert_eq!(n, 6);
+            let mut buf = vec![0u16; n];
+            let written = abc_file_get_string_utf16(f, str_off, buf.as_mut_ptr(), buf.len());
+            assert_eq!(written, 6);
+            assert_eq!(String::from_utf16(&buf).unwrap(), "target");
+            abc_file_close(f);
+
+            // Destroy the NUL terminator (the fuzz reproducer).
+            data[payload + 6] = 0xe1;
+            let f = abc_file_open(data.as_ptr(), data.len());
+            assert!(!f.is_null());
+            // The query must not trust the tag: SIZE_MAX, so no caller
+            // ever sizes a destination buffer from it.
+            assert_eq!(
+                abc_file_get_string_utf16(f, str_off, std::ptr::null_mut(), 0),
+                usize::MAX,
+                "corrupted item must fail the query"
+            );
+            // The fill must fail without overflowing (or writing at all —
+            // the payload runs past the tag-declared 6 units, which the
+            // bounded converter detects before the 7th unit).
+            let mut buf = vec![0u16; 6];
+            assert_eq!(
+                abc_file_get_string_utf16(f, str_off, buf.as_mut_ptr(), buf.len()),
+                usize::MAX,
+                "corrupted item must fail the fill"
+            );
+            // The raw-byte view still sees a terminated payload (the scan
+            // stops at the NEXT NUL in the file, bounded by the file span),
+            // so it reports the raw length — but it is never used to size a
+            // conversion buffer.
+            let raw_len = abc_file_get_string(f, str_off, std::ptr::null_mut(), 0);
+            assert!(raw_len >= 6, "raw view is bounded, not clairvoyant");
             abc_file_close(f);
         }
     }
