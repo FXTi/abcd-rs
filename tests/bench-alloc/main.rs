@@ -53,6 +53,7 @@
 //! task_info (hand-written externs, no libc dep); Windows is unprobed
 //! (n/a — the GH experiment lane reports its own).
 
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -545,4 +546,55 @@ fn bench_decompile_subset() {
     }
     let steady = monitor.finish();
     report("decompile", subset.len(), &results, &steady);
+}
+
+/// Corpus-free synthetic workload for hosts that cannot export the corpus
+/// (Windows CI runners — the corpus image is linux/amd64 and their docker
+/// is Windows-containers only). Mimics our allocation profile: heavy churn
+/// of small Strings / Vecs / HashMap entries (interner-like), deterministic
+/// xorshift so every variant does identical work. RSS sampling still applies
+/// (returns empty on Windows — speed-only there).
+#[test]
+#[ignore = "local/CI-probe instrument; run explicitly"]
+fn bench_synthetic() {
+    let passes = env_usize("ABCD_BENCH_PASSES", 3).max(1);
+    let scale = env_usize("ABCD_BENCH_SCALE", 1_000_000).max(1);
+    let monitor = RssMonitor::start();
+    let mut results = Vec::new();
+    for _pass in 0..passes {
+        let t0 = Instant::now();
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut keep: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut churn: Vec<String> = Vec::new();
+        for i in 0..scale {
+            let key = format!("sym_{}", next() % 10_000);
+            let vals: Vec<u64> = (0..(next() % 16 + 1)).map(|_| next()).collect();
+            keep.insert(key, vals);
+            churn.push(format!("payload_{}_{}", i, next()));
+            if churn.len() > 512 {
+                // Churn: drop the oldest quarter, mimicking phase turnover.
+                churn.drain(..128);
+                let keys: Vec<String> = keep.keys().take(64).cloned().collect();
+                for k in keys {
+                    keep.remove(&k);
+                }
+            }
+            black_box(&churn);
+            black_box(&keep);
+        }
+        let wall = t0.elapsed();
+        results.push(StageTimes {
+            decode: Duration::ZERO,
+            lift: Duration::ZERO,
+            decompile: wall,
+        });
+    }
+    let steady = monitor.finish();
+    report("synthetic", scale, &results, &steady);
 }
