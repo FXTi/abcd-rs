@@ -33,6 +33,70 @@ use abcd_analysis::control::{
 };
 use abcd_ir::FuncId;
 use abcd_lift::lift_file;
+use rayon::prelude::*;
+
+/// Per-fixture (aggregatable) gate counters. Every field merges by
+/// addition / map-merge, so the parallel fold is order-independent; the
+/// REGION-ERROR lines travel as per-fixture ordered strings and are
+/// replayed in fixture order below, byte-identical to the serial loop.
+#[derive(Default)]
+struct RegionStats {
+    functions: usize,
+    functions_empty: usize,
+    functions_structured: usize,
+    blocks_reachable: usize,
+    blocks_dead: usize,
+    region_nodes: usize,
+    loops_total: usize,
+    loops_while: usize,
+    loops_do_while: usize,
+    edges_internal: usize,
+    edges_continue: usize,
+    edges_continue_labeled: usize,
+    edges_break: usize,
+    edges_break_labeled: usize,
+    irreducible_cores: usize,
+    functions_with_irreducible: usize,
+    escape_hist: BTreeMap<&'static str, usize>,
+    functions_with_escape: usize,
+    cross_arm_edges: usize,
+    functions_with_cross_arm: usize,
+    try_cuts: usize,
+    try_regions: usize,
+    /// Formatted REGION-ERROR payloads (sans the counter guard), in
+    /// per-fixture function order.
+    errors: Vec<String>,
+}
+
+impl RegionStats {
+    fn merge(&mut self, other: RegionStats) {
+        self.functions += other.functions;
+        self.functions_empty += other.functions_empty;
+        self.functions_structured += other.functions_structured;
+        self.blocks_reachable += other.blocks_reachable;
+        self.blocks_dead += other.blocks_dead;
+        self.region_nodes += other.region_nodes;
+        self.loops_total += other.loops_total;
+        self.loops_while += other.loops_while;
+        self.loops_do_while += other.loops_do_while;
+        self.edges_internal += other.edges_internal;
+        self.edges_continue += other.edges_continue;
+        self.edges_continue_labeled += other.edges_continue_labeled;
+        self.edges_break += other.edges_break;
+        self.edges_break_labeled += other.edges_break_labeled;
+        self.irreducible_cores += other.irreducible_cores;
+        self.functions_with_irreducible += other.functions_with_irreducible;
+        for (k, n) in other.escape_hist {
+            *self.escape_hist.entry(k).or_insert(0) += n;
+        }
+        self.functions_with_escape += other.functions_with_escape;
+        self.cross_arm_edges += other.cross_arm_edges;
+        self.functions_with_cross_arm += other.functions_with_cross_arm;
+        self.try_cuts += other.try_cuts;
+        self.try_regions += other.try_regions;
+        self.errors.extend(other.errors);
+    }
+}
 
 #[test]
 #[ignore = "requires exported GHCR corpus and python3"]
@@ -41,110 +105,105 @@ fn corpus_region_gate() {
     let paths = common::manifest_paths(&root);
     assert_eq!(paths.len(), 5517, "expected the full 5517-fixture corpus");
 
-    let mut fixtures = 0usize;
-    let mut functions = 0usize;
-    let mut functions_empty = 0usize;
-    let mut functions_structured = 0usize;
-    let mut blocks_reachable = 0usize;
-    let mut blocks_dead = 0usize;
-    let mut region_nodes = 0usize;
-    let mut loops_total = 0usize;
-    let mut loops_while = 0usize;
-    let mut loops_do_while = 0usize;
-    let mut edges_internal = 0usize;
-    let mut edges_continue = 0usize;
-    let mut edges_continue_labeled = 0usize;
-    let mut edges_break = 0usize;
-    let mut edges_break_labeled = 0usize;
-    let mut irreducible_cores = 0usize;
-    let mut functions_with_irreducible = 0usize;
-    let mut escape_hist: BTreeMap<&'static str, usize> = BTreeMap::new();
-    let mut functions_with_escape = 0usize;
-    let mut cross_arm_edges = 0usize;
-    let mut functions_with_cross_arm = 0usize;
-    let mut try_cuts = 0usize;
-    let mut try_regions = 0usize;
+    // Parallel per-fixture structuring (rayon); each fixture's stats are
+    // collected in manifest order and folded serially below.
+    let per_fixture: Vec<RegionStats> = paths
+        .par_iter()
+        .map(|relative| {
+            let data = std::fs::read(root.join(relative)).expect("read fixture");
+            let file = abcd_file::decode(&data).expect("decode fixture");
+            let module = lift_file(&file).expect("lift fixture");
+            let mut stats = RegionStats::default();
+            for fi in 0..module.functions.len() {
+                let func = FuncId::new(fi as u32);
+                let tree = structure_regions(&module, func);
+                // Determinism: a fresh second run must be identical.
+                let again = structure_regions(&module, func);
+                assert_eq!(
+                    tree, again,
+                    "non-deterministic region tree in {relative} {func:?}"
+                );
+
+                stats.functions += 1;
+                if module.func(func).expect("func").blocks.is_empty() {
+                    stats.functions_empty += 1;
+                    assert!(tree.root.is_none());
+                    continue;
+                }
+                assert!(
+                    tree.root.is_some(),
+                    "function with blocks must structure in {relative} {func:?}"
+                );
+                stats.functions_structured += 1;
+
+                // Totality: the tree covers every Normal-reachable block
+                // exactly once (If heads and Block/Irreducible members are
+                // the block-carrying nodes).
+                let mut covered = 0usize;
+                for n in tree.nodes() {
+                    match n {
+                        RegionNode::Block(_) => covered += 1,
+                        RegionNode::If { .. } => covered += 1,
+                        RegionNode::Irreducible { blocks, .. } => covered += blocks.len(),
+                        _ => {}
+                    }
+                }
+                let universe = reachable_blocks(&module, func, &|b| {
+                    abcd_analysis::control::block_succs(&module, b)
+                })
+                .len();
+                assert_eq!(
+                    covered, universe,
+                    "tree does not cover the reachable universe in {relative} {func:?}"
+                );
+
+                collect_stats(&tree, &mut stats);
+
+                for e in &tree.errors {
+                    stats.errors.push(format!("{relative} {func:?}: {e:?}"));
+                }
+            }
+            stats
+        })
+        .collect();
+
+    let fixtures = paths.len();
+    let mut stats = RegionStats::default();
+    for s in per_fixture {
+        stats.merge(s);
+    }
+    // Replay the error lines in fixture order with the serial loop's
+    // first-10 guard.
     let mut try_errors = 0usize;
-
-    for relative in &paths {
-        let data = std::fs::read(root.join(relative)).expect("read fixture");
-        let file = abcd_file::decode(&data).expect("decode fixture");
-        let module = lift_file(&file).expect("lift fixture");
-        fixtures += 1;
-        for fi in 0..module.functions.len() {
-            let func = FuncId::new(fi as u32);
-            let tree = structure_regions(&module, func);
-            // Determinism: a fresh second run must be identical.
-            let again = structure_regions(&module, func);
-            assert_eq!(
-                tree, again,
-                "non-deterministic region tree in {relative} {func:?}"
-            );
-
-            functions += 1;
-            if module.func(func).expect("func").blocks.is_empty() {
-                functions_empty += 1;
-                assert!(tree.root.is_none());
-                continue;
-            }
-            assert!(
-                tree.root.is_some(),
-                "function with blocks must structure in {relative} {func:?}"
-            );
-            functions_structured += 1;
-
-            // Totality: the tree covers every Normal-reachable block
-            // exactly once (If heads and Block/Irreducible members are the
-            // block-carrying nodes).
-            let mut covered = 0usize;
-            for n in tree.nodes() {
-                match n {
-                    RegionNode::Block(_) => covered += 1,
-                    RegionNode::If { .. } => covered += 1,
-                    RegionNode::Irreducible { blocks, .. } => covered += blocks.len(),
-                    _ => {}
-                }
-            }
-            let universe = reachable_blocks(&module, func, &|b| {
-                abcd_analysis::control::block_succs(&module, b)
-            })
-            .len();
-            assert_eq!(
-                covered, universe,
-                "tree does not cover the reachable universe in {relative} {func:?}"
-            );
-
-            collect_stats(
-                &tree,
-                &mut blocks_reachable,
-                &mut blocks_dead,
-                &mut region_nodes,
-                &mut loops_total,
-                &mut loops_while,
-                &mut loops_do_while,
-                &mut edges_internal,
-                &mut edges_continue,
-                &mut edges_continue_labeled,
-                &mut edges_break,
-                &mut edges_break_labeled,
-                &mut irreducible_cores,
-                &mut functions_with_irreducible,
-                &mut escape_hist,
-                &mut functions_with_escape,
-                &mut cross_arm_edges,
-                &mut functions_with_cross_arm,
-                &mut try_cuts,
-                &mut try_regions,
-            );
-
-            for e in &tree.errors {
-                try_errors += 1;
-                if try_errors <= 10 {
-                    eprintln!("REGION-ERROR {relative} {func:?}: {e:?}");
-                }
-            }
+    for line in &stats.errors {
+        try_errors += 1;
+        if try_errors <= 10 {
+            eprintln!("REGION-ERROR {line}");
         }
     }
+
+    let functions = stats.functions;
+    let functions_empty = stats.functions_empty;
+    let functions_structured = stats.functions_structured;
+    let blocks_reachable = stats.blocks_reachable;
+    let blocks_dead = stats.blocks_dead;
+    let region_nodes = stats.region_nodes;
+    let loops_total = stats.loops_total;
+    let loops_while = stats.loops_while;
+    let loops_do_while = stats.loops_do_while;
+    let edges_internal = stats.edges_internal;
+    let edges_continue = stats.edges_continue;
+    let edges_continue_labeled = stats.edges_continue_labeled;
+    let edges_break = stats.edges_break;
+    let edges_break_labeled = stats.edges_break_labeled;
+    let irreducible_cores = stats.irreducible_cores;
+    let functions_with_irreducible = stats.functions_with_irreducible;
+    let escape_hist = &stats.escape_hist;
+    let functions_with_escape = stats.functions_with_escape;
+    let cross_arm_edges = stats.cross_arm_edges;
+    let functions_with_cross_arm = stats.functions_with_cross_arm;
+    let try_cuts = stats.try_cuts;
+    let try_regions = stats.try_regions;
 
     eprintln!(
         "REGION-GATE fixtures={fixtures} functions={functions} \
@@ -184,46 +243,24 @@ fn corpus_region_gate() {
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_stats(
-    tree: &RegionTree,
-    blocks_reachable: &mut usize,
-    blocks_dead: &mut usize,
-    region_nodes: &mut usize,
-    loops_total: &mut usize,
-    loops_while: &mut usize,
-    loops_do_while: &mut usize,
-    edges_internal: &mut usize,
-    edges_continue: &mut usize,
-    edges_continue_labeled: &mut usize,
-    edges_break: &mut usize,
-    edges_break_labeled: &mut usize,
-    irreducible_cores: &mut usize,
-    functions_with_irreducible: &mut usize,
-    escape_hist: &mut BTreeMap<&'static str, usize>,
-    functions_with_escape: &mut usize,
-    cross_arm_edges: &mut usize,
-    functions_with_cross_arm: &mut usize,
-    try_cuts: &mut usize,
-    try_regions: &mut usize,
-) {
-    *region_nodes += tree.nodes().len();
-    *blocks_dead += tree.dead_blocks.len();
-    *try_regions += tree.try_plans.len();
-    *try_cuts += tree
+fn collect_stats(tree: &RegionTree, stats: &mut RegionStats) {
+    stats.region_nodes += tree.nodes().len();
+    stats.blocks_dead += tree.dead_blocks.len();
+    stats.try_regions += tree.try_plans.len();
+    stats.try_cuts += tree
         .try_plans
         .iter()
         .filter(|p| p.cuts_structured_region)
         .count();
-    *cross_arm_edges += tree.cross_arm_edges.len();
+    stats.cross_arm_edges += tree.cross_arm_edges.len();
     if !tree.cross_arm_edges.is_empty() {
-        *functions_with_cross_arm += 1;
+        stats.functions_with_cross_arm += 1;
     }
-    *loops_total += tree.loops.len();
+    stats.loops_total += tree.loops.len();
     for l in &tree.loops {
         match l.kind {
-            LoopKind::While => *loops_while += 1,
-            LoopKind::DoWhile => *loops_do_while += 1,
+            LoopKind::While => stats.loops_while += 1,
+            LoopKind::DoWhile => stats.loops_do_while += 1,
         }
     }
     let mut reachable = 0usize;
@@ -235,30 +272,30 @@ fn collect_stats(
             _ => {}
         }
     }
-    *blocks_reachable += reachable;
+    stats.blocks_reachable += reachable;
     for e in &tree.edges {
         match e.class {
-            EdgeClass::Internal => *edges_internal += 1,
+            EdgeClass::Internal => stats.edges_internal += 1,
             EdgeClass::Continue { labeled, .. } => {
-                *edges_continue += 1;
+                stats.edges_continue += 1;
                 if labeled {
-                    *edges_continue_labeled += 1;
+                    stats.edges_continue_labeled += 1;
                 }
             }
             EdgeClass::Break { labeled, .. } => {
-                *edges_break += 1;
+                stats.edges_break += 1;
                 if labeled {
-                    *edges_break_labeled += 1;
+                    stats.edges_break_labeled += 1;
                 }
             }
         }
     }
-    *irreducible_cores += tree.irreducible.len();
+    stats.irreducible_cores += tree.irreducible.len();
     if !tree.irreducible.is_empty() {
-        *functions_with_irreducible += 1;
+        stats.functions_with_irreducible += 1;
     }
     if !tree.escape_hatches.is_empty() {
-        *functions_with_escape += 1;
+        stats.functions_with_escape += 1;
     }
     for h in &tree.escape_hatches {
         let key = match h {
@@ -266,6 +303,6 @@ fn collect_stats(
             EscapeHatch::Stranded { .. } => "stranded",
             EscapeHatch::CrossEdge { .. } => "cross_edge",
         };
-        *escape_hist.entry(key).or_insert(0) += 1;
+        *stats.escape_hist.entry(key).or_insert(0) += 1;
     }
 }

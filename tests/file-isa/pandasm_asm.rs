@@ -41,6 +41,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
+use rayon::prelude::*;
+
 /// Ledger of documented divergences (class name → abc paths).
 const LEDGER_PATH: &str = "scripts/pandasm-asm-divergences.json";
 
@@ -382,7 +384,7 @@ pub(crate) fn canonicalize(pa: &[u8]) -> Vec<u8> {
 /// human-readable failure reason.
 type Verdict = Result<(), String>;
 
-fn run_gate(prefix: &str, check: impl Fn(&std::path::Path, &str, &str) -> Verdict) {
+fn run_gate(prefix: &str, check: impl Fn(&std::path::Path, &str, &str) -> Verdict + Sync) {
     let root = crate::exported_corpus_root();
     let rows = crate::manifest_select(&root, crate::SELECT_ABC_PANDASM);
     let filter = std::env::var("ABCD_PANDASM_ASM_FILTER").ok();
@@ -407,28 +409,36 @@ fn run_gate(prefix: &str, check: impl Fn(&std::path::Path, &str, &str) -> Verdic
         .map(|line| line.split_once('\t').expect("manifest paths").0)
         .collect();
 
-    let mut total = 0usize;
+    // In-scope rows, in manifest order (the filter preserves order).
+    let scoped: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|line| line.split_once('\t').expect("manifest paths"))
+        .filter(|(rel, _)| filter.as_ref().is_none_or(|f| rel.contains(f.as_str())))
+        .collect();
+
+    // Parallel per-fixture verdicts (rayon). The indexed collect keeps
+    // manifest row order, so the serial fold below emits the identical
+    // report the serial loop did.
+    let verdicts: Vec<Verdict> = scoped
+        .par_iter()
+        .map(|&(rel, pandasm)| check(&root, rel, pandasm))
+        .collect();
+
+    let total = scoped.len();
     let mut matched = 0usize;
     let mut documented: BTreeMap<&str, usize> = BTreeMap::new();
     let mut failing: BTreeSet<String> = BTreeSet::new();
     let mut undocumented: Vec<String> = Vec::new();
     let mut reasons: Vec<String> = Vec::new();
-    for line in &rows {
-        let (rel, pandasm) = line.split_once('\t').expect("manifest paths");
-        if let Some(f) = &filter {
-            if !rel.contains(f.as_str()) {
-                continue;
-            }
-        }
-        total += 1;
-        match check(&root, rel, pandasm) {
+    for ((rel, _), verdict) in scoped.iter().zip(verdicts) {
+        match verdict {
             Ok(()) => matched += 1,
             Err(reason) => {
-                failing.insert(rel.to_owned());
+                failing.insert(rel.to_string());
                 match listed.get(rel) {
                     Some(class) => *documented.entry(class).or_default() += 1,
                     None => {
-                        undocumented.push(rel.to_owned());
+                        undocumented.push(rel.to_string());
                         if reasons.len() < 20 {
                             reasons.push(reason);
                         }

@@ -33,6 +33,7 @@ use crate::common;
 
 use abcd_ir::FuncId;
 use abcd_lift::lift_file;
+use rayon::prelude::*;
 
 #[test]
 #[ignore = "requires exported GHCR corpus and python3"]
@@ -41,26 +42,34 @@ fn dominators_agree_with_verifier_on_corpus() {
     let paths = common::manifest_paths(&root);
     assert_eq!(paths.len(), 5517, "expected the full 5517-fixture corpus");
 
-    let mut fixtures = 0usize;
-    let mut functions = 0usize;
-    let mut blocks_compared = 0usize;
-    let mut blocks_skipped = 0usize;
-    let mut blocks_total = 0usize;
-
-    for relative in &paths {
-        let data = std::fs::read(root.join(relative)).expect("read fixture");
-        let file = abcd_file::decode(&data).expect("decode fixture");
-        let module = lift_file(&file).expect("lift fixture");
-        fixtures += 1;
-        for fi in 0..module.functions.len() {
-            let (compared, skipped, total) =
-                common::check_function(&module, FuncId::new(fi as u32), relative);
-            functions += 1;
-            blocks_compared += compared;
-            blocks_skipped += skipped;
-            blocks_total += total;
-        }
-    }
+    // Parallel per-fixture agreement checks (rayon); the per-fixture
+    // (functions, compared, skipped, total) counts sum
+    // order-independently, and the in-check assertions fail the gate on
+    // any disagreement regardless of scheduling.
+    let (functions, blocks_compared, blocks_skipped, blocks_total) = paths
+        .par_iter()
+        .map(|relative| {
+            let data = std::fs::read(root.join(relative)).expect("read fixture");
+            let file = abcd_file::decode(&data).expect("decode fixture");
+            let module = lift_file(&file).expect("lift fixture");
+            let mut functions = 0usize;
+            let mut compared = 0usize;
+            let mut skipped = 0usize;
+            let mut total = 0usize;
+            for fi in 0..module.functions.len() {
+                let (c, s, t) = common::check_function(&module, FuncId::new(fi as u32), relative);
+                functions += 1;
+                compared += c;
+                skipped += s;
+                total += t;
+            }
+            (functions, compared, skipped, total)
+        })
+        .reduce(
+            || (0, 0, 0, 0),
+            |(a1, b1, c1, d1), (a2, b2, c2, d2)| (a1 + a2, b1 + b2, c1 + c2, d1 + d2),
+        );
+    let fixtures = paths.len();
 
     eprintln!(
         "DOM-AGREEMENT fixtures={fixtures} functions={functions} \

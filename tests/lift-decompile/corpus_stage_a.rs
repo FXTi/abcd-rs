@@ -39,6 +39,7 @@ use abcd_decompile::fitness::Fitness;
 use abcd_decompile::recover::{recover_func, OpStat, Outcome};
 use abcd_ir::FuncId;
 use abcd_lift::lift_file;
+use rayon::prelude::*;
 
 /// Ops whose fallback outcome is DOCUMENTED (the §5 hard 7 + the
 /// N-class `ThrowDeleteSuperProperty`, whose member expression the op
@@ -70,51 +71,74 @@ fn corpus_stage_a_gate() {
         "expected the 2832-fixture non-test262 corpus"
     );
 
-    let mut fixtures = 0usize;
+    // Parallel per-fixture recovery (rayon): the determinism and
+    // instruction/outcome asserts stay inside the map; each fixture's
+    // histogram comes back keyed by op name and merges
+    // order-independently.
+    let per_fixture: Vec<(usize, usize, usize, BTreeMap<&'static str, OpStat>)> = paths
+        .par_iter()
+        .map(|relative| {
+            let data = std::fs::read(root.join(relative)).expect("read fixture");
+            let file = abcd_file::decode(&data).expect("decode fixture");
+            let module = lift_file(&file).expect("lift fixture");
+
+            // Determinism: two independent dumps are byte-identical.
+            let dump1 = dump_module(&module);
+            let dump2 = dump_module(&module);
+            assert_eq!(dump1, dump2, "non-deterministic dump in {relative}");
+
+            let mut functions = 0usize;
+            let mut instructions = 0usize;
+            let mut outcome_total = 0usize;
+            let mut histogram: BTreeMap<&'static str, OpStat> = BTreeMap::new();
+            for fi in 0..module.functions.len() {
+                let func = FuncId::new(fi as u32);
+                let rf = recover_func(&module, func);
+                functions += 1;
+                // Every instruction of the function gets exactly one outcome.
+                let f = module.func(func).expect("func");
+                let func_insts: usize = f
+                    .blocks
+                    .iter()
+                    .map(|b| module.block(*b).map(|bl| bl.insts.len()).unwrap_or(0))
+                    .sum();
+                instructions += func_insts;
+                let func_outcomes: usize = rf
+                    .histogram
+                    .values()
+                    .map(|s| s.counts.iter().sum::<usize>())
+                    .sum();
+                assert_eq!(
+                    func_insts, func_outcomes,
+                    "instruction/outcome mismatch in {relative} {func:?}"
+                );
+                outcome_total += func_outcomes;
+                for (op, stat) in rf.histogram {
+                    let entry = histogram.entry(op).or_default();
+                    entry.fitness = stat.fitness;
+                    for (i, c) in stat.counts.iter().enumerate() {
+                        entry.counts[i] += c;
+                    }
+                }
+            }
+            (functions, instructions, outcome_total, histogram)
+        })
+        .collect();
+
+    let fixtures = paths.len();
     let mut functions = 0usize;
     let mut histogram: BTreeMap<&'static str, OpStat> = BTreeMap::new();
     let mut instructions = 0usize;
     let mut outcome_total = 0usize;
-
-    for relative in &paths {
-        let data = std::fs::read(root.join(relative)).expect("read fixture");
-        let file = abcd_file::decode(&data).expect("decode fixture");
-        let module = lift_file(&file).expect("lift fixture");
-        fixtures += 1;
-
-        // Determinism: two independent dumps are byte-identical.
-        let dump1 = dump_module(&module);
-        let dump2 = dump_module(&module);
-        assert_eq!(dump1, dump2, "non-deterministic dump in {relative}");
-
-        for fi in 0..module.functions.len() {
-            let func = FuncId::new(fi as u32);
-            let rf = recover_func(&module, func);
-            functions += 1;
-            // Every instruction of the function gets exactly one outcome.
-            let f = module.func(func).expect("func");
-            let func_insts: usize = f
-                .blocks
-                .iter()
-                .map(|b| module.block(*b).map(|bl| bl.insts.len()).unwrap_or(0))
-                .sum();
-            instructions += func_insts;
-            let func_outcomes: usize = rf
-                .histogram
-                .values()
-                .map(|s| s.counts.iter().sum::<usize>())
-                .sum();
-            assert_eq!(
-                func_insts, func_outcomes,
-                "instruction/outcome mismatch in {relative} {func:?}"
-            );
-            outcome_total += func_outcomes;
-            for (op, stat) in rf.histogram {
-                let entry = histogram.entry(op).or_default();
-                entry.fitness = stat.fitness;
-                for (i, c) in stat.counts.iter().enumerate() {
-                    entry.counts[i] += c;
-                }
+    for (f, i, o, h) in per_fixture {
+        functions += f;
+        instructions += i;
+        outcome_total += o;
+        for (op, stat) in h {
+            let entry = histogram.entry(op).or_default();
+            entry.fitness = stat.fitness;
+            for (i, c) in stat.counts.iter().enumerate() {
+                entry.counts[i] += c;
             }
         }
     }

@@ -16,6 +16,7 @@ use crate::common;
 
 use abcd_ir::Op;
 use abcd_taint::names::callee_name_candidates;
+use rayon::prelude::*;
 
 #[test]
 #[ignore = "requires exported GHCR corpus and python3"]
@@ -28,28 +29,39 @@ fn callee_name_frequency() {
         "expected the 1149 runtime-passed fixtures"
     );
 
-    let mut freq: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut sites = 0usize;
-    let mut named = 0usize;
-    for relative in &paths {
-        let module = common::lift_fixture(&root, relative);
-        for f in &module.functions {
-            for &b in &f.blocks {
-                for &iid in &module.blocks[b.index()].insts {
-                    let inst = &module.insts[iid.index()];
-                    let Op::Call { callee, .. } = &inst.op else {
-                        continue;
-                    };
-                    sites += 1;
-                    let candidates = callee_name_candidates(&module, *callee);
-                    if let Some(top) = candidates.first() {
-                        named += 1;
-                        *freq.entry(top.clone()).or_insert(0) += 1;
+    // Parallel per-fixture frequency counts (rayon); the name-keyed map
+    // and the site/named counts merge order-independently.
+    let (freq, sites, named) = paths
+        .par_iter()
+        .map(|relative| {
+            let module = common::lift_fixture(&root, relative);
+            let mut freq: std::collections::BTreeMap<String, usize> = Default::default();
+            let mut sites = 0usize;
+            let mut named = 0usize;
+            for f in &module.functions {
+                for &b in &f.blocks {
+                    for &iid in &module.blocks[b.index()].insts {
+                        let inst = &module.insts[iid.index()];
+                        let Op::Call { callee, .. } = &inst.op else {
+                            continue;
+                        };
+                        sites += 1;
+                        let candidates = callee_name_candidates(&module, *callee);
+                        if let Some(top) = candidates.first() {
+                            named += 1;
+                            *freq.entry(top.clone()).or_insert(0) += 1;
+                        }
                     }
                 }
             }
-        }
-    }
+            (freq, sites, named)
+        })
+        .reduce(Default::default, |(mut af, as_, an), (bf, bs, bn)| {
+            for (name, n) in bf {
+                *af.entry(name).or_insert(0) += n;
+            }
+            (af, as_ + bs, an + bn)
+        });
 
     let mut ranked: Vec<(String, usize)> = freq.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));

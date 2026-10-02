@@ -44,6 +44,7 @@ bitflags = "2"
 string-interner = "0.19"
 toml = "0.9"
 miniz_oxide = "0.9"
+rayon = "1"
 
 abcd-isa-sys = { path = "abcd-isa-sys" }
 abcd-isa = { path = "abcd-isa" }
@@ -75,3 +76,8 @@ abcd-decompile = { workspace = true }
 abcd-hap = { workspace = true }
 serde = { workspace = true }
 serde_json = "1"
+# Test-only: the corpus gates' per-fixture loops parallelize with rayon
+# (cargo's harness parallelism splits across test FUNCTIONS, not the
+# fixture loop inside one gate). Aggregation stays deterministic: every
+# per-fixture result is collected in fixture order and folded serially.
+rayon = { workspace = true }

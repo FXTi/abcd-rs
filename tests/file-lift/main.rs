@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use abcd_file::decode;
+use rayon::prelude::*;
 
 fn corpus_root() -> PathBuf {
     std::env::var_os("ABCD_CORPUS_ROOT")
@@ -81,11 +82,58 @@ with open(sys.argv[1], encoding="utf-8") as manifest:
 /// set until v2-P1a (6d1fcd0) fixed the abcd-file nested-literal-array
 /// decode — since then ZERO pending is the gate: every fixture lifts and
 /// every failure class is a hard gate failure.
+/// One fixture's lift+verify outcome, with the exact eprintln lines the
+/// serial loop emitted for it (replay order = row order).
+enum Outcome {
+    /// Lift succeeded; `functions` is the module's function count,
+    /// `verify_errors` the verifier's error strings (empty when clean,
+    /// truncated to the first 3 for the report line as before).
+    Lifted {
+        functions: usize,
+        verify_errors: Vec<String>,
+        verify_errors_total: usize,
+    },
+    /// The registered-pending class (unregistered nested literal array).
+    Pending(String),
+    /// Any other lift failure.
+    LiftFailure(String),
+}
+
 #[test]
 #[ignore = "requires exported GHCR corpus + python3"]
 fn exported_corpus_lifts_and_verifies_v2() {
     let root = corpus_root();
     let rows = manifest_rows(&root);
+    // Parallel decode + lift + verify per fixture (rayon); the indexed
+    // collect keeps row order and the serial fold below re-emits the
+    // report lines exactly where the serial loop printed them.
+    let outcomes: Vec<Outcome> = rows
+        .par_iter()
+        .map(|(relative, _version, _profile, _kind)| {
+            let data = std::fs::read(root.join(relative)).expect("fixture");
+            let file = decode(&data).unwrap_or_else(|e| panic!("decode {relative}: {e}"));
+            let module = match abcd_lift::lift_file(&file) {
+                Ok(m) => m,
+                Err(abcd_lift::LiftError::LiteralArrayOutOfRange(idx)) => {
+                    return Outcome::Pending(format!("{idx:#x}"));
+                }
+                Err(e) => return Outcome::LiftFailure(format!("{e}")),
+            };
+            let functions = module.functions.len();
+            let report = abcd_ir::verify_module(&module);
+            Outcome::Lifted {
+                functions,
+                verify_errors: report
+                    .errors
+                    .iter()
+                    .take(3)
+                    .map(|e| format!("{e}"))
+                    .collect(),
+                verify_errors_total: report.errors.len(),
+            }
+        })
+        .collect();
+
     let mut fixtures = 0usize;
     let mut fixtures_test262 = 0usize;
     let mut functions = 0usize;
@@ -93,36 +141,36 @@ fn exported_corpus_lifts_and_verifies_v2() {
     let mut pending = 0usize;
     let mut verify_failures = 0usize;
     let mut verify_errors_total = 0usize;
-    for (relative, version, profile, kind) in &rows {
-        let data = std::fs::read(root.join(relative)).expect("fixture");
-        let file = decode(&data).unwrap_or_else(|e| panic!("decode {relative}: {e}"));
+    for ((relative, version, profile, kind), outcome) in rows.iter().zip(&outcomes) {
         fixtures += 1;
         if kind == "test262" {
             fixtures_test262 += 1;
         }
-        let module = match abcd_lift::lift_file(&file) {
-            Ok(m) => m,
-            Err(abcd_lift::LiftError::LiteralArrayOutOfRange(idx)) => {
+        match outcome {
+            Outcome::Pending(idx) => {
                 pending += 1;
                 eprintln!(
                     "PENDING(v2-P1a) [{version}/{profile}] {relative}: \
-                     unregistered nested literal array at {idx:#x}"
+                     unregistered nested literal array at {idx}"
                 );
-                continue;
             }
-            Err(e) => {
+            Outcome::LiftFailure(e) => {
                 lift_failures += 1;
                 eprintln!("LIFT FAIL [{version}/{profile}] {relative}: {e}");
-                continue;
             }
-        };
-        functions += module.functions.len();
-        let report = abcd_ir::verify_module(&module);
-        if !report.errors.is_empty() {
-            verify_failures += 1;
-            verify_errors_total += report.errors.len();
-            for e in report.errors.iter().take(3) {
-                eprintln!("VERIFY [{version}/{profile}] {relative}: {e}");
+            Outcome::Lifted {
+                functions: n,
+                verify_errors,
+                verify_errors_total: total,
+            } => {
+                functions += n;
+                if !verify_errors.is_empty() {
+                    verify_failures += 1;
+                    verify_errors_total += total;
+                    for e in verify_errors {
+                        eprintln!("VERIFY [{version}/{profile}] {relative}: {e}");
+                    }
+                }
             }
         }
     }

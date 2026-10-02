@@ -107,6 +107,7 @@ use abcd_ir::verify_module;
 use abcd_lower::LowerOptions;
 use abcd_opt::inline::{inline_module, InlinePolicy, InlineReport};
 use abcd_opt::optimize_module;
+use rayon::prelude::*;
 
 // Shared front-end + rewrite pipeline (verbatim extraction; the test262
 // suite runs the same path).
@@ -192,161 +193,201 @@ for path in sorted(paths):
         }
     }
 
+    let determinism = std::env::var("ABCD_INLINE_DETERMINISM").as_deref() != Ok("0");
+
+    /// One fixture's full three-variant outcome: the exact report lines
+    /// the serial loop emitted (replayed in row order), per-variant
+    /// skip (category, reason) pairs for the histograms, the encoded
+    /// bytes to write per variant, and the inline report (merged even
+    /// when the v2inline rewrite then fails, as before).
+    struct RowOut {
+        lines: Vec<String>,
+        wrote: [bool; 3],
+        skips: [Option<(String, String)>; 3],
+        outputs: [Option<Vec<u8>>; 3],
+        inline: Option<InlineReport>,
+    }
+
+    fn record(out: &mut RowOut, relative: &str, variant: usize, (category, reason): Skip) {
+        let key = category.to_string();
+        out.lines.push(format!(
+            "SKIP {} {relative} | {key} | {reason}",
+            VARIANTS[variant]
+        ));
+        out.skips[variant] = Some((key, reason));
+    }
+
+    // Parallel per-fixture rewrite pipeline (rayon). Each fixture is
+    // independent; the indexed collect keeps row order, and the serial
+    // fold below replays SKIP/WROTE lines and writes the oracle
+    // candidates exactly where the serial loop did.
+    let rows_out: Vec<RowOut> = paths
+        .par_lines()
+        .map(|relative| {
+            let mut out = RowOut {
+                lines: Vec::new(),
+                wrote: [false; 3],
+                skips: [None, None, None],
+                outputs: [None, None, None],
+                inline: None,
+            };
+            // Front-end stage shared by all variants.
+            let (file, module) = match guarded(|| front_end(&root.join(relative))) {
+                Ok(pair) => pair,
+                Err((category, reason)) => {
+                    let key = category.to_string();
+                    for (variant, name) in VARIANTS.iter().enumerate() {
+                        out.lines
+                            .push(format!("SKIP {name} {relative} | {key} | {reason}"));
+                        out.skips[variant] = Some((key.clone(), reason.clone()));
+                    }
+                    return out;
+                }
+            };
+
+            // Variant: lift-only.
+            match guarded(|| rewrite_fixture(&module, &file, LowerOptions::default())) {
+                Ok((encoded, functions)) => {
+                    out.lines
+                        .push(format!("WROTE v2lift {relative} ({functions} functions)"));
+                    out.outputs[0] = Some(encoded);
+                    out.wrote[0] = true;
+                }
+                Err(s) => record(&mut out, relative, 0, s),
+            }
+
+            // Variant: lift + optimize (optimize mutates the module;
+            // re-verify before lowering — the N27/N28 post-opt hygiene
+            // gate).
+            let opt_result = guarded(|| {
+                let mut optimized = module.clone();
+                optimize_module(&mut optimized);
+                let report = verify_module(&optimized);
+                if !report.is_ok() {
+                    return Err((
+                        SkipCategory::Verify,
+                        format!("post-optimize verify: {:?}", report.errors),
+                    ));
+                }
+                Ok(optimized)
+            });
+            let optimized = match opt_result {
+                Ok(optimized) => optimized,
+                Err(s) => {
+                    record(&mut out, relative, 1, s);
+                    return out;
+                }
+            };
+            match guarded(|| {
+                rewrite_fixture(
+                    &optimized,
+                    &file,
+                    LowerOptions {
+                        prune_unused_frame_init_consts: true,
+                    },
+                )
+            }) {
+                Ok((encoded, functions)) => {
+                    out.lines
+                        .push(format!("WROTE v2opt {relative} ({functions} functions)"));
+                    out.outputs[1] = Some(encoded);
+                    out.wrote[1] = true;
+                }
+                Err(s) => record(&mut out, relative, 1, s),
+            }
+
+            // Variant: lift + inline (OPT-IN — the D2 inline pass, never
+            // part of optimize_module; re-verify after inlining — zero
+            // verifier errors is the hard gate). LowerOptions::default():
+            // inline does not optimize, so no frame-init pruning.
+            let inline_result = guarded(|| {
+                let mut inlined = module.clone();
+                let report = inline_module(&mut inlined, &InlinePolicy::default());
+                let verify = verify_module(&inlined);
+                if !verify.is_ok() {
+                    return Err((
+                        SkipCategory::Verify,
+                        format!("post-inline verify: {:?}", verify.errors),
+                    ));
+                }
+                Ok((inlined, report))
+            });
+            let (inlined, report) = match inline_result {
+                Ok(pair) => pair,
+                Err(s) => {
+                    record(&mut out, relative, 2, s);
+                    return out;
+                }
+            };
+            out.inline = Some(report);
+            match guarded(|| rewrite_fixture(&inlined, &file, LowerOptions::default())) {
+                Ok((encoded, functions)) => {
+                    out.lines
+                        .push(format!("WROTE v2inline {relative} ({functions} functions)"));
+                    if determinism {
+                        // Two inline-on rewrites of the same fixture must be
+                        // byte-identical (fresh front-end: decode → lift →
+                        // inline → lower → encode again).
+                        let second = guarded(|| {
+                            let (file2, module2) = front_end(&root.join(relative))?;
+                            let mut inlined2 = module2;
+                            inline_module(&mut inlined2, &InlinePolicy::default());
+                            let verify2 = verify_module(&inlined2);
+                            if !verify2.is_ok() {
+                                return Err((
+                                    SkipCategory::Verify,
+                                    format!("post-inline re-verify: {:?}", verify2.errors),
+                                ));
+                            }
+                            rewrite_fixture(&inlined2, &file2, LowerOptions::default())
+                        });
+                        match second {
+                            Ok((encoded2, _)) => assert_eq!(
+                                encoded, encoded2,
+                                "inline-on rewrite must be deterministic: {relative}"
+                            ),
+                            Err((category, reason)) => panic!(
+                                "determinism re-run failed for {relative}: {category} | {reason}"
+                            ),
+                        }
+                    }
+                    out.outputs[2] = Some(encoded);
+                    out.wrote[2] = true;
+                }
+                Err(s) => record(&mut out, relative, 2, s),
+            }
+            out
+        })
+        .collect();
+
+    // Serial fold in row order: replay the report lines, write the
+    // oracle candidates, fold the histograms and inline stats.
     let mut fixtures = 0usize;
     let mut wrote = [0usize; 3];
     let mut histograms: [BTreeMap<String, usize>; 3] =
         [BTreeMap::new(), BTreeMap::new(), BTreeMap::new()];
     let mut inline_stats = InlineReport::default();
-    // W6 (q-P2): the inline determinism double-run is ON by default — it
-    // is the only in-cargo guard against a nondeterministic inline pass.
-    // ABCD_INLINE_DETERMINISM=0 opts out (debugging speed).
-    let determinism = std::env::var("ABCD_INLINE_DETERMINISM").as_deref() != Ok("0");
 
-    let record_skip = |variant: usize,
-                       name: &str,
-                       relative: &str,
-                       (category, reason): Skip,
-                       histograms: &mut [BTreeMap<String, usize>; 3]| {
-        let key = category.to_string();
-        eprintln!("SKIP {name} {relative} | {key} | {reason}");
-        *histograms[variant].entry(key).or_insert(0) += 1;
-    };
-
-    for relative in paths.lines() {
+    for (relative, row) in paths.lines().zip(&rows_out) {
         fixtures += 1;
-
-        // Front-end stage shared by all variants.
-        let (file, module) = match guarded(|| front_end(&root.join(relative))) {
-            Ok(pair) => pair,
-            Err(skip) => {
-                let reason = skip.1;
-                let key = skip.0.to_string();
-                for (variant, name) in VARIANTS.iter().enumerate() {
-                    eprintln!("SKIP {name} {relative} | {key} | {reason}");
-                    *histograms[variant].entry(key.clone()).or_insert(0) += 1;
-                }
-                continue;
-            }
-        };
-
-        // Variant: lift-only.
-        match guarded(|| rewrite_fixture(&module, &file, LowerOptions::default())) {
-            Ok((encoded, functions)) => {
-                eprintln!("WROTE v2lift {relative} ({functions} functions)");
-                if let Some(dir) = &out_root {
-                    let target = dir.join("v2lift").join(relative);
-                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-                    std::fs::write(target, encoded).expect("write oracle candidate");
-                }
-                wrote[0] += 1;
-            }
-            Err(skip) => record_skip(0, "v2lift", relative, skip, &mut histograms),
+        for line in &row.lines {
+            eprintln!("{line}");
         }
-
-        // Variant: lift + optimize (optimize mutates the module; re-verify
-        // before lowering — the N27/N28 post-opt hygiene gate).
-        let opt_result = guarded(|| {
-            let mut optimized = module.clone();
-            optimize_module(&mut optimized);
-            let report = verify_module(&optimized);
-            if !report.is_ok() {
-                return Err((
-                    SkipCategory::Verify,
-                    format!("post-optimize verify: {:?}", report.errors),
-                ));
+        for variant in 0..3 {
+            if row.wrote[variant] {
+                wrote[variant] += 1;
             }
-            Ok(optimized)
-        });
-        let optimized = match opt_result {
-            Ok(optimized) => optimized,
-            Err(skip) => {
-                record_skip(1, "v2opt", relative, skip, &mut histograms);
-                continue;
+            if let Some((key, _)) = &row.skips[variant] {
+                *histograms[variant].entry(key.clone()).or_insert(0) += 1;
             }
-        };
-        match guarded(|| {
-            rewrite_fixture(
-                &optimized,
-                &file,
-                LowerOptions {
-                    prune_unused_frame_init_consts: true,
-                },
-            )
-        }) {
-            Ok((encoded, functions)) => {
-                eprintln!("WROTE v2opt {relative} ({functions} functions)");
-                if let Some(dir) = &out_root {
-                    let target = dir.join("v2opt").join(relative);
-                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-                    std::fs::write(target, encoded).expect("write oracle candidate");
-                }
-                wrote[1] += 1;
+            if let (Some(dir), Some(encoded)) = (&out_root, &row.outputs[variant]) {
+                let target = dir.join(VARIANTS[variant]).join(relative);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(target, encoded).expect("write oracle candidate");
             }
-            Err(skip) => record_skip(1, "v2opt", relative, skip, &mut histograms),
         }
-
-        // Variant: lift + inline (OPT-IN — the D2 inline pass, never
-        // part of optimize_module; re-verify after inlining — zero
-        // verifier errors is the hard gate). LowerOptions::default():
-        // inline does not optimize, so no frame-init pruning.
-        let inline_result = guarded(|| {
-            let mut inlined = module.clone();
-            let report = inline_module(&mut inlined, &InlinePolicy::default());
-            let verify = verify_module(&inlined);
-            if !verify.is_ok() {
-                return Err((
-                    SkipCategory::Verify,
-                    format!("post-inline verify: {:?}", verify.errors),
-                ));
-            }
-            Ok((inlined, report))
-        });
-        let (inlined, report) = match inline_result {
-            Ok(pair) => pair,
-            Err(skip) => {
-                record_skip(2, "v2inline", relative, skip, &mut histograms);
-                continue;
-            }
-        };
-        inline_stats.merge(&report);
-        match guarded(|| rewrite_fixture(&inlined, &file, LowerOptions::default())) {
-            Ok((encoded, functions)) => {
-                eprintln!("WROTE v2inline {relative} ({functions} functions)");
-                if determinism {
-                    // Two inline-on rewrites of the same fixture must be
-                    // byte-identical (fresh front-end: decode → lift →
-                    // inline → lower → encode again).
-                    let second = guarded(|| {
-                        let (file2, module2) = front_end(&root.join(relative))?;
-                        let mut inlined2 = module2;
-                        inline_module(&mut inlined2, &InlinePolicy::default());
-                        let verify2 = verify_module(&inlined2);
-                        if !verify2.is_ok() {
-                            return Err((
-                                SkipCategory::Verify,
-                                format!("post-inline re-verify: {:?}", verify2.errors),
-                            ));
-                        }
-                        rewrite_fixture(&inlined2, &file2, LowerOptions::default())
-                    });
-                    match second {
-                        Ok((encoded2, _)) => assert_eq!(
-                            encoded, encoded2,
-                            "inline-on rewrite must be deterministic: {relative}"
-                        ),
-                        Err((category, reason)) => panic!(
-                            "determinism re-run failed for {relative}: {category} | {reason}"
-                        ),
-                    }
-                }
-                if let Some(dir) = &out_root {
-                    let target = dir.join("v2inline").join(relative);
-                    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-                    std::fs::write(target, encoded).expect("write oracle candidate");
-                }
-                wrote[2] += 1;
-            }
-            Err(skip) => record_skip(2, "v2inline", relative, skip, &mut histograms),
+        if let Some(report) = &row.inline {
+            inline_stats.merge(report);
         }
     }
 

@@ -40,6 +40,7 @@ use abcd_file::File;
 use abcd_ir::{verify_module, FuncId, Module};
 use abcd_lift::lift_file;
 use abcd_lower::{lower_function, to_method_body};
+use rayon::prelude::*;
 
 /// Read → decode → v0.2 lift → verify (same front end as
 /// corpus_lower_oracle).
@@ -188,48 +189,68 @@ for path in sorted(paths):
     );
     let paths = String::from_utf8(output.stdout).expect("UTF-8 fixture paths");
 
+    // Parallel per-fixture determinism pairs (rayon). Each fixture
+    // returns its mismatch report lines (empty when clean / skipped);
+    // the indexed collect keeps row order, so the serial replay below
+    // prints exactly what the serial loop printed.
+    let reports: Vec<Option<String>> = paths
+        .par_lines()
+        .map(|relative| {
+            let path = root.join(relative);
+
+            let (file1, module1) = front_end(&path)?;
+            let (file2, module2) = front_end(&path)?;
+
+            let bytes1 = rewrite_fixture(&module1, &file1);
+            // Same module lowered a second time: isolates lower-stage
+            // nondeterminism (front end shared).
+            let bytes1b = rewrite_fixture(&module1, &file1);
+            let bytes2 = rewrite_fixture(&module2, &file2);
+
+            let (Some(b1), Some(b1c), Some(b2)) = (bytes1, bytes1b, bytes2) else {
+                return None;
+            };
+
+            let mut report = String::new();
+            if b1 != b1c {
+                report.push_str(&format!(
+                    "LOWER-NONDET {relative} ({} vs {} bytes)\n",
+                    b1.len(),
+                    b1c.len()
+                ));
+            }
+            if b1 != b2 {
+                report.push_str(&format!(
+                    "E2E-NONDET {relative} ({} vs {} bytes)\n",
+                    b1.len(),
+                    b2.len()
+                ));
+                report.push_str(&pinpoint(&module1, &module2, &file1));
+            }
+            Some(report)
+        })
+        .collect();
+
     let mut fixtures = 0usize;
     let mut skipped = 0usize;
     let mut e2e_mismatch = 0usize;
     let mut lower_mismatch = 0usize;
 
-    for relative in paths.lines() {
+    for report in &reports {
         fixtures += 1;
-        let path = root.join(relative);
-
-        let Some((file1, module1)) = front_end(&path) else {
+        let Some(report) = report else {
             skipped += 1;
             continue;
         };
-        let Some((file2, module2)) = front_end(&path) else {
-            skipped += 1;
-            continue;
-        };
-
-        let bytes1 = rewrite_fixture(&module1, &file1);
-        // Same module lowered a second time: isolates lower-stage
-        // nondeterminism (front end shared).
-        let bytes1b = rewrite_fixture(&module1, &file1);
-        let bytes2 = rewrite_fixture(&module2, &file2);
-
-        let (Some(b1), Some(b1c), Some(b2)) = (bytes1, bytes1b, bytes2) else {
-            skipped += 1;
-            continue;
-        };
-
-        if b1 != b1c {
-            lower_mismatch += 1;
-            eprintln!(
-                "LOWER-NONDET {relative} ({} vs {} bytes)",
-                b1.len(),
-                b1c.len()
-            );
+        for line in report.lines() {
+            if line.starts_with("LOWER-NONDET") {
+                lower_mismatch += 1;
+            }
+            if line.starts_with("E2E-NONDET") {
+                e2e_mismatch += 1;
+            }
         }
-        if b1 != b2 {
-            e2e_mismatch += 1;
-            eprintln!("E2E-NONDET {relative} ({} vs {} bytes)", b1.len(), b2.len());
-            eprint!("{}", pinpoint(&module1, &module2, &file1));
-        }
+        eprint!("{report}");
     }
 
     eprintln!(

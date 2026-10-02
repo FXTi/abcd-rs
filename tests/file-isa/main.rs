@@ -18,6 +18,7 @@ use abcd_file::{decode, encode};
 use abcd_isa::{
     decode as decode_isa, encode as encode_isa, BytecodeFlags, EntityKind, Operand, Version,
 };
+use rayon::prelude::*;
 use std::process::Command;
 
 mod pandasm_asm;
@@ -125,13 +126,16 @@ fn modules_abc_decodes_fully_with_v24_table() {
 }
 
 /// Decode every fixture listed by the exported corpus manifest.
+///
+/// The per-fixture decode fans out over rayon; there is nothing to
+/// aggregate beyond the count, which is the row count itself (a panic
+/// anywhere fails the gate, in either scheduling).
 #[test]
 #[ignore = "requires exported GHCR corpus"]
 fn exported_corpus_index_decodes_every_fixture() {
     let root = exported_corpus_root();
     let rows = manifest_select(&root, SELECT_ABC);
-    let mut count = 0usize;
-    for rel in &rows {
+    rows.par_iter().for_each(|rel| {
         let path = root.join(rel);
         let data = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("fixture missing at {}: {e}", path.display()));
@@ -153,32 +157,39 @@ fn exported_corpus_index_decodes_every_fixture() {
             "version mismatch at {}",
             path.display()
         );
-        count += 1;
-    }
+    });
+    let count = rows.len();
     // Floor recorded at the 2757-fixture export; new fixtures only grow it.
     assert!(count >= 2757, "unexpected exported corpus size: {count}");
 }
 
 /// Exercise the ISA encode/decode layer for every decoded method body.
+///
+/// Parallel over fixtures (rayon); each fixture contributes its method
+/// count, summed order-independently (integer addition).
 #[test]
 #[ignore = "requires exported GHCR corpus"]
 fn exported_corpus_method_bytecodes_roundtrip_through_isa() {
     let root = exported_corpus_root();
     let rows = manifest_select(&root, SELECT_ABC);
-    let mut methods = 0usize;
-    for rel in &rows {
-        let data = std::fs::read(root.join(rel)).expect("fixture");
-        let file = decode(&data).expect("decode fixture");
-        for class in file.classes.values() {
-            for method in &class.methods {
-                let Some(body) = &method.body else { continue };
-                let encoded = encode_isa(&body.bytecodes).expect("encode method bytecodes");
-                let decoded = decode_isa(&encoded.0).expect("decode encoded method bytecodes");
-                assert_eq!(decoded.len(), body.bytecodes.len());
-                methods += 1;
+    let methods: usize = rows
+        .par_iter()
+        .map(|rel| {
+            let data = std::fs::read(root.join(rel)).expect("fixture");
+            let file = decode(&data).expect("decode fixture");
+            let mut methods = 0usize;
+            for class in file.classes.values() {
+                for method in &class.methods {
+                    let Some(body) = &method.body else { continue };
+                    let encoded = encode_isa(&body.bytecodes).expect("encode method bytecodes");
+                    let decoded = decode_isa(&encoded.0).expect("decode encoded method bytecodes");
+                    assert_eq!(decoded.len(), body.bytecodes.len());
+                    methods += 1;
+                }
             }
-        }
-    }
+            methods
+        })
+        .sum();
     assert!(methods > 10_000, "unexpected method count: {methods}");
 }
 
@@ -877,14 +888,15 @@ struct PaStats {
 }
 
 /// Compare every decoded method of one fixture against its reference.pa,
-/// per instruction. Returns the fixture's stats; mismatches are appended
-/// to `register` as human-readable records.
+/// per instruction. Returns the fixture's stats and the human-readable
+/// mismatch register entries (in the same order the serial loop appended
+/// them — the caller reassembles registers across fixtures in row order).
 fn compare_fixture_with_pandasm(
     root: &std::path::Path,
     rel: &str,
     pandasm: &str,
-    register: &mut Vec<String>,
-) -> PaStats {
+) -> (PaStats, Vec<String>) {
+    let mut register: Vec<String> = Vec::new();
     let data = std::fs::read(root.join(rel)).expect("fixture");
     let file = decode(&data).unwrap_or_else(|e| panic!("{rel}: {e}"));
     // The string-table oracle for the pandasm string disambiguation
@@ -994,27 +1006,40 @@ fn compare_fixture_with_pandasm(
         }
     }
     stats.lossy_strings = lossy.get();
-    stats
+    (stats, register)
 }
 
 /// The REAL 9/11 read verification: every corpus fixture's decoded
 /// instruction stream must match upstream's own disassembly instruction by
 /// instruction. Any mismatch is a registered finding (fixture + method +
 /// instruction index + both renderings), not silently absorbed.
+///
+/// Parallel over fixtures (rayon): each fixture compares independently
+/// into its own stats + register, the rayon's indexed `collect` keeps
+/// manifest row order, and the aggregation below folds the results
+/// serially in that order — the printed report is byte-identical to the
+/// serial loop's.
 #[test]
 #[ignore = "requires exported GHCR corpus + python3"]
 fn exported_corpus_instructions_match_upstream_pandasm() {
     let root = exported_corpus_root();
     let rows = manifest_select(&root, SELECT_ABC_PANDASM);
+    let results: Vec<(PaStats, Vec<String>)> = rows
+        .par_iter()
+        .map(|line| {
+            let (rel, pandasm) = line.split_once('\t').expect("manifest paths");
+            compare_fixture_with_pandasm(&root, rel, pandasm)
+        })
+        .collect();
     let mut register: Vec<String> = Vec::new();
     let mut matrix: std::collections::BTreeMap<(String, String), PaStats> =
         std::collections::BTreeMap::new();
     let mut total = PaStats::default();
     let mut lossy_fixtures: Vec<String> = Vec::new();
     let mut lossy_strings = 0usize;
-    for line in &rows {
-        let (rel, pandasm) = line.split_once('\t').expect("manifest paths");
-        let stats = compare_fixture_with_pandasm(&root, rel, pandasm, &mut register);
+    for (line, (stats, entries)) in rows.iter().zip(results) {
+        let (rel, _pandasm) = line.split_once('\t').expect("manifest paths");
+        register.extend(entries);
         if stats.lossy_strings > 0 {
             eprintln!("LOSSY-STRING {rel}: {} reconciled", stats.lossy_strings);
             lossy_fixtures.push(rel.to_owned());
@@ -1093,38 +1118,51 @@ fn rewritten_corpus_preserves_arithmetic_entities() {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid index JSON"))
         .collect();
-    let mut checked = 0;
-    for row in rows.iter().filter(|row| row["case"] == "local/arithmetic") {
-        let relative = row["abc"].as_str().expect("abc path");
-        let file = decode(&std::fs::read(root.join(relative)).expect("fixture"))
-            .unwrap_or_else(|error| panic!("decode {relative}: {error}"));
-        let output = encode(&file).unwrap_or_else(|error| panic!("encode {relative}: {error}"));
-        let rewritten = decode(&output).expect("decode rewritten fixture");
-        let snapshot = |f: &abcd_file::File| {
-            f.all_methods()
-                .map(|(_, method)| {
-                    let name = f.strings.resolve(method.name).unwrap().to_owned();
-                    let body = method.body.as_ref().unwrap();
-                    let operands = body
-                        .bytecodes
-                        .iter()
-                        .flat_map(|bc| {
-                            bc.entity_operands().into_iter().map(|(kind, id)| {
-                                let offset = body.entity_offsets[&(kind, id.0)];
-                                (
-                                    bc.mnemonic(),
-                                    kind,
-                                    f.resolve_entity_str(offset).unwrap().to_owned(),
-                                )
+    let relatives: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["case"] == "local/arithmetic")
+        .map(|row| row["abc"].as_str().expect("abc path"))
+        .collect();
+    // Parallel decode → encode → re-decode → snapshot-compare per
+    // fixture (rayon); the encoded bytes come back in fixture order and
+    // the optional oracle-candidate writes stay serial.
+    let outputs: Vec<Vec<u8>> = relatives
+        .par_iter()
+        .map(|relative| {
+            let file = decode(&std::fs::read(root.join(relative)).expect("fixture"))
+                .unwrap_or_else(|error| panic!("decode {relative}: {error}"));
+            let output = encode(&file).unwrap_or_else(|error| panic!("encode {relative}: {error}"));
+            let rewritten = decode(&output).expect("decode rewritten fixture");
+            let snapshot = |f: &abcd_file::File| {
+                f.all_methods()
+                    .map(|(_, method)| {
+                        let name = f.strings.resolve(method.name).unwrap().to_owned();
+                        let body = method.body.as_ref().unwrap();
+                        let operands = body
+                            .bytecodes
+                            .iter()
+                            .flat_map(|bc| {
+                                bc.entity_operands().into_iter().map(|(kind, id)| {
+                                    let offset = body.entity_offsets[&(kind, id.0)];
+                                    (
+                                        bc.mnemonic(),
+                                        kind,
+                                        f.resolve_entity_str(offset).unwrap().to_owned(),
+                                    )
+                                })
                             })
-                        })
-                        .collect::<Vec<_>>();
-                    (name, body.bytecodes.len(), operands)
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(rewritten.version, file.version, "{relative}");
-        assert_eq!(snapshot(&rewritten), snapshot(&file), "{relative}");
+                            .collect::<Vec<_>>();
+                        (name, body.bytecodes.len(), operands)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(rewritten.version, file.version, "{relative}");
+            assert_eq!(snapshot(&rewritten), snapshot(&file), "{relative}");
+            output
+        })
+        .collect();
+    let mut checked = 0;
+    for (relative, output) in relatives.iter().zip(&outputs) {
         if let Some(directory) = std::env::var_os("ABCD_REWRITTEN_DIR") {
             let target = std::path::PathBuf::from(directory).join(relative);
             std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -1252,28 +1290,40 @@ fn rewritten_corpus_module_cases() {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid index JSON"))
         .collect();
+    let relatives: Vec<&str> = rows
+        .iter()
+        .filter(|row| {
+            row["case"]
+                .as_str()
+                .is_some_and(|case| CASES.contains(&case))
+        })
+        .map(|row| row["abc"].as_str().expect("abc path"))
+        .collect();
+    // Parallel decode → encode → re-decode → snapshot-compare per
+    // fixture (rayon); oracle-candidate writes stay serial, in order.
+    let outputs: Vec<Vec<u8>> = relatives
+        .par_iter()
+        .map(|relative| {
+            let file = decode(&std::fs::read(root.join(relative)).expect("fixture"))
+                .unwrap_or_else(|error| panic!("decode {relative}: {error}"));
+            let expected = module_field_snapshots(&file);
+            assert!(
+                expected.iter().any(|(_, v)| v.starts_with("module(")),
+                "{relative}: fixture must carry module-record data"
+            );
+            let output = encode(&file).unwrap_or_else(|error| panic!("encode {relative}: {error}"));
+            let rewritten = decode(&output)
+                .unwrap_or_else(|error| panic!("decode rewritten {relative}: {error}"));
+            assert_eq!(
+                module_field_snapshots(&rewritten),
+                expected,
+                "{relative}: module/scope data must survive the identity rewrite"
+            );
+            output
+        })
+        .collect();
     let mut checked = 0;
-    for row in rows.iter().filter(|row| {
-        row["case"]
-            .as_str()
-            .is_some_and(|case| CASES.contains(&case))
-    }) {
-        let relative = row["abc"].as_str().expect("abc path");
-        let file = decode(&std::fs::read(root.join(relative)).expect("fixture"))
-            .unwrap_or_else(|error| panic!("decode {relative}: {error}"));
-        let expected = module_field_snapshots(&file);
-        assert!(
-            expected.iter().any(|(_, v)| v.starts_with("module(")),
-            "{relative}: fixture must carry module-record data"
-        );
-        let output = encode(&file).unwrap_or_else(|error| panic!("encode {relative}: {error}"));
-        let rewritten =
-            decode(&output).unwrap_or_else(|error| panic!("decode rewritten {relative}: {error}"));
-        assert_eq!(
-            module_field_snapshots(&rewritten),
-            expected,
-            "{relative}: module/scope data must survive the identity rewrite"
-        );
+    for (relative, output) in relatives.iter().zip(&outputs) {
         if let Some(directory) = std::env::var_os("ABCD_REWRITTEN_DIR") {
             let target = std::path::PathBuf::from(directory).join(relative);
             std::fs::create_dir_all(target.parent().unwrap()).unwrap();
@@ -1310,54 +1360,66 @@ fn rewritten_corpus_module_request_phase_cases() {
         .lines()
         .map(|line| serde_json::from_str(line).expect("valid index JSON"))
         .collect();
-    let mut checked = 0;
-    for row in rows.iter().filter(|row| {
-        row["case"]
-            .as_str()
-            .is_some_and(|case| CASES.contains(&case))
-    }) {
-        let relative = row["abc"].as_str().expect("abc path");
-        let file = decode(&std::fs::read(root.join(relative)).expect("fixture"))
-            .unwrap_or_else(|error| panic!("decode {relative}: {error}"));
-        // The fixture must actually carry phase data (guard against drift).
-        let phase_flags: Vec<Vec<u8>> = file
-            .classes
-            .values()
-            .flat_map(|c| c.fields.iter())
-            .filter_map(|f| match &f.initial_value {
-                Some(abcd_file::FieldValue::ModuleRequestPhase(p)) => Some(p.flags.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            !phase_flags.is_empty(),
-            "{relative}: fixture must carry module-request-phase data"
-        );
+    let relatives: Vec<&str> = rows
+        .iter()
+        .filter(|row| {
+            row["case"]
+                .as_str()
+                .is_some_and(|case| CASES.contains(&case))
+        })
+        .map(|row| row["abc"].as_str().expect("abc path"))
+        .collect();
+    // Parallel decode → encode → re-decode → flag-compare per fixture
+    // (rayon); oracle-candidate writes stay serial, in order.
+    let outputs: Vec<Vec<u8>> = relatives
+        .par_iter()
+        .map(|relative| {
+            let file = decode(&std::fs::read(root.join(relative)).expect("fixture"))
+                .unwrap_or_else(|error| panic!("decode {relative}: {error}"));
+            // The fixture must actually carry phase data (guard against drift).
+            let phase_flags: Vec<Vec<u8>> = file
+                .classes
+                .values()
+                .flat_map(|c| c.fields.iter())
+                .filter_map(|f| match &f.initial_value {
+                    Some(abcd_file::FieldValue::ModuleRequestPhase(p)) => Some(p.flags.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !phase_flags.is_empty(),
+                "{relative}: fixture must carry module-request-phase data"
+            );
 
-        let expected = module_field_snapshots(&file);
-        let output = encode(&file).unwrap_or_else(|error| panic!("encode {relative}: {error}"));
-        let rewritten =
-            decode(&output).unwrap_or_else(|error| panic!("decode rewritten {relative}: {error}"));
-        assert_eq!(
-            module_field_snapshots(&rewritten),
-            expected,
-            "{relative}: module/scope/phase data must survive the identity rewrite"
-        );
-        // The rewritten field must point at a VALID re-emitted blob:
-        // decoding the rewritten file must yield the same flags.
-        let rewritten_flags: Vec<Vec<u8>> = rewritten
-            .classes
-            .values()
-            .flat_map(|c| c.fields.iter())
-            .filter_map(|f| match &f.initial_value {
-                Some(abcd_file::FieldValue::ModuleRequestPhase(p)) => Some(p.flags.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            rewritten_flags, phase_flags,
-            "{relative}: lazy-import flags must survive the rewrite"
-        );
+            let expected = module_field_snapshots(&file);
+            let output = encode(&file).unwrap_or_else(|error| panic!("encode {relative}: {error}"));
+            let rewritten = decode(&output)
+                .unwrap_or_else(|error| panic!("decode rewritten {relative}: {error}"));
+            assert_eq!(
+                module_field_snapshots(&rewritten),
+                expected,
+                "{relative}: module/scope/phase data must survive the identity rewrite"
+            );
+            // The rewritten field must point at a VALID re-emitted blob:
+            // decoding the rewritten file must yield the same flags.
+            let rewritten_flags: Vec<Vec<u8>> = rewritten
+                .classes
+                .values()
+                .flat_map(|c| c.fields.iter())
+                .filter_map(|f| match &f.initial_value {
+                    Some(abcd_file::FieldValue::ModuleRequestPhase(p)) => Some(p.flags.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                rewritten_flags, phase_flags,
+                "{relative}: lazy-import flags must survive the rewrite"
+            );
+            output
+        })
+        .collect();
+    let mut checked = 0;
+    for (relative, output) in relatives.iter().zip(&outputs) {
         if let Some(directory) = std::env::var_os("ABCD_REWRITTEN_DIR") {
             let target = std::path::PathBuf::from(directory).join(relative);
             std::fs::create_dir_all(target.parent().unwrap()).unwrap();

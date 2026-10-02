@@ -42,6 +42,7 @@ use std::process::Command;
 use abcd_ir::{verify_module, FuncId};
 use abcd_lift::lift_file;
 use abcd_lower::{lower_function, to_method_body};
+use rayon::prelude::*;
 
 /// Decode → lift → verify → lower → encode one fixture.
 fn rewrite(root: &std::path::Path, relative: &str) -> Vec<u8> {
@@ -118,19 +119,31 @@ for path in sorted(paths):
     assert_eq!(paths.len(), 21, "18 async-await + 3 async-generator rows");
 
     let out_dir = std::env::var_os("ABCD_ASYNC_OUT").map(PathBuf::from);
-    for relative in &paths {
-        let a = rewrite(&root, relative);
+    // Parallel per-fixture rewrites (rayon): in write-out mode each
+    // fixture rewrites once; otherwise twice with the byte-identity
+    // assert inside the map. Writes and report lines replay serially in
+    // path order.
+    let rewrites: Vec<Vec<u8>> = paths
+        .par_iter()
+        .map(|relative| {
+            let a = rewrite(&root, relative);
+            if out_dir.is_none() {
+                let b = rewrite(&root, relative);
+                assert_eq!(a, b, "determinism: two rewrites of {relative} differ");
+            }
+            a
+        })
+        .collect();
+    for (relative, a) in paths.iter().zip(&rewrites) {
         if let Some(dir) = &out_dir {
             // Write-out mode (pre/post evidence): the tree mirrors the
             // corpus layout for `diff -r`.
             let dest = dir.join(relative);
             std::fs::create_dir_all(dest.parent().expect("parent")).expect("mkdir");
-            std::fs::write(&dest, &a).expect("write rewrite");
+            std::fs::write(&dest, a).expect("write rewrite");
             eprintln!("N68-ASYNC-REWRITE {relative}");
             continue;
         }
-        let b = rewrite(&root, relative);
-        assert_eq!(a, b, "determinism: two rewrites of {relative} differ");
         eprintln!("N68-ASYNC-OK {relative}");
     }
     eprintln!("N68-ASYNC-GATE fixtures={} lowered=all", paths.len());

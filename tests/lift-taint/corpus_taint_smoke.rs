@@ -24,6 +24,7 @@
 use crate::common;
 
 use abcd_taint::{SinkSpec, SourceSpec, TaintConfig, TaintReport};
+use rayon::prelude::*;
 
 /// The smoke configuration (the documented source choice). A
 /// sensitivity mode seeds ALL functions' params
@@ -63,6 +64,21 @@ fn stats_snapshot(r: &TaintReport) -> String {
     format!("{:?}", r.stats)
 }
 
+/// One fixture's order-independent contribution to the smoke aggregate.
+struct FixtureOut {
+    hits: usize,
+    path_edges: usize,
+    gap_resolved: usize,
+    gap_unresolved: usize,
+    lookups: usize,
+    negative_cache_hits: usize,
+    sites_body_step: usize,
+    sites_native_keep: usize,
+    sites_unknown: usize,
+    misses: std::collections::BTreeMap<String, usize>,
+    hits_by_name: std::collections::BTreeMap<String, usize>,
+}
+
 #[test]
 #[ignore = "requires exported GHCR corpus and python3"]
 fn taint_smoke_all_fixtures() {
@@ -74,6 +90,47 @@ fn taint_smoke_all_fixtures() {
         "expected the 1149 runtime-passed fixtures"
     );
 
+    let config = smoke_config();
+    // Parallel per-fixture taint runs (rayon): the per-fixture
+    // determinism asserts stay inside the map; only order-independent
+    // counts and name-keyed maps come back for the serial fold.
+    let per_fixture: Vec<FixtureOut> = paths
+        .par_iter()
+        .map(|relative| {
+            let module = common::lift_fixture(&root, relative);
+            let a = abcd_taint::run_taint(&module, &config);
+            let b = abcd_taint::run_taint(&module, &config);
+            assert_eq!(
+                a.hits.len(),
+                b.hits.len(),
+                "determinism (hit count): {relative}"
+            );
+            assert_eq!(a.hits, b.hits, "determinism (hits): {relative}");
+            assert_eq!(
+                stats_snapshot(&a),
+                stats_snapshot(&b),
+                "determinism (counters): {relative}"
+            );
+            assert_eq!(
+                a.summaries_applied, b.summaries_applied,
+                "determinism (applied summaries): {relative}"
+            );
+            FixtureOut {
+                hits: a.hits.len(),
+                path_edges: a.path_edges,
+                gap_resolved: a.gap_sites_resolved,
+                gap_unresolved: a.gap_sites_unresolved,
+                lookups: a.stats.lookups,
+                negative_cache_hits: a.stats.negative_cache_hits,
+                sites_body_step: a.stats.sites_body_step,
+                sites_native_keep: a.stats.sites_native_keep,
+                sites_unknown: a.stats.sites_unknown,
+                misses: a.summary_misses,
+                hits_by_name: a.summary_hits,
+            }
+        })
+        .collect();
+
     let mut total_hits = 0usize;
     let mut fixtures_with_flows = 0usize;
     let mut total_edges = 0usize;
@@ -83,43 +140,24 @@ fn taint_smoke_all_fixtures() {
     let mut miss_log: std::collections::BTreeMap<String, usize> = Default::default();
     let mut hit_log: std::collections::BTreeMap<String, usize> = Default::default();
 
-    for relative in &paths {
-        let module = common::lift_fixture(&root, relative);
-        let a = abcd_taint::run_taint(&module, &smoke_config());
-        let b = abcd_taint::run_taint(&module, &smoke_config());
-        assert_eq!(
-            a.hits.len(),
-            b.hits.len(),
-            "determinism (hit count): {relative}"
-        );
-        assert_eq!(a.hits, b.hits, "determinism (hits): {relative}");
-        assert_eq!(
-            stats_snapshot(&a),
-            stats_snapshot(&b),
-            "determinism (counters): {relative}"
-        );
-        assert_eq!(
-            a.summaries_applied, b.summaries_applied,
-            "determinism (applied summaries): {relative}"
-        );
-
-        total_hits += a.hits.len();
-        total_edges += a.path_edges;
-        gap_resolved += a.gap_sites_resolved;
-        gap_unresolved += a.gap_sites_unresolved;
-        if !a.hits.is_empty() {
+    for f in per_fixture {
+        total_hits += f.hits;
+        total_edges += f.path_edges;
+        gap_resolved += f.gap_resolved;
+        gap_unresolved += f.gap_unresolved;
+        if f.hits > 0 {
             fixtures_with_flows += 1;
         }
-        agg.lookups += a.stats.lookups;
-        agg.negative_cache_hits += a.stats.negative_cache_hits;
-        agg.sites_body_step += a.stats.sites_body_step;
-        agg.sites_native_keep += a.stats.sites_native_keep;
-        agg.sites_unknown += a.stats.sites_unknown;
-        for (name, n) in &a.summary_misses {
-            *miss_log.entry(name.clone()).or_insert(0) += n;
+        agg.lookups += f.lookups;
+        agg.negative_cache_hits += f.negative_cache_hits;
+        agg.sites_body_step += f.sites_body_step;
+        agg.sites_native_keep += f.sites_native_keep;
+        agg.sites_unknown += f.sites_unknown;
+        for (name, n) in f.misses {
+            *miss_log.entry(name).or_insert(0) += n;
         }
-        for (name, n) in &a.summary_hits {
-            *hit_log.entry(name.clone()).or_insert(0) += n;
+        for (name, n) in f.hits_by_name {
+            *hit_log.entry(name).or_insert(0) += n;
         }
     }
 

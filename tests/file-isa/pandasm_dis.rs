@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 
 use abcd_file::decode;
+use rayon::prelude::*;
 
 /// Ledger of documented byte-level divergences (class name → abc paths).
 const LEDGER_PATH: &str = "scripts/pandasm-dis-divergences.json";
@@ -106,39 +107,54 @@ fn exported_corpus_pandasm_byte_identical() {
         .map(|line| line.split_once('\t').expect("manifest paths").0)
         .collect();
 
-    let mut total = 0usize;
+    // In-scope rows, in manifest order (the filter preserves order).
+    let scoped: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|line| line.split_once('\t').expect("manifest paths"))
+        .filter(|(rel, _)| filter.as_ref().is_none_or(|f| rel.contains(f.as_str())))
+        .collect();
+
+    // Parallel per-fixture render + byte compare (rayon). Each fixture
+    // returns whether it byte-matched, plus its first-diff report when
+    // it failed; the indexed collect keeps manifest row order, so the
+    // serial fold below emits the identical report the serial loop did.
+    let outcomes: Vec<Option<String>> = scoped
+        .par_iter()
+        .map(|&(rel, pandasm)| {
+            let data = std::fs::read(root.join(rel)).expect("fixture");
+            let file = decode(&data).unwrap_or_else(|e| panic!("{rel}: {e}"));
+            let source_name = std::path::Path::new(rel)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("fixture basename");
+            let ours = abcd_file::pandasm::emit_file(&file, source_name);
+            let reference = std::fs::read(root.join(pandasm)).expect("reference.pa");
+            if ours == reference {
+                None
+            } else {
+                Some(first_diff(rel, &ours, &reference))
+            }
+        })
+        .collect();
+
+    let total = scoped.len();
     let mut matched = 0usize;
     let mut documented: BTreeMap<&str, usize> = BTreeMap::new();
     let mut failing: BTreeSet<String> = BTreeSet::new();
     let mut undocumented: Vec<String> = Vec::new();
     let mut diffs: Vec<String> = Vec::new();
-    for line in &rows {
-        let (rel, pandasm) = line.split_once('\t').expect("manifest paths");
-        if let Some(f) = &filter {
-            if !rel.contains(f.as_str()) {
-                continue;
-            }
-        }
-        total += 1;
-        let data = std::fs::read(root.join(rel)).expect("fixture");
-        let file = decode(&data).unwrap_or_else(|e| panic!("{rel}: {e}"));
-        let source_name = std::path::Path::new(rel)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("fixture basename");
-        let ours = abcd_file::pandasm::emit_file(&file, source_name);
-        let reference = std::fs::read(root.join(pandasm)).expect("reference.pa");
-        if ours == reference {
+    for ((rel, _), diff) in scoped.iter().zip(outcomes) {
+        let Some(diff) = diff else {
             matched += 1;
             continue;
-        }
-        failing.insert(rel.to_owned());
+        };
+        failing.insert(rel.to_string());
         match listed.get(rel) {
             Some(class) => *documented.entry(class).or_default() += 1,
             None => {
-                undocumented.push(rel.to_owned());
+                undocumented.push(rel.to_string());
                 if diffs.len() < 20 {
-                    diffs.push(first_diff(rel, &ours, &reference));
+                    diffs.push(diff);
                 }
             }
         }

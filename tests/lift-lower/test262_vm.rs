@@ -105,6 +105,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use abcd_lower::LowerOptions;
+use rayon::prelude::*;
 
 use super::rewrite_pipeline::{front_end, guarded, rewrite_fixture};
 
@@ -189,6 +190,52 @@ for path, _ in rows:
         }
     }
 
+    // Parallel per-fixture front-end + v2lift rewrite (rayon). Each
+    // fixture reports its exact SKIP/WROTE line, its skip category for
+    // the histogram, and the encoded bytes; the indexed collect keeps
+    // row order and the serial fold below replays lines and writes the
+    // candidates exactly where the serial loop did.
+    struct RowOut {
+        line: String,
+        skip: Option<String>,
+        encoded: Option<Vec<u8>>,
+    }
+
+    let rows_out: Vec<RowOut> = paths
+        .par_lines()
+        .map(|relative| {
+            // Front-end stage (shared pipeline with corpus_lower_oracle).
+            let (file, module) = match guarded(|| front_end(&root.join(relative))) {
+                Ok(pair) => pair,
+                Err((category, reason)) => {
+                    let key = category.to_string();
+                    return RowOut {
+                        line: format!("SKIP v2lift {relative} | {key} | {reason}"),
+                        skip: Some(key),
+                        encoded: None,
+                    };
+                }
+            };
+
+            // The single v2lift variant: default LowerOptions.
+            match guarded(|| rewrite_fixture(&module, &file, LowerOptions::default())) {
+                Ok((encoded, functions)) => RowOut {
+                    line: format!("WROTE v2lift {relative} ({functions} functions)"),
+                    skip: None,
+                    encoded: Some(encoded),
+                },
+                Err((category, reason)) => {
+                    let key = category.to_string();
+                    RowOut {
+                        line: format!("SKIP v2lift {relative} | {key} | {reason}"),
+                        skip: Some(key),
+                        encoded: None,
+                    }
+                }
+            }
+        })
+        .collect();
+
     let mut fixtures = 0usize;
     let mut wrote = 0usize;
     let mut histogram: BTreeMap<String, usize> = BTreeMap::new();
@@ -196,36 +243,18 @@ for path, _ in rows:
     // set against EXPECTED_ENCODE_SKIPS.
     let mut skip_log: Vec<(&str, String)> = Vec::new();
 
-    for relative in paths.lines() {
+    for (relative, row) in paths.lines().zip(&rows_out) {
         fixtures += 1;
-
-        // Front-end stage (shared pipeline with corpus_lower_oracle).
-        let (file, module) = match guarded(|| front_end(&root.join(relative))) {
-            Ok(pair) => pair,
-            Err((category, reason)) => {
-                let key = category.to_string();
-                eprintln!("SKIP v2lift {relative} | {key} | {reason}");
-                *histogram.entry(key.clone()).or_insert(0) += 1;
-                skip_log.push((relative, key));
-                continue;
-            }
-        };
-
-        // The single v2lift variant: default LowerOptions.
-        match guarded(|| rewrite_fixture(&module, &file, LowerOptions::default())) {
-            Ok((encoded, functions)) => {
-                eprintln!("WROTE v2lift {relative} ({functions} functions)");
-                let target = out_candidates.join(relative);
-                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-                std::fs::write(target, encoded).expect("write oracle candidate");
-                wrote += 1;
-            }
-            Err((category, reason)) => {
-                let key = category.to_string();
-                eprintln!("SKIP v2lift {relative} | {key} | {reason}");
-                *histogram.entry(key.clone()).or_insert(0) += 1;
-                skip_log.push((relative, key));
-            }
+        eprintln!("{}", row.line);
+        if let Some(key) = &row.skip {
+            *histogram.entry(key.clone()).or_insert(0) += 1;
+            skip_log.push((relative, key.clone()));
+        }
+        if let Some(encoded) = &row.encoded {
+            let target = out_candidates.join(relative);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, encoded).expect("write oracle candidate");
+            wrote += 1;
         }
     }
 

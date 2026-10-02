@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use abcd_analysis::dataflow::UseDefChains;
 use abcd_decompile::emit::{consumed_functions, decompile_module, DecompileStats, EmitOptions};
 use abcd_ir::{FuncId, Op};
+use rayon::prelude::*;
 
 /// Functions legitimately NOT emitted: their defining
 /// `DefineFunc`/`DefineClass` op is dead — its result has no users, or
@@ -191,6 +192,83 @@ fn corpus_decompile_gate() {
         "expected the 2832-fixture non-test262 corpus"
     );
 
+    // The TS sample set: the first NODE_SAMPLE ≤11-format fixtures in
+    // manifest order (the serial loop's `ts_outputs.len() < NODE_SAMPLE`
+    // rule, resolved up front so the parallel map knows which fixtures
+    // need the extra `--ts` emission).
+    let ts_sample: std::collections::HashSet<usize> = {
+        let mut set = std::collections::HashSet::new();
+        for (i, relative) in paths.iter().enumerate() {
+            if set.len() >= NODE_SAMPLE {
+                break;
+            }
+            if relative.starts_with("9.0.0.0/") || relative.starts_with("11.0.2.0/") {
+                set.insert(i);
+            }
+        }
+        set
+    };
+
+    /// One fixture's outcome. The JS/TS texts are kept only for the
+    /// node-check samples (first NODE_SAMPLE fixtures / `ts_sample`,
+    /// manifest order — same membership as the serial loop).
+    struct FixtureOut {
+        functions: usize,
+        bytes: usize,
+        dead: usize,
+        stats: DecompileStats,
+        js_sample: Option<String>,
+        ts_sample: Option<String>,
+    }
+
+    // Parallel decode → lift → decompile per fixture (rayon); the
+    // indexed collect keeps manifest order and the serial fold below
+    // replays the sample collection and stat merges exactly as the
+    // serial loop did.
+    let per_fixture: Vec<FixtureOut> = paths
+        .par_iter()
+        .enumerate()
+        .map(|(i, relative)| {
+            let data = std::fs::read(root.join(relative)).expect("read fixture");
+            let file = abcd_file::decode(&data).expect("decode fixture");
+            let module = lift_file(&file).expect("lift fixture");
+
+            // Determinism: two independent runs are byte-identical.
+            let d1 = decompile_module(&module, &EmitOptions::default());
+            let d2 = decompile_module(&module, &EmitOptions::default());
+            assert_eq!(d1.text, d2.text, "non-deterministic output in {relative}");
+            let js_sample = (i < NODE_SAMPLE).then(|| d1.text.clone());
+            // The d-P8 `--ts` flag: signatures survive only on ≤11-format
+            // files (fact #A7) — collect a TS sample from those.
+            let ts_sample = ts_sample.contains(&i).then(|| {
+                decompile_module(&module, &EmitOptions {
+                    ts: true,
+                    ..Default::default()
+                })
+                .text
+            });
+            // Per-function coverage: every function is either emitted or
+            // dead-dropped (its defining op is itself dead) — nothing is
+            // silently dropped.
+            let _ = consumed_functions(&module);
+            let dead = dead_dropped_functions(&module);
+            assert!(
+                d1.stats.function_bodies + dead >= module.functions.len(),
+                "function bodies emitted ({}) + dead-dropped ({dead}) < functions ({}) in {relative}",
+                d1.stats.function_bodies,
+                module.functions.len(),
+            );
+            FixtureOut {
+                functions: module.functions.len(),
+                bytes: d1.text.len(),
+                dead,
+                stats: d1.stats,
+                js_sample,
+                ts_sample,
+            }
+        })
+        .collect();
+
     let mut stats = DecompileStats::default();
     let mut fixtures = 0usize;
     let mut functions_total = 0usize;
@@ -199,48 +277,18 @@ fn corpus_decompile_gate() {
     let mut node_outputs: Vec<(String, String)> = Vec::new();
     let mut ts_outputs: Vec<(String, String)> = Vec::new();
 
-    for relative in &paths {
-        let data = std::fs::read(root.join(relative)).expect("read fixture");
-        let file = abcd_file::decode(&data).expect("decode fixture");
-        let module = lift_file(&file).expect("lift fixture");
+    for (relative, out) in paths.iter().zip(per_fixture) {
         fixtures += 1;
-        functions_total += module.functions.len();
-
-        // Determinism: two independent runs are byte-identical.
-        let d1 = decompile_module(&module, &EmitOptions::default());
-        let d2 = decompile_module(&module, &EmitOptions::default());
-        assert_eq!(d1.text, d2.text, "non-deterministic output in {relative}");
-        bytes += d1.text.len();
-        if node_outputs.len() < NODE_SAMPLE {
-            node_outputs.push((relative.clone(), d1.text.clone()));
+        functions_total += out.functions;
+        bytes += out.bytes;
+        dead_total += out.dead;
+        if let Some(text) = out.js_sample {
+            node_outputs.push((relative.clone(), text));
         }
-        // The d-P8 `--ts` flag: signatures survive only on ≤11-format
-        // files (fact #A7) — collect a TS sample from those.
-        if ts_outputs.len() < NODE_SAMPLE
-            && (relative.starts_with("9.0.0.0/") || relative.starts_with("11.0.2.0/"))
-        {
-            let ts = decompile_module(
-                &module,
-                &EmitOptions {
-                    ts: true,
-                    ..Default::default()
-                },
-            );
-            ts_outputs.push((relative.clone(), ts.text));
+        if let Some(text) = out.ts_sample {
+            ts_outputs.push((relative.clone(), text));
         }
-        // Per-function coverage: every function is either emitted or
-        // dead-dropped (its defining op is itself dead) — nothing is
-        // silently dropped.
-        let _ = consumed_functions(&module);
-        let dead = dead_dropped_functions(&module);
-        dead_total += dead;
-        assert!(
-            d1.stats.function_bodies + dead >= module.functions.len(),
-            "function bodies emitted ({}) + dead-dropped ({dead}) < functions ({}) in {relative}",
-            d1.stats.function_bodies,
-            module.functions.len(),
-        );
-        merge_stats(&mut stats, &d1.stats);
+        merge_stats(&mut stats, &out.stats);
     }
 
     eprintln!("DECOMPILE-GATE fixtures={fixtures} functions_total={functions_total}");
