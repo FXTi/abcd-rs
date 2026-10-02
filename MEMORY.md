@@ -1546,3 +1546,23 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   cause, dabai is already on 1.99.0), 5871493e (wild smoke sweep over
   all 156 gated packages — decode/lift/verify/decompile/recompile,
   report + bug list in design/wild-smoke-report.md).
+- q-P13 item 1 RESOLVED (2026-10-01): the 1.99.0 SIGSEGV root cause is
+  LLVM 23's __llvm_profile_data layout change (rustc 1.99.0 bumped to
+  LLVM 23, PR rust-lang/rust#158734): the record grew 64B->72B
+  (UniformCounterPtr +8B, OffloadDeviceWaveSize +2B; Values offset
+  0x28->0x30, NumValueSites 0x34->0x3C). Our build.rs adds
+  -fprofile-instr-generate to the C++ bridge compiled with SYSTEM
+  clang++-20 (LLVM-20 layout); old-layout and new-layout records land
+  in the same __llvm_prf_data section, and covrt at exit mis-parses
+  the 64B records with a 72B stride — clang's NumCounters=1 becomes a
+  wild Values pointer (0x1) → SIGSEGV in initializeValueProfRuntimeRecord
+  (InstrProfilingValue.c:328) ← __llvm_profile_write_file ←
+  __run_exit_handlers. 1.98.1 (LLVM 22) matches clang-20's layout, so
+  the pin works by layout coincidence. Orchestrator independently
+  reproduced with a self-built 3-file crate (build.rs cc-instrumented
+  C++ static lib with one static dtor + one test): SIGSEGV under
+  1.99.0+clang-20, clean under 1.98.1 (worker matrix). Crash-point
+  drift across binaries explained: it depends on what garbage the
+  misaligned read lands on. Fix paths when unpinning: clang-23 for the
+  bridge, or stop instrumenting C++ under 1.99+. The 1.98.1 pin stays
+  until then. Upstream report deferred per ruling (root cause only).
