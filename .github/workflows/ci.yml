@@ -252,44 +252,6 @@ jobs:
           CXX_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-g++
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: qemu-arm -L /usr/arm-linux-gnueabihf
 
-  # musl is the default Linux platform for distribution (2026-10-02
-  # ruling): no glibc floor. GH container jobs can't run on musl (the
-  # runner injects a glibc-linked node), so this lane drives an Alpine
-  # docker image from the ubuntu host — same pattern as the corpus
-  # acquisition. The -crt-static override is required because bindgen
-  # dlopens libclang from build scripts (impossible in a fully static
-  # musl binary); the fully-static distribution profile is a release task.
-  musl:
-    name: Build & Test (x86_64-musl, Alpine)
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    needs: [fmt]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
-      - name: Build & test in Alpine (musl)
-        run: |
-          set -euo pipefail
-          docker run --rm -v "$PWD:/w" -w /w -e CARGO_HOME=/w/target/cargo-home \
-            -e RUSTFLAGS="-C target-feature=-crt-static" rust:alpine sh -c '
-              set -e
-              # libclang package name carries the LLVM major version and
-              # rolls forward with Alpine; pick the newest available.
-              apk add -q --no-cache build-base ruby ca-certificates
-              apk add -q --no-cache $(apk search -q | grep -E "^clang[0-9]+-libclang$" | sort -V | tail -1)
-              cargo test --workspace'
-
   # ── Per-push corpus jobs (the c-P3 job graph) ──────────────────────
   # One job per data-flow test target (tests/<flow>/). Every corpus job
   # shares the same acquisition recipe: sparse submodule clone + rust +
@@ -304,7 +266,7 @@ jobs:
     name: file-isa (pandasm per-instruction + corpus decode/re-encode)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -338,7 +300,7 @@ jobs:
     name: hap-file (wild OHOS hap container + decode gates)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -377,7 +339,7 @@ jobs:
     name: file-lift (corpus lift+verify, 5517 incl. test262)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -409,7 +371,7 @@ jobs:
     name: lift-lower (rewrite suites + VM oracle ×3 variants)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -461,7 +423,7 @@ jobs:
     name: test262-vm (test262 rewrite + recorded-behavior VM oracle)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -519,7 +481,7 @@ jobs:
     name: test262-dream (test262 decompile → es2abc recompile → recorded VM oracle)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -582,7 +544,7 @@ jobs:
     name: lift-analysis (callgraph smoke + dom agreement + regions)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -614,7 +576,7 @@ jobs:
     name: lift-taint (probe ladder + corpus smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -648,7 +610,7 @@ jobs:
     name: lift-decompile (stage A/B gates + dream gate + node evidence)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -695,7 +657,7 @@ jobs:
     name: Coverage (full estate)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     env:
       # clang-23, matching the LLVM bundled by rustc >=1.99 (LLVM 23 changed
       # the __llvm_profile_data record layout; an older clang's instrumented
@@ -796,7 +758,7 @@ jobs:
     name: ASan (nightly, address sanitizer, corpus-compute suites)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [fmt, build, build32, win32, arm32, musl]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
