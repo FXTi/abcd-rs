@@ -129,6 +129,79 @@ jobs:
           CXXFLAGS: -m32
           LDFLAGS: -m32
 
+  # 32-bit Windows (2026-10-02 ruling): i686-pc-windows-msvc builds and
+  # tests run natively under WoW64 on the 64-bit runner — no emulation.
+  win32:
+    name: Build & Test (i686-windows)
+    runs-on: windows-2022
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.protectNTFS false
+          git config --global core.longpaths true
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      # The cc crate resolves the target-appropriate MSVC toolchain itself.
+      - run: cargo build --target i686-pc-windows-msvc
+      - run: cargo test --target i686-pc-windows-msvc
+
+  # 32-bit ARM Linux (2026-10-02 ruling): armv7 cross-compile; tests run
+  # under qemu-user (the only 32-bit shape with a real OpenHarmony
+  # counterpart — legacy 32-bit ARM devices).
+  arm32:
+    name: Build & Test (armv7-linux)
+    runs-on: ubuntu-latest
+    needs: [fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sparse-clone the arkcompiler_runtime_core submodules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
+            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
+            url=$(git config -f .gitmodules "submodule.$sm.url")
+            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
+            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
+            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
+            git -C "$sm" checkout --quiet -f "$sha"
+          done
+      - name: Install armv7 cross toolchain + qemu-user
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user libc6-armhf-cross libstdc++-12-dev-armhf-cross
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - run: cargo build --target armv7-unknown-linux-gnueabihf
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
+          CXX_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-g++
+      - run: cargo test --target armv7-unknown-linux-gnueabihf
+        env:
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+          CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
+          CXX_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-g++
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: qemu-arm -L /usr/arm-linux-gnueabihf
+
   # ── Per-push corpus jobs (the c-P3 job graph) ──────────────────────
   # One job per data-flow test target (tests/<flow>/). Every corpus job
   # shares the same acquisition recipe: sparse submodule clone + rust +
@@ -142,7 +215,7 @@ jobs:
   file-isa:
     name: file-isa (pandasm per-instruction + corpus decode/re-encode)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -175,7 +248,7 @@ jobs:
   hap-file:
     name: hap-file (wild OHOS hap container + decode gates)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -213,7 +286,7 @@ jobs:
   file-lift:
     name: file-lift (corpus lift+verify, 5517 incl. test262)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -244,7 +317,7 @@ jobs:
   lift-lower:
     name: lift-lower (rewrite suites + VM oracle ×3 variants)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -295,7 +368,7 @@ jobs:
   test262-vm:
     name: test262-vm (test262 rewrite + recorded-behavior VM oracle)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -352,7 +425,7 @@ jobs:
   test262-dream:
     name: test262-dream (test262 decompile → es2abc recompile → recorded VM oracle)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -414,7 +487,7 @@ jobs:
   lift-analysis:
     name: lift-analysis (callgraph smoke + dom agreement + regions)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -445,7 +518,7 @@ jobs:
   lift-taint:
     name: lift-taint (probe ladder + corpus smoke)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -478,7 +551,7 @@ jobs:
   lift-decompile:
     name: lift-decompile (stage A/B gates + dream gate + node evidence)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
       - name: Sparse-clone the arkcompiler_runtime_core submodules
@@ -524,7 +597,7 @@ jobs:
   coverage:
     name: Coverage (full estate)
     runs-on: ubuntu-latest
-    needs: [fmt, build, build32]
+    needs: [fmt, build, build32, win32, arm32]
     env:
       # clang-23, matching the LLVM bundled by rustc >=1.99 (LLVM 23 changed
       # the __llvm_profile_data record layout; an older clang's instrumented
