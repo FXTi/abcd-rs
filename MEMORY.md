@@ -1725,3 +1725,17 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   platform per ruling; fully-static distribution profile remains a
   release-time task (bindgen static or -crt-static tradeoff). Job
   count now 24.
+- Allocator bench round 2 (2026-10-02): steady-state RSS sampling added
+  (50ms monitor thread; VmRSS on Linux, mach task_info on macOS, no new
+  deps). mac three-way: speed mimalloc 1971ms vs jemalloc 2156ms vs
+  system 2994ms on decompile, but jemalloc's steady RSS is the standout
+  (decompile median 84.5MiB = 41% of mimalloc's, 25% of system's);
+  mimalloc's steady ~= peak (resident cache ~130+MiB). musl three-way
+  (Alpine on dabai): musl malloc is 42-60% SLOWER than glibc (lift
+  1759 vs 1236ms) with tiny footprint — MUST pair jemalloc/mimalloc;
+  musl+mimalloc is the fastest musl config (decompile 2666ms) but still
+  trails glibc+system (2487ms) — a pure musl switch is a net speed LOSS
+  on our workload; its value is deployment shape (static, no glibc
+  floor), not speed. Both allocator crates build clean on musl (cmake /
+  configure paths). Recommendation recorded for the distribution
+  profile: musl+mimalloc (speed-first at acceptable RSS).

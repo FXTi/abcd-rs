@@ -12,6 +12,18 @@
 //! KEEP=1 scripts/remote-test.sh test -p abcd-rs --release --test bench-alloc -- --ignored --nocapture
 //! KEEP=1 scripts/remote-test.sh test -p abcd-rs --release --test bench-alloc --features alloc-mimalloc -- --ignored --nocapture
 //! KEEP=1 scripts/remote-test.sh test -p abcd-rs --release --test bench-alloc --features alloc-jemalloc -- --ignored --nocapture
+//!
+//! # dabai (Linux/musl, round-2): same three variants in an Alpine container
+//! # (rsync the tree to dabai:/home/zjx/abcdtest/musl-bench first). The
+//! # derived image is `docker build` from rust:alpine plus
+//! # `apk add build-base ruby clang16-libclang cmake make`.
+//! # -crt-static is REQUIRED: musl defaults to fully static linking and the
+//! # abcd-file-sys build script then cannot dlopen libclang (bindgen).
+//! docker run --rm -v <tree>:/w -w /w abcd-musl-bench sh -c '
+//!   export CARGO_HOME=/w/.cargo-home-musl CARGO_TARGET_DIR=/w/target-musl
+//!   export RUSTFLAGS="-C target-feature=-crt-static"
+//!   cargo test -p abcd-rs --release --test bench-alloc [--features alloc-*] -- --ignored --nocapture
+//! '
 //! ```
 //!
 //! Run each of the two tests in a SEPARATE process invocation so the
@@ -31,9 +43,20 @@
 //! `ABCD_BENCH_TOP_PER_VERSION` (decompile-subset fixtures per corpus
 //! version, largest by file size, default 5), `ABCD_CORPUS_ROOT` (corpus
 //! override, same as the other corpus gates).
+//!
+//! Memory reporting is two-axis (round-2 ruling): the process-lifetime
+//! PEAK RSS (VmHWM / ru_maxrss) plus a STEADY-STATE sample — a monitor
+//! thread reads the live RSS every 50 ms for the duration of the workload
+//! and the report prints the median/p95 of that sample sequence
+//! (`rss_median_mib` / `rss_p95_mib` in the SUMMARY line). Linux samples
+//! VmRSS from /proc/self/status; macOS samples resident_size via mach
+//! task_info (hand-written externs, no libc dep); Windows is unprobed
+//! (n/a — the GH experiment lane reports its own).
 
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(all(feature = "alloc-mimalloc", feature = "alloc-jemalloc"))]
@@ -97,6 +120,145 @@ fn peak_rss_bytes() -> Option<u64> {
     {
         None
     }
+}
+
+// ============================================================================
+// Steady-state RSS (monitor thread sampling the live RSS every 50 ms)
+// ============================================================================
+
+/// The monitor's sampling cadence.
+const RSS_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Live RSS in bytes, or None on platforms without a probe here.
+/// Linux: VmRSS from /proc/self/status (process-wide value). macOS:
+/// resident_size from mach task_info (MACH_TASK_BASIC_INFO), hand-written
+/// externs so no libc dev-dep is needed. Windows: unprobed.
+fn current_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest.trim().strip_suffix("kB")?.trim().parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // MACH_TASK_BASIC_INFO (flavor 20). Layout: three mach_vm_size_t
+        // (u64: virtual_size, resident_size, resident_size_max), two
+        // time_value_t (i32 pairs), policy (i32), suspend_count (i32) —
+        // 48 bytes = 12 integer_t, hence the count 12 below.
+        #[repr(C)]
+        struct MachTaskBasicInfo {
+            virtual_size: u64,
+            resident_size: u64,
+            resident_size_max: u64,
+            user_time: [i32; 2],
+            system_time: [i32; 2],
+            policy: i32,
+            suspend_count: i32,
+        }
+        extern "C" {
+            fn mach_task_self() -> u32;
+            fn task_info(
+                task: u32,
+                flavor: i32,
+                info: *mut MachTaskBasicInfo,
+                count: *mut u32,
+            ) -> i32;
+        }
+        const MACH_TASK_BASIC_INFO: i32 = 20;
+        let mut info = MachTaskBasicInfo {
+            virtual_size: 0,
+            resident_size: 0,
+            resident_size_max: 0,
+            user_time: [0; 2],
+            system_time: [0; 2],
+            policy: 0,
+            suspend_count: 0,
+        };
+        let mut count: u32 = 12;
+        let rc = unsafe {
+            task_info(
+                mach_task_self(),
+                MACH_TASK_BASIC_INFO,
+                &mut info,
+                &mut count,
+            )
+        };
+        (rc == 0).then_some(info.resident_size)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Background RSS sampler: a thread that records `current_rss_bytes()`
+/// every `RSS_SAMPLE_INTERVAL` until stopped. `finish()` joins the thread
+/// and returns the sample sequence (empty on unprobed platforms).
+struct RssMonitor {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<Option<Vec<u64>>>>,
+}
+
+impl RssMonitor {
+    fn start() -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let handle = std::thread::spawn(move || -> Option<Vec<u64>> {
+            // Bail out immediately when the platform has no probe, so the
+            // monitor costs nothing there.
+            current_rss_bytes()?;
+            let mut samples = Vec::new();
+            while !stop_thread.load(Ordering::Relaxed) {
+                if let Some(bytes) = current_rss_bytes() {
+                    samples.push(bytes);
+                }
+                std::thread::sleep(RSS_SAMPLE_INTERVAL);
+            }
+            Some(samples)
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop sampling; the collected RSS samples in bytes (empty when the
+    /// platform is unprobed).
+    fn finish(mut self) -> Vec<u64> {
+        self.stop.store(true, Ordering::Relaxed);
+        match self.handle.take() {
+            Some(h) => h.join().ok().flatten().unwrap_or_default(),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Nearest-rank percentile of a sample sequence (bytes), `p` in (0, 1].
+/// Sorts a copy, so the caller's sequence is untouched.
+fn percentile_bytes(samples: &[u64], p: f64) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let idx = ((sorted.len() as f64 * p).ceil() as usize).max(1) - 1;
+    Some(sorted[idx.min(sorted.len() - 1)])
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn fmt_mib(value: Option<u64>) -> String {
+    value
+        .map(|b| format!("{:.1}", mib(b)))
+        .unwrap_or_else(|| "n/a".into())
 }
 
 // ============================================================================
@@ -164,8 +326,10 @@ impl StageTimes {
 }
 
 /// Print the fixed-format per-pass lines plus the median/spread/RSS
-/// summary line the report tables are built from.
-fn report(workload: &str, fixtures: usize, passes: &[StageTimes]) {
+/// summary line the report tables are built from. `steady_rss` is the
+/// monitor thread's RSS sample sequence (bytes) gathered over the whole
+/// workload; its median/p95 are the steady-state memory figures.
+fn report(workload: &str, fixtures: usize, passes: &[StageTimes], steady_rss: &[u64]) {
     let walls_ms: Vec<f64> = passes
         .iter()
         .map(|p| p.wall().as_secs_f64() * 1e3)
@@ -178,7 +342,9 @@ fn report(workload: &str, fixtures: usize, passes: &[StageTimes]) {
     } else {
         0.0
     };
-    let rss_mib = peak_rss_bytes().map(|b| b as f64 / (1024.0 * 1024.0));
+    let rss_mib = peak_rss_bytes().map(mib);
+    let rss_median = percentile_bytes(steady_rss, 0.5);
+    let rss_p95 = percentile_bytes(steady_rss, 0.95);
 
     println!("[bench] === workload: {workload} ===");
     println!("[bench] allocator: {}", allocator_name());
@@ -202,12 +368,25 @@ fn report(workload: &str, fixtures: usize, passes: &[StageTimes]) {
         }
         None => println!("[bench] peak RSS: unprobed on this platform"),
     }
+    if steady_rss.is_empty() {
+        println!("[bench] steady RSS: unprobed on this platform (no samples)");
+    } else {
+        println!(
+            "[bench] steady RSS: median {} MiB | p95 {} MiB ({} samples @ {} ms)",
+            fmt_mib(rss_median),
+            fmt_mib(rss_p95),
+            steady_rss.len(),
+            RSS_SAMPLE_INTERVAL.as_millis(),
+        );
+    }
     println!(
-        "[bench] SUMMARY workload={workload} allocator={} wall_median_ms={med:.1} wall_min_ms={min:.1} wall_max_ms={max:.1} peak_rss_mib={}",
+        "[bench] SUMMARY workload={workload} allocator={} wall_median_ms={med:.1} wall_min_ms={min:.1} wall_max_ms={max:.1} peak_rss_mib={} rss_median_mib={} rss_p95_mib={}",
         allocator_name(),
         rss_mib
             .map(|m| format!("{m:.1}"))
             .unwrap_or_else(|| "n/a".into()),
+        fmt_mib(rss_median),
+        fmt_mib(rss_p95),
     );
 }
 
@@ -228,6 +407,7 @@ fn bench_lift_corpus() {
         paths.len()
     );
 
+    let monitor = RssMonitor::start();
     let mut results = Vec::new();
     for pass in 0..passes {
         let mut t = StageTimes {
@@ -275,7 +455,8 @@ fn bench_lift_corpus() {
         }
         results.push(t);
     }
-    report("lift", paths.len(), &results);
+    let steady = monitor.finish();
+    report("lift", paths.len(), &results, &steady);
 }
 
 // ============================================================================
@@ -327,6 +508,7 @@ fn bench_decompile_subset() {
         paths.len()
     );
 
+    let monitor = RssMonitor::start();
     let mut results = Vec::new();
     for pass in 0..passes {
         let mut t = StageTimes {
@@ -361,5 +543,6 @@ fn bench_decompile_subset() {
         }
         results.push(t);
     }
-    report("decompile", subset.len(), &results);
+    let steady = monitor.finish();
+    report("decompile", subset.len(), &results, &steady);
 }
