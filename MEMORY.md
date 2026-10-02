@@ -1704,3 +1704,15 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   pairings), macOS libmalloc is a decent zone/magazine allocator and
   macOS has no static-linking culture — that's why there's no macOS
   saying.
+- Allocator bench v1 (2026-10-02, harness tests/bench-alloc, features
+  alloc-mimalloc/alloc-jemalloc; orchestrator re-ran the system variant
+  matching within noise). Linux dabai (9950X, glibc 2.31): lift 5517
+  fixtures — glibc 1236ms/39MiB, jemalloc 1136ms/50MiB, mimalloc
+  1158ms/136MiB; decompile top-30 — glibc 2487ms/82MiB, mimalloc
+  2047ms/154MiB, jemalloc 2287ms/94MiB. macOS M4 Pro: mimalloc wins
+  BOTH axes (lift 1304->1038ms AND 310->182MiB; decompile 2627->1853ms
+  AND 507->205MiB) — libmalloc is the weak default there, contrary to
+  the "macOS needs no swap" folklore. Verdicts so far: Linux glibc is
+  NOT the bottleneck (musl must pair jemalloc/mimalloc if adopted);
+  mimalloc on macOS is a free double win; Windows pending a GH
+  experiment.

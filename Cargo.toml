@@ -59,6 +59,21 @@ abcd-taint = { path = "abcd-taint" }
 abcd-decompile = { path = "abcd-decompile" }
 abcd-hap = { path = "abcd-hap" }
 
+# Allocator selection for the tests/bench-alloc instrumentation target
+# (musl/allocator track, MEMORY.md 2026-10-02: bench-first ruling).
+# The global allocator is a compile-time choice, so it is a cargo feature;
+# default = the system allocator. Enable at most one — the bench target
+# compile-errors on two (a target may declare only one global allocator).
+[features]
+default = []
+alloc-mimalloc = ["dep:mimalloc"]
+alloc-jemalloc = ["dep:tikv-jemallocator"]
+
+# Optional: only compiled for the tests/bench-alloc allocator matrix.
+[dependencies]
+mimalloc = { version = "0.1", optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
+
 # Dev-dependencies of the root package: exactly the crates the migrated
 # cross-crate suites under tests/ link against (plus serde_json for the
 # corpus-manifest parsing in tests/file-isa, matching abcd-file's dev-dep).
