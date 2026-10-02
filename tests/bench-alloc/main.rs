@@ -8,10 +8,9 @@
 //! ONE, hence the at-most-one-feature compile_error below):
 //!
 //! ```text
-//! # dabai (Linux/glibc): system vs mimalloc vs jemalloc, release, 3 passes
+//! # dabai (Linux/glibc): system vs mimalloc, release, 3 passes
 //! KEEP=1 scripts/remote-test.sh test -p abcd-rs --release --test bench-alloc -- --ignored --nocapture
 //! KEEP=1 scripts/remote-test.sh test -p abcd-rs --release --test bench-alloc --features alloc-mimalloc -- --ignored --nocapture
-//! KEEP=1 scripts/remote-test.sh test -p abcd-rs --release --test bench-alloc --features alloc-jemalloc -- --ignored --nocapture
 //!
 //! # dabai (Linux/musl, round-2): same three variants in an Alpine container
 //! # (rsync the tree to dabai:/home/zjx/abcdtest/musl-bench first). The
@@ -60,24 +59,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[cfg(all(feature = "alloc-mimalloc", feature = "alloc-jemalloc"))]
-compile_error!("bench-alloc: enable at most one of alloc-mimalloc / alloc-jemalloc");
+// (jemalloc was dropped after the mimalloc-everywhere ruling — the harness
+// keeps a system-vs-mimalloc A/B only.)
 
 #[cfg(feature = "alloc-mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(feature = "alloc-jemalloc")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 /// The allocator label that goes into every report line.
 fn allocator_name() -> &'static str {
     #[cfg(feature = "alloc-mimalloc")]
     return "mimalloc";
-    #[cfg(feature = "alloc-jemalloc")]
-    return "jemalloc";
-    #[cfg(all(not(feature = "alloc-mimalloc"), not(feature = "alloc-jemalloc")))]
+    #[cfg(not(feature = "alloc-mimalloc"))]
     return "system";
 }
 
