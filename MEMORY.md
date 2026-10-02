@@ -1681,3 +1681,14 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   every #[ignore]d local instrument must no-op off-host. N81 (bridge
   heap overflow, afd9574) landed the same day — found by the rewrite
   worker's fuzz, fixed with span-bounded conversion at all 5 sites.
+- Stack-overflow root fix (2026-10-02, ec78e62): the maintainer rejected
+  the 64MiB stack workaround as symptom-treating ("从递归改成迭代呀") —
+  correct call. abcd-analysis's input-depth CFG recursion (region
+  structuring family + TryRegion projection + rpo dfs + callgraph trace
+  + alias/heap resolve chains) converted to explicit-stack iteration,
+  zero API change, byte-identical corpus gate numbers. Deepest corpus
+  nesting measured: 513 levels (test262 left-shift S11.7.1_A4_T2 func
+  8). Red-first: 256KiB-stack tests aborted pre-fix, pass post-fix. The
+  ASan lane keeps no stack workaround — its green run is the proof.
+  Lesson (orchestrator, recorded): widening a resource limit is never
+  the fix for input-driven depth; iterate.
