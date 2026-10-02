@@ -1618,3 +1618,17 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   old toolchains are on their own). PR #22 (clang-23 LLVM-parity fix)
   was merged by the maintainer — rustc is back on @stable with the
   coverage job on clang++-23.
+- CI hygiene rulings (2026-10-02): (1) clippy gate + cargo deny check
+  join fmt as FRONT gates (fmt ∥ clippy ∥ deny → build matrix → corpus
+  jobs) — but the 421 pre-existing clippy warnings must be cleared
+  FIRST (debt cleanup worker, classification report, intentional ones
+  get #[allow] with reasons), gate goes live only on a clean tree.
+  (2) Sanitizer job sits at coverage's level: a dedicated heavy job
+  (ubuntu-latest + nightly + -Zsanitizer=address + -Zbuild-std, C++
+  bridge gets -fsanitize=address via CXXFLAGS) — never spread across
+  jobs because sanitizers are nightly-only, ~2x slower, incompatible
+  with -C instrument-coverage, and unsupported on Windows lanes.
+  (3) Also queued for the same CI PR: timeout-minutes on every job +
+  concurrency group cancel-in-progress (today's 2.4h stuck-coverage
+  incident proved both). Why sanitizers are not "everywhere": nightly
+  flag, 2x corpus wall-clock, coverage-incompatible, no Windows.
