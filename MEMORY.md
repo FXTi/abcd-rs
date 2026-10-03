@@ -1780,3 +1780,37 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   ledger row goes red both ways. Orchestrator ran the gate
   independently: green in 243s, ledger matches. Also: Cargo.lock
   hygiene (one stale mimalloc root-dep line removed).
+- c-COV diagnosis (2026-10-03, 90% coverage push phase 1): fresh full-estate
+  llvm-cov at HEAD 877fdc8 on dabai (1.98.1+clang-20 layout parity) + a MERGED
+  run adding the two q-P10-skipped pandasm asm gates (6110s instrumented) and
+  the legacy sweep over a regenerated 0.0.0.2 dump. True corpus-inclusive:
+  OUR Rust 38,276/45,156 = 84.76% (gap to 90% = +2,364 lines); incl. bridge
+  84.18% (+2,805). Nine read-only diagnosis workers classified every missed
+  line (all ranges reconciled 1:1 with the lcov data); full report
+  design/coverage-90-diagnosis.md. Headlines: (1) the q-P10 skip cost ~1,850
+  visible lines — merged parse.rs 43.8->83.1%, insn_ctor 50.1->78.9%; the
+  pandasm residual is 355 corpus-absent construct arms + 165 parse-error arms,
+  all synthetic-test closable. (2) folds.rs's residue is 52% MAINLINE
+  shape-variant arms (NOT the eval's mostly-bail story) — ~8 fixture families
+  close ~455. (3) translate.rs residue = 315 deprecated.* NEVER-EMITTED lines
+  (verified: zero deprecated.* mnemonics across all 5,517 corpus .pa). (4)
+  abcd-cli run() dispatch is 5.5% covered — zero tests touch it (one
+  run_dispatch.rs closes ~231). (5) ~566 lines provably DEAD with zero-caller
+  proofs (abc_class_get_name post-q-P4 drift, 25 is_* accessors, AliasOracle
+  seam, trim_call_args CALL-flag cluster, Expr::status, layout.rs no-producer
+  branch arms…). (6) legacy_table.rs 298 dark = 49 mappings no wild 0.0.0.2
+  file uses — the 34 legacy modules were found by scanning raw-hap headers
+  (version tuple (0,0,0,2); the wild-decompile abc/ export is RECOMPILED
+  24.0.0.0 artifacts, not the raw files — orchestrator caught my own wrong
+  probe input feeding recompiled files into the legacy sweep, 1,289/1,289
+  red). Corrections to worker claims: "corpus_lower_oracle/corpus_stage_a
+  didn't run under coverage" was WRONG (log lines prove both ran; the 0-counts
+  were llvm-cov inlining artifacts) — their derived actions voided, arm lists
+  kept. Side findings for ruling: inline.rs F1 bail-after-mutation (empty-cont
+  bail fires after the block split — N82 candidate), decode.rs ~10 silent-drop
+  arms vs the loud-error convention (policy first), emit_call
+  this-reunification 25 lines never fire (verify-then-delete candidate).
+  Decision points in the doc §8 (metric definition vs CI job, deletion
+  batches, deprecated.* arms, bridge residuals, N82, decode policy).
+  remote-test.sh now forwards CC/CXX (needed for the dabai coverage
+  toolchain pin).

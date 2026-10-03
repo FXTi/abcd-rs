@@ -67,11 +67,14 @@ set -- "${FILTERED[@]}"
 # Forward ABCD_* env vars (e.g. ABCD_LOWERED_DIR for corpus rewrites) to
 # the remote run. Use an ABSOLUTE remote path for ABCD_LOWERED_DIR (e.g.
 # /home/zjx/abcdtest/lowered-out) and fetch it back with rsync afterwards;
-# the tests treat it verbatim.
+# the tests treat it verbatim. Also forward the toolchain selectors CC/CXX:
+# the coverage run needs CXX=clang++-20 on dabai so the build.rs C++-bridge
+# instrumentation matches the rustc LLVM profile layout (N: rustc 1.99 =
+# LLVM 23 layout; 1.98.1 = LLVM 22, layout-compatible with clang-20).
 REMOTE_ENV=()
 while IFS='=' read -r name value; do
     case "${name}" in
-        ABCD_*) REMOTE_ENV+=("${name}=${value}") ;;
+        ABCD_*|CC|CXX) REMOTE_ENV+=("${name}=${value}") ;;
     esac
 done < <(env)
 
