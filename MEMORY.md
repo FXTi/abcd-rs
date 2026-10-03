@@ -1829,3 +1829,29 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   arms: convert to LOUD errors (behavior change — wild-corpus impact check
   first: the hap-file 156-package gate + full corpus must stay green, proving
   no real input fires them).
+- c-COV phase A landed (2026-10-03, three atomic commits, all gates green):
+  5a8bda6 deletions (1,032 lines: dead accessors/impls across file/ir/
+  analysis/taint/decompile/cli/pandasm + bridge abc_class_get_name & 13
+  nm-verified stubs; AliasOracle seam surgery rewrote 12 engine-test call
+  sites to the live query API; folds.rs/layout.rs/etc. unreachable arms got
+  proof comments instead of deletion); 2bbc2ef N82 (inliner block-terminal
+  call bail-after-mutation — red-first test proved the half-splice
+  (ForeignSuccessor + PredDoesNotTarget on a "skipped" module); fix =
+  eligibility pre-check BEFORE mutation, new SkipReason::BlockTerminalCall;
+  corpus 1152x3 zero-skip unchanged; the other three late bails re-classified
+  in the inline_site doc comment: two now unreachable-by-construction, one
+  benign defensive on unverified input); 01cbd7d decode-loud (11 silent-drop
+  arms -> Malformed/InvalidOffset/InvalidString incl. the 1784
+  Ok-with-dangling-offset-map structural inconsistency; safety proof = corpus
+  + wild-156 gates green before AND after; 11 new negative tests).
+  INCIDENT: a workspace race reverted the deletion worker's pandasm edits
+  mid-flight (someone's git checkout/restore); the worker md5-verified and
+  redid them. New worker rule: verify your diff is still present before
+  reporting done. FOLLOW-UPS REGISTERED: (a) decode.rs ARRAY-element
+  analogues (nested-annotation->Void, bad method-handle->Void, residual-tag
+  ->U32, String unwrap_or_default, entity-not-in-map -> "") stay silent —
+  same class as the converted arms, needs a maintainer ruling; (b) latent
+  robustness: abc_annotation_array_read trusts the file's element count into
+  vec![0u64; count] (OOM on crafted input; C++ side u32 wrap) — N83
+  candidate; (c) N82 worker noted step-G empty-callee-block clone on
+  unverified input (same benign class).
