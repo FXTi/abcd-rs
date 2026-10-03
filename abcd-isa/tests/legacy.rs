@@ -160,6 +160,15 @@ fn legacy_errors() {
         decode_legacy(&[0x22, 0x01, 0xa6]).unwrap_err(),
         DecodeError::InvalidJumpTarget { offset: 0, .. }
     ));
+    // jump with a negative raw offset from offset 0: the target is negative,
+    // so it fails the usize conversion before the boundary check
+    assert_eq!(
+        decode_legacy(&[0x22, 0xff]).unwrap_err(),
+        DecodeError::InvalidJumpTarget {
+            offset: 0,
+            target: -1
+        }
+    );
 }
 
 #[test]

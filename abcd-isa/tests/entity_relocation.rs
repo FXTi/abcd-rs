@@ -45,3 +45,18 @@ fn failed_relocations_leave_bytes_unchanged() {
     );
     assert_eq!(bytes, original);
 }
+
+#[test]
+fn invalid_instruction_edges() {
+    // Empty slice: no opcode byte at all.
+    assert_eq!(
+        relocate_entity_id(&mut [], 0, EntityId(0)),
+        Err(RelocationError::InvalidInstruction)
+    );
+    // Lone prefix byte (0xff, the ecma prefix): the second opcode byte is
+    // missing, so no full opcode is readable.
+    assert_eq!(
+        relocate_entity_id(&mut [0xff], 0, EntityId(0)),
+        Err(RelocationError::InvalidInstruction)
+    );
+}
