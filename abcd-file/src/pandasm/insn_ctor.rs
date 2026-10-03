@@ -1715,3 +1715,246 @@ pub(crate) fn construct(mnemonic: &str, ops: &[RawOperand]) -> Option<Bytecode> 
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit coverage for the construction table (the CI coverage job skips
+    //! the asm corpus gates, so these tests carry the table's coverage):
+    //! every MNEMONICS entry constructs from its canonical operand vector —
+    //! the shape `parse::build_body` feeds — wrong shapes count as `None`,
+    //! and unknown mnemonics map to `None`. The corpus-absent arms
+    //! (`deprecated.*`, `wide.*`, the legacy jumps, …) additionally
+    //! round-trip through abcd_isa encode/decode.
+    use super::*;
+    use abcd_isa::Operand;
+
+    /// The RawOperand vector `build_body` would feed `construct` for
+    /// `mnemonic`: one operand per the dummy instance's operand kinds.
+    fn canonical_ops(mnemonic: &str) -> Vec<RawOperand> {
+        dummy(mnemonic)
+            .unwrap_or_else(|| panic!("{mnemonic} must have a dummy arm"))
+            .operands()
+            .iter()
+            .map(|op| match *op {
+                Operand::Reg(_) => R(1),
+                Operand::Imm(_) => I(1),
+                Operand::Entity(_, _) => E(1),
+                Operand::Label(_) => L(0),
+            })
+            .collect()
+    }
+
+    /// The operand view a canonical construction must produce (dummy's
+    /// kinds with the canonical payloads).
+    fn canonical_operands(mnemonic: &str) -> Vec<Operand> {
+        dummy(mnemonic)
+            .unwrap()
+            .operands()
+            .iter()
+            .map(|op| match *op {
+                Operand::Reg(_) => Operand::Reg(1),
+                Operand::Imm(_) => Operand::Imm(1),
+                Operand::Entity(kind, _) => Operand::Entity(kind, 1),
+                Operand::Label(_) => Operand::Label(0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mnemonics_table_is_sorted_and_unique() {
+        // build_body looks specs up by name; keep the table binary-search
+        // friendly and free of shadowed entries.
+        let mut sorted = MNEMONICS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, MNEMONICS, "MNEMONICS must be sorted and unique");
+    }
+
+    #[test]
+    fn dummy_covers_every_mnemonic() {
+        for &mnemonic in MNEMONICS {
+            assert!(dummy(mnemonic).is_some(), "dummy({mnemonic})");
+        }
+        assert!(dummy("bogus").is_none());
+        assert!(dummy("").is_none());
+        // Case matters: the table is exact-match.
+        assert!(dummy("Ldai").is_none());
+    }
+
+    #[test]
+    fn construct_every_mnemonic_mainline() {
+        for &mnemonic in MNEMONICS {
+            let ops = canonical_ops(mnemonic);
+            let bc = construct(mnemonic, &ops)
+                .unwrap_or_else(|| panic!("construct({mnemonic}, canonical ops)"));
+            assert_eq!(bc.mnemonic(), mnemonic, "constructed variant");
+            assert_eq!(
+                bc.operands(),
+                canonical_operands(mnemonic),
+                "constructed operands for {mnemonic}"
+            );
+        }
+    }
+
+    #[test]
+    fn construct_rejects_wrong_operand_shapes() {
+        for &mnemonic in MNEMONICS {
+            let ops = canonical_ops(mnemonic);
+            if ops.is_empty() {
+                // `mnemonic` guards on `ops.is_empty()`: any operand must
+                // fall through to the catch-all.
+                assert!(
+                    construct(mnemonic, &[I(0)]).is_none(),
+                    "{mnemonic} with an operand"
+                );
+            } else {
+                // Operand-count mismatch (one short) is always rejected.
+                assert!(
+                    construct(mnemonic, &ops[..ops.len() - 1]).is_none(),
+                    "{mnemonic} short"
+                );
+                // Kind mismatch in the first position is always rejected
+                // (no ISA operand list starts with a different-kind prefix
+                // of itself).
+                let mut wrong = ops.clone();
+                wrong[0] = match wrong[0] {
+                    R(_) => I(0),
+                    I(_) | E(_) | L(_) => R(0),
+                };
+                assert!(
+                    construct(mnemonic, &wrong).is_none(),
+                    "{mnemonic} wrong first kind"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn construct_unknown_mnemonic_is_none() {
+        assert!(construct("bogus", &[]).is_none());
+        assert!(construct("bogus", &[R(1), I(1), E(1), L(0)]).is_none());
+        assert!(construct("LDai", &[I(1)]).is_none());
+    }
+
+    /// The 88 corpus-absent construct arms (42 `deprecated.*`, 17 `wide.*`,
+    /// 14 legacy jumps, plus the scattered rest) with their canonical
+    /// operand vectors: construct must succeed and the instruction must
+    /// survive an encode/decode round-trip unchanged.
+    #[test]
+    fn corpus_absent_arms_construct_and_roundtrip() {
+        let cases: &[(&str, &[RawOperand])] = &[
+            ("callruntime.notifyconcurrentresult", &[]),
+            ("closeiterator", &[I(1), R(1)]),
+            ("createregexpwithliteral", &[I(1), E(1), I(1)]),
+            ("deprecated.asyncfunctionawaituncaught", &[R(1), R(1)]),
+            ("deprecated.asyncfunctionreject", &[R(1), R(1), R(1)]),
+            ("deprecated.asyncfunctionresolve", &[R(1), R(1), R(1)]),
+            ("deprecated.asyncgeneratorreject", &[R(1), R(1)]),
+            ("deprecated.callarg0", &[R(1)]),
+            ("deprecated.callarg1", &[R(1), R(1)]),
+            ("deprecated.callargs2", &[R(1), R(1), R(1)]),
+            ("deprecated.callargs3", &[R(1), R(1), R(1), R(1)]),
+            ("deprecated.callrange", &[I(1), R(1)]),
+            ("deprecated.callspread", &[R(1), R(1), R(1)]),
+            ("deprecated.callthisrange", &[I(1), R(1)]),
+            ("deprecated.copydataproperties", &[R(1), R(1)]),
+            ("deprecated.createarraywithbuffer", &[I(1)]),
+            ("deprecated.createobjecthavingmethod", &[I(1)]),
+            ("deprecated.createobjectwithbuffer", &[I(1)]),
+            ("deprecated.dec", &[R(1)]),
+            (
+                "deprecated.defineclasswithbuffer",
+                &[E(1), I(1), I(1), R(1), R(1)],
+            ),
+            ("deprecated.delobjprop", &[R(1), R(1)]),
+            ("deprecated.dynamicimport", &[R(1)]),
+            ("deprecated.getiteratornext", &[R(1), R(1)]),
+            ("deprecated.getmodulenamespace", &[E(1)]),
+            ("deprecated.getresumemode", &[R(1)]),
+            ("deprecated.gettemplateobject", &[R(1)]),
+            ("deprecated.inc", &[R(1)]),
+            ("deprecated.ldmodulevar", &[E(1), I(1)]),
+            ("deprecated.ldobjbyindex", &[R(1), I(1)]),
+            ("deprecated.ldobjbyname", &[E(1), R(1)]),
+            ("deprecated.ldobjbyvalue", &[R(1), R(1)]),
+            ("deprecated.ldsuperbyname", &[E(1), R(1)]),
+            ("deprecated.ldsuperbyvalue", &[R(1), R(1)]),
+            ("deprecated.neg", &[R(1)]),
+            ("deprecated.not", &[R(1)]),
+            ("deprecated.resumegenerator", &[R(1)]),
+            ("deprecated.setobjectwithproto", &[R(1), R(1)]),
+            ("deprecated.stclasstoglobalrecord", &[E(1)]),
+            ("deprecated.stconsttoglobalrecord", &[E(1)]),
+            ("deprecated.stlettoglobalrecord", &[E(1)]),
+            ("deprecated.stlexvar", &[I(1), I(1), R(1)]),
+            ("deprecated.stmodulevar", &[E(1)]),
+            ("deprecated.suspendgenerator", &[R(1), R(1)]),
+            ("deprecated.tonumber", &[R(1)]),
+            ("deprecated.tonumeric", &[R(1)]),
+            ("jeq", &[R(1), L(0)]),
+            ("jeqnull", &[L(0)]),
+            ("jequndefined", &[L(0)]),
+            ("jne", &[R(1), L(0)]),
+            ("jnenull", &[L(0)]),
+            ("jneundefined", &[L(0)]),
+            ("jnstricteq", &[R(1), L(0)]),
+            ("jnstricteqnull", &[L(0)]),
+            ("jnstrictequndefined", &[L(0)]),
+            ("jnstricteqz", &[L(0)]),
+            ("jstricteq", &[R(1), L(0)]),
+            ("jstricteqnull", &[L(0)]),
+            ("jstrictequndefined", &[L(0)]),
+            ("jstricteqz", &[L(0)]),
+            ("ldobjbyindex", &[I(1), I(1)]),
+            ("ldthisbyname", &[I(1), E(1)]),
+            ("ldthisbyvalue", &[I(1)]),
+            ("newobjapply", &[I(1), R(1)]),
+            ("setobjectwithproto", &[I(1), R(1)]),
+            ("stobjbyindex", &[I(1), R(1), I(1)]),
+            ("stownbynamewithnameset", &[I(1), E(1), R(1)]),
+            ("stownbyvalue", &[I(1), R(1), R(1)]),
+            ("stthisbyname", &[I(1), E(1)]),
+            ("stthisbyvalue", &[I(1), R(1)]),
+            ("supercallarrowrange", &[I(1), I(1), R(1)]),
+            ("throw.undefinedifhole", &[R(1), R(1)]),
+            ("wide.callthisrange", &[I(1), R(1)]),
+            ("wide.copyrestargs", &[I(1)]),
+            ("wide.createobjectwithexcludedkeys", &[I(1), R(1), R(1)]),
+            ("wide.getmodulenamespace", &[I(1)]),
+            ("wide.ldexternalmodulevar", &[I(1)]),
+            ("wide.ldlexvar", &[I(1), I(1)]),
+            ("wide.ldobjbyindex", &[I(1)]),
+            ("wide.ldpatchvar", &[I(1)]),
+            ("wide.newlexenv", &[I(1)]),
+            ("wide.newlexenvwithname", &[I(1), E(1)]),
+            ("wide.newobjrange", &[I(1), R(1)]),
+            ("wide.stlexvar", &[I(1), I(1)]),
+            ("wide.stobjbyindex", &[R(1), I(1)]),
+            ("wide.stownbyindex", &[R(1), I(1)]),
+            ("wide.stpatchvar", &[I(1)]),
+            ("wide.supercallarrowrange", &[I(1), R(1)]),
+            ("wide.supercallthisrange", &[I(1), R(1)]),
+        ];
+        assert_eq!(cases.len(), 88, "the corpus-absent arm inventory");
+        for &(mnemonic, ops) in cases {
+            let bc = construct(mnemonic, ops)
+                .unwrap_or_else(|| panic!("construct({mnemonic}) must succeed"));
+            assert_eq!(bc.mnemonic(), mnemonic);
+            let (bytes, _) =
+                abcd_isa::encode(&[bc]).unwrap_or_else(|e| panic!("{mnemonic} must encode: {e}"));
+            let decoded =
+                abcd_isa::decode(&bytes).unwrap_or_else(|e| panic!("{mnemonic} must decode: {e}"));
+            assert_eq!(decoded.len(), 1, "{mnemonic} decodes to one insn");
+            assert_eq!(
+                decoded[0].0.mnemonic(),
+                mnemonic,
+                "{mnemonic} mnemonic round-trip"
+            );
+            assert_eq!(
+                decoded[0].0.operands(),
+                bc.operands(),
+                "{mnemonic} operands round-trip"
+            );
+        }
+    }
+}

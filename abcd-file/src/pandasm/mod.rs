@@ -1641,14 +1641,24 @@ fn replace_once(haystack: &mut Vec<u8>, needle: &[u8], with: &[u8]) {
 mod tests {
     //! The no-panic rule: the emitter must render ANY File model, including
     //! hand-built ones with dangling references (placeholders, never panic).
+    //!
+    //! The CI coverage job skips the asm corpus gates, so these tests also
+    //! carry the emitter's coverage: direct calls for the name/float
+    //! helpers, and synthetic File models for the emission arms no corpus
+    //! binary produces (external records/methods, module blobs, the ≤12
+    //! header-table fallback, …).
     use super::*;
-    use crate::model::{MethodBody, ParamAnnotations};
+    use crate::model::{Field, MethodBody, ModuleRequestPhase, ParamAnnotations};
     use crate::types::AccessFlags;
     use std::collections::{BTreeMap, HashMap};
 
     fn empty_file() -> File {
+        file_at(Version::new(12, 0, 6, 0))
+    }
+
+    fn file_at(version: Version) -> File {
         File {
-            version: Version::new(12, 0, 6, 0),
+            version,
             checksum: 0,
             size: 0,
             file_type: crate::FileType::Dynamic,
@@ -1660,6 +1670,78 @@ mod tests {
             entity_map: HashMap::new(),
             string_raw_bytes: HashMap::new(),
         }
+    }
+
+    /// A minimal static method named `name`; `body` attaches a body.
+    fn bare_method(file: &mut File, name: &str, offset: u32, body: Option<MethodBody>) -> Method {
+        Method {
+            name: file.strings.get_or_intern(name),
+            offset,
+            access_flags: AccessFlags::STATIC,
+            function_kind: crate::types::FunctionKind::None,
+            source_lang: SourceLang::EcmaScript,
+            is_external: false,
+            return_type: None,
+            arg_types: Vec::new(),
+            body,
+            annotations: crate::model::Annotations::default(),
+            param_annotations: ParamAnnotations::default(),
+            debug: None,
+        }
+    }
+
+    fn body_of(bytecodes: Vec<Bytecode>) -> MethodBody {
+        MethodBody {
+            num_vregs: 0,
+            num_args: 0,
+            bytecodes,
+            entity_offsets: HashMap::new(),
+            try_blocks: Vec::new(),
+            ic_size: None,
+        }
+    }
+
+    fn bare_field(
+        file: &mut File,
+        name: &str,
+        field_type: Type,
+        initial_value: Option<FieldValue>,
+    ) -> Field {
+        Field {
+            name: file.strings.get_or_intern(name),
+            offset: 0,
+            field_type,
+            access_flags: AccessFlags::empty(),
+            is_external: false,
+            initial_value,
+            annotations: crate::model::Annotations::default(),
+        }
+    }
+
+    fn add_class(
+        file: &mut File,
+        descriptor: &str,
+        methods: Vec<Method>,
+        fields: Vec<Field>,
+    ) -> StringId {
+        let sid = file.strings.get_or_intern(descriptor);
+        file.classes.insert(
+            sid,
+            Class {
+                descriptor: sid,
+                name: sid,
+                access_flags: AccessFlags::empty(),
+                source_lang: SourceLang::EcmaScript,
+                source_file: None,
+                is_external: false,
+                super_class: None,
+                interfaces: Vec::new(),
+                methods,
+                fields,
+                annotations: crate::model::Annotations::default(),
+            },
+        );
+        sid
     }
 
     #[test]
@@ -1734,5 +1816,268 @@ mod tests {
         let text = String::from_utf8_lossy(&out);
         assert!(text.contains(".function any f() <static> {"), "{text}");
         assert!(text.contains("\tldai 0x7\n"), "{text}");
+    }
+
+    // -- Float formatting (direct calls; the corpus never prints these) ----
+
+    #[test]
+    fn float_formatting_special_values() {
+        // std::scientific, precision 6.
+        assert_eq!(format_scientific6(f64::NAN), "nan");
+        assert_eq!(format_scientific6(-f64::NAN), "-nan");
+        assert_eq!(format_scientific6(f64::INFINITY), "inf");
+        assert_eq!(format_scientific6(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_scientific6(1.0), "1.000000e+00");
+        assert_eq!(format_scientific6(0.1), "1.000000e-01");
+        assert_eq!(format_scientific6(4294967296.0), "4.294967e+09");
+        assert_eq!(format_scientific6(-2.5), "-2.500000e+00");
+        // iostream default (%g, precision 6).
+        assert_eq!(format_g6(f64::NAN), "nan");
+        assert_eq!(format_g6(-f64::NAN), "-nan");
+        assert_eq!(format_g6(f64::INFINITY), "inf");
+        assert_eq!(format_g6(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_g6(0.0), "0");
+        assert_eq!(format_g6(-0.0), "-0");
+        assert_eq!(format_g6(1.25), "1.25");
+        assert_eq!(format_g6(2.5), "2.5");
+        assert_eq!(format_g6(42.0), "42");
+        assert_eq!(format_g6(-0.25), "-0.25");
+        // Outside [-4, 6): the %e branch (trailing zeros stripped).
+        assert_eq!(format_g6(0.00001), "1e-05");
+        assert_eq!(format_g6(1234567.0), "1.23457e+06");
+        assert_eq!(format_g6(123456789.0), "1.23457e+08");
+    }
+
+    // -- Name helpers (direct calls) ----------------------------------------
+
+    #[test]
+    fn record_pandasm_name_all_forms() {
+        // Reference descriptors: strip the wrapper, `/` → `.`.
+        assert_eq!(record_pandasm_name(b"Lfoo/Bar;"), b"foo.Bar");
+        assert_eq!(record_pandasm_name(b"Lx;"), b"x");
+        assert_eq!(record_pandasm_name(b"L;"), b";");
+        // Array rank: strip `[`s, re-append `[]`s.
+        assert_eq!(record_pandasm_name(b"[I"), b"i32[]");
+        assert_eq!(record_pandasm_name(b"[[I"), b"i32[][]");
+        assert_eq!(record_pandasm_name(b"[Lfoo/Bar;"), b"foo.Bar[]");
+        // Primitive letters.
+        let letters: &[(&[u8], &[u8])] = &[
+            (b"Z", b"u1"),
+            (b"B", b"i8"),
+            (b"H", b"u8"),
+            (b"S", b"i16"),
+            (b"C", b"u16"),
+            (b"I", b"i32"),
+            (b"U", b"u32"),
+            (b"F", b"f32"),
+            (b"D", b"f64"),
+            (b"J", b"i64"),
+            (b"Q", b"u64"),
+            (b"V", b"void"),
+            (b"A", b"any"),
+        ];
+        for &(desc, name) in letters {
+            assert_eq!(record_pandasm_name(desc), name, "descriptor {desc:?}");
+        }
+        // Anything else passes through (e.g. the synthesized global).
+        assert_eq!(record_pandasm_name(b"_GLOBAL"), b"_GLOBAL");
+    }
+
+    #[test]
+    fn language_str_all_variants() {
+        assert_eq!(language_str(SourceLang::EcmaScript), "ECMAScript");
+        assert_eq!(language_str(SourceLang::JavaScript), "JavaScript");
+        assert_eq!(language_str(SourceLang::TypeScript), "TypeScript");
+        assert_eq!(language_str(SourceLang::ArkTs), "ArkTS");
+        assert_eq!(language_str(SourceLang::PandaAssembly), "PandaAssembly");
+    }
+
+    #[test]
+    fn mutf8_bytes_forms() {
+        assert_eq!(mutf8_bytes("ab"), b"ab");
+        // Embedded NUL → C0 80.
+        assert_eq!(mutf8_bytes("a\0b"), [b'a', 0xC0, 0x80, b'b']);
+        // Astral characters → CESU-8 surrogate pairs.
+        assert_eq!(
+            mutf8_bytes("\u{1F600}"),
+            [0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]
+        );
+        // The N72 disambiguation suffix is never emitted.
+        assert_eq!(mutf8_bytes("ok\u{E000}dead"), b"ok");
+    }
+
+    #[test]
+    fn replace_once_first_occurrence_only() {
+        let mut v = b"a.ctor b.ctor".to_vec();
+        replace_once(&mut v, b".ctor", b"_ctor_");
+        assert_eq!(v, b"a_ctor_ b.ctor");
+        // Missing needle: no-op. Empty needle: no-op.
+        replace_once(&mut v, b"missing", b"x");
+        assert_eq!(v, b"a_ctor_ b.ctor");
+        replace_once(&mut v, b"", b"x");
+        assert_eq!(v, b"a_ctor_ b.ctor");
+    }
+
+    // -- Synthetic models: emission arms no corpus binary produces ----------
+
+    #[test]
+    fn external_method_reference_falls_back_to_bare_signature() {
+        // A MethodId operand whose offset is no class method (an external
+        // reference): the signature falls back to `<name>:()`.
+        let mut file = file_at(DEFAULT_VERSION);
+        let orphan = file.strings.get_or_intern("orphan");
+        file.entity_map.insert(0x500, orphan);
+        let mut entity_offsets = HashMap::new();
+        entity_offsets.insert((EntityKind::MethodId, 0), 0x500);
+        let body = MethodBody {
+            entity_offsets,
+            ..body_of(vec![
+                abcd_isa::insn::Definefunc::new(
+                    abcd_isa::Imm(0),
+                    abcd_isa::EntityId(0),
+                    abcd_isa::Imm(0),
+                ),
+                abcd_isa::insn::Returnundefined::new(),
+            ])
+        };
+        let m = bare_method(&mut file, "f", 0x100, Some(body));
+        add_class(&mut file, "L_GLOBAL;", vec![m], vec![]);
+        let out = emit_file(&file, "t.abc");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("\tdefinefunc 0x0, orphan:(), 0x0\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn array_records_are_system_types() {
+        // A class whose pandasm name contains `[`: never printed as a
+        // record, its methods get no owner prefix.
+        let mut file = file_at(DEFAULT_VERSION);
+        let body = body_of(vec![abcd_isa::insn::Returnundefined::new()]);
+        let m = bare_method(&mut file, "f", 0x100, Some(body));
+        add_class(&mut file, "[I", vec![m], vec![]);
+        let out = emit_file(&file, "t.abc");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains(".function any f() <static> {"), "{text}");
+        assert!(!text.contains(".record i32[]"), "{text}");
+    }
+
+    #[test]
+    fn field_value_offset_forms_and_unprintable_types() {
+        let mut file = file_at(Version::new(12, 0, 6, 0));
+        let fields = vec![
+            bare_field(&mut file, "plain", Type::U32, Some(FieldValue::I32(0x2a))),
+            bare_field(
+                &mut file,
+                crate::TYPE_SUMMARY_OFFSET_FIELD,
+                Type::U32,
+                Some(FieldValue::TypeSummaryOffset(0x123)),
+            ),
+            // A u32 field whose value is not an offset: nothing prints.
+            bare_field(&mut file, "odd", Type::U32, Some(FieldValue::F64(1.0))),
+            // A value on a type the emitter never prints values for.
+            bare_field(&mut file, "wide", Type::I64, Some(FieldValue::I64(9))),
+        ];
+        add_class(&mut file, "LR;", vec![], fields);
+        let out = emit_file(&file, "t.abc");
+        let text = String::from_utf8_lossy(&out);
+        // Upstream prints the typeSummaryOffset value (it is only excluded
+        // from module-literal classification).
+        assert!(text.contains("\tu32 plain = 0x2a\n"), "{text}");
+        assert!(text.contains("\tu32 typeSummaryOffset = 0x123\n"), "{text}");
+        assert!(text.contains("\tu32 odd\n"), "{text}");
+        assert!(text.contains("\ti64 wide\n"), "{text}");
+        assert!(!text.contains("odd ="), "{text}");
+        assert!(!text.contains("wide ="), "{text}");
+    }
+
+    #[test]
+    fn header_less_12x_models_fall_back_to_decoded_order() {
+        // Hand-built ≤12.0.6.0 model without the header table: regular
+        // arrays in decoded order, then module blobs, then scope-names
+        // arrays.
+        let mut file = file_at(Version::new(12, 0, 6, 0));
+        file.literal_arrays.push(crate::LiteralArray {
+            values: vec![LiteralValue::Integer(7)],
+        });
+        file.literal_arrays
+            .push(crate::LiteralArray { values: Vec::new() });
+        file.literal_array_offsets.insert(0x10, 0);
+        file.literal_array_offsets.insert(0x50, 1);
+        let req = file.strings.get_or_intern("r");
+        let md = ModuleData {
+            source_offset: 0x100,
+            requests: vec![req],
+            records: vec![ModuleRecord::StarExport {
+                module_request_idx: 0,
+            }],
+        };
+        let module_field = bare_field(
+            &mut file,
+            "moduleRecordIdx",
+            Type::U32,
+            Some(FieldValue::ModuleData(md)),
+        );
+        add_class(&mut file, "L_ESModuleRecord;", vec![], vec![module_field]);
+        let scope_field = bare_field(
+            &mut file,
+            "scopeNames",
+            Type::U32,
+            Some(FieldValue::LiteralArrayRef(0x50)),
+        );
+        add_class(
+            &mut file,
+            "L_ESScopeNamesRecord;",
+            vec![],
+            vec![scope_field],
+        );
+        let out = emit_file(&file, "t.abc");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("0 0x10 { 1 [ i32:7, ]}\n"), "{text}");
+        assert!(
+            text.contains(
+                "1 0x100 { 1 [\n\tMODULE_REQUEST_ARRAY: {\n\t\t0 : r,\n\t};\n\tModuleTag: STAR_EXPORT, module_request: r;\n]}\n"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("2 0x50 \n"), "scope-names array last: {text}");
+    }
+
+    #[test]
+    fn header_table_skips_phase_slots_and_dangling_arrays() {
+        // Decoded ≤12.0.6.0 shape: the header table is present, phase blobs
+        // occupy slots but never list, and a slot whose array never decoded
+        // prints key-only.
+        let mut file = file_at(Version::new(12, 0, 6, 0));
+        file.literal_arrays.push(crate::LiteralArray {
+            values: vec![LiteralValue::Integer(7)],
+        });
+        file.literal_array_offsets.insert(0x10, 0);
+        file.literal_array_header_offsets = vec![0x10, 0x200, 0x99];
+        let phase_field = bare_field(
+            &mut file,
+            crate::MODULE_REQUEST_PHASE_FIELD,
+            Type::U32,
+            Some(FieldValue::ModuleRequestPhase(ModuleRequestPhase {
+                source_offset: 0x200,
+                flags: vec![0],
+            })),
+        );
+        add_class(
+            &mut file,
+            "L_ModuleRequestPhaseRecord;",
+            vec![],
+            vec![phase_field],
+        );
+        let out = emit_file(&file, "t.abc");
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("0 0x10 { 1 [ i32:7, ]}\n"), "{text}");
+        assert!(!text.contains("1 0x200"), "phase slot excluded: {text}");
+        assert!(
+            text.contains("2 0x99 \n"),
+            "dangling array prints key-only: {text}"
+        );
     }
 }
