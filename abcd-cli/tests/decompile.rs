@@ -79,3 +79,52 @@ fn corrupt_abc_is_a_tool_error() {
     let err = decompile::decompile(&m, DecompileOptions::default()).unwrap_err();
     assert_eq!(err.exit_code(), 2);
 }
+
+#[test]
+fn lift_failure_is_a_tool_error() {
+    let m = module(&common::lift_fail_abc(), "liftfail.abc");
+    let err = decompile::decompile(&m, DecompileOptions::default()).unwrap_err();
+    assert_eq!(err.exit_code(), 2, "lift failure is a tool error");
+    let msg = err.to_string();
+    assert!(msg.contains("failed to lift"), "{msg}");
+    assert!(msg.contains("ldthisbyname"), "{msg}");
+}
+
+#[test]
+fn write_all_out_dir_occupied_by_a_file_is_a_tool_error() {
+    let dir = common::tempdir("decompile-io-err");
+    let occupied = dir.join("occupied");
+    std::fs::write(&occupied, b"x").unwrap();
+    let m = module(&common::tiny_abc(), "modules.abc");
+    let err = decompile::write_all(&[m], &occupied, DecompileOptions::default()).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("cannot create output directory"),
+        "{err}"
+    );
+}
+
+#[test]
+fn write_all_write_failure_is_a_tool_error() {
+    // A directory squatting the <name>.js output path fails the write.
+    let dir = common::tempdir("decompile-write-err");
+    std::fs::create_dir_all(dir.join("modules.js")).unwrap();
+    let m = module(&common::tiny_abc(), "modules.abc");
+    let err = decompile::write_all(&[m], &dir, DecompileOptions::default()).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("cannot write"), "{err}");
+}
+
+#[test]
+fn write_all_aborts_the_batch_on_an_unliftable_module() {
+    // [good, decode-ok/lift-fail]: the first module lands, the second
+    // fails the decompile and the error aborts the batch.
+    let good = module(&common::tiny_abc(), "good.abc");
+    let bad = module(&common::lift_fail_abc(), "bad.abc");
+    let dir = common::tempdir("decompile-batch-err");
+    let err = decompile::write_all(&[good, bad], &dir, DecompileOptions::default()).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("failed to lift"), "{err}");
+    assert!(dir.join("good.js").exists(), "the good module was written");
+    assert!(!dir.join("bad.js").exists(), "the bad module was not");
+}

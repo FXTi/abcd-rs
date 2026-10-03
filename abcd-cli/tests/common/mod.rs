@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use abcd_file::{AccessFlags, Builder, Type};
+use abcd_file::{AccessFlags, Builder, CodeEntity, Type};
 
 // ---------------------------------------------------------------------------
 // Mini ZIP writer (STORED entries only — ~50 lines by design)
@@ -131,6 +131,55 @@ pub fn tiny_abc() -> Vec<u8> {
     b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 4, 0);
     b.deduplicate();
     b.finalize().expect("tiny_abc must finalize")
+}
+
+/// Decode-ok / lift-fail fixture: `f() { return this.key; }` via the
+/// `ldthisbyname` opcode. The `this-by-*` family is IC-fused `this`
+/// property access that es2panda never emits, and the lifter refuses it
+/// loudly (`LiftError::UnsupportedThisByAccess`, N51 ruling — precedent:
+/// abcd-lift/tests/lift_this_by_unsupported.rs). The file itself decodes
+/// cleanly, so CLI commands reach their lift stage and must map the
+/// failure to a tool error.
+pub fn lift_fail_abc() -> Vec<u8> {
+    use abcd_isa::{Bytecode, EntityId, Imm};
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    let proto = b.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+    let (code, offsets) = abcd_isa::encode(&[
+        Bytecode::Ldthisbyname(Imm(0), placeholder), // 0: acc = this.key
+        Bytecode::Returnundefined,                   // 1
+    ])
+    .unwrap();
+    let m = b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &code, 1, 0);
+    let key = b.add_string("key");
+    b.relocate_code_id(m, offsets[0], 0, CodeEntity::String(key))
+        .unwrap();
+    b.deduplicate();
+    b.finalize().expect("lift_fail_abc must finalize")
+}
+
+/// `func_main_0() { return 1 + 2; }` — a constant-foldable body, so the
+/// abcd-opt pipeline reports a change (the `optimized_changed` stat and
+/// the dispatch layer's ", optimized" summary tag).
+pub fn foldable_abc() -> Vec<u8> {
+    use abcd_isa::{Bytecode, Imm, Reg};
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    let proto = b.create_proto(Type::Void, &[]);
+    let (code, _offsets) = abcd_isa::encode(&[
+        Bytecode::Ldai(Imm(1)),         // 0: acc = 1
+        Bytecode::Sta(Reg(0)),          // 1: v0 = 1
+        Bytecode::Ldai(Imm(2)),         // 2: acc = 2
+        Bytecode::Add2(Imm(0), Reg(0)), // 3: acc = 2 + v0
+        Bytecode::Return,               // 4: return acc
+    ])
+    .unwrap();
+    b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 4, 3);
+    b.deduplicate();
+    b.finalize().expect("foldable_abc must finalize")
 }
 
 // ---------------------------------------------------------------------------

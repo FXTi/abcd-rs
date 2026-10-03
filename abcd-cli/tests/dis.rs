@@ -50,3 +50,46 @@ fn dis_corrupt_abc_is_a_tool_error() {
     let err = dis::disassemble(&modules[0]).unwrap_err();
     assert_eq!(err.exit_code(), 2, "decode failure is a tool error");
 }
+
+#[test]
+fn write_all_out_dir_occupied_by_a_file_is_a_tool_error() {
+    let modules =
+        input::load_bytes(&common::tiny_abc(), "tiny.abc", ModuleSelection::Single).expect("load");
+    let dir = common::tempdir("dis-io-err");
+    let occupied = dir.join("occupied");
+    std::fs::write(&occupied, b"x").unwrap();
+    let err = dis::write_all(&modules, &occupied).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("cannot create output directory"),
+        "{err}"
+    );
+}
+
+#[test]
+fn write_all_write_failure_is_a_tool_error() {
+    // A directory squatting the <name>.pa output path fails the write.
+    let modules =
+        input::load_bytes(&common::tiny_abc(), "tiny.abc", ModuleSelection::Single).expect("load");
+    let dir = common::tempdir("dis-write-err");
+    std::fs::create_dir_all(dir.join("tiny.pa")).unwrap();
+    let err = dis::write_all(&modules, &dir).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("cannot write"), "{err}");
+}
+
+#[test]
+fn write_all_aborts_the_batch_on_a_bad_module() {
+    // [good, corrupt]: the first module lands, the second fails the
+    // disassembly and the error aborts the batch.
+    let mut modules =
+        input::load_bytes(&common::tiny_abc(), "tiny.abc", ModuleSelection::Single).expect("load");
+    let mut bad = input::load_bytes(b"junk", "bad.abc", ModuleSelection::Single).expect("load");
+    modules.append(&mut bad);
+    let dir = common::tempdir("dis-batch-err");
+    let err = dis::write_all(&modules, &dir).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("failed to decode"), "{err}");
+    assert!(dir.join("tiny.pa").exists(), "the good module was written");
+    assert!(!dir.join("bad.pa").exists(), "the bad module was not");
+}

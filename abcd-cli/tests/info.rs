@@ -83,3 +83,38 @@ fn corrupt_abc_is_a_tool_error() {
     let err = info::report(&modules[0], false).unwrap_err();
     assert_eq!(err.exit_code(), 2, "decode failure is a tool error");
 }
+
+#[test]
+fn static_version_header_reports_static_type() {
+    // The vendored GetFileType keys `static` off the header version field
+    // (bytes 12..16) equal to 0.1.0.7; decode does not reject the type.
+    let mut abc = common::tiny_abc();
+    abc[12..16].copy_from_slice(&[0, 1, 0, 7]);
+    let modules = input::load_bytes(&abc, "static.abc", ModuleSelection::Single).unwrap();
+    let report = info::report(&modules[0], false).unwrap();
+    assert_eq!(report.file_type, "static");
+    let text = info::render_text(&report);
+    assert!(text.contains("file type:       static"), "{text}");
+}
+
+#[test]
+fn trailing_bytes_past_the_declared_size_report_invalid_type() {
+    // GetFileType requires buffer size == header-declared file_size; the
+    // decoder itself accepts a larger buffer, so one trailing byte keeps
+    // the file decodable while the type reads `invalid`.
+    let mut abc = common::tiny_abc();
+    abc.push(0);
+    let modules = input::load_bytes(&abc, "invalid.abc", ModuleSelection::Single).unwrap();
+    let report = info::report(&modules[0], false).unwrap();
+    assert_eq!(report.file_type, "invalid");
+}
+
+#[test]
+fn render_in_text_mode_produces_the_text_report() {
+    let out = info::render(&[report(false)], false).unwrap();
+    assert!(
+        out.contains("module:          modules (modules.abc)"),
+        "{out}"
+    );
+    assert!(out.contains("file type:       dynamic"), "{out}");
+}

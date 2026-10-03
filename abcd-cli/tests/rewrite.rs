@@ -159,6 +159,17 @@ fn rewrite_corrupt_input_is_a_tool_error() {
 }
 
 #[test]
+fn rewrite_lift_failure_is_a_tool_error() {
+    // The ldthisbyname fixture decodes but the lifter refuses it (N51).
+    let module = module_of(&common::lift_fail_abc(), "liftfail.abc");
+    let err = rewrite::rewrite(&module, RewriteOptions::default()).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    let msg = err.to_string();
+    assert!(msg.contains("lift failed"), "{msg}");
+    assert!(msg.contains("ldthisbyname"), "{msg}");
+}
+
+#[test]
 fn degenerate_zero_arg_shape_rewrites_cleanly() {
     // `common::tiny_abc()` declares `num_args = 0` — a shape no real
     // producer emits (es2abc always carries the three implicit frame
@@ -205,4 +216,60 @@ fn write_all_writes_one_abc_per_module() {
         assert_eq!(bytes.len(), *size);
         shape(&bytes); // every written file decodes
     }
+}
+
+#[test]
+fn rewrite_opt_reports_a_change_on_foldable_code() {
+    let module = module_of(&common::foldable_abc(), "fold.abc");
+    let out = rewrite::rewrite(
+        &module,
+        RewriteOptions {
+            optimize: true,
+            check: true,
+        },
+    )
+    .expect("opt rewrite");
+    assert!(
+        out.stats.optimized_changed,
+        "the constant fold must report a change"
+    );
+}
+
+#[test]
+fn write_all_out_dir_occupied_by_a_file_is_a_tool_error() {
+    let dir = common::tempdir("rewrite-io-err");
+    let occupied = dir.join("occupied");
+    std::fs::write(&occupied, b"x").unwrap();
+    let module = module_of(&rewritable_abc(), "raw.abc");
+    let err = rewrite::write_all(&[module], &occupied, RewriteOptions::default()).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("cannot create output directory"),
+        "{err}"
+    );
+}
+
+#[test]
+fn write_all_write_failure_is_a_tool_error() {
+    // A directory squatting the <name>.abc output path fails the write.
+    let dir = common::tempdir("rewrite-write-err");
+    std::fs::create_dir_all(dir.join("raw.abc")).unwrap();
+    let module = module_of(&rewritable_abc(), "raw.abc");
+    let err = rewrite::write_all(&[module], &dir, RewriteOptions::default()).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("cannot write"), "{err}");
+}
+
+#[test]
+fn write_all_aborts_the_batch_on_an_unliftable_module() {
+    // [good, decode-ok/lift-fail]: the first module lands, the second
+    // fails the rewrite and the error aborts the batch.
+    let good = module_of(&rewritable_abc(), "good.abc");
+    let bad = module_of(&common::lift_fail_abc(), "bad.abc");
+    let dir = common::tempdir("rewrite-batch-err");
+    let err = rewrite::write_all(&[good, bad], &dir, RewriteOptions::default()).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("lift failed"), "{err}");
+    assert!(dir.join("good.abc").exists(), "the good module was written");
+    assert!(!dir.join("bad.abc").exists(), "the bad module was not");
 }

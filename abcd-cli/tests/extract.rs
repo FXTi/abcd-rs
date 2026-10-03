@@ -112,3 +112,48 @@ fn summary_mentions_counts_sizes_and_paths() {
     assert!(text.contains("entry.abc"), "summary: {text}");
     assert!(text.contains("entry.module.json"), "summary: {text}");
 }
+
+#[test]
+fn out_dir_occupied_by_a_file_is_a_tool_error() {
+    // create_dir_all on a path that exists as a regular file fails.
+    let hap = common::hap("entry", &common::tiny_abc());
+    let dir = common::tempdir("extract-io-err");
+    let occupied = dir.join("occupied");
+    std::fs::write(&occupied, b"x").unwrap();
+    let err = extract::extract_bytes(&hap, "entry.hap", &occupied, false).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("cannot create output directory"),
+        "{err}"
+    );
+}
+
+#[test]
+fn module_json_write_failure_is_a_tool_error() {
+    // --force skips the collision preflight; a DIRECTORY squatting the
+    // <name>.module.json path then fails the actual write (the .abc
+    // payload write comes first and succeeds).
+    let hap = common::hap("entry", &common::tiny_abc());
+    let dir = common::tempdir("extract-json-err");
+    std::fs::create_dir_all(dir.join("entry.module.json")).unwrap();
+    let err = extract::extract_bytes(&hap, "entry.hap", &dir, true).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("cannot write"), "{err}");
+    assert!(dir.join("entry.abc").exists(), "the .abc write came first");
+}
+
+#[test]
+fn abc_write_failure_is_a_tool_error() {
+    // Same shape, with the directory squatting the <name>.abc path: the
+    // FIRST write fails and no module.json is produced.
+    let hap = common::hap("entry", &common::tiny_abc());
+    let dir = common::tempdir("extract-abc-err");
+    std::fs::create_dir_all(dir.join("entry.abc")).unwrap();
+    let err = extract::extract_bytes(&hap, "entry.hap", &dir, true).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(err.to_string().contains("cannot write"), "{err}");
+    assert!(
+        !dir.join("entry.module.json").exists(),
+        "nothing beyond the failed .abc write"
+    );
+}

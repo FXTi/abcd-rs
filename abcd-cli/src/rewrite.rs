@@ -272,3 +272,33 @@ pub fn write_all(
     }
     Ok(written)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body_with(bytecodes: Vec<abcd_isa::Bytecode>) -> abcd_file::MethodBody {
+        abcd_file::MethodBody {
+            num_vregs: 0,
+            num_args: 0,
+            bytecodes,
+            entity_offsets: Default::default(),
+            try_blocks: Vec::new(),
+            ic_size: None,
+        }
+    }
+
+    #[test]
+    fn body_state_tags_each_shape() {
+        // `body_state` feeds the `--check` body-presence-mismatch
+        // diagnostic, which only fires on a pipeline bug (unreachable
+        // end-to-end without fault injection); the tag mapping itself is
+        // pinned here.
+        assert_eq!(body_state(&None), "no body");
+        assert_eq!(body_state(&Some(body_with(Vec::new()))), "empty body");
+        assert_eq!(
+            body_state(&Some(body_with(vec![abcd_isa::Bytecode::Returnundefined]))),
+            "body"
+        );
+    }
+}

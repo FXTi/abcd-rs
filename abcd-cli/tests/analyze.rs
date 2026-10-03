@@ -237,3 +237,177 @@ fn corrupt_abc_is_a_tool_error() {
     let err = analyze::report(&modules[0], NONE).unwrap_err();
     assert_eq!(err.exit_code(), 2, "decode failure is a tool error");
 }
+
+#[test]
+fn lift_failure_is_a_tool_error() {
+    let modules = input::load_bytes(
+        &common::lift_fail_abc(),
+        "liftfail.abc",
+        ModuleSelection::Single,
+    )
+    .unwrap();
+    let err = analyze::report(&modules[0], NONE).unwrap_err();
+    assert_eq!(err.exit_code(), 2, "lift failure is a tool error");
+    let msg = err.to_string();
+    assert!(msg.contains("failed to lift"), "{msg}");
+    assert!(msg.contains("ldthisbyname"), "{msg}");
+}
+
+// ---- call-kind tags ----
+
+/// `func_main_0() { f.apply(t, a); super-calls…; new f(); }` — one call
+/// per `CallKind` the lift produces (the `Direct` kind has no lift-side
+/// producer). All callees stay unknown; the kind tags are what matters.
+fn call_kinds_abc() -> Vec<u8> {
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    let proto = b.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+    let (code, offsets) = abcd_isa::encode(&[
+        Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 0: acc = f
+        Bytecode::Sta(Reg(0)),                            // 1: v0 = f
+        Bytecode::Ldundefined,                            // 2
+        Bytecode::Sta(Reg(1)),                            // 3: v1 = undefined
+        Bytecode::Ldundefined,                            // 4
+        Bytecode::Sta(Reg(2)),                            // 5: v2 = undefined
+        Bytecode::Lda(Reg(0)),                            // 6: acc = f
+        Bytecode::Apply(Imm(0), Reg(1), Reg(2)),          // 7: f.apply(v1, v2)
+        Bytecode::Lda(Reg(0)),                            // 8
+        Bytecode::Supercallthisrange(Imm(0), Imm(1), Reg(1)), // 9: super f(v1)
+        Bytecode::Lda(Reg(0)),                            // 10
+        Bytecode::Supercallspread(Imm(0), Reg(2)),        // 11: super f(...v2)
+        Bytecode::Lda(Reg(0)),                            // 12
+        Bytecode::CallruntimeSupercallforwardallargs(Reg(1)), // 13
+        Bytecode::Lda(Reg(0)),                            // 14
+        Bytecode::Sta(Reg(3)),                            // 15: v3 = f
+        Bytecode::Newobjrange(Imm(0), Imm(1), Reg(3)),    // 16: new f()
+        Bytecode::Returnundefined,                        // 17
+    ])
+    .unwrap();
+    let m = b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 8, 0);
+    let f = b.add_string("f");
+    b.relocate_code_id(m, offsets[0], 0, CodeEntity::String(f))
+        .unwrap();
+    b.deduplicate();
+    b.finalize().expect("call_kinds_abc must finalize")
+}
+
+#[test]
+fn callgraph_reports_every_liftable_call_kind() {
+    let report = analyze(&call_kinds_abc(), "kinds.abc", ALL);
+    assert_eq!(report.summary.call_sites, 5);
+    assert_eq!(report.summary.resolution.unknown, 5);
+    let cg = report.callgraph.as_ref().unwrap();
+    let main = cg
+        .functions
+        .iter()
+        .find(|f| f.function == "func_main_0")
+        .expect("func_main_0 listed");
+    let kinds: Vec<&str> = main.sites.iter().map(|s| s.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "apply",
+            "super",
+            "super_spread",
+            "super_forward_all_args",
+            "new"
+        ],
+        "{main:?}"
+    );
+    let text = analyze::render_text(&report);
+    for tag in [
+        "apply call [",
+        "super call [",
+        "super_spread call [",
+        "super_forward_all_args call [",
+        "new call [",
+    ] {
+        assert!(text.contains(tag), "missing {tag:?} in:\n{text}");
+    }
+}
+
+// ---- external call targets ----
+
+#[test]
+fn callgraph_text_renders_external_targets() {
+    // The external-target tag lives in the renderer: a hand-built report
+    // drives it (every report field is public). A synthesized .abc cannot
+    // carry an external class member — the Builder writes foreign methods
+    // to the foreign region where decode does not surface them as members
+    // (abcd-file/tests/foreign_items.rs), and the lift reserves function
+    // slots for class members only.
+    let report = analyze::AnalyzeReport {
+        module: "m".to_string(),
+        provenance: "m.abc".to_string(),
+        input_bytes: 0,
+        summary: analyze::SummaryReport {
+            functions: 2,
+            external_functions: 1,
+            blocks: 1,
+            instructions: 1,
+            call_sites: 1,
+            resolution: analyze::ResolutionReport {
+                resolved_internal: 0,
+                resolved_external: 1,
+                resolved_mixed: 0,
+                unknown: 0,
+            },
+            entry: None,
+        },
+        callgraph: Some(analyze::CallgraphReport {
+            functions: vec![analyze::FunctionCallgraph {
+                function_index: 0,
+                function: "func_main_0".to_string(),
+                sites: vec![analyze::CallSiteReport {
+                    inst: 3,
+                    kind: "dynamic".to_string(),
+                    edge_kind: "resolved_value_flow".to_string(),
+                    resolution_complete: true,
+                    targets: vec![analyze::CallTarget {
+                        index: 1,
+                        name: "native_ext".to_string(),
+                        external: true,
+                    }],
+                }],
+            }],
+        }),
+        dominators: None,
+    };
+    let text = analyze::render_text(&report);
+    assert!(text.contains("fn 1 native_ext (external)"), "{text}");
+    assert!(text.contains("entry:           (none)"), "{text}");
+}
+
+// ---- entry convention ----
+
+/// tiny_abc but the method is named `f`: no `func_main_0` convention.
+fn no_entry_abc() -> Vec<u8> {
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    let proto = b.create_proto(Type::Void, &[]);
+    let (code, _offsets) = abcd_isa::encode(&[Bytecode::Return]).unwrap();
+    b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &code, 4, 0);
+    b.deduplicate();
+    b.finalize().expect("no_entry fixture must finalize")
+}
+
+#[test]
+fn missing_entry_function_renders_none() {
+    let report = analyze(&no_entry_abc(), "noentry.abc", NONE);
+    assert_eq!(report.summary.entry, None);
+    let text = analyze::render_text(&report);
+    assert!(text.contains("entry:           (none)"), "{text}");
+}
+
+#[test]
+fn render_in_text_mode_produces_the_text_report() {
+    let out = analyze::render(&[analyze(&common::tiny_abc(), "modules.abc", NONE)], false).unwrap();
+    assert!(
+        out.contains("module:          modules (modules.abc)"),
+        "{out}"
+    );
+    assert!(out.contains("entry:           func_main_0"), "{out}");
+}
