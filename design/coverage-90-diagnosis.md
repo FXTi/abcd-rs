@@ -199,18 +199,23 @@ the bail/defense forest.
    fault-injection-only CLI --check failure exits (~15), cli.rs parse panic
    arms (17). No pins — documented as deliberately uncovered.
 
-## 8. Decision points for the maintainer
+## 8. Decision points for the maintainer — ALL RULED (2026-10-03)
 
-1. **Metric definition** (§6): CI-job number vs documented merged procedure
-   (the pandasm asm pair can never run under per-push coverage — 102 min).
-2. **Deletion batches** (plan item 4): approve per batch; all proofs in the
-   worker reports (/tmp/cov-diag/*.md, to be distilled on request).
-3. **NEVER-EMITTED deprecated.* arms** (315): test via Builder (they ARE
-   reachable code — legacy 0.0.0.2 files decode into Deprecated* variants…
-   but wait: legacy decode maps to the MODERN opcode set; the Deprecated*
-   arms in translate.rs fire only on modern-table deprecated opcodes which
-   no producer emits) — so: synthetic tests, or accept-and-document?
-4. **Bridge residuals** (~275 catch/guard lines): accept/exclude ruling.
-5. **N82 registration**: inline.rs bail-after-mutation lead (§5).
-6. **decode.rs silent-drop arms** (§5): policy before pinning.
-7. **emit_call this-reunification** (25 lines): verify-then-delete vs keep.
+1. **Metric definition**: RULED **A** — the CI coverage job number is
+   authoritative. Consequence: pandasm-layer coverage is closed by unit tests
+   alone (the corpus asm gates stay skipped under llvm-cov); mainline parse
+   paths need positive unit tests too, not just the arms.
+2. **Deletion batches**: RULED **approved** (~566 lines, per-batch proofs,
+   full-suite verification per batch).
+3. **NEVER-EMITTED deprecated.* arms**: RULED **test them** (part of the
+   "classes 1-4 all get tests" ruling — Builder-synthesized bytecode).
+4. **Residuals**: RULED **fault-injection where feasible, accept-and-document
+   the rest**.
+5. **N82**: RULED **register + red-first fix**.
+6. **decode.rs silent-drop arms**: RULED **convert to loud errors** (wild
+   impact check first: hap-file 156-gate + full corpus stay green).
+7. **Bail arms** (not originally a question): the "accept, don't pin"
+   recommendation was **OVERRULED** — they get tests too.
+
+**Overarching ruling**: "不是加泳道，是加测试" — real tests, no lane/instrument
+tricks.

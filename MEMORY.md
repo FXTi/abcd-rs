@@ -1814,3 +1814,18 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   batches, deprecated.* arms, bridge residuals, N82, decode policy).
   remote-test.sh now forwards CC/CXX (needed for the dabai coverage
   toolchain pin).
+- c-COV rulings (2026-10-03, maintainer): (1) The four big uncovered classes —
+  deprecated.* lift arms (315), pattern-matcher BAIL arms (~593; the
+  orchestrator's "accept, don't pin" recommendation OVERRULED — cover them),
+  mainline shape-variant arms (~1,080), error paths (~730) — ALL get tests.
+  "不是加泳道，是加测试" — no CI-lane/instrument tricks, real tests only.
+  (2) Metric = the CI coverage job number (option A): the pandasm asm corpus
+  gates stay skipped under llvm-cov, so pandasm-layer coverage is closed by
+  unit tests alone (mainline included). (3) Dead-code deletion batches
+  APPROVED (~566 lines, per-batch zero-caller proof, full-suite verification
+  per batch). (4) Residuals: fault-injection tests where feasible, the rest
+  accepted-and-documented. (5) inline.rs bail-after-mutation lead registered
+  as N82 and approved for red-first fixing. (6) decode.rs ~10 silent-drop
+  arms: convert to LOUD errors (behavior change — wild-corpus impact check
+  first: the hap-file 156-package gate + full corpus must stay green, proving
+  no real input fires them).
