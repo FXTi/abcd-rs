@@ -649,3 +649,333 @@ fn deprecated_copydataproperties_lifts_and_lowers_to_the_modern_opcode() {
         out_body.bytecodes
     );
 }
+
+// ─── c-COV A13: the N62 literal-dedup matcher matrix ────────────────────────
+//
+// `to_method_body`'s reverse literal-shape resolution
+// (`const_matches_literal_array`/`const_matches_literal_value`/
+// `typed_array_table_index`) mirrors the lift's forward resolution for
+// every `LiteralValue` kind. The corpus literal tables carry only a subset
+// (Integer/Double/String/Method/...), so the rare kinds — Integer8, Float,
+// BuiltinTypeIndex, EtsImplements, the method-kind tags, the typed-array
+// raw-offset payloads — plus the guard arms (non-array tree, depth>64,
+// out-of-range table index) are pinned here with hand-built const trees
+// matched against hand-extended decoded files.
+
+use abcd_file::{LiteralArray, LiteralArrayIdx};
+use abcd_ir::ConstId;
+use abcd_lower::LayoutResult;
+
+/// A lowered-result stand-in carrying one `createarraywithbuffer` per given
+/// shape const (entity operand raw value = the ConstId), so
+/// `to_method_body`'s reverse resolution runs on it.
+fn layout_result_with_shapes(shapes: &[ConstId]) -> LayoutResult {
+    let mut bytecodes: Vec<Bytecode> = shapes
+        .iter()
+        .map(|&cid| Bytecode::Createarraywithbuffer(Imm(0), EntityId(cid.0)))
+        .collect();
+    bytecodes.push(Bytecode::Returnundefined);
+    LayoutResult {
+        bytecodes,
+        try_blocks: Vec::new(),
+        num_regs: 0,
+        entity_traces: Default::default(),
+        ic_size: 0,
+    }
+}
+
+/// Resolve `shape` (a const of `module`) against `file`'s literal-array
+/// table through the real `to_method_body` channel.
+fn resolve_shape(
+    file: &File,
+    module: &Module,
+    shape: ConstId,
+) -> Result<abcd_file::MethodBody, LowerError> {
+    let result = layout_result_with_shapes(&[shape]);
+    to_method_body(module, FuncId::new(0), &result, file)
+}
+
+/// Push a literal array onto the file's table, registered at `offset`.
+fn push_array(file: &mut File, offset: u32, values: Vec<LiteralValue>) -> u32 {
+    let idx = file.literal_arrays.len() as u32;
+    file.literal_arrays.push(LiteralArray { values });
+    file.literal_array_offsets.insert(offset, idx);
+    idx
+}
+
+/// The resolved source offset of a shape operand in the produced body.
+fn resolved_offset(body: &abcd_file::MethodBody, shape: ConstId) -> u32 {
+    body.entity_offsets[&(EntityKind::LiteralarrayId, shape.0)]
+}
+
+/// Rare scalar tags: an 8-bit integer, a 32-bit float, and a builtin-type
+/// index all match a `Const::Number` by payload value.
+#[test]
+fn literal_dedup_matches_rare_scalar_kinds() {
+    let (mut file, _) = build_input_file();
+    push_array(
+        &mut file,
+        0x9500,
+        vec![
+            LiteralValue::Integer8(42),
+            LiteralValue::Float(2.5),
+            LiteralValue::BuiltinTypeIndex(7),
+        ],
+    );
+    let mut module = Module::new();
+    let shape = module.consts.push(Const::ArrayLiteral(vec![
+        Const::number(42.0),
+        Const::number(2.5),
+        Const::number(7.0),
+    ]));
+    let body = resolve_shape(&file, &module, shape)
+        .expect("Integer8/Float/BuiltinTypeIndex payloads match by value");
+    assert_eq!(resolved_offset(&body, shape), 0x9500);
+
+    // A payload mismatch (43 != 42) does NOT match — nothing resolves.
+    let mut module = Module::new();
+    let wrong = module.consts.push(Const::ArrayLiteral(vec![
+        Const::number(43.0),
+        Const::number(2.5),
+        Const::number(7.0),
+    ]));
+    let err = resolve_shape(&file, &module, wrong)
+        .expect_err("a mismatched Integer8 payload must not resolve");
+    assert!(
+        matches!(
+            err,
+            LowerError::UntraceableEntity {
+                kind: EntityKind::LiteralarrayId,
+                raw,
+                ..
+            } if raw == wrong.0
+        ),
+        "expected UntraceableEntity, got {err:?}"
+    );
+}
+
+/// An `EtsImplements` string entry matches a `Const::String` by content
+/// (same arm as the plain `String` tag).
+#[test]
+fn literal_dedup_matches_ets_implements_by_content() {
+    let (mut file, _) = build_input_file();
+    let sid = file
+        .strings
+        .get("payload")
+        .expect("the input file carries the string \"payload\"");
+    push_array(&mut file, 0x9510, vec![LiteralValue::EtsImplements(sid)]);
+
+    let mut module = Module::new();
+    let sym = module.sym.intern("payload");
+    let shape = module
+        .consts
+        .push(Const::ArrayLiteral(vec![Const::String(sym)]));
+    let body = resolve_shape(&file, &module, shape)
+        .expect("EtsImplements matches a string const by content");
+    assert_eq!(resolved_offset(&body, shape), 0x9510);
+
+    // Different content must not match.
+    let mut module = Module::new();
+    let other = module.sym.intern("not-payload");
+    let wrong = module
+        .consts
+        .push(Const::ArrayLiteral(vec![Const::String(other)]));
+    let err = resolve_shape(&file, &module, wrong).expect_err("different content must not resolve");
+    assert!(
+        matches!(err, LowerError::UntraceableEntity { .. }),
+        "expected UntraceableEntity, got {err:?}"
+    );
+}
+
+/// The rare method-kind tags (async-generator / getter / setter) match a
+/// `Const::MethodRef` by function-table position, like the plain `Method`
+/// and `GeneratorMethod` tags do. Each kind gets its own file: the matcher
+/// takes the SMALLEST matching table index, and the tags are
+/// indistinguishable from each other by content.
+#[test]
+fn literal_dedup_matches_rare_method_kinds() {
+    for (i, make) in [
+        LiteralValue::AsyncGeneratorMethod as fn(u32) -> LiteralValue,
+        LiteralValue::Getter,
+        LiteralValue::Setter,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (mut file, entities) = build_input_file();
+        let target_index = file
+            .all_methods()
+            .position(|(_, m)| m.offset == entities.target_offset)
+            .expect("target is in the function table") as u32;
+        let offset = 0x9520 + 0x10 * i as u32;
+        push_array(&mut file, offset, vec![make(entities.target_offset)]);
+
+        let mut module = Module::new();
+        let shape = module
+            .consts
+            .push(Const::ArrayLiteral(vec![Const::MethodRef(FuncId::new(
+                target_index,
+            ))]));
+        let body = resolve_shape(&file, &module, shape)
+            .expect("async-generator/getter/setter tags resolve by table position");
+        assert_eq!(resolved_offset(&body, shape), offset);
+    }
+}
+
+/// The typed-array/raw-buffer payload family (`LiteralBufferIndex` and
+/// `ArrayU1`..`ArrayString`, N52): each payload is a raw file offset that
+/// resolves to a table index through the offset map (with a direct-index
+/// fallback for hand-built models), and the nested array then matches by
+/// content.
+#[test]
+fn literal_dedup_matches_the_typed_array_family() {
+    let (mut file, _) = build_input_file();
+    // The shared nested match target: [7].
+    let inner = push_array(&mut file, 0x9600, vec![LiteralValue::Integer(7)]);
+    // Thirteen raw payloads: twelve resolve through the offset map, the
+    // thirteenth (ArrayString) uses the direct-index fallback — its raw
+    // value IS the target's table index and is absent from the map.
+    let mut raws = Vec::new();
+    for i in 0..12u32 {
+        raws.push(0x9700 + i * 0x10);
+    }
+    let outer_values = vec![
+        LiteralValue::LiteralBufferIndex(LiteralArrayIdx(raws[0])),
+        LiteralValue::ArrayU1(LiteralArrayIdx(raws[1])),
+        LiteralValue::ArrayU8(LiteralArrayIdx(raws[2])),
+        LiteralValue::ArrayI8(LiteralArrayIdx(raws[3])),
+        LiteralValue::ArrayU16(LiteralArrayIdx(raws[4])),
+        LiteralValue::ArrayI16(LiteralArrayIdx(raws[5])),
+        LiteralValue::ArrayU32(LiteralArrayIdx(raws[6])),
+        LiteralValue::ArrayI32(LiteralArrayIdx(raws[7])),
+        LiteralValue::ArrayU64(LiteralArrayIdx(raws[8])),
+        LiteralValue::ArrayI64(LiteralArrayIdx(raws[9])),
+        LiteralValue::ArrayF32(LiteralArrayIdx(raws[10])),
+        LiteralValue::ArrayF64(LiteralArrayIdx(raws[11])),
+        LiteralValue::ArrayString(LiteralArrayIdx(inner)),
+    ];
+    for &raw in &raws {
+        file.literal_array_offsets.insert(raw, inner);
+    }
+    let outer = push_array(&mut file, 0x9800, outer_values);
+    assert_eq!(outer, 2, "the input file starts with one literal array");
+
+    let inner_tree = Const::ArrayLiteral(vec![Const::number(7.0)]);
+    let mut module = Module::new();
+    let shape = module.consts.push(Const::ArrayLiteral(
+        (0..13).map(|_| inner_tree.clone()).collect(),
+    ));
+    let body = resolve_shape(&file, &module, shape)
+        .expect("every typed-array payload kind resolves to the nested target");
+    assert_eq!(resolved_offset(&body, shape), 0x9800);
+}
+
+/// A typed-array payload whose raw offset is neither in the offset map nor
+/// a valid direct index resolves to NOTHING — the shape is untraceable.
+#[test]
+fn literal_dedup_typed_array_unknown_offset_is_untraceable() {
+    let (mut file, _) = build_input_file();
+    push_array(
+        &mut file,
+        0x9810,
+        vec![LiteralValue::ArrayU8(LiteralArrayIdx(0xDEAD))],
+    );
+    let mut module = Module::new();
+    let shape = module
+        .consts
+        .push(Const::ArrayLiteral(vec![Const::ArrayLiteral(vec![])]));
+    let err = resolve_shape(&file, &module, shape)
+        .expect_err("an unmappable typed-array payload must not resolve");
+    assert!(
+        matches!(
+            err,
+            LowerError::UntraceableEntity {
+                kind: EntityKind::LiteralarrayId,
+                ..
+            }
+        ),
+        "expected UntraceableEntity, got {err:?}"
+    );
+}
+
+/// The depth guard: literal trees nested deeper than 64 levels never match
+/// (the forward lift resolution has the same guard) — the shape is
+/// untraceable even though every intermediate level pairs up.
+#[test]
+fn literal_dedup_depth_guard_beyond_64_levels() {
+    let (mut file, _) = build_input_file();
+    // Chain: table[1] = [LiteralArray(2)], table[2] = [LiteralArray(3)], …
+    // — 65 links deep; index 66 never exists (the guard fires first).
+    for i in 1..=65u32 {
+        let idx = file.literal_arrays.len() as u32;
+        assert_eq!(idx, i);
+        file.literal_arrays.push(LiteralArray {
+            values: vec![LiteralValue::LiteralArray(LiteralArrayIdx(i + 1))],
+        });
+    }
+    // The matching const tree, 65 levels of nesting.
+    let mut tree = Const::ArrayLiteral(vec![]);
+    for _ in 0..65 {
+        tree = Const::ArrayLiteral(vec![tree]);
+    }
+    let mut module = Module::new();
+    let shape = module.consts.push(tree);
+    let err =
+        resolve_shape(&file, &module, shape).expect_err("a 65-deep nesting hits the depth guard");
+    assert!(
+        matches!(
+            err,
+            LowerError::UntraceableEntity {
+                kind: EntityKind::LiteralarrayId,
+                ..
+            }
+        ),
+        "expected UntraceableEntity, got {err:?}"
+    );
+}
+
+/// A NON-array const tree matched against the literal table fails
+/// immediately (the guard before the element walk), and a nested
+/// `LiteralArray` payload past the end of the table fails the lookup.
+#[test]
+fn literal_dedup_rejects_non_array_trees_and_oob_nested_indices() {
+    let (mut file, _) = build_input_file();
+    // (a) the shape const is not an ArrayLiteral at all.
+    let mut module = Module::new();
+    let null_shape = module.consts.push(Const::Null);
+    let err = resolve_shape(&file, &module, null_shape)
+        .expect_err("a non-array tree never matches a literal array");
+    assert!(
+        matches!(
+            err,
+            LowerError::UntraceableEntity {
+                kind: EntityKind::LiteralarrayId,
+                ..
+            }
+        ),
+        "(a) expected UntraceableEntity, got {err:?}"
+    );
+
+    // (b) the nested payload index is out of the table's range.
+    push_array(
+        &mut file,
+        0x9820,
+        vec![LiteralValue::LiteralArray(LiteralArrayIdx(999))],
+    );
+    let mut module = Module::new();
+    let shape = module
+        .consts
+        .push(Const::ArrayLiteral(vec![Const::ArrayLiteral(vec![])]));
+    let err = resolve_shape(&file, &module, shape)
+        .expect_err("an out-of-range nested index must not resolve");
+    assert!(
+        matches!(
+            err,
+            LowerError::UntraceableEntity {
+                kind: EntityKind::LiteralarrayId,
+                ..
+            }
+        ),
+        "(b) expected UntraceableEntity, got {err:?}"
+    );
+}

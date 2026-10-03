@@ -410,6 +410,21 @@ impl Machine {
                     self.acc = i64::from(self.acc == self.reg(r.0));
                     pc += 1;
                 }
+                // `noteq imm, v0` — acc = (acc != v0) (ic slot ignored).
+                Bytecode::Noteq(_, r) => {
+                    self.acc = i64::from(self.acc != self.reg(r.0));
+                    pc += 1;
+                }
+                // `stricteq`/`strictnoteq` — the i64 machine has no tagged
+                // values, so strict comparison coincides with ==/!=.
+                Bytecode::Stricteq(_, r) => {
+                    self.acc = i64::from(self.acc == self.reg(r.0));
+                    pc += 1;
+                }
+                Bytecode::Strictnoteq(_, r) => {
+                    self.acc = i64::from(self.acc != self.reg(r.0));
+                    pc += 1;
+                }
                 // `istrue` — acc = ToBoolean(acc) (modeled as != 0).
                 Bytecode::Istrue => {
                     self.acc = i64::from(self.acc != 0);
@@ -428,6 +443,31 @@ impl Machine {
                 // `jeq v0, label` — jump if acc == v0.
                 Bytecode::Jeq(r, label) => {
                     if self.acc == self.reg(r.0) {
+                        pc = label.0 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+                // `jne v0, label` — jump if acc != v0.
+                Bytecode::Jne(r, label) => {
+                    if self.acc != self.reg(r.0) {
+                        pc = label.0 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+                // `jstricteq v0, label` — the i64 machine has no tagged
+                // values, so strict equality coincides with `==`.
+                Bytecode::Jstricteq(r, label) => {
+                    if self.acc == self.reg(r.0) {
+                        pc = label.0 as usize;
+                    } else {
+                        pc += 1;
+                    }
+                }
+                // `jnstricteq v0, label` — negation of `jstricteq`.
+                Bytecode::Jnstricteq(r, label) => {
+                    if self.acc != self.reg(r.0) {
                         pc = label.0 as usize;
                     } else {
                         pc += 1;
