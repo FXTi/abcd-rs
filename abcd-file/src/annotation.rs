@@ -110,3 +110,67 @@ pub enum AnnotationValue {
         values: Vec<AnnotationValue>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `from_u8` covers every vendored `MethodHandleType` constant and
+    /// rejects unknown bytes; `is_field_op` splits at GET_INSTANCE.
+    #[test]
+    fn method_handle_type_table() {
+        let cases: [(u8, MethodHandleType, bool); 9] = [
+            (
+                sys::MethodHandleType_PUT_STATIC,
+                MethodHandleType::PutStatic,
+                true,
+            ),
+            (
+                sys::MethodHandleType_GET_STATIC,
+                MethodHandleType::GetStatic,
+                true,
+            ),
+            (
+                sys::MethodHandleType_PUT_INSTANCE,
+                MethodHandleType::PutInstance,
+                true,
+            ),
+            (
+                sys::MethodHandleType_GET_INSTANCE,
+                MethodHandleType::GetInstance,
+                true,
+            ),
+            (
+                sys::MethodHandleType_INVOKE_STATIC,
+                MethodHandleType::InvokeStatic,
+                false,
+            ),
+            (
+                sys::MethodHandleType_INVOKE_INSTANCE,
+                MethodHandleType::InvokeInstance,
+                false,
+            ),
+            (
+                sys::MethodHandleType_INVOKE_CONSTRUCTOR,
+                MethodHandleType::InvokeConstructor,
+                false,
+            ),
+            (
+                sys::MethodHandleType_INVOKE_DIRECT,
+                MethodHandleType::InvokeDirect,
+                false,
+            ),
+            (
+                sys::MethodHandleType_INVOKE_INTERFACE,
+                MethodHandleType::InvokeInterface,
+                false,
+            ),
+        ];
+        for (raw, expect, field_op) in cases {
+            assert_eq!(MethodHandleType::from_u8(raw), Some(expect), "raw {raw}");
+            assert_eq!(expect.is_field_op(), field_op, "raw {raw}");
+        }
+        assert_eq!(MethodHandleType::from_u8(9), None);
+        assert_eq!(MethodHandleType::from_u8(u8::MAX), None);
+    }
+}

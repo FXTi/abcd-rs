@@ -264,4 +264,122 @@ mod tests {
         assert_eq!(read_string(file.raw, data.len() as u32), None);
         assert_eq!(read_string(file.raw, ABSENT), None);
     }
+
+    /// Build a file whose foreign-class string item carries the MUTF-8
+    /// bytes of a lone surrogate (`ED A0 B4` = U+D834), via the N72
+    /// raw-strings side channel: Rust strings cannot hold the surrogate,
+    /// so the builder key is the lossy form (three U+FFFD per surrogate).
+    fn lossy_string_file() -> (Vec<u8>, u32) {
+        const LOSSY: &str = "\u{FFFD}\u{FFFD}\u{FFFD}";
+        const RAW: [u8; 3] = [0xED, 0xA0, 0xB4];
+        let mut builder = crate::Builder::new();
+        builder.set_raw_strings(
+            [(LOSSY.to_string(), Box::from(&RAW[..]))]
+                .into_iter()
+                .collect(),
+        );
+        builder.add_foreign_class(LOSSY);
+        let data = builder.finalize().unwrap();
+        let offset = {
+            let file = AbcFile::open(&data).unwrap();
+            let offset = unsafe { sys::abc_file_class_offset(file.raw, 0) };
+            assert_ne!(offset, ABSENT);
+            // Sanity: the string is lossy (no lossless form) and reads as
+            // the lossy replacement text.
+            assert_eq!(read_string(file.raw, offset), Some(LOSSY.to_string()));
+            offset
+        };
+        (data, offset)
+    }
+
+    /// The same lossy string interned twice with the same raw form reuses
+    /// the plain identity (Case::Duplicate); a pre-seeded DIFFERENT raw
+    /// form disambiguates (Case::Collision success path).
+    #[test]
+    fn intern_string_lossy_duplicate_and_collision() {
+        const LOSSY: &str = "\u{FFFD}\u{FFFD}\u{FFFD}";
+        const RAW: [u8; 3] = [0xED, 0xA0, 0xB4];
+        const OTHER_RAW: [u8; 3] = [0xED, 0xB4, 0x86]; // U+DF06, same lossy form
+        let (data, offset) = lossy_string_file();
+        let file = AbcFile::open(&data).unwrap();
+
+        let mut strings = crate::StringPool::default();
+        let mut raw_map = std::collections::HashMap::new();
+        let first = intern_string(file.raw, offset, &mut strings, &mut raw_map)
+            .unwrap()
+            .expect("string present");
+        assert_eq!(strings.resolve(first), Some(LOSSY));
+        // Same raw form again: the plain identity is reused.
+        let dup = intern_string(file.raw, offset, &mut strings, &mut raw_map)
+            .unwrap()
+            .expect("string present");
+        assert_eq!(dup, first);
+
+        // A different raw form for the same lossy content (pre-seeded)
+        // disambiguates: the identity gains the sentinel + hex(raw) suffix.
+        let mut strings = crate::StringPool::default();
+        let mut raw_map: std::collections::HashMap<String, Box<[u8]>> =
+            [(LOSSY.to_string(), Box::from(&OTHER_RAW[..]))]
+                .into_iter()
+                .collect();
+        let sid = intern_string(file.raw, offset, &mut strings, &mut raw_map)
+            .unwrap()
+            .expect("string present");
+        let expected = format!("{LOSSY}{RAW_ID_SENTINEL}eda0b4");
+        assert_eq!(
+            strings.resolve(sid),
+            Some(expected.as_str()),
+            "the colliding raw form must get a disambiguated identity"
+        );
+        assert_eq!(
+            raw_map.get(expected.as_str()).map(|b| b.as_ref()),
+            Some(&RAW[..]),
+            "the disambiguated identity records the new raw form"
+        );
+    }
+
+    /// The two loud collision guards: a disambiguated identity already
+    /// recorded with DIFFERENT bytes (hash-level collision), and a genuine
+    /// file string carrying the disambiguated identity.
+    #[test]
+    fn intern_string_collision_guards_are_loud() {
+        const LOSSY: &str = "\u{FFFD}\u{FFFD}\u{FFFD}";
+        const RAW: [u8; 3] = [0xED, 0xA0, 0xB4];
+        const OTHER_RAW: [u8; 3] = [0xED, 0xB4, 0x86];
+        let (data, offset) = lossy_string_file();
+        let file = AbcFile::open(&data).unwrap();
+        let disambiguated = format!(
+            "{LOSSY}{RAW_ID_SENTINEL}{}",
+            RAW.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+
+        // Disambiguated identity already recorded with different bytes.
+        let mut strings = crate::StringPool::default();
+        let mut raw_map: std::collections::HashMap<String, Box<[u8]>> = [
+            (LOSSY.to_string(), Box::from(&OTHER_RAW[..])),
+            (disambiguated.clone(), Box::from(&[0xED, 0xB4, 0x87][..])),
+        ]
+        .into_iter()
+        .collect();
+        let err = intern_string(file.raw, offset, &mut strings, &mut raw_map)
+            .expect_err("identity recorded with different bytes must fail");
+        assert!(
+            matches!(err, Error::Malformed { field: "string", ref context } if context.contains("disambiguated lossy-string identity collision")),
+            "unexpected error: {err:?}"
+        );
+
+        // A genuine pool string already carrying the disambiguated identity.
+        let mut strings = crate::StringPool::default();
+        strings.get_or_intern(&disambiguated);
+        let mut raw_map: std::collections::HashMap<String, Box<[u8]>> =
+            [(LOSSY.to_string(), Box::from(&OTHER_RAW[..]))]
+                .into_iter()
+                .collect();
+        let err = intern_string(file.raw, offset, &mut strings, &mut raw_map)
+            .expect_err("genuine identity collision must fail");
+        assert!(
+            matches!(err, Error::Malformed { field: "string", ref context } if context.contains("genuine string collides")),
+            "unexpected error: {err:?}"
+        );
+    }
 }

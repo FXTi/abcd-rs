@@ -281,6 +281,10 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         for bytecode in &body.bytecodes {
             for (kind, id) in bytecode.entity_operands() {
                 use abcd_isa::EntityKind;
+                // Vacuous today: EntityKind is generated with exactly these
+                // three variants (abcd-isa-sys templates/bytecode.rs.erb
+                // collects every `id?` operand role). Future-proofing
+                // against ISA-template growth, not a reachable filter.
                 if !matches!(
                     kind,
                     EntityKind::StringId | EntityKind::MethodId | EntityKind::LiteralarrayId
@@ -324,6 +328,14 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                             offset
                         }
                         EntityKind::LiteralarrayId => {
+                            // Unreachable by construction: no legacy opcode
+                            // decodes to a variant with a LiteralarrayId
+                            // entity operand (abcd-isa/src/legacy_table.rs
+                            // maps the create*withbuffer family to the
+                            // Imm-only Deprecated* variants); legacy
+                            // literal-array references arrive through the
+                            // blob pass below instead. Kept for symmetry
+                            // with the modern arm.
                             let Some((count, table_off)) = legacy_lit_table else {
                                 return Err(invalid());
                             };
@@ -2340,5 +2352,92 @@ mod tests {
             ),
             "expected Malformed/annotation array data, got: {result:?}"
         );
+    }
+
+    /// Arm: a literal array as an annotation ARRAY element ('#' inside the
+    /// array-element converter). Upstream cannot represent arrays of
+    /// literal arrays (pandasm `GetArrayTypeAsChar` has no '#' case), so no
+    /// producer emits this and the public `decode` path never routes '#'
+    /// here (the element dispatch treats '#' as the SCALAR literal-array
+    /// tag). Drive the converter directly over a crafted payload.
+    #[test]
+    fn literal_array_as_array_element_decodes() {
+        let mut b = crate::Builder::new();
+        b.set_api(12, "beta1");
+        let cls = b.add_global_class();
+        b.class_set_source_lang(cls, crate::types::SourceLang::EcmaScript);
+        // An array element whose payload is `[uleb 1][u32 string_off]` —
+        // the exact layout the '#' arm reads.
+        let s = b.add_string("probe_s");
+        let name = b.add_string("e");
+        let ann = b.create_annotation_ex(
+            cls,
+            &[crate::AnnotationElemDefEx {
+                name,
+                tag: b'V', // ArrayString
+                value: crate::AnnotationElemValue::EntityArray(vec![s.as_raw()]),
+            }],
+        );
+        b.class_add_runtime_annotation(cls, ann);
+        let proto = b.create_proto(crate::types::Type::Tagged, &[]);
+        let m = b.class_add_method(
+            cls,
+            "func_main_0",
+            proto,
+            crate::types::AccessFlags::PUBLIC,
+            &[0x65],
+            1,
+            0,
+        );
+        b.method_set_source_lang(m, crate::types::SourceLang::EcmaScript);
+        let la = b.add_literal_array("la");
+        b.literal_array_add_integer(la, 7);
+        let mut data = b.finalize().expect("finalize");
+
+        // The literal array's source offset, learned through a decode.
+        let file = decode(&data).expect("decode");
+        let la_off = file
+            .literal_array_offsets
+            .iter()
+            .find_map(|(&off, &idx)| (idx == 0).then_some(off))
+            .expect("literal array offset");
+
+        // Find the annotation array payload: the string item offset of
+        // "probe_s" preceded by the uleb count byte 0x01.
+        let mut pat = vec![(7u8 << 1) | 1]; // "probe_s" is 7 ASCII chars
+        pat.extend_from_slice(b"probe_s");
+        pat.push(0);
+        let str_off = data
+            .windows(pat.len())
+            .position(|w| w == pat.as_slice())
+            .expect("string item") as u32;
+        let payload_pos = data
+            .windows(5)
+            .position(|w| w[0] == 1 && w[1..5] == str_off.to_le_bytes())
+            .expect("array payload") as u32;
+
+        // Rewrite the element to hold the literal array's offset.
+        data[payload_pos as usize + 1..payload_pos as usize + 5]
+            .copy_from_slice(&la_off.to_le_bytes());
+
+        let abc = crate::file::AbcFile::open(&data).expect("open");
+        let mut strings = StringPool::new();
+        let entity_map = HashMap::new();
+        let result = decode_annotation_array_elements(
+            abc.raw,
+            b'#',
+            1,
+            payload_pos,
+            &entity_map,
+            &mut strings,
+        )
+        .expect("literal-array element must decode");
+        assert_eq!(result.len(), 1);
+        match &result[0] {
+            AnnotationValue::LiteralArray(values) => {
+                assert_eq!(values, &vec![crate::LiteralValue::Integer(7)]);
+            }
+            other => panic!("expected LiteralArray element, got {other:?}"),
+        }
     }
 }
