@@ -1500,6 +1500,117 @@ fn two_calls_in_one_block_both_inline() {
     verify_ok(&module);
 }
 
+// ─── N82: block-terminal call ────────────────────────────────────────────────
+
+/// N82 regression: an inlinable call that is the LAST instruction of
+/// its block (block-terminal). v0.2 models control flow via explicit
+/// edges, not terminator placement, so the IR can carry the shape even
+/// though the verifier's `MissingTerminator` rule keeps it out of
+/// verified modules — the inliner's library rule ("a site that cannot
+/// be soundly rewritten is recorded in the skip histogram, never
+/// half-spliced") must hold on such input too.
+///
+/// Pre-fix, `inline_site` steps A–E mutated the module (callee cloned
+/// into the arena, the call block truncated and re-terminated with a
+/// branch into the clone, an EMPTY continuation block created) before
+/// step F's empty-continuation bail recorded a `callee-no-body` skip —
+/// leaving a half-spliced module behind a recorded skip: the call was
+/// GONE from the call block, the call block branched into a callee
+/// clone no function owned, and the old Normal successor's pred edge
+/// had no matching terminator.
+///
+/// The fix rejects the shape in ELIGIBILITY, before any mutation. This
+/// test pins: the skip is recorded under its own reason, and the module
+/// is byte-for-byte untouched (same block lists, arena lengths, and the
+/// call still the last instruction of its block).
+#[test]
+fn block_terminal_call_is_skipped_before_any_mutation() {
+    let mut module = Module::new();
+    let g = build_add1_callee(&mut module);
+    let f = create_static(&mut module, "f");
+    let entry;
+    let tail;
+    {
+        let mut b = V2Builder::new(&mut module, f);
+        entry = b.entry();
+        tail = b.create_block();
+        // The Normal edge out of the call block exists independently of
+        // instruction placement (explicit-edge model) — the call below
+        // is nevertheless the block's LAST instruction.
+        b.add_predecessor(tail, entry);
+        let a = b.emit_number(40.0);
+        let (_c, _r) = emit_closure_call(&mut b, g, None, vec![a], CallKind::Dynamic);
+        // NO terminator emission: the call stays block-terminal.
+        b.set_insert_block(tail);
+        let two = b.emit_number(2.0);
+        b.emit_void(Op::Return { value: Some(two) });
+    }
+
+    let entry_insts_before = module.blocks[entry.index()].insts.clone();
+    let f_blocks_before = module.functions[f.index()].blocks.clone();
+    let (n_blocks, n_insts, n_values) = (
+        module.blocks.len(),
+        module.insts.len(),
+        module.values.len(),
+    );
+
+    let report = inline_module(&mut module, &default_policy());
+
+    // Forensics (visible with --nocapture): the recorded reason and the
+    // post-run module state, so a regression shows its corruption.
+    let reasons: Vec<&str> = report.skips.keys().map(|r| r.label()).collect();
+    eprintln!("N82 probe: sites_inlined={} reasons={reasons:?}", report.sites_inlined);
+    eprintln!(
+        "N82 probe: entry insts before={entry_insts_before:?} after={:?}",
+        module.blocks[entry.index()].insts
+    );
+    eprintln!(
+        "N82 probe: blocks {} -> {}, insts {} -> {}, values {} -> {}",
+        n_blocks,
+        module.blocks.len(),
+        n_insts,
+        module.insts.len(),
+        n_values,
+        module.values.len()
+    );
+    eprintln!(
+        "N82 probe: post-run verify errors: {:?}",
+        verify_module(&module).errors
+    );
+
+    assert_eq!(report.sites_inlined, 0, "the site must not inline: {report:?}");
+    // The skip is recorded under its own reason (pre-fix the late
+    // step-F bail mis-recorded it as "callee-no-body").
+    assert_eq!(reasons, ["block-terminal-call"], "{report:?}");
+    // The module is UNTOUCHED: the skip happened before any splice.
+    assert_eq!(
+        module.blocks[entry.index()].insts,
+        entry_insts_before,
+        "the call block kept its tail (pre-fix it was truncated and \
+         re-terminated with a branch into the orphaned callee clone)"
+    );
+    assert_eq!(
+        module.functions[f.index()].blocks,
+        f_blocks_before,
+        "the caller's block list is unchanged"
+    );
+    assert_eq!(
+        module.blocks.len(),
+        n_blocks,
+        "no clone/continuation blocks leaked into the arena"
+    );
+    assert_eq!(
+        module.insts.len(),
+        n_insts,
+        "no cloned/glue instructions leaked into the arena"
+    );
+    assert_eq!(
+        module.values.len(),
+        n_values,
+        "no fresh clone values leaked into the arena"
+    );
+}
+
 // ─── Loc fidelity (design §7) ────────────────────────────────────────────────
 
 /// Cloned instructions keep their source locs; splice glue carries

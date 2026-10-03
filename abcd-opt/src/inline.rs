@@ -106,6 +106,14 @@
 //! - `this` is bindable: trivially always — `this: Some(v)` binds the
 //!   receiver; `this: None` binds exactly `undefined` (vendored
 //!   `setVregs`). `Direct` with `this: None` is malformed and skipped.
+//! - The call is not the LAST instruction of its block (block-terminal
+//!   call, N82 — v0.2 models control flow via explicit edges, not
+//!   terminator placement, so the shape can occur in unverified input).
+//!   The splice moves the post-call tail into the continuation block,
+//!   whose last instruction must be the moved terminator owning the
+//!   call block's old Normal successor edges; a block-terminal call
+//!   would leave the continuation EMPTY and those edges unowned. This
+//!   is refused in eligibility, BEFORE any mutation.
 //! - Size caps: the callee has at most [`InlinePolicy::max_callee_insts`]
 //!   instructions and the caller's per-function inlined-instruction
 //!   budget ([`InlinePolicy::max_inlined_insts_per_caller`]) is not
@@ -224,6 +232,17 @@ pub enum SkipReason {
     /// A region protecting the call block also uses it as a catch
     /// handler (handler identity would be disturbed).
     CallBlockIsHandler,
+    /// The call is the LAST instruction of its block (block-terminal —
+    /// v0.2 models control flow via explicit edges, not terminator
+    /// placement, so the IR can carry the shape even though the
+    /// verifier's `MissingTerminator` rule excludes it from verified
+    /// modules). The splice moves the post-call tail into the
+    /// continuation block, whose last instruction must be the moved
+    /// terminator owning the call block's old Normal successor edges;
+    /// a block-terminal call would leave the continuation EMPTY and
+    /// those edges unowned (N82: the step-F bail for this then fired
+    /// AFTER steps A–E had already half-spliced the module).
+    BlockTerminalCall,
 }
 
 impl SkipReason {
@@ -249,6 +268,7 @@ impl SkipReason {
             SkipReason::DirectWithoutThis => "direct-without-this",
             SkipReason::CallTypeUnknown => "call-type-unknown",
             SkipReason::CallBlockIsHandler => "call-block-is-handler",
+            SkipReason::BlockTerminalCall => "block-terminal-call",
         }
     }
 }
@@ -342,7 +362,7 @@ fn inline_func(
         let (callee_val, this, args, kind) = (*callee_val, *this, args.clone(), *kind);
         let call_block = inst.block;
 
-        let reason = match eligibility(module, policy, caller, call_block, callee_val, this, kind) {
+        let reason = match eligibility(module, policy, caller, call_block, iid, callee_val, this, kind) {
             Ok(callee) => {
                 let size = callee_inst_count(module, callee);
                 if size > budget {
@@ -530,12 +550,16 @@ fn slot_roles(call_type: CallType, param_count: usize) -> Option<Vec<SlotRole>> 
 
 /// All eligibility checks for one call site. `Ok(callee)` means the
 /// site is inlinable; `Err(reason)` is the skip-histogram entry.
+/// Every check here runs BEFORE any mutation: a site that is refused
+/// leaves the module untouched (the library rule — a recorded skip is
+/// never half-spliced, N82).
 #[allow(clippy::too_many_arguments)]
 fn eligibility(
     module: &Module,
     policy: &InlinePolicy,
     caller: FuncId,
     call_block: BlockId,
+    call_iid: InstId,
     callee_val: ValueId,
     this: Option<ValueId>,
     kind: CallKind,
@@ -663,6 +687,27 @@ fn eligibility(
                 return Err(SkipReason::CallBlockIsHandler);
             }
         }
+    }
+
+    // Block-terminal call (N82): the call is the LAST instruction of
+    // its block. The splice (inline_site step E) moves the post-call
+    // tail into the continuation block, whose last instruction must be
+    // the moved terminator that owns the call block's old Normal
+    // successor edges; a block-terminal call would leave the
+    // continuation EMPTY and those edges unowned. Refuse it HERE,
+    // before any mutation — pre-fix this shape reached step F's
+    // empty-continuation bail AFTER steps A–E had already truncated
+    // the call block, spliced a branch into the orphaned callee
+    // clone, and leaked the clone/continuation blocks into the arena.
+    // (v0.2 models control flow via explicit edges, not terminator
+    // placement, so the IR can carry the shape even though the
+    // verifier's `MissingTerminator` rule excludes it from verified
+    // modules — hence no corpus occurrence.)
+    if module
+        .block(call_block)
+        .is_some_and(|b| b.insts.last() == Some(&call_iid))
+    {
+        return Err(SkipReason::BlockTerminalCall);
     }
 
     Ok(callee)
@@ -848,7 +893,24 @@ enum NewTargetBinding {
 /// eligibility-passing input none can fire; were one ever to fire, the
 /// early return would leave only unreferenced arena appends (blocks/
 /// insts/values owned by no function — verifier-neutral), never a
-/// half-rewritten CFG.
+/// half-rewritten CFG. Post-N82 reachability of the late checks:
+///
+/// - the step-E call-block lookup is unreachable: eligibility re-read
+///   the same block (the block arena is append-only), and an invalid
+///   `call_block` already bailed above at the `call_pos` lookup,
+///   before any mutation;
+/// - the step-F `cont` lookups (missing block / EMPTY continuation)
+///   are unreachable BY CONSTRUCTION: `cont` is pushed into the arena
+///   by step E itself, and eligibility's [`SkipReason::BlockTerminalCall`]
+///   check guarantees the call is not its block's last instruction, so
+///   the moved tail `post` is non-empty;
+/// - the step-F successor `if let Some(...)` None arm can still fire
+///   on MALFORMED caller input (a post-call terminator targeting a
+///   block outside the arena — eligibility checks the CALLEE's CFG
+///   integrity, not the caller's). It is not a bail: the splice
+///   completes, and a nonexistent successor has no preds/phis to
+///   re-key, so skipping the re-key introduces no new corruption (the
+///   dangling target predates the splice).
 #[allow(clippy::too_many_arguments)]
 fn inline_site(
     module: &mut Module,
