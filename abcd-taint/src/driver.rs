@@ -107,6 +107,14 @@ pub struct TaintConfig {
     /// is the PTA's own). Default 2; 0/1 stay selectable for A/B/C
     /// measurement in the probe runner.
     pub alias_rung: u8,
+    /// Override for the rung-2 PTA's propagation-step budget
+    /// ([`abcd_analysis::dataflow::pta::PtaConfig::step_budget`]);
+    /// `None` (the default) uses the engine default. A budget cut
+    /// degrades the run to the rung-1 pipeline, recorded loudly in
+    /// [`TaintReport::alias_rung_used`] — the knob exists so operators
+    /// facing a pathological module (and tests pinning the degrade arm)
+    /// can exercise it without a 25M-step module.
+    pub pta_step_budget: Option<usize>,
 }
 
 impl Default for TaintConfig {
@@ -121,6 +129,7 @@ impl Default for TaintConfig {
             native_identity: true,
             max_field_chain: DEFAULT_MAX_FIELD_CHAIN,
             alias_rung: 2,
+            pta_step_budget: None,
         }
     }
 }
@@ -210,8 +219,13 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     let (refined, oracle, rung_used) = match config.alias_rung {
         0 => (None, Oracle::Rung0(Rung0AliasOracle::new(module)), 0u8),
         2 => {
-            let outcome =
-                abcd_analysis::dataflow::pta::analyze(module, &base_graph, &PtaConfig::default());
+            let pta_config = PtaConfig {
+                step_budget: config
+                    .pta_step_budget
+                    .unwrap_or(abcd_analysis::dataflow::pta::DEFAULT_STEP_BUDGET),
+                ..PtaConfig::default()
+            };
+            let outcome = abcd_analysis::dataflow::pta::analyze(module, &base_graph, &pta_config);
             if outcome.stats().capped {
                 let (g, o, u) = rung1_pipeline();
                 (Some(g), o, u)

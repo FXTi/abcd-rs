@@ -110,6 +110,17 @@ pub fn add_func_named(m: &mut Module, name: &str) -> FuncId {
     id
 }
 
+/// A fresh external (bodyless) function record: no blocks at all.
+pub fn add_external_func(m: &mut Module, name: &str) -> FuncId {
+    let name = m.sym.intern(name);
+    let id = FuncId::new(m.functions.len() as u32);
+    let mut fd = FunctionData::new(ClassId::new(0), name, FunctionKind::Function);
+    fd.is_external = true;
+    m.functions.push(fd);
+    m.classes[0].methods.push(id);
+    id
+}
+
 /// A fresh empty block appended to `f`.
 pub fn add_block(m: &mut Module, f: FuncId) -> BlockId {
     let id = BlockId::new(m.blocks.len() as u32);
@@ -281,4 +292,36 @@ pub fn try_get_global(m: &mut Module, b: BlockId, name: &str) -> ValueId {
 /// The ConstId of a pushed constant (for odd test needs).
 pub fn push_const(m: &mut Module, c: Const) -> ConstId {
     m.consts.push(c)
+}
+
+/// A const-defined value (`ValueDef::Const`, no instruction).
+pub fn const_value(m: &mut Module, c: Const) -> ValueId {
+    let cid = m.consts.push(c);
+    let val = ValueId::new(m.values.len() as u32);
+    m.values.push(Value {
+        def: ValueDef::Const(cid),
+        ty: Ty::Any,
+    });
+    val
+}
+
+/// A `Const::MethodRef` load (function value as a pooled constant).
+pub fn load_method_ref(m: &mut Module, b: BlockId, func: FuncId) -> ValueId {
+    let c = m.consts.push(Const::MethodRef(func));
+    emit(m, b, Op::LoadConst(c))
+}
+
+/// Define + allocate a closure of `body` in block `b`; returns the
+/// closure value.
+pub fn closure_of(m: &mut Module, b: BlockId, body: FuncId) -> ValueId {
+    let def = emit(
+        m,
+        b,
+        Op::DefineFunc {
+            body,
+            captures: vec![],
+            length: 0,
+        },
+    );
+    emit(m, b, Op::AllocClosure { func: def })
 }

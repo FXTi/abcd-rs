@@ -287,6 +287,9 @@ impl TaintToml {
             native_identity: self.native_identity,
             max_field_chain: self.max_field_chain,
             alias_rung: self.alias_rung,
+            // Not exposed in the TOML schema (a test/operator knob):
+            // the engine default applies.
+            pta_step_budget: None,
         })
     }
 }

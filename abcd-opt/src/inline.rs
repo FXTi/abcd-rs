@@ -1408,6 +1408,16 @@ fn inline_site(
 mod tests {
     use super::*;
 
+    /// The documented default policy constants (the corpus driver's
+    /// budget pins; also keeps the Default impl itself covered — under
+    /// --release the cross-crate callers inline it away).
+    #[test]
+    fn inline_policy_default_constants() {
+        let p = InlinePolicy::default();
+        assert_eq!(p.max_callee_insts, 64);
+        assert_eq!(p.max_inlined_insts_per_caller, 512);
+    }
+
     /// The T4 new.target binding table: New → the callee itself,
     /// Direct/Dynamic → undefined, everything else unbindable (and
     /// ineligible at the call site).
@@ -1435,17 +1445,39 @@ mod tests {
         }
     }
 
-    /// The skip-reason vocabulary is stable (corpus histogram keys).
+    /// The skip-reason vocabulary is stable (corpus histogram keys) —
+    /// every variant pinned (c-COV W10: the full label table).
     #[test]
     fn skip_reason_labels_are_stable() {
-        assert_eq!(
-            SkipReason::UnsupportedCallKind.label(),
-            "unsupported-call-kind"
-        );
-        assert_eq!(
-            SkipReason::CalleeHasTryRegions.label(),
-            "callee-has-try-regions"
-        );
-        assert_eq!(SkipReason::CallTypeUnknown.label(), "call-type-unknown");
+        let labels: [(SkipReason, &str); 20] = [
+            (SkipReason::UnsupportedCallKind, "unsupported-call-kind"),
+            (SkipReason::UnresolvedCallee, "unresolved-callee"),
+            (SkipReason::SelfRecursive, "self-recursive"),
+            (SkipReason::CalleeNoBody, "callee-no-body"),
+            (SkipReason::CalleeKind, "callee-kind"),
+            (SkipReason::CalleeTooLarge, "callee-too-large"),
+            (SkipReason::CallerBudgetExhausted, "caller-budget-exhausted"),
+            (SkipReason::CalleeHasTryRegions, "callee-has-try-regions"),
+            (SkipReason::CalleeEntryHasPreds, "callee-entry-has-preds"),
+            (SkipReason::CalleeForeignValue, "callee-foreign-value"),
+            (SkipReason::CalleeUsesLexEnv, "callee-uses-lexenv"),
+            (
+                SkipReason::CalleeUsesPrivateNames,
+                "callee-uses-private-names",
+            ),
+            (SkipReason::CalleeUsesArguments, "callee-uses-arguments"),
+            (SkipReason::CalleeUsesSuper, "callee-uses-super"),
+            (SkipReason::CalleeSuspends, "callee-suspends"),
+            (SkipReason::CalleeDefinesClosure, "callee-defines-closure"),
+            (SkipReason::DirectWithoutThis, "direct-without-this"),
+            (SkipReason::CallTypeUnknown, "call-type-unknown"),
+            (SkipReason::CallBlockIsHandler, "call-block-is-handler"),
+            (SkipReason::BlockTerminalCall, "block-terminal-call"),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (reason, want) in labels {
+            assert_eq!(reason.label(), want, "{reason:?}");
+            assert!(seen.insert(want), "labels are unique: {want}");
+        }
     }
 }
