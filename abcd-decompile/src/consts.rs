@@ -363,4 +363,72 @@ mod tests {
         assert_eq!(render_regexp_flags(1 | 2 | 16), "giu");
         assert_eq!(render_regexp_flags(64 | 1), "dg");
     }
+
+    #[test]
+    fn mutf8_units_decoding() {
+        // ASCII.
+        assert_eq!(mutf8_units(b"a"), vec![0x61]);
+        // 2-byte form (U+00E9).
+        assert_eq!(mutf8_units(&[0xC3, 0xA9]), vec![0xE9]);
+        // 3-byte form (U+4E2D).
+        assert_eq!(mutf8_units(&[0xE4, 0xB8, 0xAD]), vec![0x4E2D]);
+        // MUTF-8 NUL (C0 80).
+        assert_eq!(mutf8_units(&[0xC0, 0x80]), vec![0x0000]);
+        // CESU-8 encoded UTF-16 surrogate unit (no scalar decoding).
+        assert_eq!(mutf8_units(&[0xED, 0xA0, 0x80]), vec![0xD800]);
+        // A 4-byte UTF-8 sequence (non-canonical MUTF-8) decodes to the
+        // scalar's UTF-16 surrogate pair (U+1F600).
+        assert_eq!(mutf8_units(&[0xF0, 0x9F, 0x98, 0x80]), vec![0xD83D, 0xDE00]);
+        // A 4-byte sequence above U+10FFFF is not a scalar: U+FFFD.
+        assert_eq!(mutf8_units(&[0xF4, 0x90, 0x80, 0x80]), vec![0xFFFD]);
+        // Truncated / invalid leads degrade to U+FFFD PER BYTE, never
+        // panic (a truncated multi-byte lead leaves its continuation
+        // bytes to degrade individually).
+        assert_eq!(mutf8_units(&[0xC3]), vec![0xFFFD]);
+        assert_eq!(mutf8_units(&[0xE4, 0xB8]), vec![0xFFFD, 0xFFFD]);
+        assert_eq!(
+            mutf8_units(&[0xF0, 0x9F, 0x98]),
+            vec![0xFFFD, 0xFFFD, 0xFFFD]
+        );
+        assert_eq!(mutf8_units(&[0x80]), vec![0xFFFD]);
+        // Mixed stream: valid, 2-byte, invalid lead, ASCII.
+        assert_eq!(
+            mutf8_units(b"a\xC3\xA9\xFFb"),
+            vec![0x61, 0xE9, 0xFFFD, 0x62]
+        );
+    }
+
+    #[test]
+    fn mutf8_string_rendering() {
+        // A lone surrogate unit renders as a \uXXXX escape (N75).
+        assert_eq!(
+            render_mutf8_string(&[0x61, 0xED, 0xA0, 0x80]),
+            "\"a\\uD800\""
+        );
+        // A well-formed CESU-8 pair renders as its astral character.
+        assert_eq!(
+            render_mutf8_string(&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]),
+            "\"\u{1F600}\""
+        );
+        // Ordinary escapes still apply on the unit path.
+        assert_eq!(render_mutf8_string(b"a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn mutf8_regexp_rendering() {
+        // `/` is escaped in the regexp body; lone surrogates escape.
+        assert_eq!(render_mutf8_regexp(b"a/b"), "a\\/b");
+        assert_eq!(render_mutf8_regexp(&[0xED, 0xA0, 0x80]), "\\uD800");
+    }
+
+    #[test]
+    fn pool_string_raw_bytes() {
+        let mut m = Module::new();
+        m.string_raw_bytes
+            .insert("raw".to_string(), vec![0xED, 0xA0, 0x80].into());
+        // A pool identity with raw bytes renders from those bytes.
+        assert_eq!(render_pool_string(&m, "raw"), "\"\\uD800\"");
+        // Anything else renders verbatim.
+        assert_eq!(render_pool_string(&m, "plain"), "\"plain\"");
+    }
 }

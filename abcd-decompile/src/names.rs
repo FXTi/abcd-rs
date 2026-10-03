@@ -614,6 +614,83 @@ pub fn namespace_fallback(index: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use abcd_ir::function::{Block, FunctionData, Inst, Value};
+    use abcd_ir::id::ClassId;
+    use abcd_ir::module::{ClassData, FunctionKind, Modifiers, SourceLang};
+    use abcd_ir::ty::Ty;
+
+    // ── Hand-built module scaffolding (mirrors tests/common) ─────────
+
+    fn mk_module() -> Module {
+        let mut m = Module::new();
+        let name = m.sym.intern("Ltest;");
+        m.classes.push(ClassData {
+            descriptor: name,
+            name,
+            modifiers: Modifiers::NONE,
+            source_lang: SourceLang::EcmaScript,
+            super_class: None,
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            annotations: Vec::new(),
+            source_file: None,
+        });
+        m
+    }
+
+    /// A fresh function with one empty entry block.
+    fn add_fn(m: &mut Module, name: &str) -> FuncId {
+        let sym = m.sym.intern(name);
+        let id = FuncId::new(m.functions.len() as u32);
+        m.functions.push(FunctionData::new(
+            ClassId::new(0),
+            sym,
+            FunctionKind::Function,
+        ));
+        let b = BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        m.func_mut(id).unwrap().blocks.push(b);
+        id
+    }
+
+    fn entry_of(m: &Module, f: FuncId) -> BlockId {
+        m.func(f).unwrap().blocks[0]
+    }
+
+    fn push_inst(m: &mut Module, b: BlockId, op: Op) -> InstId {
+        let id = InstId::new(m.insts.len() as u32);
+        m.insts.push(Inst {
+            op,
+            result: None,
+            block: b,
+            loc: None,
+        });
+        m.block_mut(b).unwrap().insts.push(id);
+        id
+    }
+
+    fn emit_val(m: &mut Module, b: BlockId, op: Op) -> ValueId {
+        let inst = push_inst(m, b, op);
+        let val = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Inst(inst),
+            ty: Ty::Any,
+        });
+        m.inst_mut(inst).unwrap().result = Some(val);
+        val
+    }
+
+    fn add_param(m: &mut Module, f: FuncId) -> ValueId {
+        let idx = m.func(f).unwrap().params.len() as u16;
+        let val = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Param(idx),
+            ty: Ty::Any,
+        });
+        m.func_mut(f).unwrap().params.push(val);
+        val
+    }
 
     #[test]
     fn common_prefix_meet() {
@@ -625,5 +702,164 @@ mod tests {
         let b = vec![f(&["x", "y"]), f(&["w"])];
         let m = common_prefix(&a, &b);
         assert_eq!(m, vec![f(&["x", "y"])]);
+    }
+
+    // ── CreatePrivateNames with an empty env stack (285) ─────────────
+
+    #[test]
+    fn create_private_names_empty_stack() {
+        let mut m = mk_module();
+        let f = add_fn(&mut m, "f");
+        let b = entry_of(&m, f);
+        let nx = m.sym.intern("x");
+        let names = m.consts.push(Const::ArrayLiteral(vec![Const::String(nx)]));
+        // No NewLexEnv precedes it: there is no frame to register into.
+        let iid = push_inst(&mut m, b, Op::CreatePrivateNames { count: 1, names });
+        let scopes = NameScopes::build(&m, f);
+        // Nothing resolved, no panic.
+        assert_eq!(scopes.name_of(iid), None);
+    }
+
+    // ── op_name_hint store/global arms (419-423) ─────────────────────
+
+    #[test]
+    fn op_name_hint_variants() {
+        let mut m = mk_module();
+        let f = add_fn(&mut m, "f");
+        let v = add_param(&mut m, f);
+        let s = m.sym.intern("hint");
+        let cases = [
+            Op::LoadProp { object: v, name: s },
+            Op::StoreProp {
+                object: v,
+                name: s,
+                value: v,
+            },
+            Op::StoreOwnPropName {
+                object: v,
+                name: s,
+                value: v,
+            },
+            Op::TryGetGlobal {
+                name: s,
+                default: None,
+            },
+            Op::StoreGlobal { name: s, value: v },
+            Op::StoreGlobalRecord {
+                name: s,
+                value: v,
+                is_const: false,
+            },
+            Op::TryStoreGlobal { name: s, value: v },
+        ];
+        for op in &cases {
+            assert_eq!(op_name_hint(&m, op).as_deref(), Some("hint"), "{op:?}");
+        }
+        assert_eq!(op_name_hint(&m, &Op::PopLexEnv), None);
+        // Define-op hints resolve through the function table.
+        let inner = add_fn(&mut m, "inner");
+        let define = Op::DefineFunc {
+            body: inner,
+            captures: Vec::new(),
+            length: 0,
+        };
+        assert_eq!(op_name_hint(&m, &define).as_deref(), Some("inner"));
+    }
+
+    // ── Module-slot TDZ evidence (474-476) + const_string (559-567) ──
+
+    #[test]
+    fn module_slot_tdz_evidence() {
+        let mut m = mk_module();
+        let f = add_fn(&mut m, "f");
+        let b = entry_of(&m, f);
+        let slot = emit_val(&mut m, b, Op::LoadModuleVar { index: 7 });
+        // A runtime-name guard whose name is a const string names slot 7.
+        let name = {
+            let sym = m.sym.intern("myVar");
+            let cid = m.consts.push(Const::String(sym));
+            emit_val(&mut m, b, Op::LoadConst(cid))
+        };
+        push_inst(&mut m, b, Op::ThrowUndefinedIfHole { name, value: slot });
+        // A non-string const name: no evidence (const_string 563).
+        let num = {
+            let cid = m.consts.push(Const::number(1.0));
+            emit_val(&mut m, b, Op::LoadConst(cid))
+        };
+        push_inst(
+            &mut m,
+            b,
+            Op::ThrowUndefinedIfHole {
+                name: num,
+                value: slot,
+            },
+        );
+        // A name not defined by a LoadConst: no evidence (565).
+        let other = emit_val(&mut m, b, Op::LoadModuleVar { index: 8 });
+        push_inst(
+            &mut m,
+            b,
+            Op::ThrowUndefinedIfHole {
+                name: other,
+                value: slot,
+            },
+        );
+        let names = module_slot_names(&m);
+        assert_eq!(names, BTreeMap::from([(7u32, "myVar".to_string())]));
+    }
+
+    // ── defined_value_name: Mov follow (575) + AllocClosure (576) ────
+
+    #[test]
+    fn defined_value_name_passthroughs() {
+        let mut m = mk_module();
+        let f = add_fn(&mut m, "f");
+        let b = entry_of(&m, f);
+        let f2 = add_fn(&mut m, "#*#myFunc");
+        let f3 = add_fn(&mut m, "other");
+        // StoreModuleVar through a Mov of the DefineFunc result.
+        let df = emit_val(
+            &mut m,
+            b,
+            Op::DefineFunc {
+                body: f2,
+                captures: Vec::new(),
+                length: 0,
+            },
+        );
+        let mv = emit_val(&mut m, b, Op::Mov { src: df });
+        push_inst(
+            &mut m,
+            b,
+            Op::StoreModuleVar {
+                index: 3,
+                value: mv,
+            },
+        );
+        // StoreModuleVar through an AllocClosure passthrough.
+        let df3 = emit_val(
+            &mut m,
+            b,
+            Op::DefineFunc {
+                body: f3,
+                captures: Vec::new(),
+                length: 0,
+            },
+        );
+        let clo = emit_val(&mut m, b, Op::AllocClosure { func: df3 });
+        push_inst(
+            &mut m,
+            b,
+            Op::StoreModuleVar {
+                index: 4,
+                value: clo,
+            },
+        );
+        let names = module_slot_names(&m);
+        // The es2panda-mangled `#*#myFunc` demangles to `myFunc`.
+        assert_eq!(
+            names,
+            BTreeMap::from([(3u32, "myFunc".to_string()), (4u32, "other".to_string())])
+        );
     }
 }

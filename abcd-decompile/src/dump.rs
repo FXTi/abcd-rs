@@ -619,3 +619,174 @@ fn dump_unary(op: UnOp, operand: &Expr) -> String {
         UnOp::IsFalse => format!("(isfalse {e})"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{ObjEntry, ObjKey};
+
+    fn id(s: &str) -> Expr {
+        Expr::Ident(s.to_string())
+    }
+
+    // ── kind_tag variants (49-56) ────────────────────────────────────
+
+    #[test]
+    fn kind_tag_variants() {
+        assert_eq!(kind_tag(FunctionKind::Function), "function");
+        assert_eq!(kind_tag(FunctionKind::Constructor), "constructor");
+        assert_eq!(kind_tag(FunctionKind::Getter), "getter");
+        assert_eq!(kind_tag(FunctionKind::Setter), "setter");
+        assert_eq!(kind_tag(FunctionKind::Generator), "generator");
+        assert_eq!(kind_tag(FunctionKind::Async), "async");
+        assert_eq!(kind_tag(FunctionKind::AsyncGenerator), "async-generator");
+        assert_eq!(kind_tag(FunctionKind::Arrow), "arrow");
+        assert_eq!(kind_tag(FunctionKind::AsyncArrow), "async-arrow");
+    }
+
+    // ── StoreProp bracket member (146) ───────────────────────────────
+
+    #[test]
+    fn store_prop_bracket_member() {
+        let mut out = String::new();
+        dump_stmt(
+            &mut out,
+            &Stmt::StoreProp {
+                object: id("o"),
+                name: "1x".to_string(),
+                dot_legal: false,
+                value: Expr::Lit(Lit::Null),
+                own: true,
+            },
+        );
+        assert_eq!(out, "    o[\"1x\"] = null /*own*/\n");
+    }
+
+    // ── GlobalStore non-identifier target (232) ──────────────────────
+
+    #[test]
+    fn global_store_bracket_target() {
+        let mut out = String::new();
+        dump_stmt(
+            &mut out,
+            &Stmt::GlobalStore {
+                name: "1x".to_string(),
+                value: Expr::Lit(Lit::Null),
+                tolerant: true,
+            },
+        );
+        assert_eq!(out, "    globalThis[\"1x\"] = null /*try*/\n");
+    }
+
+    // ── SuperProp dynamic key (364) + SuperMarker (373) ──────────────
+
+    #[test]
+    fn super_expr_arms() {
+        let dynamic = Expr::SuperProp {
+            name: None,
+            key: Some(Box::new(id("k"))),
+        };
+        assert_eq!(dump_expr(&dynamic), "super[k]");
+        let named = Expr::SuperProp {
+            name: Some("n".to_string()),
+            key: None,
+        };
+        assert_eq!(dump_expr(&named), "super.n");
+        assert_eq!(dump_expr(&Expr::SuperMarker), "super");
+    }
+
+    // ── YieldStar (434) ──────────────────────────────────────────────
+
+    #[test]
+    fn yield_star_dump() {
+        let e = Expr::YieldStar {
+            value: Box::new(id("g")),
+        };
+        assert_eq!(dump_expr(&e), "(yield* g)");
+    }
+
+    // ── TemplateObject raw-only (454) ────────────────────────────────
+
+    #[test]
+    fn template_raw_only_dump() {
+        let e = Expr::TemplateObject {
+            raw: Some(vec![Lit::String("r".to_string())]),
+            cooked: None,
+        };
+        assert_eq!(dump_expr(&e), "template(raw [\"r\"], cooked <unresolved>)");
+    }
+
+    // ── SetObjectWithProto (507-510) ─────────────────────────────────
+
+    #[test]
+    fn set_object_with_proto_dump() {
+        let e = Expr::SetObjectWithProto {
+            obj: Box::new(id("o")),
+            proto: Box::new(id("p")),
+        };
+        assert_eq!(dump_expr(&e), "set-object-with-proto(o, p) /*plumbing*/");
+    }
+
+    // ── ObjectBuild entry kinds (543-556) ────────────────────────────
+
+    #[test]
+    fn object_build_entry_kinds() {
+        let e = Expr::ObjectBuild {
+            entries: vec![
+                ObjEntry::KeyValue(Lit::String("a".to_string()), id("v")),
+                ObjEntry::Computed(id("k"), id("v")),
+                ObjEntry::Spread(id("s")),
+                ObjEntry::Proto(id("p")),
+                ObjEntry::Method("m".to_string(), id("f")),
+                ObjEntry::Getter(ObjKey::Name("g".to_string()), id("gf")),
+                ObjEntry::Setter(ObjKey::Computed(Box::new(id("ck"))), id("sf")),
+            ],
+        };
+        assert_eq!(
+            dump_expr(&e),
+            "build-object({\"a\": v, [k]: v, ...s, __proto__: p, m: f, get Name(\"g\"): gf, set Computed(Ident(\"ck\")): sf})"
+        );
+    }
+
+    // ── ArrayBuild (562-570) ─────────────────────────────────────────
+
+    #[test]
+    fn array_build_dump() {
+        let e = Expr::ArrayBuild {
+            elements: vec![
+                crate::expr::ArrayElem::Item(id("a")),
+                crate::expr::ArrayElem::Spread(id("s")),
+            ],
+        };
+        assert_eq!(dump_expr(&e), "build-array([a, ...s])");
+    }
+
+    // ── Fallback with operands (577) ─────────────────────────────────
+
+    #[test]
+    fn fallback_with_operands_dump() {
+        let e = Expr::Fallback {
+            op: "Op",
+            note: "why",
+            operands: vec![id("a"), Expr::Lit(Lit::Null)],
+        };
+        assert_eq!(dump_expr(&e), "fallback(Op /*why*/, a, null)");
+        let bare = Expr::Fallback {
+            op: "Op",
+            note: "why",
+            operands: Vec::new(),
+        };
+        assert_eq!(dump_expr(&bare), "fallback(Op /*why*/)");
+    }
+
+    // ── UnOp::Void (617) ─────────────────────────────────────────────
+
+    #[test]
+    fn unary_void_dump() {
+        let e = Expr::Unary {
+            op: UnOp::Void,
+            operand: Box::new(id("x")),
+        };
+        assert_eq!(dump_expr(&e), "(void x)");
+    }
+}
