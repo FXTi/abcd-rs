@@ -265,3 +265,58 @@ pub(crate) unsafe extern "C" fn collect_literal_val_cb(
     };
     ctx.values.push(lit);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `LiteralTag::try_from` rejects unknown tag bytes with the exact
+    /// error variant.
+    #[test]
+    fn unknown_literal_tag_is_an_error() {
+        let err = LiteralTag::try_from(0xEE).expect_err("an unknown tag must fail");
+        assert!(
+            matches!(err, Error::UnknownLiteralTag(0xEE)),
+            "expected UnknownLiteralTag(0xee), got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("unknown literal tag 238"),
+            "Display must name the tag: {err}"
+        );
+    }
+
+    /// The collector callback skips elements whose tag byte does not parse
+    /// — unreachable through `decode()`: the bridge's tolerant enumerator
+    /// STOPS at an unknown tag (file_bridge.cpp
+    /// `abc_literal_enumerate_vals_tolerant`'s `default: return`), so the
+    /// callback never sees one from a file. Driven directly here.
+    #[test]
+    fn collector_skips_unparsable_tag() {
+        let mut strings = crate::StringPool::default();
+        let mut ctx = LiteralCollectCtx {
+            file: std::ptr::null(),
+            strings: &mut strings,
+            string_raw_bytes: std::ptr::null_mut(),
+            error: None,
+            values: Vec::new(),
+        };
+        let val = sys::AbcLiteralVal {
+            tag: 0xEE,
+            // SAFETY: the callback returns before reading `data` when the
+            // tag does not parse, so the zeroed union is never observed.
+            data: unsafe { std::mem::zeroed() },
+            str_data: std::ptr::null(),
+            str_utf16_len: 0,
+        };
+        // SAFETY: `ctx` outlives the synchronous callback; the file pointer
+        // is never dereferenced on this path.
+        unsafe {
+            collect_literal_val_cb(&val, &mut ctx as *mut LiteralCollectCtx as *mut c_void);
+        }
+        assert!(
+            ctx.values.is_empty(),
+            "an unparsable tag must be skipped, not pushed"
+        );
+        assert!(ctx.error.is_none());
+    }
+}

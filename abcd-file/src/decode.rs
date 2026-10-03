@@ -2440,4 +2440,73 @@ mod tests {
             other => panic!("expected LiteralArray element, got {other:?}"),
         }
     }
+
+    /// Arm: the '#' array-element converter propagates a dangling nested
+    /// literal array loudly (the `?` inside the `Ok(AVT::LiteralArray)`
+    /// arm). Same unreachable-through-decode reasoning as its sibling test
+    /// above ('#' is the SCALAR literal-array tag in the element dispatch):
+    /// drive the converter directly with a payload whose element dangles.
+    #[test]
+    fn literal_array_array_element_dangling_is_hard_error() {
+        let mut b = crate::Builder::new();
+        b.set_api(12, "beta1");
+        let cls = b.add_global_class();
+        b.class_set_source_lang(cls, crate::types::SourceLang::EcmaScript);
+        let s = b.add_string("probe_s");
+        let name = b.add_string("e");
+        let ann = b.create_annotation_ex(
+            cls,
+            &[crate::AnnotationElemDefEx {
+                name,
+                tag: b'V', // ArrayString
+                value: crate::AnnotationElemValue::EntityArray(vec![s.as_raw()]),
+            }],
+        );
+        b.class_add_runtime_annotation(cls, ann);
+        let proto = b.create_proto(crate::types::Type::Tagged, &[]);
+        let m = b.class_add_method(
+            cls,
+            "func_main_0",
+            proto,
+            crate::types::AccessFlags::PUBLIC,
+            &[0x65],
+            1,
+            0,
+        );
+        b.method_set_source_lang(m, crate::types::SourceLang::EcmaScript);
+        let mut data = b.finalize().expect("finalize");
+
+        // Find the array payload (`[uleb 1][u32 string_off]`) and rewrite
+        // the element to dangle past the declared file size.
+        let mut pat = vec![(7u8 << 1) | 1]; // "probe_s" is 7 ASCII chars
+        pat.extend_from_slice(b"probe_s");
+        pat.push(0);
+        let str_off = data
+            .windows(pat.len())
+            .position(|w| w == pat.as_slice())
+            .expect("string item") as u32;
+        let payload_pos = data
+            .windows(5)
+            .position(|w| w[0] == 1 && w[1..5] == str_off.to_le_bytes())
+            .expect("array payload") as u32;
+        let bogus = 0xFFFF_FF00u32;
+        data[payload_pos as usize + 1..payload_pos as usize + 5]
+            .copy_from_slice(&bogus.to_le_bytes());
+
+        let abc = crate::file::AbcFile::open(&data).expect("open");
+        let mut strings = StringPool::new();
+        let entity_map = HashMap::new();
+        let result = decode_annotation_array_elements(
+            abc.raw,
+            b'#',
+            1,
+            payload_pos,
+            &entity_map,
+            &mut strings,
+        );
+        assert!(
+            matches!(result, Err(Error::InvalidOffset(o)) if o == bogus),
+            "expected InvalidOffset({bogus:#x}), got: {result:?}"
+        );
+    }
 }

@@ -382,4 +382,80 @@ mod tests {
             "unexpected error: {err:?}"
         );
     }
+
+    /// The disambiguated identity already recorded with the SAME bytes is
+    /// the benign re-read (a third occurrence of the identical raw form):
+    /// no error, the disambiguated identity is reused.
+    #[test]
+    fn intern_string_collision_same_bytes_reuses_identity() {
+        const LOSSY: &str = "\u{FFFD}\u{FFFD}\u{FFFD}";
+        const RAW: [u8; 3] = [0xED, 0xA0, 0xB4];
+        const OTHER_RAW: [u8; 3] = [0xED, 0xB4, 0x86];
+        let (data, offset) = lossy_string_file();
+        let file = AbcFile::open(&data).unwrap();
+        let disambiguated = format!("{LOSSY}{RAW_ID_SENTINEL}eda0b4");
+
+        let mut strings = crate::StringPool::default();
+        // LOSSY collides on OTHER_RAW; the disambiguated identity is already
+        // recorded with EXACTLY the incoming raw bytes.
+        let mut raw_map: std::collections::HashMap<String, Box<[u8]>> = [
+            (LOSSY.to_string(), Box::from(&OTHER_RAW[..])),
+            (disambiguated.clone(), Box::from(&RAW[..])),
+        ]
+        .into_iter()
+        .collect();
+        let sid = intern_string(file.raw, offset, &mut strings, &mut raw_map)
+            .expect("same-bytes re-read is not a collision")
+            .expect("string present");
+        assert_eq!(strings.resolve(sid), Some(disambiguated.as_str()));
+    }
+
+    /// `read_string_raw_bytes` guards: an invalid offset (the raw reader
+    /// reports length 0) and a valid EMPTY string both yield `None` — an
+    /// empty string is never lossy, so it never needs a raw-bytes record.
+    #[test]
+    fn raw_bytes_guards_reject_invalid_offset_and_empty_string() {
+        let mut builder = crate::Builder::new();
+        builder.add_foreign_class(""); // A foreign class item is a string.
+        let data = builder.finalize().unwrap();
+        let offset = {
+            let file = AbcFile::open(&data).unwrap();
+            unsafe { sys::abc_file_class_offset(file.raw, 0) }
+        };
+        let file = AbcFile::open(&data).unwrap();
+        // The empty string item: raw length 0 -> None (the `len == 0` arm).
+        assert_eq!(read_string_raw_bytes(file.raw, offset), None);
+        // An offset past the declared file size: same arm via the bridge's
+        // catch-all (GetSpanFromId throws, the bridge answers 0).
+        assert_eq!(read_string_raw_bytes(file.raw, data.len() as u32), None);
+        assert_eq!(read_string_raw_bytes(file.raw, ABSENT), None);
+    }
+
+    /// The remaining raw-read guards are unreachable by bridge determinism;
+    /// this test documents the proofs (and pins the reachable neighbors so a
+    /// bridge behavior change is caught):
+    /// - `read_string_reporting_lossy`'s `written != units` guard: the
+    ///   bridge's query and fill run the same deterministic bounded
+    ///   conversion over the same immutable bytes with the same declared
+    ///   length, so the counts always agree.
+    /// - its raw-fallback `len == 0` guard: the fallback is only reached
+    ///   after a successful UTF-16 query, which requires the same
+    ///   `bounded_cstr_len` the raw reader would fail — a string that
+    ///   reached the fallback always has a nonzero raw length.
+    /// - `read_string_raw_bytes`'s `copied == 0` guard: the fill call
+    ///   copies `min(len, buf_len - 1) = len > 0` bytes whenever the query
+    ///   succeeded.
+    /// - `intern_string`'s lossy-but-unreadable-raw fallback: `lossy` is
+    ///   only true after a raw read already succeeded, and the immediate
+    ///   re-read is deterministic.
+    #[test]
+    fn utf16_fill_and_raw_fallback_agree_on_valid_strings() {
+        let (data, offset) = lossy_string_file();
+        let file = AbcFile::open(&data).unwrap();
+        // A lone-surrogate string: UTF-16 query succeeds, Rust conversion
+        // fails, raw fallback answers with the lossy form (the raw read
+        // necessarily succeeds — see the proof above).
+        let raw = read_string_raw_bytes(file.raw, offset);
+        assert_eq!(raw.as_deref(), Some(&[0xED, 0xA0, 0xB4][..]));
+    }
 }

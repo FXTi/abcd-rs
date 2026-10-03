@@ -1850,4 +1850,1517 @@ mod tests {
         let r = verify_func(&m, f);
         assert!(r.is_ok(), "got: {:?}", r.errors);
     }
+
+    // ── W12: one negative per remaining dark error arm ───────────────
+    //
+    // Each test builds the minimal invalid shape from the arm→shape table
+    // and asserts the exact VerifyErrorKind plus its Display message (the
+    // message asserts also cover the VerifyError/VerifyWarning Display and
+    // source() impls).
+    //
+    // Deliberately absent (UNREACHABLE-INVARIANT, documented):
+    // - ArityMismatch: Op::arity() and Op::operands() both derive from the
+    //   same op value; a mismatch needs taxonomy drift in op.rs, not an
+    //   input property (the op.rs drift-guard test pins consistency).
+    // - verify_dominance's func-None early return: its only caller already
+    //   resolved `func`.
+    // - the empty-npreds dominator arm: after the N64 retain every
+    //   Normal-reachable non-entry block has a reachable Normal pred by
+    //   construction, and the entry is skipped.
+
+    /// Extract the single error matching `pred`.
+    fn expect_error<'a>(
+        r: &'a VerifyReport,
+        pred: impl Fn(&VerifyErrorKind) -> bool,
+        what: &str,
+    ) -> &'a VerifyError {
+        let matches: Vec<_> = r.errors.iter().filter(|e| pred(&e.kind)).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one {what}, got: {:?}",
+            r.errors
+        );
+        matches[0]
+    }
+
+    /// A module with one function whose entry just returns.
+    fn minimal_func_module() -> (Module, FuncId) {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        emit_void(&mut m, entry, Op::Return { value: None });
+        (m, f)
+    }
+
+    #[test]
+    fn func_out_of_range_is_module_level_error() {
+        let (m, _) = minimal_func_module();
+        let bogus = FuncId::new(999);
+        let r = verify_func(&m, bogus);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::FuncOutOfRange(id) if *id == bogus),
+            "FuncOutOfRange",
+        );
+        assert_eq!(e.func, None, "a missing function has no location");
+        assert_eq!(
+            format!("{e}"),
+            "verify error: function FuncId(999) is outside the function table"
+        );
+        assert!(std::error::Error::source(e).is_some());
+    }
+
+    #[test]
+    fn missing_body_is_error() {
+        let mut m = mk_module();
+        let name = m.sym.intern("bodiless");
+        m.functions.push(FunctionData::new(
+            ClassId::new(0),
+            name,
+            FunctionKind::Function,
+        ));
+        let f = FuncId::new(m.functions.len() as u32 - 1);
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::MissingBody),
+            "MissingBody",
+        );
+        assert_eq!(e.func, Some(f));
+        assert_eq!(e.block, None);
+        assert_eq!(
+            format!("{e}"),
+            format!("verify error in {f}: function has no blocks but is not external")
+        );
+    }
+
+    #[test]
+    fn duplicate_block_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        m.func_mut(f).unwrap().blocks.push(entry); // entry listed twice
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::DuplicateBlock(b) if *b == entry),
+            "DuplicateBlock",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!("verify error in FuncId(0): block list contains duplicate {entry}")
+        );
+    }
+
+    #[test]
+    fn block_out_of_arena_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let b2 = add_block(&mut m, f);
+        emit_void(&mut m, b2, Op::Return { value: None });
+        // Rewire: entry -> b2, and a bogus arena id listed as a block with
+        // a Normal pred edge from it (rides the defensive normal_succs
+        // empty arms: out-of-arena block lookup).
+        let bogus = BlockId::new(999);
+        m.func_mut(f).unwrap().blocks.push(bogus);
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        emit_void(&mut m, entry, Op::Branch { dest: b2 });
+        link(&mut m, entry, b2);
+        link(&mut m, bogus, b2); // pred from an out-of-arena block
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::BlockOutOfArena(b) if *b == bogus),
+            "BlockOutOfArena",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!("verify error in FuncId(0): {bogus} is outside the block arena")
+        );
+    }
+
+    #[test]
+    fn foreign_try_block_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let g = add_func(&mut m);
+        let gx = entry_of(&m, g);
+        emit_void(&mut m, gx, Op::Return { value: None });
+        // f's try region protects a block of g.
+        let h = add_block(&mut m, f);
+        emit_void(&mut m, h, Op::Return { value: None });
+        let exc = add_exception_param(&mut m, h);
+        m.func_mut(f).unwrap().try_regions.push(TryRegion {
+            protected: vec![gx],
+            catches: vec![Catch {
+                handler: h,
+                exception: exc,
+                type_idx: None,
+            }],
+        });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignTryBlock(b) if *b == gx),
+            "ForeignTryBlock",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!("verify error in FuncId(0): try region references foreign block {gx}")
+        );
+    }
+
+    #[test]
+    fn duplicate_try_block_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let t = add_block(&mut m, f);
+        let h = add_block(&mut m, f);
+        emit_void(&mut m, t, Op::Return { value: None });
+        emit_void(&mut m, h, Op::Return { value: None });
+        let exc = add_exception_param(&mut m, h);
+        link_exc(&mut m, t, h);
+        m.func_mut(f).unwrap().try_regions.push(TryRegion {
+            protected: vec![t, t],
+            catches: vec![Catch {
+                handler: h,
+                exception: exc,
+                type_idx: None,
+            }],
+        });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::DuplicateTryBlock(b) if *b == t),
+            "DuplicateTryBlock",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {t}: try region contains duplicate protected block {t}"
+            )
+        );
+    }
+
+    /// A foreign handler is an error; an in-arena foreign handler that
+    /// never received the exceptional edge also trips the
+    /// MissingExceptionalPred check. A handler outside the ARENA rides the
+    /// N38 scan's defensive skip.
+    #[test]
+    fn foreign_handler_and_missing_exceptional_pred_are_errors() {
+        let (mut m, f) = minimal_func_module();
+        let g = add_func(&mut m);
+        let gx = entry_of(&m, g);
+        emit_void(&mut m, gx, Op::Return { value: None });
+        let t = add_block(&mut m, f);
+        emit_void(&mut m, t, Op::Return { value: None });
+        // Case 1: handler is another function's block, no exceptional edge.
+        let exc = add_exception_param(&mut m, gx);
+        m.func_mut(f).unwrap().try_regions.push(TryRegion {
+            protected: vec![t],
+            catches: vec![Catch {
+                handler: gx,
+                exception: exc,
+                type_idx: None,
+            }],
+        });
+        // Case 2: handler outside the block arena entirely.
+        let arena_bug = BlockId::new(999);
+        let exc2 = add_exception_param(&mut m, arena_bug);
+        m.func_mut(f).unwrap().try_regions.push(TryRegion {
+            protected: vec![t],
+            catches: vec![Catch {
+                handler: arena_bug,
+                exception: exc2,
+                type_idx: None,
+            }],
+        });
+        let r = verify_func(&m, f);
+        expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignHandler(b) if *b == gx),
+            "ForeignHandler(gx)",
+        );
+        expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignHandler(b) if *b == arena_bug),
+            "ForeignHandler(arena)",
+        );
+        let e = expect_error(
+            &r,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::MissingExceptionalPred {
+                        handler,
+                        protected,
+                    } if *handler == gx && *protected == t
+                )
+            },
+            "MissingExceptionalPred",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {gx}: handler {gx} is missing the exceptional predecessor edge from protected block {t}"
+            )
+        );
+    }
+
+    #[test]
+    fn bad_exception_param_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let t = add_block(&mut m, f);
+        let h = add_block(&mut m, f);
+        emit_void(&mut m, t, Op::Return { value: None });
+        emit_void(&mut m, h, Op::Return { value: None });
+        // The catch's exception value is a plain PARAM, not the dispatch's
+        // ExceptionParam.
+        let not_exc = add_param(&mut m, f, 0);
+        link_exc(&mut m, t, h);
+        m.func_mut(f).unwrap().try_regions.push(TryRegion {
+            protected: vec![t],
+            catches: vec![Catch {
+                handler: h,
+                exception: not_exc,
+                type_idx: None,
+            }],
+        });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::BadExceptionParam { value, handler }
+                        if *value == not_exc && *handler == h
+                )
+            },
+            "BadExceptionParam",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {h}: catch exception value {not_exc} is not defined by ExceptionParam({h})"
+            )
+        );
+    }
+
+    #[test]
+    fn param_out_of_arena_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let bogus = ValueId::new(999);
+        m.func_mut(f).unwrap().params.push(bogus);
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ValueOutOfArena(v) if *v == bogus),
+            "ValueOutOfArena(param)",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!("verify error in FuncId(0): result value {bogus} is outside the value arena")
+        );
+    }
+
+    #[test]
+    fn param_def_mismatch_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let p0 = add_param(&mut m, f, 0); // params[0], def Param(0): fine
+        let _ = p0;
+        // params[1] whose def says Param(7).
+        let bad = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Param(7),
+            ty: Ty::Any,
+        });
+        m.func_mut(f).unwrap().params.push(bad);
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::ParamDefMismatch { value, actual }
+                        if *value == bad && *actual == ValueDef::Param(7)
+                )
+            },
+            "ParamDefMismatch",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0): parameter value {bad} has mismatched definition {:?}",
+                ValueDef::Param(7)
+            )
+        );
+    }
+
+    /// An out-of-arena InstId in a block's list, in the middle (rides the
+    /// structural-scan skips) and as the last entry of a predecessor block
+    /// (rides normal_succs' out-of-arena last-inst arm).
+    #[test]
+    fn inst_out_of_arena_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let bogus = InstId::new(999);
+        // Middle of the entry block: [bogus, return].
+        m.block_mut(entry).unwrap().insts.insert(0, bogus);
+        // A second block whose ONLY entry is bogus, listed as a Normal pred
+        // of entry... would trip EntryHasPred; use a mid block instead.
+        let b2 = add_block(&mut m, f);
+        m.block_mut(b2).unwrap().insts.push(bogus);
+        // entry currently ends with Return; give the CFG entry -> b2 via a
+        // branch and reterminate b2 through the bogus slot (stays bogus).
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        insts.push(bogus);
+        emit_void(&mut m, entry, Op::Branch { dest: b2 });
+        link(&mut m, entry, b2);
+        link(&mut m, b2, entry);
+        let r = verify_func(&m, f);
+        let matches: Vec<_> = r
+            .errors
+            .iter()
+            .filter(|e| matches!(e.kind, VerifyErrorKind::InstOutOfArena(id) if id == bogus))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            2,
+            "both block listings must report the dangling inst: {:?}",
+            r.errors
+        );
+        assert_eq!(
+            format!("{}", matches[0]),
+            format!("verify error in FuncId(0) {entry} {bogus}: {bogus} is outside the inst arena")
+        );
+    }
+
+    #[test]
+    fn inst_block_mismatch_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let b2 = add_block(&mut m, f);
+        let c = m.consts.push(Const::number(1.0));
+        // The inst records `entry` as its home but is ALSO listed in b2.
+        let i = push_inst(&mut m, entry, Op::LoadConst(c));
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        emit_void(&mut m, entry, Op::Branch { dest: b2 });
+        link(&mut m, entry, b2);
+        m.block_mut(b2).unwrap().insts.push(i);
+        emit_void(&mut m, b2, Op::Return { value: None });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::InstBlockMismatch { expected, actual }
+                        if *expected == b2 && *actual == entry
+                )
+            },
+            "InstBlockMismatch",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {b2} {i}: instruction is listed in {b2} but records its block as {entry}"
+            )
+        );
+    }
+
+    #[test]
+    fn result_out_of_arena_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let c = m.consts.push(Const::number(1.0));
+        let i = push_inst(&mut m, entry, Op::LoadConst(c));
+        let bogus = ValueId::new(999);
+        m.inst_mut(i).unwrap().result = Some(bogus);
+        // Keep the block well-terminated: [load, return].
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ValueOutOfArena(v) if *v == bogus),
+            "ValueOutOfArena(result)",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry} {i}: result value {bogus} is outside the value arena"
+            )
+        );
+    }
+
+    #[test]
+    fn result_def_mismatch_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let c = m.consts.push(Const::number(1.0));
+        let i = push_inst(&mut m, entry, Op::LoadConst(c));
+        // The result value's def points at a Param, not at its inst.
+        let v = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Param(0),
+            ty: Ty::Any,
+        });
+        m.inst_mut(i).unwrap().result = Some(v);
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::ResultDefMismatch { value, actual }
+                        if *value == v && *actual == ValueDef::Param(0)
+                )
+            },
+            "ResultDefMismatch",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry} {i}: result {v} has mismatched definition {:?}",
+                ValueDef::Param(0)
+            )
+        );
+    }
+
+    #[test]
+    fn entry_has_pred_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let b1 = add_block(&mut m, f);
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        emit_void(&mut m, entry, Op::Branch { dest: b1 });
+        emit_void(&mut m, b1, Op::Branch { dest: entry }); // back-edge
+        link(&mut m, entry, b1);
+        link(&mut m, b1, entry);
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::EntryHasPred),
+            "EntryHasPred",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry}: entry block has a predecessor from another block"
+            )
+        );
+    }
+
+    #[test]
+    fn duplicate_pred_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let b1 = add_block(&mut m, f);
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        emit_void(&mut m, entry, Op::Branch { dest: b1 });
+        link(&mut m, entry, b1);
+        link(&mut m, entry, b1); // the same edge twice
+        emit_void(&mut m, b1, Op::Return { value: None });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::DuplicatePred(edge) if edge.from == entry),
+            "DuplicatePred",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {b1}: duplicate predecessor edge {:?}",
+                Edge {
+                    from: entry,
+                    kind: EdgeKind::Normal,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn foreign_pred_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let b1 = add_block(&mut m, f);
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        emit_void(&mut m, entry, Op::Branch { dest: b1 });
+        link(&mut m, entry, b1);
+        emit_void(&mut m, b1, Op::Return { value: None });
+        // A pred edge from another function's block (in-arena, foreign).
+        let g = add_func(&mut m);
+        let gx = entry_of(&m, g);
+        emit_void(&mut m, gx, Op::Return { value: None });
+        link(&mut m, gx, b1);
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignPred(b) if *b == gx),
+            "ForeignPred",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!("verify error in FuncId(0) {b1}: predecessor {gx} is not in this function")
+        );
+    }
+
+    /// An empty block errors; its use as a Normal predecessor also rides
+    /// normal_succs' empty-insts arm (and PredDoesNotTarget).
+    #[test]
+    fn empty_block_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let empty = add_block(&mut m, f);
+        let b2 = add_block(&mut m, f);
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        emit_void(&mut m, entry, Op::Branch { dest: b2 });
+        link(&mut m, entry, b2);
+        emit_void(&mut m, b2, Op::Return { value: None });
+        link(&mut m, empty, b2); // the empty block as a predecessor
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::EmptyBlock),
+            "EmptyBlock",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {empty}: block has no instructions (missing terminator)"
+            )
+        );
+        assert!(
+            has_error(
+                &r,
+                |k| matches!(k, VerifyErrorKind::PredDoesNotTarget(b) if *b == empty)
+            ),
+            "the empty predecessor's terminator cannot target anything: {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn foreign_successor_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let g = add_func(&mut m);
+        let gx = entry_of(&m, g);
+        emit_void(&mut m, gx, Op::Return { value: None });
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        emit_void(&mut m, entry, Op::Branch { dest: gx });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignSuccessor(b) if *b == gx),
+            "ForeignSuccessor",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry} {:?}: successor {gx} is not in this function",
+                e.inst.unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn phi_duplicate_edge_is_error() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let b1 = add_block(&mut m, f);
+        let b2 = add_block(&mut m, f);
+        let join = add_block(&mut m, f);
+        link(&mut m, entry, b1);
+        link(&mut m, entry, b2);
+        link(&mut m, b1, join);
+        link(&mut m, b2, join);
+        emit_void(
+            &mut m,
+            entry,
+            Op::CondBranch {
+                cond: p0,
+                true_dest: b1,
+                false_dest: b2,
+            },
+        );
+        let v1 = load_number(&mut m, b1, 1.0);
+        emit_void(&mut m, b1, Op::Branch { dest: join });
+        emit_void(&mut m, b2, Op::Branch { dest: join });
+        let e1 = Edge {
+            from: b1,
+            kind: EdgeKind::Normal,
+        };
+        // Two entries keyed on the SAME edge (count still equals preds).
+        let phi = emit(
+            &mut m,
+            join,
+            Op::Phi {
+                entries: vec![(e1, v1), (e1, v1)],
+            },
+        );
+        emit_void(&mut m, join, Op::Return { value: Some(phi) });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::PhiDuplicateEdge { edge } if *edge == e1),
+            "PhiDuplicateEdge",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {join} {:?}: phi contains duplicate entry edge {:?}",
+                e.inst.unwrap(),
+                e1
+            )
+        );
+    }
+
+    #[test]
+    fn undefined_value_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let bogus = ValueId::new(999);
+        let v = add(&mut m, entry, bogus, p0);
+        emit_void(&mut m, entry, Op::Return { value: Some(v) });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::UndefinedValue(val) if *val == bogus),
+            "UndefinedValue",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry} {:?}: uses undefined value {bogus}",
+                e.inst.unwrap()
+            )
+        );
+    }
+
+    /// A phi entry whose value is outside the value arena: UndefinedValue
+    /// from the use scan, and the dominance phi-entry walk skips it.
+    #[test]
+    fn undefined_phi_entry_value_is_error() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let b1 = add_block(&mut m, f);
+        let join = add_block(&mut m, f);
+        link(&mut m, entry, b1);
+        link(&mut m, b1, join);
+        emit_void(&mut m, entry, Op::Branch { dest: b1 });
+        emit_void(&mut m, b1, Op::Branch { dest: join });
+        let bogus = ValueId::new(999);
+        let phi = emit(
+            &mut m,
+            join,
+            Op::Phi {
+                entries: vec![(
+                    Edge {
+                        from: b1,
+                        kind: EdgeKind::Normal,
+                    },
+                    bogus,
+                )],
+            },
+        );
+        emit_void(&mut m, join, Op::Return { value: Some(phi) });
+        let r = verify_func(&m, f);
+        expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::UndefinedValue(v) if *v == bogus),
+            "UndefinedValue(phi entry)",
+        );
+    }
+
+    /// A used value whose def is an out-of-arena inst is not owned
+    /// (ForeignValue); the dominance walk skips the dangling def.
+    #[test]
+    fn foreign_value_out_of_arena_def_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let dangling = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Inst(InstId::new(999)),
+            ty: Ty::Any,
+        });
+        let v = add(&mut m, entry, dangling, p0);
+        emit_void(&mut m, entry, Op::Return { value: Some(v) });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignValue(val) if *val == dangling),
+            "ForeignValue",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry} {:?}: value {dangling} is not owned by this function",
+                e.inst.unwrap()
+            )
+        );
+    }
+
+    /// A used value whose def inst lives in ANOTHER function's block is
+    /// foreign; both the operand and phi-entry dominance walks skip it.
+    #[test]
+    fn foreign_value_foreign_block_def_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        // The defining inst lives in g's entry block.
+        let g = add_func(&mut m);
+        let gx = entry_of(&m, g);
+        let foreign_def = {
+            let c = m.consts.push(Const::number(7.0));
+            emit(&mut m, gx, Op::LoadConst(c))
+        };
+        emit_void(
+            &mut m,
+            gx,
+            Op::Return {
+                value: Some(foreign_def),
+            },
+        );
+        // Use g's value in f: as a plain operand…
+        let v = add(&mut m, entry, foreign_def, p0);
+        emit_void(&mut m, entry, Op::Return { value: Some(v) });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignValue(val) if *val == foreign_def),
+            "ForeignValue(foreign block)",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry} {:?}: value {foreign_def} is not owned by this function",
+                e.inst.unwrap()
+            )
+        );
+    }
+
+    /// Phi-entry variants of the dangling/foreign def walks.
+    #[test]
+    fn phi_entry_with_dangling_or_foreign_def_is_error() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let b1 = add_block(&mut m, f);
+        let b2 = add_block(&mut m, f);
+        let join = add_block(&mut m, f);
+        link(&mut m, entry, b1);
+        link(&mut m, entry, b2);
+        link(&mut m, b1, join);
+        link(&mut m, b2, join);
+        emit_void(
+            &mut m,
+            entry,
+            Op::CondBranch {
+                cond: p0,
+                true_dest: b1,
+                false_dest: b2,
+            },
+        );
+        emit_void(&mut m, b1, Op::Branch { dest: join });
+        emit_void(&mut m, b2, Op::Branch { dest: join });
+        // b1's phi entry value: def is an out-of-arena inst.
+        let dangling = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Inst(InstId::new(999)),
+            ty: Ty::Any,
+        });
+        // b2's phi entry value: def is an inst of another function.
+        let g = add_func(&mut m);
+        let gx = entry_of(&m, g);
+        let foreign = {
+            let c = m.consts.push(Const::number(7.0));
+            emit(&mut m, gx, Op::LoadConst(c))
+        };
+        emit_void(
+            &mut m,
+            gx,
+            Op::Return {
+                value: Some(foreign),
+            },
+        );
+        let phi = emit(
+            &mut m,
+            join,
+            Op::Phi {
+                entries: vec![
+                    (
+                        Edge {
+                            from: b1,
+                            kind: EdgeKind::Normal,
+                        },
+                        dangling,
+                    ),
+                    (
+                        Edge {
+                            from: b2,
+                            kind: EdgeKind::Normal,
+                        },
+                        foreign,
+                    ),
+                ],
+            },
+        );
+        emit_void(&mut m, join, Op::Return { value: Some(phi) });
+        let r = verify_func(&m, f);
+        expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignValue(v) if *v == dangling),
+            "ForeignValue(dangling def)",
+        );
+        expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignValue(v) if *v == foreign),
+            "ForeignValue(foreign def)",
+        );
+    }
+
+    /// A phi entry keyed on an edge from another function's block: the
+    /// structural PhiForeignEdge error fires and the dominance walk skips
+    /// the foreign source. The entry's value is defined INSIDE the
+    /// function, so the dominance walk reaches the foreign-source skip.
+    #[test]
+    fn phi_entry_from_foreign_block_is_error() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let b1 = add_block(&mut m, f);
+        let join = add_block(&mut m, f);
+        link(&mut m, entry, b1);
+        link(&mut m, b1, join);
+        emit_void(&mut m, entry, Op::Branch { dest: b1 });
+        let v1 = load_number(&mut m, b1, 1.0); // defined in-function
+        emit_void(&mut m, b1, Op::Branch { dest: join });
+        let g = add_func(&mut m);
+        let gx = entry_of(&m, g);
+        emit_void(&mut m, gx, Op::Return { value: None });
+        let foreign_edge = Edge {
+            from: gx,
+            kind: EdgeKind::Normal,
+        };
+        let phi = emit(
+            &mut m,
+            join,
+            Op::Phi {
+                entries: vec![(foreign_edge, v1)],
+            },
+        );
+        emit_void(&mut m, join, Op::Return { value: Some(phi) });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::PhiForeignEdge { edge } if *edge == foreign_edge),
+            "PhiForeignEdge",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {join} {:?}: phi entry edge {:?} is not a predecessor edge of the block",
+                e.inst.unwrap(),
+                foreign_edge
+            )
+        );
+    }
+
+    /// A phi entry carrying the exception param on an edge whose source is
+    /// reachable but OUTSIDE the handler's exceptional downstream.
+    #[test]
+    fn exception_param_phi_out_of_scope_is_error() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let t = add_block(&mut m, f);
+        let h = add_block(&mut m, f);
+        let n2 = add_block(&mut m, f);
+        let join = add_block(&mut m, f);
+        link(&mut m, entry, t);
+        link(&mut m, entry, n2);
+        link(&mut m, n2, join);
+        let exc = add_exception_param(&mut m, h);
+        add_try(&mut m, f, vec![t], h, exc);
+        emit_void(
+            &mut m,
+            entry,
+            Op::CondBranch {
+                cond: p0,
+                true_dest: t,
+                false_dest: n2,
+            },
+        );
+        emit_void(&mut m, t, Op::Return { value: None });
+        emit_void(&mut m, h, Op::Return { value: None });
+        emit_void(&mut m, n2, Op::Branch { dest: join });
+        let phi = emit(
+            &mut m,
+            join,
+            Op::Phi {
+                entries: vec![(
+                    Edge {
+                        from: n2,
+                        kind: EdgeKind::Normal,
+                    },
+                    exc,
+                )],
+            },
+        );
+        emit_void(&mut m, join, Op::Return { value: Some(phi) });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::ExceptionParamPhiOutOfScope { pred, value, handler }
+                        if *pred == n2 && *value == exc && *handler == h
+                )
+            },
+            "ExceptionParamPhiOutOfScope",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {join} {:?}: phi entry from {n2} uses exception value {exc} delivered at handler {h} (N45)",
+                e.inst.unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn use_before_def_is_error() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let v = add(&mut m, entry, p0, p0); // pos 0: defines v
+        let w = add(&mut m, entry, v, p0); // pos 1: uses v (once)
+        emit_void(&mut m, entry, Op::Return { value: Some(w) });
+        // Swap the two adds: the use now precedes its def within the block.
+        m.block_mut(entry).unwrap().insts.swap(0, 1);
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::UseBeforeDef { value } if *value == v),
+            "UseBeforeDef",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry} {:?}: uses {v} before its definition in the same block",
+                e.inst.unwrap()
+            )
+        );
+    }
+
+    /// An Exceptional pred edge whose source has no try region dispatching
+    /// to the block is an error.
+    #[test]
+    fn exceptional_pred_without_region_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let t = add_block(&mut m, f);
+        let h = add_block(&mut m, f);
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        emit_void(&mut m, entry, Op::Branch { dest: t });
+        link(&mut m, entry, t);
+        emit_void(&mut m, t, Op::Return { value: None });
+        emit_void(&mut m, h, Op::Return { value: None });
+        link_exc(&mut m, t, h); // exceptional edge with NO try region
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ExceptionalPredWithoutRegion(b) if *b == t),
+            "ExceptionalPredWithoutRegion",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {h}: exceptional predecessor {t} has no try region dispatching to this handler"
+            )
+        );
+    }
+
+    /// A terminator targeting an in-function block that does not list the
+    /// edge in its predecessors: CFG edge symmetry error.
+    #[test]
+    fn successor_missing_pred_is_error() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let b2 = add_block(&mut m, f);
+        let insts = &mut m.block_mut(entry).unwrap().insts;
+        insts.clear();
+        emit_void(&mut m, entry, Op::Branch { dest: b2 });
+        // No link(entry, b2): b2.preds misses the edge.
+        emit_void(&mut m, b2, Op::Return { value: None });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::SuccessorMissingPred(b) if *b == b2),
+            "SuccessorMissingPred",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry} {:?}: successor {b2} is missing this block from its predecessors",
+                e.inst.unwrap()
+            )
+        );
+    }
+
+    /// Ownership of const-defined values: in-pool is owned (no error), an
+    /// out-of-pool ConstId is foreign.
+    #[test]
+    fn const_defined_value_ownership_is_checked() {
+        let (mut m, f) = minimal_func_module();
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let c = m.consts.push(Const::number(1.0));
+        // A value defined as Const(in-pool): owned — no error.
+        let owned = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Const(c),
+            ty: Ty::Any,
+        });
+        // A value defined as Const(out-of-pool): foreign.
+        let bogus = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::Const(ConstId::new(999)),
+            ty: Ty::Any,
+        });
+        let v = add(&mut m, entry, owned, p0);
+        let w = add(&mut m, entry, bogus, v);
+        emit_void(&mut m, entry, Op::Return { value: Some(w) });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ForeignValue(val) if *val == bogus),
+            "ForeignValue(const)",
+        );
+        assert!(
+            !r.errors
+                .iter()
+                .any(|e| matches!(e.kind, VerifyErrorKind::ForeignValue(v) if v == owned)),
+            "the in-pool const-defined value must be owned: {:?}",
+            r.errors
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {entry} {:?}: value {bogus} is not owned by this function",
+                e.inst.unwrap()
+            )
+        );
+    }
+
+    /// The N38 handler scan skips a handler instruction that is out of the
+    /// inst arena (the structural scan reports it instead).
+    #[test]
+    fn handler_with_out_of_arena_inst_skips_n38_scan() {
+        let (mut m, f) = minimal_func_module();
+        let t = add_block(&mut m, f);
+        let h = add_block(&mut m, f);
+        emit_void(&mut m, t, Op::Return { value: None });
+        let exc = add_exception_param(&mut m, h);
+        add_try(&mut m, f, vec![t], h, exc);
+        // The handler's instruction list dangles.
+        let bogus = InstId::new(999);
+        m.block_mut(h).unwrap().insts.push(bogus);
+        emit_void(&mut m, h, Op::Return { value: None });
+        let r = verify_func(&m, f);
+        assert!(
+            has_error(
+                &r,
+                |k| matches!(k, VerifyErrorKind::InstOutOfArena(id) if *id == bogus)
+            ),
+            "expected InstOutOfArena, got: {:?}",
+            r.errors
+        );
+        assert!(
+            r.warnings.is_empty(),
+            "the dangling handler inst must not reach the N38 scan: {:?}",
+            r.warnings
+        );
+    }
+
+    /// Two uses of the same handler's exception param hit the region cache
+    /// (the second `exc_region` call returns the cached set).
+    #[test]
+    fn exception_param_used_twice_caches_region() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let t = add_block(&mut m, f);
+        let h = add_block(&mut m, f);
+        link(&mut m, entry, t);
+        let exc = add_exception_param(&mut m, h);
+        add_try(&mut m, f, vec![t], h, exc);
+        emit_void(&mut m, entry, Op::Branch { dest: t });
+        emit_void(&mut m, t, Op::Return { value: None });
+        let one = load_number(&mut m, h, 1.0);
+        let w1 = add(&mut m, h, exc, one); // first use of exc
+        let w2 = add(&mut m, h, exc, w1); // second use — region cache hit
+        emit_void(&mut m, h, Op::Return { value: Some(w2) });
+        let r = verify_func(&m, f);
+        assert!(r.is_ok(), "two in-scope uses must pass: {:?}", r.errors);
+    }
+
+    /// The exception param is valid in the handler's exceptional-reachable
+    /// DOWNSTREAM (the region BFS walks successors).
+    #[test]
+    fn exception_param_in_handler_downstream_is_valid() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let t = add_block(&mut m, f);
+        let h = add_block(&mut m, f);
+        let down = add_block(&mut m, f);
+        link(&mut m, entry, t);
+        link(&mut m, h, down);
+        let exc = add_exception_param(&mut m, h);
+        add_try(&mut m, f, vec![t], h, exc);
+        emit_void(&mut m, entry, Op::Branch { dest: t });
+        emit_void(&mut m, t, Op::Return { value: None });
+        emit_void(&mut m, h, Op::Branch { dest: down });
+        let one = load_number(&mut m, down, 1.0);
+        let w = add(&mut m, down, exc, one); // used in the handler's downstream
+        emit_void(&mut m, down, Op::Return { value: Some(w) });
+        let r = verify_func(&m, f);
+        assert!(
+            r.is_ok(),
+            "downstream-of-handler use must be in scope: {:?}",
+            r.errors
+        );
+    }
+
+    /// Phi entries carrying entry-defined values (params, constants) are
+    /// exempt from dominance by construction.
+    #[test]
+    fn phi_with_param_entries_passes() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let b1 = add_block(&mut m, f);
+        let b2 = add_block(&mut m, f);
+        let join = add_block(&mut m, f);
+        link(&mut m, entry, b1);
+        link(&mut m, entry, b2);
+        link(&mut m, b1, join);
+        link(&mut m, b2, join);
+        emit_void(
+            &mut m,
+            entry,
+            Op::CondBranch {
+                cond: p0,
+                true_dest: b1,
+                false_dest: b2,
+            },
+        );
+        emit_void(&mut m, b1, Op::Branch { dest: join });
+        emit_void(&mut m, b2, Op::Branch { dest: join });
+        let phi = emit(
+            &mut m,
+            join,
+            Op::Phi {
+                entries: vec![
+                    (
+                        Edge {
+                            from: b1,
+                            kind: EdgeKind::Normal,
+                        },
+                        p0, // entry-defined: exempt
+                    ),
+                    (
+                        Edge {
+                            from: b2,
+                            kind: EdgeKind::Normal,
+                        },
+                        p0,
+                    ),
+                ],
+            },
+        );
+        emit_void(&mut m, join, Op::Return { value: Some(phi) });
+        let r = verify_func(&m, f);
+        assert!(r.is_ok(), "param phi entries must pass: {:?}", r.errors);
+    }
+
+    /// A phi entry whose value is defined in a block that does NOT dominate
+    /// the entry's source edge is an N45 error.
+    #[test]
+    fn phi_use_not_dominated_is_error() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let entry = entry_of(&m, f);
+        let p0 = add_param(&mut m, f, 0);
+        let b1 = add_block(&mut m, f);
+        let b2 = add_block(&mut m, f);
+        let join = add_block(&mut m, f);
+        link(&mut m, entry, b1);
+        link(&mut m, entry, b2);
+        link(&mut m, b1, join);
+        link(&mut m, b2, join);
+        emit_void(
+            &mut m,
+            entry,
+            Op::CondBranch {
+                cond: p0,
+                true_dest: b1,
+                false_dest: b2,
+            },
+        );
+        let v1 = load_number(&mut m, b1, 1.0); // defined in b1
+        emit_void(&mut m, b1, Op::Branch { dest: join });
+        emit_void(&mut m, b2, Op::Branch { dest: join });
+        // The b2 edge entry uses b1's value — b1 does not dominate b2.
+        let phi = emit(
+            &mut m,
+            join,
+            Op::Phi {
+                entries: vec![
+                    (
+                        Edge {
+                            from: b1,
+                            kind: EdgeKind::Normal,
+                        },
+                        v1,
+                    ),
+                    (
+                        Edge {
+                            from: b2,
+                            kind: EdgeKind::Normal,
+                        },
+                        v1,
+                    ),
+                ],
+            },
+        );
+        emit_void(&mut m, join, Op::Return { value: Some(phi) });
+        let r = verify_func(&m, f);
+        let e = expect_error(
+            &r,
+            |k| {
+                matches!(
+                    k,
+                    VerifyErrorKind::PhiUseNotDominated { pred, value, def_block }
+                        if *pred == b2 && *value == v1 && *def_block == b1
+                )
+            },
+            "PhiUseNotDominated",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!(
+                "verify error in FuncId(0) {join} {:?}: phi entry from {b2} uses {v1} whose definition in {b1} does not dominate the predecessor (over Normal edges)",
+                e.inst.unwrap()
+            )
+        );
+    }
+
+    // ── Module-level reference integrity ─────────────────────────────
+
+    #[test]
+    fn class_super_and_interface_out_of_range_are_errors() {
+        let (mut m, _f) = minimal_func_module();
+        let bogus_super = ClassId::new(99);
+        let bogus_iface = ClassId::new(98);
+        m.classes[0].super_class = Some(bogus_super);
+        m.classes[0].interfaces.push(bogus_iface);
+        let r = verify_module(&m);
+        expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ClassOutOfRange(c) if *c == bogus_super),
+            "ClassOutOfRange(super)",
+        );
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ClassOutOfRange(c) if *c == bogus_iface),
+            "ClassOutOfRange(interface)",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!("verify error: class {bogus_iface} is outside the class table")
+        );
+    }
+
+    #[test]
+    fn class_method_out_of_range_is_error() {
+        let (mut m, _f) = minimal_func_module();
+        let bogus = FuncId::new(99);
+        m.classes[0].methods.push(bogus);
+        let r = verify_module(&m);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::FuncOutOfRange(id) if *id == bogus),
+            "FuncOutOfRange(class method)",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!("verify error: function {bogus} is outside the function table")
+        );
+    }
+
+    #[test]
+    fn func_class_out_of_range_is_error() {
+        let (mut m, _f) = minimal_func_module();
+        let name = m.sym.intern("orphan");
+        let bogus_class = ClassId::new(99);
+        m.functions.push(FunctionData {
+            class_id: bogus_class,
+            is_external: true, // isolate from MissingBody
+            ..FunctionData::new(ClassId::new(0), name, FunctionKind::Function)
+        });
+        let r = verify_module(&m);
+        let e = expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::ClassOutOfRange(c) if *c == bogus_class),
+            "ClassOutOfRange(func.class_id)",
+        );
+        assert_eq!(
+            format!("{e}"),
+            format!("verify error: class {bogus_class} is outside the class table")
+        );
+    }
+
+    /// Const-pool MethodRef payloads are checked, including nested inside
+    /// ObjectLiteral and ArrayLiteral trees (which also exercises the two
+    /// walks the corpus never lifts).
+    #[test]
+    fn const_method_ref_out_of_range_is_error() {
+        let (mut m, _f) = minimal_func_module();
+        let bogus_direct = FuncId::new(77);
+        let bogus_nested = FuncId::new(78);
+        let bogus_in_array = FuncId::new(79);
+        m.consts.push(Const::MethodRef(bogus_direct));
+        let key = m.sym.intern("k");
+        m.consts.push(Const::ObjectLiteral {
+            keys: vec![Const::String(key)],
+            values: vec![Const::MethodRef(bogus_nested)],
+        });
+        m.consts.push(Const::ArrayLiteral(vec![
+            Const::Null,
+            Const::MethodRef(bogus_in_array),
+        ]));
+        let r = verify_module(&m);
+        expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::FuncOutOfRange(id) if *id == bogus_direct),
+            "FuncOutOfRange(direct const)",
+        );
+        expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::FuncOutOfRange(id) if *id == bogus_nested),
+            "FuncOutOfRange(nested const)",
+        );
+        expect_error(
+            &r,
+            |k| matches!(k, VerifyErrorKind::FuncOutOfRange(id) if *id == bogus_in_array),
+            "FuncOutOfRange(array const)",
+        );
+    }
+
+    /// Valid shapes the corpus never lifts: a class with a super class and
+    /// interfaces verifies clean.
+    #[test]
+    fn valid_super_class_and_interfaces_pass() {
+        let (mut m, _f) = minimal_func_module();
+        m.classes[0].super_class = Some(ClassId::new(0)); // self
+        m.classes[0].interfaces.push(ClassId::new(0));
+        let r = verify_module(&m);
+        assert!(
+            r.is_ok(),
+            "valid super/interfaces must pass: {:?}",
+            r.errors
+        );
+    }
+
+    // ── Display + source() across all location combinations ─────────
+
+    #[test]
+    fn error_and_warning_display_cover_all_location_combos() {
+        let kind = || VerifyErrorKind::MissingTerminator;
+        let combos = [
+            (
+                None,
+                None,
+                None,
+                "verify error: block does not end with a terminator",
+            ),
+            (
+                Some(FuncId::new(1)),
+                None,
+                None,
+                "verify error in FuncId(1): block does not end with a terminator",
+            ),
+            (
+                Some(FuncId::new(1)),
+                Some(BlockId::new(2)),
+                None,
+                "verify error in FuncId(1) BlockId(2): block does not end with a terminator",
+            ),
+            (
+                Some(FuncId::new(1)),
+                Some(BlockId::new(2)),
+                Some(InstId::new(3)),
+                "verify error in FuncId(1) BlockId(2) InstId(3): block does not end with a terminator",
+            ),
+        ];
+        for (func, block, inst, want) in combos {
+            let e = VerifyError {
+                func,
+                block,
+                inst,
+                kind: kind(),
+            };
+            assert_eq!(format!("{e}"), want);
+            assert_eq!(
+                format!("{}", std::error::Error::source(&e).unwrap()),
+                "block does not end with a terminator"
+            );
+        }
+
+        let w_combos = [
+            (
+                None,
+                None,
+                None,
+                "verify warning: handler phi joins 2 distinct values across exceptional edges — imprecise join; passes must NOT constant-fold it (N38)",
+            ),
+            (
+                Some(FuncId::new(1)),
+                Some(BlockId::new(4)),
+                Some(InstId::new(5)),
+                "verify warning in FuncId(1) BlockId(4) InstId(5): handler phi joins 2 distinct values across exceptional edges — imprecise join; passes must NOT constant-fold it (N38)",
+            ),
+        ];
+        for (func, block, inst, want) in w_combos {
+            let w = VerifyWarning {
+                func,
+                block,
+                inst,
+                kind: VerifyWarningKind::HandlerPhiImpreciseJoin {
+                    handler: BlockId::new(4),
+                    count: 2,
+                },
+            };
+            assert_eq!(format!("{w}"), want);
+            assert!(std::error::Error::source(&w).is_some());
+        }
+    }
 }
