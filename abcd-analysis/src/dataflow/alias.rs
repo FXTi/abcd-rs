@@ -78,9 +78,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use abcd_ir::{BlockId, FuncId, InstId, Module, Op, ValueDef, ValueId};
 
-use super::heap::{
-    AliasOracle, AllocSiteSet, HeapRef, SiteInfo, Tribool, is_keyed_alloc, resolve_alloc_sites,
-};
+use super::heap::{AliasOracle, AllocSiteSet, SiteInfo, is_keyed_alloc, resolve_alloc_sites};
 use super::ifds::CallGraphOracle;
 use crate::callgraph::{CallGraph, CallTargets};
 use crate::frame::frame_slots_of;
@@ -792,46 +790,12 @@ impl<'m> Rung1AliasOracle<'m> {
 }
 
 impl<F> AliasOracle<F> for Rung1AliasOracle<'_> {
-    fn may_alias(&self, a: &HeapRef, b: &HeapRef) -> Tribool {
-        // Key-level tri-state, engine-independent (rung-0 logic — the
-        // keys are what rung 1 refines).
-        super::heap::key_may_alias(a, b)
-    }
-
-    fn must_alias(&self, base_a: ValueId, base_b: ValueId, at: InstId) -> bool {
-        // Rung-0 honesty kept: only a PROVEN single-site, phi-free,
-        // balanced, uncapped answer on both sides counts.
-        let a = self.query(base_a, at);
-        let b = self.query(base_b, at);
-        a.is_single_precise() && b.is_single_precise() && a.sites == b.sites
-    }
-
-    fn aliases_of_store(&mut self, _taint: &F, _store: InstId, _func: FuncId) -> Vec<F> {
-        // With site-keyed facts the computeAliases injection IS the
-        // store's re-key — and re-keying needs the client's fact algebra,
-        // which the F-generic seam cannot express. The client
-        // (abcd-taint) performs it via `site_info_at` at the store rule;
-        // the trait trigger stays for oracles that can inject at the key
-        // level (rung 0) and for rung-2 value-level rebasing.
-        Vec::new()
-    }
-
     fn inject_calling_context(&mut self, call: InstId, callee: FuncId, _fact: &F) {
         // Rung-1 queries carry their context per-query (the stack), so
         // answers do not depend on global learning; the edge is recorded
         // for the §5.4 co-evolution discipline (rung 2 will rebuild the
         // graph as contexts accumulate).
         self.seen_contexts.borrow_mut().insert((call, callee));
-    }
-
-    fn needs_requery_on_return(&self) -> bool {
-        // The strategy doc's answer (§5.2: "rung 1 will say no"): answers
-        // are SSA-stable, returns change nothing about def chains.
-        false
-    }
-
-    fn points_to(&self, base: ValueId, at: InstId) -> AllocSiteSet {
-        self.query(base, at).sites
     }
 }
 

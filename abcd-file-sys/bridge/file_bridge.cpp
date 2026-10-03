@@ -257,11 +257,6 @@ void File::ThrowIfWithCheck(bool cond, const std::string_view &msg,
 #endif
 }
 
-// GetLiteralArraysId
-File::EntityId File::GetLiteralArraysId() const {
-    return EntityId(GetHeader()->literalarray_idx_off);
-}
-
 // GetClassId — linear scan (sufficient for our use case)
 File::EntityId File::GetClassId(const uint8_t *mutf8_name) const {
     auto classes = GetClasses();
@@ -278,16 +273,6 @@ File::EntityId File::GetClassId(const uint8_t *mutf8_name) const {
         }
     }
     return EntityId();
-}
-
-// GetClassIdFromClassHashTable — stub (we don't use hash table acceleration)
-File::EntityId File::GetClassIdFromClassHashTable(const uint8_t *mutf8_name) const {
-    return GetClassId(mutf8_name);
-}
-
-// CalcFilenameHash — stub
-uint32_t File::CalcFilenameHash(const std::string & /*filename*/) {
-    return 0;
 }
 
 // ValidateChecksum — real implementation using adler32
@@ -308,37 +293,10 @@ std::unique_ptr<const File> File::OpenFromMemory(os::mem::ConstBytePtr &&ptr) {
     return std::unique_ptr<const File>(new File("", std::move(ptr)));
 }
 
-std::unique_ptr<const File> File::OpenFromMemory(os::mem::ConstBytePtr &&ptr,
-                                                  std::string_view filename) {
-    return std::unique_ptr<const File>(new File(std::string(filename), std::move(ptr)));
-}
-
-// Open — not supported (no filesystem access)
-std::unique_ptr<const File> File::Open(std::string_view /*filename*/, OpenMode /*open_mode*/) {
-    return nullptr;
-}
-
-// OpenUncompressedArchive — not supported
-std::unique_ptr<const File> File::OpenUncompressedArchive(int /*fd*/,
-    const std::string_view & /*filename*/, size_t /*size*/,
-    uint32_t /*offset*/, OpenMode /*open_mode*/) {
-    return nullptr;
-}
-
 // ContainsLiteralArrayInHeader — delegates to IsVersionLessOrEqual
 bool ContainsLiteralArrayInHeader(const std::array<uint8_t, File::VERSION_SIZE> &version) {
     return IsVersionLessOrEqual(version, LAST_CONTAINS_LITERAL_IN_HEADER_VERSION);
 }
-
-// Free functions — stubs
-bool CheckSecureMem(uintptr_t, size_t) { return true; }
-
-bool CheckHeader(const os::mem::ConstBytePtr & /*ptr*/, const std::string_view & /*filename*/) {
-    return true;
-}
-
-void CheckFileVersion(const std::array<uint8_t, File::VERSION_SIZE> & /*file_version*/,
-                      const std::string_view & /*filename*/) {}
 
 PandaFileType GetFileType(const uint8_t *data, int32_t size) {
     // Ported from upstream file.cpp (merged here; see review finding #4).
@@ -364,30 +322,6 @@ PandaFileType GetFileType(const uint8_t *data, int32_t size) {
         return PandaFileType::FILE_STATIC;
     }
     return PandaFileType::FILE_DYNAMIC;
-}
-
-std::unique_ptr<const File> OpenPandaFileOrZip(std::string_view /*location*/,
-                                                File::OpenMode /*open_mode*/) {
-    return nullptr;
-}
-
-std::unique_ptr<const File> OpenPandaFileFromMemory(const void *buffer, size_t size,
-                                                     std::string tag) {
-    auto *bytes = reinterpret_cast<std::byte *>(const_cast<void *>(buffer));
-    os::mem::ConstBytePtr ptr(bytes, size, nullptr);
-    return File::OpenFromMemory(std::move(ptr), tag);
-}
-
-std::unique_ptr<const File> OpenPandaFileFromSecureMemory(uint8_t *buffer, size_t size) {
-    auto *bytes = reinterpret_cast<std::byte *>(buffer);
-    os::mem::ConstBytePtr ptr(bytes, size, nullptr);
-    return File::OpenFromMemory(std::move(ptr));
-}
-
-std::unique_ptr<const File> OpenPandaFile(std::string_view /*location*/,
-                                           std::string_view /*archive_filename*/,
-                                           File::OpenMode /*open_mode*/) {
-    return nullptr;
 }
 
 const char *ARCHIVE_FILENAME = "";
@@ -981,25 +915,6 @@ try {
     return a->accessor.GetDescriptor();
 } catch (...) {
     return nullptr;
-}
-}
-
-size_t abc_class_get_name(const AbcClassAccessor *a, char *buf, size_t buf_len) {
-try {
-    auto sd = a->accessor.GetName();
-    if (!sd.data) return 0;
-    // Bound the terminator scan by the file span (never strlen).
-    size_t len = 0;
-    if (!bounded_cstr_len(a->accessor.GetPandaFile(), sd.data, &len)) return 0;
-    if (buf && buf_len > 0) {
-        size_t copy = len < buf_len - 1 ? len : buf_len - 1;
-        std::memcpy(buf, sd.data, copy);
-        buf[copy] = '\0';
-        return copy;
-    }
-    return len;
-} catch (...) {
-    return 0;
 }
 }
 

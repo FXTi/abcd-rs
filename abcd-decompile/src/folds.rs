@@ -269,6 +269,9 @@ fn fold_children(n: &mut SNode, stats: &mut FoldStats) {
                 fold_seq(&mut c.body, stats);
             }
         }
+        // unreachable: fold_children runs per-list strictly BEFORE the list
+        // folds that create ForOf/ForIn/Switch nodes (folds.rs:200-213), and
+        // no list is re-walked — c-COV diagnosis
         SNode::ForOf { body, .. } | SNode::ForIn { body, .. } => fold_seq(body, stats),
         SNode::Switch { cases, .. } => {
             for c in cases {
@@ -5527,6 +5530,9 @@ fn async_fold_seq(
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
+            // unreachable: ForOf/ForIn nodes are created only inside fold()
+            // (folds.rs:1418/1433/2577), which runs after async_driver_fold
+            // (emit.rs:512 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
             | SNode::ForIn { body, .. } => async_fold_seq(body, uses, decls, stats),
             SNode::Try {
@@ -5539,10 +5545,16 @@ fn async_fold_seq(
                 for c in catches {
                     async_fold_seq(&mut c.body, uses, decls, stats);
                 }
+                // unreachable: Try.finally is Some only after fold_finally
+                // (folds.rs:4143/4154) inside fold(), which runs after
+                // async_driver_fold — c-COV diagnosis
                 if let Some(f) = finally {
                     async_fold_seq(f, uses, decls, stats);
                 }
             }
+            // unreachable: SNode::Switch is created only by fold_switches
+            // (folds.rs:3115/3183) inside fold(), which runs after
+            // async_driver_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
                     async_fold_seq(&mut c.body, uses, decls, stats);
@@ -5693,6 +5705,9 @@ fn entry_site_matches(nodes: &[SNode], cx: &mut GenDriverCx) -> bool {
         SNode::While { body, .. }
         | SNode::DoWhile { body, .. }
         | SNode::Labeled { body, .. }
+        // unreachable: ForOf/ForIn nodes are created only inside fold()
+        // (folds.rs:1418/1433/2577), which runs after
+        // generator_machine_fold (emit.rs:508 vs 531) — c-COV diagnosis
         | SNode::ForOf { body, .. }
         | SNode::ForIn { body, .. } => entry_site_matches(body, cx),
         SNode::Try {
@@ -5705,6 +5720,9 @@ fn entry_site_matches(nodes: &[SNode], cx: &mut GenDriverCx) -> bool {
                 || catches.iter().any(|c| entry_site_matches(&c.body, cx))
                 || finally.as_ref().is_some_and(|f| entry_site_matches(f, cx))
         }
+        // unreachable: SNode::Switch is created only by fold_switches
+        // (folds.rs:3115/3183) inside fold(), which runs after
+        // generator_machine_fold — c-COV diagnosis
         SNode::Switch { cases, .. } => cases.iter().any(|c| entry_site_matches(&c.body, cx)),
         SNode::Stmts(_) | SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => false,
     })
@@ -5991,6 +6009,9 @@ fn gen_fold_seq(nodes: &mut Vec<SNode>, cx: &mut GenDriverCx, stats: &mut FoldSt
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
+            // unreachable: ForOf/ForIn nodes are created only inside fold()
+            // (folds.rs:1418/1433/2577), which runs after
+            // generator_machine_fold (emit.rs:508 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
             | SNode::ForIn { body, .. } => gen_fold_seq(body, cx, stats),
             SNode::Try {
@@ -6003,10 +6024,16 @@ fn gen_fold_seq(nodes: &mut Vec<SNode>, cx: &mut GenDriverCx, stats: &mut FoldSt
                 for c in catches {
                     gen_fold_seq(&mut c.body, cx, stats);
                 }
+                // unreachable: Try.finally is Some only after fold_finally
+                // (folds.rs:4143/4154) inside fold(), which runs after
+                // generator_machine_fold — c-COV diagnosis
                 if let Some(f) = finally {
                     gen_fold_seq(f, cx, stats);
                 }
             }
+            // unreachable: SNode::Switch is created only by fold_switches
+            // (folds.rs:3115/3183) inside fold(), which runs after
+            // generator_machine_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
                     gen_fold_seq(&mut c.body, cx, stats);
@@ -6287,6 +6314,9 @@ fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<ValueId> {
                 SNode::While { body, .. }
                 | SNode::DoWhile { body, .. }
                 | SNode::Labeled { body, .. }
+                // unreachable: ForOf/ForIn nodes are created only inside
+                // fold() (folds.rs:1418/1433/2577), which runs after
+                // async_machine_fold (emit.rs:517 vs 531) — c-COV diagnosis
                 | SNode::ForOf { body, .. }
                 | SNode::ForIn { body, .. } => return first_significant_stmt(body),
                 // If/Switch/Break/Continue: the first executed statement
@@ -6323,6 +6353,9 @@ fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<ValueId> {
                     visit(otherwise, stack, out);
                 }
                 SNode::Labeled { body, .. }
+                // unreachable: ForOf/ForIn nodes are created only inside
+                // fold(), which runs after async_machine_fold (emit.rs:517
+                // vs 531) — c-COV diagnosis
                 | SNode::ForOf { body, .. }
                 | SNode::ForIn { body, .. } => visit(body, stack, out),
                 SNode::Try {
@@ -6335,10 +6368,16 @@ fn collect_loop_exit_throws(nodes: &[SNode]) -> BTreeSet<ValueId> {
                     for c in catches {
                         visit(&c.body, stack, out);
                     }
+                    // unreachable: Try.finally is Some only after
+                    // fold_finally (folds.rs:4143/4154) inside fold(),
+                    // which runs after async_machine_fold — c-COV diagnosis
                     if let Some(f) = finally {
                         visit(f, stack, out);
                     }
                 }
+                // unreachable: SNode::Switch is created only by
+                // fold_switches (folds.rs:3115/3183) inside fold(), which
+                // runs after async_machine_fold — c-COV diagnosis
                 SNode::Switch { cases, .. } => {
                     for c in cases {
                         visit(&c.body, stack, out);
@@ -6742,6 +6781,9 @@ fn async_machine_seq(nodes: &mut Vec<SNode>, cx: &mut AsyncMachineCx, stats: &mu
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
+            // unreachable: ForOf/ForIn nodes are created only inside fold()
+            // (folds.rs:1418/1433/2577), which runs after
+            // async_machine_fold (emit.rs:517 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
             | SNode::ForIn { body, .. } => async_machine_seq(body, cx, stats),
             SNode::Try {
@@ -6754,10 +6796,16 @@ fn async_machine_seq(nodes: &mut Vec<SNode>, cx: &mut AsyncMachineCx, stats: &mu
                 for c in catches {
                     async_machine_seq(&mut c.body, cx, stats);
                 }
+                // unreachable: Try.finally is Some only after fold_finally
+                // (folds.rs:4143/4154) inside fold(), which runs after
+                // async_machine_fold — c-COV diagnosis
                 if let Some(f) = finally {
                     async_machine_seq(f, cx, stats);
                 }
             }
+            // unreachable: SNode::Switch is created only by fold_switches
+            // (folds.rs:3115/3183) inside fold(), which runs after
+            // async_machine_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
                     async_machine_seq(&mut c.body, cx, stats);
@@ -6963,6 +7011,9 @@ fn strip_genobj_phi_assigns(
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
+            // unreachable: ForOf/ForIn nodes are created only inside fold()
+            // (folds.rs:1418/1433/2577), which runs after
+            // async_machine_fold (emit.rs:517 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
             | SNode::ForIn { body, .. } => strip_genobj_phi_assigns(body, aliases, targets),
             SNode::Try {
@@ -6975,10 +7026,16 @@ fn strip_genobj_phi_assigns(
                 for c in catches {
                     strip_genobj_phi_assigns(&mut c.body, aliases, targets);
                 }
+                // unreachable: Try.finally is Some only after fold_finally
+                // (folds.rs:4143/4154) inside fold(), which runs after
+                // async_machine_fold — c-COV diagnosis
                 if let Some(f) = finally {
                     strip_genobj_phi_assigns(f, aliases, targets);
                 }
             }
+            // unreachable: SNode::Switch is created only by fold_switches
+            // (folds.rs:3115/3183) inside fold(), which runs after
+            // async_machine_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
                     strip_genobj_phi_assigns(&mut c.body, aliases, targets);
@@ -7017,6 +7074,9 @@ fn strip_dead_phi_decls(
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
+            // unreachable: ForOf/ForIn nodes are created only inside fold()
+            // (folds.rs:1418/1433/2577), which runs after
+            // async_machine_fold (emit.rs:517 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
             | SNode::ForIn { body, .. } => strip_dead_phi_decls(body, targets, remaining, uses),
             SNode::Try {
@@ -7029,10 +7089,16 @@ fn strip_dead_phi_decls(
                 for c in catches {
                     strip_dead_phi_decls(&mut c.body, targets, remaining, uses);
                 }
+                // unreachable: Try.finally is Some only after fold_finally
+                // (folds.rs:4143/4154) inside fold(), which runs after
+                // async_machine_fold — c-COV diagnosis
                 if let Some(f) = finally {
                     strip_dead_phi_decls(f, targets, remaining, uses);
                 }
             }
+            // unreachable: SNode::Switch is created only by fold_switches
+            // (folds.rs:3115/3183) inside fold(), which runs after
+            // async_machine_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
                     strip_dead_phi_decls(&mut c.body, targets, remaining, uses);
@@ -7321,6 +7387,9 @@ fn agen_entry_elide(nodes: &mut [SNode], genobj: ValueId, stats: &mut FoldStats)
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
+            // unreachable: ForOf/ForIn nodes are created only inside fold()
+            // (folds.rs:1418/1433/2577), which runs after
+            // async_generator_machine_fold (emit.rs:524 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
             | SNode::ForIn { body, .. } => {
                 if agen_entry_elide(body, genobj, stats) {
@@ -7333,6 +7402,9 @@ fn agen_entry_elide(nodes: &mut [SNode], genobj: ValueId, stats: &mut FoldStats)
                 finally,
                 ..
             } => {
+                // unreachable (finally conjunct): Try.finally is Some only
+                // after fold_finally (folds.rs:4143/4154) inside fold(),
+                // which runs after async_generator_machine_fold — c-COV diagnosis
                 if agen_entry_elide(body, genobj, stats)
                     || catches
                         .iter_mut()
@@ -7344,6 +7416,9 @@ fn agen_entry_elide(nodes: &mut [SNode], genobj: ValueId, stats: &mut FoldStats)
                     return true;
                 }
             }
+            // unreachable: SNode::Switch is created only by fold_switches
+            // (folds.rs:3115/3183) inside fold(), which runs after
+            // async_generator_machine_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
                     if agen_entry_elide(&mut c.body, genobj, stats) {
@@ -7387,6 +7462,9 @@ fn agen_fold_seq(nodes: &mut Vec<SNode>, cx: &mut AsyncMachineCx, stats: &mut Fo
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
+            // unreachable: ForOf/ForIn nodes are created only inside fold()
+            // (folds.rs:1418/1433/2577), which runs after
+            // async_generator_machine_fold (emit.rs:524 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
             | SNode::ForIn { body, .. } => agen_fold_seq(body, cx, stats),
             SNode::Try {
@@ -7399,10 +7477,16 @@ fn agen_fold_seq(nodes: &mut Vec<SNode>, cx: &mut AsyncMachineCx, stats: &mut Fo
                 for c in catches {
                     agen_fold_seq(&mut c.body, cx, stats);
                 }
+                // unreachable: Try.finally is Some only after fold_finally
+                // (folds.rs:4143/4154) inside fold(), which runs after
+                // async_generator_machine_fold — c-COV diagnosis
                 if let Some(f) = finally {
                     agen_fold_seq(f, cx, stats);
                 }
             }
+            // unreachable: SNode::Switch is created only by fold_switches
+            // (folds.rs:3115/3183) inside fold(), which runs after
+            // async_generator_machine_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
                     agen_fold_seq(&mut c.body, cx, stats);
@@ -8024,6 +8108,9 @@ fn sweep_dead_decls(nodes: &mut [SNode], dead: &BTreeSet<ValueId>) {
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
+            // unreachable: ForOf/ForIn nodes are created only inside fold()
+            // (folds.rs:1418/1433/2577); sweep_dead_decls runs only from the
+            // generator/async machine folds, all before fold() — c-COV diagnosis
             | SNode::ForOf { body, .. }
             | SNode::ForIn { body, .. } => sweep_dead_decls(body, dead),
             SNode::Try {
@@ -8036,10 +8123,16 @@ fn sweep_dead_decls(nodes: &mut [SNode], dead: &BTreeSet<ValueId>) {
                 for c in catches {
                     sweep_dead_decls(&mut c.body, dead);
                 }
+                // unreachable: Try.finally is Some only after fold_finally
+                // (folds.rs:4143/4154) inside fold(), which runs after the
+                // generator/async machine folds — c-COV diagnosis
                 if let Some(f) = finally {
                     sweep_dead_decls(f, dead);
                 }
             }
+            // unreachable: SNode::Switch is created only by fold_switches
+            // (folds.rs:3115/3183) inside fold(), which runs after the
+            // generator/async machine folds — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
                     sweep_dead_decls(&mut c.body, dead);
@@ -8198,6 +8291,9 @@ fn ys_fold_seq(
             SNode::While { body, .. }
             | SNode::DoWhile { body, .. }
             | SNode::Labeled { body, .. }
+            // unreachable: ForOf/ForIn nodes are created only inside fold()
+            // (folds.rs:1418/1433/2577), which runs after yield_star_fold
+            // (emit.rs:530 vs 531) — c-COV diagnosis
             | SNode::ForOf { body, .. }
             | SNode::ForIn { body, .. } => ys_fold_seq(body, async_, uses, stats),
             SNode::Try {
@@ -8210,10 +8306,16 @@ fn ys_fold_seq(
                 for c in catches {
                     ys_fold_seq(&mut c.body, async_, uses, stats);
                 }
+                // unreachable: Try.finally is Some only after fold_finally
+                // (folds.rs:4143/4154) inside fold(), which runs after
+                // yield_star_fold — c-COV diagnosis
                 if let Some(f) = finally {
                     ys_fold_seq(f, async_, uses, stats);
                 }
             }
+            // unreachable: SNode::Switch is created only by fold_switches
+            // (folds.rs:3115/3183) inside fold(), which runs after
+            // yield_star_fold — c-COV diagnosis
             SNode::Switch { cases, .. } => {
                 for c in cases {
                     ys_fold_seq(&mut c.body, async_, uses, stats);

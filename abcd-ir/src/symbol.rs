@@ -40,11 +40,6 @@ impl SymbolTable {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
-
-    /// Whether the table is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
 }
 
 #[cfg(test)]

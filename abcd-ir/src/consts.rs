@@ -91,11 +91,6 @@ impl ConstPool {
     pub fn len(&self) -> usize {
         self.consts.len()
     }
-
-    /// Whether the pool is empty.
-    pub fn is_empty(&self) -> bool {
-        self.consts.is_empty()
-    }
 }
 
 #[cfg(test)]

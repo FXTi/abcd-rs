@@ -80,8 +80,6 @@ fn call_result_hops_into_callee_alloc_site() {
     assert!(ans.sites.iter().eq([site]), "the callee's alloc site");
     assert!(ans.precise_for_keying(), "complete and balanced: {ans:?}");
 
-    // The trait surface reports the same set.
-    assert_eq!(AliasOracle::<()>::points_to(&oracle, result, call).len(), 1);
     // site_info_at uses the refined answer (not the rung-0 empty set).
     let info = oracle.site_info_at(result, call);
     assert!(info.is_single_precise());
@@ -181,11 +179,15 @@ fn balanced_discipline_separates_call_sites() {
     assert_eq!(a1.sites.iter().next().unwrap(), o1.inst_of(&m));
     assert_eq!(a2.sites.iter().next().unwrap(), o2.inst_of(&m));
 
-    // must_alias honesty: proven same-site (o1 through the call) is
-    // must-alias; o1 vs o2 is not.
-    assert!(AliasOracle::<()>::must_alias(&oracle, r1, o1, call1));
-    assert!(!AliasOracle::<()>::must_alias(&oracle, r1, o2, call1));
-    assert!(!AliasOracle::<()>::must_alias(&oracle, r1, r2, call1));
+    // must-alias honesty: proven same-site (o1 through the call) is
+    // must-alias; o1 vs o2 is not. (The oracle seam's must_alias
+    // delegate was deleted as dead surface; same query composition here.)
+    let (qa, qb) = (oracle.query(r1, call1), oracle.query(o1, call1));
+    assert!(qa.is_single_precise() && qb.is_single_precise() && qa.sites == qb.sites);
+    let (qa, qb) = (oracle.query(r1, call1), oracle.query(o2, call1));
+    assert!(!(qa.is_single_precise() && qb.is_single_precise() && qa.sites == qb.sites));
+    let (qa, qb) = (oracle.query(r1, call1), oracle.query(r2, call1));
+    assert!(!(qa.is_single_precise() && qb.is_single_precise() && qa.sites == qb.sites));
 }
 
 /// Must-alias honesty: a phi merge of the same single site on both
@@ -248,12 +250,9 @@ fn must_alias_honesty_on_phi_and_unbalanced() {
     assert_eq!(ans.sites.len(), 1, "one site through the phi");
     assert!(ans.has_phi);
     assert!(!ans.is_single_precise(), "phi kills single-precision");
-    assert!(!AliasOracle::<()>::must_alias(
-        &oracle,
-        phi,
-        a,
-        InstId::new(0)
-    ));
+    // Not must-alias: the phi side is not single-precise.
+    let (qa, qb) = (oracle.query(phi, InstId::new(0)), oracle.query(a, InstId::new(0)));
+    assert!(!(qa.is_single_precise() && qb.is_single_precise() && qa.sites == qb.sites));
 }
 
 /// The b3 shape: a callee value that is a PARAMETER (`register(cb) {
@@ -423,9 +422,9 @@ fn depth_cap_cuts_and_falls_back() {
     // — sound, weak, never the precise-but-wrong one.
     let info = shallow.site_info_at(cur, outer_call);
     assert!(info.sites.is_empty() && info.has_unknown);
-    assert!(!AliasOracle::<()>::must_alias(
-        &shallow, cur, cur, outer_call
-    ));
+    // Not must-alias: a capped answer is not single-precise.
+    let (qa, qb) = (shallow.query(cur, outer_call), shallow.query(cur, outer_call));
+    assert!(!(qa.is_single_precise() && qb.is_single_precise() && qa.sites == qb.sites));
 }
 
 /// Unresolved call targets are opaque; native (bodyless) callees too.
@@ -457,7 +456,7 @@ fn unresolved_and_native_calls_are_unknown() {
     let oracle = Rung1AliasOracle::new(&m, &graph);
     let ans = oracle.query(r, call);
     assert!(ans.has_unknown);
-    assert_eq!(AliasOracle::<()>::points_to(&oracle, r, call).len(), 0);
+    assert_eq!(oracle.query(r, call).sites.len(), 0);
 }
 
 /// Determinism: two engines over the same module answer identically,

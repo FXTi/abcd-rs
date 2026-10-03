@@ -211,11 +211,6 @@ impl Legalizer {
     pub fn reserve(&mut self, name: &str) {
         self.used.insert(name.to_string());
     }
-
-    /// Whether `name` is already taken in this scope.
-    pub fn is_used(&self, name: &str) -> bool {
-        self.used.contains(name)
-    }
 }
 
 #[cfg(test)]

@@ -64,46 +64,12 @@ impl MemClasses {
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
-
-    const NAMES: [(MemClasses, &str); 6] = [
-        (Self::HEAP, "heap"),
-        (Self::LEX_ENV, "lexenv"),
-        (Self::GLOBAL, "global"),
-        (Self::MODULE, "module"),
-        (Self::ITERATOR, "iterator"),
-        (Self::PROTOTYPE, "prototype"),
-    ];
 }
 
 impl std::ops::BitOr for MemClasses {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         self.union(rhs)
-    }
-}
-
-impl std::ops::BitOrAssign for MemClasses {
-    fn bitor_assign(&mut self, rhs: Self) {
-        *self = self.union(rhs);
-    }
-}
-
-impl std::fmt::Display for MemClasses {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut first = true;
-        for (class, name) in Self::NAMES {
-            if self.contains(class) {
-                if !first {
-                    write!(f, "|")?;
-                }
-                write!(f, "{name}")?;
-                first = false;
-            }
-        }
-        if first {
-            write!(f, "none")?;
-        }
-        Ok(())
     }
 }
 

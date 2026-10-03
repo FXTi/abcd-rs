@@ -18,8 +18,8 @@
 //!
 //! Because facts are keyed by site rather than by local, aliasing is
 //! resolved *at the key*: a store through `x.f` and a load through `y.f`
-//! meet iff `x` and `y` share a site. That is why
-//! [`Rung0AliasOracle::aliases_of_store`] injects nothing — the
+//! meet iff `x` and `y` share a site. That is why the rung-0 oracle's
+//! `computeAliases` trigger injects nothing — the
 //! `computeAliases` trigger of infoflow.md §4.2 is subsumed by key
 //! matching at rung 0. Rung 1 (a Boomerang-shaped demand-driven query
 //! engine) replaces that with memoized backward queries *without changing
@@ -304,45 +304,21 @@ pub fn key_may_alias(a: &HeapRef, b: &HeapRef) -> Tribool {
 
 /// Oracle for heap aliasing, implemented by heap-v0 (rung 0) initially
 /// and by a demand-driven query engine (rung 1) later WITHOUT call-site
-/// changes in the taint engine (analysis-strategy.md §5.2 — this trait's
-/// method set is that section's spec, generalized over the client's fact
-/// type `F` so `abcd-analysis` never depends on `abcd-taint`; modeled on
-/// FlowDroid's `IAliasingStrategy` policy interface, infoflow.md §9).
+/// changes in the taint engine (analysis-strategy.md §5.2, generalized
+/// over the client's fact type `F` so `abcd-analysis` never depends on
+/// `abcd-taint`; modeled on FlowDroid's `IAliasingStrategy` policy
+/// interface, infoflow.md §9).
+///
+/// Only the calling-context channel survives on the seam: the
+/// `may_alias`/`must_alias`/`aliases_of_store`/`needs_requery_on_return`/
+/// `points_to` surface had no production consumer (the taint problem keys
+/// facts by site set and uses the inherent oracle queries directly), so
+/// it was deleted as dead surface.
 pub trait AliasOracle<F> {
-    /// Cheap, must-not-block queries used inside flow functions.
-    /// Tri-state over alloc-site sets; heap-v0 answers from def chains
-    /// only.
-    fn may_alias(&self, a: &HeapRef, b: &HeapRef) -> Tribool;
-
-    /// Must-alias on SSA bases at a program point: rung 0 answers "same
-    /// single site along both def chains, no phi in between".
-    fn must_alias(&self, base_a: ValueId, base_b: ValueId, at: InstId) -> bool;
-
-    /// The expensive trigger: a taint was written to the heap at `store`.
-    /// Returns additional (heap-keyed) taint facts to inject into the
-    /// forward analysis — the analogue of infoflow.md §4.2's
-    /// `computeAliases` triggers. heap-v0 answers locally (key-level
-    /// merging makes this empty); rung 1 runs a memoized backward query
-    /// here.
-    fn aliases_of_store(&mut self, taint: &F, store: InstId, func: FuncId) -> Vec<F>;
-
     /// Interprocedural discipline, mirroring infoflow.md §4.3: the oracle
     /// learns calling contexts so alias queries started in a callee
     /// return to the right callers.
     fn inject_calling_context(&mut self, call: InstId, callee: FuncId, fact: &F);
-
-    /// Whether the oracle needs to be re-queried on return edges
-    /// (FlowDroid's `PtsBased` said yes, `FlowSensitive` said no; rung 1
-    /// will say no). heap-v0 answers everything from def chains, so no.
-    fn needs_requery_on_return(&self) -> bool;
-
-    /// Rung-1 capability probe: resolve a base value to allocation sites
-    /// at a program point. heap-v0 implements it as the local def-chain
-    /// walk ([`resolve_alloc_sites`]); the rung-1 engine overrides with
-    /// the memoized interprocedural query. Call-graph resolution
-    /// (analysis-strategy §5.4) may consume this too — one mechanism
-    /// serves both the alias ladder and dispatch precision.
-    fn points_to(&self, base: ValueId, at: InstId) -> AllocSiteSet;
 }
 
 /// The rung-0 oracle: def-chain answers only
@@ -379,37 +355,9 @@ impl<'m> Rung0AliasOracle<'m> {
 }
 
 impl<F> AliasOracle<F> for Rung0AliasOracle<'_> {
-    fn may_alias(&self, a: &HeapRef, b: &HeapRef) -> Tribool {
-        key_may_alias(a, b)
-    }
-
-    fn must_alias(&self, base_a: ValueId, base_b: ValueId, _at: InstId) -> bool {
-        let a = self.resolve(base_a);
-        let b = self.resolve(base_b);
-        a.is_single_precise() && b.is_single_precise() && a.sites == b.sites
-    }
-
-    fn aliases_of_store(&mut self, _taint: &F, _store: InstId, _func: FuncId) -> Vec<F> {
-        // Rung 0 resolves aliasing at the fact KEY (site-keyed heap facts
-        // merge at the key), so there is nothing to inject — see the
-        // module docs. Rung 1 overrides this with a backward query.
-        Vec::new()
-    }
-
     fn inject_calling_context(&mut self, _call: InstId, _callee: FuncId, _fact: &F) {
         // Rung 0 is context-insensitive by construction (def chains carry
         // no calling context); nothing to record.
-    }
-
-    fn needs_requery_on_return(&self) -> bool {
-        false
-    }
-
-    fn points_to(&self, base: ValueId, _at: InstId) -> AllocSiteSet {
-        // Rung 0 is flow-insensitive along the def chain: `at` does not
-        // refine the answer (documented imprecision; the parameter exists
-        // so rung 1's point-aware query drops in unchanged).
-        self.resolve(base).sites
     }
 }
 
@@ -433,17 +381,14 @@ mod tests {
         assert!(info.is_single_precise());
         assert_eq!(update_kind(&info), UpdateKind::Strong);
 
+        // The oracle seam's must-alias/points-to delegates were deleted
+        // as dead surface; the same answers come from `resolve`:
+        // must-alias = both sides single-precise with equal sites,
+        // points-to = the resolved site set.
         let oracle = Rung0AliasOracle::new(&m);
-        assert!(AliasOracle::<()>::must_alias(
-            &oracle,
-            obj,
-            alias,
-            InstId::new(0)
-        ));
-        assert_eq!(
-            AliasOracle::<()>::points_to(&oracle, alias, InstId::new(0)).len(),
-            1
-        );
+        let (a, b) = (oracle.resolve(obj), oracle.resolve(alias));
+        assert!(a.is_single_precise() && b.is_single_precise() && a.sites == b.sites);
+        assert_eq!(oracle.resolve(alias).sites.len(), 1);
     }
 
     #[test]
@@ -503,16 +448,10 @@ mod tests {
         assert_eq!(update_kind(&info), UpdateKind::Weak);
 
         let oracle = Rung0AliasOracle::new(&m);
-        assert!(!AliasOracle::<()>::must_alias(
-            &oracle,
-            phi,
-            a,
-            InstId::new(0)
-        ));
-        assert_eq!(
-            AliasOracle::<()>::points_to(&oracle, phi, InstId::new(0)).len(),
-            2
-        );
+        // Not must-alias: the phi side is not single-precise.
+        let (pa, pb) = (oracle.resolve(phi), oracle.resolve(a));
+        assert!(!(pa.is_single_precise() && pb.is_single_precise() && pa.sites == pb.sites));
+        assert_eq!(oracle.resolve(phi).sites.len(), 2);
     }
 
     #[test]
@@ -538,12 +477,8 @@ mod tests {
         // Different sites of different kinds do not alias.
         let obj = alloc_object(&mut m, entry);
         let oracle = Rung0AliasOracle::new(&m);
-        assert!(!AliasOracle::<()>::must_alias(
-            &oracle,
-            arr,
-            obj,
-            InstId::new(0)
-        ));
+        let (a, b) = (oracle.resolve(arr), oracle.resolve(obj));
+        assert!(!(a.is_single_precise() && b.is_single_precise() && a.sites == b.sites));
     }
 
     #[test]
@@ -562,12 +497,9 @@ mod tests {
         assert_eq!(update_kind(&info), UpdateKind::Weak);
 
         let oracle = Rung0AliasOracle::new(&m);
-        assert!(!AliasOracle::<()>::must_alias(
-            &oracle,
-            loaded,
-            loaded,
-            InstId::new(0)
-        ));
+        // Not must-alias: an unknown-source value is not single-precise.
+        let (a, b) = (oracle.resolve(loaded), oracle.resolve(loaded));
+        assert!(!(a.is_single_precise() && b.is_single_precise() && a.sites == b.sites));
     }
 
     #[test]
@@ -601,42 +533,30 @@ mod tests {
         let s1 = AllocSiteSet::one(InstId::new(1));
         let s2 = AllocSiteSet::one(InstId::new(2));
 
-        let m = Module::new();
-        let oracle = Rung0AliasOracle::new(&m);
+        // The oracle seam's may-alias delegate was deleted as dead
+        // surface; it was a pure forward to `key_may_alias`.
         let same = HeapRef {
             sites: s1.clone(),
             fields: f1.clone(),
         };
-        assert_eq!(
-            AliasOracle::<()>::may_alias(&oracle, &same, &same.clone()),
-            Tribool::True
-        );
+        assert_eq!(key_may_alias(&same, &same.clone()), Tribool::True);
         // Different named fields: never the same location.
         let other_field = HeapRef {
             sites: s1.clone(),
             fields: f2,
         };
-        assert_eq!(
-            AliasOracle::<()>::may_alias(&oracle, &same, &other_field),
-            Tribool::False
-        );
+        assert_eq!(key_may_alias(&same, &other_field), Tribool::False);
         // Same field, disjoint sites: different objects.
         let other_obj = HeapRef {
             sites: s2,
             fields: f1.clone(),
         };
-        assert_eq!(
-            AliasOracle::<()>::may_alias(&oracle, &same, &other_obj),
-            Tribool::False
-        );
+        assert_eq!(key_may_alias(&same, &other_obj), Tribool::False);
         // Same field, unknown sites on one side: undecidable.
         let unknown = HeapRef {
             sites: AllocSiteSet::new(),
             fields: f1,
         };
-        assert_eq!(
-            AliasOracle::<()>::may_alias(&oracle, &same, &unknown),
-            Tribool::Unknown
-        );
+        assert_eq!(key_may_alias(&same, &unknown), Tribool::Unknown);
     }
 }

@@ -53,15 +53,10 @@ fn plan_and_write(
     force: bool,
 ) -> Result<Vec<ExtractedModule>, CliError> {
     let mut planned: Vec<ExtractedModule> = Vec::with_capacity(modules.len());
-    let mut seen_names: Vec<&str> = Vec::with_capacity(modules.len());
+    // No duplicate-name guard here: `input::container_modules` already
+    // enforces globally unique module names (input.rs dedup loop), so two
+    // modules can never share a name at this point.
     for m in modules {
-        if seen_names.contains(&m.name.as_str()) {
-            return Err(CliError::Tool(format!(
-                "container yields two modules named {:?}; refusing to pick output names",
-                m.name
-            )));
-        }
-        seen_names.push(&m.name);
         let abc_path = out_dir.join(format!("{}.abc", m.name));
         let json_path = m
             .module_json

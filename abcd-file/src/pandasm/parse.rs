@@ -2743,9 +2743,11 @@ fn parse_language(text: &[u8]) -> Option<SourceLang> {
 // `text:literal-index-order-underdetermined`).
 
 fn fix_literal_assignment(file: &mut File, target: &[(u32, u32)]) {
-    if super::simulated_literal_assignment(file) == *target {
-        return;
-    }
+    // No fast path: simulated_literal_assignment was deleted (its emitter
+    // keys are bare `{index} 0x{offset}` while parse_literal_key requires
+    // a trailing value byte, so it always returned [] and the compare
+    // against a non-empty target was never true). The sort below always
+    // runs — same behavior as before.
     // Method order within a class is invisible in the text (functions print
     // signature-sorted) but drives the 13.x/24.x collection order. Sort
     // each class's methods by the smallest printed index their literal

@@ -540,26 +540,4 @@ impl Expr {
             _ => 20,
         }
     }
-
-    /// The node's Stage-A status for the coverage histogram (nodes not
-    /// carrying an explicit status are [`NodeStatus::Expressed`] —
-    /// plumbing nodes carry [`NodeStatus::Plumbing`] explicitly).
-    pub fn status(&self) -> NodeStatus {
-        match self {
-            Expr::Iter { status, .. } => *status,
-            Expr::GeneratorDriver { .. }
-            | Expr::AsyncDriver { .. }
-            | Expr::Class { sendable: true, .. }
-            | Expr::Fallback { .. } => NodeStatus::Fallback,
-            Expr::TemplateObject { .. }
-            | Expr::IterResultObj { .. }
-            | Expr::CreateGenerator { .. }
-            | Expr::CopyDataProps { .. }
-            | Expr::SetObjectWithProto { .. }
-            | Expr::ArraySpread { .. }
-            | Expr::RestObject { .. }
-            | Expr::DefineGetterSetter { .. } => NodeStatus::Plumbing,
-            _ => NodeStatus::Expressed,
-        }
-    }
 }

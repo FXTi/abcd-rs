@@ -711,6 +711,10 @@ fn rewrite_try_regions(
         protected.dedup();
         region.protected = protected;
         for catch in &mut region.catches {
+            // unreachable: both callers (merge, empty-jump elimination)
+            // are guarded by exception-neutrality checks that refuse
+            // handler involvement, so catch.handler == removed cannot
+            // occur — c-COV diagnosis
             if catch.handler == removed
                 && let Some(&replacement) = replacements.first()
             {

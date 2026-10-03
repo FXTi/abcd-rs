@@ -634,12 +634,6 @@ impl Builder {
         self.literal_array_add_raw_bool(la, val);
     }
 
-    /// Append a complete `FLOAT` literal (`[tag][value]` pair).
-    pub fn literal_array_add_f32(&mut self, la: LiteralArrayHandle, val: f32) {
-        self.literal_array_add_u8(la, LiteralTag::Float as u8);
-        self.literal_array_add_u32(la, val.to_bits());
-    }
-
     /// Append a complete `INTEGER` literal (`[tag][value]` pair).
     pub fn literal_array_add_integer(&mut self, la: LiteralArrayHandle, val: u32) {
         self.literal_array_add_u8(la, LiteralTag::Integer as u8);
@@ -651,12 +645,6 @@ impl Builder {
     pub fn literal_array_add_method_affiliate(&mut self, la: LiteralArrayHandle, val: u16) {
         self.literal_array_add_u8(la, LiteralTag::MethodAffiliate as u8);
         self.literal_array_add_u16(la, val);
-    }
-
-    /// Append a complete `DOUBLE` literal (`[tag][value]` pair).
-    pub fn literal_array_add_f64(&mut self, la: LiteralArrayHandle, val: f64) {
-        self.literal_array_add_u8(la, LiteralTag::Double as u8);
-        self.literal_array_add_u64(la, val.to_bits());
     }
 
     /// Append a complete `STRING` literal (`[tag][value]` pair).

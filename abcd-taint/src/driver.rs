@@ -184,37 +184,6 @@ pub struct TaintReport {
     pub alias_rung_used: u8,
 }
 
-impl TaintReport {
-    /// The smoke-summary lines (verbatim format pinned by the corpus
-    /// smoke test): flows, counters, determinism-friendly.
-    pub fn summary_lines(&self) -> Vec<String> {
-        let mut lines = vec![
-            format!("TAINT-FLOWS hits={}", self.hits.len()),
-            format!(
-                "TAINT-COUNTERS lookups={} neg_cache_hits={} body_step={} native_keep={} unknown={}",
-                self.stats.lookups,
-                self.stats.negative_cache_hits,
-                self.stats.sites_body_step,
-                self.stats.sites_native_keep,
-                self.stats.sites_unknown,
-            ),
-        ];
-        let hits: Vec<String> = self
-            .summary_hits
-            .iter()
-            .map(|(s, n)| format!("{s}={n}"))
-            .collect();
-        lines.push(format!("TAINT-SUMMARY-HITS {}", hits.join(" ")));
-        let misses: Vec<String> = self
-            .summary_misses
-            .iter()
-            .map(|(s, n)| format!("{s}={n}"))
-            .collect();
-        lines.push(format!("TAINT-SUMMARY-MISSES {}", misses.join(" ")));
-        lines
-    }
-}
-
 /// Run the taint analysis over `module`.
 pub fn run_taint(module: &Module, config: &TaintConfig) -> TaintReport {
     run_taint_full(module, config).0

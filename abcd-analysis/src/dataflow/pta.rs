@@ -109,9 +109,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use abcd_ir::{Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
 
 use super::alias::QueryAnswer;
-use super::heap::{
-    AliasOracle, AllocSiteSet, HeapRef, SiteInfo, Tribool, is_keyed_alloc, resolve_alloc_sites,
-};
+use super::heap::{AliasOracle, AllocSiteSet, SiteInfo, is_keyed_alloc, resolve_alloc_sites};
 use crate::callgraph::{CallEdge, CallEdgeKind, CallGraph, CallTargets};
 use crate::frame::frame_slots_of;
 
@@ -444,6 +442,7 @@ impl<'m> Pta<'m> {
         let id = self.handlers.len() as u32;
         self.handlers.push((base, handler));
         self.handlers_by_base.entry(base).or_default().push(id);
+        // unreachable under the activation-priority pump discipline (pta.rs:873-886 scans pending activations before the worklist; pts mutates only in the worklist loop) — c-COV diagnosis
         if let Some(objs) = self.pts.get(&base).cloned() {
             for o in objs {
                 self.fire(id, o);
@@ -1256,6 +1255,7 @@ fn join_stacks(a: &[EnvEntry], b: &[EnvEntry]) -> Vec<EnvEntry> {
                 sites: x.sites.clone(),
                 unknown: true,
             }),
+            // unreachable: len = max(a.len(), b.len()), so for i < len at least one side is Some — c-COV diagnosis
             (None, None) => unreachable!(),
         }
     }
@@ -1286,11 +1286,6 @@ impl<'m> Rung2AliasOracle<'m> {
     /// The module the engine ran over.
     pub fn module(&self) -> &'m Module {
         self.module
-    }
-
-    /// The engine counters.
-    pub fn stats(&self) -> &PtaStats {
-        &self.stats
     }
 
     /// The rich query, in the rung-1 [`QueryAnswer`] vocabulary:
@@ -1374,36 +1369,9 @@ impl<'m> Rung2AliasOracle<'m> {
 }
 
 impl<F> AliasOracle<F> for Rung2AliasOracle<'_> {
-    fn may_alias(&self, a: &HeapRef, b: &HeapRef) -> Tribool {
-        // Key-level tri-state, engine-independent (rung-0 logic — the
-        // keys are what rung 2 refines).
-        super::heap::key_may_alias(a, b)
-    }
-
-    fn must_alias(&self, base_a: ValueId, base_b: ValueId, at: InstId) -> bool {
-        let a = self.query(base_a, at);
-        let b = self.query(base_b, at);
-        a.is_single_precise() && b.is_single_precise() && a.sites == b.sites
-    }
-
-    fn aliases_of_store(&mut self, _taint: &F, _store: InstId, _func: FuncId) -> Vec<F> {
-        // Same shape as rung 1: re-keying needs the client's fact
-        // algebra, which the F-generic seam cannot express; the client
-        // (abcd-taint) performs it via `site_info_at` at the store rule.
-        Vec::new()
-    }
-
     fn inject_calling_context(&mut self, _call: InstId, _callee: FuncId, _fact: &F) {
         // The fixed point already co-evolved every context the module
         // records — there is nothing per-query left to learn.
-    }
-
-    fn needs_requery_on_return(&self) -> bool {
-        false
-    }
-
-    fn points_to(&self, base: ValueId, at: InstId) -> AllocSiteSet {
-        self.query(base, at).sites
     }
 }
 

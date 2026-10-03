@@ -224,12 +224,6 @@ pub struct Annotations {
     pub runtime_type: Vec<Annotation>,
 }
 
-/// Trait for types that carry [`Annotations`].
-pub trait HasAnnotations {
-    fn annotations(&self) -> &Annotations;
-    fn annotations_mut(&mut self) -> &mut Annotations;
-}
-
 /// A single decoded annotation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Annotation {
@@ -259,11 +253,6 @@ pub struct LiteralArray {
 // ---------------------------------------------------------------------------
 
 impl File {
-    /// Look up a class by interned descriptor.
-    pub fn class(&self, descriptor: StringId) -> Option<&Class> {
-        self.classes.get(&descriptor)
-    }
-
     /// Look up a class by descriptor string (convenience).
     pub fn class_by_str(&self, descriptor: &str) -> Option<&Class> {
         let sid = self.strings.get(descriptor)?;
@@ -288,11 +277,6 @@ impl File {
         self.strings.resolve(*sid)
     }
 
-    /// Get a literal array by index (for resolving bytecode operands).
-    pub fn literal_array(&self, index: usize) -> Option<&LiteralArray> {
-        self.literal_arrays.get(index)
-    }
-
     /// Decode module data from the literal array at the given index.
     ///
     /// Module data is stored as a special literal array in ABC files.
@@ -310,76 +294,8 @@ impl File {
     }
 }
 
-impl HasAccessFlags for Class {
-    fn access_flags(&self) -> AccessFlags {
-        self.access_flags
-    }
-}
-
-impl HasAnnotations for Class {
-    fn annotations(&self) -> &Annotations {
-        &self.annotations
-    }
-    fn annotations_mut(&mut self) -> &mut Annotations {
-        &mut self.annotations
-    }
-}
-
-impl Class {
-    /// Find a method by interned name within this class.
-    pub fn method_by_name(&self, name: StringId) -> Option<&Method> {
-        self.methods.iter().find(|m| m.name == name)
-    }
-
-    /// Find a method by name string (requires the string pool for lookup).
-    pub fn method_by_name_str<'a>(&'a self, pool: &StringPool, name: &str) -> Option<&'a Method> {
-        let sid = pool.get(name)?;
-        self.methods.iter().find(|m| m.name == sid)
-    }
-
-    /// Find a field by interned name within this class.
-    pub fn field_by_name(&self, name: StringId) -> Option<&Field> {
-        self.fields.iter().find(|f| f.name == name)
-    }
-
-    /// Find a field by name string (requires the string pool for lookup).
-    pub fn field_by_name_str<'a>(&'a self, pool: &StringPool, name: &str) -> Option<&'a Field> {
-        let sid = pool.get(name)?;
-        self.fields.iter().find(|f| f.name == sid)
-    }
-
-    /// Look up the super class in the given file.
-    pub fn super_class_in<'a>(&self, file: &'a File) -> Option<&'a Class> {
-        file.class(self.super_class?)
-    }
-}
-
 impl HasAccessFlags for Method {
     fn access_flags(&self) -> AccessFlags {
         self.access_flags
-    }
-}
-
-impl HasAnnotations for Method {
-    fn annotations(&self) -> &Annotations {
-        &self.annotations
-    }
-    fn annotations_mut(&mut self) -> &mut Annotations {
-        &mut self.annotations
-    }
-}
-
-impl HasAccessFlags for Field {
-    fn access_flags(&self) -> AccessFlags {
-        self.access_flags
-    }
-}
-
-impl HasAnnotations for Field {
-    fn annotations(&self) -> &Annotations {
-        &self.annotations
-    }
-    fn annotations_mut(&mut self) -> &mut Annotations {
-        &mut self.annotations
     }
 }

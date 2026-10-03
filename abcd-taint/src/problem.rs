@@ -1450,6 +1450,9 @@ impl IfdsProblem for TaintProblem<'_> {
                     }
                     let formal_base = match binding {
                         ParamBinding::Precise { formal_base, .. } => formal_base,
+                        // unreachable: the else branch guarantees Precise
+                        // (OverApproxAll was handled and returned above) —
+                        // c-COV diagnosis
                         ParamBinding::OverApproxAll => unreachable!(),
                     };
                     match kind {

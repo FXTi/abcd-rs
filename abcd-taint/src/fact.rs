@@ -78,14 +78,6 @@ impl TaintFact {
         }
     }
 
-    /// A fact on a bare global (empty chain).
-    pub fn global(name: Sym) -> Self {
-        TaintFact {
-            base: TaintBase::Global(name),
-            fields: FieldChain::new(),
-        }
-    }
-
     /// This fact with one more field step, k-capped.
     pub fn pushed(&self, key: FieldKey, cap: usize) -> Self {
         TaintFact {

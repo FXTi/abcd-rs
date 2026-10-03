@@ -28,13 +28,12 @@
 
 use abcd_analysis::dataflow::alias::Rung1AliasOracle;
 use abcd_analysis::dataflow::heap::{
-    self, AliasOracle, AllocSiteSet, FieldChain, FieldKey, HeapRef, Rung0AliasOracle, SiteInfo,
-    Tribool,
+    self, AliasOracle, AllocSiteSet, FieldChain, FieldKey, Rung0AliasOracle, SiteInfo,
 };
 use abcd_analysis::dataflow::pta::{EnvAnswer, Rung2AliasOracle};
 use abcd_ir::{FuncId, InstId, ValueId};
 
-use crate::fact::{Fact, TaintBase, TaintFact};
+use crate::fact::{TaintBase, TaintFact};
 
 /// The oracle the [`crate::problem::TaintProblem`] runs against.
 pub enum Oracle<'m> {
@@ -65,17 +64,6 @@ impl<'m> Oracle<'m> {
             Oracle::Rung0(o) => o.resolve(value),
             Oracle::Rung1(o) => o.site_info_at(value, at),
             Oracle::Rung2(o) => o.site_info_at(value, at),
-        }
-    }
-
-    /// The refined capability probe (§5.2): allocation sites of a base
-    /// value at a program point. Call-graph resolution consumes the same
-    /// answer through the engine directly (one engine, two consumers).
-    pub fn points_to(&self, value: ValueId, at: InstId) -> AllocSiteSet {
-        match self {
-            Oracle::Rung0(o) => AliasOracle::<Fact>::points_to(o, value, at),
-            Oracle::Rung1(o) => AliasOracle::<Fact>::points_to(o, value, at),
-            Oracle::Rung2(o) => AliasOracle::<Fact>::points_to(o, value, at),
         }
     }
 
@@ -124,6 +112,10 @@ impl<'m> Oracle<'m> {
     pub fn is_env_site(&self, site: InstId) -> bool {
         match self {
             Oracle::Rung2(o) => o.is_env_site(site),
+            // unreachable: the only caller (problem.rs GetLexVar fallback)
+            // is guarded by lex_env_at(...) -> Some, which fires only on
+            // Oracle::Rung2, so `self` here always dispatches above —
+            // c-COV diagnosis
             _ => false,
         }
     }
@@ -162,45 +154,16 @@ impl<'m> Oracle<'m> {
 
 /// Delegate the §5.2 seam so the problem's call sites stay
 /// oracle-agnostic (the refined engines' docs apply; rung 0 is the
-/// baseline behavior).
+/// baseline behavior). Only the calling-context channel survives: the
+/// may/must-alias tri-state, the store-alias trigger, the requery probe,
+/// and the points-to delegates had no consumer and were deleted as dead
+/// surface.
 impl<F> AliasOracle<F> for Oracle<'_> {
-    fn may_alias(&self, a: &HeapRef, b: &HeapRef) -> Tribool {
-        heap::key_may_alias(a, b)
-    }
-
-    fn must_alias(&self, base_a: ValueId, base_b: ValueId, at: InstId) -> bool {
-        match self {
-            Oracle::Rung0(o) => AliasOracle::<F>::must_alias(o, base_a, base_b, at),
-            Oracle::Rung1(o) => AliasOracle::<F>::must_alias(o, base_a, base_b, at),
-            Oracle::Rung2(o) => AliasOracle::<F>::must_alias(o, base_a, base_b, at),
-        }
-    }
-
-    fn aliases_of_store(&mut self, taint: &F, store: InstId, func: FuncId) -> Vec<F> {
-        match self {
-            Oracle::Rung0(o) => AliasOracle::<F>::aliases_of_store(o, taint, store, func),
-            Oracle::Rung1(o) => AliasOracle::<F>::aliases_of_store(o, taint, store, func),
-            Oracle::Rung2(o) => AliasOracle::<F>::aliases_of_store(o, taint, store, func),
-        }
-    }
-
     fn inject_calling_context(&mut self, call: InstId, callee: FuncId, fact: &F) {
         match self {
             Oracle::Rung0(o) => AliasOracle::<F>::inject_calling_context(o, call, callee, fact),
             Oracle::Rung1(o) => AliasOracle::<F>::inject_calling_context(o, call, callee, fact),
             Oracle::Rung2(o) => AliasOracle::<F>::inject_calling_context(o, call, callee, fact),
-        }
-    }
-
-    fn needs_requery_on_return(&self) -> bool {
-        false
-    }
-
-    fn points_to(&self, base: ValueId, at: InstId) -> AllocSiteSet {
-        match self {
-            Oracle::Rung0(o) => AliasOracle::<F>::points_to(o, base, at),
-            Oracle::Rung1(o) => AliasOracle::<F>::points_to(o, base, at),
-            Oracle::Rung2(o) => AliasOracle::<F>::points_to(o, base, at),
         }
     }
 }

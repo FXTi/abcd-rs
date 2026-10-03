@@ -1,6 +1,5 @@
 use crate::Error;
 use abcd_file_sys as sys;
-use string_interner::Symbol;
 
 bitflags::bitflags! {
     /// Access flags for classes, methods, and fields.
@@ -37,92 +36,13 @@ bitflags::bitflags! {
 
 /// Trait for types that carry [`AccessFlags`].
 ///
-/// Provides default `is_*()` convenience methods for all known flags.
-/// Not all flags are meaningful for every implementor (e.g. `is_volatile`
-/// is only relevant for fields), but the methods are still safe to call —
-/// they simply return `false` when the flag is not set.
+/// `is_static` is the only convenience accessor with callers (pandasm
+/// emission); the other flag checks were deleted as dead surface.
 pub trait HasAccessFlags {
     fn access_flags(&self) -> AccessFlags;
 
-    fn is_public(&self) -> bool {
-        self.access_flags().contains(AccessFlags::PUBLIC)
-    }
-    fn is_private(&self) -> bool {
-        self.access_flags().contains(AccessFlags::PRIVATE)
-    }
-    fn is_protected(&self) -> bool {
-        self.access_flags().contains(AccessFlags::PROTECTED)
-    }
     fn is_static(&self) -> bool {
         self.access_flags().contains(AccessFlags::STATIC)
-    }
-    fn is_final(&self) -> bool {
-        self.access_flags().contains(AccessFlags::FINAL)
-    }
-    fn is_super(&self) -> bool {
-        self.access_flags().contains(AccessFlags::SUPER)
-    }
-    fn is_synchronized(&self) -> bool {
-        self.access_flags().contains(AccessFlags::SYNCHRONIZED)
-    }
-    fn is_bridge(&self) -> bool {
-        self.access_flags().contains(AccessFlags::BRIDGE)
-    }
-    fn is_volatile(&self) -> bool {
-        self.access_flags().contains(AccessFlags::VOLATILE)
-    }
-    fn is_transient(&self) -> bool {
-        self.access_flags().contains(AccessFlags::TRANSIENT)
-    }
-    fn is_varargs(&self) -> bool {
-        self.access_flags().contains(AccessFlags::VARARGS)
-    }
-    fn is_native(&self) -> bool {
-        self.access_flags().contains(AccessFlags::NATIVE)
-    }
-    fn is_interface(&self) -> bool {
-        self.access_flags().contains(AccessFlags::INTERFACE)
-    }
-    fn is_abstract(&self) -> bool {
-        self.access_flags().contains(AccessFlags::ABSTRACT)
-    }
-    fn is_strict(&self) -> bool {
-        self.access_flags().contains(AccessFlags::STRICT)
-    }
-    fn is_synthetic(&self) -> bool {
-        self.access_flags().contains(AccessFlags::SYNTHETIC)
-    }
-    fn is_annotation(&self) -> bool {
-        self.access_flags().contains(AccessFlags::ANNOTATION)
-    }
-    fn is_enum(&self) -> bool {
-        self.access_flags().contains(AccessFlags::ENUM)
-    }
-    fn is_constructor(&self) -> bool {
-        self.access_flags().contains(AccessFlags::CONSTRUCTOR)
-    }
-    fn has_default_methods(&self) -> bool {
-        self.access_flags()
-            .contains(AccessFlags::HAS_DEFAULT_METHODS)
-    }
-    fn is_default_interface_method(&self) -> bool {
-        self.access_flags()
-            .contains(AccessFlags::DEFAULT_INTERFACE_METHOD)
-    }
-    fn is_single_impl(&self) -> bool {
-        self.access_flags().contains(AccessFlags::SINGLE_IMPL)
-    }
-    fn is_intrinsic(&self) -> bool {
-        self.access_flags().contains(AccessFlags::INTRINSIC)
-    }
-    fn is_proxy(&self) -> bool {
-        self.access_flags().contains(AccessFlags::PROXY)
-    }
-    fn is_fast_native(&self) -> bool {
-        self.access_flags().contains(AccessFlags::FAST_NATIVE)
-    }
-    fn is_critical_native(&self) -> bool {
-        self.access_flags().contains(AccessFlags::CRITICAL_NATIVE)
     }
 }
 
@@ -309,59 +229,6 @@ impl TryFrom<u8> for FunctionKind {
             x if x == Self::ConcurrentFunction as u8 => Ok(Self::ConcurrentFunction),
             x if x == Self::SendableFunction as u8 => Ok(Self::SendableFunction),
             _ => Err(Error::UnknownFunctionKind(v)),
-        }
-    }
-}
-
-// ─── Display impls ──────────────────────────────────────────────────────────
-
-impl std::fmt::Display for Type {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Type::Void => f.write_str("void"),
-            Type::Bool => f.write_str("u1"),
-            Type::I8 => f.write_str("i8"),
-            Type::U8 => f.write_str("u8"),
-            Type::I16 => f.write_str("i16"),
-            Type::U16 => f.write_str("u16"),
-            Type::I32 => f.write_str("i32"),
-            Type::U32 => f.write_str("u32"),
-            Type::I64 => f.write_str("i64"),
-            Type::U64 => f.write_str("u64"),
-            Type::F32 => f.write_str("f32"),
-            Type::F64 => f.write_str("f64"),
-            Type::Tagged => f.write_str("any"),
-            // Reference types need a StringPool to display the descriptor;
-            // fall back to the raw symbol index.
-            Type::Reference(sid) => write!(f, "ref({})", sid.to_usize()),
-        }
-    }
-}
-
-impl std::fmt::Display for SourceLang {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SourceLang::EcmaScript => f.write_str("ecmascript"),
-            SourceLang::PandaAssembly => f.write_str("panda_assembly"),
-            SourceLang::JavaScript => f.write_str("javascript"),
-            SourceLang::TypeScript => f.write_str("typescript"),
-            SourceLang::ArkTs => f.write_str("arkts"),
-        }
-    }
-}
-
-impl std::fmt::Display for FunctionKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FunctionKind::None => f.write_str("none"),
-            FunctionKind::Function => f.write_str("function"),
-            FunctionKind::NcFunction => f.write_str("nc_function"),
-            FunctionKind::GeneratorFunction => f.write_str("generator"),
-            FunctionKind::AsyncFunction => f.write_str("async"),
-            FunctionKind::AsyncGeneratorFunction => f.write_str("async_generator"),
-            FunctionKind::AsyncNcFunction => f.write_str("async_nc"),
-            FunctionKind::ConcurrentFunction => f.write_str("concurrent"),
-            FunctionKind::SendableFunction => f.write_str("sendable"),
         }
     }
 }

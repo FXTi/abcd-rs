@@ -279,12 +279,6 @@ pub struct SummaryRegistry {
     stats: RefCell<RegistryStats>,
 }
 
-impl Default for SummaryRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SummaryRegistry {
     /// An empty registry.
     pub fn new() -> Self {
@@ -383,16 +377,6 @@ impl SummaryRegistry {
     /// Render a `Sym` from the counters back to its name.
     pub fn resolve(&self, sym: Sym) -> Option<String> {
         self.syms.borrow().resolve(sym).map(str::to_owned)
-    }
-
-    /// Number of registered summaries.
-    pub fn len(&self) -> usize {
-        self.by_key.len()
-    }
-
-    /// Whether the registry is empty.
-    pub fn is_empty(&self) -> bool {
-        self.by_key.is_empty()
     }
 }
 

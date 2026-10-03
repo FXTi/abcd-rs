@@ -299,6 +299,12 @@ fn add_trampoline(
 /// Rewrite the target of a (conditional or unconditional) branch bytecode.
 /// No-op for non-branch bytecodes.
 fn rewrite_branch_target(bc: &mut Bytecode, target: BlockId) {
+    // unreachable in practice: the sole caller (layout.rs:202) passes the
+    // last bytecode of a conditional block, which isel only ever emits as
+    // unfused Jnez (isel.rs:2004) or fused Jeq/Jne/Jstricteq/Jnstricteq
+    // (isel.rs:2527-2531) — never Jmp (unconditional blocks take another
+    // path) and never Jeqz or the strict-eqz/null/undefined fused family
+    // (no producer in abcd-lower; kept for match exhaustiveness) — c-COV diagnosis
     let label = match bc {
         Bytecode::Jmp(l)
         | Bytecode::Jeqz(l)
@@ -317,6 +323,8 @@ fn rewrite_branch_target(bc: &mut Bytecode, target: BlockId) {
         | Bytecode::Jne(_, l)
         | Bytecode::Jstricteq(_, l)
         | Bytecode::Jnstricteq(_, l) => l,
+        // unreachable: caller only passes branch bytecodes (see above) —
+        // c-COV diagnosis
         _ => return,
     };
     *label = Label(target.0);
@@ -452,6 +460,9 @@ fn resolve_labels(bc: &mut Bytecode, offsets: &HashMap<BlockId, usize>) {
                 *label = Label(off as u32);
             }
         }
+        // unreachable except Jnez: isel never emits Jeqz or the
+        // strict-eqz/null/undefined branch family (no producer in
+        // abcd-lower; kept for match exhaustiveness) — c-COV diagnosis
         Bytecode::Jeqz(label)
         | Bytecode::Jnez(label)
         | Bytecode::Jstricteqz(label)

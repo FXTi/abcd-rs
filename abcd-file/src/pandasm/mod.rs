@@ -320,12 +320,10 @@ mod sim {
         next_resize: usize,
     }
 
-    impl Default for U32Set {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
+    // `new` without `Default`: the only construction sites are the two
+    // `U32Set::new()` calls in `collect_literal_tables`; the Default impl
+    // was dead surface (clippy would want one, hence the allow).
+    #[allow(clippy::new_without_default)]
     impl U32Set {
         pub fn new() -> Self {
             U32Set {
@@ -832,12 +830,12 @@ impl<'f> Emitter<'f> {
         body: &MethodBody,
         labels: &mut BTreeMap<u32, String>,
     ) -> Vec<u8> {
-        let mut operands = bc.operands();
-        // Upstream call-arg trimming (CALL-flagged pandasm opcodes): pop
-        // trailing registers beyond the callee proto's argument count.
-        if bc.has_flag(BytecodeFlags::CALL) {
-            self.trim_call_args(bc, body, &mut operands);
-        }
+        let operands = bc.operands();
+        // Upstream call-arg trimming (CALL-flagged pandasm opcodes) is
+        // not needed here: BytecodeFlags::CALL exists in the ISA schema
+        // but is never assigned to any instruction (regression test
+        // abcd-isa/tests/bytecode.rs has_flag_call_not_assigned), so the
+        // trim_call_args/method_proto machinery was deleted as dead.
         let float = bc.has_flag(BytecodeFlags::FLOAT);
         let mut out = bc.mnemonic().as_bytes().to_vec();
         for (i, op) in operands.iter().enumerate() {
@@ -845,56 +843,6 @@ impl<'f> Emitter<'f> {
             self.render_operand(bc, float, op, body, labels, &mut out);
         }
         out
-    }
-
-    fn trim_call_args(&self, bc: &Bytecode, body: &MethodBody, operands: &mut Vec<Operand>) {
-        let n_regs = operands
-            .iter()
-            .filter(|op| matches!(op, Operand::Reg(_)))
-            .count();
-        // Callee: the METHOD_ID operand if any, else the containing method
-        // (indirect call — no proto known here, no trim).
-        let callee_offset = bc
-            .entity_operands()
-            .into_iter()
-            .find(|(kind, _)| *kind == EntityKind::MethodId)
-            .and_then(|(kind, id)| body.entity_offsets.get(&(kind, id.0)).copied());
-        let Some((num_args, is_static)) = callee_offset.and_then(|off| self.method_proto(off))
-        else {
-            return;
-        };
-        let overhead = if is_static {
-            n_regs as i64 - num_args as i64
-        } else {
-            n_regs as i64 - num_args as i64 - 1
-        };
-        if overhead <= 0 {
-            return;
-        }
-        // Drop the LAST `overhead` register operands.
-        let n_regs_total = operands
-            .iter()
-            .filter(|op| matches!(op, Operand::Reg(_)))
-            .count();
-        let mut seen = 0usize;
-        operands.retain(|op| {
-            if matches!(op, Operand::Reg(_)) {
-                seen += 1;
-                seen <= n_regs_total - overhead as usize
-            } else {
-                true
-            }
-        });
-    }
-
-    /// (proto num_args, is_static) of the method at an item offset.
-    fn method_proto(&self, offset: u32) -> Option<(u32, bool)> {
-        for class in self.file.classes.values() {
-            if let Some(m) = class.methods.iter().find(|m| m.offset == offset) {
-                return Some((m.arg_types.len() as u32, m.is_static()));
-            }
-        }
-        None
     }
 
     fn render_operand(
@@ -986,6 +934,8 @@ impl<'f> Emitter<'f> {
     /// space). Upstream drops TAGVALUE-tagged items (`FillLiteralData`'s
     /// early return); our `Integer8` is that tag.
     fn serialize_literal_array(&self, values: &[LiteralValue]) -> Vec<u8> {
+        // Integer8 is filtered out here (the upstream TAGVALUE drop), so
+        // serialize_literal_item has no Integer8 arm — one would be dead.
         let items: Vec<&LiteralValue> = values
             .iter()
             .filter(|v| !matches!(v, LiteralValue::Integer8(_)))
@@ -1007,9 +957,6 @@ impl<'f> Emitter<'f> {
         match v {
             LiteralValue::Bool(b) => {
                 let _ = write!(out, "u1:{}", *b as u8);
-            }
-            LiteralValue::Integer8(v) => {
-                let _ = write!(out, "i8:{}", *v as i8);
             }
             LiteralValue::Integer(v) => {
                 let _ = write!(out, "i32:{}", *v as i32);
@@ -1640,35 +1587,6 @@ impl<'f> Emitter<'f> {
 /// First-name-wins label allocation (upstream `LabelTable` insert).
 fn alloc_label(labels: &mut BTreeMap<u32, String>, idx: u32, name: String) -> String {
     labels.entry(idx).or_insert(name).clone()
-}
-
-/// The 13.x/24.x literal-table assignment for a model: the `(index,
-/// offset)` pairs the emitter's collection would print, in index order.
-/// Exposed to the parser (crate-internal): the method ORDER within a class
-/// is invisible in pandasm text (functions print in signature-sorted
-/// order), so the parser may sort methods to make this assignment reproduce
-/// the parsed LITERALS keys. Pure query — no emission behavior change.
-pub(crate) fn simulated_literal_assignment(file: &File) -> Vec<(u32, u32)> {
-    if file.version <= LAST_HEADER_LITERAL_VERSION {
-        return Vec::new();
-    }
-    let mut emitter = Emitter::new(file);
-    emitter.classify_field_offsets();
-    let (regular, modules) = emitter.collect_literal_tables();
-    let mut out: Vec<(u32, u32)> = Vec::new();
-    let read_key = |key: &[u8], out: &mut Vec<(u32, u32)>| {
-        if let Some((index, offset, _)) = parse::parse_literal_key(key) {
-            out.push((index, offset));
-        }
-    };
-    for key in regular.keys() {
-        read_key(key, &mut out);
-    }
-    for key in modules.keys() {
-        read_key(key, &mut out);
-    }
-    out.sort_by_key(|(index, _)| *index);
-    out
 }
 
 /// The u32 wire value of a field's initial value, abstracting over the

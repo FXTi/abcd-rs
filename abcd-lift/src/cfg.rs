@@ -42,6 +42,9 @@ pub struct RawCfg {
 /// Returns `None` if the method body has no bytecodes.
 pub fn build_cfg(body: &MethodBody) -> Option<RawCfg> {
     let bytecodes = &body.bytecodes;
+    // unreachable in production: the only non-test caller (lib.rs:441) is
+    // dominated by the `body.bytecodes.is_empty()` hard error at
+    // lib.rs:421-423 — c-COV diagnosis
     if bytecodes.is_empty() {
         return None;
     }

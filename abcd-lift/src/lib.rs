@@ -292,6 +292,11 @@ impl<'f> Lifter<'f> {
             Const::Number(bits) => ScalarKey::Number(*bits),
             Const::String(s) => ScalarKey::String(*s),
             Const::BigInt(s) => ScalarKey::BigInt(*s),
+            // unreachable: every call site (metadata.rs field values /
+            // annotation elements, translate.rs load_const family) passes
+            // Number/Bool/String/Null/Undefined/Hole/BigInt, all of which
+            // have ScalarKeys — no caller can pass ArrayLiteral/
+            // ObjectLiteral/MethodRef — c-COV diagnosis
             other => return self.const_shape(other.clone()),
         };
         if let Some(&id) = self.scalar_consts.get(&key) {

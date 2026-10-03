@@ -180,9 +180,8 @@ void abc_class_enumerate_runtime_type_annotations(AbcClassAccessor *a, AbcAnnota
 
 uint32_t abc_class_get_class_id(const AbcClassAccessor *a);
 
-/* Class descriptor (raw MUTF-8 bytes, null-terminated) and name */
+/* Class descriptor (raw MUTF-8 bytes, null-terminated) */
 const uint8_t *abc_class_get_descriptor(const AbcClassAccessor *a);
-size_t abc_class_get_name(const AbcClassAccessor *a, char *buf, size_t buf_len);
 
 /* ========== Method Data Accessor ========== */
 
