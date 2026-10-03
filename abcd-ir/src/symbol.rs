@@ -40,6 +40,14 @@ impl SymbolTable {
     pub fn len(&self) -> usize {
         self.inner.len()
     }
+
+    /// Whether the table is empty. Kept as the conventional pair of
+    /// `len` (clippy::len_without_is_empty requires it) even with no
+    /// caller yet — the c-COV deletion removed it once and the clippy
+    /// gate objected.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 }
 
 #[cfg(test)]

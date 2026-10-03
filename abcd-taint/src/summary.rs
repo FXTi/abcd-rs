@@ -279,6 +279,10 @@ pub struct SummaryRegistry {
     stats: RefCell<RegistryStats>,
 }
 
+// `new` without `Default`: the c-COV deletion removed the zero-caller
+// Default impl; clippy::new_without_default would force one back, hence
+// the documented allow.
+#[allow(clippy::new_without_default)]
 impl SummaryRegistry {
     /// An empty registry.
     pub fn new() -> Self {

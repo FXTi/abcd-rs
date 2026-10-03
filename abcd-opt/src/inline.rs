@@ -362,7 +362,9 @@ fn inline_func(
         let (callee_val, this, args, kind) = (*callee_val, *this, args.clone(), *kind);
         let call_block = inst.block;
 
-        let reason = match eligibility(module, policy, caller, call_block, iid, callee_val, this, kind) {
+        let reason = match eligibility(
+            module, policy, caller, call_block, iid, callee_val, this, kind,
+        ) {
             Ok(callee) => {
                 let size = callee_inst_count(module, callee);
                 if size > budget {

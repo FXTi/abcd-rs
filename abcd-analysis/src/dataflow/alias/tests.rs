@@ -251,7 +251,10 @@ fn must_alias_honesty_on_phi_and_unbalanced() {
     assert!(ans.has_phi);
     assert!(!ans.is_single_precise(), "phi kills single-precision");
     // Not must-alias: the phi side is not single-precise.
-    let (qa, qb) = (oracle.query(phi, InstId::new(0)), oracle.query(a, InstId::new(0)));
+    let (qa, qb) = (
+        oracle.query(phi, InstId::new(0)),
+        oracle.query(a, InstId::new(0)),
+    );
     assert!(!(qa.is_single_precise() && qb.is_single_precise() && qa.sites == qb.sites));
 }
 
@@ -423,7 +426,10 @@ fn depth_cap_cuts_and_falls_back() {
     let info = shallow.site_info_at(cur, outer_call);
     assert!(info.sites.is_empty() && info.has_unknown);
     // Not must-alias: a capped answer is not single-precise.
-    let (qa, qb) = (shallow.query(cur, outer_call), shallow.query(cur, outer_call));
+    let (qa, qb) = (
+        shallow.query(cur, outer_call),
+        shallow.query(cur, outer_call),
+    );
     assert!(!(qa.is_single_precise() && qb.is_single_precise() && qa.sites == qb.sites));
 }
 

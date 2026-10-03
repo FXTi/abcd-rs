@@ -1548,18 +1548,18 @@ fn block_terminal_call_is_skipped_before_any_mutation() {
 
     let entry_insts_before = module.blocks[entry.index()].insts.clone();
     let f_blocks_before = module.functions[f.index()].blocks.clone();
-    let (n_blocks, n_insts, n_values) = (
-        module.blocks.len(),
-        module.insts.len(),
-        module.values.len(),
-    );
+    let (n_blocks, n_insts, n_values) =
+        (module.blocks.len(), module.insts.len(), module.values.len());
 
     let report = inline_module(&mut module, &default_policy());
 
     // Forensics (visible with --nocapture): the recorded reason and the
     // post-run module state, so a regression shows its corruption.
     let reasons: Vec<&str> = report.skips.keys().map(|r| r.label()).collect();
-    eprintln!("N82 probe: sites_inlined={} reasons={reasons:?}", report.sites_inlined);
+    eprintln!(
+        "N82 probe: sites_inlined={} reasons={reasons:?}",
+        report.sites_inlined
+    );
     eprintln!(
         "N82 probe: entry insts before={entry_insts_before:?} after={:?}",
         module.blocks[entry.index()].insts
@@ -1578,7 +1578,10 @@ fn block_terminal_call_is_skipped_before_any_mutation() {
         verify_module(&module).errors
     );
 
-    assert_eq!(report.sites_inlined, 0, "the site must not inline: {report:?}");
+    assert_eq!(
+        report.sites_inlined, 0,
+        "the site must not inline: {report:?}"
+    );
     // The skip is recorded under its own reason (pre-fix the late
     // step-F bail mis-recorded it as "callee-no-body").
     assert_eq!(reasons, ["block-terminal-call"], "{report:?}");
