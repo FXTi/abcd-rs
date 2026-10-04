@@ -315,24 +315,6 @@ fn array_i64_u64_f64_decode() {
     }
 }
 
-/// The generic 'H' (Array) tag has no element-size mapping: the decoder
-/// returns an empty value list (defensive arm).
-#[test]
-fn array_unknown_tag_decodes_empty() {
-    let mut data = build_single_elem("arrh", b'Q', AnnotationElemValue::Array(vec![7]));
-    let tag_pos = locate_tag_byte(&data, "arrh", b'Q');
-    data[tag_pos] = b'H';
-    let file = decode(&data).expect("decode");
-    assert_eq!(
-        single_element_value(&file),
-        &AnnotationValue::Array {
-            tag: b'H',
-            values: vec![]
-        },
-        "the generic array tag has no element size; the payload is skipped"
-    );
-}
-
 /// An unknown scalar tag byte ('0' = AVT::Unknown) decodes as a raw U32
 /// (the vendored fallback).
 #[test]

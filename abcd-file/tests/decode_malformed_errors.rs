@@ -1658,66 +1658,6 @@ fn literal_array_unreadable_string_interns_empty() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Annotation array silent-Void arms (in-array fallbacks, deliberately NOT
-// loud per decode.rs's converter contract)
-// ---------------------------------------------------------------------------
-
-/// An ArrayAnnotation ('Z') element whose nested annotation offset dangles
-/// decodes to `AnnotationValue::Void` (the in-array fallback).
-#[test]
-fn annotation_array_annotation_elem_failure_decodes_void() {
-    let mut b = Builder::new();
-    b.set_api(12, "beta1");
-    let cls = b.add_global_class();
-    b.class_set_source_lang(cls, SourceLang::EcmaScript);
-    let inner_name = b.add_string("inner");
-    let inner = b.create_annotation_ex(
-        cls,
-        &[AnnotationElemDefEx {
-            name: inner_name,
-            tag: b'7',
-            value: AnnotationElemValue::Scalar(9),
-        }],
-    );
-    let name = b.add_string("arrAnn");
-    let ann = b.create_annotation_ex(
-        cls,
-        &[AnnotationElemDefEx {
-            name,
-            tag: b'Z', // ArrayAnnotation
-            value: AnnotationElemValue::EntityArray(vec![inner.as_raw()]),
-        }],
-    );
-    b.class_add_runtime_annotation(cls, ann);
-    let proto = b.create_proto(Type::Tagged, &[]);
-    let m = b.class_add_method(
-        cls,
-        "func_main_0",
-        proto,
-        AccessFlags::PUBLIC,
-        &[0x65],
-        1,
-        0,
-    );
-    b.method_set_source_lang(m, SourceLang::EcmaScript);
-    let mut data = b.finalize().expect("finalize");
-
-    let (_, value_pos, _) = locate_annotation(&data, "arrAnn", b'Z');
-    let payload = header_field(&data, value_pos); // [uleb count=1][u32 offset]
-    assert_eq!(data[payload as usize], 1, "single-element array payload");
-    write_u32(&mut data, payload as usize + 1, BOGUS);
-    let file = decode(&data).expect("an in-array failure decodes as Void");
-    let g = file.classes.values().find(|c| !c.is_external).unwrap();
-    match &g.annotations.compile_time[0].elements[0].value {
-        AnnotationValue::Array { tag, values } => {
-            assert_eq!(*tag, b'Z');
-            assert_eq!(values, &[AnnotationValue::Void]);
-        }
-        other => panic!("expected Array element, got {other:?}"),
-    }
-}
-
 /// Build a file with an ArrayMethodHandle ('@') annotation element holding
 /// two method handles (to distinct targets). Returns the bytes; the payload
 /// layout is `[uleb count=2][u32 mh1][u32 mh2]`.
@@ -1754,57 +1694,6 @@ fn build_method_handle_array() -> Vec<u8> {
     );
     b.method_set_source_lang(m, SourceLang::EcmaScript);
     b.finalize().expect("finalize")
-}
-
-/// An ArrayMethodHandle element with an unknown handle-type byte decodes to
-/// `AnnotationValue::Void`; the well-formed sibling still decodes (the
-/// in-array success + fallback arms in one pass).
-#[test]
-fn annotation_array_method_handle_bad_type_decodes_void() {
-    let mut data = build_method_handle_array();
-    let (_, value_pos, _) = locate_annotation(&data, "mhArr", b'@');
-    let payload = header_field(&data, value_pos) as usize;
-    assert_eq!(data[payload], 2, "two-element array payload");
-    let mh2_off = header_field(&data, payload + 5) as usize;
-    data[mh2_off] = 0xFF; // unknown MethodHandleType discriminant
-    let file = decode(&data).expect("a bad in-array handle type decodes as Void");
-    let g = file.classes.values().find(|c| !c.is_external).unwrap();
-    match &g.annotations.compile_time[0].elements[0].value {
-        AnnotationValue::Array { tag, values } => {
-            assert_eq!(*tag, b'@');
-            assert_eq!(values.len(), 2);
-            assert!(
-                matches!(values[0], AnnotationValue::MethodHandle(_)),
-                "the well-formed element must decode: {values:?}"
-            );
-            assert_eq!(values[1], AnnotationValue::Void);
-        }
-        other => panic!("expected Array element, got {other:?}"),
-    }
-}
-
-/// An ArrayMethodHandle element whose method-handle item is unreadable
-/// decodes to `AnnotationValue::Void` (the in-array fallback).
-#[test]
-fn annotation_array_method_handle_read_failure_decodes_void() {
-    let mut data = build_method_handle_array();
-    let (_, value_pos, _) = locate_annotation(&data, "mhArr", b'@');
-    let payload = header_field(&data, value_pos) as usize;
-    write_u32(&mut data, payload + 5, BOGUS); // second element dangles
-    let file = decode(&data).expect("an unreadable in-array handle decodes as Void");
-    let g = file.classes.values().find(|c| !c.is_external).unwrap();
-    match &g.annotations.compile_time[0].elements[0].value {
-        AnnotationValue::Array { tag, values } => {
-            assert_eq!(*tag, b'@');
-            assert_eq!(values.len(), 2);
-            assert!(
-                matches!(values[0], AnnotationValue::MethodHandle(_)),
-                "the well-formed element must decode: {values:?}"
-            );
-            assert_eq!(values[1], AnnotationValue::Void);
-        }
-        other => panic!("expected Array element, got {other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2254,108 +2143,13 @@ fn annotation_element_name_unreadable_is_hard_error() {
     );
 }
 
-/// A Record ('D') annotation element whose entity offset is in no class
-/// table entry's payload falls back to the empty-string descriptor (the
-/// vendored scalar-record fallback).
-#[test]
-fn annotation_record_element_unknown_entity_decodes_empty() {
-    let mut b = Builder::new();
-    b.set_api(12, "beta1");
-    let cls = b.add_global_class();
-    b.class_set_source_lang(cls, SourceLang::EcmaScript);
-    let rec = b.add_foreign_class("LRec;");
-    let name = b.add_string("recelem");
-    let ann = b.create_annotation_ex(
-        cls,
-        &[AnnotationElemDefEx {
-            name,
-            tag: b'D', // Record
-            value: AnnotationElemValue::EntityRef(rec.as_raw()),
-        }],
-    );
-    b.class_add_runtime_annotation(cls, ann);
-    let proto = b.create_proto(Type::Tagged, &[]);
-    let m = b.class_add_method(
-        cls,
-        "func_main_0",
-        proto,
-        AccessFlags::PUBLIC,
-        &[0x65],
-        1,
-        0,
-    );
-    b.method_set_source_lang(m, SourceLang::EcmaScript);
-    let mut data = b.finalize().expect("finalize");
-    let (_, value_pos, _) = locate_annotation(&data, "recelem", b'D');
-    write_u32(&mut data, value_pos, 0x40); // valid EntityId, in no entity map
-    let file = decode(&data).expect("an unknown record entity is not an error");
-    let g = file.classes.values().find(|c| !c.is_external).unwrap();
-    match &g.annotations.compile_time[0].elements[0].value {
-        AnnotationValue::Record(sid) => {
-            assert_eq!(file.strings.resolve(*sid), Some(""));
-        }
-        other => panic!("expected Record element, got {other:?}"),
-    }
-}
-
-/// An ArrayRecord ('W') element whose offset is in no entity map decodes to
-/// `Record("")` (the in-array fallback).
-#[test]
-fn annotation_array_record_unknown_entity_decodes_empty() {
-    let mut b = Builder::new();
-    b.set_api(12, "beta1");
-    let cls = b.add_global_class();
-    b.class_set_source_lang(cls, SourceLang::EcmaScript);
-    let rec = b.add_foreign_class("LRec;");
-    let name = b.add_string("recarr");
-    let ann = b.create_annotation_ex(
-        cls,
-        &[AnnotationElemDefEx {
-            name,
-            tag: b'W', // ArrayRecord
-            value: AnnotationElemValue::EntityArray(vec![rec.as_raw()]),
-        }],
-    );
-    b.class_add_runtime_annotation(cls, ann);
-    let proto = b.create_proto(Type::Tagged, &[]);
-    let m = b.class_add_method(
-        cls,
-        "func_main_0",
-        proto,
-        AccessFlags::PUBLIC,
-        &[0x65],
-        1,
-        0,
-    );
-    b.method_set_source_lang(m, SourceLang::EcmaScript);
-    let mut data = b.finalize().expect("finalize");
-    let (_, value_pos, _) = locate_annotation(&data, "recarr", b'W');
-    let payload = header_field(&data, value_pos) as usize;
-    assert_eq!(data[payload], 1, "single-element array payload");
-    write_u32(&mut data, payload + 1, 0x40);
-    let file = decode(&data).expect("an unknown array-record entity is not an error");
-    let g = file.classes.values().find(|c| !c.is_external).unwrap();
-    match &g.annotations.compile_time[0].elements[0].value {
-        AnnotationValue::Array { tag, values } => {
-            assert_eq!(*tag, b'W');
-            assert_eq!(
-                values.len(),
-                1,
-                "the element must survive as a fallback: {values:?}"
-            );
-            match values[0] {
-                AnnotationValue::Record(sid) => {
-                    assert_eq!(file.strings.resolve(sid), Some(""));
-                }
-                ref other => panic!("expected Record element, got {other:?}"),
-            }
-        }
-        other => panic!("expected Array element, got {other:?}"),
-    }
-}
-
 /// An ArrayMethodHandle element whose entity offset is in no entity map
-/// decodes with an empty entity name (the in-array fallback).
+/// decodes with an empty entity name. PINNED TOLERANCE (format evidence):
+/// a method handle may legally target a FOREIGN method/field (the vendored
+/// MethodHandleItem holds any BaseItem); foreign members live in the
+/// foreign region and never enter the entity map, so a miss is format-legal
+/// and must NOT become a hard error (see
+/// annotation_loud_errors.rs::method_handle_foreign_entity_decodes_with_empty_name).
 #[test]
 fn annotation_array_method_handle_unknown_entity_decodes_empty() {
     let mut data = build_method_handle_array();

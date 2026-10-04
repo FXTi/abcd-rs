@@ -1432,15 +1432,28 @@ fn decode_annotation_list(
                             }
                         }
                         AVT::String => {
-                            let s = read_string(f, out.value).unwrap_or_default();
+                            // Loud: an unreadable value string is malformed
+                            // input (same treatment as the element name
+                            // string above), never a silent empty string.
+                            let s =
+                                read_string(f, out.value).ok_or(Error::InvalidString(out.value))?;
                             let sid = strings.get_or_intern(&s);
                             AnnotationValue::String(sid)
                         }
                         AVT::Record => {
+                            // Loud: a Record value is a class reference.
+                            // Every class — local or foreign — sits in the
+                            // class index and enters entity_map (foreign
+                            // classes as descriptor-string items), and the
+                            // vendored emitter rejects unresolvable class
+                            // references (assembly-emitter.cpp
+                            // CreateScalarRecordValueItem returns nullptr).
+                            // A miss is therefore a dangling offset:
+                            // malformed input, never a silent "".
                             let sid = entity_map
                                 .get(&out.value)
                                 .copied()
-                                .unwrap_or_else(|| strings.get_or_intern(""));
+                                .ok_or(Error::InvalidOffset(out.value))?;
                             AnnotationValue::Record(sid)
                         }
                         AVT::Method => {
@@ -1504,6 +1517,14 @@ fn decode_annotation_list(
                             let entity = entity_map
                                 .get(&entity_off)
                                 .copied()
+                                // Tolerant (pinned): a method handle may
+                                // legally target a FOREIGN method/field
+                                // (vendored MethodHandleItem holds any
+                                // BaseItem); foreign members live in the
+                                // foreign region and never enter entity_map
+                                // (see resolve_foreign_entity_name), so a
+                                // miss is format-legal and decodes with an
+                                // empty entity name.
                                 .unwrap_or_else(|| strings.get_or_intern(""));
                             AnnotationValue::MethodHandle(ResolvedMethodHandle {
                                 handle_type: ht,
@@ -1601,12 +1622,14 @@ fn decode_annotation_array_elements(
 ) -> Result<Vec<AnnotationValue>, Error> {
     use sys::AnnotationValueType as AVT;
 
-    if count == 0 {
-        return Ok(Vec::new());
-    }
-
-    // Determine element size from the array tag.
-    let element_size: u32 = match AVT::try_from(tag) {
+    // Determine element size from the array tag. Loud: the generic 'H'
+    // (AVT::Array) tag, non-array tags, and unknown tag bytes have no
+    // defined element width — the vendored assembler never emits 'H' for
+    // an array element (pandasm `GetArrayTypeAsChar` maps each component
+    // type to a specific tag 'K'..'@'; annotation.h), so such a file is
+    // malformed input, never a silent empty array.
+    let avt = AVT::try_from(tag);
+    let element_size: u32 = match avt {
         Ok(AVT::ArrayU1 | AVT::ArrayI8 | AVT::ArrayU8) => 1,
         Ok(AVT::ArrayI16 | AVT::ArrayU16) => 2,
         Ok(
@@ -1622,8 +1645,19 @@ fn decode_annotation_array_elements(
             | AVT::LiteralArray,
         ) => 4,
         Ok(AVT::ArrayI64 | AVT::ArrayU64 | AVT::ArrayF64) => 8,
-        _ => return Ok(Vec::new()),
+        _ => {
+            return Err(Error::Malformed {
+                field: "annotation array element tag",
+                context: format!(
+                    "annotation array at offset {entity_offset:#x}: tag {tag:#x} has no defined element size"
+                ),
+            });
+        }
     };
+
+    if count == 0 {
+        return Ok(Vec::new());
+    }
 
     let mut raw_values = vec![0u64; count as usize];
     let n = unsafe {
@@ -1646,12 +1680,24 @@ fn decode_annotation_array_elements(
         });
     }
     let n = n as usize;
+    if n < count as usize {
+        // Loud: the bridge short-reads only when the array's data region
+        // runs out mid-array (the span is bounded by the header-declared
+        // file size) — the declared element count overruns the payload:
+        // malformed input, never a silent truncation.
+        return Err(Error::Malformed {
+            field: "annotation array data",
+            context: format!(
+                "annotation array at offset {entity_offset:#x}: declared {count} elements, {n} readable"
+            ),
+        });
+    }
 
     // Convert raw values to AnnotationValue based on element tag.
     raw_values[..n]
         .iter()
         .map(|&raw| -> Result<AnnotationValue, Error> {
-            let value = match AVT::try_from(tag) {
+            let value = match avt {
                 Ok(AVT::ArrayU1) => AnnotationValue::Bool(raw != 0),
                 Ok(AVT::ArrayI8) => AnnotationValue::I8(raw as i8),
                 Ok(AVT::ArrayU8) => AnnotationValue::U8(raw as u8),
@@ -1664,14 +1710,19 @@ fn decode_annotation_array_elements(
                 Ok(AVT::ArrayF32) => AnnotationValue::F32(f32::from_bits(raw as u32)),
                 Ok(AVT::ArrayF64) => AnnotationValue::F64(f64::from_bits(raw)),
                 Ok(AVT::ArrayString) => {
-                    let s = read_string(f, raw as u32).unwrap_or_default();
+                    // Loud: an unreadable string item is malformed input
+                    // (scalar AVT::String analogue), never a silent "".
+                    let s = read_string(f, raw as u32).ok_or(Error::InvalidString(raw as u32))?;
                     AnnotationValue::String(strings.get_or_intern(&s))
                 }
                 Ok(AVT::ArrayRecord) => {
+                    // Loud: class references always resolve through the
+                    // class index into entity_map (scalar AVT::Record
+                    // analogue); a miss is a dangling offset.
                     let sid = entity_map
                         .get(&(raw as u32))
                         .copied()
-                        .unwrap_or_else(|| strings.get_or_intern(""));
+                        .ok_or(Error::InvalidOffset(raw as u32))?;
                     AnnotationValue::Record(sid)
                 }
                 Ok(AVT::ArrayMethod) => {
@@ -1689,17 +1740,24 @@ fn decode_annotation_array_elements(
                     }
                 }
                 Ok(AVT::ArrayAnnotation) => {
-                    match decode_annotation_list(f, &[raw as u32], entity_map, strings) {
-                        Ok(mut list) if !list.is_empty() => {
-                            AnnotationValue::Annotation(Box::new(list.remove(0)))
-                        }
-                        _ => AnnotationValue::Void,
-                    }
+                    // Loud: propagate the inner decoder's error (scalar
+                    // AVT::Annotation analogue), never a silent Void. A
+                    // one-element input slice yields exactly one annotation
+                    // on Ok; the empty case is defensive.
+                    let mut list = decode_annotation_list(f, &[raw as u32], entity_map, strings)?;
+                    let nested = list.pop().ok_or_else(|| Error::Malformed {
+                        field: "nested annotation",
+                        context: format!("annotation array at offset {entity_offset:#x}"),
+                    })?;
+                    AnnotationValue::Annotation(Box::new(nested))
                 }
                 Ok(AVT::LiteralArray) => {
                     AnnotationValue::LiteralArray(decode_literal_array_at(f, raw as u32, strings)?)
                 }
                 Ok(AVT::ArrayMethodHandle) => {
+                    // Loud: an unreadable handle item or an unknown
+                    // handle-type discriminant is malformed input (scalar
+                    // AVT::MethodHandle analogues), never a silent Void.
                     let mut handle_type_raw = 0u8;
                     let mut entity_off = 0u32;
                     let rc = unsafe {
@@ -1710,25 +1768,44 @@ fn decode_annotation_array_elements(
                             &mut entity_off,
                         )
                     };
-                    if rc == 0 {
-                        if let Some(ht) = MethodHandleType::from_u8(handle_type_raw) {
-                            let entity = entity_map
-                                .get(&entity_off)
-                                .copied()
-                                .unwrap_or_else(|| strings.get_or_intern(""));
-                            AnnotationValue::MethodHandle(ResolvedMethodHandle {
-                                handle_type: ht,
-                                entity,
-                                entity_offset: entity_off,
-                            })
-                        } else {
-                            AnnotationValue::Void
-                        }
-                    } else {
-                        AnnotationValue::Void
+                    if rc != 0 {
+                        return Err(Error::Malformed {
+                            field: "method_handle",
+                            context: format!("annotation array at offset {entity_offset:#x}"),
+                        });
                     }
+                    let ht = MethodHandleType::from_u8(handle_type_raw).ok_or_else(|| {
+                        Error::Malformed {
+                            field: "method_handle_type",
+                            context: format!(
+                                "annotation array at offset {entity_offset:#x}: unknown handle type {handle_type_raw:#x}"
+                            ),
+                        }
+                    })?;
+                    // Tolerant (pinned): foreign method/field targets are
+                    // format-legal and never enter entity_map — empty entity
+                    // name (scalar AVT::MethodHandle analogue).
+                    let entity = entity_map
+                        .get(&entity_off)
+                        .copied()
+                        .unwrap_or_else(|| strings.get_or_intern(""));
+                    AnnotationValue::MethodHandle(ResolvedMethodHandle {
+                        handle_type: ht,
+                        entity,
+                        entity_offset: entity_off,
+                    })
                 }
-                _ => AnnotationValue::U32(raw as u32),
+                // Unreachable through decode(): the element-size check above
+                // rejects every tag without a value conversion before any
+                // element is read. Loud per the file's convention.
+                _ => {
+                    return Err(Error::Malformed {
+                        field: "annotation array element tag",
+                        context: format!(
+                            "annotation array at offset {entity_offset:#x}: tag {tag:#x} has no value conversion"
+                        ),
+                    });
+                }
             };
             Ok(value)
         })
@@ -2507,6 +2584,82 @@ mod tests {
         assert!(
             matches!(result, Err(Error::InvalidOffset(o)) if o == bogus),
             "expected InvalidOffset({bogus:#x}), got: {result:?}"
+        );
+    }
+
+    /// Arm: a declared element count that overruns the array's data span is
+    /// a hard error, never a silent truncation (the bridge clamps the read
+    /// to what the span holds and yields the short count). Reaching this
+    /// through the public `decode` path would require the array payload to
+    /// sit at the declared file end with every later-decoded item below it
+    /// — the builder's item order never produces that — so drive the
+    /// converter directly with an inflated count over a valid payload.
+    #[test]
+    fn annotation_array_short_read_is_hard_error() {
+        let mut b = crate::Builder::new();
+        b.set_api(12, "beta1");
+        let cls = b.add_global_class();
+        b.class_set_source_lang(cls, crate::types::SourceLang::EcmaScript);
+        let s = b.add_string("probe_s");
+        let name = b.add_string("e");
+        let ann = b.create_annotation_ex(
+            cls,
+            &[crate::AnnotationElemDefEx {
+                name,
+                tag: b'V', // ArrayString
+                value: crate::AnnotationElemValue::EntityArray(vec![s.as_raw()]),
+            }],
+        );
+        b.class_add_runtime_annotation(cls, ann);
+        let proto = b.create_proto(crate::types::Type::Tagged, &[]);
+        let m = b.class_add_method(
+            cls,
+            "func_main_0",
+            proto,
+            crate::types::AccessFlags::PUBLIC,
+            &[0x65],
+            1,
+            0,
+        );
+        b.method_set_source_lang(m, crate::types::SourceLang::EcmaScript);
+        let data = b.finalize().expect("finalize");
+
+        // Find the array payload (`[uleb 1][u32 string_off]`).
+        let mut pat = vec![(7u8 << 1) | 1]; // "probe_s" is 7 ASCII chars
+        pat.extend_from_slice(b"probe_s");
+        pat.push(0);
+        let str_off = data
+            .windows(pat.len())
+            .position(|w| w == pat.as_slice())
+            .expect("string item") as u32;
+        let payload_pos = data
+            .windows(5)
+            .position(|w| w[0] == 1 && w[1..5] == str_off.to_le_bytes())
+            .expect("array payload") as u32;
+
+        let abc = crate::file::AbcFile::open(&data).expect("open");
+        let mut strings = StringPool::new();
+        let entity_map = HashMap::new();
+        // Tag 'Q' = ArrayU32 (4-byte elements). The declared count vastly
+        // overruns the span between the payload and the declared file end,
+        // so the bridge yields fewer elements than declared.
+        let result = decode_annotation_array_elements(
+            abc.raw,
+            b'Q',
+            0xFFFF,
+            payload_pos,
+            &entity_map,
+            &mut strings,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Error::Malformed {
+                    field: "annotation array data",
+                    ..
+                })
+            ),
+            "expected Malformed/annotation array data, got: {result:?}"
         );
     }
 }
