@@ -173,17 +173,22 @@ fn elimination_still_fires_when_converging_edges_agree() {
 /// 4:  lda v3              ; acc = a0 (arg0 sits above the 3 vregs)
 /// 5:  sta v0              ; v0 = a0 (the maybe-value)
 /// 6:  lda v2              ; acc = undefined
-/// 7:  jeq v0, L_UNDEF     ; a0 == undefined → jump-only block B
+/// 7:  eq v0               ; acc = (undefined == a0)
+/// 8:  jnez L_UNDEF        ; a0 == undefined → jump-only block B
+///                         ; (unfused form — es2abc lowers this shape as
+///                         ; eq;jnez; the fused jeq family is a lift hard
+///                         ; error: unimplemented + deprecated upstream,
+///                         ; no producer)
 /// --- T (fall-through, the DIRECT P → T edge): ---
-/// 8:  lda v0              ; acc = v0 (= a0 on this edge)
-/// 9:  return
+/// 9:  lda v0              ; acc = v0 (= a0 on this edge)
+/// 10: return
 /// --- L_UNDEF (B): ---
-/// 10: mov v0, v1          ; v0 = 7 (lifts to a rename → B is jump-only)
-/// 11: jmp T
+/// 11: mov v0, v1          ; v0 = 7 (lifts to a rename → B is jump-only)
+/// 12: jmp T
 /// ```
 ///
-/// Lift produces pred P (0..7) with a direct edge to T (8..9) AND an
-/// edge via jump-only B (10..11); T's phi for v0 carries a0 for the
+/// Lift produces pred P (0..8) with a direct edge to T (9..10) AND an
+/// edge via jump-only B (11..12); T's phi for v0 carries a0 for the
 /// direct edge and 7 for the B-mediated edge.
 fn build_optional_chain_file() -> File {
     let mut builder = Builder::new();
@@ -198,14 +203,15 @@ fn build_optional_chain_file() -> File {
         Bytecode::Lda(Reg(3)),
         Bytecode::Sta(Reg(0)),
         Bytecode::Lda(Reg(2)),
-        Bytecode::Jeq(Reg(0), Label(10)),
+        Bytecode::Eq(Imm(0), Reg(0)),
+        Bytecode::Jnez(Label(11)),
         Bytecode::Lda(Reg(0)),
         Bytecode::Return,
         Bytecode::Mov(Reg(0), Reg(1)),
-        Bytecode::Jmp(Label(8)),
+        Bytecode::Jmp(Label(9)),
     ];
     let (bytes, offsets) = encode_bytecodes(&code_seq).unwrap();
-    assert_eq!(offsets.len(), 12, "every instruction needs an offset");
+    assert_eq!(offsets.len(), 13, "every instruction needs an offset");
     builder.class_add_method(class, "f", proto, AccessFlags::STATIC, &bytes, 3, 1);
     builder.deduplicate();
     abcd_file::decode(&builder.finalize().unwrap()).unwrap()
