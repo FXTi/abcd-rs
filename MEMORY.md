@@ -1956,3 +1956,26 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   empty in all four copies, the runtime accessor is offset-only with no
   name API, our local-member name resolution already exceeds upstream
   fidelity); document-only, no behavior change.
+- c-COV follow-up batch landed (2026-10-04, five atomic commits + 3
+  fixture/docs commits, all worker-verified on dabai): af9910d N84
+  (format_g6 stripped INTEGER trailing zeros for [100000,999999] — root
+  fix: strip only when '.' present; boundary table in commit; byte-
+  identity 5517/5517 + asm 5503+14/5517 unchanged); 3929c9d opt
+  optional-chain fixture defused to es2abc's unfused eq;jnez form;
+  fec0cbc fused compare-and-branch family -> LiftError::
+  UnsupportedFusedCompareBranch (14 variants, N51 shape; W2 truthiness
+  pins flipped to hard-error pins; corpus 1152x3 zero-skip); 12d6751
+  encode-side NestedLiteralArrayInAnnotation rejection (pre-fix corrupt
+  file demonstrated: 5 items in, 3 garbage out; scoped exactly to
+  annotation-embedded arrays; param-annotation counting fixed a real
+  ann_la under-count); c46c774 N83 (abc_annotation_get_array_element
+  bounds count by payload span at the bridge boundary — 32 GiB OOM
+  craft demonstrated pre-fix; abc_annotation_array_read hardened: prefix
+  -overrun guard + SubSpan underflow fixed + span clamp, partial-read
+  semantics unchanged); 78687c4 decode array-element silent arms -> loud
+  (10 arms; MethodHandle entity-miss stays TOLERANT pinned — format-
+  legal foreign targets, matching the impact-nil verdict; Record
+  entity-miss -> InvalidOffset — no format-legal dangling case; 6 stale
+  silent pins retired). method-handle foreign entity="": documented
+  intended/impact-nil (upstream does strictly less; no functional
+  consumer). CI watched per push.
