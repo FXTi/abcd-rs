@@ -385,7 +385,8 @@ struct AbcModuleAccessor {
 
 struct AbcAnnotationAccessor {
     AnnotationDA accessor;
-    AbcAnnotationAccessor(const File &f, File::EntityId id) : accessor(f, id) {}
+    const File &file;
+    AbcAnnotationAccessor(const File &f, File::EntityId id) : accessor(f, id), file(f) {}
 };
 
 struct AbcDebugInfo {
@@ -1639,7 +1640,24 @@ try {
     if (idx >= a->accessor.GetCount()) return -1;
     auto elem = a->accessor.GetElement(idx);
     auto arr = elem.GetArrayValue();
-    out->count = arr.GetCount();
+    uint32_t count = arr.GetCount();
+    // N83: the count is a file-declared ULEB128 that the safe caller feeds
+    // straight to its allocator (`vec![0u64; count]` — 32 GiB for
+    // u32::MAX). The vendored ArrayValue yields it unchecked, so bound it
+    // here at the boundary (the N81 bounded-string pattern): every element
+    // occupies >= 1 byte, hence a well-formed array's count can never
+    // exceed the payload bytes between the count prefix and the end of the
+    // declared file. A count past that is malformed input — fail loudly
+    // instead of yielding an allocation-sized number.
+    auto sp = a->file.GetSpanFromId(arr.GetId());
+    if (sp.empty()) return -1;
+    auto [cnt, prefix_len, ok] = panda::leb128::DecodeUnsigned<uint32_t>(sp.data());
+    // The vendored ArrayValue ctor already read this prefix through
+    // helpers::ReadULeb128, which throws unless it is complete and inside
+    // the span, so prefix_len <= sp.Size() holds here.
+    if (!ok) return -1;
+    if (static_cast<uint64_t>(count) > sp.Size() - prefix_len) return -1;
+    out->count = count;
     out->entity_off = arr.GetId().GetOffset();
     return 0;
 } catch (...) {
@@ -1690,12 +1708,21 @@ try {
     auto sp = f->file->GetSpanFromId(File::EntityId(entity_off));
     if (sp.empty()) return -1;
 
-    // Skip the ULEB128 count prefix.
+    // Skip the ULEB128 count prefix. The raw-pointer decode reads at most 5
+    // bytes and the handle's buffer is zero-padded (audit #A3), but the
+    // prefix must still lie inside the span — otherwise SubSpan's size
+    // would underflow.
     auto [cnt, bytes_read, ok] = panda::leb128::DecodeUnsigned<uint32_t>(sp.data());
-    if (!ok) return -1;
+    if (!ok || bytes_read > sp.Size()) return -1;
     auto data = sp.SubSpan(bytes_read);
 
+    // N83: clamp the element count by the payload span. The loop below
+    // already stops at the span end (same return value either way); making
+    // the bound explicit keeps the u32 product element_size*i below
+    // data.Size(), so it can never wrap for a pathological caller count.
     uint32_t n = std::min(count, max_count);
+    uint64_t span_cap = data.Size() / element_size;
+    if (span_cap < n) n = static_cast<uint32_t>(span_cap);
     for (uint32_t i = 0; i < n; ++i) {
         auto elem = data.SubSpan(element_size * i);
         if (elem.Size() < element_size) return static_cast<int>(i);

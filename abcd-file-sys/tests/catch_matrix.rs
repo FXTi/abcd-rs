@@ -838,7 +838,10 @@ fn annotation_getters_reject_out_of_range_index() {
 }
 
 /// `abc_annotation_array_read`: an unterminated ULEB count fails with -1; a
-/// payload ending mid-element returns the partial read count.
+/// count prefix running past the span fails with -1 (N83 — the raw-pointer
+/// decode terminates on the zero padding, so without the explicit guard the
+/// span size would underflow); a payload ending mid-element returns the
+/// partial read count.
 #[test]
 fn annotation_array_read_truncation_guards() {
     unsafe {
@@ -851,6 +854,17 @@ fn annotation_array_read_truncation_guards() {
         );
         abc_file_close(f);
 
+        // A one-byte span whose continuation bit is set: the decode would
+        // complete on the padded zero byte, leaving a 2-byte prefix over a
+        // 1-byte span.
+        let f = open(&minimal_file(&[0x80]));
+        assert_eq!(
+            abc_annotation_array_read(f, 64, 4, 2, buf.as_mut_ptr(), 2),
+            -1,
+            "count prefix past the span end must fail"
+        );
+        abc_file_close(f);
+
         // count = 2, element_size 4, but only one element's bytes remain.
         let g = open(&minimal_file(&[0x02, 0x2A, 0x00, 0x00, 0x00]));
         assert_eq!(
@@ -860,6 +874,111 @@ fn annotation_array_read_truncation_guards() {
         );
         assert_eq!(buf[0], 42);
         abc_file_close(g);
+    }
+}
+
+/// N83: `abc_annotation_get_array_element` must bound the file-declared
+/// array element count by the array's data span before yielding it. The
+/// craft declares u32::MAX elements over a one-element payload; pre-fix the
+/// raw count crossed the boundary and the safe caller sized
+/// `vec![0u64; count]` from it (32 GiB -> abort on capped memory, silent
+/// truncation otherwise). Post-fix the bridge rejects the element with -1.
+/// End-to-end twin: abcd-file/tests/annotation_loud_errors.rs
+/// ::huge_array_count_is_hard_error_not_abort.
+#[test]
+fn annotation_array_element_huge_count_is_rejected() {
+    unsafe {
+        // Fixture: one class annotation with a single u32-array element [42].
+        let b = abc_builder_new();
+        assert!(!b.is_null());
+        abc_builder_set_api(b, 9, c"".as_ptr());
+        let cls = abc_builder_add_global_class(b);
+        assert_ne!(cls, u32::MAX);
+        let ann_cls = abc_builder_add_class(b, c"LAnno;".as_ptr());
+        assert_ne!(ann_cls, u32::MAX);
+        let elem_name = abc_builder_add_string(b, c"value".as_ptr());
+        let values = [42u32];
+        let elem = AbcAnnotationElemDefEx {
+            name_string_handle: elem_name,
+            tag: b'Q' as std::ffi::c_char,
+            is_array: 1,
+            scalar_value: 0,
+            scalar_value_64: 0,
+            array_values: values.as_ptr(),
+            array_count: 1,
+        };
+        let ann = abc_builder_create_annotation_ex(b, ann_cls, &elem, 1);
+        assert_ne!(ann, u32::MAX);
+        abc_builder_class_add_annotation(b, cls, ann);
+        let mut out_len = 0u32;
+        let ptr = abc_builder_finalize(b, &mut out_len);
+        assert!(!ptr.is_null(), "array-annotation fixture must finalize");
+        let mut data = std::slice::from_raw_parts(ptr, out_len as usize).to_vec();
+        abc_builder_free(b);
+
+        unsafe extern "C" fn collect_ann(off: u32, ctx: *mut c_void) -> i32 {
+            unsafe { (*(ctx as *mut Vec<u32>)).push(off) };
+            0
+        }
+        unsafe fn open_ann(data: &[u8]) -> (*mut AbcFileHandle, *mut AbcAnnotationAccessor) {
+            let f = unsafe { open(data) };
+            let ca = unsafe { abc_class_open(f, class_off_by_name(data, "L_GLOBAL;") as u32) };
+            assert!(!ca.is_null());
+            let mut anns: Vec<u32> = Vec::new();
+            unsafe {
+                abc_class_enumerate_annotations(
+                    ca,
+                    Some(collect_ann),
+                    &mut anns as *mut Vec<u32> as *mut c_void,
+                );
+                abc_class_close(ca);
+            }
+            assert_eq!(anns.len(), 1);
+            let aa = unsafe { abc_annotation_open(f, anns[0]) };
+            assert!(!aa.is_null());
+            (f, aa)
+        }
+
+        // Pass 1: locate the array item through the bridge and confirm the
+        // unmutated element reads fine.
+        let (f, aa) = open_ann(&data);
+        let mut elem_out = AbcAnnotationElem {
+            name_off: 0,
+            tag: 0,
+            value: 0,
+        };
+        assert_eq!(abc_annotation_get_element(aa, 0, &mut elem_out), 0);
+        assert_eq!(elem_out.tag, b'Q');
+        let array_off = elem_out.value as usize;
+        let mut arr = AbcAnnotationArrayVal {
+            count: 0,
+            entity_off: 0,
+        };
+        assert_eq!(abc_annotation_get_array_element(aa, 0, &mut arr), 0);
+        assert_eq!(arr.count, 1, "positive control: one-element array");
+        abc_annotation_close(aa);
+        abc_file_close(f);
+
+        // Mutate: the array item is [ULEB128 count][count x u32 value];
+        // overwrite its five bytes (1-byte count + one 4-byte value) with the
+        // five-byte ULEB encoding of u32::MAX — a huge declared count over a
+        // tiny remaining payload.
+        data[array_off..array_off + 5].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+
+        // Pass 2: the bounded bridge rejects the element outright instead of
+        // yielding u32::MAX to the caller's allocator.
+        let (f, aa) = open_ann(&data);
+        let mut arr = AbcAnnotationArrayVal {
+            count: 0,
+            entity_off: 0,
+        };
+        assert_eq!(
+            abc_annotation_get_array_element(aa, 0, &mut arr),
+            -1,
+            "a declared count past the array's data span must be rejected"
+        );
+        abc_annotation_close(aa);
+        abc_file_close(f);
     }
 }
 

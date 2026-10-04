@@ -368,7 +368,11 @@ struct AbcAnnotationElem {
 int abc_annotation_get_element(const AbcAnnotationAccessor *a, uint32_t idx,
                                struct AbcAnnotationElem *out);
 
-/* Array element access: returns 0 on success, -1 on error */
+/* Array element access: returns 0 on success, -1 on error.
+   The yielded count is bounded by the array's payload span (>= 1 byte per
+   element, N83): a file-declared count that cannot fit in the remaining
+   bytes is malformed input and fails with -1 instead of crossing the
+   boundary into the caller's allocator. */
 struct AbcAnnotationArrayVal {
     uint32_t count;
     uint32_t entity_off;
@@ -386,6 +390,9 @@ int abc_annotation_get_value_f64(const AbcAnnotationAccessor *a, uint32_t idx, d
    element_size: size in bytes of each element (1, 2, 4, or 8).
    out_values: output buffer for element values (zero-extended to uint64_t).
    max_count: capacity of out_values.
+   The read is clamped by the array's payload span (N83): at most the
+   elements that fit in the remaining bytes are read, and a count prefix
+   running past the span fails with -1.
    Returns: number of elements read, or -1 on error. */
 int abc_annotation_array_read(const AbcFileHandle *f, uint32_t entity_off,
                                uint32_t element_size, uint32_t count,
