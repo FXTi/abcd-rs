@@ -1855,3 +1855,54 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   vec![0u64; count] (OOM on crafted input; C++ side u32 wrap) — N83
   candidate; (c) N82 worker noted step-G empty-callee-block clone on
   unverified input (same benign class).
+- c-COV phase B waves 1+2 (2026-10-03/04, all landed on main): W4 a5dd3d0
+  (isa: all 49 wild-unused legacy mappings synthesized, legacy_table ->
+  ~100% merged); W1 feb2a37 (cli: run_dispatch.rs drives run() — lib.rs
+  5.5%->100%, crate 93.97%; proven-uncoverable set documented); W2 88d798c
+  (lift: 82 tests — 315 deprecated.* + zero-corpus modern arms + metadata/
+  resolve; corpus oracle 1152x3 unchanged); W3 30168e0 (lower: 349/390 gap
+  lines closed; 7 arms newly PROVEN-unreachable incl. regalloc 982/1042/
+  1180); W6 233c463 (pandasm unit-only per the CI-metric ruling: parse
+  43.8->98.89%, insn_ctor 50.1->99.61%, mod 80.1->97.47%); W5 9ac8d73
+  (file: encode 76.8->99.22%, annotation.rs/module.rs 100%); W11 979e9b0
+  (bridge: file_bridge 83.68->89.45%, isa_bridge 44.87->77.88% via a
+  sys-level malformed-offset catch matrix — SUPPORT_KNOWN_EXCEPTION makes
+  vendor throws drivable); W9 6deb2b2 (decompile emit/recover/dump/names/
+  consts: emit 84.98%, recover 91.94% zero MG/ERR/BAIL left, dump/names
+  only DEFENSE left); W10 00adf5d (analysis/taint/opt: 128 tests, scope
+  84.3->96.7%; API addition TaintConfig::pta_step_budget (cli passes None,
+  not TOML-exposed)); W12 38874df (decode malformed battery 52 tests,
+  decode.rs 96.69%; verify.rs 81.4->99.58%; literal.rs 99.2%; file.rs
+  97.67%); W7 e0bb4aa (folds.rs 48.92->96.81%, production 98.35% — 88
+  in-module tests, 8 fixture families + ~380 bail near-miss pins).
+- c-COV WORKSPACE INCIDENT (2026-10-04 ~02:53): a worker's broad
+  checkout/restore reverted ALL of abcd-decompile/ tracked files to HEAD,
+  wiping three workers' uncommitted in-module tests (W7 ~1900 lines, W9
+  five files, W8's classfold batch). All reconstructed from transcripts;
+  W8 later FAILED mid-flight (its structure_w8.rs left broken) and a
+  finisher (W8b) was dispatched. Rules now in force: workers verify their
+  diff is present before reporting done; keep off-tree backups of
+  uncommitted work; NEVER git checkout/restore shared paths; orchestrator
+  commits completed batches PROMPTLY.
+- c-COV follow-up register (from worker findings, for rulings/fixes):
+  (1) format_g6 mis-renders f64 in [100000,999999] with trailing zeros
+  (100000.0 -> "1" instead of "100000") — corpus never carries one, so
+  gates never saw it; fix = strip trailing zeros only when '.' present —
+  N84 candidate. (2) The fused null/undefined/strict-zero branch family
+  (translate.rs:1609-1625) folds to plain truthiness, DROPPING the
+  ===0/null/undefined distinction — zero producers emit these opcodes,
+  latent; needs a ruling (pin-as-is now). (3) decode.rs ARRAY-element
+  analogues stay silent (nested-annotation->Void etc.) — same class as
+  the converted arms; ruling pending. (4) abc_annotation_array_read
+  trusts the file's element count into vec![0u64; count] — OOM on crafted
+  input; N83 candidate. (5) W11 F1: vendored FieldDataAccessor type-bucket
+  enumerators match FieldTag::ANNOTATION (0x04) not 0x05/0x06 — field
+  type-annotation buckets unreadable by construction (accepted residual,
+  upstream quirk). (6) W11 F3: decode method-handle foreign-entity
+  resolution is entity_map-only -> foreign members decode entity="".
+  (7) inline.rs step-G empty-callee-block clone on unverified input
+  (benign, documented). (8) SCCP NaN self-meet -> Bottom benign quirk,
+  pinned in opt_sccp_folds.rs. (9) W12: the decode.rs last-mile is all
+  accepted-unreachable with bridge/vendor proofs. (10) Process: local mac
+  rustfmt 1.89 vs dabai 1.99 skew — workers must fmt with the REMOTE
+  toolchain (KEEP=1 + fmt there + rsync back ONLY their own files).
