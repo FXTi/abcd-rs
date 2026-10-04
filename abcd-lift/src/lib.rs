@@ -124,6 +124,29 @@ pub enum LiftError {
         "unsupported this-by-* opcode `{0}` (N51): es2panda never emits this IC-fused family and its IC semantics are unsupported — please report this file to the abcd-rs maintainers"
     )]
     UnsupportedThisByAccess(&'static str),
+    /// The fused compare-and-branch family — the acc-branch forms
+    /// (`jstricteqz` / `jnstricteqz`, `jeqnull` / `jnenull`,
+    /// `jstricteqnull` / `jnstricteqnull`, `jequndefined` /
+    /// `jneundefined`, `jstrictequndefined` / `jnstrictequndefined`)
+    /// and the fused compare-branch forms (`jeq` / `jne` /
+    /// `jstricteq` / `jnstricteq`)
+    /// (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:1700-1796):
+    /// isa.yaml documents only `pc += imm` for the family — NO
+    /// comparison semantics. The C++ interpreter FATALs all 24
+    /// variants (interpreter-inl.cpp:6853-6964), the assembly
+    /// interpreter NOP-skips them (interpreter_stub.cpp:5412-5516),
+    /// the baseline JIT/AOT ignore them, es2abc never emits them
+    /// (pandagen.cpp:1139-1170 lowers unfused:
+    /// `ldundefined;eq;jnez` / `ldundefined;stricteq;jnez`), and
+    /// abckit marks the null/undefined/zero forms deprecated and the
+    /// compare forms replaced. Corpus coverage is zero (0/5517
+    /// reference .pa + 156 wild packages), so there is NO upstream
+    /// behavior to lift — a hard error (maintainer ruling 2026-10-04,
+    /// N51 pattern), never silently invented.
+    #[error(
+        "unsupported fused compare-and-branch opcode `{0}` (ruling 2026-10-04): isa.yaml documents no comparison semantics (pc += imm only), the vendor interpreters FATAL/NOP-skip the family, and no producer emits it — please report this file to the abcd-rs maintainers"
+    )]
+    UnsupportedFusedCompareBranch(&'static str),
     /// `deprecated.defineclasswithbuffer method_id, imm1:u16, imm2:u16,
     /// v1:in:top, v2:in:top` (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:1239-1244):
     /// the vendor runtime reads v1 as the LEXENV and v2 as the PROTO

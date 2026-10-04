@@ -11,9 +11,16 @@
 //! (LiftError::InvalidSuperCheckKind), `newobjrange` with argc = 0
 //! (the acc fallback), and the `fallthrough_block` last-block fallback
 //! (a conditional branch as the method's final instruction).
+//!
+//! The fused compare-and-branch family (jeq/jne/jstricteq/jnstricteq
+//! and the null/undefined/strict-zero acc-branch forms) pins the
+//! LiftError::UnsupportedFusedCompareBranch HARD ERROR — maintainer
+//! ruling 2026-10-04 (N51 pattern): isa.yaml documents no comparison
+//! semantics, the vendor interpreters FATAL/NOP-skip the family, and
+//! no producer emits it.
 
 use abcd_file::{AccessFlags, Builder, CodeEntity, Type, decode};
-use abcd_ir::{CallKind, CmpOp, Const, Op, UnOp, ValueDef, ValueId};
+use abcd_ir::{CallKind, Const, Op, ValueDef, ValueId};
 use abcd_isa::{Bytecode, EntityId, Imm, Label, Reg, encode as encode_bytecodes};
 use abcd_lift::{LiftError, lift_file};
 
@@ -398,14 +405,25 @@ fn setobjectwithproto_proto_in_register_obj_in_acc() {
 }
 
 // ── Fused acc-branch family (jstricteqz / jeqnull / ...) ─────────────
-// translate.rs:1609-1625: every fused null/undefined/strict-zero form
-// folds to the SAME shape as jeqz/jnez — a UnaryOp IsFalse/IsTrue over
-// the acc feeding a CondBranch (the strict/null/undefined payload is
-// NOT preserved — pinned as-is; see the wave report).
+// translate.rs fused compare-and-branch arms: HARD ERROR (maintainer
+// ruling 2026-10-04, N51 pattern). isa.yaml:1700-1796 documents only
+// `pc += imm` for the family (NO comparison semantics); the C++
+// interpreter FATALs all 24 variants (interpreter-inl.cpp:6853-6964),
+// the assembly interpreter NOP-skips them
+// (interpreter_stub.cpp:5412-5516), the baseline JIT/AOT ignore them,
+// es2abc never emits them (pandagen.cpp:1139-1170 lowers unfused:
+// ldundefined;eq;jnez / ldundefined;stricteq;jnez), abckit marks the
+// null/undefined/zero forms deprecated and the compare forms
+// replaced, and corpus coverage is zero (0/5517 .pa + 156 wild
+// packages). The W2 truthiness-fold pins are REPLACED by hard-error
+// pins (the fold contradicted the mnemonic intent with no upstream
+// behavior to justify it); the Builder fixtures are kept as negative
+// inputs.
 
-/// Layout: `ldtrue; <branch> →L; ldnull; return; L: ldfalse; return`.
-fn fused_acc_branch(bc: Bytecode) -> abcd_ir::Module {
-    let file = build(
+/// Layout: `ldtrue; <branch> →L; ldnull; return; L: ldfalse; return`
+/// (the W2 fixture, kept as the negative input).
+fn fused_acc_branch_file(bc: Bytecode) -> abcd_file::File {
+    build(
         &[
             Bytecode::Ldtrue,
             bc,                // idx 1, target Label(4)
@@ -415,69 +433,51 @@ fn fused_acc_branch(bc: Bytecode) -> abcd_ir::Module {
             Bytecode::Return,  // idx 5
         ],
         0,
-    );
-    let m = lift_file(&file).expect("lift");
-    verify_clean(&m);
-    m
+    )
 }
 
 #[test]
-fn fused_acc_branches_fold_to_istrue_isfalse() {
-    let falsy: [fn(Label) -> Bytecode; 5] = [
-        |l| Bytecode::Jstricteqz(l),
-        |l| Bytecode::Jeqnull(l),
-        |l| Bytecode::Jstricteqnull(l),
-        |l| Bytecode::Jequndefined(l),
-        |l| Bytecode::Jstrictequndefined(l),
+fn fused_acc_branches_are_hard_errors() {
+    type AccBranchCase = (fn(Label) -> Bytecode, &'static str);
+    let cases: [AccBranchCase; 10] = [
+        (|l| Bytecode::Jstricteqz(l), "jstricteqz"),
+        (|l| Bytecode::Jnstricteqz(l), "jnstricteqz"),
+        (|l| Bytecode::Jeqnull(l), "jeqnull"),
+        (|l| Bytecode::Jnenull(l), "jnenull"),
+        (|l| Bytecode::Jstricteqnull(l), "jstricteqnull"),
+        (|l| Bytecode::Jnstricteqnull(l), "jnstricteqnull"),
+        (|l| Bytecode::Jequndefined(l), "jequndefined"),
+        (|l| Bytecode::Jneundefined(l), "jneundefined"),
+        (|l| Bytecode::Jstrictequndefined(l), "jstrictequndefined"),
+        (|l| Bytecode::Jnstrictequndefined(l), "jnstrictequndefined"),
     ];
-    let truthy: [fn(Label) -> Bytecode; 5] = [
-        |l| Bytecode::Jnstricteqz(l),
-        |l| Bytecode::Jnenull(l),
-        |l| Bytecode::Jnstricteqnull(l),
-        |l| Bytecode::Jneundefined(l),
-        |l| Bytecode::Jnstrictequndefined(l),
-    ];
-    for (family, want_op) in [(falsy, UnOp::IsFalse), (truthy, UnOp::IsTrue)] {
-        for mk in family {
-            let bc = mk(Label(4));
-            let m = fused_acc_branch(bc);
-            let Op::CondBranch {
-                cond,
-                true_dest,
-                false_dest,
-            } = find_op(&m, |o| matches!(o, Op::CondBranch { .. }))
-            else {
-                unreachable!()
-            };
-            let Op::UnaryOp { op, operand } = defining_op(&m, *cond) else {
-                panic!("the branch condition is a unary truth test")
-            };
-            assert_eq!(*op, want_op, "{bc:?} folds to {want_op:?}");
-            assert_eq!(
-                const_of(&m, *operand),
-                Const::Bool(true),
-                "the tested value is the acc"
-            );
-            assert_ne!(
-                true_dest, false_dest,
-                "taken and fall-through targets differ"
-            );
-        }
+    for (mk, name) in cases {
+        let file = fused_acc_branch_file(mk(Label(4)));
+        let err = lift_file(&file).expect_err("fused acc-branch must fail lift");
+        assert!(
+            matches!(err, LiftError::UnsupportedFusedCompareBranch(n) if n == name),
+            "{name}: dedicated fused-branch variant naming the opcode, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(name), "error names the opcode: {msg}");
+        assert!(msg.contains("2026-10-04"), "error cites the ruling: {msg}");
     }
 }
 
-// ── Fused compare-branch family (jne / jstricteq / jnstricteq) ───────
-// translate.rs:1629-1637: acc CMP reg → CondBranch.
+// ── Fused compare-branch family (jeq / jne / jstricteq / jnstricteq) ─
+// Same hard-error ruling (see the acc-branch section above); the W2
+// CmpOp-pin fixture is kept as the negative input.
 
 #[test]
-fn fused_compare_branches_carry_the_cmp_op() {
-    type CompareBranchCase = (fn(Reg, Label) -> Bytecode, CmpOp);
-    let cases: [CompareBranchCase; 3] = [
-        (Bytecode::Jne, CmpOp::NotEq),
-        (Bytecode::Jstricteq, CmpOp::StrictEq),
-        (Bytecode::Jnstricteq, CmpOp::StrictNotEq),
+fn fused_compare_branches_are_hard_errors() {
+    type CompareBranchCase = (fn(Reg, Label) -> Bytecode, &'static str);
+    let cases: [CompareBranchCase; 4] = [
+        (Bytecode::Jeq, "jeq"),
+        (Bytecode::Jne, "jne"),
+        (Bytecode::Jstricteq, "jstricteq"),
+        (Bytecode::Jnstricteq, "jnstricteq"),
     ];
-    for (mk, want) in cases {
+    for (mk, name) in cases {
         let bc = mk(Reg(3), Label(6));
         let file = build(
             &[
@@ -492,23 +492,14 @@ fn fused_compare_branches_carry_the_cmp_op() {
             ],
             4,
         );
-        let m = lift_file(&file).expect("lift");
-        verify_clean(&m);
-        let Op::CondBranch {
-            cond,
-            true_dest,
-            false_dest,
-        } = find_op(&m, |o| matches!(o, Op::CondBranch { .. }))
-        else {
-            unreachable!()
-        };
-        let Op::Compare { op, left, right } = defining_op(&m, *cond) else {
-            panic!("the branch condition is a Compare")
-        };
-        assert_eq!(*op, want, "{bc:?} carries {want:?}");
-        assert_eq!(const_of(&m, *left), Const::number(1.0), "left = acc");
-        assert_eq!(const_of(&m, *right), Const::number(2.0), "right = v3");
-        assert_ne!(true_dest, false_dest);
+        let err = lift_file(&file).expect_err("fused compare-branch must fail lift");
+        assert!(
+            matches!(err, LiftError::UnsupportedFusedCompareBranch(n) if n == name),
+            "{name}: dedicated fused-branch variant naming the opcode, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(name), "error names the opcode: {msg}");
+        assert!(msg.contains("2026-10-04"), "error cites the ruling: {msg}");
     }
 }
 

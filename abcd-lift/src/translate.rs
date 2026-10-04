@@ -90,8 +90,14 @@
 //! `ThrowIfSuperNotCalled{kind}` (0 → NotCalled, 1 → Rebind, anything
 //! else → hard [`LiftError::InvalidSuperCheckKind`]), throw.notexists/
 //! patternnoncoercible/deletesuperproperty → the dedicated ops,
-//! debugger → `Debugger`, jumps → `Branch`/`CondBranch` (jeqz-family
-//! via `UnaryOp::{IsTrue,IsFalse}`; jeq-family via `Compare`), return
+//! debugger → `Debugger`, jumps → `Branch`/`CondBranch` (jeqz/jnez
+//! via `UnaryOp::{IsTrue,IsFalse}`; the fused compare-and-branch
+//! family — jeq/jne/jstricteq/jnstricteq and the
+//! null/undefined/strict-zero acc-branch forms — is a hard
+//! [`LiftError::UnsupportedFusedCompareBranch`]: isa.yaml documents
+//! no comparison semantics, the vendor interpreters FATAL/NOP-skip
+//! the family, and no producer emits it — ruling 2026-10-04, N51
+//! pattern), return
 //! family → `Return`, setgeneratorstate/nop/callruntime.
 //! notifyconcurrentresult/callruntime.topropertykey → no-ops (v0.1
 //! parity).
@@ -1606,34 +1612,66 @@ pub fn translate_bytecode(
         }
         Bytecode::Jeqz(label) => cond_branch_acc(fx, false, *label, idx, block, loc),
         Bytecode::Jnez(label) => cond_branch_acc(fx, true, *label, idx, block, loc),
-        Bytecode::Jstricteqz(label) => {
-            // acc === 0 → branch
-            cond_branch_acc(fx, false, *label, idx, block, loc);
+        // Fused compare-and-branch family (isa.yaml:1700-1796) — HARD
+        // ERROR (maintainer ruling 2026-10-04, N51 pattern). isa.yaml
+        // documents only `pc += imm` for all 24 variants — NO
+        // comparison semantics; the C++ interpreter FATALs every
+        // variant (interpreter-inl.cpp:6853-6964), the assembly
+        // interpreter NOP-skips them (interpreter_stub.cpp:5412-5516),
+        // the baseline JIT/AOT ignore them, es2abc never emits them
+        // (pandagen.cpp:1139-1170 lowers unfused: `ldundefined;eq;
+        // jnez` / `ldundefined;stricteq;jnez`), abckit marks the
+        // null/undefined/zero forms deprecated and the compare forms
+        // replaced, and corpus coverage is zero (0/5517 .pa + 156
+        // wild packages). The former truthiness fold contradicted the
+        // mnemonic intent with no upstream behavior to justify it —
+        // refused loudly, never silently invented (mirrors
+        // `LiftError::UnsupportedThisByAccess`).
+        Bytecode::Jstricteqz(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jstricteqz"));
         }
-        Bytecode::Jnstricteqz(label) => cond_branch_acc(fx, true, *label, idx, block, loc),
-        Bytecode::Jeqnull(label) | Bytecode::Jstricteqnull(label) => {
-            cond_branch_acc(fx, false, *label, idx, block, loc);
+        Bytecode::Jnstricteqz(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jnstricteqz"));
         }
-        Bytecode::Jnenull(label) | Bytecode::Jnstricteqnull(label) => {
-            cond_branch_acc(fx, true, *label, idx, block, loc);
+        Bytecode::Jeqnull(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jeqnull"));
         }
-        Bytecode::Jequndefined(label) | Bytecode::Jstrictequndefined(label) => {
-            cond_branch_acc(fx, false, *label, idx, block, loc);
+        Bytecode::Jnenull(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jnenull"));
         }
-        Bytecode::Jneundefined(label) | Bytecode::Jnstrictequndefined(label) => {
-            cond_branch_acc(fx, true, *label, idx, block, loc);
+        Bytecode::Jstricteqnull(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jstricteqnull"));
         }
-        Bytecode::Jeq(reg, label) => {
-            compare_branch(fx, CmpOp::Eq, reg, *label, idx, block, loc);
+        Bytecode::Jnstricteqnull(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jnstricteqnull"));
         }
-        Bytecode::Jne(reg, label) => {
-            compare_branch(fx, CmpOp::NotEq, reg, *label, idx, block, loc);
+        Bytecode::Jequndefined(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jequndefined"));
         }
-        Bytecode::Jstricteq(reg, label) => {
-            compare_branch(fx, CmpOp::StrictEq, reg, *label, idx, block, loc);
+        Bytecode::Jneundefined(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jneundefined"));
         }
-        Bytecode::Jnstricteq(reg, label) => {
-            compare_branch(fx, CmpOp::StrictNotEq, reg, *label, idx, block, loc);
+        Bytecode::Jstrictequndefined(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch(
+                "jstrictequndefined",
+            ));
+        }
+        Bytecode::Jnstrictequndefined(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch(
+                "jnstrictequndefined",
+            ));
+        }
+        Bytecode::Jeq(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jeq"));
+        }
+        Bytecode::Jne(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jne"));
+        }
+        Bytecode::Jstricteq(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jstricteq"));
+        }
+        Bytecode::Jnstricteq(..) => {
+            return Err(LiftError::UnsupportedFusedCompareBranch("jnstricteq"));
         }
 
         // ── Return ───────────────────────────────────────────────────
@@ -2431,41 +2469,6 @@ fn cond_branch_acc(
     let acc = fx.read_acc(block);
     let op = if truthy { UnOp::IsTrue } else { UnOp::IsFalse };
     let cond = fx.emit_val(block, Op::UnaryOp { op, operand: acc }, loc);
-    let true_dest = fx.label_block(label);
-    let false_dest = fx.fallthrough_block(idx);
-    fx.emit_void(
-        block,
-        Op::CondBranch {
-            cond,
-            true_dest,
-            false_dest,
-        },
-        loc,
-    );
-}
-
-/// Emit a compare + conditional branch (jeq/jne/jstricteq/jnstricteq):
-/// jump to `label` when `acc CMP reg` holds.
-fn compare_branch(
-    fx: &mut FnLift,
-    op: CmpOp,
-    reg: &Reg,
-    label: abcd_isa::Label,
-    idx: usize,
-    block: BlockId,
-    loc: Option<u32>,
-) {
-    let acc = fx.read_acc(block);
-    let other = fx.read_reg(*reg, block);
-    let cond = fx.emit_val(
-        block,
-        Op::Compare {
-            op,
-            left: acc,
-            right: other,
-        },
-        loc,
-    );
     let true_dest = fx.label_block(label);
     let false_dest = fx.fallthrough_block(idx);
     fx.emit_void(
