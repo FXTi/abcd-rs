@@ -1927,3 +1927,18 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   fixed, 11 decode silent arms made loud. Wave commits: a5dd3d0 feb2a37
   88d798c 30168e0 233c463 9ac8d73 979e9b0 6deb2b2 00adf5d 38874df
   e0bb4aa a9daf83 (+ phase A 5a8bda6/2bbc2ef/01cbd7d/66df5c3).
+- c-COV follow-up rulings (2026-10-04, maintainer): (1) fused
+  null/undefined/strict-zero branch family (translate.rs:1609-1625,
+  folds to truthiness, loses === semantics, zero producers): PIN CURRENT
+  behavior — but verify upstream semantics first (investigation worker
+  dispatched; if upstream is strict, re-rule with that evidence). (2)
+  decode.rs annotation ARRAY-element silent arms (~6 spots): convert to
+  LOUD errors, same policy as 01cbd7d (impact check gates conversions).
+  (3) nested LiteralValue::LiteralArray inside annotation-embedded literal
+  arrays (vendored writer corrupts): ENCODE-side explicit structured
+  rejection, scoped exactly to that shape. (4) N83 commissioned red-first:
+  abc_annotation_array_read unbounded count -> OOM (boundary fix per the
+  N81 bounded pattern). (5) N84 commissioned red-first: format_g6
+  trailing-zero strip eats integer digits ([100000,999999] -> "1").
+  (6) method-handle foreign-entity entity="" — read-only investigation
+  (intended vs decode gap).
