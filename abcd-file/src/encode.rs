@@ -1752,6 +1752,25 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     Ok(output)
 }
 
+/// Encode preflight over every annotation in the file (hard-errors rule):
+/// reject the shapes the vendored writer cannot represent BEFORE any bytes
+/// are emitted.
+///
+/// Two rejections:
+/// - 64-bit annotation ARRAY elements (`UnsupportedAnnotationArrayType`):
+///   the bridge array ABI is 32-bit only (finding #18).
+/// - a `LiteralValue::LiteralArray` nested inside an annotation-EMBEDDED
+///   literal array (c-COV W5 ruling): upstream pandasm has no representation
+///   for the shape and the vendored writer/reader pair corrupts it on
+///   encode → decode (every item after the nested reference decodes
+///   shifted; the reference resolves to a wrong array). TOP-LEVEL (model)
+///   literal-array nesting is unaffected — model arrays never pass through
+///   this pass.
+///
+/// The walk covers class/method/field annotations and method PARAMETER
+/// annotations: param annotations encode through the same
+/// `encode_single_annotation` → `annotation_value_to_raw` path, so an
+/// embedded array there carries the same unrepresentable shape.
 fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
     fn annotations(a: &Annotations) -> impl Iterator<Item = &Annotation> {
         a.compile_time
@@ -1760,7 +1779,48 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
             .chain(a.compile_time_type.iter())
             .chain(a.runtime_type.iter())
     }
-    fn value(v: &AnnotationValue) -> Result<(), Error> {
+
+    /// Entity the annotation is attached to. `Copy` and formatted only when
+    /// an error is actually built, so the hot path carries no allocation.
+    #[derive(Clone, Copy)]
+    enum Owner {
+        Class(StringId),
+        Method(StringId, StringId),
+        Field(StringId, StringId),
+        MethodParam(StringId, StringId, usize),
+    }
+
+    /// The annotation element whose value tree is being validated. Nested
+    /// annotations re-seat the site at their own descriptor/element names.
+    #[derive(Clone, Copy)]
+    struct Site {
+        annotation: StringId,
+        element: StringId,
+    }
+
+    fn resolve(pool: &StringPool, sid: StringId) -> &str {
+        pool.resolve(sid).unwrap_or("<unknown>")
+    }
+
+    fn owner_string(pool: &StringPool, owner: Owner) -> String {
+        match owner {
+            Owner::Class(c) => format!("class {}", resolve(pool, c)),
+            Owner::Method(c, m) => format!("method {}::{}", resolve(pool, c), resolve(pool, m)),
+            Owner::Field(c, f) => format!("field {}::{}", resolve(pool, c), resolve(pool, f)),
+            Owner::MethodParam(c, m, i) => format!(
+                "parameter {i} of method {}::{}",
+                resolve(pool, c),
+                resolve(pool, m)
+            ),
+        }
+    }
+
+    fn value(
+        pool: &StringPool,
+        owner: Owner,
+        site: Site,
+        v: &AnnotationValue,
+    ) -> Result<(), Error> {
         match v {
             AnnotationValue::Array { tag, values } => {
                 if values.iter().any(|item| {
@@ -1772,40 +1832,107 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
                     return Err(Error::UnsupportedAnnotationArrayType { tag: *tag });
                 }
                 for item in values {
-                    value(item)?;
+                    value(pool, owner, site, item)?;
                 }
                 Ok(())
             }
             AnnotationValue::Annotation(a) => {
                 for e in &a.elements {
-                    value(&e.value)?;
+                    value(
+                        pool,
+                        owner,
+                        Site {
+                            annotation: a.class_descriptor,
+                            element: e.name,
+                        },
+                        &e.value,
+                    )?;
                 }
                 Ok(())
             }
             AnnotationValue::LiteralArray(values) => {
-                let _ = values;
+                // c-COV W5: a nested literal-array reference here has no
+                // representation in the vendored writer (its encode arm is
+                // defense-only; this pass is what rejects the shape).
+                for (item_index, item) in values.iter().enumerate() {
+                    if let LiteralValue::LiteralArray(idx) = item {
+                        return Err(Error::NestedLiteralArrayInAnnotation {
+                            annotation: resolve(pool, site.annotation).to_owned(),
+                            element_name: resolve(pool, site.element).to_owned(),
+                            owner: owner_string(pool, owner),
+                            item_index,
+                            nested_index: idx.0,
+                        });
+                    }
+                }
                 Ok(())
             }
             _ => Ok(()),
         }
     }
+    let pool = &file.strings;
     for class in file.classes.values() {
         for ann in annotations(&class.annotations) {
             for e in &ann.elements {
-                value(&e.value)?;
+                value(
+                    pool,
+                    Owner::Class(class.descriptor),
+                    Site {
+                        annotation: ann.class_descriptor,
+                        element: e.name,
+                    },
+                    &e.value,
+                )?;
             }
         }
         for method in &class.methods {
             for ann in annotations(&method.annotations) {
                 for e in &ann.elements {
-                    value(&e.value)?;
+                    value(
+                        pool,
+                        Owner::Method(class.descriptor, method.name),
+                        Site {
+                            annotation: ann.class_descriptor,
+                            element: e.name,
+                        },
+                        &e.value,
+                    )?;
+                }
+            }
+            for (index, anns) in method
+                .param_annotations
+                .compile_time
+                .iter()
+                .chain(&method.param_annotations.runtime)
+                .enumerate()
+            {
+                for ann in anns {
+                    for e in &ann.elements {
+                        value(
+                            pool,
+                            Owner::MethodParam(class.descriptor, method.name, index),
+                            Site {
+                                annotation: ann.class_descriptor,
+                                element: e.name,
+                            },
+                            &e.value,
+                        )?;
+                    }
                 }
             }
         }
         for field in &class.fields {
             for ann in annotations(&field.annotations) {
                 for e in &ann.elements {
-                    value(&e.value)?;
+                    value(
+                        pool,
+                        Owner::Field(class.descriptor, field.name),
+                        Site {
+                            annotation: ann.class_descriptor,
+                            element: e.name,
+                        },
+                        &e.value,
+                    )?;
                 }
             }
         }
@@ -1816,7 +1943,9 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
 /// Count the literal arrays that annotation encoding will create: exactly
 /// one `ann_la_*` builder array per `AnnotationValue::LiteralArray` element,
 /// recursing into nested annotations and array elements (both are handled by
-/// paths that create such arrays).
+/// paths that create such arrays). PARAMETER annotations are included: they
+/// encode through the same `encode_single_annotation` path, so their
+/// embedded arrays consume builder handles during class configuration too.
 ///
 /// The count determines the builder handle of every model literal array
 /// (created after class configuration): `handle(i) = count + i`.
@@ -1839,6 +1968,15 @@ fn count_annotation_literal_arrays(file: &File) -> u32 {
             .map(|e| in_value(&e.value))
             .sum()
     }
+    fn in_param_annotations(p: &ParamAnnotations) -> u32 {
+        p.compile_time
+            .iter()
+            .chain(&p.runtime)
+            .flat_map(|anns| anns.iter())
+            .flat_map(|ann| ann.elements.iter())
+            .map(|e| in_value(&e.value))
+            .sum()
+    }
     file.classes
         .values()
         .map(|class| {
@@ -1846,7 +1984,9 @@ fn count_annotation_literal_arrays(file: &File) -> u32 {
                 + class
                     .methods
                     .iter()
-                    .map(|m| in_annotations(&m.annotations))
+                    .map(|m| {
+                        in_annotations(&m.annotations) + in_param_annotations(&m.param_annotations)
+                    })
                     .sum::<u32>()
                 + class
                     .fields
@@ -2279,6 +2419,9 @@ fn resolve_class_for_ann(
 /// into `File::literal_arrays`. Model arrays are created after all
 /// annotation-embedded ones, so the builder handle is
 /// `ann_la_base + idx` (`literal_array_count` bounds-checks `idx`).
+/// The shape itself is rejected up front by `validate_annotation_arrays`
+/// (c-COV W5: unrepresentable upstream, corrupted by the vendored
+/// writer/reader pair); the nested arm below is defense-only.
 #[allow(clippy::too_many_arguments)]
 fn encode_literal_value_simple(
     b: &mut Builder,
@@ -2361,6 +2504,14 @@ fn encode_literal_value_simple(
             b.literal_array_add_u16(la, *v);
         }
         LiteralValue::LiteralArray(idx) => {
+            // DEFENSE-ONLY (c-COV W5 ruling): validate_annotation_arrays
+            // rejects every nested literal-array reference inside an
+            // annotation-embedded literal array before encoding starts —
+            // the vendored writer/reader pair corrupts the shape and
+            // upstream pandasm cannot express it — so this arm is
+            // unreachable through `encode`. It stays so the writer path
+            // remains total; the bounds check below is the residual guard.
+            //
             // idx is a model table index into File::literal_arrays, NOT a
             // builder handle: annotation-embedded arrays occupy the low
             // handle slots. Model arrays are created right after them, so

@@ -37,6 +37,29 @@ pub enum Error {
     /// current builder ABI.
     #[error("unsupported annotation array element type for tag {tag:#x}")]
     UnsupportedAnnotationArrayType { tag: u8 },
+    /// A `LiteralValue::LiteralArray` nested inside an annotation-embedded
+    /// literal array (c-COV W5 ruling). Upstream pandasm has no
+    /// representation for this shape and the vendored writer/reader pair
+    /// corrupts it on encode → decode: every item after the nested
+    /// reference decodes shifted and the reference itself resolves to a
+    /// wrong array. Encode rejects it before writing anything (hard-errors
+    /// rule). Top-level (model) literal-array nesting is unaffected.
+    #[error(
+        "annotation {annotation} element '{element_name}' on {owner}: literal-array item {item_index} is a nested literal array (model table index {nested_index}), which has no representation inside annotation-embedded literal arrays"
+    )]
+    NestedLiteralArrayInAnnotation {
+        /// Descriptor of the annotation class carrying the embedded array.
+        annotation: String,
+        /// Name of the annotation element carrying the embedded array.
+        element_name: String,
+        /// Entity the annotation is attached to (class, method, field, or
+        /// method parameter).
+        owner: String,
+        /// Index of the offending item within the embedded literal array.
+        item_index: usize,
+        /// Model table index the nested reference points at.
+        nested_index: u32,
+    },
     /// Unknown source language discriminant.
     #[error("unknown source language {0}")]
     UnknownSourceLang(u8),

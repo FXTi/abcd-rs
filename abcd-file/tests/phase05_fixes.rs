@@ -84,6 +84,13 @@ fn local_var_scope_survives_encode_roundtrip() {
 /// not a builder handle. With an annotation-embedded literal array present
 /// (which consumes builder handles during class configuration), a nested
 /// reference must still point at the right array after a roundtrip.
+///
+/// Note (c-COV W5 ruling): the annotation-EMBEDDED array itself may not
+/// carry a nested `LiteralValue::LiteralArray` reference — encode rejects
+/// that shape (`Error::NestedLiteralArrayInAnnotation`, covered in
+/// encode_errors.rs) because the vendored writer/reader pair corrupts it.
+/// This test therefore exercises the handle arithmetic with a PLAIN
+/// embedded array; the nested reference lives at model level.
 #[test]
 fn nested_literal_array_resolves_to_model_table_index() {
     // Base file: just the global class. Pin a 12.x version so the literal
@@ -104,8 +111,9 @@ fn nested_literal_array_resolves_to_model_table_index() {
     });
 
     // Annotation-embedded literal array on the global class: this creates an
-    // `ann_la_0` builder array while classes are configured. It also nests a
-    // reference to model array [1], exercising encode_literal_value_simple.
+    // `ann_la_0` builder array while classes are configured, shifting every
+    // model array's builder handle — the #8 scenario. It carries NO nested
+    // reference (rejected since the c-COV W5 ruling; see above).
     let ann_desc = file.strings.get_or_intern("LAnno;");
     let elem_name = file.strings.get_or_intern("v");
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
@@ -113,10 +121,7 @@ fn nested_literal_array_resolves_to_model_table_index() {
         class_descriptor: ann_desc,
         elements: vec![AnnotationElem {
             name: elem_name,
-            value: AnnotationValue::LiteralArray(vec![
-                LiteralValue::Integer(42),
-                LiteralValue::LiteralArray(LiteralArrayIdx(1)),
-            ]),
+            value: AnnotationValue::LiteralArray(vec![LiteralValue::Integer(42)]),
         }],
     });
 
