@@ -1979,3 +1979,11 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   silent pins retired). method-handle foreign entity="": documented
   intended/impact-nil (upstream does strictly less; no functional
   consumer). CI watched per push.
+- V-I8/V-I9 CLOSED (2026-10-04): V-I8 (vendor-sync.md §3 master-pin doc
+  drift) was ALREADY fixed at q-P4's 3c16944 (2026-09-26) — the register
+  entry was stale, verified the current §3 documents the v7.0 pin +
+  4d586cb porting cost correctly. V-I9 (sys tests hardcoding vendor
+  values that have bindgen names): swept — Type_TypeId_TAGGED x2,
+  AbcAccessFlags_ABC_ACC_PUBLIC x7, LiteralTag_ARRAY_U8 x2; 0xa0
+  (returnundefined) stays hardcoded (enum_bindings has no opcode
+  constants — no named form in scope). 49 tests green, clippy/fmt clean.
