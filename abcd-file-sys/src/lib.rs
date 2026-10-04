@@ -158,14 +158,14 @@ mod tests {
             let method_name = b"func_main_0\0";
             // Minimal bytecode: just a return instruction (0xa0 = returnundefined)
             let code: [u8; 1] = [0xa0];
-            // Create a TAGGED proto (0x0d) with no params, then add method
-            let proto = abc_builder_create_proto(b, 0x0d, std::ptr::null(), 0);
+            // Create a TAGGED proto with no params, then add method
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
             let m = abc_builder_class_add_method_with_proto(
                 b,
                 cls,
                 method_name.as_ptr() as *const std::ffi::c_char,
                 proto,
-                0x0001, // ACC_PUBLIC
+                AbcAccessFlags_ABC_ACC_PUBLIC,
                 code.as_ptr(),
                 code.len() as u32,
                 1, // num_vregs
@@ -204,13 +204,13 @@ mod tests {
             let cls_desc = b"L_GLOBAL;\0";
             let cls = abc_builder_add_class(b, cls_desc.as_ptr() as *const std::ffi::c_char);
             let code: [u8; 1] = [0x65];
-            let proto = abc_builder_create_proto(b, 0x0d, std::ptr::null(), 0);
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
             let m = abc_builder_class_add_method_with_proto(
                 b,
                 cls,
                 c"f".as_ptr(),
                 proto,
-                0x1,
+                AbcAccessFlags_ABC_ACC_PUBLIC,
                 code.as_ptr(),
                 1,
                 1,
@@ -344,7 +344,7 @@ mod tests {
                 cls,
                 c"target".as_ptr(),
                 proto,
-                0x1, // ACC_PUBLIC
+                AbcAccessFlags_ABC_ACC_PUBLIC,
                 code.as_ptr(),
                 1,
                 1,
@@ -473,9 +473,9 @@ mod tests {
             // Literal array index table at 64: one entry -> array at 68.
             data.extend_from_slice(&68u32.to_le_bytes());
             // Literal array at 68: count=2 (one [tag][value] pair),
-            // tag = ARRAY_U8 (0x0b), then the 4-byte array payload.
+            // tag = ARRAY_U8, then the 4-byte array payload.
             data.extend_from_slice(&2u32.to_le_bytes());
-            data.push(0x0b);
+            data.push(LiteralTag_ARRAY_U8);
             data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
             let file_size = data.len() as u32;
             data[16..20].copy_from_slice(&file_size.to_le_bytes());
@@ -497,7 +497,7 @@ mod tests {
                 1,
                 "ARRAY_* value must be delivered exactly once"
             );
-            assert_eq!(seen[0].0, 0x0b, "tag must be ARRAY_U8");
+            assert_eq!(seen[0].0, LiteralTag_ARRAY_U8, "tag must be ARRAY_U8");
             // The value is the file offset of the array payload:
             // 68 (array) + 4 (count) + 1 (tag).
             assert_eq!(seen[0].1, 73, "value must be the array data offset");
@@ -639,7 +639,7 @@ mod tests {
                 cls,
                 c"func".as_ptr(),
                 proto,
-                0x1, // ACC_PUBLIC
+                AbcAccessFlags_ABC_ACC_PUBLIC,
                 code.as_ptr(),
                 1,
                 1,
@@ -790,7 +790,7 @@ mod tests {
                 cls,
                 c"f".as_ptr(),
                 proto,
-                0x1,
+                AbcAccessFlags_ABC_ACC_PUBLIC,
                 code.as_ptr(),
                 1,
                 1,
@@ -855,7 +855,7 @@ mod tests {
                 cls,
                 c"func".as_ptr(),
                 proto,
-                0x1, // ACC_PUBLIC
+                AbcAccessFlags_ABC_ACC_PUBLIC,
                 code.as_ptr(),
                 1,
                 1,
@@ -962,7 +962,7 @@ mod tests {
                 rec_cls,
                 c"test.js".as_ptr() as _,
                 Type_TypeId_U32,
-                1, // ACC_PUBLIC
+                AbcAccessFlags_ABC_ACC_PUBLIC,
             );
             assert_ne!(field, u32::MAX);
 
@@ -974,7 +974,7 @@ mod tests {
                 global,
                 c"func_main_0".as_ptr() as _,
                 proto,
-                1,
+                AbcAccessFlags_ABC_ACC_PUBLIC,
                 [0x65u8].as_ptr(),
                 1,
                 1,
