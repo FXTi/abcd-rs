@@ -1942,3 +1942,17 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   trailing-zero strip eats integer digits ([100000,999999] -> "1").
   (6) method-handle foreign-entity entity="" — read-only investigation
   (intended vs decode gap).
+- Fused-branch final ruling (2026-10-04, maintainer): the fused
+  compare-and-branch family becomes a HARD ERROR at lift (N51 pattern).
+  Upstream investigation established: isa.yaml documents no comparison
+  semantics (pc += imm only); C++ interpreter FATALs all 24 variants;
+  asm interpreter NOP-skips; JIT/AOT ignore; es2abc never emits (lowers
+  unfused); abckit marks the family deprecated/replaced; zero occurrences
+  in 5,517 corpus .pa + 156 wild packages. The truthiness fold was not a
+  miscompile against any real behavior but contradicted the mnemonic
+  intent — hard error chosen over silent wrong-semantics.
+  method-handle foreign-entity entity="": VERDICT intended/impact-nil
+  (upstream does strictly less — ark_disasm's method-handle branches are
+  empty in all four copies, the runtime accessor is offset-only with no
+  name API, our local-member name resolution already exceeds upstream
+  fidelity); document-only, no behavior change.
