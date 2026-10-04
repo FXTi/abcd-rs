@@ -1906,3 +1906,24 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   accepted-unreachable with bridge/vendor proofs. (10) Process: local mac
   rustfmt 1.89 vs dabai 1.99 skew — workers must fmt with the REMOTE
   toolchain (KEEP=1 + fmt there + rsync back ONLY their own files).
+- c-COV COMPLETE (2026-10-04): the 90% goal is MET and exceeded. Final
+  CI-metric full-estate measurement on dabai at a9daf83 (cargo +1.98.1
+  llvm-cov --workspace --release --include-ignored --skip pandasm_asm
+  --skip wild_smoke --skip wild_gate, clang++-20 parity; 168 suites, 0
+  failures): OUR code (Rust + bridge C++, vendored/build.rs excluded)
+  59,815/61,891 = **96.65%**; OUR Rust src 57,254/58,934 = **97.15%**;
+  bridge C++ 86.61%. Honest denominator note: in-module #[cfg(test)]
+  code (18,213 lines, ~100% executed) counts in the CI metric — with all
+  test-module tails stripped, production-only OUR Rust is 39,487/40,721
+  = **96.97%** (1,234 dark), so the goal is met under BOTH readings.
+  Remaining dark is the documented accepted set: folds.rs 486 (104
+  production DEFENSE/proven-DEAD/attribution + 384 test-internal panic
+  arms), structure.rs 255 (~80 DEFENSE + ~45 proven-unreachable + ~130
+  hard-unconstructed shapes registered for future fuzzing), emit.rs 112
+  (DEF + 26 proven-unconstructible), recover.rs 99 (DEF), bridge 296+71
+  (the accepted catch-firewall/bad_alloc residuals), plus vendor-excluded
+  files. Campaign totals: 16 test-writing workers + 9 diagnosis workers,
+  ~700 new tests, ~35k new test lines, 1,032 dead lines deleted, N82
+  fixed, 11 decode silent arms made loud. Wave commits: a5dd3d0 feb2a37
+  88d798c 30168e0 233c463 9ac8d73 979e9b0 6deb2b2 00adf5d 38874df
+  e0bb4aa a9daf83 (+ phase A 5a8bda6/2bbc2ef/01cbd7d/66df5c3).
