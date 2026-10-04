@@ -168,14 +168,21 @@ pub fn format_g6(v: f64) -> String {
     } else {
         e
     };
-    // Strip trailing zeros (and a trailing point) from the mantissa.
+    // Strip trailing zeros (and a trailing point) from the mantissa. %g
+    // drops the FRACTION's trailing zeros only: when the formatted output
+    // has no '.', every digit is an integer digit and must be kept (the
+    // prec == 0 case — |v| in [100000, 1000000) — renders "100000", not
+    // "1"). The %e mantissa always carries a '.' (prec = P - 1 >= 1), so
+    // the guard is needed on the fraction-less branch only.
     match s.find('e') {
         Some(epos) => {
             let mantissa = s[..epos].trim_end_matches('0').trim_end_matches('.');
             s = format!("{}{}", mantissa, &s[epos..]);
         }
         None => {
-            s = s.trim_end_matches('0').trim_end_matches('.').to_owned();
+            if s.contains('.') {
+                s = s.trim_end_matches('0').trim_end_matches('.').to_owned();
+            }
         }
     }
     s
@@ -1846,6 +1853,23 @@ mod tests {
         assert_eq!(format_g6(0.00001), "1e-05");
         assert_eq!(format_g6(1234567.0), "1.23457e+06");
         assert_eq!(format_g6(123456789.0), "1.23457e+08");
+    }
+
+    #[test]
+    fn float_formatting_g6_integer_trailing_zeros() {
+        // %g drops the trailing zeros of the FRACTION only; integer digits
+        // are never stripped. Reference: C `printf("%g", ...)` prints
+        // 100000|100000|123400|999999|1e+06 for the values below; upstream
+        // prints via plain iostream defaultfloat (precision 6), the same
+        // semantics (disassembler.cpp SerializeFieldValue et al.).
+        assert_eq!(format_g6(100000.0), "100000");
+        assert_eq!(format_g6(-100000.0), "-100000");
+        assert_eq!(format_g6(100000.5), "100000"); // rounds to 6 significant digits
+        assert_eq!(format_g6(123400.0), "123400");
+        assert_eq!(format_g6(999999.0), "999999");
+        // %g switches to %e once the post-rounding exponent reaches P = 6.
+        assert_eq!(format_g6(1000000.0), "1e+06");
+        assert_eq!(format_g6(999999.9), "1e+06");
     }
 
     // -- Name helpers (direct calls) ----------------------------------------
