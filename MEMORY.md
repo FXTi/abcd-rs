@@ -1987,3 +1987,17 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   AbcAccessFlags_ABC_ACC_PUBLIC x7, LiteralTag_ARRAY_U8 x2; 0xa0
   (returnundefined) stays hardcoded (enum_bindings has no opcode
   constants — no named form in scope). 49 tests green, clippy/fmt clean.
+- upstream-radar gitee->GitHub mirror fix (2026-10-05, maintainer
+  instruction): the radar failed twice (runs 37263899505/37262053516) at
+  its FIRST step — git ls-remote gitee.com/ark_standalone_build/manifest
+  -> SSL timeout (gitee unreachable from GH runners). Maintainer created
+  the mirror github.com/FXTi/ark_standalone_build (OpenHarmony-* as
+  BRANCHES; the radar pattern matches heads+tags so heads suffice; raw
+  XMLs serve via raw.githubusercontent.com, verified). Fix =
+  MANIFEST_REPO + RAW base + README (arkcompiler-test PR #4, branch
+  radar/github-mirror). Component remotes inside the manifest XML are
+  upstream data (gitcode.com) — never the failure point. VERIFIED before
+  merge: dispatch on the branch green in seconds — "newest
+  OpenHarmony-* ref: OpenHarmony-7.0-Release tip 89a24878 (tracked:
+  OpenHarmony-7.0-Release)", "no drift; nothing to do". Awaiting
+  maintainer merge of PR #4.
