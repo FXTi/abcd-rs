@@ -255,6 +255,12 @@ fn lift_field<'f>(lf: &mut Lifter<'f>, field: &'f Field) -> Result<FieldData, Li
             // other offset-valued field models above.
             None
         }
+        Some(abcd_file::FieldValue::JsonFileContent { content, .. }) => {
+            let sym = lf
+                .sym_of_file_sid(*content)
+                .ok_or(LiftError::UnresolvedEntity(0))?;
+            Some(lf.const_scalar(Const::String(sym)))
+        }
         None => None,
     };
     Ok(FieldData {

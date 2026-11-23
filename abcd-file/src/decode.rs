@@ -217,6 +217,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                     off,
                     &entity_map,
                     &mut strings,
+                    &mut string_raw_bytes,
                     &descriptor_str,
                     &mut module_data_offsets,
                     &mut scope_names_offsets,
@@ -741,6 +742,26 @@ pub const ES_MODULE_RECORD_DESCRIPTOR: &str = "L_ESModuleRecord;";
 /// literal arrays (upstream `_ESScopeNamesRecord`, same sources).
 pub const ES_SCOPE_NAMES_RECORD_DESCRIPTOR: &str = "L_ESScopeNamesRecord;";
 
+/// Name of the u32 field on a `--merge-abc` module record class whose value is
+/// the file offset of an untagged `ModuleDataAccessor` blob (upstream
+/// `es2panda` `Emitter::AddModuleRecord` `IsMergeAbc` branch; `abc2program`
+/// `abc_field_processor.cpp` `MODULE_RECORD_IDX`; `libpandafile`
+/// `collect_util.h` `MODULE_RECORD_IDX`).
+pub const MODULE_RECORD_IDX_FIELD: &str = "moduleRecordIdx";
+
+/// Name of the u32 field on a `--merge-abc` module record class whose value is
+/// the file offset of a tagged scope-names literal array (vendored
+/// `libpandabase/utils/const_value.h` `ark::SCOPE_NAMES`; `disassembler.cpp`
+/// `GetMetadataFieldValue`; `abc_field_processor.cpp` `SCOPE_NAMES`).
+pub const SCOPE_NAMES_FIELD: &str = "scopeNames";
+
+/// Name of the u32 field on a `--merge-abc` JSON module record class whose
+/// value is the file offset of the `StringItem` holding the JSON text
+/// (`es2panda` `Emitter::GenJsonContentRecord`; `ecmascript/jspandafile`
+/// `JSPandaFile::JSON_FILE_CONTENT`; `abc_field_processor.cpp`
+/// `JSON_FILE_CONTENT`).
+pub const JSON_FILE_CONTENT_FIELD: &str = "jsonFileContent";
+
 /// Name of the u32 field whose value is the file offset of an untagged
 /// module-request-phase blob (one u8 lazy-import flag per module request).
 /// Matched by NAME, not by class: upstream's merge-abc mode emits the field
@@ -920,6 +941,7 @@ fn decode_field_at(
     field_off: u32,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    string_raw_bytes: &mut HashMap<String, Box<[u8]>>,
     class_descriptor: &str,
     module_data_offsets: &mut HashSet<u32>,
     scope_names_offsets: &mut HashSet<u32>,
@@ -1067,7 +1089,10 @@ fn decode_field_at(
             phase_blob_offsets.insert(offset);
             Some(FieldValue::ModuleRequestPhase(phase))
         }
-        (ES_MODULE_RECORD_DESCRIPTOR, TypeId::U32, Some(FieldValue::I32(off))) => {
+        (desc, TypeId::U32, Some(FieldValue::I32(off)))
+            if desc == ES_MODULE_RECORD_DESCRIPTOR
+                || strings.resolve(name) == Some(MODULE_RECORD_IDX_FIELD) =>
+        {
             let offset = u32::try_from(off).map_err(|_| {
                 Error::ModuleData(format!(
                     "{class_descriptor} field at {field_off:#x}: negative blob offset {off}"
@@ -1079,7 +1104,10 @@ fn decode_field_at(
             module_data_offsets.insert(offset);
             Some(FieldValue::ModuleData(data))
         }
-        (ES_SCOPE_NAMES_RECORD_DESCRIPTOR, TypeId::U32, Some(FieldValue::I32(off))) => {
+        (desc, TypeId::U32, Some(FieldValue::I32(off)))
+            if desc == ES_SCOPE_NAMES_RECORD_DESCRIPTOR
+                || strings.resolve(name) == Some(SCOPE_NAMES_FIELD) =>
+        {
             let offset = u32::try_from(off).map_err(|_| {
                 Error::ModuleData(format!(
                     "{class_descriptor} field at {field_off:#x}: negative blob offset {off}"
@@ -1087,6 +1115,20 @@ fn decode_field_at(
             })?;
             scope_names_offsets.insert(offset);
             Some(FieldValue::LiteralArrayRef(offset))
+        }
+        (_, TypeId::U32, Some(FieldValue::I32(off)))
+            if strings.resolve(name) == Some(JSON_FILE_CONTENT_FIELD) =>
+        {
+            let offset = off as u32;
+            if offset == 0 {
+                return Err(Error::InvalidString(0));
+            }
+            let content = crate::file::intern_string(f, offset, strings, string_raw_bytes)?
+                .ok_or(Error::InvalidString(offset))?;
+            Some(FieldValue::JsonFileContent {
+                source_offset: offset,
+                content,
+            })
         }
         (_, _, value) => value,
     };

@@ -1066,7 +1066,7 @@ impl<'f> Emitter<'f> {
                 }
                 if name != crate::TYPE_SUMMARY_OFFSET_FIELD
                     && !is_scope_record
-                    && name != "scopeNames"
+                    && name != crate::SCOPE_NAMES_FIELD
                 {
                     self.module_literals.push(offset);
                 }
@@ -1204,7 +1204,10 @@ impl<'f> Emitter<'f> {
                 class_raw == b"_ESModuleRecord;" || class_raw == b"_ESScopeNamesRecord";
             for field in &class.fields {
                 let name = self.file.strings.resolve(field.name).unwrap_or("");
-                if !(class_matches || name == "scopeNames" || name == "moduleRecordIdx") {
+                if !(class_matches
+                    || name == crate::SCOPE_NAMES_FIELD
+                    || name == crate::MODULE_RECORD_IDX_FIELD)
+                {
                     continue;
                 }
                 if let Some(offset) = field_u32_offset(field) {
@@ -1604,6 +1607,7 @@ fn field_u32_offset(field: &crate::model::Field) -> Option<u32> {
         Some(FieldValue::ModuleData(md)) => Some(md.source_offset),
         Some(FieldValue::LiteralArrayRef(off)) => Some(*off),
         Some(FieldValue::ModuleRequestPhase(p)) => Some(p.source_offset),
+        Some(FieldValue::JsonFileContent { source_offset, .. }) => Some(*source_offset),
         // Upstream prints the offset (disassembler.cpp GetMetadataFieldValue
         // SetValue) and only EXCLUDES it from module-literal classification
         // — classify_field_offsets drops it by field name.

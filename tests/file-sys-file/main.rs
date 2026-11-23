@@ -3,10 +3,10 @@
 //! the vendor values (`abc_vendor_*`); a vendor rename breaks the bridge
 //! build (constant name), a vendor value change fails here.
 //!
-//! The fourth name (`L_ESModuleRecord;`) has no referenceable vendor
-//! constant (in-cone constant is private, collect_util.h:40; the public
-//! abc2program one is outside the CI sparse cone) — it stays behaviorally
-//! pinned by the module-record tests, documented at the constant.
+//! `L_ESModuleRecord;`, `moduleRecordIdx`, and `jsonFileContent` have no
+//! public in-cone vendor constant (the in-cone `collect_util.h:40` constants
+//! are private; `abc2program` and `es2panda` sit outside the CI sparse cone)
+//! — they stay behaviorally pinned by `abcd-file/tests/module_record_fields.rs`.
 //!
 //! Migrated from `abcd-file/tests/vendor_name_pins.rs` to the root
 //! package's cross-crate integration layout (file-sys → file data flow:
@@ -47,5 +47,14 @@ fn scope_names_record_descriptor_matches_vendor() {
         abcd_file::ES_SCOPE_NAMES_RECORD_DESCRIPTOR,
         format!("L{vendor};"),
         "vendor renamed _ESScopeNamesRecord (ark::SCOPE_NAME_RECORD)"
+    );
+}
+
+#[test]
+fn scope_names_field_matches_vendor() {
+    assert_eq!(
+        abcd_file::SCOPE_NAMES_FIELD,
+        cstr(unsafe { sys::abc_vendor_scope_names_field_name() }),
+        "vendor renamed scopeNames (ark::SCOPE_NAMES)"
     );
 }

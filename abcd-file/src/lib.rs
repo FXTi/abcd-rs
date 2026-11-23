@@ -54,9 +54,11 @@ pub use model::*;
 mod decode;
 pub use decode::decode;
 // V-I1 vendor-name pins: compared against the vendor's own constants by
-// tests/vendor_name_pins.rs (via the bridge's abc_vendor_* exports).
+// tests/file-sys-file/main.rs (via the bridge's abc_vendor_* exports) or
+// behaviorally pinned in tests/module_record_fields.rs.
 pub use decode::{
-    ES_MODULE_RECORD_DESCRIPTOR, ES_SCOPE_NAMES_RECORD_DESCRIPTOR, MODULE_REQUEST_PHASE_FIELD,
+    ES_MODULE_RECORD_DESCRIPTOR, ES_SCOPE_NAMES_RECORD_DESCRIPTOR, JSON_FILE_CONTENT_FIELD,
+    MODULE_RECORD_IDX_FIELD, MODULE_REQUEST_PHASE_FIELD, SCOPE_NAMES_FIELD,
     TYPE_SUMMARY_OFFSET_FIELD,
 };
 

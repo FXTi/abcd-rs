@@ -1623,10 +1623,11 @@ impl Parser {
     }
 
     /// Build one field; the value classification mirrors `decode_field_at`
-    /// (phase by field name, module/scope blobs by record descriptor).
+    /// (phase/json by field name, module/scope blobs by record descriptor or
+    /// `--merge-abc` field name).
     fn build_field(
         &mut self,
-        _rec: &PaRecord,
+        rec: &PaRecord,
         desc_sid: StringId,
         pf: &PaField,
         b: &mut BuildCtx,
@@ -1650,8 +1651,18 @@ impl Parser {
                         "typeSummaryOffset fields are not representable".to_owned(),
                     );
                 }
-                let u32_value = |_p: &Parser| -> Result<u32, ParseError> {
-                    let text = std::str::from_utf8(text).map_err(|_| ParseError {
+                if name_str == crate::JSON_FILE_CONTENT_FIELD && field_type == Type::U32 {
+                    // Upstream ark_disasm prints `u32 jsonFileContent = 0x…`
+                    // as a raw u32 scalar without emitting the target string
+                    // into `# STRINGS`; assembling the raw offset would dangle
+                    // when `JSPandaFile` reads `GetStringData(EntityId(off))`.
+                    return err(
+                        pf.line,
+                        "jsonFileContent fields are not representable in pandasm text".to_owned(),
+                    );
+                }
+                let parse_hex_u32 = |raw: &[u8]| -> Result<u32, ParseError> {
+                    let text = std::str::from_utf8(raw).map_err(|_| ParseError {
                         line: pf.line,
                         message: "field value is not ASCII".to_owned(),
                     })?;
@@ -1662,32 +1673,39 @@ impl Parser {
                     })
                 };
                 if name_str == crate::MODULE_REQUEST_PHASE_FIELD && field_type == Type::U32 {
-                    let off = u32_value(self)?;
+                    let off = parse_hex_u32(text)?;
+                    // In `--merge-abc`, pair with the sibling `moduleRecordIdx`
+                    // on the same record first; fall back to the file's first
+                    // module blob for standalone `_ModuleRequestPhaseRecord`.
+                    let sibling_module = rec
+                        .fields
+                        .iter()
+                        .find(|f| f.name == crate::MODULE_RECORD_IDX_FIELD.as_bytes())
+                        .and_then(|f| f.value.as_deref())
+                        .and_then(|v| parse_hex_u32(v).ok())
+                        .and_then(|mod_off| self.modules.get(&mod_off));
+                    let target_module = sibling_module.or_else(|| self.modules.values().next());
                     Some(FieldValue::ModuleRequestPhase(ModuleRequestPhase {
                         source_offset: off,
                         // The phase flags are never printed; one zero flag
-                        // per module request of the file's first module
-                        // blob (the flags are text-invisible either way).
-                        flags: self
-                            .modules
-                            .values()
-                            .next()
+                        // per module request of the paired module blob.
+                        flags: target_module
                             .map(|m| vec![0u8; m.requests.len()])
                             .unwrap_or_default(),
                     }))
-                } else if descriptor == crate::ES_MODULE_RECORD_DESCRIPTOR
+                } else if (descriptor == crate::ES_MODULE_RECORD_DESCRIPTOR
+                    || name_str == crate::MODULE_RECORD_IDX_FIELD)
                     && field_type == Type::U32
                 {
-                    let off = u32_value(self)?;
+                    let off = parse_hex_u32(text)?;
                     let pa_module = self.modules.get(&off).cloned();
                     let md = match pa_module {
                         Some(ref pa) => self.build_module_data(off, pa)?,
                         None => {
-                            // 13.x/24.x: the disassembler never prints the
-                            // module blob for these records (the field-name
-                            // driven collector misses it), so the content
-                            // is unrecoverable — an empty blob keeps the
-                            // model structurally valid for encode.
+                            // 13.x/24.x standalone `_ESModuleRecord`: the
+                            // disassembler never prints the module blob when
+                            // the field name is not `moduleRecordIdx`, so an
+                            // empty blob keeps the model structurally valid.
                             ModuleData {
                                 source_offset: off,
                                 requests: Vec::new(),
@@ -1696,14 +1714,15 @@ impl Parser {
                         }
                     };
                     Some(FieldValue::ModuleData(md))
-                } else if descriptor == crate::ES_SCOPE_NAMES_RECORD_DESCRIPTOR
+                } else if (descriptor == crate::ES_SCOPE_NAMES_RECORD_DESCRIPTOR
+                    || name_str == crate::SCOPE_NAMES_FIELD)
                     && field_type == Type::U32
                 {
-                    Some(FieldValue::LiteralArrayRef(u32_value(self)?))
+                    Some(FieldValue::LiteralArrayRef(parse_hex_u32(text)?))
                 } else {
                     match field_type {
                         Type::U32 | Type::U8 | Type::Bool => {
-                            let v = u32_value(self)?;
+                            let v = parse_hex_u32(text)?;
                             Some(FieldValue::I32(v as i32))
                         }
                         Type::F64 => {

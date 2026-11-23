@@ -90,11 +90,11 @@ static_assert(panda::pandasm::Value::GetArrayTypeAsChar(panda::pandasm::Value::T
 // V-I1 vendor-name pins (q-P3, 2026-09-25): abcd-file's decode constants
 // must track these vendor strings. Exporting the vendor constants turns a
 // vendor rename into a loud failure — a renamed CONSTANT breaks this build,
-// a changed VALUE fails the abcd-file vendor_name_pins test. The
-// `_ESModuleRecord;` descriptor has no referenceable vendor constant (the
-// only in-cone one is private, libpandafile/util/collect_util.h:40;
-// abc2program/common/abc_file_utils.h is public but outside the CI sparse
-// cone) — it stays behaviorally pinned by the module-record tests.
+// a changed VALUE fails the abcd-file vendor_name_pins test. `_ESModuleRecord;`,
+// `moduleRecordIdx`, and `jsonFileContent` have no public in-cone constant
+// (`collect_util.h:40` is private; `abc2program/common/abc_file_utils.h` and
+// `es2panda` sit outside the CI sparse cone) — they stay behaviorally pinned
+// by `abcd-file/tests/module_record_fields.rs`.
 const char *abc_vendor_type_summary_field_name() {
     static const std::string v{ark::TYPE_SUMMARY_FIELD_NAME};
     return v.c_str();
@@ -105,6 +105,10 @@ const char *abc_vendor_module_request_phase_idx() {
 }
 const char *abc_vendor_scope_names_record() {
     static const std::string v{ark::SCOPE_NAME_RECORD};
+    return v.c_str();
+}
+const char *abc_vendor_scope_names_field_name() {
+    static const std::string v{ark::SCOPE_NAMES};
     return v.c_str();
 }
 
@@ -2570,6 +2574,22 @@ try {
     // layout offset inline (vendor file_items.cpp FieldItem::WriteValue), so
     // the reference relocates with the literal-array item automatically.
     auto *val = b->container.GetOrCreateIdValueItem(b->literal_arrays[lit_handle]);
+    b->fields[field_handle]->SetValue(val);
+    return 0;
+} catch (...) {
+    return -1;
+}
+}
+
+int32_t abc_builder_field_set_value_string(AbcBuilder *b, uint32_t field_handle,
+                                           uint32_t string_handle) {
+try {
+    if (field_handle >= b->fields.size()) return -1;
+    if (string_handle >= b->strings.size()) return -1;
+    // ScalarValueItem Type::ID over StringItem: FieldItem writes
+    // FieldTag::VALUE + the string item's layout offset inline, matching
+    // es2panda Emitter::GenJsonContentRecord (`jsonFileContent`).
+    auto *val = b->container.GetOrCreateIdValueItem(b->strings[string_handle]);
     b->fields[field_handle]->SetValue(val);
     return 0;
 } catch (...) {

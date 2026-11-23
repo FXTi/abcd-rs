@@ -44,6 +44,7 @@ typedef int (*AbcAnnotationCb)(uint32_t annotation_off, void *ctx);
 const char *abc_vendor_type_summary_field_name(void);
 const char *abc_vendor_module_request_phase_idx(void);
 const char *abc_vendor_scope_names_record(void);
+const char *abc_vendor_scope_names_field_name(void);
 
 /* ========== File handle ========== */
 
@@ -609,6 +610,12 @@ void abc_builder_field_set_value_f64(AbcBuilder *b, uint32_t field_handle, doubl
  * Returns 0 on success, -1 on an invalid field or literal-array handle. */
 int32_t abc_builder_field_set_value_literalarray(AbcBuilder *b, uint32_t field_handle,
                                                  uint32_t lit_handle);
+/* Set a field's initial value to a string item reference (ScalarValueItem
+ * Type::ID -> FieldTag::VALUE + u32 string offset, relocated automatically
+ * at layout time). Used by es2abc for merge-abc `jsonFileContent` records.
+ * Returns 0 on success, -1 on an invalid field or string handle. */
+int32_t abc_builder_field_set_value_string(AbcBuilder *b, uint32_t field_handle,
+                                           uint32_t string_handle);
 
 /* --- Try-Catch blocks --- */
 struct AbcCatchBlockDef {

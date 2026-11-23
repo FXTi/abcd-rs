@@ -147,17 +147,19 @@ pub enum FieldValue {
     I64(i64),
     F32(f32),
     F64(f64),
-    /// `_ESModuleRecord` record field: the u32 wire value is the source-file
-    /// offset of an untagged ModuleDataAccessor-format blob (vendored
-    /// `module_data_accessor-inl.h`). Decode reads the blob through the
-    /// vendored accessor into this structural model; encode re-emits it as a
-    /// fresh literal-array item and writes the field value as the item's NEW
-    /// layout offset (never the stale source offset).
+    /// Module-record field (standalone `_ESModuleRecord`, or `moduleRecordIdx`
+    /// on the module's own record class in `--merge-abc` output): the u32 wire
+    /// value is the source-file offset of an untagged ModuleDataAccessor-format
+    /// blob (vendored `module_data_accessor-inl.h`). Decode reads the blob
+    /// through the vendored accessor into this structural model; encode
+    /// re-emits it as a fresh literal-array item and writes the field value as
+    /// the item's NEW layout offset (never the stale source offset).
     ModuleData(ModuleData),
-    /// `_ESScopeNamesRecord` record field: the u32 wire value is the
-    /// source-file offset of a normal tagged literal array. The offset is
-    /// resolved through [`File::literal_array_offsets`] at encode time, so
-    /// the rewritten field points at the re-emitted literal array.
+    /// Scope-names field (standalone `_ESScopeNamesRecord`, or `scopeNames` on
+    /// the module's own record class in `--merge-abc` output): the u32 wire
+    /// value is the source-file offset of a normal tagged literal array. The
+    /// offset is resolved through [`File::literal_array_offsets`] at encode
+    /// time, so the rewritten field points at the re-emitted literal array.
     LiteralArrayRef(u32),
     /// `moduleRequestPhaseIdx` field (on `_ModuleRequestPhaseRecord`, or on
     /// the module's own record in merge-abc output): the u32 wire value is
@@ -166,6 +168,17 @@ pub enum FieldValue {
     /// blob structurally; encode re-emits it and relocates the field value,
     /// exactly like [`FieldValue::ModuleData`].
     ModuleRequestPhase(ModuleRequestPhase),
+    /// `jsonFileContent` field (`--merge-abc` JSON module record emitted by
+    /// `es2panda` `Emitter::GenJsonContentRecord`, read at runtime by
+    /// `JSPandaFile` via `GetStringData(EntityId(offset))`): the u32 wire value
+    /// is the source-file offset of a `StringItem` holding the raw JSON text.
+    /// Decode resolves the string (keeping `source_offset` for `pandasm`
+    /// byte-identity with `ark_disasm`); encode re-emits a `ScalarValueItem`
+    /// `Type::ID` over the `StringItem` so the offset relocates automatically.
+    JsonFileContent {
+        source_offset: u32,
+        content: StringId,
+    },
     /// `typeSummaryOffset` field (any class — 4.x–5.x-era es2abc emits it
     /// on AbilityStage/Application records): the u32 wire value is the
     /// source-file offset of a literal array whose elements are THEMSELVES

@@ -1258,6 +1258,9 @@ fn module_field_snapshots(f: &abcd_file::File) -> Vec<(String, String)> {
                         .collect();
                     format!("scope({})", values.join(","))
                 }
+                Some(abcd_file::FieldValue::JsonFileContent { content, .. }) => {
+                    format!("json({:?})", f.strings.resolve(*content).unwrap_or("?"))
+                }
                 other => format!("{other:?}"),
             };
             out.push((key, value));

@@ -549,6 +549,21 @@ impl Builder {
         Ok(())
     }
 
+    /// Set a field's initial value to a string item reference.
+    ///
+    /// Emits `ScalarValueItem` `Type::ID` over `StringItem`, so the writer
+    /// stores the string item's layout offset inline (`FieldTag::VALUE` + u32)
+    /// and relocates it automatically (`--merge-abc` `jsonFileContent`).
+    pub fn field_set_value_string(&mut self, f: FieldHandle, s: StringHandle) -> Result<(), Error> {
+        // SAFETY: the builder is live; the bridge validates both handles.
+        if unsafe { sys::abc_builder_field_set_value_string(self.raw, f.0, s.0) } != 0 {
+            return Err(Error::ModuleData(
+                "field_set_value_string: invalid field or string handle".into(),
+            ));
+        }
+        Ok(())
+    }
+
     // --- Code ---
 
     /// Create a standalone code item.
@@ -1565,6 +1580,10 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                         class_descriptor: rs(cls.descriptor)?.to_owned(),
                         field_off: field.offset,
                     });
+                }
+                Some(FieldValue::JsonFileContent { content, .. }) => {
+                    let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, *content)?;
+                    b.field_set_value_string(field_h, sh)?;
                 }
                 Some(FieldValue::ModuleData(_))
                 | Some(FieldValue::LiteralArrayRef(_))
