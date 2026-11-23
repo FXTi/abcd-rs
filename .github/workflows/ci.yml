@@ -40,25 +40,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      # See the build job for why: sparse, non-recursive, blob:none.
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       # Zero-warning estate since the 2026-10-02 debt cleanup; gate it so
       # new lints never get in.
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -71,11 +55,25 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  vendor-verify:
+    name: Vendor snapshot & codegen verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - run: python3 scripts/vendor-gen.py verify
+
   build:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
-    needs: [fmt, clippy, deny]
+    needs: [fmt, clippy, deny, vendor-verify]
     strategy:
       matrix:
         # Platform-compatibility lanes (2026-10-02 ruling): OS x arch cross,
@@ -94,37 +92,10 @@ jobs:
           - windows-11-arm # aarch64 Windows
     steps:
       - uses: actions/checkout@v4
-      # Not actions/checkout's submodules:true: it recurses and dies on
-      # upstream's dangling nested gitlink (static_core/tools/plugins/
-      # ecmascript has no .gitmodules mapping). And a plain submodule update
-      # cannot checkout on Windows at all: upstream's tree contains
-      # NTFS-illegal paths (…/test…/a.ets) and >260-char names under
-      # static_core/ test trees we never compile. So: shallow blob:none
-      # sparse clones limited to the subtrees the bridges actually build
-      # from (isa, libpandafile, libpandabase, assembler, templates,
-      # platforms). Also much faster than a full 280MB checkout.
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          # protectNTFS off BEFORE the clone: git validates every index entry
-          # on clone even in --sparse mode and rejects upstream's
-          # NTFS-illegal paths; the sparse cone then keeps those files from
-          # ever being materialized.
-          git config --global core.protectNTFS false
-          git config --global core.longpaths true
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
+      # Upstream C++ sources and pre-generated Rust/C++ bindings live in
+      # vendor/ and abcd-*-sys/*/generated/ (verified by vendor-verify);
+      # build.rs compiles pure C++17 via cc with no Ruby or bindgen needed.
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
       # The workspace is small and cache causes more problems than it solves
       # (stale artifacts, coverage/build conflicts, 10GB quota pressure).
@@ -139,29 +110,14 @@ jobs:
     name: Build & Test (i686-linux)
     runs-on: ubuntu-22.04
     timeout-minutes: 20
-    needs: [fmt, clippy, deny]
+    needs: [fmt, clippy, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - name: Install 32-bit toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: i686-unknown-linux-gnu
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       # The bridge C++ needs -m32 on both steps (cc reads CFLAGS/CXXFLAGS;
       # the i686 target spec carries -m32 at link time itself, so no LDFLAGS
       # anywhere — rustc's linker driver never reads it). i686 binaries
@@ -181,29 +137,12 @@ jobs:
     name: Build & Test (i686-windows)
     runs-on: windows-2022
     timeout-minutes: 20
-    needs: [fmt, clippy, deny]
+    needs: [fmt, clippy, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config --global core.protectNTFS false
-          git config --global core.longpaths true
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: i686-pc-windows-msvc
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       # The cc crate resolves the target-appropriate MSVC toolchain itself.
       - run: cargo build --target i686-pc-windows-msvc
       - run: cargo test --target i686-pc-windows-msvc
@@ -215,29 +154,14 @@ jobs:
     name: Build & Test (armv7-linux)
     runs-on: ubuntu-22.04
     timeout-minutes: 25
-    needs: [fmt, clippy, deny]
+    needs: [fmt, clippy, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - name: Install armv7 cross toolchain + qemu-user
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user libc6-armhf-cross libstdc++-12-dev-armhf-cross
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: armv7-unknown-linux-gnueabihf
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - run: cargo build --target armv7-unknown-linux-gnueabihf
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
@@ -252,20 +176,21 @@ jobs:
 
   # ── Per-push corpus jobs (the c-P3 job graph) ──────────────────────
   # One job per data-flow test target (tests/<flow>/). Every corpus job
-  # shares the same acquisition recipe: sparse submodule clone + rust +
-  # ruby + `docker pull` of the digest-pinned image + corpus export (the
-  # image bakes everything, incl. the 30 opcode fixtures). Docker is used
-  # only for corpus acquisition and the
-  # docker oracles (VM compare, dream gate), never for the cargo runs.
+  # shares the same acquisition recipe: checkout + rust + `docker pull` of
+  # the digest-pinned image + corpus export (the image bakes everything,
+  # incl. the 30 opcode fixtures). Docker is used only for corpus
+  # acquisition and the docker oracles (VM compare, dream gate), never for
+  # the cargo runs.
   # Wall-time target: ≤12 min per job (measured suites are seconds-to-
   # minutes; the dream gate is the heavyweight at ~3-5 min).
   #
   # `needs: [build, build32, win32, arm32]` — deliberately NOT `[fmt, …]`:
-  # all three front gates (fmt ∥ clippy ∥ deny) already gate `build`, and
-  # naming one gate alone here gave that job a different dependent set — the
-  # run page's job graph then drew Rustfmt as its own box instead of one box
-  # holding the three parallel gates (the stale `fmt` was a leftover from
-  # when fmt was the only gate, c7783c9). Keep this list to the build lanes.
+  # all four front gates (fmt ∥ clippy ∥ deny ∥ vendor-verify) already gate
+  # `build`, and naming one gate alone here gave that job a different
+  # dependent set — the run page's job graph then drew Rustfmt as its own box
+  # instead of one box holding the parallel front gates (the stale `fmt` was
+  # a leftover from when fmt was the only gate, c7783c9). Keep this list to
+  # the build lanes.
 
   file-isa:
     name: file-isa (pandasm per-instruction + corpus decode/re-encode)
@@ -274,22 +199,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -308,22 +218,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       # The wild hap corpus lives behind the image's `export-wild` command
       # (NOT the plain `export`): 156 packages (all 156 decode-ok across 276
       # .abc modules since 0.0.0.2 legacy ISA decode landed) with a
@@ -359,22 +254,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - name: Acquire the wild hap corpus (image export-wild)
         shell: bash
         run: |
@@ -397,22 +277,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -429,22 +294,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -481,22 +331,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -537,22 +372,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -598,22 +418,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -630,22 +435,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -664,22 +454,7 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@stable
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
         run: |
@@ -717,27 +492,10 @@ jobs:
       CXX: clang++-23
     steps:
       - uses: actions/checkout@v4
-      # See the build job for why: sparse, non-recursive, blob:none.
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
-
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
 
       - name: Acquire the corpus (image export + opcode fixtures)
         shell: bash
@@ -817,24 +575,9 @@ jobs:
     needs: [build, build32, win32, arm32]
     steps:
       - uses: actions/checkout@v4
-      - name: Sparse-clone the arkcompiler_runtime_core submodules
-        shell: bash
-        run: |
-          set -euo pipefail
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            sha=$(git ls-tree HEAD "$sm" | awk '{print $3}')
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone               isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "$sha"
-            git -C "$sm" checkout --quiet -f "$sha"
-          done
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.4'
 
       - name: Acquire the corpus (image export + wild haps)
         shell: bash

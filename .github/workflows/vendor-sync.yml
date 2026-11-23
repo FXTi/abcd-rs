@@ -1,10 +1,12 @@
 name: vendor-sync
 
-# Upstream tag radar. The vendored code is a pair of git submodules pinned to
-# a proven upstream commit (see design/vendor-sync.md). This workflow polls
-# upstream release tags and, when the newest OpenHarmony-* tag (by committer
-# date) is not the pinned commit, opens ONE standing PR per tag that re-pins
-# both submodules to it — WITH the build/test outcome recorded.
+# Upstream tag radar. Upstream ArkCompiler sources live in a single curated
+# snapshot (`vendor/arkcompiler_runtime_core/`) pinned by per-file SHA-256 in
+# `vendor/UPSTREAM.toml`, paired with pre-generated C++/Rust bindings (see
+# `design/vendor-sync.md`). This workflow polls upstream release tags and, when
+# the newest OpenHarmony-* tag (by committer date) is not the pinned commit,
+# runs `scripts/vendor-gen.py sync` and opens ONE standing PR per tag — WITH
+# the codegen/build/test outcome recorded.
 # A red PR is not a failure of this job; it IS the radar working: it documents
 # the porting cost of that upstream version. Merging such a PR requires the
 # porting work to make it green.
@@ -13,7 +15,7 @@ name: vendor-sync
 #   - tag filter: tags STARTING WITH "OpenHarmony-" — nothing stricter;
 #   - ordering: tag TIME (peeled commit's committer date), newest wins —
 #     deliberately NO version-number parsing;
-#   - both submodule pins must agree, else fail loudly (repo-state bug);
+#   - single source of truth: `vendor/UPSTREAM.toml` records the pinned commit;
 #   - noise policy R2-a: one standing PR per tag (label vendor-bump), the
 #     dup-check covers ALL PR states so a closed-but-unmerged tag stays
 #     dismissed (closing = the human's "won't port" decision);
@@ -80,24 +82,22 @@ jobs:
             fi
           done <<< "$tags"
           echo "newest: $best_tag ($best_sha, $(date -u -d "@$best_ct" +%Y-%m-%d))"
-          # 4) R1: BOTH pins must agree; disagreement is a repo-state bug.
-          pin_isa=$(git ls-tree HEAD abcd-isa-sys/arkcompiler_runtime_core | awk '{print $3}')
-          pin_file=$(git ls-tree HEAD abcd-file-sys/arkcompiler_runtime_core | awk '{print $3}')
-          echo "pin abcd-isa-sys : $pin_isa"
-          echo "pin abcd-file-sys: $pin_file"
-          if [ "$pin_isa" != "$pin_file" ]; then
-            echo "FATAL: submodule pins disagree — half-moved pin, not upstream drift" >&2
+          # 4) Read current snapshot pin from vendor/UPSTREAM.toml.
+          pin_sha=$(sed -n 's/^commit = "\([0-9a-f][0-9a-f]*\)"$/\1/p' vendor/UPSTREAM.toml)
+          if [ -z "$pin_sha" ]; then
+            echo "FATAL: failed to parse commit SHA from vendor/UPSTREAM.toml" >&2
             exit 1
           fi
+          echo "pinned (vendor/UPSTREAM.toml): $pin_sha"
           echo "latest=$best_tag" >> "$GITHUB_OUTPUT"
           echo "tag_sha=$best_sha" >> "$GITHUB_OUTPUT"
-          echo "pinned=$pin_isa" >> "$GITHUB_OUTPUT"
-          if [ "$best_sha" = "$pin_isa" ]; then
+          echo "pinned=$pin_sha" >> "$GITHUB_OUTPUT"
+          if [ "$best_sha" = "$pin_sha" ]; then
             echo "drift=false" >> "$GITHUB_OUTPUT"
             echo "Pin already matches the newest tag — nothing to do."
           else
             echo "drift=true" >> "$GITHUB_OUTPUT"
-            echo "DRIFT: pinned $pin_isa != $best_tag ($best_sha)"
+            echo "DRIFT: pinned $pin_sha != $best_tag ($best_sha)"
           fi
 
       - name: Skip if any PR for this tag already exists (open OR closed — R2-a)
@@ -124,50 +124,54 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Repin both submodules to the tag commit (one commit, twin gitlinks)
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.tag.outputs.drift == 'true' && steps.dup.outputs.skip == 'false'
+        with:
+          components: rustfmt
+
+      - uses: ruby/setup-ruby@v1
+        if: steps.tag.outputs.drift == 'true' && steps.dup.outputs.skip == 'false'
+        with:
+          ruby-version: '3.4'
+
+      - name: Sync vendor snapshot and regenerate bindings
         id: repin
         if: steps.tag.outputs.drift == 'true' && steps.dup.outputs.skip == 'false'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Sparse materialization per ci.yml: upstream's tree has NTFS-illegal
-          # and >260-char paths we never build; keep the same cone discipline.
-          git config --global core.protectNTFS false
-          git config --global core.longpaths true
           branch="vendor-bump/${{ steps.tag.outputs.latest }}-$(date +%Y%m%d)"
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
           git checkout -b "$branch"
-          for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-            url=$(git config -f .gitmodules "submodule.$sm.url")
-            git clone --quiet --depth 1 --filter=blob:none --sparse "$url" "$sm"
-            git -C "$sm" sparse-checkout set --cone isa libpandafile libpandabase assembler templates platforms
-            git -C "$sm" fetch --quiet --depth 1 origin "${{ steps.tag.outputs.tag_sha }}"
-            git -C "$sm" checkout --quiet -f "${{ steps.tag.outputs.tag_sha }}"
-            # Old pin too, for the drift summary (best effort — blobs fetch lazily).
-            git -C "$sm" fetch --quiet --depth 1 origin "${{ steps.tag.outputs.pinned }}" || true
-          done
-          git add abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core
-          git commit -m "chore(sys): repin arkcompiler_runtime_core to ${{ steps.tag.outputs.latest }}
+          set +e
+          python3 scripts/vendor-gen.py sync \
+            --repo "$UPSTREAM" \
+            --tag "${{ steps.tag.outputs.latest }}" \
+            --commit "${{ steps.tag.outputs.tag_sha }}" > codegen.log 2>&1
+          codegen_rc=$?
+          set -e
+          cat codegen.log
+          pin_after=$(sed -n 's/^commit = "\([0-9a-f][0-9a-f]*\)"$/\1/p' vendor/UPSTREAM.toml)
+          if [ "$pin_after" != "${{ steps.tag.outputs.tag_sha }}" ]; then
+            echo "FATAL: vendor snapshot did not advance to ${{ steps.tag.outputs.tag_sha }} (infra/clone failure)" >&2
+            exit 1
+          fi
+          echo "codegen_rc=$codegen_rc" >> "$GITHUB_OUTPUT"
+          git add vendor/ abcd-isa-sys/ abcd-file-sys/
+          {
+            echo '### Drift summary (`vendor/` + pre-generated bindings)'
+            echo '```'
+            git diff --cached --stat -- vendor/arkcompiler_runtime_core vendor/generated abcd-isa-sys abcd-file-sys
+            echo '```'
+          } > drift-summary.md
+          git commit -m "chore(vendor): sync arkcompiler_runtime_core to ${{ steps.tag.outputs.latest }}
 
           Automated tag radar: upstream's newest OpenHarmony-* tag (by committer
           date) is ${{ steps.tag.outputs.latest }} (${{ steps.tag.outputs.tag_sha }}),
-          pinned is ${{ steps.tag.outputs.pinned }}. Both gitlinks move together.
+          pinned was ${{ steps.tag.outputs.pinned }}. Refreshes vendor/ snapshot,
+          vendor/UPSTREAM.toml, and pre-generated C++/Rust bindings together.
           Build/test outcome is in the PR body; a red PR documents the porting cost."
-
-      - name: Diff summary of the drift (consumed subtrees only)
-        id: summary
-        if: steps.repin.outcome == 'success'
-        run: |
-          {
-            echo '### Drift summary (consumed subtrees only)'
-            echo '```'
-            git -C abcd-file-sys/arkcompiler_runtime_core diff --stat \
-              "${{ steps.tag.outputs.pinned }}..${{ steps.tag.outputs.tag_sha }}" \
-              -- isa libpandafile libpandabase assembler templates platforms 2>/dev/null \
-              || echo "(diff unavailable in shallow clone)"
-            echo '```'
-          } > drift-summary.md
 
       - name: cargo build + test (outcome recorded, never gates the PR)
         id: verify
@@ -189,14 +193,15 @@ jobs:
           set -euo pipefail
           branch="${{ steps.repin.outputs.branch }}"
           git push -u origin "$branch"
+          codegen_rc="${{ steps.repin.outputs.codegen_rc }}"
           build_rc="${{ steps.verify.outputs.build_rc }}"
           test_rc="${{ steps.verify.outputs.test_rc }}"
-          verdict="✅ build and test green — repin is free"
-          if [ "$build_rc" != "0" ] || [ "$test_rc" != "0" ]; then
-            verdict="❌ build ($build_rc) / test ($test_rc) — porting work required before merge"
+          verdict="✅ codegen, build, and test green — sync is free"
+          if [ "$codegen_rc" != "0" ] || [ "$build_rc" != "0" ] || [ "$test_rc" != "0" ]; then
+            verdict="❌ codegen ($codegen_rc) / build ($build_rc) / test ($test_rc) — porting work required before merge"
           fi
           {
-            echo "Upstream tag radar: repin both submodules from"
+            echo "Upstream tag radar: sync \`vendor/arkcompiler_runtime_core/\` from"
             echo "\`${{ steps.tag.outputs.pinned }}\` to **${{ steps.tag.outputs.latest }}**"
             echo "(\`${{ steps.tag.outputs.tag_sha }}\`, the newest \`OpenHarmony-*\` tag by committer date)."
             echo
@@ -208,7 +213,7 @@ jobs:
             echo "deliberate \"won't port\" decision for this tag; a newer upstream"
             echo "tag will open a NEW PR. A red build here is the radar working as"
             echo "designed — it documents the porting cost of this upstream version"
-            echo "(shim/bridge adaptation, never submodule edits)."
+            echo "(shim/bridge/codegen adaptation, never edits under vendor/arkcompiler_runtime_core/)."
             echo "Do not merge until green. See design/vendor-sync.md."
             echo
             cat drift-summary.md
@@ -216,7 +221,7 @@ jobs:
             echo '[Run log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})'
           } > pr-body.md
           gh pr create \
-            --title "chore(sys): repin arkcompiler_runtime_core to ${{ steps.tag.outputs.latest }}" \
+            --title "chore(vendor): sync arkcompiler_runtime_core to ${{ steps.tag.outputs.latest }}" \
             --body-file pr-body.md \
             --label "vendor-bump" \
             --head "$branch"
@@ -243,8 +248,8 @@ jobs:
 
           Possible causes:
           - Upstream repo unreachable or the OpenHarmony-* tag scheme changed
-          - Submodule sparse-clone/fetch/checkout failure
-          - Submodule pins disagree (half-moved pin = repo-state bug, R1)
+          - Upstream sparse-clone/fetch failure inside `scripts/vendor-gen.py sync`
+          - Malformed `vendor/UPSTREAM.toml`
 
           Please investigate the run log above.
           BODY
