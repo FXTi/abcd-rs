@@ -10,6 +10,9 @@
 //! then region handlers in region order) so pass output stays
 //! byte-comparable with the v0.1 oracle.
 
+use std::collections::{HashMap, HashSet};
+
+use abcd_ir::function::FunctionData;
 use abcd_ir::{BlockId, EdgeKind, FuncId, Module, Op, ValueId};
 
 /// Terminator (Normal-edge) successors of a block (v0.1 `block_succs`).
@@ -71,6 +74,7 @@ pub fn augmented_succs(module: &Module, func: FuncId, block: BlockId) -> Vec<(Bl
     let Some(func_data) = module.func(func) else {
         return succs;
     };
+    let owned: HashSet<BlockId> = func_data.blocks.iter().copied().collect();
     for region in &func_data.try_regions {
         if !region.protected.contains(&block) {
             continue;
@@ -78,12 +82,75 @@ pub fn augmented_succs(module: &Module, func: FuncId, block: BlockId) -> Vec<(Bl
         for catch in &region.catches {
             let handler = catch.handler;
             let entry = (handler, EdgeKind::Exceptional);
-            if func_data.blocks.contains(&handler) && !succs.contains(&entry) {
+            if owned.contains(&handler) && !succs.contains(&entry) {
                 succs.push(entry);
             }
         }
     }
     succs
+}
+
+/// Pre-index every protected block's live catch handlers in region-then-catch
+/// order (`O(|blocks| + sum |protected|)` once per function — #29).
+pub(crate) fn exception_handlers_by_block(
+    func_data: &FunctionData,
+) -> HashMap<BlockId, Vec<BlockId>> {
+    if func_data.try_regions.is_empty() {
+        return HashMap::new();
+    }
+    let owned: HashSet<BlockId> = func_data.blocks.iter().copied().collect();
+    let mut map: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    for region in &func_data.try_regions {
+        let valid_handlers: Vec<BlockId> = region
+            .catches
+            .iter()
+            .map(|c| c.handler)
+            .filter(|h| owned.contains(h))
+            .collect();
+        if valid_handlers.is_empty() {
+            continue;
+        }
+        for &b in &region.protected {
+            let slot = map.entry(b).or_default();
+            for &h in &valid_handlers {
+                if !slot.contains(&h) {
+                    slot.push(h);
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Augmented successors using a pre-built [`exception_handlers_by_block`] map.
+pub(crate) fn augmented_succs_indexed(
+    module: &Module,
+    exc_handlers: &HashMap<BlockId, Vec<BlockId>>,
+    block: BlockId,
+) -> Vec<(BlockId, EdgeKind)> {
+    let mut succs: Vec<(BlockId, EdgeKind)> = normal_succs(module, block)
+        .into_iter()
+        .map(|to| (to, EdgeKind::Normal))
+        .collect();
+    if let Some(handlers) = exc_handlers.get(&block) {
+        for &h in handlers {
+            succs.push((h, EdgeKind::Exceptional));
+        }
+    }
+    succs
+}
+
+/// Follow a chain in `replacements` (`a -> b -> c`), bounded by map size so a
+/// degenerate self/mutual cycle never loops.
+#[inline]
+pub(crate) fn resolve_subst(replacements: &HashMap<ValueId, ValueId>, mut v: ValueId) -> ValueId {
+    for _ in 0..=replacements.len() {
+        match replacements.get(&v) {
+            Some(&next) if next != v => v = next,
+            _ => break,
+        }
+    }
+    v
 }
 
 /// Replace all uses of `old` with `new_val` across every instruction in
@@ -100,20 +167,62 @@ pub fn replace_uses_in_func(
     let Some(func) = module.func(func_id) else {
         return 0;
     };
-    let blocks: Vec<BlockId> = func.blocks.clone();
+    let num_blocks = func.blocks.len();
     let mut count = 0;
-    for bb in blocks {
-        let Some(block) = module.block(bb) else {
-            continue;
+    for bi in 0..num_blocks {
+        let Some(bb) = module.func(func_id).and_then(|f| f.blocks.get(bi).copied()) else {
+            break;
         };
-        let all_insts: Vec<abcd_ir::InstId> = block.insts.clone();
-        for inst_id in all_insts {
+        let inst_len = module.block(bb).map_or(0, |b| b.insts.len());
+        for ii in 0..inst_len {
+            let Some(inst_id) = module.block(bb).and_then(|b| b.insts.get(ii).copied()) else {
+                break;
+            };
             let Some(inst) = module.inst_mut(inst_id) else {
                 continue;
             };
             for v in inst.op.operands_mut() {
                 if *v == old {
                     *v = new_val;
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Apply a batch of value substitutions across `func_id` in a single pass
+/// (#29), resolving transitive chains (`v1 -> v2 -> v3`) first.
+pub fn replace_uses_map_in_func(
+    module: &mut Module,
+    func_id: FuncId,
+    replacements: &HashMap<ValueId, ValueId>,
+) -> usize {
+    if replacements.is_empty() {
+        return 0;
+    }
+    let Some(func) = module.func(func_id) else {
+        return 0;
+    };
+    let num_blocks = func.blocks.len();
+    let mut count = 0;
+    for bi in 0..num_blocks {
+        let Some(bb) = module.func(func_id).and_then(|f| f.blocks.get(bi).copied()) else {
+            break;
+        };
+        let inst_len = module.block(bb).map_or(0, |b| b.insts.len());
+        for ii in 0..inst_len {
+            let Some(inst_id) = module.block(bb).and_then(|b| b.insts.get(ii).copied()) else {
+                break;
+            };
+            let Some(inst) = module.inst_mut(inst_id) else {
+                continue;
+            };
+            for v in inst.op.operands_mut() {
+                let target = resolve_subst(replacements, *v);
+                if target != *v {
+                    *v = target;
                     count += 1;
                 }
             }

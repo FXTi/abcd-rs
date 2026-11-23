@@ -20,204 +20,207 @@
 //! share one engine. Iteration order is deterministic everywhere (RPO is
 //! pinned by the successor order the relation returns).
 
+use std::collections::{HashMap, HashSet};
+
 use abcd_ir::{BlockId, FuncId, Module};
 
-/// The core engine output: RPO order plus per-position immediate dominator
-/// (as an RPO position). Shared by both directions.
-struct RawTree {
-    /// Nodes in reverse post-order, roots first.
-    rpo: Vec<usize>,
-    /// Node → RPO position (`None` = unreachable from the roots).
-    rpo_index: Vec<Option<usize>>,
-    /// RPO position → RPO position of the immediate dominator (`None` for
-    /// roots and for the unreachable).
-    idom: Vec<Option<usize>>,
-}
-
-/// Iterative-DFS post-order from `start`, then reversed. `succ` appends a
-/// node's successors to `out` in the relation's deterministic order.
-fn dfs_rpo(node_count: usize, start: usize, succ: &dyn Fn(usize, &mut Vec<usize>)) -> Vec<usize> {
-    let mut visited = vec![false; node_count];
-    let mut post_order = Vec::new();
-    let mut frame_succs = Vec::new();
-    visited[start] = true;
-    succ(start, &mut frame_succs);
-    let mut stack = vec![(start, std::mem::take(&mut frame_succs), 0usize)];
-    while let Some((node, succs, next)) = stack.last_mut() {
-        if *next < succs.len() {
-            let s = succs[*next];
-            *next += 1;
-            if !visited[s] {
-                visited[s] = true;
-                succ(s, &mut frame_succs);
-                stack.push((s, std::mem::take(&mut frame_succs), 0));
+/// Iterative-DFS post-order over `BlockId`s from `roots`, then reversed.
+///
+/// Discovering reachable blocks directly over `BlockId` (rather than
+/// sizing dense `0..module.blocks.len()` tables) keeps per-function memory
+/// and time `O(|reachable|)` even on multi-MB `.abc` bundles with hundreds
+/// of thousands of module-wide blocks (#29).
+fn dfs_rpo_blocks(roots: &[BlockId], succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Vec<BlockId> {
+    if roots.is_empty() {
+        return Vec::new();
+    }
+    let mut visited: HashSet<BlockId> = HashSet::with_capacity(roots.len() * 4);
+    let mut post_order: Vec<BlockId> = Vec::new();
+    if roots.len() == 1 {
+        let start = roots[0];
+        visited.insert(start);
+        let mut stack = vec![(start, succ(start), 0usize)];
+        while let Some((node, succs, next)) = stack.last_mut() {
+            if *next < succs.len() {
+                let s = succs[*next];
+                *next += 1;
+                if visited.insert(s) {
+                    stack.push((s, succ(s), 0));
+                }
+            } else {
+                post_order.push(*node);
+                stack.pop();
             }
-        } else {
-            post_order.push(*node);
-            stack.pop();
+        }
+    } else {
+        // Multi-root virtual super-root: visit roots in slice order.
+        let mut stack: Vec<(Option<BlockId>, Vec<BlockId>, usize)> =
+            vec![(None, roots.to_vec(), 0)];
+        while let Some((node, succs, next)) = stack.last_mut() {
+            if *next < succs.len() {
+                let s = succs[*next];
+                *next += 1;
+                if visited.insert(s) {
+                    stack.push((Some(s), succ(s), 0));
+                }
+            } else {
+                if let Some(real) = *node {
+                    post_order.push(real);
+                }
+                stack.pop();
+            }
         }
     }
     post_order.reverse();
     post_order
 }
 
-/// Cooper–Harvey–Kennedy over `node_count` real nodes with the given
-/// `roots`. More than one root synthesizes a virtual super-root (used for
-/// post-dominance over multi-exit functions); the virtual root never
-/// appears in the returned tree.
-fn compute_tree(
-    node_count: usize,
-    roots: &[usize],
-    succ: &dyn Fn(usize, &mut Vec<usize>),
-) -> RawTree {
-    let (total, start) = if roots.len() == 1 {
-        (node_count, roots[0])
-    } else {
-        (node_count + 1, node_count)
-    };
-    let virtual_root = node_count;
-    let succ_of = |i: usize, out: &mut Vec<usize>| {
-        if i == virtual_root {
-            debug_assert!(roots.len() != 1);
-            out.extend_from_slice(roots);
-        } else {
-            succ(i, out);
-        }
-    };
-
-    let rpo = dfs_rpo(total, start, &succ_of);
-    let mut rpo_index: Vec<Option<usize>> = vec![None; total];
-    for (pos, &node) in rpo.iter().enumerate() {
-        rpo_index[node] = Some(pos);
-    }
-
-    // Predecessor lists (over reachable nodes only), in RPO-first-seen
-    // order: walk the RPO and append, so intersect sees the earliest
-    // processed predecessor first.
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); total];
-    let mut scratch = Vec::new();
-    for &node in &rpo {
-        succ_of(node, &mut scratch);
-        for &s in &scratch {
-            if rpo_index[s].is_some() {
-                preds[s].push(node);
-            }
-        }
-        scratch.clear();
-    }
-
-    let mut idom: Vec<Option<usize>> = vec![None; total];
-    let start_pos = rpo_index[start].expect("start is reachable");
-    idom[start_pos] = Some(start_pos);
-
-    // Two-finger intersect on RPO positions: dominators always precede
-    // their dominatees in RPO, so the larger-position finger walks up its
-    // idom chain and the walk strictly decreases. All values are RPO
-    // positions (the `idom` table's own currency).
-    fn intersect(mut a: usize, mut b: usize, idom: &[Option<usize>]) -> usize {
-        while a != b {
-            while a > b {
-                a = idom[a].expect("processed");
-            }
-            while b > a {
-                b = idom[b].expect("processed");
-            }
-        }
-        a
-    }
-
-    loop {
-        let mut changed = false;
-        for (pos, &node) in rpo.iter().enumerate().skip(1) {
-            // The synthesized virtual root is always at position 0; every
-            // node iterated here is real.
-            debug_assert!(roots.len() == 1 || node != virtual_root);
-            let mut new_idom: Option<usize> = None;
-            for &p in &preds[node] {
-                let p_pos = rpo_index[p].expect("reachable");
-                // Only processed predecessors participate (RPO order
-                // guarantees at least one exists for a reachable node).
-                if idom[p_pos].is_none() {
-                    continue;
-                }
-                new_idom = Some(match new_idom {
-                    None => p_pos,
-                    Some(cur) => intersect(p_pos, cur, &idom),
-                });
-            }
-            if idom[pos] != new_idom {
-                idom[pos] = new_idom;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // Strip the virtual root: real roots become parentless, and the node
-    // space shrinks back to the real blocks.
-    if roots.len() != 1 {
-        let mut real_rpo = rpo.clone();
-        real_rpo.retain(|&n| n != virtual_root);
-        let mut real_index = vec![None; node_count];
-        for (pos, &n) in real_rpo.iter().enumerate() {
-            real_index[n] = Some(pos);
-        }
-        let real_idom: Vec<Option<usize>> = real_rpo
-            .iter()
-            .map(|&n| {
-                let old_pos = rpo_index[n].expect("reachable");
-                idom[old_pos].and_then(|d| {
-                    let d_node = rpo[d];
-                    (d_node != virtual_root).then(|| real_index[d_node].expect("real"))
-                })
-            })
-            .collect();
-        RawTree {
-            rpo: real_rpo,
-            rpo_index: real_index,
-            idom: real_idom,
-        }
-    } else {
-        RawTree {
-            rpo,
-            rpo_index,
-            idom,
-        }
-    }
-}
-
-/// One wrapped tree (block-keyed view over [`RawTree`]).
+/// One wrapped tree (dense RPO-indexed Cooper–Harvey–Kennedy view).
 #[derive(Clone, Debug)]
 struct BlockTree {
     /// Reachable blocks in RPO (roots first).
     rpo: Vec<BlockId>,
-    /// Block arena index → RPO position (`None` = unreachable).
-    rpo_index: Vec<Option<usize>>,
-    /// RPO position → RPO position of immediate dominator.
+    /// Reachable block → RPO position (absent = unreachable).
+    rpo_index: HashMap<BlockId, usize>,
+    /// RPO position → RPO position of immediate dominator (`None` for roots).
     idom: Vec<Option<usize>>,
 }
 
 impl BlockTree {
-    fn build(module: &Module, roots: &[BlockId], succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Self {
-        let node_count = module.blocks.len();
-        let index_succ = |i: usize, out: &mut Vec<usize>| {
-            for b in succ(BlockId::new(i as u32)) {
-                out.push(b.index());
-            }
-        };
-        let root_indices: Vec<usize> = roots.iter().map(|b| b.index()).collect();
-        let raw = compute_tree(node_count, &root_indices, &index_succ);
+    fn empty() -> Self {
         BlockTree {
-            rpo: raw.rpo.iter().map(|&i| BlockId::new(i as u32)).collect(),
-            rpo_index: raw.rpo_index,
-            idom: raw.idom,
+            rpo: Vec::new(),
+            rpo_index: HashMap::new(),
+            idom: Vec::new(),
+        }
+    }
+
+    fn build(roots: &[BlockId], succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Self {
+        let rpo = dfs_rpo_blocks(roots, succ);
+        if rpo.is_empty() {
+            return Self::empty();
+        }
+        let n = rpo.len();
+        let mut rpo_index: HashMap<BlockId, usize> = HashMap::with_capacity(n);
+        for (pos, &b) in rpo.iter().enumerate() {
+            rpo_index.insert(b, pos);
+        }
+
+        // Two-finger intersect on RPO positions: dominators always precede
+        // their dominatees in RPO, so the larger-position finger walks up its
+        // idom chain and the walk strictly decreases.
+        fn intersect(mut a: usize, mut b: usize, idom: &[Option<usize>]) -> usize {
+            while a != b {
+                while a > b {
+                    a = idom[a].expect("processed");
+                }
+                while b > a {
+                    b = idom[b].expect("processed");
+                }
+            }
+            a
+        }
+
+        if roots.len() == 1 {
+            // Predecessor lists (as RPO positions), in RPO-first-seen order.
+            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+            for (u_pos, &u) in rpo.iter().enumerate() {
+                for s in succ(u) {
+                    if let Some(&s_pos) = rpo_index.get(&s) {
+                        preds[s_pos].push(u_pos);
+                    }
+                }
+            }
+            let mut idom: Vec<Option<usize>> = vec![None; n];
+            idom[0] = Some(0);
+            loop {
+                let mut changed = false;
+                for pos in 1..n {
+                    let mut new_idom: Option<usize> = None;
+                    for &p_pos in &preds[pos] {
+                        if idom[p_pos].is_none() {
+                            continue;
+                        }
+                        new_idom = Some(match new_idom {
+                            None => p_pos,
+                            Some(cur) => intersect(p_pos, cur, &idom),
+                        });
+                    }
+                    if idom[pos] != new_idom {
+                        idom[pos] = new_idom;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            BlockTree {
+                rpo,
+                rpo_index,
+                idom,
+            }
+        } else {
+            // Virtual super-root sits at extended RPO position 0; real nodes
+            // sit at `pos + 1` (`1..=n`).
+            let total = n + 1;
+            let mut preds: Vec<Vec<usize>> = vec![Vec::new(); total];
+            let mut seen_root = HashSet::with_capacity(roots.len());
+            for &r in roots {
+                if seen_root.insert(r)
+                    && let Some(&r_pos) = rpo_index.get(&r)
+                {
+                    preds[r_pos + 1].push(0);
+                }
+            }
+            // Note: duplicates in `roots` must match the legacy `out.extend_from_slice(roots)`
+            // behavior (though duplicate `0` predecessors intersect idempotently: `intersect(0, 0) == 0`).
+            for (u_pos, &u) in rpo.iter().enumerate() {
+                for s in succ(u) {
+                    if let Some(&s_pos) = rpo_index.get(&s) {
+                        preds[s_pos + 1].push(u_pos + 1);
+                    }
+                }
+            }
+            let mut ext_idom: Vec<Option<usize>> = vec![None; total];
+            ext_idom[0] = Some(0);
+            loop {
+                let mut changed = false;
+                for pos in 1..total {
+                    let mut new_idom: Option<usize> = None;
+                    for &p_pos in &preds[pos] {
+                        if ext_idom[p_pos].is_none() {
+                            continue;
+                        }
+                        new_idom = Some(match new_idom {
+                            None => p_pos,
+                            Some(cur) => intersect(p_pos, cur, &ext_idom),
+                        });
+                    }
+                    if ext_idom[pos] != new_idom {
+                        ext_idom[pos] = new_idom;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            // Strip virtual root `0`: real roots (`ext_idom == Some(0)`)
+            // become `None`, other real nodes shift down by 1.
+            let idom = (1..total)
+                .map(|ext_pos| ext_idom[ext_pos].and_then(|d| (d != 0).then(|| d - 1)))
+                .collect();
+            BlockTree {
+                rpo,
+                rpo_index,
+                idom,
+            }
         }
     }
 
     fn position(&self, b: BlockId) -> Option<usize> {
-        self.rpo_index.get(b.index()).copied().flatten()
+        self.rpo_index.get(&b).copied()
     }
 
     fn is_reachable(&self, b: BlockId) -> bool {
@@ -290,17 +293,24 @@ pub struct Dominators {
 }
 
 impl Dominators {
-    /// Dominators over an arbitrary successor relation.
-    pub fn over(module: &Module, func: FuncId, succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Self {
-        let roots: Vec<BlockId> = module
-            .func(func)
-            .and_then(|f| f.entry())
-            .into_iter()
-            .collect();
+    /// Dominators over an explicit entry block and successor relation
+    /// (used by [`super::structure_subgraph`] without touching `Module`).
+    pub(crate) fn from_entry(
+        func: FuncId,
+        entry: Option<BlockId>,
+        succ: &dyn Fn(BlockId) -> Vec<BlockId>,
+    ) -> Self {
+        let roots: Vec<BlockId> = entry.into_iter().collect();
         Dominators {
             func,
-            tree: BlockTree::build(module, &roots, succ),
+            tree: BlockTree::build(&roots, succ),
         }
+    }
+
+    /// Dominators over an arbitrary successor relation.
+    pub fn over(module: &Module, func: FuncId, succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Self {
+        let entry = module.func(func).and_then(|f| f.entry());
+        Self::from_entry(func, entry, succ)
     }
 
     /// Dominators over terminator (Normal-edge) successors.
@@ -359,40 +369,43 @@ pub struct PostDominators {
 }
 
 impl PostDominators {
-    /// Post-dominators over an arbitrary successor relation.
-    pub fn over(module: &Module, func: FuncId, succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Self {
-        let exits: Vec<BlockId> = module
-            .func(func)
-            .map(|f| {
-                f.blocks
-                    .iter()
-                    .copied()
-                    .filter(|&b| succ(b).is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let tree = if exits.is_empty() {
-            BlockTree {
-                rpo: Vec::new(),
-                rpo_index: vec![None; module.blocks.len()],
-                idom: Vec::new(),
+    /// Post-dominators over an explicit block slice and successor relation
+    /// (used by [`super::structure_subgraph`] without touching `Module`).
+    pub(crate) fn over_blocks(
+        func: FuncId,
+        blocks: &[BlockId],
+        succ: &dyn Fn(BlockId) -> Vec<BlockId>,
+    ) -> Self {
+        let block_set: HashSet<BlockId> = blocks.iter().copied().collect();
+        let mut exits: Vec<BlockId> = Vec::new();
+        let mut preds: HashMap<BlockId, Vec<BlockId>> = HashMap::with_capacity(blocks.len());
+        for &b in blocks {
+            let s_list = succ(b);
+            if s_list.is_empty() {
+                exits.push(b);
             }
-        } else {
-            // Reverse the relation: predecessors of a block are the blocks
-            // that list it as a successor (in-function only).
-            let mut preds: Vec<Vec<BlockId>> = vec![Vec::new(); module.blocks.len()];
-            if let Some(f) = module.func(func) {
-                for &b in &f.blocks {
-                    for s in succ(b) {
-                        if f.blocks.contains(&s) {
-                            preds[s.index()].push(b);
-                        }
-                    }
+            for s in s_list {
+                if block_set.contains(&s) {
+                    preds.entry(s).or_default().push(b);
                 }
             }
-            BlockTree::build(module, &exits, &|b| preds[b.index()].clone())
+        }
+        let tree = if exits.is_empty() {
+            BlockTree::empty()
+        } else {
+            BlockTree::build(&exits, &|b| preds.get(&b).cloned().unwrap_or_default())
         };
         PostDominators { func, tree }
+    }
+
+    /// Post-dominators over an arbitrary successor relation.
+    pub fn over(module: &Module, func: FuncId, succ: &dyn Fn(BlockId) -> Vec<BlockId>) -> Self {
+        let empty: &[BlockId] = &[];
+        let blocks = module
+            .func(func)
+            .map(|f| f.blocks.as_slice())
+            .unwrap_or(empty);
+        Self::over_blocks(func, blocks, succ)
     }
 
     /// Post-dominators over exception-augmented successors (exceptions are

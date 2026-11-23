@@ -27,6 +27,7 @@ dependencies = [
  "abcd-taint",
  "clap",
  "mimalloc",
+ "rayon",
  "serde",
  "serde_json",
  "toml",
@@ -41,6 +42,7 @@ dependencies = [
  "abcd-ir",
  "abcd-isa",
  "abcd-lift",
+ "rayon",
 ]
 
 [[package]]
@@ -115,6 +117,7 @@ dependencies = [
  "abcd-isa",
  "abcd-lift",
  "abcd-opt",
+ "rayon",
  "thiserror",
 ]
 

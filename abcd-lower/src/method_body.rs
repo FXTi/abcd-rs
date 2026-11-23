@@ -42,15 +42,20 @@ use std::collections::HashMap;
 use abcd_file::{File, LiteralValue, MethodBody};
 use abcd_ir::{Const, ConstId, FuncId, Module, Sym};
 use abcd_isa::EntityKind;
+use rayon::prelude::*;
 
-use crate::LowerError;
 use crate::layout::LayoutResult;
+use crate::{LowerError, LowerOptions, lower_function_with_options};
 
 /// Build an encodable [`MethodBody`] for a lowered function.
 ///
 /// `file` is the source file the module was lifted from: it provides the
 /// string table, the method table, and the literal-array table the IR
 /// entities must resolve against.
+///
+/// When lowering an entire module, prefer constructing [`EntityResolver`]
+/// once (or calling [`lower_module_bodies`]) rather than calling this
+/// per-function wrapper in a loop (#29).
 ///
 /// Every entity operand of every emitted bytecode must be traceable to a
 /// source-file offset; otherwise [`LowerError::UntraceableEntity`] is
@@ -61,73 +66,47 @@ pub fn to_method_body(
     result: &LayoutResult,
     file: &File,
 ) -> Result<MethodBody, LowerError> {
-    let param_count = module
-        .func(func_id)
-        .map(|f| f.params.len())
-        .unwrap_or_default();
-
-    let resolver = EntityResolver::new(module, file);
-
-    let mut entity_offsets: HashMap<(EntityKind, u32), u32> = HashMap::new();
-    for bc in &result.bytecodes {
-        for (kind, id) in bc.entity_operands() {
-            let offset =
-                match kind {
-                    EntityKind::StringId => resolver.string_offset(Sym::new(id.0)).ok_or(
-                        LowerError::UntraceableEntity {
-                            func: func_id,
-                            kind,
-                            raw: id.0,
-                        },
-                    )?,
-                    EntityKind::MethodId => resolver.method_offset(FuncId::new(id.0)).ok_or(
-                        LowerError::UntraceableEntity {
-                            func: func_id,
-                            kind,
-                            raw: id.0,
-                        },
-                    )?,
-                    EntityKind::LiteralarrayId => resolver
-                        .literal_array_offset(ConstId::new(id.0))
-                        .ok_or(LowerError::UntraceableEntity {
-                            func: func_id,
-                            kind,
-                            raw: id.0,
-                        })?,
-                };
-            entity_offsets.insert((kind, id.0), offset);
-        }
-    }
-
-    Ok(MethodBody {
-        // Convention (abcd-file/src/decode.rs:717-723): num_vregs counts the
-        // method's own registers only, num_args the arguments; the runtime
-        // frame is num_vregs + num_args with args in the top slots
-        // (vendor static_core/runtime/include/method.h:514). Under the
-        // copy-in prologue this split is EXACT: parameter values are pinned
-        // to vreg homes at the bottom of the lowering frame (inside
-        // num_regs, alongside the reserved copy-temp/spill slots), and the
-        // prologue Moves the ABI top slots Reg(num_regs + i) into those
-        // homes at entry. Args live above the declared vregs, never
-        // aliasing a local slot.
-        num_vregs: u32::from(result.num_regs),
-        num_args: param_count as u32,
-        bytecodes: result.bytecodes.clone(),
-        entity_offsets,
-        try_blocks: result.try_blocks.clone(),
-        // N73: hand the lowered IC-slot consumption to encode so the
-        // method's `_ESSlotNumberAnnotation`/`SlotNumber` is synced —
-        // the source annotation goes stale whenever the lowering's
-        // dense IC assignment consumes more slots than the source
-        // bytecode did (wide→narrow folds add IC slots).
-        ic_size: Some(result.ic_size),
-    })
+    EntityResolver::new(module, file).to_method_body(func_id, result)
 }
 
-/// Reverse entity resolver: v0.2 IR identities → source-file offsets.
-struct EntityResolver<'a> {
+/// Lower every function in `module` in parallel and relocate its entity
+/// operands through a single shared [`EntityResolver`] (#29).
+///
+/// Bodyless functions (`blocks.is_empty()`) yield `None`; errors are
+/// deterministic (the lowest [`FuncId`]'s error wins, matching sequential
+/// `0..module.functions.len()` lowering).
+pub fn lower_module_bodies(
+    module: &Module,
+    file: &File,
+    options: LowerOptions,
+) -> Result<Vec<Option<MethodBody>>, LowerError> {
+    let resolver = EntityResolver::new(module, file);
+    let results: Vec<Result<Option<MethodBody>, LowerError>> = (0..module.functions.len())
+        .into_par_iter()
+        .map(|i| {
+            let func_id = FuncId::new(i as u32);
+            let Some(func) = module.func(func_id) else {
+                return Ok(None);
+            };
+            if func.blocks.is_empty() {
+                return Ok(None);
+            }
+            let layout = lower_function_with_options(module, func_id, options)?;
+            let body = resolver.to_method_body(func_id, &layout)?;
+            Ok(Some(body))
+        })
+        .collect();
+    results.into_iter().collect()
+}
+
+/// Module-scoped reverse entity resolver: v0.2 IR identities → source-file
+/// offsets (#29).
+///
+/// Built once per `(Module, File)` pair and safe to share across threads
+/// (`Sync`). All lookups (`string_offset`, `method_offset`,
+/// `literal_array_offset`) run in `O(1)` amortized time.
+pub struct EntityResolver<'a> {
     module: &'a Module,
-    file: &'a File,
     /// MUTF-8 string content → smallest source offset of a string entity
     /// with that content.
     string_offsets: HashMap<String, u32>,
@@ -137,11 +116,17 @@ struct EntityResolver<'a> {
     /// Literal-array table index → source offset (inverted
     /// `literal_array_offsets`).
     literal_index_to_offset: HashMap<u32, u32>,
+    /// Canonical `Const::ArrayLiteral` shape → smallest matching
+    /// literal-array table index.
+    shape_to_min_index: HashMap<Const, u32>,
 }
 
 impl<'a> EntityResolver<'a> {
-    fn new(module: &'a Module, file: &'a File) -> Self {
-        let mut string_offsets: HashMap<String, u32> = HashMap::new();
+    /// Index `file`'s string, method, and literal-array tables once for
+    /// `module`.
+    pub fn new(module: &'a Module, file: &'a File) -> Self {
+        let mut string_offsets: HashMap<String, u32> =
+            HashMap::with_capacity(file.entity_map.len());
         // Smallest offset wins on duplicate content (encode resolves
         // string operands content-addressed, so any valid entry produces
         // identical output; the choice only needs to be deterministic).
@@ -153,19 +138,90 @@ impl<'a> EntityResolver<'a> {
                 string_offsets.entry(content.to_string()).or_insert(offset);
             }
         }
-        let method_offsets = file.all_methods().map(|(_, m)| m.offset).collect();
-        let literal_index_to_offset = file
+        let method_offsets: Vec<u32> = file.all_methods().map(|(_, m)| m.offset).collect();
+        let mut method_offset_to_index: HashMap<u32, u32> =
+            HashMap::with_capacity(method_offsets.len());
+        for (i, &off) in method_offsets.iter().enumerate() {
+            method_offset_to_index.entry(off).or_insert(i as u32);
+        }
+        let literal_index_to_offset: HashMap<u32, u32> = file
             .literal_array_offsets
             .iter()
             .map(|(&offset, &index)| (index, offset))
             .collect();
+
+        let mut shape_to_min_index: HashMap<Const, u32> =
+            HashMap::with_capacity(file.literal_arrays.len());
+        let mut cache: Vec<Option<Option<Const>>> = vec![None; file.literal_arrays.len()];
+        for idx in 0..file.literal_arrays.len() as u32 {
+            if let Some(shape) =
+                build_literal_array_const(module, file, &method_offset_to_index, &mut cache, idx, 0)
+            {
+                shape_to_min_index.entry(shape).or_insert(idx);
+            }
+        }
+
         Self {
             module,
-            file,
             string_offsets,
             method_offsets,
             literal_index_to_offset,
+            shape_to_min_index,
         }
+    }
+
+    /// Relocate a lowered function's [`LayoutResult`] into an encodable
+    /// [`MethodBody`].
+    pub fn to_method_body(
+        &self,
+        func_id: FuncId,
+        result: &LayoutResult,
+    ) -> Result<MethodBody, LowerError> {
+        let param_count = self
+            .module
+            .func(func_id)
+            .map(|f| f.params.len())
+            .unwrap_or_default();
+
+        let mut entity_offsets: HashMap<(EntityKind, u32), u32> = HashMap::new();
+        for bc in &result.bytecodes {
+            for (kind, id) in bc.entity_operands() {
+                let offset = match kind {
+                    EntityKind::StringId => {
+                        self.string_offset(Sym::new(id.0))
+                            .ok_or(LowerError::UntraceableEntity {
+                                func: func_id,
+                                kind,
+                                raw: id.0,
+                            })?
+                    }
+                    EntityKind::MethodId => self.method_offset(FuncId::new(id.0)).ok_or(
+                        LowerError::UntraceableEntity {
+                            func: func_id,
+                            kind,
+                            raw: id.0,
+                        },
+                    )?,
+                    EntityKind::LiteralarrayId => self
+                        .literal_array_offset(ConstId::new(id.0))
+                        .ok_or(LowerError::UntraceableEntity {
+                            func: func_id,
+                            kind,
+                            raw: id.0,
+                        })?,
+                };
+                entity_offsets.insert((kind, id.0), offset);
+            }
+        }
+
+        Ok(MethodBody {
+            num_vregs: u32::from(result.num_regs),
+            num_args: param_count as u32,
+            bytecodes: result.bytecodes.clone(),
+            entity_offsets,
+            try_blocks: result.try_blocks.clone(),
+            ic_size: Some(result.ic_size),
+        })
     }
 
     /// [`Sym`] → source offset of an equal-content string entity.
@@ -184,109 +240,107 @@ impl<'a> EntityResolver<'a> {
     /// literal-array table entry whose content matches the shape.
     fn literal_array_offset(&self, shape: ConstId) -> Option<u32> {
         let tree = self.module.consts.get(shape)?;
-        let index = (0..self.file.literal_arrays.len() as u32)
-            .find(|&idx| self.const_matches_literal_array(tree, idx, 0))?;
+        let &index = self.shape_to_min_index.get(tree)?;
         self.literal_index_to_offset.get(&index).copied()
     }
+}
 
-    /// Structural content equality between a shape const tree and the
-    /// literal array at `table_idx` — the exact inverse of `abcd-lift`'s
-    /// `const_for_literal_array`/`const_for_literal_value` (every
-    /// resolution that lift performs forward is inverted here, including
-    /// nested arrays and the raw-offset typed-array payloads).
-    fn const_matches_literal_array(&self, tree: &Const, table_idx: u32, depth: u32) -> bool {
-        if depth > 64 {
-            return false;
-        }
-        let Const::ArrayLiteral(items) = tree else {
-            return false;
-        };
-        let Some(la) = self.file.literal_arrays.get(table_idx as usize) else {
-            return false;
-        };
-        items.len() == la.values.len()
-            && items
-                .iter()
-                .zip(la.values.iter())
-                .all(|(c, v)| self.const_matches_literal_value(c, v, depth))
+/// Convert `file.literal_arrays[table_idx]` into its canonical [`Const`]
+/// shape (the exact inverse of `abcd-lift`'s `const_for_literal_array`),
+/// returning `None` if any element uses an uninterned string, unknown
+/// method offset, non-shape literal tag, or nesting depth > 64.
+fn build_literal_array_const(
+    module: &Module,
+    file: &File,
+    method_offset_to_index: &HashMap<u32, u32>,
+    cache: &mut [Option<Option<Const>>],
+    table_idx: u32,
+    depth: u32,
+) -> Option<Const> {
+    if depth > 64 {
+        return None;
     }
+    let idx_usize = table_idx as usize;
+    let la = file.literal_arrays.get(idx_usize)?;
+    // Memoize depth-valid conversions (`None` inside `Some(None)` marks
+    // either an active cycle or a permanently non-representable array).
+    if let Some(cached) = &cache[idx_usize] {
+        return cached.clone();
+    }
+    // Install `Some(None)` before recursing as a cycle guard.
+    cache[idx_usize] = Some(None);
+    let mut items = Vec::with_capacity(la.values.len());
+    for v in &la.values {
+        let c = build_literal_value_const(module, file, method_offset_to_index, cache, v, depth)?;
+        items.push(c);
+    }
+    let out = Const::ArrayLiteral(items);
+    cache[idx_usize] = Some(Some(out.clone()));
+    Some(out)
+}
 
-    /// One const ↔ one literal value (the inverse of
-    /// `const_for_literal_value`).
-    fn const_matches_literal_value(&self, c: &Const, v: &LiteralValue, depth: u32) -> bool {
-        match (c, v) {
-            (Const::Bool(b), LiteralValue::Bool(vb)) => b == vb,
-            (Const::Number(bits), LiteralValue::Integer8(n)) => *bits == (*n as f64).to_bits(),
-            (Const::Number(bits), LiteralValue::Integer(n)) => *bits == (*n as f64).to_bits(),
-            (Const::Number(bits), LiteralValue::Float(x)) => *bits == (*x as f64).to_bits(),
-            (Const::Number(bits), LiteralValue::Double(x)) => *bits == x.to_bits(),
-            (Const::Number(bits), LiteralValue::Accessor(n)) => *bits == f64::from(*n).to_bits(),
-            (Const::Number(bits), LiteralValue::MethodAffiliate(n)) => {
-                *bits == f64::from(*n).to_bits()
-            }
-            (Const::Number(bits), LiteralValue::BuiltinTypeIndex(n)) => {
-                *bits == f64::from(*n).to_bits()
-            }
-            (Const::String(sym), LiteralValue::String(sid))
-            | (Const::String(sym), LiteralValue::EtsImplements(sid)) => {
-                self.module.sym.resolve(*sym).is_some()
-                    && self.file.strings.resolve(*sid) == self.module.sym.resolve(*sym)
-            }
-            (Const::MethodRef(fid), LiteralValue::Method(off))
-            | (Const::MethodRef(fid), LiteralValue::GeneratorMethod(off))
-            | (Const::MethodRef(fid), LiteralValue::AsyncGeneratorMethod(off))
-            | (Const::MethodRef(fid), LiteralValue::Getter(off))
-            | (Const::MethodRef(fid), LiteralValue::Setter(off)) => {
-                self.method_index_of(*off) == Some(fid.index() as u32)
-            }
-            (Const::Null, LiteralValue::NullValue(_)) => true,
-            (Const::ArrayLiteral(_), LiteralValue::LiteralArray(idx)) => {
-                self.const_matches_literal_array(c, idx.0, depth + 1)
-            }
-            (Const::ArrayLiteral(_), LiteralValue::LiteralBufferIndex(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayU1(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayU8(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayI8(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayU16(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayI16(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayU32(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayI32(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayU64(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayI64(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayF32(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayF64(raw))
-            | (Const::ArrayLiteral(_), LiteralValue::ArrayString(raw)) => {
-                // The lift's N52 rule: raw file offset → table index via
-                // the offset map, with a direct-index fallback for
-                // hand-built models.
-                match self.typed_array_table_index(raw.0) {
-                    Some(idx) => self.const_matches_literal_array(c, idx, depth + 1),
-                    None => false,
-                }
-            }
-            _ => false,
+fn build_literal_value_const(
+    module: &Module,
+    file: &File,
+    method_offset_to_index: &HashMap<u32, u32>,
+    cache: &mut [Option<Option<Const>>],
+    v: &LiteralValue,
+    depth: u32,
+) -> Option<Const> {
+    match v {
+        LiteralValue::Bool(vb) => Some(Const::Bool(*vb)),
+        LiteralValue::Integer8(n) => Some(Const::Number((*n as f64).to_bits())),
+        LiteralValue::Integer(n) => Some(Const::Number((*n as f64).to_bits())),
+        LiteralValue::Float(x) => Some(Const::Number((*x as f64).to_bits())),
+        LiteralValue::Double(x) => Some(Const::Number(x.to_bits())),
+        LiteralValue::Accessor(n) => Some(Const::Number(f64::from(*n).to_bits())),
+        LiteralValue::MethodAffiliate(n) => Some(Const::Number(f64::from(*n).to_bits())),
+        LiteralValue::BuiltinTypeIndex(n) => Some(Const::Number(f64::from(*n).to_bits())),
+        LiteralValue::String(sid) | LiteralValue::EtsImplements(sid) => {
+            let s = file.strings.resolve(*sid)?;
+            module.sym.get(s).map(Const::String)
+        }
+        LiteralValue::Method(off)
+        | LiteralValue::GeneratorMethod(off)
+        | LiteralValue::AsyncGeneratorMethod(off)
+        | LiteralValue::Getter(off)
+        | LiteralValue::Setter(off) => method_offset_to_index
+            .get(off)
+            .map(|&idx| Const::MethodRef(FuncId::new(idx))),
+        LiteralValue::NullValue(_) => Some(Const::Null),
+        LiteralValue::LiteralArray(idx) => build_literal_array_const(
+            module,
+            file,
+            method_offset_to_index,
+            cache,
+            idx.0,
+            depth + 1,
+        ),
+        LiteralValue::LiteralBufferIndex(raw)
+        | LiteralValue::ArrayU1(raw)
+        | LiteralValue::ArrayU8(raw)
+        | LiteralValue::ArrayI8(raw)
+        | LiteralValue::ArrayU16(raw)
+        | LiteralValue::ArrayI16(raw)
+        | LiteralValue::ArrayU32(raw)
+        | LiteralValue::ArrayI32(raw)
+        | LiteralValue::ArrayU64(raw)
+        | LiteralValue::ArrayI64(raw)
+        | LiteralValue::ArrayF32(raw)
+        | LiteralValue::ArrayF64(raw)
+        | LiteralValue::ArrayString(raw) => {
+            let idx = typed_array_table_index(file, raw.0)?;
+            build_literal_array_const(module, file, method_offset_to_index, cache, idx, depth + 1)
         }
     }
+}
 
-    /// Raw file offset → literal-array table index (the lift's
-    /// `typed_array_table_index`): offset map first, direct index as a
-    /// fallback for hand-built models.
-    fn typed_array_table_index(&self, raw: u32) -> Option<u32> {
-        if let Some(&idx) = self.file.literal_array_offsets.get(&raw) {
-            return Some(idx);
-        }
-        if (raw as usize) < self.file.literal_arrays.len() {
-            return Some(raw);
-        }
-        None
+fn typed_array_table_index(file: &File, raw: u32) -> Option<u32> {
+    if let Some(&idx) = file.literal_array_offsets.get(&raw) {
+        return Some(idx);
     }
-
-    /// The method offset's position in `all_methods()` order (the
-    /// function-table reservation order).
-    fn method_index_of(&self, offset: u32) -> Option<u32> {
-        self.method_offsets
-            .iter()
-            .position(|&o| o == offset)
-            .map(|i| i as u32)
+    if (raw as usize) < file.literal_arrays.len() {
+        return Some(raw);
     }
+    None
 }

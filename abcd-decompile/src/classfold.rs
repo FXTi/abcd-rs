@@ -42,7 +42,7 @@ use abcd_ir::frame::this_param_index;
 use abcd_ir::op::Op;
 use abcd_ir::{ConstId, FuncId, InstId, Module, ValueDef};
 
-use crate::names::NameScopes;
+use crate::names::{DecompileIndex, NameScopes};
 
 /// One class's folded field initializers plus the elided ctor calls.
 #[derive(Clone, Debug)]
@@ -56,17 +56,31 @@ pub struct ClassFieldFold {
 /// Compute the fold for the class whose constructor is `ctor` (see the
 /// module docs for the exact pattern); `None` when any condition fails.
 pub fn plan(module: &Module, ctor: FuncId) -> Option<ClassFieldFold> {
+    plan_with_index(module, ctor, None)
+}
+
+/// [`plan`] accelerated by a pre-built [`DecompileIndex`] (`O(1)` ctor and
+/// `PutLexVar` lookup instead of scanning `module.insts` and `module.blocks`
+/// per function — #29).
+pub fn plan_with_index(
+    module: &Module,
+    ctor: FuncId,
+    index: Option<&DecompileIndex>,
+) -> Option<ClassFieldFold> {
     // 0. `ctor` is the constructor of a DefineClass/DefineSendableClass
     // in the module — the fold pairs recover's elision with emission's
     // field declarations, both keyed on the class's ctor (without a
     // class definition site the declarations would never print and the
     // elided definitions would be LOST).
-    let is_class_ctor = module.insts.iter().any(|inst| {
-        matches!(
-            &inst.op,
-            Op::DefineClass { ctor: c, .. } | Op::DefineSendableClass { ctor: c, .. } if *c == ctor
-        )
-    });
+    let is_class_ctor = match index {
+        Some(idx) => idx.class_ctors.contains(&ctor),
+        None => module.insts.iter().any(|inst| {
+            matches!(
+                &inst.op,
+                Op::DefineClass { ctor: c, .. } | Op::DefineSendableClass { ctor: c, .. } if *c == ctor
+            )
+        }),
+    };
     if !is_class_ctor {
         return None;
     }
@@ -128,23 +142,34 @@ pub fn plan(module: &Module, ctor: FuncId) -> Option<ClassFieldFold> {
 
     // 2. Exactly one initializer body behind the lexenv slots.
     let mut bodies: BTreeSet<FuncId> = BTreeSet::new();
-    for &(_, level, slot) in &calls {
-        for block in &module.blocks {
-            for &iid in &block.insts {
-                let inst = module.inst(iid)?;
-                let Op::PutLexVar {
-                    level: l,
-                    slot: s,
-                    value,
-                } = &inst.op
-                else {
-                    continue;
-                };
-                if *l != level || *s != slot {
-                    continue;
+    match index {
+        Some(idx) => {
+            for &(_, level, slot) in &calls {
+                if let Some(found) = idx.lex_closure_stores.get(&(level, slot)) {
+                    bodies.extend(found.iter().copied());
                 }
-                if let Some(body) = peel_closure_body(module, *value) {
-                    bodies.insert(body);
+            }
+        }
+        None => {
+            for &(_, level, slot) in &calls {
+                for block in &module.blocks {
+                    for &iid in &block.insts {
+                        let inst = module.inst(iid)?;
+                        let Op::PutLexVar {
+                            level: l,
+                            slot: s,
+                            value,
+                        } = &inst.op
+                        else {
+                            continue;
+                        };
+                        if *l != level || *s != slot {
+                            continue;
+                        }
+                        if let Some(body) = peel_closure_body(module, *value) {
+                            bodies.insert(body);
+                        }
+                    }
                 }
             }
         }
@@ -162,7 +187,7 @@ pub fn plan(module: &Module, ctor: FuncId) -> Option<ClassFieldFold> {
         return None;
     }
     let init_this = this_param_index(module, init_fd)?;
-    let scopes = NameScopes::build(module, init);
+    let scopes = NameScopes::build_with_index(module, init, index);
     let mut fields: Vec<(String, ConstId)> = Vec::new();
     for &iid in &module.block(init_fd.blocks[0])?.insts {
         let inst = module.inst(iid)?;
@@ -202,7 +227,7 @@ pub fn plan(module: &Module, ctor: FuncId) -> Option<ClassFieldFold> {
 
 /// Peel a `DefineMethod`/`AllocClosure`/`DefineFunc` chain to the
 /// function body behind a value; `None` for any other shape.
-fn peel_closure_body(module: &Module, mut v: abcd_ir::ValueId) -> Option<FuncId> {
+pub(crate) fn peel_closure_body(module: &Module, mut v: abcd_ir::ValueId) -> Option<FuncId> {
     loop {
         let ValueDef::Inst(iid) = module.value(v)?.def else {
             return None;

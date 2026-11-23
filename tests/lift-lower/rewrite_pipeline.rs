@@ -8,7 +8,7 @@ use std::fmt;
 use abcd_file::File;
 use abcd_ir::{FuncId, Module, verify_module};
 use abcd_lift::lift_file;
-use abcd_lower::{LowerError, lower_function_with_options, to_method_body};
+use abcd_lower::{EntityResolver, LowerError, lower_function_with_options};
 
 /// Fixed SKIP category vocabulary (mirrors the v0.1 driver's; the
 /// histogram keys are gate evidence — keep them stable).
@@ -94,7 +94,8 @@ pub(crate) fn rewrite_fixture(
     // Bodyless functions (external/native declarations, lifted as
     // block-less external FunctionData) keep their `None` body; every
     // other function lowers to a fresh MethodBody.
-    let mut bodies = Vec::new();
+    let resolver = EntityResolver::new(module, file);
+    let mut bodies = Vec::with_capacity(module.functions.len());
     for index in 0..module.functions.len() {
         let func_id = FuncId::new(index as u32);
         let func = module.func(func_id).expect("function-table index");
@@ -105,7 +106,8 @@ pub(crate) fn rewrite_fixture(
         let name = module.sym.resolve(func.name).unwrap_or("?").to_string();
         let lowered = lower_function_with_options(module, func_id, options)
             .map_err(|e| (lower_category(&e), format!("lower {name}: {e}")))?;
-        let body = to_method_body(module, func_id, &lowered, file)
+        let body = resolver
+            .to_method_body(func_id, &lowered)
             .map_err(|e| (lower_category(&e), format!("to_method_body {name}: {e}")))?;
         bodies.push(Some(body));
     }

@@ -19,6 +19,7 @@ readme = "README.md"
 [dependencies]
 abcd-ir = { workspace = true }
 abcd-analysis = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 abcd-file = { workspace = true }

@@ -9,7 +9,7 @@
 use crate::id::{ConstId, FuncId, Sym};
 
 /// A typed constant value.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Const {
     /// `undefined`.
     Undefined,

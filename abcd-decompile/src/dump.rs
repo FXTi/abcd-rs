@@ -18,9 +18,11 @@ use crate::recover::{BlockStmts, RecoveredFunc, Stmt};
 
 /// Dump a whole module (every function, in table order).
 pub fn dump_module(module: &Module) -> String {
+    let index = crate::names::DecompileIndex::build(module);
     let mut out = String::new();
     for i in 0..module.functions.len() {
-        let rf = crate::recover::recover_func(module, abcd_ir::FuncId::new(i as u32));
+        let rf =
+            crate::recover::recover_func_with_index(module, abcd_ir::FuncId::new(i as u32), &index);
         out.push_str(&dump_func(&rf));
     }
     out

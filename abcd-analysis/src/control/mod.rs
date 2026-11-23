@@ -58,8 +58,8 @@ pub use dom::{Dominators, PostDominators};
 pub use loops::{back_edges, natural_loop};
 pub use reach::reachable_blocks;
 pub use regions::{
-    ClassifiedEdge, EdgeClass, EscapeHatch, IrreducibleCore, LoopInfo, LoopKind, RegionError,
-    RegionId, RegionNode, RegionTree, TryPlan, structure_regions,
+    CfgSubgraph, ClassifiedEdge, EdgeClass, EscapeHatch, IrreducibleCore, LoopInfo, LoopKind,
+    RegionError, RegionId, RegionNode, RegionTree, TryPlan, structure_regions, structure_subgraph,
 };
 pub use rpo::compute_rpo;
 pub use succs::{augmented_succs, block_succs, inst_succs};

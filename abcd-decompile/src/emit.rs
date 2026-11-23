@@ -46,12 +46,14 @@ use abcd_ir::module::{ExportDecl, FunctionKind, ImportDecl, Module, Signature};
 use abcd_ir::op::{BinOp, CallKind, CmpOp, UnOp};
 use abcd_ir::ty::{DynPrim, StaticTy, Ty};
 use abcd_ir::{Const, FuncId, Op, ValueDef};
+use rayon::prelude::*;
 
 use crate::consts::{lit_of, render_lit_m, render_mutf8_regexp, render_pool_string, sym_str};
 use crate::expr::{ArrayElem, Expr, IterOp, Lit, NodeStatus, ObjEntry};
 use crate::folds::{self, FoldStats};
 use crate::legalize::{Legalizer, is_legal_ident, sanitize};
-use crate::recover::{RecoveredFunc, Stmt, recover_func};
+use crate::names::DecompileIndex;
+use crate::recover::{RecoveredFunc, Stmt, recover_func, recover_func_with_index};
 use crate::structure::{Leaf, SNode, StructStats, structure_func};
 
 /// Emitter options.
@@ -118,8 +120,32 @@ pub struct DecompiledModule {
 
 /// Decompile a whole module to JS text.
 pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule {
+    // Consumed functions: closure bodies, class ctors, and every
+    // MethodRef in the const pool (emitted inline, never top-level).
+    let consumed = consumed_functions(module);
+    let index = DecompileIndex::build(module);
+
+    // Parallel per-function recovery + structuring + folds (#29): each
+    // function is a pure read-only `(&Module, &DecompileIndex)` consumer,
+    // and collecting orphan lexenv names during the same parallel pass
+    // eliminates the duplicate whole-module `recover_func` sweep.
+    let (prepared, orphan_sets): (Vec<PreparedFunc>, Vec<BTreeSet<String>>) =
+        (0..module.functions.len())
+            .into_par_iter()
+            .map(|i| {
+                let func = FuncId::new(i as u32);
+                let top_level = !consumed.contains(&func);
+                prepare_func(module, Some(&index), func, top_level)
+            })
+            .unzip();
+    let mut orphan_names = BTreeSet::new();
+    for s in orphan_sets {
+        orphan_names.extend(s);
+    }
+
     let mut em = Emitter {
         module,
+        index: Some(&index),
         opts,
         stats: DecompileStats::default(),
         fn_names: Legalizer::new(),
@@ -127,6 +153,8 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         current_kind: FunctionKind::Function,
         class_depth: 0,
         hoisted: BTreeSet::new(),
+        prepared: prepared.into_iter().map(Some).collect(),
+        reused: BTreeMap::new(),
     };
     let mut out = String::new();
     out.push_str("// Decompiled by abcd-decompile (abcd-rs) — Stage B + emission v1.\n");
@@ -224,7 +252,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     // synthetic `m{index}` fallback). Declaring them at module scope
     // keeps the output strict-mode-parseable AND gives the trailing
     // `export { name }` records a binding to reference.
-    let slot_names = crate::names::module_slot_names(module);
+    let slot_names = &index.slot_names;
     let mut slots = BTreeSet::new();
     for inst in &module.insts {
         match &inst.op {
@@ -247,15 +275,11 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     }
 
     // Orphan lexical-slot predeclarations (G1; see
-    // `orphan_lexenv_names`).
-    for name in orphan_lexenv_names(module) {
+    // `orphan_lexenv_names_in_func`).
+    for name in orphan_names {
         em.fn_names.reserve(&name);
         out.push_str(&format!("let {name}; /* orphan lexenv slot (G1) */\n"));
     }
-
-    // Consumed functions: closure bodies, class ctors, and every
-    // MethodRef in the const pool (emitted inline, never top-level).
-    let consumed = consumed_functions(module);
 
     // Top-level functions.
     let mut entry_call: Option<String> = None;
@@ -407,6 +431,7 @@ fn collect_method_refs_const(c: &Const, out: &mut BTreeSet<FuncId>) {
 
 struct Emitter<'m> {
     module: &'m Module,
+    index: Option<&'m DecompileIndex>,
     opts: &'m EmitOptions,
     stats: DecompileStats,
     /// Module-scope name legalizer (top-level function names).
@@ -428,6 +453,21 @@ struct Emitter<'m> {
     /// is not defined` — a class declared inside a `try` block, used
     /// after it.)
     hoisted: BTreeSet<String>,
+    /// Precomputed per-function Stage A + Stage B + Folds output (taken on
+    /// first emission; cloned into `reused` only if tail duplication emits
+    /// the same inline function more than once).
+    prepared: Vec<Option<PreparedFunc>>,
+    /// Snapshot cache for functions emitted more than once.
+    reused: BTreeMap<FuncId, PreparedFunc>,
+}
+
+#[derive(Clone)]
+struct PreparedFunc {
+    top_level: bool,
+    rf: RecoveredFunc,
+    body: Vec<SNode>,
+    struct_stats: StructStats,
+    fold_stats: FoldStats,
 }
 
 /// Orphan lexical bindings (IR gap G1): unnamed lexenv slots get
@@ -437,7 +477,7 @@ struct Emitter<'m> {
 /// gate: for-update-continue-1, "v2_1 is not defined"). Declaring the
 /// fallback names at module top is sound under textual nesting:
 /// functions that DO declare the name shadow it locally.
-fn orphan_lexenv_names(module: &Module) -> BTreeSet<String> {
+fn orphan_lexenv_names_in_func(rf: &RecoveredFunc) -> BTreeSet<String> {
     fn is_fallback(name: &str) -> bool {
         let b = name.as_bytes();
         // v<digits>_<digits>
@@ -464,83 +504,81 @@ fn orphan_lexenv_names(module: &Module) -> BTreeSet<String> {
         }
     }
     let mut out = BTreeSet::new();
-    for i in 0..module.functions.len() {
-        let rf = recover_func(module, FuncId::new(i as u32));
-        for b in &rf.blocks {
-            for st in &b.stmts {
-                if let Stmt::LexStore { name, .. } = st
-                    && is_fallback(&sanitize(name))
-                {
-                    out.insert(sanitize(name));
-                }
-                for e in stmt_exprs(st) {
-                    walk_expr(e, &mut out);
-                }
+    for b in &rf.blocks {
+        for st in &b.stmts {
+            if let Stmt::LexStore { name, .. } = st
+                && is_fallback(&sanitize(name))
+            {
+                out.insert(sanitize(name));
+            }
+            for e in stmt_exprs(st) {
+                walk_expr(e, &mut out);
             }
         }
     }
     out
 }
 
+/// Pure per-function pipeline: Stage A → orphan scan → Stage B → folds.
+fn prepare_func(
+    module: &Module,
+    index: Option<&DecompileIndex>,
+    func: FuncId,
+    top_level: bool,
+) -> (PreparedFunc, BTreeSet<String>) {
+    let mut rf = match index {
+        Some(idx) => recover_func_with_index(module, func, idx),
+        None => recover_func(module, func),
+    };
+    let orphans = orphan_lexenv_names_in_func(&rf);
+    let mut structured = structure_func(module, &rf);
+    let mut fstats = FoldStats::default();
+    folds::generator_machine_fold(&mut structured.body, rf.kind, &mut fstats);
+    folds::async_driver_fold(&mut structured.body, rf.kind, &mut fstats);
+    folds::async_machine_fold(&mut structured.body, rf.kind, &mut fstats);
+    folds::async_generator_machine_fold(&mut structured.body, rf.kind, &mut fstats);
+    folds::yield_star_fold(&mut structured.body, rf.kind, &mut fstats);
+    folds::fold(&mut structured.body, &mut fstats);
+    folds::scope_fold(&mut structured.body, &rf.params, &mut fstats);
+    folds::late_decl_fold(&mut structured.body, &rf.params, top_level, &mut fstats);
+    folds::rest_param_fold(
+        &mut structured.body,
+        &mut rf.params,
+        rf.hidden_params,
+        &mut fstats,
+    );
+    (
+        PreparedFunc {
+            top_level,
+            rf,
+            body: structured.body,
+            struct_stats: structured.stats,
+            fold_stats: fstats,
+        },
+        orphans,
+    )
+}
+
 /// The full per-function pipeline: Stage A → Stage B → folds.
 impl<'m> Emitter<'m> {
-    /// The full per-function pipeline: Stage A → Stage B → folds.
+    /// Consume (or reuse) the precomputed Stage A → Stage B → folds output.
     fn func_nodes(&mut self, func: FuncId, top_level: bool) -> (RecoveredFunc, Vec<SNode>) {
         self.stats.function_bodies += 1;
-        let mut rf = recover_func(self.module, func);
-        let mut structured = structure_func(self.module, &rf);
-        let mut fstats = FoldStats::default();
-        // The generator driver fold runs FIRST (d-P11, R4): pre-fold the
-        // resume-mode dispatch is a plain if-chain everywhere (the
-        // switch re-detection never sees it), giving one uniform match
-        // shape across all profiles.
-        folds::generator_machine_fold(&mut structured.body, rf.kind, &mut fstats);
-        // The async-completion fold (N68/G6) runs BEFORE fold()'s
-        // rethrow-try dissolution so a folded `catch (e) { throw e; }`
-        // rejection wrapper dissolves as the no-op it is.
-        folds::async_driver_fold(&mut structured.body, rf.kind, &mut fstats);
-        // The async suspend/resume fold (N68 remainder) runs after the
-        // completion fold (the dispatch continuation then carries the
-        // folded `return v` / `throw v` forms) and before fold() (the
-        // same rethrow-try dissolution applies to the folded body).
-        folds::async_machine_fold(&mut structured.body, rf.kind, &mut fstats);
-        // The async-generator machine fold (d-P14) runs after the
-        // async folds (it bails for non-AsyncGenerator kinds, they
-        // bail for it) and before fold() — the resume-mode dispatches
-        // are still plain if-chains here (the switch re-detection
-        // never sees the folded ones), and the folded catch-all
-        // rejection dissolves in fold()'s rethrow-try pass.
-        folds::async_generator_machine_fold(&mut structured.body, rf.kind, &mut fstats);
-        // The YieldStar delegation fold (d-P15) runs after the
-        // generator machine folds (their entry gates already vetted
-        // the genobj plumbing; the YieldStar driver loop's own
-        // suspend sites are not theirs) and before fold() — the
-        // folded `yield*` body then sees the ordinary desugars.
-        folds::yield_star_fold(&mut structured.body, rf.kind, &mut fstats);
-        folds::fold(&mut structured.body, &mut fstats);
-        folds::scope_fold(&mut structured.body, &rf.params, &mut fstats);
-        // N74-W4: after scope_fold, restore the TDZ/undeclared-read
-        // window of bindings whose first store is a root-level
-        // statement (a hoisted `let`/`var` reads `undefined` where the
-        // original threw ReferenceError). Global stores convert only at
-        // the top level — inside a nested function a `let` would
-        // SHADOW the global binding (dream gate: params-dflt-gen-meth's
-        // `callCount` counter died to exactly that).
-        folds::late_decl_fold(&mut structured.body, &rf.params, top_level, &mut fstats);
-        // N74-W4: `CopyRestArgs` → a real `...rest` parameter (the
-        // vendor staging slot reads as a spurious trailing visible
-        // param; the `[...arguments]` approximation reads the OUTER
-        // function's arguments in arrows).
-        folds::rest_param_fold(
-            &mut structured.body,
-            &mut rf.params,
-            rf.hidden_params,
-            &mut fstats,
-        );
+        let p = if let Some(slot) = self.prepared.get_mut(func.index())
+            && let Some(pre) = slot.take()
+            && pre.top_level == top_level
+        {
+            self.reused.insert(func, pre.clone());
+            pre
+        } else if let Some(cached) = self.reused.get(&func).filter(|p| p.top_level == top_level) {
+            cached.clone()
+        } else {
+            prepare_func(self.module, self.index, func, top_level).0
+        };
         self.stats.structure =
-            merge_struct_stats(std::mem::take(&mut self.stats.structure), &structured.stats);
-        self.stats.folds = merge_fold_stats(std::mem::take(&mut self.stats.folds), &fstats);
-        (rf, structured.body)
+            merge_struct_stats(std::mem::take(&mut self.stats.structure), &p.struct_stats);
+        self.stats.folds = merge_fold_stats(std::mem::take(&mut self.stats.folds), &p.fold_stats);
+        (p.rf, p.body)
     }
 
     /// Returns the (legalized, minted) emitted name and the raw name.
@@ -1216,11 +1254,11 @@ impl<'m> Emitter<'m> {
         // CreatePrivateNames buffers carry numeric slots, not strings,
         // so names are the resolved/fallback ones — documented).
         let mut priv_names: BTreeSet<String> = BTreeSet::new();
-        collect_private_names(self.module, ctor, &mut priv_names);
+        collect_private_names_with_index(self.module, self.index, ctor, &mut priv_names);
         if let Some(Lit::Array(items)) = lit_of(self.module, members) {
             for item in &items {
                 if let Lit::MethodRef(f) = item {
-                    collect_private_names(self.module, *f, &mut priv_names);
+                    collect_private_names_with_index(self.module, self.index, *f, &mut priv_names);
                 }
             }
         }
@@ -1229,7 +1267,7 @@ impl<'m> Emitter<'m> {
         // (the ctor's initializer call is elided at recover). Folded
         // names are EXCLUDED from the bare `#name;` set — a duplicate
         // private declaration would be a SyntaxError.
-        let fold = crate::classfold::plan(self.module, ctor);
+        let fold = crate::classfold::plan_with_index(self.module, ctor, self.index);
         let folded_names: BTreeSet<&str> = fold
             .iter()
             .flat_map(|f| f.fields.iter().map(|(n, _)| n.as_str()))
@@ -2249,11 +2287,21 @@ fn fn_uses_super(module: &Module, func: FuncId) -> bool {
 /// Collect private names referenced by a function's private-name ops
 /// (the names are level/slot fallbacks when unresolvable — IR gap,
 /// documented; the set makes declarations duplicate-safe).
+#[cfg(test)]
 fn collect_private_names(module: &Module, func: FuncId, out: &mut BTreeSet<String>) {
+    collect_private_names_with_index(module, None, func, out);
+}
+
+fn collect_private_names_with_index(
+    module: &Module,
+    index: Option<&DecompileIndex>,
+    func: FuncId,
+    out: &mut BTreeSet<String>,
+) {
     let Some(f) = module.func(func) else {
         return;
     };
-    let scopes = crate::names::NameScopes::build(module, func);
+    let scopes = crate::names::NameScopes::build_with_index(module, func, index);
     for &b in &f.blocks {
         let Some(block) = module.block(b) else {
             continue;
@@ -2881,6 +2929,7 @@ mod tests {
     fn emitter<'m>(module: &'m Module, opts: &'m EmitOptions) -> Emitter<'m> {
         Emitter {
             module,
+            index: None,
             opts,
             stats: DecompileStats::default(),
             fn_names: Legalizer::new(),
@@ -2888,6 +2937,8 @@ mod tests {
             current_kind: FunctionKind::Function,
             class_depth: 0,
             hoisted: BTreeSet::new(),
+            prepared: Vec::new(),
+            reused: BTreeMap::new(),
         }
     }
 

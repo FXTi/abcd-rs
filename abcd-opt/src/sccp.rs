@@ -77,6 +77,7 @@ impl FuncPass for Sccp {
             .iter()
             .flat_map(|region| region.catches.iter().map(|c| c.handler))
             .collect();
+        let exc_handlers = crate::analysis::exception_handlers_by_block(func_data);
 
         // Initialize lattice: all values start at Top.
         let mut lattice: HashMap<ValueId, LatticeVal> = HashMap::new();
@@ -129,7 +130,7 @@ impl FuncPass for Sccp {
         }
         // Seed CFG edges from entry — AUGMENTED successors (N38(i)):
         // exception edges included, so catch handlers are reachable.
-        for edge in crate::analysis::augmented_succs(module, func, entry) {
+        for edge in crate::analysis::augmented_succs_indexed(module, &exc_handlers, entry) {
             cfg_worklist.push_back((entry, edge.0, edge.1));
         }
 
@@ -188,7 +189,7 @@ impl FuncPass for Sccp {
                             );
                         }
                         // Add CFG edges from terminators.
-                        add_cfg_edges(module, func, inst_id, &lattice, &mut cfg_worklist);
+                        add_cfg_edges(module, &exc_handlers, inst_id, &lattice, &mut cfg_worklist);
                     }
                 }
             }
@@ -232,7 +233,13 @@ impl FuncPass for Sccp {
                                     &mut ssa_worklist,
                                 );
                             }
-                            add_cfg_edges(module, func, inst_id, &lattice, &mut cfg_worklist);
+                            add_cfg_edges(
+                                module,
+                                &exc_handlers,
+                                inst_id,
+                                &lattice,
+                                &mut cfg_worklist,
+                            );
                         }
                     }
                 }
@@ -549,7 +556,7 @@ fn evaluate_phi(
 /// in `evaluate_phi`).
 fn add_cfg_edges(
     module: &Module,
-    func: FuncId,
+    exc_handlers: &HashMap<BlockId, Vec<BlockId>>,
     inst_id: InstId,
     lattice: &HashMap<ValueId, LatticeVal>,
     cfg_worklist: &mut VecDeque<CfgEdge>,
@@ -595,21 +602,12 @@ fn add_cfg_edges(
         // the block's terminator — enough for reachability).
         _ => return,
     }
-    // Exception edges: handlers of the try regions protecting this
-    // block (the exception half of `analysis::augmented_succs`; the
-    // terminator half is computed above so lattice-pruned CondBranch
-    // edges stay pruned).
-    let Some(func_data) = module.func(func) else {
-        return;
-    };
-    for region in &func_data.try_regions {
-        if !region.protected.contains(&block) {
-            continue;
-        }
-        for catch in &region.catches {
-            let handler = catch.handler;
+    // Exception edges: pre-indexed handlers of the try regions protecting
+    // this block (#29).
+    if let Some(handlers) = exc_handlers.get(&block) {
+        for &handler in handlers {
             let edge = (block, handler, EdgeKind::Exceptional);
-            if func_data.blocks.contains(&handler) && !dests.contains(&edge) {
+            if !dests.contains(&edge) {
                 dests.push(edge);
             }
         }

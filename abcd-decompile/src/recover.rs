@@ -47,8 +47,8 @@ use crate::expr::{Expr, IterOp, Lit, NodeStatus, ObjEntry};
 use crate::fitness::{Fitness, elision_reason, fallback_note, fitness_of, op_name};
 use crate::legalize::{Legalizer, is_legal_ident, sanitize};
 use crate::names::{
-    NameScopes, local_name_in, module_slot_fallback, module_slot_names, namespace_fallback,
-    op_name_hint,
+    DecompileIndex, NameScopes, local_name_in, module_slot_fallback, module_slot_names,
+    namespace_fallback, op_name_hint,
 };
 
 /// One instruction's Stage-A outcome (the coverage histogram's unit).
@@ -378,7 +378,17 @@ pub fn builder_hook(module: &Module, chains: &UseDefChains, alloc: ValueId) -> V
 
 /// Run Stage A over one function.
 pub fn recover_func(module: &Module, func: FuncId) -> RecoveredFunc {
-    Recover::new(module, func).run()
+    Recover::new(module, func, None).run()
+}
+
+/// Run Stage A over one function using a shared module-level [`DecompileIndex`]
+/// (#29).
+pub fn recover_func_with_index(
+    module: &Module,
+    func: FuncId,
+    index: &DecompileIndex,
+) -> RecoveredFunc {
+    Recover::new(module, func, Some(index)).run()
 }
 
 /// The decompilation kind of a function: the file-metadata kind,
@@ -535,6 +545,7 @@ fn is_statement_op(op: &Op) -> bool {
 
 struct Recover<'m> {
     module: &'m Module,
+    index: Option<&'m DecompileIndex>,
     func: FuncId,
     chains: UseDefChains,
     scopes: NameScopes,
@@ -562,20 +573,20 @@ struct Recover<'m> {
     /// B2: the class-field fold plan for THIS function when it is the
     /// ctor of a `DefineClass` (lazily computed on the first `Call`).
     class_fold: Option<Option<crate::classfold::ClassFieldFold>>,
-    /// G2: resolved module-var slot↔name map (computed once, in
-    /// [`Recover::reserve_module_slot_names`], before params mint).
-    slot_names: BTreeMap<u32, String>,
+    /// Fallback G2 map when no [`DecompileIndex`] was supplied.
+    owned_slot_names: BTreeMap<u32, String>,
     histogram: BTreeMap<&'static str, OpStat>,
 }
 
 impl<'m> Recover<'m> {
-    fn new(module: &'m Module, func: FuncId) -> Self {
+    fn new(module: &'m Module, func: FuncId, index: Option<&'m DecompileIndex>) -> Self {
         let mut r = Recover {
             hidden_params: 0,
             module,
+            index,
             func,
             chains: UseDefChains::build(module, func),
-            scopes: NameScopes::build(module, func),
+            scopes: NameScopes::build_with_index(module, func, index),
             legal: Legalizer::new(),
             inline: HashSet::new(),
             alias: HashMap::new(),
@@ -586,7 +597,7 @@ impl<'m> Recover<'m> {
             inst_pos: HashMap::new(),
             barriers: HashMap::new(),
             class_fold: None,
-            slot_names: BTreeMap::new(),
+            owned_slot_names: BTreeMap::new(),
             histogram: BTreeMap::new(),
         };
         r.precompute_positions();
@@ -818,17 +829,26 @@ impl<'m> Recover<'m> {
     /// otherwise shadow the module-scope `let` the resolved name refers
     /// to (a `StoreModuleVar` prints the resolved name verbatim).
     fn reserve_module_slot_names(&mut self) {
-        self.slot_names = module_slot_names(self.module);
-        for n in self.slot_names.values() {
-            self.legal.reserve(n);
+        if let Some(idx) = self.index {
+            for n in idx.slot_names.values() {
+                self.legal.reserve(n);
+            }
+        } else {
+            self.owned_slot_names = module_slot_names(self.module);
+            for n in self.owned_slot_names.values() {
+                self.legal.reserve(n);
+            }
         }
     }
 
     /// The emitted name of a module-var slot: the resolved binding name
     /// when file evidence pinned one (G2), else the synthetic fallback.
     fn module_slot_name(&self, index: u32) -> String {
-        self.slot_names
-            .get(&index)
+        let map = match self.index {
+            Some(idx) => &idx.slot_names,
+            None => &self.owned_slot_names,
+        };
+        map.get(&index)
             .cloned()
             .unwrap_or_else(|| module_slot_fallback(index))
     }
@@ -1155,7 +1175,9 @@ impl<'m> Recover<'m> {
     /// class-field declarations (lazy [`crate::classfold::plan`]).
     fn folded_init_call(&mut self, iid: InstId) -> bool {
         self.class_fold
-            .get_or_insert_with(|| crate::classfold::plan(self.module, self.func))
+            .get_or_insert_with(|| {
+                crate::classfold::plan_with_index(self.module, self.func, self.index)
+            })
             .as_ref()
             .is_some_and(|fold| fold.call_insts.contains(&iid))
     }

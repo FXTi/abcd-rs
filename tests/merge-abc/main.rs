@@ -28,10 +28,10 @@ use abcd_file::{
     MODULE_REQUEST_PHASE_FIELD, ModuleRecordDef, SCOPE_NAMES_FIELD, SourceLang, Type, Version,
     decode, encode, pandasm,
 };
-use abcd_ir::{FuncId, verify_module};
+use abcd_ir::verify_module;
 use abcd_isa::{Bytecode, Imm, Reg, encode as encode_isa, insn};
 use abcd_lift::lift_file;
-use abcd_lower::{LowerOptions, lower_function_with_options, to_method_body};
+use abcd_lower::{LowerOptions, lower_module_bodies};
 use abcd_opt::optimize_module;
 
 /// Supported `--merge-abc` versions (12.0.6.0 header literal table, 13.0.1.0
@@ -339,18 +339,7 @@ fn rewrite_file_e2e(bytes: &[u8], optimize: bool) -> (Vec<u8>, bool) {
     let lower_opts = LowerOptions {
         prune_unused_frame_init_consts: optimize,
     };
-    let mut bodies = Vec::with_capacity(module.functions.len());
-    for i in 0..module.functions.len() {
-        let fid = FuncId::new(i as u32);
-        let func = module.func(fid).expect("func");
-        if func.blocks.is_empty() {
-            bodies.push(None);
-            continue;
-        }
-        let layout = lower_function_with_options(&module, fid, lower_opts).expect("lower");
-        let body = to_method_body(&module, fid, &layout, &file).expect("to_method_body");
-        bodies.push(Some(body));
-    }
+    let bodies = lower_module_bodies(&module, &file, lower_opts).expect("lower_module_bodies");
 
     let mut rebuilt = file.clone();
     let mut cursor = bodies.into_iter();

@@ -2,20 +2,13 @@
 
 use abcd_ir::{BlockId, FuncId, Module};
 
-/// Blocks of `func` reachable from the entry under `succ`, in BFS
-/// discovery order (deterministic: queue discipline + the relation's own
-/// successor order). The entry itself is first; an entry-less function
-/// yields an empty vector.
-pub fn reachable_blocks(
-    module: &Module,
-    func: FuncId,
+/// Blocks reachable from `entry` under `succ`, in deterministic BFS order.
+pub(crate) fn reachable_from(
+    entry: BlockId,
     succ: &dyn Fn(BlockId) -> Vec<BlockId>,
 ) -> Vec<BlockId> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let Some(entry) = module.func(func).and_then(|f| f.entry()) else {
-        return out;
-    };
     let mut queue = std::collections::VecDeque::from([entry]);
     seen.insert(entry);
     while let Some(b) = queue.pop_front() {
@@ -27,4 +20,19 @@ pub fn reachable_blocks(
         }
     }
     out
+}
+
+/// Blocks of `func` reachable from the entry under `succ`, in BFS
+/// discovery order (deterministic: queue discipline + the relation's own
+/// successor order). The entry itself is first; an entry-less function
+/// yields an empty vector.
+pub fn reachable_blocks(
+    module: &Module,
+    func: FuncId,
+    succ: &dyn Fn(BlockId) -> Vec<BlockId>,
+) -> Vec<BlockId> {
+    let Some(entry) = module.func(func).and_then(|f| f.entry()) else {
+        return Vec::new();
+    };
+    reachable_from(entry, succ)
 }

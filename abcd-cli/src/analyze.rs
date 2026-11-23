@@ -20,6 +20,7 @@
 use abcd_analysis::callgraph::{CallEdgeKind, CallGraph, CallTargets};
 use abcd_analysis::control::Dominators;
 use abcd_ir::{CallKind, FuncId, Module};
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::CliError;
@@ -277,30 +278,32 @@ fn callgraph_section(ir: &Module, graph: &CallGraph) -> CallgraphReport {
     CallgraphReport { functions }
 }
 
-/// Build the `--dominators` section: one tree per function.
+/// Build the `--dominators` section: one tree per function (parallelized across functions).
 fn dominator_sections(ir: &Module) -> Vec<DominatorTree> {
-    let mut out = Vec::with_capacity(ir.functions.len());
-    for (fi, f) in ir.functions.iter().enumerate() {
-        let func = FuncId::new(fi as u32);
-        let dom = Dominators::normal(ir, func);
-        let nodes = dom
-            .rpo()
-            .iter()
-            .map(|b| DomNode {
-                block: b.index() as u32,
-                idom: dom.idom(*b).map(|i| i.index() as u32),
-                depth: dom.dominator_chain(*b).len().saturating_sub(1),
-            })
-            .collect();
-        out.push(DominatorTree {
-            function_index: fi as u32,
-            function: func_name(ir, func),
-            blocks: f.blocks.len(),
-            reachable: dom.rpo().len(),
-            nodes,
-        });
-    }
-    out
+    ir.functions
+        .par_iter()
+        .enumerate()
+        .map(|(fi, f)| {
+            let func = FuncId::new(fi as u32);
+            let dom = Dominators::normal(ir, func);
+            let nodes = dom
+                .rpo()
+                .iter()
+                .map(|b| DomNode {
+                    block: b.index() as u32,
+                    idom: dom.idom(*b).map(|i| i.index() as u32),
+                    depth: dom.dominator_chain(*b).len().saturating_sub(1),
+                })
+                .collect();
+            DominatorTree {
+                function_index: fi as u32,
+                function: func_name(ir, func),
+                blocks: f.blocks.len(),
+                reachable: dom.rpo().len(),
+                nodes,
+            }
+        })
+        .collect()
 }
 
 /// Human-readable rendering of one report (goes to stdout).

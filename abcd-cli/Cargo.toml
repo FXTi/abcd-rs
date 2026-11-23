@@ -24,6 +24,7 @@ abcd-lower.workspace = true
 abcd-analysis.workspace = true
 abcd-taint.workspace = true
 abcd-decompile.workspace = true
+rayon.workspace = true
 toml.workspace = true
 
 # Final-binary allocator (2026-10-02 ruling, revised same-day): mimalloc

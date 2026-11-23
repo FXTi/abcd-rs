@@ -36,6 +36,11 @@ impl SymbolTable {
         self.inner.resolve(inner)
     }
 
+    /// Look up an already-interned string without mutating the table.
+    pub fn get(&self, s: &str) -> Option<Sym> {
+        self.inner.get(s).map(|sym| Sym(sym.to_usize() as u32))
+    }
+
     /// Number of interned symbols.
     pub fn len(&self) -> usize {
         self.inner.len()

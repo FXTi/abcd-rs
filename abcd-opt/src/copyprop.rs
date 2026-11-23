@@ -9,10 +9,12 @@
 //! — and folding it is sound even for handler phis, since the folded
 //! value equals every incoming value regardless of dispatch timing).
 
-use abcd_ir::{BlockId, FuncId, InstId, Module, Op};
+use std::collections::{HashMap, HashSet};
+
+use abcd_ir::{BlockId, FuncId, InstId, Module, Op, ValueId};
 
 use crate::FuncPass;
-use crate::analysis::replace_uses_in_func;
+use crate::analysis::{replace_uses_map_in_func, resolve_subst};
 
 /// The copy-propagation pass.
 pub struct CopyProp;
@@ -34,13 +36,14 @@ impl FuncPass for CopyProp {
 }
 
 /// Find and eliminate trivial phis where all incoming values are the same
-/// (or the phi itself). Replace all uses of the phi result with that value.
+/// (or the phi itself), applying all substitutions in a single pass per round
+/// (#29).
 fn eliminate_trivial_phis(module: &mut Module, func: FuncId) -> bool {
-    let mut changed = false;
     let Some(func_data) = module.func(func) else {
         return false;
     };
     let blocks: Vec<BlockId> = func_data.blocks.clone();
+    let mut subst: HashMap<ValueId, ValueId> = HashMap::new();
 
     for bb in blocks {
         let phis: Vec<InstId> = module
@@ -53,6 +56,7 @@ fn eliminate_trivial_phis(module: &mut Module, func: FuncId) -> bool {
                     .collect()
             })
             .unwrap_or_default();
+        let mut dead_phis: HashSet<InstId> = HashSet::new();
         for phi_id in phis {
             let result = match module.inst(phi_id).and_then(|i| i.result) {
                 Some(v) => v,
@@ -63,17 +67,17 @@ fn eliminate_trivial_phis(module: &mut Module, func: FuncId) -> bool {
                 continue;
             };
             if let Op::Phi { entries } = &inst.op {
-                // Find the unique non-self value.
-                let mut unique: Option<abcd_ir::ValueId> = None;
+                let mut unique: Option<ValueId> = None;
                 let mut is_trivial = true;
 
                 for (_edge, val) in entries {
-                    if *val == result {
+                    let resolved = resolve_subst(&subst, *val);
+                    if resolved == result {
                         continue;
                     } // self-reference
                     match unique {
-                        None => unique = Some(*val),
-                        Some(u) if u == *val => {} // same value
+                        None => unique = Some(resolved),
+                        Some(u) if u == resolved => {} // same value
                         _ => {
                             is_trivial = false;
                             break;
@@ -86,15 +90,8 @@ fn eliminate_trivial_phis(module: &mut Module, func: FuncId) -> bool {
                 }
 
                 if let Some(replacement) = unique {
-                    // Replace all uses of `result` with `replacement`.
-                    replace_uses_in_func(module, func, result, replacement);
-                    // Keep the block structure in sync with the use-def
-                    // rewrite. Leaving the eliminated phi in `insts` would
-                    // make later lowering visit a dead instruction.
-                    if let Some(block) = module.block_mut(bb) {
-                        block.insts.retain(|&id| id != phi_id);
-                    }
-                    changed = true;
+                    subst.insert(result, replacement);
+                    dead_phis.insert(phi_id);
                 }
                 // If unique is None, all entries are self-references (dead phi).
                 // ADCE will clean it up (N28: that holds because the dead
@@ -102,7 +99,16 @@ fn eliminate_trivial_phis(module: &mut Module, func: FuncId) -> bool {
                 // this arm).
             }
         }
+        if !dead_phis.is_empty()
+            && let Some(block) = module.block_mut(bb)
+        {
+            block.insts.retain(|id| !dead_phis.contains(id));
+        }
     }
 
-    changed
+    if subst.is_empty() {
+        return false;
+    }
+    replace_uses_map_in_func(module, func, &subst);
+    true
 }

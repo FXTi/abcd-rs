@@ -30,7 +30,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use abcd_ir::{BlockId, Edge, EdgeKind, FuncId, InstId, Module, Op, ValueDef, ValueId};
 
 use crate::FuncPass;
-use crate::analysis::{augmented_succs, normal_succs, replace_uses_in_func};
+use crate::analysis::{
+    augmented_succs_indexed, exception_handlers_by_block, normal_succs, replace_uses_map_in_func,
+};
 
 // ─── ADCE ────────────────────────────────────────────────────────────────────
 
@@ -244,6 +246,7 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
             // and has no preds — produce `Phi { entries: [] }` whose
             // result may stay live: no edge ever writes its home
             // register at lowering, so uses read frame garbage (N27).
+            let mut phi_subst = std::collections::HashMap::new();
             for &phi_id in &succ_phis {
                 let (result, incoming) = {
                     let Some(inst) = module.inst(phi_id) else {
@@ -261,11 +264,14 @@ fn merge_single_succ_pred(module: &mut Module, func: FuncId) -> bool {
                 if let (Some(result), Some(value)) = (result, incoming)
                     && value != result
                 {
-                    replace_uses_in_func(module, func, result, value);
+                    phi_subst.insert(result, value);
                 }
                 // Self-referential single-entry phis (dead cycles)
                 // need no rewrite: uses already name the phi result,
                 // and ADCE sweeps them when the result is unused.
+            }
+            if !phi_subst.is_empty() {
+                replace_uses_map_in_func(module, func, &phi_subst);
             }
 
             // Remove the terminator from bb.
@@ -518,6 +524,7 @@ fn rebuild_predecessors(module: &mut Module, func: FuncId) {
         return;
     };
     let blocks: Vec<BlockId> = func_data.blocks.clone();
+    let exc_handlers = exception_handlers_by_block(func_data);
     for &block in &blocks {
         if let Some(b) = module.block_mut(block) {
             b.preds.clear();
@@ -528,7 +535,7 @@ fn rebuild_predecessors(module: &mut Module, func: FuncId) {
     // (Exceptional; handlers still owned by this function only). This
     // keeps handler preds consistent with the pruned try_regions.
     for &block in &blocks {
-        for (succ, kind) in augmented_succs(module, func, block) {
+        for (succ, kind) in augmented_succs_indexed(module, &exc_handlers, block) {
             let edge = Edge { from: block, kind };
             if let Some(succ_block) = module.block_mut(succ)
                 && !succ_block.preds.contains(&edge)
@@ -740,6 +747,7 @@ fn remove_unreachable_blocks(module: &mut Module, func: FuncId) -> bool {
         return false;
     };
     let blocks: Vec<BlockId> = func_data.blocks.clone();
+    let exc_handlers = exception_handlers_by_block(func_data);
 
     // BFS from entry over terminator successors + exception edges.
     let mut reachable = HashSet::new();
@@ -747,7 +755,7 @@ fn remove_unreachable_blocks(module: &mut Module, func: FuncId) -> bool {
     reachable.insert(entry);
     queue.push_back(entry);
     while let Some(bb) = queue.pop_front() {
-        for (succ, _kind) in augmented_succs(module, func, bb) {
+        for (succ, _kind) in augmented_succs_indexed(module, &exc_handlers, bb) {
             if reachable.insert(succ) {
                 queue.push_back(succ);
             }

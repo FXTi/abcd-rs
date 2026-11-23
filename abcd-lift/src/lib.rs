@@ -210,9 +210,9 @@ pub(crate) struct Lifter<'f> {
     /// Scalar-constant dedup (a lift-layer policy; the pool itself is
     /// append-only).
     scalar_consts: HashMap<ScalarKey, ConstId>,
-    /// Shape-constant (array/object trees) dedup — linear scan over
-    /// structural equality (few shapes per file).
-    shape_consts: Vec<(Const, ConstId)>,
+    /// Shape-constant (array/object/method-ref trees) dedup — O(1) hash
+    /// lookup over structural equality (`Const: Eq + Hash`).
+    shape_consts: HashMap<Const, ConstId>,
     /// Literal-array table index → converted shape tree (memoized).
     pub(crate) lit_cache: HashMap<u32, Const>,
     /// Cycle guard for nested literal arrays.
@@ -253,7 +253,7 @@ impl<'f> Lifter<'f> {
             field_to_id: HashMap::new(),
             func_bases: HashMap::new(),
             scalar_consts: HashMap::new(),
-            shape_consts: Vec::new(),
+            shape_consts: HashMap::new(),
             lit_cache: HashMap::new(),
             lit_active: BTreeSet::new(),
             module_datas: Vec::new(),
@@ -324,13 +324,11 @@ impl<'f> Lifter<'f> {
     /// Pool a shape constant (array/object/method-ref tree; structural
     /// dedup).
     pub(crate) fn const_shape(&mut self, c: Const) -> ConstId {
-        for (existing, id) in &self.shape_consts {
-            if *existing == c {
-                return *id;
-            }
+        if let Some(&id) = self.shape_consts.get(&c) {
+            return id;
         }
         let id = self.module.consts.push(c.clone());
-        self.shape_consts.push((c, id));
+        self.shape_consts.insert(c, id);
         id
     }
 

@@ -22,6 +22,7 @@ abcd-ir = { workspace = true }
 abcd-analysis = { workspace = true }
 abcd-file = { workspace = true }
 abcd-isa = { workspace = true }
+rayon = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

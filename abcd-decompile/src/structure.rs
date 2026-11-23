@@ -72,25 +72,22 @@
 //!   documented approximation, counted).
 //!
 //! Handlers are NOT in the region tree (d-P1's N45 design): each
-//! handler body is structured as its own sub-CFG. Since
-//! [`structure_regions`] only structures from a function entry, the
-//! structurer builds a per-function SHIM module (a clone whose handler
-//! sub-CFGs are exposed as extra functions with the out-of-set
-//! terminator edges cut to `Return`) and structures each handler
-//! through the same [`structure_regions`] entry point. Nested
-//! try-in-handler regions recurse through their own shims. The
+//! handler body is structured as its own sub-CFG through a zero-copy
+//! [`CfgSubgraph`] view ([`structure_subgraph`]), projecting out-of-set
+//! Normal terminator edges without cloning or mutating [`Module`] (#29).
+//! Nested try-in-handler regions recurse through their own subgraphs. The
 //! `ExceptionParam` binding comes from Stage A's [`Stmt::CatchBind`]
 //! marker at the handler head.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use abcd_analysis::control::{
-    EdgeClass, LoopKind, RegionId, RegionNode, RegionTree, block_succs, structure_regions,
+    CfgSubgraph, EdgeClass, LoopKind, RegionId, RegionNode, RegionTree, block_succs,
+    structure_regions, structure_subgraph,
 };
-use abcd_ir::function::FunctionData;
+use abcd_ir::BlockId;
 use abcd_ir::module::Module;
 use abcd_ir::op::{CmpOp, UnOp};
-use abcd_ir::{BlockId, ClassId, FuncId, Op, Sym};
 
 use crate::expr::{Expr, Lit};
 use crate::recover::{RecoveredFunc, Stmt};
@@ -684,10 +681,7 @@ struct Ctx<'m> {
     bmap: HashMap<BlockId, usize>,
     stats: StructStats,
     frames: Vec<Frame>,
-    /// Shim module (a clone exposing handler sub-CFGs as functions);
-    /// built lazily when the function has try regions with handlers.
-    shim_module: Option<Module>,
-    /// handler entry → its own region tree (over the shim module).
+    /// handler entry → its own region tree (zero-copy subgraph view).
     shim_trees: HashMap<BlockId, RegionTree>,
     /// handler entry → the plans nested inside its sub-CFG.
     shim_plans: HashMap<BlockId, Vec<Plan>>,
@@ -732,9 +726,8 @@ struct Ctx<'m> {
     uniq_trees: HashMap<BlockId, RegionTree>,
     /// Handler entry -> plans nested inside its unique prefix.
     uniq_plans: HashMap<BlockId, Vec<Plan>>,
-    /// De-absorption shim module (unique-set boundary edges cut; join
-    /// sets patched on demand in [`Ctx::join_tree`]).
-    deabsorb_module: Option<Module>,
+    /// Whether de-absorption analysis populated unique handler subgraphs.
+    has_deabsorb: bool,
     /// Join block set -> its structured tree (None = failed; memoized).
     join_memo: HashMap<BTreeSet<BlockId>, Option<(RegionTree, Vec<Plan>)>>,
     /// Join sets currently being emitted by enclosing de-absorbed
@@ -771,7 +764,6 @@ impl<'m> Ctx<'m> {
             bmap,
             stats: StructStats::default(),
             frames: Vec::new(),
-            shim_module: None,
             shim_trees: HashMap::new(),
             shim_plans: HashMap::new(),
             shim_sets: HashMap::new(),
@@ -785,7 +777,7 @@ impl<'m> Ctx<'m> {
             uniq_sets: HashMap::new(),
             uniq_trees: HashMap::new(),
             uniq_plans: HashMap::new(),
-            deabsorb_module: None,
+            has_deabsorb: false,
             join_memo: HashMap::new(),
             pending_joins: Vec::new(),
             suppress_wraps: Vec::new(),
@@ -982,53 +974,40 @@ impl<'m> Ctx<'m> {
             }
         }
 
-        // Build the shim module: clone, patch out-of-set terminators,
-        // add one shim function per handler.
-        let mut shim = self.module.clone();
-        for (&h, set) in &sets {
+        // Precompute projected Normal successors matching the boundary-cut
+        // semantics across all handler sets in deterministic `handlers` order
+        // (zero `Module` clones — #29).
+        let mut shim_succ_map: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+        for &h in &handlers {
+            let Some(set) = sets.get(&h) else {
+                continue;
+            };
             if !set.contains(&h) {
                 continue; // entry swallowed (exotic) — honesty at emission
             }
             for &b in set {
-                let Some(block) = shim.block(b).cloned() else {
-                    continue;
-                };
-                let Some(&last) = block.insts.last() else {
-                    continue;
-                };
-                let new_op = match &shim.inst(last).expect("inst").op {
-                    Op::Branch { dest } if !set.contains(dest) => Some(Op::Return { value: None }),
-                    Op::CondBranch {
-                        true_dest,
-                        false_dest,
-                        ..
-                    } => {
-                        let t_in = set.contains(true_dest);
-                        let f_in = set.contains(false_dest);
-                        match (t_in, f_in) {
-                            (true, true) => None,
-                            (true, false) => Some(Op::Branch { dest: *true_dest }),
-                            (false, true) => Some(Op::Branch { dest: *false_dest }),
-                            (false, false) => Some(Op::Return { value: None }),
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(op) = new_op {
-                    shim.inst_mut(last).expect("inst").op = op;
-                }
+                let cur = shim_succ_map
+                    .remove(&b)
+                    .unwrap_or_else(|| block_succs(self.module, b));
+                let filtered: Vec<BlockId> = cur.into_iter().filter(|s| set.contains(s)).collect();
+                shim_succ_map.insert(b, filtered);
             }
         }
-        for (&h, set) in &sets {
+        let shim_succs = |b: BlockId| -> Vec<BlockId> {
+            shim_succ_map
+                .get(&b)
+                .cloned()
+                .unwrap_or_else(|| block_succs(self.module, b))
+        };
+        for &h in &handlers {
+            let Some(set) = sets.get(&h) else {
+                continue;
+            };
             if !set.contains(&h) {
                 continue;
             }
             let mut blocks: Vec<BlockId> = vec![h];
             blocks.extend(set.iter().copied().filter(|b| *b != h));
-            let name: Sym = shim.sym.intern(&format!("$handler${}", h.index()));
-            let fid = FuncId::new(shim.functions.len() as u32);
-            let mut fd = FunctionData::new(ClassId::new(0), name, self.rf.kind);
-            fd.blocks = blocks;
             // Nested try regions fully inside this handler's set ride
             // along (their handlers get their own shims). A region
             // whose protected set ALSO covers an inner handler block
@@ -1041,7 +1020,7 @@ impl<'m> Ctx<'m> {
             // try/catch — its handler body and its phi temporaries
             // (dream gate: opt-try-catch-func/test-nested-try-catch
             // `ReferenceError: v101 is not defined`, d-P5).
-            let block_set: BTreeSet<BlockId> = fd.blocks.iter().copied().collect();
+            let block_set: BTreeSet<BlockId> = blocks.iter().copied().collect();
             let mut chosen: Vec<usize> = Vec::new();
             loop {
                 let mut changed = false;
@@ -1069,14 +1048,22 @@ impl<'m> Ctx<'m> {
                 eprintln!(
                     "SHIM B{} (fn {}): set={:?} chosen={:?}",
                     h.index(),
-                    fid.index(),
-                    fd.blocks.iter().map(|b| b.index()).collect::<Vec<_>>(),
+                    self.rf.func.index(),
+                    blocks.iter().map(|b| b.index()).collect::<Vec<_>>(),
                     chosen
                 );
             }
-            fd.try_regions = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
-            shim.functions.push(fd);
-            let tree = structure_regions(&shim, fid);
+            let try_regions: Vec<_> = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
+            let tree = structure_subgraph(
+                self.module,
+                &CfgSubgraph {
+                    func: self.rf.func,
+                    entry: Some(h),
+                    blocks: &blocks,
+                    succ: &shim_succs,
+                    try_regions: &try_regions,
+                },
+            );
             let plans = tree
                 .try_plans
                 .iter()
@@ -1092,7 +1079,6 @@ impl<'m> Ctx<'m> {
             self.shim_sets.insert(h, set.clone());
             self.stats.handler_shims += 1;
         }
-        self.shim_module = Some(shim);
         self.build_deabsorb(&approx_sets);
     }
 
@@ -1154,53 +1140,33 @@ impl<'m> Ctx<'m> {
         for (&h, set) in approx_sets {
             uniq.insert(h, set.difference(&self.shared_join).copied().collect());
         }
-        // The de-absorption shim module: unique-set boundary edges cut
-        // (join-set boundaries are patched on demand in `join_tree`).
-        let mut dmod = self.module.clone();
-        for set in uniq.values() {
+        // Zero-copy unique-prefix subgraphs (#29): unique sets are pairwise
+        // disjoint, so each unique block maps to at most one handler set.
+        let mut uniq_owner: HashMap<BlockId, BlockId> = HashMap::new();
+        for (&h, set) in &uniq {
             for &b in set {
-                let Some(block) = dmod.block(b).cloned() else {
-                    continue;
-                };
-                let Some(&last) = block.insts.last() else {
-                    continue;
-                };
-                let new_op = match &dmod.inst(last).expect("inst").op {
-                    Op::Branch { dest } if !set.contains(dest) => Some(Op::Return { value: None }),
-                    Op::CondBranch {
-                        true_dest,
-                        false_dest,
-                        ..
-                    } => {
-                        let t_in = set.contains(true_dest);
-                        let f_in = set.contains(false_dest);
-                        match (t_in, f_in) {
-                            (true, true) => None,
-                            (true, false) => Some(Op::Branch { dest: *true_dest }),
-                            (false, true) => Some(Op::Branch { dest: *false_dest }),
-                            (false, false) => Some(Op::Return { value: None }),
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(op) = new_op {
-                    dmod.inst_mut(last).expect("inst").op = op;
-                }
+                uniq_owner.insert(b, h);
             }
         }
-        // Unique-handler shim functions + trees (the same ride-along
-        // rule as the legacy shims).
+        let uniq_succs = |b: BlockId| -> Vec<BlockId> {
+            let raw = block_succs(self.module, b);
+            if let Some(&owner) = uniq_owner.get(&b)
+                && let Some(set) = uniq.get(&owner)
+            {
+                raw.into_iter().filter(|s| set.contains(s)).collect()
+            } else {
+                raw
+            }
+        };
+        // Unique-handler subgraph trees (the same ride-along rule as the
+        // legacy shims, with zero `Module` clones).
         for (&h, set) in &uniq {
             if !set.contains(&h) {
                 continue;
             }
             let mut blocks: Vec<BlockId> = vec![h];
             blocks.extend(set.iter().copied().filter(|b| *b != h));
-            let name: Sym = dmod.sym.intern(&format!("$uhandler${}", h.index()));
-            let fid = FuncId::new(dmod.functions.len() as u32);
-            let mut fd = FunctionData::new(ClassId::new(0), name, self.rf.kind);
-            fd.blocks = blocks;
-            let block_set: BTreeSet<BlockId> = fd.blocks.iter().copied().collect();
+            let block_set: BTreeSet<BlockId> = blocks.iter().copied().collect();
             let mut chosen: Vec<usize> = Vec::new();
             loop {
                 let mut changed = false;
@@ -1224,9 +1190,17 @@ impl<'m> Ctx<'m> {
                 }
             }
             chosen.sort_unstable();
-            fd.try_regions = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
-            dmod.functions.push(fd);
-            let tree = structure_regions(&dmod, fid);
+            let try_regions: Vec<_> = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
+            let tree = structure_subgraph(
+                self.module,
+                &CfgSubgraph {
+                    func: self.rf.func,
+                    entry: Some(h),
+                    blocks: &blocks,
+                    succ: &uniq_succs,
+                    try_regions: &try_regions,
+                },
+            );
             let plans = tree
                 .try_plans
                 .iter()
@@ -1241,7 +1215,7 @@ impl<'m> Ctx<'m> {
             self.uniq_plans.insert(h, plans);
             self.uniq_sets.insert(h, set.clone());
         }
-        self.deabsorb_module = Some(dmod);
+        self.has_deabsorb = true;
     }
 
     // ── Block parts ──────────────────────────────────────────────────
@@ -2556,49 +2530,17 @@ impl<'m> Ctx<'m> {
         head: BlockId,
         set: &BTreeSet<BlockId>,
     ) -> Option<(RegionTree, Vec<Plan>)> {
-        // A FRESH clone per join set (only the set's own boundary is
-        // cut — join blocks never branch into unique handler prefixes,
-        // so the uniq patching is irrelevant here). A tower that bails
-        // after its sets were patched therefore cannot poison a later
-        // tower's join trees.
-        let mut dmod = self.module.clone();
-        for &b in set {
-            let Some(block) = dmod.block(b).cloned() else {
-                continue;
-            };
-            let Some(&last) = block.insts.last() else {
-                continue;
-            };
-            let new_op = match &dmod.inst(last).expect("inst").op {
-                Op::Branch { dest } if !set.contains(dest) => Some(Op::Return { value: None }),
-                Op::CondBranch {
-                    true_dest,
-                    false_dest,
-                    ..
-                } => {
-                    let t_in = set.contains(true_dest);
-                    let f_in = set.contains(false_dest);
-                    match (t_in, f_in) {
-                        (true, true) => None,
-                        (true, false) => Some(Op::Branch { dest: *true_dest }),
-                        (false, true) => Some(Op::Branch { dest: *false_dest }),
-                        (false, false) => Some(Op::Return { value: None }),
-                    }
-                }
-                _ => None,
-            };
-            if let Some(op) = new_op {
-                dmod.inst_mut(last).expect("inst").op = op;
-            }
-        }
         let f = self.module.func(self.rf.func)?;
         let mut blocks: Vec<BlockId> = vec![head];
         blocks.extend(set.iter().copied().filter(|b| *b != head));
-        let name: Sym = dmod.sym.intern(&format!("$join${}", head.index()));
-        let fid = FuncId::new(dmod.functions.len() as u32);
-        let mut fd = FunctionData::new(ClassId::new(0), name, self.rf.kind);
-        fd.blocks = blocks;
-        let block_set = set.clone();
+        let join_succs = |b: BlockId| -> Vec<BlockId> {
+            let raw = block_succs(self.module, b);
+            if set.contains(&b) {
+                raw.into_iter().filter(|s| set.contains(s)).collect()
+            } else {
+                raw
+            }
+        };
         let mut chosen: Vec<usize> = Vec::new();
         loop {
             let mut changed = false;
@@ -2607,7 +2549,7 @@ impl<'m> Ctx<'m> {
                     continue;
                 }
                 let ok = tr.protected.iter().all(|b| {
-                    block_set.contains(b)
+                    set.contains(b)
                         || chosen
                             .iter()
                             .any(|&j| f.try_regions[j].catches.iter().any(|cc| cc.handler == *b))
@@ -2622,9 +2564,17 @@ impl<'m> Ctx<'m> {
             }
         }
         chosen.sort_unstable();
-        fd.try_regions = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
-        dmod.functions.push(fd);
-        let tree = structure_regions(&dmod, fid);
+        let try_regions: Vec<_> = chosen.iter().map(|&i| f.try_regions[i].clone()).collect();
+        let tree = structure_subgraph(
+            self.module,
+            &CfgSubgraph {
+                func: self.rf.func,
+                entry: Some(head),
+                blocks: &blocks,
+                succ: &join_succs,
+                try_regions: &try_regions,
+            },
+        );
         // The set must be exactly the tree's universe (no strays).
         if tree_blocks(&tree) != *set {
             return None;
@@ -2696,7 +2646,7 @@ impl<'m> Ctx<'m> {
                 return false;
             }};
         }
-        if self.deabsorb_module.is_none() {
+        if !self.has_deabsorb {
             return false;
         }
         let handlers = self.f().plans[p].handlers.clone();

@@ -18,7 +18,7 @@
 //! Everything here returns RAW names; legalization/disambiguation is the
 //! [`crate::legalize::Legalizer`]'s job at mint time.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use abcd_ir::ValueDef;
 use abcd_ir::consts::Const;
@@ -29,6 +29,89 @@ use abcd_ir::op::Op;
 
 use crate::consts::sym_str;
 use crate::legalize::sanitize;
+
+/// Module-wide pre-indexed lookup tables shared across per-function Stage A
+/// recovery, `classfold`, and Stage C emission (#29).
+///
+/// Built once in `O(|Module|)` time (instead of rescanning `module.insts`,
+/// `module.blocks`, and `module.functions` per function) and `Sync` for
+/// parallel `rayon` recovery.
+#[derive(Clone, Debug, Default)]
+pub struct DecompileIndex {
+    /// `func.index()` → first defining parent function in module order.
+    parents: Vec<Option<FuncId>>,
+    /// Resolved G2 module-variable slot names (`module_slot_names(module)`).
+    pub slot_names: BTreeMap<u32, String>,
+    /// Constructors referenced by `DefineClass` / `DefineSendableClass`.
+    pub class_ctors: HashSet<FuncId>,
+    /// `(level, slot)` → closure bodies stored via `PutLexVar` anywhere in
+    /// the module.
+    pub lex_closure_stores: HashMap<(u16, u16), BTreeSet<FuncId>>,
+}
+
+impl DecompileIndex {
+    /// Build all module-wide decompile lookup tables in one linear pass.
+    pub fn build(module: &Module) -> Self {
+        let mut parents = vec![None; module.functions.len()];
+        for (fi, f) in module.functions.iter().enumerate() {
+            let p = FuncId::new(fi as u32);
+            for &b in &f.blocks {
+                let Some(block) = module.block(b) else {
+                    continue;
+                };
+                for &iid in &block.insts {
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
+                    for child in defined_children(module, &inst.op) {
+                        if child != p
+                            && let Some(slot) = parents.get_mut(child.index())
+                        {
+                            slot.get_or_insert(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut class_ctors = HashSet::new();
+        for inst in &module.insts {
+            if let Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } = &inst.op {
+                class_ctors.insert(*ctor);
+            }
+        }
+
+        let mut lex_closure_stores: HashMap<(u16, u16), BTreeSet<FuncId>> = HashMap::new();
+        for block in &module.blocks {
+            for &iid in &block.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if let Op::PutLexVar { level, slot, value } = &inst.op
+                    && let Some(body) = crate::classfold::peel_closure_body(module, *value)
+                {
+                    lex_closure_stores
+                        .entry((*level, *slot))
+                        .or_default()
+                        .insert(body);
+                }
+            }
+        }
+
+        Self {
+            parents,
+            slot_names: module_slot_names(module),
+            class_ctors,
+            lex_closure_stores,
+        }
+    }
+
+    /// Capture parent of `func` (`O(1)` lookup matching `parent_of`).
+    #[inline]
+    pub fn parent_of(&self, func: FuncId) -> Option<FuncId> {
+        self.parents.get(func.index()).copied().flatten()
+    }
+}
 
 /// One lexical-environment frame (one `NewLexEnv*`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -76,26 +159,45 @@ impl NameScopes {
     /// Build the chain of `func` in `module`, seeded with the
     /// function's inherited (captured) environment.
     pub fn build(module: &Module, func_id: FuncId) -> Self {
+        Self::build_with_index(module, func_id, None)
+    }
+
+    /// [`NameScopes::build`] using a pre-built [`DecompileIndex`] when
+    /// available (`O(1)` parent lookup instead of scanning `module.functions`).
+    pub fn build_with_index(
+        module: &Module,
+        func_id: FuncId,
+        index: Option<&DecompileIndex>,
+    ) -> Self {
         let mut visiting = Vec::new();
-        let seed = Self::inherited_chain(module, func_id, &mut visiting);
+        let seed = Self::inherited_chain(module, func_id, index, &mut visiting);
         Self::build_seeded(module, func_id, seed)
     }
 
     /// The env chain a function INHERITS: the parent's env stack at the
     /// definition site. `visiting` guards define-site cycles (a malformed
     /// module could nest functions mutually; degrade to no seed).
-    fn inherited_chain(module: &Module, func: FuncId, visiting: &mut Vec<FuncId>) -> Vec<EnvFrame> {
+    fn inherited_chain(
+        module: &Module,
+        func: FuncId,
+        index: Option<&DecompileIndex>,
+        visiting: &mut Vec<FuncId>,
+    ) -> Vec<EnvFrame> {
         if visiting.contains(&func) {
             return Vec::new();
         }
-        let Some(parent) = parent_of(module, func) else {
+        let parent_opt = match index {
+            Some(idx) => idx.parent_of(func),
+            None => parent_of(module, func),
+        };
+        let Some(parent) = parent_opt else {
             return Vec::new();
         };
         if visiting.contains(&parent) {
             return Vec::new();
         }
         visiting.push(func);
-        let seed = Self::inherited_chain(module, parent, visiting);
+        let seed = Self::inherited_chain(module, parent, index, visiting);
         visiting.pop();
         let scopes = Self::build_seeded(module, parent, seed);
         scopes.defines.get(&func).cloned().unwrap_or_default()
@@ -113,13 +215,14 @@ impl NameScopes {
             return scopes;
         };
         let order = augmented_rpo(module, func_id);
+        let block_set: HashSet<BlockId> = func.blocks.iter().copied().collect();
 
         // Predecessors (both edge kinds), in-function only.
         let mut preds: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
         for &b in &func.blocks {
             if let Some(block) = module.block(b) {
                 for e in &block.preds {
-                    if func.blocks.contains(&e.from) {
+                    if block_set.contains(&e.from) {
                         preds.entry(b).or_default().push(e.from);
                     }
                 }
@@ -356,12 +459,13 @@ fn augmented_rpo(module: &Module, func_id: FuncId) -> Vec<BlockId> {
     let Some(func) = module.func(func_id) else {
         return Vec::new();
     };
+    let block_set: HashSet<BlockId> = func.blocks.iter().copied().collect();
     // Augmented successors: inverse of the stored preds (both kinds).
     let mut succs: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
     for &b in &func.blocks {
         if let Some(block) = module.block(b) {
             for e in &block.preds {
-                if func.blocks.contains(&e.from) {
+                if block_set.contains(&e.from) {
                     succs.entry(e.from).or_default().push(b);
                 }
             }

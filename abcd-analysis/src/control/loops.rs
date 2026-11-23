@@ -6,9 +6,29 @@
 //! here). The natural loop of a back edge is the header plus every block
 //! that can reach the latch without passing through the header.
 
+use std::collections::HashSet;
+
 use abcd_ir::{BlockId, FuncId, Module};
 
 use super::dom::Dominators;
+
+/// All back edges `(from, header)` within an explicit `blocks` slice.
+pub(crate) fn back_edges_in_blocks(
+    blocks: &[BlockId],
+    dom: &Dominators,
+    succ: &dyn Fn(BlockId) -> Vec<BlockId>,
+) -> Vec<(BlockId, BlockId)> {
+    let block_set: HashSet<BlockId> = blocks.iter().copied().collect();
+    let mut edges = Vec::new();
+    for &b in blocks {
+        for s in succ(b) {
+            if block_set.contains(&s) && dom.dominates(s, b) {
+                edges.push((b, s));
+            }
+        }
+    }
+    edges
+}
 
 /// All back edges `(from, header)` of `func`: edges whose target
 /// dominates their source. Iteration is deterministic — `func.blocks`
@@ -20,18 +40,10 @@ pub fn back_edges(
     dom: &Dominators,
     succ: &dyn Fn(BlockId) -> Vec<BlockId>,
 ) -> Vec<(BlockId, BlockId)> {
-    let mut edges = Vec::new();
     let Some(f) = module.func(func) else {
-        return edges;
+        return Vec::new();
     };
-    for &b in &f.blocks {
-        for s in succ(b) {
-            if f.blocks.contains(&s) && dom.dominates(s, b) {
-                edges.push((b, s));
-            }
-        }
-    }
-    edges
+    back_edges_in_blocks(&f.blocks, dom, succ)
 }
 
 /// The natural loop of back edge `(latch → header)`: `{header}` plus

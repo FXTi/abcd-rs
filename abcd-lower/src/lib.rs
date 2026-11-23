@@ -22,7 +22,7 @@ pub mod regalloc;
 use abcd_ir::{BlockId, FuncId, Module, ValueId};
 
 pub use layout::LayoutResult;
-pub use method_body::to_method_body;
+pub use method_body::{EntityResolver, lower_module_bodies, to_method_body};
 pub use regalloc::RegAlloc;
 
 /// Lowering options (the default is the v0.1-LIFT-faithful behavior).

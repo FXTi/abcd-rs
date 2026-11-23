@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 
 use abcd_file::File;
 use abcd_ir::verify_module;
-use abcd_lower::{LowerOptions, lower_function_with_options, to_method_body};
+use abcd_lower::{EntityResolver, LowerOptions, lower_function_with_options};
+use rayon::prelude::*;
 
 use crate::CliError;
 use crate::input::InputModule;
@@ -144,23 +145,31 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
         prune_unused_frame_init_consts: opts.optimize,
     };
 
-    let mut bodies = Vec::with_capacity(func_ids.len());
+    let resolver = EntityResolver::new(&ir, &file);
+    let per_func: Vec<Result<Option<abcd_file::MethodBody>, CliError>> = func_ids
+        .par_iter()
+        .map(|&func_id| {
+            let func = ir.func(func_id).expect("coverage validated above");
+            if func.blocks.is_empty() {
+                return Ok(None);
+            }
+            let name = ir.sym.resolve(func.name).unwrap_or("?");
+            let layout = lower_function_with_options(&ir, func_id, lower_options)
+                .map_err(|e| CliError::Tool(format!("{}: lower of {name} failed: {e}", ctx())))?;
+            let body = resolver.to_method_body(func_id, &layout).map_err(|e| {
+                CliError::Tool(format!("{}: relocation of {name} failed: {e}", ctx()))
+            })?;
+            Ok(Some(body))
+        })
+        .collect();
+    let mut bodies = Vec::with_capacity(per_func.len());
     let mut lowered = 0;
-    for &func_id in &func_ids {
-        let func = ir.func(func_id).expect("coverage validated above");
-        // Bodyless functions (external/native declarations) keep their
-        // `None` body; everything else lowers to a fresh MethodBody.
-        if func.blocks.is_empty() {
-            bodies.push(None);
-            continue;
+    for res in per_func {
+        let slot = res?;
+        if slot.is_some() {
+            lowered += 1;
         }
-        let name = ir.sym.resolve(func.name).unwrap_or("?");
-        let layout = lower_function_with_options(&ir, func_id, lower_options)
-            .map_err(|e| CliError::Tool(format!("{}: lower of {name} failed: {e}", ctx())))?;
-        let body = to_method_body(&ir, func_id, &layout, &file)
-            .map_err(|e| CliError::Tool(format!("{}: relocation of {name} failed: {e}", ctx())))?;
-        bodies.push(Some(body));
-        lowered += 1;
+        bodies.push(slot);
     }
 
     let mut rebuilt = file.clone();
