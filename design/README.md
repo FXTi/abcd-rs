@@ -17,7 +17,7 @@ Architecture, format specifications, research surveys, and verification records 
 | [decompile.md](decompile.md) | Decompiler architecture (`abcd-decompile`): expression recovery, pattern-independent structuring, JS/TS emission & oracle gates |
 | [cli-plan.md](cli-plan.md) | `abcd` CLI command surface, container sniffing, exit-code contract, and `taint.toml` configuration |
 | [vendor-sync.md](vendor-sync.md) | Curated `vendor/` snapshot (`OpenHarmony-v7.0-Release`), offline codegen (`scripts/vendor-gen.py`), and upstream tag radar |
-| [ci.md](ci.md) | 20-job CI pipeline (`vendor-verify` + 32-bit / 3-OS build matrix + corpus & VM oracle gates) |
+| [ci.md](ci.md) | 21-job CI pipeline (`doc` + `vendor-verify` + 32-bit / 3-OS build matrix + corpus & `--merge-abc` VM oracle gates) |
 | [roadmap.md](roadmap.md) | Project milestones, architectural invariants, and engineering working agreements |
 
 ## Reference Surveys & Historical Records

@@ -28,31 +28,44 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy
+    name: Clippy & Fuzz Check
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       # Zero-warning estate since the 2026-10-02 debt cleanup; gate it so
       # new lints never get in.
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Keep standalone cargo-fuzz targets type-checked against library APIs.
+      - run: cargo check --manifest-path fuzz/Cargo.toml --bins
+
+  doc:
+    name: Rustdoc (-D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
   deny:
     name: cargo deny (licenses + advisories)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   vendor-verify:
@@ -60,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -73,16 +86,14 @@ jobs:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
-    needs: [fmt, clippy, deny, vendor-verify]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     strategy:
       matrix:
         # Platform-compatibility lanes (2026-10-02 ruling): OS x arch cross,
         # each at the OLDEST label GitHub still offers — the point is that
         # artifacts built here keep running for ordinary users on old
         # systems. ubuntu-latest is deliberately NOT a lane: every other job
-        # covers the current baseline. (The focal container lane was
-        # considered and dropped; MSRV deliberately not tracked — we follow
-        # the latest Rust, old-toolchain builders are on their own.)
+        # covers the current baseline.
         os:
           - ubuntu-22.04 # oldest x86_64 Linux glibc GH offers
           - ubuntu-22.04-arm # aarch64 Linux (OpenHarmony's home turf)
@@ -91,37 +102,27 @@ jobs:
           - windows-2022 # oldest Windows label
           - windows-11-arm # aarch64 Windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # Upstream C++ sources and pre-generated Rust/C++ bindings live in
       # vendor/ and abcd-*-sys/*/generated/ (verified by vendor-verify);
       # build.rs compiles pure C++17 via cc with no Ruby or bindgen needed.
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
-      # The workspace is small and cache causes more problems than it solves
-      # (stale artifacts, coverage/build conflicts, 10GB quota pressure).
       - run: cargo build
       - run: cargo test
 
-  # 32-bit lane (2026-10-02): GH offers no 32-bit runners, so this is a
-  # cross-compile + native-run lane — x86_64 kernels execute i686 binaries
-  # directly once multilib is installed, no qemu needed. The vendored C++
-  # bridge has never been compiled 32-bit before; this lane is the probe.
   build32:
     name: Build & Test (i686-linux)
     runs-on: ubuntu-22.04
     timeout-minutes: 20
-    needs: [fmt, clippy, deny, vendor-verify]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install 32-bit toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: i686-unknown-linux-gnu
-      # The bridge C++ needs -m32 on both steps (cc reads CFLAGS/CXXFLAGS;
-      # the i686 target spec carries -m32 at link time itself, so no LDFLAGS
-      # anywhere — rustc's linker driver never reads it). i686 binaries
-      # execute natively on the x86_64 kernel once multilib exists.
       - run: cargo build --target i686-unknown-linux-gnu
         env:
           CFLAGS: -m32
@@ -131,32 +132,26 @@ jobs:
           CFLAGS: -m32
           CXXFLAGS: -m32
 
-  # 32-bit Windows (2026-10-02 ruling): i686-pc-windows-msvc builds and
-  # tests run natively under WoW64 on the 64-bit runner — no emulation.
   win32:
     name: Build & Test (i686-windows)
     runs-on: windows-2022
     timeout-minutes: 20
-    needs: [fmt, clippy, deny, vendor-verify]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: i686-pc-windows-msvc
-      # The cc crate resolves the target-appropriate MSVC toolchain itself.
       - run: cargo build --target i686-pc-windows-msvc
       - run: cargo test --target i686-pc-windows-msvc
 
-  # 32-bit ARM Linux (2026-10-02 ruling): armv7 cross-compile; tests run
-  # under qemu-user (the only 32-bit shape with a real OpenHarmony
-  # counterpart — legacy 32-bit ARM devices).
   arm32:
     name: Build & Test (armv7-linux)
     runs-on: ubuntu-22.04
     timeout-minutes: 25
-    needs: [fmt, clippy, deny, vendor-verify]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install armv7 cross toolchain + qemu-user
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user libc6-armhf-cross libstdc++-12-dev-armhf-cross
       - uses: dtolnay/rust-toolchain@stable
@@ -174,23 +169,9 @@ jobs:
           CXX_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-g++
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: qemu-arm -L /usr/arm-linux-gnueabihf
 
-  # ── Per-push corpus jobs (the c-P3 job graph) ──────────────────────
-  # One job per data-flow test target (tests/<flow>/). Every corpus job
-  # shares the same acquisition recipe: checkout + rust + `docker pull` of
-  # the digest-pinned image + corpus export (the image bakes everything,
-  # incl. the 30 opcode fixtures). Docker is used only for corpus
-  # acquisition and the docker oracles (VM compare, dream gate), never for
-  # the cargo runs.
-  # Wall-time target: ≤12 min per job (measured suites are seconds-to-
-  # minutes; the dream gate is the heavyweight at ~3-5 min).
-  #
-  # `needs: [build, build32, win32, arm32]` — deliberately NOT `[fmt, …]`:
-  # all four front gates (fmt ∥ clippy ∥ deny ∥ vendor-verify) already gate
-  # `build`, and naming one gate alone here gave that job a different
-  # dependent set — the run page's job graph then drew Rustfmt as its own box
-  # instead of one box holding the parallel front gates (the stale `fmt` was
-  # a leftover from when fmt was the only gate, c7783c9). Keep this list to
-  # the build lanes.
+  # ── Per-push corpus jobs ───────────────────────────────────────────
+  # All five front gates (fmt ∥ clippy ∥ doc ∥ deny ∥ vendor-verify)
+  # already gate the four build lanes (`needs: [build, build32, win32, arm32]`).
 
   file-isa:
     name: file-isa (pandasm per-instruction + corpus decode/re-encode)
@@ -198,18 +179,12 @@ jobs:
     timeout-minutes: 20
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Acquire the corpus (image export + opcode fixtures)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-      # modules.abc (Group J) is local-only by license; its test skips by
-      # absence. --test-threads=1 avoids 7 rayon-parallel gates thrashing
-      # disk/L3 simultaneously.
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: corpus
       - run: cargo test -p abcd-rs --test file-isa --release -- --ignored --nocapture --test-threads=1
 
   hap-file:
@@ -218,57 +193,26 @@ jobs:
     timeout-minutes: 20
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      # The wild hap corpus lives behind the image's `export-wild` command
-      # (NOT the plain `export`): 156 packages (all 156 decode-ok across 276
-      # .abc modules since 0.0.0.2 legacy ISA decode landed) with a
-      # manifest.json oracle. export-wild requires an empty target directory.
-      - name: Acquire the wild hap corpus (image export-wild)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus/wild
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export-wild /work/wild
-      # The gate is self-contained: the manifest pins expectations per package
-      # and the suite hard-asserts the total (156), so corpus drift goes red
-      # without a ledger. Skips silently where the corpus is absent.
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: wild
       - run: cargo test -p abcd-rs --test hap-file --release -- --ignored --nocapture
 
-  # The wild gate (design/wild-gate-evaluation.md, form (a) standalone
-  # job): the core-25 wild-OHOS subset promoted from the local smoke
-  # instrument to a per-push gate — A: decompile (call_entry) → docker
-  # es2abc recompile MUST accept (the N79/N80 silent-emitter-bug capture
-  # surface) → recompiled artifact decodes with function count >=
-  # original; B: the per-package fallback ledger
-  # (scripts/wild-dream-divergences.json, hard-error both directions) +
-  # the 1% global fallback tripwire; plus the standing laws (panic/lift/
-  # verify = red, hard-asserted 25 packages / 64 modules). Acquisition
-  # is the proven hap-file recipe (export-wild). GH estimate 4–6.5 min
-  # (evaluation §5); timeout 15 leaves headroom over the 12-min budget
-  # rule for the decompile-heavy tail.
   wild-gate:
     name: wild-gate (core-25 wild recompile acceptance + fallback ledger)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Acquire the wild hap corpus (image export-wild)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus/wild
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export-wild /work/wild
-      # The gate test itself drives scripts/dream-gate.py --skip-compare
-      # --jobs 4 for the docker es2abc recompile (the dream gate's exact
-      # invocation), then asserts acceptance + the ledger. The
-      # red-proof test runs here too: it feeds es2abc a deliberately
-      # broken JS and asserts the rejection surfaces as a SyntaxError —
-      # the signal the main gate turns red on.
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: wild
       - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture wild_gate
 
   file-lift:
@@ -277,41 +221,32 @@ jobs:
     timeout-minutes: 20
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Acquire the corpus (image export + opcode fixtures)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: corpus
       - run: cargo test -p abcd-rs --test file-lift --release -- --ignored --nocapture
 
   lift-lower:
-    name: lift-lower (rewrite suites + VM oracle ×3 variants)
+    name: lift-lower (rewrite + --merge-abc e2e + VM oracle ×3 variants)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Acquire the corpus (image export + opcode fixtures)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-      # corpus_lower_oracle + determinism + async + regalloc + sendable
-      # (test262_vm is excluded — it runs in the dedicated test262-vm job
-      # below with its own compare).
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: corpus
+      - name: --merge-abc multi-module end-to-end oracle (12.0.6.0 .. 24.0.0.0)
+        run: cargo test -p abcd-rs --test merge-abc --release -- --ignored --nocapture
       - name: Corpus rewrite suites
         run: cargo test -p abcd-rs --test lift-lower --release -- --ignored --nocapture --skip test262_vm
         env:
           ABCD_LOWERED_DIR: ${{ github.workspace }}/target/lowered-out
-      # The python VM oracle compare for all three variants (the script
-      # exits nonzero on any behavior mismatch).
       - name: VM oracle compare (v2lift / v2opt / v2inline)
         shell: bash
         run: |
@@ -331,29 +266,14 @@ jobs:
     timeout-minutes: 25
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Acquire the corpus (image export + opcode fixtures)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-      # Rewrites all 2685 test262 rows through the v2lift pipeline and
-      # writes candidates + the filtered index to target/test262-vm/
-      # (suite default). The suite hard-gates the row count (2685).
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: corpus
       - name: test262 rewrite suite
         run: cargo test -p abcd-rs --test lift-lower --release -- --ignored --nocapture test262_vm
-      # VM oracle against the baked runtime records: exit_code/stdout/
-      # timeout exact, stderr by error-name normalization (upstream's
-      # rule; empirical justification in tests/lift-lower/test262_vm.rs).
-      # The gate is pass + documented == total: since N72 closed all 53
-      # initial divergences, scripts/test262-vm-divergences.json is empty
-      # (2685/2685 pass) — a new undocumented divergence fails the job.
-      # Full 2685 rows (no sampling): the compare measured 5m28s at --jobs 4
-      # locally (arm64 docker/qemu — an upper bound for native-amd64 runners),
-      # inside the 12-minute budget.
       - name: test262 VM oracle compare (v2lift)
         shell: bash
         run: |
@@ -372,40 +292,17 @@ jobs:
     timeout-minutes: 30
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Acquire the corpus (image export + opcode fixtures)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-      # test262 P3: decompile all 2685 recorded test262 rows (asserts
-      # the row count and ZERO decompile panics), then recompile each
-      # via the image's es2abc (24.0.0.0/baseline, script mode) and
-      # compare against the baked runtime record (exit/stdout/timeout
-      # exact, stderr by error-name — the upstream test262 rule).
-      # Gate form: B-plan ledger (scripts/test262-dream-divergences.json
-      # — pass + documented == total; a new undocumented divergence or a
-      # stale entry fails the job) + the 2676 pass floor asserted by the
-      # oracle test (after N74–N78 closed all 225 decompile-bug rows, leaving
-      # 2676 pass / 0 decompile-bug / 9 expected-fallback generator-machinery
-      # rows; suite header in tests/lift-decompile/dream_gate_t262.rs).
-      # Wall time: separate job (NOT folded into test262-vm, whose own
-      # 2685-row compare already fills its budget). Measured locally
-      # (qemu, --jobs 8): generate 6.1s, es2abc recompile ~3m46s, VM
-      # compare ~8m6s (inflated by the 86 hang rows' VM timeouts;
-      # native-amd64 runners are several times faster and pay no qemu
-      # toll) — same shape as the test262-vm job, inside 12 min. Full
-      # 2685 rows, no sampling; if a runner regression pushes this over
-      # budget, the lever is compare-rewritten-corpus.py --sample N
-      # (deterministic every-Nth) — document the sampling decision here.
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: corpus
       - name: test262 dream gate (generate + recompile + recorded compare)
         run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture dream_gate_t262_oracle
       - name: Upload the test262 dream-gate report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test262-dream-gate-report
           path: target/dream-gate-t262/dream-gate-report.json
@@ -418,15 +315,12 @@ jobs:
     timeout-minutes: 20
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Acquire the corpus (image export + opcode fixtures)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: corpus
       - run: cargo test -p abcd-rs --test lift-analysis --release -- --ignored --nocapture
 
   lift-taint:
@@ -435,17 +329,12 @@ jobs:
     timeout-minutes: 20
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Acquire the corpus (image export + opcode fixtures)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-      # corpus_callee_names is a frequency-count instrument, not a gate —
-      # local-only by design.
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: corpus
       - run: cargo test -p abcd-rs --test lift-taint --release -- --ignored --nocapture --skip corpus_callee_names
 
   lift-decompile:
@@ -454,65 +343,39 @@ jobs:
     timeout-minutes: 30
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Acquire the corpus (image export + opcode fixtures)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-      # corpus_stage_a + corpus_decompile (2832 non-test262 rows) +
-      # dream_gate_oracle (which calls generate() once + single-container
-      # es2abc/ark_js_vm compare) + the node behavior suites. Skip
-      # dream_gate_generate so it does not race dream_gate_oracle on
-      # target/dream-gate/.
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: corpus
       - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --test-threads=1 --skip textual_oracle --skip dream_gate_generate --skip dream_gate_t262 --skip wild_gate --skip wild_smoke
       - name: Upload the dream-gate report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dream-gate-report
           path: target/dream-gate/dream-gate-report.json
           retention-days: 30
           if-no-files-found: ignore
 
-  # Full-estate coverage: the corpus-inclusive metric (the "90%" number)
-  # — everything, including the ignored corpus suites, with the corpus
-  # export present.
   coverage:
     name: Coverage (full estate)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [build, build32, win32, arm32]
     env:
-      # clang-23, matching the LLVM bundled by rustc >=1.99 (LLVM 23 changed
-      # the __llvm_profile_data record layout; an older clang's instrumented
-      # bridge objects mixed into the same profraw section SIGSEGV the test
-      # binary at exit — q-P13 root cause). Pinned rustc remains @stable.
       CXX: clang++-23
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: both
 
-      - name: Acquire the corpus (image export + opcode fixtures)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-          # The wild hap corpus too: --include-ignored runs the hap-file
-          # gate, and it must not silently skip here. export-wild requires
-          # an empty target directory.
-          mkdir -p exports/corpus/wild
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export-wild /work/wild
-
-      # NOTE: No actions/cache here on purpose. Do NOT add it back.
       - name: Install clang-23 (LLVM version parity with rustc's bundled LLVM)
         shell: bash
         run: |
@@ -526,27 +389,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Collect coverage (full estate incl. the corpus suites)
-        # --skip pandasm_asm: the two asm round-trip gates are byte-loop-heavy
-        # (parse+encode+decode+emit x5517 x2) and llvm-cov instrumentation
-        # multiplies them past 2h on a 4-vCPU runner (measured: 67s plain
-        # release -> 30min+ instrumented on a 16-core box). Their behavioral
-        # gating is owned per-push by the file-isa job; the parser keeps its
-        # unit-test (incl. fuzz) coverage. (q-P10 ruling A, 2026-09-30)
-        # --skip wild_smoke: the wild big-abc smoke sweep is a local
-        # instrument (decompile-heavy: p95 18s per module x242) owned by the
-        # hap-file job's cheap gate; under instrumentation it dominates the
-        # job for zero coverage value. (2026-10-01 maintainer ruling)
-        # --skip wild_gate: the core-25 wild gate is a docker-es2abc
-        # recompile gate owned per-push by the wild-gate job; under
-        # instrumentation its decompile phase (the p95+ tail of the wild
-        # set by construction) multiplies past the job budget for zero
-        # coverage value. (2026-10-03 wild-gate promotion)
-        # --skip dream_gate_oracle / dream_gate_t262_oracle / wild_gate_red_proof:
-        # docker es2abc/ark_js_vm runs execute uninstrumented inside the
-        # container (zero Rust coverage value); dream_gate_generate and
-        # dream_gate_t262_generate still run here so all Rust emission paths
-        # are covered without spawning Docker or racing on target/dream-gate*.
-        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_smoke --skip wild_gate --skip dream_gate_oracle --skip dream_gate_t262_oracle
+        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_smoke --skip wild_gate --skip dream_gate_oracle --skip dream_gate_t262_oracle --skip merge_abc_docker_oracle
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
@@ -558,56 +401,32 @@ jobs:
 
       - name: Upload coverage artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: lcov.info
           retention-days: 30
 
-  # AddressSanitizer at coverage's level (2026-10-02 ruling): one dedicated
-  # heavy job, off the critical path. Sanitizers are nightly-only in Rust
-  # (-Zsanitizer), ~2x slower, incompatible with -C instrument-coverage,
-  # and unavailable on the Windows lanes — hence a lane, not "everywhere".
-  #
-  # Scope (same ruling, option 2): the corpus-compute suites that actually
-  # hammer the FFI boundary (decode/encode/lift/lower over 5517 fixtures +
-  # the 156 wild packages) run under ASan — ASan's ~2x tax is affordable
-  # there (unlike llvm-cov's 50x). Excluded: the docker oracles (the VM and
-  # es2abc live in the image, not our code — ASan has nothing to check) and
-  # the two local instruments (pandasm_asm / wild_smoke, same as coverage).
   asan:
     name: ASan (nightly, address sanitizer, corpus-compute suites)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [build, build32, win32, arm32]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
+      - uses: ./.github/actions/export-corpus
+        with:
+          image: ${{ env.ARK_TEST_IMAGE }}
+          mode: both
 
-      - name: Acquire the corpus (image export + wild haps)
-        shell: bash
-        run: |
-          set -euo pipefail
-          docker pull "$ARK_TEST_IMAGE"
-          mkdir -p exports/corpus
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
-          mkdir -p exports/corpus/wild
-          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export-wild /work/wild
-
-      # Default (non-ignored) tests first, then the corpus-compute targets.
-      # lift-lower skips test262_vm (docker VM compare — nothing for ASan).
-      # lift-decompile and test262-dream are docker-oracle suites: out.
       - name: cargo test under ASan
         env:
           CFLAGS: -fsanitize=address
           CXXFLAGS: -fsanitize=address
           ASAN_OPTIONS: detect_leaks=1
-        # Sanitizer builds must not inherit the warning elevation. Doctests
-        # are out: rustdoc's separate link step misses rustc's bundled ASan
-        # runtime (undefined __asan_* from the instrumented bridge objects);
-        # they run on every other job.
         run: |
           set -euo pipefail
           export RUSTFLAGS="-Zsanitizer=address"

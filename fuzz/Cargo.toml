@@ -1,0 +1,41 @@
+[package]
+name = "abcd-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace so `libfuzzer-sys` is never pulled into ordinary
+# `cargo build` / `cargo test` runs on the main workspace.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+abcd-hap = { path = "../abcd-hap" }
+abcd-isa = { path = "../abcd-isa" }
+abcd-file = { path = "../abcd-file" }
+abcd-ir = { path = "../abcd-ir" }
+abcd-lift = { path = "../abcd-lift" }
+
+[[bin]]
+name = "fuzz_hap_container"
+path = "fuzz_targets/fuzz_hap_container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_abc_decode"
+path = "fuzz_targets/fuzz_abc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pandasm_parse"
+path = "fuzz_targets/fuzz_pandasm_parse.rs"
+test = false
+doc = false
+bench = false

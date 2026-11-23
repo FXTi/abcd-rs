@@ -83,7 +83,7 @@ Architecture, format research, and subsystem designs live in [`design/`](design/
 - [IR v0.2](design/ir-v0.2.md) & [IR Background](design/ir.md) — SSA IR specification, frame-slot call contract, T1–T10 taint invariants, lift/opt/lower algorithms
 - [Analysis Strategy](design/analysis-strategy.md) — IFDS solver, rungs 0–2 alias/PTA ladder, summary & callback-gap model
 - [Decompiler](design/decompile.md) — Stages A/B/C expression recovery, region structuring, and JS/TS emission
-- [Vendor Sync](design/vendor-sync.md) & [CI/CD](design/ci.md) — curated `vendor/` snapshot, offline codegen verification, tag radar, and the 20-job CI pipeline
+- [Vendor Sync](design/vendor-sync.md) & [CI/CD](design/ci.md) — curated `vendor/` snapshot, offline codegen verification, tag radar, and the 21-job CI pipeline
 
 ## Building
 

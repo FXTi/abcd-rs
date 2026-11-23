@@ -1,0 +1,27 @@
+name: Export ArkCompiler test corpus
+description: Pull the digest-pinned arkcompiler-test image and export corpus fixtures.
+inputs:
+  image:
+    description: Digest-pinned arkcompiler-test image reference
+    required: true
+  mode:
+    description: "'corpus' (5517 fixtures), 'wild' (156 OHOS haps), or 'both'"
+    required: false
+    default: corpus
+
+runs:
+  using: composite
+  steps:
+    - name: Export corpus fixtures (${{ inputs.mode }})
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker pull "${{ inputs.image }}"
+        if [ "${{ inputs.mode }}" = "corpus" ] || [ "${{ inputs.mode }}" = "both" ]; then
+          mkdir -p exports/corpus
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "${{ inputs.image }}" export /work
+        fi
+        if [ "${{ inputs.mode }}" = "wild" ] || [ "${{ inputs.mode }}" = "both" ]; then
+          mkdir -p exports/corpus/wild
+          docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "${{ inputs.image }}" export-wild /work/wild
+        fi
