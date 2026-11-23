@@ -1,0 +1,1211 @@
+//! Lexical slot scope reconstruction, TDZ-preserving late declarations, and rest parameters.
+
+use super::*;
+
+// ── d-P8: LexStore scope reconstruction (design §4.3 "Names") ──────
+//
+// v1 (d-P4) printed every lexical binding as a function-top `let n;`
+// plus plain `n = value;` assignments, with `/* scope-push […] */`
+// comments marking the `NewLexEnv*` sites. This fold reconstructs the
+// declaration site where provable: es2abc initializes a pushed frame's
+// slots with `stlexvar 0, slot` IMMEDIATELY after the push (the TDZ
+// hole + the elided `ThrowUndefinedIfHoleWithName` guard prove every
+// read is post-init), so the first store to a slot right after its
+// push IS the source's `let` declaration.
+//
+// Provable means ALL of:
+//   - the store sits in the same statement run as the push, at level 0
+//     (the just-pushed frame), with a slot index inside the frame;
+//   - every store to the same NAME anywhere in the function lives in
+//     that same run after the push (a store elsewhere would become an
+//     assignment to a binding the block declaration does not cover);
+//   - the name is not a parameter (redeclaration is a SyntaxError) and
+//     was not already block-declared by this fold (same-named frames
+//     stay comments + plain assignments — the honesty rule).
+//
+// `const` is deliberately NOT inferred: a capturing closure can
+// reassign the slot from a nested function body (cross-function proof
+// is out of scope) — declarations are uniformly `let`.
+//
+// Where the shape is unprovable the `/* scope-push […] */` comment and
+// the plain assignments stay, unchanged.
+
+/// One LexStore occurrence: which `Stmts` run (walk order) and leaf.
+pub(in crate::folds) struct LexStoreSite {
+    /// The run's walk-order id.
+    pub(in crate::folds) run: usize,
+    /// The leaf index within the run.
+    pub(in crate::folds) index: usize,
+}
+
+/// Reconstruct block-scoped declarations at provable lexenv push
+/// sites. Runs AFTER the desugar folds (it consumes their output).
+pub fn scope_fold(nodes: &mut [SNode], params: &[String], stats: &mut FoldStats) {
+    // Pass 1: census of every LexStore name → its sites.
+    fn census(
+        nodes: &[SNode],
+        runs: &mut usize,
+        stores: &mut std::collections::HashMap<String, Vec<LexStoreSite>>,
+    ) {
+        for n in nodes {
+            match n {
+                SNode::Stmts(leaves) => {
+                    let run = *runs;
+                    *runs += 1;
+                    for (index, l) in leaves.iter().enumerate() {
+                        if let Leaf::Raw(Stmt::LexStore { name, .. }) = l {
+                            stores
+                                .entry(name.clone())
+                                .or_default()
+                                .push(LexStoreSite { run, index });
+                        }
+                    }
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    census(then, runs, stores);
+                    census(otherwise, runs, stores);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => census(body, runs, stores),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    census(body, runs, stores);
+                    for c in catches {
+                        census(&c.body, runs, stores);
+                    }
+                    if let Some(f) = finally {
+                        census(f, runs, stores);
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        census(&c.body, runs, stores);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    let mut runs = 0usize;
+    let mut stores: std::collections::HashMap<String, Vec<LexStoreSite>> =
+        std::collections::HashMap::new();
+    census(nodes, &mut runs, &mut stores);
+
+    // Pass 2: convert the provable initializations.
+    let mut converted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    fn convert(
+        nodes: &mut [SNode],
+        runs: &mut usize,
+        stores: &std::collections::HashMap<String, Vec<LexStoreSite>>,
+        params: &[String],
+        converted: &mut std::collections::HashSet<String>,
+        stats: &mut FoldStats,
+    ) {
+        for n in nodes.iter_mut() {
+            match n {
+                SNode::Stmts(leaves) => {
+                    let run = *runs;
+                    *runs += 1;
+                    convert_run(leaves, run, stores, params, converted, stats);
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    convert(then, runs, stores, params, converted, stats);
+                    convert(otherwise, runs, stores, params, converted, stats);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => {
+                    convert(body, runs, stores, params, converted, stats)
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    convert(body, runs, stores, params, converted, stats);
+                    for c in catches {
+                        convert(&mut c.body, runs, stores, params, converted, stats);
+                    }
+                    if let Some(f) = finally {
+                        convert(f, runs, stores, params, converted, stats);
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        convert(&mut c.body, runs, stores, params, converted, stats);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn convert_run(
+        leaves: &mut Vec<Leaf>,
+        run: usize,
+        stores: &std::collections::HashMap<String, Vec<LexStoreSite>>,
+        params: &[String],
+        converted: &mut std::collections::HashSet<String>,
+        stats: &mut FoldStats,
+    ) {
+        let mut push_at: Vec<usize> = Vec::new();
+        for (i, l) in leaves.iter().enumerate() {
+            if matches!(l, Leaf::Raw(Stmt::ScopePush { .. })) {
+                push_at.push(i);
+            }
+        }
+        // Apply edits back-to-front so indices stay valid.
+        for &p in push_at.iter().rev() {
+            let Leaf::Raw(Stmt::ScopePush { names }) = &leaves[p] else {
+                unreachable!()
+            };
+            let slot_count = names.len();
+            // The immediate initialization run: level-0 slot stores
+            // (re-stores of already-initialized slots, elided-guard
+            // markers, and honesty comments may interleave).
+            let mut inits: Vec<(usize, u16)> = Vec::new(); // (leaf index, slot)
+            let mut j = p + 1;
+            while j < leaves.len() {
+                match &leaves[j] {
+                    Leaf::Raw(Stmt::LexStore { level, slot, .. })
+                        if *level == 0 && (*slot as usize) < slot_count =>
+                    {
+                        if inits.iter().any(|&(_, s)| s == *slot) {
+                            // A re-store of an initialized slot ends the
+                            // initialization run (conservative).
+                            break;
+                        }
+                        inits.push((j, *slot));
+                        j += 1;
+                    }
+                    Leaf::Raw(Stmt::Elided { .. } | Stmt::Fallback { .. }) => {
+                        j += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if inits.is_empty() {
+                continue;
+            }
+            // Which inits are provable declarations?
+            let mut declared_slots: Vec<u16> = Vec::new();
+            let mut decl_edits: Vec<(usize, Leaf)> = Vec::new();
+            for &(idx, slot) in &inits {
+                let Leaf::Raw(Stmt::LexStore { name, .. }) = &leaves[idx] else {
+                    unreachable!()
+                };
+                let name = name.clone();
+                if params.contains(&name) || converted.contains(&name) {
+                    continue;
+                }
+                // Same-name slots within this push: only the first may
+                // become a declaration (a second `let n` in one scope is
+                // a SyntaxError).
+                if decl_edits.iter().any(|(_, l)| {
+                    matches!(l, Leaf::Decl { name: dn, .. } if *dn == crate::legalize::sanitize(&name))
+                }) {
+                    continue;
+                }
+                // Every store to this name must live in THIS run after
+                // the push (else the block declaration would not cover
+                // it — strict-mode ReferenceError, or a shadowed
+                // binding).
+                let ok = stores
+                    .get(&name)
+                    .into_iter()
+                    .flatten()
+                    .all(|s| s.run == run && s.index > p);
+                if !ok {
+                    continue;
+                }
+                let Leaf::Raw(Stmt::LexStore { value, .. }) = &leaves[idx] else {
+                    unreachable!()
+                };
+                decl_edits.push((
+                    idx,
+                    Leaf::Decl {
+                        name: crate::legalize::sanitize(&name),
+                        mutable: true,
+                        value: Some(value.clone()),
+                    },
+                ));
+                declared_slots.push(slot);
+                converted.insert(name);
+            }
+            if decl_edits.is_empty() {
+                continue;
+            }
+            let mut declared_raw: Vec<String> = Vec::new();
+            for (idx, leaf) in decl_edits {
+                if let Leaf::Decl { name, .. } = &leaf {
+                    declared_raw.push(name.clone());
+                }
+                leaves[idx] = leaf;
+                stats.scope_fold += 1;
+            }
+            // The name's OTHER stores in this run (the `ok` check above
+            // proved they all live here, after the push) print as plain
+            // assignments — but left as raw `LexStore` leaves they still
+            // count toward emit's hoisted `lex_decls` whenever the push
+            // comment survives (an unprovable sibling slot keeps
+            // `own > level`), printing a second `let n;` at the function
+            // top — a same-scope redeclaration (SyntaxError; wild-smoke
+            // Bug B). Rewrite them to plain assignment leaves so the
+            // block declaration is the ONLY declaration of the name.
+            for l in leaves.iter_mut().skip(p + 1) {
+                if let Leaf::Raw(Stmt::LexStore { name, value, .. }) = l
+                    && declared_raw
+                        .iter()
+                        .any(|d| *d == crate::legalize::sanitize(name))
+                {
+                    *l = Leaf::Assign {
+                        target: crate::legalize::sanitize(name),
+                        value: value.clone(),
+                    };
+                }
+            }
+            // The push comment: consumed when every slot was declared;
+            // otherwise it stays, listing the undeclared slots only.
+            let Leaf::Raw(Stmt::ScopePush { names }) = &mut leaves[p] else {
+                unreachable!()
+            };
+            let remaining: Vec<Option<String>> = names
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| !declared_slots.contains(&(i as u16)))
+                .map(|(_, n)| n.clone())
+                .collect();
+            if remaining.is_empty() {
+                // Back-to-front push processing makes removal safe.
+                leaves.remove(p);
+            } else {
+                *names = remaining;
+            }
+        }
+    }
+    let mut runs = 0usize;
+    convert(nodes, &mut runs, &stores, params, &mut converted, stats);
+}
+
+// ── N74-W4: late declaration-site reconstruction (TDZ honesty) ─────
+//
+// The v1 scope model hoists every lexical/global binding: `let n;`
+// from emit's `lex_decls`, `var g;` at module top for global stores
+// (es2abc compiles function bodies STRICT — an undeclared STORE is a
+// ReferenceError, so the hoist cannot simply be dropped). Hoisting is
+// sound for value flow but DESTROYS the initialization window: a read
+// or closure call between scope entry and the first store sees
+// `undefined` where the original program's binding was still the TDZ
+// hole (lexical: `ldlexvar` + `ThrowUndefinedIfHoleWithName` →
+// ReferenceError) or did not exist at all (sloppy global:
+// undeclared-read ReferenceError). test262's `*-before-initialization`
+// rows and the "undeclared variable" operator rows (`x > (x = 1)`)
+// observe exactly this window.
+//
+// This fold reconstructs the window when it is PROVABLY faithful: the
+// binding's textually first store sits in a DECLARATION-CAPABLE run —
+// the function body's root statement run, or the root run of a `try`
+// BODY (a try body executes unconditionally up to the first throw, and
+// block-scope is safe there only when nothing references the name
+// outside that try body — checked). The first store becomes
+// `let n = <value>;` at that exact position; all other stores become
+// plain assignments; the hoisted `let n;` vanishes because
+// `lex_decls` only counts remaining `LexStore` leaves (the module-top
+// `var g;` stays — a function-scope `let` legally shadows it, and the
+// shadow IS the binding every in-function reference resolves to).
+// Every access executing before the declaration line then hits the JS
+// TDZ — the same ReferenceError the original program produced — and
+// every access after sees the stored value. Stores in nested functions
+// are capture-assignments to the same binding and stay assignments
+// (each function body is folded separately; their stores fail the
+// level/ownership check).
+//
+// Provable means ALL of:
+//   - the name is stored by exactly one KIND of store (lexical or
+//     global — a mix means the scope model is inconsistent);
+//   - for lexical stores, every store targets an OWN frame slot
+//     (level < own-push count, the `lex_decls` rule) — a capture store
+//     at level ≥ own belongs to an ancestor's binding;
+//   - global stores convert only at the TOP LEVEL (a `let` inside a
+//     nested function would shadow the global — dream gate:
+//     params-dflt-gen-meth's `callCount` died to exactly that);
+//   - the textually first store sits in a declaration-capable run, and
+//     when that run is inside a `try` body, NO reference to the name
+//     exists outside that try body (an outside reference would
+//     silently read the module-top `var` instead);
+//   - the name is not a parameter, was not already declared by
+//     [`scope_fold`], and is not a read-only global name
+//     (`undefined`/`NaN`/`Infinity` — the read-only-global collision
+//     lane owns those).
+//
+// Where the shape is unprovable the hoisted-`let`/hoisted-`var`
+// emission stays, unchanged (the honesty rule).
+
+/// One store occurrence for the late-decl fold.
+pub(in crate::folds) struct LateStore {
+    /// Sanitized binding name.
+    pub(in crate::folds) name: String,
+    /// The store's value defines a function/class (the module's PUBLIC
+    /// surface: an external reader — e.g. a test driver appended after
+    /// `func_main_0.call(this)` — reads the module-scope binding, so the
+    /// store must NOT become a shadowing local `let`; N74 yield-star
+    /// golden/node regression).
+    pub(in crate::folds) func_valued: bool,
+    /// Lexical store (vs global store).
+    pub(in crate::folds) lexical: bool,
+    /// The scope-chain level (lexical only; 0 for globals).
+    pub(in crate::folds) level: u16,
+    /// The innermost DECLARATION-CAPABLE region: `Some(0)` at the root
+    /// list, `Some(try-id)` inside a chain of `try` bodies; `None` when
+    /// the store sits in a run no declaration may occupy (an `if` arm,
+    /// a loop body, a `catch`/`finally`, …).
+    pub(in crate::folds) region: Option<usize>,
+    /// The enclosing try-body ids (innermost last) — the nesting check.
+    pub(in crate::folds) stack: Vec<usize>,
+    /// Whole-tree pre-order sequence number.
+    pub(in crate::folds) seq: usize,
+}
+
+/// The fold's whole-tree context.
+pub(in crate::folds) struct LateDeclCx {
+    /// Own lexenv pushes (the `lex_decls` ownership rule).
+    pub(in crate::folds) pushes: usize,
+    /// Names already declared (`scope_fold` conversions, params).
+    pub(in crate::folds) declared: std::collections::HashSet<String>,
+    /// Store sites, in pre-order.
+    pub(in crate::folds) stores: Vec<LateStore>,
+    /// `(name, try-stack-membership)`: a name read (or store target)
+    /// that appears OUTSIDE some try body — per try-id disqualifiers.
+    /// We record for every name-use the full try-stack; a candidate
+    /// with `try_id = Some(t)` dies if any use's stack lacks `t`.
+    pub(in crate::folds) uses: Vec<(String, Vec<usize>)>,
+    /// Monotonic try-body ids.
+    pub(in crate::folds) next_try: usize,
+    /// Pre-order counter.
+    pub(in crate::folds) seq: usize,
+    /// Sequence positions of every ScopePush/ScopePop (a name whose
+    /// use/store SPAN contains one may be re-pushed mid-span — a
+    /// different binding with the same name; N74-W4 corpus regression
+    /// for-update-continue-1: `let v2_0` declared twice for two
+    /// iterations' slots, the inner shadowing the outer's read).
+    pub(in crate::folds) scope_edges: Vec<usize>,
+}
+
+impl LateDeclCx {
+    fn new() -> Self {
+        Self {
+            pushes: 0,
+            declared: std::collections::HashSet::new(),
+            stores: Vec::new(),
+            uses: Vec::new(),
+            next_try: 1,
+            seq: 0,
+            scope_edges: Vec::new(),
+        }
+    }
+}
+
+/// Whether `e` mentions `name` as an identifier (a read of the
+/// binding; declaration sites and store targets are recorded by the
+/// caller).
+pub(in crate::folds) fn collect_ident_uses(
+    e: &Expr,
+    try_stack: &[usize],
+    out: &mut Vec<(String, Vec<usize>)>,
+) {
+    if let Expr::Ident(name) = e {
+        out.push((name.clone(), try_stack.to_vec()));
+    }
+    for c in expr_children(e) {
+        collect_ident_uses(c, try_stack, out);
+    }
+}
+
+/// Census for the late-decl fold. `region_stack` = enclosing
+/// DECLARATION-CAPABLE region ids (root list, try bodies, `if` arms,
+/// catch/finally bodies, labeled blocks — innermost last; loops and
+/// switch cases are NOT capable: a `let` there is per-iteration /
+/// fallthrough-unsafe). A store may become a declaration only when its
+/// run sits directly in a capable container (`capable_here`).
+pub(in crate::folds) fn late_decl_census(
+    nodes: &[SNode],
+    capable_here: bool,
+    region_stack: &mut Vec<usize>,
+    cx: &mut LateDeclCx,
+) {
+    for n in nodes {
+        match n {
+            SNode::Stmts(leaves) => {
+                for l in leaves {
+                    cx.seq += 1;
+                    match l {
+                        Leaf::Raw(Stmt::ScopePush { .. }) => {
+                            cx.pushes += 1;
+                            cx.scope_edges.push(cx.seq);
+                        }
+                        Leaf::Raw(Stmt::LexStore {
+                            level, name, value, ..
+                        }) => {
+                            let name = crate::legalize::sanitize(name);
+                            collect_ident_uses(value, region_stack, &mut cx.uses);
+                            cx.uses.push((name.clone(), region_stack.clone()));
+                            cx.stores.push(LateStore {
+                                func_valued: matches!(
+                                    value,
+                                    Expr::Closure { .. } | Expr::Class { .. }
+                                ),
+                                name,
+                                lexical: true,
+                                level: *level,
+                                region: capable_here
+                                    .then(|| region_stack.last().copied().unwrap_or(0)),
+                                stack: region_stack.clone(),
+                                seq: cx.seq,
+                            });
+                        }
+                        Leaf::Raw(Stmt::GlobalStore { name, value, .. }) => {
+                            let name = crate::legalize::sanitize(name);
+                            collect_ident_uses(value, region_stack, &mut cx.uses);
+                            cx.uses.push((name.clone(), region_stack.clone()));
+                            cx.stores.push(LateStore {
+                                func_valued: matches!(
+                                    value,
+                                    Expr::Closure { .. } | Expr::Class { .. }
+                                ),
+                                name,
+                                lexical: false,
+                                level: 0,
+                                region: capable_here
+                                    .then(|| region_stack.last().copied().unwrap_or(0)),
+                                stack: region_stack.clone(),
+                                seq: cx.seq,
+                            });
+                        }
+                        Leaf::Decl { name, value, .. } => {
+                            cx.declared.insert(name.clone());
+                            if let Some(v) = value {
+                                collect_ident_uses(v, region_stack, &mut cx.uses);
+                            }
+                        }
+                        Leaf::Raw(Stmt::ScopePop) => {
+                            cx.scope_edges.push(cx.seq);
+                        }
+                        Leaf::Assign { target, value } => {
+                            collect_ident_uses(value, region_stack, &mut cx.uses);
+                            cx.uses.push((target.clone(), region_stack.clone()));
+                        }
+                        Leaf::Raw(s) => {
+                            for e in stmt_exprs_of(s) {
+                                collect_ident_uses(e, region_stack, &mut cx.uses);
+                            }
+                        }
+                        Leaf::Destructure { obj, .. } => {
+                            collect_ident_uses(obj, region_stack, &mut cx.uses);
+                        }
+                    }
+                }
+            }
+            SNode::If {
+                cond,
+                then,
+                otherwise,
+            } => {
+                collect_ident_uses(cond, region_stack, &mut cx.uses);
+                for arm in [then, otherwise] {
+                    let id = cx.next_try;
+                    cx.next_try += 1;
+                    region_stack.push(id);
+                    late_decl_census(arm, true, region_stack, cx);
+                    region_stack.pop();
+                }
+            }
+            SNode::While { cond, body, .. } => {
+                if let Some(c) = cond {
+                    collect_ident_uses(c, region_stack, &mut cx.uses);
+                }
+                late_decl_census(body, false, region_stack, cx);
+            }
+            SNode::DoWhile { body, cond, .. } => {
+                late_decl_census(body, false, region_stack, cx);
+                collect_ident_uses(cond, region_stack, &mut cx.uses);
+            }
+            SNode::Labeled { body, .. } => {
+                let id = cx.next_try;
+                cx.next_try += 1;
+                region_stack.push(id);
+                late_decl_census(body, true, region_stack, cx);
+                region_stack.pop();
+            }
+            SNode::ForOf { iter, body, .. } => {
+                collect_ident_uses(iter, region_stack, &mut cx.uses);
+                late_decl_census(body, false, region_stack, cx);
+            }
+            SNode::ForIn { obj, body, .. } => {
+                collect_ident_uses(obj, region_stack, &mut cx.uses);
+                late_decl_census(body, false, region_stack, cx);
+            }
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                // Body, catches, and finally are all capable regions
+                // (a `let` confined to any of them is scoped to it).
+                let id = cx.next_try;
+                cx.next_try += 1;
+                region_stack.push(id);
+                late_decl_census(body, true, region_stack, cx);
+                region_stack.pop();
+                for c in catches {
+                    let id = cx.next_try;
+                    cx.next_try += 1;
+                    region_stack.push(id);
+                    late_decl_census(&c.body, true, region_stack, cx);
+                    region_stack.pop();
+                }
+                if let Some(f) = finally {
+                    let id = cx.next_try;
+                    cx.next_try += 1;
+                    region_stack.push(id);
+                    late_decl_census(f, true, region_stack, cx);
+                    region_stack.pop();
+                }
+            }
+            SNode::Switch { disc, cases } => {
+                collect_ident_uses(disc, region_stack, &mut cx.uses);
+                for c in cases {
+                    for t in &c.tests {
+                        collect_ident_uses(t, region_stack, &mut cx.uses);
+                    }
+                    late_decl_census(&c.body, false, region_stack, cx);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+}
+
+/// All expression positions of a raw statement (for the use census).
+pub(in crate::folds) fn stmt_exprs_of(s: &Stmt) -> Vec<&Expr> {
+    match s {
+        Stmt::Declare { value, .. } => vec![value],
+        Stmt::PhiAssign { value, .. } => vec![value],
+        Stmt::Expr(e) => vec![e],
+        Stmt::StoreProp { object, value, .. } => vec![object, value],
+        Stmt::StoreIndex {
+            object,
+            index,
+            value,
+            ..
+        } => vec![object, index, value],
+        Stmt::StoreDyn {
+            object, key, value, ..
+        } => vec![object, key, value],
+        Stmt::DefineMethod { object, func, .. } => vec![object, func],
+        Stmt::StorePrivate { object, value, .. } => vec![object, value],
+        Stmt::StoreSuper { key, value, .. } => key.iter().chain(std::iter::once(value)).collect(),
+        Stmt::LexStore { value, .. }
+        | Stmt::GlobalStore { value, .. }
+        | Stmt::ModuleStore { value, .. } => vec![value],
+        Stmt::Throw(e) => vec![e],
+        Stmt::Return(Some(e)) => vec![e],
+        Stmt::CondBranch { cond, .. } => vec![cond],
+        _ => Vec::new(),
+    }
+}
+
+/// See the section comment. Runs AFTER [`scope_fold`] (it consumes the
+/// stores scope_fold could not turn into declarations). `top_level`
+/// gates the global-store half (nested functions would shadow).
+pub fn late_decl_fold(
+    nodes: &mut [SNode],
+    params: &[String],
+    top_level: bool,
+    stats: &mut FoldStats,
+) {
+    let mut cx = LateDeclCx::new();
+    late_decl_census(nodes, true, &mut Vec::new(), &mut cx);
+
+    // Group by name; the qualifying set.
+    let mut names: Vec<String> = cx.stores.iter().map(|s| s.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    let mut convert: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    for name in names {
+        let sites: Vec<&LateStore> = cx.stores.iter().filter(|s| s.name == name).collect();
+        // One store kind only (a lexical/global mix means the scope
+        // model is inconsistent — the honest fallback stays).
+        if sites.iter().any(|s| s.lexical) && sites.iter().any(|s| !s.lexical) {
+            continue;
+        }
+        // Lexical stores must all target OWN frame slots (the
+        // `lex_decls` rule); a capture store belongs to an ancestor.
+        if sites
+            .iter()
+            .any(|s| s.lexical && s.level as usize >= cx.pushes)
+        {
+            continue;
+        }
+        // Global stores convert only at the top level.
+        if sites.iter().any(|s| !s.lexical) && !top_level {
+            continue;
+        }
+        // A function/class-valued binding AT THE MODULE TOP is the
+        // module's public surface: converting its first store to a local
+        // `let` shadows the module-scope `var` hoist and external readers
+        // (e.g. a test driver appended after `func_main_0.call(this)`)
+        // see `undefined` (the yield-star golden/node regression).
+        // Function-local closures keep the `let` conversion (s38).
+        if top_level && sites.iter().any(|s| s.func_valued) {
+            continue;
+        }
+        // Not a parameter, not already declared by scope_fold, not a
+        // read-only global name (the sister lane's collision class).
+        if params.contains(&name)
+            || cx.declared.contains(&name)
+            || matches!(name.as_str(), "undefined" | "NaN" | "Infinity")
+        {
+            continue;
+        }
+        // Coverage model (N74-W4). When the root run holds a store the
+        // declaration goes to the root (a function-scope `let` covering
+        // everything; nested stores stay assignments). Otherwise each
+        // declaration-capable region holding a store gets its own `let`
+        // (sibling `try` bodies etc. — S13.2.1_A7_T4's independent
+        // `x = x` probes), provided:
+        //   - every OTHER store and every READ of the name is COVERED
+        //     by a converted region — the reference's region stack
+        //     contains the region id (region 0, the root, covers
+        //     everything) — otherwise that reference would silently
+        //     read the module-top `var`/outer binding instead;
+        //   - no converted region nests inside another (an inner `let`
+        //     would shadow the outer region's binding mid-window).
+        let root_has = sites.iter().any(|s| s.region == Some(0));
+        if root_has {
+            // Same-name re-push mid-span → distinct bindings; bail.
+            let span_lo = sites.iter().map(|s| s.seq).min().unwrap_or(0);
+            let mut span_hi = span_lo;
+            for (n, _) in cx.uses.iter().filter(|(n, _)| *n == name) {
+                let _ = n;
+            }
+            for s in sites.iter() {
+                span_hi = span_hi.max(s.seq);
+            }
+            if cx.scope_edges.iter().any(|e| *e > span_lo && *e < span_hi) {
+                continue;
+            }
+            convert.insert(name, vec![0]);
+            continue;
+        }
+        let store_regions: std::collections::HashSet<usize> =
+            sites.iter().filter_map(|s| s.region).collect();
+        if store_regions.is_empty() {
+            continue;
+        }
+        let nested = cx.stores.iter().filter(|st| st.name == name).any(|st| {
+            st.region.is_some()
+                && st
+                    .stack
+                    .iter()
+                    .any(|t| store_regions.contains(t) && Some(*t) != st.region)
+        });
+        if nested {
+            continue;
+        }
+        let covered = |stack: &Vec<usize>| {
+            store_regions.contains(&0) || stack.iter().any(|t| store_regions.contains(t))
+        };
+        if cx
+            .uses
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .any(|(_, stack)| !covered(stack))
+        {
+            continue;
+        }
+        // Same-name re-push mid-span → distinct bindings; bail.
+        let span_lo = sites.iter().map(|s| s.seq).min().unwrap_or(0);
+        let mut span_hi = span_lo;
+        for s in sites.iter() {
+            span_hi = span_hi.max(s.seq);
+        }
+        if cx.scope_edges.iter().any(|e| *e > span_lo && *e < span_hi) {
+            continue;
+        }
+        convert.insert(name, store_regions.iter().copied().collect());
+    }
+    if convert.is_empty() {
+        return;
+    }
+
+    // Rewrite: per (name, region), the first store becomes the `let`;
+    // every other store becomes a plain assignment. Region ids are
+    // recomputed with the census's traversal (same walk, same ids).
+    let mut declared_now: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite(
+        nodes: &mut [SNode],
+        capable_here: bool,
+        region_stack: &mut Vec<usize>,
+        next_try: &mut usize,
+        convert: &std::collections::HashMap<String, Vec<usize>>,
+        declared_now: &mut std::collections::HashSet<(String, usize)>,
+        stats: &mut FoldStats,
+    ) {
+        for n in nodes.iter_mut() {
+            match n {
+                SNode::Stmts(leaves) => {
+                    let region = capable_here.then(|| region_stack.last().copied().unwrap_or(0));
+                    for l in leaves.iter_mut() {
+                        let name_regions = match l {
+                            Leaf::Raw(Stmt::LexStore { name, .. })
+                            | Leaf::Raw(Stmt::GlobalStore { name, .. }) => convert
+                                .get(&crate::legalize::sanitize(name))
+                                .map(|r| (crate::legalize::sanitize(name), r)),
+                            _ => None,
+                        };
+                        let Some((name, regions)) = name_regions else {
+                            continue;
+                        };
+                        let value = match l {
+                            Leaf::Raw(Stmt::LexStore { value, .. })
+                            | Leaf::Raw(Stmt::GlobalStore { value, .. }) => value.clone(),
+                            _ => unreachable!(),
+                        };
+                        // A declaration only in the name's DECL regions;
+                        // other capable stores (and non-capable runs)
+                        // stay plain assignments to it.
+                        let key = region.map(|r| (name.clone(), r));
+                        if let Some(key) = key
+                            && regions.contains(&key.1)
+                            && !declared_now.contains(&key)
+                        {
+                            declared_now.insert(key);
+                            *l = Leaf::Decl {
+                                name,
+                                mutable: true,
+                                value: Some(value),
+                            };
+                            stats.late_decl += 1;
+                        } else {
+                            *l = Leaf::Assign {
+                                target: name,
+                                value,
+                            };
+                        }
+                    }
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    for arm in [then, otherwise] {
+                        let id = *next_try;
+                        *next_try += 1;
+                        region_stack.push(id);
+                        rewrite(
+                            arm,
+                            true,
+                            region_stack,
+                            next_try,
+                            convert,
+                            declared_now,
+                            stats,
+                        );
+                        region_stack.pop();
+                    }
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => rewrite(
+                    body,
+                    false,
+                    region_stack,
+                    next_try,
+                    convert,
+                    declared_now,
+                    stats,
+                ),
+                SNode::Labeled { body, .. } => {
+                    let id = *next_try;
+                    *next_try += 1;
+                    region_stack.push(id);
+                    rewrite(
+                        body,
+                        true,
+                        region_stack,
+                        next_try,
+                        convert,
+                        declared_now,
+                        stats,
+                    );
+                    region_stack.pop();
+                }
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    let id = *next_try;
+                    *next_try += 1;
+                    region_stack.push(id);
+                    rewrite(
+                        body,
+                        true,
+                        region_stack,
+                        next_try,
+                        convert,
+                        declared_now,
+                        stats,
+                    );
+                    region_stack.pop();
+                    for c in catches {
+                        let id = *next_try;
+                        *next_try += 1;
+                        region_stack.push(id);
+                        rewrite(
+                            &mut c.body,
+                            true,
+                            region_stack,
+                            next_try,
+                            convert,
+                            declared_now,
+                            stats,
+                        );
+                        region_stack.pop();
+                    }
+                    if let Some(f) = finally {
+                        let id = *next_try;
+                        *next_try += 1;
+                        region_stack.push(id);
+                        rewrite(
+                            f,
+                            true,
+                            region_stack,
+                            next_try,
+                            convert,
+                            declared_now,
+                            stats,
+                        );
+                        region_stack.pop();
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        rewrite(
+                            &mut c.body,
+                            false,
+                            region_stack,
+                            next_try,
+                            convert,
+                            declared_now,
+                            stats,
+                        );
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    let mut next_try = 1usize;
+    rewrite(
+        nodes,
+        true,
+        &mut Vec::new(),
+        &mut next_try,
+        &convert,
+        &mut declared_now,
+        stats,
+    );
+}
+
+// ── N74-W4: rest-parameter reconstruction ──────────────────────────
+//
+// es2abc lowers `(...rest)` / `(a, ...rest)` to `copyrestargs k` (k =
+// the named-parameter count) plus ONE extra frame slot past the named
+// params (the rest array's staging slot — recover sees it as a spurious
+// trailing visible parameter `pN`). The generic emission prints
+// `[...arguments].slice(k) /*CopyRestArgs*/` — wrong in arrows and
+// closures (`arguments` is the OUTER function's; test262's
+// arrowparameters-cover-rest rows read the outer script's empty
+// arguments) and wrong for `.length` (the spurious slot inflates it —
+// rest-parameters/expected-argument-count). When the body holds exactly
+// one `CopyRestArgs` shape, rewrite it to a real rest parameter: every
+// `Expr::RestArgs` becomes the rest name, the visible params at-or-past
+// `k` drop (the staging slot), and `...<name>` joins the printed
+// signature. Bails — keeping the loud approximation — when any dropped
+// parameter is referenced in the body.
+
+/// Apply `f` to every expression position in the tree (leaves AND
+/// node conditions — the mutation counterpart of the use-census walk).
+pub(in crate::folds) fn map_exprs_mut(nodes: &mut [SNode], f: &mut impl FnMut(&mut Expr)) {
+    fn one_expr(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+        f(e);
+        for c in expr_children_mut(e) {
+            one_expr(c, f);
+        }
+    }
+    fn one_leaf(l: &mut Leaf, f: &mut impl FnMut(&mut Expr)) {
+        match l {
+            Leaf::Raw(s) => match s {
+                Stmt::Declare { value, .. }
+                | Stmt::PhiAssign { value, .. }
+                | Stmt::Expr(value)
+                | Stmt::Throw(value) => one_expr(value, f),
+                Stmt::Return(Some(e)) => one_expr(e, f),
+                Stmt::StoreProp { object, value, .. } => {
+                    one_expr(object, f);
+                    one_expr(value, f);
+                }
+                Stmt::StoreIndex {
+                    object,
+                    index,
+                    value,
+                    ..
+                } => {
+                    one_expr(object, f);
+                    one_expr(index, f);
+                    one_expr(value, f);
+                }
+                Stmt::StoreDyn {
+                    object, key, value, ..
+                } => {
+                    one_expr(object, f);
+                    one_expr(key, f);
+                    one_expr(value, f);
+                }
+                Stmt::DefineMethod { object, func, .. } => {
+                    one_expr(object, f);
+                    one_expr(func, f);
+                }
+                Stmt::StorePrivate { object, value, .. } => {
+                    one_expr(object, f);
+                    one_expr(value, f);
+                }
+                Stmt::StoreSuper { key, value, .. } => {
+                    if let Some(k) = key {
+                        one_expr(k, f);
+                    }
+                    one_expr(value, f);
+                }
+                Stmt::LexStore { value, .. }
+                | Stmt::GlobalStore { value, .. }
+                | Stmt::ModuleStore { value, .. } => one_expr(value, f),
+                Stmt::CondBranch { cond, .. } => one_expr(cond, f),
+                _ => {}
+            },
+            Leaf::Destructure { obj, .. } => one_expr(obj, f),
+            Leaf::Decl { value: Some(v), .. } => one_expr(v, f),
+            Leaf::Decl { value: None, .. } => {}
+            Leaf::Assign { value, .. } => one_expr(value, f),
+        }
+    }
+    for n in nodes {
+        match n {
+            SNode::Stmts(run) => {
+                for l in run {
+                    one_leaf(l, f);
+                }
+            }
+            SNode::If {
+                cond,
+                then,
+                otherwise,
+            } => {
+                one_expr(cond, f);
+                map_exprs_mut(then, f);
+                map_exprs_mut(otherwise, f);
+            }
+            SNode::While { cond, body, .. } => {
+                if let Some(c) = cond {
+                    one_expr(c, f);
+                }
+                map_exprs_mut(body, f);
+            }
+            SNode::DoWhile { body, cond, .. } => {
+                map_exprs_mut(body, f);
+                one_expr(cond, f);
+            }
+            SNode::Labeled { body, .. } => map_exprs_mut(body, f),
+            SNode::ForOf { iter, body, .. } => {
+                one_expr(iter, f);
+                map_exprs_mut(body, f);
+            }
+            SNode::ForIn { obj, body, .. } => {
+                one_expr(obj, f);
+                map_exprs_mut(body, f);
+            }
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                map_exprs_mut(body, f);
+                for c in catches {
+                    map_exprs_mut(&mut c.body, f);
+                }
+                if let Some(fin) = finally {
+                    map_exprs_mut(fin, f);
+                }
+            }
+            SNode::Switch { disc, cases } => {
+                one_expr(disc, f);
+                for c in cases {
+                    for t in &mut c.tests {
+                        one_expr(t, f);
+                    }
+                    map_exprs_mut(&mut c.body, f);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+}
+
+/// See the section comment. Mutates `params` (drops the staging slots,
+/// appends `...<rest>`) and rewrites the body's `RestArgs` exprs.
+/// `hidden` is the ABI-slot count (`params[hidden..]` are visible).
+pub fn rest_param_fold(
+    nodes: &mut [SNode],
+    params: &mut Vec<String>,
+    hidden: usize,
+    stats: &mut FoldStats,
+) {
+    // Exactly one CopyRestArgs shape?
+    let mut starts = BTreeSet::new();
+    map_exprs_mut(nodes, &mut |e| {
+        if let Expr::RestArgs { start_index } = e {
+            starts.insert(*start_index);
+        }
+    });
+    let collected: Vec<u16> = starts.into_iter().collect();
+    let [k] = collected[..] else {
+        return;
+    };
+    let k = k as usize;
+    let visible = params.len() - hidden.min(params.len());
+    if visible < k {
+        return; // shape mismatch — keep the approximation
+    }
+    // The dropped slots (the staging slot + anything past it) must be
+    // unreferenced.
+    let dropped: Vec<String> = params[hidden + k..].to_vec();
+    let mut dropped_used = false;
+    map_exprs_mut(nodes, &mut |e| {
+        if let Expr::Ident(n) = e
+            && dropped.iter().any(|d| d == n)
+        {
+            dropped_used = true;
+        }
+    });
+    if dropped_used {
+        return;
+    }
+    // Mint a collision-free rest name over every name the body knows.
+    let mut taken: BTreeSet<String> = params.iter().cloned().collect();
+    map_exprs_mut(nodes, &mut |e| match e {
+        Expr::Ident(n) => {
+            taken.insert(n.clone());
+        }
+        Expr::Temp { name, .. } => {
+            taken.insert(name.clone());
+        }
+        _ => {}
+    });
+    walk_leaves(nodes, &mut |l| match l {
+        Leaf::Raw(Stmt::Declare { name, .. }) | Leaf::Raw(Stmt::PhiDecl { name, .. }) => {
+            taken.insert(name.clone());
+        }
+        Leaf::Raw(Stmt::PhiAssign { target, .. }) => {
+            taken.insert(target.clone());
+        }
+        Leaf::Raw(Stmt::LexStore { name, .. }) | Leaf::Raw(Stmt::GlobalStore { name, .. }) => {
+            taken.insert(crate::legalize::sanitize(name));
+        }
+        Leaf::Decl { name, .. } => {
+            taken.insert(name.clone());
+        }
+        Leaf::Assign { target, .. } => {
+            taken.insert(target.clone());
+        }
+        _ => {}
+    });
+    let mut rest = "rest".to_string();
+    let mut i = 1usize;
+    while taken.contains(&rest) {
+        rest = format!("rest${i}");
+        i += 1;
+    }
+    // Rewrite. A bare `rest;` expression-statement (an unused
+    // CopyRestArgs result — keep-alive evidence, recover.rs) is
+    // consumed, not rewritten.
+    let rest_expr = Expr::Ident(rest.clone());
+    fn strip_bare_rest(nodes: &mut [SNode]) {
+        for n in nodes.iter_mut() {
+            match n {
+                SNode::Stmts(run) => {
+                    run.retain(|l| !matches!(l, Leaf::Raw(Stmt::Expr(Expr::RestArgs { .. }))));
+                }
+                SNode::If {
+                    then, otherwise, ..
+                } => {
+                    strip_bare_rest(then);
+                    strip_bare_rest(otherwise);
+                }
+                SNode::While { body, .. }
+                | SNode::DoWhile { body, .. }
+                | SNode::Labeled { body, .. }
+                | SNode::ForOf { body, .. }
+                | SNode::ForIn { body, .. } => strip_bare_rest(body),
+                SNode::Try {
+                    body,
+                    catches,
+                    finally,
+                    ..
+                } => {
+                    strip_bare_rest(body);
+                    for c in catches {
+                        strip_bare_rest(&mut c.body);
+                    }
+                    if let Some(f) = finally {
+                        strip_bare_rest(f);
+                    }
+                }
+                SNode::Switch { cases, .. } => {
+                    for c in cases {
+                        strip_bare_rest(&mut c.body);
+                    }
+                }
+                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+            }
+        }
+    }
+    strip_bare_rest(nodes);
+    map_exprs_mut(nodes, &mut |e| {
+        if matches!(e, Expr::RestArgs { .. }) {
+            *e = rest_expr.clone();
+        }
+    });
+    params.truncate(hidden + k);
+    params.push(format!("...{rest}"));
+    stats.rest_param += 1;
+}
