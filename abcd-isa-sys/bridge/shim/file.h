@@ -25,8 +25,10 @@
 #include "utils/span.h"
 #include "utils/bit_utils.h"
 
-// LOG macro — shim replacing the 541-line upstream logger.h
-#include "utils/logger.h"
+// LOG macro — shim in `vendor/shim/utils/logger.h` replacing upstream logger.h.
+// Use `<...>` so `/I` / `-I` include priority (`bridge/shim` -> `vendor/shim`)
+// always wins over MSVC `/FI` parent-TU directory lookup.
+#include <utils/logger.h>
 
 namespace panda::panda_file {
 
