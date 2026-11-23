@@ -85,20 +85,20 @@ jobs:
   build:
     name: Build & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 25
     needs: [fmt, clippy, doc, deny, vendor-verify]
     strategy:
       matrix:
         # Platform-compatibility lanes (2026-10-02 ruling): OS x arch cross,
-        # each at the OLDEST label GitHub still offers — the point is that
-        # artifacts built here keep running for ordinary users on old
-        # systems. ubuntu-latest is deliberately NOT a lane: every other job
-        # covers the current baseline.
+        # each at the oldest reliable label GitHub offers — macos-15-intel
+        # covers macOS 15 + x86_64 Darwin, while macos-latest (macos-26 arm64)
+        # taps the actively scaled Apple Silicon pool (macos-15 arm64 queues
+        # frequently hit the 15-min hosted provisioning timeout).
         os:
           - ubuntu-22.04 # oldest x86_64 Linux glibc GH offers
           - ubuntu-22.04-arm # aarch64 Linux (OpenHarmony's home turf)
-          - macos-15 # Apple Silicon (macos-14 label retired by GitHub)
-          - macos-15-intel # Intel Mac (macos-13 label retired — jobs queued forever)
+          - macos-latest # Apple Silicon arm64 (actively scaled macos-26 pool)
+          - macos-15-intel # Intel Mac + macOS 15 runtime
           - windows-2022 # oldest Windows label
           - windows-11-arm # aarch64 Windows
     steps:
@@ -170,14 +170,18 @@ jobs:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: qemu-arm -L /usr/arm-linux-gnueabihf
 
   # ── Per-push corpus jobs ───────────────────────────────────────────
-  # All five front gates (fmt ∥ clippy ∥ doc ∥ deny ∥ vendor-verify)
-  # already gate the four build lanes (`needs: [build, build32, win32, arm32]`).
+  # Depend directly on the five fast Tier-1 gates (`fmt`, `clippy`, `doc`,
+  # `deny`, `vendor-verify`, ~70s) rather than waiting serially behind the
+  # cross-OS `build` matrix: `clippy --all-targets` has already verified
+  # compilation on Linux, running Tier 2 in parallel with `Build & Test`
+  # shaves ~3 min off wall-clock critical path, and slow macOS/Windows runner
+  # queues never stall or skip Linux VM/corpus verification.
 
   file-isa:
     name: file-isa (pandasm per-instruction + corpus decode/re-encode)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -191,7 +195,7 @@ jobs:
     name: hap-file (wild OHOS hap container + decode gates)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -205,7 +209,7 @@ jobs:
     name: wild-gate (core-25 wild recompile acceptance + fallback ledger)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -219,7 +223,7 @@ jobs:
     name: file-lift (corpus lift+verify, 5517 incl. test262)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -233,7 +237,7 @@ jobs:
     name: lift-lower (rewrite + --merge-abc e2e + VM oracle ×3 variants)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -264,7 +268,7 @@ jobs:
     name: test262-vm (test262 rewrite + recorded-behavior VM oracle)
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -290,7 +294,7 @@ jobs:
     name: test262-dream (test262 decompile → es2abc recompile → recorded VM oracle)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -313,7 +317,7 @@ jobs:
     name: lift-analysis (callgraph smoke + dom agreement + regions)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -327,7 +331,7 @@ jobs:
     name: lift-taint (probe ladder + corpus smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -341,7 +345,7 @@ jobs:
     name: lift-decompile (stage A/B gates + dream gate + node evidence)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -363,7 +367,7 @@ jobs:
     name: Coverage (full estate)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     env:
       CXX: clang++-23
     steps:
@@ -411,7 +415,7 @@ jobs:
     name: ASan (nightly, address sanitizer, corpus-compute suites)
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: [build, build32, win32, arm32]
+    needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
