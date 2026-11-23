@@ -146,7 +146,6 @@ fn model_with_methods(
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     }
 }
 
@@ -439,7 +438,6 @@ fn type_summary_offset_field_yields_no_initial_value() {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     };
     let m = lift_file(&file).expect("lift");
     verify_clean(&m);
@@ -850,7 +848,6 @@ fn annotation_degrade_arms_for_dangling_identities() {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     };
     let mut m = lift_file(&file).expect("lift");
     verify_clean(&m);
@@ -1002,7 +999,6 @@ fn annotation_value_as_const_exotic_array_elements() {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     };
     let mut m = lift_file(&file).expect("lift");
     verify_clean(&m);
@@ -1092,7 +1088,6 @@ fn dangling_annotation_descriptor_and_element_name_are_skipped() {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     };
     let m = lift_file(&file).expect("lift");
     verify_clean(&m);
@@ -1143,7 +1138,6 @@ fn class_descriptor_key_mismatch_is_an_unresolved_entity() {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     };
     let err = lift_file(&file).expect_err("descriptor/key mismatch");
     assert!(matches!(err, LiftError::UnresolvedEntity(0)), "got {err:?}");
@@ -1185,7 +1179,6 @@ fn class_stubbed_by_super_reference_has_no_func_base() {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     };
     let err = lift_file(&file).expect_err("stubbed class has no func base");
     assert!(matches!(err, LiftError::UnresolvedEntity(0)), "got {err:?}");
@@ -1373,7 +1366,6 @@ fn module_record_file(md: abcd_file::ModuleData) -> abcd_file::File {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     }
 }
 
@@ -1449,7 +1441,6 @@ fn out_of_range_module_request_idx_is_malformed() {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     };
     let err = lift_file(&file).expect_err("request idx 7 with one request");
     assert!(

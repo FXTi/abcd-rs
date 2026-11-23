@@ -1,15 +1,15 @@
-//! `LowerOptions::prune_unused_frame_init_consts` regression: the v0.2
-//! frame-initial constants are instruction-less `ValueDef::Const` values
-//! (design/ir-v0.2.md §5.1), so an optimizer cannot sweep the seed the
-//! way v0.1's ADCE sweeps the seed INSTRUCTION. The lower's default
-//! (v0.1-lift parity) materializes even unused seeds' loads; the option
-//! (v0.1-opt parity) skips unused ones entirely.
+//! Frame-initial constant ownership & ADCE pruning regression (#30):
+//! `FunctionData::frame_init_consts` owns each function's seeded
+//! `ValueDef::Const` values directly. Unoptimized lowering materializes all
+//! owned seeds (`v2lift` parity); running ADCE (`abcd-opt`) sweeps unused
+//! entries from `func.frame_init_consts`, so lowering skips unused seed loads
+//! automatically without any `LowerOptions` flag (`v2opt` parity).
 
 use crate::common;
 use abcd_ir::verify_module;
 use abcd_ir::{Const, Module, Op};
 use abcd_isa::Bytecode;
-use abcd_lower::{LowerOptions, lower_function, lower_function_with_options};
+use abcd_lower::lower_function;
 
 use common::V2Builder;
 
@@ -21,7 +21,7 @@ fn build() -> (Module, abcd_ir::FuncId) {
     let func = V2Builder::create_function(&mut module, "f", abcd_ir::FunctionKind::Function);
     {
         let mut b = V2Builder::new(&mut module, func);
-        let _param_anchor = b.create_param(); // anchors the function's value-id range
+        let _param_anchor = b.create_param();
         let _unused = b.create_const_value(Const::Undefined);
         let used = b.create_const_value(Const::Hole);
         let obj = b.emit_val(Op::LoadNewTarget);
@@ -37,7 +37,7 @@ fn build() -> (Module, abcd_ir::FuncId) {
 }
 
 #[test]
-fn default_lowering_materializes_unused_seed() {
+fn unoptimized_lowering_materializes_owned_unused_seed() {
     let (module, func) = build();
     let report = verify_module(&module);
     assert!(report.is_ok(), "{:?}", report.errors);
@@ -47,7 +47,7 @@ fn default_lowering_materializes_unused_seed() {
             .bytecodes
             .iter()
             .any(|bc| matches!(bc, Bytecode::Ldundefined)),
-        "v0.1-lift parity: the unused seed's load is emitted: {:?}",
+        "owned unused seed load is emitted: {:?}",
         result.bytecodes
     );
     assert!(
@@ -55,29 +55,24 @@ fn default_lowering_materializes_unused_seed() {
             .bytecodes
             .iter()
             .any(|bc| matches!(bc, Bytecode::Ldhole)),
-        "the used seed's load is emitted: {:?}",
+        "used seed load is emitted: {:?}",
         result.bytecodes
     );
 }
 
 #[test]
-fn prune_option_skips_unused_seed_keeps_used() {
-    let (module, func) = build();
-    let result = lower_function_with_options(
-        &module,
-        func,
-        LowerOptions {
-            prune_unused_frame_init_consts: true,
-        },
-    )
-    .expect("lowers");
+fn swept_frame_init_consts_skips_unused_seed_keeps_used() {
+    let (mut module, func) = build();
+    // Simulate ADCE sweeping the unused `Undefined` entry while retaining the
+    // live `Hole` entry (`abcd-opt`'s `Adce` performs this sweep).
+    module.functions[func.index()].frame_init_consts.remove(0);
+    let result = lower_function(&module, func).expect("lowers");
     assert!(
         !result
             .bytecodes
             .iter()
             .any(|bc| matches!(bc, Bytecode::Ldundefined)),
-        "v0.1-opt parity: ADCE swept the unused seed instruction, so no \
-         load is materialized: {:?}",
+        "swept unused seed is not materialized: {:?}",
         result.bytecodes
     );
     assert!(
@@ -85,7 +80,7 @@ fn prune_option_skips_unused_seed_keeps_used() {
             .bytecodes
             .iter()
             .any(|bc| matches!(bc, Bytecode::Ldhole)),
-        "the used seed still materializes: {:?}",
+        "used seed still materializes: {:?}",
         result.bytecodes
     );
 }

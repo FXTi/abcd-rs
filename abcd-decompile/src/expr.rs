@@ -51,6 +51,8 @@ pub enum Lit {
     Number(u64),
     /// A string literal (unescaped content).
     String(String),
+    /// A lone-surrogate string literal as exact UTF-16 code units (#30).
+    Utf16(Vec<u16>),
     /// A BigInt literal (decimal repr; printed `n`-suffixed).
     BigInt(String),
     /// An array literal shape (`createarraywithbuffer`).
@@ -305,6 +307,16 @@ pub enum Expr {
         /// resolved. Fallback text source when raw is absent.
         cooked: Option<Vec<Lit>>,
     },
+    /// Stage-B folded tagged template call (e.g. `` tag`a${x}b` `` or
+    /// `` String.raw`a\nb` ``, #30).
+    TaggedTemplate {
+        /// Tag callee expression (`tag` or `obj.method`).
+        tag: Box<Expr>,
+        /// Raw quasi strings (`quasis.len() == exprs.len() + 1`).
+        quasis: Vec<String>,
+        /// Interpolated substitution expressions.
+        exprs: Vec<Expr>,
+    },
     /// `{ value, done }` — the iterator result object. Invisible in
     /// source after the for-of fold (d-P3); kept verbatim meanwhile.
     IterResultObj {
@@ -533,6 +545,7 @@ impl Expr {
             // (`function f(){}()` is a declaration + error, not a call).
             Expr::Closure { .. } => 1,
             Expr::Call { .. }
+            | Expr::TaggedTemplate { .. }
             | Expr::PropName { .. }
             | Expr::PropIndex { .. }
             | Expr::PropDyn { .. }

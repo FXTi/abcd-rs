@@ -1557,43 +1557,35 @@ fn phase_blob_unreadable_is_hard_error() {
 #[test]
 fn literal_array_lossy_identity_collision_is_hard_error() {
     // ED A0 B4 = U+D834, ED B4 86 = U+DF06, ED B4 87 = U+DF07 — all
-    // lossy-decode to three U+FFFD (see abcd-file/src/file.rs N72 tests).
+    // #30 regression: BMP Private Use Area strings (`\u{E000}..=\u{F8FF}`,
+    // including the exact former sentinel strings `LOSSY + U+E000 + hex`)
+    // MUST coexist losslessly with colliding lone-surrogate strings (`RAW_A`,
+    // `RAW_B`, `RAW_C`) across `decode` -> `encode` -> `decode`.
     const RAW_A: [u8; 3] = [0xED, 0xA0, 0xB4];
     const RAW_B: [u8; 3] = [0xED, 0xB4, 0x86];
     const RAW_C: [u8; 3] = [0xED, 0xB4, 0x87];
     const LOSSY: &str = "\u{FFFD}\u{FFFD}\u{FFFD}";
-    // The disambiguated identities RAW_B / RAW_C would get:
-    // content + U+E000 + lowercase hex(raw).
     let genuine_b = format!("{LOSSY}\u{E000}edb486");
     let genuine_c = format!("{LOSSY}\u{E000}edb487");
+    let icon_pua = "\u{E000}\u{E001}\u{F8FF}";
 
     let mut b = Builder::new();
     b.set_api(12, "beta1");
-    b.set_raw_strings(
-        [
-            ("key_a".to_string(), Box::from(&RAW_A[..])),
-            ("key_b".to_string(), Box::from(&RAW_B[..])),
-            ("key_c".to_string(), Box::from(&RAW_C[..])),
-        ]
-        .into_iter()
-        .collect(),
-    );
     let cls = b.add_global_class();
     b.class_set_source_lang(cls, SourceLang::EcmaScript);
     let la = b.add_literal_array("s");
-    // Order matters: the first lossy form records RAW_A; each genuine
-    // string interns the exact disambiguated identity of the lossy form
-    // that follows it, so both collisions fail loudly.
-    let s_a = b.add_string("key_a");
+    let s_a = b.add_string_mutf8(&RAW_A).unwrap();
     b.literal_array_add_string(la, s_a);
     let s_gb = b.add_string(&genuine_b);
     b.literal_array_add_string(la, s_gb);
-    let s_b = b.add_string("key_b");
+    let s_b = b.add_string_mutf8(&RAW_B).unwrap();
     b.literal_array_add_string(la, s_b);
     let s_gc = b.add_string(&genuine_c);
     b.literal_array_add_string(la, s_gc);
-    let s_c = b.add_string("key_c");
+    let s_c = b.add_string_mutf8(&RAW_C).unwrap();
     b.literal_array_add_string(la, s_c);
+    let s_pua = b.add_string(icon_pua);
+    b.literal_array_add_string(la, s_pua);
     let proto = b.create_proto(Type::Tagged, &[]);
     let m = b.class_add_method(
         cls,
@@ -1607,17 +1599,27 @@ fn literal_array_lossy_identity_collision_is_hard_error() {
     b.method_set_source_lang(m, SourceLang::EcmaScript);
     let data = b.finalize().expect("finalize");
 
-    let err = decode(&data).expect_err("a genuine identity collision must fail");
-    assert!(
-        matches!(
-            &err,
-            Error::Malformed {
-                field: "string",
-                context,
-            } if context.contains("genuine string collides with a disambiguated")
-        ),
-        "expected Malformed/string genuine-collision, got: {err:?}"
+    let decoded = decode(&data).expect("PUA + lone-surrogate strings decode losslessly");
+    let reencoded = abcd_file::encode(&decoded).expect("round-trip encode");
+    let roundtripped = decode(&reencoded).expect("round-trip decode");
+    let vals = &roundtripped.literal_arrays[0].values;
+    assert_eq!(vals.len(), 6);
+    let sid = |i: usize| match vals[i] {
+        abcd_file::LiteralValue::String(s) => s,
+        ref other => panic!("expected String at {i}, got {other:?}"),
+    };
+    assert_eq!(roundtripped.strings.raw_mutf8(sid(0)), Some(&RAW_A[..]));
+    assert_eq!(
+        roundtripped.strings.as_str(sid(1)),
+        Some(genuine_b.as_str())
     );
+    assert_eq!(roundtripped.strings.raw_mutf8(sid(2)), Some(&RAW_B[..]));
+    assert_eq!(
+        roundtripped.strings.as_str(sid(3)),
+        Some(genuine_c.as_str())
+    );
+    assert_eq!(roundtripped.strings.raw_mutf8(sid(4)), Some(&RAW_C[..]));
+    assert_eq!(roundtripped.strings.as_str(sid(5)), Some(icon_pua));
 }
 
 /// A literal-array string element whose item is unreadable interns the
@@ -2216,22 +2218,11 @@ fn build_operand_collision() -> Vec<u8> {
 
     let mut b = Builder::new();
     b.set_api(12, "beta1");
-    b.set_raw_strings(
-        [
-            ("key_a".to_string(), Box::from(&RAW_A[..])),
-            ("key_b".to_string(), Box::from(&RAW_B[..])),
-        ]
-        .into_iter()
-        .collect(),
-    );
     let cls = b.add_global_class();
     b.class_set_source_lang(cls, SourceLang::EcmaScript);
     let proto = b.create_proto(Type::Void, &[]);
-    // The second method's NAME is the genuine string carrying the
-    // disambiguated identity of key_b.
     let m2 = b.class_add_method(cls, &genuine, proto, AccessFlags::STATIC, &[0x65], 1, 0);
     b.method_set_source_lang(m2, SourceLang::EcmaScript);
-    // caller: ldstr key_a; ldstr key_b; returnundefined.
     let placeholder = EntityId(u16::MAX as u32);
     let mut insns = vec![
         Bytecode::LdaStr(placeholder),
@@ -2242,8 +2233,8 @@ fn build_operand_collision() -> Vec<u8> {
     let (code, offsets) = abcd_isa::encode(&insns).unwrap();
     let caller = b.class_add_method(cls, "caller", proto, AccessFlags::STATIC, &code, 1, 0);
     b.method_set_source_lang(caller, SourceLang::EcmaScript);
-    let s_a = b.add_string("key_a");
-    let s_b = b.add_string("key_b");
+    let s_a = b.add_string_mutf8(&RAW_A).unwrap();
+    let s_b = b.add_string_mutf8(&RAW_B).unwrap();
     b.relocate_code_id(caller, offsets[0], 0, CodeEntity::String(s_a))
         .expect("relocate first string operand");
     b.relocate_code_id(caller, offsets[1], 0, CodeEntity::String(s_b))
@@ -2252,54 +2243,39 @@ fn build_operand_collision() -> Vec<u8> {
     b.finalize().expect("finalize")
 }
 
-/// Modern: the N72 genuine-collision guard propagates through the method
-/// string-operand intern (`intern_string(...) ?`), not just the literal
-/// array pass.
+/// Modern (#30): PUA method names and colliding lone-surrogate string
+/// operands coexist losslessly without sentinel collisions.
 #[test]
-fn modern_string_operand_identity_collision_is_hard_error() {
+fn modern_string_operand_pua_and_lone_surrogates_coexist() {
+    const RAW_A: [u8; 3] = [0xED, 0xA0, 0xB4];
+    const RAW_B: [u8; 3] = [0xED, 0xB4, 0x86];
     let data = build_operand_collision();
-    let err = decode(&data).expect_err("the genuine identity collision must fail");
+    let file = decode(&data).expect("coexisting PUA + lone surrogates must decode");
+    let reencoded = abcd_file::encode(&file).expect("re-encode");
+    let rt = decode(&reencoded).expect("re-decode");
+    assert_eq!(rt.strings.lossy_count(), 2);
+    assert!(rt.strings.get_raw_mutf8(&RAW_A).is_some());
+    assert!(rt.strings.get_raw_mutf8(&RAW_B).is_some());
     assert!(
-        matches!(
-            &err,
-            Error::Malformed {
-                field: "string",
-                context,
-            } if context.contains("genuine string collides with a disambiguated")
-        ),
-        "expected Malformed/string genuine-collision, got: {err:?}"
+        rt.strings
+            .get("\u{FFFD}\u{FFFD}\u{FFFD}\u{E000}edb486")
+            .is_some()
     );
 }
 
-/// Legacy: the same propagation through the legacy direct-offset string
-/// operand rule.
+/// Legacy (#30): direct-offset lone-surrogate string operands and PUA method
+/// names coexist losslessly without sentinel collisions.
 #[test]
-fn legacy_string_operand_identity_collision_is_hard_error() {
-    // Same collision as the modern variant, but the file must stay clean
-    // until the legacy rewrite: start from a fixture with NO string
-    // operands (the collision would otherwise fire in the modern decode
-    // that make_legacy performs to learn the code location).
+fn legacy_string_operand_pua_and_lone_surrogates_coexist() {
     const RAW_A: [u8; 3] = [0xED, 0xA0, 0xB4];
     const RAW_B: [u8; 3] = [0xED, 0xB4, 0x86];
     const LOSSY: &str = "\u{FFFD}\u{FFFD}\u{FFFD}";
     let genuine = format!("{LOSSY}\u{E000}edb486");
     let mut b = Builder::new();
     b.set_api(12, "beta1");
-    b.set_raw_strings(
-        [
-            ("key_a".to_string(), Box::from(&RAW_A[..])),
-            ("key_b".to_string(), Box::from(&RAW_B[..])),
-        ]
-        .into_iter()
-        .collect(),
-    );
     let cls = b.add_global_class();
     b.class_set_source_lang(cls, SourceLang::EcmaScript);
     let proto = b.create_proto(Type::Void, &[]);
-    // The second method's NAME carries the disambiguated identity of key_b.
-    // Bodiless (empty code emits no code item): the legacy rewrite below
-    // only rewrites `caller`, and a modern-encoded second stream would be
-    // undecodable legacy bytecode.
     let m2 = b.class_add_method(cls, &genuine, proto, AccessFlags::STATIC, &[], 0, 0);
     b.method_set_source_lang(m2, SourceLang::EcmaScript);
     let mut insns = vec![Bytecode::Returnundefined];
@@ -2307,33 +2283,25 @@ fn legacy_string_operand_identity_collision_is_hard_error() {
     let (code, _) = abcd_isa::encode(&insns).unwrap();
     let caller = b.class_add_method(cls, "caller", proto, AccessFlags::STATIC, &code, 1, 0);
     b.method_set_source_lang(caller, SourceLang::EcmaScript);
-    let _a = b.add_string("key_a");
-    let _b = b.add_string("key_b");
+    let _a = b.add_string_mutf8(&RAW_A).unwrap();
+    let _b = b.add_string_mutf8(&RAW_B).unwrap();
     let lit = b.add_literal_array("lit");
     b.literal_array_add_integer(lit, 42);
     b.deduplicate();
     let mut data = b.finalize().expect("finalize");
-    // The two raw string items: [uleb (1<<1)|0 = 0x02][3 raw bytes][NUL].
     let item_a = locate_unique(&data, &[0x02, 0xED, 0xA0, 0xB4, 0x00]) as u32;
     let item_b = locate_unique(&data, &[0x02, 0xED, 0xB4, 0x86, 0x00]) as u32;
-    // Legacy stream: lda.str id32 (item_a); lda.str id32 (item_b); return.dyn.
     let mut stream = vec![0x18];
     stream.extend_from_slice(&item_a.to_le_bytes());
     stream.push(0x18);
     stream.extend_from_slice(&item_b.to_le_bytes());
     stream.push(0xa6);
     make_legacy(&mut data, &stream);
-    let err = decode(&data).expect_err("the genuine identity collision must fail (legacy)");
-    assert!(
-        matches!(
-            &err,
-            Error::Malformed {
-                field: "string",
-                context,
-            } if context.contains("genuine string collides with a disambiguated")
-        ),
-        "expected Malformed/string genuine-collision, got: {err:?}"
-    );
+    let file = decode(&data).expect("legacy PUA + lone surrogates must decode");
+    assert_eq!(file.strings.lossy_count(), 2);
+    assert!(file.strings.get_raw_mutf8(&RAW_A).is_some());
+    assert!(file.strings.get_raw_mutf8(&RAW_B).is_some());
+    assert!(file.strings.get(&genuine).is_some());
 }
 
 /// Legacy: a defineclasswithbuffer immediate with no legacy header table

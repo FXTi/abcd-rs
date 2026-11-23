@@ -246,91 +246,47 @@ fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir::Ins
 /// consecutive anchor-less functions are indistinguishable by id — and
 /// the lift does not produce the shape (a lazily created frame-initial
 /// const is wired into the instruction whose read created it).
-pub fn frame_init_consts(module: &Module, func_id: FuncId, used_only: bool) -> Vec<ValueId> {
-    // The use gate (opt parity): constants with at least one operand use
-    // in the owning function (phi entries are operands). Fusion
-    // suppression never hides a frame-initial const's use: suppressed
-    // instructions are the fused-away LoadConst/constant-index producers,
-    // which carry no SSA operands of their own.
-    let mut used: HashSet<ValueId> = HashSet::new();
-    if used_only && let Some(func) = module.func(func_id) {
-        for &bb in &func.blocks {
-            let Some(block) = module.block(bb) else {
-                continue;
-            };
-            for &iid in &block.insts {
-                if let Some(inst) = module.inst(iid) {
-                    used.extend(inst.op.operands());
-                }
-            }
+/// Per-function frame-initial constant values (`ValueDef::Const`, #30).
+///
+/// Ownership is recorded directly on [`abcd_ir::FunctionData::frame_init_consts`]
+/// at lift/construction time (and swept of dead entries by `abcd-opt`'s ADCE).
+/// For hand-built IR modules that construct a [`ValueDef::Const`] value and
+/// reference it in an instruction without registering it on
+/// `func.frame_init_consts`, any unrecorded `ValueDef::Const` operand used in
+/// `func.blocks` is appended in encounter order (`O(|F|)`).
+pub fn frame_init_consts(module: &Module, func_id: FuncId) -> Vec<ValueId> {
+    let Some(func) = module.func(func_id) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ValueId> = Vec::with_capacity(func.frame_init_consts.len());
+    let mut seen: HashSet<ValueId> = HashSet::with_capacity(func.frame_init_consts.len());
+    for &vid in &func.frame_init_consts {
+        if module
+            .value(vid)
+            .is_some_and(|v| matches!(v.def, ValueDef::Const(_)))
+            && seen.insert(vid)
+        {
+            out.push(vid);
         }
     }
-
-    // One module-wide pass, in function-table order: each function's
-    // anchor minimum (the id-range fallback) plus the const-defined
-    // operand uses (the primary, exact attribution).
-    let mut starts: Vec<(FuncId, u32)> = Vec::new();
-    let mut users: HashMap<ValueId, Vec<FuncId>> = HashMap::new();
-    for (i, f) in module.functions.iter().enumerate() {
-        let mut lo = u32::MAX;
-        for v in &f.params {
-            lo = lo.min(v.0);
-        }
-        for region in &f.try_regions {
-            for catch in &region.catches {
-                lo = lo.min(catch.exception.0);
-            }
-        }
-        for &bb in &f.blocks {
-            let Some(block) = module.block(bb) else {
+    for &bb in &func.blocks {
+        let Some(block) = module.block(bb) else {
+            continue;
+        };
+        for &iid in &block.insts {
+            let Some(inst) = module.inst(iid) else {
                 continue;
             };
-            for &iid in &block.insts {
-                let Some(inst) = module.inst(iid) else {
-                    continue;
-                };
-                if let Some(result) = inst.result {
-                    lo = lo.min(result.0);
-                }
-                for operand in inst.op.operands() {
-                    if module
+            for operand in inst.op.operands() {
+                if !seen.contains(&operand)
+                    && module
                         .value(operand)
                         .is_some_and(|v| matches!(v.def, ValueDef::Const(_)))
-                    {
-                        users
-                            .entry(operand)
-                            .or_default()
-                            .push(FuncId::new(i as u32));
-                    }
+                {
+                    seen.insert(operand);
+                    out.push(operand);
                 }
             }
-        }
-        if lo != u32::MAX {
-            starts.push((FuncId::new(i as u32), lo));
-        }
-    }
-    let mut out = Vec::new();
-    for (vid, value) in module.values.iter().enumerate() {
-        if !matches!(value.def, ValueDef::Const(_)) {
-            continue;
-        }
-        let id = vid as u32;
-        let vid = ValueId::new(id);
-        let owned = match users.get(&vid) {
-            // A used const belongs to its using function(s) — see the
-            // doc comment. This also covers anchor-less functions, which
-            // the id ranges cannot see.
-            Some(us) => us.contains(&func_id),
-            // An unused const: the id-range attribution — the owning
-            // function is the last one whose anchor minimum is <= id.
-            None => starts
-                .iter()
-                .rev()
-                .find(|(_, lo)| *lo <= id)
-                .is_some_and(|(owner, _)| *owner == func_id),
-        };
-        if owned && (!used_only || used.contains(&vid)) {
-            out.push(vid);
         }
     }
     out
@@ -338,11 +294,8 @@ pub fn frame_init_consts(module: &Module, func_id: FuncId, used_only: bool) -> V
 
 /// Allocate registers for a function using SSA-based chordal coloring.
 ///
-/// `suppression` (fusion analysis) names the v0.2-expansion values that
-/// must be invisible to allocation — v0.1's allocator never saw them,
-/// and coloring them would drift every other value's home.
-///
-/// Default options (v0.1-lift-faithful); see [`crate::LowerOptions`].
+/// `suppression` (fusion analysis) names the expansion values that must be
+/// invisible to allocation.
 pub fn allocate(
     module: &Module,
     func_id: FuncId,
@@ -356,7 +309,7 @@ pub fn allocate_with_options(
     module: &Module,
     func_id: FuncId,
     suppression: &Suppression,
-    options: crate::LowerOptions,
+    _options: crate::LowerOptions,
 ) -> Result<RegAlloc, RegAllocError> {
     let Some(func) = module.func(func_id) else {
         return Ok(RegAlloc {
@@ -399,7 +352,7 @@ pub fn allocate_with_options(
     // order (each new seed was inserted at entry index 0). The insertion
     // order matters: MCS's heap pops equal (weight, rank) keys in
     // heap-structural order.
-    let const_values = frame_init_consts(module, func_id, options.prune_unused_frame_init_consts);
+    let const_values = frame_init_consts(module, func_id);
     let entry = rpo.first().copied();
     let mut all_values: Vec<ValueId> = Vec::new();
     for &bb in &rpo {

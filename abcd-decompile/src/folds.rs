@@ -194,6 +194,7 @@ pub struct FoldStats {
 /// Run every fold over a structured body (recursive driver).
 pub fn fold(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
     fold_seq(nodes, stats);
+    fold_tagged_templates(nodes);
 }
 
 fn fold_seq(nodes: &mut Vec<SNode>, stats: &mut FoldStats) {
@@ -400,6 +401,10 @@ pub(crate) fn expr_children(e: &Expr) -> Vec<&Expr> {
             }
             out.extend(args.iter());
         }
+        Expr::TaggedTemplate { tag, exprs, .. } => {
+            out.push(tag);
+            out.extend(exprs.iter());
+        }
         Expr::DynamicImport { specifier } => out.push(specifier),
         Expr::Unary { operand, .. } => out.push(operand),
         Expr::Delete { target } => out.push(target),
@@ -504,6 +509,505 @@ fn strip_cond(mut e: &Expr) -> &Expr {
 fn fold_leaves(leaves: &mut Vec<Leaf>, stats: &mut FoldStats) {
     fold_rest_destructure(leaves, stats);
     fold_literal_builders(leaves, stats);
+}
+
+// ── Tagged-template call fold (#30) ──────────────────────────────────
+
+fn fold_tagged_templates(nodes: &mut [SNode]) {
+    let mut use_counts: std::collections::HashMap<ValueId, usize> =
+        std::collections::HashMap::new();
+    collect_value_uses_in_snodes(nodes, &mut use_counts);
+    fold_tagged_in_snodes(nodes, &use_counts);
+}
+
+fn collect_value_uses_in_expr(e: &Expr, counts: &mut std::collections::HashMap<ValueId, usize>) {
+    if let Expr::Temp { value, .. } = e {
+        *counts.entry(*value).or_insert(0) += 1;
+    }
+    for c in expr_children(e) {
+        collect_value_uses_in_expr(c, counts);
+    }
+}
+
+fn collect_value_uses_in_leaf(l: &Leaf, counts: &mut std::collections::HashMap<ValueId, usize>) {
+    match l {
+        Leaf::Raw(s) => match s {
+            Stmt::Declare { value, .. }
+            | Stmt::PhiAssign { value, .. }
+            | Stmt::LexStore { value, .. }
+            | Stmt::GlobalStore { value, .. }
+            | Stmt::ModuleStore { value, .. } => collect_value_uses_in_expr(value, counts),
+            Stmt::Expr(e) | Stmt::Throw(e) => collect_value_uses_in_expr(e, counts),
+            Stmt::Return(Some(e)) => collect_value_uses_in_expr(e, counts),
+            Stmt::StoreProp { object, value, .. } | Stmt::StorePrivate { object, value, .. } => {
+                collect_value_uses_in_expr(object, counts);
+                collect_value_uses_in_expr(value, counts);
+            }
+            Stmt::StoreIndex {
+                object,
+                index: key,
+                value,
+                ..
+            }
+            | Stmt::StoreDyn {
+                object, key, value, ..
+            } => {
+                collect_value_uses_in_expr(object, counts);
+                collect_value_uses_in_expr(key, counts);
+                collect_value_uses_in_expr(value, counts);
+            }
+            Stmt::DefineMethod { object, func, .. } => {
+                collect_value_uses_in_expr(object, counts);
+                collect_value_uses_in_expr(func, counts);
+            }
+            Stmt::StoreSuper { key, value, .. } => {
+                if let Some(k) = key {
+                    collect_value_uses_in_expr(k, counts);
+                }
+                collect_value_uses_in_expr(value, counts);
+            }
+            Stmt::CondBranch { cond, .. } => collect_value_uses_in_expr(cond, counts),
+            _ => {}
+        },
+        Leaf::Destructure { obj, .. } => collect_value_uses_in_expr(obj, counts),
+        Leaf::Decl { value: Some(v), .. } | Leaf::Assign { value: v, .. } => {
+            collect_value_uses_in_expr(v, counts)
+        }
+        Leaf::Decl { value: None, .. } => {}
+    }
+}
+
+fn collect_value_uses_in_snodes(
+    nodes: &[SNode],
+    counts: &mut std::collections::HashMap<ValueId, usize>,
+) {
+    for n in nodes {
+        match n {
+            SNode::Stmts(leaves) => {
+                for l in leaves {
+                    collect_value_uses_in_leaf(l, counts);
+                }
+            }
+            SNode::If {
+                cond,
+                then,
+                otherwise,
+            } => {
+                collect_value_uses_in_expr(cond, counts);
+                collect_value_uses_in_snodes(then, counts);
+                collect_value_uses_in_snodes(otherwise, counts);
+            }
+            SNode::While { cond, body, .. } => {
+                if let Some(c) = cond {
+                    collect_value_uses_in_expr(c, counts);
+                }
+                collect_value_uses_in_snodes(body, counts);
+            }
+            SNode::DoWhile { cond, body, .. } => {
+                collect_value_uses_in_expr(cond, counts);
+                collect_value_uses_in_snodes(body, counts);
+            }
+            SNode::ForOf { iter, body, .. } => {
+                collect_value_uses_in_expr(iter, counts);
+                collect_value_uses_in_snodes(body, counts);
+            }
+            SNode::ForIn { obj, body, .. } => {
+                collect_value_uses_in_expr(obj, counts);
+                collect_value_uses_in_snodes(body, counts);
+            }
+            SNode::Switch { disc, cases, .. } => {
+                collect_value_uses_in_expr(disc, counts);
+                for c in cases {
+                    for t in &c.tests {
+                        collect_value_uses_in_expr(t, counts);
+                    }
+                    collect_value_uses_in_snodes(&c.body, counts);
+                }
+            }
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                collect_value_uses_in_snodes(body, counts);
+                for c in catches {
+                    collect_value_uses_in_snodes(&c.body, counts);
+                }
+                if let Some(fin) = finally {
+                    collect_value_uses_in_snodes(fin, counts);
+                }
+            }
+            SNode::Labeled { body, .. } => collect_value_uses_in_snodes(body, counts),
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+}
+
+fn fold_tagged_in_snodes(
+    nodes: &mut [SNode],
+    use_counts: &std::collections::HashMap<ValueId, usize>,
+) {
+    for n in nodes.iter_mut() {
+        match n {
+            SNode::Stmts(leaves) => fold_tagged_in_leaves(leaves, use_counts),
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                fold_tagged_in_snodes(then, use_counts);
+                fold_tagged_in_snodes(otherwise, use_counts);
+            }
+            SNode::While { body, .. }
+            | SNode::DoWhile { body, .. }
+            | SNode::ForOf { body, .. }
+            | SNode::ForIn { body, .. }
+            | SNode::Labeled { body, .. } => fold_tagged_in_snodes(body, use_counts),
+            SNode::Switch { cases, .. } => {
+                for c in cases {
+                    fold_tagged_in_snodes(&mut c.body, use_counts);
+                }
+            }
+            SNode::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                fold_tagged_in_snodes(body, use_counts);
+                for c in catches {
+                    fold_tagged_in_snodes(&mut c.body, use_counts);
+                }
+                if let Some(fin) = finally {
+                    fold_tagged_in_snodes(fin, use_counts);
+                }
+            }
+            SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
+        }
+    }
+}
+
+fn member_expr_object(e: &Expr) -> Option<&Expr> {
+    match e {
+        Expr::PropName { object, .. }
+        | Expr::PropIndex { object, .. }
+        | Expr::PropDyn { object, .. } => Some(object),
+        _ => None,
+    }
+}
+
+fn is_pure_template_setup_leaf(l: &Leaf) -> bool {
+    match l {
+        Leaf::Raw(Stmt::Declare {
+            mutable: false,
+            value,
+            ..
+        }) => matches!(
+            value,
+            Expr::Lit(_) | Expr::ArrayLit { .. } | Expr::ArrayBuild { .. }
+        ),
+        Leaf::Raw(Stmt::StoreProp { own: true, .. })
+        | Leaf::Raw(Stmt::StoreIndex { own: true, .. })
+        | Leaf::Raw(Stmt::StoreDyn { own: true, .. }) => true,
+        _ => false,
+    }
+}
+
+fn leaf_mutates_ident(l: &Leaf, ident: &str) -> bool {
+    match l {
+        Leaf::Assign { target, .. } => target == ident,
+        Leaf::Raw(
+            Stmt::PhiAssign { target, .. }
+            | Stmt::LexStore { name: target, .. }
+            | Stmt::GlobalStore { name: target, .. },
+        ) => target == ident,
+        _ => false,
+    }
+}
+
+fn try_rewrite_tagged_call_in_expr(
+    e: &mut Expr,
+    tpl_vid: ValueId,
+    quasis: &[String],
+    prior_leaves: &[Leaf],
+    intervening_leaves: &[Leaf],
+    use_counts: &std::collections::HashMap<ValueId, usize>,
+) -> Option<Option<usize>> {
+    if let Expr::Call {
+        callee,
+        this,
+        args,
+        kind: abcd_ir::op::CallKind::Direct | abcd_ir::op::CallKind::Dynamic,
+    } = e
+        && args.len() == quasis.len()
+        && temp_value(&args[0]) == Some(tpl_vid)
+    {
+        match this {
+            None => {
+                // `tag(...)` without receiver: `tag` must not be a bare member
+                // expression (which in JS `` obj.m`...` `` would bind `this = obj`).
+                if member_expr_object(callee).is_none()
+                    && !matches!(
+                        callee.as_ref(),
+                        Expr::PrivateLoad { .. } | Expr::SuperProp { .. }
+                    )
+                {
+                    let mutated = temp_name(callee).is_some_and(|nm| {
+                        intervening_leaves.iter().any(|l| leaf_mutates_ident(l, nm))
+                    });
+                    if !mutated {
+                        let subs = args[1..].to_vec();
+                        let tag = callee.clone();
+                        *e = Expr::TaggedTemplate {
+                            tag,
+                            quasis: quasis.to_vec(),
+                            exprs: subs,
+                        };
+                        return Some(None);
+                    }
+                }
+            }
+            Some(recv) => {
+                if member_expr_object(callee) == Some(recv.as_ref()) {
+                    let subs = args[1..].to_vec();
+                    let tag = callee.clone();
+                    *e = Expr::TaggedTemplate {
+                        tag,
+                        quasis: quasis.to_vec(),
+                        exprs: subs,
+                    };
+                    return Some(None);
+                }
+                if let Some(fn_vid) = temp_value(callee)
+                    && use_counts.get(&fn_vid).copied() == Some(1)
+                    && matches!(
+                        recv.as_ref(),
+                        Expr::Ident(_) | Expr::Temp { .. } | Expr::GlobalThis
+                    )
+                {
+                    let found_c = prior_leaves.iter().enumerate().rev().find_map(|(c, l)| {
+                        if let Leaf::Raw(Stmt::Declare {
+                            mutable: false,
+                            value,
+                            value_id,
+                            ..
+                        }) = l
+                            && *value_id == fn_vid
+                        {
+                            Some((c, value))
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some((c, member_val)) = found_c
+                        && member_expr_object(member_val) == Some(recv.as_ref())
+                        && prior_leaves[c + 1..]
+                            .iter()
+                            .all(is_pure_template_setup_leaf)
+                        && temp_name(recv).is_none_or(|nm| {
+                            !intervening_leaves.iter().any(|l| leaf_mutates_ident(l, nm))
+                        })
+                    {
+                        let subs = args[1..].to_vec();
+                        let tag = Box::new(member_val.clone());
+                        *e = Expr::TaggedTemplate {
+                            tag,
+                            quasis: quasis.to_vec(),
+                            exprs: subs,
+                        };
+                        return Some(Some(c));
+                    }
+                }
+            }
+        }
+    }
+    for child in expr_children_mut(e) {
+        if let Some(res) = try_rewrite_tagged_call_in_expr(
+            child,
+            tpl_vid,
+            quasis,
+            prior_leaves,
+            intervening_leaves,
+            use_counts,
+        ) {
+            return Some(res);
+        }
+    }
+    None
+}
+
+fn try_rewrite_tagged_call_in_leaf(
+    leaf: &mut Leaf,
+    tpl_vid: ValueId,
+    quasis: &[String],
+    prior_leaves: &[Leaf],
+    intervening_leaves: &[Leaf],
+    use_counts: &std::collections::HashMap<ValueId, usize>,
+) -> Option<Option<usize>> {
+    match leaf {
+        Leaf::Raw(s) => match s {
+            Stmt::Declare { value, .. }
+            | Stmt::PhiAssign { value, .. }
+            | Stmt::LexStore { value, .. }
+            | Stmt::GlobalStore { value, .. }
+            | Stmt::ModuleStore { value, .. }
+            | Stmt::Expr(value)
+            | Stmt::Throw(value)
+            | Stmt::Return(Some(value)) => try_rewrite_tagged_call_in_expr(
+                value,
+                tpl_vid,
+                quasis,
+                prior_leaves,
+                intervening_leaves,
+                use_counts,
+            ),
+            Stmt::StoreProp { object, value, .. } | Stmt::StorePrivate { object, value, .. } => {
+                try_rewrite_tagged_call_in_expr(
+                    object,
+                    tpl_vid,
+                    quasis,
+                    prior_leaves,
+                    intervening_leaves,
+                    use_counts,
+                )
+                .or_else(|| {
+                    try_rewrite_tagged_call_in_expr(
+                        value,
+                        tpl_vid,
+                        quasis,
+                        prior_leaves,
+                        intervening_leaves,
+                        use_counts,
+                    )
+                })
+            }
+            Stmt::StoreIndex {
+                object,
+                index: key,
+                value,
+                ..
+            }
+            | Stmt::StoreDyn {
+                object, key, value, ..
+            } => try_rewrite_tagged_call_in_expr(
+                object,
+                tpl_vid,
+                quasis,
+                prior_leaves,
+                intervening_leaves,
+                use_counts,
+            )
+            .or_else(|| {
+                try_rewrite_tagged_call_in_expr(
+                    key,
+                    tpl_vid,
+                    quasis,
+                    prior_leaves,
+                    intervening_leaves,
+                    use_counts,
+                )
+            })
+            .or_else(|| {
+                try_rewrite_tagged_call_in_expr(
+                    value,
+                    tpl_vid,
+                    quasis,
+                    prior_leaves,
+                    intervening_leaves,
+                    use_counts,
+                )
+            }),
+            Stmt::CondBranch { cond, .. } => try_rewrite_tagged_call_in_expr(
+                cond,
+                tpl_vid,
+                quasis,
+                prior_leaves,
+                intervening_leaves,
+                use_counts,
+            ),
+            _ => None,
+        },
+        Leaf::Decl { value: Some(v), .. } | Leaf::Assign { value: v, .. } => {
+            try_rewrite_tagged_call_in_expr(
+                v,
+                tpl_vid,
+                quasis,
+                prior_leaves,
+                intervening_leaves,
+                use_counts,
+            )
+        }
+        _ => None,
+    }
+}
+
+fn fold_tagged_in_leaves(
+    leaves: &mut Vec<Leaf>,
+    use_counts: &std::collections::HashMap<ValueId, usize>,
+) {
+    let mut k = 0;
+    while k < leaves.len() {
+        let candidate = match &leaves[k] {
+            Leaf::Raw(Stmt::Declare {
+                mutable: false,
+                value:
+                    Expr::TemplateObject {
+                        raw: Some(raw_lits),
+                        ..
+                    },
+                value_id,
+                ..
+            }) if !raw_lits.is_empty() && use_counts.get(value_id).copied() == Some(1) => {
+                let quasis: Option<Vec<String>> = raw_lits
+                    .iter()
+                    .map(|l| match l {
+                        Lit::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                quasis.map(|q| (*value_id, q))
+            }
+            _ => None,
+        };
+        let Some((tpl_vid, quasis)) = candidate else {
+            k += 1;
+            continue;
+        };
+
+        let mut target_m: Option<usize> = None;
+        for (m, leaf) in leaves.iter().enumerate().skip(k + 1) {
+            let mut local_uses = std::collections::HashMap::new();
+            collect_value_uses_in_leaf(leaf, &mut local_uses);
+            if local_uses.get(&tpl_vid).copied().unwrap_or(0) > 0 {
+                target_m = Some(m);
+                break;
+            }
+        }
+        let Some(m) = target_m else {
+            k += 1;
+            continue;
+        };
+
+        let (head, tail) = leaves.split_at_mut(m);
+        let prior_leaves = &head[..k];
+        let intervening_leaves = &head[k + 1..];
+        let rewritten = try_rewrite_tagged_call_in_leaf(
+            &mut tail[0],
+            tpl_vid,
+            &quasis,
+            prior_leaves,
+            intervening_leaves,
+            use_counts,
+        );
+        if let Some(extra_remove_c) = rewritten {
+            leaves.remove(k);
+            if let Some(c) = extra_remove_c {
+                leaves.remove(c);
+                k = k.saturating_sub(1);
+            }
+        } else {
+            k += 1;
+        }
+    }
 }
 
 fn fold_literal_builders(leaves: &mut Vec<Leaf>, stats: &mut FoldStats) {
@@ -3413,6 +3917,10 @@ pub(crate) fn expr_children_mut(e: &mut Expr) -> Vec<&mut Expr> {
                 out.push(t);
             }
             out.extend(args.iter_mut());
+        }
+        Expr::TaggedTemplate { tag, exprs, .. } => {
+            out.push(tag);
+            out.extend(exprs.iter_mut());
         }
         Expr::DynamicImport { specifier } => out.push(specifier),
         Expr::Unary { operand, .. } => out.push(operand),

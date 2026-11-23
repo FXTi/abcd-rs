@@ -214,6 +214,9 @@ impl<'m> V2Builder<'m> {
             def: ValueDef::Const(cid),
             ty: Ty::Any,
         });
+        self.module.functions[self.func.index()]
+            .frame_init_consts
+            .push(val);
         val
     }
 }

@@ -43,7 +43,6 @@ use std::sync::OnceLock;
 
 use abcd_isa::{BytecodeFlags, EntityKind, Version};
 
-use crate::file::RAW_ID_SENTINEL;
 use crate::model::{
     Annotation, AnnotationElem, AnnotationValue, Annotations, CatchBlock, Class, Field, FieldValue,
     File, LiteralArray, Method, MethodBody, ModuleData, ModuleRecord, ModuleRequestPhase,
@@ -157,77 +156,6 @@ fn lossy(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 // MUTF-8 → String with the N72 lossy class
 // ---------------------------------------------------------------------------
-
-/// Strict MUTF-8 decode: `C0 80` → NUL, CESU-8 surrogate pairs combine into
-/// astral characters. `None` on any malformed sequence, including LONE
-/// surrogates — exactly the case the vendored MUTF-8→UTF-16 conversion
-/// fails on (the decode-side lossy class, N72).
-fn mutf8_decode(bytes: &[u8]) -> Option<String> {
-    let mut out: Vec<u16> = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == 0 {
-            return None; // MUTF-8 never carries a raw NUL
-        } else if b < 0x80 {
-            out.push(b as u16);
-            i += 1;
-        } else if b & 0xE0 == 0xC0 {
-            let b2 = *bytes.get(i + 1)?;
-            if b2 & 0xC0 != 0x80 {
-                return None;
-            }
-            out.push((((b & 0x1F) as u16) << 6) | (b2 & 0x3F) as u16);
-            i += 2;
-        } else if b & 0xF0 == 0xE0 {
-            let b2 = *bytes.get(i + 1)?;
-            let b3 = *bytes.get(i + 2)?;
-            if b2 & 0xC0 != 0x80 || b3 & 0xC0 != 0x80 {
-                return None;
-            }
-            let cp = (((b & 0x0F) as u32) << 12) | (((b2 & 0x3F) as u32) << 6) | (b3 & 0x3F) as u32;
-            if (0xD800..0xDC00).contains(&cp) {
-                // High surrogate: try to pair with a following low one
-                // (CESU-8 astral encoding, lossless).
-                let (n2, n3, n4) = (*bytes.get(i + 3)?, *bytes.get(i + 4)?, *bytes.get(i + 5)?);
-                if n2 & 0xF0 != 0xE0 || n3 & 0xC0 != 0x80 || n4 & 0xC0 != 0x80 {
-                    return None; // lone high surrogate: the lossy class
-                }
-                let lo =
-                    (((n2 & 0x0F) as u32) << 12) | (((n3 & 0x3F) as u32) << 6) | (n4 & 0x3F) as u32;
-                if !(0xDC00..0xE000).contains(&lo) {
-                    return None; // high surrogate followed by a non-low: lossy
-                }
-                out.push(cp as u16);
-                out.push(lo as u16);
-                i += 6;
-                continue;
-            } else if (0xDC00..0xE000).contains(&cp) {
-                return None; // lone low surrogate: the lossy class
-            }
-            out.push(cp as u16);
-            i += 3;
-        } else if b & 0xF8 == 0xF0 {
-            let b2 = *bytes.get(i + 1)?;
-            let b3 = *bytes.get(i + 2)?;
-            let b4 = *bytes.get(i + 3)?;
-            if b2 & 0xC0 != 0x80 || b3 & 0xC0 != 0x80 || b4 & 0xC0 != 0x80 {
-                return None;
-            }
-            let cp = (((b & 0x07) as u32) << 18)
-                | (((b2 & 0x3F) as u32) << 12)
-                | (((b3 & 0x3F) as u32) << 6)
-                | (b4 & 0x3F) as u32;
-            let ch = char::from_u32(cp)?;
-            let mut buf = [0u16; 2];
-            out.extend_from_slice(&*ch.encode_utf16(&mut buf));
-            i += 4;
-        } else {
-            return None;
-        }
-    }
-    String::from_utf16(&out).ok()
-}
 
 // ---------------------------------------------------------------------------
 // The string oracle (raw contents may contain quotes/commas/newlines)
@@ -585,9 +513,8 @@ const SYNTHETIC_OFFSET_BASE: u32 = 0x4000_0000;
 struct Parser {
     version: Version,
     oracle: Oracle,
-    /// String pool with the N72 lossy-string side table.
+    /// Lossless MUTF-8 / UTF-8 string pool (#30).
     strings: StringPool,
-    string_raw_bytes: HashMap<String, Box<[u8]>>,
     /// STRING section: content → offsets (file order = offset order).
     string_offsets: HashMap<Vec<u8>, Vec<u32>>,
     /// Regular literal entries in print order: (key index, key offset,
@@ -620,7 +547,6 @@ impl Parser {
             version,
             oracle: Oracle::default(),
             strings: StringPool::default(),
-            string_raw_bytes: HashMap::new(),
             string_offsets: HashMap::new(),
             regular: Vec::new(),
             lit_by_text: HashMap::new(),
@@ -633,61 +559,9 @@ impl Parser {
         }
     }
 
-    /// Intern raw MUTF-8 bytes, mirroring `file::intern_string` (the N72
-    /// lossy class: lone-surrogate contents intern their lossy form and
-    /// record the raw bytes; colliding raw forms get a sentinel identity).
+    /// Intern raw MUTF-8 bytes losslessly into [`StringPool`] (#30).
     fn intern(&mut self, raw: &[u8]) -> Result<StringId, ParseError> {
-        if let Some(text) = mutf8_decode(raw) {
-            return Ok(self.strings.get_or_intern(&text));
-        }
-        let text = String::from_utf8_lossy(raw).into_owned();
-        enum Case {
-            Duplicate,
-            First,
-            Collision,
-        }
-        let case = match self.string_raw_bytes.get(&text) {
-            Some(existing) if existing.as_ref() == raw => Case::Duplicate,
-            Some(_) => Case::Collision,
-            None => Case::First,
-        };
-        let identity = match case {
-            Case::Duplicate => text,
-            Case::First => {
-                self.string_raw_bytes
-                    .insert(text.clone(), raw.to_vec().into_boxed_slice());
-                text
-            }
-            Case::Collision => {
-                let mut disambiguated = text.clone();
-                disambiguated.push(RAW_ID_SENTINEL);
-                for b in raw {
-                    disambiguated.push_str(&format!("{b:02x}"));
-                }
-                match self.string_raw_bytes.get(&disambiguated) {
-                    Some(existing) => {
-                        if existing.as_ref() != raw {
-                            return err(
-                                0,
-                                "disambiguated lossy-string identity collision".to_owned(),
-                            );
-                        }
-                    }
-                    None => {
-                        if self.strings.get(disambiguated.as_str()).is_some() {
-                            return err(
-                                0,
-                                "genuine string collides with a lossy identity".to_owned(),
-                            );
-                        }
-                        self.string_raw_bytes
-                            .insert(disambiguated.clone(), raw.to_vec().into_boxed_slice());
-                    }
-                }
-                disambiguated
-            }
-        };
-        Ok(self.strings.get_or_intern(&identity))
+        Ok(self.strings.intern_mutf8(raw))
     }
 
     // -- top level -----------------------------------------------------------
@@ -1608,7 +1482,6 @@ impl Parser {
             literal_array_offsets,
             literal_array_header_offsets,
             entity_map: b.entity_map,
-            string_raw_bytes: self.string_raw_bytes,
         };
         // 13.x/24.x: the LITERALS index assignment is a pure function of
         // the (textually invisible) per-class method order and of which
@@ -2930,6 +2803,7 @@ mod tests {
     }
 
     // -- mutf8_decode: strict decoder, direct calls -----------------------
+    use crate::string_pool::mutf8_decode_utf8 as mutf8_decode;
 
     #[test]
     fn mutf8_decode_valid_forms() {
@@ -3999,14 +3873,8 @@ mod tests {
         let file = parse_file(&input).expect("exotic strings parse");
         // The 4-byte form decoded to the astral character.
         assert!(file.strings.get("\u{1F600}").is_some());
-        // Both lone-surrogate raw forms are registered (collision →
-        // disambiguated identity).
-        assert_eq!(
-            file.string_raw_bytes.len(),
-            2,
-            "{:?}",
-            file.string_raw_bytes
-        );
+        // Both lone-surrogate raw forms are registered losslessly (#30).
+        assert_eq!(file.strings.lossy_count(), 2);
         // Emit side: the raw bytes are re-emitted verbatim at their listed
         // offsets (the 4-byte form goes out as CESU-8, so anchor the
         // surrogate checks on their STRING entry headers).

@@ -343,7 +343,6 @@ fn module_request_phase_flags_become_lazy_requests() {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     };
 
     let m = lift_file(&file).expect("lift");
@@ -451,7 +450,6 @@ fn annotation_buckets_merge_in_documented_order() {
         entity_map: Default::default(),
         literal_array_offsets: Default::default(),
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     };
 
     let m = lift_file(&file).expect("lift");

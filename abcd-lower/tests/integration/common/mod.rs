@@ -170,7 +170,7 @@ impl<'m> V2Builder<'m> {
         val
     }
 
-    /// Create a frame-initial-style const value.
+    /// Create a frame-initial-style const value registered on `self.func` (#30).
     pub fn create_const_value(&mut self, c: Const) -> ValueId {
         let cid = self.module.consts.push(c);
         let val = ValueId::new(self.module.values.len() as u32);
@@ -178,6 +178,9 @@ impl<'m> V2Builder<'m> {
             def: ValueDef::Const(cid),
             ty: Ty::Any,
         });
+        self.module.functions[self.func.index()]
+            .frame_init_consts
+            .push(val);
         val
     }
 }

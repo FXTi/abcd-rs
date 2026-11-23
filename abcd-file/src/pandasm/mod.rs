@@ -72,45 +72,20 @@ pub fn emit_file(file: &File, source_name: &str) -> Vec<u8> {
 // String bytes (MUTF-8 re-encode, matching upstream's raw print)
 // ---------------------------------------------------------------------------
 
-/// The raw bytes upstream prints for a pooled string: the captured original
-/// MUTF-8 for the registered lossy class (lone surrogates), else the MUTF-8
-/// re-encode of the pool identity (embedded NUL as `C0 80`, astral chars as
-/// surrogate pairs).
+/// The raw bytes upstream prints for a pooled string: exact MUTF-8 wire
+/// bytes (borrowed verbatim for lone-surrogate entries, encoded on demand for
+/// valid Unicode entries including BMP PUA `U+E000..=U+F8FF`, #30).
 fn string_bytes(file: &File, sid: StringId) -> Vec<u8> {
-    let Some(identity) = file.strings.resolve(sid) else {
-        return b"!invalid:string".to_vec();
-    };
-    if let Some(raw) = file.string_raw_bytes.get(identity) {
-        return raw.to_vec();
+    match file.strings.to_mutf8_bytes(sid) {
+        Some(bytes) => bytes.into_owned(),
+        None => b"!invalid:string".to_vec(),
     }
-    mutf8_bytes(identity)
 }
 
-/// MUTF-8 encode (embedded NUL as C0 80, astral chars as surrogate pairs).
-/// The N72 disambiguation suffix (U+E000 + hex) is our bookkeeping and is
-/// never emitted.
+/// MUTF-8 encode (embedded NUL as C0 80, astral chars as surrogate pairs,
+/// all BMP characters including PUA `U+E000..=U+F8FF` preserved verbatim).
 pub fn mutf8_bytes(s: &str) -> Vec<u8> {
-    let s = s.find('\u{E000}').map_or(s, |i| &s[..i]);
-    let mut out = Vec::new();
-    for c in s.chars() {
-        let c = c as u32;
-        if c == 0 {
-            out.extend_from_slice(&[0xC0, 0x80]);
-        } else if c >= 0x10000 {
-            let c = c - 0x10000;
-            for unit in [0xD800 + (c >> 10), 0xDC00 + (c & 0x3FF)] {
-                out.extend_from_slice(&[
-                    0xE0 | (unit >> 12) as u8,
-                    0x80 | ((unit >> 6) & 0x3F) as u8,
-                    0x80 | (unit & 0x3F) as u8,
-                ]);
-            }
-        } else {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(char::from_u32(c).unwrap().encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    out
+    crate::string_pool::mutf8_encode(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -1679,7 +1654,6 @@ mod tests {
             literal_array_offsets: HashMap::new(),
             literal_array_header_offsets: Vec::new(),
             entity_map: HashMap::new(),
-            string_raw_bytes: HashMap::new(),
         }
     }
 
@@ -1930,8 +1904,9 @@ mod tests {
             mutf8_bytes("\u{1F600}"),
             [0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]
         );
-        // The N72 disambiguation suffix is never emitted.
-        assert_eq!(mutf8_bytes("ok\u{E000}dead"), b"ok");
+        // BMP Private Use Area characters (e.g. HarmonyOS IconFont code points)
+        // are preserved verbatim without truncation.
+        assert_eq!(mutf8_bytes("ok\u{E000}dead"), "ok\u{E000}dead".as_bytes());
     }
 
     #[test]

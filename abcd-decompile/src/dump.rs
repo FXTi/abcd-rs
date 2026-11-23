@@ -458,6 +458,17 @@ pub fn dump_expr(e: &Expr) -> String {
                 (None, None) => "template(<unresolved>) /*raw+cooked absent*/".to_string(),
             }
         }
+        Expr::TaggedTemplate { tag, quasis, exprs } => {
+            let mut s = format!("{}`", dump_expr(tag));
+            for (i, q) in quasis.iter().enumerate() {
+                s.push_str(q);
+                if let Some(arg) = exprs.get(i) {
+                    s.push_str(&format!("${{{}}}", dump_expr(arg)));
+                }
+            }
+            s.push('`');
+            s
+        }
         Expr::IterResultObj { value, done } => format!(
             "{{value: {}, done: {}}} /*iter-result*/",
             dump_expr(value),

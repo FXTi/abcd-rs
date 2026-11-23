@@ -216,6 +216,10 @@ pub struct FunctionData {
     /// `params[0]` (the FUNC slot under the `0xF` default; the earlier
     /// "`params[0]` = `this`" convention is superseded, N66/N67).
     pub params: Vec<ValueId>,
+    /// Per-function frame-initial constant values ([`ValueDef::Const`], e.g.
+    /// `Undefined` for unread virtual registers and `Hole` for unread
+    /// accumulator at entry), in creation order (#30).
+    pub frame_init_consts: Vec<ValueId>,
     /// Blocks owned by this function; `blocks[0]` is the entry block.
     pub blocks: Vec<BlockId>,
     /// Structured try regions (§5.2); also the source of exceptional CFG
@@ -239,6 +243,7 @@ impl FunctionData {
             modifiers: Modifiers::NONE,
             is_external: false,
             params: Vec::new(),
+            frame_init_consts: Vec::new(),
             blocks: Vec::new(),
             try_regions: Vec::new(),
             debug: None,

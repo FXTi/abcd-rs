@@ -136,14 +136,7 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
         )));
     }
 
-    // LowerOptions field doc: `prune_unused_frame_init_consts` must be set
-    // when lowering abcd-opt's output (the optimizer can delete the last
-    // use of a frame-initial constant, and the v0.2 seed is
-    // instruction-less, so the lower must skip the materialization); it
-    // must stay clear for lift output, which v0.1-lift emits verbatim.
-    let lower_options = LowerOptions {
-        prune_unused_frame_init_consts: opts.optimize,
-    };
+    let lower_options = LowerOptions::default();
 
     let resolver = EntityResolver::new(&ir, &file);
     let per_func: Vec<Result<Option<abcd_file::MethodBody>, CliError>> = func_ids

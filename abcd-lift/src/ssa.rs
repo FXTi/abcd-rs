@@ -51,6 +51,9 @@ pub struct SsaBuilder {
     /// their `ConstId` with literal loads of the same constant.
     frame_initial_undefined: Option<ValueId>,
     frame_initial_hole: Option<ValueId>,
+    /// Frame-initial constant `ValueId`s materialized for this function, in
+    /// creation order (#30).
+    pub frame_init_consts: Vec<ValueId>,
     undefined_const: ConstId,
     hole_const: ConstId,
 }
@@ -65,6 +68,7 @@ impl SsaBuilder {
             incomplete_phis: HashMap::new(),
             frame_initial_undefined: None,
             frame_initial_hole: None,
+            frame_init_consts: Vec::new(),
             undefined_const,
             hole_const,
         }
@@ -149,6 +153,7 @@ impl SsaBuilder {
             RegOrAcc::Acc => self.frame_initial_hole = Some(val),
             RegOrAcc::Reg(_) => self.frame_initial_undefined = Some(val),
         }
+        self.frame_init_consts.push(val);
         val
     }
 

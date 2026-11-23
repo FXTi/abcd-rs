@@ -286,15 +286,11 @@ fn g06_emit_tagged_call() {
     let d = decompile_module(&m, &EmitOptions::default());
     assert!(d.stats.fallback_comments.is_empty());
     assert!(
-        d.text.contains("p1(v13, 3.0)"),
-        "tag call with the template object arg:\n{}",
+        d.text.contains("const v15 = p1`a${3.0}b`;"),
+        "tagged template call folded cleanly without identity-tag wrapper:\n{}",
         d.text
     );
-    assert!(
-        d.text.contains("const v13 = ((_=>_)`a${0}b`);"),
-        "reconstructed template object:\n{}",
-        d.text
-    );
+    assert!(!d.text.contains("((_=>_)"), "no wrapper:\n{}", d.text);
 }
 
 /// g07 — emit-level: the `String.raw`a\nb`` this-call shape (corpus
@@ -332,15 +328,12 @@ fn g07_emit_string_raw_shape() {
     let d = decompile_module(&m, &EmitOptions::default());
     assert!(d.stats.fallback_comments.is_empty());
     assert!(
-        d.text.contains("((_=>_)`a\\nb`)"),
-        "raw text in the template object:\n{}",
+        d.text.contains("const v12 = p1.raw`a\\nb`;"),
+        "method-form tagged template folded cleanly without .call or identity-tag wrapper:\n{}",
         d.text
     );
-    assert!(
-        d.text.contains(".call("),
-        "this-call shape preserved:\n{}",
-        d.text
-    );
+    assert!(!d.text.contains("((_=>_)"), "no wrapper:\n{}", d.text);
+    assert!(!d.text.contains(".call("), "no .call:\n{}", d.text);
 }
 
 /// g08 — emit-level fallback: raw genuinely absent (flat const array —

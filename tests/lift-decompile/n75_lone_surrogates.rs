@@ -1,24 +1,12 @@
-//! N75: lone-surrogate string fidelity in the DECOMPILER (3 test262
-//! dream-gate `decompile-bug-misc-assertion-divergence` rows).
+//! N75 / #30: lone-surrogate and BMP PUA string fidelity in `abcd-decompile`.
 //!
-//! The .abc layer (abcd-file, N72-C3) preserves raw MUTF-8 bytes for
-//! strings that have no lossless Rust `String` form (lone surrogates),
-//! keyed by pool identity (the lossy content, or its sentinel-
-//! disambiguated `content + U+E000 + hex(raw)` form on a raw-form
-//! collision) in `File::string_raw_bytes`. But a lone surrogate cannot
-//! be written into valid UTF-8 JS source: the decompiler used to emit
-//! the lossy identity verbatim, degrading every surrogate to three
-//! U+FFFD (and LEAKING the sentinel-disambiguation suffix into the
-//! output), so the recompiled program's string differed from the
-//! original.
-//!
-//! The fix: the lift plumbs `string_raw_bytes` into the IR `Module`,
-//! and the decompiler's string-literal rendering consults it — a pooled
-//! string with a raw-bytes record renders from those bytes, with each
-//! lone-surrogate code unit as a `\uXXXX` escape (valid JS; es2abc
-//! recompiles it to the same MUTF-8 bytes) and well-formed surrogate
-//! pairs passing through as their astral character (CESU-8 re-encode
-//! is byte-identical).
+//! `abcd-file::StringPool` and `abcd-ir::SymbolTable` store lone-surrogate
+//! MUTF-8 strings in a dedicated byte-keyed bucket (`as_str() == None`,
+//! `utf16_units()` / `raw_mutf8()` exact) rather than mangling UTF-8 string
+//! keys with `U+E000` sentinels. `abcd-decompile` converts lone-surrogate
+//! symbols to [`abcd_decompile::expr::Lit::Utf16`] (and escapes lone surrogates
+//! in `AllocRegExp` patterns and module specifiers as `\uXXXX`), while genuine
+//! BMP Private Use Area strings (`U+E000..=U+F8FF`) pass through untouched.
 //!
 //! Corpus-fixture tests (`#[ignore]`d like `golden_yield_star.rs`); run:
 //!
@@ -28,7 +16,7 @@
 
 use crate::common;
 
-use abcd_decompile::consts::{render_mutf8_string, render_pool_string};
+use abcd_decompile::consts::{render_mutf8_string, render_pool_string, render_sym_string};
 use abcd_decompile::emit::{EmitOptions, decompile_module};
 
 /// The three dream-gate rows this task delists.
@@ -85,17 +73,21 @@ fn n75_render_mutf8_string_units() {
     assert_eq!(render_mutf8_string(&[0xED, 0xA0]), "\"\u{FFFD}\u{FFFD}\"");
 }
 
-/// A sentinel-disambiguated pool identity resolves through the module's
-/// side table to its RAW bytes — the sentinel suffix never reaches the
-/// output — while unrecorded strings render verbatim.
+/// Colliding lone surrogates (`U+D834` and `U+DF06`) and genuine BMP PUA
+/// strings (`U+E000..=U+F8FF`) coexist losslessly in `SymbolTable` without
+/// sentinel mangling (#30).
 #[test]
 fn n75_render_pool_string_lookup() {
     let mut module = abcd_ir::module::Module::new();
-    let identity = "���\u{E000}edbc86".to_string();
-    module
-        .string_raw_bytes
-        .insert(identity.clone(), vec![0xED, 0xBC, 0x86].into_boxed_slice());
-    assert_eq!(render_pool_string(&module, &identity), "\"\\uDF06\"");
+    let sym_lo = module.sym.intern_raw_mutf8(&[0xED, 0xBC, 0x86]);
+    let sym_hi = module.sym.intern_raw_mutf8(&[0xED, 0xA0, 0xB4]);
+    let sym_pua = module.sym.intern("\u{FFFD}\u{FFFD}\u{FFFD}\u{E000}edbc86");
+    assert_eq!(render_sym_string(&module, sym_lo), "\"\\uDF06\"");
+    assert_eq!(render_sym_string(&module, sym_hi), "\"\\uD834\"");
+    assert_eq!(
+        render_sym_string(&module, sym_pua),
+        "\"\u{FFFD}\u{FFFD}\u{FFFD}\u{E000}edbc86\""
+    );
     assert_eq!(render_pool_string(&module, "plain"), "\"plain\"");
 }
 
@@ -119,10 +111,9 @@ fn n75_no_fffd_no_sentinel() {
 }
 
 /// Row 1 (built-ins/StringIteratorPrototype/next/next-iteration-
-/// surrogate-pairs): `lo` is the lone HIGH surrogate D834 (plain lossy
-/// identity), `hi` the lone LOW surrogate DF06 whose raw form collided
-/// on the same lossy content — its pool identity is sentinel-
-/// disambiguated and must still render as the bare escape.
+/// surrogate-pairs): `lo` is the lone HIGH surrogate D834, `hi` the lone
+/// LOW surrogate DF06 whose lossy form would collide — both render as
+/// their exact `\uXXXX` escapes.
 #[test]
 #[ignore]
 fn n75_string_iterator_row() {
@@ -133,7 +124,7 @@ fn n75_string_iterator_row() {
     );
     assert!(
         text.contains("hi = \"\\uDF06\";"),
-        "sentinel-disambiguated lone low surrogate not escaped:\n{text}"
+        "colliding lone low surrogate not escaped:\n{text}"
     );
 }
 

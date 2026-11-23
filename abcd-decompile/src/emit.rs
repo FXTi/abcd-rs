@@ -48,7 +48,7 @@ use abcd_ir::ty::{DynPrim, StaticTy, Ty};
 use abcd_ir::{Const, FuncId, Op, ValueDef};
 use rayon::prelude::*;
 
-use crate::consts::{lit_of, render_lit_m, render_mutf8_regexp, render_pool_string, sym_str};
+use crate::consts::{lit_of, render_lit_m, render_pool_string, render_sym_string, sym_str};
 use crate::expr::{ArrayElem, Expr, IterOp, Lit, NodeStatus, ObjEntry};
 use crate::folds::{self, FoldStats};
 use crate::legalize::{Legalizer, is_legal_ident, sanitize};
@@ -173,7 +173,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
             } => {
                 let local = sanitize(&sym_str(module, *local_name));
                 let import = module_facing_name(&sym_str(module, *import_name));
-                let spec = render_pool_string(module, &sym_str(module, *module_request));
+                let spec = render_sym_string(module, *module_request);
                 em.fn_names.reserve(&local);
                 if local == import {
                     out.push_str(&format!("import {{ {local} }} from {spec};\n"));
@@ -186,7 +186,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
                 module_request,
             } => {
                 let local = sanitize(&sym_str(module, *local_name));
-                let spec = render_pool_string(module, &sym_str(module, *module_request));
+                let spec = render_sym_string(module, *module_request);
                 em.fn_names.reserve(&local);
                 out.push_str(&format!("import * as {local} from {spec};\n"));
             }
@@ -330,11 +330,11 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
             } => {
                 let import = module_facing_name(&sym_str(module, *import_name));
                 let export = module_facing_name(&sym_str(module, *export_name));
-                let spec = render_pool_string(module, &sym_str(module, *module_request));
+                let spec = render_sym_string(module, *module_request);
                 out.push_str(&format!("export {{ {import} as {export} }} from {spec};\n"));
             }
             ExportDecl::Star { module_request } => {
-                let spec = render_pool_string(module, &sym_str(module, *module_request));
+                let spec = render_sym_string(module, *module_request);
                 out.push_str(&format!("export * from {spec};\n"));
             }
         }
@@ -1516,14 +1516,7 @@ impl<'m> Emitter<'m> {
                 self.sub(right, prec + 1, out);
             }
             Expr::RegExp { pattern, flags } => {
-                // N75: a pattern with a raw-bytes record (lone
-                // surrogates) renders from those bytes — the lossy pool
-                // identity (or its sentinel-disambiguated form) is not
-                // valid JS text.
-                let body = match self.module.string_raw_bytes.get(pattern) {
-                    Some(raw) => render_mutf8_regexp(raw),
-                    None => pattern.replace('/', "\\/"),
-                };
+                let body = pattern.replace('/', "\\/");
                 out.push_str(&format!("/{body}/{flags}"));
             }
             Expr::ObjectLit { entries } => {
@@ -1830,6 +1823,19 @@ impl<'m> Emitter<'m> {
                         }
                     }
                 }
+            }
+            Expr::TaggedTemplate { tag, quasis, exprs } => {
+                self.sub(tag, 19, out);
+                out.push('`');
+                for (i, q) in quasis.iter().enumerate() {
+                    out.push_str(q);
+                    if let Some(arg) = exprs.get(i) {
+                        out.push_str("${");
+                        self.expr(arg, 0, out);
+                        out.push('}');
+                    }
+                }
+                out.push('`');
             }
             Expr::IterResultObj { value, done } => {
                 out.push_str("{ value: ");
@@ -3043,15 +3049,11 @@ mod tests {
             flags: "gi".to_string(),
         };
         assert_eq!(ex(&m, &e), "/a\\/b/gi");
-        // A pattern with raw MUTF-8 bytes renders from those bytes.
-        let mut m2 = mk_module();
-        m2.string_raw_bytes
-            .insert("rx".to_string(), vec![0x61, 0x2F, 0x62].into());
         let e2 = Expr::RegExp {
-            pattern: "rx".to_string(),
+            pattern: "\\uD800/b".to_string(),
             flags: String::new(),
         };
-        assert_eq!(ex(&m2, &e2), "/a\\/b/");
+        assert_eq!(ex(&m, &e2), "/\\uD800\\/b/");
     }
 
     // ── ObjectBuild entry arms (1520-1525, 1530-1533, 1551) ──────────

@@ -336,10 +336,8 @@ fn rewrite_file_e2e(bytes: &[u8], optimize: bool) -> (Vec<u8>, bool) {
         assert!(post.is_ok(), "post-opt IR verify failed: {:?}", post.errors);
     }
 
-    let lower_opts = LowerOptions {
-        prune_unused_frame_init_consts: optimize,
-    };
-    let bodies = lower_module_bodies(&module, &file, lower_opts).expect("lower_module_bodies");
+    let bodies =
+        lower_module_bodies(&module, &file, LowerOptions::default()).expect("lower_module_bodies");
 
     let mut rebuilt = file.clone();
     let mut cursor = bodies.into_iter();

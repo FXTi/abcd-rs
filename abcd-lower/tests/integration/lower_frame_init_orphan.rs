@@ -20,7 +20,7 @@
 //! placement); the id-range rule remains the fallback for unused consts.
 
 use crate::common;
-use abcd_ir::{Const, FuncId, FunctionKind, Module, Op};
+use abcd_ir::{Const, FuncId, FunctionKind, Module, Op, Ty, Value, ValueDef, ValueId};
 use abcd_isa::Bytecode;
 use abcd_lower::{LowerOptions, lower_function, lower_function_with_options};
 
@@ -85,18 +85,10 @@ fn anchorless_function_frame_init_const_lowers() {
 }
 
 #[test]
-fn anchorless_function_frame_init_const_lowers_under_prune_option() {
+fn anchorless_function_frame_init_const_lowers_with_options() {
     let (module, func) = build_degenerate_only();
-    // v0.1-opt parity: the used gate must not drop the seed either —
-    // the const IS used (by the Return).
-    let result = lower_function_with_options(
-        &module,
-        func,
-        LowerOptions {
-            prune_unused_frame_init_consts: true,
-        },
-    )
-    .expect("the used frame-init const survives the opt-parity use gate");
+    let result = lower_function_with_options(&module, func, LowerOptions::default())
+        .expect("the used frame-init const lowers cleanly");
     assert!(
         result
             .bytecodes
@@ -134,19 +126,20 @@ fn degenerate_function_after_anchored_function_owns_its_const() {
 }
 
 #[test]
-fn unused_const_in_anchorless_function_stays_unowned() {
-    // Residual boundary (documented in `frame_init_consts`): an UNUSED
-    // frame-initial const of a degenerate function carries no use to
-    // reverse-lookup and no anchor range to sort into, so it finds no
-    // owner. Nothing references it, so lowering still succeeds; the
-    // seed load is not materialized (the lift never produces this
-    // shape — its lazily created frame-initial consts are wired into
-    // the instruction whose read created them).
+fn unowned_unused_arena_const_is_not_materialized() {
+    // An unreferenced `ValueDef::Const` pushed directly into `module.values`
+    // without being registered in `func.frame_init_consts` is not owned by
+    // `func` and must not be materialized (#30).
     let mut module = Module::new();
     let func = V2Builder::create_function(&mut module, "g", FunctionKind::Function);
+    let cid = module.consts.push(Const::Undefined);
+    let _orphan = ValueId::new(module.values.len() as u32);
+    module.values.push(Value {
+        def: ValueDef::Const(cid),
+        ty: Ty::Any,
+    });
     {
         let mut b = V2Builder::new(&mut module, func);
-        let _unused = b.create_const_value(Const::Undefined);
         b.emit_void(Op::Return { value: None });
     }
     let result = lower_function(&module, func).expect("no live operand references the const");

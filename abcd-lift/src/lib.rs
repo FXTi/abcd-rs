@@ -240,14 +240,9 @@ enum ScalarKey {
 
 impl<'f> Lifter<'f> {
     fn new(file: &'f File) -> Self {
-        let mut module = Module::new();
-        // N75: plumb the file's lone-surrogate raw-bytes side table so
-        // the decompiler can render those strings as `\uXXXX` escapes
-        // (keyed by the same pool identity the symbols intern as).
-        module.string_raw_bytes = file.string_raw_bytes.clone();
         Self {
             file,
-            module,
+            module: Module::new(),
             method_to_func: HashMap::new(),
             class_to_id: HashMap::new(),
             field_to_id: HashMap::new(),
@@ -262,9 +257,14 @@ impl<'f> Lifter<'f> {
         }
     }
 
-    /// Intern a file-level string as a symbol.
+    /// Intern a file-level string as a symbol, preserving lone-surrogate
+    /// MUTF-8 bytes losslessly (#30).
     pub(crate) fn sym_of_file_sid(&mut self, sid: abcd_file::StringId) -> Option<Sym> {
-        let s = self.file.strings.resolve(sid)?;
+        if let Some(raw) = self.file.strings.raw_mutf8(sid) {
+            let lossy = self.file.strings.resolve(sid)?;
+            return Some(self.module.sym.intern_lossy_raw(lossy, raw));
+        }
+        let s = self.file.strings.as_str(sid)?;
         Some(self.module.sym.intern(s))
     }
 
@@ -624,8 +624,9 @@ pub(crate) fn lift_method<'f>(
         fx.ssa.seal_block(bb, &mut fx.lf.module);
     }
 
-    // Publish the translated body into the reserved function-table
-    // slot (pass 1 pre-filled a shell).
+    // Record the function's frame-initial constant ValueIds (#30) and
+    // publish the translated body into the reserved function-table slot.
+    fd.frame_init_consts = fx.ssa.frame_init_consts.clone();
     fx.lf.module.functions[func_id.index()] = fd;
 
     // N18 dead-island sweep (augmented reachability).

@@ -68,7 +68,6 @@ fn model(
         entity_map,
         literal_array_offsets,
         literal_array_header_offsets: Vec::new(),
-        string_raw_bytes: Default::default(),
     }
 }
 

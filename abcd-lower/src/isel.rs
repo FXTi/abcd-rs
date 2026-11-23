@@ -419,7 +419,7 @@ pub fn select_with_options(
     alloc: &RegAlloc,
     rpo: &[BlockId],
     suppression: &Suppression,
-    options: crate::LowerOptions,
+    _options: crate::LowerOptions,
 ) -> Result<IselResult, LowerError> {
     let mut block_codes: Vec<(BlockId, Vec<Bytecode>)> = Vec::new();
     let mut ic = IcAllocator::new();
@@ -485,8 +485,7 @@ pub fn select_with_options(
     // `frame_init_consts`): lift parity keeps unused seeds' loads (v0.1
     // emits the seed's load unconditionally, only the `Sta` use-gated);
     // opt parity drops seeds whose last use the optimizer deleted.
-    let mut entry_consts =
-        regalloc::frame_init_consts(module, func_id, options.prune_unused_frame_init_consts);
+    let mut entry_consts = regalloc::frame_init_consts(module, func_id);
     entry_consts.sort_unstable_by(|a, b| b.cmp(a)); // descending id = reverse creation
 
     // N21 pinned stores for handler-block phis, grouped by emission point.

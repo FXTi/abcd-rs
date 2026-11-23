@@ -30,6 +30,18 @@ pub fn lit_of(module: &Module, id: ConstId) -> Option<Lit> {
     const_to_lit(module, module.consts.get(id)?)
 }
 
+/// Convert a [`Sym`] to its lossless [`Lit`] (`Lit::String` for valid UTF-8,
+/// `Lit::Utf16` for lone-surrogate strings, #30).
+pub fn lit_of_sym(module: &Module, sym: Sym) -> Lit {
+    if let Some(s) = module.sym.as_str(sym) {
+        Lit::String(s.to_string())
+    } else if let Some(units) = module.sym.utf16_units(sym) {
+        Lit::Utf16(units)
+    } else {
+        Lit::String(format!("<sym#{}>", sym.index()))
+    }
+}
+
 /// Convert a [`Const`] tree to a [`Lit`] tree (recursive; shapes nest).
 pub fn const_to_lit(module: &Module, c: &Const) -> Option<Lit> {
     Some(match c {
@@ -38,7 +50,7 @@ pub fn const_to_lit(module: &Module, c: &Const) -> Option<Lit> {
         Const::Null => Lit::Null,
         Const::Bool(b) => Lit::Bool(*b),
         Const::Number(bits) => Lit::Number(*bits),
-        Const::String(s) => Lit::String(sym_str(module, *s)),
+        Const::String(s) => lit_of_sym(module, *s),
         Const::BigInt(s) => Lit::BigInt(sym_str(module, *s)),
         Const::ArrayLiteral(items) => Lit::Array(
             items
@@ -194,39 +206,86 @@ fn push_units_string_body(out: &mut String, units: &[u16]) {
     }
 }
 
-/// Render raw MUTF-8 string bytes as a JS double-quoted string literal
-/// (see `push_units_string_body`).
-pub fn render_mutf8_string(raw: &[u8]) -> String {
-    let mut out = String::with_capacity(raw.len() + 2);
+/// Render UTF-16 code units (including lone surrogates) as a JS
+/// double-quoted string literal (#30).
+pub fn render_utf16_string(units: &[u16]) -> String {
+    let mut out = String::with_capacity(units.len() + 2);
     out.push('"');
-    push_units_string_body(&mut out, &mutf8_units(raw));
+    push_units_string_body(&mut out, units);
     out.push('"');
     out
 }
 
-/// Render raw MUTF-8 bytes of a REGEXP pattern (N75): like
-/// [`render_mutf8_string`] but for the `/…/` body — no quotes, `/`
-/// escaped (mirroring the non-raw `pattern.replace('/', "\\/")` path),
-/// line terminators always escaped (they are illegal in a regexp
-/// literal even though `push_js_char` would pass `\n` as `\\n`, which
-/// is also fine here), and lone surrogates as `\uXXXX` escapes.
+/// Render raw MUTF-8 string bytes as a JS double-quoted string literal
+/// (see `push_units_string_body`).
+pub fn render_mutf8_string(raw: &[u8]) -> String {
+    render_utf16_string(&mutf8_units(raw))
+}
+
+/// Render raw MUTF-8 bytes of a REGEXP pattern: no quotes, `/` escaped,
+/// lone surrogates as `\uXXXX` escapes.
 pub fn render_mutf8_regexp(raw: &[u8]) -> String {
     let mut body = String::new();
     push_units_string_body(&mut body, &mutf8_units(raw));
     body.replace('/', "\\/")
 }
 
-/// Render a pooled string as a JS string literal, honoring the module's
-/// raw-bytes side table (N75): a string whose pool identity carries
-/// original MUTF-8 bytes (lone surrogates have no lossless Rust
-/// `String` form — and a colliding identity carries a disambiguation
-/// sentinel that must never reach the output) renders from those bytes;
-/// anything else renders verbatim.
-pub fn render_pool_string(module: &Module, s: &str) -> String {
-    match module.string_raw_bytes.get(s) {
-        Some(raw) => render_mutf8_string(raw),
-        None => render_string(s),
+/// Resolve a [`Sym`] for an `AllocRegExp` pattern (#30): valid UTF-8 passes
+/// through verbatim (preserving regexp escapes like `\d`); lone-surrogate
+/// symbols escape lone surrogate units as `\uXXXX` while keeping valid code
+/// points intact.
+pub fn sym_regexp_pattern(module: &Module, sym: Sym) -> String {
+    if let Some(s) = module.sym.as_str(sym) {
+        return s.to_string();
     }
+    let Some(units) = module.sym.utf16_units(sym) else {
+        return format!("<sym#{}>", sym.index());
+    };
+    let mut out = String::with_capacity(units.len());
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i];
+        if (0xD800..=0xDBFF).contains(&u)
+            && i + 1 < units.len()
+            && (0xDC00..=0xDFFF).contains(&units[i + 1])
+        {
+            let hi = (u - 0xD800) as u32;
+            let lo = (units[i + 1] - 0xDC00) as u32;
+            let cp = 0x10000 + ((hi << 10) | lo);
+            if let Some(ch) = char::from_u32(cp) {
+                out.push(ch);
+            }
+            i += 2;
+        } else if (0xD800..=0xDFFF).contains(&u) {
+            out.push_str(&format!("\\u{u:04X}"));
+            i += 1;
+        } else {
+            match char::from_u32(u as u32) {
+                Some('\n') => out.push_str("\\n"),
+                Some('\r') => out.push_str("\\r"),
+                Some('\u{2028}') => out.push_str("\\u2028"),
+                Some('\u{2029}') => out.push_str("\\u2029"),
+                Some(ch) => out.push(ch),
+                None => out.push_str(&format!("\\u{u:04X}")),
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Render a [`Sym`] directly from `module.sym` as a JS string literal (#30).
+pub fn render_sym_string(module: &Module, sym: Sym) -> String {
+    if let Some(raw) = module.sym.raw_mutf8(sym) {
+        render_mutf8_string(raw)
+    } else {
+        render_string(&sym_str(module, sym))
+    }
+}
+
+/// Render a UTF-8 string as a JS string literal (compatibility alias).
+pub fn render_pool_string(_module: &Module, s: &str) -> String {
+    render_string(s)
 }
 
 /// Render a [`Lit`] as its JS literal text (used by the dump; Stage C
@@ -235,8 +294,7 @@ pub fn render_lit(lit: &Lit) -> String {
     render_lit_inner(None, lit)
 }
 
-/// [`render_lit`] with the module's raw-bytes side table consulted for
-/// string leaves (N75) — the Stage C emission path uses this one.
+/// [`render_lit`] with module context (Stage C entry point).
 pub fn render_lit_m(module: &Module, lit: &Lit) -> String {
     render_lit_inner(Some(module), lit)
 }
@@ -250,10 +308,8 @@ fn render_lit_inner(module: Option<&Module>, lit: &Lit) -> String {
         Lit::Null => "null".to_string(),
         Lit::Bool(b) => b.to_string(),
         Lit::Number(bits) => render_number(*bits),
-        Lit::String(s) => match module {
-            Some(m) => render_pool_string(m, s),
-            None => render_string(s),
-        },
+        Lit::String(s) => render_string(s),
+        Lit::Utf16(units) => render_utf16_string(units),
         Lit::BigInt(s) => format!("{s}n"),
         Lit::Array(items) => {
             let inner: Vec<String> = items.iter().map(|i| render_lit_inner(module, i)).collect();
@@ -422,13 +478,12 @@ mod tests {
     }
 
     #[test]
-    fn pool_string_raw_bytes() {
+    fn pool_sym_lone_surrogates_and_pua() {
         let mut m = Module::new();
-        m.string_raw_bytes
-            .insert("raw".to_string(), vec![0xED, 0xA0, 0x80].into());
-        // A pool identity with raw bytes renders from those bytes.
-        assert_eq!(render_pool_string(&m, "raw"), "\"\\uD800\"");
-        // Anything else renders verbatim.
+        let raw_sym = m.sym.intern_raw_mutf8(&[0xED, 0xA0, 0x80]);
+        let pua_sym = m.sym.intern("\u{E000}icon");
+        assert_eq!(render_sym_string(&m, raw_sym), "\"\\uD800\"");
+        assert_eq!(render_sym_string(&m, pua_sym), "\"\u{E000}icon\"");
         assert_eq!(render_pool_string(&m, "plain"), "\"plain\"");
     }
 }

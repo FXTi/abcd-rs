@@ -17,34 +17,24 @@ pub mod fusion;
 pub mod isel;
 pub mod layout;
 pub mod method_body;
+pub mod module_lower;
 pub mod regalloc;
 
 use abcd_ir::{BlockId, FuncId, Module, ValueId};
 
 pub use layout::LayoutResult;
 pub use method_body::{EntityResolver, lower_module_bodies, to_method_body};
+pub use module_lower::{lower_module, lower_module_with_options, rewrite_file};
 pub use regalloc::RegAlloc;
 
-/// Lowering options (the default is the v0.1-LIFT-faithful behavior).
+/// Lowering options.
+///
+/// Frame-initial constant ownership now lives directly on
+/// [`abcd_ir::FunctionData::frame_init_consts`] and is swept by ADCE (#30),
+/// so unoptimized and optimized modules lower through the same uniform
+/// configuration.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LowerOptions {
-    /// Prune frame-initial constants (v0.1's entry-top seed literals)
-    /// that have no operand use left in the function.
-    ///
-    /// The two v0.1 pipeline variants differ here and the v0.2 IR cannot
-    /// represent the difference on its own: v0.1's lift seeds the
-    /// frame-initial undefined/hole as entry-top INSTRUCTIONS (emitted
-    /// unconditionally at lower, even when a discarded operand read left
-    /// them unused), while v0.1's optimizer sweeps an unused seed
-    /// instruction with ADCE. v0.2's seeds are instruction-less
-    /// [`ValueDef::Const`](abcd_ir::ValueDef) values (design/ir-v0.2.md
-    /// §5.1), so there is no instruction for a pass to sweep — the
-    /// lowering must skip the materialization instead. Set this when
-    /// lowering an OPTIMIZED module (abcd-opt's output): it reproduces
-    /// v0.1-opt's byte stream. Leave it clear for lift output (it would
-    /// otherwise drop the unused seed loads v0.1-lift emits).
-    pub prune_unused_frame_init_consts: bool,
-}
+pub struct LowerOptions {}
 
 /// Errors that can occur during lowering.
 #[derive(Debug, thiserror::Error)]

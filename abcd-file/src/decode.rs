@@ -59,12 +59,6 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     let file_type = crate::file::file_type(data);
 
     let mut strings = StringPool::new();
-    // N72: original MUTF-8 bytes for strings with no lossless Rust
-    // `String` form (lone surrogates — see File::string_raw_bytes),
-    // populated by [`crate::file::intern_string`] wherever a string is
-    // interned through an offset-bearing path (entity operands, literal
-    // tables). Metadata-only paths (names, annotations) intern plain.
-    let mut string_raw_bytes: HashMap<String, Box<[u8]>> = HashMap::new();
 
     // Open debug info (file-level, lives for entire decode).
     //
@@ -102,8 +96,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
             // A foreign-class item is just a string item (no methods/fields):
             // read its descriptor directly instead of building an accessor,
             // which upstream only supports for non-external classes.
-            if let Some(desc) = read_string(f, class_off) {
-                let sid = strings.get_or_intern(&desc);
+            if let Some(sid) = crate::file::intern_string(f, class_off, &mut strings) {
                 entity_map.insert(class_off, sid);
             }
             continue;
@@ -137,9 +130,8 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
             let _fg = HandleGuard(Some(|| unsafe { sys::abc_field_close(fr) }));
             let name_off = unsafe { sys::abc_field_name_off(fr) };
             if name_off != ABSENT
-                && let Some(name) = read_string(f, name_off)
+                && let Some(sid) = crate::file::intern_string(f, name_off, &mut strings)
             {
-                let sid = strings.get_or_intern(&name);
                 entity_map.insert(unsafe { sys::abc_field_get_field_id(fr) }, sid);
             }
         }
@@ -164,8 +156,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         if is_external(f, class_off) {
             // Foreign classes carry only a descriptor: surface them as
             // minimal Class entries so super_class references resolve.
-            if let Some(desc_str) = read_string(f, class_off) {
-                let descriptor = strings.get_or_intern(&desc_str);
+            if let Some(descriptor) = crate::file::intern_string(f, class_off, &mut strings) {
                 classes.insert(
                     descriptor,
                     Class {
@@ -217,7 +208,6 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                     off,
                     &entity_map,
                     &mut strings,
-                    &mut string_raw_bytes,
                     &descriptor_str,
                     &mut module_data_offsets,
                     &mut scope_names_offsets,
@@ -360,13 +350,8 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                         continue;
                     }
                     if kind == EntityKind::StringId {
-                        let sid = crate::file::intern_string(
-                            f,
-                            offset,
-                            &mut strings,
-                            &mut string_raw_bytes,
-                        )?
-                        .ok_or_else(invalid)?;
+                        let sid = crate::file::intern_string(f, offset, &mut strings)
+                            .ok_or_else(invalid)?;
                         entity_map.insert(offset, sid);
                         continue;
                     }
@@ -396,11 +381,8 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                     continue;
                 }
                 if kind == EntityKind::StringId {
-                    // N72: lossy-string raw capture + collision
-                    // disambiguation (crate::file::intern_string).
                     let sid =
-                        crate::file::intern_string(f, offset, &mut strings, &mut string_raw_bytes)?
-                            .ok_or_else(invalid)?;
+                        crate::file::intern_string(f, offset, &mut strings).ok_or_else(invalid)?;
                     entity_map.insert(offset, sid);
                     continue;
                 }
@@ -489,7 +471,6 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         decode_literal_arrays(
             f,
             &mut strings,
-            &mut string_raw_bytes,
             &referenced_literal_offsets,
             &module_data_offsets,
             &phase_blob_offsets,
@@ -506,7 +487,6 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
         literal_array_offsets,
         literal_array_header_offsets,
         entity_map,
-        string_raw_bytes,
     })
 }
 
@@ -941,7 +921,6 @@ fn decode_field_at(
     field_off: u32,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
-    string_raw_bytes: &mut HashMap<String, Box<[u8]>>,
     class_descriptor: &str,
     module_data_offsets: &mut HashSet<u32>,
     scope_names_offsets: &mut HashSet<u32>,
@@ -962,11 +941,10 @@ fn decode_field_at(
             context: format!("field at offset {field_id:#x}"),
         });
     } else {
-        let s = read_string(f, name_off).ok_or_else(|| Error::Malformed {
+        crate::file::intern_string(f, name_off, strings).ok_or_else(|| Error::Malformed {
             field: "name",
             context: format!("field at offset {field_id:#x}"),
-        })?;
-        strings.get_or_intern(&s)
+        })?
     };
 
     // `abc_field_type` returns the type entity offset. For primitive types the
@@ -1123,7 +1101,7 @@ fn decode_field_at(
             if offset == 0 {
                 return Err(Error::InvalidString(0));
             }
-            let content = crate::file::intern_string(f, offset, strings, string_raw_bytes)?
+            let content = crate::file::intern_string(f, offset, strings)
                 .ok_or(Error::InvalidString(offset))?;
             Some(FieldValue::JsonFileContent {
                 source_offset: offset,
@@ -1877,8 +1855,6 @@ fn decode_literal_array_at(
     let mut ctx = crate::literal::LiteralCollectCtx {
         file: f,
         strings: strings as *mut StringPool,
-        string_raw_bytes: std::ptr::null_mut(),
-        error: None,
         values: Vec::new(),
     };
     unsafe {
@@ -1900,7 +1876,6 @@ type LiteralArrayTable = (Vec<LiteralArray>, HashMap<u32, u32>, Vec<u32>);
 fn decode_literal_arrays(
     f: *const sys::AbcFileHandle,
     strings: &mut StringPool,
-    string_raw_bytes: &mut HashMap<String, Box<[u8]>>,
     referenced_offsets: &HashSet<u32>,
     module_data_offsets: &HashSet<u32>,
     phase_blob_offsets: &HashSet<u32>,
@@ -1991,8 +1966,6 @@ fn decode_literal_arrays(
             let mut ctx = crate::literal::LiteralCollectCtx {
                 file: f,
                 strings: strings as *mut StringPool,
-                string_raw_bytes: string_raw_bytes as *mut HashMap<String, Box<[u8]>>,
-                error: None,
                 values: Vec::new(),
             };
             unsafe {
@@ -2002,11 +1975,6 @@ fn decode_literal_arrays(
                     Some(crate::literal::collect_literal_val_cb),
                     &mut ctx as *mut crate::literal::LiteralCollectCtx as *mut c_void,
                 );
-            }
-            // The N72 genuine-collision guard rode the context out of
-            // the (non-unwinding) C callback — propagate loudly.
-            if let Some(error) = ctx.error.take() {
-                return Err(error);
             }
             for value in &ctx.values {
                 if let LiteralValue::LiteralArray(idx) = value {

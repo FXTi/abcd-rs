@@ -215,13 +215,6 @@ impl ModuleRecordDef {
 /// ABC file builder.
 pub struct Builder {
     raw: *mut sys::AbcBuilder,
-    /// Original MUTF-8 bytes of decoded strings that have no lossless Rust
-    /// `String` form (MUTF-8 lone surrogates), keyed by their decoded
-    /// (lossy) content — re-emitted verbatim by [`Builder::mutf8_of`]
-    /// instead of re-encoding the lossy form (N72; see
-    /// [`crate::model::File::string_raw_bytes`]). Empty for files that
-    /// carry no such strings and for programmatically built files.
-    raw_strings: std::collections::HashMap<String, Box<[u8]>>,
 }
 
 impl Builder {
@@ -230,26 +223,18 @@ impl Builder {
         // SAFETY: no preconditions.
         let raw = unsafe { sys::abc_builder_new() };
         assert!(!raw.is_null(), "abc_builder_new returned null");
-        Self {
-            raw,
-            raw_strings: std::collections::HashMap::new(),
-        }
+        Self { raw }
     }
 
-    /// Install the decoded file's raw-MUTF-8 side table (N72 lone-surrogate
-    /// lossless round-trip; see [`crate::model::File::string_raw_bytes`]).
-    pub fn set_raw_strings(&mut self, raw_strings: std::collections::HashMap<String, Box<[u8]>>) {
-        self.raw_strings = raw_strings;
-    }
-
-    /// MUTF-8 bytes for emission: the recorded original bytes when this
-    /// content was decoded from a lone-surrogate MUTF-8 string, otherwise
-    /// the standard UTF-8 → MUTF-8 conversion.
     fn mutf8_of(&self, s: &str) -> CString {
-        if let Some(raw) = self.raw_strings.get(s) {
-            return CString::new(raw.to_vec()).expect("MUTF-8 contains no NUL");
-        }
         c_mutf8(s)
+    }
+
+    fn mutf8_cstr(raw: &[u8]) -> Result<CString, Error> {
+        CString::new(raw.to_vec()).map_err(|_| Error::Malformed {
+            field: "string",
+            context: "raw MUTF-8 bytes contain an embedded NUL".to_owned(),
+        })
     }
 
     /// Set the API policy before adding items.
@@ -278,6 +263,14 @@ impl Builder {
         StringHandle(unsafe { sys::abc_builder_add_string(self.raw, c_str.as_ptr()) })
     }
 
+    /// Add a raw MUTF-8 string (e.g. lone-surrogate wire bytes, #30).
+    pub fn add_string_mutf8(&mut self, raw: &[u8]) -> Result<StringHandle, Error> {
+        let c_str = Self::mutf8_cstr(raw)?;
+        Ok(StringHandle(unsafe {
+            sys::abc_builder_add_string(self.raw, c_str.as_ptr())
+        }))
+    }
+
     // --- Classes ---
 
     /// Add a class with the given descriptor (e.g. `"LMyClass;"`).
@@ -286,9 +279,25 @@ impl Builder {
         ClassHandle(unsafe { sys::abc_builder_add_class(self.raw, c_desc.as_ptr()) })
     }
 
+    pub(crate) fn add_class_cstr(&mut self, c_desc: &CString) -> ClassHandle {
+        ClassHandle(unsafe { sys::abc_builder_add_class(self.raw, c_desc.as_ptr()) })
+    }
+
     /// Add a foreign (external) class.
     pub fn add_foreign_class(&mut self, descriptor: &str) -> ClassHandle {
         let c_desc = self.mutf8_of(descriptor);
+        ClassHandle(unsafe { sys::abc_builder_add_foreign_class(self.raw, c_desc.as_ptr()) })
+    }
+
+    /// Add a foreign class from raw MUTF-8 descriptor bytes (#30).
+    pub fn add_foreign_class_mutf8(&mut self, raw: &[u8]) -> Result<ClassHandle, Error> {
+        let c_desc = Self::mutf8_cstr(raw)?;
+        Ok(ClassHandle(unsafe {
+            sys::abc_builder_add_foreign_class(self.raw, c_desc.as_ptr())
+        }))
+    }
+
+    pub(crate) fn add_foreign_class_cstr(&mut self, c_desc: &CString) -> ClassHandle {
         ClassHandle(unsafe { sys::abc_builder_add_foreign_class(self.raw, c_desc.as_ptr()) })
     }
 
@@ -381,6 +390,20 @@ impl Builder {
         num_args: u32,
     ) -> MethodHandle {
         let c_name = self.mutf8_of(name);
+        self.class_add_method_cstr(cls, &c_name, proto, flags, code, num_vregs, num_args)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn class_add_method_cstr(
+        &mut self,
+        cls: ClassHandle,
+        c_name: &CString,
+        proto: ProtoHandle,
+        flags: AccessFlags,
+        code: &[u8],
+        num_vregs: u32,
+        num_args: u32,
+    ) -> MethodHandle {
         MethodHandle(unsafe {
             sys::abc_builder_class_add_method_with_proto(
                 self.raw,
@@ -405,6 +428,16 @@ impl Builder {
         flags: AccessFlags,
     ) -> MethodHandle {
         let c_name = self.mutf8_of(name);
+        self.add_foreign_method_cstr(cls, &c_name, proto, flags)
+    }
+
+    pub(crate) fn add_foreign_method_cstr(
+        &mut self,
+        cls: ClassHandle,
+        c_name: &CString,
+        proto: ProtoHandle,
+        flags: AccessFlags,
+    ) -> MethodHandle {
         MethodHandle(unsafe {
             sys::abc_builder_add_foreign_method(
                 self.raw,
@@ -472,6 +505,16 @@ impl Builder {
         flags: AccessFlags,
     ) -> FieldHandle {
         let c_name = self.mutf8_of(name);
+        self.class_add_field_cstr(cls, &c_name, ty, flags)
+    }
+
+    pub(crate) fn class_add_field_cstr(
+        &mut self,
+        cls: ClassHandle,
+        c_name: &CString,
+        ty: Type,
+        flags: AccessFlags,
+    ) -> FieldHandle {
         FieldHandle(unsafe {
             sys::abc_builder_class_add_field(
                 self.raw,
@@ -493,6 +536,17 @@ impl Builder {
         flags: AccessFlags,
     ) -> FieldHandle {
         let c_name = self.mutf8_of(name);
+        self.class_add_field_ex_cstr(cls, &c_name, ty, ref_class, flags)
+    }
+
+    pub(crate) fn class_add_field_ex_cstr(
+        &mut self,
+        cls: ClassHandle,
+        c_name: &CString,
+        ty: Type,
+        ref_class: ClassHandle,
+        flags: AccessFlags,
+    ) -> FieldHandle {
         FieldHandle(unsafe {
             sys::abc_builder_class_add_field_ex(
                 self.raw,
@@ -508,6 +562,15 @@ impl Builder {
     /// Add a foreign field.
     pub fn add_foreign_field(&mut self, cls: ClassHandle, name: &str, ty: Type) -> FieldHandle {
         let c_name = self.mutf8_of(name);
+        self.add_foreign_field_cstr(cls, &c_name, ty)
+    }
+
+    pub(crate) fn add_foreign_field_cstr(
+        &mut self,
+        cls: ClassHandle,
+        c_name: &CString,
+        ty: Type,
+    ) -> FieldHandle {
         FieldHandle(unsafe {
             sys::abc_builder_add_foreign_field(self.raw, cls.0, c_name.as_ptr(), ty.as_raw_u8())
         })
@@ -1219,17 +1282,23 @@ impl EntityHandles {
 pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     validate_annotation_arrays(file)?;
     let mut b = Builder::new();
-    // N72: lone-surrogate strings re-emit their original MUTF-8 bytes.
-    b.set_raw_strings(file.string_raw_bytes.clone());
     b.set_file_version(file.version)?;
     let pool = &file.strings;
 
-    // Helper: resolve a StringId to &str, erroring on invalid ids.
+    // Helper: resolve a StringId to &str (lossy-safe for error formatting /
+    // ASCII sentinel checks), erroring on invalid ids.
     let rs = |id: StringId| -> Result<&str, Error> {
         pool.resolve(id).ok_or_else(|| Error::Malformed {
             field: "string_id",
             context: format!("dangling StringId {id:?} in file"),
         })
+    };
+    let rcstr = |id: StringId| -> Result<CString, Error> {
+        let bytes = pool.to_mutf8_bytes(id).ok_or_else(|| Error::Malformed {
+            field: "string_id",
+            context: format!("dangling StringId {id:?} in file"),
+        })?;
+        Builder::mutf8_cstr(&bytes)
     };
 
     // --- Collect all strings and build handle map ---
@@ -1243,28 +1312,22 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     // scope-names arrays), wired up after the literal-array section exists.
     let mut deferred_field_values: Vec<(FieldHandle, &FieldValue)> = Vec::new();
     let mut ann_la_counter: u32 = 0;
-    // Number of annotation-embedded literal arrays that will be created
-    // while classes are configured. Model literal arrays are only created
-    // afterwards (creation order is significant to the vendored writer), so
-    // their builder handles start at this offset — used to resolve nested
-    // `LiteralValue::LiteralArray` references on the annotation path (#8).
     let ann_la_base = count_annotation_literal_arrays(file);
 
     // First pass: foreign classes
     for (&desc, cls) in &file.classes {
         if cls.is_external {
-            let h = b.add_foreign_class(rs(desc)?);
+            let h = b.add_foreign_class_cstr(&rcstr(desc)?);
             class_handles.insert(desc, h);
         }
     }
     // Second pass: normal classes
     for (&desc, cls) in &file.classes {
         if !cls.is_external {
-            let desc_str = rs(desc)?;
-            let h = if desc_str == "L_GLOBAL;" {
+            let h = if pool.as_str(desc) == Some("L_GLOBAL;") {
                 b.add_global_class()
             } else {
-                b.add_class(desc_str)
+                b.add_class_cstr(&rcstr(desc)?)
             };
             class_handles.insert(desc, h);
         }
@@ -1279,11 +1342,11 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
         if let Some(&h) = map.get(&desc) {
             return Ok(h);
         }
-        let desc_str = pool.resolve(desc).ok_or_else(|| Error::Malformed {
+        let bytes = pool.to_mutf8_bytes(desc).ok_or_else(|| Error::Malformed {
             field: "string_id",
             context: format!("dangling StringId {desc:?} for class descriptor"),
         })?;
-        let h = b.add_foreign_class(desc_str);
+        let h = b.add_foreign_class_cstr(&Builder::mutf8_cstr(&bytes)?);
         map.insert(desc, h);
         Ok(h)
     };
@@ -1310,7 +1373,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
 
         // --- Methods ---
         for method in &cls.methods {
-            let method_name_str = rs(method.name)?;
+            let method_name_cstr = rcstr(method.name)?;
             let ret_type = method.return_type.unwrap_or(Type::Void);
             let ret_class = if let Type::Reference(d) = ret_type {
                 Some(resolve_class_id(&mut b, &mut class_handles, pool, d)?)
@@ -1332,7 +1395,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
             let proto = b.create_proto_ex(&ret_type, ret_class, &method.arg_types, &arg_classes);
 
             let method_h = if method.is_external {
-                b.add_foreign_method(cls_h, method_name_str, proto, method.access_flags)
+                b.add_foreign_method_cstr(cls_h, &method_name_cstr, proto, method.access_flags)
             } else {
                 // Encode bytecodes
                 let (code_bytes, byte_offsets) = if let Some(ref body) = method.body {
@@ -1358,9 +1421,9 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 // and attach a separate CodeHandle with try-blocks via method_set_code.
                 // This avoids creating an orphaned code item.
                 let inline_code = if has_try_blocks { &[][..] } else { &code_bytes };
-                let m_h = b.class_add_method(
+                let m_h = b.class_add_method_cstr(
                     cls_h,
-                    method_name_str,
+                    &method_name_cstr,
                     proto,
                     method.access_flags,
                     inline_code,
@@ -1549,15 +1612,15 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
 
         // --- Fields ---
         for field in &cls.fields {
-            let field_name_str = rs(field.name)?;
+            let field_name_cstr = rcstr(field.name)?;
             let ty = field.field_type;
             let field_h = if field.is_external {
-                b.add_foreign_field(cls_h, field_name_str, ty)
+                b.add_foreign_field_cstr(cls_h, &field_name_cstr, ty)
             } else if let Type::Reference(d) = ty {
                 let ref_cls = resolve_class_id(&mut b, &mut class_handles, pool, d)?;
-                b.class_add_field_ex(cls_h, field_name_str, ty, ref_cls, field.access_flags)
+                b.class_add_field_ex_cstr(cls_h, &field_name_cstr, ty, ref_cls, field.access_flags)
             } else {
-                b.class_add_field(cls_h, field_name_str, ty, field.access_flags)
+                b.class_add_field_cstr(cls_h, &field_name_cstr, ty, field.access_flags)
             };
 
             // Track field handle for annotation references.
@@ -2417,11 +2480,11 @@ fn resolve_class_for_ann(
     if let Some(&h) = class_handles.get(&desc) {
         return Ok(h);
     }
-    let desc_str = pool.resolve(desc).ok_or_else(|| Error::Malformed {
+    let bytes = pool.to_mutf8_bytes(desc).ok_or_else(|| Error::Malformed {
         field: "string_id",
         context: format!("dangling StringId {desc:?} for annotation class descriptor"),
     })?;
-    let h = b.add_foreign_class(desc_str);
+    let h = b.add_foreign_class_cstr(&Builder::mutf8_cstr(&bytes)?);
     class_handles.insert(desc, h);
     Ok(h)
 }
@@ -2926,11 +2989,15 @@ fn get_or_add_string_id(
     if let Some(&h) = string_handles.get(&sid) {
         return Ok(h);
     }
-    let s = pool.resolve(sid).ok_or_else(|| Error::Malformed {
-        field: "string_id",
-        context: format!("dangling StringId {sid:?} in string table"),
-    })?;
-    let h = b.add_string(s);
+    let h = if let Some(raw) = pool.raw_mutf8(sid) {
+        b.add_string_mutf8(raw)?
+    } else {
+        let s = pool.as_str(sid).ok_or_else(|| Error::Malformed {
+            field: "string_id",
+            context: format!("dangling StringId {sid:?} in string table"),
+        })?;
+        b.add_string(s)
+    };
     string_handles.insert(sid, h);
     Ok(h)
 }

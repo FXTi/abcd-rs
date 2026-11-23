@@ -513,6 +513,19 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             }
         }
     }
+    for &val in &func.frame_init_consts {
+        match module.value(val).map(|v| v.def) {
+            None => report
+                .errors
+                .push(err(None, None, VerifyErrorKind::ValueOutOfArena(val))),
+            Some(ValueDef::Const(c)) if module.consts.get(c).is_some() => {
+                defined.insert(val, ());
+            }
+            Some(_) => report
+                .errors
+                .push(err(None, None, VerifyErrorKind::ForeignValue(val))),
+        }
+    }
     for &bb in &func.blocks {
         let Some(block) = module.block(bb) else {
             continue;

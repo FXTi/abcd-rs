@@ -279,15 +279,7 @@ for path in sorted(paths):
                     return out;
                 }
             };
-            match guarded(|| {
-                rewrite_fixture(
-                    &optimized,
-                    &file,
-                    LowerOptions {
-                        prune_unused_frame_init_consts: true,
-                    },
-                )
-            }) {
+            match guarded(|| rewrite_fixture(&optimized, &file, LowerOptions::default())) {
                 Ok((encoded, functions)) => {
                     out.lines
                         .push(format!("WROTE v2opt {relative} ({functions} functions)"));

@@ -27,7 +27,7 @@ Version conditioning: `12.0.6.0` is `LAST_CONTAINS_LITERAL_IN_HEADER_VERSION`. O
   3. `L_ESModuleRecord;` or `moduleRecordIdx` → `FieldValue::ModuleData(ModuleData)` (untagged `ModuleDataAccessor` blob; excluded from tagged literal-array decoding and relocated on `encode`).
   4. `L_ESScopeNamesRecord;` or `scopeNames` → `FieldValue::LiteralArrayRef(u32)` (tagged literal array collected on `13.x+` and relocated on `encode`).
   5. `jsonFileContent` → `FieldValue::JsonFileContent { source_offset, content: StringId }` (`StringItem` offset for `--merge-abc` JSON modules; re-emitted via `ScalarValueItem(StringItem*)` on `encode`).
-- **MUTF-8 lone surrogates (`File::string_raw_bytes`)**: strings that have no lossless UTF-8 `String` representation record their exact MUTF-8 bytes keyed by disambiguated pool identity so `encode` and `pandasm` round-trip them losslessly instead of emitting `U+FFFD`.
+- **MUTF-8 lone surrogates (`StringPool` raw-byte bucket)**: strings that have no lossless UTF-8 `String` representation intern directly by their canonical MUTF-8 byte slice inside `File::strings` (`raw_mutf8()` / `to_mutf8_bytes()`), so `encode` and `pandasm` round-trip colliding lone-surrogate sequences and BMP Private Use Area (`U+E000..=U+F8FF`) strings losslessly without in-band sentinels or side tables.
 
 ## Pandasm disassembler & assembler (`abcd-file/src/pandasm/`)
 

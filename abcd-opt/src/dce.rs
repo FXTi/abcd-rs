@@ -102,22 +102,37 @@ impl FuncPass for Adce {
 
         // Sweep: remove dead instructions.
         let mut changed = false;
+        let mut live_const_uses: HashSet<ValueId> = HashSet::new();
         for &bb in &blocks {
             let Some(block) = module.block(bb) else {
                 continue;
             };
             let old_len = block.insts.len();
-            let new_insts: Vec<InstId> = block
-                .insts
-                .iter()
-                .copied()
-                .filter(|i| live.contains(i))
-                .collect();
+            let mut new_insts: Vec<InstId> = Vec::with_capacity(old_len);
+            for &iid in &block.insts {
+                if live.contains(&iid) {
+                    new_insts.push(iid);
+                    if let Some(inst) = module.inst(iid) {
+                        live_const_uses.extend(inst.op.operands());
+                    }
+                }
+            }
             if new_insts.len() != old_len {
                 changed = true;
                 if let Some(block) = module.block_mut(bb) {
                     block.insts = new_insts;
                 }
+            }
+        }
+
+        // Sweep unused frame-initial constants owned by this function (#30).
+        if let Some(func_data) = module.func_mut(func) {
+            let old_consts = func_data.frame_init_consts.len();
+            func_data
+                .frame_init_consts
+                .retain(|v| live_const_uses.contains(v));
+            if func_data.frame_init_consts.len() != old_consts {
+                changed = true;
             }
         }
 

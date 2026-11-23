@@ -40,7 +40,9 @@
 
 pub use abcd_file_sys::FileType;
 pub use abcd_isa::Version;
-pub use string_interner::{DefaultStringInterner as StringPool, DefaultSymbol as StringId};
+
+pub mod string_pool;
+pub use string_pool::{StringId, StringPool};
 
 mod error;
 pub use error::Error;

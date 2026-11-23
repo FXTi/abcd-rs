@@ -126,7 +126,7 @@ pub fn report(module: &InputModule, verify: bool) -> Result<InfoReport, CliError
             literal_arrays: file.literal_arrays.len(),
             entity_index_entries: file.entity_map.len(),
             debug_infos,
-            lossy_strings: file.string_raw_bytes.len(),
+            lossy_strings: file.strings.lossy_count(),
         },
         verify: verify_report,
     })

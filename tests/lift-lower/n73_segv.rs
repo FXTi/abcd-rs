@@ -157,16 +157,10 @@ fn n73_call_this_range_with_name_rewrites_with_synced_ic_slots() {
             "{relative}: post-optimize verify: {:?}",
             report.errors
         );
-        let (encoded, _) = rewrite_fixture(
-            &optimized,
-            &file,
-            abcd_lower::LowerOptions {
-                prune_unused_frame_init_consts: true,
-            },
-        )
-        .unwrap_or_else(|(cat, reason)| {
-            panic!("{relative}: v2opt rewrite failed: {cat} | {reason}")
-        });
+        let (encoded, _) = rewrite_fixture(&optimized, &file, abcd_lower::LowerOptions::default())
+            .unwrap_or_else(|(cat, reason)| {
+                panic!("{relative}: v2opt rewrite failed: {cat} | {reason}")
+            });
         assert_ic_slots_covered(&encoded, &format!("{relative} v2opt"));
         if let Some(dir) = &out_root {
             let target = dir.join("v2opt").join(relative);

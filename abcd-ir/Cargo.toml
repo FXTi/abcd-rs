@@ -13,4 +13,3 @@ readme = "README.md"
 # structurally by the crate graph — do not add such a dependency.
 [dependencies]
 thiserror.workspace = true
-string-interner.workspace = true

@@ -81,13 +81,12 @@ assert!(!abc_bytes.is_empty());
 | `checksum` | `u32` | Header Adler-32 checksum |
 | `size` | `u32` | Header-declared file size in bytes |
 | `file_type` | `FileType` | `Dynamic` (JS/TS), `Static` (ArkTS `0.1.x`), or `Invalid` |
-| `strings` | `StringPool` | Interned string pool (`StringId` keys) |
+| `strings` | `StringPool` | Lossless dual-bucket string pool (`StringId` keys for valid UTF-8 and raw MUTF-8 lone-surrogate sequences) |
 | `classes` | `BTreeMap<StringId, Class>` | Classes keyed by interned descriptor (e.g. `"L_GLOBAL;"`) |
 | `literal_arrays` | `Vec<LiteralArray>` | Decoded tagged literal arrays (header table + index-referenced + `scopeNames` + nested arrays) |
 | `literal_array_offsets` | `HashMap<u32, u32>` | Source-file literal-array offset → `literal_arrays` index |
 | `literal_array_header_offsets` | `Vec<u32>` | Raw header literal-array table on `<= 12.0.6.0` (including excluded module/phase blob slots, for `pandasm` byte-identity) |
 | `entity_map` | `HashMap<u32, StringId>` | Source-file entity offset → interned name/descriptor |
-| `string_raw_bytes` | `HashMap<String, Box<[u8]>>` | Original MUTF-8 bytes for lone-surrogate strings with no lossless UTF-8 form (re-emitted verbatim by `encode`) |
 
 Convenience methods on `File`:
 

@@ -1401,6 +1401,36 @@ fn inline_site(
         }
     }
 
+    // Propagate any `ValueDef::Const` values referenced by the cloned callee
+    // instructions into the caller's `frame_init_consts` (#30).
+    let mut const_vals: Vec<ValueId> = Vec::new();
+    for &cb in &cloned_blocks {
+        if let Some(b) = module.block(cb) {
+            for &iid in &b.insts {
+                if let Some(inst) = module.inst(iid) {
+                    for v in inst.op.operands() {
+                        if module
+                            .value(v)
+                            .is_some_and(|val| matches!(val.def, ValueDef::Const(_)))
+                            && !const_vals.contains(&v)
+                        {
+                            const_vals.push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !const_vals.is_empty()
+        && let Some(caller_func) = module.func_mut(caller)
+    {
+        for v in const_vals {
+            if !caller_func.frame_init_consts.contains(&v) {
+                caller_func.frame_init_consts.push(v);
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -42,7 +42,7 @@ use abcd_ir::module::{FunctionKind, Module};
 use abcd_ir::op::{CallKind, CmpOp, Op, PropKey, SuperKey};
 use abcd_ir::{ConstId, Sym};
 
-use crate::consts::{lit_of, render_regexp_flags, sym_str};
+use crate::consts::{lit_of, lit_of_sym, render_regexp_flags, sym_regexp_pattern, sym_str};
 use crate::expr::{Expr, IterOp, Lit, NodeStatus, ObjEntry};
 use crate::fitness::{Fitness, elision_reason, fallback_note, fitness_of, op_name};
 use crate::legalize::{Legalizer, is_legal_ident, sanitize};
@@ -1249,14 +1249,23 @@ impl<'m> Recover<'m> {
             } => {
                 self.record(op, Outcome::Expressed);
                 let own = matches!(op, Op::StoreOwnPropName { .. });
-                let raw = sym_str(self.module, *name);
-                out.push(Stmt::StoreProp {
-                    object: self.expr_of(*object),
-                    dot_legal: is_legal_ident(&raw),
-                    name: raw,
-                    value: self.expr_of(*value),
-                    own,
-                });
+                if let Some(s) = self.module.sym.as_str(*name) {
+                    let raw = s.to_string();
+                    out.push(Stmt::StoreProp {
+                        object: self.expr_of(*object),
+                        dot_legal: is_legal_ident(&raw),
+                        name: raw,
+                        value: self.expr_of(*value),
+                        own,
+                    });
+                } else {
+                    out.push(Stmt::StoreDyn {
+                        object: self.expr_of(*object),
+                        key: Expr::Lit(lit_of_sym(self.module, *name)),
+                        value: self.expr_of(*value),
+                        own,
+                    });
+                }
             }
             Op::StorePropIdx {
                 object,
@@ -1730,16 +1739,23 @@ impl<'m> Recover<'m> {
                 },
             },
             Op::AllocRegExp { pattern, flags } => Expr::RegExp {
-                pattern: sym_str(self.module, *pattern),
+                pattern: sym_regexp_pattern(self.module, *pattern),
                 flags: render_regexp_flags(*flags),
             },
             Op::AllocClosure { func } => self.closure_of(*func),
             Op::LoadProp { object, name } => {
-                let raw = sym_str(self.module, *name);
-                Expr::PropName {
-                    object: Box::new(self.expr_of(*object)),
-                    dot_legal: is_legal_ident(&raw),
-                    name: raw,
+                if let Some(s) = self.module.sym.as_str(*name) {
+                    let raw = s.to_string();
+                    Expr::PropName {
+                        object: Box::new(self.expr_of(*object)),
+                        dot_legal: is_legal_ident(&raw),
+                        name: raw,
+                    }
+                } else {
+                    Expr::PropDyn {
+                        object: Box::new(self.expr_of(*object)),
+                        key: Box::new(Expr::Lit(lit_of_sym(self.module, *name))),
+                    }
                 }
             }
             Op::LoadPropIdx { object, index } => Expr::PropIndex {
@@ -1758,7 +1774,7 @@ impl<'m> Recover<'m> {
             },
             Op::TestProp { object, key } => {
                 let key_expr = match key {
-                    PropKey::Name(s) => Expr::Lit(Lit::String(sym_str(self.module, *s))),
+                    PropKey::Name(s) => Expr::Lit(lit_of_sym(self.module, *s)),
                     PropKey::Index(k) | PropKey::Dynamic(k) => self.expr_of(*k),
                 };
                 Expr::Compare {
@@ -1793,15 +1809,20 @@ impl<'m> Recover<'m> {
                 Expr::Ident(sanitize(&name))
             }
             Op::TryGetGlobal { name, .. } => {
-                let raw = sym_str(self.module, *name);
-                if is_legal_ident(&raw) {
-                    Expr::Ident(raw)
+                if let Some(s) = self.module.sym.as_str(*name) {
+                    let raw = s.to_string();
+                    if is_legal_ident(&raw) {
+                        Expr::Ident(raw)
+                    } else {
+                        Expr::PropIndex {
+                            object: Box::new(Expr::GlobalThis),
+                            index: Box::new(Expr::Lit(Lit::String(raw))),
+                        }
+                    }
                 } else {
-                    // A global whose name is not a legal identifier can
-                    // only be referenced through the global object.
                     Expr::PropIndex {
                         object: Box::new(Expr::GlobalThis),
-                        index: Box::new(Expr::Lit(Lit::String(raw))),
+                        index: Box::new(Expr::Lit(lit_of_sym(self.module, *name))),
                     }
                 }
             }

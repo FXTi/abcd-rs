@@ -107,9 +107,9 @@ pub fn lower_module_bodies(
 /// `literal_array_offset`) run in `O(1)` amortized time.
 pub struct EntityResolver<'a> {
     module: &'a Module,
-    /// MUTF-8 string content → smallest source offset of a string entity
-    /// with that content.
-    string_offsets: HashMap<String, u32>,
+    /// Canonical MUTF-8 wire bytes → smallest source offset of a string entity
+    /// with those exact bytes (#30).
+    string_offsets: HashMap<Box<[u8]>, u32>,
     /// Function-table position → method source offset (`all_methods()`
     /// order = the lift's reservation order).
     method_offsets: Vec<u32>,
@@ -124,8 +124,8 @@ pub struct EntityResolver<'a> {
 impl<'a> EntityResolver<'a> {
     /// Index `file`'s string, method, and literal-array tables once for
     /// `module`.
-    pub fn new(module: &'a Module, file: &'a File) -> Self {
-        let mut string_offsets: HashMap<String, u32> =
+    pub fn new(module: &'a Module, file: &File) -> Self {
+        let mut string_offsets: HashMap<Box<[u8]>, u32> =
             HashMap::with_capacity(file.entity_map.len());
         // Smallest offset wins on duplicate content (encode resolves
         // string operands content-addressed, so any valid entry produces
@@ -134,8 +134,10 @@ impl<'a> EntityResolver<'a> {
             file.entity_map.iter().map(|(&o, &s)| (o, s)).collect();
         entries.sort_unstable();
         for (offset, sid) in entries {
-            if let Some(content) = file.strings.resolve(sid) {
-                string_offsets.entry(content.to_string()).or_insert(offset);
+            if let Some(bytes) = file.strings.to_mutf8_bytes(sid) {
+                string_offsets
+                    .entry(bytes.into_owned().into_boxed_slice())
+                    .or_insert(offset);
             }
         }
         let method_offsets: Vec<u32> = file.all_methods().map(|(_, m)| m.offset).collect();
@@ -224,21 +226,21 @@ impl<'a> EntityResolver<'a> {
         })
     }
 
-    /// [`Sym`] → source offset of an equal-content string entity.
-    fn string_offset(&self, sym: Sym) -> Option<u32> {
-        let content = self.module.sym.resolve(sym)?;
-        self.string_offsets.get(content).copied()
+    /// [`Sym`] → source offset of an equal-MUTF-8-content string entity.
+    pub(crate) fn string_offset(&self, sym: Sym) -> Option<u32> {
+        let bytes = self.module.sym.to_mutf8_bytes(sym)?;
+        self.string_offsets.get(bytes.as_ref()).copied()
     }
 
     /// [`FuncId`] → source offset of the method at that function-table
     /// position.
-    fn method_offset(&self, func: FuncId) -> Option<u32> {
+    pub(crate) fn method_offset(&self, func: FuncId) -> Option<u32> {
         self.method_offsets.get(func.index()).copied()
     }
 
     /// [`ConstId`] (a literal shape) → source offset of the smallest
     /// literal-array table entry whose content matches the shape.
-    fn literal_array_offset(&self, shape: ConstId) -> Option<u32> {
+    pub(crate) fn literal_array_offset(&self, shape: ConstId) -> Option<u32> {
         let tree = self.module.consts.get(shape)?;
         let &index = self.shape_to_min_index.get(tree)?;
         self.literal_index_to_offset.get(&index).copied()
@@ -297,8 +299,14 @@ fn build_literal_value_const(
         LiteralValue::MethodAffiliate(n) => Some(Const::Number(f64::from(*n).to_bits())),
         LiteralValue::BuiltinTypeIndex(n) => Some(Const::Number(f64::from(*n).to_bits())),
         LiteralValue::String(sid) | LiteralValue::EtsImplements(sid) => {
-            let s = file.strings.resolve(*sid)?;
-            module.sym.get(s).map(Const::String)
+            if let Some(raw) = file.strings.raw_mutf8(*sid) {
+                module.sym.get_raw_mutf8(raw).map(Const::String)
+            } else {
+                file.strings
+                    .as_str(*sid)
+                    .and_then(|s| module.sym.get(s))
+                    .map(Const::String)
+            }
         }
         LiteralValue::Method(off)
         | LiteralValue::GeneratorMethod(off)
