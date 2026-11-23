@@ -232,7 +232,7 @@ fn const_of(module: &Module, v: abcd_ir::ValueId) -> Option<ConstId> {
 mod tests {
     use super::*;
     use abcd_ir::function::{Block, FunctionData, Inst, Value};
-    use abcd_ir::module::{ClassData, FunctionKind, Modifiers, SourceLang};
+    use abcd_ir::module::{ClassData, FunctionKind};
     use abcd_ir::ty::Ty;
     use abcd_ir::{BlockId, CallKind, ClassId, Const, ValueId};
 
@@ -241,18 +241,7 @@ mod tests {
     fn mk_module() -> Module {
         let mut m = Module::new();
         let name = m.sym.intern("Ltest;");
-        m.classes.push(ClassData {
-            descriptor: name,
-            name,
-            modifiers: Modifiers::NONE,
-            source_lang: SourceLang::EcmaScript,
-            super_class: None,
-            interfaces: Vec::new(),
-            fields: Vec::new(),
-            methods: Vec::new(),
-            annotations: Vec::new(),
-            source_file: None,
-        });
+        m.classes.push(ClassData::new(name, name));
         m
     }
 

@@ -22,12 +22,13 @@
 //!   lazy flags on [`ModuleRequest`].
 
 use abcd_file::{
-    self, AccessFlags, AnnotationValue, Class, Field, Method, ModuleData, ModuleRecord, Type,
+    self, AccessFlags, AnnotationValue, Class, Field, Method, ModuleData, ModuleRecord,
+    ModuleRequestPhase, Type,
 };
 use abcd_ir::{
-    AnnValue, Annotation, ClassData, ClassId, Const, ExportDecl, FieldData, FieldId, FunctionKind,
-    ImportDecl, LineEntry, LocalName, LocalScope, Modifiers, ModuleRequest, Signature, SourceLang,
-    StaticTy, Sym, Ty, ValueId,
+    AnnValue, Annotation, ClassData, ClassId, Const, ConstId, EsModule, ExportDecl, FieldData,
+    FieldId, FunctionKind, ImportDecl, LineEntry, LocalName, LocalScope, Modifiers, ModuleRequest,
+    Signature, SourceLang, StaticTy, Sym, Ty, ValueId,
 };
 
 use crate::resolve;
@@ -182,11 +183,34 @@ pub fn lift_class<'f>(lf: &mut Lifter<'f>, class: &'f Class) -> Result<ClassId, 
         .filter_map(|&s| lf.class_of_descriptor(s))
         .collect();
 
+    let class_desc_str = lf.file.strings.resolve(class.descriptor).unwrap_or("");
+    let is_standalone_module_record = class_desc_str == abcd_file::ES_MODULE_RECORD_DESCRIPTOR
+        || class_desc_str == "L_ModuleRequestPhaseRecord;";
+    let is_standalone_scope_record = class_desc_str == abcd_file::ES_SCOPE_NAMES_RECORD_DESCRIPTOR;
+
+    let mut class_module_data: Option<&'f ModuleData> = None;
+    let mut class_module_phase: Option<&'f ModuleRequestPhase> = None;
+    let mut class_scope_names: Option<ConstId> = None;
+
     let mut fields = Vec::with_capacity(class.fields.len());
     for f in &class.fields {
-        fields.push(lift_field(lf, f)?);
+        fields.push(lift_field(
+            lf,
+            f,
+            is_standalone_module_record,
+            is_standalone_scope_record,
+            &mut class_module_data,
+            &mut class_module_phase,
+            &mut class_scope_names,
+        )?);
     }
     let annotations = lift_annotations(lf, &class.annotations);
+
+    // Seed `scope_names` on the reserved class slot before lifting methods so
+    // `finish_debug` can attach it to `DebugData.scope_names` on `--merge-abc`
+    // classes (where the field is named `"scopeNames"` on the record class
+    // rather than keyed by `source_file` on `_ESScopeNamesRecord`).
+    lf.module.classes[class_id.index()].scope_names = class_scope_names;
 
     let mut method_ids = Vec::with_capacity(class.methods.len());
     for (mi, method) in class.methods.iter().enumerate() {
@@ -197,6 +221,11 @@ pub fn lift_class<'f>(lf: &mut Lifter<'f>, class: &'f Class) -> Result<ClassId, 
         crate::lift_method(lf, class_id, method, func_id)?;
         method_ids.push(func_id);
     }
+
+    let es_module = match class_module_data {
+        Some(md) => Some(build_es_module(lf, md, class_module_phase)?),
+        None => None,
+    };
 
     // Assign into the reserved slot (pass 1 pre-filled a shell).
     lf.module.classes[class_id.index()] = ClassData {
@@ -210,14 +239,27 @@ pub fn lift_class<'f>(lf: &mut Lifter<'f>, class: &'f Class) -> Result<ClassId, 
         methods: method_ids,
         annotations,
         source_file,
+        es_module,
+        scope_names: class_scope_names,
     };
     Ok(class_id)
 }
 
-/// Lift a class field; module-record/scope-names/lazy-flag blobs are
-/// collected into the lifter's side channels (they become module-level
-/// declarations in [`emit_module_records`]).
-fn lift_field<'f>(lf: &mut Lifter<'f>, field: &'f Field) -> Result<FieldData, LiftError> {
+/// Lift a class field; standalone `_ESModuleRecord`/`_ModuleRequestPhaseRecord`/
+/// `_ESScopeNamesRecord` blobs collect into the lifter's module-level side
+/// channels, while `--merge-abc` per-record `moduleRecordIdx` /
+/// `moduleRequestPhaseIdx` / `scopeNames` fields stay paired with their owning
+/// [`ClassData`].
+#[allow(clippy::too_many_arguments)]
+fn lift_field<'f>(
+    lf: &mut Lifter<'f>,
+    field: &'f Field,
+    is_standalone_module_record: bool,
+    is_standalone_scope_record: bool,
+    class_module_data: &mut Option<&'f ModuleData>,
+    class_module_phase: &mut Option<&'f ModuleRequestPhase>,
+    class_scope_names: &mut Option<ConstId>,
+) -> Result<FieldData, LiftError> {
     let name = lf
         .sym_of_file_sid(field.name)
         .ok_or(LiftError::UnresolvedEntity(0))?;
@@ -228,17 +270,25 @@ fn lift_field<'f>(lf: &mut Lifter<'f>, field: &'f Field) -> Result<FieldData, Li
         Some(abcd_file::FieldValue::F32(v)) => Some(lf.const_scalar(Const::number(*v as f64))),
         Some(abcd_file::FieldValue::F64(v)) => Some(lf.const_scalar(Const::number(*v))),
         Some(abcd_file::FieldValue::ModuleData(md)) => {
-            lf.module_datas.push(md);
+            if is_standalone_module_record {
+                lf.module_datas.push(md);
+            } else {
+                *class_module_data = Some(md);
+            }
             None
         }
         Some(abcd_file::FieldValue::ModuleRequestPhase(phase)) => {
-            lf.module_phases.push(phase);
+            if is_standalone_module_record {
+                lf.module_phases.push(phase);
+            } else {
+                *class_module_phase = Some(phase);
+            }
             None
         }
         Some(abcd_file::FieldValue::LiteralArrayRef(offset)) => {
-            // `_ESScopeNamesRecord` field: the field NAME is the source
-            // file, the blob a scope-names literal array (offset form —
-            // resolve like the N52 typed-array payloads).
+            // Standalone `_ESScopeNamesRecord` field: the field NAME is the
+            // source file; `--merge-abc` `scopeNames` field: attached to the
+            // owning record class itself.
             let idx = lf
                 .file
                 .literal_array_offsets
@@ -246,7 +296,11 @@ fn lift_field<'f>(lf: &mut Lifter<'f>, field: &'f Field) -> Result<FieldData, Li
                 .copied()
                 .ok_or(LiftError::UnresolvedEntity(*offset))?;
             let konst = resolve::const_for_literal_array(lf, idx)?;
-            lf.scope_name_fields.push((name, konst));
+            if is_standalone_scope_record {
+                lf.scope_name_fields.push((name, konst));
+            } else {
+                *class_scope_names = Some(konst);
+            }
             None
         }
         Some(abcd_file::FieldValue::TypeSummaryOffset(_)) => {
@@ -559,15 +613,25 @@ pub fn finish_debug(fx: &mut FnLift) {
         .filter_map(|p| fx.lf.sym_of_file_sid(p.name))
         .collect();
 
-    // The home record's scope names attach by source-FILE name (the
-    // _ESScopeNamesRecord field name is the source file).
-    let scope_names = source_file.and_then(|sf| {
-        fx.lf
-            .scope_name_fields
-            .iter()
-            .find(|(name, _)| *name == sf)
-            .map(|(_, c)| *c)
-    });
+    // The home record's scope names come from the owning class (`--merge-abc`
+    // `scopeNames` field on the record class) or fall back to matching
+    // `source_file` against standalone `_ESScopeNamesRecord` fields.
+    let class_idx = fx.lf.module.functions[func_id.index()].class_id.index();
+    let scope_names = fx
+        .lf
+        .module
+        .classes
+        .get(class_idx)
+        .and_then(|c| c.scope_names)
+        .or_else(|| {
+            source_file.and_then(|sf| {
+                fx.lf
+                    .scope_name_fields
+                    .iter()
+                    .find(|(name, _)| *name == sf)
+                    .map(|(_, c)| *c)
+            })
+        });
 
     fx.lf.module.functions[func_id.index()].debug = Some(abcd_ir::DebugData {
         source_file,
@@ -592,27 +656,37 @@ fn local_var_ty(lf: &mut Lifter, sig: abcd_file::StringId) -> Option<Ty> {
     Some(ty_of(lf, &ty))
 }
 
-/// Convert the collected module-record blobs into the module's
-/// imports/exports and per-request lazy flags.
+/// Convert one `ModuleData` (+ optional `ModuleRequestPhase` blob) into a
+/// semantic [`EsModule`].
+fn build_es_module(
+    lf: &mut Lifter,
+    md: &ModuleData,
+    phase: Option<&ModuleRequestPhase>,
+) -> Result<EsModule, LiftError> {
+    let mut es = EsModule::default();
+    for (qi, &req_sid) in md.requests.iter().enumerate() {
+        let Some(specifier) = lf.sym_of_file_sid(req_sid) else {
+            continue;
+        };
+        let lazy = phase.and_then(|p| p.flags.get(qi)).is_some_and(|&f| f > 0);
+        es.module_requests.push(ModuleRequest { specifier, lazy });
+    }
+    for record in &md.records {
+        emit_module_record(lf, md, record, &mut es.imports, &mut es.exports)?;
+    }
+    Ok(es)
+}
+
+/// Convert the collected standalone `_ESModuleRecord` blobs into the module's
+/// top-level imports/exports and per-request lazy flags.
 pub fn emit_module_records(lf: &mut Lifter) -> Result<(), LiftError> {
     let module_datas: Vec<&ModuleData> = lf.module_datas.clone();
     for (ri, md) in module_datas.iter().enumerate() {
-        // Per-request lazy flags: the phase blob paired with this
-        // record (positional pairing; missing blob or short flag list →
-        // eager, documented).
         let phase = lf.module_phases.get(ri).copied();
-        for (qi, &req_sid) in md.requests.iter().enumerate() {
-            let Some(specifier) = lf.sym_of_file_sid(req_sid) else {
-                continue;
-            };
-            let lazy = phase.and_then(|p| p.flags.get(qi)).is_some_and(|&f| f > 0);
-            lf.module
-                .module_requests
-                .push(ModuleRequest { specifier, lazy });
-        }
-        for record in &md.records {
-            emit_module_record(lf, md, record)?;
-        }
+        let es = build_es_module(lf, md, phase)?;
+        lf.module.module_requests.extend(es.module_requests);
+        lf.module.imports.extend(es.imports);
+        lf.module.exports.extend(es.exports);
     }
     Ok(())
 }
@@ -622,6 +696,8 @@ fn emit_module_record(
     lf: &mut Lifter,
     md: &ModuleData,
     record: &ModuleRecord,
+    imports: &mut Vec<ImportDecl>,
+    exports: &mut Vec<ExportDecl>,
 ) -> Result<(), LiftError> {
     let request_sym = |lf: &mut Lifter, idx: u32| -> Result<Sym, LiftError> {
         let Some(&sid) = md.requests.get(idx as usize) else {
@@ -646,7 +722,7 @@ fn emit_module_record(
             let import_name = lf
                 .sym_of_file_sid(*import_name)
                 .ok_or(LiftError::UnresolvedEntity(0))?;
-            lf.module.imports.push(ImportDecl::Regular {
+            imports.push(ImportDecl::Regular {
                 local_name,
                 import_name,
                 module_request,
@@ -660,7 +736,7 @@ fn emit_module_record(
             let local_name = lf
                 .sym_of_file_sid(*local_name)
                 .ok_or(LiftError::UnresolvedEntity(0))?;
-            lf.module.imports.push(ImportDecl::Namespace {
+            imports.push(ImportDecl::Namespace {
                 local_name,
                 module_request,
             });
@@ -675,7 +751,7 @@ fn emit_module_record(
             let export_name = lf
                 .sym_of_file_sid(*export_name)
                 .ok_or(LiftError::UnresolvedEntity(0))?;
-            lf.module.exports.push(ExportDecl::Local {
+            exports.push(ExportDecl::Local {
                 local_name,
                 export_name,
             });
@@ -692,7 +768,7 @@ fn emit_module_record(
             let import_name = lf
                 .sym_of_file_sid(*import_name)
                 .ok_or(LiftError::UnresolvedEntity(0))?;
-            lf.module.exports.push(ExportDecl::Indirect {
+            exports.push(ExportDecl::Indirect {
                 export_name,
                 import_name,
                 module_request,
@@ -700,7 +776,7 @@ fn emit_module_record(
         }
         ModuleRecord::StarExport { module_request_idx } => {
             let module_request = request_sym(lf, *module_request_idx)?;
-            lf.module.exports.push(ExportDecl::Star { module_request });
+            exports.push(ExportDecl::Star { module_request });
         }
     }
     Ok(())

@@ -1159,6 +1159,13 @@ pub fn verify_module(module: &Module) -> VerifyReport {
                     .push(module_err(VerifyErrorKind::FuncOutOfRange(m)));
             }
         }
+        if let Some(sn) = class.scope_names
+            && module.consts.get(sn).is_none()
+        {
+            report
+                .errors
+                .push(module_err(VerifyErrorKind::ConstOutOfRange(sn)));
+        }
     }
 
     for (fi, func) in module.functions.iter().enumerate() {
@@ -1213,7 +1220,7 @@ mod tests {
     use super::*;
     use crate::consts::Const;
     use crate::function::{Block, Catch, FunctionData, Inst, TryRegion, Value};
-    use crate::module::{ClassData, FunctionKind, Modifiers, SourceLang};
+    use crate::module::{ClassData, FunctionKind};
     use crate::op::BinOp;
     use crate::ty::Ty;
 
@@ -1222,18 +1229,7 @@ mod tests {
     fn mk_module() -> Module {
         let mut m = Module::new();
         let name = m.sym.intern("Ltest;");
-        m.classes.push(ClassData {
-            descriptor: name,
-            name,
-            modifiers: Modifiers::NONE,
-            source_lang: SourceLang::EcmaScript,
-            super_class: None,
-            interfaces: Vec::new(),
-            fields: Vec::new(),
-            methods: Vec::new(),
-            annotations: Vec::new(),
-            source_file: None,
-        });
+        m.classes.push(ClassData::new(name, name));
         m
     }
 

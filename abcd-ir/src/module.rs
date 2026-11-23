@@ -174,6 +174,47 @@ pub struct ClassData {
     pub annotations: Vec<Annotation>,
     /// Source file name, when known.
     pub source_file: Option<Sym>,
+    /// Per-record ES module declarations for `--merge-abc` bundles (`moduleRecordIdx`
+    /// paired with this class's own `moduleRequestPhaseIdx` when present). `None`
+    /// for non-module classes and standalone `_ESModuleRecord` files (which
+    /// populate [`Module::imports`], [`Module::exports`], and
+    /// [`Module::module_requests`]).
+    pub es_module: Option<EsModule>,
+    /// Per-record scope-names literal array for `--merge-abc` bundles
+    /// (`scopeNames` field on this class, resolved into [`Module::consts`]).
+    /// `None` when absent.
+    pub scope_names: Option<ConstId>,
+}
+
+impl ClassData {
+    /// Construct an empty `EcmaScript` class shell for `descriptor` / `name`.
+    pub fn new(descriptor: Sym, name: Sym) -> Self {
+        Self {
+            descriptor,
+            name,
+            modifiers: Modifiers::NONE,
+            source_lang: SourceLang::EcmaScript,
+            super_class: None,
+            interfaces: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            annotations: Vec::new(),
+            source_file: None,
+            es_module: None,
+            scope_names: None,
+        }
+    }
+}
+
+/// Per-record ES module metadata attached to a `--merge-abc` record class.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EsModule {
+    /// Import declarations of this module record.
+    pub imports: Vec<ImportDecl>,
+    /// Export declarations of this module record.
+    pub exports: Vec<ExportDecl>,
+    /// Module requests with their lazy-import flags, in request order.
+    pub module_requests: Vec<ModuleRequest>,
 }
 
 /// One entry of a module's module-request list (N7): the specifier plus

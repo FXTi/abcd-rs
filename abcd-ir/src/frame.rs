@@ -115,7 +115,7 @@ pub fn this_param_index(module: &Module, func: &FunctionData) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::{Annotation, ClassData, FunctionKind, Modifiers, SourceLang};
+    use crate::module::{Annotation, ClassData, FunctionKind};
     use crate::{ClassId, Const, FuncId};
 
     fn bare_module() -> Module {
@@ -143,18 +143,7 @@ mod tests {
 
     fn add_call_type(m: &mut Module, f: FuncId, bits: u32) {
         let descriptor = m.sym.intern("L_ESCallTypeAnnotation;");
-        m.classes.push(ClassData {
-            descriptor,
-            name: descriptor,
-            modifiers: Modifiers::NONE,
-            source_lang: SourceLang::EcmaScript,
-            super_class: None,
-            interfaces: Vec::new(),
-            fields: Vec::new(),
-            methods: Vec::new(),
-            annotations: Vec::new(),
-            source_file: None,
-        });
+        m.classes.push(ClassData::new(descriptor, descriptor));
         let class = ClassId::new((m.classes.len() - 1) as u32);
         let elem = m.sym.intern("callType");
         let cid = m.consts.push(Const::number(f64::from(bits)));

@@ -90,8 +90,8 @@ pub use function::{
 };
 pub use id::{BlockId, ClassId, ConstId, FieldId, FuncId, InstId, Sym, ValueId};
 pub use module::{
-    AnnValue, Annotation, ClassData, ExportDecl, FieldData, FunctionKind, ImportDecl, Modifiers,
-    Module, ModuleRequest, Signature, SourceLang,
+    AnnValue, Annotation, ClassData, EsModule, ExportDecl, FieldData, FunctionKind, ImportDecl,
+    Modifiers, Module, ModuleRequest, Signature, SourceLang,
 };
 pub use op::{Arity, BinOp, CallKind, CmpOp, Op, PropKey, SuperCheck, SuperKey, UnOp};
 pub use symbol::SymbolTable;

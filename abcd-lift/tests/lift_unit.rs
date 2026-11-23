@@ -736,3 +736,187 @@ fn delobjprop_operand_roles() {
         "object must come from the register, not the acc constant"
     );
 }
+
+// ─── `--merge-abc` per-record EsModule, phase pairing & scopeNames ──
+
+#[test]
+fn merge_abc_records_pair_phase_and_scope_names_per_class() {
+    use abcd_file::ModuleRecordDef;
+
+    let file = build(|b| {
+        b.set_api(12, "beta1");
+
+        // La;: moduleRecordIdx (1 request, NO phase field) + scopeNames + debug method
+        let cls_a = b.add_class("La;");
+        b.class_set_source_lang(cls_a, SourceLang::EcmaScript);
+        let mod_a = b.class_add_field(
+            cls_a,
+            abcd_file::MODULE_RECORD_IDX_FIELD,
+            Type::U32,
+            AccessFlags::PUBLIC,
+        );
+        let scope_a = b.class_add_field(
+            cls_a,
+            abcd_file::SCOPE_NAMES_FIELD,
+            Type::U32,
+            AccessFlags::PUBLIC,
+        );
+        let dep_b = b.add_string("./b");
+        let mod_a_la = b.add_literal_array("La_mod");
+        let recs_a = [ModuleRecordDef::RegularImport {
+            local_name: b.add_string("x"),
+            import_name: b.add_string("x"),
+            module_request_idx: 0,
+        }];
+        b.literal_array_add_module_data(mod_a_la, &[dep_b], &recs_a)
+            .expect("La module data");
+        b.field_set_value_literalarray(mod_a, mod_a_la)
+            .expect("wire La moduleRecordIdx");
+        let scope_a_la = b.add_literal_array("La_scope");
+        let s_alpha = b.add_string("alpha");
+        b.literal_array_add_string(scope_a_la, s_alpha);
+        b.field_set_value_literalarray(scope_a, scope_a_la)
+            .expect("wire La scopeNames");
+        let proto = b.create_proto(Type::Tagged, &[]);
+        let (code, _) = encode_bytecodes(&[Bytecode::Returnundefined]).unwrap();
+        let ma = b.class_add_method(
+            cls_a,
+            "func_main_0",
+            proto,
+            AccessFlags::STATIC,
+            &code,
+            0,
+            0,
+        );
+        let lnp = b.create_lnp();
+        let dbg = b.create_debug_info(lnp, 1);
+        let src_a = b.add_string("a.ts");
+        b.lnp_emit_set_file(lnp, dbg, src_a);
+        b.lnp_emit_end(lnp);
+        b.method_set_debug_info(ma, dbg);
+
+        // Lb;: moduleRecordIdx (2 requests) + moduleRequestPhaseIdx ([0, 1]) + scopeNames (debug-less method)
+        let cls_b = b.add_class("Lb;");
+        b.class_set_source_lang(cls_b, SourceLang::EcmaScript);
+        let mod_b = b.class_add_field(
+            cls_b,
+            abcd_file::MODULE_RECORD_IDX_FIELD,
+            Type::U32,
+            AccessFlags::PUBLIC,
+        );
+        let phase_b = b.class_add_field(
+            cls_b,
+            abcd_file::MODULE_REQUEST_PHASE_FIELD,
+            Type::U32,
+            AccessFlags::PUBLIC,
+        );
+        let scope_b = b.class_add_field(
+            cls_b,
+            abcd_file::SCOPE_NAMES_FIELD,
+            Type::U32,
+            AccessFlags::PUBLIC,
+        );
+        let dep_c = b.add_string("./c");
+        let dep_lazy = b.add_string("./lazy");
+        let mod_b_la = b.add_literal_array("Lb_mod");
+        let recs_b = [ModuleRecordDef::LocalExport {
+            local_name: b.add_string("y"),
+            export_name: b.add_string("default"),
+        }];
+        b.literal_array_add_module_data(mod_b_la, &[dep_c, dep_lazy], &recs_b)
+            .expect("Lb module data");
+        b.field_set_value_literalarray(mod_b, mod_b_la)
+            .expect("wire Lb moduleRecordIdx");
+        let phase_b_la = b.add_literal_array("Lb_phase");
+        b.literal_array_add_module_request_phase(phase_b_la, &[0, 1])
+            .expect("Lb phase");
+        b.field_set_value_literalarray(phase_b, phase_b_la)
+            .expect("wire Lb phase");
+        let scope_b_la = b.add_literal_array("Lb_scope");
+        let s_beta = b.add_string("beta");
+        b.literal_array_add_string(scope_b_la, s_beta);
+        b.field_set_value_literalarray(scope_b, scope_b_la)
+            .expect("wire Lb scopeNames");
+        let proto_b = b.create_proto(Type::Tagged, &[]);
+        b.class_add_method(
+            cls_b,
+            "func_main_0",
+            proto_b,
+            AccessFlags::STATIC,
+            &code,
+            0,
+            0,
+        );
+
+        // Lcfg;: jsonFileContent
+        let cls_json = b.add_class("Lcfg;");
+        b.class_set_source_lang(cls_json, SourceLang::EcmaScript);
+        let json_f = b.class_add_field(
+            cls_json,
+            abcd_file::JSON_FILE_CONTENT_FIELD,
+            Type::U32,
+            AccessFlags::PUBLIC,
+        );
+        let json_s = b.add_string("{\"v\":1}");
+        b.field_set_value_string(json_f, json_s)
+            .expect("wire jsonFileContent");
+    });
+
+    let mut m = lift_file(&file).expect("lift merge-abc");
+    verify_clean(&m);
+
+    // Multi-record merge-abc does not flatten heterogeneous module records onto Module.
+    assert!(m.imports.is_empty());
+    assert!(m.exports.is_empty());
+    assert!(m.module_requests.is_empty());
+
+    fn find_class<'a>(m: &'a abcd_ir::Module, desc: &str) -> &'a abcd_ir::ClassData {
+        m.classes
+            .iter()
+            .find(|c| resolve(m, c.descriptor) == desc)
+            .unwrap_or_else(|| panic!("missing class {desc}"))
+    }
+
+    // La; has NO phase field -> its request must stay eager (not steal Lb;'s phase!).
+    let la = find_class(&m, "La;").clone();
+    let es_a = la.es_module.expect("La.es_module");
+    assert_eq!(es_a.module_requests.len(), 1);
+    assert_eq!(resolve(&m, es_a.module_requests[0].specifier), "./b");
+    assert!(!es_a.module_requests[0].lazy);
+    assert_eq!(es_a.imports.len(), 1);
+    let alpha_sym = m.sym.intern("alpha");
+    let scope_a_cid = la.scope_names.expect("La.scope_names");
+    assert_eq!(
+        m.consts.get(scope_a_cid),
+        Some(&Const::ArrayLiteral(vec![Const::String(alpha_sym)]))
+    );
+    let fn_a = &m.functions[la.methods[0].index()];
+    assert_eq!(
+        fn_a.debug.as_ref().and_then(|d| d.scope_names),
+        Some(scope_a_cid),
+        "finish_debug must attach owning class scopeNames even when source_file is a.ts"
+    );
+
+    // Lb; owns its [0, 1] phase blob.
+    let lb = find_class(&m, "Lb;").clone();
+    let es_b = lb.es_module.expect("Lb.es_module");
+    let reqs_b: Vec<(&str, bool)> = es_b
+        .module_requests
+        .iter()
+        .map(|r| (resolve(&m, r.specifier), r.lazy))
+        .collect();
+    assert_eq!(reqs_b, [("./c", false), ("./lazy", true)]);
+    assert_eq!(es_b.exports.len(), 1);
+    let beta_sym = m.sym.intern("beta");
+    let scope_b_cid = lb.scope_names.expect("Lb.scope_names");
+    assert_eq!(
+        m.consts.get(scope_b_cid),
+        Some(&Const::ArrayLiteral(vec![Const::String(beta_sym)]))
+    );
+
+    // Lcfg; jsonFileContent lifts to Const::String.
+    let lcfg = find_class(&m, "Lcfg;").clone();
+    let json_sym = m.sym.intern("{\"v\":1}");
+    let init_cid = lcfg.fields[0].initial_value.expect("json initial_value");
+    assert_eq!(m.consts.get(init_cid), Some(&Const::String(json_sym)));
+}

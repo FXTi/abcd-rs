@@ -34,18 +34,9 @@ impl<'m> V2Builder<'m> {
     pub fn create_function(module: &'m mut Module, name: &str, kind: FunctionKind) -> FuncId {
         if module.classes.is_empty() {
             let descriptor = module.sym.intern("Ltest;");
-            module.classes.push(abcd_ir::ClassData {
-                descriptor,
-                name: descriptor,
-                modifiers: abcd_ir::Modifiers::NONE,
-                source_lang: abcd_ir::SourceLang::EcmaScript,
-                super_class: None,
-                interfaces: Vec::new(),
-                fields: Vec::new(),
-                methods: Vec::new(),
-                annotations: Vec::new(),
-                source_file: None,
-            });
+            module
+                .classes
+                .push(abcd_ir::ClassData::new(descriptor, descriptor));
         }
         let sym = module.sym.intern(name);
         let func = FuncId::new(module.functions.len() as u32);

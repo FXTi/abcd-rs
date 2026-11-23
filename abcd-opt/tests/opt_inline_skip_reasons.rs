@@ -35,18 +35,9 @@ fn set_call_type(module: &mut Module, f: FuncId, bits: u32) {
     {
         Some(i) => ClassId::new(i as u32),
         None => {
-            module.classes.push(abcd_ir::ClassData {
-                descriptor,
-                name: descriptor,
-                modifiers: abcd_ir::Modifiers::NONE,
-                source_lang: abcd_ir::SourceLang::EcmaScript,
-                super_class: None,
-                interfaces: Vec::new(),
-                fields: Vec::new(),
-                methods: Vec::new(),
-                annotations: Vec::new(),
-                source_file: None,
-            });
+            module
+                .classes
+                .push(abcd_ir::ClassData::new(descriptor, descriptor));
             ClassId::new((module.classes.len() - 1) as u32)
         }
     };
@@ -298,18 +289,9 @@ fn annotation_element_arms_fall_through_to_default() {
     let mut module = Module::new();
     // (a) callType annotation whose only element is named "other".
     let descriptor = module.sym.intern("L_ESCallTypeAnnotation;");
-    module.classes.push(abcd_ir::ClassData {
-        descriptor,
-        name: descriptor,
-        modifiers: abcd_ir::Modifiers::NONE,
-        source_lang: abcd_ir::SourceLang::EcmaScript,
-        super_class: None,
-        interfaces: Vec::new(),
-        fields: Vec::new(),
-        methods: Vec::new(),
-        annotations: Vec::new(),
-        source_file: None,
-    });
+    module
+        .classes
+        .push(abcd_ir::ClassData::new(descriptor, descriptor));
     let ann_class = ClassId::new((module.classes.len() - 1) as u32);
     let other = module.sym.intern("other");
     let call_type = module.sym.intern("callType");
@@ -969,18 +951,9 @@ fn unrelated_annotation_class_falls_through() {
         b.emit_void(Op::Return { value: Some(p3) });
     }
     let descriptor = module.sym.intern("LOther;");
-    module.classes.push(abcd_ir::ClassData {
-        descriptor,
-        name: descriptor,
-        modifiers: abcd_ir::Modifiers::NONE,
-        source_lang: abcd_ir::SourceLang::EcmaScript,
-        super_class: None,
-        interfaces: Vec::new(),
-        fields: Vec::new(),
-        methods: Vec::new(),
-        annotations: Vec::new(),
-        source_file: None,
-    });
+    module
+        .classes
+        .push(abcd_ir::ClassData::new(descriptor, descriptor));
     let ann_class = ClassId::new((module.classes.len() - 1) as u32);
     let elem = module.sym.intern("callType");
     let cid = module.consts.push(Const::number(0.0));

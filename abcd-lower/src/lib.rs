@@ -283,18 +283,9 @@ mod tests {
     fn const_assignment_lowers_with_the_name_register() {
         let mut module = Module::new();
         let descriptor = module.sym.intern("Ltest;");
-        module.classes.push(abcd_ir::ClassData {
-            descriptor,
-            name: descriptor,
-            modifiers: abcd_ir::Modifiers::NONE,
-            source_lang: abcd_ir::SourceLang::EcmaScript,
-            super_class: None,
-            interfaces: Vec::new(),
-            fields: Vec::new(),
-            methods: Vec::new(),
-            annotations: Vec::new(),
-            source_file: None,
-        });
+        module
+            .classes
+            .push(abcd_ir::ClassData::new(descriptor, descriptor));
         let name_sym = module.sym.intern("f");
         let func = FuncId::new(0);
         module.functions.push(FunctionData::new(

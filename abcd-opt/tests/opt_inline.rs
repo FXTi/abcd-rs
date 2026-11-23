@@ -51,18 +51,9 @@ fn set_call_type(module: &mut Module, f: FuncId, bits: u32) {
     {
         Some(i) => abcd_ir::ClassId::new(i as u32),
         None => {
-            module.classes.push(abcd_ir::ClassData {
-                descriptor,
-                name: descriptor,
-                modifiers: abcd_ir::Modifiers::NONE,
-                source_lang: abcd_ir::SourceLang::EcmaScript,
-                super_class: None,
-                interfaces: Vec::new(),
-                fields: Vec::new(),
-                methods: Vec::new(),
-                annotations: Vec::new(),
-                source_file: None,
-            });
+            module
+                .classes
+                .push(abcd_ir::ClassData::new(descriptor, descriptor));
             abcd_ir::ClassId::new((module.classes.len() - 1) as u32)
         }
     };

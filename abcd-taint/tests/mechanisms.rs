@@ -811,18 +811,7 @@ fn call_binding_annotated_calltype_zero() {
     // The annotation class record.
     let ann_name = m.sym.intern("L_ESCallTypeAnnotation;");
     let ann_class = abcd_ir::ClassId::new(m.classes.len() as u32);
-    m.classes.push(abcd_ir::ClassData {
-        descriptor: ann_name,
-        name: ann_name,
-        modifiers: abcd_ir::Modifiers::NONE,
-        source_lang: abcd_ir::module::SourceLang::EcmaScript,
-        super_class: None,
-        interfaces: Vec::new(),
-        fields: Vec::new(),
-        methods: Vec::new(),
-        annotations: Vec::new(),
-        source_file: None,
-    });
+    m.classes.push(abcd_ir::ClassData::new(ann_name, ann_name));
     let f = add_func_named(&mut m, "annotated");
     let fb = entry_of(&m, f);
     let formal = add_param(&mut m, f, 0);

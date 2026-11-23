@@ -289,18 +289,9 @@ impl<'f> Lifter<'f> {
         }
         let descriptor = self.sym_of_file_sid(sid)?;
         let cid = ClassId::new(self.module.classes.len() as u32);
-        self.module.classes.push(abcd_ir::ClassData {
-            descriptor,
-            name: descriptor,
-            modifiers: abcd_ir::Modifiers::NONE,
-            source_lang: abcd_ir::SourceLang::EcmaScript,
-            super_class: None,
-            interfaces: Vec::new(),
-            fields: Vec::new(),
-            methods: Vec::new(),
-            annotations: Vec::new(),
-            source_file: None,
-        });
+        self.module
+            .classes
+            .push(abcd_ir::ClassData::new(descriptor, descriptor));
         self.class_to_id.insert(sid, cid);
         Some(cid)
     }
@@ -371,18 +362,9 @@ pub fn lift_file(file: &File) -> Result<Module, LiftError> {
         let descriptor = lf
             .sym_of_file_sid(class.descriptor)
             .unwrap_or_else(|| lf.sym("<unnamed-class>"));
-        lf.module.classes.push(abcd_ir::ClassData {
-            descriptor,
-            name: descriptor,
-            modifiers: abcd_ir::Modifiers::NONE,
-            source_lang: abcd_ir::SourceLang::EcmaScript,
-            super_class: None,
-            interfaces: Vec::new(),
-            fields: Vec::new(),
-            methods: Vec::new(),
-            annotations: Vec::new(),
-            source_file: None,
-        });
+        lf.module
+            .classes
+            .push(abcd_ir::ClassData::new(descriptor, descriptor));
         for method in &class.methods {
             let fid = FuncId::new(lf.module.functions.len() as u32);
             lf.method_to_func.entry(method.offset).or_insert(fid);
