@@ -1130,8 +1130,9 @@ impl IfdsProblem for TaintProblem<'_> {
                 out.push(source.clone());
             }
             // ── Module variables ─────────────────────────────────────
-            Op::LoadModuleVar { index } => {
-                if fact.base == TaintBase::ModuleVar(*index)
+            Op::LoadModuleVar { index, kind } => {
+                if kind.is_local()
+                    && fact.base == TaintBase::ModuleVar(*index)
                     && let Some(result) = curr_inst.result
                 {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(result))));

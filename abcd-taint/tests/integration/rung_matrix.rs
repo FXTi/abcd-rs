@@ -530,8 +530,26 @@ fn module_var_and_global_store_channels() {
     add_param(&mut m, f, 0);
     let p = add_param(&mut m, f, 1);
     emit_void(&mut m, entry, Op::StoreModuleVar { index: 3, value: p });
-    let x = emit(&mut m, entry, Op::LoadModuleVar { index: 3 });
+    let x = emit(
+        &mut m,
+        entry,
+        Op::LoadModuleVar {
+            index: 3,
+            kind: abcd_ir::ModuleVarKind::Local,
+        },
+    );
     print_call(&mut m, entry, vec![x]);
+    // External import slot 3 is a distinct namespace and must NOT alias local
+    // export slot 3.
+    let ext = emit(
+        &mut m,
+        entry,
+        Op::LoadModuleVar {
+            index: 3,
+            kind: abcd_ir::ModuleVarKind::External,
+        },
+    );
+    print_call(&mut m, entry, vec![ext]);
     let gr = intern(&mut m, "GR");
     emit_void(
         &mut m,

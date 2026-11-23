@@ -413,6 +413,13 @@ impl Op {
             // ReferenceError when the global is absent (mirrors
             // TryGetGlobal's "never throws").
             TryStoreGlobal { .. } => writes(MemClasses::GLOBAL),
+            LoadModuleVar { kind, .. } if kind.is_lazy() => Effects {
+                reads: MemClasses::ALL,
+                writes: MemClasses::ALL,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // first read evaluates target module
+                allocs: AllocKind::Unknown,
+            },
             LoadModuleVar { .. } => reads(MemClasses::MODULE),
             StoreModuleVar { .. } => writes(MemClasses::MODULE),
             GetModuleNamespace { .. } => Effects {
@@ -744,6 +751,10 @@ mod tests {
                 key: crate::op::SuperKey::Name(name),
                 this_value: v,
             },
+            Op::LoadModuleVar {
+                index: 0,
+                kind: crate::op::ModuleVarKind::Lazy,
+            },
         ];
         for op in cases {
             assert!(
@@ -756,7 +767,14 @@ mod tests {
         // (v0.1 parity — they were NOT on the essential list).
         for op in [
             Op::GetLexVar { level: 0, slot: 0 },
-            Op::LoadModuleVar { index: 0 },
+            Op::LoadModuleVar {
+                index: 0,
+                kind: crate::op::ModuleVarKind::Local,
+            },
+            Op::LoadModuleVar {
+                index: 0,
+                kind: crate::op::ModuleVarKind::External,
+            },
             Op::GetResumeMode { genobj: v },
             Op::AllocObject {
                 shape: ConstId::new(0),

@@ -496,6 +496,126 @@ fn get_module_namespace_emits_vendor_opcode() {
     );
 }
 
+/// `Op::LoadModuleVar`, `Op::StoreModuleVar`, and `Op::GetModuleNamespace`
+/// preserve local vs external vs lazy vs sendable identity and select wide
+/// `u16` encodings when `index > 255`.
+#[test]
+fn module_var_ops_preserve_kind_and_select_wide_encodings() {
+    use abcd_ir::ModuleVarKind;
+
+    let cases: &[(ModuleVarKind, u32, Bytecode)] = &[
+        (ModuleVarKind::Local, 3, Bytecode::Ldlocalmodulevar(Imm(3))),
+        (
+            ModuleVarKind::Local,
+            300,
+            Bytecode::WideLdlocalmodulevar(Imm(300)),
+        ),
+        (
+            ModuleVarKind::External,
+            4,
+            Bytecode::Ldexternalmodulevar(Imm(4)),
+        ),
+        (
+            ModuleVarKind::External,
+            301,
+            Bytecode::WideLdexternalmodulevar(Imm(301)),
+        ),
+        (
+            ModuleVarKind::Lazy,
+            5,
+            Bytecode::CallruntimeLdlazymodulevar(Imm(5)),
+        ),
+        (
+            ModuleVarKind::Lazy,
+            302,
+            Bytecode::CallruntimeWideldlazymodulevar(Imm(302)),
+        ),
+        (
+            ModuleVarKind::SendableLocal,
+            6,
+            Bytecode::CallruntimeLdsendablelocalmodulevar(Imm(6)),
+        ),
+        (
+            ModuleVarKind::SendableLocal,
+            303,
+            Bytecode::CallruntimeWideldsendablelocalmodulevar(Imm(303)),
+        ),
+        (
+            ModuleVarKind::SendableExternal,
+            7,
+            Bytecode::CallruntimeLdsendableexternalmodulevar(Imm(7)),
+        ),
+        (
+            ModuleVarKind::SendableExternal,
+            304,
+            Bytecode::CallruntimeWideldsendableexternalmodulevar(Imm(304)),
+        ),
+        (
+            ModuleVarKind::LazySendable,
+            8,
+            Bytecode::CallruntimeLdlazysendablemodulevar(Imm(8)),
+        ),
+        (
+            ModuleVarKind::LazySendable,
+            305,
+            Bytecode::CallruntimeWideldlazysendablemodulevar(Imm(305)),
+        ),
+        (
+            ModuleVarKind::SendableClass,
+            9,
+            Bytecode::CallruntimeLdsendableclass(Imm(9)),
+        ),
+    ];
+
+    for (kind, index, want) in cases {
+        let mut module = Module::new();
+        let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
+        {
+            let mut b = V2Builder::new(&mut module, func);
+            let v = b.emit_val(Op::LoadModuleVar {
+                index: *index,
+                kind: *kind,
+            });
+            b.emit_void(Op::Return { value: Some(v) });
+        }
+        let result = lower_function(&module, func).expect("LoadModuleVar must lower");
+        let want_dbg = format!("{want:?}");
+        assert!(
+            result
+                .bytecodes
+                .iter()
+                .any(|bc| format!("{bc:?}") == want_dbg),
+            "LoadModuleVar({kind:?}, {index}) missing {want:?}: {:?}",
+            result.bytecodes
+        );
+    }
+
+    let mut module = Module::new();
+    let func = V2Builder::create_function(&mut module, "wide_mod", FunctionKind::Function);
+    {
+        let mut b = V2Builder::new(&mut module, func);
+        let ns = b.emit_val(Op::GetModuleNamespace { index: 400 });
+        b.emit_void(Op::StoreModuleVar {
+            index: 401,
+            value: ns,
+        });
+        b.emit_void(Op::Return { value: Some(ns) });
+    }
+    let result = lower_function(&module, func).expect("wide module ops must lower");
+    assert!(
+        result
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::WideGetmodulenamespace(Imm(400))))
+    );
+    assert!(
+        result
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::WideStmodulevar(Imm(401))))
+    );
+}
+
 /// `Op::DynamicImport` → `dynamicimport` with the specifier in acc.
 #[test]
 fn dynamic_import_emits_vendor_opcode() {

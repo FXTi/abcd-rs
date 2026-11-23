@@ -841,9 +841,11 @@ impl<'m> Pta<'m> {
                     Op::StoreModuleVar { index, value } => {
                         self.add_edge(local(*value), Ptr::ModuleVar(*index));
                     }
-                    Op::LoadModuleVar { index } => {
+                    Op::LoadModuleVar { index, kind } => {
                         if let Some(r) = inst.result {
-                            self.add_edge(Ptr::ModuleVar(*index), local(r));
+                            if kind.is_local() {
+                                self.add_edge(Ptr::ModuleVar(*index), local(r));
+                            }
                             self.add_fact(local(r), Obj::Unknown);
                         }
                     }

@@ -49,7 +49,14 @@ fn g01_tdz_guard_names_slot() {
     let foo = add_func_named(&mut m, "foo");
     {
         let b = entry_of(&m, foo);
-        let v = emit(&mut m, b, Op::LoadModuleVar { index: 0 });
+        let v = emit(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: abcd_ir::ModuleVarKind::Local,
+            },
+        );
         let name = intern(&mut m, "moduleVar");
         emit_void(
             &mut m,
@@ -170,7 +177,14 @@ fn g02_defined_names_and_default_export() {
             },
         );
         // print(answer): load slot 2 with its TDZ guard, then return it.
-        let v = emit(&mut m, b, Op::LoadModuleVar { index: 2 });
+        let v = emit(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 2,
+                kind: abcd_ir::ModuleVarKind::Local,
+            },
+        );
         let name = intern(&mut m, "answer");
         emit_void(
             &mut m,
@@ -224,14 +238,28 @@ fn g03_conflicting_names_fall_back() {
     let main = add_func_named(&mut m, "func_main_0");
     {
         let b = entry_of(&m, main);
-        let v0 = emit(&mut m, b, Op::LoadModuleVar { index: 0 });
+        let v0 = emit(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: abcd_ir::ModuleVarKind::Local,
+            },
+        );
         let a = intern(&mut m, "alpha");
         emit_void(
             &mut m,
             b,
             Op::ThrowUndefinedIfHoleWithName { name: a, value: v0 },
         );
-        let v1 = emit(&mut m, b, Op::LoadModuleVar { index: 0 });
+        let v1 = emit(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: abcd_ir::ModuleVarKind::Local,
+            },
+        );
         let bsym = intern(&mut m, "beta");
         emit_void(
             &mut m,

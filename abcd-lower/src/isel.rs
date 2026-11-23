@@ -1607,16 +1607,80 @@ fn select_inst(
         }
 
         // ── Module variables ─────────────────────────────────────────
-        Op::LoadModuleVar { index } => {
-            codes.push(Bytecode::Ldlocalmodulevar(Imm(*index as i64)));
+        Op::LoadModuleVar { index, kind } => {
+            use abcd_ir::ModuleVarKind;
+            let bc = match (*kind, u8::try_from(*index), u16::try_from(*index)) {
+                (ModuleVarKind::Local, Ok(n), _) => Bytecode::Ldlocalmodulevar(Imm(i64::from(n))),
+                (ModuleVarKind::Local, Err(_), Ok(w)) => {
+                    Bytecode::WideLdlocalmodulevar(Imm(i64::from(w)))
+                }
+                (ModuleVarKind::External, Ok(n), _) => {
+                    Bytecode::Ldexternalmodulevar(Imm(i64::from(n)))
+                }
+                (ModuleVarKind::External, Err(_), Ok(w)) => {
+                    Bytecode::WideLdexternalmodulevar(Imm(i64::from(w)))
+                }
+                (ModuleVarKind::Lazy, Ok(n), _) => {
+                    Bytecode::CallruntimeLdlazymodulevar(Imm(i64::from(n)))
+                }
+                (ModuleVarKind::Lazy, Err(_), Ok(w)) => {
+                    Bytecode::CallruntimeWideldlazymodulevar(Imm(i64::from(w)))
+                }
+                (ModuleVarKind::SendableLocal, Ok(n), _) => {
+                    Bytecode::CallruntimeLdsendablelocalmodulevar(Imm(i64::from(n)))
+                }
+                (ModuleVarKind::SendableLocal, Err(_), Ok(w)) => {
+                    Bytecode::CallruntimeWideldsendablelocalmodulevar(Imm(i64::from(w)))
+                }
+                (ModuleVarKind::SendableExternal, Ok(n), _) => {
+                    Bytecode::CallruntimeLdsendableexternalmodulevar(Imm(i64::from(n)))
+                }
+                (ModuleVarKind::SendableExternal, Err(_), Ok(w)) => {
+                    Bytecode::CallruntimeWideldsendableexternalmodulevar(Imm(i64::from(w)))
+                }
+                (ModuleVarKind::LazySendable, Ok(n), _) => {
+                    Bytecode::CallruntimeLdlazysendablemodulevar(Imm(i64::from(n)))
+                }
+                (ModuleVarKind::LazySendable, Err(_), Ok(w)) => {
+                    Bytecode::CallruntimeWideldlazysendablemodulevar(Imm(i64::from(w)))
+                }
+                (ModuleVarKind::SendableClass, _, Ok(w)) => {
+                    Bytecode::CallruntimeLdsendableclass(Imm(i64::from(w)))
+                }
+                (_, _, Err(_)) => {
+                    return Err(LowerError::UnsupportedInstruction {
+                        func: func_id,
+                        message: format!("LoadModuleVar index {index} exceeds u16::MAX"),
+                    });
+                }
+            };
+            codes.push(bc);
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         Op::StoreModuleVar { index, value } => {
             ensure_acc(tracker, func_id, *value, alloc, codes)?;
-            codes.push(Bytecode::Stmodulevar(Imm(*index as i64)));
+            if let Ok(n) = u8::try_from(*index) {
+                codes.push(Bytecode::Stmodulevar(Imm(i64::from(n))));
+            } else if let Ok(w) = u16::try_from(*index) {
+                codes.push(Bytecode::WideStmodulevar(Imm(i64::from(w))));
+            } else {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: format!("StoreModuleVar index {index} exceeds u16::MAX"),
+                });
+            }
         }
         Op::GetModuleNamespace { index } => {
-            codes.push(Bytecode::Getmodulenamespace(Imm(*index as i64)));
+            if let Ok(n) = u8::try_from(*index) {
+                codes.push(Bytecode::Getmodulenamespace(Imm(i64::from(n))));
+            } else if let Ok(w) = u16::try_from(*index) {
+                codes.push(Bytecode::WideGetmodulenamespace(Imm(i64::from(w))));
+            } else {
+                return Err(LowerError::UnsupportedInstruction {
+                    func: func_id,
+                    message: format!("GetModuleNamespace index {index} exceeds u16::MAX"),
+                });
+            }
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         Op::DynamicImport { specifier } => {

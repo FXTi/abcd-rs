@@ -990,7 +990,14 @@ fn t14_globals_and_module() {
             value: _tg2,
         },
     );
-    let lmv = emit(&mut m, b, Op::LoadModuleVar { index: 3 });
+    let lmv = emit(
+        &mut m,
+        b,
+        Op::LoadModuleVar {
+            index: 3,
+            kind: abcd_ir::ModuleVarKind::Local,
+        },
+    );
     emit_void(
         &mut m,
         b,

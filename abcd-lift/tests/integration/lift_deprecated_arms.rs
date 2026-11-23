@@ -790,10 +790,30 @@ fn deprecated_ldmodulevar_carries_the_symbol_index() {
     let mut m = lift_file(&file).expect("lift");
     verify_clean(&m);
     let sym_idx = m.sym.intern("mod-ld").0;
-    let Op::LoadModuleVar { index } = find_op(&m, |o| matches!(o, Op::LoadModuleVar { .. })) else {
+    let Op::LoadModuleVar { index, kind } = find_op(&m, |o| matches!(o, Op::LoadModuleVar { .. }))
+    else {
         unreachable!()
     };
     assert_eq!(*index, sym_idx);
+    assert_eq!(*kind, abcd_ir::ModuleVarKind::Local);
+
+    let ext_file = build_with_string(
+        &[
+            Bytecode::DeprecatedLdmodulevar(PLACEHOLDER, Imm(1)),
+            Bytecode::Return,
+        ],
+        0,
+        0,
+        "mod-ext",
+    );
+    let ext_m = lift_file(&ext_file).expect("lift external deprecated.ldmodulevar");
+    verify_clean(&ext_m);
+    let Op::LoadModuleVar { kind: ext_kind, .. } =
+        find_op(&ext_m, |o| matches!(o, Op::LoadModuleVar { .. }))
+    else {
+        unreachable!()
+    };
+    assert_eq!(*ext_kind, abcd_ir::ModuleVarKind::External);
 }
 
 // ── deprecated.ldobjbyname → LoadProp (reg object) ───────────────────

@@ -93,7 +93,9 @@ pub use module::{
     AnnValue, Annotation, ClassData, EsModule, ExportDecl, FieldData, FunctionKind, ImportDecl,
     Modifiers, Module, ModuleRequest, Signature, SourceLang,
 };
-pub use op::{Arity, BinOp, CallKind, CmpOp, Op, PropKey, SuperCheck, SuperKey, UnOp};
+pub use op::{
+    Arity, BinOp, CallKind, CmpOp, ModuleVarKind, Op, PropKey, SuperCheck, SuperKey, UnOp,
+};
 pub use symbol::SymbolTable;
 pub use ty::{DynPrim, StaticTy, Ty};
 pub use verify::{

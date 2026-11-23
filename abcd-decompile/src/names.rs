@@ -550,7 +550,7 @@ fn def_inst(module: &Module, v: ValueId) -> Option<&abcd_ir::function::Inst> {
 /// [`Op::LoadModuleVar`].
 fn load_module_slot(module: &Module, v: ValueId) -> Option<u32> {
     match &def_inst(module, v)?.op {
-        Op::LoadModuleVar { index } => Some(*index),
+        Op::LoadModuleVar { index, .. } => Some(*index),
         _ => None,
     }
 }
@@ -762,7 +762,14 @@ mod tests {
         let mut m = mk_module();
         let f = add_fn(&mut m, "f");
         let b = entry_of(&m, f);
-        let slot = emit_val(&mut m, b, Op::LoadModuleVar { index: 7 });
+        let slot = emit_val(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 7,
+                kind: abcd_ir::ModuleVarKind::Local,
+            },
+        );
         // A runtime-name guard whose name is a const string names slot 7.
         let name = {
             let sym = m.sym.intern("myVar");
@@ -784,7 +791,14 @@ mod tests {
             },
         );
         // A name not defined by a LoadConst: no evidence (565).
-        let other = emit_val(&mut m, b, Op::LoadModuleVar { index: 8 });
+        let other = emit_val(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 8,
+                kind: abcd_ir::ModuleVarKind::Local,
+            },
+        );
         push_inst(
             &mut m,
             b,

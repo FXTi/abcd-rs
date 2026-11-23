@@ -725,7 +725,14 @@ fn resultless_alloc_and_load_shapes_are_skipped() {
             default: None,
         },
     );
-    push_inst(&mut m, entry, Op::LoadModuleVar { index: 0 });
+    push_inst(
+        &mut m,
+        entry,
+        Op::LoadModuleVar {
+            index: 0,
+            kind: abcd_ir::ModuleVarKind::Local,
+        },
+    );
     push_inst(&mut m, entry, Op::Mov { src: o });
     push_inst(&mut m, entry, Op::LoadFunction);
     emit_void(&mut m, entry, Op::Return { value: None });

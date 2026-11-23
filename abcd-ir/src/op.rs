@@ -135,6 +135,59 @@ pub enum CmpOp {
     InstanceOf,
 }
 
+/// Kind of a module-variable load ([`Op::LoadModuleVar`]).
+///
+/// ArkCompiler separates local module export slots (`ldlocalmodulevar`),
+/// eagerly-evaluated external import bindings (`ldexternalmodulevar`),
+/// lazily-evaluated external import bindings (`callruntime.ldlazymodulevar`,
+/// which triggers target-module evaluation on first read), and their sendable
+/// counterparts into distinct index spaces and runtime paths.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ModuleVarKind {
+    /// Local export slot of the current module (`ldlocalmodulevar` /
+    /// `wide.ldlocalmodulevar`).
+    #[default]
+    Local,
+    /// Imported binding from an eagerly-evaluated external module
+    /// (`ldexternalmodulevar` / `wide.ldexternalmodulevar`).
+    External,
+    /// Imported binding from an `import lazy` module
+    /// (`callruntime.ldlazymodulevar` / `callruntime.wideldlazymodulevar`);
+    /// triggers lazy module evaluation on first read.
+    Lazy,
+    /// Sendable local module export slot
+    /// (`callruntime.ldsendablelocalmodulevar` /
+    /// `callruntime.wideldsendablelocalmodulevar`).
+    SendableLocal,
+    /// Sendable external module import binding
+    /// (`callruntime.ldsendableexternalmodulevar` /
+    /// `callruntime.wideldsendableexternalmodulevar`).
+    SendableExternal,
+    /// Sendable `import lazy` binding
+    /// (`callruntime.ldlazysendablemodulevar` /
+    /// `callruntime.wideldlazysendablemodulevar`).
+    LazySendable,
+    /// Sendable class lexical/module slot (`callruntime.ldsendableclass`).
+    SendableClass,
+}
+
+impl ModuleVarKind {
+    /// `true` when the slot belongs to the current module's own export table
+    /// (`Local` or `SendableLocal`), i.e. the same index space written by
+    /// [`Op::StoreModuleVar`].
+    #[must_use]
+    pub const fn is_local(self) -> bool {
+        matches!(self, Self::Local | Self::SendableLocal)
+    }
+
+    /// `true` when reading the binding may trigger lazy module evaluation
+    /// (`Lazy` or `LazySendable`).
+    #[must_use]
+    pub const fn is_lazy(self) -> bool {
+        matches!(self, Self::Lazy | Self::LazySendable)
+    }
+}
+
 /// Call kind — the §5.3 binding table (vendored frame-slot model,
 /// [`crate::frame::FrameSlots`], where `H` is the callee's leading implicit
 /// `[func][new.target][this]` slot count — `H = 3` under the `0xF` default):
@@ -612,11 +665,14 @@ pub enum Op {
         /// The stored value.
         value: ValueId,
     },
-    /// Load a module-local variable by its module slot.
+    /// Load a module variable by its module slot and namespace kind.
     LoadModuleVar {
-        /// The module-variable slot (module semantics, not a file pool
-        /// index).
+        /// The module-variable slot (index within `kind`'s table, not a file
+        /// pool index).
         index: u32,
+        /// Whether this load reads a local export slot, an external import
+        /// binding, a lazy import binding, or a sendable variant.
+        kind: ModuleVarKind,
     },
     /// Store a module-local variable.
     StoreModuleVar {

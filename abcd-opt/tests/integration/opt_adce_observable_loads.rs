@@ -220,7 +220,10 @@ fn adce_still_deletes_pure_reads_and_allocs() {
         ),
         (
             "LoadModuleVar",
-            Box::new(|_b, _p0| Op::LoadModuleVar { index: 0 }),
+            Box::new(|_b, _p0| Op::LoadModuleVar {
+                index: 0,
+                kind: abcd_ir::ModuleVarKind::Local,
+            }),
         ),
         (
             "AllocObject",

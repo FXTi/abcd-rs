@@ -228,7 +228,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     let mut slots = BTreeSet::new();
     for inst in &module.insts {
         match &inst.op {
-            Op::LoadModuleVar { index } | Op::StoreModuleVar { index, .. } => {
+            Op::LoadModuleVar { index, .. } | Op::StoreModuleVar { index, .. } => {
                 slots.insert(*index);
             }
             Op::GetModuleNamespace { index } => {

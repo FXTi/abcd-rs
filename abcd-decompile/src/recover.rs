@@ -865,7 +865,7 @@ impl<'m> Recover<'m> {
                             self.legal.reserve(&sanitize(n));
                         }
                     }
-                    Op::LoadModuleVar { index } | Op::StoreModuleVar { index, .. } => {
+                    Op::LoadModuleVar { index, .. } | Op::StoreModuleVar { index, .. } => {
                         let n = self.module_slot_name(*index);
                         self.legal.reserve(&n);
                     }
@@ -1556,7 +1556,7 @@ impl<'m> Recover<'m> {
                 && let Some(inst) = self.module.inst(*iid)
             {
                 raw = match &inst.op {
-                    Op::LoadModuleVar { index } => Some(self.module_slot_name(*index)),
+                    Op::LoadModuleVar { index, .. } => Some(self.module_slot_name(*index)),
                     Op::GetModuleNamespace { index } => Some(namespace_fallback(*index)),
                     Op::GetLexVar { .. } => self.scopes.name_of(*iid).map(str::to_string),
                     other => op_name_hint(self.module, other),
@@ -1783,7 +1783,7 @@ impl<'m> Recover<'m> {
                     }
                 }
             }
-            Op::LoadModuleVar { index } => Expr::Ident(self.module_slot_name(*index)),
+            Op::LoadModuleVar { index, .. } => Expr::Ident(self.module_slot_name(*index)),
             Op::GetModuleNamespace { index } => Expr::ModuleNamespace { index: *index },
             Op::DynamicImport { specifier } => Expr::DynamicImport {
                 specifier: Box::new(self.expr_of(*specifier)),

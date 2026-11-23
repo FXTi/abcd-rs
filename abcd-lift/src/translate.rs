@@ -989,18 +989,18 @@ pub fn translate_bytecode(
                 block,
                 Op::LoadModuleVar {
                     index: index.0 as u32,
+                    kind: abcd_ir::ModuleVarKind::Local,
                 },
                 loc,
             );
             fx.write_acc(block, v);
         }
         Bytecode::Ldexternalmodulevar(index) | Bytecode::WideLdexternalmodulevar(index) => {
-            // Local vs external module-var distinction folds
-            // (documented).
             let v = fx.emit_val(
                 block,
                 Op::LoadModuleVar {
                     index: index.0 as u32,
+                    kind: abcd_ir::ModuleVarKind::External,
                 },
                 loc,
             );
@@ -1855,21 +1855,60 @@ pub fn translate_bytecode(
             );
             fx.write_acc(block, v);
         }
-        Bytecode::CallruntimeLdsendableclass(index)
-        | Bytecode::CallruntimeLdsendableexternalmodulevar(index)
-        | Bytecode::CallruntimeWideldsendableexternalmodulevar(index)
-        | Bytecode::CallruntimeLdsendablelocalmodulevar(index)
-        | Bytecode::CallruntimeWideldsendablelocalmodulevar(index)
-        | Bytecode::CallruntimeLdlazymodulevar(index)
-        | Bytecode::CallruntimeWideldlazymodulevar(index)
-        | Bytecode::CallruntimeLdlazysendablemodulevar(index)
-        | Bytecode::CallruntimeWideldlazysendablemodulevar(index) => {
-            // Sendable/lazy module-var forms fold to the plain
-            // module-var load (v0.1 parity).
+        Bytecode::CallruntimeLdsendableclass(index) => {
             let v = fx.emit_val(
                 block,
                 Op::LoadModuleVar {
                     index: index.0 as u32,
+                    kind: abcd_ir::ModuleVarKind::SendableClass,
+                },
+                loc,
+            );
+            fx.write_acc(block, v);
+        }
+        Bytecode::CallruntimeLdsendableexternalmodulevar(index)
+        | Bytecode::CallruntimeWideldsendableexternalmodulevar(index) => {
+            let v = fx.emit_val(
+                block,
+                Op::LoadModuleVar {
+                    index: index.0 as u32,
+                    kind: abcd_ir::ModuleVarKind::SendableExternal,
+                },
+                loc,
+            );
+            fx.write_acc(block, v);
+        }
+        Bytecode::CallruntimeLdsendablelocalmodulevar(index)
+        | Bytecode::CallruntimeWideldsendablelocalmodulevar(index) => {
+            let v = fx.emit_val(
+                block,
+                Op::LoadModuleVar {
+                    index: index.0 as u32,
+                    kind: abcd_ir::ModuleVarKind::SendableLocal,
+                },
+                loc,
+            );
+            fx.write_acc(block, v);
+        }
+        Bytecode::CallruntimeLdlazymodulevar(index)
+        | Bytecode::CallruntimeWideldlazymodulevar(index) => {
+            let v = fx.emit_val(
+                block,
+                Op::LoadModuleVar {
+                    index: index.0 as u32,
+                    kind: abcd_ir::ModuleVarKind::Lazy,
+                },
+                loc,
+            );
+            fx.write_acc(block, v);
+        }
+        Bytecode::CallruntimeLdlazysendablemodulevar(index)
+        | Bytecode::CallruntimeWideldlazysendablemodulevar(index) => {
+            let v = fx.emit_val(
+                block,
+                Op::LoadModuleVar {
+                    index: index.0 as u32,
+                    kind: abcd_ir::ModuleVarKind::LazySendable,
                 },
                 loc,
             );
@@ -2344,9 +2383,21 @@ pub fn translate_bytecode(
             let v = fx.emit_val(block, Op::LoadSuper { key, this_value }, loc);
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedLdmodulevar(eid, _flag) => {
+        Bytecode::DeprecatedLdmodulevar(eid, flag) => {
             let name = fx.resolve_str(*eid)?;
-            let v = fx.emit_val(block, Op::LoadModuleVar { index: name.0 }, loc);
+            let kind = if flag.0 == 0 {
+                abcd_ir::ModuleVarKind::Local
+            } else {
+                abcd_ir::ModuleVarKind::External
+            };
+            let v = fx.emit_val(
+                block,
+                Op::LoadModuleVar {
+                    index: name.0,
+                    kind,
+                },
+                loc,
+            );
             fx.write_acc(block, v);
         }
         Bytecode::DeprecatedStconsttoglobalrecord(eid) => {

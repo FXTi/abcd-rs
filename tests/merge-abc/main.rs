@@ -171,15 +171,27 @@ fn build_synthetic_merge_abc(version: Version) -> Vec<u8> {
     b.field_set_value_literalarray(helper_scope_field, helper_scope_la)
         .expect("wire Lhelper scopeNames");
 
-    let (helper_main_code, _) =
-        encode_isa(&[Bytecode::Ldundefined, Bytecode::Returnundefined]).expect("encode helper");
+    // Exercise external import slot 0 (`ldexternalmodulevar`), lazy import
+    // slot 1 (`callruntime.ldlazymodulevar`), local export store (`stmodulevar`),
+    // and local export load (`ldlocalmodulevar`) so `lift → lower` proves all
+    // three module-var load flavors survive without collapsing to `ldlocalmodulevar`.
+    let (helper_main_code, _) = encode_isa(&[
+        insn::Ldexternalmodulevar::new(Imm(0)),
+        insn::Sta::new(Reg(0)),
+        insn::CallruntimeLdlazymodulevar::new(Imm(1)),
+        insn::Add2::new(Imm(0), Reg(0)),
+        insn::Stmodulevar::new(Imm(0)),
+        insn::Ldlocalmodulevar::new(Imm(0)),
+        Bytecode::Return,
+    ])
+    .expect("encode helper");
     let m_helper_main = b.class_add_method(
         cls_helper,
         "func_main_0",
         proto,
         AccessFlags::PUBLIC | AccessFlags::STATIC,
         &helper_main_code,
-        1,
+        2,
         3,
     );
     b.method_set_source_lang(m_helper_main, SourceLang::EcmaScript);
@@ -277,6 +289,36 @@ fn assert_merge_abc_invariants(file: &File, expect_json: bool, from_pandasm: boo
     }
 }
 
+fn assert_helper_module_var_opcodes(file: &File) {
+    let helper_cls = file.class_by_str("Lhelper;").expect("Lhelper;");
+    let helper_main = helper_cls
+        .methods
+        .iter()
+        .find(|m| file.strings.resolve(m.name) == Some("func_main_0"))
+        .expect("Lhelper::func_main_0");
+    let bcs = &helper_main.body.as_ref().expect("helper body").bytecodes;
+    assert!(
+        bcs.iter()
+            .any(|bc| matches!(bc, Bytecode::Ldexternalmodulevar(Imm(0)))),
+        "Ldexternalmodulevar(0) must survive lift → lower: {bcs:?}"
+    );
+    assert!(
+        bcs.iter()
+            .any(|bc| matches!(bc, Bytecode::CallruntimeLdlazymodulevar(Imm(1)))),
+        "CallruntimeLdlazymodulevar(1) must survive lift → lower: {bcs:?}"
+    );
+    assert!(
+        bcs.iter()
+            .any(|bc| matches!(bc, Bytecode::Stmodulevar(Imm(0)))),
+        "Stmodulevar(0) must survive lift → lower: {bcs:?}"
+    );
+    assert!(
+        bcs.iter()
+            .any(|bc| matches!(bc, Bytecode::Ldlocalmodulevar(Imm(0)))),
+        "Ldlocalmodulevar(0) must survive lift → lower: {bcs:?}"
+    );
+}
+
 /// Rewrite every method body of `file` through `lift → verify → [opt → verify] → lower → encode`.
 fn rewrite_file_e2e(bytes: &[u8], optimize: bool) -> (Vec<u8>, bool) {
     let file = decode(bytes).expect("decode for rewrite");
@@ -371,6 +413,7 @@ fn synthetic_merge_abc_all_four_pipelines_across_versions() {
         let (rewritten_lift, _) = rewrite_file_e2e(&raw, false);
         let decoded_lift = decode(&rewritten_lift).expect("decode v2lift merge-abc");
         assert_merge_abc_invariants(&decoded_lift, true, false);
+        assert_helper_module_var_opcodes(&decoded_lift);
 
         let (rewritten_opt, opt_changed) = rewrite_file_e2e(&raw, true);
         assert!(
@@ -379,6 +422,7 @@ fn synthetic_merge_abc_all_four_pipelines_across_versions() {
         );
         let decoded_opt = decode(&rewritten_opt).expect("decode v2opt merge-abc");
         assert_merge_abc_invariants(&decoded_opt, true, false);
+        assert_helper_module_var_opcodes(&decoded_opt);
 
         // 4) Decompile determinism, zero fallbacks, and Node syntax check
         let d1 = decompile_module(&ir, &EmitOptions::default());
