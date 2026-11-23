@@ -118,6 +118,23 @@ fn first_diff(rel: &str, ours: &[u8], reference: &[u8]) -> String {
 /// methods, strings).
 type Sections = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let (&first, rest) = needle.split_first()?;
+    let mut offset = 0usize;
+    while offset + needle.len() <= haystack.len() {
+        let rel = haystack[offset..].iter().position(|&b| b == first)?;
+        let idx = offset + rel;
+        if idx + needle.len() > haystack.len() {
+            return None;
+        }
+        if &haystack[idx + 1..idx + needle.len()] == rest {
+            return Some(idx);
+        }
+        offset = idx + 1;
+    }
+    None
+}
+
 /// Split pandasm text into (header, literals, records, methods, strings)
 /// section bodies. Sections are delimited by the `# ====================`
 /// banners; missing sections yield empty bodies (the normalizer is
@@ -126,13 +143,10 @@ fn split_sections(pa: &[u8]) -> Sections {
     const BANNER: &[u8] = b"# ====================\n";
     let mut marks = Vec::new();
     let mut pos = 0usize;
-    while pos + BANNER.len() <= pa.len() {
-        if &pa[pos..pos + BANNER.len()] == BANNER {
-            marks.push(pos);
-            pos += BANNER.len();
-            continue;
-        }
-        pos += 1;
+    while let Some(rel) = find_subslice(&pa[pos..], BANNER) {
+        let m = pos + rel;
+        marks.push(m);
+        pos = m + BANNER.len();
     }
     // Header: everything before the first banner. Then each banner is
     // followed by `# NAME\n\n` and the body runs to the next banner.
@@ -245,30 +259,35 @@ pub(crate) fn canonicalize(pa: &[u8]) -> Vec<u8> {
         }
     }
     fn replace_lit_offsets(text: &[u8], resolve: &dyn Fn(u32) -> Option<Vec<u8>>) -> Vec<u8> {
+        const PREFIX: &[u8] = b"lit_offset:0x";
+        if find_subslice(text, PREFIX).is_none() {
+            return text.to_vec();
+        }
         let mut out = Vec::with_capacity(text.len());
         let mut i = 0usize;
-        while i < text.len() {
-            if text[i..].starts_with(b"lit_offset:0x") {
-                let start = i + b"lit_offset:0x".len();
-                let end = text[start..]
-                    .iter()
-                    .position(|&b| !b.is_ascii_hexdigit())
-                    .map(|p| start + p)
-                    .unwrap_or(text.len());
-                if let Ok(off) =
-                    u32::from_str_radix(std::str::from_utf8(&text[start..end]).unwrap_or(""), 16)
-                    && let Some(target) = resolve(off)
-                {
-                    out.extend_from_slice(b"lit_offset:@[");
-                    out.extend_from_slice(&target);
-                    out.extend_from_slice(b"]");
-                    i = end;
-                    continue;
-                }
+        while let Some(rel) = find_subslice(&text[i..], PREFIX) {
+            let hit = i + rel;
+            out.extend_from_slice(&text[i..hit]);
+            let start = hit + PREFIX.len();
+            let end = text[start..]
+                .iter()
+                .position(|&b| !b.is_ascii_hexdigit())
+                .map(|p| start + p)
+                .unwrap_or(text.len());
+            if let Ok(off) =
+                u32::from_str_radix(std::str::from_utf8(&text[start..end]).unwrap_or(""), 16)
+                && let Some(target) = resolve(off)
+            {
+                out.extend_from_slice(b"lit_offset:@[");
+                out.extend_from_slice(&target);
+                out.extend_from_slice(b"]");
+                i = end;
+            } else {
+                out.extend_from_slice(&text[hit..start]);
+                i = start;
             }
-            out.push(text[i]);
-            i += 1;
         }
+        out.extend_from_slice(&text[i..]);
         out
     }
     let mut canonical = by_offset.clone();

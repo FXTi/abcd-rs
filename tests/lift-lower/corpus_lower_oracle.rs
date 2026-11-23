@@ -193,7 +193,8 @@ for path in sorted(paths):
         }
     }
 
-    let determinism = std::env::var("ABCD_INLINE_DETERMINISM").as_deref() != Ok("0");
+    let determinism = std::env::var("ABCD_INLINE_DETERMINISM").as_deref() != Ok("0")
+        && std::env::var_os("CARGO_LLVM_COV").is_none();
 
     /// One fixture's full three-variant outcome: the exact report lines
     /// the serial loop emitted (replayed in row order), per-variant

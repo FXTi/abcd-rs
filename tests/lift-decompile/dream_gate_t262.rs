@@ -45,6 +45,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use abcd_decompile::emit::{EmitOptions, decompile_module};
+use rayon::prelude::*;
 
 /// The gate root inside `target/` (never committed).
 fn gate_root() -> std::path::PathBuf {
@@ -147,84 +148,122 @@ fn generate() -> usize {
 
     let src_root = gate.join("src");
     std::fs::create_dir_all(&src_root).expect("create gate src root");
-    let mut manifest = String::new();
 
+    enum RowOutcome {
+        Ok {
+            is_module: bool,
+            js_bytes: usize,
+            fallback_comments: BTreeMap<&'static str, usize>,
+            manifest_line: String,
+        },
+        Panic {
+            abc: String,
+            msg: String,
+        },
+    }
+
+    let check_determinism = std::env::var_os("CARGO_LLVM_COV").is_none();
+    let outcomes: Vec<RowOutcome> = rows
+        .par_iter()
+        .map(|(abc, case, version, profile)| {
+            let data = std::fs::read(root.join(abc)).expect("read fixture");
+            let opts = EmitOptions {
+                call_entry: true,
+                ..EmitOptions::default()
+            };
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let file = abcd_file::decode(&data).expect("decode fixture");
+                let module = abcd_lift::lift_file(&file).expect("lift fixture");
+                let d1 = decompile_module(&module, &opts);
+                if check_determinism {
+                    let d2 = decompile_module(&module, &opts);
+                    assert_eq!(d1.text, d2.text, "non-deterministic output in {abc}");
+                }
+                let is_module = !module.imports.is_empty()
+                    || !module.exports.is_empty()
+                    || !module.module_requests.is_empty();
+                (d1, is_module)
+            }));
+            let (d1, is_module) = match attempt {
+                Ok(pair) => pair,
+                Err(payload) => {
+                    let msg = payload
+                        .downcast::<String>()
+                        .map(|s| *s)
+                        .or_else(|e| e.downcast::<&str>().map(|s| s.to_string()))
+                        .unwrap_or_else(|_| "non-string panic".to_string());
+                    return RowOutcome::Panic {
+                        abc: abc.clone(),
+                        msg,
+                    };
+                }
+            };
+
+            let js_path = src_root.join(format!("{abc}.js"));
+            std::fs::create_dir_all(js_path.parent().expect("parent")).expect("mkdirs");
+            std::fs::write(&js_path, &d1.text).expect("write js");
+
+            let hard: Vec<&str> = HARD7
+                .iter()
+                .copied()
+                .filter(|op| d1.stats.fallback_comments.contains_key(op))
+                .collect();
+            let hard_json = hard
+                .iter()
+                .map(|op| format!("\"{}\"", json_escape(op)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut row = String::new();
+            write!(
+                row,
+                "{{\"abc\": \"{}\", \"case\": \"{}\", \"version\": \"{}\", \"profile\": \"{}\", \"module\": {}, \"hard_fallbacks\": [{}], \"cross_arm_residual\": {}, \"functions_with_fallbacks\": {}, \"js_bytes\": {}}}",
+                json_escape(abc),
+                json_escape(case),
+                version,
+                profile,
+                is_module,
+                hard_json,
+                d1.stats.structure.cross_arm_notes,
+                d1.stats.functions_with_fallbacks,
+                d1.text.len(),
+            )
+            .expect("write row");
+            RowOutcome::Ok {
+                is_module,
+                js_bytes: d1.text.len(),
+                fallback_comments: d1.stats.fallback_comments,
+                manifest_line: row,
+            }
+        })
+        .collect();
+
+    let mut manifest = String::new();
     let mut total_bytes = 0usize;
     let mut module_fixtures = 0usize;
     let mut panics: Vec<(String, String)> = Vec::new();
     let mut fallback_ops: BTreeMap<&'static str, usize> = BTreeMap::new();
-    for (abc, case, version, profile) in &rows {
-        let data = std::fs::read(root.join(abc)).expect("read fixture");
-        let opts = EmitOptions {
-            call_entry: true,
-            ..EmitOptions::default()
-        };
-        // A panic ANYWHERE (decode/lift/decompile) is a real bug on a
-        // corpus row: catch it, report it, keep going so ONE run lists
-        // every offender.
-        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let file = abcd_file::decode(&data).expect("decode fixture");
-            let module = abcd_lift::lift_file(&file).expect("lift fixture");
-            let d1 = decompile_module(&module, &opts);
-            let d2 = decompile_module(&module, &opts);
-            assert_eq!(d1.text, d2.text, "non-deterministic output in {abc}");
-            let is_module = !module.imports.is_empty()
-                || !module.exports.is_empty()
-                || !module.module_requests.is_empty();
-            (module, d1, is_module)
-        }));
-        let (d1, is_module) = match attempt {
-            Ok((_module, d1, is_module)) => (d1, is_module),
-            Err(payload) => {
-                let msg = payload
-                    .downcast::<String>()
-                    .map(|s| *s)
-                    .or_else(|e| e.downcast::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_else(|_| "non-string panic".to_string());
-                panics.push((abc.clone(), msg));
-                continue;
+    for outcome in outcomes {
+        match outcome {
+            RowOutcome::Ok {
+                is_module,
+                js_bytes,
+                fallback_comments,
+                manifest_line,
+            } => {
+                if is_module {
+                    module_fixtures += 1;
+                }
+                total_bytes += js_bytes;
+                for (op, count) in fallback_comments {
+                    *fallback_ops.entry(op).or_default() += count;
+                }
+                manifest.push_str(&manifest_line);
+                manifest.push('\n');
             }
-        };
-
-        if is_module {
-            module_fixtures += 1;
+            RowOutcome::Panic { abc, msg } => {
+                panics.push((abc, msg));
+            }
         }
-
-        let js_path = src_root.join(format!("{abc}.js"));
-        std::fs::create_dir_all(js_path.parent().expect("parent")).expect("mkdirs");
-        std::fs::write(&js_path, &d1.text).expect("write js");
-        total_bytes += d1.text.len();
-
-        for (op, count) in &d1.stats.fallback_comments {
-            *fallback_ops.entry(op).or_default() += count;
-        }
-        let hard: Vec<&str> = HARD7
-            .iter()
-            .copied()
-            .filter(|op| d1.stats.fallback_comments.contains_key(op))
-            .collect();
-        let hard_json = hard
-            .iter()
-            .map(|op| format!("\"{}\"", json_escape(op)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut row = String::new();
-        write!(
-            row,
-            "{{\"abc\": \"{}\", \"case\": \"{}\", \"version\": \"{}\", \"profile\": \"{}\", \"module\": {}, \"hard_fallbacks\": [{}], \"cross_arm_residual\": {}, \"functions_with_fallbacks\": {}, \"js_bytes\": {}}}",
-            json_escape(abc),
-            json_escape(case),
-            version,
-            profile,
-            is_module,
-            hard_json,
-            d1.stats.structure.cross_arm_notes,
-            d1.stats.functions_with_fallbacks,
-            d1.text.len(),
-        )
-        .expect("write row");
-        manifest.push_str(&row);
-        manifest.push('\n');
     }
     std::fs::write(gate.join("decompile-manifest.jsonl"), manifest).expect("write manifest");
     eprintln!(

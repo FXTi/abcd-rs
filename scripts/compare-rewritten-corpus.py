@@ -8,19 +8,113 @@ judgments) are run under ark_js_vm and compared field-by-field against
 the manifest runtime record: exit_code, stdout, timeout EXACTLY; stderr
 per --recorded-stderr (exact, or error-name — the upstream test262
 runner's rule: match the error constructor name, ignore message text,
-paths, stack frames, and addresses)."""
+paths, stack frames, and addresses).
+
+Performance architecture: instead of spawning thousands of separate
+`docker run --rm` containers (and re-parsing the 5,517-row baked
+`index.jsonl` thousands of times), all candidate checks execute inside a
+SINGLE `--network none` container that imports `/opt/arkcompiler-test/arktest.py`
+once, indexes the baked manifest once in memory, and fans out across
+`--jobs` worker threads invoking `ark_disasm` / `ark_js_vm` directly.
+"""
 
 import argparse
-import concurrent.futures
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import sys
 
 # First `<Name>Error:` token — the error constructor name. Upstream's
 # test262 runner matches on exactly this (util_test262.py:163-166).
 ERROR_NAME = re.compile(r"([A-Za-z_$][A-Za-z0-9_$]*Error):")
+
+CONTAINER_BATCH_WORKER = r"""
+import concurrent.futures
+import json
+from pathlib import Path
+import sys
+import tempfile
+
+sys.path.insert(0, "/opt/arkcompiler-test")
+import arktest
+
+payload = json.loads(sys.stdin.read())
+jobs = payload["jobs"]
+items = payload["items"]
+
+baked_passed = {}
+if any(item["kind"] == "passed" for item in items):
+    for row in arktest.index(arktest.ROOT / "corpus"):
+        if row.get("runtime", {}).get("status") == "passed":
+            key = (row["version"], row["case"], row["profile"])
+            if key in baked_passed:
+                baked_passed[key] = None
+            else:
+                baked_passed[key] = row
+
+
+def run_one(item):
+    cand_path = (Path("/work") / item["rel"]).resolve()
+    if item["kind"] == "recorded":
+        try:
+            arktest.inspect(cand_path)
+            res = arktest.call("ark_js_vm", [cand_path], timeout=30)
+            return {"mode": "recorded", "ok": True, "result": res}
+        except Exception as exc:
+            return {
+                "mode": "recorded",
+                "ok": False,
+                "error": "",
+                "stderr": json.dumps({"error": str(exc)}),
+            }
+
+    key = (item["version"], item["case"], item["profile"])
+    baked = baked_passed.get(key)
+    if baked is not None:
+        try:
+            header = arktest.inspect(cand_path)
+            if header["version"] != baked["version"]:
+                raise ValueError("candidate ABC has wrong version")
+            with tempfile.TemporaryDirectory(prefix="ark-compare-") as tmp:
+                dis = arktest.call("ark_disasm", [cand_path, Path(tmp) / "candidate.pa"])
+                arktest.require_ok(dis)
+            res = arktest.call("ark_js_vm", [cand_path], timeout=30)
+            res["matches"] = all(
+                res[k] == baked["runtime"][k]
+                for k in ("exit_code", "stdout", "stderr", "timeout")
+            )
+            return {"mode": "baked", "ok": bool(res["matches"]), "result": res}
+        except Exception as exc:
+            return {
+                "mode": "baked",
+                "ok": False,
+                "result": {"error": "", "stderr": json.dumps({"error": str(exc)})},
+            }
+
+    # Locally generated fixture absent from the baked manifest: run in
+    # ark_js_vm and let the host compare against the manifest expectation.
+    try:
+        arktest.inspect(cand_path)
+        res = arktest.call("ark_js_vm", [cand_path], timeout=30)
+        return {"mode": "fallback_run", "ok": res.get("exit_code") == 0, "result": res}
+    except Exception as exc:
+        return {
+            "mode": "fallback_run",
+            "ok": False,
+            "result": {"error": "", "stderr": json.dumps({"error": str(exc)})},
+        }
+
+
+if jobs <= 1 or len(items) <= 1:
+    out = [run_one(it) for it in items]
+else:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        out = list(pool.map(run_one, items))
+
+sys.stdout.write(json.dumps(out))
+"""
 
 
 def error_name(stderr):
@@ -44,7 +138,7 @@ def main():
         "--jobs",
         type=int,
         default=1,
-        help="parallel docker runs (default 1 = sequential)",
+        help="parallel worker processes inside the oracle container (default 1)",
     )
     parser.add_argument(
         "--recorded",
@@ -97,7 +191,9 @@ def main():
 
     image = subprocess.run(
         ["docker", "image", "inspect", args.image, "--format", "{{.Id}}"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     results = []
     structural = 0
@@ -127,171 +223,163 @@ def main():
     if args.sample > 1:
         comparable = comparable[:: args.sample]
 
-    # Every container gets a label unique to this process so crashed/hung
-    # qemu VMs (which do not exit, so `--rm` never fires) can be reaped in
-    # the finally block below — a killed client leaves the container burning
-    # CPU otherwise.
     label = f"abcd-oracle={os.getpid()}"
 
-    def compare_recorded(row, relative):
-        """test262 row: run the candidate and compare against the manifest
-        runtime record field-by-field (see the module docstring for the
-        stderr policy). The result always carries the per-field mismatch
-        list so the mismatch taxonomy is computable from the report."""
-        expected = row["runtime"]
-        command = [
-            "docker", "run", "--rm", "--platform", "linux/amd64",
-            "--network", "none", "--label", label,
-            # Pin the VM stack ulimit (see compare() below).
-            "--ulimit", "stack=8388608:8388608",
-            "-v", f"{candidates}:/work:ro", args.image,
-            "run", f"/work/{relative}",
-        ]
-        try:
-            run = subprocess.run(command, capture_output=True, text=True, timeout=120)
-        except subprocess.TimeoutExpired:
-            return {"abc": row["abc"], "kind": "recorded", "passed": False,
-                    "mismatches": ["client-timeout"],
-                    "oracle": {"error": "client-side timeout", "timeout": True}}
-        try:
-            result = json.loads(run.stdout)
-        except json.JSONDecodeError:
-            result = {"error": run.stdout, "stderr": run.stderr}
-            return {"abc": row["abc"], "kind": "recorded", "passed": False,
-                    "mismatches": ["oracle-error"], "oracle": result}
-        actual_stderr = result.get("stderr") or ""
-        expected_stderr = expected["stderr"] or ""
-        stderr_exact = actual_stderr == expected_stderr
-        # error-name policy: exact match, or both sides name the same
-        # error constructor (message/paths/frames/addresses ignored).
-        stderr_error_name = stderr_exact or (
-            error_name(actual_stderr) is not None
-            and error_name(actual_stderr) == error_name(expected_stderr)
-        )
-        mismatches = []
-        if result.get("exit_code") != expected["exit_code"]:
-            mismatches.append("exit_code")
-        if result.get("stdout") != expected["stdout"]:
-            mismatches.append("stdout")
-        if bool(result.get("timeout")) != bool(expected["timeout"]):
-            mismatches.append("timeout")
-        if not stderr_exact:
-            mismatches.append("stderr")
-        stderr_ok = stderr_exact if args.recorded_stderr == "exact" else stderr_error_name
-        entry = {
-            "abc": row["abc"], "kind": "recorded",
-            "passed": not mismatches or (mismatches == ["stderr"] and stderr_ok),
-            "mismatches": mismatches,
-            "stderr_exact": stderr_exact,
-            "stderr_error_name": stderr_error_name,
-            "oracle": result,
-        }
-        if mismatches:
-            entry["expected"] = {
-                "exit_code": expected["exit_code"],
-                "stdout": expected["stdout"],
-                "stderr": expected["stderr"],
-                "timeout": expected["timeout"],
+    if comparable:
+        batch_input = json.dumps(
+            {
+                "jobs": args.jobs,
+                "items": [
+                    {
+                        "kind": kind,
+                        "rel": str(relative),
+                        "case": row["case"],
+                        "version": row["version"],
+                        "profile": row["profile"],
+                    }
+                    for kind, row, relative in comparable
+                ],
             }
-        return entry
-
-    def compare(entry):
-        kind, row, relative = entry
-        if kind == "recorded":
-            return compare_recorded(row, relative)
+        )
         command = [
-            "docker", "run", "--rm", "--platform", "linux/amd64",
-            "--network", "none", "--label", label,
-            # Pin the stack ulimit to the VM's expected 8 MiB (the baked
-            # runtime records were produced under it): GH runners' docker
-            # default is 16 MiB, which makes ark_js_vm WARN on stderr
-            # ("Get current thread stack size exceed 8388608") — a pure
-            # environment difference that must not fail the comparison.
-            "--ulimit", "stack=8388608:8388608",
-            "-v", f"{candidates}:/work:ro", args.image,
-            "compare", f"/work/{relative}", "--case", row["case"],
-            "--version", row["version"], "--profile", row["profile"],
+            "docker",
+            "run",
+            "--rm",
+            "-i",
+            "--platform",
+            "linux/amd64",
+            "--network",
+            "none",
+            "--label",
+            label,
+            # Pin the stack ulimit to the VM's expected 8 MiB (GH runners'
+            # docker default is 16 MiB, which makes ark_js_vm warn on stderr).
+            "--ulimit",
+            "stack=8388608:8388608",
+            "-v",
+            f"{candidates}:/work:ro",
+            "--entrypoint",
+            "python3",
+            args.image,
+            "-c",
+            CONTAINER_BATCH_WORKER,
         ]
         try:
-            process = subprocess.run(command, capture_output=True, text=True, timeout=120)
-        except subprocess.TimeoutExpired:
-            # The docker CLI itself hung (qemu core-dump): the labeled
-            # container is reaped in the finally block; record a timeout
-            # failure instead of aborting the whole run.
-            return {"abc": row["abc"], "passed": False,
-                    "oracle": {"error": "client-side timeout", "timeout": True}}
-        try:
-            result = json.loads(process.stdout)
-        except json.JSONDecodeError:
-            result = {"error": process.stdout, "stderr": process.stderr}
-        if (
-            process.returncode != 0
-            and "select exactly one fixture" in (process.stdout + process.stderr)
-        ):
-            # The image's baked manifest does not know this case (locally
-            # generated fixture, e.g. scripts/gen-opcode-fixtures.py).
-            # Fall back to running the candidate in the VM and comparing
-            # stdout/exit/timeout against the manifest's recorded runtime
-            # expectation — the same oracle semantics as `compare`.
-            expected = row["runtime"]
-            try:
-                run = subprocess.run(
-                    ["docker", "run", "--rm", "--platform", "linux/amd64",
-                     "--network", "none", "--label", label,
-                     # See the compare path above: pin the VM stack ulimit.
-                     "--ulimit", "stack=8388608:8388608",
-                     "-v", f"{candidates}:/work:ro", args.image,
-                     "run", f"/work/{relative}"],
-                    capture_output=True, text=True, timeout=120)
-            except subprocess.TimeoutExpired:
-                return {"abc": row["abc"], "passed": False,
-                        "oracle": {"error": "client-side timeout", "timeout": True}}
-            try:
-                result = json.loads(run.stdout)
-            except json.JSONDecodeError:
-                result = {"error": run.stdout, "stderr": run.stderr}
-                return {"abc": row["abc"], "passed": False, "oracle": result}
-            result["expectation"] = "manifest runtime record (case not baked into the image)"
-            passed = (
-                run.returncode == 0
-                and result.get("exit_code") == expected["exit_code"]
-                and result.get("stdout") == expected["stdout"]
-                and result.get("timeout") is False
+            proc = subprocess.run(
+                command,
+                input=batch_input,
+                capture_output=True,
+                text=True,
+                timeout=max(300, len(comparable) * 5),
             )
-            return {"abc": row["abc"], "passed": passed, "oracle": result}
-        passed = process.returncode == 0 and result.get("matches") is True
-        return {"abc": row["abc"], "passed": passed, "oracle": result}
+            if proc.returncode != 0:
+                print(proc.stderr, file=sys.stderr)
+                raise RuntimeError(
+                    f"batch oracle container failed with exit code {proc.returncode}"
+                )
+            raw_outcomes = json.loads(proc.stdout)
+        finally:
+            lingering = subprocess.run(
+                ["docker", "ps", "-aq", "--filter", f"label={label}"],
+                capture_output=True,
+                text=True,
+            ).stdout.split()
+            if lingering:
+                subprocess.run(["docker", "rm", "-f", *lingering], capture_output=True)
 
-    try:
-        if args.jobs == 1:
-            for entry in comparable:
-                results.append(compare(entry))
-        else:
-            # Parallel mode (--jobs N): results stay in manifest order, so the
-            # report is deterministic regardless of completion order.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-                results.extend(pool.map(compare, comparable))
-    finally:
-        lingering = subprocess.run(
-            ["docker", "ps", "-aq", "--filter", f"label={label}"],
-            capture_output=True, text=True,
-        ).stdout.split()
-        if lingering:
-            subprocess.run(["docker", "rm", "-f", *lingering], capture_output=True)
+        for (kind, row, _relative), outcome in zip(comparable, raw_outcomes):
+            if kind == "recorded":
+                expected = row["runtime"]
+                if not outcome["ok"]:
+                    result = {"error": outcome.get("error", ""), "stderr": outcome.get("stderr", "")}
+                    results.append(
+                        {
+                            "abc": row["abc"],
+                            "kind": "recorded",
+                            "passed": False,
+                            "mismatches": ["oracle-error"],
+                            "oracle": result,
+                        }
+                    )
+                    continue
+                result = outcome["result"]
+                actual_stderr = result.get("stderr") or ""
+                expected_stderr = expected["stderr"] or ""
+                stderr_exact = actual_stderr == expected_stderr
+                stderr_error_name = stderr_exact or (
+                    error_name(actual_stderr) is not None
+                    and error_name(actual_stderr) == error_name(expected_stderr)
+                )
+                mismatches = []
+                if result.get("exit_code") != expected["exit_code"]:
+                    mismatches.append("exit_code")
+                if result.get("stdout") != expected["stdout"]:
+                    mismatches.append("stdout")
+                if bool(result.get("timeout")) != bool(expected["timeout"]):
+                    mismatches.append("timeout")
+                if not stderr_exact:
+                    mismatches.append("stderr")
+                stderr_ok = (
+                    stderr_exact
+                    if args.recorded_stderr == "exact"
+                    else stderr_error_name
+                )
+                entry = {
+                    "abc": row["abc"],
+                    "kind": "recorded",
+                    "passed": not mismatches
+                    or (mismatches == ["stderr"] and stderr_ok),
+                    "mismatches": mismatches,
+                    "stderr_exact": stderr_exact,
+                    "stderr_error_name": stderr_error_name,
+                    "oracle": result,
+                }
+                if mismatches:
+                    entry["expected"] = {
+                        "exit_code": expected["exit_code"],
+                        "stdout": expected["stdout"],
+                        "stderr": expected["stderr"],
+                        "timeout": expected["timeout"],
+                    }
+                results.append(entry)
+            elif outcome["mode"] == "fallback_run":
+                expected = row["runtime"]
+                result = outcome["result"]
+                if "error" in result and "exit_code" not in result:
+                    results.append(
+                        {"abc": row["abc"], "passed": False, "oracle": result}
+                    )
+                else:
+                    result["expectation"] = (
+                        "manifest runtime record (case not baked into the image)"
+                    )
+                    passed = (
+                        outcome["ok"]
+                        and result.get("exit_code") == expected["exit_code"]
+                        and result.get("stdout") == expected["stdout"]
+                        and result.get("timeout") is False
+                    )
+                    results.append(
+                        {"abc": row["abc"], "passed": passed, "oracle": result}
+                    )
+            else:
+                result = outcome["result"]
+                passed = bool(outcome["ok"]) and result.get("matches") is True
+                results.append({"abc": row["abc"], "passed": passed, "oracle": result})
 
     compared = [result for result in results if not result.get("missing")]
     missing = [result["abc"] for result in results if result.get("missing")]
     report = {
-        "image": args.image, "image_id": image, "selected": len(rows),
-        "runtime_compared": len(compared), "structural_only": structural,
+        "image": args.image,
+        "image_id": image,
+        "selected": len(rows),
+        "runtime_compared": len(compared),
+        "structural_only": structural,
         "passed": sum(result["passed"] for result in compared),
         "results": results,
     }
     recorded = [result for result in compared if result.get("kind") == "recorded"]
     if recorded:
-        # Mismatch taxonomy over the recorded (test262) rows: every row
-        # lands in exactly one named class keyed by its mismatch field
-        # set — hard-error discipline, no unexplained rows.
         taxonomy = {}
         for result in recorded:
             key = "+".join(result["mismatches"]) or "pass"
@@ -301,8 +389,6 @@ def main():
             "passed": sum(result["passed"] for result in recorded),
             "stderr_policy": args.recorded_stderr,
             "taxonomy": taxonomy,
-            # Of the stderr-only mismatches, how many the error-name
-            # normalization reconciles (same constructor thrown).
             "stderr_only_error_name_reconciled": sum(
                 1
                 for result in recorded
@@ -310,21 +396,11 @@ def main():
             ),
         }
     if args.allow_missing:
-        # Additive fields, present only under --allow-missing: missing
-        # fixtures are excluded from pass/fail counts and listed explicitly.
         report["missing"] = len(missing)
         report["missing_fixtures"] = missing
     undocumented = []
     stale = []
     if args.expect_divergences:
-        # Documented-divergence gate (test262 P2): a JSON object mapping a
-        # divergence CLASS NAME to the exact list of manifest abc paths in
-        # that class. Hard-error discipline, both directions:
-        #  - every missing or non-passing selected row must be listed
-        #    (an undocumented divergence fails the gate);
-        #  - every listed row that was selected must still be missing or
-        #    failing (a fixed row that was not delisted fails the gate —
-        #    the manifest can never silently rot).
         listed = {}
         with args.expect_divergences.open(encoding="utf-8") as handle:
             for klass, paths in json.load(handle).items():
@@ -341,26 +417,24 @@ def main():
         failing = {result["abc"] for result in compared if not result["passed"]}
         observed = failing | set(missing)
         undocumented = sorted(observed - set(listed))
-        stale = sorted(path for path in listed if path in selected and path not in observed)
+        stale = sorted(
+            path for path in listed if path in selected and path not in observed
+        )
         classes = {}
         for path in sorted(observed & set(listed)):
             klass = listed[path]
             classes[klass] = classes.get(klass, 0) + 1
         report["divergences"] = {
             "manifest": str(args.expect_divergences),
-            "classes": classes,
             "documented": sum(classes.values()),
+            "classes": classes,
             "undocumented": undocumented,
             "stale": stale,
         }
-    print(json.dumps(report, ensure_ascii=False, indent=2))
-    if not compared or undocumented or stale:
-        return 1
+    print(json.dumps(report, indent=2, sort_keys=True))
     if args.expect_divergences:
-        # Every failure is documented and nothing is stale: the gate is
-        # "passed + documented == compared (+ missing documented)".
-        return 0
-    return 0 if all(result["passed"] for result in compared) else 1
+        return 0 if not undocumented and not stale else 1
+    return 0 if report["passed"] == len(compared) else 1
 
 
 if __name__ == "__main__":

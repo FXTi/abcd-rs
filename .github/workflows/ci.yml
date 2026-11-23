@@ -208,8 +208,9 @@ jobs:
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
       # modules.abc (Group J) is local-only by license; its test skips by
-      # absence.
-      - run: cargo test -p abcd-rs --test file-isa --release -- --ignored --nocapture
+      # absence. --test-threads=1 avoids 7 rayon-parallel gates thrashing
+      # disk/L3 simultaneously.
+      - run: cargo test -p abcd-rs --test file-isa --release -- --ignored --nocapture --test-threads=1
 
   hap-file:
     name: hap-file (wild OHOS hap container + decode gates)
@@ -319,7 +320,7 @@ jobs:
             echo "== variant $v"
             python3 scripts/compare-rewritten-corpus.py \
               exports/corpus/index.jsonl "target/lowered-out/$v" \
-              --image "$ARK_TEST_IMAGE" --jobs 4 \
+              --image "$ARK_TEST_IMAGE" --jobs 8 \
               | tee "target/oracle-$v.json" \
               | jq -r '"selected=\(.selected) compared=\(.runtime_compared) passed=\(.passed)"'
           done
@@ -361,7 +362,7 @@ jobs:
             target/test262-vm/index.jsonl target/test262-vm/v2lift \
             --recorded --recorded-stderr error-name --allow-missing \
             --expect-divergences scripts/test262-vm-divergences.json \
-            --image "$ARK_TEST_IMAGE" --jobs 4 \
+            --image "$ARK_TEST_IMAGE" --jobs 8 \
             | tee target/oracle-test262.json \
             | jq -r '"selected=\(.selected) compared=\(.runtime_compared) passed=\(.passed) missing=\(.missing) divergences=\(.divergences.classes) undocumented=\(.divergences.undocumented | length) stale=\(.divergences.stale | length)"'
 
@@ -463,10 +464,11 @@ jobs:
           mkdir -p exports/corpus
           docker run --rm --platform linux/amd64 -v "$PWD/exports/corpus:/work" "$ARK_TEST_IMAGE" export /work
       # corpus_stage_a + corpus_decompile (2832 non-test262 rows) +
-      # dream_gate generate+oracle (docker on the runner) + the node
-      # behavior suites (node is preinstalled on runners). textual_oracle
-      # is a report-only instrument — local-only by design.
-      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --skip textual_oracle --skip dream_gate_t262
+      # dream_gate_oracle (which calls generate() once + single-container
+      # es2abc/ark_js_vm compare) + the node behavior suites. Skip
+      # dream_gate_generate so it does not race dream_gate_oracle on
+      # target/dream-gate/.
+      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --test-threads=1 --skip textual_oracle --skip dream_gate_generate --skip dream_gate_t262 --skip wild_gate --skip wild_smoke
       - name: Upload the dream-gate report
         if: always()
         uses: actions/upload-artifact@v4
@@ -539,7 +541,12 @@ jobs:
         # instrumentation its decompile phase (the p95+ tail of the wild
         # set by construction) multiplies past the job budget for zero
         # coverage value. (2026-10-03 wild-gate promotion)
-        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_smoke --skip wild_gate
+        # --skip dream_gate_oracle / dream_gate_t262_oracle / wild_gate_red_proof:
+        # docker es2abc/ark_js_vm runs execute uninstrumented inside the
+        # container (zero Rust coverage value); dream_gate_generate and
+        # dream_gate_t262_generate still run here so all Rust emission paths
+        # are covered without spawning Docker or racing on target/dream-gate*.
+        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_smoke --skip wild_gate --skip dream_gate_oracle --skip dream_gate_t262_oracle
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
@@ -604,8 +611,8 @@ jobs:
         run: |
           set -euo pipefail
           export RUSTFLAGS="-Zsanitizer=address"
-          cargo test --workspace --lib --tests --target x86_64-unknown-linux-gnu -Zbuild-std
+          cargo test --workspace --lib --tests --release --target x86_64-unknown-linux-gnu -Zbuild-std
           for t in file-isa file-lift hap-file lift-analysis lift-taint; do
-            cargo test -p abcd-rs --test "$t" --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip pandasm_asm --skip wild_smoke
+            cargo test -p abcd-rs --test "$t" --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --test-threads=1 --skip pandasm_asm --skip wild_smoke
           done
-          cargo test -p abcd-rs --test lift-lower --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip test262_vm
+          cargo test -p abcd-rs --test lift-lower --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --test-threads=1 --skip test262_vm

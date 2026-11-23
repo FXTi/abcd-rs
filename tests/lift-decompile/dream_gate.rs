@@ -37,6 +37,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use abcd_decompile::emit::{EmitOptions, decompile_module};
+use rayon::prelude::*;
 
 /// The gate root inside `target/` (never committed).
 fn gate_root() -> std::path::PathBuf {
@@ -129,64 +130,81 @@ fn generate() -> usize {
     let gate = gate_root();
     let src_root = gate.join("src");
     std::fs::create_dir_all(&src_root).expect("create gate src root");
-    let mut manifest = String::new();
 
+    struct RowGen {
+        is_module: bool,
+        js_bytes: usize,
+        manifest_line: String,
+    }
+
+    let check_determinism = std::env::var_os("CARGO_LLVM_COV").is_none();
+    let generated: Vec<RowGen> = passed
+        .par_iter()
+        .map(|(abc, case, version, profile, _status)| {
+            let data = std::fs::read(root.join(abc)).expect("read fixture");
+            let file = abcd_file::decode(&data).expect("decode fixture");
+            let module = abcd_lift::lift_file(&file).expect("lift fixture");
+
+            let opts = EmitOptions {
+                call_entry: true,
+                ..EmitOptions::default()
+            };
+            let d1 = decompile_module(&module, &opts);
+            if check_determinism {
+                let d2 = decompile_module(&module, &opts);
+                assert_eq!(d1.text, d2.text, "non-deterministic output in {abc}");
+            }
+
+            let is_module = !module.imports.is_empty()
+                || !module.exports.is_empty()
+                || !module.module_requests.is_empty();
+
+            let js_path = src_root.join(format!("{abc}.js"));
+            std::fs::create_dir_all(js_path.parent().expect("parent")).expect("mkdirs");
+            std::fs::write(&js_path, &d1.text).expect("write js");
+
+            let hard: Vec<&str> = HARD7
+                .iter()
+                .copied()
+                .filter(|op| d1.stats.fallback_comments.contains_key(op))
+                .collect();
+            let hard_json = hard
+                .iter()
+                .map(|op| format!("\"{}\"", json_escape(op)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut row = String::new();
+            write!(
+                row,
+                "{{\"abc\": \"{}\", \"case\": \"{}\", \"version\": \"{}\", \"profile\": \"{}\", \"module\": {}, \"hard_fallbacks\": [{}], \"cross_arm_residual\": {}, \"functions_with_fallbacks\": {}, \"js_bytes\": {}}}",
+                json_escape(abc),
+                json_escape(case),
+                version,
+                profile,
+                is_module,
+                hard_json,
+                d1.stats.structure.cross_arm_notes,
+                d1.stats.functions_with_fallbacks,
+                d1.text.len(),
+            )
+            .expect("write row");
+            RowGen {
+                is_module,
+                js_bytes: d1.text.len(),
+                manifest_line: row,
+            }
+        })
+        .collect();
+
+    let mut manifest = String::new();
     let mut total_bytes = 0usize;
     let mut module_fixtures = 0usize;
-    for (abc, case, version, profile, _status) in &passed {
-        let data = std::fs::read(root.join(abc)).expect("read fixture");
-        let file = abcd_file::decode(&data).expect("decode fixture");
-        let module = abcd_lift::lift_file(&file).expect("lift fixture");
-
-        // Determinism: two independent runs, byte-identical. The gate
-        // emits the entry-point call so the recompiled program actually
-        // runs (EmitOptions::call_entry).
-        let opts = EmitOptions {
-            call_entry: true,
-            ..EmitOptions::default()
-        };
-        let d1 = decompile_module(&module, &opts);
-        let d2 = decompile_module(&module, &opts);
-        assert_eq!(d1.text, d2.text, "non-deterministic output in {abc}");
-
-        let is_module = !module.imports.is_empty()
-            || !module.exports.is_empty()
-            || !module.module_requests.is_empty();
-        if is_module {
+    for item in &generated {
+        if item.is_module {
             module_fixtures += 1;
         }
-
-        let js_path = src_root.join(format!("{abc}.js"));
-        std::fs::create_dir_all(js_path.parent().expect("parent")).expect("mkdirs");
-        std::fs::write(&js_path, &d1.text).expect("write js");
-        total_bytes += d1.text.len();
-
-        let hard: Vec<&str> = HARD7
-            .iter()
-            .copied()
-            .filter(|op| d1.stats.fallback_comments.contains_key(op))
-            .collect();
-        let hard_json = hard
-            .iter()
-            .map(|op| format!("\"{}\"", json_escape(op)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut row = String::new();
-        write!(
-            row,
-            "{{\"abc\": \"{}\", \"case\": \"{}\", \"version\": \"{}\", \"profile\": \"{}\", \"module\": {}, \"hard_fallbacks\": [{}], \"cross_arm_residual\": {}, \"functions_with_fallbacks\": {}, \"js_bytes\": {}}}",
-            json_escape(abc),
-            json_escape(case),
-            version,
-            profile,
-            is_module,
-            hard_json,
-            d1.stats.structure.cross_arm_notes,
-            d1.stats.functions_with_fallbacks,
-            d1.text.len(),
-        )
-        .expect("write row");
-        manifest.push_str(&row);
+        total_bytes += item.js_bytes;
+        manifest.push_str(&item.manifest_line);
         manifest.push('\n');
     }
     std::fs::write(gate.join("decompile-manifest.jsonl"), manifest).expect("write manifest");

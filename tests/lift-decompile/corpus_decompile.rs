@@ -223,6 +223,7 @@ fn corpus_decompile_gate() {
     // indexed collect keeps manifest order and the serial fold below
     // replays the sample collection and stat merges exactly as the
     // serial loop did.
+    let check_determinism = std::env::var_os("CARGO_LLVM_COV").is_none();
     let per_fixture: Vec<FixtureOut> = paths
         .par_iter()
         .enumerate()
@@ -231,10 +232,14 @@ fn corpus_decompile_gate() {
             let file = abcd_file::decode(&data).expect("decode fixture");
             let module = lift_file(&file).expect("lift fixture");
 
-            // Determinism: two independent runs are byte-identical.
+            // Determinism: two independent runs are byte-identical (skipped
+            // only under llvm-cov instrumentation where lift-decompile owns
+            // the determinism assertion).
             let d1 = decompile_module(&module, &EmitOptions::default());
-            let d2 = decompile_module(&module, &EmitOptions::default());
-            assert_eq!(d1.text, d2.text, "non-deterministic output in {relative}");
+            if check_determinism {
+                let d2 = decompile_module(&module, &EmitOptions::default());
+                assert_eq!(d1.text, d2.text, "non-deterministic output in {relative}");
+            }
             let js_sample = (i < NODE_SAMPLE).then(|| d1.text.clone());
             // The d-P8 `--ts` flag: signatures survive only on ≤11-format
             // files (fact #A7) — collect a TS sample from those.

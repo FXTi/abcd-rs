@@ -3,69 +3,86 @@
 
 Pipeline (design/decompile.md §7 d-P4):
 
-1. `cargo test -p abcd-decompile --test dream_gate --release -- --ignored`
-   has already decompiled every runtime-passed corpus fixture to
-   `target/dream-gate/src/<abc-path>.js` (+ `decompile-manifest.jsonl`
-   with module flags and hard-7 fallback presence).
-2. THIS script recompiles each with the GHCR image's es2abc, version
-   pinned to the fixture's own version directory (the image carries
-   exactly the corpus's six versions — no substitution is needed) and
-   module mode when the IR flagged the fixture as a module. Output:
-   `target/dream-gate/abc/<abc-path>`, the tree layout
-   `scripts/compare-rewritten-corpus.py` expects.
-3. `scripts/compare-rewritten-corpus.py` (UNCHANGED) runs each
-   recompiled fixture in ark_js_vm and compares stdout/exit against the
-   baked runtime records.
+1. `cargo test -p abcd-rs --test lift-decompile --release -- --ignored`
+   has already decompiled every selected corpus fixture to
+   `<gate-dir>/src/<abc-path>.js` (+ `decompile-manifest.jsonl` with
+   module flags and hard-7 fallback presence).
+2. THIS script recompiles all selected JS files inside a SINGLE
+   `--network none` container importing `/opt/arkcompiler-test/arktest.py`
+   and fanning out across `--jobs` workers, eliminating thousands of
+   per-fixture `docker run --rm` startups. Output: `<gate-dir>/abc/<abc-path>`.
+3. `scripts/compare-rewritten-corpus.py` runs each recompiled fixture in
+   `ark_js_vm` (also inside a single batch container) and compares
+   stdout/exit against the baked runtime records.
 4. Triage buckets (every non-pass fixture lands in exactly one):
    - `es2abc-cant`: es2abc rejected the recompile (syntax/construct it
      cannot emit); sub-reason from the compiler stderr.
    - `expected-fallback`: the decompiled text carries hard-7 fallback
-     comments (async/generator machinery, design §5) — behavior
-     divergence is expected by construction.
-   - `fixture-unsupported`: G2 residual only (post-d-P9): module
-     fixtures whose `export { name }` references a binding with no
-     consistent slot-name file evidence (synthetic `m{i}` names).
+     comments (async/generator machinery) — behavior divergence is
+     expected by construction.
+   - `fixture-unsupported`: G2 residual only: module fixtures whose
+     `export { name }` references a binding with no consistent slot-name
+     file evidence (synthetic `m{i}` names).
    - `decompile-bug`: everything else — invalid JS or wrong semantics
      attributable to our emitter.
-
-Usage:
-
-    cargo test -p abcd-decompile --test dream_gate --release -- --ignored
-    python3 scripts/dream-gate.py [--jobs 8] [--case local/arithmetic] \
-        [--skip-compare] [--skip-compile]
-
-test262 mode (test262 P3): `--gate-dir target/dream-gate-t262 --index
-target/dream-gate-t262/index.jsonl --recorded --recorded-stderr
-error-name [--expect-divergences scripts/test262-dream-divergences.json]`
-reuses THIS pipeline against the test262 gate root and its filtered
-index; the compare flags pass straight through to
-compare-rewritten-corpus.py (recorded-behavior comparison + the
-B-plan ledger gate). `--gate-dir` also reads `ABCD_DREAM_GATE_DIR`.
-
-`--skip-compile`/`--skip-compare` reuse prior artifacts (iteration).
-Writes `<gate-dir>/dream-gate-report.json` and prints the
-histogram verbatim.
 """
 
 import argparse
-import concurrent.futures
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 
-# The corpus image; CI pins it by digest via ARK_TEST_IMAGE
-# (.github/workflows/ci.yml). Local default stays :latest.
 IMAGE = os.environ.get("ARK_TEST_IMAGE", "ghcr.io/fxti/arkcompiler-test:latest")
 REPO = Path(__file__).resolve().parent.parent
-# Set in main() from --gate-dir / ABCD_DREAM_GATE_DIR (the test262 gate
-# passes its own root); read by load_rows/compile_one and the compare
-# step. Default: the project-corpus dream gate root.
 GATE = Path(
     os.environ.get("ABCD_DREAM_GATE_DIR", REPO / "target" / "dream-gate")
 )
 MANIFEST = REPO / "exports" / "corpus" / "index.jsonl"
+
+CONTAINER_COMPILE_WORKER = r"""
+import concurrent.futures
+import json
+from pathlib import Path
+import sys
+
+sys.path.insert(0, "/opt/arkcompiler-test")
+import arktest
+
+payload = json.loads(sys.stdin.read())
+jobs = payload["jobs"]
+rows = payload["rows"]
+
+
+def compile_one(row):
+    rel = row["abc"]
+    src = Path("/work/src") / f"{rel}.js"
+    out = Path("/work/abc") / rel
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.unlink(missing_ok=True)
+    mode = "module" if row.get("module") else "script"
+    try:
+        arktest.compile_one(src.resolve(), out, row["version"], row["profile"], mode)
+        if out.is_file():
+            return {"abc": rel, "compiled": True}
+        return {"abc": rel, "compiled": False, "raw_error": "missing output"}
+    except Exception as exc:
+        return {
+            "abc": rel,
+            "compiled": False,
+            "raw_error": json.dumps({"error": str(exc)}),
+        }
+
+
+if jobs <= 1 or len(rows) <= 1:
+    results = [compile_one(r) for r in rows]
+else:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        results = list(pool.map(compile_one, rows))
+
+sys.stdout.write(json.dumps(results))
+"""
 
 
 def load_rows():
@@ -73,55 +90,101 @@ def load_rows():
         return [json.loads(line) for line in f if line.strip()]
 
 
-def compile_one(row):
-    """Recompile one fixture's decompiled JS with its pinned es2abc."""
-    rel = row["abc"]
-    src = GATE / "src" / f"{rel}.js"
-    out = GATE / "abc" / rel
-    out.parent.mkdir(parents=True, exist_ok=True)
-    # The image's compile refuses to overwrite an existing output.
-    out.unlink(missing_ok=True)
-    cmd = [
-        "docker", "run", "--rm", "--platform", "linux/amd64",
-        "--network", "none",
-        "-v", f"{GATE}:/work",
-        IMAGE, "compile",
-        "--version", row["version"],
-        "--profile", row["profile"],
-    ]
-    if row["module"]:
-        cmd += ["--mode", "module"]
-    cmd += [f"/work/src/{rel}.js", f"/work/abc/{rel}"]
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True,
-            # 900s: GH runners are slow, and N76's A7_T2 currently emits a
-            # ~12MB JS (the absorbed-continuation wart; de-absorption is
-            # the registered follow-up) — es2abc needs minutes on it.
-            timeout=900)
-    except subprocess.TimeoutExpired:
-        return {"abc": rel, "compiled": False, "error": "compile timeout"}
-    if proc.returncode == 0 and out.is_file():
-        return {"abc": rel, "compiled": True}
-    # The compile subcommand reports es2abc failures as a doubly
-    # JSON-encoded payload (scripts/gen-opcode-fixtures.py precedent).
-    text = proc.stdout or proc.stderr
+def extract_first_error_line(text: str) -> str:
     detail = text
     try:
         outer = json.loads(text)
         if isinstance(outer, dict) and isinstance(outer.get("error"), str):
-            inner = json.loads(outer["error"])
-            detail = inner.get("stderr") or inner.get("error") or str(inner)
+            try:
+                inner = json.loads(outer["error"])
+                if isinstance(inner, dict):
+                    detail = inner.get("stderr") or inner.get("error") or str(inner)
+                else:
+                    detail = outer["error"]
+            except (json.JSONDecodeError, TypeError):
+                detail = outer["error"]
         elif isinstance(outer, dict):
             detail = outer.get("stderr") or json.dumps(outer)[:500]
     except (json.JSONDecodeError, TypeError):
         pass
-    first = ""
     for line in str(detail).splitlines():
         if line.strip():
-            first = line.strip()
-            break
-    return {"abc": rel, "compiled": False, "error": first[:300]}
+            return line.strip()[:300]
+    return ""
+
+
+def compile_batch(rows, jobs: int):
+    if not rows:
+        return {}
+    label = f"abcd-dream-compile={os.getpid()}"
+    cmd = [
+        "docker",
+        "run",
+        "--rm",
+        "-i",
+        "--platform",
+        "linux/amd64",
+        "--network",
+        "none",
+        "--label",
+        label,
+        "-v",
+        f"{GATE}:/work",
+        "--entrypoint",
+        "python3",
+        IMAGE,
+        "-c",
+        CONTAINER_COMPILE_WORKER,
+    ]
+    batch_input = json.dumps(
+        {
+            "jobs": jobs,
+            "rows": [
+                {
+                    "abc": r["abc"],
+                    "version": r["version"],
+                    "profile": r["profile"],
+                    "module": bool(r["module"]),
+                }
+                for r in rows
+            ],
+        }
+    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=batch_input,
+            capture_output=True,
+            text=True,
+            timeout=max(900, len(rows) * 5),
+        )
+        if proc.returncode != 0:
+            print(proc.stderr, file=sys.stderr)
+            raise RuntimeError(
+                f"batch compile container failed with exit code {proc.returncode}"
+            )
+        raw_list = json.loads(proc.stdout)
+    finally:
+        lingering = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", f"label={label}"],
+            capture_output=True,
+            text=True,
+        ).stdout.split()
+        if lingering:
+            subprocess.run(["docker", "rm", "-f", *lingering], capture_output=True)
+
+    compile_results = {}
+    for item in raw_list:
+        abc = item["abc"]
+        if item["compiled"]:
+            compile_results[abc] = {"abc": abc, "compiled": True}
+        else:
+            compile_results[abc] = {
+                "abc": abc,
+                "compiled": False,
+                "error": extract_first_error_line(item.get("raw_error", "")),
+            }
+    return compile_results
 
 
 def main():
@@ -146,16 +209,29 @@ def main():
         "exports/corpus/index.jsonl; the test262 gate passes its "
         "filtered index.jsonl)",
     )
-    # Passthroughs to compare-rewritten-corpus.py (test262 mode).
-    ap.add_argument("--recorded", action="store_true",
-                    help="compare runtime.status=='recorded' rows "
-                    "(test262) against the manifest runtime record")
-    ap.add_argument("--recorded-stderr", choices=["exact", "error-name"],
-                    default="exact")
-    ap.add_argument("--expect-divergences", type=Path, default=None,
-                    help="documented-divergence ledger passthrough")
-    ap.add_argument("--sample", type=int, default=1,
-                    help="deterministic every-Nth compare sampling")
+    ap.add_argument(
+        "--recorded",
+        action="store_true",
+        help="compare runtime.status=='recorded' rows "
+        "(test262) against the manifest runtime record",
+    )
+    ap.add_argument(
+        "--recorded-stderr",
+        choices=["exact", "error-name"],
+        default="exact",
+    )
+    ap.add_argument(
+        "--expect-divergences",
+        type=Path,
+        default=None,
+        help="documented-divergence ledger passthrough",
+    )
+    ap.add_argument(
+        "--sample",
+        type=int,
+        default=1,
+        help="deterministic every-Nth compare sampling",
+    )
     args = ap.parse_args()
     if args.gate_dir is not None:
         GATE = args.gate_dir.resolve()
@@ -167,41 +243,46 @@ def main():
     print(f"dream-gate: {len(rows)} fixtures", flush=True)
 
     # ── Step 2: recompile ────────────────────────────────────────────
-    compile_results = {}
     if not args.skip_compile:
-        done = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-            for result in pool.map(compile_one, rows):
-                compile_results[result["abc"]] = result
-                done += 1
-                if done % 100 == 0:
-                    print(f"  compiled {done}/{len(rows)}", flush=True)
+        compile_results = compile_batch(rows, args.jobs)
         (GATE / "compile-results.json").write_text(
-            json.dumps(compile_results, indent=1), encoding="utf-8")
+            json.dumps(compile_results, indent=1), encoding="utf-8"
+        )
     else:
         compile_results = json.loads(
-            (GATE / "compile-results.json").read_text(encoding="utf-8"))
+            (GATE / "compile-results.json").read_text(encoding="utf-8")
+        )
 
     compiled = sum(1 for r in compile_results.values() if r["compiled"])
     print(f"dream-gate: recompiled {compiled}/{len(rows)}", flush=True)
 
-    # ── Step 3: behavior comparison (UNCHANGED oracle script) ────────
+    # ── Step 3: behavior comparison ──────────────────────────────────
     compare_rc = 0
     if not args.skip_compare:
         compare_cmd = [
-            "python3", str(REPO / "scripts" / "compare-rewritten-corpus.py"),
-            str(index), str(GATE / "abc"),
-            "--image", IMAGE,
-            "--allow-missing", "--jobs", str(args.jobs),
+            "python3",
+            str(REPO / "scripts" / "compare-rewritten-corpus.py"),
+            str(index),
+            str(GATE / "abc"),
+            "--image",
+            IMAGE,
+            "--allow-missing",
+            "--jobs",
+            str(args.jobs),
         ]
         if args.recorded:
-            compare_cmd += ["--recorded", "--recorded-stderr",
-                            args.recorded_stderr]
+            compare_cmd += [
+                "--recorded",
+                "--recorded-stderr",
+                args.recorded_stderr,
+            ]
         if args.sample > 1:
             compare_cmd += ["--sample", str(args.sample)]
         if args.expect_divergences:
-            compare_cmd += ["--expect-divergences",
-                            str(args.expect_divergences)]
+            compare_cmd += [
+                "--expect-divergences",
+                str(args.expect_divergences),
+            ]
         for case in args.cases:
             compare_cmd += ["--case", case]
         proc = subprocess.run(compare_cmd, capture_output=True, text=True)
@@ -212,18 +293,26 @@ def main():
         try:
             report = json.loads(proc.stdout)
         except json.JSONDecodeError:
-            print(f"compare script output not JSON: {proc.stdout[:500]}",
-                  file=sys.stderr)
+            print(
+                f"compare script output not JSON: {proc.stdout[:500]}",
+                file=sys.stderr,
+            )
             print(proc.stderr[:2000], file=sys.stderr)
             return 2
     else:
-        report = json.loads((GATE / "compare-stdout.json").read_text(encoding="utf-8"))
+        report = json.loads(
+            (GATE / "compare-stdout.json").read_text(encoding="utf-8")
+        )
 
     # ── Step 4: triage ───────────────────────────────────────────────
-    by_abc = {r["abc"]: r for r in rows}
     compare_by_abc = {r["abc"]: r for r in report["results"]}
-    buckets = {"pass": [], "decompile-bug": [], "es2abc-cant": [],
-               "expected-fallback": [], "fixture-unsupported": []}
+    buckets = {
+        "pass": [],
+        "decompile-bug": [],
+        "es2abc-cant": [],
+        "expected-fallback": [],
+        "fixture-unsupported": [],
+    }
     reasons = {}
 
     for row in rows:
@@ -233,35 +322,26 @@ def main():
         if comp["compiled"] and cmp_res.get("passed"):
             buckets["pass"].append(abc)
             continue
-        # Non-pass: exactly one bucket.
         if not comp["compiled"]:
             err = comp.get("error", "")
             if row["hard_fallbacks"]:
                 bucket = "expected-fallback"
-            elif (row["module"] and "SyntaxError" in err
-                  and "Export name" in err and "is not defined" in err):
-                # G2 residual (post-d-P9): a module-var slot whose
-                # binding name has NO consistent file evidence (both
-                # channels — TDZ-guard name, stored definition name —
-                # absent or contradictory) keeps its synthetic `m{i}`
-                # fallback, so the export record's local name cannot
-                # resolve. Sharper than the d-P4 blanket "module" rule:
-                # any OTHER module compile failure is ours/es2abc's.
+            elif (
+                row["module"]
+                and "SyntaxError" in err
+                and "Export name" in err
+                and "is not defined" in err
+            ):
                 bucket = "fixture-unsupported"
             elif "SyntaxError" in err:
-                # Our text does not parse — that's ours, not es2abc's.
                 bucket = "decompile-bug"
             else:
                 bucket = "es2abc-cant"
             key = f"{bucket}: {err}"
         else:
-            # Compiled but behavior diverged (or the VM run failed).
             if row["hard_fallbacks"]:
                 bucket = "expected-fallback"
             else:
-                # Post-d-P9 G2 is closed: a module fixture that compiles
-                # and diverges is a behavior bug in our emitter like any
-                # other — no module-specific amnesty.
                 bucket = "decompile-bug"
             oracle = cmp_res.get("oracle", {})
             key = f"{bucket}: {json.dumps(oracle)}"
@@ -282,14 +362,15 @@ def main():
         "oracle_missing": report.get("missing"),
     }
     (GATE / "dream-gate-report.json").write_text(
-        json.dumps(full, indent=1), encoding="utf-8")
+        json.dumps(full, indent=1), encoding="utf-8"
+    )
     print(f"report: {GATE / 'dream-gate-report.json'}")
     if args.expect_divergences and compare_rc != 0:
-        # The B-plan ledger gate (test262 P3): an undocumented or stale
-        # divergence fails THIS script too — the histogram above is
-        # informational, the ledger is the gate.
-        print("dream-gate: ledger gate FAILED (undocumented or stale "
-              "divergence — see compare output above)", file=sys.stderr)
+        print(
+            "dream-gate: ledger gate FAILED (undocumented or stale "
+            "divergence — see compare output above)",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
