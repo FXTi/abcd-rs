@@ -397,15 +397,28 @@ the rejection probe).
 
 ## Crate map
 
-- `src/expr.rs` — internal expression AST: literals from `Const` (f64 bit-exact, shortest round-trip), legalized identifiers, named/index/dynamic property access, calls per `CallKind`, unary/binary/compare with precedence metadata, deferred `FuncId`/class references, `yield`/`yield*`/`await` nodes, object/array literal builders, raw+cooked template literals, and explicit `Fallback` nodes.
-- `src/recover.rs` — Stage A expression recovery: per-block def-use walk over `abcd_analysis::dataflow::UseDefChains` with `Op::effects()` barrier checks, `PhiAssign` records, `ExceptionParam` catch bindings, and `AllocObject`/`AllocArray` builder hooks.
-- `src/structure.rs` — Stage B pattern-independent control-flow structuring over `abcd_analysis::control::regions`, `TryRegion` projection, cut-try join hoisting (`emit_cut_try`, `try_loop_cut_do_while`), and continuation de-absorption (`emit_deabsorb_tower`).
-- `src/folds.rs` — JS desugaring folds: object/array literal reconstruction, `for..of`, `for..in`, `for await..of`, `finally` deduplication, `scope_fold` lexical `let` recovery, generator / async / async-generator state-machine folds, `yield*` delegation, and `late_decl_fold`.
+- `src/expr.rs` — internal expression AST: literals from `Const` (f64 bit-exact, shortest round-trip), legalized identifiers, named/index/dynamic property access, calls per `CallKind`, unary/binary/compare with precedence metadata, deferred `FuncId`/class references, `yield`/`yield*`/`await` nodes, object/array literal builders, raw+cooked template literals, tagged templates, and explicit `Fallback` nodes.
+- `src/recover.rs` — Stage A expression recovery: per-block def-use walk over `abcd_analysis::dataflow::UseDefChains` with `Op::effects()` barrier checks, `PhiAssign` records, `ExceptionParam` catch bindings, `AllocObject`/`AllocArray` builder hooks, and per-record module-slot binding resolution (`per_class_env`).
+- `src/structure/` — Stage B pattern-independent control-flow structuring over `abcd_analysis::control::regions`:
+  - `mod.rs` — region walker (`Seq`/`If`/`Loop`/`Switch`), labeled break/continue, irreducible dispatch escape hatch, and out-of-SSA phi placement.
+  - `try_project.rs` — laminar `TryPlan` wrapping, cut-try join hoisting (`emit_cut_try`, `try_loop_cut_do_while`), and continuation de-absorption (`emit_deabsorb_tower`).
+- `src/folds/` — JS desugaring and state-machine folds:
+  - `mod.rs` — Stage-B fold pipeline orchestration and `FoldStats`.
+  - `literals.rs` — object/array literal builders (`fold_literal_builders`), rest destructuring (`fold_rest_destructure`), and tagged-template recovery (`fold_tagged_templates`).
+  - `loops.rs` — `for..of`, `for await..of` (`match_for_await_driver`), dead loop-exit throw sweeping (`sweep_dead_loop_exit_throws`), and `for..in` (`fold_single_pass_for_ins`).
+  - `control.rs` — `switch` chain re-detection (`fold_switches`) and alpha-equivalent duplicated-`finally` folding (`fold_finally`).
+  - `scope.rs` — lexical slot scope reconstruction (`scope_fold`), TDZ-preserving `late_decl_fold`, and `rest_param_fold`.
+  - `machines/` — per-kind state-machine folds (`generator.rs`, `async_fn.rs`, `async_gen.rs`, `yield_star.rs`).
 - `src/classfold.rs` — ES/TS class reconstruction (`DefineClass` constructor + member literal buffer + instance field initializers + private fields/methods).
-- `src/emit.rs` — Stage C precedence-exact JS/TS emitter (`decompile_module`, `EmitOptions`, `DecompileStats`).
-- `src/names.rs`, `src/legalize.rs`, `src/consts.rs`, `src/fitness.rs`, `src/dump.rs` — seeded lexical-env/private-name propagation (`NameScopes`), G2 module-slot resolution (`module_slot_names`), identifier legalization, MUTF-8/lone-surrogate string & RegExp rendering, op fitness metadata, and deterministic Stage-A dumps.
-- `abcd-decompile/tests/golden_*.rs` — in-crate unit goldens for expressions, control-flow structuring, classes, modules, templates, generators, and async functions.
-- `tests/lift-decompile/` — cross-crate corpus & runtime gates (`corpus_stage_a`, `corpus_decompile`, `dream_gate`, `dream_gate_t262`, `wild_gate`, `async_node`, `async_gen_node`, `yield_star_node`).
+- `src/emit/` — Stage C precedence-exact JS/TS emitter:
+  - `mod.rs` — single-stream module emission (`decompile_module`, `EmitOptions`, `DecompileStats`).
+  - `decl.rs` — class, method, function, closure, and TypeScript signature emission.
+  - `expr.rs` — precedence-exact expression and literal printing.
+- `src/split.rs` — `--merge-abc` multi-module directory tree output (`decompile_module_split`, `normalize_record_path`): partitions classes, functions, per-record `EsModule` slots, and `jsonFileContent` JSON records into safe relative paths while rewriting internal OHMUrl (`@bundle:`, `@package:`, `@normalized:`) specifiers into relative POSIX imports.
+- `src/arkui.rs` — opt-in OpenHarmony ArkUI declarative sugar pass (`EmitOptions::arkui` / `--arkui`): reconstructs `@Entry` / `@CustomDialog` / `@Component struct`, `@State` / `@Prop` / `@Link` / `@ObjectLink` / `@Provide` / `@Consume` / `@LocalStorage*` / `@Storage*` fields, `build()` and `@Builder` UI trees (`observeComponentCreation2`, custom child `$prop` bindings, `If`, `ForEach` / `LazyForEach`), and prototype-overflow methods while eliding synthetic `ViewPU` boilerplate.
+- `src/names.rs`, `src/legalize.rs`, `src/consts.rs`, `src/fitness.rs`, `src/dump.rs` — seeded lexical-env/private-name propagation (`NameScopes`), G2 & per-record module-slot resolution (`DecompileIndex::build` / `build_split`), identifier legalization, MUTF-8/lone-surrogate string & RegExp rendering, op fitness metadata, and deterministic Stage-A dumps.
+- `abcd-decompile/tests/integration/` — in-crate unit goldens for expressions, control-flow structuring, classes, modules, templates, generators, async functions, `--split-modules`, and `--arkui`.
+- `tests/lift-decompile/` & `tests/merge-abc/` — cross-crate corpus, `--merge-abc` re-bundle, and runtime gates (`corpus_stage_a`, `corpus_decompile`, `dream_gate`, `dream_gate_t262`, `wild_gate`, `merge-abc`, `async_node`, `async_gen_node`, `yield_star_node`).
 
 ## The fallback-honesty rule
 

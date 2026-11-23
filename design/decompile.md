@@ -797,5 +797,46 @@ abcd-lift/src/lib.rs + abcd-lower/src/lib.rs (pipeline boundaries);
 design/archive/n62-literal-array-dedup-divergence.md (style exemplar);
 design/archive/agent-roadmap.md (d-track rows, gen1 history, abcd-analysis
 re-scope); design/archive/test-plan.md + design/archive/phase5-decision-briefing.md
-(docker oracle infra); git history `5de5ab9`, `1a8e3f4`, `f045e4a`
+(docker oracle infra); git history `5de5ab9`, `1a8e3f4`, `f045e4a`.
+
+---
+
+## 10. Modularization, `--split-modules`, and OpenHarmony ArkUI Sugar (`#26`)
+
+### 10.1 Submodule layout (`folds/`, `structure/`, `emit/`)
+
+To keep individual fold families and printer layers independently maintainable without altering behavior:
+- `src/folds/` splits Stage-B desugaring into `literals.rs`, `loops.rs`, `control.rs`, `scope.rs`, and `machines/{generator,async_fn,async_gen,yield_star}.rs`.
+- `src/structure/` separates region walking (`mod.rs`) from laminar `TryRegion` projection and cut-try join hoisting (`try_project.rs`).
+- `src/emit/` separates module orchestration (`mod.rs`), class/function/signature declarations (`decl.rs`), and precedence-exact expression/literal printing (`expr.rs`).
+
+### 10.2 Multi-module `--merge-abc` tree output (`--split-modules`, `src/split.rs`)
+
+`--merge-abc` bundles store each compiled source file or JSON asset as its own `ClassData` record (`ClassData::descriptor`, `ClassData::es_module`, `ClassData::scope_names`, and `FieldData` `"jsonFileContent"`). `decompile_module_split` reconstructs the multi-file directory tree:
+1. **Per-record ES module slot isolation (`DecompileIndex::build_split`)**:
+   - `Op::LoadModuleVar { index, kind: External | SendableExternal | Lazy | LazySendable }` indexes 0-based into that record's `ImportDecl::Regular` entries;
+   - `Op::LoadModuleVar { index, kind: Local | SendableLocal | SendableClass }` and `Op::StoreModuleVar { index }` index 0-based into that record's distinct `ExportDecl::Local.local_name` entries (cross-checked against TDZ guards and `StoreModuleVar` definitions);
+   - `Op::GetModuleNamespace { index }` indexes into `EsModule.module_requests` to resolve `ImportDecl::Namespace`.
+2. **Safe OHMUrl path normalization (`normalize_record_path`)**:
+   - Strips `@bundle:`, `@package:`, and `@normalized:` OHMUrl wrappers; skips synthetic metadata records (`L_ESModuleRecord;`, `L_ESSlotNumberAnnotation;`, etc.) and external SDK stubs (`@ohos.*`, `@kit.*`, `@system.*`); drops `..` and root segments; suffixes Windows reserved device stems (`CON`, `NUL`, `COM1`..`LPT9`); and emits `.json` payloads directly from `jsonFileContent`.
+   - Rewrites internal `@bundle:` / `@package:` / `@normalized:` specifiers and extensionless relative JSON imports into navigable POSIX relative paths.
+
+### 10.3 `ets_loader` / `ui2abc` lowering shapes (API 9–24) & `--arkui` (`src/arkui.rs`)
+
+Across OpenHarmony SDK API 9–24, `ets_loader` compiles declarative ArkTS `@Component struct` sources into ES classes before invoking `es2abc`:
+- **Component & page registration**: `@Component struct Foo` becomes `class Foo extends ViewPU` (API 9 partial-update: `extends View`), preceded in `func_main_0` by a `"finalizeConstruction" in ViewPU.prototype` polyfill and followed by `registerNamedRoute(() => new Foo(...), ...)` (API 10+) or `loadDocument(new Foo(...))` (`@Entry`), plus `setController` on `@CustomDialog` components. When method counts exceed `DefineClass`'s literal-buffer capacity, `es2abc` attaches remaining methods (`initialRender`, `@Builder` helpers, and `#~@...` mangled aliases / `DefineGetterSetterByValue` accessors) onto `Foo.prototype` in `func_main_0`.
+- **Reactive state wrappers (constructor)**:
+  - `@State x = v` → `this.__x = new ObservedPropertySimplePU(v, this, "x")` / `ObservedPropertyObjectPU` (API 9: `*Simple` / `*Object`).
+  - `@Provide("alias") x = v` → `@State` wrapper paired with `this.addProvidedVar("alias", this.__x, ...)`.
+  - `@Prop x` → `this.__x = new SynchedPropertySimpleOneWayPU(params.x, this, "x")` / `SynchedPropertyObjectOneWayPU`.
+  - `@Link x` → `this.__x = new SynchedPropertySimpleTwoWayPU(params.x, this, "x")` / `SynchedPropertyObjectTwoWayPU`.
+  - `@ObjectLink x` → `this.__x = new SynchedPropertyNestedObjectPU(params.x, this, "x")` (including upstream's historical `SynchedPropertyNesedObjectPU` spelling).
+  - `@Consume("alias") x` → `this.__x = this.initializeConsume("alias", "x")`.
+  - `@LocalStorageLink` / `@LocalStorageProp` / `@StorageLink` / `@StorageProp` → `this.createLocalStorageLink` / `createLocalStorageProp` / `createStorageLink` / `createStorageProp` (or `AppStorage.setAndLink` / `setAndProp`).
+- **Declarative render tree (`initialRender` & `@Builder`)**:
+  - Built-in components lower to `this.observeComponentCreation2((elmtId, isInitialRender) => { Comp.create(args); Comp.attr(...); }, Comp)` (API 9: `observeComponentCreation`), with container children nested before the matching `Comp.pop()` and leaf components (`Text`, `Image`, `Blank`, `Divider`, `TextInput`, etc.) popping inside the creation closure or implicitly.
+  - Custom child components lower to `ViewPU.create(new Child(this, { prop: val, link: this.__link }, ...))` paired with `this.updateStateVarsOfChildByElmtId(elmtId, { ... })`.
+  - Conditional rendering lowers to `If.create()` + `this.ifElseBranchUpdateFunction(branchId, () => { ... })` (or `If.branchId(n)`), and list rendering lowers to `ForEach.create()` + `this.forEachUpdateFunction(elmtId, arr, itemGen, keyGen)` or `LazyForEach.create(..., dataSource, itemGen, keyGen)`.
+
+When `EmitOptions::arkui` (`abcd decompile --arkui`) is enabled, `src/arkui.rs` runs as an opt-in presentation pass reconstructing `@Entry` / `@CustomDialog` / `@Component struct`, decorated fields, `@Builder` methods, and `build() { ... }` trees while preserving user lifecycle hooks (`aboutToAppear`, `onPageShow`, etc.) and leaving default `arkui: false` JS output untouched for `es2abc` recompilation gates.
 (gen1).

@@ -88,6 +88,11 @@ pub struct EmitOptions {
     /// `undefined` under es2abc's strict functions (N74). Off by
     /// default — human-facing output stays clean.
     pub call_entry: bool,
+    /// Reconstruct OpenHarmony ArkUI declarative `@Entry` / `@Component struct`
+    /// definitions (`@State`, `@Prop`, `@Link`, `@Provide`, `@Consume`,
+    /// `build() { ... }`) from `ets_loader`-lowered `ViewPU` / `View` classes
+    /// (#26 Phase 3). Off by default so JS recompile gates stay pure ES.
+    pub arkui: bool,
 }
 
 /// Emission counters (the corpus gate prints them verbatim).
@@ -296,6 +301,15 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         if consumed.contains(&f) {
             continue;
         }
+        if opts.arkui
+            && !opts.call_entry
+            && module
+                .func(f)
+                .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
+            && crate::arkui::try_emit_arkui_main(&mut em, f, &mut out)
+        {
+            continue;
+        }
         let emitted = em.emit_top_level_function(f, &mut out);
         if opts.call_entry && emitted.1 == "func_main_0" {
             entry_call = Some(emitted.0);
@@ -358,7 +372,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
 /// }`) is an IdentifierName, not a binding: reserved words are legal
 /// (`as default` is THE default-export spelling). Keep valid
 /// IdentifierNames verbatim; sanitize only genuinely broken shapes.
-pub(in crate::emit) fn module_facing_name(raw: &str) -> String {
+pub(crate) fn module_facing_name(raw: &str) -> String {
     if crate::legalize::is_ident_name(raw) {
         raw.to_string()
     } else {
@@ -441,22 +455,22 @@ pub(in crate::emit) fn collect_method_refs_const(c: &Const, out: &mut BTreeSet<F
     }
 }
 
-pub(in crate::emit) struct Emitter<'m> {
-    pub(in crate::emit) module: &'m Module,
-    pub(in crate::emit) index: Option<&'m DecompileIndex>,
-    pub(in crate::emit) opts: &'m EmitOptions,
-    pub(in crate::emit) stats: DecompileStats,
+pub(crate) struct Emitter<'m> {
+    pub(crate) module: &'m Module,
+    pub(crate) index: Option<&'m DecompileIndex>,
+    pub(crate) opts: &'m EmitOptions,
+    pub(crate) stats: DecompileStats,
     /// Module-scope name legalizer (top-level function names).
-    pub(in crate::emit) fn_names: Legalizer,
-    pub(in crate::emit) current_fn_has_fallback: bool,
+    pub(crate) fn_names: Legalizer,
+    pub(crate) current_fn_has_fallback: bool,
     /// The kind of the function currently being emitted (`yield` is
     /// only printable inside generator kinds; in plain async functions
     /// the `SuspendGenerator` op is async machinery — R4).
-    pub(in crate::emit) current_kind: FunctionKind,
+    pub(crate) current_kind: FunctionKind,
     /// Nesting depth of class-body emission (private names are only
     /// printable `#x` inside a class body; es2abc's out-of-class
     /// instance initializers print the loud string-key fallback).
-    pub(in crate::emit) class_depth: usize,
+    pub(crate) class_depth: usize,
     /// Temporaries of the CURRENT function whose uses escape their
     /// declaration's structured block (JS `const`/`let`/`class` are
     /// block-scoped; SSA dominance is not block-aligned). They are
@@ -464,22 +478,22 @@ pub(in crate::emit) struct Emitter<'m> {
     /// the original site. (d-P4 dream gate: `ReferenceError: _funcObj$1
     /// is not defined` — a class declared inside a `try` block, used
     /// after it.)
-    pub(in crate::emit) hoisted: BTreeSet<String>,
+    pub(crate) hoisted: BTreeSet<String>,
     /// Precomputed per-function Stage A + Stage B + Folds output (taken on
     /// first emission; cloned into `reused` only if tail duplication emits
     /// the same inline function more than once).
-    pub(in crate::emit) prepared: Vec<Option<PreparedFunc>>,
+    pub(crate) prepared: Vec<Option<PreparedFunc>>,
     /// Snapshot cache for functions emitted more than once.
-    pub(in crate::emit) reused: BTreeMap<FuncId, PreparedFunc>,
+    pub(crate) reused: BTreeMap<FuncId, PreparedFunc>,
 }
 
 #[derive(Clone)]
-pub(in crate::emit) struct PreparedFunc {
-    pub(in crate::emit) top_level: bool,
-    pub(in crate::emit) rf: RecoveredFunc,
-    pub(in crate::emit) body: Vec<SNode>,
-    pub(in crate::emit) struct_stats: StructStats,
-    pub(in crate::emit) fold_stats: FoldStats,
+pub(crate) struct PreparedFunc {
+    pub(crate) top_level: bool,
+    pub(crate) rf: RecoveredFunc,
+    pub(crate) body: Vec<SNode>,
+    pub(crate) struct_stats: StructStats,
+    pub(crate) fold_stats: FoldStats,
 }
 
 /// Orphan lexical bindings (IR gap G1): unnamed lexenv slots get
@@ -532,7 +546,7 @@ pub(in crate::emit) fn orphan_lexenv_names_in_func(rf: &RecoveredFunc) -> BTreeS
 }
 
 /// Pure per-function pipeline: Stage A → orphan scan → Stage B → folds.
-pub(in crate::emit) fn prepare_func(
+pub(crate) fn prepare_func(
     module: &Module,
     index: Option<&DecompileIndex>,
     func: FuncId,
@@ -574,7 +588,7 @@ pub(in crate::emit) fn prepare_func(
 /// The full per-function pipeline: Stage A → Stage B → folds.
 impl<'m> Emitter<'m> {
     /// Consume (or reuse) the precomputed Stage A → Stage B → folds output.
-    pub(in crate::emit) fn func_nodes(
+    pub(crate) fn func_nodes(
         &mut self,
         func: FuncId,
         top_level: bool,
@@ -607,7 +621,7 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    fn emit_node(&mut self, n: &SNode, indent: usize, out: &mut String) {
+    pub(crate) fn emit_node(&mut self, n: &SNode, indent: usize, out: &mut String) {
         let pad = "  ".repeat(indent);
         match n {
             SNode::Stmts(leaves) => {
@@ -783,7 +797,7 @@ impl<'m> Emitter<'m> {
         }
     }
 
-    fn emit_leaf(&mut self, l: &Leaf, indent: usize, out: &mut String) {
+    pub(crate) fn emit_leaf(&mut self, l: &Leaf, indent: usize, out: &mut String) {
         match l {
             Leaf::Raw(s) => self.emit_stmt(s, indent, out),
             Leaf::Destructure { obj, keys, rest } => {
@@ -829,7 +843,7 @@ impl<'m> Emitter<'m> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn emit_stmt(&mut self, s: &Stmt, indent: usize, out: &mut String) {
+    pub(crate) fn emit_stmt(&mut self, s: &Stmt, indent: usize, out: &mut String) {
         let pad = "  ".repeat(indent);
         match s {
             Stmt::Declare {
@@ -1097,7 +1111,7 @@ impl<'m> Emitter<'m> {
     }
 
     /// An expression printed at statement (precedence-0) context.
-    fn estr(&mut self, e: &Expr) -> String {
+    pub(crate) fn estr(&mut self, e: &Expr) -> String {
         let mut s = String::new();
         self.expr(e, 0, &mut s);
         s
@@ -1128,7 +1142,7 @@ impl<'m> Emitter<'m> {
 /// Level-N>0 stores target ancestor scopes and are declared by the
 /// ancestor's own pass. Names already bound as parameters are skipped
 /// (a `let` redeclaration of a parameter is a SyntaxError).
-pub(in crate::emit) fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
+pub(crate) fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
     fn walk(
         nodes: &[SNode],
         out: &mut Vec<String>,
@@ -1388,7 +1402,7 @@ pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
     out
 }
 
-pub(in crate::emit) fn merge_struct_stats(mut a: StructStats, b: &StructStats) -> StructStats {
+pub(crate) fn merge_struct_stats(mut a: StructStats, b: &StructStats) -> StructStats {
     a.ifs += b.ifs;
     a.loops_while += b.loops_while;
     a.loops_do_while += b.loops_do_while;
@@ -1418,7 +1432,7 @@ pub(in crate::emit) fn merge_struct_stats(mut a: StructStats, b: &StructStats) -
     a
 }
 
-pub(in crate::emit) fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
+pub(crate) fn merge_fold_stats(mut a: FoldStats, b: &FoldStats) -> FoldStats {
     a.for_of += b.for_of;
     a.for_await_of += b.for_await_of;
     a.for_in += b.for_in;

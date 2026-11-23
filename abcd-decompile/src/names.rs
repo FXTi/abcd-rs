@@ -23,12 +23,43 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use abcd_ir::ValueDef;
 use abcd_ir::consts::Const;
 use abcd_ir::function::DebugData;
-use abcd_ir::id::{BlockId, ConstId, FuncId, InstId, ValueId};
-use abcd_ir::module::Module;
-use abcd_ir::op::Op;
+use abcd_ir::id::{BlockId, ClassId, ConstId, FuncId, InstId, ValueId};
+use abcd_ir::module::{EsModule, ExportDecl, ImportDecl, Module};
+use abcd_ir::op::{ModuleVarKind, Op};
 
 use crate::consts::sym_str;
 use crate::legalize::sanitize;
+
+/// Per-record ES module slot bindings for `--split-modules` (#26 Phase 2):
+/// separates `External` (`RegularImport`), `Local` (`LocalExport` / `StoreModuleVar`),
+/// and `Namespace` (`GetModuleNamespace`) slot indices per owning [`ClassId`].
+#[derive(Clone, Debug, Default)]
+pub struct RecordModuleEnv {
+    /// `ldexternalmodulevar idx` → `idx`-th `ImportDecl::Regular.local_name`.
+    pub external_slots: BTreeMap<u32, String>,
+    /// `ldlocalmodulevar idx` / `stmodulevar idx` → resolved local binding name.
+    pub local_slots: BTreeMap<u32, String>,
+    /// `getmodulenamespace idx` → `ImportDecl::Namespace.local_name` matching `module_requests[idx]`.
+    pub namespace_slots: BTreeMap<u32, String>,
+}
+
+impl RecordModuleEnv {
+    /// Resolve an external (imported) module slot index.
+    pub fn external_name(&self, idx: u32) -> String {
+        self.external_slots
+            .get(&idx)
+            .cloned()
+            .unwrap_or_else(|| format!("ext{idx}"))
+    }
+
+    /// Resolve a local (exported/module-scoped) module slot index.
+    pub fn local_name(&self, idx: u32) -> String {
+        self.local_slots
+            .get(&idx)
+            .cloned()
+            .unwrap_or_else(|| module_slot_fallback(idx))
+    }
+}
 
 /// Module-wide pre-indexed lookup tables shared across per-function Stage A
 /// recovery, `classfold`, and Stage C emission (#29).
@@ -42,6 +73,8 @@ pub struct DecompileIndex {
     parents: Vec<Option<FuncId>>,
     /// Resolved G2 module-variable slot names (`module_slot_names(module)`).
     pub slot_names: BTreeMap<u32, String>,
+    /// Optional per-class isolated ES module slot tables (`build_split`).
+    pub per_class_env: Option<HashMap<ClassId, RecordModuleEnv>>,
     /// Constructors referenced by `DefineClass` / `DefineSendableClass`.
     pub class_ctors: HashSet<FuncId>,
     /// `(level, slot)` → closure bodies stored via `PutLexVar` anywhere in
@@ -101,9 +134,18 @@ impl DecompileIndex {
         Self {
             parents,
             slot_names: module_slot_names(module),
+            per_class_env: None,
             class_ctors,
             lex_closure_stores,
         }
+    }
+
+    /// Build decompile lookup tables with isolated per-record [`RecordModuleEnv`]s
+    /// for `--split-modules` (#26 Phase 2).
+    pub fn build_split(module: &Module) -> Self {
+        let mut base = Self::build(module);
+        base.per_class_env = Some(build_per_class_module_envs(module));
+        base
     }
 
     /// Capture parent of `func` (`O(1)` lookup matching `parent_of`).
@@ -713,6 +755,149 @@ fn demangle_internal_name(raw: String) -> String {
 /// The synthetic fallback for a module namespace slot (gap G2).
 pub fn namespace_fallback(index: u32) -> String {
     format!("ns{index}")
+}
+
+fn build_per_class_module_envs(module: &Module) -> HashMap<ClassId, RecordModuleEnv> {
+    let mut out = HashMap::with_capacity(module.classes.len());
+    let standalone_esm = if !module.imports.is_empty()
+        || !module.exports.is_empty()
+        || !module.module_requests.is_empty()
+    {
+        Some(EsModule {
+            imports: module.imports.clone(),
+            exports: module.exports.clone(),
+            module_requests: module.module_requests.clone(),
+        })
+    } else {
+        None
+    };
+
+    for (ci, cls) in module.classes.iter().enumerate() {
+        let cid = ClassId::new(ci as u32);
+        let desc = sym_str(module, cls.descriptor);
+        let esm = cls.es_module.as_ref().or_else(|| {
+            (desc == "L_GLOBAL;")
+                .then_some(standalone_esm.as_ref())
+                .flatten()
+        });
+
+        let mut env = RecordModuleEnv::default();
+        let mut taken = BTreeSet::new();
+
+        if let Some(esm) = esm {
+            let mut ext_idx = 0u32;
+            for imp in &esm.imports {
+                match imp {
+                    ImportDecl::Regular { local_name, .. } => {
+                        let local = sanitize(&sym_str(module, *local_name));
+                        taken.insert(local.clone());
+                        env.external_slots.insert(ext_idx, local);
+                        ext_idx += 1;
+                    }
+                    ImportDecl::Namespace {
+                        local_name,
+                        module_request,
+                    } => {
+                        let local = sanitize(&sym_str(module, *local_name));
+                        taken.insert(local.clone());
+                        for (ridx, req) in esm.module_requests.iter().enumerate() {
+                            if req.specifier == *module_request {
+                                env.namespace_slots.insert(ridx as u32, local.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect local-slot candidates from this class's own functions first.
+        let mut candidates: BTreeMap<u32, Option<String>> = BTreeMap::new();
+        for &fid in &cls.methods {
+            let Some(fd) = module.func(fid) else {
+                continue;
+            };
+            for &bid in &fd.blocks {
+                let Some(block) = module.block(bid) else {
+                    continue;
+                };
+                for &iid in &block.insts {
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
+                    match &inst.op {
+                        Op::StoreGlobal { name, .. }
+                        | Op::StoreGlobalRecord { name, .. }
+                        | Op::TryStoreGlobal { name, .. } => {
+                            taken.insert(sanitize(&sym_str(module, *name)));
+                        }
+                        Op::ThrowUndefinedIfHoleWithName { name, value } => {
+                            if let Some(slot) = load_local_module_slot(module, *value) {
+                                consider(&mut candidates, slot, sym_str(module, *name));
+                            }
+                        }
+                        Op::ThrowUndefinedIfHole { name, value } => {
+                            if let Some(slot) = load_local_module_slot(module, *value)
+                                && let Some(n) = const_string(module, *name)
+                            {
+                                consider(&mut candidates, slot, n);
+                            }
+                        }
+                        Op::StoreModuleVar { index, value } => {
+                            if let Some(name) = defined_value_name(module, *value) {
+                                consider(&mut candidates, *index, name);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Supplement unclaimed local slots from `ExportDecl::Local` in unique
+        // `local_name` declaration order (upstream `SourceTextModule` local
+        // export index assignment).
+        if let Some(esm) = esm {
+            let mut distinct_locals = Vec::new();
+            let mut seen_locals = BTreeSet::new();
+            for exp in &esm.exports {
+                if let ExportDecl::Local { local_name, .. } = exp {
+                    let raw = sym_str(module, *local_name);
+                    if seen_locals.insert(raw.clone()) {
+                        distinct_locals.push(raw);
+                    }
+                }
+            }
+            for (slot_idx, raw_name) in distinct_locals.into_iter().enumerate() {
+                candidates.entry(slot_idx as u32).or_insert(Some(raw_name));
+            }
+        }
+
+        let mut name_count: BTreeMap<String, usize> = BTreeMap::new();
+        for cand in candidates.values().flatten() {
+            *name_count.entry(sanitize(cand)).or_insert(0) += 1;
+        }
+        for (slot, cand) in candidates {
+            let Some(name) = cand else { continue };
+            let name = sanitize(&name);
+            if name_count.get(&name).copied().unwrap_or(0) > 1 || taken.contains(&name) {
+                continue;
+            }
+            env.local_slots.insert(slot, name);
+        }
+
+        out.insert(cid, env);
+    }
+    out
+}
+
+fn load_local_module_slot(module: &Module, v: ValueId) -> Option<u32> {
+    match &def_inst(module, v)?.op {
+        Op::LoadModuleVar {
+            index,
+            kind: ModuleVarKind::Local | ModuleVarKind::SendableLocal | ModuleVarKind::SendableClass,
+        } => Some(*index),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

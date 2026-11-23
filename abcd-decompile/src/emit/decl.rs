@@ -4,7 +4,7 @@ use super::*;
 
 impl<'m> Emitter<'m> {
     /// Returns the (legalized, minted) emitted name and the raw name.
-    pub(in crate::emit) fn emit_top_level_function(
+    pub(crate) fn emit_top_level_function(
         &mut self,
         func: FuncId,
         out: &mut String,
@@ -112,6 +112,23 @@ impl<'m> Emitter<'m> {
         sendable: bool,
         out: &mut String,
     ) {
+        if self.opts.arkui
+            && !sendable
+            && !self.hoisted.contains(name)
+            && crate::arkui::try_emit_arkui_component(
+                self,
+                pad,
+                indent,
+                name,
+                ctor,
+                heritage.as_deref(),
+                members,
+                member_attrs,
+                out,
+            )
+        {
+            return;
+        }
         self.stats.classes += 1;
         if sendable {
             out.push_str(&format!(
@@ -231,7 +248,7 @@ impl<'m> Emitter<'m> {
         out.push_str(&format!("{pad}}}\n"));
     }
 
-    fn emit_class_method(
+    pub(crate) fn emit_class_method(
         &mut self,
         pad: &str,
         indent: usize,

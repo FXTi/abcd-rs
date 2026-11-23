@@ -198,14 +198,14 @@ pub struct TaintArgs {
     pub select: SelectArgs,
 }
 
-/// `abcd decompile <input> [-o out.js] [--ts] [--line-anchors]`.
+/// `abcd decompile <input> [-o out.js] [--ts] [--line-anchors] [--split-modules] [--arkui]`.
 #[derive(Debug, Args)]
 pub struct DecompileArgs {
     /// Input file: bare .abc or a container (.hap/.hsp/.app/.hqf).
     pub input: PathBuf,
     /// Output path. With a single module this is the .js file (stdout if
-    /// omitted); with --all this is a directory receiving
-    /// <module-name>.js per module and is required.
+    /// omitted); with --all or --split-modules this is an output directory
+    /// and is required.
     #[arg(short = 'o', long = "output", value_name = "PATH")]
     pub output: Option<PathBuf>,
     /// Emit TypeScript annotations where the file format carries signature
@@ -219,6 +219,14 @@ pub struct DecompileArgs {
     /// top-level functions (off by default: human-facing output stays clean).
     #[arg(long = "call-entry")]
     pub call_entry: bool,
+    /// Reconstruct a `--merge-abc` bundle into a multi-file directory tree
+    /// (`.js`/`.ts`/`.ets` and `.json`) under `-o <DIR>`.
+    #[arg(long = "split-modules")]
+    pub split_modules: bool,
+    /// Reconstruct OpenHarmony ArkUI declarative `@Entry` / `@Component struct`
+    /// and `build()` syntax from `ViewPU` / `View` classes.
+    #[arg(long)]
+    pub arkui: bool,
     /// Module selection for multi-module containers.
     #[command(flatten)]
     pub select: SelectArgs,

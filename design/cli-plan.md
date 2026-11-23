@@ -27,7 +27,7 @@ in `[workspace.dependencies]` (currently unused — reserved for this).
 | `abcd dis` | abcd-file + abcd-isa | .abc → pandasm text | Backed by the 4,557,285-instruction 0-mismatch corpus evidence. Options: whole file / single method / raw byte offsets. **Ruled 2026-09-28: output must be BYTE-IDENTICAL to upstream ark_disasm — see §4.1.** |
 | `abcd asm` | abcd-isa + abcd-file | pandasm text → .abc | The round-trip direction of `dis`. A **writer** — phase 2. |
 | `abcd rewrite` | file→lift→opt→lower→file | .abc → rewritten .abc | Identity or optimizing rewrite (normalization, future instrumentation hook). A **writer** — phase 2. |
-| `abcd decompile` | abcd-decompile | .abc → .js | EmitOptions surfaced as flags (`--line-anchors`, `--ts`, entry-call toggle). |
+| `abcd decompile` | abcd-decompile | .abc → .js/.ts/.ets | EmitOptions surfaced as flags (`--line-anchors`, `--ts`, `--call-entry`, `--arkui`, plus `--split-modules -o <dir>` for multi-record `--merge-abc` trees). |
 | `abcd analyze` | abcd-analysis | .abc → callgraph/dominator/region reports | Needs an output format decision (text tree vs `--json`). |
 | `abcd taint` | abcd-taint | .abc + source/sink config → findings | TaintConfig has sources/sinks/builtin_summaries/seed flags; CLI needs a small config file format (TOML/JSON) or repeated flags. |
 

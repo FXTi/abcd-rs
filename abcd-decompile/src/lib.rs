@@ -32,6 +32,7 @@
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+pub mod arkui;
 pub mod classfold;
 pub mod consts;
 pub mod dump;
@@ -42,8 +43,12 @@ pub mod folds;
 pub mod legalize;
 pub mod names;
 pub mod recover;
+pub mod split;
 pub mod structure;
 
 pub use emit::{DecompiledModule, EmitOptions, decompile_module};
 pub use recover::{RecoveredFunc, recover_func};
+pub use split::{
+    SplitDecompiledModule, SplitFile, SplitFileKind, decompile_module_split, normalize_record_path,
+};
 pub use structure::{SNode, Structured, structure_func};

@@ -127,3 +127,27 @@ fn write_all_aborts_the_batch_on_an_unliftable_module() {
     assert!(dir.join("good.js").exists(), "the good module was written");
     assert!(!dir.join("bad.js").exists(), "the bad module was not");
 }
+
+#[test]
+fn write_split_emits_js_and_ets_trees() {
+    let m = module(&common::tiny_abc(), "modules.abc");
+    let js_dir = common::tempdir("decompile-split-js");
+    let (n_js, b_js) =
+        decompile::write_split(&m, &js_dir, DecompileOptions::default()).expect("write_split js");
+    assert_eq!(n_js, 1);
+    assert!(b_js > 0);
+    assert!(js_dir.join("index.js").exists());
+
+    let ets_dir = common::tempdir("decompile-split-ets");
+    let (n_ets, _) = decompile::write_split(
+        &m,
+        &ets_dir,
+        DecompileOptions {
+            arkui: true,
+            ..Default::default()
+        },
+    )
+    .expect("write_split ets");
+    assert_eq!(n_ets, 1);
+    assert!(ets_dir.join("index.ets").exists());
+}

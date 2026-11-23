@@ -224,9 +224,45 @@ fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
         ts: args.ts,
         line_anchors: args.line_anchors,
         call_entry: args.call_entry,
+        arkui: args.arkui,
     };
     let selection = selection_of(&args.select.module, args.select.all);
     let modules = input::load(&args.input, selection)?;
+
+    if args.split_modules {
+        let out_dir = match &args.output {
+            Some(dir) => dir.clone(),
+            None => {
+                return Err(CliError::User(
+                    "--split-modules requires -o <dir>".to_string(),
+                ));
+            }
+        };
+        if args.select.all && modules.len() > 1 {
+            for m in &modules {
+                let sub = out_dir.join(&m.name);
+                let (files, bytes) = decompile::write_split(m, &sub, opts)?;
+                println!(
+                    "{}: {} files ({bytes} bytes) -> {}",
+                    m.name,
+                    files,
+                    sub.display()
+                );
+            }
+        } else {
+            let module = modules
+                .first()
+                .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
+            let (files, bytes) = decompile::write_split(module, &out_dir, opts)?;
+            println!(
+                "{}: {} files ({bytes} bytes) -> {}",
+                module.name,
+                files,
+                out_dir.display()
+            );
+        }
+        return Ok(());
+    }
 
     if args.select.all {
         // Per-module artifacts: -o is the output directory and required.

@@ -23,6 +23,7 @@
 use std::process::Command;
 
 use abcd_decompile::emit::{EmitOptions, decompile_module};
+use abcd_decompile::split::{SplitFileKind, decompile_module_split};
 use abcd_file::{
     AccessFlags, Builder, FieldValue, File, JSON_FILE_CONTENT_FIELD, MODULE_RECORD_IDX_FIELD,
     MODULE_REQUEST_PHASE_FIELD, ModuleRecordDef, SCOPE_NAMES_FIELD, SourceLang, Type, Version,
@@ -443,6 +444,81 @@ fn synthetic_merge_abc_all_four_pipelines_across_versions() {
                 d1.text
             );
         }
+
+        // 5) Multi-file `--split-modules` tree reconstruction (#26 Phase 2)
+        let split = decompile_module_split(&ir, &EmitOptions::default());
+        assert_eq!(
+            split.files.len(),
+            3,
+            "expected main.js, helper.js, cfg.json"
+        );
+        let main_sf = split
+            .files
+            .iter()
+            .find(|f| f.rel_path == "main.js")
+            .expect("main.js");
+        assert!(
+            main_sf
+                .text
+                .contains("import { makeAdder } from \"./helper\";")
+        );
+        assert!(
+            main_sf
+                .text
+                .contains("import { bonus } from \"./lazyMod\";")
+        );
+        assert!(main_sf.text.contains("export { result };"));
+
+        let helper_sf = split
+            .files
+            .iter()
+            .find(|f| f.rel_path == "helper.js")
+            .expect("helper.js");
+        assert!(
+            helper_sf.text.contains("import cfg from \"./cfg.json\";"),
+            "helper.js must rewrite extensionless JSON import:\n{}",
+            helper_sf.text
+        );
+        assert!(helper_sf.text.contains("export { makeAdder };"));
+
+        let cfg_sf = split
+            .files
+            .iter()
+            .find(|f| f.rel_path == "cfg.json")
+            .expect("cfg.json");
+        assert_eq!(cfg_sf.kind, SplitFileKind::Json);
+        assert_eq!(cfg_sf.text, "{\"base\":20,\"tag\":\"merge-ok\"}\n");
+
+        if has_node {
+            for sf in &split.files {
+                if sf.kind == SplitFileKind::Json {
+                    continue;
+                }
+                let tmp = std::env::temp_dir().join(format!(
+                    "abcd-merge-split-{}-{}-{}",
+                    std::process::id(),
+                    version,
+                    sf.rel_path.replace('/', "_")
+                ));
+                std::fs::write(&tmp, &sf.text).expect("write split mjs");
+                // Copy with `.mjs` suffix so `node --check` parses ESM syntax.
+                let mjs = tmp.with_extension("mjs");
+                std::fs::rename(&tmp, &mjs).expect("rename to mjs");
+                let check = Command::new("node")
+                    .arg("--check")
+                    .arg(&mjs)
+                    .output()
+                    .expect("run node --check on split file");
+                let _ = std::fs::remove_file(&mjs);
+                assert!(
+                    check.status.success(),
+                    "node --check rejected split {} ({version}):\n{}\n{}",
+                    sf.rel_path,
+                    String::from_utf8_lossy(&check.stderr),
+                    sf.text
+                );
+            }
+        }
     }
 }
 
@@ -596,20 +672,60 @@ print(json.dumps(out))
                 decomp.text
             );
         }
+
+        // Pipeline 5 (#26 Phase 2): `--split-modules` multi-file tree output
+        // ready for `es2abc --module --merge-abc` re-bundling & VM execution!
+        let split = decompile_module_split(
+            &ir,
+            &EmitOptions {
+                call_entry: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            split.stats.functions_with_fallbacks, 0,
+            "fallbacks in split merge-abc ({ver_s}): {:?}",
+            split.stats.fallback_comments
+        );
+        let split_dir = work.join(format!("split-{ver_s}"));
+        std::fs::create_dir_all(&split_dir).expect("create split dir");
+        let mut info_lines = String::new();
+        for sf in &split.files {
+            let dst = split_dir.join(&sf.rel_path);
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent).expect("create split parent");
+            }
+            std::fs::write(&dst, &sf.text).expect("write split file");
+            info_lines.push_str(&format!(
+                "/work/split-{ver_s}/{};{};esm;{};entry\n",
+                sf.rel_path, sf.record_name, sf.rel_path
+            ));
+        }
+        std::fs::write(
+            work.join(format!("split-filesInfo-{ver_s}.txt")),
+            info_lines,
+        )
+        .expect("write split filesInfo");
     }
 
-    // Step 3: Verify ALL 9 candidate .abc files (3 versions × 3 variants:
-    // identity encode, v2lift, v2opt) pass BOTH `ark_disasm` AND
-    // `ark_js_vm --entry-point=main` with exact `"merge-ok:42\n"` stdout inside
-    // ONE single container!
+    // Step 3: Verify ALL 12 candidate .abc files (3 versions × 4 variants:
+    // identity encode, v2lift, v2opt, and re-bundled `--split-modules` output)
+    // pass BOTH `ark_disasm` AND `ark_js_vm --entry-point=main` with exact
+    // `"merge-ok:42\n"` stdout inside ONE single container!
     let verify_py = r#"
 import json, subprocess, sys
 sys.path.insert(0, "/opt/arkcompiler-test")
 import arktest
 
+versions = arktest.read_json(arktest.ROOT / "versions.json")
 checked = 0
 for ver in ["12.0.6.0", "13.0.1.0", "24.0.0.0"]:
-    for kind in ["id", "lift", "opt"]:
+    split_abc = f"/work/cand-split-{ver}.abc"
+    c = arktest.call("es2abc", versions[ver] + [
+        "--module", "--merge-abc", f"--output={split_abc}", f"@/work/split-filesInfo-{ver}.txt"
+    ])
+    arktest.require_ok(c)
+    for kind in ["id", "lift", "opt", "split"]:
         abc = f"/work/cand-{kind}-{ver}.abc"
         pa = f"/work/cand-{kind}-{ver}.pa"
         arktest.inspect(abc)

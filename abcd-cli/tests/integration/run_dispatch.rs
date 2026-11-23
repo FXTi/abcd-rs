@@ -445,6 +445,49 @@ fn decompile_output_path_on_a_directory_is_a_tool_error() {
     assert!(err.to_string().contains("cannot write"), "{err}");
 }
 
+#[test]
+fn decompile_split_modules_requires_an_output_dir() {
+    let (_dir, abc) = tiny_abc_file("dispatch-decompile-split-err");
+    let err = run_argv(&["abcd", "decompile", &abc, "--split-modules"]).unwrap_err();
+    assert_eq!(
+        err,
+        CliError::User("--split-modules requires -o <dir>".to_string())
+    );
+    assert_eq!(err.exit_code(), 1);
+}
+
+#[test]
+fn decompile_split_modules_and_arkui_write_tree() {
+    let (dir, abc) = tiny_abc_file("dispatch-decompile-split-ets");
+    let out = dir.join("split");
+    run_argv(&[
+        "abcd",
+        "decompile",
+        &abc,
+        "--split-modules",
+        "--arkui",
+        "-o",
+        out.to_str().unwrap(),
+    ])
+    .expect("decompile --split-modules --arkui");
+    assert!(out.join("index.ets").exists());
+
+    let (app_dir, app) = app_file("dispatch-decompile-split-all");
+    let app_out = app_dir.join("split-all");
+    run_argv(&[
+        "abcd",
+        "decompile",
+        &app,
+        "--all",
+        "--split-modules",
+        "-o",
+        app_out.to_str().unwrap(),
+    ])
+    .expect("decompile --all --split-modules");
+    assert!(app_out.join("entry").join("index.js").exists());
+    assert!(app_out.join("phone").join("index.js").exists());
+}
+
 // ---- analyze ----
 
 #[test]

@@ -828,7 +828,25 @@ impl<'m> Recover<'m> {
     /// params mint — a source param sharing a binding's name would
     /// otherwise shadow the module-scope `let` the resolved name refers
     /// to (a `StoreModuleVar` prints the resolved name verbatim).
+    fn record_env(&self) -> Option<&crate::names::RecordModuleEnv> {
+        let cid = self.module.func(self.func)?.class_id;
+        self.index?.per_class_env.as_ref()?.get(&cid)
+    }
+
     fn reserve_module_slot_names(&mut self) {
+        if let Some(env) = self.record_env() {
+            let names: Vec<String> = env
+                .external_slots
+                .values()
+                .chain(env.local_slots.values())
+                .chain(env.namespace_slots.values())
+                .cloned()
+                .collect();
+            for n in names {
+                self.legal.reserve(&n);
+            }
+            return;
+        }
         if let Some(idx) = self.index {
             for n in idx.slot_names.values() {
                 self.legal.reserve(n);
@@ -844,6 +862,9 @@ impl<'m> Recover<'m> {
     /// The emitted name of a module-var slot: the resolved binding name
     /// when file evidence pinned one (G2), else the synthetic fallback.
     fn module_slot_name(&self, index: u32) -> String {
+        if let Some(env) = self.record_env() {
+            return env.local_name(index);
+        }
         let map = match self.index {
             Some(idx) => &idx.slot_names,
             None => &self.owned_slot_names,
@@ -851,6 +872,30 @@ impl<'m> Recover<'m> {
         map.get(&index)
             .cloned()
             .unwrap_or_else(|| module_slot_fallback(index))
+    }
+
+    fn load_module_var_name(&self, index: u32, kind: abcd_ir::ModuleVarKind) -> String {
+        if let Some(env) = self.record_env() {
+            return match kind {
+                abcd_ir::ModuleVarKind::External
+                | abcd_ir::ModuleVarKind::SendableExternal
+                | abcd_ir::ModuleVarKind::Lazy
+                | abcd_ir::ModuleVarKind::LazySendable => env.external_name(index),
+                abcd_ir::ModuleVarKind::Local
+                | abcd_ir::ModuleVarKind::SendableLocal
+                | abcd_ir::ModuleVarKind::SendableClass => env.local_name(index),
+            };
+        }
+        self.module_slot_name(index)
+    }
+
+    fn module_namespace_name(&self, index: u32) -> String {
+        if let Some(env) = self.record_env()
+            && let Some(n) = env.namespace_slots.get(&index)
+        {
+            return n.clone();
+        }
+        namespace_fallback(index)
     }
 
     /// Reserve every name that can appear as a bare identifier in an
@@ -885,12 +930,16 @@ impl<'m> Recover<'m> {
                             self.legal.reserve(&sanitize(n));
                         }
                     }
-                    Op::LoadModuleVar { index, .. } | Op::StoreModuleVar { index, .. } => {
+                    Op::LoadModuleVar { index, kind } => {
+                        let n = self.load_module_var_name(*index, *kind);
+                        self.legal.reserve(&n);
+                    }
+                    Op::StoreModuleVar { index, .. } => {
                         let n = self.module_slot_name(*index);
                         self.legal.reserve(&n);
                     }
                     Op::GetModuleNamespace { index } => {
-                        self.legal.reserve(&namespace_fallback(*index));
+                        self.legal.reserve(&self.module_namespace_name(*index));
                     }
                     _ => {}
                 }
@@ -1587,8 +1636,10 @@ impl<'m> Recover<'m> {
                 && let Some(inst) = self.module.inst(*iid)
             {
                 raw = match &inst.op {
-                    Op::LoadModuleVar { index, .. } => Some(self.module_slot_name(*index)),
-                    Op::GetModuleNamespace { index } => Some(namespace_fallback(*index)),
+                    Op::LoadModuleVar { index, kind } => {
+                        Some(self.load_module_var_name(*index, *kind))
+                    }
+                    Op::GetModuleNamespace { index } => Some(self.module_namespace_name(*index)),
                     Op::GetLexVar { .. } => self.scopes.name_of(*iid).map(str::to_string),
                     other => op_name_hint(self.module, other),
                 };
@@ -1826,8 +1877,18 @@ impl<'m> Recover<'m> {
                     }
                 }
             }
-            Op::LoadModuleVar { index, .. } => Expr::Ident(self.module_slot_name(*index)),
-            Op::GetModuleNamespace { index } => Expr::ModuleNamespace { index: *index },
+            Op::LoadModuleVar { index, kind } => {
+                Expr::Ident(self.load_module_var_name(*index, *kind))
+            }
+            Op::GetModuleNamespace { index } => {
+                if let Some(env) = self.record_env()
+                    && let Some(ns) = env.namespace_slots.get(index)
+                {
+                    Expr::Ident(ns.clone())
+                } else {
+                    Expr::ModuleNamespace { index: *index }
+                }
+            }
             Op::DynamicImport { specifier } => Expr::DynamicImport {
                 specifier: Box::new(self.expr_of(*specifier)),
             },

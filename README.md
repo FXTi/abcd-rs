@@ -52,6 +52,7 @@ cargo run -p abcd-cli -- info modules.abc --verify
 cargo run -p abcd-cli -- extract app.hap -o extracted/
 cargo run -p abcd-cli -- dis modules.abc -o modules.pa
 cargo run -p abcd-cli -- decompile app.hap --module entry -o entry.js
+cargo run -p abcd-cli -- decompile app.hap --module entry --split-modules --arkui -o src_out/
 cargo run -p abcd-cli -- rewrite input.abc --opt --check -o opt.abc
 cargo run -p abcd-cli -- analyze input.abc --callgraph --dominators
 cargo run -p abcd-cli -- taint input.abc --config taint.toml
