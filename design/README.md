@@ -16,8 +16,8 @@ Architecture, format specifications, research surveys, and verification records 
 | [analysis-strategy.md](analysis-strategy.md) | Static analysis & taint architecture (`abcd-analysis` / `abcd-taint`): IFDS solver, rungs 0–2 PTA ladder, summaries & callback gaps |
 | [decompile.md](decompile.md) | Decompiler architecture (`abcd-decompile`): expression recovery, pattern-independent structuring, JS/TS emission & oracle gates |
 | [cli-plan.md](cli-plan.md) | `abcd` CLI command surface, container sniffing, exit-code contract, and `taint.toml` configuration |
-| [vendor-sync.md](vendor-sync.md) | Submodule pin policy (`OpenHarmony-v7.0-Release`), shim-only adaptation, and automated upstream tag radar |
-| [ci.md](ci.md) | 19-job CI pipeline, 32-bit / 3-OS build matrix, corpus & VM oracle gates |
+| [vendor-sync.md](vendor-sync.md) | Curated `vendor/` snapshot (`OpenHarmony-v7.0-Release`), offline codegen (`scripts/vendor-gen.py`), and upstream tag radar |
+| [ci.md](ci.md) | 20-job CI pipeline (`vendor-verify` + 32-bit / 3-OS build matrix + corpus & VM oracle gates) |
 | [roadmap.md](roadmap.md) | Project milestones, architectural invariants, and engineering working agreements |
 
 ## Reference Surveys & Historical Records

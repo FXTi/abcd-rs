@@ -8,9 +8,10 @@
 
 ```
 abcd-rs/
-├── abcd-isa-sys/        # ISA FFI layer (Ruby codegen + C++ bridge + bindgen)
+├── vendor/              # Curated arkcompiler_runtime_core snapshot + UPSTREAM.toml + shared C++ shims/headers
+├── abcd-isa-sys/        # ISA FFI layer (pre-generated ISA/FFI bindings + C++ bridge)
 ├── abcd-isa/            # Safe ISA API (modern + legacy 0.0.0.2 decode, encode, relocation, Version)
-├── abcd-file-sys/       # Container FFI layer (libpandafile accessors/writer + C bridge + bindgen)
+├── abcd-file-sys/       # Container FFI layer (libpandafile accessors/writer + C bridge + pre-generated bindings)
 ├── abcd-file/           # Safe .abc API (decode, encode, Builder, ark_disasm-exact pandasm dis/asm)
 ├── abcd-hap/            # Pure-Rust in-memory ZIP reader for .hap/.hsp/.app/.hqf containers
 ├── abcd-ir/             # Format-independent SSA IR (Module, ClassData, FunctionData, 88 Ops, Effects, Verifier)

@@ -33,10 +33,10 @@ Version conditioning: `12.0.6.0` is `LAST_CONTAINS_LITERAL_IN_HEADER_VERSION`. O
 
 `pandasm::emit_file` reproduces upstream `ark_disasm` output byte-for-byte across all 5,517 corpus fixtures (matching `libstdc++` `unordered_set` bucket order on `13.x`/`24.x` literal collection and header-slot order on `<= 12.0.6.0`). `pandasm::parse_file_with_version` parses `.pa` text back into `File` for assembly via `encode`.
 
-## FFI bridge & submodule strategy (`abcd-file-sys`)
+## FFI bridge & vendor snapshot strategy (`abcd-file-sys`)
 
-- Upstream `arkcompiler_runtime_core` is a pinned read-only git submodule (`OpenHarmony-v7.0-Release`) paired with 10 minimal shims in `bridge/shim/` (`vendor_fixups.h`, `zlib.h` inline Adler-32, non-aborting `logger.h`, `platform_compat.h`, …).
-- `build.rs` runs 7 Ruby template invocations (`source_lang_enum.h`, `type.h`, `file_format_version.h`, plus 4 assembler/ISA headers) and 2 `bindgen` passes (`bindings.rs` + `enum_bindings.rs`).
+- Upstream `arkcompiler_runtime_core` C++ sources live in the shared, read-only `vendor/arkcompiler_runtime_core/` snapshot (`OpenHarmony-v7.0-Release`, verified by per-file SHA-256 in `vendor/UPSTREAM.toml`), paired with shared shims in `vendor/shim/` (`platform_compat.h`, `securec.h`, `pgo.h`, inline Adler-32 `zlib.h`, non-aborting `logger.h`, `os/*`) and crate-local `bridge/shim/{vendor_fixups.h, isa.h}`.
+- `scripts/vendor-gen.py` pre-generates the 7 Ruby C++ headers (`source_lang_enum.h`, `type.h`, `file_format_version.h`, plus 4 assembler/ISA headers), `src/generated/bindings.rs`, `src/generated/enum_bindings.rs`, and `vendor/generated/file_bridge_enum_checks.h` (`109` C++17 `static_assert`s checked during every `cc::Build` run, with zero build-time Ruby or `bindgen`).
 - Every string read in `file_bridge.cpp` is strictly bounded by the file span and tag-declared UTF-16 unit count (`bounded_cstr_len` + `convert_string_utf16_bounded`, closing N81), and annotation array counts are clamped to remaining payload bytes (closing N83).
 
 ## Known limitations

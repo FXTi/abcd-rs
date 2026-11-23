@@ -1,144 +1,97 @@
 # abcd-file-sys
 
-> This document is intended for crate maintainers and contributors, covering the internal architecture, build pipeline, and API design of abcd-file-sys.
+> This document is intended for crate maintainers and contributors, covering the internal architecture, build pipeline, and API design of `abcd-file-sys`.
 > If you just want to use the file format API, see the higher-level [`abcd-file`](../abcd-file/README.md) crate.
 
-This crate provides ArkCompiler `.abc` file format C FFI bindings for Rust, wrapping arkcompiler's `libpandafile` C++ library via a thin C bridge layer. It exposes two generated artifacts through `src/lib.rs`:
+This crate provides ArkCompiler `.abc` file format C FFI bindings for Rust, wrapping `arkcompiler_runtime_core`'s `libpandafile` C++ library via a thin C bridge layer and pre-generated Rust bindings. It exposes two pre-generated artifacts through `src/lib.rs`:
 
-- `bindings.rs` — raw `abc_*` FFI functions, produced by bindgen from `bridge/file_bridge.h` (allowlists `abc_.*` functions, `Abc.*` types, `ABC_.*` vars).
-- `enum_bindings.rs` — vendor constants extracted directly from vendor C++ headers (a second bindgen pass over a build.rs-generated header), so Rust references vendor values instead of hand-maintained mirrors: `ABC_ACC_*` access flags (names auto-extracted from `modifiers.h`, values referencing the vendor constexprs) and the vendor enum classes `LiteralTag`, `ModuleTag`, `FunctionKind`, `SourceLang`, `Type::TypeId`, `MethodHandleType`.
+- `src/generated/bindings.rs` — raw `abc_*` FFI functions, opaque handle structs, callbacks, and `ABC_*` constants generated offline by `scripts/vendor-gen.py` from `bridge/file_bridge.h`.
+- `src/generated/enum_bindings.rs` — upstream constants extracted offline by `scripts/vendor-gen.py` directly from `vendor/` headers (`ABC_ACC_*` access flags from `modifiers.h`, plus `LiteralTag`, `ModuleTag`, `FunctionKind`, `SourceLang`, `Type::TypeId`, and `MethodHandleType`), bidirectional-locked at C++ compile time by 109 `static_assert`s in `vendor/generated/file_bridge_enum_checks.h`.
 
 ## Directory Structure
 
 ```
 abcd-file-sys/
-├── build.rs                           # Ruby codegen → enums header → cc compile → bindgen ×2
-├── Cargo.toml                         # (no `links` key; dependents use the crate directly)
+├── build.rs                           # Pure cc::Build compiling libpandafile + file_bridge.cpp
+├── Cargo.toml                         # Depends only on `cc` at build time (zero bindgen/Ruby)
 ├── src/
-│   └── lib.rs                         # include!(bindings.rs) + include!(enum_bindings.rs)
-│                                      # + Rust safe-type wrappers (FileType, AnnotationValueType, …)
-│                                      # + in-crate integration tests
-├── bridge/
-│   ├── file_bridge.h                  # C wrapper header (extern "C", ~184 functions)
-│   ├── file_bridge.cpp                # C wrapper implementation
-│   └── shim/                          # Minimal shims (10 files, replacing heavy deps)
-│       ├── vendor_fixups.h            # Force-included: missing transitive includes
-│       ├── isa.h                      # Minimal ISA facade for vendored code that includes it
-│       ├── pgo.h                      # ProfileOptimizer stub (no-op)
-│       ├── securec.h                  # Huawei secure C library shim (memcpy_s wrapper)
-│       ├── platform_compat.h          # MSVC compat (force-included with /FI on Windows)
-│       ├── zlib.h                     # Inline adler32 implementation (no system zlib needed)
-│       ├── os/file.h                  # Empty stub
-│       ├── os/filesystem.h            # Empty stub
-│       ├── os/mem.h                   # Non-owning os::mem::MapViewOfFile-style stub
-│       └── utils/logger.h             # LOG macro shim — see "Logger shim" below
-└── arkcompiler_runtime_core/          # git submodule (upstream, pinned; read-only)
-    ├── isa/                           # gen.rb + isapi.rb + isa.yaml (Ruby codegen engine)
-    ├── assembler/                     # annotation value type validation headers
-    ├── libpandafile/                  # Core file format library
-    │   ├── *.h / *.cpp                # Data accessors, file items, debug info
-    │   ├── templates/                 # ERB templates
-    │   └── *.rb / *.yaml              # Ruby codegen modules + type data
-    ├── templates/plugin_options.rb    # Common codegen options module
-    ├── platforms/                     # Target platform headers
-    └── libpandabase/                  # include/libpandabase/** + utils/utf.cpp
+│   ├── lib.rs                         # Re-exports src/generated/{bindings,enum_bindings}.rs
+│   │                                  # + safe-type wrappers (FileType, AnnotationValueType, …)
+│   │                                  # + in-crate integration tests
+│   └── generated/
+│       ├── bindings.rs                # Pre-generated C FFI bindings for file_bridge.h
+│       └── enum_bindings.rs           # Pre-generated vendor enum & access-flag constants
+└── bridge/
+    ├── file_bridge.h                  # C wrapper header (extern "C", ~186 functions)
+    ├── file_bridge.cpp                # C wrapper implementation + static_assert enum checks
+    └── shim/                          # Crate-local shims
+        ├── vendor_fixups.h            # Force-included (-include / /FI): missing transitive includes
+        └── isa.h                      # Minimal ISA facade for vendored headers that include it
+
+../vendor/                             # Shared workspace vendor snapshot & shims
+├── UPSTREAM.toml                      # Upstream tag, commit SHA, and per-file SHA-256 manifest
+├── arkcompiler_runtime_core/          # Curated upstream snapshot (isa, libpandafile, libpandabase, ...)
+├── generated/                         # Pre-generated upstream C++ headers + file_bridge_enum_checks.h
+└── shim/                              # Shared C++ shims
+    ├── platform_compat.h              # MSVC compat (force-included with /FI on Windows)
+    ├── pgo.h                          # ProfileOptimizer no-op stub
+    ├── securec.h                      # Huawei secure C library shim (memcpy_s / memset_s)
+    ├── zlib.h                         # Inline Adler-32 implementation (no system zlib needed)
+    ├── os/{file.h,filesystem.h,mem.h} # Lightweight OS/memory stubs
+    └── utils/logger.h                 # Non-aborting LOG macro shim — see "Logger shim" below
 ```
 
-### Upstream code: a pinned git submodule
+### Upstream code: curated `vendor/` snapshot
 
-The upstream repo
-([openharmony/arkcompiler_runtime_core](https://github.com/openharmony/arkcompiler_runtime_core))
-is a **git submodule at the crate root** (`abcd-file-sys/arkcompiler_runtime_core`),
-pinned to a proven upstream commit. **Never edit inside the submodule** —
-local adaptation lives in `bridge/shim/` only. After cloning, run
-`git submodule update --init`. See `../design/vendor-sync.md` for the pin
-policy and the automated upstream tag radar (`.github/workflows/vendor-sync.yml`).
+Upstream sources from [`openharmony/arkcompiler_runtime_core`](https://github.com/openharmony/arkcompiler_runtime_core) live in [`../vendor/arkcompiler_runtime_core/`](../vendor/arkcompiler_runtime_core) (336 files, `1.8 MB`, test directories stripped) and are cryptographically pinned by per-file SHA-256 in [`../vendor/UPSTREAM.toml`](../vendor/UPSTREAM.toml). **Never edit inside `vendor/arkcompiler_runtime_core/`** — CI (`vendor-verify`) rejects any hash drift or stray file. Local adaptation lives in `../vendor/shim/` and `bridge/shim/` only. See [`../design/vendor-sync.md`](../design/vendor-sync.md).
 
-Missing transitive includes that the upstream build provides are injected via
-`vendor_fixups.h` (force-included with `-include` / `/FI`), avoiding any
-upstream file modifications.
+Missing transitive includes that the upstream CMake/GN build provides are injected via `bridge/shim/vendor_fixups.h` (force-included with `-include` / `/FI`), avoiding any upstream file modifications.
 
-`pgo.h` (ProfileOptimizer) is stubbed in `bridge/shim/` and shadowed via
-include path priority — the upstream version depends on runtime
-infrastructure we don't have.
+`pgo.h` (`ProfileOptimizer`) is stubbed in `../vendor/shim/pgo.h` and shadowed via include-path priority — the upstream version depends on runtime infrastructure we do not build.
 
-The full upstream subtree is present, but `build.rs` compiles only the
-translation units the bridge needs (the same set as the old vendored
-subset): the `libpandafile` data accessors / item container / writer,
-`libpandabase/utils/utf.cpp`, and `bridge/file_bridge.cpp`. Excluded on
-purpose: `file_reader.cpp` (legacy-tree drift — it calls
-`MethodParamItem::AddRuntimeAnnotation`, which legacy `file_items.h` never
-declares; the consistent implementation lives in `static_core/libarkfile`),
-plus `file.cpp`, `pgo.cpp`, and `method_handle_data_accessor.cpp` (runtime
-machinery the bridge never used).
+`build.rs` compiles only the translation units the bridge needs: the `libpandafile` data accessors / item container / writer, `libpandabase/utils/utf.cpp`, and `bridge/file_bridge.cpp`. Excluded on purpose: `file_reader.cpp` (legacy-tree drift — it calls `MethodParamItem::AddRuntimeAnnotation`, which legacy `file_items.h` never declares; the consistent implementation lives in `static_core/libarkfile`), plus `file.cpp`, `pgo.cpp`, and `method_handle_data_accessor.cpp` (unused runtime machinery).
 
 ## Build Pipeline Overview
 
+### 1. Offline generation (`python3 scripts/vendor-gen.py codegen`, verified in CI by `vendor-verify`)
+
 ```
-isa.yaml / types.yaml (data sources)
+vendor/arkcompiler_runtime_core/{isa/isa.yaml, libpandafile/types.yaml, ...}
     │
-    ▼
-gen.rb + per-template requires (Ruby pipeline, 7 invocations)
+    ├──► Ruby (gen.rb + per-template requires)
+    │       ├──► vendor/generated/source_lang_enum.h
+    │       ├──► vendor/generated/type.h
+    │       ├──► vendor/generated/file_format_version.h
+    │       ├──► vendor/generated/bytecode_instruction_enum_gen.h
+    │       ├──► vendor/generated/bytecode_instruction-inl_gen.h
+    │       ├──► vendor/generated/isa_constants_gen.h
+    │       └──► vendor/generated/ark_version.h
     │
-    ├──► source_lang_enum.h              (SourceLang enum: ECMASCRIPT, ARKTS, ...)
-    ├──► type.h                          (Type class: TypeId enum + property queries)
-    ├──► file_format_version.h           (version constants + API version mapping)
-    ├──► bytecode_instruction_enum_gen.h (ISA opcode/format/flag enums for assembler headers)
-    ├──► bytecode_instruction-inl_gen.h  (inline ISA helpers)
-    ├──► isa_constants_gen.h             (assembler ISA constants)
-    └──► ark_version.h                   (assembler version header)
-            │
-            ▼
-build.rs Phase 1b: file_bridge_enums.h — ACC_* names parsed from
-modifiers.h, values referenced from vendor headers (no hand mirrors)
-            │
-            ▼
-cc compiles the bridge + the upstream translation units it needs:
-the libpandafile accessor/container/writer .cpp set (see above),
-libpandabase/utils/utf.cpp + bridge/file_bridge.cpp
-            │
-            ▼
-bindgen pass 1: bridge/file_bridge.h → bindings.rs
-bindgen pass 2: file_bridge_enums.h → enum_bindings.rs
-            │
-            ▼
-src/lib.rs (include! both artifacts)
+    ├──► Vendor C++ header enum/constexpr extractor
+    │       ├──► src/generated/enum_bindings.rs (+ rustfmt)
+    │       └──► vendor/generated/file_bridge_enum_checks.h (109 C++17 static_asserts)
+    │
+    └──► C99 header parser on bridge/file_bridge.h
+            └──► src/generated/bindings.rs (+ rustfmt)
 ```
 
-### Ruby Code Generation
+### 2. Ordinary `cargo build` (`build.rs`)
 
-Each template gets only the Ruby modules it needs (matching upstream's CMake approach):
-
-| Template | Data | Requires | Module |
-|----------|------|----------|--------|
-| `source_lang_enum.h.erb` | `isa.yaml` | `plugin_options.rb` | `Common` |
-| `type.h.erb` | `types.yaml` | `types.rb` | `PandaFile` |
-| `file_format_version.h.erb` | `isa.yaml` | `isapi.rb, pandafile_isapi.rb` | `Panda` |
-
-Ruby's `def` is last-writer-wins — each `.rb` file redefines `Gen.on_require(data)`, so the final definition must match the module the template uses. Per-template requires ensure this naturally.
-
-### Comparison with arkcompiler's Original Build System
-
-- Use Rust `build.rs` to drive Ruby instead of CMake/GN.
-- Vendor `.cpp` files compiled directly — no CMake target dependencies.
-- `vendor_fixups.h` force-include replaces upstream's transitive header propagation (PCH / CMake target includes).
-- `-DSUPPORT_KNOWN_EXCEPTION` enables the C++ exception path in the `THROW_IF` macro, avoiding dependency on upstream's `LOG(FATAL)` infrastructure.
-- `-DNDEBUG` eliminates C++ debug assertion runtime dependencies.
-- `bridge/shim/zlib.h` provides inline `adler32` (byte-equivalent to the reference implementation) — no system zlib linkage needed.
+`build.rs` runs only `cc::Build` to compile the C++17 bridge and `libpandafile` translation units. `bridge/file_bridge.cpp` includes `file_bridge_enum_checks.h`, proving at C++ compile time on every target OS/architecture that every constant in `src/generated/enum_bindings.rs` equals the exact upstream C++ enum/constexpr value — without invoking `bindgen` or `libclang` over C++17 STL headers.
 
 ### Logger shim (intentional semantic change — keep documented)
 
-`bridge/shim/utils/logger.h` makes vendored `LOG(FATAL)` print to `std::cerr` and CONTINUE instead of aborting (vendor-audit ruling #A4: a data-path failure must not kill the host process). Vendored FATAL sites (e.g. `line_number_program.h`, `debug_info_extractor.cpp`) thus degrade to print-and-continue. This is a deliberate weakening for embedding safety; on any future vendor sync, do NOT re-arm it without a maintainer decision.
+`../vendor/shim/utils/logger.h` makes vendored `LOG(FATAL)` print to `std::cerr` and CONTINUE instead of aborting (vendor-audit ruling #A4: a data-path failure must not kill the host process). Vendored FATAL sites (e.g. `line_number_program.h`, `debug_info_extractor.cpp`) thus degrade to print-and-continue. This is a deliberate weakening for embedding safety; on any future vendor sync, do NOT re-arm it without a maintainer decision.
 
 ## C Bridge API Design
 
-`bridge/file_bridge.h` + `bridge/file_bridge.cpp` (~184 exported functions)
+`bridge/file_bridge.h` + `bridge/file_bridge.cpp` (~186 exported functions)
 
 Design principles:
 
-1. Pure C interface (`extern "C"`) — `file_bridge.h` only includes `<stddef.h>` + `<stdint.h>`; all types are opaque.
+1. Pure C99 interface (`extern "C"`) — `file_bridge.h` only includes `<stddef.h>` + `<stdint.h>`; all handle types are opaque.
 2. Open/close lifecycle for each accessor type — caller owns the handle.
-3. **Every entry point is exception-guarded**: each `extern "C"` function body is wrapped in `try { … } catch (…)`, converting C++ exceptions (bad_alloc, vendored aborts reachable through allocation paths) to sentinel returns (audit findings #11/#12).
+3. **Every entry point is exception-guarded**: each `extern "C"` function body is wrapped in `try { … } catch (…)`, converting C++ exceptions (`bad_alloc`, vendored `THROW_IF` exceptions) to sentinel returns (audit findings #11/#12).
 4. Callback-based enumeration — see the early-stop contract below.
 5. Sentinel conventions:
    - `UINT32_MAX` — not found / absent (offsets, indices).
@@ -182,7 +135,7 @@ int            abc_file_validate_checksum(const AbcFileHandle *f);
 
 ### Tolerant literal-array enumeration
 
-The vendored `LiteralDataAccessor::EnumerateLiteralVals` aborts on `LiteralTag` 0x00 (`TAGVALUE`/`INTEGER_8` — a legal 1-byte integer literal in real 12.x files, audit finding #A1) and on unknown tags. The bridge therefore walks `[tag][value]` pairs itself: tag 0x00 is treated as a 1-byte integer, every read is bounds-checked, unknown/truncated items stop enumeration (never abort), and every tag literal is pinned to the vendored `LiteralTag` enum with a `static_assert` (audit finding #13). Typed arrays (`ARRAY_U1`…`ARRAY_STRING`) deliver their array-data offset through the callback like every other value.
+The vendored `LiteralDataAccessor::EnumerateLiteralVals` aborts on `LiteralTag` `0x00` (`TAGVALUE`/`INTEGER_8` — a legal 1-byte integer literal in real 12.x files, audit finding #A1) and on unknown tags. The bridge therefore walks `[tag][value]` pairs itself: tag `0x00` is treated as a 1-byte integer, every read is bounds-checked, unknown/truncated items stop enumeration (never abort), and every tag literal is pinned to the vendored `LiteralTag` enum with a `static_assert` (audit finding #13). Typed arrays (`ARRAY_U1`…`ARRAY_STRING`) deliver their array-data offset through the callback like every other value.
 
 ### Builder (ABC file generation)
 
@@ -200,30 +153,22 @@ const uint8_t  *abc_builder_finalize_with_code_ids(AbcBuilder *b, uint32_t *out_
 // ... strings, fields, literals, protos, annotations, debug info, try-catch
 ```
 
-The builder wraps `ItemContainer` + a memory-backed writer. `finalize` computes the layout, applies deferred code-id relocations through the caller-supplied ISA updater (so file-sys never duplicates ISA encoding rules), writes the file, and backfills the adler32 checksum over `[version..end]` (the memory writer performs no checksum counting, unlike upstream `FileWriter` — audit finding #A8). A second `finalize` on the same builder is idempotent: literal-item staging is flushed with replace semantics and relocation patching overwrites the operand field (see the field comments in `file_bridge.cpp` and `abcd-file/tests/double_finalize.rs`).
+The builder wraps `ItemContainer` + a memory-backed writer. `finalize` computes the layout, applies deferred code-id relocations through the caller-supplied ISA updater (so `abcd-file-sys` never duplicates ISA encoding rules), writes the file, and backfills the Adler-32 checksum over `[version..end]` (the memory writer performs no checksum counting, unlike upstream `FileWriter` — audit finding #A8). A second `finalize` on the same builder is idempotent: literal-item staging is flushed with replace semantics and relocation patching overwrites the operand field (see `abcd-file/tests/double_finalize.rs`).
 
-Per-builder API policy: each builder stores its own (api, sub_api) and a `BuilderVersionScope` activates it under a mutex around every version-sensitive vendored call, so interleaved/concurrent builders never inherit each other's settings (upstream keeps these as process globals). Select the policy (`abc_builder_set_api` or `abc_builder_set_file_version`) before creating any items.
+Per-builder API policy: each builder stores its own `(api, sub_api)` and a `BuilderVersionScope` activates it under a mutex around every version-sensitive vendored call, so interleaved/concurrent builders never inherit each other's settings (upstream keeps these as process globals). Select the policy (`abc_builder_set_api` or `abc_builder_set_file_version`) before creating any items.
 
 ## Build Dependencies
 
-- Ruby 2.5+ (runs gen.rb code generation)
-- C++17 compiler (compiles bridge + vendor sources)
-- `cc` crate (compiles C++ during Rust build)
-- `bindgen` crate (generates Rust FFI bindings)
+- **Ordinary `cargo build` / `cargo test`**: C++17 compiler + `cc` crate only.
+- **Offline binding regeneration (`scripts/vendor-gen.py`)**: Python 3 + Ruby 2.5+ + `rustfmt`.
 
 ## Statistics
 
-- Upstream code: `arkcompiler_runtime_core` submodule (pinned; read-only) + 10 shim files
-- C++ sources compiled: the bridge-needed libpandafile `.cpp` set + libpandabase `utf.cpp` + `file_bridge.cpp`
-- Ruby generates 7 headers; `build.rs` generates `file_bridge_enums.hpp`
-- 2 bindgen passes: `bindings.rs` (C bridge API) + `enum_bindings.rs` (vendor constants)
-- C bridge exports ~184 functions across 10 accessor types + index accessor + builder + vendor-name pins
+- Upstream code: shared `vendor/arkcompiler_runtime_core/` snapshot (336 files, `1.8 MB`) + 8 shared shims in `vendor/shim/` + 2 crate-local shims in `bridge/shim/`
+- C++ sources compiled: 16 `libpandafile` `.cpp` files + `libpandabase/utils/utf.cpp` + `bridge/file_bridge.cpp`
+- Pre-generated bindings: `src/generated/bindings.rs` + `src/generated/enum_bindings.rs` + 109 `static_assert` checks in `vendor/generated/file_bridge_enum_checks.h`
+- C bridge exports ~186 functions across 10 accessor types + index accessor + builder + vendor-name pins
 
 ## Publishing
 
-This crate is publish-*shaped* but unpublished. Note that `cargo package` /
-`cargo publish` would now drag the full `arkcompiler_runtime_core` submodule
-(hundreds of MB) into the `.crate`. If publishing ever happens, the strategy
-needs an `exclude` for the submodule plus pre-generated sources (vendoring the
-generated headers + the few compiled C++ files into the package). Registered
-decision — no action for now.
+This crate is unpublished; its `build.rs` references the shared workspace `../vendor/` directory (`1.8 MB`). If standalone crates.io publishing is ever desired, staging `vendor/` inside the crate package at release time is straightforward since all codegen artifacts are already pre-generated and submodule-free.

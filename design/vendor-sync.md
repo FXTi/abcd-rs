@@ -1,124 +1,112 @@
-# Vendor Sync System (submodule era)
+# Vendor Snapshot & Offline Codegen System
 
 ## Principles
 
-1. **Vendored code is a git submodule, not a copy.** Both `-sys` crates carry
-   the full upstream repo — <https://github.com/openharmony/arkcompiler_runtime_core> —
-   as a git submodule at the crate root: `abcd-isa-sys/arkcompiler_runtime_core`
-   and `abcd-file-sys/arkcompiler_runtime_core`. There is no `vendor/` folder
-   layer and no copied subset; nothing to diff, nothing to sync by script.
-2. **Never edit inside the submodule checkouts.** They are upstream. Local
-   adaptation lives in `bridge/shim/` only: missing transitive headers are
-   injected with `-include vendor_fixups.h`; heavy dependencies
-   (logger/securec/zlib/os abstraction/pgo) are replaced by standalone shim
-   headers with include-path priority; behavior differences use macros
-   (`-DNDEBUG`, `-DSUPPORT_KNOWN_EXCEPTION`, `-DPANDA_TARGET_UNIX`,
-   `-DPANDA_TARGET_MACOS` on Apple targets).
-3. **The pin is content-chosen, not tag-chosen.** Both submodules are pinned
-   to `4fba38e` (`OpenHarmony-v7.0-Release`, PR #20 merged `c6e41cc`), moved
-   from the former master pin `7303d5c2`. The measured porting cost of that
-   repin was exactly ONE bridge fix (`4d586cb`: the ported `GetFileType`
-   referenced master-only constants `FILE_TYPE_OFFSET`/
-   `FILE_TYPE_STATIC_FLAG`/`OLD_STATIC_VERSION`, deleted at v7.0; now
-   references `File::STATIC_VERSION` symbolically) — zero Rust changes, loud
-   compile-time failure (q-P3 audit, design/bridge-vendor-isolation.md §A.3).
-   Release tags are NOT automatically safe: v7.0's legacy root
-   `libpandafile/` is self-inconsistent (`file_reader.cpp` calls
-   `MethodParamItem::AddRuntimeAnnotation`, which legacy `file_items.h`
-   never declares; the consistent implementation lives in
-   `static_core/libarkfile`). Our build does not compile that TU
-   (abcd-file-sys/build.rs EXCLUDED list). Repins are deliberate, gated
-   work — per-repin checklist: (a) expect loud compile breaks where the
-   bridge references renamed/deleted vendor API (by design); (b) re-diff
-   `ParamAnnotationsItem`'s ctor semantics (V-I4 — a future branch on
-   `is_runtime_annotations` would silently empty the runtime bucket; the
-   `runtime_only_bucket_seals_as_runtime` tripwire test catches it);
-   (c) watch the q-P3 watch list (design/bridge-vendor-isolation.md §C).
+1. **Single curated snapshot + cryptographic manifest.** Both `-sys` crates
+   compile against a single test-stripped upstream snapshot at
+   `vendor/arkcompiler_runtime_core/` (`336` files, `1.84 MB` from
+   <https://github.com/openharmony/arkcompiler_runtime_core>, covering only the
+   six consumed subtrees: `isa`, `libpandafile`, `libpandabase`, `assembler`,
+   `templates`, `platforms`, plus `LICENSE`). `vendor/UPSTREAM.toml` records the
+   upstream repository URL, tag, full commit SHA, and per-file SHA-256 digest of
+   every file in the snapshot. There are no git submodules, no nested dangling
+   gitlinks, and no NTFS-hostile upstream test paths.
+2. **Never edit inside `vendor/arkcompiler_runtime_core/`.** Upstream files are
+   strictly read-only and verified hash-for-hash by `python3 scripts/vendor-gen.py verify`
+   in CI (`vendor-verify`). Local C++ adaptation lives in shim headers only:
+   - `vendor/shim/` holds shared compatibility shims (`platform_compat.h`,
+     `securec.h`, `pgo.h`, inline Adler-32 `zlib.h`, `os/{file,filesystem,mem}.h`,
+     and the non-aborting `utils/logger.h`).
+   - `abcd-isa-sys/bridge/shim/` (`file.h`, `utils/const_value.h`) and
+     `abcd-file-sys/bridge/shim/` (`isa.h`, `vendor_fixups.h`) hold the two
+     crate-specific shadowing headers whose include semantics intentionally
+     differ between the standalone ISA emitter and full `libpandafile`.
+3. **Offline pre-generation; zero Ruby or `bindgen` during `cargo build`.**
+   `scripts/vendor-gen.py` runs upstream's Ruby `.erb` pipeline, extracts vendor
+   C++ enums/access-flag constants, parses the pure-C99 `isa_bridge.h` and
+   `file_bridge.h` headers, formats Rust outputs with `rustfmt`, and writes:
+   - `vendor/generated/*` — shared C++ headers (`bytecode_*_gen.h`, `type.h`,
+     `source_lang_enum.h`, `file_format_version.h`, `isa_constants_gen.h`,
+     `ark_version.h`) plus `file_bridge_enum_checks.h` (`109` C++17
+     `static_assert`s locking every constant in `enum_bindings.rs` to the real
+     upstream C++ headers at compile time);
+   - `abcd-isa-sys/bridge/generated/*` and `abcd-isa-sys/src/generated/{bindings.rs, bytecode.rs}`;
+   - `abcd-file-sys/src/generated/{bindings.rs, enum_bindings.rs}`.
+   Ordinary `cargo build` and `cargo test` runs invoke **only** `cc::Build` over
+   committed C++17 and Rust files — eliminating Ruby, `bindgen`, and `libclang`
+   from contributor machines and all 21 CI build/test runners.
+4. **The pin is content-chosen, not tag-chosen.** `vendor/UPSTREAM.toml` is
+   pinned to `4fba38ecc7a9264159a60a87048af831932f2c21`
+   (`OpenHarmony-v7.0-Release`). Release tags are NOT automatically safe:
+   v7.0's legacy root `libpandafile/` is self-inconsistent (`file_reader.cpp`
+   calls `MethodParamItem::AddRuntimeAnnotation`, which legacy `file_items.h`
+   never declares; `abcd-file-sys/build.rs` excludes that TU). Repins remain
+   deliberate, gated work — per-repin checklist:
+   - expect loud compile or `static_assert` breaks where the bridge or
+     `enum_bindings.rs` references renamed/deleted vendor API (by design);
+   - re-diff `ParamAnnotationsItem`'s constructor semantics (V-I4 — caught by
+     `runtime_only_bucket_seals_as_runtime`);
+   - check the q-P3 watch list (`design/bridge-vendor-isolation.md` §C).
 
-## Why two submodules of the same repo
+## Consistency gate in CI (`vendor-verify`)
 
-Each `-sys` crate must be self-contained (a crate cannot reach into a
-sibling's directory at package time), so each carries its own submodule
-checkout of the same upstream repo, pinned to the same commit. The pin is
-recorded twice (two gitlinks); both must always move together.
+The Tier-1 `vendor-verify` job in `.github/workflows/ci.yml` runs
+`python3 scripts/vendor-gen.py verify` on every push and PR:
 
-## Consistency checks in CI
+1. **Snapshot integrity**: walks `vendor/arkcompiler_runtime_core/` and verifies
+   every file's SHA-256 against `vendor/UPSTREAM.toml` (failing on any modified,
+   missing, or stray file).
+2. **Codegen reproducibility**: runs a fresh Ruby + Python + `rustfmt` codegen
+   into a temporary directory and diffs every generated C++ and Rust file
+   byte-for-byte against `vendor/generated/`, `abcd-isa-sys/{bridge,src}/generated/`,
+   and `abcd-file-sys/src/generated/`.
 
-With no copied files, the old `vendor-check` job dissolved. What remains:
+## Tag radar (`.github/workflows/vendor-sync.yml`)
 
-- Every CI checkout that builds uses the sparse submodule-clone recipe in
-  `ci.yml` (blob:none, cone-limited to the consumed subtrees).
-- The `common-files-consistency` job (byte-identical bridge shims across the
-  two `-sys` crates) was **removed 2026-09-24** by maintainer ruling: shim
-  drift between the two crates is acceptable ("不同步也没关系"). The shims are
-  still OURS and still duplicated; they just are no longer CI-enforced.
+The weekly (and manually dispatchable) upstream tag radar polls
+`openharmony/arkcompiler_runtime_core`:
 
-## Tag radar (landed — `.github/workflows/vendor-sync.yml`)
+1. `git ls-remote --tags` upstream → keep tags **starting with `OpenHarmony-`**;
+2. fetch only matching tags (`--filter=tree:0 --depth 1`) and sort by **peeled
+   committer timestamp** — newest wins (no version-number parsing);
+3. compare the newest tag's commit SHA against `commit = "..."` in
+   `vendor/UPSTREAM.toml`. Identical → done;
+4. on drift (with no existing open or closed `vendor-bump` PR for that tag),
+   run `python3 scripts/vendor-gen.py sync --repo "$UPSTREAM" --tag <tag> --commit <sha>`
+   on branch `vendor-bump/<tag>-<date>`, capture the diff summary across
+   `vendor/` and `abcd-*-sys/`, commit, run `cargo build` + `cargo test`
+   (recording `codegen_rc`, `build_rc`, and `test_rc` without gating PR
+   creation), and open ONE standing PR (`vendor-bump`).
 
-The ruby-based `vendor-sync.rb` daily sync is gone with the copied subsets.
-The replacement is an upstream **tag radar** (design: `ci-rework-plan.md` §2
-plus maintainer amendments 2026-09-24; reference implementation `3092de4`):
+Noise policy (R2-a): **one standing PR per tag** across all PR states (closing
+an unmerged PR permanently dismisses that tag; a newer tag opens a new PR).
+Infrastructure failures before snapshot export open or update one standing
+`vendor-radar` issue.
 
-1. `git ls-remote --tags` upstream → keep tags **starting with
-   `OpenHarmony-`** — nothing stricter, no version-shape or suffix pattern;
-2. fetch only the matching tags (`--depth 1`) and sort by **tag time** — the
-   peeled commit's committer date — newest wins. No version-number parsing
-   or sorting anywhere;
-3. R1: compare the (peeled) tag commit with **both** pinned submodule
-   gitlinks; the pins disagreeing fails loudly (a half-moved pin is a
-   repo-state bug, not upstream drift). Identical → done;
-4. Different → on branch `vendor-bump/<tag>-<date>`, checkout the tag commit
-   in BOTH submodules (one commit — the pins always move together), run
-   `cargo build` + `cargo test` (exit codes **recorded, never gating**), and
-   open a PR (label `vendor-bump`) with the verdict, a diff summary over the
-   consumed subtrees (`isa libpandafile libpandabase assembler templates`),
-   and the run-log link.
+## Developer workflows
 
-Noise policy (R2-a, approved): **one standing PR per tag** — the dup-check
-covers ALL PR states, so a closed-but-unmerged PR is the human's deliberate
-"won't port" verdict for that tag and it stays dismissed; a newer tag opens
-a NEW PR and the old one stays as history. Radar infra failure before a
-verdict (ls-remote/fetch failure, pin disagreement) opens or updates ONE
-standing issue, label `vendor-radar`.
+### Regenerating bindings after editing `isa_bridge.h`, `file_bridge.h`, or `.erb` templates
 
-A **red** bump PR is the radar working as designed (PR #20 was the
-example: v7.0-Release initially broke the build on the
-legacy-`libpandafile` drift above; one bridge port later it merged green).
-The PR documents the porting cost; merging requires making it green
-(shim/bridge adaptation, never submodule edits).
+```sh
+python3 scripts/vendor-gen.py codegen
+python3 scripts/vendor-gen.py verify
+cargo test --workspace
+```
+
+### Updating the upstream snapshot manually
+
+```sh
+python3 scripts/vendor-gen.py sync \
+  --tag OpenHarmony-vX.Y-Release \
+  --commit <upstream-commit-sha>
+cargo build && cargo test        # plus corpus suites and dream gate
+git add vendor/ abcd-isa-sys/ abcd-file-sys/
+git commit -m "chore(vendor): sync arkcompiler_runtime_core to OpenHarmony-vX.Y-Release"
+```
 
 ## Rollback
 
-- **Pin rollback**: the twin gitlinks move in ONE commit by construction, so
-  rollback is `git revert <pin-commit>` + `git submodule update`; git history
-  is the complete pin audit trail.
-- **Radar rollback**: the operational kill switch is commenting out the cron
-  in `vendor-sync.yml` (the `6919592` precedent); full rollback is reverting
-  the workflow commit. No external state exists under R2-a — dismissing the
-  radar is just closing its open PR/issue.
-- **Migration rollback** (emergency-only): the copy-era `vendor/` trees were
-  deleted in the migration commits; reverting those restores the
-  pre-submodule state. Forward-only in practice.
-
-## Updating the pin manually
-
-```sh
-for sm in abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core; do
-  git -C "$sm" fetch origin master
-  git -C "$sm" checkout --detach <new-commit>
-done
-cargo build && cargo test        # plus the corpus suites and the dream gate
-git add abcd-isa-sys/arkcompiler_runtime_core abcd-file-sys/arkcompiler_runtime_core
-git commit
-```
-
-Always move both pins together, and validate with the full gate set
-(workspace tests, corpus suites, dream gate) before committing.
-
-## Cloning
-
-```sh
-git clone --recurse-submodules <repo>
-# or, in an existing clone:
-git submodule update --init
-```
+- **Pin rollback**: snapshot files, `vendor/UPSTREAM.toml`, and pre-generated
+  bindings move in one atomic commit, so rollback is a single `git revert <sha>`.
+- **Radar kill switch**: comment out the `schedule` cron in
+  `.github/workflows/vendor-sync.yml`.

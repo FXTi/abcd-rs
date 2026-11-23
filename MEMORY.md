@@ -2033,3 +2033,19 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   rewrote evergreen `design/` docs (`README.md`, `overview.md`, `roadmap.md`,
   `ci.md`, `file-format.md`, `isa.md`, `isa-compat.md`, `ir-v0.2.md`, `ir.md`,
   `decompile.md`, `analysis-strategy.md`, `abcd-hap-research.md`).
+- Route A build-time decoupling landed (2026-11-24, maintainer-approved):
+  replaced both 280 MB `arkcompiler_runtime_core` git submodules, build-time
+  Ruby execution, and both `bindgen`/`libclang` passes (which panicked on
+  `windows-11-arm` VS 18 / MSVC 14.52 STL headers) with:
+  1) `scripts/vendor-gen.py` (`sync`, `codegen`, `verify` — zero `bindgen`
+     dependency; parses `isa_bridge.h`/`file_bridge.h` + upstream enum/flag
+     headers and runs upstream Ruby `.erb` templates + `rustfmt`),
+  2) a single test-stripped `vendor/arkcompiler_runtime_core/` snapshot
+     (`336` files, `1.84 MB`, `OpenHarmony-v7.0-Release` @ `4fba38ecc7a9`)
+     verified by per-file SHA-256 in `vendor/UPSTREAM.toml`,
+  3) deduplicated shared C++ shims in `vendor/shim/` and `109` C++17
+     `static_assert`s in `vendor/generated/file_bridge_enum_checks.h` locking
+     `enum_bindings.rs` to real vendor C++ headers on every `cargo build`,
+  4) pure `cc::Build` `build.rs` scripts in `abcd-isa-sys` and `abcd-file-sys`,
+     a Tier-1 `vendor-verify` CI gate, and removal of all 17 per-job
+     sparse-submodule + `setup-ruby` boilerplate steps in `.github/workflows/ci.yml`.

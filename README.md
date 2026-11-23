@@ -10,7 +10,7 @@ A Rust toolkit for ArkCompiler bytecode (`.abc`) files and OpenHarmony applicati
 
 | Crate | Description |
 |-------|-------------|
-| [`abcd-isa-sys`](abcd-isa-sys) | C FFI bindings for the bytecode ISA (Ruby codegen + C++ bridge + bindgen) |
+| [`abcd-isa-sys`](abcd-isa-sys) | C FFI bindings for the bytecode ISA (pre-generated ISA/FFI bindings + C++ bridge) |
 | [`abcd-isa`](abcd-isa) | Safe Rust API: bytecode decode/encode (including legacy `0.0.0.2`), entity relocation, versions |
 | [`abcd-file-sys`](abcd-file-sys) | C FFI bindings for the `.abc` container format (`libpandafile` accessors + builder) |
 | [`abcd-file`](abcd-file) | Safe Rust API: read / write / inspect `.abc` files + `ark_disasm`-compatible `pandasm` text disassembler/assembler |
@@ -78,40 +78,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Architecture, format research, and subsystem designs live in [`design/`](design/README.md):
 
 - [Overview](design/overview.md) — 13-crate architecture, dependency graph, data flow, compatibility matrix
-- [ISA](design/isa.md) & [ISA Compatibility](design/isa-compat.md) — Ruby codegen, bytecode decode/encode, legacy `0.0.0.2` support
+- [ISA](design/isa.md) & [ISA Compatibility](design/isa-compat.md) — offline Ruby codegen, bytecode decode/encode, legacy `0.0.0.2` support
 - [File Format](design/file-format.md) & [HAP Containers](design/abcd-hap-research.md) — `.abc` container layout, `--merge-abc` records, FFI bridge, ZIP container reader
 - [IR v0.2](design/ir-v0.2.md) & [IR Background](design/ir.md) — SSA IR specification, frame-slot call contract, T1–T10 taint invariants, lift/opt/lower algorithms
 - [Analysis Strategy](design/analysis-strategy.md) — IFDS solver, rungs 0–2 alias/PTA ladder, summary & callback-gap model
 - [Decompiler](design/decompile.md) — Stages A/B/C expression recovery, region structuring, and JS/TS emission
-- [Vendor Sync](design/vendor-sync.md) & [CI/CD](design/ci.md) — submodule pin policy, tag radar, and the 19-job CI pipeline
+- [Vendor Sync](design/vendor-sync.md) & [CI/CD](design/ci.md) — curated `vendor/` snapshot, offline codegen verification, tag radar, and the 20-job CI pipeline
 
-## Cloning
-
-The `-sys` crates vendor upstream `arkcompiler_runtime_core` as **git submodules** at the crate roots:
+## Building
 
 ```sh
-git clone --recurse-submodules https://github.com/FXTi/abcd-rs.git
-# or, in an existing clone:
-git submodule update --init
+git clone https://github.com/FXTi/abcd-rs.git
+cd abcd-rs
+cargo build --release
 ```
 
-Building requires **Ruby 2.5+** and a **C++17** toolchain (`build.rs` runs upstream's `isa.yaml` codegen and compiles the C++ bridges under `abcd-isa-sys/arkcompiler_runtime_core/` and `abcd-file-sys/arkcompiler_runtime_core/`).
+Building requires only a stable **Rust** toolchain and a **C++17** compiler (`clang++`, `g++`, or MSVC). Upstream `arkcompiler_runtime_core` C++ sources live in a lightweight, test-stripped snapshot under [`vendor/`](vendor) (`1.8 MB`, verified by per-file SHA-256 in [`vendor/UPSTREAM.toml`](vendor/UPSTREAM.toml)), and all Ruby/FFI bindings are pre-generated in the tree — no git submodules, Ruby, or `libclang`/`bindgen` are needed on any platform (including Windows).
 
-**Windows contributors:** upstream's full tree contains NTFS-reserved filenames under `static_core/` test directories. Configure Git before initializing submodules and use the same sparse-checkout cone as CI:
-
-```powershell
-git config --global core.protectNTFS false
-git config --global core.longpaths true
-foreach ($sm in "abcd-isa-sys/arkcompiler_runtime_core", "abcd-file-sys/arkcompiler_runtime_core") {
-  $sha = (git ls-tree HEAD $sm) -split '\s+' | Select-Object -Index 2
-  $url = git config -f .gitmodules "submodule.$sm.url"
-  git clone --depth 1 --filter=blob:none --sparse $url $sm
-  git -C $sm sparse-checkout set --cone isa libpandafile libpandabase assembler templates platforms
-  git -C $sm fetch --depth 1 origin $sha
-  git -C $sm checkout -f $sha
-}
-```
+Maintainers updating the upstream snapshot, `.erb` templates, or C bridge headers run `python3 scripts/vendor-gen.py codegen` (requires Python 3, Ruby, and `rustfmt`; verified in CI by `vendor-verify`).
 
 ## License
 
-Apache-2.0. The `arkcompiler_runtime_core` submodules pull in [OpenHarmony `arkcompiler_runtime_core`](https://github.com/openharmony/arkcompiler_runtime_core) (also Apache-2.0), pinned to a proven upstream commit.
+Apache-2.0. [`vendor/arkcompiler_runtime_core/`](vendor/arkcompiler_runtime_core) vendors a curated subset of [OpenHarmony `arkcompiler_runtime_core`](https://github.com/openharmony/arkcompiler_runtime_core) (also Apache-2.0), pinned by SHA-256 manifest in [`vendor/UPSTREAM.toml`](vendor/UPSTREAM.toml).
