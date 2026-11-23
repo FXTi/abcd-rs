@@ -96,12 +96,10 @@ fn dead_dropped_functions(module: &abcd_ir::Module) -> usize {
                     }
                     _ => None,
                 };
-                // Nested `if let` (not a let chain): the root package is
-                // edition 2021, where let chains are not available.
-                if let (Some(body), Some(result)) = (body, inst.result) {
-                    if value_dead(&chains, result) {
-                        dead.insert(body);
-                    }
+                if let (Some(body), Some(result)) = (body, inst.result)
+                    && value_dead(&chains, result)
+                {
+                    dead.insert(body);
                 }
             }
         }

@@ -338,8 +338,8 @@ fn collect_hits(
             for fact in result.facts_at(iid, &zero) {
                 let Fact::Taint(tf) = &fact else { continue };
                 let Some(v) = tf.local_base() else { continue };
-                let position = if args.iter().position(|&a| a == v).is_some() {
-                    format!("arg {}", args.iter().position(|&a| a == v).unwrap())
+                let position = if let Some(pos) = args.iter().position(|&a| a == v) {
+                    format!("arg {pos}")
                 } else if this == &Some(v) {
                     "this".to_owned()
                 } else if base == Some(v) {

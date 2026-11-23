@@ -249,13 +249,11 @@ fn textual_oracle() {
         }
         let mut covered = 0usize;
         for t in &want {
-            // Nested `if let` (not a let chain): the root package is
-            // edition 2021, where let chains are not available.
-            if let Some(n) = pool.get_mut(t) {
-                if *n > 0 {
-                    *n -= 1;
-                    covered += 1;
-                }
+            if let Some(n) = pool.get_mut(t)
+                && *n > 0
+            {
+                *n -= 1;
+                covered += 1;
             }
         }
         let containment = covered as f64 / want.len().max(1) as f64;

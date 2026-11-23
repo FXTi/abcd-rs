@@ -2879,8 +2879,8 @@ fn strip_internal_phi_plumbing(
         SNode::Stmts(run) => {
             run.retain(|l| match l {
                 Leaf::Raw(Stmt::PhiAssign { target, value, .. }) => {
-                    !copies.contains(target.as_str())
-                        && !(roots.contains(target.as_str())
+                    !(copies.contains(target.as_str())
+                        || roots.contains(target.as_str())
                             && temp_name(value) == Some(target.as_str()))
                 }
                 Leaf::Raw(Stmt::PhiDecl { name, .. }) => !copies.contains(name.as_str()),

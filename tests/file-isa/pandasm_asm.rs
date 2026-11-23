@@ -257,14 +257,13 @@ pub(crate) fn canonicalize(pa: &[u8]) -> Vec<u8> {
                     .unwrap_or(text.len());
                 if let Ok(off) =
                     u32::from_str_radix(std::str::from_utf8(&text[start..end]).unwrap_or(""), 16)
+                    && let Some(target) = resolve(off)
                 {
-                    if let Some(target) = resolve(off) {
-                        out.extend_from_slice(b"lit_offset:@[");
-                        out.extend_from_slice(&target);
-                        out.extend_from_slice(b"]");
-                        i = end;
-                        continue;
-                    }
+                    out.extend_from_slice(b"lit_offset:@[");
+                    out.extend_from_slice(&target);
+                    out.extend_from_slice(b"]");
+                    i = end;
+                    continue;
                 }
             }
             out.push(text[i]);
@@ -312,28 +311,26 @@ pub(crate) fn canonicalize(pa: &[u8]) -> Vec<u8> {
                 .unwrap_or(rest.trim_ascii())
                 .to_vec();
         }
-        if let Some(eq) = line.windows(3).rposition(|w| w == b" = ") {
-            if line[eq + 3..].starts_with(b"0x") {
-                if let Ok(off) =
-                    u32::from_str_radix(std::str::from_utf8(&line[eq + 5..]).unwrap_or(""), 16)
-                {
-                    let field_name = line
-                        .get(1..eq)
-                        .and_then(|t| t.iter().position(|&b| b == b' ').map(|sp| &t[sp + 1..]))
-                        .unwrap_or(b"");
-                    let is_blob_field = blob_records.contains(&cur_record.as_slice())
-                        || field_name == b"moduleRequestPhaseIdx"
-                        || field_name == b"scopeNames";
-                    if let Some(target) = canonical.get(&off) {
-                        line_out = line[..eq + 3].to_vec();
-                        line_out.extend_from_slice(b"@[");
-                        line_out.extend_from_slice(target);
-                        line_out.extend_from_slice(b"]");
-                    } else if is_blob_field {
-                        line_out = line[..eq + 3].to_vec();
-                        line_out.extend_from_slice(b"@blob");
-                    }
-                }
+        if let Some(eq) = line.windows(3).rposition(|w| w == b" = ")
+            && line[eq + 3..].starts_with(b"0x")
+            && let Ok(off) =
+                u32::from_str_radix(std::str::from_utf8(&line[eq + 5..]).unwrap_or(""), 16)
+        {
+            let field_name = line
+                .get(1..eq)
+                .and_then(|t| t.iter().position(|&b| b == b' ').map(|sp| &t[sp + 1..]))
+                .unwrap_or(b"");
+            let is_blob_field = blob_records.contains(&cur_record.as_slice())
+                || field_name == b"moduleRequestPhaseIdx"
+                || field_name == b"scopeNames";
+            if let Some(target) = canonical.get(&off) {
+                line_out = line[..eq + 3].to_vec();
+                line_out.extend_from_slice(b"@[");
+                line_out.extend_from_slice(target);
+                line_out.extend_from_slice(b"]");
+            } else if is_blob_field {
+                line_out = line[..eq + 3].to_vec();
+                line_out.extend_from_slice(b"@blob");
             }
         }
         rec_out.extend_from_slice(&line_out);

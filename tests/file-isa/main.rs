@@ -633,15 +633,17 @@ fn pa_operand_token(
     }
     if token.is_ascii() {
         let text = std::str::from_utf8(token).unwrap();
-        if let Some(rest) = text.strip_prefix('v') {
-            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
-                return format!("v{rest}");
-            }
+        if let Some(rest) = text.strip_prefix('v')
+            && !rest.is_empty()
+            && rest.bytes().all(|b| b.is_ascii_digit())
+        {
+            return format!("v{rest}");
         }
-        if let Some(rest) = text.strip_prefix('a') {
-            if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
-                return format!("a{rest}");
-            }
+        if let Some(rest) = text.strip_prefix('a')
+            && !rest.is_empty()
+            && rest.bytes().all(|b| b.is_ascii_digit())
+        {
+            return format!("a{rest}");
         }
         if let Some((name, _sig)) = text.split_once(":(") {
             return format!("m:{}", hex(name.as_bytes()));

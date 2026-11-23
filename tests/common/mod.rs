@@ -179,10 +179,10 @@ pub fn verify_reference_dom_sets(module: &Module, func_id: FuncId) -> Vec<HashSe
         };
         let i = index[&bb];
         for edge in &block.preds {
-            if edge.kind == EdgeKind::Normal {
-                if let Some(&p) = index.get(&edge.from) {
-                    npreds[i].push(p);
-                }
+            if edge.kind == EdgeKind::Normal
+                && let Some(&p) = index.get(&edge.from)
+            {
+                npreds[i].push(p);
             }
         }
     }

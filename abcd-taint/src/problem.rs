@@ -1676,7 +1676,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 // additionally kill incoming operand taints the flows
                 // did not re-add (WrapperPropagationRule's killSource):
                 // the summary is the complete model of the operands' fate.
-                let retain = !cleared && !(exclusive && on_operand);
+                let retain = !(cleared || exclusive && on_operand);
                 if retain {
                     out.push(source.clone());
                 }
