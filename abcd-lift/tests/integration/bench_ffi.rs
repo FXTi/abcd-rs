@@ -1,5 +1,5 @@
 //! V-I7 local instrumentation: measure ISA-classification FFI overhead on the
-//! lift hot path (design/bridge-vendor-isolation.md §B row 5).
+//! lift hot path (design/archive/bridge-vendor-isolation.md §B row 5).
 //!
 //! Lift's CFG construction calls `Bytecode::is_jump` / `is_terminator` per
 //! instruction (abcd-lift/src/cfg.rs), and each call currently crosses FFI

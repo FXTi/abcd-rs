@@ -133,10 +133,7 @@ pub fn format_g6(v: f64) -> String {
     }
     // X = the %e-form exponent AFTER rounding to P significant digits —
     // Rust's `{:.5e}` performs exactly that rounding.
-    let e = format_scientific_exp(v, (P - 1) as usize);
-    let x: i32 = e[e.find('e').unwrap() + 1..]
-        .parse()
-        .expect("%e exponent parses");
+    let (e, x) = format_scientific_exp(v, (P - 1) as usize);
     let mut s = if (-4..P).contains(&x) {
         let prec = (P - 1 - x).max(0) as usize;
         format!("{v:.prec$}")
@@ -163,17 +160,19 @@ pub fn format_g6(v: f64) -> String {
     s
 }
 
-/// `{:.5e}`-style scientific text with the C two-digit signed exponent.
-fn format_scientific_exp(v: f64, prec: usize) -> String {
+/// `{:.5e}`-style scientific text with the C two-digit signed exponent and
+/// its parsed base-10 exponent.
+fn format_scientific_exp(v: f64, prec: usize) -> (String, i32) {
     let s = format!("{v:.prec$e}");
     let epos = s.find('e').expect("scientific format has an exponent");
     let exp: i32 = s[epos + 1..].parse().expect("scientific exponent");
-    format!(
+    let text = format!(
         "{}e{}{:02}",
         &s[..epos],
         if exp < 0 { '-' } else { '+' },
         exp.abs()
-    )
+    );
+    (text, exp)
 }
 
 // ---------------------------------------------------------------------------

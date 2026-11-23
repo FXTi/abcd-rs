@@ -6,8 +6,7 @@ on:
   push:
     branches: [main]
 
-# A new push makes every in-flight run of the same ref obsolete
-# (today's stuck-2.4h-coverage incident burned a runner for nothing).
+# A new push makes every in-flight run of the same ref obsolete.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -15,11 +14,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # The corpus image, pinned by digest ONCE here and referenced by every
-  # corpus job (design/ci-rework-plan.md Track 2). Bump deliberately: the
-  # corpus suites hard-assert fixture counts (5517 rows / 1149 passed).
-  # This digest bakes the 30 opcode fixtures — no local generation step —
-  # plus the 156-package wild OHOS hap set behind `export-wild` (hap-file).
+  # Digest-pinned corpus image (design/archive/ci-rework-plan.md Track 2).
+  # Bump deliberately: corpus suites hard-assert fixture counts (5517 rows /
+  # 1149 passed) plus the 156-package wild OHOS hap set (`export-wild`).
   ARK_TEST_IMAGE: ghcr.io/fxti/arkcompiler-test@sha256:a39526126a10b9bc5fdde3f1560ad41c66403ca046d36157d7b771e16690f70b
 
 jobs:
@@ -28,8 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-workspace
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -39,14 +35,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-workspace
         with:
           components: clippy
-      # Zero-warning estate since the 2026-10-02 debt cleanup; gate it so
-      # new lints never get in.
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Keep standalone cargo-fuzz targets type-checked against library APIs.
       - run: cargo check --manifest-path fuzz/Cargo.toml --bins
 
   doc:
@@ -54,8 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-workspace
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
@@ -73,12 +64,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-workspace
         with:
           components: rustfmt
-      - uses: ruby/setup-ruby@v1
-        with:
           ruby-version: '3.4'
       - run: python3 scripts/vendor-gen.py verify
 
@@ -89,11 +77,6 @@ jobs:
     needs: [fmt, clippy, doc, deny, vendor-verify]
     strategy:
       matrix:
-        # Platform-compatibility lanes (2026-10-02 ruling): OS x arch cross,
-        # each at the oldest reliable label GitHub offers — macos-15-intel
-        # covers macOS 15 + x86_64 Darwin, while macos-latest (macos-26 arm64)
-        # taps the actively scaled Apple Silicon pool (macos-15 arm64 queues
-        # frequently hit the 15-min hosted provisioning timeout).
         os:
           - ubuntu-22.04 # oldest x86_64 Linux glibc GH offers
           - ubuntu-22.04-arm # aarch64 Linux (OpenHarmony's home turf)
@@ -102,8 +85,7 @@ jobs:
           - windows-2022 # oldest Windows label
           - windows-11-arm # aarch64 Windows
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-workspace
       # Upstream C++ sources and pre-generated Rust/C++ bindings live in
       # vendor/ and abcd-*-sys/*/generated/ (verified by vendor-verify);
       # build.rs compiles pure C++17 via cc with no Ruby or bindgen needed.
@@ -117,12 +99,11 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - name: Install 32-bit toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-workspace
         with:
           targets: i686-unknown-linux-gnu
+      - name: Install 32-bit toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
       - run: cargo build --target i686-unknown-linux-gnu
         env:
           CFLAGS: -m32
@@ -138,8 +119,7 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-workspace
         with:
           targets: i686-pc-windows-msvc
       - run: cargo build --target i686-pc-windows-msvc
@@ -151,12 +131,11 @@ jobs:
     timeout-minutes: 25
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - name: Install armv7 cross toolchain + qemu-user
-        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user libc6-armhf-cross libstdc++-12-dev-armhf-cross
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-workspace
         with:
           targets: armv7-unknown-linux-gnueabihf
+      - name: Install armv7 cross toolchain + qemu-user
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user libc6-armhf-cross libstdc++-12-dev-armhf-cross
       - run: cargo build --target armv7-unknown-linux-gnueabihf
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
@@ -171,11 +150,7 @@ jobs:
 
   # ── Per-push corpus jobs ───────────────────────────────────────────
   # Depend directly on the five fast Tier-1 gates (`fmt`, `clippy`, `doc`,
-  # `deny`, `vendor-verify`, ~70s) rather than waiting serially behind the
-  # cross-OS `build` matrix: `clippy --all-targets` has already verified
-  # compilation on Linux, running Tier 2 in parallel with `Build & Test`
-  # shaves ~3 min off wall-clock critical path, and slow macOS/Windows runner
-  # queues never stall or skip Linux VM/corpus verification.
+  # `deny`, `vendor-verify`) in parallel with the cross-OS `build` matrix.
 
   file-isa:
     name: file-isa (pandasm per-instruction + corpus decode/re-encode)
@@ -183,12 +158,10 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: corpus
+          corpus-mode: corpus
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - run: cargo test -p abcd-rs --test file-isa --release -- --ignored --nocapture --test-threads=1
 
   hap-file:
@@ -197,12 +170,10 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: wild
+          corpus-mode: wild
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - run: cargo test -p abcd-rs --test hap-file --release -- --ignored --nocapture
 
   wild-gate:
@@ -211,12 +182,10 @@ jobs:
     timeout-minutes: 15
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: wild
+          corpus-mode: wild
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture wild_gate
 
   file-lift:
@@ -225,12 +194,10 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: corpus
+          corpus-mode: corpus
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - run: cargo test -p abcd-rs --test file-lift --release -- --ignored --nocapture
 
   lift-lower:
@@ -239,12 +206,10 @@ jobs:
     timeout-minutes: 25
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: corpus
+          corpus-mode: corpus
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - name: --merge-abc multi-module end-to-end oracle (12.0.6.0 .. 24.0.0.0)
         run: cargo test -p abcd-rs --test merge-abc --release -- --ignored --nocapture
       - name: Corpus rewrite suites
@@ -270,12 +235,10 @@ jobs:
     timeout-minutes: 25
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: corpus
+          corpus-mode: corpus
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - name: test262 rewrite suite
         run: cargo test -p abcd-rs --test lift-lower --release -- --ignored --nocapture test262_vm
       - name: test262 VM oracle compare (v2lift)
@@ -296,12 +259,10 @@ jobs:
     timeout-minutes: 30
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: corpus
+          corpus-mode: corpus
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - name: test262 dream gate (generate + recompile + recorded compare)
         run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture dream_gate_t262_oracle
       - name: Upload the test262 dream-gate report
@@ -319,12 +280,10 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: corpus
+          corpus-mode: corpus
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - run: cargo test -p abcd-rs --test lift-analysis --release -- --ignored --nocapture
 
   lift-taint:
@@ -333,12 +292,10 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: corpus
+          corpus-mode: corpus
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - run: cargo test -p abcd-rs --test lift-taint --release -- --ignored --nocapture --skip corpus_callee_names
 
   lift-decompile:
@@ -347,12 +304,10 @@ jobs:
     timeout-minutes: 30
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: ./.github/actions/export-corpus
+      - uses: ./.github/actions/setup-workspace
         with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: corpus
+          corpus-mode: corpus
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
       - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --test-threads=1 --skip textual_oracle --skip dream_gate_generate --skip dream_gate_t262 --skip wild_gate --skip wild_smoke
       - name: Upload the dream-gate report
         if: always()
@@ -371,14 +326,11 @@ jobs:
     env:
       CXX: clang++-23
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-workspace
         with:
           components: llvm-tools-preview
-      - uses: ./.github/actions/export-corpus
-        with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: both
+          corpus-mode: both
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
 
       - name: Install clang-23 (LLVM version parity with rustc's bundled LLVM)
         shell: bash
@@ -417,14 +369,12 @@ jobs:
     timeout-minutes: 45
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/setup-workspace
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: ./.github/actions/export-corpus
-        with:
-          image: ${{ env.ARK_TEST_IMAGE }}
-          mode: both
+          corpus-mode: both
+          corpus-image: ${{ env.ARK_TEST_IMAGE }}
 
       - name: cargo test under ASan
         env:

@@ -31,6 +31,8 @@
 //! [`Bytecode`], [`Reg`], [`Imm`], [`EntityId`], [`Label`],
 //! [`Operand`], [`insn`], [`BytecodeFlags`], [`ExceptionType`].
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 pub use abcd_isa_sys::{Bytecode, EntityId, EntityKind, Imm, Label, Operand, Reg};
 pub use abcd_isa_sys::{BytecodeFlags, ExceptionType, insn};
 

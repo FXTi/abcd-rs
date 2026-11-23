@@ -1,4 +1,4 @@
-//! F-new-1 (design/review-bridge-wrapper.md): the bridge baked staged
+//! F-new-1 (design/archive/review-bridge-wrapper.md): the bridge baked staged
 //! line-number-program operands (SET_FILE / START_LOCAL encode `StringItem`
 //! file offsets into the debug constant pool at flush time) against a layout
 //! computed BEFORE the staged literal-array items were applied to their

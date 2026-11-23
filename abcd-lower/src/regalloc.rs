@@ -789,7 +789,7 @@ fn compute_liveness(
                 }
             }
 
-            if new_in != *live_in.get(&bb).unwrap() || new_out != *live_out.get(&bb).unwrap() {
+            if live_in.get(&bb) != Some(&new_in) || live_out.get(&bb) != Some(&new_out) {
                 changed = true;
                 live_in.insert(bb, new_in);
                 live_out.insert(bb, new_out);

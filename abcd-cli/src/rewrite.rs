@@ -142,7 +142,9 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     let per_func: Vec<Result<Option<abcd_file::MethodBody>, CliError>> = func_ids
         .par_iter()
         .map(|&func_id| {
-            let func = ir.func(func_id).expect("coverage validated above");
+            let func = ir.func(func_id).ok_or_else(|| {
+                CliError::Tool(format!("{}: missing lifted function {func_id:?}", ctx()))
+            })?;
             if func.blocks.is_empty() {
                 return Ok(None);
             }
@@ -169,9 +171,16 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     let mut cursor = bodies.into_iter();
     for class in rebuilt.classes.values_mut() {
         for method in &mut class.methods {
-            let body = cursor.next().expect("one slot per method");
+            let body = cursor.next().ok_or_else(|| {
+                CliError::Tool(format!("{}: lowered method-slot count mismatch", ctx()))
+            })?;
             if method.body.is_some() {
-                method.body = Some(body.expect("a lowered body for every method that had one"));
+                method.body = Some(body.ok_or_else(|| {
+                    CliError::Tool(format!(
+                        "{}: missing lowered body for non-empty method",
+                        ctx()
+                    ))
+                })?);
             }
         }
     }

@@ -46,7 +46,7 @@
      `enum_bindings.rs` references renamed/deleted vendor API (by design);
    - re-diff `ParamAnnotationsItem`'s constructor semantics (V-I4 — caught by
      `runtime_only_bucket_seals_as_runtime`);
-   - check the q-P3 watch list (`design/bridge-vendor-isolation.md` §C).
+   - check the vendor-isolation watch list (`design/archive/bridge-vendor-isolation.md` §C).
 
 ## Consistency gate in CI (`vendor-verify`)
 

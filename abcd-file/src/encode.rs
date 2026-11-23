@@ -1648,12 +1648,11 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, *content)?;
                     b.field_set_value_string(field_h, sh)?;
                 }
-                Some(FieldValue::ModuleData(_))
-                | Some(FieldValue::LiteralArrayRef(_))
-                | Some(FieldValue::ModuleRequestPhase(_)) => deferred_field_values.push((
-                    field_h,
-                    field.initial_value.as_ref().expect("deferred value"),
-                )),
+                Some(
+                    fv @ (FieldValue::ModuleData(_)
+                    | FieldValue::LiteralArrayRef(_)
+                    | FieldValue::ModuleRequestPhase(_)),
+                ) => deferred_field_values.push((field_h, fv)),
                 None => {}
             }
 

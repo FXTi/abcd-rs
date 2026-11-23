@@ -925,7 +925,7 @@ fn inline_site(
     kind: CallKind,
 ) -> Result<(), SkipReason> {
     let mut undef = Undef::new(module);
-    let nt_binding = new_target_binding(kind).expect("eligibility limited kinds to Direct/Dynamic");
+    let nt_binding = new_target_binding(kind).ok_or(SkipReason::CalleeKind)?;
     // The call's position in its block: the `undefined` materialization
     // (when needed) is inserted there, before the call, so it dominates
     // every cloned block and the continuation.
@@ -1102,7 +1102,7 @@ fn inline_site(
             });
             module
                 .block_mut(fresh_block)
-                .expect("fresh block in arena")
+                .ok_or(SkipReason::CalleeNoBody)?
                 .insts
                 .push(fresh_iid);
         }
@@ -1119,7 +1119,7 @@ fn inline_site(
         }
         module
             .block_mut(fresh_block)
-            .expect("fresh block in arena")
+            .ok_or(SkipReason::CalleeNoBody)?
             .preds = preds;
     }
     let clone_entry = map_block(callee_blocks[0])?;
@@ -1133,7 +1133,7 @@ fn inline_site(
             .insts
             .iter()
             .position(|&i| i == call_iid)
-            .expect("call inst is listed in its block");
+            .ok_or(SkipReason::CalleeNoBody)?;
         (pos, block.insts[pos + 1..].to_vec())
     };
     let cont = BlockId::new(module.blocks.len() as u32);
@@ -1156,7 +1156,9 @@ fn inline_site(
         loc: None,
     });
     {
-        let block = module.block_mut(call_block).expect("call block in arena");
+        let block = module
+            .block_mut(call_block)
+            .ok_or(SkipReason::CalleeNoBody)?;
         block.insts.truncate(pre_len);
         block.insts.push(br);
     }
@@ -1287,7 +1289,7 @@ fn inline_site(
             });
             module
                 .block_mut(cont)
-                .expect("continuation in arena")
+                .ok_or(SkipReason::CalleeNoBody)?
                 .insts
                 .insert(0, phi_iid);
             phi_val

@@ -1,0 +1,55 @@
+name: Setup abcd-rs workspace
+description: Check out repository, install Rust toolchain (and optional Ruby / corpus fixtures).
+inputs:
+  toolchain:
+    description: "'stable' or 'nightly'"
+    required: false
+    default: stable
+  components:
+    description: Optional comma-separated rustup components (e.g. rustfmt, clippy)
+    required: false
+    default: ""
+  targets:
+    description: Optional rustup target triples
+    required: false
+    default: ""
+  ruby-version:
+    description: Optional Ruby version to install (only needed for vendor-gen.py)
+    required: false
+    default: ""
+  corpus-mode:
+    description: Optional corpus export mode ('corpus', 'wild', or 'both')
+    required: false
+    default: ""
+  corpus-image:
+    description: Digest-pinned arkcompiler-test image when corpus-mode is set
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v7
+
+    - if: inputs.toolchain == 'stable'
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - if: inputs.toolchain == 'nightly'
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - if: inputs.ruby-version != ''
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: ${{ inputs.ruby-version }}
+
+    - if: inputs.corpus-mode != ''
+      uses: ./.github/actions/export-corpus
+      with:
+        image: ${{ inputs.corpus-image }}
+        mode: ${{ inputs.corpus-mode }}

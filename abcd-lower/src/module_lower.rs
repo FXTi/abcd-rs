@@ -103,7 +103,7 @@ pub fn rewrite_file(
     for (fi, func_data) in module.functions.iter().enumerate() {
         if let Some(&(desc_sid, mi, mut off)) = base_method_locs.get(fi) {
             if off == 0 {
-                off = alloc_offset(&mut next_offset);
+                off = alloc_offset(&mut next_offset)?;
                 if let Some(cls) = out.classes.get_mut(&desc_sid)
                     && let Some(m) = cls.methods.get_mut(mi)
                 {
@@ -122,13 +122,20 @@ pub fn rewrite_file(
                     .copied()
                     .unwrap_or_else(|| ensure_global_class(&mut out)),
             };
-            let off = alloc_offset(&mut next_offset);
+            let off = alloc_offset(&mut next_offset)?;
             let synth_method = build_synthesized_method(module, func_data, &mut out, off)?;
             out.entity_map.insert(off, synth_method.name);
-            let cls = out.classes.get_mut(&desc_sid).expect("class exists");
+            let cls_sid = if out.classes.contains_key(&desc_sid) {
+                desc_sid
+            } else {
+                ensure_global_class(&mut out)
+            };
+            let Some(cls) = out.classes.get_mut(&cls_sid) else {
+                return Err(LowerError::SyntheticOffsetOverflow);
+            };
             let mi = cls.methods.len();
             cls.methods.push(synth_method);
-            func_slots.push((desc_sid, mi));
+            func_slots.push((cls_sid, mi));
             method_offsets.push(off);
         }
     }
@@ -213,7 +220,7 @@ pub fn lower_module_with_options(
                 raw: cls_data.descriptor.0,
             },
         )?;
-        let cls_off = alloc_offset(&mut next_offset);
+        let cls_off = alloc_offset(&mut next_offset)?;
         file.entity_map.insert(cls_off, desc_sid);
         class_desc_sids.push(desc_sid);
         let _ = ci;
@@ -224,14 +231,14 @@ pub fn lower_module_with_options(
 
     let mut method_offsets: Vec<u32> = Vec::with_capacity(module.functions.len());
     for _ in 0..module.functions.len() {
-        method_offsets.push(alloc_offset(&mut next_offset));
+        method_offsets.push(alloc_offset(&mut next_offset)?);
     }
 
     let mut field_offsets: Vec<Vec<u32>> = Vec::with_capacity(module.classes.len());
     for cls_data in &module.classes {
         let mut offs = Vec::with_capacity(cls_data.fields.len());
         for _ in 0..cls_data.fields.len() {
-            offs.push(alloc_offset(&mut next_offset));
+            offs.push(alloc_offset(&mut next_offset)?);
         }
         field_offsets.push(offs);
     }
@@ -339,7 +346,7 @@ pub fn lower_module_with_options(
                         raw: sn_cid.0,
                     },
                 )?;
-                let field_off = materializer.alloc_offset();
+                let field_off = materializer.alloc_offset()?;
                 let sn_name = materializer
                     .file
                     .strings
@@ -368,15 +375,17 @@ pub fn lower_module_with_options(
                     .file
                     .strings
                     .get_or_intern(abcd_file::MODULE_RECORD_IDX_FIELD);
-                let mr_off = materializer.alloc_offset();
-                let phase_entry = phase_opt.map(|ph| {
+                let mr_off = materializer.alloc_offset()?;
+                let phase_entry = if let Some(ph) = phase_opt {
                     let pname = materializer
                         .file
                         .strings
                         .get_or_intern(abcd_file::MODULE_REQUEST_PHASE_FIELD);
-                    let poff = materializer.alloc_offset();
-                    (pname, poff, ph)
-                });
+                    let poff = materializer.alloc_offset()?;
+                    Some((pname, poff, ph))
+                } else {
+                    None
+                };
                 if let Some(cls) = materializer.file.classes.get_mut(&desc_sid) {
                     cls.fields.push(Field {
                         name: mr_name,
@@ -463,7 +472,7 @@ pub fn lower_module_with_options(
             .strings
             .get_or_intern(abcd_file::ES_MODULE_RECORD_DESCRIPTOR);
         let field_name = file.strings.get_or_intern("moduleRecordIdx");
-        let f_off = alloc_offset(&mut next_offset);
+        let f_off = alloc_offset(&mut next_offset)?;
         let mut fields = vec![Field {
             name: field_name,
             offset: f_off,
@@ -477,7 +486,7 @@ pub fn lower_module_with_options(
             let ph_name = file
                 .strings
                 .get_or_intern(abcd_file::MODULE_REQUEST_PHASE_FIELD);
-            let ph_off = alloc_offset(&mut next_offset);
+            let ph_off = alloc_offset(&mut next_offset)?;
             fields.push(Field {
                 name: ph_name,
                 offset: ph_off,
@@ -558,12 +567,12 @@ fn initial_synth_offset(file: &File) -> u32 {
 }
 
 #[inline]
-fn alloc_offset(next: &mut u32) -> u32 {
+fn alloc_offset(next: &mut u32) -> Result<u32, LowerError> {
     let off = *next;
     *next = next
         .checked_add(4)
-        .expect("synthetic entity offset overflow");
-    off
+        .ok_or(LowerError::SyntheticOffsetOverflow)?;
+    Ok(off)
 }
 
 fn intern_sym(
@@ -678,7 +687,7 @@ impl<'m, 'f> Materializer<'m, 'f> {
         }
     }
 
-    fn alloc_offset(&mut self) -> u32 {
+    fn alloc_offset(&mut self) -> Result<u32, LowerError> {
         alloc_offset(&mut self.next_offset)
     }
 
@@ -756,7 +765,7 @@ impl<'m, 'f> Materializer<'m, 'f> {
             return Some(off);
         }
         let sid = intern_sym(&self.module.sym, &mut self.file.strings, sym)?;
-        let off = self.alloc_offset();
+        let off = self.alloc_offset().ok()?;
         self.file.entity_map.insert(off, sid);
         self.string_offsets.insert(bytes.into_boxed_slice(), off);
         Some(off)
@@ -802,7 +811,7 @@ impl<'m, 'f> Materializer<'m, 'f> {
             _ => return None,
         };
         let idx = self.file.literal_arrays.len() as u32;
-        let off = self.alloc_offset();
+        let off = self.alloc_offset().ok()?;
         self.file.literal_arrays.push(LiteralArray { values });
         self.file.literal_array_offsets.insert(off, idx);
         Some((idx, off))

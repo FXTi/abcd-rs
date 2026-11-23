@@ -400,7 +400,7 @@ pub fn recover_func_with_index(
 /// (`AsyncFunctionEnter` + the per-await suspend/resume plumbing).
 /// Trusting the metadata emitted `await` into a non-async body (an
 /// unparseable text; 146/242 wild modules rejected by the es2abc
-/// recompile channel — design/wild-smoke-report.md). es2abc emits
+/// recompile channel — design/archive/wild-smoke-report.md). es2abc emits
 /// `AsyncFunctionEnter` ONLY for async functions (es2panda
 /// `asyncFunctionBuilder.cpp` `Prepare`), so its presence is decisive:
 /// a metadata-plain function carrying the entry op IS async. The

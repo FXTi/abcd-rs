@@ -1,15 +1,15 @@
-//! # abcd-lower — lower converter: `abcd_ir::Module` → `abcd_file::MethodBody`
+//! # abcd-lower — lower converter: `abcd_ir::Module` → `abcd_file::File` / `MethodBody`
 //!
-//! IR v0.2 migration plan P2 (design/ir-v0.2.md §8): the lowering half of
-//! the pipeline (lower = IR→file). This is a source-level port of v0.1
-//! `abcd_ir::lower` (deleted at v2-P4; git history is the archive) onto
-//! the IR: the same algorithms (MCS chordal
-//! coloring, slot-level parallel-copy resolution, acc-as-cache instruction
-//! selection, block layout with edge trampolines, N43 try-range
-//! reconstruction, and the entity relocation channel), operating on
-//! [`abcd_ir::Module`] and producing [`abcd_file::MethodBody`].
+//! Format-aware lowering layer (`design/ir-v0.2.md` §8, `design/ir.md` §7)
+//! that compiles the SSA IR ([`abcd_ir::Module`]) back to `.abc` bytecode and
+//! container structures: chordal maximum-cardinality-search register
+//! allocation, slot-level parallel-copy cycle breaking, accumulator-as-cache
+//! instruction selection, basic-block layout with edge trampolines, try-range
+//! reconstruction, entity relocation, in-place file rewriting ([`rewrite_file`]),
+//! and standalone whole-module lowering ([`lower_module`]).
 
 #![deny(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod analysis;
 pub mod copy_resolve;
@@ -195,10 +195,13 @@ pub enum LowerError {
         /// The offending block.
         block: BlockId,
     },
+    /// Synthetic entity offset space (`u32`) overflowed while materializing
+    /// new container items.
+    #[error("synthetic entity offset overflowed u32 address space")]
+    SyntheticOffsetOverflow,
 }
 
-/// Lower a single IR function back to bytecodes (default options —
-/// v0.1-lift-faithful; see [`LowerOptions`]).
+/// Lower a single IR function back to bytecodes with default [`LowerOptions`].
 pub fn lower_function(module: &Module, func_id: FuncId) -> Result<LayoutResult, LowerError> {
     lower_function_with_options(module, func_id, LowerOptions::default())
 }

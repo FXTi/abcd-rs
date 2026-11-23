@@ -1,6 +1,6 @@
 //! The wild gate: the core-25 wild-OHOS subset promoted from the
 //! local-only smoke instrument (`wild_smoke.rs`) to a per-push CI gate.
-//! Design: `design/wild-gate-evaluation.md` — the maintainer-approved
+//! Design: `design/archive/wild-gate-evaluation.md` — the maintainer-approved
 //! semantics are **A + B + the standing laws** (§6.E):
 //!
 //! - **A — recompile acceptance.** Per core-25 package: `abcd_hap`
@@ -39,7 +39,7 @@
 //! a manifest change requires a corpus-image re-curation + digest bump
 //! anyway, and the embedded list makes that drift a compile-time-visible
 //! review act. Provenance: the q-P12 core-25 pick list, measured in
-//! `design/wild-gate-evaluation.md` §3.2.
+//! `design/archive/wild-gate-evaluation.md` §3.2.
 //!
 //! Ledger regeneration: run the gate once; it writes the observed
 //! per-package counts to `target/wild-gate/fallback-observed.json`

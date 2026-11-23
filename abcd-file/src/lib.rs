@@ -38,6 +38,8 @@
 //! All public types are safe, owned structs with no lifetimes.
 //! `unsafe` is confined to internal FFI calls into [`abcd_file_sys`].
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 pub use abcd_file_sys::FileType;
 pub use abcd_isa::Version;
 

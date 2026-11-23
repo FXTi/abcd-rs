@@ -4625,7 +4625,7 @@ fn ft_fold_at(nodes: &[SNode], i: usize) -> Option<Vec<SNode>> {
 
     // Unwrap a sole inner try/catch: `try { try{A} catch{B} } finally{F}`
     // reads as `try { A } catch { B } finally { F }`.
-    let unwrap = stripped_body.len() == 1
+    let inner_try = if stripped_body.len() == 1
         && matches!(
             &stripped_body[0],
             SNode::Try {
@@ -4633,17 +4633,20 @@ fn ft_fold_at(nodes: &[SNode], i: usize) -> Option<Vec<SNode>> {
                 catches,
                 ..
             } if !catches.is_empty()
-        );
-    let (folded_try, construct_ft) = if unwrap {
-        let SNode::Try {
-            body: ibody,
-            catches: icatches,
-            note: inote,
-            finally: None,
-        } = stripped_body.into_iter().next().unwrap()
-        else {
-            unreachable!()
-        };
+        ) {
+        match stripped_body.pop() {
+            Some(SNode::Try {
+                body: ibody,
+                catches: icatches,
+                note: inote,
+                finally: None,
+            }) => Some((ibody, icatches, inote)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let (folded_try, construct_ft) = if let Some((ibody, icatches, inote)) = inner_try {
         let ft =
             ft_list_fallthrough(&ibody) || icatches.iter().any(|c| ft_list_fallthrough(&c.body));
         (

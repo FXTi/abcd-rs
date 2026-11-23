@@ -1,49 +1,40 @@
-//! # abcd-taint — taint analysis on the v0.2 IR
+//! # abcd-taint — interprocedural IFDS taint analysis on `abcd-ir`
 //!
-//! The taint-analysis application crate (design/analysis-strategy.md
-//! §5.2–§5.5 is the spec; this crate is its v2-P5b deliverable). It plugs
-//! into `abcd-analysis`'s IFDS solver skeleton as a client
-//! ([`abcd_analysis::dataflow::ifds::IfdsProblem`]) and never touches the
-//! solver's internals:
+//! Taint-analysis engine (`design/analysis-strategy.md` §5.2–§5.5) built as a
+//! client of `abcd-analysis`'s [`abcd_analysis::dataflow::ifds::IfdsProblem`]
+//! tabulation solver:
 //!
-//! - [`fact`] — the fact model: [`fact::Fact`] = Λ or a
-//!   [`fact::TaintFact`] access path (`base` + k-capped field chain),
-//!   following soot-infoflow's access-path discipline with weak/strong updates
-//!   via the rung 0–2 alias oracle ladder ([`oracle`]).
-//! - [`names`] — callee-name resolution through the global-load def
-//!   chain (`TryGetGlobal`/`LoadProp` → name candidates). This is what
-//!   makes name-keyed summaries and sinks fire on the corpus' ~97%
-//!   `UnknownCallees` call sites.
-//! - [`summary`] — the minimal summary registry (summaries.md §"A
-//!   minimal summary registry for a JS bytecode analyzer"):
-//!   `Map<(Sym, Arity), Summary>` with flows over
-//!   `{param(i), base, return, field(path), return-field(path)}`,
-//!   clears, `is_alias`, a callback gap specification (the mini-gap tag
-//!   plus the t-P4 full propagator's enter/return rules), an
-//!   `exclusive` bit, negative caching, and miss counters from day one.
-//! - [`gap`] — the full gap propagator (t-P4; FlowDroid's
-//!   `spawnAnalysisIntoClientCode`): callback-summary call sites grow
-//!   synthetic call edges into the resolved callback bodies, the IFDS
-//!   enters them with tainted formals, and the callback's return flows
-//!   back onto the summary call's result per the gap spec.
-//! - [`problem`] — the [`problem::TaintProblem`]: the four flow
-//!   functions, driven by `Op::operands()`/`Op::has_result()` plus
-//!   explicit per-family rules only where semantics demand (property
-//!   loads/stores, calls + the summary wrapper, return wiring,
-//!   exception edges).
-//! - [`driver`] — source/sink configuration, the analysis run, and the
-//!   taint-path report (line/column from `Inst.loc`, T8).
-//! - [`prototype`] — the t-P3 receiver-type approximation: alloc-site
-//!   kinds / constant def chains / global-store provenance → prototype
-//!   families, closing the receiver-typed builtin call gap (`a.pop` ⇒
-//!   `Array.prototype.pop`) in the summary lookup.
+//! - [`fact`] — the fact domain: [`fact::Fact`] = `Λ` (zero fact) or a
+//!   [`fact::TaintFact`] access path (`base` + `k`-capped field chain),
+//!   applying strong or weak updates via the rungs 0–2 alias oracle ladder
+//!   ([`oracle`]).
+//! - [`names`] — callee-name resolution through global and property load
+//!   definition chains (`TryGetGlobal`/`LoadProp` → qualified name candidates),
+//!   enabling name-keyed summaries and sinks on dynamic JS/ArkTS call sites.
+//! - [`summary`] — builtin and library summary registry (`Map<(Sym, Arity), Summary>`):
+//!   endpoint flows over `{param(i), base, return, field(path), return-field(path)}`,
+//!   clears, `is_alias`, callback gap specifications, `exclusive` dispatch,
+//!   negative caching, and hit/miss telemetry.
+//! - [`gap`] — callback-gap propagation (analogous to FlowDroid's
+//!   `spawnAnalysisIntoClientCode`): summary call sites taking higher-order
+//!   callbacks (`Array.prototype.map`, `forEach`, `Promise.prototype.then`, …)
+//!   materialize synthetic call edges into resolved callback bodies and wire
+//!   tainted formals and return values back to the summary result.
+//! - [`problem`] — [`problem::TaintProblem`]: normal, call, return, and
+//!   call-to-return flow functions driven by `Op::operands()`/`Op::has_result()`,
+//!   explicit property/global/module/lexical transfer rules, and exception-edge
+//!   propagation.
+//! - [`driver`] — source/sink configuration, solver execution, and witness-path
+//!   reconstruction with source line/column attribution (`Inst.loc`).
+//! - [`prototype`] — receiver prototype-family inference from allocation kinds,
+//!   constant definition chains, and global-store provenance, resolving
+//!   instance method calls (e.g. `arr.pop()` → `Array.prototype.pop`).
 //!
-//! The crate graph is the enforcement of the format-independence
-//! invariant: the library depends on `abcd-ir` + `abcd-analysis` only;
-//! corpus and compiled-probe suites live in the root `tests/lift-taint`
-//! target.
+//! Library `[dependencies]` reference only `abcd-ir` and `abcd-analysis`,
+//! preserving strict format independence.
 
 #![deny(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod driver;
 pub mod fact;

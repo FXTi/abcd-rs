@@ -1,7 +1,7 @@
 //! Opt-in corpus gate for Stage B + emission v1 (d-P3,
 //! design/decompile.md §7): decompile every function of every
 //! NON-test262 corpus fixture (2832 rows — the c-P3 scope; test262
-//! decompile is a later phase per design/test262-feasibility.md) to JS
+//! decompile is a later phase per design/archive/test262-feasibility.md) to JS
 //! text.
 //!
 //! Assertions:
@@ -181,7 +181,7 @@ fn merge_stats(a: &mut DecompileStats, b: &DecompileStats) {
 fn corpus_decompile_gate() {
     let root = common::corpus_root();
     // Scoped to the NON-test262 rows (c-P3): test262 decompile is a
-    // later phase per design/test262-feasibility.md — the 2685 test262
+    // later phase per design/archive/test262-feasibility.md — the 2685 test262
     // rows gate lift+verify (tests/file-lift) only.
     let paths = common::project_manifest_paths(&root);
     assert_eq!(

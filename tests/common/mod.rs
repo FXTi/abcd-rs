@@ -82,7 +82,7 @@ for path in sorted(paths):
 ///
 /// The Stage-A/Stage-B decompile corpus gates are scoped to this set
 /// (c-P3): test262 decompile is a later phase per
-/// `design/test262-feasibility.md`, so the 2685 compiled test262 rows
+/// `design/archive/test262-feasibility.md`, so the 2685 compiled test262 rows
 /// gate lift+verify (`tests/file-lift`) only.
 pub fn project_manifest_paths(root: &Path) -> Vec<String> {
     let output = Command::new("python3")

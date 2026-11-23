@@ -12,6 +12,8 @@
 //! Output conventions (§3.4): results on stdout, diagnostics on stderr,
 //! exit codes 0 ok / 1 user error / 2 tool error, no panics on data.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 pub mod analyze;
 pub mod asm;
 pub mod cli;
@@ -106,7 +108,7 @@ fn run_rewrite(args: &RewriteArgs) -> Result<(), CliError> {
 
     let module = modules
         .first()
-        .expect("input layer guarantees at least one module");
+        .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
     let out = rewrite::rewrite(module, opts)?;
     match &args.output {
         Some(path) => {
@@ -183,7 +185,7 @@ fn run_dis(args: &DisArgs) -> Result<(), CliError> {
 
     let module = modules
         .first()
-        .expect("input layer guarantees at least one module");
+        .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
     let pa = dis::disassemble(module)?;
     match &args.output {
         Some(path) => {
@@ -245,7 +247,7 @@ fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
 
     let module = modules
         .first()
-        .expect("input layer guarantees at least one module");
+        .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
     let js = decompile::decompile(module, opts)?.text;
     match &args.output {
         Some(path) => {

@@ -1630,10 +1630,9 @@ impl IfdsProblem for TaintProblem<'_> {
             SiteClass::Summary { name, exclusive } => {
                 let base = call_base_value(module, call_inst);
                 let result = call_inst.result;
-                let summary = self
-                    .registry
-                    .lookup(&name, args.len())
-                    .expect("classified sites have a summary");
+                let Some(summary) = self.registry.lookup(&name, args.len()) else {
+                    return;
+                };
                 // Clears first (summaries.md §2.2 step 3).
                 let cleared = summary
                     .clears

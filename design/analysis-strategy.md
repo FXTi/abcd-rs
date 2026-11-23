@@ -198,7 +198,7 @@ This is a durable differentiation, not an accident of timing:
    identity (T7), reporting locations (T8), and the interprocedural binding
    table (T10). No retrofit.
 3. **Synergy with the decompile track.** `abcd-decompile` is a registered
-   d-track (`design/agent-roadmap.md`, decompile registry; d-P0 in progress).
+   d-track (`design/archive/agent-roadmap.md`, decompile registry; d-P0 in progress).
    When it matures, its output is ArkTS-shaped source — the input language of
    ArkAnalyzer-class tools. The two tracks are complementary, not competing:
    decompiled source feeds source-level tooling for deep developer workflows;
@@ -304,7 +304,7 @@ solver.
   alloc site along the def chain"; phi merges take set union of sites;
   strong update only when the base is provably a single site with no phi in
   between (the §4.3 must-alias substitute); weak update otherwise. This is
-  the heap model already registered for v2-P5a (`design/agent-roadmap.md`:
+  the heap model already registered for v2-P5a (`design/archive/agent-roadmap.md`:
   "`dataflow/`（…IFDS 骨架/heap v0 分配点键控+强弱更新+精度阶梯文档）").
 - *What it buys:* sound heap flow for the overwhelmingly common cases —
   object/array literals created and consumed in straight-line code,
@@ -400,7 +400,7 @@ Concrete decisions, each traceable to a study-doc section or an external URL.
 ### 5.2 heap-v0 in P5a as planned + the alias trait seam sized for rung 1
 
 v2-P5a ships heap-v0 (rung 0, §4.4) exactly as registered
-(`design/agent-roadmap.md` v2-P5a). The one *addition* this document mandates
+(`design/archive/agent-roadmap.md` v2-P5a). The one *addition* this document mandates
 is that the alias oracle be a trait from day one, sized so the rung-1
 Boomerang-shaped engine is a drop-in implementation, not a refactor. The
 trait must have exactly these methods (modeled on FlowDroid's
@@ -463,7 +463,7 @@ mode), and miss counters + a "report missing" log from day one (that log *is*
 the corpus growth process, summaries.md §3). Do not implement the merge-all-
 subclasses step (summaries.md, lookup §"Do **not**") — receiver types are
 usually unknown at our level. Scope for P5b stays the registered top-20
-builtins (`design/agent-roadmap.md` v2-P5b).
+builtins (`design/archive/agent-roadmap.md` v2-P5b).
 
 ### 5.4 Call graph: on-the-fly, per reader C
 
@@ -472,7 +472,7 @@ hierarchy, "on demand" resolution *is* the value-flow analysis, so the graph
 must co-evolve with the analysis. Concretely:
 
 - v2-P5a's `callgraph/` component is on-the-fly as registered
-  (`design/agent-roadmap.md` v2-P5a: "`callgraph/`（on-the-fly）"), seeded by
+  (`design/archive/agent-roadmap.md` v2-P5a: "`callgraph/`（on-the-fly）"), seeded by
   name-based (RTA-analog) resolution and refined by the same `points_to`
   mechanism as the alias ladder (§5.2) — one query engine, two consumers.
 - The solver consumes the graph only through query methods (the `IInfoflowCFG`
@@ -489,7 +489,7 @@ must co-evolve with the analysis. Concretely:
 **Evaluation corpus (two tiers):**
 
 1. **Smoke tier** (registered): the corpus' own `print` sinks
-   (`design/ir-v0.2.md` §8 P5; `design/agent-roadmap.md` v2-P5b). Proves the
+   (`design/ir-v0.2.md` §8 P5; `design/archive/agent-roadmap.md` v2-P5b). Proves the
    pipeline runs end-to-end on real bytecode.
 2. **Precision probe suite** (new, mandated by this document): a small,
    hand-built `.abc` suite with *known* ground truth, one family per precision

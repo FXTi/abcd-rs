@@ -1,6 +1,6 @@
 //! Test group A — foreign (external) fields and methods.
 //!
-//! Format facts under test (see design/test-plan.md):
+//! Format facts under test (see design/archive/test-plan.md):
 //! * foreign items live in the file's foreign region and are reachable by
 //!   offset (annotation ENUM/METHOD elements, method handles) — they are
 //!   NOT members of any class's field/method stream, so decode cannot

@@ -29,6 +29,8 @@
 //! }
 //! ```
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
 mod container;
 mod error;
 mod zip;

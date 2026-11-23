@@ -5,15 +5,16 @@
 //! failure, write failure). Clap's own parse errors — which would exit 2
 //! by default — are remapped to 1 to fit that contract.
 
+#![deny(clippy::unwrap_used)]
+
 use std::process::ExitCode;
 
 use clap::Parser;
 
 // The final binary owns the global allocator (libraries never set one).
-// mimalloc everywhere (2026-10-02 ruling, revised: one allocator for all
-// platforms — measured -43% vs the Windows CRT allocator, -26%/-42% vs
-// macOS libmalloc; jemalloc has no MSVC support anyway). Numbers:
-// tests/bench-alloc + MEMORY.md.
+// mimalloc is used across all platforms (Linux, macOS, Windows MSVC):
+// benchmarked at -43% wall time vs Windows CRT allocator and -26%..-42%
+// vs macOS libmalloc (see design/archive/MEMORY.md).
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

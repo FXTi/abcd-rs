@@ -1,62 +1,53 @@
 //! # abcd-lift — lift converter: `abcd_file::File` → `abcd_ir::Module`
 //!
-//! IR v0.2 migration plan P1 (design/ir-v0.2.md §8, design/ir.md §7):
-//! the format-aware conversion layer that decodes v0.1's container model
-//! into the format-independent v0.2 IR. This crate is the ONLY component
-//! that imports both sides (`abcd-file` + `abcd-isa` on the container
-//! end, `abcd-ir` on the semantic end).
+//! Format-aware lifting layer (`design/ir-v0.2.md` §8, `design/ir.md` §7)
+//! that translates decoded `.abc` containers ([`abcd_file::File`]) into the
+//! format-independent SSA IR ([`abcd_ir::Module`]). Alongside `abcd-lower`,
+//! this crate is the boundary between the `.abc`/ISA container layer and the
+//! semantic IR:
 //!
-//! The conversion ports v0.1 `abcd_ir::lift`'s battle-proven semantics
-//! (VM oracle 1149/1149 on both pipelines) into v0.2's types:
-//!
-//! - **Entity resolution → [`abcd_ir::SymbolTable`] + [`FuncId`]** — strings are
-//!   content-keyed symbols; a method reference is a [`FuncId`] into the
-//!   module's function table (the S1/N2 lesson: the file's method table
-//!   is built FIRST, then bytecode/literal offsets resolve to indices —
-//!   never name-keyed, never raw offsets).
+//! - **Entity resolution → [`abcd_ir::SymbolTable`] + [`FuncId`]** — strings
+//!   intern losslessly as content-keyed [`Sym`]s (UTF-8 or raw MUTF-8 bytes);
+//!   method references resolve via a pre-built file method-offset table into
+//!   [`FuncId`] indices (never name-keyed, never raw offsets).
 //! - **Literal arrays → [`abcd_ir::ConstPool`]** — typed [`Const`] trees
-//!   (nested arrays included; typed arrays resolved to real trees, N52:
-//!   no raw offsets); method references inside literal arrays become
-//!   [`Const::MethodRef`]`(FuncId)`.
+//!   (including nested arrays and typed primitive arrays), with method
+//!   references lifted to [`Const::MethodRef`]`(FuncId)`.
 //! - **Module records → [`abcd_ir::EsModule`] / [`abcd_ir::ImportDecl`] / [`abcd_ir::ExportDecl`]** —
 //!   standalone `_ESModuleRecord` and `--merge-abc` `moduleRecordIdx`
 //!   field blobs (`FieldValue::ModuleData`) parse into declarations with
-//!   `module_request_idx` resolved to specifier syms;
+//!   `module_request_idx` resolved to specifier [`Sym`]s;
 //!   `moduleRequestPhaseIdx` blobs pair per-record into
 //!   [`abcd_ir::ModuleRequest`]`{specifier, lazy}`;
-//!   `_ESScopeNamesRecord` and `--merge-abc` `scopeNames` fields land on
+//!   `_ESScopeNamesRecord` and `--merge-abc` `scopeNames` fields populate
 //!   [`abcd_ir::ClassData::scope_names`] and
 //!   [`DebugData::scope_names`](abcd_ir::DebugData).
-//! - **Annotations** — the four file buckets merge into ONE list per
-//!   attach site, in the documented order: `compile_time`, `runtime`,
-//!   `compile_time_type`, `runtime_type`.
-//! - **Debug** — the LNP dual stream becomes
-//!   [`DebugData`](abcd_ir::DebugData): line/column keyed by the lifted
-//!   [`InstId`]s (also on `Inst.loc`), local names with
-//!   their #5 scope extents mapped onto lifted instructions, param
-//!   names, source file/code.
-//! - **CFG + Braun SSA** — v0.1's exact semantics: param seeding from
-//!   the code-header `num_args` (u32→u16 checked, B5), entry param
-//!   seeding, frame-initial values as CONSTANTS
-//!   ([`Const::Undefined`](abcd_ir::Const) for vregs,
-//!   [`Const::Hole`](abcd_ir::Const) for acc-read-before-write — P3-T7,
-//!   represented as `ValueDef::Const`, no seeding instructions), handler
-//!   [`ExceptionParam`](abcd_ir::ValueDef) seeding (N13), Braun
-//!   construction with preds known before SSA (empty-phi-free).
-//! - **Try regions** — structured [`TryRegion`]s
-//!   plus materialized [`EdgeKind::Exceptional`](abcd_ir::EdgeKind)
-//!   edges in `Block.preds` for EVERY (protected block → handler) pair
-//!   (the verifier's `MissingExceptionalPred` rule), and the N18
-//!   dead-island sweep over augmented reachability.
-//! - **Opcode coverage** — every opcode v0.1's lift handles, mapped to
-//!   v0.2 ops per the (v2-P0.5-grown) taxonomy; deprecated opcodes fold
-//!   to the modern ops (v0.1 convention). The full mapping table lives
-//!   in `translate.rs`'s header docs.
+//! - **Annotations** — the four container retention buckets merge into one
+//!   ordered list per attach site (`compile_time`, `runtime`,
+//!   `compile_time_type`, `runtime_type`).
+//! - **Debug** — line/column tables attach to lifted [`InstId`]s (and
+//!   `Inst.loc`), local variable names carry instruction-extent scopes, and
+//!   parameter names and source text lift into [`DebugData`](abcd_ir::DebugData).
+//! - **CFG + Braun SSA** — `u32`→`u16` checked parameter counts, entry
+//!   parameter seeding, explicit frame-initial constants recorded on
+//!   [`FunctionData::frame_init_consts`] ([`Const::Undefined`](abcd_ir::Const)
+//!   for uninitialized vregs, [`Const::Hole`](abcd_ir::Const) for
+//!   accumulator-read-before-write), catch-handler
+//!   [`ExceptionParam`](abcd_ir::ValueDef) values, and predecessor-complete
+//!   Braun SSA construction with trivial-phi pruning.
+//! - **Try regions** — structured [`TryRegion`]s with materialized
+//!   [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) edges in `Block.preds` for
+//!   every `(protected block → handler)` pair, followed by unreachable-block
+//!   pruning over exception-augmented reachability.
+//! - **Opcode coverage** — every modern (`9.0.0.0`..`24.0.0.0`) and legacy
+//!   (`0.0.0.2`) bytecode opcode maps into the 88-op IR taxonomy (see
+//!   `translate.rs` for the full opcode mapping).
 //!
-//! Library rule (mirroring abcd-ir): no panics on data; every fallible
-//! finding is a [`LiftError`].
+//! Library rule: no panics on data; every malformed or unsupported input
+//! returns a typed [`LiftError`].
 
 #![deny(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 mod cfg;
 mod metadata;

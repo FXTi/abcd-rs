@@ -1,4 +1,4 @@
-//! Regression tests for Phase 0.5 worker F fixes (design/review-bridge-wrapper.md):
+//! Regression tests for Phase 0.5 worker F fixes (design/archive/review-bridge-wrapper.md):
 //! - #5  local-variable scopes must survive an encode roundtrip
 //! - #6  unresolvable annotation references must fail, not encode as 0
 //! - #7  entity annotation array elements resolve to real handles

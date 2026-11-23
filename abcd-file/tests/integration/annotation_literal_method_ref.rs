@@ -1,4 +1,4 @@
-//! F-new-2 (design/review-bridge-wrapper.md): annotation-embedded literal
+//! F-new-2 (design/archive/review-bridge-wrapper.md): annotation-embedded literal
 //! arrays (`AnnotationValue::LiteralArray`) were written by
 //! `encode_literal_value_simple`, which had no entity context and stored
 //! method references as the RAW source-file offset u32. The new file's

@@ -30,6 +30,7 @@
 //!    naming the op (see [`fitness`]) — never silently dropped.
 
 #![deny(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod classfold;
 pub mod consts;

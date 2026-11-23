@@ -1092,7 +1092,7 @@ with open(sys.argv[1], encoding="utf-8") as manifest:
 // es2abc recompile channel, all `SyntaxError: await is only valid in
 // async functions` (minimal repro `OpenHarmony-3.2-Release/
 // CallUI.hap#ets/modules.abc` → emitted js:318 inside the plain
-// `addSubscriber()` class method; see design/wild-smoke-report.md).
+// `addSubscriber()` class method; see design/archive/wild-smoke-report.md).
 //
 // The fix derives the decompilation kind from the definitive BODY
 // evidence: es2abc emits `AsyncFunctionEnter` only for async

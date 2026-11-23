@@ -35,7 +35,7 @@ The 24 table adds exactly 9 instructions, all new (no renumbering):
    No per-version opcode tables are needed on the read side; the version
    differences live entirely in the *file container* (header fields,
    literal-array tables, protos, annotation buckets — see
-   design/vendor-audit.md §4), not in the ISA.
+   design/archive/vendor-audit.md §4), not in the ISA.
 2. Instruction *semantics* may still differ in detail across versions
    (e.g. behavior of deprecated/callruntime entries); the table-level
    compatibility proven here is about encodings and opcode identity.

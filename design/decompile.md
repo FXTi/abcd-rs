@@ -66,7 +66,7 @@ fidelity (§7 metadata contract of design/ir-v0.2.md: locs, lossless
 
 ## 2. Lessons from our own past: gen1
 
-History (agent-roadmap.md §反编译轨道): the project's first generation
+History (`design/archive/agent-roadmap.md` §反编译轨道): the project's first generation
 WAS a decompiler — commit `5de5ab9` (2026-02-15) shipped
 `abcd-decompiler` + `abcd-cli`; the second generation pivoted to the
 format/ISA/round-trip stack and moved gen1 to `recovery/gen1/` at
@@ -498,7 +498,7 @@ forest, region tree).
 
 ## 7. Phase plan d-P1..d-P4 with gates
 
-Matches the registered roadmap rows (agent-roadmap.md); each phase
+Matches the registered roadmap rows (`design/archive/agent-roadmap.md`); each phase
 independently green, gates checked on the corpus like every prior
 phase in this project.
 
@@ -545,7 +545,7 @@ Pretty-printer, module/class emission, full fold-rule set,
 **decompile each corpus fixture → recompile with es2abc → run under
 ark_js_vm → compare behavior (stdout/exit) against the original
 fixture's VM oracle result.** The docker image already used for the
-oracle (`design/test-plan.md`, `design/phase5-decision-briefing.md`;
+oracle (`design/archive/test-plan.md`, `design/archive/phase5-decision-briefing.md`;
 es2abc + ark_js_vm, image sha256:5e7627…) hosts all three steps.
 Feasibility notes:
 
@@ -794,8 +794,8 @@ Prior art (technique grounding — each §4 choice names its source):
 Internal: design/ir-v0.2.md (T1–T10, §7 metadata contract, §9
 resolutions); abcd-ir/src/op.rs (the taxonomy audited in §5);
 abcd-lift/src/lib.rs + abcd-lower/src/lib.rs (pipeline boundaries);
-design/n62-literal-array-dedup-divergence.md (style exemplar);
-design/agent-roadmap.md (d-track rows, gen1 history, abcd-analysis
-re-scope); design/test-plan.md + design/phase5-decision-briefing.md
+design/archive/n62-literal-array-dedup-divergence.md (style exemplar);
+design/archive/agent-roadmap.md (d-track rows, gen1 history, abcd-analysis
+re-scope); design/archive/test-plan.md + design/archive/phase5-decision-briefing.md
 (docker oracle infra); git history `5de5ab9`, `1a8e3f4`, `f045e4a`
 (gen1).

@@ -1,73 +1,42 @@
 //! # abcd-opt — optimization passes for the SSA IR (`abcd-ir`)
 //!
-//! The v0.2 port of v0.1's `abcd-ir/src/opt` pipeline (migration P3 of
-//! `design/ir-v0.2.md`): [`peephole`] (constant folding), [`sccp`] (sparse
-//! conditional constant propagation), [`dce`] (aggressive dead code
-//! elimination + CFG simplification), and [`copyprop`] (trivial-phi
-//! elimination). [`inline`] is the D2 (2026-09-21) rewrite of v0.1's
-//! N44-quarantined inliner on the v0.2 IR — OPT-IN ONLY, never wired
-//! into [`optimize_module`] (the corpus byte-identity gates measure the
-//! default pipeline).
+//! Format-independent optimization pipeline over [`abcd_ir::Module`]:
+//! [`peephole`] (local constant folding), [`sccp`] (sparse conditional
+//! constant propagation), [`dce`] (effects-driven aggressive dead code
+//! elimination + CFG simplification), and [`copyprop`] (trivial-phi and copy
+//! elimination). [`inline`] provides a guarded single-callee SSA function
+//! inliner on an **opt-in** basis (never run by [`optimize_module`], preserving
+//! function boundaries for callers such as `abcd-decompile`).
 //!
-//! ## Format independence (hard, structurally enforced)
+//! ## Format independence (structurally enforced)
 //!
 //! Every pass operates on [`abcd_ir::Module`] alone. This crate's
-//! `Cargo.toml` `[dependencies]` list **only** `abcd-ir` (the IR) — never
-//! `abcd-file`, `abcd-isa`, `abcd-file-sys`, `abcd-isa-sys`, `abcd-lift`,
-//! or `abcd-lower` (the format-coupled crates are dev-dependencies only,
-//! for the end-to-end regression tests) — the crate graph is the
-//! enforcement mechanism.
+//! `Cargo.toml` `[dependencies]` list **only** `abcd-ir` — never `abcd-file`,
+//! `abcd-isa`, `abcd-file-sys`, `abcd-isa-sys`, `abcd-lift`, or `abcd-lower`.
 //!
-//! ## The v0.1 behavioral contract that survives the port
+//! ## ECMAScript & exception soundness invariants
 //!
-//! - **N36**: both fold engines evaluate non-commutative operators in
-//!   vendored operand order (`vreg OP acc`, i.e. `right OP left` in IR
-//!   field terms — lift's `binary_op`/`compare` emit `left = acc`,
-//!   `right = vreg`).
-//! - **N37**: folds preserve `-0.0` (constants are bit-exact
-//!   [`Const::Number`](abcd_ir::Const) payloads; no fold canonicalizes
-//!   `-0.0` to `+0.0`).
-//! - **N38**: SCCP exception soundness — reachability includes
-//!   [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) edges, handler-block
-//!   phis are forced to lattice Bottom, and `Eq`/`NotEq` never
-//!   ToNumber-coerce nullish operands.
-//! - **N39**: `UnOp::BitNot` (vendor `not`) is bitwise; `LogicalNot` is
-//!   the boolean one.
-//! - **N40**: `StrictEq` folds with host `==` on numbers (`0 === -0`
-//!   true, `NaN !== NaN`), never a bit comparison.
-//! - **N41**: `null` is never coerced to `0.0` by a fold.
-//! - **N42**: bitwise/shift folds use ECMA-262 `to_int32`/`to_uint32`
-//!   (wrap mod 2^32, NaN/±Inf → +0), not Rust's saturating casts.
-//! - **N47**: SCCP's edge seeding does not stop at `Return`/`Unreachable`
-//!   terminators — exception edges are still added.
-//! - **N48/N50**: ADCE essentiality is DERIVED from
-//!   [`Op::effects`](abcd_ir::Op::effects) (T3) — no hand-maintained
-//!   list; see [`dce`].
-//! - **N27/N28**: passes keep the module verifier-clean (no empty phis on
-//!   reachable blocks, no copyprop residue); the corpus driver re-verifies
-//!   after optimizing.
-//!
-//! ## Accepted byte divergences from the v0.1 optimizer (gate 2)
-//!
-//! Maintainer ruling (2026-09-21, v2-P3): the v2opt rewrite diverges from
-//! the v0.1 opt rewrite on exactly the 53 N62 files (lift-layer literal
-//! array dedup, accepted) plus 90 files in three attributed, VM-neutral
-//! mechanisms — `1149/1149 − 53 N62 − 90 (P3-M1/P3-M2/N63)`:
-//!
-//! - **P3-M1 (72 files)** — fold re-materialization keeps opcode
-//!   identity: a folded canonical-NaN/+∞ pools as `Const::Number` bits
-//!   and lowers back to `ldnan`/`ldinfinity`, where v0.1's
-//!   `LiteralNumber` fold degraded to `fldai`.
-//! - **P3-M2 (12 files)** — ADCE essentiality is effects-derived, and
-//!   the honest `DefineFunc`/`AllocClosure` records (vendor
-//!   `RuntimeDefinefunc` runs no user code,
-//!   runtime_stubs-inl.h:2459-2505) let ADCE delete dead
-//!   definefunc+closure chains that v0.1's conservative hand-list kept.
-//! - **N63 (6 files)** — v0.1's SCCP left exception-param values at
-//!   lattice Top (the identity element), folding phis that mix a
-//!   constant with the exception object down to the constant; v0.2
-//!   resolves [`ValueDef::ExceptionParam`](abcd_ir::ValueDef) to Bottom
-//!   and keeps the phi — strictly more sound.
+//! - **Operand evaluation order**: both fold engines evaluate non-commutative
+//!   binary/comparison operators in ArkCompiler's operand order (`vreg OP acc`,
+//!   encoded on IR instructions as `right OP left`).
+//! - **Signed zero & IEEE-754 identity**: folds preserve `-0.0` bit-exactly via
+//!   [`Const::Number`](abcd_ir::Const); `StrictEq` compares numbers with IEEE
+//!   `==` (`0 === -0` is `true`, `NaN !== NaN`), while canonical `NaN` / `±∞`
+//!   values lower back to dedicated `ldnan` / `ldinfinity` opcodes.
+//! - **Abstract equality & coercion**: `Eq`/`NotEq` and arithmetic folds never
+//!   mis-coerce `null` or `undefined` to `0.0`.
+//! - **Unary & bitwise semantics**: `UnOp::BitNot` performs 32-bit bitwise NOT
+//!   whereas `UnOp::LogicalNot` performs boolean negation; bitwise and shift
+//!   folds apply ECMA-262 `ToInt32` / `ToUint32` (wrapping modulo 2^32,
+//!   mapping `NaN`/`±Infinity` to `+0`), never Rust's saturating float casts.
+//! - **SCCP exception soundness**: reachability traverses
+//!   [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) edges (including blocks
+//!   ending in `Return`/`Unreachable`), and [`ValueDef::ExceptionParam`](abcd_ir::ValueDef)
+//!   plus handler-block phis evaluate to lattice `Bottom`.
+//! - **Effects-derived ADCE**: instruction essentiality is derived solely from
+//!   [`Op::effects`](abcd_ir::Op::effects) (`T3` contract), sweeping unused
+//!   pure instructions and dead `FunctionData::frame_init_consts` while
+//!   keeping [`abcd_ir::verify_module`] clean after every pass.
 //!
 //! ## Library rule
 //!
@@ -75,6 +44,7 @@
 //! they cannot soundly rewrite.
 
 #![deny(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod analysis;
 pub mod copyprop;

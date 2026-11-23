@@ -200,23 +200,21 @@ fn safe_module_name(name: &str) -> Option<String> {
 
 /// Apply the module-selection rule (never silently pick from several).
 fn select(
-    modules: Vec<InputModule>,
+    mut modules: Vec<InputModule>,
     source_name: &str,
     selection: ModuleSelection<'_>,
 ) -> Result<Vec<InputModule>, CliError> {
-    let listing = || {
-        let names: Vec<&str> = modules.iter().map(|m| m.name.as_str()).collect();
+    let listing = |mods: &[InputModule]| {
+        let names: Vec<&str> = mods.iter().map(|m| m.name.as_str()).collect();
         format!("; available modules: {}", names.join(", "))
     };
     match selection {
         ModuleSelection::All => Ok(modules),
         ModuleSelection::Named(want) => match modules.iter().position(|m| m.name == want) {
-            Some(i) => Ok(vec![
-                modules.into_iter().nth(i).expect("position checked above"),
-            ]),
+            Some(i) => Ok(vec![modules.swap_remove(i)]),
             None => Err(CliError::User(format!(
                 "{source_name} has no module named {want:?}{}",
-                listing()
+                listing(&modules)
             ))),
         },
         ModuleSelection::Single => {
@@ -226,7 +224,7 @@ fn select(
             Err(CliError::User(format!(
                 "{source_name} contains {} modules; pass --module <name> or --all{}",
                 modules.len(),
-                listing(),
+                listing(&modules),
             )))
         }
     }

@@ -295,7 +295,7 @@ bytes must be total.
 |---|---|
 | **(a) Synthesize ZIP bytes in Rust test code** | **Recommended primary.** A ~100-line test helper writes local headers + CD + EOCD for STORED/DEFLATE entries (deflate via `miniz_oxide` in dev-deps). Covers: minimal hap (`module.json` + `ets/modules.abc`), deflated nested hap inside synthetic `.app`, signing-block junk inserted before CD, truncated EOCD/CD, u32-overflow sizes, unsafe entry names, hqf patch layout. Fully deterministic, no blobs in VCS. |
 | (b) Borrow upstream test ideas, own data | Fold into (a): port `zip_wrapper_test`/`unzip_wrapper_test` negative cases (bad names, partial data, CRC mismatch) as synthesized inputs. Not a separate strategy. |
-| (c) Real fixtures in `ghcr.io/fxti/arkcompiler-test` | **Recommended second phase**, integration-level: 2-3 real signed haps (incl. one with signing block, one `.app`, one `.hsp`), digest-pinned like the existing corpus (`MEMORY.md` pattern: opt-in corpus tests reading `exports/corpus/index.jsonl`). Validates against the wild; not required for L1. |
+| (c) Real fixtures in `ghcr.io/fxti/arkcompiler-test` | **Recommended second phase**, integration-level: 2-3 real signed haps (incl. one with signing block, one `.app`, one `.hsp`), digest-pinned like the existing corpus (`design/archive/MEMORY.md` pattern: opt-in corpus tests reading `exports/corpus/index.jsonl`). Validates against the wild; not required for L1. |
 
 Additionally keep `/Users/fxti/Downloads/ClashNEXT-1.3.3.hap` + `app_unpacking_tool.jar`
 as local-only manual cross-checks (already demonstrated above).

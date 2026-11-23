@@ -26,11 +26,8 @@ Architecture, format specifications, research surveys, and verification records 
   - [hermes-ir-survey.md](hermes-ir-survey.md) — Meta Hermes IR survey informing `abcd-ir` v0.2
   - [flowdroid/](flowdroid/) (`heros.md`, `soot-infoflow.md`, `driver-and-callgraph.md`, `summaries.md`) — FlowDroid / Heros source study informing `abcd-analysis` and `abcd-taint`
   - [arkanalyzer/](arkanalyzer/) (`core-ir.md`, `callgraph-and-pta.md`, `dataflow-and-checkers.md`, `gaps-and-lessons.md`) — OpenHarmony ArkAnalyzer source study
-- **Engineering audits, investigations & campaign logs**:
-  - [vendor-audit.md](vendor-audit.md), [bridge-vendor-isolation.md](bridge-vendor-isolation.md), [review-isa-file.md](review-isa-file.md) — FFI/vendor safety audits and findings ledger
-  - [n62-literal-array-dedup-divergence.md](n62-literal-array-dedup-divergence.md) — literal-array deduplication investigation
-  - [wild-gate-evaluation.md](wild-gate-evaluation.md), [wild-smoke-report.md](wild-smoke-report.md), [test262-expansion-plan.md](test262-expansion-plan.md) — wild OHOS and `test262` gate designs
-  - [test-coverage-audit.md](test-coverage-audit.md), [ci-rework-plan.md](ci-rework-plan.md), [test-plan.md](test-plan.md), [agent-roadmap.md](agent-roadmap.md) — historical audit snapshots and task registries
+- **Historical campaign logs & engineering audits**:
+  - Archived under [`archive/`](archive/README.md) (`MEMORY.md`, `agent-roadmap.md`, FFI/bridge audits, coverage diagnoses, `test262` and wild-gate evaluation reports).
 
 ## End-to-end pipeline
 

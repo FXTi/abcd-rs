@@ -1,41 +1,32 @@
 //! # abcd-ir — the SSA IR
 //!
-//! The intermediate representation for ArkCompiler bytecode programs
-//! (`design/ir-v0.2.md`, background in `design/ir.md` §1–§8): identity
-//! tables, module/function graphs, the op taxonomy, the effects table,
-//! the type lattice, and the verifier. Lift (`abcd-lift`, decode → IR),
-//! optimize (`abcd-opt`, IR → IR), and lower (`abcd-lower`, IR →
-//! bytecode) live in separate crates.
+//! Format-independent Static Single Assignment intermediate representation for
+//! ArkCompiler bytecode programs (`design/ir-v0.2.md`, background in
+//! `design/ir.md` §1–§8): identity tables, module/function arenas, the 88-op
+//! taxonomy, the effects table, the type lattice, and the structural verifier.
+//! Lifting (`abcd-lift`, container → IR), optimization (`abcd-opt`, IR → IR),
+//! and lowering (`abcd-lower`, IR → container) live in separate crates.
 //!
-//! This crate **is** the IR (the v2-P4 swap, 2026-09-21: the v0.1
-//! `abcd-ir` crate was deleted — git history is the archive — and
-//! `abcd-ir2` was renamed `abcd-ir`).
+//! ## Format independence (structurally enforced)
 //!
-//! ## Format independence (hard, structurally enforced)
-//!
-//! The IR describes a **program** — classes, functions, value flow,
-//! types, annotations, module records, debug info — never a **file**.
+//! The IR describes a **program** — classes, functions, value flow, types,
+//! annotations, module records, debug info — never a serialized **file**.
 //! This crate's `Cargo.toml` declares **no dependency** on `abcd-file`,
-//! `abcd-isa`, `abcd-file-sys`, or `abcd-isa-sys`, and never may: the
-//! crate graph is the enforcement mechanism (design/ir.md §8 invariant
-//! 1).
+//! `abcd-isa`, `abcd-file-sys`, or `abcd-isa-sys`, and never may (`design/ir.md`
+//! §8 invariant 1):
 //!
-//! What must never appear here (the §6.2 v0.1 leak inventory):
-//!
-//! - `version` / `file_type` (file identity, not program semantics);
-//! - file offsets as entity identity (`method_offset`, `EntityId`,
-//!   `source_offset`) — identity is [`FuncId`]/[`ClassId`] + the
-//!   [`SymbolTable`];
-//! - a file string pool (`StringId`) — names are [`Sym`];
-//! - literal-array indices (`LiteralArrayIdx`, `literal_array_offsets`) —
-//!   literal shapes are typed [`Const`]s in the [`ConstPool`];
-//! - four annotation buckets — one [`Annotation`] list per attach site;
-//! - file-bound type payloads (`IrType::Static(file StringId)`, N46) —
-//!   [`StaticTy::Reference`] carries a module [`ClassId`];
-//! - `num_vregs` / `num_args` frame layout (SSA has no registers);
-//! - file-range try blocks — structured [`TryRegion`]s;
-//! - register/accumulator concepts (`RegOrAcc`) — out-of-SSA is a
-//!   lowering concern only.
+//! - file-header identity (`version`, `file_type`) stays outside the IR;
+//! - entity identity uses [`FuncId`], [`ClassId`], and [`SymbolTable`], never
+//!   raw 32-bit file offsets;
+//! - strings intern losslessly as [`Sym`]s (valid UTF-8 or raw MUTF-8 bytes);
+//! - literal shapes live as typed [`Const`] trees in [`ConstPool`], never
+//!   raw literal-array table indices;
+//! - annotations merge into a single ordered [`Annotation`] list per site;
+//! - class/reference types carry a module [`ClassId`] ([`StaticTy::Reference`]);
+//! - register counts and accumulator slots do not exist in SSA (`frame` models
+//!   only the `[func][new.target][this]` calling convention);
+//! - exception handlers are structured [`TryRegion`]s with explicit
+//!   [`EdgeKind::Exceptional`] CFG edges.
 //!
 //! ## The taint-analysis contract (T1–T10)
 //!
@@ -69,6 +60,7 @@
 //! `thiserror::Error`.
 
 #![deny(missing_docs)]
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
 pub mod consts;
 pub mod effects;

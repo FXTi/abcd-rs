@@ -4,7 +4,7 @@
 
 Global `RUSTFLAGS: "-D warnings"` enforces zero compiler warnings across every target. Upstream C++ sources and pre-generated Rust/C++ bindings are committed in `vendor/` and `abcd-*-sys/*/generated/`, so build and corpus runners need neither git submodule checkouts nor Ruby/`bindgen`. Member-crate integration tests are consolidated into one `tests/integration/main.rs` binary per crate to minimize linker overhead, and Docker oracle scripts (`scripts/compare-rewritten-corpus.py`, `scripts/dream-gate.py`) batch all fixture executions inside a single long-lived `--network none` container per invocation.
 
-Corpus-heavy jobs run only after the fast source, lint, rustdoc, fuzz-build, vendor-integrity, and cross-platform/32-bit compilation gates succeed (`needs: [build, build32, win32, arm32]`), and share `.github/actions/export-corpus` for digest-pinned corpus extraction.
+Corpus-heavy jobs run immediately after the five fast Tier-1 source/lint/rustdoc/deny/vendor-integrity gates succeed (`needs: [fmt, clippy, doc, deny, vendor-verify]`), executing in parallel with the cross-OS `build` matrix, and share `.github/actions/setup-workspace` + `.github/actions/export-corpus` for toolchain setup and digest-pinned corpus extraction.
 
 ### Tier 1 — Fast source, lint, rustdoc, fuzz-check, vendor-integrity, platform & 32-bit gates
 
@@ -15,7 +15,7 @@ Corpus-heavy jobs run only after the fast source, lint, rustdoc, fuzz-build, ven
 | `doc` | Ubuntu | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` (broken intra-doc link & rustdoc gate) |
 | `deny` | Ubuntu | `cargo deny` license and security-advisory audit |
 | `vendor-verify` | Ubuntu | `python3 scripts/vendor-gen.py verify` — SHA-256 audit of `vendor/arkcompiler_runtime_core/` against `vendor/UPSTREAM.toml` + byte-exact fresh Ruby/FFI codegen check |
-| `build` | Ubuntu / macOS / Windows (x86_64 + ARM64, 6 lanes) | Full workspace `cargo build` + non-ignored `cargo test` (including synthetic `--merge-abc` 4-pipeline e2e suite) across oldest supported runner images (`ubuntu-22.04`, `ubuntu-22.04-arm`, `macos-15`, `macos-15-intel`, `windows-2022`, `windows-11-arm`) |
+| `build` | Ubuntu / macOS / Windows (x86_64 + ARM64, 6 lanes) | Full workspace `cargo build` + non-ignored `cargo test` (including synthetic `--merge-abc` 4-pipeline e2e suite) across oldest supported runner images (`ubuntu-22.04`, `ubuntu-22.04-arm`, `macos-latest`, `macos-15-intel`, `windows-2022`, `windows-11-arm`) |
 | `build32` | Ubuntu (`i686-unknown-linux-gnu`) | 32-bit x86 pointer-width / FFI layout gate |
 | `win32` | Windows (`i686-pc-windows-msvc`) | 32-bit MSVC ABI + C++ bridge gate |
 | `arm32` | Ubuntu (`armv7-unknown-linux-gnueabihf` + QEMU) | 32-bit ARM alignment / signedness / FFI gate |
