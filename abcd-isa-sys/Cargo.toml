@@ -13,4 +13,3 @@ bitflags.workspace = true
 
 [build-dependencies]
 cc = "1"
-bindgen = "0.71"

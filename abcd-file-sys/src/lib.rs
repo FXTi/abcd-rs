@@ -1,9 +1,9 @@
 //! Low-level C FFI bindings for the ArkCompiler `.abc` container format (`libpandafile`).
 //!
-//! Built from the pinned upstream `arkcompiler_runtime_core` submodule via
-//! Ruby code generation, an exception-guarded C++ bridge (`bridge/file_bridge.h`),
-//! and two `bindgen` passes (`bindings.rs` for `abc_*` functions and
-//! `enum_bindings.rs` for vendor enum/flag constants).
+//! Built from the workspace `vendor/` snapshot (`OpenHarmony-v7.0-Release`),
+//! an exception-guarded C++ bridge (`bridge/file_bridge.h`), and pre-generated
+//! Rust bindings (`src/generated/bindings.rs` and `src/generated/enum_bindings.rs`,
+//! verified at C++ compile time via `static_assert`s).
 //!
 //! Most callers should use the safe `abcd-file` crate rather than calling raw
 //! FFI entry points directly.
@@ -12,11 +12,12 @@
     non_upper_case_globals,
     non_camel_case_types,
     non_snake_case,
-    dead_code
+    dead_code,
+    clippy::all
 )]
 
-include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-include!(concat!(env!("OUT_DIR"), "/enum_bindings.rs"));
+include!("generated/bindings.rs");
+include!("generated/enum_bindings.rs");
 
 // ---------------------------------------------------------------------------
 // Rust safe-type wrappers for C++ enums not exposed through bindgen

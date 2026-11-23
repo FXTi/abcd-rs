@@ -1,173 +1,68 @@
 // Build script for abcd-isa-sys.
 //
-// Three phases:
-//   1. Ruby code generation — runs gen.rb against isa.yaml to produce C++ headers
-//      and the Rust `bytecode.rs` source.
-//   2. C++ compilation — compiles the bridge (`isa_bridge.cpp`) and vendor sources
-//      into a static library via the `cc` crate.
-//   3. Rust FFI bindings — runs `bindgen` on the bridge header to produce
-//      `bindings.rs`.
+// Compiles the C++ ISA bridge (`bridge/isa_bridge.cpp`) and upstream emitter /
+// format-version translation units from the workspace `vendor/` snapshot.
+// All Ruby/ISA and FFI Rust bindings are pre-generated offline via
+// `scripts/vendor-gen.py` and verified in CI (`vendor-verify`).
 
 use std::env;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::Path;
 
 fn main() {
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let out_dir = env::var("OUT_DIR").unwrap();
+    let local_vendor = format!("{manifest}/vendor");
+    let vendor_root = if Path::new(&format!("{local_vendor}/arkcompiler_runtime_core")).is_dir() {
+        local_vendor
+    } else {
+        format!("{manifest}/../vendor")
+    };
 
-    // Phase 1: Ruby code generation
-    let gen_rb = format!("{manifest}/arkcompiler_runtime_core/isa/gen.rb");
-    let isa_yaml = format!("{manifest}/arkcompiler_runtime_core/isa/isa.yaml");
-    let isapi = format!("{manifest}/arkcompiler_runtime_core/isa/isapi.rb");
-    let pf_isapi = format!("{manifest}/arkcompiler_runtime_core/libpandafile/pandafile_isapi.rb");
-    let requires = format!("{isapi},{pf_isapi}");
+    let ark = format!("{vendor_root}/arkcompiler_runtime_core");
+    let vendor_gen = format!("{vendor_root}/generated");
+    let vendor_shim = format!("{vendor_root}/shim");
 
-    // Generate bytecode_instruction_enum_gen.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!(
-            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/bytecode_instruction_enum_gen.h.erb"
-        ),
-        &format!("{out_dir}/bytecode_instruction_enum_gen.h"),
-    );
-
-    // Generate bytecode_instruction-inl_gen.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!(
-            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/bytecode_instruction-inl_gen.h.erb"
-        ),
-        &format!("{out_dir}/bytecode_instruction-inl_gen.h"),
-    );
-
-    // Generate bytecode_emitter_def_gen.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!(
-            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/bytecode_emitter_def_gen.h.erb"
-        ),
-        &format!("{out_dir}/bytecode_emitter_def_gen.h"),
-    );
-
-    // Generate bytecode_emitter_gen.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!(
-            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/bytecode_emitter_gen.h.erb"
-        ),
-        &format!("{out_dir}/bytecode_emitter_gen.h"),
-    );
-
-    // Generate file_format_version.h
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!(
-            "{manifest}/arkcompiler_runtime_core/libpandafile/templates/file_format_version.h.erb"
-        ),
-        &format!("{out_dir}/file_format_version.h"),
-    );
-
-    // Generate isa_bridge_emit_dispatch.h (C++ emitter dispatch switch)
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/templates/isa_bridge_emit_dispatch.h.erb"),
-        &format!("{out_dir}/isa_bridge_emit_dispatch.h"),
-    );
-
-    // Generate isa_bridge_valid_opcode.h (opcode validity lookup)
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/templates/isa_bridge_valid_opcode.h.erb"),
-        &format!("{out_dir}/isa_bridge_valid_opcode.h"),
-    );
-
-    // Generate bytecode.rs (Rust Bytecode enum + Operands + insn constructors)
-    run_ruby(
-        &gen_rb,
-        &isa_yaml,
-        &requires,
-        &format!("{manifest}/templates/bytecode.rs.erb"),
-        &format!("{out_dir}/bytecode.rs"),
-    );
-
-    // Phase 2: Compile C++ bridge
     let mut cc_build = cc::Build::new();
     cc_build
         .cpp(true)
         .std("c++17")
         .warnings(false)
         .define("NDEBUG", None)
-        .include(&out_dir)
+        .include(format!("{manifest}/bridge/generated"))
+        .include(&vendor_gen)
         .include(format!("{manifest}/bridge/shim"))
+        .include(&vendor_shim)
         .include(format!("{manifest}/bridge"))
-        .include(format!("{manifest}/arkcompiler_runtime_core/libpandafile"))
-        .include(format!(
-            "{manifest}/arkcompiler_runtime_core/libpandabase/include"
-        ))
-        // Upstream mixes both include forms: "macros.h" (bare, needs the
-        // inner dir) and "libpandabase/utils/timers.h" (needs include/).
-        .include(format!(
-            "{manifest}/arkcompiler_runtime_core/libpandabase/include/libpandabase"
-        ))
+        .include(format!("{ark}/libpandafile"))
+        .include(format!("{ark}/libpandabase/include"))
+        // Upstream mixes both include forms: "macros.h" (bare, needs the inner
+        // dir) and "libpandabase/utils/timers.h" (needs include/).
+        .include(format!("{ark}/libpandabase/include/libpandabase"))
+        .include(format!("{ark}/platforms"))
         .file(format!("{manifest}/bridge/isa_bridge.cpp"))
-        .file(format!(
-            "{manifest}/arkcompiler_runtime_core/libpandafile/file_format_version.cpp"
-        ))
-        .file(format!(
-            "{manifest}/arkcompiler_runtime_core/libpandafile/bytecode_emitter.cpp"
-        ));
+        .file(format!("{ark}/libpandafile/file_format_version.cpp"))
+        .file(format!("{ark}/libpandafile/bytecode_emitter.cpp"));
 
     let target = env::var("TARGET").unwrap_or_default();
-    // Force-include the shim libpandafile/file.h BEFORE everything: with the
-    // full submodule present, upstream's `"file.h"` quote-includes resolve
-    // same-dir to the REAL libpandafile/file.h (which drags in os/mem.h →
-    // the platform layer), but the shim's include guard (LIBPANDAFILE_FILE_H)
-    // matches, so pre-including the shim turns the real file into a no-op —
-    // the old flat subset achieved the same via -I fall-through.
+    // Force-include the crate-local shim `file.h` BEFORE everything so
+    // upstream quote-includes of `"file.h"` resolve to our lightweight stub
+    // (matching include guard `LIBPANDAFILE_FILE_H`) rather than pulling in OS
+    // memory/filesystem headers unneeded by the ISA emitter.
     if target.contains("windows") {
         cc_build.define("PANDA_TARGET_WINDOWS", None);
-        cc_build.include(format!("{manifest}/arkcompiler_runtime_core/platforms"));
-        // Force-include MSVC compat header before all source files
-        cc_build.flag(format!("/FI{manifest}/bridge/shim/platform_compat.h"));
+        cc_build.flag(format!("/FI{vendor_shim}/platform_compat.h"));
         cc_build.flag(format!("/FI{manifest}/bridge/shim/file.h"));
-        // Enable C++ exception handling (vendor code uses <iostream>)
         cc_build.flag("/EHsc");
-        // Conformance mode: platforms/windows/libpandabase/file.h relies on
-        // C++17 guaranteed copy elision (returns Unexpected temporaries whose
-        // move ctor is deliberately deleted upstream); default MSVC rejects it.
         cc_build.flag("/permissive-");
     } else {
-        // Full-subtree vendoring pulls os/file.h, which requires the
-        // platform macro (the old flat subset never reached it).
         cc_build.define("PANDA_TARGET_UNIX", None);
-        // macOS has no stat64: upstream gates those paths on this macro.
         if target.contains("apple") {
             cc_build.define("PANDA_TARGET_MACOS", None);
         }
-        // Platform headers: "unix/libpandabase/file.h" resolves under
-        // platforms/unix (full subtree now present).
-        cc_build.include(format!("{manifest}/arkcompiler_runtime_core/platforms"));
         cc_build
             .flag("-include")
             .flag(format!("{manifest}/bridge/shim/file.h"));
     }
 
-    // Coverage: instrument C++ when running under cargo-llvm-cov
     if env::var("CARGO_LLVM_COV").is_ok() {
         cc_build
             .flag("-fprofile-instr-generate")
@@ -176,60 +71,7 @@ fn main() {
 
     cc_build.compile("isa_bridge");
 
-    // Phase 3: Generate Rust FFI bindings
-    // Write a wrapper header that includes both the static header and generated declarations
-    let wrapper_h = format!("{out_dir}/isa_bridge_bindgen.h");
-    std::fs::write(
-        &wrapper_h,
-        format!("#include \"{manifest}/bridge/isa_bridge.h\"\n"),
-    )
-    .expect("failed to write bindgen wrapper header");
-
-    let bindings = bindgen::Builder::default()
-        .header(&wrapper_h)
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .allowlist_function("isa_.*")
-        .allowlist_type("Isa.*")
-        .allowlist_var("ISA_.*")
-        .generate()
-        .expect("bindgen failed");
-
-    let out_path = PathBuf::from(&out_dir).join("bindings.rs");
-    bindings
-        .write_to_file(&out_path)
-        .expect("failed to write bindings");
-
-    // rerun-if-changed
     println!("cargo:rerun-if-changed=bridge/");
-    println!("cargo:rerun-if-changed=templates/");
-    // The submodule is read-only between pin bumps (CI tag-radar updates
-    // only), so watch the whole thing — simpler and can't miss a path.
-    println!("cargo:rerun-if-changed=arkcompiler_runtime_core/");
-}
-
-/// Run a Ruby ERB code-generation step.
-///
-/// Invokes `gen.rb` with the given ISA data file, require paths, template, and
-/// output path.  Panics if Ruby is not installed or the template fails.
-fn run_ruby(gen_rb: &str, data: &str, requires: &str, template: &str, output: &str) {
-    let status = Command::new("ruby")
-        .args([
-            "-rostruct",
-            gen_rb,
-            "-t",
-            template,
-            "-d",
-            data,
-            "-r",
-            requires,
-            "-o",
-            output,
-        ])
-        .status()
-        .unwrap_or_else(|e| panic!("Failed to run ruby: {e}. Is ruby installed?"));
-
-    assert!(
-        status.success(),
-        "Ruby code generation failed for template: {template}"
-    );
+    println!("cargo:rerun-if-changed=src/generated/");
+    println!("cargo:rerun-if-changed={vendor_root}/");
 }
