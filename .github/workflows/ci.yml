@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           components: rustfmt
@@ -35,6 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           components: clippy
@@ -46,6 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
       - run: cargo doc --workspace --no-deps
         env:
@@ -64,6 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           components: rustfmt
@@ -85,6 +89,7 @@ jobs:
           - windows-2022 # oldest Windows label
           - windows-11-arm # aarch64 Windows
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
       # Upstream C++ sources and pre-generated Rust/C++ bindings live in
       # vendor/ and abcd-*-sys/*/generated/ (verified by vendor-verify);
@@ -99,6 +104,7 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           targets: i686-unknown-linux-gnu
@@ -119,6 +125,7 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           targets: i686-pc-windows-msvc
@@ -131,6 +138,7 @@ jobs:
     timeout-minutes: 25
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           targets: armv7-unknown-linux-gnueabihf
@@ -158,6 +166,7 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: corpus
@@ -170,6 +179,7 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: wild
@@ -182,6 +192,7 @@ jobs:
     timeout-minutes: 15
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: wild
@@ -194,6 +205,7 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: corpus
@@ -206,6 +218,7 @@ jobs:
     timeout-minutes: 25
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: corpus
@@ -235,6 +248,7 @@ jobs:
     timeout-minutes: 25
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: corpus
@@ -259,6 +273,7 @@ jobs:
     timeout-minutes: 30
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: corpus
@@ -280,6 +295,7 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: corpus
@@ -292,6 +308,7 @@ jobs:
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: corpus
@@ -304,6 +321,7 @@ jobs:
     timeout-minutes: 30
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           corpus-mode: corpus
@@ -326,6 +344,7 @@ jobs:
     env:
       CXX: clang++-23
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           components: llvm-tools-preview
@@ -369,6 +388,7 @@ jobs:
     timeout-minutes: 45
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
         with:
           toolchain: nightly

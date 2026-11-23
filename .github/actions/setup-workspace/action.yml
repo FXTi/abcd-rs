@@ -1,5 +1,5 @@
 name: Setup abcd-rs workspace
-description: Check out repository, install Rust toolchain (and optional Ruby / corpus fixtures).
+description: Install Rust toolchain (and optional Ruby / corpus fixtures) after checkout.
 inputs:
   toolchain:
     description: "'stable' or 'nightly'"
@@ -29,8 +29,6 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: actions/checkout@v7
-
     - if: inputs.toolchain == 'stable'
       uses: dtolnay/rust-toolchain@stable
       with:
