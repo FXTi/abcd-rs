@@ -9,29 +9,30 @@
 //! The conversion ports v0.1 `abcd_ir::lift`'s battle-proven semantics
 //! (VM oracle 1149/1149 on both pipelines) into v0.2's types:
 //!
-//! - **Entity resolution → [`SymbolTable`] + [`FuncId`]** — strings are
+//! - **Entity resolution → [`abcd_ir::SymbolTable`] + [`FuncId`]** — strings are
 //!   content-keyed symbols; a method reference is a [`FuncId`] into the
 //!   module's function table (the S1/N2 lesson: the file's method table
 //!   is built FIRST, then bytecode/literal offsets resolve to indices —
 //!   never name-keyed, never raw offsets).
-//! - **Literal arrays → [`ConstPool`]** — typed [`Const`] trees
+//! - **Literal arrays → [`abcd_ir::ConstPool`]** — typed [`Const`] trees
 //!   (nested arrays included; typed arrays resolved to real trees, N52:
 //!   no raw offsets); method references inside literal arrays become
 //!   [`Const::MethodRef`]`(FuncId)`.
-//! - **Module records → [`ImportDecl`]/[`ExportDecl`]** — the N7 model:
-//!   `_ESModuleRecord` field blobs (`FieldValue::ModuleData`) parsed into
-//!   declarations with `module_request_idx` resolved to specifier syms;
-//!   `moduleRequestPhaseIdx` blobs become
-//!   [`ModuleRequest`](abcd_ir::ModuleRequest)`{specifier, lazy}`;
-//!   `_ESScopeNamesRecord` fields land on
-//!   [`DebugData::scope_names`](abcd_ir::DebugData) of the functions
-//!   whose source file matches the field name.
+//! - **Module records → [`abcd_ir::EsModule`] / [`abcd_ir::ImportDecl`] / [`abcd_ir::ExportDecl`]** —
+//!   standalone `_ESModuleRecord` and `--merge-abc` `moduleRecordIdx`
+//!   field blobs (`FieldValue::ModuleData`) parse into declarations with
+//!   `module_request_idx` resolved to specifier syms;
+//!   `moduleRequestPhaseIdx` blobs pair per-record into
+//!   [`abcd_ir::ModuleRequest`]`{specifier, lazy}`;
+//!   `_ESScopeNamesRecord` and `--merge-abc` `scopeNames` fields land on
+//!   [`abcd_ir::ClassData::scope_names`] and
+//!   [`DebugData::scope_names`](abcd_ir::DebugData).
 //! - **Annotations** — the four file buckets merge into ONE list per
 //!   attach site, in the documented order: `compile_time`, `runtime`,
 //!   `compile_time_type`, `runtime_type`.
 //! - **Debug** — the LNP dual stream becomes
 //!   [`DebugData`](abcd_ir::DebugData): line/column keyed by the lifted
-//!   [`InstId`](abcd_ir::InstId)s (also on `Inst.loc`), local names with
+//!   [`InstId`]s (also on `Inst.loc`), local names with
 //!   their #5 scope extents mapped onto lifted instructions, param
 //!   names, source file/code.
 //! - **CFG + Braun SSA** — v0.1's exact semantics: param seeding from
@@ -42,7 +43,7 @@
 //!   represented as `ValueDef::Const`, no seeding instructions), handler
 //!   [`ExceptionParam`](abcd_ir::ValueDef) seeding (N13), Braun
 //!   construction with preds known before SSA (empty-phi-free).
-//! - **Try regions** — structured [`TryRegion`](abcd_ir::TryRegion)s
+//! - **Try regions** — structured [`TryRegion`]s
 //!   plus materialized [`EdgeKind::Exceptional`](abcd_ir::EdgeKind)
 //!   edges in `Block.preds` for EVERY (protected block → handler) pair
 //!   (the verifier's `MissingExceptionalPred` rule), and the N18
@@ -50,8 +51,7 @@
 //! - **Opcode coverage** — every opcode v0.1's lift handles, mapped to
 //!   v0.2 ops per the (v2-P0.5-grown) taxonomy; deprecated opcodes fold
 //!   to the modern ops (v0.1 convention). The full mapping table lives
-//!   in `translate.rs`'s header docs; the machine-checked version is
-//!   `compare.rs`'s canonicalization.
+//!   in `translate.rs`'s header docs.
 //!
 //! Library rule (mirroring abcd-ir): no panics on data; every fallible
 //! finding is a [`LiftError`].

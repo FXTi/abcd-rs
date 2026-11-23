@@ -1,5 +1,5 @@
 //! The taint driver: source/sink configuration, the IFDS run over the
-//! call graph + rung-0 alias oracle, and the taint-path report.
+//! call graph + rung-selected alias oracle (default rung-2 PTA), and the taint-path report.
 //!
 //! ## Configuration
 //!
@@ -50,7 +50,8 @@ use crate::summary::{RegistryStats, Summary, SummaryRegistry};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceSpec {
     /// Parameters of every function with this name are tainted.
-    /// `params: None` = all parameters (including `params[0]` = `this`).
+    /// `params: None` = all parameter slots (including the leading implicit
+    /// `[func][new.target][this]` frame slots when present; see [`abcd_ir::frame`]).
     FunctionParams {
         /// The function name (`func_main_0` for module entry points).
         name: String,

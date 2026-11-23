@@ -1,5 +1,5 @@
 //! Stage B — control-flow structuring (design/decompile.md §4.2):
-//! d-P1's region tree ([`abcd_analysis::control::regions`]) + Stage A's
+//! d-P1's region tree ([`abcd_analysis::control::structure_regions`]) + Stage A's
 //! per-block statements ([`crate::recover::RecoveredFunc`]) → a structured
 //! JavaScript statement tree ([`SNode`]).
 //!
@@ -23,7 +23,7 @@
 //!   `L$entry: { … }` blocks such that `break L$entry` from the
 //!   preceding siblings lands at the arm's start, plus a `A$k: { … }`
 //!   wrapper so mid-arm exits become `break A$k` (see
-//!   [`Ctx::emit_alternates`]).
+//!   `Ctx::emit_alternates_wrapped`).
 //! - `Irreducible` → the state-variable dispatch escape hatch of
 //!   design §4.2.4, with an honesty comment (expected count on the
 //!   es2abc corpus: zero — the d-P1 gate proved it — but the path
@@ -52,7 +52,7 @@
 //!   other `break` exits that bypass them, an honesty comment is added
 //!   ([`StructStats::exit_phi_after_loop`] counts the placements).
 //!
-//! ## try/catch projection (design §4.2.5 + d-P1's [`TryPlan`])
+//! ## try/catch projection (design §4.2.5 + d-P1's [`abcd_analysis::control::TryPlan`])
 //!
 //! Protected sets are laminar (d-P1 asserts it). Each block maps to its
 //! innermost plan; each region node is `Uniform(plan)` or `Mixed`:
@@ -66,7 +66,7 @@
 //! - A `Mixed` `Loop` is the d-P1 `cuts_structured_region` case: the
 //!   loop is emitted whole and the `try` lands INSIDE the loop body at
 //!   the cut boundary, with an honesty comment on the plan
-//!   ([`TryPlan::cuts_structured_region`]).
+//!   ([`abcd_analysis::control::TryPlan::cuts_structured_region`]).
 //! - A `Mixed` node whose HEAD block is protected wraps whole (the
 //!   condition evaluation is protected; arms may be over-protected —
 //!   documented approximation, counted).

@@ -4,6 +4,7 @@ description = "Optimization passes for the SSA IR (abcd_ir::Module): peephole, S
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+readme = "README.md"
 
 # DELIBERATE INVARIANT (design/ir-v0.2.md §1, design/ir.md §8 invariant 1,
 # same enforcement mechanism as abcd-ir): layering is lift = decode→IR,

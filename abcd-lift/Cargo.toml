@@ -4,6 +4,7 @@ description = "Lifter: decode (abcd_file::File) → IR (abcd_ir::Module) — lay
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+readme = "README.md"
 
 [dependencies]
 abcd-file.workspace = true

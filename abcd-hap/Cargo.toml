@@ -4,6 +4,7 @@ description = "In-memory, unpack-only reader for OpenHarmony HAP/HSP/APP/HQF con
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+readme = "README.md"
 keywords = ["harmonyos", "openharmony", "hap", "zip", "abc"]
 categories = ["parser-implementations"]
 
@@ -13,5 +14,5 @@ miniz_oxide.workspace = true
 
 [dev-dependencies]
 miniz_oxide.workspace = true
-# Wild-OHOS instrument only (tests/wild_ohos.rs): decode extracted bytecode.
+# End-to-end container → decode test helpers (corpus gate in root tests/hap-file).
 abcd-file.workspace = true

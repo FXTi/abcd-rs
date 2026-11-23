@@ -33,7 +33,7 @@
 use std::path::PathBuf;
 
 use abcd_file::File;
-use abcd_ir::{verify_module, FuncId, Module, Op};
+use abcd_ir::{FuncId, Module, Op, verify_module};
 use abcd_isa::Bytecode;
 use abcd_lift::lift_file;
 use abcd_lower::{lower_function, to_method_body};

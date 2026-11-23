@@ -3,7 +3,7 @@
 //!
 //! - Trivial phi: all incoming values are the same → replace with that value.
 //!
-//! v0.2 port note: phi entries key on full [`Edge`]s (kind-qualified);
+//! v0.2 port note: phi entries key on full [`abcd_ir::Edge`]s (kind-qualified);
 //! triviality is decided on the VALUEs alone, exactly as in v0.1 (a phi
 //! whose normal and exceptional in-edges carry the same value is trivial
 //! — and folding it is sound even for handler phis, since the folded

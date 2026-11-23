@@ -62,7 +62,7 @@
 //! ## The soundness contract (rung-0 floor, unchanged)
 //!
 //! [`Rung2AliasOracle::site_info_at`] returns the PTA answer only when it
-//! is complete (no [`Obj::Unknown`] in the value's set, no unkeyed
+//! is complete (no `Obj::Unknown` in the value's set, no unkeyed
 //! objects, no cap cut); anything else degrades to the rung-0 local
 //! def-chain answer — the ladder's rule that climbing can only make
 //! keying *more* precise, never less sound. `Unknown` is seeded by:
@@ -80,7 +80,7 @@
 //!
 //! `GetLexVar`/`PutLexVar` carry no environment operand, so environment
 //! identity is reconstructed by a dedicated flow analysis (the
-//! [`EnvTables`] built by [`analyze`]): `NewLexEnv`/
+//! `EnvTables` built by [`analyze`]): `NewLexEnv`/
 //! `NewLexEnvWithName` instructions are environment allocation sites; a
 //! forward per-function dataflow tracks the environment stack at every
 //! instruction (push on `NewLexEnv`, pop on `PopLexEnv`); a closure's

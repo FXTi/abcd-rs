@@ -36,7 +36,7 @@
 
 use crate::common;
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
 
 /// A normalized token: identifiers/literals/punctuation.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

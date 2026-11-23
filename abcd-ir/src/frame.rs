@@ -21,7 +21,7 @@
 //! `ldthis` reads it back (`EcmaInterpreter::GetThis`,
 //! `interpreter-inl.cpp:7907-7912`; `HANDLE_OPCODE(LDTHIS)`,
 //! `interpreter-inl.cpp:6970-6973`) — so the IR's this value of a
-//! `Bytecode::Ldthis` is the this-role [`ValueDef::Param`], never
+//! `Bytecode::Ldthis` is the this-role [`crate::ValueDef::Param`], never
 //! `params[0]` (which is the FUNC slot under the `0xF` default).
 
 use crate::function::FunctionData;

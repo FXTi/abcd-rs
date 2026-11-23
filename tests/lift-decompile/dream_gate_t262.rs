@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
 
 /// The gate root inside `target/` (never committed).
 fn gate_root() -> std::path::PathBuf {

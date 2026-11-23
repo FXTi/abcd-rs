@@ -1,9 +1,10 @@
 [package]
 name = "abcd-cli"
-description = "Command-line interface for the abcd-rs ArkCompiler bytecode toolkit (extract / info / decompile)"
+description = "Command-line interface for the abcd-rs ArkCompiler bytecode toolkit (extract / info / dis / asm / decompile / rewrite / analyze / taint)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+readme = "README.md"
 publish = false
 
 [[bin]]

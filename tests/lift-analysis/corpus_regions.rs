@@ -29,7 +29,7 @@ use crate::common;
 use std::collections::BTreeMap;
 
 use abcd_analysis::control::{
-    reachable_blocks, structure_regions, EdgeClass, EscapeHatch, LoopKind, RegionNode, RegionTree,
+    EdgeClass, EscapeHatch, LoopKind, RegionNode, RegionTree, reachable_blocks, structure_regions,
 };
 use abcd_ir::FuncId;
 use abcd_lift::lift_file;

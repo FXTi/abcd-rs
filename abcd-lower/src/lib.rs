@@ -227,7 +227,7 @@ pub fn lower_function_with_options(
     }
 
     // Step 0: Fusion analysis (BEFORE register allocation): the v0.2
-    // lift's expansion mappings (compare.rs rule 3) materialize values
+    // lift's expansion mappings materialize values
     // v0.1 never had — DefineFunc/AllocClosure pairs, by-index constant
     // loads, try-load-global defaults. Their results must never be
     // colored, or the allocator's value universe would differ from

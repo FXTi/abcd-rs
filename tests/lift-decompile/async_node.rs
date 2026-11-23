@@ -27,9 +27,9 @@
 //! root package's manifest dir IS the repo root — the corpus/target
 //! paths lost the crate-local `..`.
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
-use abcd_file::{decode, AccessFlags, Builder, FunctionKind as FileKind, Type};
-use abcd_isa::{encode as encode_bytecodes, Bytecode, Imm, Reg};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
+use abcd_file::{AccessFlags, Builder, FunctionKind as FileKind, Type, decode};
+use abcd_isa::{Bytecode, Imm, Reg, encode as encode_bytecodes};
 use abcd_lift::lift_file;
 
 /// Build a 12.x file whose global class carries one static ASYNC method

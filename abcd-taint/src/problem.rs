@@ -27,7 +27,7 @@
 //!   handler's `ExceptionParam` binding on handler return sites (T5).
 //! - **Exception edges**: intraprocedural `Throw` → handler entry maps
 //!   the thrown value's taint onto the catch binding
-//!   ([`ValueDef::ExceptionParam`]) — "ExceptionParam taints the catch
+//!   ([`abcd_ir::ValueDef::ExceptionParam`]) — "ExceptionParam taints the catch
 //!   binding".
 //!
 //! Everything else is pass-through (facts survive) plus the generic

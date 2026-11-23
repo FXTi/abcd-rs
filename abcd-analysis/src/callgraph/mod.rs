@@ -254,7 +254,7 @@ impl CallGraph {
     ///   edges are left untouched (widening those needs edge merging,
     ///   deferred with the fixed point).
     /// - A bridged edge's `resolution_complete` is the engine answer's
-    ///   may-completeness ([`QueryAnswer::complete_for_resolution`] —
+    ///   may-completeness ([`crate::dataflow::alias::QueryAnswer::complete_for_resolution`] —
     ///   unbalanced fan-out is acceptable here: callee resolution is a
     ///   may-direction consumer; the answer is complete modulo the
     ///   recorded graph, the same contract the base graph has).

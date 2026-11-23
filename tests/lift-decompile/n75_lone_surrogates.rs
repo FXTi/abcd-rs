@@ -29,7 +29,7 @@
 use crate::common;
 
 use abcd_decompile::consts::{render_mutf8_string, render_pool_string};
-use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
 
 /// The three dream-gate rows this task delists.
 const ROWS: [&str; 3] = [

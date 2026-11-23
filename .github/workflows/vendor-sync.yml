@@ -164,7 +164,7 @@ jobs:
             echo '```'
             git -C abcd-file-sys/arkcompiler_runtime_core diff --stat \
               "${{ steps.tag.outputs.pinned }}..${{ steps.tag.outputs.tag_sha }}" \
-              -- isa libpandafile libpandabase assembler templates 2>/dev/null \
+              -- isa libpandafile libpandabase assembler templates platforms 2>/dev/null \
               || echo "(diff unavailable in shallow clone)"
             echo '```'
           } > drift-summary.md

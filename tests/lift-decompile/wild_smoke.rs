@@ -46,7 +46,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
 
 /// The exported wild corpus root; same override as the hap-file gate.
 fn wild_corpus_root() -> PathBuf {

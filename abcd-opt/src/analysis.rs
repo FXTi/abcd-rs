@@ -5,7 +5,7 @@
 //! v0.2 differences from v0.1 (T5): CFG edges are kinded
 //! ([`EdgeKind::Normal`] terminator successors vs
 //! [`EdgeKind::Exceptional`] try→handler dispatch), predecessor lists are
-//! `Vec<Edge>`, and phi entries key on full [`Edge`]s. Successor
+//! `Vec<Edge>`, and phi entries key on full [`abcd_ir::Edge`]s. Successor
 //! iteration order matches v0.1 exactly (terminator successors first,
 //! then region handlers in region order) so pass output stays
 //! byte-comparable with the v0.1 oracle.

@@ -57,7 +57,7 @@
 
 use crate::common;
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
 
 /// Decompile one corpus fixture (twice — determinism is part of the
 /// contract) and return the text.

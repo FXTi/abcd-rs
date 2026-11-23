@@ -14,7 +14,7 @@
 //! Candidates are returned most-qualified first. Bare property names
 //! (`"log"` alone) are deliberately NOT emitted: a bare-method registry
 //! key would collide across every object with a same-named method.
-//! Resolved-callee [`FunctionData`] names are matched by the driver on
+//! Resolved-callee [`abcd_ir::FunctionData`] names are matched by the driver on
 //! top of these candidates (directly-resolved internal functions).
 
 use abcd_ir::{Const, Module, Op, Sym, ValueDef, ValueId};

@@ -1,5 +1,5 @@
 //! `abcd rewrite` — rewrite `.abc` through the full IR pipeline:
-//! decode → lift → [opt] → lower → encode (design/cli-plan.md §2, §4 P2).
+//! `decode → lift → [opt] → lower → encode` (design/cli-plan.md §2, §4 P2).
 //!
 //! A writer command: the emitted bytes are a new `.abc` file. `--check`
 //! re-decodes the emitted bytes (a full structural decode — header, index
@@ -79,7 +79,7 @@ fn shape(file: &File) -> (usize, usize) {
     (methods, instructions)
 }
 
-/// Rewrite one module through decode → lift → [opt] → lower → encode.
+/// Rewrite one module through `decode → lift → [opt] → lower → encode`.
 ///
 /// All-or-nothing: any decode/lift/lower/encode failure is a tool error
 /// and no bytes leave the function (cli-plan.md §4: writer commands get a

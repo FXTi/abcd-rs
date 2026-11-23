@@ -16,7 +16,7 @@
 //! - **Fresh identities**: the callee CFG is cloned with FRESH
 //!   `ValueId`s/`InstId`s/`BlockId`s (arena append — no id reuse, T1).
 //! - **Parameter mapping** (the vendored frame-slot model — see
-//!   [`CallType`]): the callee's `params` are the code-header arg
+//!   [`abcd_ir::FrameSlots`]): the callee's `params` are the code-header arg
 //!   slots. The leading slots are the vendored implicit frame slots
 //!   `[func][new.target][this]` (present per the callee's
 //!   `L_ESCallTypeAnnotation;` callType bits; annotation ABSENT → the
@@ -96,7 +96,7 @@
 //!   the caller's; env-observability is decided by
 //!   `nested_definitions_read_outer_env`, so callees that merely CALL
 //!   other known functions still inline).
-//! - The call-type slot roles are determinable ([`CallType`]): from
+//! - The call-type slot roles are determinable ([`abcd_ir::FrameSlots`]): from
 //!   the callee's `L_ESCallTypeAnnotation;` when present, else the
 //!   vendored `0xF` default for STATIC callees (the corpus shape). A
 //!   NON-STATIC callee without the annotation is refused

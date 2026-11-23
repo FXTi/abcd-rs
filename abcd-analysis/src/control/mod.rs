@@ -26,8 +26,8 @@
 //! `abcd-ir::verify` keeps its own private, minimal iterative dominator
 //! computation (the N45 use-def check) because the layering is one-way:
 //! `abcd-ir` must never depend on `abcd-analysis`. The two implementations
-//! are pinned to agree by the agreement tests (`abcd-analysis/tests/
-//! corpus_dom_agreement.rs` corpus-wide and `dom_agreement_crafted.rs` on
+//! are pinned to agree by the agreement tests (`tests/lift-analysis/`
+//! `corpus_dom_agreement.rs` corpus-wide and `dom_agreement_crafted.rs` on
 //! hand-built shapes), which re-implement the verifier's set-based
 //! algorithm verbatim as the reference. The contract:
 //!

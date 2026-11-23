@@ -105,13 +105,13 @@ use std::process::Command;
 
 use abcd_ir::verify_module;
 use abcd_lower::LowerOptions;
-use abcd_opt::inline::{inline_module, InlinePolicy, InlineReport};
+use abcd_opt::inline::{InlinePolicy, InlineReport, inline_module};
 use abcd_opt::optimize_module;
 use rayon::prelude::*;
 
 // Shared front-end + rewrite pipeline (verbatim extraction; the test262
 // suite runs the same path).
-use super::rewrite_pipeline::{front_end, guarded, rewrite_fixture, Skip, SkipCategory};
+use super::rewrite_pipeline::{Skip, SkipCategory, front_end, guarded, rewrite_fixture};
 
 /// The three rewrite variants, in driver order.
 const VARIANTS: [&str; 3] = ["v2lift", "v2opt", "v2inline"];

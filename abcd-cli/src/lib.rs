@@ -1,11 +1,13 @@
 //! abcd-cli — the `abcd` command-line binary (design/cli-plan.md §3).
 //!
-//! Subcommands: `extract` (container → .abc files), `info` (file summary,
-//! `--verify`, `--json`), `dis` (.abc → pandasm .pa, byte-identical to
-//! ark_disasm), `decompile` (.abc → .js). All bytecode-consuming
-//! commands share the [`input`] layer: bare `.abc` and containers are
-//! sniffed by magic bytes, and multi-module containers require an explicit
-//! `--module` / `--all` choice.
+//! Subcommands: `extract` (container → `.abc` files), `info` (file summary,
+//! `--verify`, `--json`), `dis` (`.abc` → pandasm `.pa`, byte-identical to
+//! `ark_disasm`), `asm` (pandasm `.pa` → `.abc`), `decompile` (`.abc` →
+//! `.js`/`.ts`), `rewrite` (`lift → [opt] → lower`), `analyze` (call-graph
+//! and dominator reports), and `taint` (TOML-configured IFDS taint analysis).
+//! All bytecode-consuming commands share the [`input`] layer: bare `.abc`
+//! and containers are sniffed by magic bytes, and multi-module containers
+//! require an explicit `--module` / `--all` choice.
 //!
 //! Output conventions (§3.4): results on stdout, diagnostics on stderr,
 //! exit codes 0 ok / 1 user error / 2 tool error, no panics on data.

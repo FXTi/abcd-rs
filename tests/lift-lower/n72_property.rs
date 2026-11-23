@@ -102,7 +102,10 @@ const N72_ROWS: [(&str, Expect); 5] = [
     // three stglobalvar stores. Pre-fix rewrite: 0 record / 5 object.
     (
         "24.0.0.0/test262/language/global-code/decl-lex-configurable-global/baseline/input.abc",
-        Expect::GlobalRecordStores { record: 2, object: 3 },
+        Expect::GlobalRecordStores {
+            record: 2,
+            object: 3,
+        },
     ),
 ];
 

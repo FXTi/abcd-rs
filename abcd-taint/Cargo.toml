@@ -1,9 +1,10 @@
 [package]
 name = "abcd-taint"
-description = "Taint analysis on the v0.2 IR: IFDS fact model, summary registry, source/sink driver (design/analysis-strategy.md §5.2–§5.5, design/flowdroid/summaries.md)"
+description = "Interprocedural IFDS taint analysis on the SSA IR: access-path facts, summaries, callback gaps, prototype resolution"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+readme = "README.md"
 
 # Crate-graph invariant (design/analysis-strategy.md §5): taint analysis
 # consumes ONLY `abcd-ir` (the IR) and `abcd-analysis` (the IFDS solver,

@@ -8,8 +8,8 @@
 //!
 //! - [`fact`] — the fact model: [`fact::Fact`] = Λ or a
 //!   [`fact::TaintFact`] access path (`base` + k-capped field chain),
-//!   following soot-infoflow's access-path discipline with weak updates
-//!   via the rung-0 heap model.
+//!   following soot-infoflow's access-path discipline with weak/strong updates
+//!   via the rung 0–2 alias oracle ladder ([`oracle`]).
 //! - [`names`] — callee-name resolution through the global-load def
 //!   chain (`TryGetGlobal`/`LoadProp` → name candidates). This is what
 //!   makes name-keyed summaries and sinks fire on the corpus' ~97%
@@ -33,9 +33,6 @@
 //!   exception edges).
 //! - [`driver`] — source/sink configuration, the analysis run, and the
 //!   taint-path report (line/column from `Inst.loc`, T8).
-//!
-//! - [`driver`] — source/sink configuration, the analysis run, and the
-//!   taint-path report (line/column from `Inst.loc`, T8).
 //! - [`prototype`] — the t-P3 receiver-type approximation: alloc-site
 //!   kinds / constant def chains / global-store provenance → prototype
 //!   families, closing the receiver-typed builtin call gap (`a.pop` ⇒
@@ -43,8 +40,8 @@
 //!
 //! The crate graph is the enforcement of the format-independence
 //! invariant: the library depends on `abcd-ir` + `abcd-analysis` only;
-//! `abcd-file`/`abcd-lift` are dev-dependencies for the corpus smoke
-//! test (see the `Cargo.toml` invariant comment).
+//! corpus and compiled-probe suites live in the root `tests/lift-taint`
+//! target.
 
 #![deny(missing_docs)]
 

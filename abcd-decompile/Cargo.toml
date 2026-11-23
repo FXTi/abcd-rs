@@ -1,9 +1,10 @@
 [package]
 name = "abcd-decompile"
-description = "Bytecode → JS/TS decompiler on the v0.2 IR: Stage A expression recovery (SSA def-use → expression trees); Stages B/C pending (design/decompile.md §4)"
+description = "Bytecode → JS/TS decompiler on the SSA IR: expression recovery, pattern-independent structuring, JS/TS emission"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+readme = "README.md"
 
 # Crate-graph invariant (design/decompile.md §3.1, same layering rule as
 # abcd-opt/abcd-analysis): abcd-decompile is a pure consumer of abcd-ir +

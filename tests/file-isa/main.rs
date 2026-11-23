@@ -16,7 +16,7 @@
 
 use abcd_file::{decode, encode};
 use abcd_isa::{
-    decode as decode_isa, encode as encode_isa, BytecodeFlags, EntityKind, Operand, Version,
+    BytecodeFlags, EntityKind, Operand, Version, decode as decode_isa, encode as encode_isa,
 };
 use rayon::prelude::*;
 use std::process::Command;

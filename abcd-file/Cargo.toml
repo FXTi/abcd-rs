@@ -1,9 +1,10 @@
 [package]
 name = "abcd-file"
-description = "Safe Rust API for ArkCompiler bytecode file format (read, write, inspect)"
+description = "Safe Rust API for ArkCompiler .abc bytecode files (decode, encode, Builder, pandasm dis/asm)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+readme = "README.md"
 keywords = ["arkcompiler", "bytecode", "abc", "panda"]
 categories = ["compilers", "parser-implementations"]
 

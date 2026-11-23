@@ -19,9 +19,9 @@
 //!
 //! Registered in `main.rs` as `mod n74_readonly_globals;`.
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
-use abcd_file::{decode, AccessFlags, Builder, CodeEntity, Type};
-use abcd_isa::{encode as encode_bytecodes, Bytecode, EntityId, Imm, Reg};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
+use abcd_file::{AccessFlags, Builder, CodeEntity, Type, decode};
+use abcd_isa::{Bytecode, EntityId, Imm, Reg, encode as encode_bytecodes};
 use abcd_lift::lift_file;
 
 /// A 12.x file whose global class carries one static method

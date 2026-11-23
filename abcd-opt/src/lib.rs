@@ -12,7 +12,7 @@
 //! ## Format independence (hard, structurally enforced)
 //!
 //! Every pass operates on [`abcd_ir::Module`] alone. This crate's
-//! `Cargo.toml` [dependencies] list **only** `abcd-ir` (the IR) — never
+//! `Cargo.toml` `[dependencies]` list **only** `abcd-ir` (the IR) — never
 //! `abcd-file`, `abcd-isa`, `abcd-file-sys`, `abcd-isa-sys`, `abcd-lift`,
 //! or `abcd-lower` (the format-coupled crates are dev-dependencies only,
 //! for the end-to-end regression tests) — the crate graph is the
@@ -36,7 +36,7 @@
 //! - **N40**: `StrictEq` folds with host `==` on numbers (`0 === -0`
 //!   true, `NaN !== NaN`), never a bit comparison.
 //! - **N41**: `null` is never coerced to `0.0` by a fold.
-//! - **N42**: bitwise/shift folds use ECMA-262 [`to_int32`]/[`to_uint32`]
+//! - **N42**: bitwise/shift folds use ECMA-262 `to_int32`/`to_uint32`
 //!   (wrap mod 2^32, NaN/±Inf → +0), not Rust's saturating casts.
 //! - **N47**: SCCP's edge seeding does not stop at `Return`/`Unreachable`
 //!   terminators — exception edges are still added.

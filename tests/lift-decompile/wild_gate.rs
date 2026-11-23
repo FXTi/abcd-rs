@@ -56,7 +56,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
 use rayon::prelude::*;
 
 /// The core-25 selection (q-P12 pick list; evaluation §2/§3.2). Paths

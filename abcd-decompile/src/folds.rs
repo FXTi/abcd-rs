@@ -94,14 +94,14 @@
 //!     per site; non-matching shapes keep their loud fallbacks.
 //! 11. **Plain-async `for await` driver loops → literal `for await
 //!    (const x of …)`** (d-P17, N70 residual 1):
-//!     [`match_for_await_driver`] extends fold 3's iterator-loop
+//!     `match_for_await_driver` extends fold 3's iterator-loop
 //!     recovery to the post-N70 driver shape — the header's folded
 //!     dispatch await temp, the `next.call(it)` phi call, the
 //!     break-routed `if (done) { TAIL; break } else { body; continue }`
 //!     dispatch whose done arm absorbed the post-loop tail (re-homed
 //!     AFTER the loop), and loop-carried bookkeeping phis collapsed to
 //!     their invariant sources by substitution. The companion sweep
-//!     [`sweep_dead_loop_exit_throws`] (N70 residual 2) removes the
+//!     `sweep_dead_loop_exit_throws` (N70 residual 2) removes the
 //!     dead after-loop `throw <resume temp>` the break-routed dispatch
 //!     left behind, under a whole-node unreachability proof (any doubt
 //!     keeps it).
@@ -187,7 +187,7 @@ pub struct FoldStats {
     /// Dead loop-exit dispatch throws swept (d-P17, N70 residual 2):
     /// the after-loop `throw <resume temp>` the async machine fold's
     /// break-routed dispatch left behind, removed only after a
-    /// whole-node unreachability proof ([`sweep_dead_loop_exit_throws`]).
+    /// whole-node unreachability proof (`sweep_dead_loop_exit_throws`).
     pub dead_exit_throw: usize,
 }
 

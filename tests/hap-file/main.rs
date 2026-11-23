@@ -3,12 +3,12 @@
 //! The corpus is the 156-package wild-OHOS set baked into the digest-pinned
 //! arkcompiler-test image and exported by `export-wild` to
 //! `exports/corpus/wild/wild-haps/` (see the hap-file job in ci.yml). The
-//! manifest (`manifest.json`) is the oracle: each package is labeled either
-//! `decode-ok` (145 packages — every extracted .abc module must decode) or
-//! `negative-invalid-opcode` (11 packages — the container must parse, and at
-//! least one module must fail decode with an "invalid opcode" error). The
-//! gate is self-contained: the expected totals (145 / 11) are hard-asserted,
-//! so a manifest/count drift goes red without any ledger.
+//! manifest (`manifest.json`) is the oracle: each package carries an
+//! expectation (`decode-ok` — all 156 packages / 276 `.abc` modules since
+//! `0.0.0.2` legacy ISA decode landed — or `negative-invalid-opcode` if the
+//! image ever adds negative fixtures). The gate is self-contained: the
+//! expected package total (`156`) and manifest self-consistency are
+//! hard-asserted, so corpus drift goes red without any ledger.
 //!
 //! Gated in CI by the hap-file job; locally:
 //!

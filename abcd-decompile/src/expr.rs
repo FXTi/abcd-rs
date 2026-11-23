@@ -82,7 +82,7 @@ pub enum Expr {
     },
     /// `object.name` (name legalized; emitted as `obj["name"]` by Stage C
     /// when the name is not a legal identifier — [`Expr::PropName`] keeps
-    /// the RAW name and [`Expr::PropNameLegal`] flag for that decision).
+    /// the RAW name and [`Expr::PropName::dot_legal`] flag for that decision).
     PropName {
         /// The receiver.
         object: Box<Expr>,
@@ -449,7 +449,7 @@ pub enum ObjEntry {
     Method(String, Expr),
     /// `get [key]() { … }` / `set [key](v) { … }` — an accessor absorbed
     /// from a `DefineGetterSetterByValue` statement (N74-W4: only the
-    /// concise accessor form carries a [[HomeObject]] — a getter whose
+    /// concise accessor form carries a `[[HomeObject]]` — a getter whose
     /// body references `super` cannot print as `Object.defineProperty`).
     /// The key is a literal name or a computed expression.
     Getter(ObjKey, Expr),

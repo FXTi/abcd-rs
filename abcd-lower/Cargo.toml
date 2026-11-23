@@ -4,6 +4,7 @@ description = "IR → ArkCompiler bytecode lowering (abcd_ir::Module → abcd_fi
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+readme = "README.md"
 
 # Crate-graph invariant (design/ir-v0.2.md §8): layering is lift =
 # decode→IR, opt = IR→IR, lower = IR→file. The lower pipeline is the ONLY

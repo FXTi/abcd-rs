@@ -19,36 +19,25 @@
 //! Every [`Stmt::Fallback`]/[`Stmt::Elided`]/[`Expr::Fallback`] and
 //! every hard-7 plumbing node prints as an annotated comment with the
 //! op name and source location — never silently dropped (gen1 lesson
-//! 6). [`EmitStats::fallback_comments`] counts them per op for the
+//! 6). [`DecompileStats::fallback_comments`] counts them per op for the
 //! corpus gate.
 //!
-//! ## Known limitations (post-d-P4 backlog)
+//! ## Remaining emitter notes
 //!
-//! - Arrow vs `function` is not recoverable from the IR — closures
-//!   print as `function` (design §4.3: cosmetic).
-//! - Lexical bindings print as assignments to declarations hoisted to
-//!   the function top (`let`/`var` placement, not per-scope `const`
-//!   reconstruction) — declaration KIND and precise scope extents are
-//!   future scope-reconstruction work.
-//! - `SuperForwardAllArgs` prints `super(...arguments)`; the
-//!   default-derived-ctor elision is a later fold.
-//! - Template literals print cooked-only with placeholders (IR gap
-//!   G4).
-//! - Multiple catch handlers per region (typed catches — no JS
-//!   surface) merge into the first clause with a note.
-//! - Class member-buffer attribute payloads (static vs instance
-//!   placement, `Enumerable`/`Readable` bits) are skipped — methods
-//!   land as instance members (dream-gate registered:
-//!   private-property-in/private-field).
-//! - The try-projection approximation zone (protected-range vs
-//!   structure mismatch: join placement inside a protected span, the
-//!   `cuts`/`splits` families) diverges on the optimizer try-catch
-//!   corpus families (dream-gate registered).
-//! - Vendor bigint inc/dec polymorphism (`5n--` → `4n`) is not
-//!   expressible with the pure `x - 1` form (no corpus coverage).
+//! - Lexical bindings that `folds::scope_fold` cannot prove single-run
+//!   block-local hoist to function-top `let`/`var` declarations (`const`
+//!   vs `let` requires cross-closure reassignment proofs).
+//! - `SuperForwardAllArgs` prints `super(...arguments)`.
+//! - Template literals emit backtick raw+cooked forms (`d-P10`) when both
+//!   lists resolve, degrading loudly to cooked-only comments when raw
+//!   arrays are absent.
+//! - Multiple catch handlers per region (typed catches — no JS surface)
+//!   merge into the single `catch` clause with explicit bindings (`d-P8`).
+//! - Vendor bigint inc/dec polymorphism (`5n--` → `4n`) has no corpus
+//!   coverage under the pure `x - 1` form.
 //! - `--ts` annotations reflect only what the format carries: signatures
 //!   exist on ≤11-format files (fact #A7); 12+/24 functions keep bare
-//!   parameter lists under the flag (d-P8).
+//!   parameter lists under the flag (`d-P8`).
 
 use std::collections::{BTreeMap, BTreeSet};
 

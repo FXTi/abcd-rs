@@ -135,17 +135,19 @@ pub enum CmpOp {
     InstanceOf,
 }
 
-/// Call kind — the §5.3 binding table:
+/// Call kind — the §5.3 binding table (vendored frame-slot model,
+/// [`crate::frame::FrameSlots`], where `H` is the callee's leading implicit
+/// `[func][new.target][this]` slot count — `H = 3` under the `0xF` default):
 ///
-/// | kind      | this binding                        | new.target    | args         |
-/// |-----------|-------------------------------------|---------------|--------------|
-/// | `Direct`  | `call.this`                         | undefined     | args→params[1..] |
-/// | `Dynamic` | computed at callee entry            | undefined     | args→params[1..] |
-/// | `Apply`   | `call.this` (explicit receiver)     | undefined     | SPREAD of args[0] |
-/// | `Super`   | inherited from enclosing ctor       | inherited     | args→params[1..] |
-/// | `SuperSpread` | inherited from enclosing ctor   | inherited     | SPREAD of args[0] |
-/// | `SuperForwardAllArgs` | inherited               | inherited     | ALL own args (forwarded) |
-/// | `New`     | fresh object from callee.prototype  | callee itself | args→params[1..] |
+/// | kind | `this` slot | `new.target` slot | formals |
+/// |------|-------------|-------------------|---------|
+/// | `Direct` | `call.this` | `undefined` | `args → params[H..]` |
+/// | `Dynamic` | computed at callee entry | `undefined` | `args → params[H..]` |
+/// | `Apply` | `call.this` (explicit receiver) | `undefined` | SPREAD of `args[0]` |
+/// | `Super` | inherited from enclosing ctor | inherited | `args → params[H..]` |
+/// | `SuperSpread` | inherited from enclosing ctor | inherited | SPREAD of `args[0]` |
+/// | `SuperForwardAllArgs` | inherited | inherited | ALL own args (forwarded) |
+/// | `New` | fresh object from `callee.prototype` | callee itself | `args → params[H..]` |
 ///
 /// The result is the callee's return value; a throw inside the callee
 /// flows to the caller's exceptional edges.

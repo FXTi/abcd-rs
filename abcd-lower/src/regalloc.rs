@@ -237,7 +237,7 @@ fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir::Ins
 /// sorted into a neighboring function's range, and register allocation
 /// never colored them (`LowerError::UnallocatedOperand`). es2abc output
 /// never produces the shape — every method carries the implicit
-/// [func][newtarget][this] frame slots as params — so the corpus never
+/// `[func][newtarget][this]` frame slots as params — so the corpus never
 /// tripped it; use-based attribution closes it.
 ///
 /// Residual boundary: an UNUSED const of an anchor-less function has

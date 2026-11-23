@@ -37,7 +37,7 @@
 //! data zero-in-repo), so the suite is corpus-dependent and
 //! `#[ignore]`d.
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
 use abcd_lift::lift_file;
 use std::path::PathBuf;
 

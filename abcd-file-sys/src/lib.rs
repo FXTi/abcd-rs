@@ -1,3 +1,13 @@
+//! Low-level C FFI bindings for the ArkCompiler `.abc` container format (`libpandafile`).
+//!
+//! Built from the pinned upstream `arkcompiler_runtime_core` submodule via
+//! Ruby code generation, an exception-guarded C++ bridge (`bridge/file_bridge.h`),
+//! and two `bindgen` passes (`bindings.rs` for `abc_*` functions and
+//! `enum_bindings.rs` for vendor enum/flag constants).
+//!
+//! Most callers should use the safe `abcd-file` crate rather than calling raw
+//! FFI entry points directly.
+
 #![allow(
     non_upper_case_globals,
     non_camel_case_types,

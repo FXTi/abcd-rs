@@ -30,7 +30,7 @@
 //!   bound past the last instruction, printed as a bare `:` line (upstream
 //!   `AddLabels` `LabelIns("")` quirk).
 //! - 13.x/24.x literal-array indexes are assigned in `std::unordered_set`
-//!   iteration order (libstdc++); [`sim`] reproduces that container's
+//!   iteration order (libstdc++); `sim` reproduces that container's
 //!   insert/rehash/erase semantics bit-exactly.
 //!
 //! The emitter never panics on any [`File`] model: unresolvable entities
@@ -38,7 +38,7 @@
 //! panic on mismatch by design — that is the gate's job, not the emitter's.)
 //!
 //! The inverse direction — whole-file pandasm text back to a [`File`]
-//! model, the `abcd asm` foundation — lives in [`parse`].
+//! model, the `abcd asm` foundation — lives in `parse` ([`parse_file`]).
 
 mod insn_ctor;
 mod parse;

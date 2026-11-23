@@ -21,7 +21,7 @@
 //!
 //! Registered in `main.rs` as `mod n74_top_level_this;`.
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
 use abcd_ir::Op;
 
 use crate::common::decompile_scaffold::*;

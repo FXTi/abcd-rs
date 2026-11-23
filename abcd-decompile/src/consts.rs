@@ -195,7 +195,7 @@ fn push_units_string_body(out: &mut String, units: &[u16]) {
 }
 
 /// Render raw MUTF-8 string bytes as a JS double-quoted string literal
-/// (see [`push_units_string_body`]).
+/// (see `push_units_string_body`).
 pub fn render_mutf8_string(raw: &[u8]) -> String {
     let mut out = String::with_capacity(raw.len() + 2);
     out.push('"');
@@ -208,7 +208,7 @@ pub fn render_mutf8_string(raw: &[u8]) -> String {
 /// [`render_mutf8_string`] but for the `/…/` body — no quotes, `/`
 /// escaped (mirroring the non-raw `pattern.replace('/', "\\/")` path),
 /// line terminators always escaped (they are illegal in a regexp
-/// literal even though [`push_js_char`] would pass `\n` as `\\n`, which
+/// literal even though `push_js_char` would pass `\n` as `\\n`, which
 /// is also fine here), and lone surrogates as `\uXXXX` escapes.
 pub fn render_mutf8_regexp(raw: &[u8]) -> String {
     let mut body = String::new();

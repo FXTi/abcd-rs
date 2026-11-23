@@ -39,7 +39,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use abcd_ir::{verify_module, FuncId};
+use abcd_ir::{FuncId, verify_module};
 use abcd_lift::lift_file;
 use abcd_lower::{lower_function, to_method_body};
 use rayon::prelude::*;

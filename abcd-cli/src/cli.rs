@@ -3,6 +3,11 @@
 //! Kept separate from `main` so argument-parsing unit tests can drive
 //! [`Cli::try_parse_from`] without spawning a process.
 
+// `clap` derive uses `///` doc comments verbatim as terminal `--help` prose,
+// where `[opt]` and `<module-name>` are CLI notation rather than intra-doc
+// links or HTML tags.
+#![allow(rustdoc::broken_intra_doc_links, rustdoc::invalid_html_tags)]
+
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -12,7 +17,7 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "abcd",
     version,
-    about = "ArkCompiler .abc toolkit: extract / info / decompile",
+    about = "ArkCompiler .abc toolkit: extract / info / dis / asm / decompile / rewrite / analyze / taint",
     long_about = "ArkCompiler .abc toolkit.\n\nEvery command that takes bytecode accepts both a bare .abc file and a\ncontainer (.hap/.hsp/.app/.hqf); the input kind is sniffed by magic bytes.\nMulti-module containers require --module <name> or --all."
 )]
 pub struct Cli {

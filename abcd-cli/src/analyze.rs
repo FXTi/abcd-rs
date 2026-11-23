@@ -9,7 +9,7 @@
 //!   histogram; `entry` is the `func_main_0` naming convention every
 //!   es2abc module carries (the IR itself has no entry concept);
 //! - `--callgraph` lists, per function, every call site with its
-//!   [`CallEdge`] classification and resolved targets (unresolved sites
+//!   [`abcd_analysis::callgraph::CallEdge`] classification and resolved targets (unresolved sites
 //!   are explicit `unknown_callees`, never dropped);
 //! - `--dominators` runs [`Dominators::normal`] per function and reports
 //!   the immediate-dominator tree in reverse post-order.

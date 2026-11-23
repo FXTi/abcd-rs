@@ -36,7 +36,7 @@ use crate::common;
 use std::collections::BTreeMap;
 
 use abcd_analysis::dataflow::UseDefChains;
-use abcd_decompile::emit::{consumed_functions, decompile_module, DecompileStats, EmitOptions};
+use abcd_decompile::emit::{DecompileStats, EmitOptions, consumed_functions, decompile_module};
 use abcd_ir::{FuncId, Op};
 use rayon::prelude::*;
 

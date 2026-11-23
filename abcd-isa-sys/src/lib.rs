@@ -9,8 +9,7 @@
 //! - Operand newtypes: [`Reg`], [`Imm`], [`EntityId`], [`Label`]
 //! - Classification flags: [`BytecodeFlags`], [`ExceptionType`]
 //!
-//! Most users should depend on
-//! [`abcd-isa`](https://crates.io/crates/abcd-isa) instead, which wraps
+//! Most users should depend on the safe `abcd-isa` crate instead, which wraps
 //! this crate in a safe `encode`/`decode` API.
 
 #![allow(

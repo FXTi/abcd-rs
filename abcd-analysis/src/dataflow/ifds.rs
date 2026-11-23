@@ -19,7 +19,7 @@
 //!   the path-edge set; an edge that was never propagated is absent
 //!   (heros.md §5 items 2, 3, 5). For the binary lattice the edge
 //!   function is degenerate, so existence is the whole content.
-//! - **The worklist + dedup chokepoint** ([`IfdsSolver::propagate`]):
+//! - **The worklist + dedup chokepoint** (`IfdsSolver::propagate`):
 //!   an edge is (re-)processed iff it is new — idempotency, scheduling,
 //!   and summary storage from one mechanism.
 //! - **Dispatch rule**: a call node gets `process_call` only

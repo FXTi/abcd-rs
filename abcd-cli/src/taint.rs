@@ -4,9 +4,9 @@
 //! Pipeline: `.abc` → [`abcd_file::decode`] → [`abcd_lift::lift_file`] →
 //! [`abcd_taint::run_taint`] with a [`TaintConfig`] parsed from the
 //! `--config` TOML file ([`crate::taint_config`]). The report carries
-//! every [`SinkHit`] — sink name, call site, source location, tainted
+//! every [`abcd_taint::SinkHit`] — sink name, call site, source location, tainted
 //! operand position, the fact, the seed it derived from, and the
-//! propagation path ([`PathStep`] sequence) — plus the driver's
+//! propagation path ([`abcd_taint::PathStep`] sequence) — plus the driver's
 //! counters. Text is the human default; `--json` is the same data,
 //! machine-readable.
 

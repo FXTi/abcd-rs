@@ -6,9 +6,9 @@
 use std::fmt;
 
 use abcd_file::File;
-use abcd_ir::{verify_module, FuncId, Module};
+use abcd_ir::{FuncId, Module, verify_module};
 use abcd_lift::lift_file;
-use abcd_lower::{lower_function_with_options, to_method_body, LowerError};
+use abcd_lower::{LowerError, lower_function_with_options, to_method_body};
 
 /// Fixed SKIP category vocabulary (mirrors the v0.1 driver's; the
 /// histogram keys are gate evidence — keep them stable).

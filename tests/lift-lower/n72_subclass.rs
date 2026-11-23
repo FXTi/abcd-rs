@@ -50,7 +50,7 @@ use std::path::PathBuf;
 
 use abcd_ir::{CallKind, FuncId, Op};
 use abcd_isa::Bytecode;
-use abcd_lower::{lower_function_with_options, LowerOptions};
+use abcd_lower::{LowerOptions, lower_function_with_options};
 
 use super::rewrite_pipeline::{front_end, guarded, rewrite_fixture};
 

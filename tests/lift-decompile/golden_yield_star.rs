@@ -46,7 +46,7 @@
 //! corpus export, so the suite became corpus-dependent and
 //! `#[ignore]`d); every expected string is unchanged.
 
-use abcd_decompile::emit::{decompile_module, EmitOptions};
+use abcd_decompile::emit::{EmitOptions, decompile_module};
 use abcd_lift::lift_file;
 use std::path::PathBuf;
 

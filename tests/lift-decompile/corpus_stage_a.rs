@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 
 use abcd_decompile::dump::dump_module;
 use abcd_decompile::fitness::Fitness;
-use abcd_decompile::recover::{recover_func, OpStat, Outcome};
+use abcd_decompile::recover::{OpStat, Outcome, recover_func};
 use abcd_ir::FuncId;
 use abcd_lift::lift_file;
 use rayon::prelude::*;

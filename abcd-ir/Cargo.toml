@@ -4,6 +4,7 @@ description = "The SSA IR — format-independent program representation (design/
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+readme = "README.md"
 
 # DELIBERATE INVARIANT (design/ir-v0.2.md §1, design/ir.md §8 invariant 1):
 # this crate must NEVER depend on abcd-file, abcd-isa, abcd-file-sys, or
