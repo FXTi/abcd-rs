@@ -275,7 +275,7 @@ let report = abcd_taint::run_taint(&module, &config);
 ```
 
 The driver builds the on-the-fly call graph + the rung-selected alias
-oracle (`TaintConfig::alias_rung`: 2 = the whole-module PTA, default;
+oracle (`TaintConfig::alias_rung`: 2 = the whole-module PTA, default, bounded by `TaintConfig::pta_step_budget`;
 1 = the demand-driven engine; 0 = the heap-v0 baseline — all selectable
 for A/B/C via `ABCD_TAINT_RUNG`). At rung 1 the graph is refined once
 with the engine's `points_to` (`CallGraph::refine_with_points_to` —

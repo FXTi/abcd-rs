@@ -1,10 +1,14 @@
-# abcd-decompile — plan & technical preparation (bytecode → JS/TS source)
+# abcd-decompile — Architecture & Design (`bytecode → JS/TS source`)
 
-Status: plan for maintainer review. Author: worker d-P0. Date: 2026-09-21.
-Roadmap row: agent-roadmap.md "反编译轨道" d-P0 (planning + technical
-preparation). No code exists; this document is the deliverable. The
-`abcd-analysis` home-crate direction in §6 reflects the orchestrator's
-2026-09-21 re-scope, pending final maintainer sign-off.
+> **Status: SHIPPED (`abcd-decompile`, d-P1..d-P17 + N74..N80).** All three
+> stages (Stage A expression recovery, Stage B pattern-independent region
+> structuring & JS desugar folds, Stage C precedence-exact JS/TS emission) are
+> implemented and gated in CI: `1,149 / 1,149` project dream gate,
+> `2,676 / 2,685` `test262` dream gate (`0` `decompile-bug`), and `64 / 64`
+> core-25 wild OHOS `.hap` recompile gate. See
+> [`abcd-decompile/README.md`](../abcd-decompile/README.md) for the crate map
+> and fold inventory; the original d-P0 architectural specification is
+> preserved below.
 
 **TL;DR** — A future crate `abcd-decompile` will consume the **lifted
 (pre-opt, or at most lightly-opted) v0.2 IR** and emit readable JS/TS in

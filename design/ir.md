@@ -1,7 +1,13 @@
-# SSA IR Design (abcd-ir) — v0.1 (as built)
+# SSA IR & Lift / Opt / Lower Algorithms
 
-> The v0.2 redesign proposal is appended below ("IR Design v0.2"); this
-> v0.1 section documents the implementation as it stands.
+> **Current status:** The v0.1 monolithic `abcd-ir` described in the first half
+> of this document was superseded and deleted at `v2-P4` (2026-09-21); its
+> Braun SSA, SCCP, Effects-ADCE, chordal MCS register allocation, and Boissinot
+> out-of-SSA algorithms now live in [`abcd-lift`](../abcd-lift/README.md),
+> [`abcd-opt`](../abcd-opt/README.md), and [`abcd-lower`](../abcd-lower/README.md)
+> over the format-independent v0.2 [`abcd-ir`](ir-v0.2.md) (and all 6 v0.1
+> "Known gaps" in §Known gaps below were closed during the port). Both the
+> original algorithm notes and the v0.2 redesign record are preserved below.
 
 ## Goals and principles
 

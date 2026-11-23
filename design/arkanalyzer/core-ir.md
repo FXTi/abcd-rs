@@ -464,11 +464,12 @@ sites, first-class exceptional edges, arena `ValueId`s; see `design/ir.md`.)
    compiler (`Ast.ts:93-97`) keeps type annotations, union types, accessors,
    and namespaces that bytecode erases; their `Type` hierarchy, however
    heuristic, is closer to the program's written intent than lifted types.
-9. **Better — a real interprocedural dataflow framework.** The IFDS solver
+9. **Better *(at the time of this 2026-09 survey; superseded by `abcd-analysis` + `abcd-taint`)* — a real interprocedural dataflow framework.** The IFDS solver
    with call/return/call-to-return flow functions and summary tables
-   (`DataflowSolver.ts`) is a reusable analysis engine; abcd-ir currently has
-   only intraprocedural passes (usedef/domtree/sccp/adce) and its domtree is
-   unwired.
+   (`DataflowSolver.ts`) was a reusable analysis engine at survey time (since
+   v2-P5a/P5b + t-P6, `abcd-analysis` and `abcd-taint` ship Cooper–Harvey–Kennedy
+   dominators, an IFDS tabulation solver, rungs 0–2 context-sensitive PTA with
+   call-graph co-evolution, and summary/callback-gap propagation).
 10. **Mixed — mutability.** ArkAnalyzer's IR is fully mutable in place
     (use-replacer visitors, `StmtUseReplacer.ts:12-72`, on-the-fly invoke
     re-typing in `TypeInference.ts:178-189`), which makes ad-hoc transformation

@@ -2001,3 +2001,35 @@ Consumer-map reasoning (maintainer Q 2026-09-21, "is the taint split
   OpenHarmony-* ref: OpenHarmony-7.0-Release tip 89a24878 (tracked:
   OpenHarmony-7.0-Release)", "no drift; nothing to do". Awaiting
   maintainer merge of PR #4.
+- `--merge-abc` multi-module P0 fix + documentation estate overhaul
+  (2026-11-24, maintainer-approved Track B + Track A):
+  Track B (`c522e46`, `c4de9ab`): exhaustive empirical scan across
+  `modules.abc` (`12.0.6.0`) and all 156 wild OHOS `.hap`s (276 `.abc`
+  modules) confirmed every `Type::U32` field in real bytecode belongs to
+  upstream `abc_field_processor.cpp:75-100`'s 5-arm table (`typeSummaryOffset`,
+  `moduleRequestPhaseIdx`, `_ESModuleRecord`/`moduleRecordIdx`,
+  `_ESScopeNamesRecord`/`scopeNames`, `jsonFileContent`). Pre-fix,
+  `moduleRecordIdx` (12,736 fields), `scopeNames` (4,285 fields), and
+  `jsonFileContent` (8 fields) fell through to `FieldValue::I32`, dangling on
+  `encode`, polluting `<=12.x` `literal_arrays` with untagged module blobs,
+  missing `13.x+` `scopeNames` literal arrays, and orphaning/mis-indexing
+  `moduleRequestPhaseIdx` in `abcd-lift`. Fixed across `abcd-file-sys`
+  (`abc_vendor_scope_names_field_name` V-I1 pin +
+  `abc_builder_field_set_value_string`), `abcd-file` (`decode`, `encode`,
+  `pandasm` dis/asm + sibling `moduleRecordIdx` phase pairing,
+  `FieldValue::JsonFileContent`), `abcd-ir` (`ClassData::{new, es_module,
+  scope_names}` + `EsModule` + verifier `ConstOutOfRange` check), and
+  `abcd-lift` (per-class `EsModule` + `ModuleRequestPhase` pairing +
+  `finish_debug` `ClassData.scope_names` attachment).
+  Track A: fixed `design/vendor-audit.md` `#B5` (`strlen` P0 N81 retraction),
+  fixed non-compiling `abcd-isa`/`abcd-file` README examples, expanded root
+  `README.md` to all 13 crates + fixed Windows sparse-checkout snippet, added
+  5 missing crate `README.md`s (`abcd-cli`, `abcd-hap`, `abcd-lift`,
+  `abcd-opt`, `abcd-lower`), refreshed crate rustdoc headers / `CallKind`
+  frame-slot table / `Cargo.toml` metadata (dropped 4 unused workspace deps,
+  aligned root `edition = "2024"`), swept all workspace broken/private
+  rustdoc intra-doc links (`RUSTDOCFLAGS="-D warnings" cargo doc --workspace
+  --no-deps` green), retired dead `scripts/gen-corpus.sh`, and
+  rewrote evergreen `design/` docs (`README.md`, `overview.md`, `roadmap.md`,
+  `ci.md`, `file-format.md`, `isa.md`, `isa-compat.md`, `ir-v0.2.md`, `ir.md`,
+  `decompile.md`, `analysis-strategy.md`, `abcd-hap-research.md`).

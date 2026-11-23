@@ -1,65 +1,46 @@
-# ABC Container Layer Design (abcd-file-sys / abcd-file)
+# ABC Container Layer Design (`abcd-file-sys` / `abcd-file`)
 
 ## File layout
 
-The first 8 bytes are the magic `PANDA\0\0\0`, followed by a little-endian field sequence. Using the development baseline `modules.abc` as an example:
+The first 8 bytes are the magic `PANDA\0\0\0`, followed by a little-endian header (`File::Header`, 60 bytes). Using `modules.abc` (`12.0.6.0`) as a concrete example:
 
-| Offset | Field | Sample value |
-|--------|-------|--------------|
-| 0x00 | magic | `PANDA\0\0\0` |
-| 0x08 | checksum (adler32, computed from the version field onward) | `0xC30BD6FF` |
-| 0x0C | version | `12.0.6.0` |
-| 0x10 | file_size | 21.6MB |
-| 0x14/0x18 | foreign_off / foreign_size | 0 / 0 |
-| 0x1C | num_classes | 2035 |
-| 0x20 | class_idx_off | 60 |
-| 0x24 | num_lnps | 15738 |
-| 0x28 | lnp_idx_off | … |
-| 0x2C | num_literalarrays | 29147 |
-| 0x30 | literalarray_idx_off | … |
-| 0x34 | num_indexes | 2 |
-| 0x38 | index_section_off | … |
+| Offset | Field | Example (`modules.abc`) |
+|--------|-------|-------------------------|
+| `0x00` | `magic` | `PANDA\0\0\0` |
+| `0x08` | `checksum` (Adler-32 over `[0x0C..file_size]`) | `0xC30BD6FF` |
+| `0x0C` | `version` | `12.0.6.0` |
+| `0x10` | `file_size` | 21.6 MB |
+| `0x14` / `0x18` | `foreign_off` / `foreign_size` | `0` / `0` |
+| `0x1C` / `0x20` | `num_classes` / `class_idx_off` | `2035` / `60` |
+| `0x24` / `0x28` | `num_lnps` / `lnp_idx_off` | `15738` / … |
+| `0x2C` / `0x30` | `num_literalarrays` / `literalarray_idx_off` | `29147` / … |
+| `0x34` / `0x38` | `num_indexes` / `index_section_off` | `2` / … |
 
-Version conditioning: `12.0.6.0` is `LAST_CONTAINS_LITERAL_IN_HEADER_VERSION` — before that version the header carries the literal-array index, after it the index moves elsewhere. Both sides branch on the version (vendored `ContainsLiteralArrayInHeader`).
+Version conditioning: `12.0.6.0` is `LAST_CONTAINS_LITERAL_IN_HEADER_VERSION`. On `<= 12.0.6.0` the header carries the literal-array table (including untagged module/phase blobs, which `abcd-file` filters out of `File::literal_arrays` while recording raw slots in `File::literal_array_header_offsets` for `pandasm` byte-identity). On `13.x+` / `24.x` (`num_literalarrays == u32::MAX`), literal arrays are discovered from method index regions, `scopeNames` fields, and transitive nested `LiteralValue::LiteralArray` references.
 
-## Entity model
+## Entity & `u32` metadata field model
 
-- All entities are located by 32-bit offsets; references inside methods use 16-bit indices resolved through `IndexHeader` (class/method/field/proto index tables) to offsets.
-- Classes/methods/fields/code are "ULEB128 prefix fields + tag sequences"; four annotation categories (compile-time / runtime / type / runtime-type), debug info (line-number program + constant pool), and module data (import/export records encoded as a literal array) are all covered.
+- Entities live at 32-bit file offsets; bytecode instructions inside a method reference 16-bit region indices resolved via `IndexHeader` into `MethodBody::entity_offsets`.
+- Every `Type::U32` field initial value emitted by `es2abc` (both standalone single-module records and `--merge-abc` per-record classes) is modeled structurally in `FieldValue`:
+  1. `typeSummaryOffset` → `FieldValue::TypeSummaryOffset(u32)` (legacy 4.x–5.x nested offset; decoded opaquely, rejected on `encode`).
+  2. `moduleRequestPhaseIdx` → `FieldValue::ModuleRequestPhase(ModuleRequestPhase)` (untagged lazy-import `u8` flags; re-emitted and relocated on `encode`).
+  3. `L_ESModuleRecord;` or `moduleRecordIdx` → `FieldValue::ModuleData(ModuleData)` (untagged `ModuleDataAccessor` blob; excluded from tagged literal-array decoding and relocated on `encode`).
+  4. `L_ESScopeNamesRecord;` or `scopeNames` → `FieldValue::LiteralArrayRef(u32)` (tagged literal array collected on `13.x+` and relocated on `encode`).
+  5. `jsonFileContent` → `FieldValue::JsonFileContent { source_offset, content: StringId }` (`StringItem` offset for `--merge-abc` JSON modules; re-emitted via `ScalarValueItem(StringItem*)` on `encode`).
+- **MUTF-8 lone surrogates (`File::string_raw_bytes`)**: strings that have no lossless UTF-8 `String` representation record their exact MUTF-8 bytes keyed by disambiguated pool identity so `encode` and `pandasm` round-trip them losslessly instead of emitting `U+FFFD`.
 
-## FFI design (file_bridge.h / file_bridge.cpp)
+## Pandasm disassembler & assembler (`abcd-file/src/pandasm/`)
 
-- Pure C interface (opaque handles); each accessor follows an `open → use → close` lifecycle.
-- Enumeration is callback-based (`int (*cb)(..., void *ctx)`, non-zero stops early).
-- Errors use sentinels: `UINT32_MAX` = absent, `0` = size_t failure.
-- Compile-time guardrails: `static_assert`s pin vendor assumptions (MAGIC_SIZE=8, LiteralTag/AnnotationValueType char encodings, `Type::TypeId::U32 == 0x08`) so vendor changes explode at compile time instead of runtime.
-- Two bindgen passes: `bindings.rs` (bridge API) + `enum_bindings.rs` (vendor enums). The ACC_* access flags are extracted by build.rs **by name from the vendored `modifiers.h`** with values referencing vendor constexprs — names are listed, values always come from vendor code, eliminating hand-written mirror drift.
+`pandasm::emit_file` reproduces upstream `ark_disasm` output byte-for-byte across all 5,517 corpus fixtures (matching `libstdc++` `unordered_set` bucket order on `13.x`/`24.x` literal collection and header-slot order on `<= 12.0.6.0`). `pandasm::parse_file_with_version` parses `.pa` text back into `File` for assembly via `encode`.
 
-## Builder
+## FFI bridge & submodule strategy (`abcd-file-sys`)
 
-`AbcBuilder` (`ItemContainer` + `MemoryWriter`) follows "add items → finalize → free":
-
-- Handle tables per item kind (class/foreign_class/string/literal_array/method/field/code/debug/lnp/annotation/proto/…); tagged class handles use the high bit `0x80000000` for foreign classes.
-- Literal arrays stage flat `(tag, value)` pairs, flushed into `LiteralArrayItem` at finalize.
-- `ItemContainer::ComputeLayout()` decides the layout: header → class index → index section → foreign → body → line-number-program index; the checksum is back-filled after writing.
-
-## Vendor and shim strategy
-
-Vendor (73 files, zero diff against upstream) + 10 shims replacing heavy dependencies:
-
-- `zlib.h`: inline adler32 (NMAX=5552 batch modulus), no system zlib link;
-- `os/mem.h`: non-owning `MapPtr` (the caller owns the memory);
-- `pgo.h`: no-op `ProfileOptimizer` (file_item_container only needs the type);
-- `platform_compat.h`: constexpr clz/ctz/popcount etc. bit builtins for MSVC;
-- `vendor_fixups.h`: force-injected (`-include`) transitive headers that the upstream build system provides — **vendor files themselves are never modified**;
-- `libpandabase/utils/timers.h`: **vendored zero-diff** (EVENT constants + inline `ScopeTimer`); upstream `timers.cpp` depends on `nlohmann/json` and `os::file::File` write support, which we do not bring in — the bridge provides definitions for the two static members instead (no-op function pointers, equivalent to upstream's `TimerStartDoNothing` defaults).
-
-Build pipeline: Ruby (gen.rb, needs Ruby ≥ 2.5) generates `type.h` / `source_lang_enum.h` / `file_format_version.h` → cc compiles the 13 vendored libpandafile `.cpp` files + `utf.cpp` + the bridge → bindgen.
+- Upstream `arkcompiler_runtime_core` is a pinned read-only git submodule (`OpenHarmony-v7.0-Release`) paired with 10 minimal shims in `bridge/shim/` (`vendor_fixups.h`, `zlib.h` inline Adler-32, non-aborting `logger.h`, `platform_compat.h`, …).
+- `build.rs` runs 7 Ruby template invocations (`source_lang_enum.h`, `type.h`, `file_format_version.h`, plus 4 assembler/ISA headers) and 2 `bindgen` passes (`bindings.rs` + `enum_bindings.rs`).
+- Every string read in `file_bridge.cpp` is strictly bounded by the file span and tag-declared UTF-16 unit count (`bounded_cstr_len` + `convert_string_utf16_bounded`, closing N81), and annotation array counts are clamped to remaining payload bytes (closing N83).
 
 ## Known limitations
 
-1. **Annotation categories were consolidated upstream at API 24**: the upstream writer only emits the `ANNOTATION` category (the tag enum and the reader keep all four categories for legacy files). The bridge maps its four annotation APIs onto the single vector — encode folds runtime/type annotations into the compile-time bucket, matching upstream es2panda behavior. This is the documented round-trip contract, pinned by `abcd-file/tests/annotation_categories.rs`: all four buckets decode into `compile_time`, the legacy buckets stay empty, and the collapsed bucket survives an encode round-trip.
-2. The string pool cannot be enumerated directly (collected indirectly by walking entities).
-3. The builder cannot set the file type (dynamic/static); the vendor code is missing it, defaults to dynamic.
-4. Byte-level round-trip is impossible (the builder decides its own layout); semantic equivalence is the goal.
-5. `ParamInfo::signature` is not preserved during encode (C++ writer limitation).
+1. **API-24 annotation category consolidation**: upstream's `ItemContainer` writer emits only `ANNOTATION`; `encode` folds all four decoded retention buckets into `compile_time` (pinned by `abcd-file/tests/annotation_categories.rs`).
+2. `FileType` on newly built files defaults to `Dynamic` (upstream `ItemContainer` exposes no static-mode toggle).
+3. `ParamInfo::signature` is not preserved during `encode` (upstream `DebugInfoItem` writer limitation).

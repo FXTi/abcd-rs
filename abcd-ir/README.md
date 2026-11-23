@@ -18,9 +18,10 @@ enforcement mechanism.
 | [`id`](src/id.rs) | Arena ids (`FuncId`, `ClassId`, `InstId`, `ValueId`, `BlockId`, …) — stable across pass pipelines |
 | [`symbol`](src/symbol.rs) | `SymbolTable` / `Sym` — content-keyed strings; every name is a `Sym` |
 | [`consts`](src/consts.rs) | `ConstPool` / `Const` — typed constant trees (literal arrays, method refs) |
-| [`module`](src/module.rs) | `Module` — the top-level program: functions, classes, imports/exports, annotations, debug data |
-| [`function`](src/function.rs) | `FunctionData` — CFG blocks, instructions, SSA values, try regions |
-| [`op`](src/op.rs) | The op taxonomy — every instruction is one `Op` with explicit operands |
+| [`frame`](src/frame.rs) | `FrameSlots` / `this_param_index` — vendored `[func][new.target][this]` implicit parameter-slot decoding (`L_ESCallTypeAnnotation;`) |
+| [`module`](src/module.rs) | `Module` — top-level program: functions, classes (including `--merge-abc` per-record `EsModule` & `scope_names`), imports/exports, annotations |
+| [`function`](src/function.rs) | `FunctionData` — CFG blocks, instructions, SSA values, try regions, debug data |
+| [`op`](src/op.rs) | The 88-variant op taxonomy — every instruction is one `Op` with explicit operands |
 | [`effects`](src/effects.rs) | `Effects` — the single, mechanically derived source of effect truth (`Op::effects`) |
 | [`ty`](src/ty.rs) | The type lattice (`Ty`, `StaticTy`) |
 | [`verify`](src/verify.rs) | The verifier — `verify_module` collects every fallible finding into a `VerifyReport` (no panics on data) |
@@ -32,6 +33,9 @@ enforcement mechanism.
   simplify, copyprop; inline opt-in)
 - **Lower** (`abcd-lower`): IR → bytecode (`abcd_ir::Module` →
   `abcd_file::MethodBody`)
+- **Analyze / Taint / Decompile** (`abcd-analysis`, `abcd-taint`,
+  `abcd-decompile`): pure IR consumers (dominators, regions, IFDS +
+  context-sensitive PTA, taint tracking, and JS/TS source recovery)
 
 ## Design
 

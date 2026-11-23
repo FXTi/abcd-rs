@@ -18,21 +18,13 @@ the one structural fact a reader cares most about.
 | **B — control-flow structuring** | **DONE** (d-P3) | region-tree consumption, desugar fold rules (`src/structure.rs`, `src/folds.rs`) |
 | **C — emission** | **DONE** (d-P4) | precedence-correct printing, modules/classes/functions, cross-arm tail-duplication fold, the recompile-and-run dream gate |
 
-## The d-P4 dream gate (decompile → es2abc recompile → ark_js_vm)
+## Verification gates (decompile → es2abc recompile → ark_js_vm)
 
-`tests/dream_gate.rs` (ignored; corpus + local docker) decompiles every
-runtime-passed corpus fixture (1149) to `target/dream-gate/src/…`
-(with `EmitOptions::call_entry` so the program actually executes) plus a
-manifest with module flags and hard-7 fallback markers;
-`scripts/dream-gate.py` recompiles each with the GHCR image's es2abc
-**version-pinned to the fixture's own version directory** (the image
-carries exactly the corpus's six versions — no substitution rule was
-needed), module mode when the IR carries imports/exports/module
-requests, then runs the UNCHANGED `scripts/compare-rewritten-corpus.py`
-behavior oracle and triages every non-pass fixture into exactly one
-bucket: `decompile-bug` / `es2abc-cant` / `expected-fallback` /
-`fixture-unsupported`. `dream_gate_oracle` asserts the acceptance floor
-(pass ≥ 1149 — the full oracle set since d-P11).
+Three corpus gates under `tests/lift-decompile/` pin decompiler correctness:
+
+- **`dream_gate.rs`** (`1149 / 1149` pass, 0 divergences since d-P11): decompiles every runtime-passed project corpus fixture with `EmitOptions::call_entry`, recompiles with version-pinned `es2abc` (module mode when `Module` carries imports/exports/module_requests), and runs `scripts/compare-rewritten-corpus.py` against `ark_js_vm`.
+- **`dream_gate_t262.rs`** (`2676 / 2685` pass, 0 `decompile-bug`, 9 documented generator-machinery expected fallbacks in `scripts/test262-dream-divergences.json`): runs the same decompile → `es2abc` → `ark_js_vm` oracle across all 2,685 recorded `test262` fixtures.
+- **`wild_gate.rs`** (`64 / 64` modules across the core-25 wild OHOS `.hap` set): verifies zero panics, clean `verify_module`, `es2abc` recompilation acceptance, and exact per-package fallback counts against `scripts/wild-dream-divergences.json` (<1% global fallback tripwire).
 
 **Acceptance histogram (2026-09-23)**: **951 pass** / 108 decompile-bug
 / 0 es2abc-cant / 54 expected-fallback / 36 fixture-unsupported (of
@@ -263,11 +255,6 @@ switch-test polarity, accessor descriptors without clobbering,
 double inversion; pinned by `lift_unit::delobjprop_operand_roles` and
 `abcd-lower/tests/lower_delobjprop_roles.rs`).
 
-Stage A is deliberately **block-local**: the conservative v1 inline rule
-requires def and use in the same block (cross-block dominance-based
-inlining and region-tree consumption are d-P3). It does NOT couple to
-`abcd-analysis::control::regions` yet.
-
 ## The d-P10 template gate (G4 closed at the decompile side)
 
 **d-P10 histogram (2026-09-25, floor now 1131)**: **1131 pass** / **0
@@ -379,14 +366,10 @@ that per site — the resumption value binds at the await site
 (`const t = await v`) when used — all-or-nothing per function, gated
 on the `AsyncFunctionEnter` entry protocol (the funcObj temp's uses
 must all be machinery), with the funcObj fallback temp swept once only
-dead catch-region phi assigns reference it. The `AsyncGenerator` kind
-carries no `AsyncFunctionEnter` (its entry is the generator
-`CreateGeneratorObj` protocol and its yields the
-`AsyncGeneratorResolve` machine — a separate lowering) and stays a
-documented fallback (golden a07). The async fixtures are
-`not-applicable` in the dream-gate oracle set, so behavior evidence is
-node-driven (`tests/async_node.rs`: Builder-built lift pins +
-IR-built loop/resolve/reject cases with exact stdout).
+dead catch-region phi assigns reference it. `AsyncGenerator` (`async function*`)
+and `yield*` delegation were subsequently closed in d-P14 (`folds::async_generator_machine_fold`
+over `Op::AsyncGeneratorResolve` + `CreateGeneratorObj`) and d-P15 (`folds::yield_star_fold`),
+behavior-pinned via Node execution in `tests/lift-decompile/{async_node,async_gen_node,yield_star_node}.rs`.
 Goldens: `tests/golden_generator.rs` g01–g06 (inline immediates,
 shared mode consts, bound yield result, yield-in-loop, entry-gate
 bail, async folds) and `tests/golden_async.rs` a01–a07 (plain await,
@@ -412,54 +395,17 @@ fixture is the corpus export's
 behavior-pinned by `tests/lift-decompile/yield_star_node.rs` including
 the rejection probe).
 
-## Crate map (Stage A)
+## Crate map
 
-- `src/expr.rs` — the internal expression tree (NOT final JS text):
-  literals from `Const` (f64 bit-exact, shortest round-trip), legalized
-  identifiers, named/index/dynamic property access, calls per `CallKind`
-  (Apply → `.apply(this, arr)` shape, New → `new`, Super forms),
-  unary/binary/compare with precedence metadata for the Stage-C printer,
-  closures/classes as **deferred references** to `FuncId`/member
-  `ConstId`, `yield`/`await` nodes, object/array literal builders,
-  template objects (raw+cooked resolved, G4 closed by d-P10), iteration/generator/async
-  plumbing nodes, and the loud `Fallback` node.
-- `src/recover.rs` — the §4.1 algorithm: per-block def-use walk on the
-  `abcd-analysis` `UseDefChains` commodity. Inline iff single use
-  (operand-slot counted) ∧ same block ∧ not phi ∧ no observable effects
-  (`Effects.may_call`/`may_throw`/`writes`) on the def or any intervening
-  instruction (O(1) prefix-sum barrier queries). Temporaries otherwise
-  (`const` per the SSA single-assignment proof; `let` for phi
-  temporaries). Phi → temporary + per-predecessor `PhiAssign` records
-  (out-of-SSA at AST level). `ExceptionParam` → `catch (e)` binding.
-  `builder_hook` exposes the `AllocObject`/`AllocArray` own-store
-  sequence for d-P3's literal fold (the fold itself is NOT Stage A).
-- `src/fitness.rs` — the §5 fitness audit as executable data: per-op
-  class (T/N/H), op names, the documented elision reasons for the
-  `Throw*` guard family (+ `AsyncFunctionEnter`), and the hard-7
-  fallback notes.
-- `src/legalize.rs` — the identifier legalizer: valid JS identifier
-  shapes, the reserved-word set, per-scope collision disambiguation
-  (`x`, `x$1`, …). The d-P4 recompile gate depends on it.
-- `src/names.rs` — name resolution: the lexical-env chain propagated
-  over the (augmented) CFG resolving `GetLexVar`/`PutLexVar`/private
-  ops to `NewLexEnvWithName`/`CreatePrivateNames` names;
-  `DebugData.local_names` scope extents; `Sym` hints from defining ops;
-  module-var slot↔name resolution from file evidence (d-P9, gap G2);
-  cosmetic fallbacks `v{n}` / `v{level}_{slot}` / `m{index}` / `ns{index}`
-  (IR gap G1, registered by d-P0; `m{index}` only where G2 evidence is
-  absent or contradictory).
-- `src/consts.rs` — `Const` → literal conversion and rendering: f64
-  shortest round-trip (`-0.0`, `NaN`, `Infinity`, exponents), JS string
-  escaping, RegExp flag bits → `dgimsuy`.
-- `src/dump.rs` — the stable, fully-parenthesized text dump (golden
-  tests + corpus determinism gate).
-- `tests/golden_expr.rs` — 19 golden expression-tree dumps, one per
-  taxonomy family (trivial + needs-work + guard elision + phi/handler-phi
-  + the hard-7 fallbacks).
-- `tests/corpus_stage_a.rs` — the ignored-gated corpus gate (moved to
-  the root package's `tests/lift-decompile/` at c-P1; 2,832 non-test262
-  fixtures since the c-P3 corpus switch): per-op coverage histogram,
-  hard-7 report, byte-identical determinism, zero panics.
+- `src/expr.rs` — internal expression AST: literals from `Const` (f64 bit-exact, shortest round-trip), legalized identifiers, named/index/dynamic property access, calls per `CallKind`, unary/binary/compare with precedence metadata, deferred `FuncId`/class references, `yield`/`yield*`/`await` nodes, object/array literal builders, raw+cooked template literals, and explicit `Fallback` nodes.
+- `src/recover.rs` — Stage A expression recovery: per-block def-use walk over `abcd_analysis::dataflow::UseDefChains` with `Op::effects()` barrier checks, `PhiAssign` records, `ExceptionParam` catch bindings, and `AllocObject`/`AllocArray` builder hooks.
+- `src/structure.rs` — Stage B pattern-independent control-flow structuring over `abcd_analysis::control::regions`, `TryRegion` projection, cut-try join hoisting (`emit_cut_try`, `try_loop_cut_do_while`), and continuation de-absorption (`emit_deabsorb_tower`).
+- `src/folds.rs` — JS desugaring folds: object/array literal reconstruction, `for..of`, `for..in`, `for await..of`, `finally` deduplication, `scope_fold` lexical `let` recovery, generator / async / async-generator state-machine folds, `yield*` delegation, and `late_decl_fold`.
+- `src/classfold.rs` — ES/TS class reconstruction (`DefineClass` constructor + member literal buffer + instance field initializers + private fields/methods).
+- `src/emit.rs` — Stage C precedence-exact JS/TS emitter (`decompile_module`, `EmitOptions`, `DecompileStats`).
+- `src/names.rs`, `src/legalize.rs`, `src/consts.rs`, `src/fitness.rs`, `src/dump.rs` — seeded lexical-env/private-name propagation (`NameScopes`), G2 module-slot resolution (`module_slot_names`), identifier legalization, MUTF-8/lone-surrogate string & RegExp rendering, op fitness metadata, and deterministic Stage-A dumps.
+- `abcd-decompile/tests/golden_*.rs` — in-crate unit goldens for expressions, control-flow structuring, classes, modules, templates, generators, and async functions.
+- `tests/lift-decompile/` — cross-crate corpus & runtime gates (`corpus_stage_a`, `corpus_decompile`, `dream_gate`, `dream_gate_t262`, `wild_gate`, `async_node`, `async_gen_node`, `yield_star_node`).
 
 ## The fallback-honesty rule
 

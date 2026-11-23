@@ -1,10 +1,11 @@
 # Test plan — isa & file foundation (tests first)
 
-Status (2026-09-17): local GHCR corpus tests are enabled as opt-in tests;
-full IR/VM equivalence remains outstanding. The older generator plan below
-is historical. Complements
-design/vendor-audit.md (§3 findings, §4 compatibility matrix) and
-design/ir.md (v0.2 boundary).
+> **Historical snapshot (2026-09-17).** All corpus and VM equivalence gates
+> planned here are now live in `.github/workflows/ci.yml` (`5,517` fixtures in
+> `export` + `156` wild OHOS packages in `export-wild`; `scripts/gen-corpus.sh`
+> was retired after `scripts/corpus-src/` migrated into the digest-pinned
+> `ghcr.io/fxti/arkcompiler-test` image). See [`design/ci.md`](ci.md) for the
+> current 19-job CI gate architecture.
 
 ## Principles
 

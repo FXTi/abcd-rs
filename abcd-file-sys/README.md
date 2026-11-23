@@ -19,7 +19,7 @@ abcd-file-sys/
 │                                      # + Rust safe-type wrappers (FileType, AnnotationValueType, …)
 │                                      # + in-crate integration tests
 ├── bridge/
-│   ├── file_bridge.h                  # C wrapper header (extern "C", ~240 functions)
+│   ├── file_bridge.h                  # C wrapper header (extern "C", ~184 functions)
 │   ├── file_bridge.cpp                # C wrapper implementation
 │   └── shim/                          # Minimal shims (10 files, replacing heavy deps)
 │       ├── vendor_fixups.h            # Force-included: missing transitive includes
@@ -40,6 +40,7 @@ abcd-file-sys/
     │   ├── templates/                 # ERB templates
     │   └── *.rb / *.yaml              # Ruby codegen modules + type data
     ├── templates/plugin_options.rb    # Common codegen options module
+    ├── platforms/                     # Target platform headers
     └── libpandabase/                  # include/libpandabase/** + utils/utf.cpp
 ```
 
@@ -51,7 +52,7 @@ is a **git submodule at the crate root** (`abcd-file-sys/arkcompiler_runtime_cor
 pinned to a proven upstream commit. **Never edit inside the submodule** —
 local adaptation lives in `bridge/shim/` only. After cloning, run
 `git submodule update --init`. See `../design/vendor-sync.md` for the pin
-policy and the (planned) upstream tag radar.
+policy and the automated upstream tag radar (`.github/workflows/vendor-sync.yml`).
 
 Missing transitive includes that the upstream build provides are injected via
 `vendor_fixups.h` (force-included with `-include` / `/FI`), avoiding any
@@ -77,11 +78,15 @@ machinery the bridge never used).
 isa.yaml / types.yaml (data sources)
     │
     ▼
-gen.rb + per-template requires (Ruby pipeline, 3 invocations)
+gen.rb + per-template requires (Ruby pipeline, 7 invocations)
     │
-    ├──► source_lang_enum.h   (SourceLang enum: ECMASCRIPT, ARKTS, ...)
-    ├──► type.h               (Type class: TypeId enum + property queries)
-    └──► file_format_version.h (version constants + API version mapping)
+    ├──► source_lang_enum.h              (SourceLang enum: ECMASCRIPT, ARKTS, ...)
+    ├──► type.h                          (Type class: TypeId enum + property queries)
+    ├──► file_format_version.h           (version constants + API version mapping)
+    ├──► bytecode_instruction_enum_gen.h (ISA opcode/format/flag enums for assembler headers)
+    ├──► bytecode_instruction-inl_gen.h  (inline ISA helpers)
+    ├──► isa_constants_gen.h             (assembler ISA constants)
+    └──► ark_version.h                   (assembler version header)
             │
             ▼
 build.rs Phase 1b: file_bridge_enums.h — ACC_* names parsed from
@@ -127,23 +132,23 @@ Ruby's `def` is last-writer-wins — each `.rb` file redefines `Gen.on_require(d
 
 ## C Bridge API Design
 
-`bridge/file_bridge.h` + `bridge/file_bridge.cpp` (~240 exported functions)
+`bridge/file_bridge.h` + `bridge/file_bridge.cpp` (~184 exported functions)
 
 Design principles:
 
 1. Pure C interface (`extern "C"`) — `file_bridge.h` only includes `<stddef.h>` + `<stdint.h>`; all types are opaque.
 2. Open/close lifecycle for each accessor type — caller owns the handle.
-3. **Every entry point is exception-guarded**: each `extern "C"` function body is wrapped in `try { … } catch (…)`, converting C++ exceptions (bad_alloc, vendored aborts reachable through allocation paths) to sentinel returns (audit findings #11/#12; ~270 guarded sites).
+3. **Every entry point is exception-guarded**: each `extern "C"` function body is wrapped in `try { … } catch (…)`, converting C++ exceptions (bad_alloc, vendored aborts reachable through allocation paths) to sentinel returns (audit findings #11/#12).
 4. Callback-based enumeration — see the early-stop contract below.
 5. Sentinel conventions:
    - `UINT32_MAX` — not found / absent (offsets, indices).
    - `SIZE_MAX` — failure of UTF-16 string queries; **zero is a valid empty string**. Query with `buf=nullptr` to size the buffer.
-   - Boolean-style queries return 1/0 (`abc_is_version_less_or_equal`, `abc_contains_literal_array_in_header`, `abc_method_is_external`, …).
+   - Boolean-style queries return 1/0 (`abc_file_validate_checksum`, `abc_file_is_external`, `abc_builder_set_file_version`, …).
    - Builder handles are `uint32_t` indices; the high bit `0x80000000` tags foreign (external) class/method/field handles.
 
 ### Callback early-stop contract
 
-`int`-returning enumeration callbacks imply early stop, but it is honored ONLY where the function's doc says so — currently the debug-info family (`abc_debug_get_line_table` / `_get_column_table` / `_get_local_vars` / `_get_parameter_info` / `_get_method_list`) and `abc_param_annotations_enumerate`. Everywhere else (all `*_enumerate_*annotations` sites, `abc_class_enumerate_interfaces`, `abc_method_enumerate_types_in_proto`, `abc_code_enumerate_try_blocks_full`) the callback's return is discarded: the vendored plain `Enumerate*` accessors deliver all items and cannot stop early (upstream models early stop as separate `*WithEarlyStop` functions, which this bridge does not wrap). The Rust wrappers always collect-all. The authoritative statement lives in `file_bridge.h` at the callback typedefs (audit finding #15).
+`int`-returning enumeration callbacks imply early stop, but it is honored ONLY where the function's doc says so — currently the debug-info family (`abc_debug_get_line_table` / `_get_column_table` / `_get_local_vars` / `_get_parameter_info`) and `abc_param_annotations_enumerate`. Everywhere else (all 12 `abc_{class,method,field}_enumerate_{,runtime_,type_,runtime_type_}annotations` sites and `abc_code_enumerate_try_blocks_full`) the callback's return is discarded: the vendored plain `Enumerate*` accessors deliver all items and cannot stop early (upstream models early stop as separate `*WithEarlyStop` functions, which this bridge does not wrap). The Rust wrappers always collect-all. The authoritative statement lives in `file_bridge.h` at the callback typedefs (audit finding #15).
 
 ### File Handle
 
@@ -197,18 +202,7 @@ const uint8_t  *abc_builder_finalize_with_code_ids(AbcBuilder *b, uint32_t *out_
 
 The builder wraps `ItemContainer` + a memory-backed writer. `finalize` computes the layout, applies deferred code-id relocations through the caller-supplied ISA updater (so file-sys never duplicates ISA encoding rules), writes the file, and backfills the adler32 checksum over `[version..end]` (the memory writer performs no checksum counting, unlike upstream `FileWriter` — audit finding #A8). A second `finalize` on the same builder is idempotent: literal-item staging is flushed with replace semantics and relocation patching overwrites the operand field (see the field comments in `file_bridge.cpp` and `abcd-file/tests/double_finalize.rs`).
 
-Per-builder API policy: each builder stores its own (api, sub_api) and a `BuilderVersionScope` activates it under a mutex around every version-sensitive vendored call, so interleaved/concurrent builders never inherit each other's settings (upstream keeps these as process globals). Select the policy before creating any items.
-
-### Version Utilities
-
-```c
-void abc_get_current_version(uint8_t out[4]);
-void abc_get_min_version(uint8_t out[4]);
-int  abc_is_version_less_or_equal(const uint8_t current[4], const uint8_t target[4]);
-int  abc_contains_literal_array_in_header(const uint8_t ver[4]);
-```
-
-Delegates to upstream's `file_format_version.cpp`, avoiding manual reimplementation. (Some version helpers are unused inside this repo but remain part of the published surface — the dead-surface policy is a maintainer decision, not a cleanup list.)
+Per-builder API policy: each builder stores its own (api, sub_api) and a `BuilderVersionScope` activates it under a mutex around every version-sensitive vendored call, so interleaved/concurrent builders never inherit each other's settings (upstream keeps these as process globals). Select the policy (`abc_builder_set_api` or `abc_builder_set_file_version`) before creating any items.
 
 ## Build Dependencies
 
@@ -221,9 +215,9 @@ Delegates to upstream's `file_format_version.cpp`, avoiding manual reimplementat
 
 - Upstream code: `arkcompiler_runtime_core` submodule (pinned; read-only) + 10 shim files
 - C++ sources compiled: the bridge-needed libpandafile `.cpp` set + libpandabase `utf.cpp` + `file_bridge.cpp`
-- Ruby generates 3 headers; build.rs generates `file_bridge_enums.h`
+- Ruby generates 7 headers; `build.rs` generates `file_bridge_enums.hpp`
 - 2 bindgen passes: `bindings.rs` (C bridge API) + `enum_bindings.rs` (vendor constants)
-- C bridge exports ~240 functions across 10 accessor types + index accessor + builder
+- C bridge exports ~184 functions across 10 accessor types + index accessor + builder + vendor-name pins
 
 ## Publishing
 

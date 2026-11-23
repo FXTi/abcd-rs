@@ -19,9 +19,11 @@ read-only at `developtools_packing_tool/`. All file:line citations below refer t
 - Every container in scope — **.hap, .hsp, .app, .har, .hqf, .appqf** — is a plain
   ZIP archive with HarmonyOS-mandated entry names (`README_zh.md:5` lists exactly this set
   for unpack; `.qf`/`.hqf` = quick-fix, `.appqf` = aggregated quick-fix).
-- The Ark bytecode entry is **exactly one file at the fixed path `ets/modules.abc`**
-  (`adapter/ohos/Uncompress.java:82`). It is STORED by the packer by default but is
-  **not guaranteed 4K-aligned** (verified on a real-world hap below), so mmap-from-zip
+- The Stage-model Ark bytecode entry is at `ets/modules.abc`
+  (`adapter/ohos/Uncompress.java:82`), whereas FA-model / multi-ability `.hap`s in the
+  wild (OHOS 3.2–4.0) carry multiple `*.abc` entries (156 wild packages yield 276 `.abc`
+  modules; `abcd_hap::abc_modules` discovers all of them). Entries are STORED by default but
+  **not guaranteed 4K-aligned** (verified on real-world haps below), so mmap-from-zip
   is not a safe assumption; we must be able to read/inflate entry data.
 - Signed haps carry a signing block between the last entry and the central directory;
   a central-directory-first ZIP reader is unaffected (no code in the packing tool even
@@ -155,11 +157,12 @@ ZIP dialect constraints (pack-side facts):
   (`isCompressed = entry.getMethod() != ZipEntry.STORED`, recorded into
   `HapZipInfo.isModuleAbcCompressed`). Upstream only *records* the compression flag; it
   does not reject compressed abc.
-- Exactly **one** abc per hap: a hap is one module, and the module's whole compiled
-  program is the single `ets/modules.abc` (Stage). Multi-module apps are multi-hap
-  (`.app` nesting), not multi-abc. Sibling artifacts: `ets/sourceMaps.map`, `ets/*.abc`
-  overlays do not exist in the packer contract; `--an-path`/`--ap-path` add annotation /
-  profile files under `ets/` but only `modules.abc` is bytecode.
+- Stage model has one `ets/modules.abc` per hap, while legacy FA / multi-ability `.hap`s
+  in the wild carry per-ability `ets/<ability>/*.abc` or `assets/js/**/*.abc` entries
+  (verified on the 156-package wild OHOS corpus: 276 `.abc` modules total). `abcd-hap`
+  therefore extracts `ets/modules.abc` first when present and discovers all `*.abc`
+  bytecode entries in archive order, plus recurses into nested `.hap`/`.hsp`/`.hqf`
+  entries inside `.app`/`.appqf` bundles (`MAX_CONTAINER_DEPTH = 2`).
 - Model check for validation: `module.json` presence = Stage (`Uncompress.java:1555`).
 
 ### 2.6 Third-party dependencies on the unpack path

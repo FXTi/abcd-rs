@@ -76,7 +76,7 @@ pub struct FunctionData {
     pub kind: FunctionKind,          // semantic enum (Function/Constructor/Generator/Async/…)
     pub modifiers: Modifiers,
     pub is_external: bool,
-    pub params: Vec<ValueId>,        // params[0] = `this` for non-static kinds
+    pub params: Vec<ValueId>,        // vendored frame slots: [func][new.target][this][formals…] (§5.3)
     pub blocks: Vec<BlockId>,        // blocks[0] = entry
     pub try_regions: Vec<TryRegion>,
     pub debug: Option<DebugData>,    // line/column tables, locals, param names
@@ -99,7 +99,7 @@ literal-array indices, no four-bucket annotations, no `Tagged`, no
 
 ## 4. Op taxonomy and effects
 
-### 4.1 Ops (87 variants as of P4 — code is the source of truth; grew via v2-P0.5/P2b/P2c)
+### 4.1 Ops (88 variants — `abcd-ir/src/op.rs` is the source of truth; grew via v2-P0.5/P2b/P2c + d-P14)
 
 Compute: `BinaryOp{op}` / `UnaryOp{op}` / `Compare{op}` (+ `ty` on the
 value, not the op). `Mov`. `LoadConst(ConstId)`.
@@ -131,7 +131,8 @@ Exceptions: `Throw`, `ThrowIfSuperNotCalled{kind}`, `ThrowUndefinedIfHole`,
 `ThrowDeleteSuperProperty`.
 Generator/async: `CreateGenerator`, `SuspendGenerator`, `ResumeGenerator`,
 `GetResumeMode`, `Await`, `AwaitUncaught{funcobj, value}` (N68),
-`AsyncFunctionEnter`, `AsyncResolve/Reject{funcobj, value}` (N68).
+`AsyncFunctionEnter`, `AsyncResolve/Reject{funcobj, value}` (N68),
+`AsyncGeneratorResolve{funcobj, value, done}` (d-P14).
 Super: `LoadSuper{name|dyn}`, `StoreSuper{name|dyn}`.
 Debug: `Debugger`.
 Control: `Branch`, `CondBranch`, `Return`, `Phi`, `Unreachable`.
@@ -236,7 +237,7 @@ buckets (→ one list + profile fold); `IrType::Static(file StringId)` (N46);
 (→ structured regions); register/acc concepts in `RegOrAcc` (→ out-of-SSA
 problem in lower only).
 
-### 6.3 Hermes IR (survey: `hermes-ir-report.md`, citations there)
+### 6.3 Hermes IR (survey: [hermes-ir-survey.md](hermes-ir-survey.md), citations there)
 
 Hermes (Meta's JS engine, `hermes-main/`) is the closest mature sibling.
 Three-way comparison on the dimensions this design cares about:
@@ -273,9 +274,16 @@ type story; debug-only verification; no round-trip.
   `Const/ClassId/FieldId/Sym` only.
 - Debug tables are program semantics (local names feed taint readability);
   line tables replay per the #16 rule at lower.
-- Import/ExportDecl preserved (module decompilation + taint entry points).
+- `ImportDecl` / `ExportDecl` / `ModuleRequest` preserved at `Module` level
+  for standalone `_ESModuleRecord` files and per owning `ClassData::es_module`
+  (plus `ClassData::scope_names`) for `--merge-abc` multi-module bundles.
 
-## 8. Migration plan (phases, each independently green)
+## 8. Migration plan (ALL PHASES COMPLETE)
+
+P0–P5 all shipped: `abcd-ir` **is** this v0.2 IR (v0.1 was deleted at v2-P4,
+git history is the archive), `abcd-lift` / `abcd-opt` / `abcd-lower` own the
+pipeline, and `abcd-analysis` + `abcd-taint` + `abcd-decompile` sit on top of
+it. Original phase breakdown preserved below for historical reference:
 
 P0 — scaffolding: new crate `abcd-ir2` (name bikeshed: `abc-ir`), taxonomy
 + effects + verifier skeleton, zero format deps enforced by Cargo.
@@ -285,11 +293,8 @@ P2 — lower: v0.2 Module → MethodBody via the existing relocation channel;
 VM oracle parity (1149/1149 both variants) as the gate.
 P3 — pass port: SCCP/copyprop/DCE/peephole with the T3 effects table;
 opt-variant oracle parity.
-P4 — swap: v0.1 `abcd-ir` retires to `abcd-ir-v1` (kept for bisection);
-v0.2 becomes `abcd-ir`. IR v0.1's test corpus stays green throughout.
-P5 — taint analysis scaffolding (separate crate `abcd-taint`: call graph +
-IFDS skeleton + summary registry for the top-20 builtins), evaluated on
-the corpus' own `print` sinks as smoke.
+P4 — swap: v0.1 `abcd-ir` deleted; `abcd-ir2` renamed to `abcd-ir`.
+P5 — analysis & taint (`abcd-analysis` + `abcd-taint`).
 
 ## 9. Open questions for the maintainer — RESOLVED 2026-09-21
 

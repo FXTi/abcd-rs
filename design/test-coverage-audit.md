@@ -148,11 +148,9 @@ Local export at audit time: **2 787 fixtures / 6 versions × 3 profiles,
 - `scripts/dream-gate.py` — es2abc recompile (version-pinned per fixture,
   module mode when flagged) + the unchanged oracle + 5-bucket triage
   (scripts/dream-gate.py:60-103,164-213).
-- ~~`scripts/gen-opcode-fixtures.py`~~ — RETIRED at c-P4 (the +30
-  stprivateproperty/testin fixtures across the 6×3 matrix from tracked
-  sources (scripts/gen-opcode-fixtures.py:38-41), verifies the target
-  opcode appears in each reference.pa (:116-118), refreshes index.jsonl
-  idempotently (:147-156).
+- ~~`scripts/gen-opcode-fixtures.py`~~ — **RETIRED at c-P4** (the +30
+  `stprivateproperty`/`testin` fixtures across the 6×3 matrix are now baked
+  directly into the corpus image; the standalone script was deleted).
 - `scripts/gen-taint-probes.py` — compiles `probes-taint/src` (committed,
   with `annotations.json` ground truth) to gitignored `probes-taint/out`;
   validates annotation↔source sink-line correspondence and VM-clean

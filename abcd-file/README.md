@@ -1,23 +1,27 @@
 # abcd-file
 
-Safe Rust API for the ArkCompiler bytecode file format. Provides reading, writing, and inspection of `.abc` files.
+Safe Rust API for the ArkCompiler bytecode container format (`.abc`). Provides eager decoding, semantic re-encoding, programmatic construction via `Builder`, and an `ark_disasm`-compatible `pandasm` text disassembler and assembler.
 
-All public types are safe, owned structs with no lifetimes. `unsafe` is confined to internal FFI calls into `abcd-file-sys`, which generally does not need to be used directly.
+All public types are safe, owned structs with no lifetimes. `unsafe` is confined to internal FFI calls into [`abcd-file-sys`](../abcd-file-sys/README.md).
 
 ## Decoding
 
-```rust
-use abcd_file::{decode, File};
+```rust,no_run
+use abcd_file::{File, decode};
 
-let data: &[u8] = &[/* raw .abc bytes */];
-let file: File = decode(data).unwrap();
+let data = std::fs::read("input.abc").unwrap();
+let file: File = decode(&data).unwrap();
 
 println!("version: {}", file.version);
 println!("classes: {}", file.classes.len());
 
 for (descriptor, class) in &file.classes {
     let descriptor = file.strings.resolve(*descriptor).unwrap();
-    println!("{descriptor} ({} methods, {} fields)", class.methods.len(), class.fields.len());
+    println!(
+        "{descriptor} ({} methods, {} fields)",
+        class.methods.len(),
+        class.fields.len()
+    );
     for method in &class.methods {
         if let Some(ref body) = method.body {
             let name = file.strings.resolve(method.name).unwrap();
@@ -27,145 +31,93 @@ for (descriptor, class) in &file.classes {
 }
 ```
 
-## Encoding (roundtrip)
+## Encoding (semantic roundtrip) & Pandasm text
 
-```rust
-use abcd_file::{decode, encode};
+```rust,no_run
+use abcd_file::{decode, encode, pandasm};
 
-let original: &[u8] = &[/* raw .abc bytes */];
-let file = decode(original).unwrap();
-let output = encode(&file).unwrap();
-// `output` is a valid .abc file — checksums differ but semantics are preserved.
+let original = std::fs::read("input.abc").unwrap();
+let file = decode(&original).unwrap();
+
+// Re-encode to .abc (relocates offsets, recomputes layout & Adler-32 checksum):
+let rewritten = encode(&file).unwrap();
+
+// Disassemble to ark_disasm-compatible .pa text and assemble back:
+let pa_bytes = pandasm::emit_file(&file, "input.abc");
+let reparsed = pandasm::parse_file_with_version(&pa_bytes, file.version).unwrap();
+# let _ = (rewritten, reparsed);
 ```
 
-## Builder
-
-Construct `.abc` files programmatically:
+## Programmatic Builder
 
 ```rust
-use abcd_file::{Builder, Type, AccessFlags};
+use abcd_file::{AccessFlags, Builder, SourceLang, Type};
 
 let mut b = Builder::new();
+b.set_api(12, "beta1");
 let cls = b.add_global_class();
-let proto = b.create_proto(Type::Void, &[]);
-let _method = b.class_add_method(
-    cls, "func_main_0", proto,
+b.class_set_source_lang(cls, SourceLang::EcmaScript);
+let proto = b.create_proto(Type::Tagged, &[]);
+let m = b.class_add_method(
+    cls,
+    "func_main_0",
+    proto,
     AccessFlags::PUBLIC | AccessFlags::STATIC,
-    &[/* encoded bytecode */], 0, 0,
+    &[0x65], // returnundefined
+    0,
+    0,
 );
+b.method_set_source_lang(m, SourceLang::EcmaScript);
 b.deduplicate();
 let abc_bytes = b.finalize().unwrap();
+assert!(!abc_bytes.is_empty());
 ```
 
-## File Structure
-
-`decode` returns a `File` with:
+## `File` Structure
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `version` | `Version` | ABC file version (e.g. 13.0.1.0) |
-| `checksum` | `u32` | Adler-32 checksum |
-| `size` | `u32` | File size in bytes |
-| `file_type` | `FileType` | `Dynamic` (JS/TS) or `Static` (ArkTS) |
-| `strings` | `StringPool` | String interner — all string data lives here |
+| `version` | `Version` | ABC file version (`0.0.0.2`, `9.0.0.0` .. `24.0.0.0`) |
+| `checksum` | `u32` | Header Adler-32 checksum |
+| `size` | `u32` | Header-declared file size in bytes |
+| `file_type` | `FileType` | `Dynamic` (JS/TS), `Static` (ArkTS `0.1.x`), or `Invalid` |
+| `strings` | `StringPool` | Interned string pool (`StringId` keys) |
 | `classes` | `BTreeMap<StringId, Class>` | Classes keyed by interned descriptor (e.g. `"L_GLOBAL;"`) |
-| `literal_arrays` | `Vec<LiteralArray>` | Literal arrays indexed by position |
-| `literal_array_offsets` | `HashMap<u32, u32>` | Source-file literal-array offset → decoded table index |
-| `entity_map` | `HashMap<u32, StringId>` | Entity offset → interned name/descriptor |
+| `literal_arrays` | `Vec<LiteralArray>` | Decoded tagged literal arrays (header table + index-referenced + `scopeNames` + nested arrays) |
+| `literal_array_offsets` | `HashMap<u32, u32>` | Source-file literal-array offset → `literal_arrays` index |
+| `literal_array_header_offsets` | `Vec<u32>` | Raw header literal-array table on `<= 12.0.6.0` (including excluded module/phase blob slots, for `pandasm` byte-identity) |
+| `entity_map` | `HashMap<u32, StringId>` | Source-file entity offset → interned name/descriptor |
+| `string_raw_bytes` | `HashMap<String, Box<[u8]>>` | Original MUTF-8 bytes for lone-surrogate strings with no lossless UTF-8 form (re-emitted verbatim by `encode`) |
 
-Navigation methods on `File`:
+Convenience methods on `File`:
 
-- `class(descriptor: StringId)` / `class_by_str(&str)` — look up a class by descriptor
-- `all_methods()` — flat iterator over `(StringId, &Method)` pairs
-- `resolve_entity(offset)` → `Option<StringId>` / `resolve_entity_str(offset)` → `Option<&str>` — resolve a bytecode entity offset to its name/descriptor
-- `literal_array(index)` — get a literal array by index
-- `decode_module(index)` — decode ES module data from a literal array
+- `class_by_str(&str) -> Option<&Class>` — look up a class by descriptor string
+- `all_methods()` — flat iterator over `(StringId, &Method)` across all classes
+- `resolve_entity(offset) -> Option<StringId>` / `resolve_entity_str(offset) -> Option<&str>` — resolve a bytecode entity offset
+- `decode_module(index) -> Result<ModuleData, Error>` — parse a tagged pandasm-style module literal array
 
-## Classes, Methods, Fields
+## Classes, Methods, Fields & `--merge-abc` Records
 
-Each `Class` contains `methods: Vec<Method>`, `fields: Vec<Field>`, and `annotations: Annotations`. Convenience lookups: `method_by_name()`, `field_by_name()`, `super_class_in(&file)`.
+- `Class` carries `descriptor`, `name`, `access_flags: AccessFlags`, `source_lang`, `source_file`, `is_external`, `super_class`, `interfaces`, `methods: Vec<Method>`, `fields: Vec<Field>`, and `annotations: Annotations`.
+- `Method` carries `offset: u32` (unique method identity in the file), `access_flags`, `function_kind: FunctionKind` (`None`, `Function`, `NcFunction`, `GeneratorFunction`, `AsyncFunction`, `AsyncGeneratorFunction`, `AsyncNcFunction`, `ConcurrentFunction`, `SendableFunction`), `return_type`, `arg_types`, `body: Option<MethodBody>`, `annotations`, `param_annotations`, and `debug: Option<MethodDebugInfo>`. `Method` also implements `HasAccessFlags` (`is_public()`, `is_static()`, `is_constructor()`, …).
+- `Field` carries `offset: u32`, `field_type: Type`, `access_flags: AccessFlags`, `is_external`, `initial_value: Option<FieldValue>`, and `annotations`.
 
-`Method` carries `body: Option<MethodBody>` (bytecodes + try-catch blocks), `debug: Option<MethodDebugInfo>`, `return_type: Option<Type>` / `arg_types: Vec<Type>`, `param_annotations`, and annotations. The `offset` field is the file's unique method identity — names are not unique across classes.
+`FieldValue` models both scalar values and source-offset-bearing metadata fields (standalone single-module records as well as `--merge-abc` per-record fields):
 
-`Field` has `field_type: Type`, optional `initial_value`, and annotations.
+- Scalars: `I32(i32)`, `I64(i64)`, `F32(f32)`, `F64(f64)`
+- `ModuleData(ModuleData)` — untagged `ModuleDataAccessor` blob on `L_ESModuleRecord;` or `--merge-abc` `moduleRecordIdx`; relocated automatically on `encode`. Inspect `md.requests` via `file.strings.resolve(req_sid)` and `md.records` (`ModuleRecord::{RegularImport, NamespaceImport, LocalExport, IndirectExport, StarExport}`).
+- `LiteralArrayRef(u32)` — tagged scope-names literal-array reference on `L_ESScopeNamesRecord;` or `--merge-abc` `scopeNames`; resolved via `file.literal_array_offsets` and relocated on `encode`.
+- `ModuleRequestPhase(ModuleRequestPhase)` — untagged lazy-import flag blob on `moduleRequestPhaseIdx`; relocated on `encode`.
+- `JsonFileContent { source_offset: u32, content: StringId }` — `--merge-abc` `jsonFileContent` string reference; relocated via `ScalarValueItem(StringItem*)` on `encode`.
+- `TypeSummaryOffset(u32)` — legacy 4.x–5.x `typeSummaryOffset` nested offset; modeled opaquely on decode and rejected loudly by `encode` (relocation unsupported).
 
-All three types expose access flag helpers (`is_public()`, `is_static()`, `is_abstract()`, etc.) derived from `AccessFlags`.
+## Annotations, Literal Arrays & Debug Info
 
-## Annotations
-
-Annotations are grouped by retention policy in the `Annotations` struct:
-
-```rust
-pub struct Annotations {
-    pub compile_time: Vec<Annotation>,       // discarded after compilation
-    pub runtime: Vec<Annotation>,            // available via reflection
-    pub compile_time_type: Vec<Annotation>,  // type annotations (compile-time)
-    pub runtime_type: Vec<Annotation>,       // type annotations (runtime)
-}
-```
-
-Each `Annotation` has a `class_descriptor: StringId` and `elements: Vec<AnnotationElem>`. Element values are fully typed via `AnnotationValue`:
-
-- Primitives: `Bool`, `I8`/`U8`, `I16`/`U16`, `I32`/`U32`, `I64`/`U64`, `F32`/`F64`
-- Interned strings: `String(StringId)`, `Record(StringId)` (class descriptor)
-- Resolved references: `Method { name: StringId, offset: u32 }`, `Enum { name: StringId, offset: u32 }` — name plus the item offset in the source file (the unique entity identity)
-- Resolved compound values: `Annotation(Box<Annotation>)` (nested annotation), `MethodHandle(ResolvedMethodHandle)`, `LiteralArray(Vec<LiteralValue>)`
-- Special: `Void`, `StringNullptr`, `Array { tag: u8, values: Vec<AnnotationValue> }` (`tag` preserves the original element-type tag)
-
-## Literal Arrays & Modules
-
-`LiteralArray` holds `values: Vec<LiteralValue>`. Literal values include:
-
-- Primitives: `Bool`, `Integer8(u8)` (the 12.x `TAGVALUE`/`INTEGER_8` tag), `Integer(u32)`, `Float(f32)`, `Double(f64)`
-- `String(StringId)` / `EtsImplements(StringId)` — interned content
-- Method references: `Method(u32)`, `GeneratorMethod(u32)`, `AsyncGeneratorMethod(u32)`, `Getter(u32)`, `Setter(u32)` — entity offsets, resolve via `File::resolve_entity_str()`
-- `MethodAffiliate(u16)`, `Accessor(u8)`, `BuiltinTypeIndex(u8)`, `NullValue(u8)`
-- Nested arrays: `LiteralArray(LiteralArrayIdx)`, `LiteralBufferIndex(LiteralArrayIdx)` — indices into `File::literal_arrays`
-- Typed arrays: `ArrayU1(LiteralArrayIdx)`, `ArrayU8`, `ArrayI8`, `ArrayU16`, `ArrayI16`, `ArrayU32`, `ArrayI32`, `ArrayU64`, `ArrayI64`, `ArrayF32`, `ArrayF64`, `ArrayString` — each an index into `File::literal_arrays` holding the element payload
-
-ES module data is encoded as a special literal array. Decode it with:
-
-```rust
-let module: ModuleData = file.decode_module(literal_array_index).unwrap();
-for req in &module.requests {
-    println!("imports from: {req}");
-}
-for record in &module.records {
-    // ModuleRecord::RegularImport, NamespaceImport, LocalExport, etc.
-}
-```
-
-## Debug Info
-
-`MethodDebugInfo` provides source mapping and local variable information:
-
-- `source_file` / `source_code` — original source
-- `line_table: Vec<LineEntry>` — instruction index → line number
-- `column_table: Vec<ColumnEntry>` — instruction index → column number
-- `local_vars: Vec<LocalVarInfo>` — variable name, type, register, scope range
-- `params: Vec<ParamInfo>` — parameter names and signatures
-
-## Types
-
-| Type | Description |
-|------|-------------|
-| `Type` | Resolved type: `Void`, `Bool`, `I32`, `F64`, `Reference(StringId)`, etc. |
-| `AccessFlags` | Bitflags: `PUBLIC`, `STATIC`, `FINAL`, `ABSTRACT`, `SYNTHETIC`, etc. |
-| `SourceLang` | `EcmaScript`, `JavaScript`, `TypeScript`, `ArkTs`, `PandaAssembly` |
-| `FunctionKind` | `Function`, `AsyncFunction`, `GeneratorFunction`, `ConcurrentFunction`, etc. |
-
-## Re-exported Types
-
-From `abcd-isa`: `Version`, `Bytecode`, `DecodeError` (operand newtypes `Reg`/`Imm`/`EntityId`/`Label` are used with `MethodBody::bytecodes` and come from the `abcd-isa` crate directly).
-
-From `abcd-file-sys`: `FileType`.
-
-From `string_interner`: `StringPool`, `StringId`.
-
-The crate also re-exports its own public model (`model::*`), `decode`, `file_type`, and the builder surface (`Builder`, `encode`, handle types, `CodeEntity`, `CatchBlockDef`, `ModuleRecordDef`, …) — see `src/lib.rs` for the exact list.
+- `Annotations` preserves four retention buckets on decode (`compile_time`, `runtime`, `compile_time_type`, `runtime_type`); `encode` folds them into the single API-24 `ANNOTATION` list per the upstream writer contract.
+- `LiteralArray` holds typed `LiteralValue` items (primitives, `String`, method offsets, `LiteralArray(LiteralArrayIdx)` nested indices, and typed arrays `ArrayU1`..`ArrayString`).
+- `MethodDebugInfo` provides `source_file`, `source_code`, instruction-indexed `line_table` and `column_table`, `local_vars`, and `params`.
 
 ## Known Limitations
 
-- Byte-level roundtrip is not possible — the builder computes its own layout, so checksums and offsets will differ. Semantic equivalence is preserved.
-- `LiteralValue` method-reference variants (`Method`, `GeneratorMethod`, `Getter`, `Setter`, …) store source-file entity offsets; use `File::resolve_entity_str()` to look them up. On encode, entity references written into literal arrays relocate automatically to the new file's layout.
-- `ParamInfo::signature` is not preserved during encode (C++ writer limitation).
+- Byte-identical `.abc` round-tripping is not a goal (`ItemContainer` computes its own layout and Adler-32 checksum); semantic equivalence is preserved, and `MethodBody::ic_size` re-synchronizes `_ESSlotNumberAnnotation` when lowered bodies change IC-slot counts.
+- `ParamInfo::signature` is not preserved during `encode` (upstream C++ `DebugInfoItem` writer limitation).

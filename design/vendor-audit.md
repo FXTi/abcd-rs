@@ -128,10 +128,16 @@ and the compatibility/architecture decisions derived from the audit.
 - **#B3 (P2, fixed)**: `abc_proto_num_args`/`abc_proto_get_arg_type` forward the
   vendor `GetNumArgs` underflow. Clamp in the bridge.
 - **#B4 (P2, fixed)**: `abc_method_handle_read` decodes ULEB with no 5-byte bound.
-- **#B5 (informational)**: class descriptors read through
-  `abc_file_get_string_utf16` rely on the class-item name ULEB having no
-  ascii bit — utf16 length decodes correctly by coincidence; strlen drives
-  the conversion, so the value is only used for buffer sizing (safe).
+- **#B5 (RETRACTED → P0 heap overflow, fixed in N81 / `afd9574`)**: the
+  original note claimed `strlen` safely drove `abc_file_get_string_utf16`
+  while the tag ULEB128 only sized the caller's destination buffer. That
+  combination was in fact a **P0 heap buffer overflow**: a corrupted NUL
+  terminator (or bogus entity offset) let an unbounded `strlen`-driven scan
+  run into neighboring items and write past the tag-sized buffer. Fixed in
+  `file_bridge.cpp` (`bounded_cstr_len` + `convert_string_utf16_bounded`):
+  every string-item read is strictly bounded by the file span AND verified
+  to decode to the exact tag-declared UTF-16 unit count (`SIZE_MAX` / `0`
+  on mismatch, never `strlen`).
 
 ## 4. Compatibility matrix (decision B — full second generation)
 

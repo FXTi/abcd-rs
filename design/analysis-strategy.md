@@ -1,12 +1,15 @@
-# Analysis Strategy 2026 — Beyond FlowDroid, and the Pointer-Analysis Verdict
+# Analysis Strategy — IFDS Tabulation & the Rung 0–2 Pointer-Analysis Ladder
 
-Status: decision document for the maintainer (2026-09). Answers the question:
-"FlowDroid is Android best practice, but is there something BETTER in 2026 on
-precision and efficiency — and do we need pointer analysis?"
-
-Audience: the maintainer and the implementation agents for v2-P5a/P5b
-(`design/agent-roadmap.md`, IR v0.2 task registry — both rows frozen pending
-this document). English per `design/roadmap.md` policy.
+> **Status: SHIPPED (`abcd-analysis` + `abcd-taint`, v2-P5a/P5b + t-P1..t-P6).**
+> All three precision rungs specified here — Rung 0 alloc-site heap-v0, Rung 1
+> on-demand backward alias queries, and Rung 2 whole-module `k=1`
+> context-sensitive PTA with on-the-fly call-graph co-evolution and
+> lexical-environment identity — are implemented and active by default
+> (`alias_rung = 2`), alongside the summary registry, full callback-gap
+> propagator (`t-P4`), and receiver-prototype resolver (`t-P3`/`t-P5`). See
+> [`abcd-analysis/README.md`](../abcd-analysis/README.md) and
+> [`abcd-taint/README.md`](../abcd-taint/README.md) for current module maps; the
+> architectural rationale and paradigm evaluation are preserved below.
 
 Inputs: the four FlowDroid study docs (`design/flowdroid/heros.md`,
 `design/flowdroid/soot-infoflow.md`, `design/flowdroid/driver-and-callgraph.md`,

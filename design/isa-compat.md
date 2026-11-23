@@ -42,3 +42,9 @@ The 24 table adds exactly 9 instructions, all new (no renumbering):
 3. `modules.abc` (12.0.6.0) decodes fully with the 24 table: 2,946,777
    instructions across 12,732 method bodies, zero unknown opcodes —
    the empirical confirmation of the diff.
+4. **Pre-second-generation (`0.0.0.2`, OpenHarmony 3.0/3.1)**: wild OHOS
+   3.2/4.0 system images also carry legacy `0.0.0.2` `.abc` modules built
+   before the 2022-08-18 ISA overhaul (`0xff`-prefixed ECMAScript opcodes).
+   Those are decoded by `abcd_isa::decode_legacy` (`abcd-isa/src/legacy.rs`)
+   into the unified `Bytecode` enum, bringing all 156 wild OHOS `.hap`
+   packages (276 `.abc` modules) to 100% decode coverage.
