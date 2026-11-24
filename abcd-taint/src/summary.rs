@@ -280,6 +280,7 @@ pub struct RegistryStats {
 /// variadic (matches any arity when no exact key exists).
 pub struct SummaryRegistry {
     by_key: HashMap<(Sym, Option<usize>), Summary>,
+    callback_leaves: HashSet<String>,
     syms: RefCell<SymbolTable>,
     /// Names already known to miss at a given arity (memoized).
     neg: RefCell<HashSet<(Sym, Option<usize>)>>,
@@ -294,6 +295,7 @@ impl SummaryRegistry {
     pub fn new() -> Self {
         SummaryRegistry {
             by_key: HashMap::new(),
+            callback_leaves: HashSet::new(),
             syms: RefCell::new(SymbolTable::new()),
             neg: RefCell::new(HashSet::new()),
             stats: RefCell::new(RegistryStats::default()),
@@ -311,8 +313,19 @@ impl SummaryRegistry {
 
     /// Register a summary under `(name, arity)` (`None` = variadic).
     pub fn register(&mut self, name: &str, arity: Option<usize>, summary: Summary) {
+        if summary.callback.is_some() {
+            self.callback_leaves.insert(name.to_owned());
+            self.callback_leaves
+                .insert(name.rsplit('.').next().unwrap_or(name).to_owned());
+        }
         let sym = self.syms.borrow_mut().intern(name);
         self.by_key.insert((sym, arity), summary);
+    }
+
+    /// Whether any registered callback-bearing summary matches `leaf`
+    /// (either as a full name or as its final `.`-delimited segment).
+    pub fn has_callback_leaf(&self, leaf: &str) -> bool {
+        self.callback_leaves.contains(leaf)
     }
 
     /// Look up `name` at argument count `argc`: exact arity first, then

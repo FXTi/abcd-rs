@@ -37,15 +37,20 @@ use abcd_analysis::dataflow::heap::{DEFAULT_MAX_FIELD_CHAIN, Rung0AliasOracle};
 use abcd_analysis::dataflow::ifds::CallGraphOracle;
 use abcd_analysis::dataflow::ifds::{IfdsConfig, IfdsResult, IfdsSolver};
 use abcd_analysis::dataflow::pta::{PtaConfig, Rung2AliasOracle};
-use abcd_analysis::module_link::ModuleLinkTable;
+use abcd_analysis::module_link::{ModuleLinkTable, ModuleSlotRef};
 use abcd_analysis::ohos_lifecycle::synthesize_ohos_harness;
 use abcd_ir::{FuncId, InstId, Loc, Module, Op};
 
 use crate::fact::{Fact, TaintFact};
 use crate::gap::GapCallGraph;
-use crate::names::{ClassPropStores, call_base_value, callee_name_candidates_indexed};
+use crate::names::{
+    ClassPropStores, call_base_value, callee_name_candidates_indexed, quick_callee_leaf_sym,
+};
 use crate::oracle::Oracle;
-use crate::problem::{TaintProblem, op_uses_value};
+use crate::problem::{
+    TaintProblem, op_uses_value, peel_ns_index, resolve_global_sources,
+    resolve_module_import_sources,
+};
 use crate::summary::{RegistryStats, Summary, SummaryRegistry};
 
 /// A taint source specification (name-keyed).
@@ -225,28 +230,599 @@ pub fn run_taint(module: &Module, config: &TaintConfig) -> TaintReport {
     run_taint_full(module, config).0
 }
 
+const PTA_SLICE_FUNC_THRESHOLD: usize = 512;
+
+fn is_const_operand(module: &Module, mut val: abcd_ir::ValueId) -> bool {
+    for _ in 0..8 {
+        let Some(v) = module.value(val) else {
+            return false;
+        };
+        match v.def {
+            abcd_ir::ValueDef::Const(_) => return true,
+            abcd_ir::ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
+                Some(Op::Mov { src }) => val = *src,
+                Some(Op::LoadConst(_)) => return true,
+                _ => return false,
+            },
+            abcd_ir::ValueDef::Param(_) | abcd_ir::ValueDef::ExceptionParam(_) => return false,
+        }
+    }
+    false
+}
+
+/// Compute demand-driven PTA entry roots on large bundles (`> 512` functions),
+/// or `None` when whole-module PTA should run.
+fn compute_pta_roots(
+    module: &Module,
+    links: &ModuleLinkTable,
+    prop_stores: &ClassPropStores,
+    base_graph: &CallGraph,
+    config: &TaintConfig,
+    harness_fid: Option<FuncId>,
+) -> Option<Vec<FuncId>> {
+    if module.functions.len() <= PTA_SLICE_FUNC_THRESHOLD {
+        return None;
+    }
+    let has_wildcard_params = config
+        .sources
+        .iter()
+        .any(|s| matches!(s, SourceSpec::FunctionParams { name, .. } if name == "*"));
+    if has_wildcard_params {
+        return None;
+    }
+
+    let n_funcs = module.functions.len();
+    let mut is_gen = vec![false; n_funcs];
+
+    for spec in &config.sources {
+        if let SourceSpec::FunctionParams { name, params } = spec {
+            for (fi, f) in module.functions.iter().enumerate() {
+                if module.sym.resolve(f.name) == Some(name.as_str()) {
+                    let has_param = match params {
+                        Some(indices) => indices.iter().any(|&i| (i as usize) < f.params.len()),
+                        None => !f.params.is_empty(),
+                    };
+                    if has_param {
+                        is_gen[fi] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let global_sources = resolve_global_sources(module, config);
+    let module_import_sources = resolve_module_import_sources(module, links, config);
+    if !global_sources.is_empty() || !module_import_sources.is_empty() {
+        for (fi, f) in module.functions.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            if is_gen[fi] || f.blocks.is_empty() || Some(fid) == harness_fid {
+                continue;
+            }
+            'scan_fn: for &b in &f.blocks {
+                let Some(bb) = module.block(b) else { continue };
+                for &iid in &bb.insts {
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
+                    let hit =
+                        match &inst.op {
+                            Op::TryGetGlobal { name, .. } => {
+                                inst.result.is_some() && global_sources.contains(name)
+                            }
+                            Op::LoadModuleVar { index, kind } => {
+                                inst.result.is_some()
+                                    && !kind.is_local()
+                                    && links.inst_class(module, iid).is_some_and(|cid| {
+                                        module_import_sources.get(&(cid, *index)).is_some_and(
+                                            |opt| opt.as_ref().is_none_or(|syms| !syms.is_empty()),
+                                        )
+                                    })
+                            }
+                            _ => false,
+                        };
+                    if hit {
+                        is_gen[fi] = true;
+                        break 'scan_fn;
+                    }
+                }
+            }
+        }
+    }
+
+    let call_source_names: HashSet<&str> = config
+        .sources
+        .iter()
+        .filter_map(|s| match s {
+            SourceSpec::CallReturn { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let mut proxy_classes = vec![false; module.classes.len()];
+    let mut any_proxy_class = false;
+
+    if !call_source_names.is_empty() || config.ohos_lifecycle {
+        let mut wanted_leaves: HashSet<&str> = call_source_names
+            .iter()
+            .map(|s| s.rsplit('.').next().unwrap_or(s))
+            .collect();
+        if config.ohos_lifecycle {
+            wanted_leaves.insert("registerJavaScriptProxy");
+        }
+        let rung0 = Oracle::Rung0(Rung0AliasOracle::new(module));
+        for (call, edge) in base_graph.sites() {
+            if Some(edge.caller) == harness_fid {
+                continue;
+            }
+            let Some(inst) = module.inst(call) else {
+                continue;
+            };
+            let Op::Call { callee, args, .. } = &inst.op else {
+                continue;
+            };
+            if let Some(leaf_sym) =
+                quick_callee_leaf_sym(module, links, prop_stores, edge.caller, *callee)
+            {
+                let direct_match = module
+                    .sym
+                    .resolve(leaf_sym)
+                    .map(|s| s.rsplit('.').next().unwrap_or(s))
+                    .is_some_and(|l| wanted_leaves.contains(l));
+                let resolved_match = !direct_match
+                    && base_graph.callees_of_call_at(call).iter().any(|f| {
+                        module
+                            .func(*f)
+                            .and_then(|fd| module.sym.resolve(fd.name))
+                            .map(|n| n.rsplit('.').next().unwrap_or(n))
+                            .is_some_and(|l| wanted_leaves.contains(l))
+                    });
+                if !direct_match && !resolved_match {
+                    continue;
+                }
+            }
+            let mut cands = callee_name_candidates_indexed(
+                module,
+                links,
+                Some(prop_stores),
+                edge.caller,
+                *callee,
+            );
+            for f in base_graph.callees_of_call_at(call) {
+                if let Some(fd) = module.func(*f)
+                    && let Some(n) = module.sym.resolve(fd.name)
+                    && !cands.iter().any(|x| x == n)
+                {
+                    cands.push(n.to_owned());
+                }
+            }
+            if !call_source_names.is_empty()
+                && cands.iter().any(|c| call_source_names.contains(c.as_str()))
+            {
+                if let Some(slot) = is_gen.get_mut(edge.caller.index()) {
+                    *slot = true;
+                }
+                if let Some(&last_arg) = args.last() {
+                    for cb in crate::gap::resolve_callback_funcs(module, &rung0, last_arg, call) {
+                        if let Some(slot) = is_gen.get_mut(cb.index()) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+            if config.ohos_lifecycle
+                && cands
+                    .iter()
+                    .any(|c| c == "@ohos.web.webview.WebviewController.registerJavaScriptProxy")
+            {
+                if let Some(slot) = is_gen.get_mut(edge.caller.index()) {
+                    *slot = true;
+                }
+                if let Some(cid) = links.func_class(edge.caller)
+                    && let Some(cslot) = proxy_classes.get_mut(cid.index())
+                {
+                    *cslot = true;
+                    any_proxy_class = true;
+                }
+            }
+        }
+    }
+
+    if any_proxy_class {
+        for (fi, f) in module.functions.iter().enumerate() {
+            if proxy_classes
+                .get(f.class_id.index())
+                .copied()
+                .unwrap_or(false)
+            {
+                is_gen[fi] = true;
+            }
+        }
+    }
+
+    // Mark Ability / ExtensionAbility lifecycle methods invoked with non-const
+    // `want` inside `harness_fid` (plus sibling lifecycle calls sharing `this`).
+    if let Some(hfid) = harness_fid
+        && let Some(hfd) = module.func(hfid)
+    {
+        let mut active_this: HashSet<abcd_ir::ValueId> = HashSet::new();
+        for &b in &hfd.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                if let Some(Op::Call { this, args, .. }) = module.inst(iid).map(|i| &i.op)
+                    && args.iter().any(|&a| !is_const_operand(module, a))
+                    && let Some(t) = this
+                {
+                    active_this.insert(*t);
+                }
+            }
+        }
+        for &b in &hfd.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                if let Some(Op::Call { this, args, .. }) = module.inst(iid).map(|i| &i.op) {
+                    let has_non_const = args.iter().any(|&a| !is_const_operand(module, a));
+                    let shares_this = this.is_some_and(|t| active_this.contains(&t));
+                    if has_non_const || shares_this {
+                        for &callee in base_graph.callees_of_call_at(iid) {
+                            if let Some(slot) = is_gen.get_mut(callee.index()) {
+                                *slot = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const MAX_PTA_BACKWARD_HOPS: u8 = 2;
+    const MAX_PTA_FAN_IN: usize = 64;
+    let backward_closure = |seeds: &[bool]| -> Vec<bool> {
+        let mut visited = vec![false; n_funcs];
+        let mut queue: VecDeque<(FuncId, u8)> = VecDeque::new();
+        for (fi, &seeded) in seeds.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            if seeded && Some(fid) != harness_fid {
+                visited[fi] = true;
+                queue.push_back((fid, 0));
+            }
+        }
+        while let Some((curr, hops)) = queue.pop_front() {
+            if hops >= MAX_PTA_BACKWARD_HOPS {
+                continue;
+            }
+            let callers = base_graph.callers_of(curr);
+            if callers.len() > MAX_PTA_FAN_IN {
+                continue;
+            }
+            for &call_iid in callers {
+                if let Some(caller) = links.inst_func(module, call_iid)
+                    && Some(caller) != harness_fid
+                    && let Some(slot) = visited.get_mut(caller.index())
+                    && !*slot
+                {
+                    *slot = true;
+                    queue.push_back((caller, hops + 1));
+                }
+            }
+        }
+        visited
+    };
+
+    let b_cone_gen = backward_closure(&is_gen);
+    let mut keep_func = b_cone_gen.clone();
+
+    let n_classes = module.classes.len();
+    let mut gen_cls = vec![false; n_classes];
+    for (fi, &g) in is_gen.iter().enumerate() {
+        let fid = FuncId::new(fi as u32);
+        if g && Some(fid) != harness_fid
+            && let Some(cid) = links.func_class(fid)
+            && let Some(slot) = gen_cls.get_mut(cid.index())
+        {
+            *slot = true;
+        }
+    }
+
+    let b_cone_count = b_cone_gen.iter().filter(|&&b| b).count();
+    let mut init_main_cls = gen_cls.clone();
+    if b_cone_count <= 128 {
+        for (fi, &in_gen_cone) in b_cone_gen.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            if in_gen_cone
+                && Some(fid) != harness_fid
+                && let Some(cid) = links.func_class(fid)
+                && let Some(slot) = init_main_cls.get_mut(cid.index())
+            {
+                *slot = true;
+            }
+        }
+    }
+
+    let mut gen_export_funcs = is_gen.clone();
+    for (fi, f) in module.functions.iter().enumerate() {
+        if !f.is_external
+            && !f.blocks.is_empty()
+            && module.sym.resolve(f.name) == Some("func_main_0")
+        {
+            if init_main_cls
+                .get(f.class_id.index())
+                .copied()
+                .unwrap_or(false)
+            {
+                keep_func[fi] = true;
+            }
+            if gen_cls.get(f.class_id.index()).copied().unwrap_or(false) {
+                gen_export_funcs[fi] = true;
+            }
+        }
+    }
+
+    let mut exported_slots: HashSet<ModuleSlotRef> = HashSet::new();
+    for (fi, &src_fn) in gen_export_funcs.iter().enumerate() {
+        let fid = FuncId::new(fi as u32);
+        if !src_fn || Some(fid) == harness_fid {
+            continue;
+        }
+        let Some(f) = module.func(fid) else {
+            continue;
+        };
+        for &b in &f.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                if let Some(Op::StoreModuleVar { index, .. }) = module.inst(iid).map(|i| &i.op) {
+                    exported_slots.insert(ModuleSlotRef {
+                        class_id: f.class_id,
+                        slot: *index,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut viewpu_cls = gen_cls.clone();
+    if !exported_slots.is_empty() {
+        let mut slot_to_readers: HashMap<ModuleSlotRef, Vec<FuncId>> = HashMap::new();
+        let mut push_reader = |sr: ModuleSlotRef, fid: FuncId| {
+            let list = slot_to_readers.entry(sr).or_default();
+            if list.last() != Some(&fid) {
+                list.push(fid);
+            }
+        };
+        for (fi, f) in module.functions.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            if f.blocks.is_empty() || Some(fid) == harness_fid {
+                continue;
+            }
+            for &b in &f.blocks {
+                let Some(bb) = module.block(b) else { continue };
+                for &iid in &bb.insts {
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
+                    match &inst.op {
+                        Op::LoadModuleVar { index, kind } => {
+                            if kind.is_local() {
+                                let sr = ModuleSlotRef {
+                                    class_id: f.class_id,
+                                    slot: *index,
+                                };
+                                if exported_slots.contains(&sr) {
+                                    push_reader(sr, fid);
+                                }
+                            } else if let Some(t) = links.external_load(f.class_id, *index) {
+                                for &sr in &t.slots {
+                                    if exported_slots.contains(&sr) {
+                                        push_reader(sr, fid);
+                                    }
+                                }
+                            }
+                        }
+                        Op::LoadProp { object, name } => {
+                            if let Some(req_idx) = peel_ns_index(module, *object)
+                                && let Some(slots) =
+                                    links.resolve_namespace_member(f.class_id, req_idx, *name)
+                            {
+                                for &sr in slots {
+                                    if exported_slots.contains(&sr) {
+                                        push_reader(sr, fid);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let mut slot_readers = vec![false; n_funcs];
+        let mut any_slot_reader = false;
+        for readers in slot_to_readers.values() {
+            if readers.len() <= MAX_PTA_FAN_IN {
+                for &fid in readers {
+                    slot_readers[fid.index()] = true;
+                    any_slot_reader = true;
+                    if let Some(cid) = links.func_class(fid)
+                        && let Some(cslot) = viewpu_cls.get_mut(cid.index())
+                    {
+                        *cslot = true;
+                    }
+                }
+            }
+        }
+        if any_slot_reader {
+            let reader_cone = backward_closure(&slot_readers);
+            let mut reader_cls = vec![false; n_classes];
+            for (fi, &in_rcone) in reader_cone.iter().enumerate() {
+                if in_rcone {
+                    keep_func[fi] = true;
+                    if let Some(cid) = links.func_class(FuncId::new(fi as u32))
+                        && let Some(cslot) = reader_cls.get_mut(cid.index())
+                    {
+                        *cslot = true;
+                    }
+                }
+            }
+            for (fi, f) in module.functions.iter().enumerate() {
+                if !f.is_external
+                    && !f.blocks.is_empty()
+                    && reader_cls.get(f.class_id.index()).copied().unwrap_or(false)
+                    && module.sym.resolve(f.name) == Some("func_main_0")
+                {
+                    keep_func[fi] = true;
+                }
+            }
+        }
+    }
+
+    // Include `ViewPU` / component lifecycle & `@Builder` methods called by
+    // `harness_fid` when their owning class is in `gen_cls` or reads a low-fan-in
+    // exported slot from `gen_cls`.
+    if let Some(hfid) = harness_fid
+        && let Some(hfd) = module.func(hfid)
+    {
+        for &b in &hfd.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                if matches!(module.inst(iid).map(|i| &i.op), Some(Op::Call { .. })) {
+                    for &callee in base_graph.callees_of_call_at(iid) {
+                        if links.func_class(callee).is_some_and(|cid| {
+                            viewpu_cls.get(cid.index()).copied().unwrap_or(false)
+                        }) && let Some(slot) = keep_func.get_mut(callee.index())
+                        {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Global-store bridge: if any `is_gen` or `gen_cls` `func_main_0` writes
+    // symbol `g` with `<= 64` readers, include those readers (plus their bounded
+    // caller cone and owning `func_main_0`) in `keep_func`.
+    let mut stored_globals: HashSet<abcd_ir::Sym> = HashSet::new();
+    for (fi, &src_fn) in gen_export_funcs.iter().enumerate() {
+        let fid = FuncId::new(fi as u32);
+        if !src_fn || Some(fid) == harness_fid {
+            continue;
+        }
+        let Some(f) = module.func(fid) else {
+            continue;
+        };
+        for &b in &f.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                if let Some(
+                    Op::StoreGlobal { name, .. }
+                    | Op::StoreGlobalRecord { name, .. }
+                    | Op::TryStoreGlobal { name, .. },
+                ) = module.inst(iid).map(|i| &i.op)
+                {
+                    stored_globals.insert(*name);
+                }
+            }
+        }
+    }
+    if !stored_globals.is_empty() {
+        let mut glob_to_readers: HashMap<abcd_ir::Sym, Vec<FuncId>> = HashMap::new();
+        for (fi, f) in module.functions.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            if f.blocks.is_empty() || Some(fid) == harness_fid {
+                continue;
+            }
+            for &b in &f.blocks {
+                let Some(bb) = module.block(b) else { continue };
+                for &iid in &bb.insts {
+                    if let Some(Op::TryGetGlobal { name, .. }) = module.inst(iid).map(|i| &i.op)
+                        && stored_globals.contains(name)
+                    {
+                        let list = glob_to_readers.entry(*name).or_default();
+                        if list.last() != Some(&fid) {
+                            list.push(fid);
+                        }
+                    }
+                }
+            }
+        }
+        let mut global_readers = vec![false; n_funcs];
+        let mut any_reader = false;
+        for readers in glob_to_readers.values() {
+            if readers.len() <= MAX_PTA_FAN_IN {
+                for &fid in readers {
+                    if !keep_func[fid.index()] {
+                        global_readers[fid.index()] = true;
+                        any_reader = true;
+                    }
+                }
+            }
+        }
+        if any_reader {
+            let reader_cone = backward_closure(&global_readers);
+            let mut reader_cls = vec![false; n_classes];
+            for (fi, &in_rcone) in reader_cone.iter().enumerate() {
+                if in_rcone {
+                    keep_func[fi] = true;
+                    if let Some(cid) = links.func_class(FuncId::new(fi as u32))
+                        && let Some(cslot) = reader_cls.get_mut(cid.index())
+                    {
+                        *cslot = true;
+                    }
+                }
+            }
+            for (fi, f) in module.functions.iter().enumerate() {
+                if !f.is_external
+                    && !f.blocks.is_empty()
+                    && reader_cls.get(f.class_id.index()).copied().unwrap_or(false)
+                    && module.sym.resolve(f.name) == Some("func_main_0")
+                {
+                    keep_func[fi] = true;
+                }
+            }
+        }
+    }
+
+    if let Some(hfid) = harness_fid
+        && let Some(slot) = keep_func.get_mut(hfid.index())
+    {
+        *slot = true;
+    }
+
+    let roots: Vec<FuncId> = keep_func
+        .iter()
+        .enumerate()
+        .filter_map(|(fi, &keep)| keep.then_some(FuncId::new(fi as u32)))
+        .collect();
+    Some(roots)
+}
+
 /// Run the analysis, also returning the raw solver result (for tests
 /// that assert on facts at arbitrary program points).
 pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, IfdsResult<Fact>) {
     let orig_func_len = module.functions.len();
     let orig_inst_len = module.insts.len();
-    let augmented = if config.ohos_lifecycle {
-        synthesize_ohos_harness(module, config.manifest_json.as_deref()).map(|(m, _)| m)
+    let (augmented, harness_fid) = if config.ohos_lifecycle {
+        match synthesize_ohos_harness(module, config.manifest_json.as_deref()) {
+            Some((m, hfid)) => (Some(m), Some(hfid)),
+            None => (None, None),
+        }
     } else {
-        None
+        (None, None)
     };
     let work_mod: &Module = augmented.as_ref().unwrap_or(module);
 
-    let base_graph = CallGraph::build(work_mod);
+    let links = ModuleLinkTable::build(work_mod);
+    let prop_stores = ClassPropStores::build(work_mod);
+    let base_graph = CallGraph::build_with_links(work_mod, &links);
     // The alias ladder (`design/analysis.md`):
     // - rung 0 solves against the base graph with def-chain answers;
     // - rung 1 builds the on-demand engine over the BASE graph and
     //   refines the graph once with the engine's points_to (one
     //   engine, two consumers; one pass, no fixed point);
-    // - rung 2 runs the whole-module PTA: its co-evolution fixed point
-    //   IS the call graph the solver runs against, and its fixed-point
-    //   tables are the oracle. A step-budget cut degrades to the rung-1
-    //   pipeline, recorded in `alias_rung_used` (loud, never silent).
+    // - rung 2 runs the k=1 PTA (root-sliced on large >512-function
+    //   bundles): its co-evolution fixed point IS the call graph the
+    //   solver runs against, and its fixed-point tables are the oracle.
+    //   A step-budget cut degrades to the rung-1 pipeline, recorded in
+    //   `alias_rung_used` (loud, never silent).
     let rung1_pipeline = || {
         let engine = Rung1AliasOracle::new(work_mod, &base_graph);
         let refined = CallGraph::refine_with_points_to(work_mod, &base_graph, &engine);
@@ -261,7 +837,21 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
                     .unwrap_or(abcd_analysis::dataflow::pta::DEFAULT_STEP_BUDGET),
                 ..PtaConfig::default()
             };
-            let outcome = abcd_analysis::dataflow::pta::analyze(work_mod, &base_graph, &pta_config);
+            let pta_roots = compute_pta_roots(
+                work_mod,
+                &links,
+                &prop_stores,
+                &base_graph,
+                config,
+                harness_fid,
+            );
+            let outcome = abcd_analysis::dataflow::pta::analyze_with_links_and_roots(
+                work_mod,
+                &links,
+                &base_graph,
+                &pta_config,
+                pta_roots.as_deref(),
+            );
             if outcome.stats().capped {
                 let (g, o, u) = rung1_pipeline();
                 (Some(g), o, u)
@@ -289,7 +879,15 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         registry.register(name, *arity, summary.clone());
     }
 
-    let problem = TaintProblem::new(work_mod, callgraph, oracle, &registry, config);
+    let problem = TaintProblem::new_with_indexed(
+        work_mod,
+        links,
+        prop_stores,
+        callgraph,
+        oracle,
+        &registry,
+        config,
+    );
     // Callback-gap layer: the eager scan's callback edges ride the
     // solver's call-graph oracle (the base graph itself is untouched —
     // sink collection and path reconstruction keep consuming it).
@@ -386,6 +984,10 @@ fn collect_hits(
     let zero = Fact::Zero;
     let mut hits = Vec::new();
     for (iid, edge) in callgraph.sites() {
+        let facts = result.facts_at(iid, &zero);
+        if facts.is_empty() {
+            continue;
+        }
         let Some(inst) = module.inst(iid) else {
             continue;
         };
@@ -411,7 +1013,7 @@ fn collect_hits(
                 continue;
             }
             let base = call_base_value(module, inst);
-            for fact in result.facts_at(iid, &zero) {
+            for fact in &facts {
                 let Fact::Taint(tf) = &fact else { continue };
                 let Some(v) = tf.local_base() else { continue };
                 let position = if let Some(pos) = args.iter().position(|&a| a == v) {
@@ -467,14 +1069,16 @@ fn inst_preds(module: &Module, inst: InstId) -> Vec<InstId> {
     out
 }
 
+const NO_EDGE: u32 = u32::MAX;
+
 /// Indices over the path-edge set for backward reconstruction.
 struct PathIndex {
     /// Dense `BlockId::index() -> Option<FuncId>` owning-function index.
     block_to_func: Vec<Option<FuncId>>,
-    /// `(anchor fact ID, target node)` → edge indices.
-    by_anchor_node: HashMap<(u32, InstId), Vec<usize>>,
-    /// target node → edge indices (any anchor).
-    by_node: HashMap<InstId, Vec<usize>>,
+    /// `InstId::index() -> first edge index` (`NO_EDGE` when empty).
+    head_by_node: Vec<u32>,
+    /// `edge_idx -> next edge index` sharing the same `target_node` (`NO_EDGE` at tail).
+    next_edge: Vec<u32>,
     /// start point → function.
     func_of_sp: HashMap<InstId, FuncId>,
     /// function → exit instructions (Return/Throw).
@@ -495,11 +1099,31 @@ impl PathIndex {
             }
         }
 
+        let edges = result.raw_path_edges();
+        let mut head_by_node = vec![NO_EDGE; module.insts.len()];
+        let mut next_edge = vec![NO_EDGE; edges.len()];
+        let mut reached_funcs = vec![false; module.functions.len()];
+        for i in (0..edges.len()).rev() {
+            let target_node = edges[i].1;
+            if let Some(head) = head_by_node.get_mut(target_node.index()) {
+                next_edge[i] = *head;
+                *head = i as u32;
+            }
+            if let Some(inst) = module.inst(target_node)
+                && let Some(fid) = block_to_func.get(inst.block.index()).copied().flatten()
+                && let Some(rf) = reached_funcs.get_mut(fid.index())
+            {
+                *rf = true;
+            }
+        }
+
         // Pre-index exceptional handler entry instructions per protected block
-        // once (`O(|try_regions|)`) so call return-site indexing never scans
-        // `module.functions`.
+        // for reached functions only.
         let mut block_exc_handlers: Vec<Vec<InstId>> = vec![Vec::new(); module.blocks.len()];
         for (fi, f) in module.functions.iter().enumerate() {
+            if !reached_funcs[fi] {
+                continue;
+            }
             let func = FuncId::new(fi as u32);
             for region in &f.try_regions {
                 let mut catch_entries = Vec::new();
@@ -528,15 +1152,6 @@ impl PathIndex {
             }
         }
 
-        let mut by_anchor_node: HashMap<(u32, InstId), Vec<usize>> = HashMap::new();
-        let mut by_node: HashMap<InstId, Vec<usize>> = HashMap::new();
-        for (i, &(src_id, target_node, _dst_id)) in result.raw_path_edges().iter().enumerate() {
-            by_anchor_node
-                .entry((src_id, target_node))
-                .or_default()
-                .push(i);
-            by_node.entry(target_node).or_default().push(i);
-        }
         let mut func_of_sp = HashMap::new();
         let mut exits_of: HashMap<FuncId, Vec<InstId>> = HashMap::new();
         let mut calls_at_return_site: HashMap<InstId, Vec<InstId>> = HashMap::new();
@@ -549,6 +1164,9 @@ impl PathIndex {
                 .and_then(|bb| bb.insts.first())
             {
                 func_of_sp.insert(*sp, func);
+            }
+            if !reached_funcs[fi] {
+                continue;
             }
             let mut exits = Vec::new();
             for &b in &f.blocks {
@@ -608,12 +1226,29 @@ impl PathIndex {
         }
         PathIndex {
             block_to_func,
-            by_anchor_node,
-            by_node,
+            head_by_node,
+            next_edge,
             func_of_sp,
             exits_of,
             calls_at_return_site,
         }
+    }
+
+    fn edges_at(&self, node: InstId) -> impl Iterator<Item = usize> + '_ {
+        let mut cur = self
+            .head_by_node
+            .get(node.index())
+            .copied()
+            .unwrap_or(NO_EDGE);
+        std::iter::from_fn(move || {
+            if cur == NO_EDGE {
+                None
+            } else {
+                let idx = cur as usize;
+                cur = self.next_edge[idx];
+                Some(idx)
+            }
+        })
     }
 
     fn func_of_inst(&self, module: &Module, inst: InstId) -> Option<FuncId> {
@@ -676,9 +1311,8 @@ fn reconstruct_path(
         return fallback();
     };
     let Some(start_edge) = index
-        .by_node
-        .get(&hit.call)
-        .and_then(|cands| cands.iter().copied().find(|&ei| edges[ei].2 == hit_fact_id))
+        .edges_at(hit.call)
+        .find(|&ei| edges[ei].2 == hit_fact_id)
     else {
         return fallback();
     };
@@ -722,12 +1356,9 @@ fn reconstruct_path(
                 let Some(call_inst) = module.inst(*call) else {
                     continue;
                 };
-                if let Some(cands) = index.by_node.get(call) {
-                    preds.extend(cands.iter().copied().filter(|&pi| {
-                        fact_local_base(edges[pi].2)
-                            .is_some_and(|v| op_uses_value(&call_inst.op, v))
-                    }));
-                }
+                preds.extend(index.edges_at(*call).filter(|&pi| {
+                    fact_local_base(edges[pi].2).is_some_and(|v| op_uses_value(&call_inst.op, v))
+                }));
             }
         } else {
             // Return-site disambiguation: if this edge's fact is on the
@@ -752,14 +1383,11 @@ fn reconstruct_path(
                                     Op::Throw { value } => Some(*value),
                                     _ => None,
                                 });
-                                if let Some(cands) = index.by_node.get(exit) {
-                                    exit_preds.extend(
-                                        cands
-                                            .iter()
-                                            .copied()
-                                            .filter(|&pi| fact_local_base(edges[pi].2) == exit_val),
-                                    );
-                                }
+                                exit_preds.extend(
+                                    index
+                                        .edges_at(*exit)
+                                        .filter(|&pi| fact_local_base(edges[pi].2) == exit_val),
+                                );
                             }
                         }
                     }
@@ -773,26 +1401,30 @@ fn reconstruct_path(
                 preds.extend(exit_preds);
             } else {
                 for p in inst_preds(module, n) {
-                    if let Some(cands) = index.by_anchor_node.get(&(src_id, p)) {
-                        // Prefer the exact-fact (pass-through) predecessor;
-                        // widen only at transforming instructions.
-                        let exact: Vec<usize> = cands
-                            .iter()
-                            .copied()
-                            .filter(|&pi| edges[pi].2 == dst_id)
-                            .collect();
-                        if exact.is_empty() {
-                            preds.extend(cands.iter().copied());
-                        } else {
-                            preds.extend(exact);
+                    // Prefer the exact-fact (pass-through) predecessor;
+                    // widen only at transforming instructions.
+                    let mut any_exact = false;
+                    for pi in index.edges_at(p) {
+                        if edges[pi].0 == src_id && edges[pi].2 == dst_id {
+                            preds.push(pi);
+                            any_exact = true;
+                        }
+                    }
+                    if !any_exact {
+                        for pi in index.edges_at(p) {
+                            if edges[pi].0 == src_id {
+                                preds.push(pi);
+                            }
                         }
                     }
                 }
                 if let Some(calls) = index.calls_at_return_site.get(&n) {
                     for c in calls {
                         // The call edge with the same anchor (bypass).
-                        if let Some(cands) = index.by_anchor_node.get(&(src_id, *c)) {
-                            preds.extend(cands.iter().copied());
+                        for pi in index.edges_at(*c) {
+                            if edges[pi].0 == src_id {
+                                preds.push(pi);
+                            }
                         }
                     }
                 }

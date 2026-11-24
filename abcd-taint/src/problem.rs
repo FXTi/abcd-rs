@@ -49,7 +49,7 @@ use crate::fact::{Fact, TaintBase, TaintFact};
 use crate::gap;
 use crate::names::{
     ClassPropStores, call_base_value, call_method_leaf, callee_name_candidates_indexed,
-    normalize_sdk_specifier,
+    kit_canonical_alias, normalize_sdk_specifier, quick_callee_leaf_sym,
 };
 use crate::oracle::Oracle;
 use crate::prototype::{FamilyAnswer, PrototypeResolver};
@@ -113,6 +113,13 @@ fn param_binding(module: &Module, callee: FuncId) -> ParamBinding {
     }
 }
 
+type ModuleSlotUsers = HashMap<(ClassId, u32), Vec<FuncId>>;
+
+struct PropTouchIndex {
+    by_prop: HashMap<Sym, Vec<FuncId>>,
+    dyn_funcs: Vec<FuncId>,
+}
+
 /// The taint problem over a module + call graph + the rung-selected
 /// alias oracle ([`Oracle`]: rung-0 baseline, rung-1 demand-driven
 /// engine, or rung-2 whole-module PTA) + summary registry + source/sink config.
@@ -150,8 +157,9 @@ pub struct TaintProblem<'m> {
     call_return_sources: HashSet<InstId>,
     /// Trailing `(err, data)` / `(data)` callback edges at `CallReturn` source sites.
     source_cb_edges: BTreeMap<InstId, Vec<FuncId>>,
-    /// `(ClassId, ext_slot)` external imports tainted via `SourceSpec::ModuleImport`.
-    module_import_sources: HashSet<(ClassId, u32)>,
+    /// `(ClassId, ext_slot)` external imports tainted via `SourceSpec::ModuleImport`:
+    /// `None` = whole-value taint, `Some(syms)` = field-sensitive namespace taint.
+    module_import_sources: HashMap<(ClassId, u32), Option<Vec<Sym>>>,
     /// Async-machine `ResumeGenerator` instruction -> awaited `ValueId` from
     /// preceding `AwaitUncaught` in the same block.
     await_resume: HashMap<InstId, ValueId>,
@@ -181,6 +189,33 @@ pub struct TaintProblem<'m> {
     /// Callback-summary sites whose callback value did NOT resolve —
     /// the honest fallback (mini-gap tag only; gap.rs module docs).
     gap_unresolved: usize,
+    /// Dense `FuncId::index() -> bool` backward caller cone of functions that
+    /// can generate `0 -> d` taint facts across `callgraph ∪ gap_edges`.
+    zero_needed: Vec<bool>,
+    /// Precomputed synthetic `__abcd_ohos_harness__` call and allocation-site guard.
+    harness: HarnessGuard,
+    /// Reverse callback-gap caller index (`callee FuncId::index() -> caller FuncIds`).
+    rev_gap_callers: Vec<Vec<FuncId>>,
+    /// One-time lazy index `(src_cid, src_slot) -> Vec<FuncId>` of functions
+    /// reading `TaintBase::ModuleVar(src_cid, src_slot)` directly or via ES links.
+    module_slot_users: RefCell<Option<ModuleSlotUsers>>,
+    /// Lazily memoized `(src_cid, src_slot) -> Vec<bool>` of functions that can
+    /// transitively reach a module-variable reader of `(src_cid, src_slot)`.
+    module_var_readers: RefCell<HashMap<(ClassId, u32), Vec<bool>>>,
+    /// Lazily memoized `sym -> Vec<bool>` of functions that can transitively
+    /// reach an `Op::TryGetGlobal` reader of `sym`.
+    global_readers: RefCell<HashMap<Sym, Vec<bool>>>,
+    /// One-time lazy index `site_iid -> Vec<FuncId>` of functions holding or
+    /// lexically reading `site_iid` on large (`> 512`-function) Rung-2 bundles.
+    heap_site_users: RefCell<Option<HashMap<InstId, Vec<FuncId>>>>,
+    /// Lazily memoized `site_iid -> Vec<bool>` backward caller cone of `heap_site_users`.
+    heap_site_cone: RefCell<HashMap<InstId, Vec<bool>>>,
+    /// Lazily memoized `Vec<bool>` backward caller cone of `Op::GetLexVar` readers.
+    lex_var_readers: RefCell<Option<Vec<bool>>>,
+    /// One-time lazy index of functions touching named/dynamic properties (`> 512`-function bundles).
+    prop_touch_index: RefCell<Option<PropTouchIndex>>,
+    /// Lazily memoized `prop_sym -> Vec<bool>` backward caller cone of `prop_touch_index`.
+    prop_touch_cone: RefCell<HashMap<Sym, Vec<bool>>>,
 }
 
 impl<'m> TaintProblem<'m> {
@@ -197,30 +232,43 @@ impl<'m> TaintProblem<'m> {
         registry: &'m SummaryRegistry,
         config: &'m TaintConfig,
     ) -> Self {
+        let links = ModuleLinkTable::build(module);
+        Self::new_with_links(module, links, callgraph, oracle, registry, config)
+    }
+
+    /// Build the problem reusing a precomputed [`ModuleLinkTable`].
+    pub fn new_with_links(
+        module: &'m Module,
+        links: ModuleLinkTable,
+        callgraph: &'m CallGraph,
+        oracle: Oracle<'m>,
+        registry: &'m SummaryRegistry,
+        config: &'m TaintConfig,
+    ) -> Self {
+        let prop_stores = ClassPropStores::build(module);
+        Self::new_with_indexed(
+            module,
+            links,
+            prop_stores,
+            callgraph,
+            oracle,
+            registry,
+            config,
+        )
+    }
+
+    /// Build the problem reusing both [`ModuleLinkTable`] and [`ClassPropStores`].
+    pub(crate) fn new_with_indexed(
+        module: &'m Module,
+        links: ModuleLinkTable,
+        prop_stores: ClassPropStores,
+        callgraph: &'m CallGraph,
+        oracle: Oracle<'m>,
+        registry: &'m SummaryRegistry,
+        config: &'m TaintConfig,
+    ) -> Self {
         let mut param_seeds = Vec::new();
-        let mut global_sources = HashSet::new();
-        // The module's symbol table is behind a shared reference; source
-        // name matching is done by STRING comparison against resolved
-        // syms, so no mutation of the module is needed: we collect the
-        // set of module syms whose string equals a global-source name.
-        let global_names: HashSet<&str> = config
-            .sources
-            .iter()
-            .filter_map(|s| match s {
-                SourceSpec::GlobalLoad { name } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
-        if !global_names.is_empty() {
-            for i in 0..module.sym.len() {
-                let sym = Sym::new(i as u32);
-                if let Some(s) = module.sym.resolve(sym)
-                    && global_names.contains(s)
-                {
-                    global_sources.insert(sym);
-                }
-            }
-        }
+        let global_sources = resolve_global_sources(module, config);
         for spec in &config.sources {
             if let SourceSpec::FunctionParams { name, params } = spec {
                 for (fi, f) in module.functions.iter().enumerate() {
@@ -241,36 +289,9 @@ impl<'m> TaintProblem<'m> {
                 }
             }
         }
-        let links = ModuleLinkTable::build(module);
-        let prop_stores = ClassPropStores::build(module);
         let global_stores = build_global_stores_map(module);
         let (block_to_func, handler_block_exc, func_handler_exc) = build_exception_indexes(module);
-        let mut module_import_sources = HashSet::new();
-        for spec in &config.sources {
-            if let SourceSpec::ModuleImport {
-                specifier,
-                import_name,
-            } = spec
-            {
-                let want_spec = normalize_sdk_specifier(specifier);
-                for ci in 0..module.classes.len() {
-                    let cid = ClassId::new(ci as u32);
-                    let mut ext_idx = 0u32;
-                    while let Some(target) = links.external_load(cid, ext_idx) {
-                        let matched = target.external_imports.iter().any(|&(s_sym, i_sym)| {
-                            let s_str = module.sym.resolve(s_sym).unwrap_or("");
-                            let i_str = module.sym.resolve(i_sym).unwrap_or("");
-                            (s_str == specifier || normalize_sdk_specifier(s_str) == want_spec)
-                                && import_name.as_deref().is_none_or(|w| w == i_str)
-                        });
-                        if matched {
-                            module_import_sources.insert((cid, ext_idx));
-                        }
-                        ext_idx += 1;
-                    }
-                }
-            }
-        }
+        let module_import_sources = resolve_module_import_sources(module, &links, config);
 
         let call_source_names: HashSet<&str> = config
             .sources
@@ -284,6 +305,13 @@ impl<'m> TaintProblem<'m> {
         let mut call_return_sources = HashSet::new();
         let mut source_cb_edges: BTreeMap<InstId, Vec<FuncId>> = BTreeMap::new();
         if !call_source_names.is_empty() || config.ohos_lifecycle {
+            let mut wanted_leaves: HashSet<&str> = call_source_names
+                .iter()
+                .map(|s| s.rsplit('.').next().unwrap_or(s))
+                .collect();
+            if config.ohos_lifecycle {
+                wanted_leaves.insert("registerJavaScriptProxy");
+            }
             for (call, edge) in callgraph.sites() {
                 let Some(inst) = module.inst(call) else {
                     continue;
@@ -291,6 +319,26 @@ impl<'m> TaintProblem<'m> {
                 let Op::Call { callee, args, .. } = &inst.op else {
                     continue;
                 };
+                if let Some(leaf_sym) =
+                    quick_callee_leaf_sym(module, &links, &prop_stores, edge.caller, *callee)
+                {
+                    let direct_match = module
+                        .sym
+                        .resolve(leaf_sym)
+                        .map(|s| s.rsplit('.').next().unwrap_or(s))
+                        .is_some_and(|l| wanted_leaves.contains(l));
+                    let resolved_match = !direct_match
+                        && callgraph.callees_of_call_at(call).iter().any(|f| {
+                            module
+                                .func(*f)
+                                .and_then(|fd| module.sym.resolve(fd.name))
+                                .map(|n| n.rsplit('.').next().unwrap_or(n))
+                                .is_some_and(|l| wanted_leaves.contains(l))
+                        });
+                    if !direct_match && !resolved_match {
+                        continue;
+                    }
+                }
                 let mut cands = callee_name_candidates_indexed(
                     module,
                     &links,
@@ -336,7 +384,7 @@ impl<'m> TaintProblem<'m> {
         }
 
         let await_resume = build_await_resume_map(module);
-        let liveness = LocalLiveness::build(module, &await_resume);
+        let liveness = LocalLiveness::build(module);
         let value_keep_flag = RefCell::new(vec![0u8; module.values.len()]);
         let func_alias_loads = RefCell::new((0..module.functions.len()).map(|_| None).collect());
         let value_alias_loads = RefCell::new(HashMap::new());
@@ -372,6 +420,17 @@ impl<'m> TaintProblem<'m> {
             fresh_memo: RefCell::new(HashMap::new()),
             gap_resolved: 0,
             gap_unresolved: 0,
+            zero_needed: Vec::new(),
+            harness: build_harness_guard(module),
+            rev_gap_callers: Vec::new(),
+            module_slot_users: RefCell::new(None),
+            module_var_readers: RefCell::new(HashMap::new()),
+            global_readers: RefCell::new(HashMap::new()),
+            heap_site_users: RefCell::new(None),
+            heap_site_cone: RefCell::new(HashMap::new()),
+            lex_var_readers: RefCell::new(None),
+            prop_touch_index: RefCell::new(None),
+            prop_touch_cone: RefCell::new(HashMap::new()),
         };
         // Eager gap scan (gap.rs): static edges, counter-free.
         let (mut edges, resolved, unresolved) = problem.scan_gap_edges();
@@ -384,10 +443,685 @@ impl<'m> TaintProblem<'m> {
             }
             entry.sort();
         }
+        let mut rev_gap_callers = vec![Vec::new(); module.functions.len()];
+        for (&call_iid, callees) in &edges {
+            if let Some(inst) = module.inst(call_iid)
+                && let Some(caller_fid) = problem
+                    .block_to_func
+                    .get(inst.block.index())
+                    .copied()
+                    .flatten()
+            {
+                for &cb in callees {
+                    if let Some(list) = rev_gap_callers.get_mut(cb.index()) {
+                        list.push(caller_fid);
+                    }
+                }
+            }
+        }
         problem.gap_edges = edges;
+        problem.rev_gap_callers = rev_gap_callers;
         problem.gap_resolved = resolved;
         problem.gap_unresolved = unresolved;
+        problem.zero_needed = problem.compute_zero_needed();
         problem
+    }
+
+    /// Compute the dense backward caller cone (`callgraph ∪ gap_edges`) of
+    /// functions capable of generating `0 -> d` taint facts.
+    fn compute_zero_needed(&self) -> Vec<bool> {
+        let n_funcs = self.module.functions.len();
+        if !self.config.seed_all_functions {
+            return vec![true; n_funcs];
+        }
+        let mut zero_needed = vec![false; n_funcs];
+        let mut queue: VecDeque<FuncId> = VecDeque::new();
+        let mark = |fid: FuncId, zn: &mut [bool], q: &mut VecDeque<FuncId>| {
+            if let Some(f) = self.module.func(fid)
+                && !f.blocks.is_empty()
+                && let Some(slot) = zn.get_mut(fid.index())
+                && !*slot
+            {
+                *slot = true;
+                q.push_back(fid);
+            }
+        };
+
+        for &(fid, _) in &self.param_seeds {
+            mark(fid, &mut zero_needed, &mut queue);
+        }
+        for &call_iid in &self.call_return_sources {
+            if let Some(inst) = self.module.inst(call_iid)
+                && let Some(fid) = self
+                    .block_to_func
+                    .get(inst.block.index())
+                    .copied()
+                    .flatten()
+            {
+                mark(fid, &mut zero_needed, &mut queue);
+            }
+        }
+        if !self.global_sources.is_empty() || !self.module_import_sources.is_empty() {
+            for (fi, f) in self.module.functions.iter().enumerate() {
+                if f.blocks.is_empty() || zero_needed[fi] {
+                    continue;
+                }
+                let fid = FuncId::new(fi as u32);
+                'blocks: for &b in &f.blocks {
+                    let Some(bb) = self.module.block(b) else {
+                        continue;
+                    };
+                    for &iid in &bb.insts {
+                        let Some(inst) = self.module.inst(iid) else {
+                            continue;
+                        };
+                        let matched = match &inst.op {
+                            Op::TryGetGlobal { name, .. } => {
+                                inst.result.is_some() && self.global_sources.contains(name)
+                            }
+                            Op::LoadModuleVar { index, kind } => {
+                                inst.result.is_some()
+                                    && !kind.is_local()
+                                    && self.links.inst_class(self.module, iid).is_some_and(|cid| {
+                                        self.module_import_sources.get(&(cid, *index)).is_some_and(
+                                            |opt| opt.as_ref().is_none_or(|syms| !syms.is_empty()),
+                                        )
+                                    })
+                            }
+                            _ => false,
+                        };
+                        if matched {
+                            mark(fid, &mut zero_needed, &mut queue);
+                            break 'blocks;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut rev_gap: Vec<Vec<FuncId>> = vec![Vec::new(); n_funcs];
+        for (&call_iid, callees) in &self.gap_edges {
+            let Some(inst) = self.module.inst(call_iid) else {
+                continue;
+            };
+            let Some(caller_fid) = self
+                .block_to_func
+                .get(inst.block.index())
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            for &cb in callees {
+                if let Some(list) = rev_gap.get_mut(cb.index()) {
+                    list.push(caller_fid);
+                }
+            }
+        }
+
+        while let Some(curr) = queue.pop_front() {
+            for &call_iid in self.callgraph.callers_of(curr) {
+                if let Some(inst) = self.module.inst(call_iid)
+                    && let Some(caller_fid) = self
+                        .block_to_func
+                        .get(inst.block.index())
+                        .copied()
+                        .flatten()
+                {
+                    mark(caller_fid, &mut zero_needed, &mut queue);
+                }
+            }
+            if let Some(gap_callers) = rev_gap.get(curr.index()) {
+                for &caller_fid in gap_callers {
+                    mark(caller_fid, &mut zero_needed, &mut queue);
+                }
+            }
+        }
+
+        zero_needed
+    }
+
+    #[inline]
+    fn is_harness_call(&self, call: InstId) -> bool {
+        self.harness.calls.contains(&call)
+    }
+
+    fn expand_backward_callers(&self, reach: &mut [bool], queue: &mut VecDeque<FuncId>) {
+        while let Some(curr) = queue.pop_front() {
+            for &call_iid in self.callgraph.callers_of(curr) {
+                if let Some(inst) = self.module.inst(call_iid)
+                    && let Some(caller_fid) = self
+                        .block_to_func
+                        .get(inst.block.index())
+                        .copied()
+                        .flatten()
+                    && Some(caller_fid) != self.harness.fid
+                    && let Some(slot) = reach.get_mut(caller_fid.index())
+                    && !*slot
+                {
+                    *slot = true;
+                    queue.push_back(caller_fid);
+                }
+            }
+            if let Some(gap_callers) = self.rev_gap_callers.get(curr.index()) {
+                for &caller_fid in gap_callers {
+                    if Some(caller_fid) != self.harness.fid
+                        && let Some(slot) = reach.get_mut(caller_fid.index())
+                        && !*slot
+                    {
+                        *slot = true;
+                        queue.push_back(caller_fid);
+                    }
+                }
+            }
+        }
+    }
+
+    fn can_callee_read_module_var(&self, src_cid: ClassId, src_slot: u32, callee: FuncId) -> bool {
+        if let Some(reach) = self.module_var_readers.borrow().get(&(src_cid, src_slot)) {
+            return reach.get(callee.index()).copied().unwrap_or(false);
+        }
+        if self.module_slot_users.borrow().is_none() {
+            let mut slot_to_funcs: HashMap<(ClassId, u32), Vec<FuncId>> = HashMap::new();
+            let mut push_fn = |cid: ClassId, slot: u32, fid: FuncId| {
+                let list = slot_to_funcs.entry((cid, slot)).or_default();
+                if list.last() != Some(&fid) {
+                    list.push(fid);
+                }
+            };
+            for (fi, f) in self.module.functions.iter().enumerate() {
+                let fid = FuncId::new(fi as u32);
+                if Some(fid) == self.harness.fid || f.blocks.is_empty() {
+                    continue;
+                }
+                for &b in &f.blocks {
+                    let Some(bb) = self.module.block(b) else {
+                        continue;
+                    };
+                    for &iid in &bb.insts {
+                        let Some(inst) = self.module.inst(iid) else {
+                            continue;
+                        };
+                        match &inst.op {
+                            Op::LoadModuleVar { index, kind } => {
+                                if kind.is_local() {
+                                    push_fn(f.class_id, *index, fid);
+                                } else if let Some(t) = self.links.external_load(f.class_id, *index)
+                                {
+                                    for sr in &t.slots {
+                                        push_fn(sr.class_id, sr.slot, fid);
+                                    }
+                                }
+                            }
+                            Op::LoadProp { object, name } => {
+                                if let Some(req_idx) = peel_ns_index(self.module, *object)
+                                    && let Some(slots) = self
+                                        .links
+                                        .resolve_namespace_member(f.class_id, req_idx, *name)
+                                {
+                                    for sr in slots {
+                                        push_fn(sr.class_id, sr.slot, fid);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            *self.module_slot_users.borrow_mut() = Some(slot_to_funcs);
+        }
+
+        let n_funcs = self.module.functions.len();
+        let mut reach = vec![false; n_funcs];
+        let mut fn_queue = VecDeque::new();
+        {
+            let users_borrow = self.module_slot_users.borrow();
+            if let Some(funcs) = users_borrow
+                .as_ref()
+                .and_then(|m| m.get(&(src_cid, src_slot)))
+            {
+                for &fid in funcs {
+                    if let Some(slot) = reach.get_mut(fid.index())
+                        && !*slot
+                    {
+                        *slot = true;
+                        fn_queue.push_back(fid);
+                    }
+                }
+            }
+        }
+        self.expand_backward_callers(&mut reach, &mut fn_queue);
+        let ans = reach.get(callee.index()).copied().unwrap_or(false);
+        self.module_var_readers
+            .borrow_mut()
+            .insert((src_cid, src_slot), reach);
+        ans
+    }
+
+    fn can_callee_read_global(&self, sym: Sym, callee: FuncId) -> bool {
+        if let Some(reach) = self.global_readers.borrow().get(&sym) {
+            return reach.get(callee.index()).copied().unwrap_or(false);
+        }
+        let n_funcs = self.module.functions.len();
+        let mut reach = vec![false; n_funcs];
+        let mut fn_queue = VecDeque::new();
+        for (fi, f) in self.module.functions.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            if Some(fid) == self.harness.fid || f.blocks.is_empty() {
+                continue;
+            }
+            'scan_g: for &b in &f.blocks {
+                let Some(bb) = self.module.block(b) else {
+                    continue;
+                };
+                for &iid in &bb.insts {
+                    if let Some(Op::TryGetGlobal { name, .. }) =
+                        self.module.inst(iid).map(|i| &i.op)
+                        && *name == sym
+                    {
+                        reach[fi] = true;
+                        fn_queue.push_back(fid);
+                        break 'scan_g;
+                    }
+                }
+            }
+        }
+        self.expand_backward_callers(&mut reach, &mut fn_queue);
+        let ans = reach.get(callee.index()).copied().unwrap_or(false);
+        self.global_readers.borrow_mut().insert(sym, reach);
+        ans
+    }
+
+    fn can_callee_read_lex_var(&self, callee: FuncId) -> bool {
+        if let Some(reach) = self.lex_var_readers.borrow().as_ref() {
+            return reach.get(callee.index()).copied().unwrap_or(false);
+        }
+        let n_funcs = self.module.functions.len();
+        let mut reach = vec![false; n_funcs];
+        let mut fn_queue = VecDeque::new();
+        for (fi, f) in self.module.functions.iter().enumerate() {
+            let fid = FuncId::new(fi as u32);
+            if Some(fid) == self.harness.fid || f.blocks.is_empty() {
+                continue;
+            }
+            'scan_l: for &b in &f.blocks {
+                let Some(bb) = self.module.block(b) else {
+                    continue;
+                };
+                for &iid in &bb.insts {
+                    if matches!(
+                        self.module.inst(iid).map(|i| &i.op),
+                        Some(Op::GetLexVar { .. })
+                    ) {
+                        reach[fi] = true;
+                        fn_queue.push_back(fid);
+                        break 'scan_l;
+                    }
+                }
+            }
+        }
+        self.expand_backward_callers(&mut reach, &mut fn_queue);
+        let ans = reach.get(callee.index()).copied().unwrap_or(false);
+        *self.lex_var_readers.borrow_mut() = Some(reach);
+        ans
+    }
+
+    fn call_has_body_callee(&self, call: InstId) -> bool {
+        self.callgraph.callees_of_call_at(call).iter().any(|c| {
+            self.module
+                .func(*c)
+                .is_some_and(|fd| !fd.is_external && !fd.blocks.is_empty())
+        })
+    }
+
+    fn func_derefs_site_rung0(&self, fid: FuncId, site: InstId) -> bool {
+        let Some(f) = self.module.func(fid) else {
+            return false;
+        };
+        if matches!(
+            self.module.inst(site).map(|i| &i.op),
+            Some(Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. })
+        ) {
+            for &b in &f.blocks {
+                let Some(bb) = self.module.block(b) else {
+                    continue;
+                };
+                for &iid in &bb.insts {
+                    if matches!(
+                        self.module.inst(iid).map(|i| &i.op),
+                        Some(Op::GetLexVar { .. } | Op::PutLexVar { .. })
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        let oracle = self.oracle.borrow();
+        let has_site = |v: ValueId| oracle.resolve(v).sites.iter().any(|s| s == site);
+        for &b in &f.blocks {
+            let Some(bb) = self.module.block(b) else {
+                continue;
+            };
+            for &iid in &bb.insts {
+                let Some(inst) = self.module.inst(iid) else {
+                    continue;
+                };
+                match &inst.op {
+                    Op::LoadProp { object, .. }
+                    | Op::LoadPropIdx { object, .. }
+                    | Op::LoadPropDyn { object, .. }
+                    | Op::StoreProp { object, .. }
+                    | Op::StoreOwnPropName { object, .. }
+                    | Op::StorePropIdx { object, .. }
+                    | Op::StoreOwnPropIdx { object, .. }
+                    | Op::StorePropDyn { object, .. }
+                    | Op::StoreOwnPropDyn { object, .. }
+                    | Op::GetIterator { obj: object } => {
+                        if has_site(*object) {
+                            return true;
+                        }
+                    }
+                    Op::Call { args, .. } if !self.call_has_body_callee(iid) => {
+                        if call_base_value(self.module, inst).is_some_and(has_site)
+                            || args.iter().copied().any(has_site)
+                        {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    fn can_callee_touch_prop(&self, prop: Sym, callee: FuncId) -> bool {
+        if let Some(reach) = self.prop_touch_cone.borrow().get(&prop) {
+            return reach.get(callee.index()).copied().unwrap_or(false);
+        }
+        if self.prop_touch_index.borrow().is_none() {
+            let mut by_prop: HashMap<Sym, Vec<FuncId>> = HashMap::new();
+            let mut dyn_funcs: Vec<FuncId> = Vec::new();
+            for (fi, f) in self.module.functions.iter().enumerate() {
+                let fid = FuncId::new(fi as u32);
+                if Some(fid) == self.harness.fid || f.blocks.is_empty() {
+                    continue;
+                }
+                let mut has_dyn = false;
+                for &b in &f.blocks {
+                    let Some(bb) = self.module.block(b) else {
+                        continue;
+                    };
+                    for &iid in &bb.insts {
+                        let Some(inst) = self.module.inst(iid) else {
+                            continue;
+                        };
+                        match &inst.op {
+                            Op::LoadProp { name, .. }
+                            | Op::StoreProp { name, .. }
+                            | Op::StoreOwnPropName { name, .. } => {
+                                let list = by_prop.entry(*name).or_default();
+                                if list.last() != Some(&fid) {
+                                    list.push(fid);
+                                }
+                            }
+                            Op::LoadPropIdx { .. }
+                            | Op::LoadPropDyn { .. }
+                            | Op::StorePropIdx { .. }
+                            | Op::StoreOwnPropIdx { .. }
+                            | Op::StorePropDyn { .. }
+                            | Op::StoreOwnPropDyn { .. }
+                            | Op::GetIterator { .. }
+                            | Op::CopyDataProps { .. } => {
+                                has_dyn = true;
+                            }
+                            Op::Call { .. } => {
+                                if let Some(leaf) = call_method_leaf(self.module, inst)
+                                    && matches!(
+                                        self.module.sym.resolve(leaf),
+                                        Some(
+                                            "assign" | "stringify" | "keys" | "values" | "entries"
+                                        )
+                                    )
+                                {
+                                    has_dyn = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if has_dyn {
+                    dyn_funcs.push(fid);
+                }
+            }
+            *self.prop_touch_index.borrow_mut() = Some(PropTouchIndex { by_prop, dyn_funcs });
+        }
+
+        let n_funcs = self.module.functions.len();
+        let mut reach = vec![false; n_funcs];
+        let mut fn_queue = VecDeque::new();
+        {
+            let idx_borrow = self.prop_touch_index.borrow();
+            if let Some(idx) = idx_borrow.as_ref() {
+                for &fid in &idx.dyn_funcs {
+                    if let Some(slot) = reach.get_mut(fid.index())
+                        && !*slot
+                    {
+                        *slot = true;
+                        fn_queue.push_back(fid);
+                    }
+                }
+                if let Some(funcs) = idx.by_prop.get(&prop) {
+                    for &fid in funcs {
+                        if let Some(slot) = reach.get_mut(fid.index())
+                            && !*slot
+                        {
+                            *slot = true;
+                            fn_queue.push_back(fid);
+                        }
+                    }
+                }
+            }
+        }
+        self.expand_backward_callers(&mut reach, &mut fn_queue);
+        let ans = reach.get(callee.index()).copied().unwrap_or(false);
+        self.prop_touch_cone.borrow_mut().insert(prop, reach);
+        ans
+    }
+
+    fn can_callee_use_heap_site(&self, site: InstId, callee: FuncId) -> bool {
+        if let Some(reach) = self.heap_site_cone.borrow().get(&site) {
+            return reach.get(callee.index()).copied().unwrap_or(false);
+        }
+        if self.heap_site_users.borrow().is_none() {
+            let mut site_to_funcs: HashMap<InstId, Vec<FuncId>> = HashMap::new();
+            {
+                let oracle_ref = self.oracle.borrow();
+                if let Oracle::Rung2(o) = &*oracle_ref {
+                    let mut push_fn = |s: InstId, fid: FuncId| {
+                        let list = site_to_funcs.entry(s).or_default();
+                        if list.last() != Some(&fid) {
+                            list.push(fid);
+                        }
+                    };
+                    for (fi, f) in self.module.functions.iter().enumerate() {
+                        let fid = FuncId::new(fi as u32);
+                        if Some(fid) == self.harness.fid || f.blocks.is_empty() {
+                            continue;
+                        }
+                        for &b in &f.blocks {
+                            let Some(bb) = self.module.block(b) else {
+                                continue;
+                            };
+                            for &iid in &bb.insts {
+                                let Some(inst) = self.module.inst(iid) else {
+                                    continue;
+                                };
+                                match &inst.op {
+                                    Op::LoadProp { object, .. }
+                                    | Op::LoadPropIdx { object, .. }
+                                    | Op::LoadPropDyn { object, .. }
+                                    | Op::StoreProp { object, .. }
+                                    | Op::StoreOwnPropName { object, .. }
+                                    | Op::StorePropIdx { object, .. }
+                                    | Op::StoreOwnPropIdx { object, .. }
+                                    | Op::StorePropDyn { object, .. }
+                                    | Op::StoreOwnPropDyn { object, .. }
+                                    | Op::GetIterator { obj: object } => {
+                                        for s in o.query(*object, iid).sites.iter() {
+                                            push_fn(s, fid);
+                                        }
+                                    }
+                                    Op::Call { args, .. } if !self.call_has_body_callee(iid) => {
+                                        if let Some(bv) = call_base_value(self.module, inst) {
+                                            for s in o.query(bv, iid).sites.iter() {
+                                                push_fn(s, fid);
+                                            }
+                                        }
+                                        for &a in args {
+                                            for s in o.query(a, iid).sites.iter() {
+                                                push_fn(s, fid);
+                                            }
+                                        }
+                                    }
+                                    Op::GetLexVar { level, .. } | Op::PutLexVar { level, .. } => {
+                                        for s in o.lex_env_at(iid, *level).sites.iter() {
+                                            push_fn(s, fid);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            *self.heap_site_users.borrow_mut() = Some(site_to_funcs);
+        }
+
+        let n_funcs = self.module.functions.len();
+        let mut reach = vec![false; n_funcs];
+        let mut fn_queue = VecDeque::new();
+        let is_rung2 = matches!(*self.oracle.borrow(), Oracle::Rung2(_));
+        if let Some(owner_fid) = self.links.inst_func(self.module, site)
+            && Some(owner_fid) != self.harness.fid
+            && (!is_rung2 || self.func_derefs_site_rung0(owner_fid, site))
+            && let Some(slot) = reach.get_mut(owner_fid.index())
+            && !*slot
+        {
+            *slot = true;
+            fn_queue.push_back(owner_fid);
+        }
+        {
+            let users_borrow = self.heap_site_users.borrow();
+            if let Some(funcs) = users_borrow.as_ref().and_then(|m| m.get(&site)) {
+                for &fid in funcs {
+                    if let Some(slot) = reach.get_mut(fid.index())
+                        && !*slot
+                    {
+                        *slot = true;
+                        fn_queue.push_back(fid);
+                    }
+                }
+            }
+        }
+        self.expand_backward_callers(&mut reach, &mut fn_queue);
+        let ans = reach.get(callee.index()).copied().unwrap_or(false);
+        self.heap_site_cone.borrow_mut().insert(site, reach);
+        ans
+    }
+
+    /// Gate state-base facts entering `callee` across any call edge (reader-cone
+    /// pruning for monotone `ModuleVar`, `Global`, `LexVar`, and large-bundle
+    /// `Heap` state, plus synthetic `__abcd_ohos_harness__` component isolation).
+    fn allow_state_into_callee(&self, call: InstId, callee: FuncId, fact: &TaintFact) -> bool {
+        match &fact.base {
+            TaintBase::ModuleVar(src_cid, src_slot) => {
+                if !self.can_callee_read_module_var(*src_cid, *src_slot, callee) {
+                    return false;
+                }
+            }
+            TaintBase::Global(sym) => {
+                if !self.can_callee_read_global(*sym, callee) {
+                    return false;
+                }
+            }
+            TaintBase::LexVar(_, _) if self.module.functions.len() > 512 => {
+                if !self.can_callee_read_lex_var(callee) {
+                    return false;
+                }
+            }
+            TaintBase::Heap(sites) if !sites.is_empty() && self.module.functions.len() > 512 => {
+                if !sites
+                    .iter()
+                    .any(|s| self.can_callee_use_heap_site(s, callee))
+                {
+                    return false;
+                }
+                if let Some(&FieldKey::Named(prop)) = fact.fields.elements().first() {
+                    let has_env = {
+                        let oracle = self.oracle.borrow();
+                        sites.iter().any(|s| oracle.is_env_site(s))
+                    };
+                    if !has_env && !self.can_callee_touch_prop(prop, callee) {
+                        return false;
+                    }
+                }
+            }
+            _ => {}
+        }
+        !self.is_harness_call(call) || self.allow_state_across_harness(call, callee, fact, true)
+    }
+
+    /// Gate state-base facts crossing synthetic `__abcd_ohos_harness__` call
+    /// and return edges so component-local `this`/`this.context`, `LexVar`,
+    /// `NewLexEnv`, `Heap(EMPTY)` wildcards, and scoped `ModuleVar` exports do
+    /// not cross-pollute unrelated modules or `ViewPU` components.
+    fn allow_state_across_harness(
+        &self,
+        call: InstId,
+        callee: FuncId,
+        fact: &TaintFact,
+        is_enter: bool,
+    ) -> bool {
+        match &fact.base {
+            TaintBase::Local(_) | TaintBase::Global(_) => true,
+            TaintBase::LexVar(_, _) => false,
+            TaintBase::Heap(sites) => {
+                if sites.is_empty() {
+                    return false;
+                }
+                if is_enter {
+                    if sites.iter().all(|s| self.harness.alloc_sites.contains(&s)) {
+                        return self
+                            .harness
+                            .call_allowed_sites
+                            .get(&call)
+                            .is_some_and(|allowed| sites.iter().any(|s| allowed.contains(&s)));
+                    }
+                    let all_env = {
+                        let oracle = self.oracle.borrow();
+                        sites.iter().all(|s| oracle.is_env_site(s))
+                    };
+                    if all_env {
+                        return sites.iter().any(|s| {
+                            self.links.inst_class(self.module, s) == self.links.func_class(callee)
+                        });
+                    }
+                }
+                true
+            }
+            TaintBase::ModuleVar(src_cid, src_slot) => {
+                if is_enter {
+                    self.can_callee_read_module_var(*src_cid, *src_slot, callee)
+                } else {
+                    true
+                }
+            }
+        }
     }
 
     /// Borrow the cross-module linkage index.
@@ -422,13 +1156,38 @@ impl<'m> TaintProblem<'m> {
         let mut edges = BTreeMap::new();
         let mut resolved = 0usize;
         let mut unresolved = 0usize;
-        for (call, _) in self.callgraph.sites() {
+        for (call, edge) in self.callgraph.sites() {
             let Some(inst) = self.module.inst(call) else {
                 continue;
             };
-            let Op::Call { args, .. } = &inst.op else {
+            let Op::Call { callee, args, .. } = &inst.op else {
                 continue;
             };
+            if let Some(leaf_sym) = quick_callee_leaf_sym(
+                self.module,
+                &self.links,
+                &self.prop_stores,
+                edge.caller,
+                *callee,
+            ) {
+                let direct_match = self
+                    .module
+                    .sym
+                    .resolve(leaf_sym)
+                    .map(|s| s.rsplit('.').next().unwrap_or(s))
+                    .is_some_and(|l| self.registry.has_callback_leaf(l));
+                let resolved_match = !direct_match
+                    && self.callgraph.callees_of_call_at(call).iter().any(|f| {
+                        self.module
+                            .func(*f)
+                            .and_then(|fd| self.module.sym.resolve(fd.name))
+                            .map(|n| n.rsplit('.').next().unwrap_or(n))
+                            .is_some_and(|l| self.registry.has_callback_leaf(l))
+                    });
+                if !direct_match && !resolved_match {
+                    continue;
+                }
+            }
             let SiteClass::Summary { name, .. } = self.compute_class(call, true).0 else {
                 continue;
             };
@@ -496,7 +1255,11 @@ impl<'m> TaintProblem<'m> {
 
     /// The k-limit for field chains.
     fn cap(&self) -> usize {
-        self.config.max_field_chain
+        if self.module.functions.len() > 512 {
+            self.config.max_field_chain.min(1)
+        } else {
+            self.config.max_field_chain
+        }
     }
 
     /// Classify a call site on the fallback ladder (memoized; counters
@@ -725,7 +1488,10 @@ impl<'m> TaintProblem<'m> {
     ///   some `LoadProp*` instruction reachable at or after `target_inst`, `v`
     ///   is soundly pruned (`false`).
     fn should_retain_local_at(&self, v: ValueId, target_inst: InstId) -> bool {
-        if self.liveness.is_live_at(target_inst, v) {
+        if self
+            .liveness
+            .is_live_at(self.module, &self.await_resume, target_inst, v)
+        {
             return true;
         }
         match self.module.value(v).map(|val| val.def) {
@@ -835,6 +1601,19 @@ impl<'m> TaintProblem<'m> {
     /// VM-allocated `map` result no longer may-aliases the source
     /// array's heap fact through the wildcard.
     fn heap_may_reach(&self, sites: &AllocSiteSet, object: ValueId, at: InstId) -> bool {
+        if self.module.functions.len() > 512 {
+            if sites.is_empty() {
+                return false;
+            }
+            let known = self.oracle.borrow().known_sites_at(object, at);
+            if !known.is_empty() {
+                return sites.intersects(&known);
+            }
+            return match self.fresh_result_site(object) {
+                Some(site) => sites.iter().any(|s| s == site),
+                None => false,
+            };
+        }
         if sites.is_empty() {
             return true;
         }
@@ -911,6 +1690,9 @@ impl<'m> TaintProblem<'m> {
     /// base itself was tainted — any property read is tainted one step.
     fn cut_first(&self, fields: &FieldChain, key: FieldKey) -> Option<FieldChain> {
         if fields.is_empty() {
+            if self.module.functions.len() > 512 {
+                return Some(FieldChain::new());
+            }
             return Some(FieldChain::new().pushed(key, self.cap()));
         }
         let first = fields.elements()[0];
@@ -1030,8 +1812,18 @@ impl<'m> TaintProblem<'m> {
                     out.extend(injected.into_iter().map(Fact::of));
                 } else {
                     let sites = self.oracle.borrow().resolve(object).sites;
+                    let base = if sites.is_empty() && self.module.functions.len() > 512 {
+                        let known = self.oracle.borrow().known_sites_at(object, at);
+                        if known.is_empty() {
+                            TaintBase::Local(object)
+                        } else {
+                            TaintBase::Heap(known)
+                        }
+                    } else {
+                        TaintBase::Heap(sites)
+                    };
                     out.push(Fact::of(TaintFact {
-                        base: TaintBase::Heap(sites),
+                        base,
                         fields: chain,
                     }));
                 }
@@ -1075,8 +1867,21 @@ impl<'m> TaintProblem<'m> {
     fn generic_propagate(&self, inst: &abcd_ir::Inst, fact: &TaintFact, out: &mut Vec<Fact>) {
         let Some(result) = inst.result else { return };
         let Some(v) = fact.local_base() else { return };
-        if op_uses_value(&inst.op, v) {
-            out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+        if !op_uses_value(&inst.op, v) {
+            return;
+        }
+        match &inst.op {
+            Op::Compare { .. } | Op::UnaryOp { .. } => {
+                if fact.fields.is_empty() {
+                    out.push(Fact::of(TaintFact::local(result)));
+                }
+            }
+            Op::BinaryOp { .. } => {
+                out.push(Fact::of(TaintFact::local(result)));
+            }
+            _ => {
+                out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+            }
         }
     }
 
@@ -1353,7 +2158,7 @@ impl IfdsProblem for TaintProblem<'_> {
         let mut seeds = Vec::new();
         if self.config.seed_all_functions {
             for (fi, f) in self.module.functions.iter().enumerate() {
-                if !f.blocks.is_empty() {
+                if !f.blocks.is_empty() && self.zero_needed.get(fi).copied().unwrap_or(false) {
                     seeds.push((FuncId::new(fi as u32), Fact::Zero));
                 }
             }
@@ -1403,10 +2208,19 @@ impl IfdsProblem for TaintProblem<'_> {
             if let Op::LoadModuleVar { index, kind } = &curr_inst.op
                 && !kind.is_local()
                 && let Some(cid) = self.links.inst_class(module, curr)
-                && self.module_import_sources.contains(&(cid, *index))
+                && let Some(field_spec) = self.module_import_sources.get(&(cid, *index))
                 && let Some(result) = curr_inst.result
             {
-                out.push(Fact::of(TaintFact::local(result)));
+                match field_spec {
+                    None => out.push(Fact::of(TaintFact::local(result))),
+                    Some(syms) => {
+                        for &sym in syms {
+                            out.push(Fact::of(
+                                TaintFact::local(result).pushed(FieldKey::Named(sym), self.cap()),
+                            ));
+                        }
+                    }
+                }
             }
             return;
         };
@@ -1516,7 +2330,7 @@ impl IfdsProblem for TaintProblem<'_> {
                     && let TaintBase::Heap(sites) = &fact.base
                 {
                     let precise = !env.has_unknown && !env.sites.is_empty();
-                    let hits = if precise {
+                    let hits = if precise || self.module.functions.len() > 512 {
                         env.sites.intersects(sites)
                     } else {
                         let oracle = self.oracle.borrow();
@@ -1677,9 +2491,14 @@ impl IfdsProblem for TaintProblem<'_> {
             Op::DefineMethod { object, func, .. } => {
                 if fact.base == TaintBase::Local(*func) {
                     let sites = self.oracle.borrow().resolve(*object).sites;
+                    let base = if sites.is_empty() && self.module.functions.len() > 512 {
+                        TaintBase::Local(*object)
+                    } else {
+                        TaintBase::Heap(sites)
+                    };
                     out.push(Fact::of(
                         TaintFact {
-                            base: TaintBase::Heap(sites),
+                            base,
                             fields: FieldChain::new(),
                         }
                         .pushed(FieldKey::AnyDynamic, self.cap()),
@@ -1753,6 +2572,7 @@ impl IfdsProblem for TaintProblem<'_> {
             }
             if let Fact::Taint(fact) = source
                 && fact.is_state_base()
+                && self.allow_state_into_callee(call, callee, fact)
             {
                 out.push(source.clone());
             }
@@ -1803,7 +2623,7 @@ impl IfdsProblem for TaintProblem<'_> {
         // the gap call finds no recorded caller and falls back to the
         // rung-0 floor (sound; documented in gap.rs).
         if let Some(gap) = &gap {
-            if fact.is_state_base() {
+            if fact.is_state_base() && self.allow_state_into_callee(call, callee, fact) {
                 out.push(source.clone());
             }
             let base = call_base_value(module, call_inst);
@@ -1827,11 +2647,21 @@ impl IfdsProblem for TaintProblem<'_> {
                 // args[i] → params[formal_base + i], NOT params[i + 1]
                 // (the pre-N66 table was written for a normalized ABI
                 // the lift never produced).
+                let allow_this_prop = if self.module.functions.len() > 512
+                    && *kind != CallKind::New
+                    && !args.contains(v)
+                    && let Some(&FieldKey::Named(prop)) = fact.fields.elements().first()
+                {
+                    self.can_callee_touch_prop(prop, callee)
+                } else {
+                    true
+                };
                 let binding = param_binding(module, callee);
                 if binding == ParamBinding::OverApproxAll {
                     // Conservative: a tainted this/arg taints EVERY
                     // param (never silently drop a flow).
-                    let on_operands = this.is_some_and(|t| t == *v) || args.contains(v);
+                    let on_operands =
+                        (allow_this_prop && this.is_some_and(|t| t == *v)) || args.contains(v);
                     if on_operands {
                         for &p in &fd.params {
                             out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
@@ -1839,10 +2669,11 @@ impl IfdsProblem for TaintProblem<'_> {
                     }
                 } else {
                     // `this` → the this slot (T4 binding convention).
-                    if let ParamBinding::Precise {
-                        this_slot: Some(slot),
-                        ..
-                    } = binding
+                    if allow_this_prop
+                        && let ParamBinding::Precise {
+                            this_slot: Some(slot),
+                            ..
+                        } = binding
                         && this.is_some_and(|t| t == *v)
                         && let Some(&p) = fd.params.get(slot)
                     {
@@ -1918,7 +2749,11 @@ impl IfdsProblem for TaintProblem<'_> {
                 // data taint (documented rung-0 gap).
             }
             // Heap/global/module/lexical state flows into the callee.
-            _ => out.push(source.clone()),
+            _ => {
+                if self.allow_state_into_callee(call, callee, fact) {
+                    out.push(source.clone());
+                }
+            }
         }
     }
 
@@ -1942,7 +2777,11 @@ impl IfdsProblem for TaintProblem<'_> {
         // across gap edges: the callback's side effects on heap/global
         // state persist at the summary call's continuation).
         if fact.is_state_base() {
-            out.push(source.clone());
+            if call_site.is_none_or(|c| {
+                !self.is_harness_call(c) || self.allow_state_across_harness(c, callee, fact, false)
+            }) {
+                out.push(source.clone());
+            }
             return;
         }
         let Some(v) = fact.local_base() else { return };
@@ -2048,7 +2887,7 @@ impl IfdsProblem for TaintProblem<'_> {
         let Some(call_inst) = module.inst(call) else {
             return;
         };
-        let Op::Call { args, .. } = &call_inst.op else {
+        let Op::Call { args, kind, .. } = &call_inst.op else {
             return;
         };
         let is_handler_site = self.handler_exception_at(return_site).is_some();
@@ -2116,8 +2955,26 @@ impl IfdsProblem for TaintProblem<'_> {
             }
             SiteClass::BodyStep => {
                 // The callee body carries operand taints through the
-                // call/return edges; everything else bypasses.
-                if !on_operand {
+                // call/return edges; caller SSA values with empty field
+                // chains also survive (JS/ArkTS passes arguments by value,
+                // so a callee cannot rebind or sanitize the caller's SSA
+                // register, while non-empty `Local(v).f` chains defer to
+                // the callee body for Rung-0 field strong-kills unless no
+                // callee touches `f` on large bundles).
+                let untouched_this_prop = if self.module.functions.len() > 512
+                    && *kind != CallKind::New
+                    && let Some(v) = fact.local_base()
+                    && !args.contains(&v)
+                    && let Some(&FieldKey::Named(prop)) = fact.fields.elements().first()
+                {
+                    self.callgraph
+                        .callees_of_call_at(call)
+                        .iter()
+                        .all(|&c| !self.can_callee_touch_prop(prop, c))
+                } else {
+                    false
+                };
+                if !on_operand || fact.fields.is_empty() || untouched_this_prop {
                     self.push_passthrough_at(source, return_site, out);
                 }
             }
@@ -2131,11 +2988,243 @@ impl IfdsProblem for TaintProblem<'_> {
                     && !is_handler_site
                     && let Some(result) = call_inst.result
                 {
-                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                    if self.module.functions.len() > 512 {
+                        if fact
+                            .local_base()
+                            .is_some_and(|v| fact.fields.is_empty() || args.contains(&v))
+                        {
+                            out.push(Fact::of(TaintFact::local(result)));
+                        }
+                    } else {
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                    }
                 }
             }
         }
     }
+
+    fn propagate_zero_to_callee(&self, _call: InstId, callee: FuncId) -> bool {
+        self.zero_needed
+            .get(callee.index())
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Default)]
+struct HarnessGuard {
+    fid: Option<FuncId>,
+    calls: HashSet<InstId>,
+    alloc_sites: HashSet<InstId>,
+    call_allowed_sites: HashMap<InstId, HashSet<InstId>>,
+}
+
+fn build_harness_guard(module: &Module) -> HarnessGuard {
+    let harness_fid = module.functions.iter().enumerate().find_map(|(fi, f)| {
+        (module.sym.resolve(f.name) == Some(abcd_analysis::ohos_lifecycle::OHOS_HARNESS_FUNC))
+            .then_some(FuncId::new(fi as u32))
+    });
+    let Some(hfid) = harness_fid else {
+        return HarnessGuard::default();
+    };
+    let Some(hfd) = module.func(hfid) else {
+        return HarnessGuard::default();
+    };
+
+    let mut calls = HashSet::new();
+    let mut alloc_sites = HashSet::new();
+    let mut val_sites: HashMap<ValueId, HashSet<InstId>> = HashMap::new();
+    let mut call_allowed_sites: HashMap<InstId, HashSet<InstId>> = HashMap::new();
+
+    // Pass 1: record `AllocObject` / `AllocArray` / `Call(New)` sites and `Mov` aliases.
+    for &b in &hfd.blocks {
+        let Some(bb) = module.block(b) else { continue };
+        for &iid in &bb.insts {
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
+            match &inst.op {
+                Op::AllocObject { .. }
+                | Op::AllocArray { .. }
+                | Op::Call {
+                    kind: CallKind::New,
+                    ..
+                } => {
+                    alloc_sites.insert(iid);
+                    if let Some(r) = inst.result {
+                        val_sites.entry(r).or_default().insert(iid);
+                    }
+                }
+                Op::Mov { src } => {
+                    if let Some(r) = inst.result
+                        && let Some(sites) = val_sites.get(src).cloned()
+                    {
+                        val_sites.entry(r).or_default().extend(sites);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Pass 2: associate `this.context = ctx_v` sites with the owning component instance.
+    for &b in &hfd.blocks {
+        let Some(bb) = module.block(b) else { continue };
+        for &iid in &bb.insts {
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
+            match &inst.op {
+                Op::StoreProp {
+                    object,
+                    name,
+                    value,
+                }
+                | Op::StoreOwnPropName {
+                    object,
+                    name,
+                    value,
+                } if module.sym.resolve(*name) == Some("context") => {
+                    if let Some(sites) = val_sites.get(value).cloned() {
+                        val_sites.entry(*object).or_default().extend(sites);
+                    }
+                }
+                Op::Mov { src } => {
+                    if let Some(r) = inst.result
+                        && let Some(sites) = val_sites.get(src).cloned()
+                    {
+                        val_sites.entry(r).or_default().extend(sites);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Pass 3: compute allowed harness allocation sites per call instruction.
+    for &b in &hfd.blocks {
+        let Some(bb) = module.block(b) else { continue };
+        for &iid in &bb.insts {
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
+            if let Op::Call { this, .. } = &inst.op {
+                calls.insert(iid);
+                let mut allowed = HashSet::new();
+                if let Some(t) = this
+                    && let Some(sites) = val_sites.get(t)
+                {
+                    allowed.extend(sites.iter().copied());
+                }
+                if let Some(r) = inst.result
+                    && let Some(sites) = val_sites.get(&r)
+                {
+                    allowed.extend(sites.iter().copied());
+                }
+                if !allowed.is_empty() {
+                    call_allowed_sites.insert(iid, allowed);
+                }
+            }
+        }
+    }
+
+    HarnessGuard {
+        fid: Some(hfid),
+        calls,
+        alloc_sites,
+        call_allowed_sites,
+    }
+}
+
+pub(crate) fn resolve_global_sources(module: &Module, config: &TaintConfig) -> HashSet<Sym> {
+    let global_names: HashSet<&str> = config
+        .sources
+        .iter()
+        .filter_map(|s| match s {
+            SourceSpec::GlobalLoad { name } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut global_sources = HashSet::new();
+    if !global_names.is_empty() {
+        for i in 0..module.sym.len() {
+            let sym = Sym::new(i as u32);
+            if let Some(s) = module.sym.resolve(sym)
+                && global_names.contains(s)
+            {
+                global_sources.insert(sym);
+            }
+        }
+    }
+    global_sources
+}
+
+pub(crate) fn resolve_module_import_sources(
+    module: &Module,
+    links: &ModuleLinkTable,
+    config: &TaintConfig,
+) -> HashMap<(ClassId, u32), Option<Vec<Sym>>> {
+    let mut module_import_sources: HashMap<(ClassId, u32), Option<Vec<Sym>>> = HashMap::new();
+    let mut device_info_syms: Option<Vec<Sym>> = None;
+    for spec in &config.sources {
+        if let SourceSpec::ModuleImport {
+            specifier,
+            import_name,
+        } = spec
+        {
+            let want_spec = normalize_sdk_specifier(specifier);
+            for ci in 0..module.classes.len() {
+                let cid = ClassId::new(ci as u32);
+                let mut ext_idx = 0u32;
+                while let Some(target) = links.external_load(cid, ext_idx) {
+                    for &(s_sym, i_sym) in &target.external_imports {
+                        let s_str = module.sym.resolve(s_sym).unwrap_or("");
+                        let i_str = module.sym.resolve(i_sym).unwrap_or("");
+                        let norm_s = normalize_sdk_specifier(s_str);
+                        let matched = (s_str == specifier || norm_s == want_spec)
+                            && import_name.as_deref().is_none_or(|w| w == i_str);
+                        if !matched {
+                            continue;
+                        }
+                        let canon_spec =
+                            kit_canonical_alias(&norm_s, i_str).unwrap_or(norm_s.as_str());
+                        let is_device_info_ns = canon_spec == "@ohos.deviceInfo"
+                            && matches!(import_name.as_deref(), None | Some("deviceInfo"))
+                            && matches!(i_str, "default" | "*" | "deviceInfo");
+                        let entry_val = if is_device_info_ns {
+                            let syms = device_info_syms.get_or_insert_with(|| {
+                                let mut out = Vec::new();
+                                for idx in 0..module.sym.len() {
+                                    let sym = Sym::new(idx as u32);
+                                    if let Some(name) = module.sym.resolve(sym)
+                                        && matches!(name, "ODID" | "udid" | "serial" | "AAID")
+                                    {
+                                        out.push(sym);
+                                    }
+                                }
+                                out
+                            });
+                            Some(syms.clone())
+                        } else {
+                            None
+                        };
+                        match module_import_sources.get_mut(&(cid, ext_idx)) {
+                            Some(existing) => {
+                                if entry_val.is_none() {
+                                    *existing = None;
+                                }
+                            }
+                            None => {
+                                module_import_sources.insert((cid, ext_idx), entry_val);
+                            }
+                        }
+                    }
+                    ext_idx += 1;
+                }
+            }
+        }
+    }
+    module_import_sources
 }
 
 fn ctor_this_of_module(module: &Module, fid: FuncId) -> Option<ValueId> {
@@ -2430,7 +3519,6 @@ fn build_global_stores_map(module: &Module) -> HashMap<Sym, Vec<ValueId>> {
 }
 
 const UNSEEN_FUNC: u32 = u32::MAX;
-const MULTI_FUNC_VAL: u32 = u32::MAX - 1;
 const UNUSED_BLOCK: u32 = u32::MAX;
 const MULTI_USE_BLOCK: u32 = u32::MAX - 1;
 
@@ -2441,26 +3529,305 @@ struct InstLivenessLoc {
     pos: u32,
 }
 
-#[derive(Clone, Copy)]
-struct FuncLivenessMeta {
+struct FuncLiveness {
     words_per_block: usize,
-    live_out_word_offset: usize,
-    val_base_offset: usize,
+    aug_live_out_words: Vec<u64>,
+    val_to_lidx: HashMap<ValueId, u32>,
+    single_block_last_use: Vec<(u32, u32)>,
+    multi_block_last_use: HashMap<(u32, u32), u32>,
 }
 
-/// Compact per-function backward SSA liveness index over [`Module`].
+impl FuncLiveness {
+    fn empty() -> Self {
+        Self {
+            words_per_block: 0,
+            aug_live_out_words: Vec::new(),
+            val_to_lidx: HashMap::new(),
+            single_block_last_use: Vec::new(),
+            multi_block_last_use: HashMap::new(),
+        }
+    }
+
+    fn build(module: &Module, fid: FuncId, await_resume: &HashMap<InstId, ValueId>) -> Self {
+        let Some(f) = module.func(fid) else {
+            return Self::empty();
+        };
+        if f.blocks.is_empty() {
+            return Self::empty();
+        }
+
+        let mut local_blocks: Vec<BlockId> = Vec::with_capacity(f.blocks.len());
+        let mut block_to_local: HashMap<BlockId, usize> = HashMap::with_capacity(f.blocks.len());
+        for &b in &f.blocks {
+            if let std::collections::hash_map::Entry::Vacant(e) = block_to_local.entry(b) {
+                e.insert(local_blocks.len());
+                local_blocks.push(b);
+            }
+        }
+        let num_blocks = local_blocks.len();
+        let ctor_this = ctor_this_of_module(module, fid);
+
+        let mut val_to_lidx: HashMap<ValueId, u32> = HashMap::new();
+        let mut intern_val = |v: ValueId| {
+            if v.index() >= module.values.len() {
+                return;
+            }
+            let next_id = val_to_lidx.len() as u32;
+            val_to_lidx.entry(v).or_insert(next_id);
+        };
+
+        for &p in &f.params {
+            intern_val(p);
+        }
+        for region in &f.try_regions {
+            for catch in &region.catches {
+                intern_val(catch.exception);
+            }
+        }
+        for &b in &local_blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if let Some(res) = inst.result {
+                    intern_val(res);
+                }
+                for_each_op_operand(&inst.op, &mut intern_val);
+                if matches!(inst.op, Op::Call { .. })
+                    && let Some(base_v) = call_base_value(module, inst)
+                {
+                    intern_val(base_v);
+                }
+                if matches!(inst.op, Op::ResumeGenerator { .. })
+                    && let Some(&aw) = await_resume.get(&iid)
+                {
+                    intern_val(aw);
+                }
+                if matches!(inst.op, Op::Return { .. })
+                    && let Some(ct) = ctor_this
+                {
+                    intern_val(ct);
+                }
+            }
+        }
+
+        let num_vals = val_to_lidx.len();
+        let words = num_vals.div_ceil(64);
+        if words == 0 {
+            return Self::empty();
+        }
+
+        let mut single_block_last_use = vec![(UNUSED_BLOCK, 0u32); num_vals];
+        let mut multi_block_last_use: HashMap<(u32, u32), u32> = HashMap::new();
+
+        let mut norm_succs: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        let mut norm_preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        let mut exc_succs: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        let mut exc_preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        let mut entry_exc_kill = vec![0u64; num_blocks * words];
+
+        for (b_local, &b) in local_blocks.iter().enumerate() {
+            for s in abcd_analysis::control::block_succs(module, b) {
+                if let Some(&sl) = block_to_local.get(&s)
+                    && !norm_succs[b_local].contains(&sl)
+                {
+                    norm_succs[b_local].push(sl);
+                    norm_preds[sl].push(b_local);
+                }
+            }
+        }
+        for region in &f.try_regions {
+            let mut handlers = Vec::new();
+            for catch in &region.catches {
+                if let Some(&hl_usize) = block_to_local.get(&catch.handler) {
+                    if !handlers.contains(&hl_usize) {
+                        handlers.push(hl_usize);
+                    }
+                    if let Some(&lidx) = val_to_lidx.get(&catch.exception) {
+                        let li = lidx as usize;
+                        entry_exc_kill[hl_usize * words + li / 64] |= 1u64 << (li % 64);
+                    }
+                }
+            }
+            for &prot_b in &region.protected {
+                if let Some(&pl_usize) = block_to_local.get(&prot_b) {
+                    for &hl in &handlers {
+                        if !exc_succs[pl_usize].contains(&hl) {
+                            exc_succs[pl_usize].push(hl);
+                            exc_preds[hl].push(pl_usize);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut gen_bits = vec![0u64; num_blocks * words];
+        let mut kill_bits = vec![0u64; num_blocks * words];
+
+        for (b_local, &b) in local_blocks.iter().enumerate() {
+            let Some(bb) = module.block(b) else { continue };
+            let b_u32 = b_local as u32;
+            let base_w = b_local * words;
+
+            let mut record_use =
+                |v: ValueId, pos_u32: u32, gen_s: &mut [u64], kill_s: &mut [u64]| {
+                    let Some(&lidx) = val_to_lidx.get(&v) else {
+                        return;
+                    };
+                    let li = lidx as usize;
+                    let w = li / 64;
+                    let mask = 1u64 << (li % 64);
+                    gen_s[w] |= mask;
+                    kill_s[w] &= !mask;
+
+                    let sb = &mut single_block_last_use[li];
+                    if sb.0 == UNUSED_BLOCK {
+                        *sb = (b_u32, pos_u32);
+                    } else if sb.0 == b_u32 {
+                        // Reverse iteration visits the maximum position first.
+                    } else if sb.0 != MULTI_USE_BLOCK {
+                        let (prev_b, prev_max) = *sb;
+                        *sb = (MULTI_USE_BLOCK, 0);
+                        multi_block_last_use.insert((prev_b, lidx), prev_max);
+                        multi_block_last_use.insert((b_u32, lidx), pos_u32);
+                    } else {
+                        multi_block_last_use.entry((b_u32, lidx)).or_insert(pos_u32);
+                    }
+                };
+
+            let gen_slice = &mut gen_bits[base_w..base_w + words];
+            let kill_slice = &mut kill_bits[base_w..base_w + words];
+
+            for (pos, &iid) in bb.insts.iter().enumerate().rev() {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if let Some(res) = inst.result
+                    && let Some(&lidx) = val_to_lidx.get(&res)
+                {
+                    let li = lidx as usize;
+                    let w = li / 64;
+                    let mask = 1u64 << (li % 64);
+                    gen_slice[w] &= !mask;
+                    kill_slice[w] |= mask;
+                }
+                let pos_u32 = pos as u32;
+                for_each_op_operand(&inst.op, |u| {
+                    record_use(u, pos_u32, gen_slice, kill_slice);
+                });
+                if matches!(inst.op, Op::Call { .. })
+                    && let Some(base_v) = call_base_value(module, inst)
+                {
+                    record_use(base_v, pos_u32, gen_slice, kill_slice);
+                }
+                if matches!(inst.op, Op::ResumeGenerator { .. })
+                    && let Some(&aw) = await_resume.get(&iid)
+                {
+                    record_use(aw, pos_u32, gen_slice, kill_slice);
+                }
+                if matches!(inst.op, Op::Return { .. })
+                    && let Some(ct) = ctor_this
+                {
+                    record_use(ct, pos_u32, gen_slice, kill_slice);
+                }
+            }
+        }
+
+        let mut live_in = gen_bits.clone();
+        let mut queue: VecDeque<usize> = (0..num_blocks).rev().collect();
+        let mut in_queue = vec![true; num_blocks];
+
+        while let Some(b_local) = queue.pop_front() {
+            in_queue[b_local] = false;
+            let base_w = b_local * words;
+            let mut changed = false;
+            for w in 0..words {
+                let mut norm_out = 0u64;
+                for &s in &norm_succs[b_local] {
+                    norm_out |= live_in[s * words + w];
+                }
+                let mut exc_out = 0u64;
+                for &h in &exc_succs[b_local] {
+                    exc_out |= live_in[h * words + w] & !entry_exc_kill[h * words + w];
+                }
+                let new_in = (norm_out & !kill_bits[base_w + w]) | gen_bits[base_w + w] | exc_out;
+                if new_in != live_in[base_w + w] {
+                    live_in[base_w + w] = new_in;
+                    changed = true;
+                }
+            }
+            if changed {
+                for &p in norm_preds[b_local].iter().chain(exc_preds[b_local].iter()) {
+                    if !in_queue[p] {
+                        in_queue[p] = true;
+                        queue.push_back(p);
+                    }
+                }
+            }
+        }
+
+        let mut aug_live_out_words = Vec::with_capacity(num_blocks * words);
+        for b_local in 0..num_blocks {
+            for w in 0..words {
+                let mut aug_out = 0u64;
+                for &s in &norm_succs[b_local] {
+                    aug_out |= live_in[s * words + w];
+                }
+                for &h in &exc_succs[b_local] {
+                    aug_out |= live_in[h * words + w] & !entry_exc_kill[h * words + w];
+                }
+                aug_live_out_words.push(aug_out);
+            }
+        }
+
+        Self {
+            words_per_block: words,
+            aug_live_out_words,
+            val_to_lidx,
+            single_block_last_use,
+            multi_block_last_use,
+        }
+    }
+
+    fn is_live_at(&self, loc: InstLivenessLoc, v: ValueId) -> bool {
+        if self.words_per_block == 0 {
+            return false;
+        }
+        let Some(&lidx) = self.val_to_lidx.get(&v) else {
+            return false;
+        };
+        let word_idx = (loc.block_local as usize) * self.words_per_block + (lidx as usize / 64);
+        if self
+            .aug_live_out_words
+            .get(word_idx)
+            .is_some_and(|&w| ((w >> (lidx % 64)) & 1) != 0)
+        {
+            return true;
+        }
+        let Some(&(ublk, max_pos)) = self.single_block_last_use.get(lidx as usize) else {
+            return true;
+        };
+        if ublk == loc.block_local {
+            max_pos >= loc.pos
+        } else if ublk == MULTI_USE_BLOCK {
+            self.multi_block_last_use
+                .get(&(loc.block_local, lidx))
+                .is_some_and(|&mp| mp >= loc.pos)
+        } else {
+            false
+        }
+    }
+}
+
+/// Compact lazy per-function backward SSA liveness index over [`Module`].
 struct LocalLiveness {
     inst_loc: Vec<InstLivenessLoc>,
-    func_meta: Vec<FuncLivenessMeta>,
-    aug_live_out_words: Vec<u64>,
-    val_slot: Vec<(u32, u32)>,
-    multi_func_val_slot: HashMap<(u32, u32), u32>,
-    single_block_last_use: Vec<(u32, u32)>,
-    multi_block_last_use: HashMap<(u32, u32, u32), u32>,
+    funcs: RefCell<Vec<Option<FuncLiveness>>>,
 }
 
 impl LocalLiveness {
-    fn build(module: &Module, await_resume: &HashMap<InstId, ValueId>) -> Self {
+    fn build(module: &Module) -> Self {
         let mut inst_loc = vec![
             InstLivenessLoc {
                 func: UNSEEN_FUNC,
@@ -2469,69 +3836,21 @@ impl LocalLiveness {
             };
             module.insts.len()
         ];
-        let mut func_meta = Vec::with_capacity(module.functions.len());
-        let mut aug_live_out_words: Vec<u64> = Vec::new();
-        let mut val_slot = vec![(UNSEEN_FUNC, 0u32); module.values.len()];
-        let mut multi_func_val_slot: HashMap<(u32, u32), u32> = HashMap::new();
-        let mut single_block_last_use: Vec<(u32, u32)> = Vec::new();
-        let mut multi_block_last_use: HashMap<(u32, u32, u32), u32> = HashMap::new();
-
-        let mut block_to_local = vec![UNSEEN_FUNC; module.blocks.len()];
-        let mut val_to_local = vec![u32::MAX; module.values.len()];
-        let mut touched_vals: Vec<usize> = Vec::new();
+        let mut block_seen = vec![false; module.blocks.len()];
+        let mut local_blocks: Vec<BlockId> = Vec::new();
 
         for (fi, f) in module.functions.iter().enumerate() {
-            let fid_u32 = fi as u32;
-            let fid = FuncId::new(fid_u32);
             if f.blocks.is_empty() {
-                func_meta.push(FuncLivenessMeta {
-                    words_per_block: 0,
-                    live_out_word_offset: aug_live_out_words.len(),
-                    val_base_offset: single_block_last_use.len(),
-                });
                 continue;
             }
-
-            let mut local_blocks: Vec<BlockId> = Vec::with_capacity(f.blocks.len());
+            let fid_u32 = fi as u32;
+            local_blocks.clear();
             for &b in &f.blocks {
-                if let Some(slot) = block_to_local.get_mut(b.index())
-                    && *slot == UNSEEN_FUNC
+                if let Some(seen) = block_seen.get_mut(b.index())
+                    && !*seen
                 {
-                    *slot = local_blocks.len() as u32;
+                    *seen = true;
                     local_blocks.push(b);
-                }
-            }
-            let num_blocks = local_blocks.len();
-            let ctor_this = ctor_this_of_module(module, fid);
-
-            let mut intern_val = |v: ValueId| -> Option<u32> {
-                let vi = v.index();
-                let slot = val_to_local.get_mut(vi)?;
-                if *slot == u32::MAX {
-                    let lidx = touched_vals.len() as u32;
-                    *slot = lidx;
-                    touched_vals.push(vi);
-                    let vs = &mut val_slot[vi];
-                    if vs.0 == UNSEEN_FUNC {
-                        *vs = (fid_u32, lidx);
-                    } else if vs.0 != MULTI_FUNC_VAL {
-                        let (prev_f, prev_lidx) = *vs;
-                        *vs = (MULTI_FUNC_VAL, 0);
-                        multi_func_val_slot.insert((prev_f, vi as u32), prev_lidx);
-                        multi_func_val_slot.insert((fid_u32, vi as u32), lidx);
-                    } else {
-                        multi_func_val_slot.insert((fid_u32, vi as u32), lidx);
-                    }
-                }
-                Some(*slot)
-            };
-
-            for &p in &f.params {
-                let _ = intern_val(p);
-            }
-            for region in &f.try_regions {
-                for catch in &region.catches {
-                    let _ = intern_val(catch.exception);
                 }
             }
             for (b_local, &b) in local_blocks.iter().enumerate() {
@@ -2546,300 +3865,43 @@ impl LocalLiveness {
                             pos: pos as u32,
                         };
                     }
-                    let Some(inst) = module.inst(iid) else {
-                        continue;
-                    };
-                    if let Some(res) = inst.result {
-                        let _ = intern_val(res);
-                    }
-                    for_each_op_operand(&inst.op, |u| {
-                        let _ = intern_val(u);
-                    });
-                    if matches!(inst.op, Op::Call { .. })
-                        && let Some(base_v) = call_base_value(module, inst)
-                    {
-                        let _ = intern_val(base_v);
-                    }
-                    if matches!(inst.op, Op::ResumeGenerator { .. })
-                        && let Some(&aw) = await_resume.get(&iid)
-                    {
-                        let _ = intern_val(aw);
-                    }
-                    if matches!(inst.op, Op::Return { .. })
-                        && let Some(ct) = ctor_this
-                    {
-                        let _ = intern_val(ct);
-                    }
                 }
             }
-
-            let num_vals = touched_vals.len();
-            let words = num_vals.div_ceil(64);
-            let live_out_word_offset = aug_live_out_words.len();
-            let val_base_offset = single_block_last_use.len();
-            func_meta.push(FuncLivenessMeta {
-                words_per_block: words,
-                live_out_word_offset,
-                val_base_offset,
-            });
-
-            if words == 0 {
-                for &b in &local_blocks {
-                    block_to_local[b.index()] = UNSEEN_FUNC;
-                }
-                continue;
-            }
-
-            single_block_last_use.resize(val_base_offset + num_vals, (UNUSED_BLOCK, 0));
-
-            let mut norm_succs: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
-            let mut norm_preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
-            let mut exc_succs: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
-            let mut exc_preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
-            let mut entry_exc_kill = vec![0u64; num_blocks * words];
-
-            for (b_local, &b) in local_blocks.iter().enumerate() {
-                for s in abcd_analysis::control::block_succs(module, b) {
-                    if let Some(&s_local) = block_to_local.get(s.index())
-                        && s_local != UNSEEN_FUNC
-                    {
-                        let sl = s_local as usize;
-                        if !norm_succs[b_local].contains(&sl) {
-                            norm_succs[b_local].push(sl);
-                            norm_preds[sl].push(b_local);
-                        }
-                    }
-                }
-            }
-            for region in &f.try_regions {
-                let mut handlers = Vec::new();
-                for catch in &region.catches {
-                    if let Some(&hl) = block_to_local.get(catch.handler.index())
-                        && hl != UNSEEN_FUNC
-                    {
-                        let hl_usize = hl as usize;
-                        if !handlers.contains(&hl_usize) {
-                            handlers.push(hl_usize);
-                        }
-                        if let Some(&lidx) = val_to_local.get(catch.exception.index())
-                            && lidx != u32::MAX
-                        {
-                            let li = lidx as usize;
-                            entry_exc_kill[hl_usize * words + li / 64] |= 1u64 << (li % 64);
-                        }
-                    }
-                }
-                for &prot_b in &region.protected {
-                    if let Some(&pl) = block_to_local.get(prot_b.index())
-                        && pl != UNSEEN_FUNC
-                    {
-                        let pl_usize = pl as usize;
-                        for &hl in &handlers {
-                            if !exc_succs[pl_usize].contains(&hl) {
-                                exc_succs[pl_usize].push(hl);
-                                exc_preds[hl].push(pl_usize);
-                            }
-                        }
-                    }
-                }
-            }
-
-            let mut gen_bits = vec![0u64; num_blocks * words];
-            let mut kill_bits = vec![0u64; num_blocks * words];
-
-            for (b_local, &b) in local_blocks.iter().enumerate() {
-                let Some(bb) = module.block(b) else { continue };
-                let b_u32 = b_local as u32;
-                let base_w = b_local * words;
-
-                let mut record_use =
-                    |v: ValueId, pos_u32: u32, gen_s: &mut [u64], kill_s: &mut [u64]| {
-                        let Some(&lidx) = val_to_local.get(v.index()) else {
-                            return;
-                        };
-                        if lidx == u32::MAX {
-                            return;
-                        }
-                        let li = lidx as usize;
-                        let w = li / 64;
-                        let mask = 1u64 << (li % 64);
-                        gen_s[w] |= mask;
-                        kill_s[w] &= !mask;
-
-                        let sb = &mut single_block_last_use[val_base_offset + li];
-                        if sb.0 == UNUSED_BLOCK {
-                            *sb = (b_u32, pos_u32);
-                        } else if sb.0 == b_u32 {
-                            // Reverse iteration visits the maximum position first.
-                        } else if sb.0 != MULTI_USE_BLOCK {
-                            let (prev_b, prev_max) = *sb;
-                            *sb = (MULTI_USE_BLOCK, 0);
-                            multi_block_last_use.insert((fid_u32, prev_b, lidx), prev_max);
-                            multi_block_last_use.insert((fid_u32, b_u32, lidx), pos_u32);
-                        } else {
-                            multi_block_last_use
-                                .entry((fid_u32, b_u32, lidx))
-                                .or_insert(pos_u32);
-                        }
-                    };
-
-                let gen_slice = &mut gen_bits[base_w..base_w + words];
-                let kill_slice = &mut kill_bits[base_w..base_w + words];
-
-                for (pos, &iid) in bb.insts.iter().enumerate().rev() {
-                    let Some(inst) = module.inst(iid) else {
-                        continue;
-                    };
-                    if let Some(res) = inst.result
-                        && let Some(&lidx) = val_to_local.get(res.index())
-                        && lidx != u32::MAX
-                    {
-                        let li = lidx as usize;
-                        let w = li / 64;
-                        let mask = 1u64 << (li % 64);
-                        gen_slice[w] &= !mask;
-                        kill_slice[w] |= mask;
-                    }
-                    let pos_u32 = pos as u32;
-                    for_each_op_operand(&inst.op, |u| {
-                        record_use(u, pos_u32, gen_slice, kill_slice);
-                    });
-                    if matches!(inst.op, Op::Call { .. })
-                        && let Some(base_v) = call_base_value(module, inst)
-                    {
-                        record_use(base_v, pos_u32, gen_slice, kill_slice);
-                    }
-                    if matches!(inst.op, Op::ResumeGenerator { .. })
-                        && let Some(&aw) = await_resume.get(&iid)
-                    {
-                        record_use(aw, pos_u32, gen_slice, kill_slice);
-                    }
-                    if matches!(inst.op, Op::Return { .. })
-                        && let Some(ct) = ctor_this
-                    {
-                        record_use(ct, pos_u32, gen_slice, kill_slice);
-                    }
-                }
-            }
-
-            let mut live_in = gen_bits.clone();
-            let mut queue: VecDeque<usize> = (0..num_blocks).rev().collect();
-            let mut in_queue = vec![true; num_blocks];
-
-            while let Some(b_local) = queue.pop_front() {
-                in_queue[b_local] = false;
-                let base_w = b_local * words;
-                let mut changed = false;
-                for w in 0..words {
-                    let mut norm_out = 0u64;
-                    for &s in &norm_succs[b_local] {
-                        norm_out |= live_in[s * words + w];
-                    }
-                    let mut exc_out = 0u64;
-                    for &h in &exc_succs[b_local] {
-                        exc_out |= live_in[h * words + w] & !entry_exc_kill[h * words + w];
-                    }
-                    let new_in =
-                        (norm_out & !kill_bits[base_w + w]) | gen_bits[base_w + w] | exc_out;
-                    if new_in != live_in[base_w + w] {
-                        live_in[base_w + w] = new_in;
-                        changed = true;
-                    }
-                }
-                if changed {
-                    for &p in norm_preds[b_local].iter().chain(exc_preds[b_local].iter()) {
-                        if !in_queue[p] {
-                            in_queue[p] = true;
-                            queue.push_back(p);
-                        }
-                    }
-                }
-            }
-
-            aug_live_out_words.reserve(num_blocks * words);
-            for b_local in 0..num_blocks {
-                for w in 0..words {
-                    let mut aug_out = 0u64;
-                    for &s in &norm_succs[b_local] {
-                        aug_out |= live_in[s * words + w];
-                    }
-                    for &h in &exc_succs[b_local] {
-                        aug_out |= live_in[h * words + w] & !entry_exc_kill[h * words + w];
-                    }
-                    aug_live_out_words.push(aug_out);
-                }
-            }
-
             for &b in &local_blocks {
-                block_to_local[b.index()] = UNSEEN_FUNC;
-            }
-            for vi in touched_vals.drain(..) {
-                val_to_local[vi] = u32::MAX;
+                block_seen[b.index()] = false;
             }
         }
 
-        Self {
-            inst_loc,
-            func_meta,
-            aug_live_out_words,
-            val_slot,
-            multi_func_val_slot,
-            single_block_last_use,
-            multi_block_last_use,
-        }
+        let funcs = RefCell::new((0..module.functions.len()).map(|_| None).collect());
+        Self { inst_loc, funcs }
     }
 
-    fn is_live_at(&self, at_inst: InstId, v: ValueId) -> bool {
+    fn is_live_at(
+        &self,
+        module: &Module,
+        await_resume: &HashMap<InstId, ValueId>,
+        at_inst: InstId,
+        v: ValueId,
+    ) -> bool {
         let Some(&loc) = self.inst_loc.get(at_inst.index()) else {
             return true;
         };
-        if loc.func == UNSEEN_FUNC {
+        if loc.func == UNSEEN_FUNC || v.index() >= module.values.len() {
             return true;
         }
-        let Some(&(v_func, raw_lidx)) = self.val_slot.get(v.index()) else {
-            return true;
-        };
-        let lidx = if v_func == loc.func {
-            raw_lidx
-        } else if v_func == MULTI_FUNC_VAL {
-            let Some(&idx) = self.multi_func_val_slot.get(&(loc.func, v.index() as u32)) else {
-                return false;
-            };
-            idx
-        } else {
-            return false;
-        };
-        let Some(&meta) = self.func_meta.get(loc.func as usize) else {
-            return true;
-        };
-        if meta.words_per_block == 0 {
-            return false;
+        let fidx = loc.func as usize;
+        let has_built = self.funcs.borrow().get(fidx).is_some_and(Option::is_some);
+        if !has_built {
+            let built = FuncLiveness::build(module, FuncId::new(loc.func), await_resume);
+            if let Some(slot) = self.funcs.borrow_mut().get_mut(fidx) {
+                *slot = Some(built);
+            }
         }
-        let word_idx = meta.live_out_word_offset
-            + (loc.block_local as usize) * meta.words_per_block
-            + (lidx as usize / 64);
-        if self
-            .aug_live_out_words
-            .get(word_idx)
-            .is_some_and(|&w| ((w >> (lidx % 64)) & 1) != 0)
-        {
-            return true;
-        }
-        let Some(&(ublk, max_pos)) = self
-            .single_block_last_use
-            .get(meta.val_base_offset + lidx as usize)
-        else {
+        let funcs_borrow = self.funcs.borrow();
+        let Some(Some(fl)) = funcs_borrow.get(fidx) else {
             return true;
         };
-        if ublk == loc.block_local {
-            max_pos >= loc.pos
-        } else if ublk == MULTI_USE_BLOCK {
-            self.multi_block_last_use
-                .get(&(loc.func, loc.block_local, lidx))
-                .is_some_and(|&mp| mp >= loc.pos)
-        } else {
-            false
-        }
+        fl.is_live_at(loc, v)
     }
 }
 
@@ -3055,7 +4117,7 @@ impl FuncAliasLoads {
     }
 }
 
-fn peel_ns_index(module: &Module, mut v: ValueId) -> Option<u32> {
+pub(crate) fn peel_ns_index(module: &Module, mut v: ValueId) -> Option<u32> {
     for _ in 0..8 {
         let ValueDef::Inst(iid) = module.value(v)?.def else {
             return None;

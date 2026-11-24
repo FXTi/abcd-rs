@@ -713,3 +713,174 @@ fn emit_void_call(m: &mut Module, b: BlockId, callee: ValueId, args: Vec<ValueId
         },
     )
 }
+
+/// Selective `Λ -> Λ` call-edge gating (`propagate_zero_to_callee == false`)
+/// skips `(Λ, inst, Λ)` tabulation inside source-free callees while preserving
+/// both non-zero argument summaries `(d, sp, d)` and direct `Λ -> d` seed edges
+/// produced by `call_flow(call, callee, &Λ)`.
+#[test]
+fn propagate_zero_to_callee_false_skips_zero_preserving_arg_and_seed_edges() {
+    let mut m = mk_module();
+    let sink = add_external_sink(&mut m, "sink");
+
+    // Source-free identity helper: `id(p) { copy = Mov(p); return copy; }`.
+    let id = add_func_named(&mut m, "id");
+    let id_entry = entry_of(&m, id);
+    add_param(&mut m, id, 0);
+    let id_p = add_param(&mut m, id, 1);
+    let id_copy = emit(&mut m, id_entry, Op::Mov { src: id_p });
+    let id_ret_inst = emit_void(
+        &mut m,
+        id_entry,
+        Op::Return {
+            value: Some(id_copy),
+        },
+    );
+    let id_sp = m.block(id_entry).unwrap().insts[0];
+
+    // Source-free callback helper seeded directly on call entry (`Λ -> V(cb_p)`):
+    // `cb(cb_p) { return cb_p; }`.
+    let cb = add_func_named(&mut m, "cb");
+    let cb_entry = entry_of(&m, cb);
+    add_param(&mut m, cb, 0);
+    let cb_p = add_param(&mut m, cb, 1);
+    let cb_ret_inst = emit_void(&mut m, cb_entry, Op::Return { value: Some(cb_p) });
+
+    // Caller: `x = "secret"; r1 = id(x); r2 = cb(dummy); sink(r1); sink(r2);`
+    let caller = add_func_named(&mut m, "caller");
+    let entry = entry_of(&m, caller);
+    add_param(&mut m, caller, 0);
+    let x = load_string(&mut m, entry, "secret");
+    let dummy = load_number(&mut m, entry, 0.0);
+    let id_ref = load_method_ref(&mut m, entry, id);
+    let r1 = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: id_ref,
+            this: None,
+            args: vec![x],
+            kind: abcd_ir::CallKind::Direct,
+        },
+    );
+    let call_id = match m.value(r1).unwrap().def {
+        abcd_ir::ValueDef::Inst(i) => i,
+        _ => panic!(),
+    };
+    let cb_ref = load_method_ref(&mut m, entry, cb);
+    let r2 = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: cb_ref,
+            this: None,
+            args: vec![dummy],
+            kind: abcd_ir::CallKind::Direct,
+        },
+    );
+    let call_cb = match m.value(r2).unwrap().def {
+        abcd_ir::ValueDef::Inst(i) => i,
+        _ => panic!(),
+    };
+    let sink_ref1 = load_method_ref(&mut m, entry, sink);
+    let sink_call1 = emit_void_call(&mut m, entry, sink_ref1, vec![r1]);
+    let sink_ref2 = load_method_ref(&mut m, entry, sink);
+    let sink_call2 = emit_void_call(&mut m, entry, sink_ref2, vec![r2]);
+    let caller_ret = emit_void(&mut m, entry, Op::Return { value: None });
+
+    let mut cg = MapCallGraph::default();
+    cg.add(call_id, id);
+    cg.add(call_cb, cb);
+    cg.add(sink_call1, sink);
+    cg.add(sink_call2, sink);
+
+    struct GatedProblem {
+        caller: FuncId,
+        cb: FuncId,
+        cb_param: ValueId,
+    }
+
+    impl IfdsProblem for GatedProblem {
+        type Fact = Fact;
+
+        fn zero(&self) -> Fact {
+            Fact::Zero
+        }
+
+        fn initial_seeds(&self) -> Vec<(FuncId, Fact)> {
+            vec![(self.caller, Fact::Zero)]
+        }
+
+        fn propagate_zero_to_callee(&self, _call: InstId, _callee: FuncId) -> bool {
+            false
+        }
+
+        fn normal_flow(&self, m: &Module, c: InstId, s: InstId, src: &Fact, out: &mut Vec<Fact>) {
+            MicroTaint.normal_flow(m, c, s, src, out);
+        }
+
+        fn call_flow(
+            &self,
+            m: &Module,
+            call: InstId,
+            callee: FuncId,
+            src: &Fact,
+            out: &mut Vec<Fact>,
+        ) {
+            if *src == Fact::Zero && callee == self.cb {
+                out.push(Fact::V(self.cb_param));
+                return;
+            }
+            MicroTaint.call_flow(m, call, callee, src, out);
+        }
+
+        fn return_flow(
+            &self,
+            m: &Module,
+            c: Option<InstId>,
+            f: FuncId,
+            e: InstId,
+            r: Option<InstId>,
+            src: &Fact,
+            out: &mut Vec<Fact>,
+        ) {
+            MicroTaint.return_flow(m, c, f, e, r, src, out);
+        }
+
+        fn call_to_return_flow(
+            &self,
+            m: &Module,
+            c: InstId,
+            r: InstId,
+            src: &Fact,
+            out: &mut Vec<Fact>,
+        ) {
+            MicroTaint.call_to_return_flow(m, c, r, src, out);
+        }
+    }
+
+    let problem = GatedProblem {
+        caller,
+        cb,
+        cb_param: cb_p,
+    };
+    let result = IfdsSolver::new(&m, &problem, &cg, IfdsConfig::default()).solve();
+
+    // Neither source-free callee receives `(Λ, inst, Λ)` path edges.
+    assert!(!result.is_reached(id_sp, &Fact::Zero));
+    assert!(!result.is_reached(id_ret_inst, &Fact::Zero));
+    assert!(!result.is_reached(cb_ret_inst, &Fact::Zero));
+
+    // Non-zero argument flow `(V(id_p), id_sp, V(id_p))` still tabulates `id`
+    // and returns taint to `r1`.
+    assert!(result.is_reached(id_sp, &Fact::V(id_p)));
+    assert!(result.is_reached(id_ret_inst, &Fact::V(id_copy)));
+    assert!(result.is_reached(sink_call1, &Fact::V(r1)));
+
+    // Direct `Λ -> V(cb_p)` seed edges from `call_flow` still fire and return to `r2`.
+    assert!(result.is_reached(cb_ret_inst, &Fact::V(cb_p)));
+    assert!(result.is_reached(sink_call2, &Fact::V(r2)));
+
+    // Caller `Λ` still bypasses calls via `call_to_return_flow`.
+    assert!(result.is_reached(caller_ret, &Fact::Zero));
+}

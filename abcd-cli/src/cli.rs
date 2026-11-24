@@ -163,7 +163,7 @@ pub struct RewriteArgs {
     pub select: SelectArgs,
 }
 
-/// `abcd analyze <input> [--callgraph] [--dominators] [--json]`.
+/// `abcd analyze <input> [--callgraph] [--dominators] [--pta] [--alias-rung <0|1|2>] [--pta-budget <STEPS>] [--json]`.
 #[derive(Debug, Args)]
 pub struct AnalyzeArgs {
     /// Input file: bare .abc or a container (.hap/.hsp/.app/.hqf).
@@ -174,6 +174,22 @@ pub struct AnalyzeArgs {
     /// Include the per-function immediate-dominator tree.
     #[arg(long)]
     pub dominators: bool,
+    /// Run Rung-2 pointer analysis (`pta::analyze`) to refine the call graph
+    /// and report PTA telemetry.
+    #[arg(long)]
+    pub pta: bool,
+    /// Call-graph / alias rung (`0` = base CallGraph, `1` = Rung-1 demand
+    /// alias, `2` = Rung-2 PTA).
+    #[arg(
+        long = "alias-rung",
+        value_name = "0|1|2",
+        value_parser = clap::value_parser!(u8).range(0..=2)
+    )]
+    pub alias_rung: Option<u8>,
+    /// Override `PtaConfig::step_budget` when `--pta` or `--alias-rung 2` is
+    /// active.
+    #[arg(long = "pta-budget", value_name = "STEPS")]
+    pub pta_budget: Option<usize>,
     /// Emit a machine-readable JSON report instead of text.
     #[arg(long)]
     pub json: bool,
@@ -182,7 +198,7 @@ pub struct AnalyzeArgs {
     pub select: SelectArgs,
 }
 
-/// `abcd taint <input> [--config <PATH>] [--preset <NAME>] [--link-modules] [--json]`.
+/// `abcd taint <input> [--config <PATH>] [--preset <NAME>] [--link-modules] [--alias-rung <0|1|2>] [--pta-budget <STEPS>] [--json]`.
 #[derive(Debug, Args)]
 pub struct TaintArgs {
     /// Input file: bare .abc or a container (.hap/.hsp/.app/.hqf).
@@ -199,6 +215,17 @@ pub struct TaintArgs {
     /// module so cross-container `@bundle:` imports resolve end-to-end.
     #[arg(long = "link-modules")]
     pub link_modules: bool,
+    /// Override `TaintConfig::alias_rung` (`0` = local def-chain, `1` = demand
+    /// alias, `2` = k=1 PTA) from TOML/preset.
+    #[arg(
+        long = "alias-rung",
+        value_name = "0|1|2",
+        value_parser = clap::value_parser!(u8).range(0..=2)
+    )]
+    pub alias_rung: Option<u8>,
+    /// Override `TaintConfig::pta_step_budget` when supplied.
+    #[arg(long = "pta-budget", value_name = "STEPS")]
+    pub pta_budget: Option<usize>,
     /// Emit a machine-readable JSON report instead of text.
     #[arg(long)]
     pub json: bool,
@@ -451,7 +478,9 @@ mod tests {
         let Command::Analyze(a) = cli.command else {
             panic!("expected analyze");
         };
-        assert!(!a.callgraph && !a.dominators && !a.json);
+        assert!(!a.callgraph && !a.dominators && !a.pta && !a.json);
+        assert_eq!(a.alias_rung, None);
+        assert_eq!(a.pta_budget, None);
     }
 
     #[test]
@@ -462,13 +491,34 @@ mod tests {
             "m.abc",
             "--callgraph",
             "--dominators",
+            "--pta",
+            "--alias-rung",
+            "2",
+            "--pta-budget",
+            "500",
             "--json",
         ])
         .unwrap();
         let Command::Analyze(a) = cli.command else {
             panic!("expected analyze");
         };
-        assert!(a.callgraph && a.dominators && a.json);
+        assert!(a.callgraph && a.dominators && a.pta && a.json);
+        assert_eq!(a.alias_rung, Some(2));
+        assert_eq!(a.pta_budget, Some(500));
+    }
+
+    #[test]
+    fn analyze_alias_rung_bounds_and_pta_budget_validation() {
+        for rung in ["0", "1", "2"] {
+            let cli = parse(&["abcd", "analyze", "m.abc", "--alias-rung", rung]).unwrap();
+            let Command::Analyze(a) = cli.command else {
+                panic!("expected analyze");
+            };
+            assert_eq!(a.alias_rung, Some(rung.parse().unwrap()));
+        }
+        assert!(parse(&["abcd", "analyze", "m.abc", "--alias-rung", "3"]).is_err());
+        assert!(parse(&["abcd", "analyze", "m.abc", "--alias-rung", "nope"]).is_err());
+        assert!(parse(&["abcd", "analyze", "m.abc", "--pta-budget", "nope"]).is_err());
     }
 
     // ---- taint ----
@@ -483,6 +533,8 @@ mod tests {
         assert_eq!(a.config, Some(PathBuf::from("t.toml")));
         assert_eq!(a.preset, None);
         assert!(!a.link_modules);
+        assert_eq!(a.alias_rung, None);
+        assert_eq!(a.pta_budget, None);
         assert!(a.json);
     }
 
@@ -505,6 +557,53 @@ mod tests {
         assert_eq!(a.config, None);
         assert_eq!(a.preset.as_deref(), Some("ohos"));
         assert!(a.link_modules && a.select.all && a.json);
+    }
+
+    #[test]
+    fn taint_alias_rung_and_pta_budget_flags() {
+        for rung in ["0", "1", "2"] {
+            let cli = parse(&[
+                "abcd",
+                "taint",
+                "m.abc",
+                "--preset",
+                "ohos",
+                "--alias-rung",
+                rung,
+                "--pta-budget",
+                "42",
+            ])
+            .unwrap();
+            let Command::Taint(a) = cli.command else {
+                panic!("expected taint");
+            };
+            assert_eq!(a.alias_rung, Some(rung.parse().unwrap()));
+            assert_eq!(a.pta_budget, Some(42));
+        }
+        assert!(
+            parse(&[
+                "abcd",
+                "taint",
+                "m.abc",
+                "--preset",
+                "ohos",
+                "--alias-rung",
+                "3"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "abcd",
+                "taint",
+                "m.abc",
+                "--preset",
+                "ohos",
+                "--pta-budget",
+                "bad",
+            ])
+            .is_err()
+        );
     }
 
     // ---- asm ----

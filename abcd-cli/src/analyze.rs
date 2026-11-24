@@ -19,6 +19,8 @@
 
 use abcd_analysis::callgraph::{CallEdgeKind, CallGraph, CallTargets};
 use abcd_analysis::control::Dominators;
+use abcd_analysis::dataflow::alias::Rung1AliasOracle;
+use abcd_analysis::dataflow::pta::{self, DEFAULT_STEP_BUDGET, PtaConfig};
 use abcd_ir::{CallKind, FuncId, Module};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -26,14 +28,21 @@ use serde::Serialize;
 use crate::CliError;
 use crate::input::InputModule;
 
-/// Which optional sections the report computes (wired to `--callgraph` /
-/// `--dominators` by the CLI layer).
+/// Which optional sections and alias rung the report computes (wired to
+/// `--callgraph`, `--dominators`, `--pta`, `--alias-rung`, and `--pta-budget`
+/// by the CLI layer).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AnalyzeOptions {
     /// Per-function call-site listing with resolved targets.
     pub callgraph: bool,
     /// Per-function immediate-dominator tree.
     pub dominators: bool,
+    /// Call-graph / alias rung (`0` = base `CallGraph::build`, `1` =
+    /// `Rung1AliasOracle` + `CallGraph::refine_with_points_to`, `2` = Rung-2
+    /// `pta::analyze`).
+    pub alias_rung: u8,
+    /// Optional Rung-2 pointer-analysis step budget override.
+    pub pta_budget: Option<usize>,
 }
 
 /// Machine-readable analysis report of one module (serialized by `--json`).
@@ -47,12 +56,38 @@ pub struct AnalyzeReport {
     pub input_bytes: usize,
     /// Module-level counts and the call-graph resolution histogram.
     pub summary: SummaryReport,
+    /// Present only when Rung-2 pointer analysis (`--pta` / `--alias-rung 2`)
+    /// ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pta: Option<PtaReport>,
     /// Present only under `--callgraph`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callgraph: Option<CallgraphReport>,
     /// Present only under `--dominators`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dominators: Option<Vec<DominatorTree>>,
+}
+
+/// Rung-2 pointer-analysis telemetry (`--pta` / `--alias-rung 2`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PtaReport {
+    /// Effective alias rung used for the reported call graph (`2` when PTA
+    /// converged within budget; `1` when `capped` triggered Rung-1 fallback).
+    pub alias_rung_used: u8,
+    /// Worklist activations executed.
+    pub activations: usize,
+    /// Total abstract heap/value facts materialized.
+    pub facts: usize,
+    /// Constraint-graph flow edges added.
+    pub flow_edges: usize,
+    /// Indirect call edges newly resolved by PTA.
+    pub call_edges_resolved: usize,
+    /// Call sites whose points-to set remained incomplete.
+    pub call_sites_partial: usize,
+    /// Lexical/module environment rounds executed.
+    pub env_rounds: usize,
+    /// Whether the step budget was exhausted before fixed point.
+    pub capped: bool,
 }
 
 /// Module-level counts (IR arena sizes) and resolution histogram.
@@ -183,7 +218,45 @@ pub fn report(module: &InputModule, opts: AnalyzeOptions) -> Result<AnalyzeRepor
         })?
     };
 
-    let graph = CallGraph::build(&ir);
+    let (graph, pta_report) = match opts.alias_rung {
+        0 => (CallGraph::build(&ir), None),
+        1 => {
+            let base = CallGraph::build(&ir);
+            let oracle = Rung1AliasOracle::new(&ir, &base);
+            (CallGraph::refine_with_points_to(&ir, &base, &oracle), None)
+        }
+        2 => {
+            let base = CallGraph::build(&ir);
+            let cfg = PtaConfig {
+                step_budget: opts.pta_budget.unwrap_or(DEFAULT_STEP_BUDGET),
+                ..PtaConfig::default()
+            };
+            let outcome = pta::analyze(&ir, &base, &cfg);
+            let stats = *outcome.stats();
+            let (cg, alias_rung_used) = if stats.capped {
+                let oracle = Rung1AliasOracle::new(&ir, &base);
+                (CallGraph::refine_with_points_to(&ir, &base, &oracle), 1)
+            } else {
+                (outcome.into_parts().0, 2)
+            };
+            let rep = PtaReport {
+                alias_rung_used,
+                activations: stats.activations,
+                facts: stats.facts,
+                flow_edges: stats.flow_edges,
+                call_edges_resolved: stats.call_edges_resolved,
+                call_sites_partial: stats.call_sites_partial,
+                env_rounds: stats.env_rounds,
+                capped: stats.capped,
+            };
+            (cg, Some(rep))
+        }
+        other => {
+            return Err(CliError::User(format!(
+                "invalid alias_rung {other} (expected 0, 1, or 2)"
+            )));
+        }
+    };
     let histogram = graph.histogram(&ir);
 
     let entry = ir
@@ -213,6 +286,7 @@ pub fn report(module: &InputModule, opts: AnalyzeOptions) -> Result<AnalyzeRepor
             },
             entry,
         },
+        pta: pta_report,
         callgraph,
         dominators,
     })
@@ -335,6 +409,20 @@ pub fn render_text(report: &AnalyzeReport) -> String {
     match &s.entry {
         Some(name) => out.push_str(&format!("entry:           {name}\n")),
         None => out.push_str("entry:           (none)\n"),
+    }
+    if let Some(pta) = &report.pta {
+        let capped_tag = if pta.capped { ", capped" } else { "" };
+        out.push_str(&format!(
+            "pta:             rung {}, {} activations, {} facts, {} flow edges, {} call edges, {} partial, {} env rounds{}\n",
+            pta.alias_rung_used,
+            pta.activations,
+            pta.facts,
+            pta.flow_edges,
+            pta.call_edges_resolved,
+            pta.call_sites_partial,
+            pta.env_rounds,
+            capped_tag,
+        ));
     }
 
     if let Some(cg) = &report.callgraph {

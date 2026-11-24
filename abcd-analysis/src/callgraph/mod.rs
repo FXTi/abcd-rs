@@ -30,6 +30,9 @@ use crate::dataflow::alias::Rung1AliasOracle;
 use crate::dataflow::ifds::CallGraphOracle;
 use crate::module_link::{ModuleLinkTable, ModuleSlotRef};
 
+mod class_hierarchy;
+use class_hierarchy::ClassHierarchyIndex;
+
 /// The targets of one call site.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallTargets {
@@ -122,6 +125,12 @@ impl CallGraph {
     /// backward callee-value tracing, in deterministic order.
     pub fn build(module: &Module) -> CallGraph {
         let links = ModuleLinkTable::build(module);
+        Self::build_with_links(module, &links)
+    }
+
+    /// Build the graph using a precomputed [`ModuleLinkTable`].
+    pub fn build_with_links(module: &Module, links: &ModuleLinkTable) -> CallGraph {
+        let hierarchy = ClassHierarchyIndex::build(module, links);
         let mut graph = CallGraph::default();
         for (fi, f) in module.functions.iter().enumerate() {
             let caller = FuncId::new(fi as u32);
@@ -136,26 +145,38 @@ impl CallGraph {
                     let Op::Call { callee, kind, .. } = &inst.op else {
                         continue;
                     };
-                    let resolution = resolve_callee(module, &links, caller, *callee, *kind);
-                    let complete = resolution.complete;
-                    let (edge_kind, targets) = if resolution.funcs.is_empty() {
-                        (CallEdgeKind::UnknownCallees, CallTargets::UnknownCallees)
+                    let resolution = resolve_callee(module, links, caller, *callee, *kind);
+                    let edge = if resolution.funcs.is_empty() {
+                        let targets = hierarchy.resolve_call(caller, *callee, *kind);
+                        if targets.is_empty() {
+                            CallEdge {
+                                caller,
+                                kind: *kind,
+                                edge_kind: CallEdgeKind::UnknownCallees,
+                                targets: CallTargets::UnknownCallees,
+                                resolution_complete: resolution.complete,
+                            }
+                        } else {
+                            CallEdge {
+                                caller,
+                                kind: *kind,
+                                edge_kind: CallEdgeKind::ResolvedValueFlow,
+                                targets: CallTargets::Resolved(targets),
+                                resolution_complete: false,
+                            }
+                        }
                     } else {
-                        let kind = match kind {
+                        let edge_kind = match kind {
                             CallKind::Direct => CallEdgeKind::Direct,
                             _ => CallEdgeKind::ResolvedValueFlow,
                         };
-                        (
-                            kind,
-                            CallTargets::Resolved(resolution.funcs.into_iter().collect()),
-                        )
-                    };
-                    let edge = CallEdge {
-                        caller,
-                        kind: *kind,
-                        edge_kind,
-                        targets,
-                        resolution_complete: complete,
+                        CallEdge {
+                            caller,
+                            kind: *kind,
+                            edge_kind,
+                            targets: CallTargets::Resolved(resolution.funcs.into_iter().collect()),
+                            resolution_complete: resolution.complete,
+                        }
                     };
                     if let CallTargets::Resolved(targets) = &edge.targets {
                         for t in targets {
@@ -446,6 +467,7 @@ fn trace(
                 }
                 Some(Op::AllocClosure { func }) => stack.push((current, *func)),
                 Some(Op::CreateGenerator { func }) => stack.push((current, *func)),
+                Some(Op::DefineMethod { func, .. }) => stack.push((current, *func)),
                 Some(Op::DefineFunc { body, .. }) => {
                     funcs.insert(*body);
                 }
@@ -981,6 +1003,1274 @@ mod tests {
             refined2.edge_at(call).unwrap().targets,
             CallTargets::UnknownCallees,
             "opaque callees stay explicitly unknown"
+        );
+    }
+
+    /// Helper: create a static Panda-convention function with `[func, newTarget, this, formals...]`.
+    fn add_method_fn(
+        m: &mut Module,
+        cid: ClassId,
+        name: &str,
+        kind: FunctionKind,
+        formals: u16,
+    ) -> (FuncId, abcd_ir::BlockId, Vec<ValueId>) {
+        let sym = m.sym.intern(name);
+        let fid = FuncId::new(m.functions.len() as u32);
+        let mut fd = FunctionData::new(cid, sym, kind);
+        fd.modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
+        m.functions.push(fd);
+        m.classes[cid.index()].methods.push(fid);
+        let b = add_block(m, fid);
+        let mut params = Vec::with_capacity((3 + formals) as usize);
+        for i in 0..(3 + formals) {
+            params.push(add_param(m, fid, i));
+        }
+        (fid, b, params)
+    }
+
+    #[test]
+    fn this_method_inherited_method_and_super_calls_resolve() {
+        use abcd_ir::op::SuperKey;
+
+        let mut m = mk_module();
+        let cid = ClassId::new(0);
+
+        let (base_ctor, b_bc, _) = add_method_fn(&mut m, cid, "Base", FunctionKind::Constructor, 0);
+        emit_void(&mut m, b_bc, Op::Return { value: None });
+
+        let (base_only, b_bo, _) =
+            add_method_fn(&mut m, cid, "baseMethod", FunctionKind::Function, 0);
+        emit_void(&mut m, b_bo, Op::Return { value: None });
+
+        let (base_greet, b_bg, _) =
+            add_method_fn(&mut m, cid, "Base.greet", FunctionKind::Function, 0);
+        emit_void(&mut m, b_bg, Op::Return { value: None });
+
+        let (sub_ctor, b_sc, p_sc) =
+            add_method_fn(&mut m, cid, "Sub", FunctionKind::Constructor, 0);
+        let super_ctor_call = push_inst(
+            &mut m,
+            b_sc,
+            Op::Call {
+                callee: p_sc[0],
+                this: Some(p_sc[2]),
+                args: vec![],
+                kind: CallKind::Super,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_sc,
+            Op::Return {
+                value: Some(p_sc[2]),
+            },
+        );
+
+        let (sub_helper, b_sh, _) = add_method_fn(&mut m, cid, "helper", FunctionKind::Function, 0);
+        emit_void(&mut m, b_sh, Op::Return { value: None });
+
+        let (sub_greet, b_sg, p_sg) =
+            add_method_fn(&mut m, cid, "Sub.greet", FunctionKind::Function, 0);
+        let s_helper = intern(&mut m, "helper");
+        let s_base_m = intern(&mut m, "baseMethod");
+        let s_greet = intern(&mut m, "greet");
+
+        // 1) `this.helper()`
+        let c_self = emit(
+            &mut m,
+            b_sg,
+            Op::LoadProp {
+                object: p_sg[2],
+                name: s_helper,
+            },
+        );
+        let self_call = push_inst(
+            &mut m,
+            b_sg,
+            Op::Call {
+                callee: c_self,
+                this: Some(p_sg[2]),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+
+        // 2) `this.baseMethod()` (inherited on miss)
+        let c_inh = emit(
+            &mut m,
+            b_sg,
+            Op::LoadProp {
+                object: p_sg[2],
+                name: s_base_m,
+            },
+        );
+        let inh_call = push_inst(
+            &mut m,
+            b_sg,
+            Op::Call {
+                callee: c_inh,
+                this: Some(p_sg[2]),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+
+        // 3) `super.greet()` -> resolves to `Base.greet`, not `Sub.greet`!
+        let c_sup = emit(
+            &mut m,
+            b_sg,
+            Op::LoadSuper {
+                this_value: p_sg[2],
+                key: SuperKey::Name(s_greet),
+            },
+        );
+        let sup_method_call = push_inst(
+            &mut m,
+            b_sg,
+            Op::Call {
+                callee: c_sup,
+                this: Some(p_sg[2]),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_sg, Op::Return { value: None });
+
+        // Define Base and Sub in `main`.
+        let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
+        let base_members = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_base_m),
+            Const::MethodRef(base_only),
+            Const::String(s_greet),
+            Const::MethodRef(base_greet),
+            Const::number(2.0),
+        ]));
+        let base_cls = emit(
+            &mut m,
+            b_main,
+            Op::DefineClass {
+                ctor: base_ctor,
+                heritage: None,
+                members: base_members,
+                member_attrs: vec![],
+                count: 2,
+            },
+        );
+        let sub_members = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_helper),
+            Const::MethodRef(sub_helper),
+            Const::String(s_greet),
+            Const::MethodRef(sub_greet),
+            Const::number(2.0),
+        ]));
+        let _ = emit(
+            &mut m,
+            b_main,
+            Op::DefineClass {
+                ctor: sub_ctor,
+                heritage: Some(base_cls),
+                members: sub_members,
+                member_attrs: vec![],
+                count: 2,
+            },
+        );
+        emit_void(&mut m, b_main, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        let check = |call: InstId, target: FuncId| {
+            let edge = cg.edge_at(call).expect("edge");
+            assert_eq!(edge.edge_kind, CallEdgeKind::ResolvedValueFlow);
+            assert_eq!(edge.targets, CallTargets::Resolved(vec![target]));
+            assert!(!edge.resolution_complete);
+        };
+        check(super_ctor_call, base_ctor);
+        check(self_call, sub_helper);
+        check(inh_call, base_only);
+        check(sup_method_call, base_greet);
+    }
+
+    #[test]
+    fn constructor_field_provenance_resolves_service_method() {
+        let mut m = mk_module();
+        let cid = ClassId::new(0);
+        let s_do_work = intern(&mut m, "doWork");
+        let s_service = intern(&mut m, "service");
+        let s_svc_name = intern(&mut m, "Service");
+
+        let (svc_ctor, b_sc, _) =
+            add_method_fn(&mut m, cid, "Service", FunctionKind::Constructor, 0);
+        emit_void(&mut m, b_sc, Op::Return { value: None });
+
+        let (do_work, b_dw, _) = add_method_fn(&mut m, cid, "doWork", FunctionKind::Function, 0);
+        emit_void(&mut m, b_dw, Op::Return { value: None });
+
+        // Controller constructor: `this.service = new Service()` (via ArkTS lexical self-binding).
+        let (ctrl_ctor, b_cc, p_cc) =
+            add_method_fn(&mut m, cid, "Controller", FunctionKind::Constructor, 0);
+        let svc_lex = emit(&mut m, b_cc, Op::GetLexVar { level: 0, slot: 0 });
+        emit_void(
+            &mut m,
+            b_cc,
+            Op::ThrowUndefinedIfHoleWithName {
+                value: svc_lex,
+                name: s_svc_name,
+            },
+        );
+        let svc_inst = emit(
+            &mut m,
+            b_cc,
+            Op::Call {
+                callee: svc_lex,
+                this: None,
+                args: vec![],
+                kind: CallKind::New,
+            },
+        );
+        let new_svc_call = match m.value(svc_inst).unwrap().def {
+            ValueDef::Inst(i) => i,
+            _ => unreachable!(),
+        };
+        emit_void(
+            &mut m,
+            b_cc,
+            Op::StoreProp {
+                object: p_cc[2],
+                name: s_service,
+                value: svc_inst,
+            },
+        );
+        emit_void(&mut m, b_cc, Op::Return { value: None });
+
+        // Controller.run(): `this.service.doWork()`
+        let (ctrl_run, b_cr, p_cr) = add_method_fn(&mut m, cid, "run", FunctionKind::Function, 0);
+        let loaded_svc = emit(
+            &mut m,
+            b_cr,
+            Op::LoadProp {
+                object: p_cr[2],
+                name: s_service,
+            },
+        );
+        let loaded_dw = emit(
+            &mut m,
+            b_cr,
+            Op::LoadProp {
+                object: loaded_svc,
+                name: s_do_work,
+            },
+        );
+        let do_work_call = push_inst(
+            &mut m,
+            b_cr,
+            Op::Call {
+                callee: loaded_dw,
+                this: Some(loaded_svc),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_cr, Op::Return { value: None });
+
+        // `func_main_0`: lexical env storing `Service`, plus `DefineClass` for `Service` & `Controller`.
+        let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
+        let _ = emit(&mut m, b_main, Op::NewLexEnv { num_vars: 1 });
+        let svc_members = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_do_work),
+            Const::MethodRef(do_work),
+            Const::number(1.0),
+        ]));
+        let svc_cls = emit(
+            &mut m,
+            b_main,
+            Op::DefineClass {
+                ctor: svc_ctor,
+                heritage: None,
+                members: svc_members,
+                member_attrs: vec![],
+                count: 1,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_main,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: svc_cls,
+            },
+        );
+        let s_run = intern(&mut m, "run");
+        let ctrl_members = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_run),
+            Const::MethodRef(ctrl_run),
+            Const::number(1.0),
+        ]));
+        let _ = emit(
+            &mut m,
+            b_main,
+            Op::DefineClass {
+                ctor: ctrl_ctor,
+                heritage: None,
+                members: ctrl_members,
+                member_attrs: vec![],
+                count: 1,
+            },
+        );
+        emit_void(&mut m, b_main, Op::PopLexEnv);
+        emit_void(&mut m, b_main, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        assert_eq!(
+            cg.edge_at(new_svc_call).unwrap().targets,
+            CallTargets::Resolved(vec![svc_ctor])
+        );
+        assert_eq!(
+            cg.edge_at(do_work_call).unwrap().targets,
+            CallTargets::Resolved(vec![do_work])
+        );
+    }
+
+    #[test]
+    fn static_singleton_get_instance_fetch_resolves() {
+        let mut m = mk_module();
+        let cid = ClassId::new(0);
+        let s_instance = intern(&mut m, "instance");
+        let s_get_inst = intern(&mut m, "getInstance");
+        let s_fetch = intern(&mut m, "fetch");
+
+        let (repo_ctor, b_rc, _) = add_method_fn(&mut m, cid, "Repo", FunctionKind::Constructor, 0);
+        emit_void(&mut m, b_rc, Op::Return { value: None });
+
+        let (fetch_fn, b_fe, _) = add_method_fn(&mut m, cid, "fetch", FunctionKind::Function, 0);
+        emit_void(&mut m, b_fe, Op::Return { value: None });
+
+        // `static getInstance()`: `Repo.instance = new Repo(); return Repo.instance;`
+        let (get_inst_fn, b_gi, _p_gi) =
+            add_method_fn(&mut m, cid, "getInstance", FunctionKind::Function, 0);
+        let repo_ref = emit(&mut m, b_gi, Op::GetLexVar { level: 0, slot: 0 });
+        let new_repo = emit(
+            &mut m,
+            b_gi,
+            Op::Call {
+                callee: repo_ref,
+                this: None,
+                args: vec![],
+                kind: CallKind::New,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_gi,
+            Op::StoreProp {
+                object: repo_ref,
+                name: s_instance,
+                value: new_repo,
+            },
+        );
+        let inst_field = emit(
+            &mut m,
+            b_gi,
+            Op::LoadProp {
+                object: repo_ref,
+                name: s_instance,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_gi,
+            Op::Return {
+                value: Some(inst_field),
+            },
+        );
+
+        // `caller()`: `Repo.getInstance().fetch()`
+        let (caller_fn, b_ca, _) = add_method_fn(&mut m, cid, "caller", FunctionKind::Function, 0);
+        let repo_in_caller = emit(&mut m, b_ca, Op::GetLexVar { level: 0, slot: 0 });
+        let gi_callee = emit(
+            &mut m,
+            b_ca,
+            Op::LoadProp {
+                object: repo_in_caller,
+                name: s_get_inst,
+            },
+        );
+        let singleton = emit(
+            &mut m,
+            b_ca,
+            Op::Call {
+                callee: gi_callee,
+                this: Some(repo_in_caller),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let gi_call = match m.value(singleton).unwrap().def {
+            ValueDef::Inst(i) => i,
+            _ => unreachable!(),
+        };
+        let fetch_callee = emit(
+            &mut m,
+            b_ca,
+            Op::LoadProp {
+                object: singleton,
+                name: s_fetch,
+            },
+        );
+        let fetch_call = push_inst(
+            &mut m,
+            b_ca,
+            Op::Call {
+                callee: fetch_callee,
+                this: Some(singleton),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_ca, Op::Return { value: None });
+
+        // `func_main_0` defines `Repo` (1 instance method `fetch`, 1 static method `getInstance`)
+        // and captures the lexical env into `caller_fn`.
+        let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
+        let _ = emit(&mut m, b_main, Op::NewLexEnv { num_vars: 1 });
+        let repo_members = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_fetch),
+            Const::MethodRef(fetch_fn),
+            Const::String(s_get_inst),
+            Const::MethodRef(get_inst_fn),
+            Const::number(1.0),
+        ]));
+        let repo_cls = emit(
+            &mut m,
+            b_main,
+            Op::DefineClass {
+                ctor: repo_ctor,
+                heritage: None,
+                members: repo_members,
+                member_attrs: vec![],
+                count: 1,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_main,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: repo_cls,
+            },
+        );
+        let _ = emit(
+            &mut m,
+            b_main,
+            Op::DefineFunc {
+                body: caller_fn,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        emit_void(&mut m, b_main, Op::PopLexEnv);
+        emit_void(&mut m, b_main, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        assert_eq!(
+            cg.edge_at(gi_call).unwrap().targets,
+            CallTargets::Resolved(vec![get_inst_fn])
+        );
+        assert_eq!(
+            cg.edge_at(fetch_call).unwrap().targets,
+            CallTargets::Resolved(vec![fetch_fn])
+        );
+    }
+
+    #[test]
+    fn arrow_closure_capturing_this_resolves_method_call() {
+        let mut m = mk_module();
+        let cid = ClassId::new(0);
+        let s_on_tap = intern(&mut m, "onTap");
+        let s_mount = intern(&mut m, "mount");
+
+        let (view_ctor, b_vc, _) =
+            add_method_fn(&mut m, cid, "MyView", FunctionKind::Constructor, 0);
+        emit_void(&mut m, b_vc, Op::Return { value: None });
+
+        let (on_tap_fn, b_ot, _) = add_method_fn(&mut m, cid, "onTap", FunctionKind::Function, 0);
+        emit_void(&mut m, b_ot, Op::Return { value: None });
+
+        let (arrow_fn, b_ar, _) = add_method_fn(&mut m, cid, "arrow", FunctionKind::Arrow, 0);
+        let cap_this = emit(&mut m, b_ar, Op::GetLexVar { level: 0, slot: 0 });
+        let tap_callee = emit(
+            &mut m,
+            b_ar,
+            Op::LoadProp {
+                object: cap_this,
+                name: s_on_tap,
+            },
+        );
+        let arrow_tap_call = push_inst(
+            &mut m,
+            b_ar,
+            Op::Call {
+                callee: tap_callee,
+                this: Some(cap_this),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_ar, Op::Return { value: None });
+
+        // `mount()` captures `this` (`p_mo[2]`) into `NewLexEnv` slot 0 and creates `arrow_fn`.
+        let (mount_fn, b_mo, p_mo) = add_method_fn(&mut m, cid, "mount", FunctionKind::Function, 0);
+        let _ = emit(&mut m, b_mo, Op::NewLexEnv { num_vars: 1 });
+        emit_void(
+            &mut m,
+            b_mo,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: p_mo[2],
+            },
+        );
+        let df_arrow = emit(
+            &mut m,
+            b_mo,
+            Op::DefineFunc {
+                body: arrow_fn,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        let _ = emit(&mut m, b_mo, Op::AllocClosure { func: df_arrow });
+        emit_void(&mut m, b_mo, Op::PopLexEnv);
+        emit_void(&mut m, b_mo, Op::Return { value: None });
+
+        let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
+        let members = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_on_tap),
+            Const::MethodRef(on_tap_fn),
+            Const::String(s_mount),
+            Const::MethodRef(mount_fn),
+            Const::number(2.0),
+        ]));
+        let _ = emit(
+            &mut m,
+            b_main,
+            Op::DefineClass {
+                ctor: view_ctor,
+                heritage: None,
+                members,
+                member_attrs: vec![],
+                count: 2,
+            },
+        );
+        emit_void(&mut m, b_main, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        assert_eq!(
+            cg.edge_at(arrow_tap_call).unwrap().targets,
+            CallTargets::Resolved(vec![on_tap_fn])
+        );
+    }
+
+    #[test]
+    fn cross_module_bundle_and_dot_encoded_imported_classes_resolve() {
+        use abcd_ir::module::{ClassData, EsModule, ExportDecl, ImportDecl, ModuleRequest};
+        use abcd_ir::op::{MemberAttrs, ModuleVarKind};
+
+        let mut m = Module::new();
+
+        // Record 0: `@bundle:` service record exporting `Auth`
+        let d0 = m
+            .sym
+            .intern("L@bundle:com.demo.app/entry/ets/service/Auth;");
+        let n0 = m.sym.intern("@bundle:com.demo.app/entry/ets/service/Auth");
+        let cid0 = ClassId::new(0);
+        let s_auth = m.sym.intern("Auth");
+        let mut cls0 = ClassData::new(d0, n0);
+        cls0.es_module = Some(EsModule {
+            imports: vec![],
+            exports: vec![ExportDecl::Local {
+                export_name: s_auth,
+                local_name: s_auth,
+            }],
+            module_requests: vec![],
+        });
+        m.classes.push(cls0);
+
+        // Record 1: `@bundle:` page record importing `Auth` via `../service/Auth`
+        let d1 = m.sym.intern("L@bundle:com.demo.app/entry/ets/pages/Login;");
+        let n1 = m.sym.intern("@bundle:com.demo.app/entry/ets/pages/Login");
+        let cid1 = ClassId::new(1);
+        let s_req_auth = m.sym.intern("../service/Auth");
+        let mut cls1 = ClassData::new(d1, n1);
+        cls1.es_module = Some(EsModule {
+            imports: vec![ImportDecl::Regular {
+                local_name: s_auth,
+                import_name: s_auth,
+                module_request: s_req_auth,
+            }],
+            exports: vec![],
+            module_requests: vec![ModuleRequest {
+                specifier: s_req_auth,
+                lazy: false,
+            }],
+        });
+        m.classes.push(cls1);
+
+        // Record 2: dot-encoded record exporting `Logger`
+        let d2 = m.sym.intern("Lentry.src.main.ets.util.Logger;");
+        let n2 = m.sym.intern("entry.src.main.ets.util.Logger");
+        let cid2 = ClassId::new(2);
+        let s_logger = m.sym.intern("Logger");
+        let mut cls2 = ClassData::new(d2, n2);
+        cls2.es_module = Some(EsModule {
+            imports: vec![],
+            exports: vec![ExportDecl::Local {
+                export_name: s_logger,
+                local_name: s_logger,
+            }],
+            module_requests: vec![],
+        });
+        m.classes.push(cls2);
+
+        // Record 3: dot-encoded record importing `Logger` via `../util/Logger`
+        let d3 = m.sym.intern("Lentry.src.main.ets.pages.Home;");
+        let n3 = m.sym.intern("entry.src.main.ets.pages.Home");
+        let cid3 = ClassId::new(3);
+        let s_req_logger = m.sym.intern("../util/Logger");
+        let mut cls3 = ClassData::new(d3, n3);
+        cls3.es_module = Some(EsModule {
+            imports: vec![ImportDecl::Regular {
+                local_name: s_logger,
+                import_name: s_logger,
+                module_request: s_req_logger,
+            }],
+            exports: vec![],
+            module_requests: vec![ModuleRequest {
+                specifier: s_req_logger,
+                lazy: false,
+            }],
+        });
+        m.classes.push(cls3);
+
+        // Populate Record 0 (`Auth`: static `verify`, instance `login`)
+        let s_verify = intern(&mut m, "verify");
+        let s_login = intern(&mut m, "login");
+        let (auth_ctor, b_ac, _) =
+            add_method_fn(&mut m, cid0, "Auth", FunctionKind::Constructor, 0);
+        emit_void(&mut m, b_ac, Op::Return { value: None });
+        let (auth_verify, b_av, _) =
+            add_method_fn(&mut m, cid0, "verify", FunctionKind::Function, 0);
+        emit_void(&mut m, b_av, Op::Return { value: None });
+        let (auth_login, b_al, _) = add_method_fn(&mut m, cid0, "login", FunctionKind::Function, 0);
+        emit_void(&mut m, b_al, Op::Return { value: None });
+
+        let (_, b_m0, _) = add_method_fn(&mut m, cid0, "func_main_0", FunctionKind::Function, 0);
+        let auth_members = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_login),
+            Const::MethodRef(auth_login),
+            Const::String(s_verify),
+            Const::MethodRef(auth_verify),
+        ]));
+        let auth_cls = emit(
+            &mut m,
+            b_m0,
+            Op::DefineClass {
+                ctor: auth_ctor,
+                heritage: None,
+                members: auth_members,
+                member_attrs: vec![
+                    MemberAttrs {
+                        is_static: false,
+                        kind: FunctionKind::Function,
+                    },
+                    MemberAttrs {
+                        is_static: true,
+                        kind: FunctionKind::Function,
+                    },
+                ],
+                count: 1,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_m0,
+            Op::StoreModuleVar {
+                index: 0,
+                value: auth_cls,
+            },
+        );
+        emit_void(&mut m, b_m0, Op::Return { value: None });
+
+        // Populate Record 1 (`Auth.verify()`, `new Auth().login()`)
+        let (_, b_m1, _) = add_method_fn(&mut m, cid1, "func_main_0", FunctionKind::Function, 0);
+        let imp_auth = emit(
+            &mut m,
+            b_m1,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::External,
+            },
+        );
+        let verify_callee = emit(
+            &mut m,
+            b_m1,
+            Op::LoadProp {
+                object: imp_auth,
+                name: s_verify,
+            },
+        );
+        let call_verify = push_inst(
+            &mut m,
+            b_m1,
+            Op::Call {
+                callee: verify_callee,
+                this: Some(imp_auth),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let auth_inst = emit(
+            &mut m,
+            b_m1,
+            Op::Call {
+                callee: imp_auth,
+                this: None,
+                args: vec![],
+                kind: CallKind::New,
+            },
+        );
+        let call_new_auth = match m.value(auth_inst).unwrap().def {
+            ValueDef::Inst(i) => i,
+            _ => unreachable!(),
+        };
+        let login_callee = emit(
+            &mut m,
+            b_m1,
+            Op::LoadProp {
+                object: auth_inst,
+                name: s_login,
+            },
+        );
+        let call_login = push_inst(
+            &mut m,
+            b_m1,
+            Op::Call {
+                callee: login_callee,
+                this: Some(auth_inst),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_m1, Op::Return { value: None });
+
+        // Populate Record 2 (`Logger`: static `create` returning `new Logger()`, instance `info`)
+        let s_create = intern(&mut m, "create");
+        let s_info = intern(&mut m, "info");
+        let (log_ctor, b_lc, _) =
+            add_method_fn(&mut m, cid2, "Logger", FunctionKind::Constructor, 0);
+        emit_void(&mut m, b_lc, Op::Return { value: None });
+        let (log_info, b_li, _) = add_method_fn(&mut m, cid2, "info", FunctionKind::Function, 0);
+        emit_void(&mut m, b_li, Op::Return { value: None });
+        let (log_create, b_lcr, p_lcr) =
+            add_method_fn(&mut m, cid2, "create", FunctionKind::Function, 0);
+        let created_log = emit(
+            &mut m,
+            b_lcr,
+            Op::Call {
+                callee: p_lcr[2],
+                this: None,
+                args: vec![],
+                kind: CallKind::New,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_lcr,
+            Op::Return {
+                value: Some(created_log),
+            },
+        );
+
+        let (_, b_m2, _) = add_method_fn(&mut m, cid2, "func_main_0", FunctionKind::Function, 0);
+        let log_members = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_info),
+            Const::MethodRef(log_info),
+            Const::String(s_create),
+            Const::MethodRef(log_create),
+            Const::number(1.0),
+        ]));
+        let log_cls = emit(
+            &mut m,
+            b_m2,
+            Op::DefineClass {
+                ctor: log_ctor,
+                heritage: None,
+                members: log_members,
+                member_attrs: vec![],
+                count: 1,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_m2,
+            Op::StoreModuleVar {
+                index: 0,
+                value: log_cls,
+            },
+        );
+        emit_void(&mut m, b_m2, Op::Return { value: None });
+
+        // Populate Record 3 (`Logger.create().info()`)
+        let (_, b_m3, _) = add_method_fn(&mut m, cid3, "func_main_0", FunctionKind::Function, 0);
+        let imp_log = emit(
+            &mut m,
+            b_m3,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::External,
+            },
+        );
+        let create_callee = emit(
+            &mut m,
+            b_m3,
+            Op::LoadProp {
+                object: imp_log,
+                name: s_create,
+            },
+        );
+        let log_inst = emit(
+            &mut m,
+            b_m3,
+            Op::Call {
+                callee: create_callee,
+                this: Some(imp_log),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let call_create = match m.value(log_inst).unwrap().def {
+            ValueDef::Inst(i) => i,
+            _ => unreachable!(),
+        };
+        let info_callee = emit(
+            &mut m,
+            b_m3,
+            Op::LoadProp {
+                object: log_inst,
+                name: s_info,
+            },
+        );
+        let call_info = push_inst(
+            &mut m,
+            b_m3,
+            Op::Call {
+                callee: info_callee,
+                this: Some(log_inst),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_m3, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        assert_eq!(
+            cg.edge_at(call_verify).unwrap().targets,
+            CallTargets::Resolved(vec![auth_verify])
+        );
+        assert_eq!(
+            cg.edge_at(call_new_auth).unwrap().targets,
+            CallTargets::Resolved(vec![auth_ctor])
+        );
+        assert_eq!(
+            cg.edge_at(call_login).unwrap().targets,
+            CallTargets::Resolved(vec![auth_login])
+        );
+        assert_eq!(
+            cg.edge_at(call_create).unwrap().targets,
+            CallTargets::Resolved(vec![log_create])
+        );
+        assert_eq!(
+            cg.edge_at(call_info).unwrap().targets,
+            CallTargets::Resolved(vec![log_info])
+        );
+    }
+
+    #[test]
+    fn deep_500_inheritance_and_field_chain_runs_on_256k_stack() {
+        const DEPTH: usize = 500;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut m = mk_module();
+                let cid = ClassId::new(0);
+                let s_next = intern(&mut m, "next");
+                let s_ping = intern(&mut m, "ping");
+
+                let mut ctors = Vec::with_capacity(DEPTH);
+                let mut ctor_blocks = Vec::with_capacity(DEPTH);
+                let mut ctor_this = Vec::with_capacity(DEPTH);
+                let (ping_fn, b_ping, _) =
+                    add_method_fn(&mut m, cid, "ping", FunctionKind::Function, 0);
+                emit_void(&mut m, b_ping, Op::Return { value: None });
+
+                for i in 0..DEPTH {
+                    let (ctor, b_c, p_c) =
+                        add_method_fn(&mut m, cid, &format!("C{i}"), FunctionKind::Constructor, 0);
+                    ctors.push(ctor);
+                    ctor_blocks.push(b_c);
+                    ctor_this.push(p_c[2]);
+                }
+
+                let (_, b_main, _) =
+                    add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
+                let _ = emit(
+                    &mut m,
+                    b_main,
+                    Op::NewLexEnv {
+                        num_vars: DEPTH as u16,
+                    },
+                );
+                let m0 = m.consts.push(Const::ArrayLiteral(vec![
+                    Const::String(s_ping),
+                    Const::MethodRef(ping_fn),
+                    Const::number(1.0),
+                ]));
+                let empty_mem = m.consts.push(Const::ArrayLiteral(vec![]));
+                let mut prev_cls = emit(
+                    &mut m,
+                    b_main,
+                    Op::DefineClass {
+                        ctor: ctors[0],
+                        heritage: None,
+                        members: m0,
+                        member_attrs: vec![],
+                        count: 1,
+                    },
+                );
+                emit_void(
+                    &mut m,
+                    b_main,
+                    Op::PutLexVar {
+                        level: 0,
+                        slot: 0,
+                        value: prev_cls,
+                    },
+                );
+                emit_void(&mut m, ctor_blocks[0], Op::Return { value: None });
+
+                for i in 1..DEPTH {
+                    prev_cls = emit(
+                        &mut m,
+                        b_main,
+                        Op::DefineClass {
+                            ctor: ctors[i],
+                            heritage: Some(prev_cls),
+                            members: empty_mem,
+                            member_attrs: vec![],
+                            count: 0,
+                        },
+                    );
+                    emit_void(
+                        &mut m,
+                        b_main,
+                        Op::PutLexVar {
+                            level: 0,
+                            slot: i as u16,
+                            value: prev_cls,
+                        },
+                    );
+                    let prev_lex = emit(
+                        &mut m,
+                        ctor_blocks[i],
+                        Op::GetLexVar {
+                            level: 0,
+                            slot: (i - 1) as u16,
+                        },
+                    );
+                    let sub_inst = emit(
+                        &mut m,
+                        ctor_blocks[i],
+                        Op::Call {
+                            callee: prev_lex,
+                            this: None,
+                            args: vec![],
+                            kind: CallKind::New,
+                        },
+                    );
+                    emit_void(
+                        &mut m,
+                        ctor_blocks[i],
+                        Op::StoreProp {
+                            object: ctor_this[i],
+                            name: s_next,
+                            value: sub_inst,
+                        },
+                    );
+                    emit_void(&mut m, ctor_blocks[i], Op::Return { value: None });
+                }
+
+                // 500-deep `LoadProp` chain on a constructed leaf instance (`inst.next.next...`).
+                let leaf_inst = emit(
+                    &mut m,
+                    b_main,
+                    Op::Call {
+                        callee: prev_cls,
+                        this: None,
+                        args: vec![],
+                        kind: CallKind::New,
+                    },
+                );
+                let mut cur = leaf_inst;
+                for _ in 0..DEPTH {
+                    cur = emit(
+                        &mut m,
+                        b_main,
+                        Op::LoadProp {
+                            object: cur,
+                            name: s_next,
+                        },
+                    );
+                }
+                let deep_callee = emit(
+                    &mut m,
+                    b_main,
+                    Op::LoadProp {
+                        object: cur,
+                        name: s_ping,
+                    },
+                );
+                let deep_call = push_inst(
+                    &mut m,
+                    b_main,
+                    Op::Call {
+                        callee: deep_callee,
+                        this: Some(cur),
+                        args: vec![],
+                        kind: CallKind::Dynamic,
+                    },
+                );
+                emit_void(&mut m, b_main, Op::Return { value: None });
+
+                let cg = CallGraph::build(&m);
+                // Bounded step cap cuts cleanly to `UnknownCallees` without stack overflow.
+                assert_eq!(
+                    cg.edge_at(deep_call).unwrap().targets,
+                    CallTargets::UnknownCallees
+                );
+            })
+            .expect("spawn 256k thread");
+        handle.join().expect("256 KiB stack must not overflow");
+    }
+
+    #[test]
+    fn sendable_class_prototype_attachment_getter_and_object_literal_resolve() {
+        use abcd_ir::op::ModuleVarKind;
+
+        let mut m = mk_module();
+        let cid = ClassId::new(0);
+        let s_work = intern(&mut m, "work");
+        let s_extra = intern(&mut m, "extra");
+        let s_shared = intern(&mut m, "shared");
+        let s_proto = intern(&mut m, "prototype");
+        let s_lit_fn = intern(&mut m, "litFn");
+        let s_prop_get = intern(&mut m, "worker");
+
+        let (send_ctor, b_sc, _) =
+            add_method_fn(&mut m, cid, "SendWorker", FunctionKind::Constructor, 0);
+        emit_void(&mut m, b_sc, Op::Return { value: None });
+        let (work_fn, b_wk, _) = add_method_fn(&mut m, cid, "work", FunctionKind::Function, 0);
+        emit_void(&mut m, b_wk, Op::Return { value: None });
+        let (extra_fn, b_ex, _) = add_method_fn(&mut m, cid, "extra", FunctionKind::Function, 0);
+        emit_void(&mut m, b_ex, Op::Return { value: None });
+        let (lit_fn, b_lf, _) = add_method_fn(&mut m, cid, "litFn", FunctionKind::Function, 0);
+        emit_void(&mut m, b_lf, Op::Return { value: None });
+
+        // `shared()` inside `SendWorker` loads its own sendable class via `ModuleVarKind::SendableClass`,
+        // constructs an instance, and returns it.
+        let (shared_fn, b_sh, _) = add_method_fn(&mut m, cid, "shared", FunctionKind::Function, 0);
+        let self_send_cls = emit(
+            &mut m,
+            b_sh,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::SendableClass,
+            },
+        );
+        let w_inst = emit(
+            &mut m,
+            b_sh,
+            Op::Call {
+                callee: self_send_cls,
+                this: None,
+                args: vec![],
+                kind: CallKind::New,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_sh,
+            Op::Return {
+                value: Some(w_inst),
+            },
+        );
+
+        // Getter `get worker()` calls `SendWorker.shared()` via `SendableClass`.
+        let (getter_fn, b_gt, _) = add_method_fn(&mut m, cid, "worker", FunctionKind::Getter, 0);
+        let cls_in_get = emit(
+            &mut m,
+            b_gt,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::SendableClass,
+            },
+        );
+        let sh_callee = emit(
+            &mut m,
+            b_gt,
+            Op::LoadProp {
+                object: cls_in_get,
+                name: s_shared,
+            },
+        );
+        let sh_res = emit(
+            &mut m,
+            b_gt,
+            Op::Call {
+                callee: sh_callee,
+                this: Some(cls_in_get),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(
+            &mut m,
+            b_gt,
+            Op::Return {
+                value: Some(sh_res),
+            },
+        );
+
+        let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
+        let send_members = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_work),
+            Const::MethodRef(work_fn),
+            Const::String(s_prop_get),
+            Const::MethodRef(getter_fn),
+            Const::String(s_shared),
+            Const::MethodRef(shared_fn),
+            Const::number(2.0),
+        ]));
+        let send_cls = emit(
+            &mut m,
+            b_main,
+            Op::DefineSendableClass {
+                ctor: send_ctor,
+                heritage: None,
+                members: send_members,
+                member_attrs: vec![],
+                count: 2,
+            },
+        );
+        // Prototype attachment: `SendWorker.prototype.extra = extra_fn`
+        let proto = emit(
+            &mut m,
+            b_main,
+            Op::LoadProp {
+                object: send_cls,
+                name: s_proto,
+            },
+        );
+        let df_extra = emit(
+            &mut m,
+            b_main,
+            Op::DefineFunc {
+                body: extra_fn,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        let cl_extra = emit(&mut m, b_main, Op::AllocClosure { func: df_extra });
+        emit_void(
+            &mut m,
+            b_main,
+            Op::StoreProp {
+                object: proto,
+                name: s_extra,
+                value: cl_extra,
+            },
+        );
+
+        let inst = emit(
+            &mut m,
+            b_main,
+            Op::Call {
+                callee: send_cls,
+                this: None,
+                args: vec![],
+                kind: CallKind::New,
+            },
+        );
+        let w_from_getter = emit(
+            &mut m,
+            b_main,
+            Op::LoadProp {
+                object: inst,
+                name: s_prop_get,
+            },
+        );
+        let extra_callee = emit(
+            &mut m,
+            b_main,
+            Op::LoadProp {
+                object: w_from_getter,
+                name: s_extra,
+            },
+        );
+        let call_extra = push_inst(
+            &mut m,
+            b_main,
+            Op::Call {
+                callee: extra_callee,
+                this: Some(w_from_getter),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+
+        // Object literal method resolution
+        let shape = m.consts.push(Const::ObjectLiteral {
+            keys: vec![Const::String(s_lit_fn)],
+            values: vec![Const::MethodRef(lit_fn)],
+        });
+        let obj = emit(&mut m, b_main, Op::AllocObject { shape });
+        let lit_callee = emit(
+            &mut m,
+            b_main,
+            Op::LoadProp {
+                object: obj,
+                name: s_lit_fn,
+            },
+        );
+        let call_lit = push_inst(
+            &mut m,
+            b_main,
+            Op::Call {
+                callee: lit_callee,
+                this: Some(obj),
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b_main, Op::Return { value: None });
+
+        let cg = CallGraph::build(&m);
+        assert_eq!(
+            cg.edge_at(call_extra).unwrap().targets,
+            CallTargets::Resolved(vec![extra_fn])
+        );
+        assert_eq!(
+            cg.edge_at(call_lit).unwrap().targets,
+            CallTargets::Resolved(vec![lit_fn])
         );
     }
 }

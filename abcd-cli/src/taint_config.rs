@@ -10,6 +10,7 @@
 //! native_identity = true
 //! max_field_chain = 5   # access-path k-limit (DEFAULT_MAX_FIELD_CHAIN)
 //! alias_rung = 2        # 0 | 1 | 2 (see design/analysis.md §2.3)
+//! # pta_step_budget = 250000 # optional Rung-2 PTA worklist step cap
 //!
 //! # Sources: name-keyed (SourceSpec).
 //! [[sources]]
@@ -103,6 +104,8 @@ struct TaintToml {
     /// Alias-oracle rung: 0, 1, or 2 (default 2).
     #[serde(default = "default_alias_rung")]
     alias_rung: u8,
+    /// Optional Rung-2 pointer-analysis step budget override.
+    pta_step_budget: Option<usize>,
     /// Extra `(name, arity, summary)` registrations.
     #[serde(default)]
     extra_summaries: Vec<SummaryToml>,
@@ -324,7 +327,7 @@ impl TaintToml {
             native_identity: self.native_identity,
             max_field_chain: self.max_field_chain,
             alias_rung: self.alias_rung,
-            pta_step_budget: None,
+            pta_step_budget: self.pta_step_budget,
             ohos_lifecycle: self.ohos_lifecycle,
             manifest_json: None,
         };
@@ -352,6 +355,7 @@ mod tests {
             abcd_analysis::dataflow::heap::DEFAULT_MAX_FIELD_CHAIN
         );
         assert_eq!(cfg.alias_rung, 2);
+        assert_eq!(cfg.pta_step_budget, None);
     }
 
     #[test]
@@ -360,6 +364,7 @@ mod tests {
             r##"
             builtin_summaries = false
             alias_rung = 1
+            pta_step_budget = 12345
             max_field_chain = 3
 
             [[sources]]
@@ -408,6 +413,7 @@ mod tests {
         );
         assert!(!cfg.builtin_summaries);
         assert_eq!(cfg.alias_rung, 1);
+        assert_eq!(cfg.pta_step_budget, Some(12345));
         assert_eq!(cfg.max_field_chain, 3);
         let (name, arity, summary) = &cfg.extra_summaries[0];
         assert_eq!(name, "sanitize");
@@ -454,6 +460,14 @@ mod tests {
         let err = parse("alias_rung = 3").unwrap_err();
         assert_eq!(err.exit_code(), 1);
         assert!(err.to_string().contains("alias_rung"), "{err}");
+    }
+
+    #[test]
+    fn pta_step_budget_rejects_bad_types() {
+        let err = parse("pta_step_budget = -1").unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let err = parse("pta_step_budget = \"lots\"").unwrap_err();
+        assert_eq!(err.exit_code(), 1);
     }
 
     #[test]

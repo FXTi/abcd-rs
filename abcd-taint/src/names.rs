@@ -104,6 +104,77 @@ pub(crate) fn callee_name_candidates_indexed(
     resolve_iterative(module, Some(links), prop_stores, caller, callee)
 }
 
+/// Fast `O(1)` pre-check returning `Some(sym)` when every candidate name
+/// produced by [`callee_name_candidates_indexed`] (and [`call_method_leaf`])
+/// for `callee` inside `caller` is guaranteed to end with `sym`'s final
+/// `.`-segment. Returns `None` when full resolution is required.
+pub(crate) fn quick_callee_leaf_sym(
+    module: &Module,
+    links: &ModuleLinkTable,
+    prop_stores: &ClassPropStores,
+    caller: FuncId,
+    mut callee: ValueId,
+) -> Option<Sym> {
+    let mut seen = [ValueId::new(u32::MAX); 8];
+    for step in 0..8 {
+        let val = module.value(callee)?;
+        match val.def {
+            ValueDef::Const(c) => {
+                let Const::MethodRef(body) = module.consts.get(c)? else {
+                    return None;
+                };
+                return Some(module.func(*body)?.name);
+            }
+            ValueDef::Inst(iid) => match &module.inst(iid)?.op {
+                Op::Mov { src } => {
+                    if seen[..step].contains(&callee) {
+                        return None;
+                    }
+                    seen[step] = callee;
+                    callee = *src;
+                }
+                Op::DefineFunc { body, .. } => {
+                    return Some(module.func(*body)?.name);
+                }
+                Op::LoadConst(c) => {
+                    let Const::MethodRef(body) = module.consts.get(*c)? else {
+                        return None;
+                    };
+                    return Some(module.func(*body)?.name);
+                }
+                Op::TryGetGlobal { name, .. } => {
+                    if module.sym.resolve(*name) == Some(OHOS_CONTEXT_GLOBAL) {
+                        return None;
+                    }
+                    return Some(*name);
+                }
+                Op::LoadProp { object, name } => {
+                    let leaf = module.sym.resolve(*name)?;
+                    if matches!(
+                        leaf,
+                        "context" | "fileIo" | "identifier" | "dataPreferences"
+                    ) {
+                        return None;
+                    }
+                    if peel_namespace_index(module, *object).is_some() {
+                        return None;
+                    }
+                    let cid = links
+                        .func_class(caller)
+                        .or_else(|| module.func(caller).map(|f| f.class_id))?;
+                    if !prop_stores.get(cid, *name).is_empty() {
+                        return None;
+                    }
+                    return Some(*name);
+                }
+                _ => return None,
+            },
+            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => return None,
+        }
+    }
+    None
+}
+
 enum ResolveStep {
     Enter {
         func: FuncId,

@@ -60,7 +60,7 @@ Higher-order summaries (`Array.prototype.{forEach,map,filter}`, `String.prototyp
 ### Alias Oracle Rungs (`0` / `1` / `2`) & OpenHarmony Rule Pack
 - **Rung 0** (`Rung0AliasOracle`): intraprocedural SSA def-chain allocation-site walk (the universal sound fallback floor).
 - **Rung 1** (`Rung1AliasOracle`): memoized demand-driven backward `points_to` with balanced call-site context stacks plus one-pass `CallGraph::refine_with_points_to`.
-- **Rung 2** (`Rung2AliasOracle`, default `alias_rung = 2`): whole-module `k=1` call-site-sensitive Andersen PTA with on-the-fly call-graph co-evolution, `NewLexEnv` capture disambiguation, and fresh summary-container call-site keying.
+- **Rung 2** (`Rung2AliasOracle`, default `alias_rung = 2`): `k=1` call-site-sensitive Andersen PTA (whole-module on `<= 512`-function modules, demand-driven root-sliced across source/sink caller cones and cross-module ES import forward closures on `> 512`-function bundles) with on-the-fly call-graph co-evolution, `NewLexEnv` capture disambiguation, and fresh summary-container call-site keying.
 - **OpenHarmony (`ohos_preset` + `ohos_lifecycle`)**: synthesizes Stage/FA `UIAbility`, `*ExtensionAbility`, and ArkUI `ViewPU` entry harnesses (`__abcd_ohos_harness__`), seeds tainted `Want` / `deviceInfo` / privacy SDK returns and `WebviewController.registerJavaScriptProxy` JSBridge methods, and tracks sync, `Promise`, `AwaitUncaught`/`ResumeGenerator`, and `(err, data)` callback flows into network, WebView, filesystem, IPC, RDB, and HiLog sinks.
 
 ## 3. Soundness & Determinism Invariants

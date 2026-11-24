@@ -9,11 +9,15 @@ use abcd_isa::{Bytecode, EntityId, Imm, Label, Reg};
 const ALL: AnalyzeOptions = AnalyzeOptions {
     callgraph: true,
     dominators: true,
+    alias_rung: 0,
+    pta_budget: None,
 };
 
 const NONE: AnalyzeOptions = AnalyzeOptions {
     callgraph: false,
     dominators: false,
+    alias_rung: 0,
+    pta_budget: None,
 };
 
 /// Two methods: `helper() { return undefined; }` and
@@ -355,6 +359,7 @@ fn callgraph_text_renders_external_targets() {
             },
             entry: None,
         },
+        pta: None,
         callgraph: Some(analyze::CallgraphReport {
             functions: vec![analyze::FunctionCallgraph {
                 function_index: 0,
@@ -409,4 +414,288 @@ fn render_in_text_mode_produces_the_text_report() {
         "{out}"
     );
     assert!(out.contains("entry:           func_main_0"), "{out}");
+}
+
+// ---- --pta, --alias-rung 0|1|2, --pta-budget (#34) ----
+
+/// Five methods exercising progressive Rung 0 < Rung 1 < Rung 2 call-graph
+/// refinement:
+/// - `local_target() { return undefined; }`
+/// - `remote_target() { return undefined; }`
+/// - `run_cb(cb) { cb(); return undefined; }` (Rung 1 formal-param closure)
+/// - `invoke(box) { let g = box.cb; g(); return undefined; }` (Rung 2 heap PTA)
+/// - `func_main_0() {
+///       run_cb(local_target);
+///       let remote_box = {}; remote_box.cb = remote_target;
+///       invoke(remote_box);
+///   }`
+fn pta_calls_abc() -> Vec<u8> {
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    let proto = b.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+
+    let (ret_undef, _) = abcd_isa::encode(&[Bytecode::Returnundefined]).unwrap();
+    let local_target = b.class_add_method(
+        cls,
+        "local_target",
+        proto,
+        AccessFlags::STATIC,
+        &ret_undef,
+        2,
+        0,
+    );
+    let remote_target = b.class_add_method(
+        cls,
+        "remote_target",
+        proto,
+        AccessFlags::STATIC,
+        &ret_undef,
+        2,
+        0,
+    );
+
+    // `run_cb(cb)`: num_vregs = 1, num_args = 4 => formal 0 (`cb`) is Reg(4).
+    let (run_cb_code, _) = abcd_isa::encode(&[
+        Bytecode::Lda(Reg(4)),      // 0: acc = cb
+        Bytecode::Callarg0(Imm(0)), // 1: cb()
+        Bytecode::Returnundefined,  // 2
+    ])
+    .unwrap();
+    let run_cb = b.class_add_method(
+        cls,
+        "run_cb",
+        proto,
+        AccessFlags::STATIC,
+        &run_cb_code,
+        1,
+        4,
+    );
+
+    // `invoke(box)`: num_vregs = 2, num_args = 4 => formal 0 (`box`) is Reg(5).
+    let (invoke_code, invoke_offsets) = abcd_isa::encode(&[
+        Bytecode::Lda(Reg(5)),                      // 0: acc = box
+        Bytecode::Ldobjbyname(Imm(0), placeholder), // 1: acc = box.cb
+        Bytecode::Sta(Reg(0)),                      // 2: v0 = g
+        Bytecode::Lda(Reg(0)),                      // 3: acc = g
+        Bytecode::Callarg0(Imm(1)),                 // 4: g()
+        Bytecode::Returnundefined,                  // 5
+    ])
+    .unwrap();
+    let invoke = b.class_add_method(
+        cls,
+        "invoke",
+        proto,
+        AccessFlags::STATIC,
+        &invoke_code,
+        2,
+        4,
+    );
+    let s_cb = b.add_string("cb");
+    b.relocate_code_id(invoke, invoke_offsets[1], 0, CodeEntity::String(s_cb))
+        .unwrap();
+
+    let (main_code, main_offsets) = abcd_isa::encode(&[
+        Bytecode::Definefunc(Imm(0), placeholder, Imm(0)), // 0: acc = local_target
+        Bytecode::Sta(Reg(0)),                             // 1: v0 = local_target
+        Bytecode::Definefunc(Imm(1), placeholder, Imm(1)), // 2: acc = run_cb
+        Bytecode::Sta(Reg(1)),                             // 3: v1 = run_cb
+        Bytecode::Lda(Reg(1)),                             // 4: acc = run_cb
+        Bytecode::Callarg1(Imm(2), Reg(0)),                // 5: run_cb(local_target)
+        Bytecode::Createemptyobject,                       // 6: acc = {}
+        Bytecode::Sta(Reg(2)),                             // 7: v2 = remote_box
+        Bytecode::Definefunc(Imm(3), placeholder, Imm(0)), // 8: acc = remote_target
+        Bytecode::Stobjbyname(Imm(4), placeholder, Reg(2)), // 9: remote_box.cb = remote_target
+        Bytecode::Definefunc(Imm(5), placeholder, Imm(1)), // 10: acc = invoke
+        Bytecode::Sta(Reg(3)),                             // 11: v3 = invoke
+        Bytecode::Lda(Reg(3)),                             // 12: acc = invoke
+        Bytecode::Callarg1(Imm(6), Reg(2)),                // 13: invoke(remote_box)
+        Bytecode::Returnundefined,                         // 14
+    ])
+    .unwrap();
+    let main = b.class_add_method(
+        cls,
+        "func_main_0",
+        proto,
+        AccessFlags::STATIC,
+        &main_code,
+        6,
+        3,
+    );
+    b.relocate_code_id(main, main_offsets[0], 0, CodeEntity::Method(local_target))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[2], 0, CodeEntity::Method(run_cb))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[8], 0, CodeEntity::Method(remote_target))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[9], 0, CodeEntity::String(s_cb))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[10], 0, CodeEntity::Method(invoke))
+        .unwrap();
+    b.deduplicate();
+    b.finalize().expect("pta_calls_abc must finalize")
+}
+
+#[test]
+fn alias_rungs_progressively_refine_call_graph_and_report_pta_telemetry() {
+    let abc = pta_calls_abc();
+
+    // Rung 0: base CallGraph::build — `run_cb` and `invoke` resolve; `cb()` and `g()` stay unknown.
+    let r0 = analyze(
+        &abc,
+        "pta.abc",
+        AnalyzeOptions {
+            callgraph: true,
+            dominators: false,
+            alias_rung: 0,
+            pta_budget: None,
+        },
+    );
+    assert_eq!(r0.pta, None);
+    assert_eq!(r0.summary.call_sites, 4);
+    assert_eq!(r0.summary.resolution.resolved_internal, 2);
+    assert_eq!(r0.summary.resolution.unknown, 2);
+    let r0_text = analyze::render_text(&r0);
+    assert!(!r0_text.contains("pta:"), "{r0_text}");
+    let r0_json: serde_json::Value =
+        serde_json::from_str(&analyze::render(&[r0], true).unwrap()).unwrap();
+    assert!(r0_json.get("pta").is_none(), "{r0_json}");
+
+    // Rung 1: Rung1AliasOracle + refine_with_points_to resolves formal-param `cb()` in `run_cb`,
+    // leaving interprocedural heap `box.cb` in `invoke` for Rung 2; no PTA block emitted.
+    let r1 = analyze(
+        &abc,
+        "pta.abc",
+        AnalyzeOptions {
+            callgraph: true,
+            dominators: false,
+            alias_rung: 1,
+            pta_budget: None,
+        },
+    );
+    assert_eq!(r1.pta, None);
+    assert_eq!(r1.summary.call_sites, 4);
+    assert_eq!(r1.summary.resolution.resolved_internal, 3);
+    assert_eq!(r1.summary.resolution.unknown, 1);
+    let r1_text = analyze::render_text(&r1);
+    assert!(!r1_text.contains("pta:"), "{r1_text}");
+
+    // Rung 2 (`--pta` / `--alias-rung 2`): interprocedural PTA resolves all 4 sites.
+    let r2 = analyze(
+        &abc,
+        "pta.abc",
+        AnalyzeOptions {
+            callgraph: true,
+            dominators: false,
+            alias_rung: 2,
+            pta_budget: None,
+        },
+    );
+    let pta = r2.pta.expect("rung 2 emits PtaReport");
+    assert_eq!(pta.alias_rung_used, 2);
+    assert!(!pta.capped);
+    assert!(pta.activations > 1, "{pta:?}");
+    assert!(pta.facts > 0, "{pta:?}");
+    assert!(pta.call_edges_resolved >= 2, "{pta:?}");
+    assert_eq!(r2.summary.call_sites, 4);
+    assert_eq!(r2.summary.resolution.resolved_internal, 4);
+    assert_eq!(r2.summary.resolution.unknown, 0);
+
+    let r2_text = analyze::render_text(&r2);
+    assert!(r2_text.contains("pta:             rung 2,"), "{r2_text}");
+    assert!(!r2_text.contains(", capped"), "{r2_text}");
+    let r2_json: serde_json::Value =
+        serde_json::from_str(&analyze::render(&[r2], true).unwrap()).unwrap();
+    assert_eq!(r2_json["pta"]["alias_rung_used"], 2);
+    assert_eq!(r2_json["pta"]["capped"], false);
+}
+
+#[test]
+fn pta_budget_cap_degrades_alias_rung_used_to_one() {
+    let abc = pta_calls_abc();
+    let r1 = analyze(
+        &abc,
+        "pta.abc",
+        AnalyzeOptions {
+            callgraph: true,
+            dominators: false,
+            alias_rung: 1,
+            pta_budget: None,
+        },
+    );
+    assert_eq!(r1.summary.resolution.resolved_internal, 3);
+    assert_eq!(r1.summary.resolution.unknown, 1);
+    let capped = analyze(
+        &abc,
+        "pta.abc",
+        AnalyzeOptions {
+            callgraph: true,
+            dominators: false,
+            alias_rung: 2,
+            pta_budget: Some(1),
+        },
+    );
+    let pta = capped.pta.expect("capped rung 2 still emits PtaReport");
+    assert!(pta.capped, "{pta:?}");
+    assert_eq!(pta.alias_rung_used, 1, "{pta:?}");
+    assert_eq!(
+        capped.summary.resolution.resolved_internal, r1.summary.resolution.resolved_internal,
+        "capped PTA must degrade CallGraph to Rung 1"
+    );
+    assert_eq!(
+        capped.summary.resolution.unknown,
+        r1.summary.resolution.unknown
+    );
+    let text = analyze::render_text(&capped);
+    assert!(text.contains("pta:             rung 1,"), "{text}");
+    assert!(text.contains(", capped\n"), "{text}");
+}
+
+#[test]
+fn invalid_alias_rung_in_analyze_options_is_a_user_error() {
+    let modules = input::load_bytes(&common::tiny_abc(), "m.abc", ModuleSelection::Single).unwrap();
+    let err = analyze::report(
+        &modules[0],
+        AnalyzeOptions {
+            callgraph: false,
+            dominators: false,
+            alias_rung: 3,
+            pta_budget: None,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert!(err.to_string().contains("invalid alias_rung"), "{err}");
+}
+
+#[test]
+fn cli_analyze_pta_and_alias_rung_dispatch_end_to_end() {
+    use abcd_cli::cli::Cli;
+    use clap::Parser;
+
+    let dir = common::tempdir("analyze-pta-cli");
+    let abc_path = dir.join("pta.abc");
+    std::fs::write(&abc_path, pta_calls_abc()).unwrap();
+    let abc = abc_path.to_str().unwrap();
+
+    for argv in [
+        &["abcd", "analyze", abc, "--pta"][..],
+        &["abcd", "analyze", abc, "--pta", "--json"][..],
+        &["abcd", "analyze", abc, "--alias-rung", "0"][..],
+        &["abcd", "analyze", abc, "--alias-rung", "1"][..],
+        &["abcd", "analyze", abc, "--alias-rung", "2"][..],
+        &[
+            "abcd",
+            "analyze",
+            abc,
+            "--pta",
+            "--pta-budget",
+            "1",
+            "--callgraph",
+        ][..],
+    ] {
+        let cli = Cli::try_parse_from(argv).expect("argv must parse");
+        abcd_cli::run(cli).expect("analyze dispatch must succeed");
+    }
 }

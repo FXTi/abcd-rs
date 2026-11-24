@@ -6,10 +6,11 @@
 #
 # Usage:
 #   scripts/test-local.sh                 # L1: fast workspace unit + synthetic integration tests
-#   scripts/test-local.sh fast            # same as default
+#   scripts/test-local.sh fast|quick      # fmt + clippy + L1 fast workspace tests
+#   scripts/test-local.sh full            # fmt + clippy + rustdoc + vendor-verify + L1 workspace tests
 #   scripts/test-local.sh crate <pkg>     # targeted single-crate unit + integration + clippy
 #   scripts/test-local.sh corpus          # L2: full offline 5,517 corpus + 156 wild .hap + modules.abc (release, zero Docker)
-#   scripts/test-local.sh all             # fmt + clippy + doc + L1 fast + L2 offline corpus
+#   scripts/test-local.sh all             # full + L2 offline corpus
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -70,9 +71,26 @@ run_corpus() {
         --skip wild_gate_red_proof_es2abc_rejection
 }
 
+run_full() {
+    echo "==> [Lint] fmt + clippy + rustdoc + vendor-verify"
+    cargo fmt --all -- --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+    python3 scripts/vendor-gen.py verify
+    run_fast
+}
+
 case "${mode}" in
     fast)
         run_fast
+        ;;
+    quick)
+        cargo fmt --all -- --check
+        cargo clippy --workspace --all-targets -- -D warnings
+        run_fast
+        ;;
+    full)
+        run_full
         ;;
     crate)
         shift
@@ -82,11 +100,7 @@ case "${mode}" in
         run_corpus
         ;;
     all)
-        echo "==> [Lint] fmt + clippy + rustdoc"
-        cargo fmt --all -- --check
-        cargo clippy --workspace --all-targets -- -D warnings
-        RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-        run_fast
+        run_full
         if [ -f "exports/corpus/index.jsonl" ]; then
             run_corpus
         else
@@ -94,7 +108,7 @@ case "${mode}" in
         fi
         ;;
     *)
-        echo "unknown mode '${mode}' (expected: fast | crate <pkg> | corpus | all)" >&2
+        echo "unknown mode '${mode}' (expected: fast | quick | full | crate <pkg> | corpus | all)" >&2
         exit 1
         ;;
 esac

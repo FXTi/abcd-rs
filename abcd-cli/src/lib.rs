@@ -136,9 +136,12 @@ fn run_rewrite(args: &RewriteArgs) -> Result<(), CliError> {
 }
 
 fn run_analyze(args: &AnalyzeArgs) -> Result<(), CliError> {
+    let alias_rung = args.alias_rung.unwrap_or(if args.pta { 2 } else { 0 });
     let opts = analyze::AnalyzeOptions {
         callgraph: args.callgraph,
         dominators: args.dominators,
+        alias_rung,
+        pta_budget: args.pta_budget,
     };
     let selection = selection_of(&args.select.module, args.select.all);
     let modules = input::load(&args.input, selection)?;
@@ -151,15 +154,21 @@ fn run_analyze(args: &AnalyzeArgs) -> Result<(), CliError> {
 }
 
 fn run_taint(args: &TaintArgs) -> Result<(), CliError> {
-    let config = taint::resolve_config(args.config.as_deref(), args.preset.as_deref())?;
+    let mut cfg = taint::resolve_config(args.config.as_deref(), args.preset.as_deref())?;
+    if let Some(r) = args.alias_rung {
+        cfg.alias_rung = r;
+    }
+    if let Some(b) = args.pta_budget {
+        cfg.pta_step_budget = Some(b);
+    }
     let selection = selection_of(&args.select.module, args.select.all);
     let modules = input::load(&args.input, selection)?;
     let reports: Vec<taint::TaintCliReport> = if args.link_modules {
-        vec![taint::report_linked(&modules, &config)?]
+        vec![taint::report_linked(&modules, &cfg)?]
     } else {
         modules
             .iter()
-            .map(|m| taint::report(m, &config))
+            .map(|m| taint::report(m, &cfg))
             .collect::<Result<_, _>>()?
     };
     println!("{}", taint::render(&reports, args.json)?);

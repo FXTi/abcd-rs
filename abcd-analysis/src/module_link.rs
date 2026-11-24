@@ -193,6 +193,28 @@ impl ModuleLinkTable {
             }
         }
 
+        let lookup_candidates = |candidates: &[String]| -> Option<ClassId> {
+            if let Some(cid) = candidates.iter().find_map(|c| key_to_class.get(c).copied()) {
+                return Some(cid);
+            }
+            for c in candidates {
+                if let Some(&cid) = key_to_class
+                    .get(&format!("{c}/index"))
+                    .or_else(|| key_to_class.get(&format!("{c}.index")))
+                {
+                    return Some(cid);
+                }
+                if let Some(stem) = c
+                    .strip_suffix("/index")
+                    .or_else(|| c.strip_suffix(".index"))
+                    && let Some(&cid) = key_to_class.get(stem)
+                {
+                    return Some(cid);
+                }
+            }
+            None
+        };
+
         let resolve_spec = |from_cid: ClassId, spec_sym: Sym| -> Option<ClassId> {
             let raw = sym_str(module, spec_sym);
             if raw.is_empty() || is_sdk_specifier(raw) {
@@ -200,21 +222,22 @@ impl ModuleLinkTable {
             }
             if raw.starts_with("./") || raw.starts_with("../") {
                 let base = class_rel_path.get(&from_cid)?;
-                let resolved = resolve_posix_relative(base, raw)?;
+                let resolved = if base.contains('/') {
+                    resolve_posix_relative(base, raw)?
+                } else {
+                    resolve_dot_relative(base, raw)?
+                };
                 let stripped = strip_known_ext(&resolved);
-                return key_to_class
-                    .get(&resolved)
-                    .or_else(|| key_to_class.get(stripped))
-                    .copied();
+                let mut rel_candidates = Vec::with_capacity(3);
+                push_unique(&mut rel_candidates, resolved.clone());
+                push_unique(&mut rel_candidates, stripped.to_owned());
+                if base.contains('/') {
+                    push_unique(&mut rel_candidates, stripped.replace('/', "."));
+                }
+                return lookup_candidates(&rel_candidates);
             }
-            let peeled = peel_ohmurl(raw);
-            let candidates = [
-                raw.to_owned(),
-                peeled.to_owned(),
-                peeled.replace('@', "/"),
-                strip_known_ext(peeled).to_owned(),
-            ];
-            candidates.iter().find_map(|c| key_to_class.get(c).copied())
+            let candidates = collect_candidates(raw, None);
+            lookup_candidates(&candidates)
         };
 
         let ctx = ExportResolveCtx {
@@ -690,6 +713,50 @@ fn is_sdk_specifier(s: &str) -> bool {
         || s.starts_with("@system:")
         || s.starts_with("@arkts.")
         || s.starts_with("@native:")
+        || s.starts_with("@hms.")
+        || s.starts_with("@hms:")
+        || s.starts_with("@normalized:Y&")
+}
+
+/// Parse `@normalized:<rest>` or bare `&<rest>` OHMUrl forms into
+/// `(mod_name, bundle_name, import_path)`.
+fn parse_normalized_ohmurl(raw: &str) -> Option<(&str, &str, &str)> {
+    let parsed = if let Some(rest) = raw.strip_prefix("@normalized:") {
+        let parts: Vec<&str> = rest.split('&').collect();
+        match parts.as_slice() {
+            [_is_native, mod_name, bundle_name, import_path, _ver, ..] => {
+                Some((*mod_name, *bundle_name, *import_path))
+            }
+            [_is_native, mod_name, p2, p3] => {
+                if p3.contains('/') || (!p3.is_empty() && p2.is_empty()) {
+                    Some((*mod_name, "", *p3))
+                } else {
+                    Some((*mod_name, "", *p2))
+                }
+            }
+            [_is_native, mod_name, import_path] => Some((*mod_name, "", *import_path)),
+            _ => None,
+        }
+    } else if let Some(rest) = raw.strip_prefix('&') {
+        let parts: Vec<&str> = rest.split('&').collect();
+        match parts.as_slice() {
+            [mod_name, bundle_name, import_path, _ver, ..] => {
+                Some((*mod_name, *bundle_name, *import_path))
+            }
+            [p0, p1, _ver] => {
+                if p1.contains('/') {
+                    Some((*p0, "", *p1))
+                } else {
+                    Some(("", "", *p0))
+                }
+            }
+            [p0, ..] => Some(("", "", *p0)),
+            [] => None,
+        }
+    } else {
+        None
+    };
+    parsed.filter(|(_, _, imp)| !imp.is_empty())
 }
 
 fn peel_ohmurl(raw: &str) -> &str {
@@ -699,14 +766,10 @@ fn peel_ohmurl(raw: &str) -> &str {
     if let Some(rest) = raw.strip_prefix("@package:") {
         return rest;
     }
+    if let Some((_, _, import_path)) = parse_normalized_ohmurl(raw) {
+        return import_path;
+    }
     if let Some(rest) = raw.strip_prefix("@normalized:") {
-        let parts: Vec<&str> = rest.split('&').collect();
-        if parts.len() >= 4 && !parts[3].is_empty() {
-            return parts[3];
-        }
-        if parts.len() >= 3 && !parts[2].is_empty() {
-            return parts[2];
-        }
         return rest;
     }
     raw
@@ -732,17 +795,77 @@ fn normalize_logical_path(raw: &str) -> String {
     strip_known_ext(&segs.join("/")).to_owned()
 }
 
+fn push_unique(out: &mut Vec<String>, candidate: String) {
+    if !candidate.is_empty() && !out.contains(&candidate) {
+        out.push(candidate);
+    }
+}
+
+fn collect_candidates(raw: &str, extra_norm: Option<&str>) -> Vec<String> {
+    let mut out = Vec::with_capacity(10);
+    push_unique(&mut out, raw.to_owned());
+    push_unique(&mut out, strip_known_ext(raw).to_owned());
+
+    if let Some((mod_name, bundle_name, import_path)) = parse_normalized_ohmurl(raw) {
+        let imp = strip_known_ext(import_path);
+        let dots = imp.replace('/', ".");
+        if !bundle_name.is_empty() {
+            push_unique(&mut out, format!("{bundle_name}/{imp}"));
+            push_unique(&mut out, format!("{bundle_name}.{dots}"));
+        }
+        push_unique(&mut out, import_path.to_owned());
+        push_unique(&mut out, imp.to_owned());
+        push_unique(&mut out, import_path.replace('/', "."));
+        push_unique(&mut out, dots.clone());
+        if !bundle_name.is_empty()
+            && let Some(sub) = imp.strip_prefix(&format!("{bundle_name}/"))
+        {
+            push_unique(&mut out, sub.to_owned());
+            push_unique(&mut out, sub.replace('/', "."));
+        }
+        if !mod_name.is_empty() {
+            if !imp.starts_with(&format!("{mod_name}/")) {
+                push_unique(&mut out, format!("{mod_name}/{imp}"));
+                push_unique(&mut out, format!("{mod_name}.{dots}"));
+            }
+            let mod_marker = format!("/{mod_name}/");
+            if let Some(pos) = imp.find(&mod_marker) {
+                let tail = &imp[pos + 1..];
+                push_unique(&mut out, tail.to_owned());
+                push_unique(&mut out, tail.replace('/', "."));
+            } else if let Some((_, after_bundle)) = imp.split_once('/')
+                && after_bundle == mod_name
+            {
+                push_unique(&mut out, after_bundle.to_owned());
+            }
+        }
+    }
+
+    let p = peel_ohmurl(raw);
+    let p_no_ext = strip_known_ext(p);
+    push_unique(&mut out, p.to_owned());
+    push_unique(&mut out, p_no_ext.to_owned());
+    push_unique(&mut out, p.replace('/', "."));
+    push_unique(&mut out, p_no_ext.replace('/', "."));
+
+    if p.contains('@') {
+        push_unique(&mut out, p.replace('@', "/"));
+        push_unique(&mut out, p_no_ext.replace('@', "/"));
+    }
+
+    if let Some(norm) = extra_norm {
+        push_unique(&mut out, norm.to_owned());
+        push_unique(&mut out, norm.replace('/', "."));
+        if norm.contains('@') {
+            push_unique(&mut out, norm.replace('@', "/"));
+        }
+    }
+
+    out
+}
+
 fn candidate_keys(raw_name: &str, norm_no_ext: &str) -> Vec<String> {
-    let mut keys = vec![raw_name.to_owned(), norm_no_ext.to_owned()];
-    let peeled = peel_ohmurl(raw_name);
-    keys.push(peeled.to_owned());
-    if peeled.contains('@') {
-        keys.push(peeled.replace('@', "/"));
-    }
-    if norm_no_ext.contains('@') {
-        keys.push(norm_no_ext.replace('@', "/"));
-    }
-    keys
+    collect_candidates(raw_name, Some(norm_no_ext))
 }
 
 fn resolve_posix_relative(from_path_no_ext: &str, rel_spec: &str) -> Option<String> {
@@ -758,6 +881,21 @@ fn resolve_posix_relative(from_path_no_ext: &str, rel_spec: &str) -> Option<Stri
         }
     }
     Some(parts.join("/"))
+}
+
+fn resolve_dot_relative(from_dot_no_ext: &str, rel_spec: &str) -> Option<String> {
+    let mut parts: Vec<&str> = from_dot_no_ext.split('.').collect();
+    parts.pop();
+    for seg in rel_spec.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("."))
 }
 
 fn json_const_of(module: &Module, cls: &ClassData) -> Option<ConstId> {
@@ -2034,5 +2172,359 @@ mod tests {
             })
             .expect("spawn");
         handle.join().expect("small stack must not overflow");
+    }
+
+    fn add_exporting_record(m: &mut Module, raw_record: &str, export_names: &[&str]) -> ClassId {
+        let desc = m.sym.intern(&format!("L{raw_record};"));
+        let name = m.sym.intern(raw_record);
+        let cid = ClassId::new(m.classes.len() as u32);
+        m.classes.push(ClassData::new(desc, name));
+
+        let exports: Vec<ExportDecl> = export_names
+            .iter()
+            .map(|ename| {
+                let s = m.sym.intern(ename);
+                ExportDecl::Local {
+                    local_name: s,
+                    export_name: s,
+                }
+            })
+            .collect();
+        m.classes[cid.index()].es_module = Some(EsModule {
+            imports: Vec::new(),
+            exports,
+            module_requests: Vec::new(),
+        });
+
+        let (_, b, _) = push_fn_with_params(m, cid, "func_main_0", FunctionKind::Function, 3);
+        let c1 = m.consts.push(Const::number(1.0));
+        for idx in 0..export_names.len() {
+            let (_, v) = emit_val(m, b, Op::LoadConst(c1));
+            emit_void(
+                m,
+                b,
+                Op::StoreModuleVar {
+                    index: idx as u32,
+                    value: v,
+                },
+            );
+        }
+        emit_void(m, b, Op::Return { value: None });
+        cid
+    }
+
+    fn add_importing_record(
+        m: &mut Module,
+        raw_record: &str,
+        specs: &[(&str, &str)],
+    ) -> (ClassId, Vec<Sym>) {
+        let desc = m.sym.intern(&format!("L{raw_record};"));
+        let name = m.sym.intern(raw_record);
+        let cid = ClassId::new(m.classes.len() as u32);
+        m.classes.push(ClassData::new(desc, name));
+
+        let mut imports = Vec::with_capacity(specs.len());
+        let mut module_requests = Vec::with_capacity(specs.len());
+        let mut req_syms = Vec::with_capacity(specs.len());
+        for &(spec, imp_name) in specs {
+            let s_req = m.sym.intern(spec);
+            let s_imp = m.sym.intern(imp_name);
+            imports.push(ImportDecl::Regular {
+                local_name: s_imp,
+                import_name: s_imp,
+                module_request: s_req,
+            });
+            module_requests.push(ModuleRequest {
+                specifier: s_req,
+                lazy: false,
+            });
+            req_syms.push(s_req);
+        }
+        m.classes[cid.index()].es_module = Some(EsModule {
+            imports,
+            exports: Vec::new(),
+            module_requests,
+        });
+
+        let (_, b, _) = push_fn_with_params(m, cid, "func_main_0", FunctionKind::Function, 3);
+        emit_void(m, b, Op::Return { value: None });
+        (cid, req_syms)
+    }
+
+    #[test]
+    fn bundle_and_infix_har_resolve_to_dot_encoded_records() {
+        let mut m = Module::new();
+        let c_main_ability = add_exporting_record(
+            &mut m,
+            "com.huawei.hmos.photos.phone_photos.ets.MainAbility.MainAbility",
+            &["MainAbility"],
+        );
+        let c_drag_ctrl = add_exporting_record(
+            &mut m,
+            "com.huawei.hmos.photos.phone_photos@browserCommon.ets.default.controller.DragController",
+            &["DragController"],
+        );
+        let (c_importer, _) = add_importing_record(
+            &mut m,
+            "com.huawei.hmos.photos.phone_photos.ets.pages.Gallery",
+            &[
+                (
+                    "@bundle:com.huawei.hmos.photos/phone_photos/ets/MainAbility/MainAbility",
+                    "MainAbility",
+                ),
+                (
+                    "@bundle:com.huawei.hmos.photos/phone_photos@browserCommon/ets/default/controller/DragController",
+                    "DragController",
+                ),
+            ],
+        );
+
+        assert!(verify_module(&m).errors.is_empty());
+        let links = ModuleLinkTable::build(&m);
+
+        let t0 = links.external_load(c_importer, 0).expect("slot 0");
+        assert!(!t0.unresolved_external);
+        assert_eq!(
+            t0.slots,
+            vec![ModuleSlotRef {
+                class_id: c_main_ability,
+                slot: 0,
+            }]
+        );
+        assert_eq!(links.namespace_target(c_importer, 0), Some(c_main_ability));
+
+        let t1 = links.external_load(c_importer, 1).expect("slot 1");
+        assert!(!t1.unresolved_external);
+        assert_eq!(
+            t1.slots,
+            vec![ModuleSlotRef {
+                class_id: c_drag_ctrl,
+                slot: 0,
+            }]
+        );
+        assert_eq!(links.namespace_target(c_importer, 1), Some(c_drag_ctrl));
+    }
+
+    #[test]
+    fn package_ohpm_resolves_to_dot_encoded_records_and_index_fallbacks() {
+        let mut m = Module::new();
+        let c_clip = add_exporting_record(
+            &mut m,
+            "pkg_modules..ohpm.@hms-core+media@1.3.1.pkg_modules.@hms-core.media.src.main.ets.Clip",
+            &["Clip"],
+        );
+        let c_media_index = add_exporting_record(
+            &mut m,
+            "pkg_modules..ohpm.@hms-core+media@1.3.1.pkg_modules.@hms-core.media.index",
+            &["MediaHub"],
+        );
+        let c_slash_index = add_exporting_record(
+            &mut m,
+            "@package:pkg_modules/.ohpm/@ohos+axios@2.2.0/pkg_modules/@ohos/axios/index",
+            &["axios"],
+        );
+        let c_stem_only = add_exporting_record(
+            &mut m,
+            "pkg_modules..ohpm.@ohos+crypto@1.0.0.pkg_modules.@ohos.crypto.Crypto",
+            &["Crypto"],
+        );
+
+        let (c_importer, _) = add_importing_record(
+            &mut m,
+            "com.demo.entry.ets.pages.Index",
+            &[
+                (
+                    "@package:pkg_modules/.ohpm/@hms-core+media@1.3.1/pkg_modules/@hms-core/media/src/main/ets/Clip",
+                    "Clip",
+                ),
+                (
+                    "@package:pkg_modules/.ohpm/@hms-core+media@1.3.1/pkg_modules/@hms-core/media",
+                    "MediaHub",
+                ),
+                (
+                    "@package:pkg_modules/.ohpm/@ohos+axios@2.2.0/pkg_modules/@ohos/axios",
+                    "axios",
+                ),
+                (
+                    "@package:pkg_modules/.ohpm/@ohos+crypto@1.0.0/pkg_modules/@ohos/crypto/Crypto/index",
+                    "Crypto",
+                ),
+            ],
+        );
+
+        assert!(verify_module(&m).errors.is_empty());
+        let links = ModuleLinkTable::build(&m);
+
+        for (slot_idx, expected_cid) in [
+            (0u32, c_clip),
+            (1u32, c_media_index),
+            (2u32, c_slash_index),
+            (3u32, c_stem_only),
+        ] {
+            let t = links.external_load(c_importer, slot_idx).expect("slot");
+            assert!(!t.unresolved_external, "slot {slot_idx} should resolve");
+            assert_eq!(
+                t.slots,
+                vec![ModuleSlotRef {
+                    class_id: expected_cid,
+                    slot: 0,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_ohmurl_bare_ampersand_and_sdk_native_filters() {
+        assert_eq!(
+            parse_normalized_ohmurl("@normalized:N&entry&com.demo&entry/src/main/ets/Helper&1.0.0"),
+            Some(("entry", "com.demo", "entry/src/main/ets/Helper"))
+        );
+        assert_eq!(
+            parse_normalized_ohmurl("@normalized:N&har&com.demo/har/src/main/ets/Api&1.0.0"),
+            Some(("har", "", "com.demo/har/src/main/ets/Api"))
+        );
+        assert_eq!(
+            parse_normalized_ohmurl("@normalized:N&entry&&entry/src/main/ets/Helper"),
+            Some(("entry", "", "entry/src/main/ets/Helper"))
+        );
+        assert_eq!(
+            parse_normalized_ohmurl("@normalized:N&entry&entry/src/main/ets/Helper"),
+            Some(("entry", "", "entry/src/main/ets/Helper"))
+        );
+        assert_eq!(
+            parse_normalized_ohmurl("&entry&com.demo&entry/src/main/ets/Foo&1.0.0"),
+            Some(("entry", "com.demo", "entry/src/main/ets/Foo"))
+        );
+        assert_eq!(
+            parse_normalized_ohmurl("&har&com.demo/har/src/main/ets/Api&1.0.0"),
+            Some(("har", "", "com.demo/har/src/main/ets/Api"))
+        );
+        assert_eq!(
+            parse_normalized_ohmurl("&com.demo/entry/ets/Foo&1.0.0&"),
+            Some(("", "", "com.demo/entry/ets/Foo"))
+        );
+        assert_eq!(
+            parse_normalized_ohmurl("&entry/src/main/ets/Foo&"),
+            Some(("", "", "entry/src/main/ets/Foo"))
+        );
+
+        let mut m = Module::new();
+        // Bare `&` 4-field record matched by 5-field `@normalized:N&...` specifier.
+        let c_helper = add_exporting_record(
+            &mut m,
+            "&entry&com.demo&entry/src/main/ets/Helper&1.0.0",
+            &["Helper"],
+        );
+        // Dot-encoded record matched by 4-field `@normalized:N&har&...` specifier.
+        let c_api = add_exporting_record(&mut m, "com.demo.har.src.main.ets.Api", &["callApi"]);
+        // 5-field `@normalized:N&...` record matched by bare `&...` specifier.
+        let c_model = add_exporting_record(
+            &mut m,
+            "@normalized:N&entry&com.demo&entry/src/main/ets/Model&1.0.0",
+            &["Model"],
+        );
+        // Internal bundled `@app:` record resolves when present, while absent `@app:` marks external.
+        let c_app_internal =
+            add_exporting_record(&mut m, "@app:com.demo/entry/BundledLib", &["bundled"]);
+        // Bare `&<mod>/<path>&<ver>` HAR record matched by 4-segment `@normalized:N&<mod>&<bundle>/<mod>/<path>&<ver>`.
+        let c_shared_har = add_exporting_record(
+            &mut m,
+            "&shared_har/src/main/ets/DeviceStore&1.0.0",
+            &["DeviceStore"],
+        );
+
+        let (c_importer, req_syms) = add_importing_record(
+            &mut m,
+            "&entry&com.demo&entry/src/main/ets/Main&1.0.0",
+            &[
+                (
+                    "@normalized:N&entry&com.demo&entry/src/main/ets/Helper&1.0.0",
+                    "Helper",
+                ),
+                (
+                    "@normalized:N&har&com.demo/har/src/main/ets/Api&1.0.0",
+                    "callApi",
+                ),
+                ("&entry&com.demo&entry/src/main/ets/Model&1.0.0", "Model"),
+                ("@app:com.demo/entry/BundledLib", "bundled"),
+                (
+                    "@normalized:N&shared_har&com.demo.app/shared_har/src/main/ets/DeviceStore&1.0.0",
+                    "DeviceStore",
+                ),
+                (
+                    "@normalized:Y&entry&com.demo&libentry.so&1.0.0",
+                    "nativeCall",
+                ),
+                ("@hms.core.push.pushService", "pushService"),
+                ("@hms:core.account", "account"),
+                ("@app:com.demo/entry/MissingNative", "missing"),
+            ],
+        );
+
+        assert!(verify_module(&m).errors.is_empty());
+        let links = ModuleLinkTable::build(&m);
+
+        for (slot_idx, expected_cid) in [
+            (0u32, c_helper),
+            (1u32, c_api),
+            (2u32, c_model),
+            (3u32, c_app_internal),
+            (4u32, c_shared_har),
+        ] {
+            let t = links.external_load(c_importer, slot_idx).expect("slot");
+            assert!(!t.unresolved_external, "slot {slot_idx} should resolve");
+            assert_eq!(
+                t.slots,
+                vec![ModuleSlotRef {
+                    class_id: expected_cid,
+                    slot: 0,
+                }]
+            );
+        }
+
+        for slot_idx in 5u32..=8u32 {
+            let t = links.external_load(c_importer, slot_idx).expect("ext slot");
+            assert!(
+                t.unresolved_external,
+                "slot {slot_idx} must mark unresolved_external"
+            );
+            assert!(t.slots.is_empty());
+            assert_eq!(t.external_imports.len(), 1);
+            assert_eq!(t.external_imports[0].0, req_syms[slot_idx as usize]);
+        }
+    }
+
+    #[test]
+    fn dot_encoded_record_relative_imports() {
+        let mut m = Module::new();
+        let c_sibling =
+            add_exporting_record(&mut m, "com.demo.entry.ets.pages.Sibling", &["Sibling"]);
+        let c_util = add_exporting_record(&mut m, "com.demo.entry.ets.common.Util", &["util"]);
+        let c_comp_idx =
+            add_exporting_record(&mut m, "com.demo.entry.ets.components.index", &["Comp"]);
+        let (c_home, _) = add_importing_record(
+            &mut m,
+            "com.demo.entry.ets.pages.Home",
+            &[
+                ("./Sibling", "Sibling"),
+                ("../common/Util", "util"),
+                ("../components", "Comp"),
+            ],
+        );
+
+        assert!(verify_module(&m).errors.is_empty());
+        let links = ModuleLinkTable::build(&m);
+
+        for (slot_idx, expected_cid) in [(0u32, c_sibling), (1u32, c_util), (2u32, c_comp_idx)] {
+            let t = links.external_load(c_home, slot_idx).expect("slot");
+            assert!(!t.unresolved_external, "slot {slot_idx} should resolve");
+            assert_eq!(
+                t.slots,
+                vec![ModuleSlotRef {
+                    class_id: expected_cid,
+                    slot: 0,
+                }]
+            );
+        }
     }
 }

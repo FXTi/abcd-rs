@@ -98,6 +98,19 @@ impl<'m> Oracle<'m> {
         }
     }
 
+    /// Union of local def-chain allocation sites and any engine-recorded
+    /// allocation sites for `value` (retaining known sites even when
+    /// `has_unknown` is `true`).
+    pub fn known_sites_at(&self, value: ValueId, at: InstId) -> AllocSiteSet {
+        let mut out = self.resolve(value).sites;
+        match self {
+            Oracle::Rung0(_) => {}
+            Oracle::Rung1(o) => out.union_with(&o.query(value, at).sites),
+            Oracle::Rung2(o) => out.union_with(&o.query(value, at).sites),
+        }
+        out
+    }
+
     /// The rung-2 environment-identity channel: the lexical environment
     /// a `GetLexVar`/`PutLexVar` at `at` with scope-chain `level`
     /// denotes. `None` on rungs 0/1 — the legacy `(level, slot)` keying

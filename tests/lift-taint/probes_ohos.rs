@@ -1827,3 +1827,656 @@ fn probe_ohos_08_real_bytecode_multi_abc_cross_container_taint() {
     assert_eq!(rep.hits[0].sink, "@ohos.hilog.info");
     assert_eq!(rep.hits[0].position, "arg 2");
 }
+
+/// Probe 9 — Multi-class OOP inheritance (`OAuthRepo extends BaseRepo`), static
+/// singleton (`OAuthRepo.getInstance()`), constructor field-type dispatch
+/// (`this.repo = OAuthRepo.getInstance()` -> `this.repo.forward(oaid)`), caller
+/// `Local` survival across resolved `BodyStep` helper (`this.noop(tok)`), and
+/// commercial 5-segment `@normalized:` cross-HAR import (`#34`).
+#[test]
+fn probe_ohos_09_oop_inheritance_singleton_field_dispatch_and_normalized_har() {
+    use abcd_analysis::callgraph::CallGraph;
+    use abcd_analysis::dataflow::ifds::CallGraphOracle;
+
+    let mut m = Module::new();
+    let c_har = add_record(
+        &mut m,
+        "L@normalized:N&har_net&com.demo.app/har_net/src/main/ets/NetRepo&1.0.0;",
+    );
+    let c_app = add_record(&mut m, "L@bundle:com.demo.app/entry/ets/AuthController;");
+
+    let s_http_mod = m.sym.intern("@ohos.net.http");
+    let s_oaid_mod = m.sym.intern("@ohos.identifier.oaid");
+    let s_hilog_mod = m.sym.intern("@ohos.hilog");
+    let s_default = m.sym.intern("default");
+    let s_http = m.sym.intern("http");
+    let s_get_oaid = m.sym.intern("getOAID");
+    let s_hilog = m.sym.intern("hilog");
+    let s_oauth_repo = m.sym.intern("OAuthRepo");
+    let s_har_spec = m
+        .sym
+        .intern("@normalized:N&har_net&com.demo.app/har_net/src/main/ets/NetRepo&1.0.0");
+
+    m.classes[c_har.index()].es_module = Some(EsModule {
+        imports: vec![ImportDecl::Regular {
+            local_name: s_http,
+            import_name: s_default,
+            module_request: s_http_mod,
+        }],
+        exports: vec![ExportDecl::Local {
+            local_name: s_oauth_repo,
+            export_name: s_oauth_repo,
+        }],
+        module_requests: vec![ModuleRequest {
+            specifier: s_http_mod,
+            lazy: false,
+        }],
+    });
+
+    m.classes[c_app.index()].es_module = Some(EsModule {
+        imports: vec![
+            ImportDecl::Regular {
+                local_name: s_oauth_repo,
+                import_name: s_oauth_repo,
+                module_request: s_har_spec,
+            },
+            ImportDecl::Regular {
+                local_name: s_get_oaid,
+                import_name: s_get_oaid,
+                module_request: s_oaid_mod,
+            },
+            ImportDecl::Regular {
+                local_name: s_hilog,
+                import_name: s_default,
+                module_request: s_hilog_mod,
+            },
+        ],
+        exports: Vec::new(),
+        module_requests: vec![
+            ModuleRequest {
+                specifier: s_har_spec,
+                lazy: false,
+            },
+            ModuleRequest {
+                specifier: s_oaid_mod,
+                lazy: false,
+            },
+            ModuleRequest {
+                specifier: s_hilog_mod,
+                lazy: false,
+            },
+        ],
+    });
+
+    // BaseRepo: `noop(x)` + `send(payload)` -> `http.createHttp().request(payload)` (line 901 TP).
+    let (base_ctor, b_bc, _) = add_fn(&mut m, c_har, "BaseRepo", FunctionKind::Constructor, 3);
+    emit_void(&mut m, b_bc, Op::Return { value: None });
+
+    let (base_noop, b_noop, _) = add_fn(&mut m, c_har, "noop", FunctionKind::Function, 4);
+    emit_void(&mut m, b_noop, Op::Return { value: None });
+
+    let (base_send, b_send, p_send) = add_fn(&mut m, c_har, "send", FunctionKind::Function, 4);
+    let http_ext = emit_val(
+        &mut m,
+        b_send,
+        Op::LoadModuleVar {
+            index: 0,
+            kind: ModuleVarKind::External,
+        },
+    );
+    let create_http = load_prop(&mut m, b_send, http_ext, "createHttp");
+    let client = emit_val(
+        &mut m,
+        b_send,
+        Op::Call {
+            callee: create_http,
+            this: Some(http_ext),
+            args: Vec::new(),
+            kind: CallKind::Direct,
+        },
+    );
+    let req_fn = load_prop(&mut m, b_send, client, "request");
+    let _ = emit_val_line(
+        &mut m,
+        b_send,
+        Op::Call {
+            callee: req_fn,
+            this: Some(client),
+            args: vec![p_send[3]],
+            kind: CallKind::Direct,
+        },
+        901,
+    );
+    emit_void(&mut m, b_send, Op::Return { value: None });
+
+    // OAuthRepo extends BaseRepo: `forward(tok)` calls `this.noop(tok)` then inherited `this.send(tok)`.
+    let (oauth_ctor, b_oc, _) = add_fn(&mut m, c_har, "OAuthRepo", FunctionKind::Constructor, 3);
+    emit_void(&mut m, b_oc, Op::Return { value: None });
+
+    let (oauth_fwd, b_fwd, p_fwd) = add_fn(&mut m, c_har, "forward", FunctionKind::Function, 4);
+    let noop_m = load_prop(&mut m, b_fwd, p_fwd[2], "noop");
+    let call_noop_val = emit_val(
+        &mut m,
+        b_fwd,
+        Op::Call {
+            callee: noop_m,
+            this: Some(p_fwd[2]),
+            args: vec![p_fwd[3]],
+            kind: CallKind::Direct,
+        },
+    );
+    let _ = call_noop_val;
+    let send_m = load_prop(&mut m, b_fwd, p_fwd[2], "send");
+    let send_call_vid = emit_val(
+        &mut m,
+        b_fwd,
+        Op::Call {
+            callee: send_m,
+            this: Some(p_fwd[2]),
+            args: vec![p_fwd[3]],
+            kind: CallKind::Direct,
+        },
+    );
+    let ValueDef::Inst(send_call_iid) = m.value(send_call_vid).unwrap().def else {
+        panic!("expected inst");
+    };
+    emit_void(&mut m, b_fwd, Op::Return { value: None });
+
+    // Static `OAuthRepo.getInstance()`: loads exported module slot 0 (`OAuthRepo`) and returns `new OAuthRepo()`.
+    let (get_inst_fn, b_gi, _) = add_fn(&mut m, c_har, "getInstance", FunctionKind::Function, 3);
+    let self_cls = emit_val(
+        &mut m,
+        b_gi,
+        Op::LoadModuleVar {
+            index: 0,
+            kind: ModuleVarKind::Local,
+        },
+    );
+    let inst_repo = emit_val(
+        &mut m,
+        b_gi,
+        Op::Call {
+            callee: self_cls,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::New,
+        },
+    );
+    emit_void(
+        &mut m,
+        b_gi,
+        Op::Return {
+            value: Some(inst_repo),
+        },
+    );
+
+    // HAR `func_main_0`: defines `BaseRepo`, `OAuthRepo extends BaseRepo`, attaches `getInstance`, exports slot 0.
+    let (_, b_har_main, _) = add_fn(&mut m, c_har, "func_main_0", FunctionKind::Function, 3);
+    let s_noop = m.sym.intern("noop");
+    let s_send = m.sym.intern("send");
+    let s_forward = m.sym.intern("forward");
+    let base_mem = m.consts.push(Const::ArrayLiteral(vec![
+        Const::String(s_noop),
+        Const::MethodRef(base_noop),
+        Const::String(s_send),
+        Const::MethodRef(base_send),
+        Const::number(2.0),
+    ]));
+    let base_cls_val = emit_val(
+        &mut m,
+        b_har_main,
+        Op::DefineClass {
+            ctor: base_ctor,
+            heritage: None,
+            members: base_mem,
+            member_attrs: Vec::new(),
+            count: 0,
+        },
+    );
+    let oauth_mem = m.consts.push(Const::ArrayLiteral(vec![
+        Const::String(s_forward),
+        Const::MethodRef(oauth_fwd),
+        Const::number(1.0),
+    ]));
+    let oauth_cls_val = emit_val(
+        &mut m,
+        b_har_main,
+        Op::DefineClass {
+            ctor: oauth_ctor,
+            heritage: Some(base_cls_val),
+            members: oauth_mem,
+            member_attrs: Vec::new(),
+            count: 0,
+        },
+    );
+    let gi_clo = mk_closure(&mut m, b_har_main, get_inst_fn);
+    store_prop(&mut m, b_har_main, oauth_cls_val, "getInstance", gi_clo);
+    emit_void(
+        &mut m,
+        b_har_main,
+        Op::StoreModuleVar {
+            index: 0,
+            value: oauth_cls_val,
+        },
+    );
+    emit_void(&mut m, b_har_main, Op::Return { value: None });
+
+    // App record: `AuthService` stores `this.repo = OAuthRepo.getInstance()` in constructor
+    // and dispatches `this.repo.forward(getOAID())` in `syncTainted()`.
+    let (svc_ctor, b_sc, p_sc) = add_fn(&mut m, c_app, "AuthService", FunctionKind::Constructor, 3);
+    let imp_repo = emit_val(
+        &mut m,
+        b_sc,
+        Op::LoadModuleVar {
+            index: 0,
+            kind: ModuleVarKind::External,
+        },
+    );
+    let gi_prop = load_prop(&mut m, b_sc, imp_repo, "getInstance");
+    let repo_inst = emit_val(
+        &mut m,
+        b_sc,
+        Op::Call {
+            callee: gi_prop,
+            this: Some(imp_repo),
+            args: Vec::new(),
+            kind: CallKind::Direct,
+        },
+    );
+    store_prop(&mut m, b_sc, p_sc[2], "repo", repo_inst);
+    emit_void(&mut m, b_sc, Op::Return { value: None });
+
+    let (svc_sync, b_sy, p_sy) = add_fn(&mut m, c_app, "syncTainted", FunctionKind::Function, 3);
+    let oaid_fn = emit_val(
+        &mut m,
+        b_sy,
+        Op::LoadModuleVar {
+            index: 1,
+            kind: ModuleVarKind::External,
+        },
+    );
+    let oaid_tok = emit_val(
+        &mut m,
+        b_sy,
+        Op::Call {
+            callee: oaid_fn,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::Dynamic,
+        },
+    );
+    let this_repo = load_prop(&mut m, b_sy, p_sy[2], "repo");
+    let fwd_prop = load_prop(&mut m, b_sy, this_repo, "forward");
+    let fwd_call_vid = emit_val(
+        &mut m,
+        b_sy,
+        Op::Call {
+            callee: fwd_prop,
+            this: Some(this_repo),
+            args: vec![oaid_tok],
+            kind: CallKind::Direct,
+        },
+    );
+    let ValueDef::Inst(fwd_call_iid) = m.value(fwd_call_vid).unwrap().def else {
+        panic!("expected inst");
+    };
+    let hl_mod = emit_val(
+        &mut m,
+        b_sy,
+        Op::LoadModuleVar {
+            index: 2,
+            kind: ModuleVarKind::External,
+        },
+    );
+    let hl_info = load_prop(&mut m, b_sy, hl_mod, "info");
+    let dom = load_num(&mut m, b_sy, 0.0);
+    let tag = load_str(&mut m, b_sy, "Auth");
+    let clean_msg = load_str(&mut m, b_sy, "ok");
+    let _ = emit_val_line(
+        &mut m,
+        b_sy,
+        Op::Call {
+            callee: hl_info,
+            this: Some(hl_mod),
+            args: vec![dom, tag, clean_msg],
+            kind: CallKind::Direct,
+        },
+        902, // CLEAN
+    );
+    emit_void(&mut m, b_sy, Op::Return { value: None });
+
+    let (_, b_app_main, _) = add_fn(&mut m, c_app, "func_main_0", FunctionKind::Function, 3);
+    let s_sync = m.sym.intern("syncTainted");
+    let svc_mem = m.consts.push(Const::ArrayLiteral(vec![
+        Const::String(s_sync),
+        Const::MethodRef(svc_sync),
+        Const::number(1.0),
+    ]));
+    let svc_cls = emit_val(
+        &mut m,
+        b_app_main,
+        Op::DefineClass {
+            ctor: svc_ctor,
+            heritage: None,
+            members: svc_mem,
+            member_attrs: Vec::new(),
+            count: 0,
+        },
+    );
+    let svc_obj = emit_val(
+        &mut m,
+        b_app_main,
+        Op::Call {
+            callee: svc_cls,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::New,
+        },
+    );
+    let sync_fn = load_prop(&mut m, b_app_main, svc_obj, "syncTainted");
+    let _ = emit_val(
+        &mut m,
+        b_app_main,
+        Op::Call {
+            callee: sync_fn,
+            this: Some(svc_obj),
+            args: Vec::new(),
+            kind: CallKind::Direct,
+        },
+    );
+    emit_void(&mut m, b_app_main, Op::Return { value: None });
+
+    // Verify Rung 0.5 (`ClassHierarchyIndex`) resolves both `this.repo.forward(...)` across
+    // `@normalized:` HAR and inherited `this.send(...)` before any PTA runs.
+    let cg = CallGraph::build(&m);
+    assert_eq!(cg.callees_of_call_at(fwd_call_iid), &[oauth_fwd]);
+    assert_eq!(cg.callees_of_call_at(send_call_iid), &[base_send]);
+
+    // Verify exact taint precision at both Rung 2 (default) and Rung 0!
+    assert_ohos_probe(
+        &m,
+        "09-oop-inheritance-singleton-normalized-har",
+        None,
+        &[901],
+    );
+    let mut cfg_r0 = ohos_preset();
+    cfg_r0.alias_rung = 0;
+    let rep_r0 = run_taint(&m, &cfg_r0);
+    let lines_r0: Vec<u32> = rep_r0
+        .hits
+        .iter()
+        .filter_map(|h| h.loc.map(|l| l.line))
+        .collect();
+    assert_eq!(lines_r0, vec![901]);
+}
+
+/// Probe 10 — Demand-driven PTA root slicing & smart IFDS `Λ`-seeding on a
+/// `650`-function (`> 512` threshold) multi-record bundle (`#34`): preserves
+/// `k=1` `New`-site context sensitivity (`tp = 1, fp = 0`) while skipping
+/// `640+` unrelated library/UI functions.
+#[test]
+fn probe_ohos_10_large_bundle_demand_driven_pta_and_ifds_scalability() {
+    let mut m = Module::new();
+
+    // 80 unrelated records x 8 functions = 640 unrelated functions with allocations & method calls.
+    let s_item = m.sym.intern("item");
+    let s_work = m.sym.intern("work");
+    for r in 0..80 {
+        let cid = add_record(
+            &mut m,
+            &format!("L@bundle:com.demo.app/entry/ets/lib/Mod{r};"),
+        );
+        let (ctor, bc, pc) = add_fn(&mut m, cid, "Widget", FunctionKind::Constructor, 3);
+        let obj = alloc_obj(&mut m, bc);
+        emit_void(
+            &mut m,
+            bc,
+            Op::StoreProp {
+                object: pc[2],
+                name: s_item,
+                value: obj,
+            },
+        );
+        emit_void(&mut m, bc, Op::Return { value: None });
+
+        let (wk, bw, pw) = add_fn(&mut m, cid, "work", FunctionKind::Function, 3);
+        let _ = emit_val(
+            &mut m,
+            bw,
+            Op::LoadProp {
+                object: pw[2],
+                name: s_item,
+            },
+        );
+        emit_void(&mut m, bw, Op::Return { value: None });
+
+        for h in 0..5 {
+            let (_, bh, _) = add_fn(&mut m, cid, &format!("util_{h}"), FunctionKind::Function, 3);
+            let _ = alloc_obj(&mut m, bh);
+            emit_void(&mut m, bh, Op::Return { value: None });
+        }
+
+        let (_, bm, _) = add_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 3);
+        let mem = m.consts.push(Const::ArrayLiteral(vec![
+            Const::String(s_work),
+            Const::MethodRef(wk),
+            Const::number(1.0),
+        ]));
+        let cls_v = emit_val(
+            &mut m,
+            bm,
+            Op::DefineClass {
+                ctor,
+                heritage: None,
+                members: mem,
+                member_attrs: Vec::new(),
+                count: 0,
+            },
+        );
+        let inst_v = emit_val(
+            &mut m,
+            bm,
+            Op::Call {
+                callee: cls_v,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::New,
+            },
+        );
+        let wk_fn = load_prop(&mut m, bm, inst_v, "work");
+        let _ = emit_val(
+            &mut m,
+            bm,
+            Op::Call {
+                callee: wk_fn,
+                this: Some(inst_v),
+                args: Vec::new(),
+                kind: CallKind::Direct,
+            },
+        );
+        emit_void(&mut m, bm, Op::Return { value: None });
+    }
+
+    // Bare-`&` commercial record exporting `secretTok` from `@ohos.identifier.oaid.getOAID()`.
+    let c_src = add_record(&mut m, "L&shared_har/src/main/ets/DeviceStore&1.0.0;");
+    let c_snk = add_record(&mut m, "L@bundle:com.demo.app/entry/ets/SinkPage;");
+    let s_oaid_mod = m.sym.intern("@ohos.identifier.oaid");
+    let s_get_oaid = m.sym.intern("getOAID");
+    let s_secret = m.sym.intern("secretTok");
+    let s_norm_src = m
+        .sym
+        .intern("@normalized:N&shared_har&com.demo.app/shared_har/src/main/ets/DeviceStore&1.0.0");
+    let s_hilog_mod = m.sym.intern("@ohos.hilog");
+    let s_default = m.sym.intern("default");
+    let s_hilog = m.sym.intern("hilog");
+
+    m.classes[c_src.index()].es_module = Some(EsModule {
+        imports: vec![ImportDecl::Regular {
+            local_name: s_get_oaid,
+            import_name: s_get_oaid,
+            module_request: s_oaid_mod,
+        }],
+        exports: vec![ExportDecl::Local {
+            local_name: s_secret,
+            export_name: s_secret,
+        }],
+        module_requests: vec![ModuleRequest {
+            specifier: s_oaid_mod,
+            lazy: false,
+        }],
+    });
+    m.classes[c_snk.index()].es_module = Some(EsModule {
+        imports: vec![
+            ImportDecl::Regular {
+                local_name: s_secret,
+                import_name: s_secret,
+                module_request: s_norm_src,
+            },
+            ImportDecl::Regular {
+                local_name: s_hilog,
+                import_name: s_default,
+                module_request: s_hilog_mod,
+            },
+        ],
+        exports: Vec::new(),
+        module_requests: vec![
+            ModuleRequest {
+                specifier: s_norm_src,
+                lazy: false,
+            },
+            ModuleRequest {
+                specifier: s_hilog_mod,
+                lazy: false,
+            },
+        ],
+    });
+
+    let (_, b_src, _) = add_fn(&mut m, c_src, "func_main_0", FunctionKind::Function, 3);
+    let oaid_fn = emit_val(
+        &mut m,
+        b_src,
+        Op::LoadModuleVar {
+            index: 0,
+            kind: ModuleVarKind::External,
+        },
+    );
+    let oaid_v = emit_val(
+        &mut m,
+        b_src,
+        Op::Call {
+            callee: oaid_fn,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::Dynamic,
+        },
+    );
+    emit_void(
+        &mut m,
+        b_src,
+        Op::StoreModuleVar {
+            index: 0,
+            value: oaid_v,
+        },
+    );
+    emit_void(&mut m, b_src, Op::Return { value: None });
+
+    // `VaultBox(v)` stores `this.payload = v`: tests Rung-2 `New`-site separation under root slicing!
+    let (vbox_ctor, b_vb, p_vb) = add_fn(&mut m, c_snk, "VaultBox", FunctionKind::Constructor, 4);
+    store_prop(&mut m, b_vb, p_vb[2], "payload", p_vb[3]);
+    emit_void(&mut m, b_vb, Op::Return { value: None });
+
+    let (_, b_snk, _) = add_fn(&mut m, c_snk, "func_main_0", FunctionKind::Function, 3);
+    let vb_mem = m.consts.push(Const::ArrayLiteral(vec![Const::number(0.0)]));
+    let vb_cls = emit_val(
+        &mut m,
+        b_snk,
+        Op::DefineClass {
+            ctor: vbox_ctor,
+            heritage: None,
+            members: vb_mem,
+            member_attrs: Vec::new(),
+            count: 1,
+        },
+    );
+    let imp_tok = emit_val(
+        &mut m,
+        b_snk,
+        Op::LoadModuleVar {
+            index: 0,
+            kind: ModuleVarKind::External,
+        },
+    );
+    let pub_tok = load_str(&mut m, b_snk, "public");
+    let tainted_box = emit_val(
+        &mut m,
+        b_snk,
+        Op::Call {
+            callee: vb_cls,
+            this: None,
+            args: vec![imp_tok],
+            kind: CallKind::New,
+        },
+    );
+    let clean_box = emit_val(
+        &mut m,
+        b_snk,
+        Op::Call {
+            callee: vb_cls,
+            this: None,
+            args: vec![pub_tok],
+            kind: CallKind::New,
+        },
+    );
+    let tainted_pay = load_prop(&mut m, b_snk, tainted_box, "payload");
+    let clean_pay = load_prop(&mut m, b_snk, clean_box, "payload");
+    let hl_mod = emit_val(
+        &mut m,
+        b_snk,
+        Op::LoadModuleVar {
+            index: 1,
+            kind: ModuleVarKind::External,
+        },
+    );
+    let hl_info = load_prop(&mut m, b_snk, hl_mod, "info");
+    let dom = load_num(&mut m, b_snk, 0.0);
+    let tag = load_str(&mut m, b_snk, "Vault");
+    let _ = emit_val_line(
+        &mut m,
+        b_snk,
+        Op::Call {
+            callee: hl_info,
+            this: Some(hl_mod),
+            args: vec![dom, tag, tainted_pay],
+            kind: CallKind::Direct,
+        },
+        1001, // TP
+    );
+    let _ = emit_val_line(
+        &mut m,
+        b_snk,
+        Op::Call {
+            callee: hl_info,
+            this: Some(hl_mod),
+            args: vec![dom, tag, clean_pay],
+            kind: CallKind::Direct,
+        },
+        1002, // CLEAN (must stay distinct under root-sliced Rung-2 PTA!)
+    );
+    emit_void(&mut m, b_snk, Op::Return { value: None });
+
+    assert!(m.functions.len() > 640);
+    assert!(verify_module(&m).errors.is_empty());
+    let rep = run_taint(&m, &ohos_preset());
+    assert_eq!(rep.alias_rung_used, 2, "must not hit PTA budget cap");
+    let lines: Vec<u32> = rep
+        .hits
+        .iter()
+        .filter_map(|h| h.loc.map(|l| l.line))
+        .collect();
+    assert_eq!(lines, vec![1001], "report={rep:?}");
+    assert!(
+        rep.path_edges < 600,
+        "smart zero_needed seeding should skip 640 unrelated functions, got {} path_edges",
+        rep.path_edges
+    );
+}

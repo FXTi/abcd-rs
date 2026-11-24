@@ -72,6 +72,9 @@ pub struct ConfigReport {
     pub max_field_chain: usize,
     /// Requested alias rung.
     pub alias_rung: u8,
+    /// Optional Rung-2 pointer-analysis step budget override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pta_step_budget: Option<usize>,
 }
 
 /// One source→sink hit.
@@ -307,6 +310,7 @@ fn build_report(
             native_identity: config.native_identity,
             max_field_chain: config.max_field_chain,
             alias_rung: config.alias_rung,
+            pta_step_budget: config.pta_step_budget,
         },
         hits,
         stats: StatsReport {
@@ -398,8 +402,7 @@ pub fn render_text(report: &TaintCliReport) -> String {
          sources:         {}\n\
          sinks:           {}\n\
          summaries:       {} builtin, {} extra\n\
-         alias rung:      {} (used {})\n\
-         path edges:      {}\n",
+         alias rung:      {} (used {})\n",
         report.module,
         report.provenance,
         c.sources.len(),
@@ -408,8 +411,11 @@ pub fn render_text(report: &TaintCliReport) -> String {
         c.extra_summaries,
         c.alias_rung,
         report.alias_rung_used,
-        report.path_edges,
     );
+    if let Some(budget) = c.pta_step_budget {
+        out.push_str(&format!("pta budget:      {budget}\n"));
+    }
+    out.push_str(&format!("path edges:      {}\n", report.path_edges));
 
     out.push_str(&format!("\nhits: {}\n", report.hits.len()));
     for (i, h) in report.hits.iter().enumerate() {

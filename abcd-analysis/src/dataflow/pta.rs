@@ -100,13 +100,16 @@
 //! cut sets [`PtaStats::capped`] and the driver degrades to rung 1
 //! (sound, loud).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 
-use abcd_ir::{CallKind, ClassId, Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
+use abcd_ir::{
+    CallKind, ClassId, Const, ConstId, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId,
+};
 
 use super::alias::QueryAnswer;
 use super::heap::{AliasOracle, AllocSiteSet, SiteInfo, is_keyed_alloc, resolve_alloc_sites};
+use super::ifds::CallGraphOracle;
 use crate::callgraph::{CallEdge, CallEdgeKind, CallGraph, CallTargets};
 use crate::frame::frame_slots_of;
 use crate::module_link::{ModuleLinkTable, ModuleSlotRef};
@@ -121,6 +124,15 @@ pub const DEFAULT_STEP_BUDGET: usize = 25_000_000;
 /// beyond the cap the outer environments are dropped, so deep
 /// `GetLexVar` levels answer unknown (sound).
 pub const DEFAULT_MAX_ENV_DEPTH: usize = 8;
+
+/// Maximum static forward call-graph / module-import BFS hops in root-sliced PTA.
+const MAX_SLICED_BASE_HOP: u8 = 3;
+
+/// Maximum dynamic closure / module-init / lex-owner hops in root-sliced PTA.
+const MAX_SLICED_DYN_HOP: u8 = 5;
+
+/// Maximum non-root / non-harness-seed functions added by `compute_sliced_bfs`.
+const MAX_SLICED_EXTRA_FUNCS: usize = 768;
 
 /// The 1-call-site calling context: `None` is the module-wide base
 /// activation, `Some(call)` the activation entered through `call`.
@@ -329,12 +341,408 @@ fn closure_body(module: &Module, func: ValueId) -> Option<FuncId> {
     }
 }
 
+/// Resolve any callable `FuncId` wrapped by `val` across `Mov`,
+/// `AllocClosure`, `CreateGenerator`, `DefineMethod`, `DefineFunc`, and
+/// `MethodRef` constants (cycle-guarded).
+fn callable_body(module: &Module, mut val: ValueId) -> Option<FuncId> {
+    let mut visiting = BTreeSet::new();
+    loop {
+        if !visiting.insert(val) {
+            return None;
+        }
+        let v = module.value(val)?;
+        match v.def {
+            ValueDef::Const(c) => {
+                return match module.consts.get(c) {
+                    Some(Const::MethodRef(f)) => Some(*f),
+                    _ => None,
+                };
+            }
+            ValueDef::Inst(iid) => match &module.inst(iid)?.op {
+                Op::Mov { src }
+                | Op::AllocClosure { func: src }
+                | Op::CreateGenerator { func: src }
+                | Op::DefineMethod { func: src, .. } => {
+                    val = *src;
+                }
+                Op::DefineFunc { body, .. } => return Some(*body),
+                Op::LoadConst(c) => {
+                    return match module.consts.get(*c) {
+                        Some(Const::MethodRef(f)) => Some(*f),
+                        _ => None,
+                    };
+                }
+                _ => return None,
+            },
+            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => return None,
+        }
+    }
+}
+
+/// Whether `val` traces (through `Mov`) to a constant (`ValueDef::Const` or
+/// `Op::LoadConst`).
+fn is_load_const(module: &Module, mut val: ValueId) -> bool {
+    let mut visiting = BTreeSet::new();
+    loop {
+        if !visiting.insert(val) {
+            return false;
+        }
+        let Some(v) = module.value(val) else {
+            return false;
+        };
+        match v.def {
+            ValueDef::Const(_) => return true,
+            ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
+                Some(Op::Mov { src }) => val = *src,
+                Some(Op::LoadConst(_)) => return true,
+                _ => return false,
+            },
+            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => return false,
+        }
+    }
+}
+
+/// Extract all member `FuncId`s from a `DefineClass` / `DefineSendableClass`
+/// member-buffer constant.
+fn class_member_funcs(module: &Module, members: ConstId) -> Vec<FuncId> {
+    let mut out = Vec::new();
+    match module.consts.get(members) {
+        Some(Const::ArrayLiteral(items)) => {
+            for item in items {
+                if let Const::MethodRef(mfid) = item {
+                    out.push(*mfid);
+                }
+            }
+        }
+        Some(Const::ObjectLiteral { values, .. }) => {
+            for item in values {
+                if let Const::MethodRef(mfid) = item {
+                    out.push(*mfid);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Collect component `this` receivers inside `__abcd_ohos_harness__` that
+/// belong to an Ability / ExtensionAbility (`StoreProp(inst, "context", ..)`
+/// or non-`LoadConst` lifecycle arguments) or to a component with at least
+/// one method/constructor in `root_keep`.
+fn collect_active_harness_receivers_in(
+    module: &Module,
+    base: &CallGraph,
+    blocks: &[abcd_ir::BlockId],
+    root_keep: &BTreeSet<FuncId>,
+) -> BTreeSet<ValueId> {
+    let mut active = BTreeSet::new();
+    for &b in blocks {
+        let Some(bb) = module.block(b) else {
+            continue;
+        };
+        for &iid in &bb.insts {
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
+            match &inst.op {
+                Op::StoreProp { object, name, .. }
+                    if module.sym.resolve(*name) == Some("context")
+                        && !is_load_const(module, *object) =>
+                {
+                    active.insert(*object);
+                }
+                Op::Call {
+                    this: Some(t),
+                    args,
+                    ..
+                } if !is_load_const(module, *t) => {
+                    let has_non_const_arg = args.iter().any(|&a| !is_load_const(module, a));
+                    let has_rooted_callee = base
+                        .callees_of_call_at(iid)
+                        .iter()
+                        .any(|c| root_keep.contains(c));
+                    if has_non_const_arg || has_rooted_callee {
+                        active.insert(*t);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    active
+}
+
+/// Precompute the deterministic bounded forward slice (`slice_allow`, `func_hop`)
+/// for root-sliced PTA (`roots = Some(root_funcs)`), starting at hop `0` from
+/// non-harness `root_funcs` and hop `1` from active `OHOS_HARNESS_FUNC` callees,
+/// expanding up to `max_base_hop` hops (capped at [`MAX_SLICED_EXTRA_FUNCS`]
+/// newly discovered functions) without recursion.
+fn compute_sliced_bfs(
+    module: &Module,
+    links: &ModuleLinkTable,
+    base: &CallGraph,
+    env_stack_at: &[Arc<[EnvEntry]>],
+    root_funcs: &[FuncId],
+    root_keep: &BTreeSet<FuncId>,
+    max_base_hop: u8,
+) -> (Vec<bool>, Vec<u8>) {
+    let mut func_hop = vec![u8::MAX; module.functions.len()];
+    let mut queue: VecDeque<FuncId> = VecDeque::new();
+
+    let enqueue_seed = |f: FuncId, hop: u8, func_hop: &mut [u8], queue: &mut VecDeque<FuncId>| {
+        if hop > max_base_hop {
+            return;
+        }
+        let Some(fd) = module.func(f) else {
+            return;
+        };
+        if fd.is_external || fd.blocks.is_empty() {
+            return;
+        }
+        if let Some(slot) = func_hop.get_mut(f.index())
+            && hop < *slot
+        {
+            *slot = hop;
+            queue.push_back(f);
+        }
+    };
+
+    let mut harness_roots = Vec::new();
+    for &func in root_funcs {
+        let Some(fd) = module.func(func) else {
+            continue;
+        };
+        if fd.is_external || fd.blocks.is_empty() {
+            continue;
+        }
+        if module.sym.resolve(fd.name) == Some(crate::ohos_lifecycle::OHOS_HARNESS_FUNC) {
+            if let Some(slot) = func_hop.get_mut(func.index()) {
+                *slot = 0;
+            }
+            harness_roots.push(func);
+        } else {
+            enqueue_seed(func, 0, &mut func_hop, &mut queue);
+        }
+    }
+
+    // Enqueue active harness callees at hop `1` after all hop-`0` roots so
+    // `queue` stays monotonically ordered by hop distance.
+    for hfunc in harness_roots {
+        let Some(fd) = module.func(hfunc) else {
+            continue;
+        };
+        let active_receivers =
+            collect_active_harness_receivers_in(module, base, &fd.blocks, root_keep);
+        for &b in &fd.blocks {
+            let Some(bb) = module.block(b) else {
+                continue;
+            };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if let Op::Call { this, args, .. } = &inst.op {
+                    let has_non_const_arg = args.iter().any(|&a| !is_load_const(module, a));
+                    let has_active_this = this.is_some_and(|t| active_receivers.contains(&t))
+                        || inst.result.is_some_and(|r| active_receivers.contains(&r));
+                    for &target_callee in base.callees_of_call_at(iid) {
+                        if has_non_const_arg
+                            || has_active_this
+                            || root_keep.contains(&target_callee)
+                        {
+                            enqueue_seed(target_callee, 1, &mut func_hop, &mut queue);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut extra_enqueued = 0usize;
+    let enqueue_extra = |f: FuncId,
+                         hop: u8,
+                         func_hop: &mut [u8],
+                         queue: &mut VecDeque<FuncId>,
+                         extra_enqueued: &mut usize| {
+        if hop > max_base_hop || *extra_enqueued >= MAX_SLICED_EXTRA_FUNCS {
+            return;
+        }
+        let Some(fd) = module.func(f) else {
+            return;
+        };
+        if fd.is_external || fd.blocks.is_empty() {
+            return;
+        }
+        if let Some(slot) = func_hop.get_mut(f.index())
+            && hop < *slot
+        {
+            if *slot == u8::MAX {
+                *extra_enqueued += 1;
+            }
+            *slot = hop;
+            queue.push_back(f);
+        }
+    };
+
+    while let Some(cur) = queue.pop_front() {
+        if extra_enqueued >= MAX_SLICED_EXTRA_FUNCS {
+            break;
+        }
+        let cur_hop = func_hop.get(cur.index()).copied().unwrap_or(u8::MAX);
+        if cur_hop >= max_base_hop {
+            continue;
+        }
+        let next_hop = cur_hop + 1;
+        let Some(fd) = module.func(cur) else {
+            continue;
+        };
+        let func_class_id = fd.class_id;
+        for &b in &fd.blocks {
+            let Some(bb) = module.block(b) else {
+                continue;
+            };
+            for &iid in &bb.insts {
+                if extra_enqueued >= MAX_SLICED_EXTRA_FUNCS {
+                    break;
+                }
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                match &inst.op {
+                    Op::Call { .. } => {
+                        for &callee in base.callees_of_call_at(iid) {
+                            enqueue_extra(
+                                callee,
+                                next_hop,
+                                &mut func_hop,
+                                &mut queue,
+                                &mut extra_enqueued,
+                            );
+                        }
+                    }
+                    Op::DefineFunc { body, .. } => {
+                        enqueue_extra(
+                            *body,
+                            next_hop,
+                            &mut func_hop,
+                            &mut queue,
+                            &mut extra_enqueued,
+                        );
+                    }
+                    Op::DefineMethod { func: inner, .. } => {
+                        if let Some(body) = callable_body(module, *inner) {
+                            enqueue_extra(
+                                body,
+                                next_hop,
+                                &mut func_hop,
+                                &mut queue,
+                                &mut extra_enqueued,
+                            );
+                        }
+                    }
+                    Op::LoadModuleVar { index, kind } => {
+                        if kind.is_local() {
+                            let slot_ref = ModuleSlotRef {
+                                class_id: func_class_id,
+                                slot: *index,
+                            };
+                            for &(def_fn, _) in links.stored_values(slot_ref) {
+                                enqueue_extra(
+                                    def_fn,
+                                    next_hop,
+                                    &mut func_hop,
+                                    &mut queue,
+                                    &mut extra_enqueued,
+                                );
+                            }
+                        } else if let Some(target) = links.external_load(func_class_id, *index) {
+                            for &slot_ref in &target.slots {
+                                for &(def_fn, _) in links.stored_values(slot_ref) {
+                                    enqueue_extra(
+                                        def_fn,
+                                        next_hop,
+                                        &mut func_hop,
+                                        &mut queue,
+                                        &mut extra_enqueued,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Op::GetModuleNamespace { index } => {
+                        if let Some(target_cid) = links.namespace_target(func_class_id, *index)
+                            && let Some(exports) = links.namespace_exports(target_cid)
+                        {
+                            for slots in exports.values() {
+                                for &sr in slots {
+                                    for &(def_fn, _) in links.stored_values(sr) {
+                                        enqueue_extra(
+                                            def_fn,
+                                            next_hop,
+                                            &mut func_hop,
+                                            &mut queue,
+                                            &mut extra_enqueued,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Op::GetLexVar { level, .. } => {
+                        if let Some(stack) = env_stack_at.get(iid.index())
+                            && (*level as usize) < stack.len()
+                        {
+                            let entry = &stack[stack.len() - 1 - *level as usize];
+                            if !entry.unknown {
+                                for &env_site in &entry.sites {
+                                    if let Some(owner_fn) = links.inst_func(module, env_site) {
+                                        enqueue_extra(
+                                            owner_fn,
+                                            next_hop,
+                                            &mut func_hop,
+                                            &mut queue,
+                                            &mut extra_enqueued,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let slice_allow = func_hop.iter().map(|&h| h <= max_base_hop).collect();
+    (slice_allow, func_hop)
+}
+
+/// Initial root-slicing state passed into `Pta::new`.
+struct SliceInit {
+    root_keep: BTreeSet<FuncId>,
+    slice_allow: Vec<bool>,
+    func_hop: Vec<u8>,
+    max_dyn_hop: u8,
+}
+
 /// The engine state.
 struct Pta<'m> {
     module: &'m Module,
+    links: &'m ModuleLinkTable,
+    base: &'m CallGraph,
     config: &'m PtaConfig,
-    links: ModuleLinkTable,
     env_stack_at: &'m [Arc<[EnvEntry]>],
+    /// Root set when running in demand-driven / root-sliced mode (`None` =
+    /// whole-module mode).
+    root_keep: Option<BTreeSet<FuncId>>,
+    /// Bounded static forward-slice allowlist (`Some` iff `roots.is_some()`).
+    slice_allow: Option<Vec<bool>>,
+    /// Per-function hop distance from roots in sliced mode (`u8::MAX` if unreached).
+    func_hop: Vec<u8>,
+    /// Maximum dynamic closure / module-init / lex-owner hop distance in sliced mode.
+    max_dyn_hop: u8,
     /// Points-to sets.
     pts: BTreeMap<Ptr, BTreeSet<Obj>>,
     /// Subset edges `s → t`.
@@ -367,36 +775,39 @@ struct Pta<'m> {
     call_unknown: BTreeSet<(InstId, Ctx)>,
     /// Load-result pointers (the empty-bucket post-pass).
     load_results: Vec<Ptr>,
-    /// Function → returned values (block/inst order).
+    /// Lazily populated `FuncId` → returned values (block/inst order).
     returns_of: HashMap<FuncId, Vec<ValueId>>,
     stats: PtaStats,
 }
 
 impl<'m> Pta<'m> {
-    fn new(module: &'m Module, config: &'m PtaConfig, env_stack_at: &'m [Arc<[EnvEntry]>]) -> Self {
-        let mut returns_of: HashMap<FuncId, Vec<ValueId>> = HashMap::new();
-        for (fi, f) in module.functions.iter().enumerate() {
-            let func = FuncId::new(fi as u32);
-            let mut returns = Vec::new();
-            for &b in &f.blocks {
-                let Some(bb) = module.block(b) else { continue };
-                for &iid in &bb.insts {
-                    let Some(inst) = module.inst(iid) else {
-                        continue;
-                    };
-                    if let Op::Return { value: Some(v) } = &inst.op {
-                        returns.push(*v);
-                    }
-                }
-            }
-            returns_of.insert(func, returns);
-        }
-        let links = ModuleLinkTable::build(module);
+    fn new(
+        module: &'m Module,
+        links: &'m ModuleLinkTable,
+        base: &'m CallGraph,
+        config: &'m PtaConfig,
+        env_stack_at: &'m [Arc<[EnvEntry]>],
+        slice_init: Option<SliceInit>,
+    ) -> Self {
+        let (root_keep, slice_allow, func_hop, max_dyn_hop) = match slice_init {
+            Some(s) => (
+                Some(s.root_keep),
+                Some(s.slice_allow),
+                s.func_hop,
+                s.max_dyn_hop,
+            ),
+            None => (None, None, Vec::new(), MAX_SLICED_DYN_HOP),
+        };
         Pta {
             module,
-            config,
             links,
+            base,
+            config,
             env_stack_at,
+            root_keep,
+            slice_allow,
+            func_hop,
+            max_dyn_hop,
             pts: BTreeMap::new(),
             edges: BTreeMap::new(),
             worklist: BTreeSet::new(),
@@ -412,9 +823,56 @@ impl<'m> Pta<'m> {
             call_targets: BTreeMap::new(),
             call_unknown: BTreeSet::new(),
             load_results: Vec::new(),
-            returns_of,
+            returns_of: HashMap::new(),
             stats: PtaStats::default(),
         }
+    }
+
+    fn is_base_slice_allowed(&self, callee: FuncId) -> bool {
+        self.slice_allow
+            .as_ref()
+            .is_none_or(|allow| allow.get(callee.index()).copied().unwrap_or(false))
+    }
+
+    fn try_record_dyn_hop(&mut self, callee: FuncId, next_hop: u8) -> bool {
+        if self.slice_allow.is_none() {
+            return true;
+        }
+        let Some(slot) = self.func_hop.get_mut(callee.index()) else {
+            return false;
+        };
+        let updated = (*slot).min(next_hop);
+        if updated > self.max_dyn_hop {
+            return false;
+        }
+        *slot = updated;
+        true
+    }
+
+    /// Returned SSA values of `callee` in deterministic block/inst order,
+    /// populated lazily on first `wire_call` into `callee`.
+    fn returns_of_func(&mut self, callee: FuncId) -> Vec<ValueId> {
+        if let Some(cached) = self.returns_of.get(&callee) {
+            return cached.clone();
+        }
+        let mut returns = Vec::new();
+        if let Some(f) = self.module.func(callee) {
+            for &b in &f.blocks {
+                let Some(bb) = self.module.block(b) else {
+                    continue;
+                };
+                for &iid in &bb.insts {
+                    let Some(inst) = self.module.inst(iid) else {
+                        continue;
+                    };
+                    if let Op::Return { value: Some(v) } = &inst.op {
+                        returns.push(*v);
+                    }
+                }
+            }
+        }
+        self.returns_of.insert(callee, returns.clone());
+        returns
     }
 
     /// Queue fact `o ∈ pts(p)`.
@@ -576,7 +1034,15 @@ impl<'m> Pta<'m> {
                 {
                     self.stats.call_edges_resolved += 1;
                 }
-                self.wire_call(call, caller_ctx, body);
+                let next_hop = self
+                    .links
+                    .inst_func(self.module, call)
+                    .and_then(|f| self.func_hop.get(f.index()).copied())
+                    .unwrap_or(u8::MAX)
+                    .saturating_add(1);
+                if self.try_record_dyn_hop(body, next_hop) {
+                    self.wire_call(call, caller_ctx, body);
+                }
             }
             Obj::Site { callable: None, .. } => {}
         }
@@ -671,15 +1137,22 @@ impl<'m> Pta<'m> {
             if let Some(inst_obj) = constructed_instance {
                 self.add_fact(Ptr::Local(result, caller_ctx), inst_obj);
             }
-            let returns = self.returns_of.get(&callee).cloned().unwrap_or_default();
+            let returns = self.returns_of_func(callee);
             for v in returns {
                 self.add_edge(Ptr::Local(v, callee_ctx), Ptr::Local(result, caller_ctx));
             }
         }
     }
 
-    /// Queue an activation for scanning (idempotent).
+    /// Queue an activation for scanning (idempotent; external/bodyless
+    /// functions are ignored).
     fn activate(&mut self, func: FuncId, ctx: Ctx) {
+        let Some(fd) = self.module.func(func) else {
+            return;
+        };
+        if fd.is_external || fd.blocks.is_empty() {
+            return;
+        }
         if self.activated.insert((func, ctx)) {
             self.pending_activations.insert((func, ctx));
         }
@@ -692,6 +1165,9 @@ impl<'m> Pta<'m> {
         let Some(fd) = self.module.func(func) else {
             return;
         };
+        let func_class_id = fd.class_id;
+        let is_harness = self.root_keep.is_some()
+            && self.module.sym.resolve(fd.name) == Some(crate::ohos_lifecycle::OHOS_HARNESS_FUNC);
         // Base-activation parameters are opaque (unrecorded callers —
         // the balanced discipline's floor); context activations are
         // bound by their call edge.
@@ -701,6 +1177,20 @@ impl<'m> Pta<'m> {
             }
         }
         let blocks = fd.blocks.clone();
+        let active_harness_receivers = if is_harness && let Some(rk) = &self.root_keep {
+            collect_active_harness_receivers_in(self.module, self.base, &blocks, rk)
+        } else {
+            BTreeSet::new()
+        };
+        let links = self.links;
+        let base = self.base;
+        let sliced = self.root_keep.is_some();
+        let next_dyn_hop = self
+            .func_hop
+            .get(func.index())
+            .copied()
+            .unwrap_or(u8::MAX)
+            .saturating_add(1);
         for b in blocks {
             let Some(bb) = self.module.block(b) else {
                 continue;
@@ -744,16 +1234,28 @@ impl<'m> Pta<'m> {
                         }
                     }
                     Op::DefineFunc { body, .. } => {
+                        let body_fn = *body;
                         if let Some(r) = inst.result {
                             self.add_fact(
                                 local(r),
                                 Obj::Site {
                                     site: iid,
                                     ctx,
-                                    callable: Some(*body),
+                                    callable: Some(body_fn),
                                     keyed: false,
                                 },
                             );
+                        }
+                        if sliced && self.try_record_dyn_hop(body_fn, next_dyn_hop) {
+                            self.activate(body_fn, None);
+                        }
+                    }
+                    Op::DefineMethod { func: inner, .. } => {
+                        if sliced
+                            && let Some(body_fn) = callable_body(self.module, *inner)
+                            && self.try_record_dyn_hop(body_fn, next_dyn_hop)
+                        {
+                            self.activate(body_fn, None);
                         }
                     }
                     Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
@@ -926,6 +1428,13 @@ impl<'m> Pta<'m> {
                                 let entry = &stack[stack.len() - 1 - *level as usize];
                                 if !entry.unknown && !entry.sites.is_empty() {
                                     for &env_site in &entry.sites {
+                                        if sliced
+                                            && let Some(owner_fn) =
+                                                links.inst_func(self.module, env_site)
+                                            && self.try_record_dyn_hop(owner_fn, next_dyn_hop)
+                                        {
+                                            self.activate(owner_fn, None);
+                                        }
                                         self.add_edge(Ptr::LexVar(env_site, *slot, true), local(r));
                                         self.add_edge(
                                             Ptr::LexVar(env_site, *slot, false),
@@ -941,25 +1450,38 @@ impl<'m> Pta<'m> {
                         }
                     }
                     Op::StoreModuleVar { index, value } => {
-                        self.add_edge(local(*value), Ptr::ModuleVar(fd.class_id, *index));
+                        self.add_edge(local(*value), Ptr::ModuleVar(func_class_id, *index));
                     }
                     Op::LoadModuleVar { index, kind } => {
                         if let Some(r) = inst.result {
                             if kind.is_local() {
                                 let slot_ref = ModuleSlotRef {
-                                    class_id: fd.class_id,
+                                    class_id: func_class_id,
                                     slot: *index,
                                 };
-                                self.add_edge(Ptr::ModuleVar(fd.class_id, *index), local(r));
-                                if !self.links.has_multi_record_esm()
-                                    || self.links.stored_values(slot_ref).is_empty()
+                                if sliced {
+                                    for &(def_fn, _) in links.stored_values(slot_ref) {
+                                        if self.try_record_dyn_hop(def_fn, next_dyn_hop) {
+                                            self.activate(def_fn, None);
+                                        }
+                                    }
+                                }
+                                self.add_edge(Ptr::ModuleVar(func_class_id, *index), local(r));
+                                if !links.has_multi_record_esm()
+                                    || links.stored_values(slot_ref).is_empty()
                                 {
                                     self.add_fact(local(r), Obj::Unknown);
                                 }
-                            } else if let Some(target) =
-                                self.links.external_load(fd.class_id, *index).cloned()
+                            } else if let Some(target) = links.external_load(func_class_id, *index)
                             {
                                 for &slot_ref in &target.slots {
+                                    if sliced {
+                                        for &(def_fn, _) in links.stored_values(slot_ref) {
+                                            if self.try_record_dyn_hop(def_fn, next_dyn_hop) {
+                                                self.activate(def_fn, None);
+                                            }
+                                        }
+                                    }
                                     self.add_edge(
                                         Ptr::ModuleVar(slot_ref.class_id, slot_ref.slot),
                                         local(r),
@@ -968,7 +1490,7 @@ impl<'m> Pta<'m> {
                                 let any_empty = target
                                     .slots
                                     .iter()
-                                    .any(|&sr| self.links.stored_values(sr).is_empty());
+                                    .any(|&sr| links.stored_values(sr).is_empty());
                                 if target.unresolved_external
                                     || target.slots.is_empty()
                                     || any_empty
@@ -982,8 +1504,7 @@ impl<'m> Pta<'m> {
                     }
                     Op::GetModuleNamespace { index } => {
                         if let Some(r) = inst.result {
-                            if let Some(target_cid) =
-                                self.links.namespace_target(fd.class_id, *index)
+                            if let Some(target_cid) = links.namespace_target(func_class_id, *index)
                             {
                                 self.add_fact(
                                     local(r),
@@ -994,12 +1515,18 @@ impl<'m> Pta<'m> {
                                         keyed: false,
                                     },
                                 );
-                                if let Some(exports) =
-                                    self.links.namespace_exports(target_cid).cloned()
-                                {
-                                    for (export_sym, slots) in exports {
+                                if let Some(exports) = links.namespace_exports(target_cid) {
+                                    for (&export_sym, slots) in exports {
                                         self.note_bucket(iid, None, Slot::Named(export_sym));
-                                        for sr in slots {
+                                        for &sr in slots {
+                                            if sliced {
+                                                for &(def_fn, _) in links.stored_values(sr) {
+                                                    if self.try_record_dyn_hop(def_fn, next_dyn_hop)
+                                                    {
+                                                        self.activate(def_fn, None);
+                                                    }
+                                                }
+                                            }
                                             self.add_edge(
                                                 Ptr::ModuleVar(sr.class_id, sr.slot),
                                                 Ptr::Field(iid, None, Slot::Named(export_sym)),
@@ -1033,14 +1560,63 @@ impl<'m> Pta<'m> {
                             }
                         }
                     }
-                    Op::Call { callee, .. } => {
-                        self.register(
-                            local(*callee),
-                            Handler::Call {
-                                call: iid,
-                                caller_ctx: ctx,
-                            },
-                        );
+                    Op::Call {
+                        callee, this, args, ..
+                    } => {
+                        let callee_val = *callee;
+                        if is_harness {
+                            let has_non_const_arg =
+                                args.iter().any(|&a| !is_load_const(self.module, a));
+                            let has_active_this = this
+                                .is_some_and(|t| active_harness_receivers.contains(&t))
+                                || inst
+                                    .result
+                                    .is_some_and(|r| active_harness_receivers.contains(&r));
+                            let base_callees = base.callees_of_call_at(iid);
+                            let any_kept = base_callees.is_empty()
+                                || has_non_const_arg
+                                || has_active_this
+                                || self
+                                    .root_keep
+                                    .as_ref()
+                                    .is_some_and(|rk| base_callees.iter().any(|c| rk.contains(c)));
+                            if any_kept {
+                                self.register(
+                                    local(callee_val),
+                                    Handler::Call {
+                                        call: iid,
+                                        caller_ctx: ctx,
+                                    },
+                                );
+                                for &target_callee in base_callees {
+                                    let keep_target = has_non_const_arg
+                                        || has_active_this
+                                        || self
+                                            .root_keep
+                                            .as_ref()
+                                            .is_some_and(|rk| rk.contains(&target_callee));
+                                    if keep_target {
+                                        let _ = self.try_record_dyn_hop(target_callee, 1);
+                                        self.wire_call(iid, ctx, target_callee);
+                                    }
+                                }
+                            }
+                        } else {
+                            self.register(
+                                local(callee_val),
+                                Handler::Call {
+                                    call: iid,
+                                    caller_ctx: ctx,
+                                },
+                            );
+                            if sliced {
+                                for &target_callee in base.callees_of_call_at(iid) {
+                                    if self.is_base_slice_allowed(target_callee) {
+                                        self.wire_call(iid, ctx, target_callee);
+                                    }
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -1113,13 +1689,20 @@ impl<'m> Pta<'m> {
         }
     }
 
-    fn run(&mut self) {
-        // Whole-module seeding: every function with a body gets a base
-        // activation (scope gating §4.1 item 5 — the module is the
-        // program; context activations arrive through resolved edges).
-        for (fi, f) in self.module.functions.iter().enumerate() {
-            if !f.is_external && !f.blocks.is_empty() {
-                self.activate(FuncId::new(fi as u32), None);
+    fn run(&mut self, roots: Option<&[FuncId]>) {
+        match roots {
+            None => {
+                // Whole-module seeding: every function with a body gets a base
+                // activation (scope gating §4.1 item 5 — the module is the
+                // program; context activations arrive through resolved edges).
+                for fi in 0..self.module.functions.len() {
+                    self.activate(FuncId::new(fi as u32), None);
+                }
+            }
+            Some(root_funcs) => {
+                for &func in root_funcs {
+                    self.activate(func, None);
+                }
             }
         }
         let mut steps = 0usize;
@@ -1131,10 +1714,74 @@ impl<'m> Pta<'m> {
 /// graph assembly (base edges ∪ PTA edges), the stripped value answers,
 /// and the lexical-environment tables.
 pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutcome {
+    let links = ModuleLinkTable::build(module);
+    analyze_with_links_and_roots(module, &links, base, config, None)
+}
+
+/// Demand-driven / root-sliced `k=1` pointer analysis reusing a prebuilt
+/// [`ModuleLinkTable`].
+///
+/// - When `roots` is `None`, runs whole-module PTA (identical to [`analyze`]).
+/// - When `roots` is `Some(root_funcs)`:
+///   - Seeds initial `(func, None)` activations ONLY for `func` in `root_funcs`
+///     (filtering `!f.is_external && !f.blocks.is_empty()`).
+///   - Expands on-the-fly during `scan(func, ctx)`:
+///     1. For every [`Op::Call`] at `iid`: in addition to registering `Handler::Call`,
+///        wires every callee `&callee` already resolved in `base.callees_of_call_at(iid)`
+///        via `wire_call(iid, ctx, callee)` — EXCEPT when `func` is named
+///        [`crate::ohos_lifecycle::OHOS_HARNESS_FUNC`] (`"__abcd_ohos_harness__"`),
+///        only wire harness calls whose target `callee` is either in `root_keep`
+///        (the `root_funcs` set) OR is called with `args` containing a non-[`Op::LoadConst`]
+///        operand (e.g. Ability/ExtensionAbility `onCreate(want)` lifecycle calls)
+///        OR shares its concrete `this` receiver with such an Ability/rooted call or
+///        `StoreProp(inst, "context", ...)`.
+///     2. For [`Op::DefineFunc`] and [`Op::DefineMethod`] scanned in an active
+///        function: activates `(body, None)` so closures passed as callbacks to
+///        external/SDK functions are scanned.
+///     3. For [`Op::LoadModuleVar`] and [`Op::GetModuleNamespace`]: for every
+///        referenced [`ModuleSlotRef`], activates `(def_fn, None)` for all
+///        `&(def_fn, _)` in [`ModuleLinkTable::stored_values`] so imported modules
+///        initialize on demand.
+pub fn analyze_with_links_and_roots(
+    module: &Module,
+    links: &ModuleLinkTable,
+    base: &CallGraph,
+    config: &PtaConfig,
+    roots: Option<&[FuncId]>,
+) -> PtaOutcome {
     let (env_stack_at, env_sites, env_rounds) = env_analysis(module, config.max_env_depth);
-    let mut engine = Pta::new(module, config, &env_stack_at);
-    engine.run();
+    let slice_init = roots.map(|root_funcs| {
+        let max_base_hop = if root_funcs.len() > 128 {
+            1
+        } else {
+            MAX_SLICED_BASE_HOP
+        };
+        let max_dyn_hop = if root_funcs.len() > 128 {
+            2
+        } else {
+            MAX_SLICED_DYN_HOP
+        };
+        let rk: BTreeSet<FuncId> = root_funcs.iter().copied().collect();
+        let (slice_allow, func_hop) = compute_sliced_bfs(
+            module,
+            links,
+            base,
+            &env_stack_at,
+            root_funcs,
+            &rk,
+            max_base_hop,
+        );
+        SliceInit {
+            root_keep: rk,
+            slice_allow,
+            func_hop,
+            max_dyn_hop,
+        }
+    });
+    let mut engine = Pta::new(module, links, base, config, &env_stack_at, slice_init);
+    engine.run(roots);
     let stats_engine = engine.stats;
+    let scanned_funcs: BTreeSet<FuncId> = engine.scanned.iter().map(|&(f, _)| f).collect();
 
     // ── Graph assembly ───────────────────────────────────────────────
     // Aggregate the PTA's resolutions per call instruction first (the
@@ -1165,15 +1812,25 @@ pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutc
                 resolution_complete: false,
             }
         } else {
+            let resolution_complete =
+                if roots.is_none() || scanned_funcs.contains(&base_edge.caller) {
+                    // Completeness is the PTA's own: the callee value's set
+                    // contained no Unknown (the PTA subsumes the base trace —
+                    // a base dead-end the PTA closes completely is complete).
+                    !pta_partial.contains(&iid)
+                } else {
+                    base_edge.resolution_complete
+                };
             CallEdge {
                 caller: base_edge.caller,
                 kind: base_edge.kind,
-                edge_kind: base_edge.edge_kind,
+                edge_kind: if base_edge.edge_kind == CallEdgeKind::UnknownCallees {
+                    CallEdgeKind::ResolvedValueFlow
+                } else {
+                    base_edge.edge_kind
+                },
                 targets: CallTargets::Resolved(targets.into_iter().collect()),
-                // Completeness is the PTA's own: the callee value's set
-                // contained no Unknown (the PTA subsumes the base trace —
-                // a base dead-end the PTA closes completely is complete).
-                resolution_complete: !pta_partial.contains(&iid),
+                resolution_complete,
             }
         };
         sites.insert(iid, edge);
@@ -1184,7 +1841,7 @@ pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutc
     // Aggregate each value's object union in ONE pass over the
     // points-to tables: `(all contexts, recorded-contexts-only, has a
     // recorded context)`.
-    let mut acc: BTreeMap<ValueId, (BTreeSet<Obj>, BTreeSet<Obj>, bool)> = BTreeMap::new();
+    let mut acc: HashMap<ValueId, (BTreeSet<Obj>, BTreeSet<Obj>, bool)> = HashMap::new();
     for (p, objs) in &engine.pts {
         let Ptr::Local(v, ctx) = p else { continue };
         let entry = acc.entry(*v).or_default();
@@ -1209,8 +1866,17 @@ pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutc
         .iter()
         .filter_map(|&(f, c)| c.map(|_| f))
         .collect();
-    for (fi, f) in module.functions.iter().enumerate() {
-        let _ = fi;
+    let lex_funcs: Vec<FuncId> = if roots.is_some() {
+        scanned_funcs.iter().copied().collect()
+    } else {
+        (0..module.functions.len())
+            .map(|fi| FuncId::new(fi as u32))
+            .collect()
+    };
+    for func in lex_funcs {
+        let Some(f) = module.func(func) else {
+            continue;
+        };
         for &b in &f.blocks {
             let Some(bb) = module.block(b) else { continue };
             for &iid in &bb.insts {
@@ -1226,8 +1892,7 @@ pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutc
                     if !entry.unknown && !entry.sites.is_empty() {
                         let mut union = BTreeSet::new();
                         for &env_site in &entry.sites {
-                            let use_rec = engine
-                                .links
+                            let use_rec = links
                                 .inst_func(module, env_site)
                                 .is_some_and(|of| recorded_funcs.contains(&of));
                             if let Some(objs) =
@@ -1297,14 +1962,14 @@ fn value_answer(
         ValueDef::Const(_) => ValueAnswer::default(),
         ValueDef::ExceptionParam(_) => unknown(),
         ValueDef::Param(_) | ValueDef::Inst(_) => {
-            let is_param = matches!(v.def, ValueDef::Param(_));
             let Some((all, recorded, has_recorded)) = acc else {
                 return unknown();
             };
-            let union = if is_param && *has_recorded {
+            let union = if *has_recorded {
                 // Balanced: recorded call-site contexts only — the base
-                // activation's unknown marker means "called from
-                // nowhere recorded" and applies only then.
+                // (`ctx == None`) activation's synthetic parameter `Unknown`
+                // marker means "called from nowhere recorded" and applies
+                // only when no recorded context exists.
                 recorded
             } else {
                 all
@@ -1444,6 +2109,18 @@ fn env_analysis(module: &Module, max_depth: usize) -> (Vec<Arc<[EnvEntry]>>, Vec
                         // A bare function value also captures (it may be
                         // called without an AllocClosure wrapper).
                         capture_points.entry(*body).or_default().insert(iid);
+                    }
+                    Op::DefineMethod { func, .. } => {
+                        if let Some(body) = callable_body(module, *func) {
+                            capture_points.entry(body).or_default().insert(iid);
+                        }
+                    }
+                    Op::DefineClass { ctor, members, .. }
+                    | Op::DefineSendableClass { ctor, members, .. } => {
+                        capture_points.entry(*ctor).or_default().insert(iid);
+                        for mfid in class_member_funcs(module, *members) {
+                            capture_points.entry(mfid).or_default().insert(iid);
+                        }
                     }
                     _ => {}
                 }
@@ -1687,9 +2364,12 @@ impl<'m> Rung2AliasOracle<'m> {
                 has_unknown: true,
                 ..ValueAnswer::default()
             });
+        let has_phi = !answer.has_unknown
+            && !answer.sites.is_empty()
+            && resolve_alloc_sites(self.module, base).has_phi;
         QueryAnswer {
             sites: answer.sites,
-            has_phi: resolve_alloc_sites(self.module, base).has_phi,
+            has_phi,
             has_unknown: answer.has_unknown,
             unbalanced: false,
             capped: self.stats.capped,

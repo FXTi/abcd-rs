@@ -516,6 +516,7 @@ fn hand_built_report(
             native_identity: true,
             max_field_chain: 5,
             alias_rung: 2,
+            pta_step_budget: None,
         },
         hits: vec![taint::HitReport {
             sink: "print".to_string(),
@@ -770,4 +771,178 @@ fn report_linked_connects_cross_module_exports_to_ohos_sink() {
     let rep = taint::report_linked(&[m1, m2], &cfg).unwrap();
     assert_eq!(rep.hits.len(), 1, "{rep:?}");
     assert_eq!(rep.hits[0].sink, "@ohos.hilog.info");
+}
+
+// ---- `--alias-rung` & `--pta-budget` / `pta_step_budget` (#34) ----
+
+/// Multi-step heap/closure fixture so Rung-2 PTA performs >1 worklist
+/// activation before converging:
+/// - `sink_cb(x) { print(x); }`
+/// - `invoke(box, val) { let f = box.cb; f(val); }`
+/// - `func_main_0() {
+///       let box = {};
+///       box.cb = sink_cb;
+///       invoke(box, TAINT);
+///   }`
+fn pta_taint_abc() -> Vec<u8> {
+    let mut b = Builder::new();
+    b.set_api(12, "");
+    let cls = b.add_global_class();
+    let proto = b.create_proto(Type::Void, &[]);
+    let placeholder = EntityId(u16::MAX as u32);
+
+    // `sink_cb(x)`: num_vregs = 2, num_args = 4 => formal 0 (`x`) is Reg(5).
+    let (sink_code, sink_offsets) = abcd_isa::encode(&[
+        Bytecode::Lda(Reg(5)),                            // 0: acc = x
+        Bytecode::Sta(Reg(0)),                            // 1: v0 = x
+        Bytecode::Tryldglobalbyname(Imm(0), placeholder), // 2: acc = print
+        Bytecode::Callarg1(Imm(1), Reg(0)),               // 3: print(v0)
+        Bytecode::Returnundefined,                        // 4
+    ])
+    .unwrap();
+    let sink_cb = b.class_add_method(cls, "sink_cb", proto, AccessFlags::STATIC, &sink_code, 2, 4);
+    let s_print = b.add_string("print");
+    b.relocate_code_id(sink_cb, sink_offsets[2], 0, CodeEntity::String(s_print))
+        .unwrap();
+
+    // `invoke(box, val)`: num_vregs = 2, num_args = 5 => formal 0 (`box`) is Reg(5), formal 1 (`val`) is Reg(6).
+    let (inv_code, inv_offsets) = abcd_isa::encode(&[
+        Bytecode::Lda(Reg(5)),                      // 0: acc = box
+        Bytecode::Ldobjbyname(Imm(0), placeholder), // 1: acc = box.cb
+        Bytecode::Sta(Reg(0)),                      // 2: v0 = f
+        Bytecode::Lda(Reg(6)),                      // 3: acc = val
+        Bytecode::Sta(Reg(1)),                      // 4: v1 = val
+        Bytecode::Lda(Reg(0)),                      // 5: acc = f
+        Bytecode::Callarg1(Imm(1), Reg(1)),         // 6: f(v1)
+        Bytecode::Returnundefined,                  // 7
+    ])
+    .unwrap();
+    let invoke = b.class_add_method(cls, "invoke", proto, AccessFlags::STATIC, &inv_code, 2, 5);
+    let s_cb = b.add_string("cb");
+    b.relocate_code_id(invoke, inv_offsets[1], 0, CodeEntity::String(s_cb))
+        .unwrap();
+
+    let (main_code, main_offsets) = abcd_isa::encode(&[
+        Bytecode::Createemptyobject,                        // 0: acc = {}
+        Bytecode::Sta(Reg(0)),                              // 1: v0 = box
+        Bytecode::Definefunc(Imm(0), placeholder, Imm(1)),  // 2: acc = sink_cb
+        Bytecode::Stobjbyname(Imm(1), placeholder, Reg(0)), // 3: box.cb = sink_cb
+        Bytecode::Tryldglobalbyname(Imm(2), placeholder),   // 4: acc = TAINT
+        Bytecode::Sta(Reg(1)),                              // 5: v1 = tainted
+        Bytecode::Definefunc(Imm(3), placeholder, Imm(2)),  // 6: acc = invoke
+        Bytecode::Sta(Reg(2)),                              // 7: v2 = invoke
+        Bytecode::Lda(Reg(2)),                              // 8: acc = invoke
+        Bytecode::Callargs2(Imm(4), Reg(0), Reg(1)),        // 9: invoke(box, v1)
+        Bytecode::Returnundefined,                          // 10
+    ])
+    .unwrap();
+    let main = b.class_add_method(
+        cls,
+        "func_main_0",
+        proto,
+        AccessFlags::STATIC,
+        &main_code,
+        4,
+        3,
+    );
+    let s_taint = b.add_string("TAINT");
+    b.relocate_code_id(main, main_offsets[2], 0, CodeEntity::Method(sink_cb))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[3], 0, CodeEntity::String(s_cb))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[4], 0, CodeEntity::String(s_taint))
+        .unwrap();
+    b.relocate_code_id(main, main_offsets[6], 0, CodeEntity::Method(invoke))
+        .unwrap();
+    b.deduplicate();
+    b.finalize().expect("pta_taint_abc must finalize")
+}
+
+#[test]
+fn taint_alias_rungs_and_pta_budget_cap_degradation() {
+    let abc = pta_taint_abc();
+
+    // Rung 2 with default budget: PTA converges at rung 2 and resolves `box.cb(TAINT)` -> `sink_cb` -> `print`.
+    let r2 = run(&abc, &format!("alias_rung = 2\n{TAINT_TO_PRINT}"));
+    assert_eq!(r2.config.alias_rung, 2);
+    assert_eq!(r2.config.pta_step_budget, None);
+    assert_eq!(r2.alias_rung_used, 2);
+    assert_eq!(r2.hits.len(), 1, "{r2:?}");
+    let r2_text = taint::render_text(&r2);
+    assert!(
+        r2_text.contains("alias rung:      2 (used 2)\n"),
+        "{r2_text}"
+    );
+    assert!(!r2_text.contains("pta budget:"), "{r2_text}");
+    let r2_json: serde_json::Value =
+        serde_json::from_str(&taint::render(&[r2], true).unwrap()).unwrap();
+    assert!(
+        r2_json["config"].get("pta_step_budget").is_none(),
+        "{r2_json}"
+    );
+
+    // Rung 0 and Rung 1 via TOML: alias_rung_used matches requested rung.
+    let r0 = run(&abc, &format!("alias_rung = 0\n{TAINT_TO_PRINT}"));
+    assert_eq!(r0.config.alias_rung, 0);
+    assert_eq!(r0.alias_rung_used, 0);
+
+    let r1 = run(&abc, &format!("alias_rung = 1\n{TAINT_TO_PRINT}"));
+    assert_eq!(r1.config.alias_rung, 1);
+    assert_eq!(r1.alias_rung_used, 1);
+
+    // Rung 2 with `pta_step_budget = 1`: budget exhaustion degrades `alias_rung_used` to 1!
+    let capped = run(
+        &abc,
+        &format!("alias_rung = 2\npta_step_budget = 1\n{TAINT_TO_PRINT}"),
+    );
+    assert_eq!(capped.config.alias_rung, 2);
+    assert_eq!(capped.config.pta_step_budget, Some(1));
+    assert_eq!(
+        capped.alias_rung_used, 1,
+        "pta_step_budget = 1 must degrade alias_rung_used to 1"
+    );
+    let capped_text = taint::render_text(&capped);
+    assert!(
+        capped_text.contains("alias rung:      2 (used 1)\npta budget:      1\n"),
+        "{capped_text}"
+    );
+    let capped_json: serde_json::Value =
+        serde_json::from_str(&taint::render(&[capped], true).unwrap()).unwrap();
+    assert_eq!(capped_json["config"]["pta_step_budget"], 1);
+    assert_eq!(capped_json["alias_rung_used"], 1);
+}
+
+#[test]
+fn cli_taint_alias_rung_and_pta_budget_override_config() {
+    use abcd_cli::cli::Cli;
+    use clap::Parser;
+
+    let dir = common::tempdir("taint-pta-cli");
+    let abc_path = dir.join("pta_taint.abc");
+    std::fs::write(&abc_path, pta_taint_abc()).unwrap();
+    let cfg_path = dir.join("taint.toml");
+    std::fs::write(&cfg_path, format!("alias_rung = 2\n{TAINT_TO_PRINT}")).unwrap();
+
+    let abc = abc_path.to_str().unwrap();
+    let cfg = cfg_path.to_str().unwrap();
+
+    for argv in [
+        &["abcd", "taint", abc, "--config", cfg, "--alias-rung", "0"][..],
+        &["abcd", "taint", abc, "--config", cfg, "--alias-rung", "1"][..],
+        &[
+            "abcd",
+            "taint",
+            abc,
+            "--config",
+            cfg,
+            "--alias-rung",
+            "2",
+            "--pta-budget",
+            "1",
+            "--json",
+        ][..],
+    ] {
+        let cli = Cli::try_parse_from(argv).expect("argv must parse");
+        abcd_cli::run(cli).expect("taint dispatch must succeed");
+    }
 }

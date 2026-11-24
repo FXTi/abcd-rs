@@ -3568,3 +3568,487 @@ fn small_stack_256k_deep_def_chains_no_overflow() {
         .expect("spawn 256k thread");
     handle.join().expect("256k thread must not overflow stack");
 }
+
+/// Caller non-field `TaintBase::Local(x)` survives across `SiteClass::BodyStep`
+/// helper calls (`helper(x); print(x)`), while non-empty `Local(o).secret`
+/// field chains still defer to the callee body so field strong-kills fire.
+#[test]
+fn bodystep_preserves_caller_scalar_local_and_keeps_field_strong_kill() {
+    use abcd_analysis::dataflow::heap::{FieldChain, FieldKey};
+    use abcd_ir::Modifiers;
+
+    // (A) Scalar caller local passed to a body-resolved helper still reaches a
+    // subsequent caller sink across all alias rungs.
+    {
+        let mut m = mk_module();
+        let helper = add_func_named(&mut m, "noopHelper");
+        m.func_mut(helper).unwrap().modifiers = Modifiers::STATIC;
+        {
+            let hb = entry_of(&m, helper);
+            for i in 0..4 {
+                add_param(&mut m, helper, i);
+            }
+            let _ = load_number(&mut m, hb, 42.0);
+            emit_void(&mut m, hb, Op::Return { value: None });
+        }
+
+        let main_fn = add_func_named(&mut m, "func_main_0");
+        let entry = entry_of(&m, main_fn);
+        add_param(&mut m, main_fn, 0);
+        let tainted = add_param(&mut m, main_fn, 1);
+
+        let href = load_method_ref(&mut m, entry, helper);
+        let _ = emit(
+            &mut m,
+            entry,
+            Op::Call {
+                callee: href,
+                this: None,
+                args: vec![tainted],
+                kind: CallKind::Direct,
+            },
+        );
+        print_call(&mut m, entry, vec![tainted]);
+        emit_void(&mut m, entry, Op::Return { value: None });
+
+        for rung in [0u8, 1, 2] {
+            let cfg = TaintConfig {
+                alias_rung: rung,
+                ..std_config()
+            };
+            let report = abcd_taint::run_taint(&m, &cfg);
+            assert!(
+                report.stats.sites_body_step >= 1,
+                "rung {rung}: expected BodyStep classification"
+            );
+            assert_eq!(
+                report.hits.len(),
+                1,
+                "rung {rung}: scalar caller local must survive BodyStep: {:?}",
+                report.hits
+            );
+            assert_eq!(report.hits[0].fact.local_base(), Some(tainted));
+        }
+    }
+
+    // (B) Field-bearing `Local(o).[secret]` does NOT bypass `BodyStep`, so a
+    // callee strong-killing `formal_o.secret = clean` sanitizes `o.secret`.
+    let run_field_case = |call_sanitizer: bool, rung: u8| -> usize {
+        let mut m = mk_module();
+        let sec = intern(&mut m, "secret");
+
+        let sanitize = add_func_named(&mut m, "sanitizeSecret");
+        m.func_mut(sanitize).unwrap().modifiers = Modifiers::STATIC;
+        {
+            let sb = entry_of(&m, sanitize);
+            add_param(&mut m, sanitize, 0);
+            add_param(&mut m, sanitize, 1);
+            add_param(&mut m, sanitize, 2);
+            let formal_o = add_param(&mut m, sanitize, 3);
+            let clean = load_string(&mut m, sb, "clean");
+            emit_void(
+                &mut m,
+                sb,
+                Op::StoreProp {
+                    object: formal_o,
+                    name: sec,
+                    value: clean,
+                },
+            );
+            emit_void(
+                &mut m,
+                sb,
+                Op::Return {
+                    value: Some(formal_o),
+                },
+            );
+        }
+
+        let main_fn = add_func_named(&mut m, "func_main_0");
+        let entry = entry_of(&m, main_fn);
+        add_param(&mut m, main_fn, 0);
+        let tainted = add_param(&mut m, main_fn, 1);
+
+        let o = alloc_object(&mut m, entry);
+        let mk_wrap = try_get_global(&mut m, entry, "mkFieldWrap");
+        let wrap = emit(
+            &mut m,
+            entry,
+            Op::Call {
+                callee: mk_wrap,
+                this: None,
+                args: vec![tainted],
+                kind: CallKind::Dynamic,
+            },
+        );
+        let cp = try_get_global(&mut m, entry, "copyField");
+        let _ = emit(
+            &mut m,
+            entry,
+            Op::Call {
+                callee: cp,
+                this: None,
+                args: vec![o, wrap],
+                kind: CallKind::Dynamic,
+            },
+        );
+        if call_sanitizer {
+            let sref = load_method_ref(&mut m, entry, sanitize);
+            let _ = emit(
+                &mut m,
+                entry,
+                Op::Call {
+                    callee: sref,
+                    this: None,
+                    args: vec![o],
+                    kind: CallKind::Direct,
+                },
+            );
+        }
+        let read_sec = emit(
+            &mut m,
+            entry,
+            Op::LoadProp {
+                object: o,
+                name: sec,
+            },
+        );
+        print_call(&mut m, entry, vec![read_sec]);
+        emit_void(&mut m, entry, Op::Return { value: None });
+
+        let sec_chain = FieldChain::new().pushed(FieldKey::Named(sec), 5);
+        let mut cfg = TaintConfig {
+            alias_rung: rung,
+            ..std_config()
+        };
+        cfg.extra_summaries.push((
+            "mkFieldWrap".to_owned(),
+            Some(1),
+            Summary::new("param0 -> return.secret")
+                .flow(Endpoint::Param(0), Endpoint::ReturnField(sec_chain)),
+        ));
+        cfg.extra_summaries.push((
+            "copyField".to_owned(),
+            Some(2),
+            Summary::new("param1 -> param0").flow(Endpoint::Param(1), Endpoint::Param(0)),
+        ));
+        abcd_taint::run_taint(&m, &cfg).hits.len()
+    };
+
+    assert_eq!(
+        run_field_case(false, 2),
+        1,
+        "rung 2: positive control without sanitizer must hit"
+    );
+    assert_eq!(
+        run_field_case(true, 2),
+        0,
+        "rung 2: callee strong-kill on Local(o).secret must not be bypassed on call_to_return_flow"
+    );
+}
+
+/// Demand-driven PTA root slicing (`> 512` functions) + `zero_needed` IFDS
+/// `Λ`-seeding: in a 600+-function multi-record bundle with 595+ unrelated
+/// object/method noise functions, a `GlobalLoad` -> OOP class method ->
+/// cross-module ES `StoreModuleVar` / `LoadModuleVar` -> `print` sink flow
+/// still resolves at Rung 2 with tiny `path_edges`.
+#[test]
+fn large_bundle_demand_pta_roots_and_zero_needed_slice_unrelated_subgraphs() {
+    use abcd_ir::consts::Const;
+    use abcd_ir::function::FunctionData;
+    use abcd_ir::module::{
+        ClassData, EsModule, ExportDecl, FunctionKind, ImportDecl, ModuleRequest,
+    };
+    use abcd_ir::op::ModuleVarKind;
+    use abcd_ir::{ClassId, FuncId, Modifiers, Module};
+
+    let mut m = Module::new();
+
+    let add_record = |m: &mut Module, desc: &str, esm: EsModule| -> ClassId {
+        let cid = ClassId::new(m.classes.len() as u32);
+        let dsym = m.sym.intern(desc);
+        let mut cls = ClassData::new(dsym, dsym);
+        cls.es_module = Some(esm);
+        m.classes.push(cls);
+        cid
+    };
+
+    let add_fn_in = |m: &mut Module, cid: ClassId, name: &str, kind: FunctionKind| -> FuncId {
+        let nsym = m.sym.intern(name);
+        let fid = FuncId::new(m.functions.len() as u32);
+        let mut fd = FunctionData::new(cid, nsym, kind);
+        fd.modifiers = Modifiers::STATIC;
+        m.functions.push(fd);
+        m.classes[cid.index()].methods.push(fid);
+        add_block(m, fid);
+        fid
+    };
+
+    let leaked_sym = m.sym.intern("leakedToken");
+    let exp_spec_sym = m.sym.intern("exporter/service");
+
+    let exp_cid = add_record(
+        &mut m,
+        "Lexporter/service;",
+        EsModule {
+            imports: Vec::new(),
+            exports: vec![ExportDecl::Local {
+                local_name: leaked_sym,
+                export_name: leaked_sym,
+            }],
+            module_requests: Vec::new(),
+        },
+    );
+    let imp_cid = add_record(
+        &mut m,
+        "Limporter/consumer;",
+        EsModule {
+            imports: vec![ImportDecl::Regular {
+                local_name: leaked_sym,
+                import_name: leaked_sym,
+                module_request: exp_spec_sym,
+            }],
+            exports: Vec::new(),
+            module_requests: vec![ModuleRequest {
+                specifier: exp_spec_sym,
+                lazy: false,
+            }],
+        },
+    );
+    let noise_cid = add_record(&mut m, "Lnoise/unrelated;", EsModule::default());
+
+    // Record 0: OOP `Boxer` class (`ctor` + `wrap`) + `func_main_0` exporting wrapped secret.
+    let ctor_fn = add_fn_in(&mut m, exp_cid, "Boxer", FunctionKind::Constructor);
+    {
+        let b = entry_of(&m, ctor_fn);
+        for i in 0..3 {
+            add_param(&mut m, ctor_fn, i);
+        }
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+    let wrap_fn = add_fn_in(&mut m, exp_cid, "wrap", FunctionKind::Function);
+    let payload_sym = intern(&mut m, "payload");
+    {
+        let b = entry_of(&m, wrap_fn);
+        add_param(&mut m, wrap_fn, 0);
+        add_param(&mut m, wrap_fn, 1);
+        add_param(&mut m, wrap_fn, 2);
+        let val = add_param(&mut m, wrap_fn, 3);
+        let obj = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: obj,
+                name: payload_sym,
+                value: val,
+            },
+        );
+        let loaded = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: obj,
+                name: payload_sym,
+            },
+        );
+        emit_void(
+            &mut m,
+            b,
+            Op::Return {
+                value: Some(loaded),
+            },
+        );
+    }
+
+    let exp_main = add_fn_in(&mut m, exp_cid, "func_main_0", FunctionKind::Function);
+    {
+        let b = entry_of(&m, exp_main);
+        for i in 0..3 {
+            add_param(&mut m, exp_main, i);
+        }
+        let wrap_sym = intern(&mut m, "wrap");
+        let members = push_const(
+            &mut m,
+            Const::ArrayLiteral(vec![Const::String(wrap_sym), Const::MethodRef(wrap_fn)]),
+        );
+        let cls_val = emit(
+            &mut m,
+            b,
+            Op::DefineClass {
+                ctor: ctor_fn,
+                heritage: None,
+                members,
+                member_attrs: Vec::new(),
+                count: 1,
+            },
+        );
+        let inst = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: cls_val,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::New,
+            },
+        );
+        let src_val = try_get_global(&mut m, b, "SECRET_ENV");
+        let wrap_callee = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: inst,
+                name: wrap_sym,
+            },
+        );
+        let wrapped = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: wrap_callee,
+                this: Some(inst),
+                args: vec![src_val],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreModuleVar {
+                index: 0,
+                value: wrapped,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+
+    // Record 1: `func_main_0` importing `leakedToken` and passing it to `print`.
+    let imp_main = add_fn_in(&mut m, imp_cid, "func_main_0", FunctionKind::Function);
+    {
+        let b = entry_of(&m, imp_main);
+        for i in 0..3 {
+            add_param(&mut m, imp_main, i);
+        }
+        let imported = emit(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::External,
+            },
+        );
+        print_call(&mut m, b, vec![imported]);
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+
+    // Record 2: `func_main_0` + 596 unrelated functions allocating objects and calling helpers.
+    let tmp_sym = intern(&mut m, "tmp");
+    let mut noise_fns = Vec::with_capacity(596);
+    for idx in 0..596usize {
+        let nf = add_fn_in(
+            &mut m,
+            noise_cid,
+            &format!("noise_{idx}"),
+            FunctionKind::Function,
+        );
+        noise_fns.push(nf);
+    }
+    for (idx, &nf) in noise_fns.iter().enumerate() {
+        let b = entry_of(&m, nf);
+        for i in 0..3 {
+            add_param(&mut m, nf, i);
+        }
+        let obj = alloc_object(&mut m, b);
+        let nval = load_number(&mut m, b, idx as f64);
+        emit_void(
+            &mut m,
+            b,
+            Op::StoreProp {
+                object: obj,
+                name: tmp_sym,
+                value: nval,
+            },
+        );
+        let read_back = emit(
+            &mut m,
+            b,
+            Op::LoadProp {
+                object: obj,
+                name: tmp_sym,
+            },
+        );
+        if idx % 4 != 3 && idx + 1 < noise_fns.len() {
+            let next_ref = load_method_ref(&mut m, b, noise_fns[idx + 1]);
+            let _ = emit(
+                &mut m,
+                b,
+                Op::Call {
+                    callee: next_ref,
+                    this: None,
+                    args: Vec::new(),
+                    kind: CallKind::Direct,
+                },
+            );
+        }
+        emit_void(
+            &mut m,
+            b,
+            Op::Return {
+                value: Some(read_back),
+            },
+        );
+    }
+    let noise_main = add_fn_in(&mut m, noise_cid, "func_main_0", FunctionKind::Function);
+    {
+        let b = entry_of(&m, noise_main);
+        for i in 0..3 {
+            add_param(&mut m, noise_main, i);
+        }
+        let first_ref = load_method_ref(&mut m, b, noise_fns[0]);
+        let _ = emit(
+            &mut m,
+            b,
+            Op::Call {
+                callee: first_ref,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::Direct,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+
+    assert!(
+        m.functions.len() > 512,
+        "expected > 512 functions to engage PTA root slicing, got {}",
+        m.functions.len()
+    );
+
+    let cfg = TaintConfig {
+        sources: vec![SourceSpec::GlobalLoad {
+            name: "SECRET_ENV".to_owned(),
+        }],
+        sinks: vec![SinkSpec::Call {
+            name: "print".to_owned(),
+        }],
+        alias_rung: 2,
+        ohos_lifecycle: true,
+        ..TaintConfig::default()
+    };
+    let report = abcd_taint::run_taint(&m, &cfg);
+    assert_eq!(report.alias_rung_used, 2);
+    assert_eq!(
+        report.hits.len(),
+        1,
+        "expected cross-module OOP export sink hit under sliced PTA + zero_needed: {:?}",
+        report.hits
+    );
+    assert_eq!(report.hits[0].sink, "print");
+    assert_eq!(report.hits[0].position, "arg 0");
+    assert!(
+        report.path_edges < 200,
+        "expected zero_needed + root-sliced PTA to skip 596 noise functions, got path_edges = {}",
+        report.path_edges
+    );
+}

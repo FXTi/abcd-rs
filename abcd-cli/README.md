@@ -20,8 +20,8 @@ Unified command-line interface (`abcd`) for the `abcd-rs` ArkCompiler bytecode t
 | `asm` | `abcd asm [-o <out.abc>] [--version <M.m.p.b>] [--check] <input.pa>` | Assembles pandasm `.pa` text into `.abc` with optional format version override and `--check` re-decode self-check. |
 | `decompile` | `abcd decompile [-o <path>] [--split-modules] [--arkui] [--ts] [--line-anchors] [--call-entry] [--module <name> \| --all] <input>` | Decompiles pre-opt SSA IR to JS, TypeScript annotations (`--ts`), `--merge-abc` multi-file trees (`--split-modules`), and ArkUI `@Component struct` / `build()` views (`--arkui`). |
 | `rewrite` | `abcd rewrite [-o <path>] [--opt] [--check] [--module <name> \| --all] <input>` | Rewrites `.abc` through `decode → lift → verify → [opt] → lower → encode` with optional `--opt` passes and `--check` readback verification. |
-| `analyze` | `abcd analyze [--callgraph] [--dominators] [--json] [--module <name> \| --all] <input>` | Emits IR arena summaries, call-graph resolution histograms, per-site targets (`--callgraph`), and RPO immediate-dominator trees (`--dominators`). |
-| `taint` | `abcd taint [--preset ohos] [--config <taint.toml>] [--link-modules] [--json] [--module <name> \| --all] <input>` | Runs interprocedural IFDS taint analysis with the built-in OpenHarmony rule pack (`--preset ohos`), custom TOML configs (`--config`), and cross-`.abc` linking (`--link-modules`). |
+| `analyze` | `abcd analyze [--callgraph] [--dominators] [--pta] [--alias-rung <0\|1\|2>] [--pta-budget <steps>] [--json] [--module <name> \| --all] <input>` | Emits IR arena summaries, call-graph resolution histograms, pointer-analysis telemetry (`--pta`), per-site targets (`--callgraph`), and RPO immediate-dominator trees (`--dominators`). |
+| `taint` | `abcd taint [--preset ohos] [--config <taint.toml>] [--link-modules] [--alias-rung <0\|1\|2>] [--pta-budget <steps>] [--json] [--module <name> \| --all] <input>` | Runs interprocedural IFDS taint analysis with the built-in OpenHarmony rule pack (`--preset ohos`), custom TOML configs (`--config`), alias/PTA controls, and cross-`.abc` linking (`--link-modules`). |
 
 ## 3. Exit Codes, Stdio Discipline & Global Allocator
 
@@ -58,6 +58,7 @@ native_identity = true
 ohos_lifecycle = true
 max_field_chain = 5
 alias_rung = 2        # 0 = local def-chain, 1 = demand alias, 2 = k=1 Andersen PTA
+# pta_step_budget = 250000
 
 [[sources]]
 kind = "function_params"   # or "global_load", "call_return", "module_import"

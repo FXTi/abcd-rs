@@ -398,6 +398,18 @@ pub trait IfdsProblem {
         source: &Self::Fact,
         out: &mut Vec<Self::Fact>,
     );
+
+    /// Whether the tautological zero fact (`Λ`) should propagate as `Λ -> Λ`
+    /// across `call` into `callee`. Defaults to `true`.
+    ///
+    /// Clients whose `initial_seeds` already plant `Λ` on every function that can
+    /// generate a non-zero fact from `Λ` (and its transitive callers) may return
+    /// `false` for callees outside that backward cone, avoiding `O(|Module|)`
+    /// `(Λ, inst, Λ)` tabulation across source-free subgraphs while still running
+    /// `call_flow(call, callee, &Λ)` for any direct `Λ -> d` seed edges.
+    fn propagate_zero_to_callee(&self, _call: InstId, _callee: FuncId) -> bool {
+        true
+    }
 }
 
 /// Solver configuration.
@@ -676,10 +688,12 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         if !self.edge_set.insert(key) {
             return;
         }
-        self.by_target
-            .entry((target_node, target_fact))
-            .or_default()
-            .insert(source);
+        if self.graph.is_call(target_node) {
+            self.by_target
+                .entry((target_node, target_fact))
+                .or_default()
+                .insert(source);
+        }
         if target_node.index() >= self.reached.len() {
             self.reached
                 .resize_with(target_node.index() + 1, CompactU32Set::default);
@@ -714,6 +728,36 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             ids.push(id);
         }
         if source == self.zero_id && !saw_zero {
+            ids.push(self.zero_id);
+        }
+        ids
+    }
+
+    /// Compute `call_flow` target fact IDs across `(call, callee)`, gating
+    /// automatic `Λ -> Λ` propagation via
+    /// [`IfdsProblem::propagate_zero_to_callee`] while still invoking
+    /// `call_flow` on `Λ` for any direct `Λ -> d` seed edges.
+    fn compute_call_targets(&mut self, call: InstId, callee: FuncId, source: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.problem.call_flow(
+            self.module,
+            call,
+            callee,
+            &self.facts[source as usize],
+            &mut out,
+        );
+        let keep_zero =
+            source == self.zero_id && self.problem.propagate_zero_to_callee(call, callee);
+        let mut ids = Vec::with_capacity(out.len() + usize::from(keep_zero));
+        let mut saw_zero = false;
+        for fact in out {
+            let id = self.intern_fact(fact);
+            if id == self.zero_id {
+                saw_zero = true;
+            }
+            ids.push(id);
+        }
+        if keep_zero && !saw_zero {
             ids.push(self.zero_id);
         }
         ids
@@ -786,9 +830,7 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             let Some(sp) = self.graph.start_point(callee) else {
                 continue;
             };
-            let d3s = self.compute_targets(d2, |p, m, src, out| {
-                p.call_flow(m, n, callee, src, out);
-            });
+            let d3s = self.compute_call_targets(n, callee, d2);
             for d3 in d3s {
                 // The callee self-loop anchors the callee-local summary
                 // computation.
