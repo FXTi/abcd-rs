@@ -20,6 +20,8 @@ probes-taint/out/
 /ArkAnalyzer
 
 # Local tooling/editor state (never commit)
+__pycache__/
+*.py[cod]
 .tmp-bin/
 .dsh-bin/
 .vscode/
