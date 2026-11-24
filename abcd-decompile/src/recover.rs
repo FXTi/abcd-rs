@@ -543,6 +543,46 @@ fn is_statement_op(op: &Op) -> bool {
     )
 }
 
+/// One `(pred, to, exceptional)` edge's parallel `PhiAssign` copies.
+struct PhiEdgeGroup {
+    pred: BlockId,
+    to: BlockId,
+    exceptional: bool,
+    assigns: Vec<(String, Expr)>,
+}
+
+/// A deferred out-of-SSA phi copy collected during the block walk and
+/// scheduled per `(pred, to, exceptional)` edge once all blocks are visited.
+struct PendingPhiAssign {
+    pred: BlockId,
+    to: BlockId,
+    exceptional: bool,
+    target: String,
+    value: Expr,
+}
+
+fn is_self_phi_assign(target: &str, value: &Expr) -> bool {
+    matches!(value, Expr::Ident(n) | Expr::Temp { name: n, .. } if n == target)
+}
+
+/// Collect every identifier / temporary name read inside `e` using an
+/// explicit heap work-stack (no recursion).
+fn collect_expr_reads(e: &Expr) -> HashSet<String> {
+    let mut reads = HashSet::new();
+    let mut stack = vec![e];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Expr::Ident(n) | Expr::Temp { name: n, .. } => {
+                reads.insert(n.clone());
+            }
+            _ => {
+                stack.extend(crate::folds::expr_children(cur));
+            }
+        }
+    }
+    reads
+}
+
 struct Recover<'m> {
     module: &'m Module,
     index: Option<&'m DecompileIndex>,
@@ -694,8 +734,9 @@ impl<'m> Recover<'m> {
 
         // Phi assignments trail their PREDECESSOR's statements; collect
         // during the walk (a phi block may precede a pred in exotic
-        // layouts), append afterwards in deterministic walk order.
-        let mut phi_tail: Vec<(BlockId, Stmt)> = Vec::new();
+        // layouts), then schedule each `(pred, to, exceptional)` parallel-copy
+        // group deterministically afterwards.
+        let mut phi_tail: Vec<PendingPhiAssign> = Vec::new();
 
         for &b in &block_ids {
             let insts = self
@@ -713,11 +754,7 @@ impl<'m> Recover<'m> {
                 self.step_inst(iid, &op, loc, b, &mut blocks[bi].stmts, &mut phi_tail);
             }
         }
-        for (pred, stmt) in phi_tail {
-            if let Some(&bi) = block_index.get(&pred) {
-                blocks[bi].stmts.push(stmt);
-            }
-        }
+        self.flush_phi_tail(&mut blocks, &block_index, phi_tail);
 
         RecoveredFunc {
             func: self.func,
@@ -1033,6 +1070,152 @@ impl<'m> Recover<'m> {
         }
     }
 
+    /// Schedule parallel out-of-SSA `PhiAssign` copies per
+    /// `(pred, to, exceptional)` edge so inlined expressions and cyclic phi
+    /// updates never clobber a variable before a sibling copy reads it.
+    fn flush_phi_tail(
+        &mut self,
+        blocks: &mut [BlockStmts],
+        block_index: &HashMap<BlockId, usize>,
+        phi_tail: Vec<PendingPhiAssign>,
+    ) {
+        let mut groups: Vec<PhiEdgeGroup> = Vec::new();
+        let mut group_idx: HashMap<(BlockId, BlockId, bool), usize> = HashMap::new();
+        for item in phi_tail {
+            if !block_index.contains_key(&item.pred) {
+                continue;
+            }
+            let key = (item.pred, item.to, item.exceptional);
+            if let Some(&gi) = group_idx.get(&key) {
+                groups[gi].assigns.push((item.target, item.value));
+            } else {
+                let gi = groups.len();
+                group_idx.insert(key, gi);
+                groups.push(PhiEdgeGroup {
+                    pred: item.pred,
+                    to: item.to,
+                    exceptional: item.exceptional,
+                    assigns: vec![(item.target, item.value)],
+                });
+            }
+        }
+
+        let mut synth_phi_seq: u32 = 0;
+        for PhiEdgeGroup {
+            pred,
+            to,
+            exceptional,
+            assigns,
+        } in groups
+        {
+            let Some(&bi) = block_index.get(&pred) else {
+                continue;
+            };
+            // Fast path: <= 1 copy or all self-assignments -> byte-identical output.
+            if assigns.len() <= 1
+                || assigns
+                    .iter()
+                    .all(|(target, value)| is_self_phi_assign(target, value))
+            {
+                for (target, value) in assigns {
+                    blocks[bi].stmts.push(Stmt::PhiAssign {
+                        target,
+                        value,
+                        to,
+                        exceptional,
+                    });
+                }
+                continue;
+            }
+
+            let k = assigns.len();
+            let mut items: Vec<(String, Expr)> = assigns;
+            let mut reads: Vec<HashSet<String>> = items
+                .iter()
+                .map(|(_, value)| collect_expr_reads(value))
+                .collect();
+            let mut done = vec![false; k];
+            let mut remaining = k;
+            let mut emitted: Vec<Stmt> = Vec::with_capacity(k + 2);
+            let mut decls: Vec<Stmt> = Vec::new();
+
+            while remaining > 0 {
+                let ready = (0..k).find(|&j| {
+                    if done[j] {
+                        return false;
+                    }
+                    let self_noop = is_self_phi_assign(&items[j].0, &items[j].1)
+                        && !(0..k).any(|i| i != j && !done[i] && items[i].0 == items[j].0);
+                    if self_noop {
+                        return true;
+                    }
+                    !(0..k).any(|i| i != j && !done[i] && reads[i].contains(&items[j].0))
+                });
+
+                if let Some(j) = ready {
+                    done[j] = true;
+                    remaining -= 1;
+                    emitted.push(Stmt::PhiAssign {
+                        target: items[j].0.clone(),
+                        value: items[j].1.clone(),
+                        to,
+                        exceptional,
+                    });
+                    continue;
+                }
+
+                // Every unscheduled assignment's target is read by another
+                // unscheduled assignment; walk `cur -> reader(cur)` to locate
+                // a directed cycle and break at the smallest index on that cycle.
+                let Some(start) = (0..k).find(|&j| !done[j]) else {
+                    break;
+                };
+                let mut path: Vec<usize> = Vec::with_capacity(remaining + 1);
+                let mut cur = start;
+                let victim = loop {
+                    if let Some(pos) = path.iter().position(|&p| p == cur) {
+                        break path[pos..].iter().copied().min().unwrap_or(cur);
+                    }
+                    path.push(cur);
+                    match (0..k).find(|&i| i != cur && !done[i] && reads[i].contains(&items[cur].0))
+                    {
+                        Some(next) => cur = next,
+                        None => break cur,
+                    }
+                };
+
+                let tmp = self.legal.mint("phi");
+                let synth_vid = ValueId::new(u32::MAX.saturating_sub(synth_phi_seq));
+                synth_phi_seq = synth_phi_seq.saturating_add(1);
+                decls.push(Stmt::PhiDecl {
+                    name: tmp.clone(),
+                    value_id: synth_vid,
+                });
+                let old_val = std::mem::replace(&mut items[victim].1, Expr::Ident(tmp.clone()));
+                reads[victim].clear();
+                reads[victim].insert(tmp.clone());
+                emitted.push(Stmt::PhiAssign {
+                    target: tmp,
+                    value: old_val,
+                    to,
+                    exceptional,
+                });
+            }
+
+            if !decls.is_empty()
+                && let Some(entry_blk) = blocks.first_mut()
+            {
+                let insert_at = entry_blk
+                    .stmts
+                    .iter()
+                    .take_while(|s| matches!(s, Stmt::CatchBind { .. } | Stmt::PhiDecl { .. }))
+                    .count();
+                entry_blk.stmts.splice(insert_at..insert_at, decls);
+            }
+            blocks[bi].stmts.extend(emitted);
+        }
+    }
+
     /// One instruction → statement(s) (or nothing, when inlined/dead).
     fn step_inst(
         &mut self,
@@ -1041,7 +1224,7 @@ impl<'m> Recover<'m> {
         loc: Option<Loc>,
         block: BlockId,
         out: &mut Vec<Stmt>,
-        phi_tail: &mut Vec<(BlockId, Stmt)>,
+        phi_tail: &mut Vec<PendingPhiAssign>,
     ) {
         // 0. Guards that must stay EXECUTABLE (N74-W4): the blanket
         //    elision below is only sound when the emitted source
@@ -1152,15 +1335,13 @@ impl<'m> Recover<'m> {
             });
             for (edge, v) in entries {
                 let value = self.expr_of(*v);
-                phi_tail.push((
-                    edge.from,
-                    Stmt::PhiAssign {
-                        target: name.clone(),
-                        value,
-                        to: block,
-                        exceptional: edge.kind == EdgeKind::Exceptional,
-                    },
-                ));
+                phi_tail.push(PendingPhiAssign {
+                    pred: edge.from,
+                    to: block,
+                    exceptional: edge.kind == EdgeKind::Exceptional,
+                    target: name.clone(),
+                    value,
+                });
             }
             return;
         }
@@ -3099,5 +3280,104 @@ mod tests {
             })
             .expect("a TemplateObject declare");
         assert_eq!(tpl, (None, None));
+    }
+
+    #[test]
+    fn parallel_phi_swap_cycle_and_bridge() {
+        let mut m = mk_module();
+        let f = add_fn(&mut m, "swapLoop");
+        let b_entry = entry_of(&m, f);
+        let _this = add_param(&mut m, f);
+        let p_x = add_param(&mut m, f);
+        let p_y = add_param(&mut m, f);
+        let p_z = add_param(&mut m, f);
+
+        let b_hdr = BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        m.func_mut(f).unwrap().blocks.push(b_hdr);
+
+        let b_latch = BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        m.func_mut(f).unwrap().blocks.push(b_latch);
+
+        push_inst(&mut m, b_entry, Op::Branch { dest: b_hdr });
+        m.block_mut(b_hdr).unwrap().preds.push(Edge {
+            from: b_entry,
+            kind: EdgeKind::Normal,
+        });
+        m.block_mut(b_hdr).unwrap().preds.push(Edge {
+            from: b_latch,
+            kind: EdgeKind::Normal,
+        });
+
+        // Bridge `m = z` read by cycle `[a, b] = [m + b, a]` on the latch edge:
+        // only ONE cycle-breaking temp (`phi`) should be minted (not on `m`).
+        let v_m = emit_val(
+            &mut m,
+            b_hdr,
+            Op::Phi {
+                entries: Vec::new(),
+            },
+        );
+        let v_a = emit_val(
+            &mut m,
+            b_hdr,
+            Op::Phi {
+                entries: Vec::new(),
+            },
+        );
+        let v_b = emit_val(
+            &mut m,
+            b_hdr,
+            Op::Phi {
+                entries: Vec::new(),
+            },
+        );
+        push_inst(&mut m, b_hdr, Op::Branch { dest: b_latch });
+        m.block_mut(b_latch).unwrap().preds.push(Edge {
+            from: b_hdr,
+            kind: EdgeKind::Normal,
+        });
+
+        let mb = emit_val(
+            &mut m,
+            b_latch,
+            Op::BinaryOp {
+                op: abcd_ir::op::BinOp::Add,
+                left: v_b,
+                right: v_m,
+            },
+        );
+        push_inst(&mut m, b_latch, Op::Branch { dest: b_hdr });
+
+        let e0 = Edge {
+            from: b_entry,
+            kind: EdgeKind::Normal,
+        };
+        let e1 = Edge {
+            from: b_latch,
+            kind: EdgeKind::Normal,
+        };
+        for (pv, entries) in [
+            (v_m, vec![(e0, p_x), (e1, p_z)]),
+            (v_a, vec![(e0, p_x), (e1, mb)]),
+            (v_b, vec![(e0, p_y), (e1, v_a)]),
+        ] {
+            let ValueDef::Inst(iid) = m.value(pv).unwrap().def else {
+                panic!("phi inst");
+            };
+            m.inst_mut(iid).unwrap().op = Op::Phi { entries };
+        }
+
+        let rf = recover_func(&m, f);
+        let synth_decls: Vec<&str> = rf.blocks[0]
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::PhiDecl { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(synth_decls, vec!["phi"]);
     }
 }

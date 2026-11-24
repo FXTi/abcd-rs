@@ -2737,3 +2737,216 @@ fn s42_scope_fold_restore_no_redeclare() {
 "#;
     assert_eq!(text, want);
 }
+
+fn run_node_eval(js_module_code: &str, expr: &str) -> String {
+    let script = format!("{js_module_code}\nprocess.stdout.write(String({expr}));\n");
+    let out = std::process::Command::new("node")
+        .arg("--input-type=module")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .expect("node must be available to verify runtime semantics");
+    assert!(
+        out.status.success(),
+        "node execution failed:\nstderr: {}\nscript:\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        script
+    );
+    String::from_utf8(out.stdout).expect("utf-8 stdout")
+}
+
+fn wire_phi(
+    m: &mut abcd_ir::Module,
+    phi_val: abcd_ir::ValueId,
+    entries: Vec<(Edge, abcd_ir::ValueId)>,
+) {
+    let abcd_ir::ValueDef::Inst(iid) = m.value(phi_val).unwrap().def else {
+        panic!("expected instruction-defined phi value");
+    };
+    m.inst_mut(iid).unwrap().op = Op::Phi { entries };
+}
+
+/// Regression: `sumDown(n)` where `Phi(v_n)` precedes `Phi(v_acc)` in the
+/// loop header and both `v_acc + v_n` and `v_n - 1` inline into the latch's
+/// parallel `PhiAssign` tail. Topological parallel-copy ordering must emit
+/// `v_acc = v_acc + v_n` BEFORE `v_n = v_n - 1` with zero synthetic temps.
+#[test]
+fn parallel_phi_sum_down() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "sumDown");
+    let b_entry = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p_n = add_param(&mut m, f);
+    let b_hdr = add_block(&mut m, f);
+    let b_latch = add_block(&mut m, f);
+    let b_exit = add_block(&mut m, f);
+
+    let c0 = load_number(&mut m, b_entry, 0.0);
+    emit_void(&mut m, b_entry, Op::Branch { dest: b_hdr });
+
+    // `Phi(v_n)` is intentionally declared BEFORE `Phi(v_acc)`.
+    let v_n = emit(
+        &mut m,
+        b_hdr,
+        Op::Phi {
+            entries: Vec::new(),
+        },
+    );
+    let v_acc = emit(
+        &mut m,
+        b_hdr,
+        Op::Phi {
+            entries: Vec::new(),
+        },
+    );
+    let z = load_number(&mut m, b_hdr, 0.0);
+    let gt = emit(
+        &mut m,
+        b_hdr,
+        Op::Compare {
+            op: CmpOp::Greater,
+            left: z,
+            right: v_n,
+        },
+    );
+    cond_on(&mut m, b_hdr, gt, b_latch, b_exit);
+
+    let acc_next = add(&mut m, b_latch, v_acc, v_n);
+    let one = load_number(&mut m, b_latch, 1.0);
+    let n_dec = emit(
+        &mut m,
+        b_latch,
+        Op::BinaryOp {
+            op: BinOp::Sub,
+            left: one,
+            right: v_n,
+        },
+    );
+    emit_void(&mut m, b_latch, Op::Branch { dest: b_hdr });
+    emit_void(&mut m, b_exit, Op::Return { value: Some(v_acc) });
+
+    let e_init = Edge {
+        from: b_entry,
+        kind: EdgeKind::Normal,
+    };
+    let e_back = Edge {
+        from: b_latch,
+        kind: EdgeKind::Normal,
+    };
+    wire_phi(&mut m, v_n, vec![(e_init, p_n), (e_back, n_dec)]);
+    wire_phi(&mut m, v_acc, vec![(e_init, c0), (e_back, acc_next)]);
+
+    link(&mut m, b_entry, b_hdr);
+    link(&mut m, b_hdr, b_latch);
+    link(&mut m, b_hdr, b_exit);
+    link(&mut m, b_latch, b_hdr);
+
+    let text = decompiled(&m);
+    assert!(
+        !text.contains("var phi"),
+        "acyclic parallel phi must not introduce a cycle-breaking temp:\n{text}"
+    );
+    let acc_pos = text.find("v4 = v4 + v3;").expect("v_acc update present");
+    let dec_pos = text.find("v3 = v3 - 1.0;").expect("v_n decrement present");
+    assert!(
+        acc_pos < dec_pos,
+        "v_acc += v_n must precede v_n -= 1:\n{text}"
+    );
+    assert_eq!(
+        run_node_eval(&text, "[sumDown(3), sumDown(0), sumDown(10)].join(',')"),
+        "6,0,55"
+    );
+}
+
+/// Regression: cyclic parallel `Op::Phi`s (`[a, b] = [b, a + b]` in Fibonacci)
+/// must break the dependency cycle via a fresh `phi` temporary declared at
+/// function entry so `fib(6) === 8`.
+#[test]
+fn parallel_phi_fibonacci_cycle() {
+    let mut m = mk_module();
+    let f = add_func_named(&mut m, "fib");
+    let b_entry = entry_of(&m, f);
+    let _this = add_param(&mut m, f);
+    let p_n = add_param(&mut m, f);
+    let b_hdr = add_block(&mut m, f);
+    let b_latch = add_block(&mut m, f);
+    let b_exit = add_block(&mut m, f);
+
+    let c0 = load_number(&mut m, b_entry, 0.0);
+    let c1 = load_number(&mut m, b_entry, 1.0);
+    emit_void(&mut m, b_entry, Op::Branch { dest: b_hdr });
+
+    let v_a = emit(
+        &mut m,
+        b_hdr,
+        Op::Phi {
+            entries: Vec::new(),
+        },
+    );
+    let v_b = emit(
+        &mut m,
+        b_hdr,
+        Op::Phi {
+            entries: Vec::new(),
+        },
+    );
+    let v_i = emit(
+        &mut m,
+        b_hdr,
+        Op::Phi {
+            entries: Vec::new(),
+        },
+    );
+    let z = load_number(&mut m, b_hdr, 0.0);
+    let gt = emit(
+        &mut m,
+        b_hdr,
+        Op::Compare {
+            op: CmpOp::Greater,
+            left: z,
+            right: v_i,
+        },
+    );
+    cond_on(&mut m, b_hdr, gt, b_latch, b_exit);
+
+    let ab = add(&mut m, b_latch, v_a, v_b);
+    let one = load_number(&mut m, b_latch, 1.0);
+    let i_dec = emit(
+        &mut m,
+        b_latch,
+        Op::BinaryOp {
+            op: BinOp::Sub,
+            left: one,
+            right: v_i,
+        },
+    );
+    emit_void(&mut m, b_latch, Op::Branch { dest: b_hdr });
+    emit_void(&mut m, b_exit, Op::Return { value: Some(v_a) });
+
+    let e_init = Edge {
+        from: b_entry,
+        kind: EdgeKind::Normal,
+    };
+    let e_back = Edge {
+        from: b_latch,
+        kind: EdgeKind::Normal,
+    };
+    wire_phi(&mut m, v_a, vec![(e_init, c0), (e_back, v_b)]);
+    wire_phi(&mut m, v_b, vec![(e_init, c1), (e_back, ab)]);
+    wire_phi(&mut m, v_i, vec![(e_init, p_n), (e_back, i_dec)]);
+
+    link(&mut m, b_entry, b_hdr);
+    link(&mut m, b_hdr, b_latch);
+    link(&mut m, b_hdr, b_exit);
+    link(&mut m, b_latch, b_hdr);
+
+    let text = decompiled(&m);
+    assert!(
+        text.contains("var phi; /* phi */"),
+        "cyclic parallel phi must declare a cycle-breaking temp:\n{text}"
+    );
+    assert_eq!(
+        run_node_eval(&text, "[fib(0), fib(1), fib(6), fib(10)].join(',')"),
+        "0,1,8,55"
+    );
+}
