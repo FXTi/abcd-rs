@@ -866,7 +866,7 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
     let mut loops_desc: Vec<usize> = (0..loops.len())
         .filter(|&i| !builder.loop_bits[i].is_empty())
         .collect();
-    loops_desc.sort_by(|&a, &b| (loop_key(b), b).cmp(&(loop_key(a), a)));
+    loops_desc.sort_by_key(|&a| std::cmp::Reverse((loop_key(a), a)));
 
     let mut edges = Vec::new();
     let rpo_blocks: Vec<BlockId> = builder.dom.rpo().to_vec();
