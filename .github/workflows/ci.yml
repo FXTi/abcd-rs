@@ -338,12 +338,17 @@ jobs:
           if-no-files-found: ignore
 
   coverage:
-    name: Coverage (full estate)
+    name: Coverage (-O${{ matrix.opt_level }} differential benchmark)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [fmt, clippy, doc, deny, vendor-verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        opt_level: ["0", "1", "2", "3"]
     env:
       CXX: clang++-23
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: ${{ matrix.opt_level }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-workspace
@@ -364,24 +369,40 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Collect coverage (full estate incl. the corpus suites)
-        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_gate_full --skip wild_gate_red_proof_es2abc_rejection --skip dream_gate_oracle --skip dream_gate_t262_oracle --skip merge_abc_docker_oracle
-
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          files: lcov.info
-          fail_ci_if_error: false
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      - name: Collect coverage (-O${{ matrix.opt_level }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          T0=$(date +%s)
+          cargo llvm-cov --no-run --workspace --release
+          T1=$(date +%s)
+          cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- \
+            --include-ignored \
+            --skip pandasm_asm \
+            --skip exported_corpus_wild_hap_rewrite_gates \
+            --skip dream_gate_generate \
+            --skip corpus_stage_a_gate \
+            --skip wild_gate_full \
+            --skip wild_gate_red_proof_es2abc_rejection \
+            --skip dream_gate_oracle \
+            --skip dream_gate_t262_oracle \
+            --skip merge_abc_docker_oracle
+          T2=$(date +%s)
+          awk -v opt="${{ matrix.opt_level }}" -v b="$((T1 - T0))" -v r="$((T2 - T1))" -v t="$((T2 - T0))" '
+            /^LF:/ { lf += substr($0, 4) }
+            /^LH:/ { lh += substr($0, 4) }
+            /^FNF:/ { fnf += substr($0, 5) }
+            /^FNH:/ { fnh += substr($0, 5) }
+            END { printf "BENCHMARK -O%s: build=%ss test_and_lcov=%ss total_cov_step=%ss | Lines %d/%d (%.2f%%) | Functions %d/%d (%.2f%%)\n", opt, b, r, t, lh, lf, (lh*100.0)/lf, fnh, fnf, (fnh*100.0)/fnf }
+          ' lcov.info
 
       - name: Upload coverage artifact
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: coverage-report
+          name: coverage-report-O${{ matrix.opt_level }}
           path: lcov.info
-          retention-days: 30
+          retention-days: 7
 
   asan-ubsan:
     name: ASan + UBSan (nightly, FFI/codec + corpus read/write)
