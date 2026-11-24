@@ -72,7 +72,7 @@ Local verification runs natively with **zero Docker / OrbStack dependency**:
 ./scripts/test-local.sh all      # Full L1 + local corpus suites when exports/ is present
 ```
 
-Cross-OS builds (`6` 64-bit + `3` 32-bit targets), nightly Rust/C++ `ASan` / `UBSan` / `TSan` sanitizer gates, `llvm-cov` coverage, and Docker-backed `ark_js_vm` / `es2abc` oracle comparisons run across the **`28`-job CI pipeline** (`.github/workflows/ci.yml`).
+Cross-OS builds (`6` 64-bit + `3` 32-bit targets), nightly Rust/C++ `ASan+UBSan` and `TSan` sanitizer gates, `llvm-cov` coverage, and Docker-backed `ark_js_vm` / `es2abc` oracle comparisons run across the **`27`-job CI pipeline** (`.github/workflows/ci.yml`).
 
 - [**Architecture & Design Index (`design/README.md`)**](design/README.md)
 - [**Engineering Standards (`design/standards.md`)**](design/standards.md) & [**Design Decisions (`design/decisions.md`)**](design/decisions.md)

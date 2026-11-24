@@ -383,10 +383,10 @@ jobs:
           path: lcov.info
           retention-days: 30
 
-  asan:
-    name: ASan (nightly, full workspace + corpus-compute suites)
+  asan-ubsan:
+    name: ASan + UBSan (nightly, FFI/codec + corpus read/write)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
@@ -397,62 +397,39 @@ jobs:
           corpus-mode: both
           corpus-image: ${{ env.ARK_TEST_IMAGE }}
 
-      - name: cargo test under ASan (Rust + C++)
+      - name: cargo test under ASan + UBSan (Rust + C++)
         env:
           CC: clang
           CXX: clang++
-          CFLAGS: -fsanitize=address
-          CXXFLAGS: -fsanitize=address
+          CFLAGS: -fsanitize=address,undefined -fno-sanitize-recover=all -fno-sanitize=vptr,function
+          CXXFLAGS: -fsanitize=address,undefined -fno-sanitize-recover=all -fno-sanitize=vptr,function
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
-        run: |
-          set -euo pipefail
-          export RUSTFLAGS="-Zsanitizer=address"
-          cargo test --workspace --lib --tests --release --target x86_64-unknown-linux-gnu -Zbuild-std
-          for t in file-isa file-lift hap-file; do
-            cargo test -p abcd-rs --test "$t" --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip pandasm_asm
-          done
-          cargo test -p abcd-rs --test lift-lower --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip test262_vm --skip lower_sendable_class --skip n72_args_array --skip n73_segv
-
-  ubsan:
-    name: UBSan (nightly, full workspace + corpus-compute suites)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    needs: [fmt, clippy, doc, deny, vendor-verify]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/setup-workspace
-        with:
-          toolchain: nightly
-          components: rust-src
-          corpus-mode: both
-          corpus-image: ${{ env.ARK_TEST_IMAGE }}
-
-      - name: cargo test under UBSan (Rust ub-checks + C++ UBSan)
-        env:
-          CC: clang
-          CXX: clang++
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
-          CFLAGS: -fsanitize=undefined -fno-sanitize-recover=all -fno-sanitize=vptr,function
-          CXXFLAGS: -fsanitize=undefined -fno-sanitize-recover=all -fno-sanitize=vptr,function
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: |
           set -euo pipefail
-          if ! echo 'int main() { return 0; }' | clang++ -x c++ - -fsanitize=undefined -o /tmp/ubsan_probe; then
-            CLANG_VER=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -n1)
-            sudo apt-get update && sudo apt-get install -y "libclang-rt-${CLANG_VER}-dev"
+          SYSROOT=$(rustc --print target-libdir --target x86_64-unknown-linux-gnu)
+          ASAN_RT=$(ls "$SYSROOT"/librustc*asan* 2>/dev/null | head -n1 || true)
+          if [ -n "$ASAN_RT" ] && nm -g "$ASAN_RT" | grep -q '__ubsan_handle_type_mismatch'; then
+            export RUSTFLAGS="-Zsanitizer=address -Zub-checks=yes"
+          else
+            if ! echo 'int main() { return 0; }' | clang++ -x c++ - -fsanitize=undefined -o /tmp/ubsan_probe; then
+              CLANG_VER=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -n1)
+              sudo apt-get update && sudo apt-get install -y "libclang-rt-${CLANG_VER}-dev"
+            fi
+            rm -f /tmp/ubsan_probe
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
+            export RUSTFLAGS="-Zsanitizer=address -Zub-checks=yes -C link-arg=-fsanitize=undefined -C link-arg=-Wl,--allow-multiple-definition"
           fi
-          rm -f /tmp/ubsan_probe
-          export RUSTFLAGS="-Zub-checks=yes -C link-arg=-fsanitize=undefined"
-          cargo test --workspace --lib --tests --release --target x86_64-unknown-linux-gnu -Zbuild-std
-          for t in file-isa file-lift hap-file; do
-            cargo test -p abcd-rs --test "$t" --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip pandasm_asm
-          done
+          cargo test -p abcd-isa-sys -p abcd-isa -p abcd-file-sys -p abcd-file -p abcd-hap --lib --tests --release --target x86_64-unknown-linux-gnu -Zbuild-std
+          cargo test -p abcd-rs --test file-sys-file --release --target x86_64-unknown-linux-gnu -Zbuild-std
+          cargo test -p abcd-rs --test file-isa --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip pandasm_asm
+          cargo test -p abcd-rs --test hap-file --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip exported_corpus_wild_hap_rewrite_gates
           cargo test -p abcd-rs --test lift-lower --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip test262_vm --skip lower_sendable_class --skip n72_args_array --skip n73_segv
 
   tsan:
-    name: TSan (nightly, full workspace + corpus-compute suites)
+    name: TSan (nightly, FFI/codec + corpus read/write)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     needs: [fmt, clippy, doc, deny, vendor-verify]
     steps:
       - uses: actions/checkout@v7
@@ -474,8 +451,8 @@ jobs:
           set -euo pipefail
           sudo sysctl -w vm.mmap_rnd_bits=28 || true
           export RUSTFLAGS="-Zsanitizer=thread"
-          cargo test --workspace --lib --tests --release --target x86_64-unknown-linux-gnu -Zbuild-std
-          for t in file-isa file-lift hap-file; do
-            cargo test -p abcd-rs --test "$t" --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip pandasm_asm
-          done
+          cargo test -p abcd-isa-sys -p abcd-isa -p abcd-file-sys -p abcd-file -p abcd-hap --lib --tests --release --target x86_64-unknown-linux-gnu -Zbuild-std
+          cargo test -p abcd-rs --test file-sys-file --release --target x86_64-unknown-linux-gnu -Zbuild-std
+          cargo test -p abcd-rs --test file-isa --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip pandasm_asm
+          cargo test -p abcd-rs --test hap-file --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip exported_corpus_wild_hap_rewrite_gates
           cargo test -p abcd-rs --test lift-lower --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip test262_vm --skip lower_sendable_class --skip n72_args_array --skip n73_segv

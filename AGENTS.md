@@ -47,7 +47,7 @@ For binding architectural rules and historical design rulings, read:
 
 ## 4. Local Verification & CI Policy
 
-- **Absolute Ban on Local Docker / OrbStack**: Never invoke `docker` or `orbctl` on the local developer machine. Cross-OS builds, 32-bit targets, `ASan` / `UBSan` / `TSan` sanitizers, coverage, and Docker-backed `ark_js_vm` / `es2abc` oracle comparisons run exclusively on GitHub Actions CI (`28` jobs).
+- **Absolute Ban on Local Docker / OrbStack**: Never invoke `docker` or `orbctl` on the local developer machine. Cross-OS builds, 32-bit targets, `ASan` / `UBSan` / `TSan` sanitizers, coverage, and Docker-backed `ark_js_vm` / `es2abc` oracle comparisons run exclusively on GitHub Actions CI (`27` jobs).
 - **Standard Local Gate Runner**:
   ```sh
   ./scripts/test-local.sh quick    # fmt + clippy + fast unit tests (<5s incremental)

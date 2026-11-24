@@ -1,6 +1,6 @@
 # Continuous Integration & Verification Architecture
 
-`abcd-rs` combines fast, zero-container local verification (`scripts/test-local.sh`) with a **`28`-job GitHub Actions CI pipeline** (`.github/workflows/ci.yml`) covering cross-platform compatibility, full-surface memory/UB/concurrency sanitizers, code coverage, and full-corpus `ark_js_vm` / `es2abc` behavioral oracles.
+`abcd-rs` combines fast, zero-container local verification (`scripts/test-local.sh`) with a **`27`-job GitHub Actions CI pipeline** (`.github/workflows/ci.yml`) covering cross-platform compatibility, FFI/codec memory/UB/concurrency sanitizers, code coverage, and full-corpus `ark_js_vm` / `es2abc` behavioral oracles.
 
 ---
 
@@ -17,7 +17,7 @@ Local development **never** requires or invokes Docker / OrbStack:
 
 ---
 
-## 2. The `28`-Job GitHub Actions Pipeline
+## 2. The `27`-Job GitHub Actions Pipeline
 
 ### Tier 1 — Fast Static Front Gates (`5` jobs)
 1. **`fmt`**: `cargo fmt --all -- --check`
@@ -41,8 +41,8 @@ Driven by the digest-pinned `ghcr.io/fxti/arkcompiler-test` image (`5,517` compi
 - **`lift-analysis` & `lift-taint`**: Dominator agreement, Rung-2 PTA call-graph determinism, compiled ground-truth taint probes, and OHOS taint probes.
 - **`lift-decompile` & `test262-dream`**: `1,149/1,149` corpus dream gate + Node async/generator/yield* runtime gates, and `2,676/2,685` `test262` `decompile → es2abc → ark_js_vm` dream gate.
 
-### Tier 4 — Full-Surface Sanitizers & Coverage (`4` jobs)
-- **`asan` / `ubsan` / `tsan`**: Three symmetric nightly Clang + Rust `-Zbuild-std` sanitizer gates (**AddressSanitizer**, **UndefinedBehaviorSanitizer** + `-Zub-checks=yes`, and **ThreadSanitizer**) instrumenting and executing **the exact same workspace + corpus-compute code surface** (`cargo test --workspace --lib --tests` + `file-isa`, `file-lift`, `hap-file`, `lift-lower`—zero stack-size workarounds).
+### Tier 4 — Sanitizers & Coverage (`3` jobs)
+- **`asan-ubsan` & `tsan`**: Two symmetric nightly Clang + Rust `-Zbuild-std` sanitizer gates—**`ASan + UBSan`** combined (`-Zsanitizer=address -Zub-checks=yes` + `-fsanitize=address,undefined`) and **`TSan`** (`-Zsanitizer=thread` + `-fsanitize=thread`)—executing **the exact same FFI/codec/container & Rayon read/write surface** (`abcd-isa-sys`, `abcd-isa`, `abcd-file-sys`, `abcd-file`, `abcd-hap`, `file-sys-file`, `file-isa`, `hap-file` decode gate, and `lift-lower` rewrite gate; zero stack-size workarounds).
 - **`coverage`**: `cargo llvm-cov` workspace + C++ bridge instrumentation (`clang++-23`).
 
 ---
