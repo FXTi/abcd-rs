@@ -823,12 +823,12 @@ impl<'m> TaintProblem<'m> {
                             return true;
                         }
                     }
-                    Op::Call { args, .. } if !self.call_has_body_callee(iid) => {
-                        if call_base_value(self.module, inst).is_some_and(has_site)
-                            || args.iter().copied().any(has_site)
-                        {
-                            return true;
-                        }
+                    Op::Call { args, .. }
+                        if !self.call_has_body_callee(iid)
+                            && (call_base_value(self.module, inst).is_some_and(has_site)
+                                || args.iter().copied().any(has_site)) =>
+                    {
+                        return true;
                     }
                     _ => {}
                 }
@@ -1049,10 +1049,10 @@ impl<'m> TaintProblem<'m> {
                     return false;
                 }
             }
-            TaintBase::LexVar(_, _) if self.module.functions.len() > 512 => {
-                if !self.can_callee_read_lex_var(callee) {
-                    return false;
-                }
+            TaintBase::LexVar(_, _)
+                if self.module.functions.len() > 512 && !self.can_callee_read_lex_var(callee) =>
+            {
+                return false;
             }
             TaintBase::Heap(sites) if !sites.is_empty() && self.module.functions.len() > 512 => {
                 if !sites
