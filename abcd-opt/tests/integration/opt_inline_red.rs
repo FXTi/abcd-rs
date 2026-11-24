@@ -1,10 +1,9 @@
-//! N44 red-first evidence (D2 inline rewrite, v2-P3b): the v0.1 inline
-//! pass was quarantined because it produced module-INVALID IR —
-//! parameters unmapped, call-site predecessors not rebuilt, try regions
-//! lost. Before the real v0.2 rewrite landed, this test demonstrated
-//! that a naive inliner with exactly those defect shapes produces
-//! verifier errors on the v0.2 IR (`abcd_ir::Module`), proving the
-//! probe shapes below discriminate valid from invalid inline output.
+//! N44 red-first evidence (`design/decisions.md` `D2`/`N44`): a naive inline
+//! splice produces module-INVALID IR when callee parameters are left unmapped,
+//! call-site predecessors are not rebuilt, or try regions are lost. This test
+//! demonstrates that a naive inliner with those three defect shapes triggers
+//! verifier errors on `abcd_ir::Module`, proving the probe shapes below
+//! discriminate valid from invalid inline output.
 //!
 //! The deliberate defects of [`naive_inline`] (each one an N44 defect):
 //!

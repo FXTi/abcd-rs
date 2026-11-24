@@ -1,4 +1,4 @@
-//! The taint problem's alias-oracle switch (analysis-strategy §5.2, §4.4):
+//! The taint problem's alias-oracle switch (`design/analysis.md`):
 //! rung 0 ([`Rung0AliasOracle`], the trivial baseline), rung 1
 //! ([`Rung1AliasOracle`], the demand-driven backward points-to engine),
 //! or rung 2 ([`Rung2AliasOracle`], the whole-module context-sensitive
@@ -13,8 +13,8 @@
 //!   the engine can only ever make keying *more* precise, never less
 //!   sound; see `abcd_analysis::dataflow::alias` module docs). Rung 2:
 //!   the PTA's fixed-point answer under the same completeness rule.
-//! - [`Oracle::aliases_of_store`] — the client-side `computeAliases`
-//!   analogue (soot-infoflow.md §4.2): a taint written to the heap at a
+//! - [`Oracle::aliases_of_store`] — client-side store-base alias
+//!   resolution: a taint written to the heap at a
 //!   store is re-keyed by the REFINED sites of the store's base. This
 //!   lives here and not inside the trait impl because re-keying needs
 //!   the fact algebra (`TaintFact`), which the `F`-generic
@@ -69,8 +69,8 @@ impl<'m> Oracle<'m> {
         }
     }
 
-    /// The MAY-direction site query (t-P4; the
-    /// `CallGraph::refine_with_points_to` consumer discipline): the
+    /// The MAY-direction site query (`CallGraph::refine_with_points_to`
+    /// consumer discipline): the
     /// refined arms return the engine's answer when it is complete
     /// modulo the recorded call graph (`complete_for_resolution` —
     /// may-direction consumers accept what negative decisions must
@@ -116,13 +116,12 @@ impl<'m> Oracle<'m> {
             Oracle::Rung2(o) => o.is_env_site(site),
             // unreachable: the only caller (problem.rs GetLexVar fallback)
             // is guarded by lex_env_at(...) -> Some, which fires only on
-            // Oracle::Rung2, so `self` here always dispatches above —
-            // c-COV diagnosis
+            // Oracle::Rung2, so `self` here always dispatches above.
             _ => false,
         }
     }
 
-    /// The computeAliases analogue: a taint on the store's VALUE, written
+    /// Store-base alias re-keying: a taint on the store's VALUE, written
     /// through `object.key` at `store`. The refined arms return the taint
     /// re-keyed by the REFINED site set of `object` when the engine's
     /// answer is precise; the caller skips its baseline (rung-0) re-key
@@ -154,9 +153,9 @@ impl<'m> Oracle<'m> {
     }
 }
 
-/// Delegate the §5.2 seam so the problem's call sites stay
-/// oracle-agnostic (the refined engines' docs apply; rung 0 is the
-/// baseline behavior). Only the calling-context channel survives: the
+/// Delegate the `AliasOracle` seam (`design/analysis.md`) so the problem's
+/// call sites stay oracle-agnostic (the refined engines' docs apply; rung 0
+/// is the baseline behavior). Only the calling-context channel survives: the
 /// may/must-alias tri-state, the store-alias trigger, the requery probe,
 /// and the points-to delegates had no consumer and were deleted as dead
 /// surface.

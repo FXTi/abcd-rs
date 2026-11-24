@@ -8,8 +8,7 @@
 //!   exception edges are first-class (T5);
 //! - frame-initial values are CONSTANTS
 //!   ([`ValueDef::Const`](abcd_ir::ValueDef)) — no seeding
-//!   instructions; the v0.1 entry-block `LiteralUndefined`/`LiteralHole`
-//!   materialization stays a v0.1 detail (design/ir-v0.2.md §5.1). One
+//!   instructions (`design/ir.md` §1–§3, `design/decisions.md` ADR-04). One
 //!   shared `Const::Undefined` for vregs, one shared `Const::Hole` for
 //!   the accumulator (vendor: `CALL_PUSH_UNDEFINED(numVregs)` +
 //!   `state->acc = JSTaggedValue::Hole()` at frame creation —

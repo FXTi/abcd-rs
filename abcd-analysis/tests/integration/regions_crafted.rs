@@ -1,5 +1,5 @@
-//! Crafted-CFG region-structuring arm coverage (c-COV W10): the bail
-//! and demote arms the corpus never produces — root multi-entry escape,
+//! Crafted-CFG region-structuring arm coverage: the bail
+//! and demote arms — root multi-entry escape,
 //! then/else handler-rejoin demotions, shared-tail plan success and
 //! each reachable bail, cross-arm edges, the loop-exit absorption and
 //! infinite-loop kind fallback, the `RegionError` reporting arms, and

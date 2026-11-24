@@ -767,20 +767,19 @@ pub const JSON_FILE_CONTENT_FIELD: &str = "jsonFileContent";
 /// `MODULE_REQUEST_PAHSE_IDX`).
 pub const MODULE_REQUEST_PHASE_FIELD: &str = "moduleRequestPhaseIdx";
 
-/// Name of the field whose value is a NESTED file offset — it points to a
-/// literal array whose elements are themselves offsets of the type literal
-/// arrays (arkcompiler_runtime_core docs/changelogs/2022-08-18-isa-changelog.md
-/// item 5; name from vendored libpandabase/utils/const_value.h:25
-/// `TYPE_SUMMARY_FIELD_NAME`). No runtime consumer
-/// (`TYPE_SUMMARY_OFFSET_NOT_FOUND` is a dead constant) and the
-/// disassembler excludes the offset from its literal classification
-/// (disassembler.cpp:1015), but the 2026-09-20 "no producer" assumption
-/// was WILD-DISPROVED: 4.x–5.x-era es2abc emits the field on
-/// AbilityStage/Application records (219/512 wild OpenHarmony haps).
-/// Decode reads the value as a fact and models it as
-/// [`FieldValue::TypeSummaryOffset`]; ENCODE is the hard error (N8
-/// revised): the nested indirection cannot be relocated, so a rewrite must
-/// never silently emit the stale offset.
+/// Name of the field whose non-zero value is the file offset of a tagged
+/// `LiteralArray` whose elements include nested `LiteralTag::LITERALARRAY`
+/// (`0x18`) references to per-type literal arrays (`arkcompiler_runtime_core`
+/// 2022-08-18 ISA changelog item 5; `TYPE_SUMMARY_FIELD_NAME` in vendored
+/// `libpandabase/utils/const_value.h`). OpenHarmony 4.x–5.x `es2abc` emits
+/// the field on AbilityStage/Application and module records.
+///
+/// A zero wire value (`TYPE_SUMMARY_OFFSET_NOT_FOUND`) decodes as
+/// [`FieldValue::I32`]`(0)`; a non-zero offset is validated as a well-formed
+/// tagged literal array, seeded into `scope_names_offsets` so both the
+/// summary array and its transitively nested type arrays enter
+/// [`File::literal_arrays`], and modeled as [`FieldValue::LiteralArrayRef`]
+/// for full relocation on `encode`.
 pub const TYPE_SUMMARY_OFFSET_FIELD: &str = "typeSummaryOffset";
 
 /// Decode a module-record blob through the vendored ModuleDataAccessor.
@@ -1038,23 +1037,38 @@ fn decode_field_at(
     //   collect the offset for literal-array decoding (13.x+ has no header
     //   table entry for it).
     let initial_value = match (class_descriptor, type_id, initial_value) {
-        // N8 (revised after the wild-OHOS sweep): a valued u32 field named
-        // `typeSummaryOffset` (any class — wild es2abc 4.x–5.x hangs it on
-        // AbilityStage/Application records) carries a nested file offset;
-        // model it opaquely as FieldValue::TypeSummaryOffset — see
-        // TYPE_SUMMARY_OFFSET_FIELD. This arm must come FIRST: upstream
-        // also attaches the field to the module record itself, so the
-        // `_ESModuleRecord` catch-all u32 arm below would otherwise win
-        // and mis-route the nested offset into the module-data blob
-        // decoder. A valueless field of this name carries no offset (nothing
-        // can dangle) and falls through to the scalar default as None.
+        // A valued u32 field named `typeSummaryOffset` (any class — wild es2abc
+        // 4.x–5.x hangs it on AbilityStage/Application and module records)
+        // carries either `0` (`TYPE_SUMMARY_OFFSET_NOT_FOUND` sentinel) or the
+        // offset of a tagged summary literal array whose `0x18` entries point
+        // at per-type literal arrays. This arm must come FIRST so the
+        // `_ESModuleRecord` catch-all u32 arm below never mis-routes it into
+        // the untagged module-data blob decoder.
         (_, TypeId::U32, Some(FieldValue::I32(off)))
             if strings.resolve(name) == Some(TYPE_SUMMARY_OFFSET_FIELD) =>
         {
             // Bit-cast, not try_from: the wire value is a u32 and the
             // bridge ABI reads it through an i32 out-param, so offsets
             // above 0x7fff_ffff arrive negative — preserve the bits.
-            Some(FieldValue::TypeSummaryOffset(off as u32))
+            let offset = off as u32;
+            if offset == 0 {
+                Some(FieldValue::I32(0))
+            } else {
+                if entity_map.contains_key(&offset)
+                    || unsafe {
+                        sys::abc_literal_enumerate_vals_checked(
+                            f,
+                            offset,
+                            None,
+                            std::ptr::null_mut(),
+                        )
+                    } != 0
+                {
+                    return Err(Error::InvalidOffset(offset));
+                }
+                scope_names_offsets.insert(offset);
+                Some(FieldValue::LiteralArrayRef(offset))
+            }
         }
         // `moduleRequestPhaseIdx` u32 fields (any class — merge-abc emits
         // them on the module's own record) reference untagged
@@ -1943,23 +1957,13 @@ fn decode_annotation_array_elements(
         .collect()
 }
 
-/// Decode a single literal array at the given entity offset.
+/// Decode a single literal array at the given entity offset, strictly
+/// validating that `offset` points at a well-formed tagged literal array.
 fn decode_literal_array_at(
     f: *const sys::AbcFileHandle,
     offset: u32,
     strings: &mut StringPool,
 ) -> Result<Vec<crate::LiteralValue>, Error> {
-    // We need a valid literal accessor handle for the panda_file reference.
-    // The EnumerateLiteralVals overload reads from the given offset directly.
-    // Loud-error convention: a null accessor means `offset` does not point at
-    // a valid literal array (malformed input), never a silent empty array —
-    // same treatment as the module-data accessor (decode_module_data_at).
-    let lr = unsafe { sys::abc_literal_open(f, offset) };
-    if lr.is_null() {
-        return Err(Error::InvalidOffset(offset));
-    }
-    let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
-
     // N72: annotation-embedded literal arrays are compile-time metadata;
     // their strings intern plain (no raw-bytes capture — NULL side
     // table), exactly the pre-N72 behavior on this path.
@@ -1968,13 +1972,16 @@ fn decode_literal_array_at(
         strings: strings as *mut StringPool,
         values: Vec::new(),
     };
-    unsafe {
-        sys::abc_literal_enumerate_vals(
-            lr,
+    let rc = unsafe {
+        sys::abc_literal_enumerate_vals_checked(
+            f,
             offset,
             Some(crate::literal::collect_literal_val_cb),
             &mut ctx as *mut crate::literal::LiteralCollectCtx as *mut c_void,
-        );
+        )
+    };
+    if rc != 0 {
+        return Err(Error::InvalidOffset(offset));
     }
     Ok(ctx.values)
 }

@@ -392,22 +392,22 @@ pub fn recover_func_with_index(
 }
 
 /// The decompilation kind of a function: the file-metadata kind,
-/// upgraded on definitive BODY evidence (Bug A, wild smoke).
+/// upgraded on definitive BODY evidence (design/decompile.md §5).
 ///
 /// OHOS 3.2-era files (format 9.0.0.0) do not tag async functions in
 /// the method metadata — an async method reads `FunctionKind::Function`
 /// while its body carries the full es2abc async machinery
 /// (`AsyncFunctionEnter` + the per-await suspend/resume plumbing).
-/// Trusting the metadata emitted `await` into a non-async body (an
-/// unparseable text; 146/242 wild modules rejected by the es2abc
-/// recompile channel — design/archive/wild-smoke-report.md). es2abc emits
+/// Trusting the metadata emitted `await` into a non-async body (a JS
+/// syntax error rejected by the `es2abc` recompile gate on wild OHOS 3.2
+/// packages — design/decompile.md). es2abc emits
 /// `AsyncFunctionEnter` ONLY for async functions (es2panda
 /// `asyncFunctionBuilder.cpp` `Prepare`), so its presence is decisive:
 /// a metadata-plain function carrying the entry op IS async. The
 /// upgrade restores the source truth (the `async` keyword) and
-/// unblocks the kind-gated R4 async folds. Generator kinds are never
+/// unblocks the kind-gated async folds. Generator kinds are never
 /// rewritten (the async-generator entry protocol carries NO
-/// `AsyncFunctionEnter` — d-P14); a missing body keeps the metadata.
+/// `AsyncFunctionEnter`); a missing body keeps the metadata.
 pub fn effective_kind(module: &Module, func: FuncId) -> FunctionKind {
     let Some(f) = module.func(func) else {
         return FunctionKind::Function;

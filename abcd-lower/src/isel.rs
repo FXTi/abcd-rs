@@ -1,27 +1,23 @@
 //! Instruction selection: IR instructions → ArkCompiler bytecodes
-//! (port of v0.1 `abcd_ir::lower::isel` onto the v0.2 IR).
+//! (`design/ir.md` §5, `design/decisions.md` `ADR-03`, `ADR-06`, `ADR-07`).
 //!
 //! Takes an IR function with register allocation results and produces
-//! a sequence of ArkCompiler bytecodes per basic block.
+//! a sequence of ArkCompiler bytecodes per basic block:
 //!
-//! v0.2 adaptations:
-//!
-//! - Entity operands are IR identities, never file offsets (the reverse
-//!   mapping lives in `method_body`): strings ride as the raw [`Sym`]
-//!   index, method references as the module function-table index
-//!   ([`FuncId`]), literal shapes as the [`ConstId`].
-//! - The lift's expansion mappings (compare.rs rule 3) fold back via
-//!   [`Suppression`]: `DefineFunc`+`AllocClosure` → definefunc,
-//!   +`DefineMethod` → definemethod, `LoadConst`+`LoadPropIdx` →
-//!   ldobjbyindex, `LoadConst(undefined)`+`TryGetGlobal` →
-//!   tryldglobalbyname.
-//! - Frame-initial values are [`ValueDef::Const`] constants; like v0.1's
-//!   entry-top seed literals they are materialized at the entry block
-//!   top (later-created first — v0.1 inserted each seed at index 0).
-//! - v0.1's `BinOp` splits into [`Op::BinaryOp`]/[`Op::Compare`]; comparisons
-//!   always emit unfused (`eq`/`noteq`/`stricteq`/`strictnoteq`/…) followed by
-//!   `jnez` at the branch, never the dead fused compare-and-branch family
-//!   (ruling 2026-10-04).
+//! - Entity operands are emitted as module-scoped IR identities (never file
+//!   offsets — reverse resolution and per-method `u16` compaction live in
+//!   `method_body`): strings ride as the raw [`Sym`] index, method references
+//!   as the module function-table index ([`FuncId`]), literal shapes as the
+//!   [`ConstId`].
+//! - Expansion chains fold back via [`Suppression`]: `DefineFunc`+`AllocClosure`
+//!   → `definefunc`, +`DefineMethod` → `definemethod`, `LoadConst`+`LoadPropIdx`
+//!   → `ldobjbyindex`, `LoadConst(undefined)`+`TryGetGlobal` →
+//!   `tryldglobalbyname`.
+//! - Frame-initial values ([`ValueDef::Const`]) are materialized at the entry
+//!   block top in reverse creation order.
+//! - Comparisons ([`Op::Compare`]) always emit unfused (`eq`/`noteq`/`stricteq`/
+//!   `strictnoteq`/…) followed by `jnez` at the branch, never the dead fused
+//!   compare-and-branch family (`ADR-07`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -40,17 +36,16 @@ use crate::regalloc::{self, RegAlloc, RegSlot};
 pub struct IselResult {
     /// Bytecodes per block (in RPO order).
     pub block_codes: Vec<(BlockId, Vec<Bytecode>)>,
-    /// Audit trail of every emitted entity operand, keyed by (entity
-    /// kind, raw operand value). v0.2 operands are IR entities by
-    /// construction (always [`EntityTrace::Traced`]); the v0.1
-    /// `Untraced` case (identity fallback for a source-less hand-built
-    /// module) has no v0.2 equivalent — traceability is decided wholly
-    /// by the reverse resolution in `method_body::to_method_body`.
+    /// Audit trail of every emitted entity operand, keyed by `(entity kind,
+    /// raw IR operand value)`. Emitted operands are IR identities by
+    /// construction (always [`EntityTrace::Traced`]); source-file traceability
+    /// is verified during relocation in `method_body::to_method_body`.
     pub entity_traces: HashMap<(EntityKind, u32), EntityTrace>,
     /// Total number of IC slots allocated for this function.
     pub ic_size: u32,
-    /// First unsupported-instruction message (v0.1 parity field; v0.2
-    /// reports unsupported shapes through `Result` hard errors instead).
+    /// Optional unsupported-instruction message (retained for diagnostic
+    /// compatibility; `select_inst` returns `Result::Err` directly on
+    /// unsupported shapes).
     pub unsupported: Option<String>,
 }
 
@@ -58,10 +53,9 @@ pub struct IselResult {
 /// entity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntityTrace {
-    /// The operand value traces to a source-file entity.
+    /// The operand value traces to an IR entity.
     Traced,
-    /// At least one use of this operand value could not be traced
-    /// (v0.1 legacy; unused in v0.2).
+    /// At least one use of this operand value could not be traced.
     Untraced,
 }
 
@@ -479,14 +473,9 @@ pub fn select_with_options(
         .flat_map(|region| region.catches.iter().map(|c| c.handler))
         .collect();
 
-    // Frame-initial constants owned by this function (v0.1's entry-top
-    // seed literals), materialized at the entry block top, LATER-CREATED
-    // FIRST — v0.1 inserted each new seed at entry index 0, so the entry
-    // block began with the seeds in reverse creation order. The set is
-    // option-gated (`LowerOptions::prune_unused_frame_init_consts` — see
-    // `frame_init_consts`): lift parity keeps unused seeds' loads (v0.1
-    // emits the seed's load unconditionally, only the `Sta` use-gated);
-    // opt parity drops seeds whose last use the optimizer deleted.
+    // Frame-initial constants owned by this function (`FunctionData::frame_init_consts`,
+    // swept of dead entries by ADCE when `abcd-opt` runs), materialized at the
+    // entry block top in reverse creation order (descending `ValueId`).
     let mut entry_consts = regalloc::frame_init_consts(module, func_id);
     entry_consts.sort_unstable_by(|a, b| b.cmp(a)); // descending id = reverse creation
 
@@ -586,13 +575,10 @@ pub fn select_with_options(
             }
         }
 
-        // Frame-initial constants (v0.1's entry-top seed literals), at the
-        // head of the entry block's instruction stream — after the pinned
-        // stores, exactly where v0.1's seed instructions sat. The load is
-        // unconditional for every seed in `entry_consts` (the option gate
-        // — see `frame_init_consts` — decides which seeds are in the set;
-        // the homing `Sta` is use-gated, and an unused seed's acc write
-        // leaves the tracker `Unknown`, v0.1's `home_result` semantics).
+        // Frame-initial constants at the head of the entry block's instruction
+        // stream — after the block-start pinned stores. The constant load is
+        // emitted for every seed in `entry_consts`; the homing `Sta` is
+        // use-gated, and an unused seed's acc write leaves the tracker `Unknown`.
         if bb == entry_block {
             for &cval in &entry_consts {
                 let Some(ValueDef::Const(cid)) = module.value(cval).map(|v| v.def) else {
@@ -608,8 +594,8 @@ pub fn select_with_options(
                     tracker = AccContent::Unknown;
                 }
                 // N21 after-def pinned stores keyed by this const value:
-                // the materialization is its definition site (v0.1's seed
-                // instruction — the store runs right after its `Sta`).
+                // the materialization is its definition site, so the store runs
+                // right after its `Sta`.
                 if let Some(stores) = after_def_stores.get(&cval) {
                     for &(_, dst) in stores {
                         let d = home_of(func_id, dst, alloc)?;
@@ -885,14 +871,12 @@ fn home_result(
 /// The bytecode that materializes a constant into the accumulator (shared
 /// by [`Op::LoadConst`] and the entry-top frame-initial materialization).
 ///
-/// v0.1 mapping, inverted: Undefined → ldundefined, Hole → ldhole, Null →
-/// ldnull, Bool → ldtrue/ldfalse, canonical-NaN bits → ldnan (the lift
-/// pools `Ldnan` as `Const::number(f64::NAN)`), +∞ bits → ldinfinity (the
-/// lift pools `Ldinfinity` likewise), other numbers → v0.1's
-/// `LiteralNumber` rule (integral, negative-zero excluded → `ldai`; else
-/// `fldai` on raw bits, N37), String → lda.str, BigInt → ldbigint. A bare
-/// shape constant (literal tree / method ref) has no materialization —
-/// shapes only flow through their dedicated ops.
+/// Constant mapping: `Undefined` → `ldundefined`, `Hole` → `ldhole`, `Null` →
+/// `ldnull`, `Bool` → `ldtrue`/`ldfalse`, canonical-NaN bits → `ldnan`, `+∞`
+/// bits → `ldinfinity`, other numbers → integral (`-0.0` excluded, `N37`) via
+/// `ldai` or raw IEEE-754 bits via `fldai`, `String` → `lda.str`, `BigInt` →
+/// `ldbigint`. A bare shape constant (literal tree / method ref) has no scalar
+/// materialization — shapes only flow through their dedicated ops.
 fn const_load_bytecode(
     module: &Module,
     cid: ConstId,
@@ -943,10 +927,9 @@ fn const_load_bytecode(
     })
 }
 
-/// Recover the by-index immediate of a fused `LoadPropIdx`/`StorePropIdx`:
-/// the value of the suppressed adjacent `LoadConst(number)`, as the
-/// vendor's i64 imm truncated to u32 exactly the way v0.1's lift truncated
-/// it (`index.0 as u32`).
+/// Recover the by-index immediate of a fused `LoadPropIdx`/`StorePropIdx`/
+/// `StoreOwnPropIdx`: the value of the suppressed adjacent `LoadConst(number)`,
+/// truncated from the vendor's `i64` immediate to `u32`.
 fn fused_index_imm(module: &Module, index: ValueId, suppression: &Suppression) -> Option<Imm> {
     if !suppression.values.contains(&index) {
         return None;
@@ -1084,8 +1067,8 @@ fn select_inst(
         }
         Op::Mov { src } => {
             // Pure register copy: no accumulator involvement (vendor
-            // `mov` is `acc: none`). Never produced by the lift (v0.1
-            // has no Mov either); lowered for robustness.
+            // `mov` is `acc: none`). Never produced by `abcd-lift`, but
+            // lowered for IR completeness.
             if let Some(v) = result
                 && used.contains(&v)
             {
@@ -1151,12 +1134,12 @@ fn select_inst(
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
         Op::AllocClosure { func } => {
-            // Fusion (compare.rs rule 3): an adjacent single-use
-            // `DefineFunc` is suppressed; emit vendor definefunc (the
-            // closure-creation bytecode) and home the CLOSURE's value.
-            // Non-fused shapes never come from the lift: a bare
-            // `DefineFunc` (result used elsewhere) already materialized
-            // the function object, so the closure is a register copy.
+            // Fusion (`fusion.rs`): an adjacent single-use `DefineFunc` is
+            // suppressed; emit vendor `definefunc` (the closure-creation
+            // bytecode) and home the CLOSURE's value. Non-fused shapes never
+            // come from `abcd-lift`: a standalone `DefineFunc` (result used
+            // elsewhere) already materialized the function object, so the
+            // closure is a register copy.
             if suppression.values.contains(func) {
                 // Fused: the DefineFunc was suppressed — emit definefunc.
                 let Some(ValueDef::Inst(fiid)) = module.value(*func).map(|v| v.def) else {
@@ -1244,10 +1227,8 @@ fn select_inst(
             name,
             value,
         } => {
-            // (N59 transitional state: own-store sources — stownbyname,
-            // definefieldbyname, definepropertybyname — also lift here;
-            // a reported IR gap. P2c's `Op::StoreOwnPropName` takes that
-            // arm.)
+            // Normal property store (`stobjbyname`, invoking prototype setters);
+            // own-property definition uses `Op::StoreOwnPropName` (`N60`).
             let regs =
                 materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
             codes.push(Bytecode::Stobjbyname(ic.two(), tracer.eid(*name), regs[0]));
@@ -1308,15 +1289,15 @@ fn select_inst(
             name,
             value,
         } => {
-            // Own-property DEFINITION (N60; v0.1 `StoreOwnProperty`):
-            // vendor stownbyname — no setters, no prototype walk.
+            // Own-property DEFINITION (`N60`): vendor `stownbyname` — no
+            // setters, no prototype walk.
             let regs =
                 materialize_operands(tracker, func_id, &[*object], Some(*value), alloc, codes)?;
             codes.push(Bytecode::Stownbyname(ic.two(), tracer.eid(*name), regs[0]));
         }
         Op::StoreOwnPropDyn { object, key, value } => {
-            // Vendor stownbyvalue (v0.1 `StoreOwnProperty` ByValue):
-            // v1 = receiver, v2 = propKey, acc = VALUE.
+            // Vendor `stownbyvalue` (`N60`): v1 = receiver, v2 = propKey,
+            // acc = VALUE.
             let regs = materialize_operands(
                 tracker,
                 func_id,
@@ -1565,8 +1546,8 @@ fn select_inst(
             });
         }
         Op::TryStoreGlobal { name, value } => {
-            // The tolerant store (N61; v0.1 `TryStoreGlobalByName`):
-            // acc := value, then trystglobalbyname with ONE IC slot.
+            // The tolerant store (`N61`): acc := value, then `trystglobalbyname`
+            // with ONE IC slot.
             ensure_acc(tracker, func_id, *value, alloc, codes)?;
             codes.push(Bytecode::Trystglobalbyname(ic.one(), tracer.eid(*name)));
         }
@@ -1711,10 +1692,9 @@ fn select_inst(
             length,
             ..
         } => {
-            // Fusion: the DefineFunc+AllocClosure chain is suppressed;
-            // emit vendor definemethod (define + bind in one), like
-            // v0.1's DefineMethod arm. The method's entity identity is
-            // the DefineFunc body's function-table index.
+            // Fusion: the `DefineFunc` + `AllocClosure` chain is suppressed;
+            // emit vendor `definemethod` (define + bind in one). The method's
+            // entity identity is the `DefineFunc` body's function-table index.
             let Some(body) = fused_definefunc_body(module, *func, suppression) else {
                 return Err(LowerError::UnsupportedInstruction {
                     func: func_id,
@@ -1770,9 +1750,8 @@ fn select_inst(
         } => {
             // N53: re-emit the SENDABLE opcode
             // (`callruntime.definesendableclass`, isa.yaml:861-866 —
-            // vendor SlowRuntimeStub::CreateSharedClass), NEVER the
-            // contemporary defineclasswithbuffer. v0.1's fold corrupted
-            // the opcode identity.
+            // vendor `SlowRuntimeStub::CreateSharedClass`), NEVER the
+            // ordinary `defineclasswithbuffer`.
             let Some(base) = heritage else {
                 return Err(LowerError::UnsupportedInstruction {
                     func: func_id,
@@ -1883,7 +1862,7 @@ fn select_inst(
             });
         }
         Op::IteratorReturn { iterator } => {
-            // v0.1's CloseIterator → closeiterator.
+            // Emit `closeiterator`.
             let iter_r = val_reg(func_id, *iterator, alloc, codes, 0)?;
             codes.push(Bytecode::Closeiterator(ic.two(), iter_r));
             home_result(tracker, result, used, func_id, alloc, codes)?;
@@ -2082,11 +2061,12 @@ fn select_inst(
 /// are resolved to their homes first (pure reads, plus scratch `mov`s for
 /// high homes), then the callee is brought into the acc (tracker-aware).
 ///
-/// v0.2's single `Call` op maps back onto the vendor families per the §5.3
-/// binding table: `Dynamic`/`Direct` (never produced by the lift — treated
-/// identically) with `this: None` → callarg*/callrange, with `this:
-/// Some` → callthis*/callthisrange (v0.1's CallThis); `Super` → the
-/// supercall*range family; `New` → newobjrange.
+/// [`Op::Call`] maps back onto the vendor call families (`design/ir.md` §2):
+/// `Dynamic`/`Direct` with `this: None` → `callarg*`/`callrange`, with
+/// `this: Some` → `callthis*`/`callthisrange`; `Super` → `supercallthisrange`;
+/// `Apply` → `apply`; `SuperSpread` → `supercallspread`;
+/// `SuperForwardAllArgs` → `callruntime.supercallforwardallargs`;
+/// `New` → `newobjrange`.
 #[allow(clippy::too_many_arguments)]
 fn select_call(
     kind: CallKind,
@@ -2128,11 +2108,9 @@ fn select_call(
                 )?,
             },
             Some(this_val) => {
-                // v0.1's CallThis: the window/operand list is [this, args...].
-                // (N57 transitional state: `apply` sources also lift to
-                // this exact shape — a reported IR gap. P2c's
-                // `CallKind::Apply` takes that arm; the 1-arg shape then
-                // unambiguously means callthis1.)
+                // Method call with receiver (`callthis*` / `callthisrange`):
+                // the window/operand list is `[this, args...]`; `apply` uses
+                // `CallKind::Apply` (`N57`).
                 let mut values = Vec::with_capacity(args.len() + 1);
                 values.push(this_val);
                 values.extend_from_slice(args);
@@ -2168,8 +2146,7 @@ fn select_call(
             }
         },
         CallKind::Super => {
-            // v0.1's SuperCall → supercallthisrange (an explicit-arguments
-            // super call). Corpus supercallthisrange is always argc=0.
+            // Explicit-arguments super constructor call → `supercallthisrange`.
             emit_range_call(
                 RangeForm::SuperCallThis,
                 callee,
@@ -2184,7 +2161,7 @@ fn select_call(
         CallKind::Apply => {
             // Vendor `apply imm:u8, v1:in:top, v2:in:top` (isa.yaml:1104):
             // func = acc, this = v1, args array = v2 — exactly one
-            // receiver and one array (N16/N57; v0.1's Apply arm).
+            // receiver and one array (`N16`/`N57`).
             let (Some(this_val), [array]) = (this, args) else {
                 return Err(LowerError::UnsupportedInstruction {
                     func: func_id,
@@ -2207,8 +2184,7 @@ fn select_call(
         }
         CallKind::SuperSpread => {
             // Vendor `supercallspread imm:u8, v:in:top` — the spread array
-            // is the register operand, the callee rides the acc (v0.1's
-            // SuperCallSpread arm).
+            // is the register operand, the callee rides the acc.
             let regs = materialize_operands(
                 tracker,
                 func_id,
@@ -2337,7 +2313,7 @@ fn emit_range_call(
 /// Emit a construct call (`new callee(args...)`) — vendor
 /// `newobjrange imm1:u16, imm2:u8, v:in:top` /
 /// `wide.newobjrange imm:u16, v:in:top`
-/// (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml ~:535/:540).
+/// (`vendor/arkcompiler_runtime_core/static_core/isa/isa.yaml` / dynamic ISA).
 ///
 /// The reserved consecutive window is filled [callee, args...] IN ORDER:
 /// the runtime reads the constructor from the FIRST register of the range

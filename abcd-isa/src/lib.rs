@@ -1,34 +1,53 @@
 //! Safe Rust API for the ArkCompiler bytecode instruction set.
 //!
-//! This crate provides three main capabilities:
+//! This crate provides five core capabilities:
 //!
-//! - [`decode`] — parse raw bytecode bytes into `(Bytecode, byte_offset)` pairs
-//!   with resolved jump targets.
+//! - [`decode`] — parse modern (`9.0.0.0`..`24.0.0.0`) bytecode bytes into
+//!   `(Bytecode, byte_offset)` pairs with resolved jump targets.
+//! - [`decode_legacy`] — translate legacy (`0.0.0.2`, OpenHarmony 3.0/3.1)
+//!   bytecode streams into the same `(Bytecode, byte_offset)` representation.
 //! - [`encode`] — assemble a slice of [`Bytecode`] instructions back into raw
-//!   bytes, resolving [`Label`] indices to byte offsets.
+//!   bytes with automatic format selection and jump widening, resolving
+//!   [`Label`] instruction indices to byte offsets.
+//! - [`relocate_entity_id`] — patch an instruction's `n`-th entity-ID operand
+//!   in place without changing instruction size.
 //! - [`Version`] — query and compare `.abc` file format versions.
 //!
-//! All public types are safe.  `unsafe` is confined to internal FFI calls into
-//! the C bridge provided by [`abcd_isa_sys`].
+//! All public types are safe. `unsafe` is confined to internal FFI calls into
+//! the C99 bridge provided by [`abcd_isa_sys`].
 //!
 //! # Quick start
 //!
-//! ```no_run
-//! use abcd_isa::{decode, encode, Bytecode};
+//! ```
+//! use abcd_isa::{
+//!     Bytecode, EntityId, EntityKind, Label, Version, decode, encode, insn, relocate_entity_id,
+//! };
 //!
-//! // Decode raw bytecode into instructions with byte offsets.
-//! let bytes: &[u8] = &[/* raw .abc method body */];
-//! let decoded: Vec<(Bytecode, u32)> = decode(bytes).unwrap();
+//! let program: Vec<Bytecode> = vec![
+//!     insn::LdaStr::new(EntityId(1)),
+//!     insn::Jmp::new(Label(3)),
+//!     insn::Ldundefined::new(),
+//!     insn::Return::new(),
+//! ];
 //!
-//! // Re-encode back to bytes (round-trip).
-//! let bcs: Vec<Bytecode> = decoded.iter().map(|(bc, _)| *bc).collect();
-//! let (output, offsets) = encode(&bcs).unwrap();
+//! let (mut bytes, offsets) = encode(&program).unwrap();
+//! assert_eq!(offsets.len(), program.len());
+//!
+//! relocate_entity_id(&mut bytes[offsets[0] as usize..], 0, EntityId(42)).unwrap();
+//!
+//! let decoded = decode(&bytes).unwrap();
+//! assert_eq!(
+//!     decoded[0].0.entity_operands(),
+//!     vec![(EntityKind::StringId, EntityId(42))]
+//! );
+//! assert!(matches!(decoded[1].0, Bytecode::Jmp(Label(3))));
+//! assert!(Version::new(12, 0, 6, 0).is_in_supported_range());
 //! ```
 //!
 //! # Re-exported types
 //!
 //! The following types are re-exported from [`abcd_isa_sys`] for convenience:
-//! [`Bytecode`], [`Reg`], [`Imm`], [`EntityId`], [`Label`],
+//! [`Bytecode`], [`Reg`], [`Imm`], [`EntityId`], [`EntityKind`], [`Label`],
 //! [`Operand`], [`insn`], [`BytecodeFlags`], [`ExceptionType`].
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]

@@ -1,5 +1,5 @@
 //! `abcd analyze` — structural analysis report over the lifted IR
-//! (design/cli-plan.md §2, P3).
+//! (design/cli.md §2, design/analysis.md §2).
 //!
 //! Pipeline: `.abc` → [`abcd_file::decode`] → [`abcd_lift::lift_file`] →
 //! abcd-analysis. Every reported field traces to a public abcd-analysis /
@@ -14,8 +14,8 @@
 //! - `--dominators` runs [`Dominators::normal`] per function and reports
 //!   the immediate-dominator tree in reverse post-order.
 //!
-//! Output conventions (§3.4): aligned text by default, `--json` for the
-//! machine-readable form; both render from the same report data.
+//! Output conventions (design/cli.md §3): aligned text by default, `--json`
+//! for the machine-readable form; both render from the same report data.
 
 use abcd_analysis::callgraph::{CallEdgeKind, CallGraph, CallTargets};
 use abcd_analysis::control::Dominators;

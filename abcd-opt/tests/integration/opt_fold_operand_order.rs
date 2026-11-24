@@ -1,4 +1,4 @@
-//! N36 regression (v0.2 port of v0.1 `opt_fold_operand_order.rs`):
+//! N36 regression (`design/decisions.md`):
 //! constant folding in BOTH engines (peephole and SCCP) computes
 //! `right OP left` in IR field terms — the IR convention (lift
 //! `binary_op`/`compare`, translate.rs) is `left` = acc operand,
@@ -17,7 +17,7 @@
 //!   computes `uint32(vreg) >> (acc & 0x1f)`; `ashr2` is the ARITHMETIC
 //!   (signed) shift (JS `>>`): `int32(vreg) >> (acc & 0x1f)`.
 //!
-//! v0.2 taxonomy note: arithmetic lives in [`BinOp`] (`Op::BinaryOp`),
+//! Taxonomy note: arithmetic lives in [`BinOp`] (`Op::BinaryOp`),
 //! comparisons in [`CmpOp`] (`Op::Compare`) — the operand roles are
 //! identical (lift emits `left = acc, right = vreg` for both).
 

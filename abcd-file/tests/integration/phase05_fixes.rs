@@ -1,10 +1,10 @@
-//! Regression tests for Phase 0.5 worker F fixes (design/archive/review-bridge-wrapper.md):
-//! - #5  local-variable scopes must survive an encode roundtrip
-//! - #6  unresolvable annotation references must fail, not encode as 0
-//! - #7  entity annotation array elements resolve to real handles
-//! - #8  nested literal-array references resolve through the handle table
-//! - #9  embedded-NUL strings encode as MUTF-8 (C0 80) instead of panicking
-//! - #18 64-bit annotation array elements return an error instead of panicking
+//! Regression tests for bridge and encoder invariants:
+//! - local-variable scopes must survive an encode roundtrip
+//! - unresolvable annotation references must fail, not encode as 0
+//! - entity annotation array elements resolve to real handles
+//! - nested literal-array references resolve through the handle table
+//! - embedded-NUL strings encode as MUTF-8 (C0 80) instead of panicking
+//! - 64-bit annotation array elements (`I64`, `U64`, `F64`) round-trip cleanly
 
 use abcd_file::{
     AccessFlags, Annotation, AnnotationElem, AnnotationElemDefEx, AnnotationElemValue,
@@ -174,35 +174,98 @@ fn embedded_nul_method_name_roundtrips() {
     );
 }
 
-/// Finding #18: 64-bit annotation array elements are unsupported by the
-/// builder ABI; encode must return `UnsupportedAnnotationArrayType` rather
-/// than panic.
+/// 64-bit annotation array elements (`R` = `ArrayI64`, `S` = `ArrayU64`,
+/// `U` = `ArrayF64`) encode with full 8-byte element width and round-trip
+/// losslessly through `decode`.
 #[test]
-fn i64_annotation_array_element_returns_error_not_panic() {
+fn scalar_64bit_annotation_arrays_roundtrip() {
     let mut b = Builder::new();
+    b.set_api(12, "beta1");
     b.add_global_class();
     let file_bytes = b.finalize().expect("finalize");
     let mut file = decode(&file_bytes).expect("decode base");
 
     let ann_desc = file.strings.get_or_intern("LAnno;");
-    let elem_name = file.strings.get_or_intern("v");
+    let n_i64 = file.strings.get_or_intern("ai64");
+    let n_u64 = file.strings.get_or_intern("au64");
+    let n_f64 = file.strings.get_or_intern("af64");
+
+    let expected_i64 = vec![
+        AnnotationValue::I64(i64::MIN),
+        AnnotationValue::I64(-1),
+        AnnotationValue::I64(0),
+        AnnotationValue::I64(i64::MAX),
+    ];
+    let expected_u64 = vec![
+        AnnotationValue::U64(0),
+        AnnotationValue::U64(1),
+        AnnotationValue::U64(0x0123_4567_89ab_cdef),
+        AnnotationValue::U64(u64::MAX),
+    ];
+    let expected_f64 = vec![
+        AnnotationValue::F64(-0.0),
+        AnnotationValue::F64(2.5),
+        AnnotationValue::F64(std::f64::consts::PI),
+        AnnotationValue::F64(f64::INFINITY),
+    ];
+
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
     cls.annotations = Annotations {
         compile_time: vec![Annotation {
             class_descriptor: ann_desc,
-            elements: vec![AnnotationElem {
-                name: elem_name,
-                value: AnnotationValue::Array {
-                    tag: b'S', // ArrayI64 (upstream pandasm array tag chars)
-                    values: vec![AnnotationValue::I64(-1)],
+            elements: vec![
+                AnnotationElem {
+                    name: n_i64,
+                    value: AnnotationValue::Array {
+                        tag: b'R',
+                        values: expected_i64.clone(),
+                    },
                 },
-            }],
+                AnnotationElem {
+                    name: n_u64,
+                    value: AnnotationValue::Array {
+                        tag: b'S',
+                        values: expected_u64.clone(),
+                    },
+                },
+                AnnotationElem {
+                    name: n_f64,
+                    value: AnnotationValue::Array {
+                        tag: b'U',
+                        values: expected_f64.clone(),
+                    },
+                },
+            ],
         }],
         ..Annotations::default()
     };
 
-    let err = encode(&file).expect_err("encode must fail, not panic");
-    assert_eq!(err, Error::UnsupportedAnnotationArrayType { tag: b'S' });
+    let reencoded = encode(&file).expect("64-bit annotation arrays must encode");
+    let file2 = decode(&reencoded).expect("decode reencoded 64-bit annotation arrays");
+    let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
+    let elems = &g2.annotations.compile_time[0].elements;
+    assert_eq!(elems.len(), 3);
+    assert_eq!(
+        elems[0].value,
+        AnnotationValue::Array {
+            tag: b'R',
+            values: expected_i64,
+        }
+    );
+    assert_eq!(
+        elems[1].value,
+        AnnotationValue::Array {
+            tag: b'S',
+            values: expected_u64,
+        }
+    );
+    assert_eq!(
+        elems[2].value,
+        AnnotationValue::Array {
+            tag: b'U',
+            values: expected_f64,
+        }
+    );
 }
 
 /// Finding #6: an annotation referencing a foreign method cannot be resolved

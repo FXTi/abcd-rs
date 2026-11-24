@@ -1,5 +1,5 @@
-//! Reverse post-order (migrated verbatim from `abcd-lower::analysis`,
-//! v2-P5a; the lowering corpus byte-identity gate pins the move).
+//! Reverse post-order over the Normal-edge CFG (`design/ir.md`,
+//! `design/decisions.md` N10; pinned by the lowering byte-identity gate).
 
 use std::collections::HashSet;
 

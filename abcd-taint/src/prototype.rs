@@ -1,7 +1,7 @@
 //! Receiver-type approximation for prototype-keyed summary lookup
-//! (design/flowdroid/summaries.md §2.3 — FlowDroid's SummaryResolver
-//! 4-level lookup, keyed here on alloc-kind → prototype family instead
-//! of Java types; t-P3).
+//! (`design/analysis.md` — keying method calls on allocation kind,
+//! constant def chains, and constructor/global provenance to prototype
+//! families).
 //!
 //! ## The gap this closes
 //!
@@ -48,7 +48,7 @@
 //!    builtin iterable. Any other iterable (user object with a custom
 //!    `@@iterator`, unknown source) types NOTHING — the family is
 //!    never invented.
-//! 5. **Constructor results** (t-P5) — `new <global>(...)` where the
+//! 5. **Constructor results** — `new <global>(...)` where the
 //!    callee's def chain bottoms out at `TryGetGlobal(name)` with
 //!    `name` a KNOWN builtin constructor (`Array`/`Object`/`RegExp`/
 //!    `String`/`Number`/`Boolean`) types the result with that
@@ -81,14 +81,12 @@
 //! - **Prototype-chain walks**: a receiver typed `Object` does not
 //!   mean "walk to `Array.prototype`" — with no hierarchy
 //!   information the walk would be invention. Families are exact
-//!   kinds, not hierarchy roots (FlowDroid's hierarchy level needs
-//!   the rung-2 whole-program PTA).
-//! - **Own-property shadows**: `a.pop = function () {…}` on an array
-//!   is invisible at the method load (store-to-load of function
-//!   values is opaque), so the builtin summary fires anyway — the
-//!   c2 lesson, structurally; probe `e7-own-method-shadow` records
-//!   the expected FP (closes at rung 2 with store-to-load function
-//!   resolution).
+//!   kinds, not hierarchy roots.
+//! - **Own-property shadows**: at rungs 0/1, `a.pop = function () {…}`
+//!   on an array is invisible at the method load (store-to-load of
+//!   function values is opaque), so the builtin summary fires anyway;
+//!   at rung 2, store-to-load function resolution resolves the user
+//!   body, which takes precedence over prototype-path summaries.
 //!
 //! ## Multi-site answers
 //!
@@ -242,7 +240,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
         if info.has_unknown {
             ans.precise = false;
         }
-        // 1b. The MAY-direction arm (t-P4): the engine's
+        // 1b. The MAY-direction arm: the engine's
         //    resolution-complete fan-out answers (unbalanced — a param
         //    receiver whose callers are all recorded in the call graph)
         //    type receivers for the ADDITIVE prototype path, exactly the
@@ -330,8 +328,8 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                     callee,
                     ..
                 }) => {
-                    // `new <builtin ctor>(...)` — t-P5 constructor-
-                    // result arm (module docs §5): es2abc lowers regexp
+                    // `new <builtin ctor>(...)` — constructor-result
+                    // arm (module docs §5): es2abc lowers regexp
                     // literals to `new RegExp(...)`, so this is the arm
                     // that types the corpus' `r.test` receivers.
                     self.constructor_family(*callee, visiting, ans);
@@ -359,7 +357,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
         }
     }
 
-    /// The t-P5 constructor-result arm: `callee` of a `kind: New` call
+    /// Constructor-result arm: `callee` of a `kind: New` call
     /// is walked through `Mov`/`Phi` to a `TryGetGlobal(name)` leaf; a
     /// KNOWN builtin constructor name types the constructed value with
     /// the matching family. Imprecise by construction (the constructor

@@ -1,5 +1,5 @@
-//! D2 inline rewrite (v2-P3b) — unit tests for `abcd_opt::inline`,
-//! one per N44 defect shape plus the eligibility matrix. Every green
+//! Unit tests for `abcd_opt::inline` (`design/ir.md`, `design/decisions.md` `D2`/`N44`),
+//! one per `N44` defect shape plus the eligibility matrix. Every green
 //! test runs `abcd_ir::verify_module` after inlining: zero errors is
 //! the hard gate. The red counterparts (naive inliner producing
 //! module-invalid IR on the same probe shape) live in

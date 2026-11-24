@@ -1,9 +1,8 @@
-//! Shared test infrastructure for the abcd-opt regression tests: a small
-//! hand-builder for v0.2 IR modules (abcd-ir has no IRBuilder — tests
-//! construct modules directly, same policy as abcd-lower's tests) and a
+//! Shared test infrastructure for the `abcd-opt` regression tests: a small
+//! hand-builder for [`abcd_ir::Module`] (`abcd-ir` has no `IRBuilder` — tests
+//! construct modules directly, same policy as `abcd-lower`'s tests) and a
 //! minimal deterministic bytecode interpreter for the end-to-end
-//! lift → optimize → lower tests (ported from v0.1 `abcd-ir/tests/common`
-//! via abcd-lower's tests/common).
+//! `lift → optimize → lower` tests.
 //!
 //! Every test target compiles this shared module separately and uses a
 //! different subset of the helpers — allow dead code module-wide.
@@ -239,7 +238,7 @@ pub fn empty_phis(module: &Module) -> Vec<String> {
     out
 }
 
-// ─── Minimal deterministic bytecode interpreter (v0.1 port) ─────────────────
+// ─── Minimal deterministic bytecode interpreter ──────────────────────────────
 
 /// What the machine observed when execution stopped.
 #[allow(dead_code)] // variants are constructed only when a path executes them

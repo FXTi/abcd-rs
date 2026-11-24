@@ -1,13 +1,13 @@
-//! Copy Propagation: eliminate trivial phis and identity operations —
-//! the v0.2 port of v0.1 `opt::copyprop`.
+//! Copy Propagation: eliminate trivial phis across SSA blocks (`design/ir.md`).
 //!
-//! - Trivial phi: all incoming values are the same → replace with that value.
+//! - Trivial phi: all non-self incoming values resolve to the same [`ValueId`]
+//!   → substitute that value across the function and drop the phi.
 //!
-//! v0.2 port note: phi entries key on full [`abcd_ir::Edge`]s (kind-qualified);
-//! triviality is decided on the VALUEs alone, exactly as in v0.1 (a phi
-//! whose normal and exceptional in-edges carry the same value is trivial
-//! — and folding it is sound even for handler phis, since the folded
-//! value equals every incoming value regardless of dispatch timing).
+//! Phi entries key on full kind-qualified [`abcd_ir::Edge`]s, while triviality
+//! is decided on the incoming values alone: a phi whose normal and exceptional
+//! in-edges carry the same value is trivial, and folding it is sound even for
+//! handler phis because the folded value equals every incoming value regardless
+//! of dispatch timing.
 
 use std::collections::{HashMap, HashSet};
 

@@ -1,4 +1,4 @@
-//! N42 regression (v0.2 port of v0.1 `opt_fold_int_conversion.rs`): both
+//! N42 regression (`design/decisions.md`): both
 //! fold engines (peephole and SCCP) must convert f64 constants to
 //! integers with ECMA-262 ToInt32/ToUint32 — WRAP mod 2^32, with
 //! NaN/±Infinity → +0 — not Rust's saturating `as` casts.

@@ -13,7 +13,7 @@
 //! (lift_apply.rs), deprecated.asyncfunctionawaituncaught/resolve/reject
 //! (lift_async_acc_value.rs), deprecated.delobjprop + tonumber
 //! (lift_unit.rs), deprecated.create{array,object}withbuffer
-//! (lift_alloc_array_buffer.rs), and the hard-error
+//! (lift_alloc_array_buffer.rs), and
 //! deprecated.defineclasswithbuffer (lift_deprecated_defineclasswithbuffer.rs).
 
 use abcd_file::{AccessFlags, Builder, CodeEntity, Type, decode};

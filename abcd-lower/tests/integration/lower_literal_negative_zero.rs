@@ -1,6 +1,5 @@
-//! N37 regression (v0.2 port of
-//! `abcd-ir/tests/lower_literal_negative_zero.rs`): lowering a `-0.0`
-//! number constant must NOT take the integer `ldai` path.
+//! `N37` (`ADR-06`) regression tests: lowering a `-0.0` number constant must
+//! NOT take the integer `ldai` path.
 //!
 //! `-0.0 == (-0.0 as i32) as f64` is TRUE (`-0.0 == 0.0` in IEEE), so the
 //! plain integer check would emit `ldai 0` for `-0.0` — losing the sign

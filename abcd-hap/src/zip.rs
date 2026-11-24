@@ -2,7 +2,7 @@
 //! container dialect (no spanned archives, no encryption, no ZIP64, methods
 //! {STORED, DEFLATE}).
 //!
-//! Layout of the reader (design §3.2):
+//! Layout of the reader (see `design/hap-container.md`):
 //!
 //! 1. Scan backwards at most 64 KiB + EOCD for `PK\x05\x06`; a candidate is
 //!    only real if its comment length lands exactly on EOF *and* the central
@@ -76,7 +76,7 @@ pub struct EntryMeta {
     pub local_header_offset: u64,
 }
 
-/// How an entry's data is stored; mirrors the design's `Compression`.
+/// How an entry's data is stored in the archive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compression {
     /// STORED; `data_offset` is the absolute offset of the entry data within
@@ -358,7 +358,8 @@ impl<'a> ZipArchive<'a> {
 
     /// Read (and inflate, if needed) an entry by metadata.
     ///
-    /// CRC is not verified (design §3.3); the data is returned as recorded.
+    /// CRC-32 is not verified on read (see `design/hap-container.md`); the data
+    /// is returned as recorded.
     pub fn read_entry(&self, meta: &EntryMeta) -> Result<EntryData<'a>, Error> {
         if meta.flags & FLAG_ENCRYPTED != 0 {
             return Err(Error::Encrypted {

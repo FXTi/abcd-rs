@@ -14,13 +14,9 @@
 //! local: annotation present → the canonical decode; absent + STATIC →
 //! the canonical default; absent + non-static → `None`.
 //!
-//! History: landed as a stopgap duplicate in t-P2 with an orchestrator
-//! ruling to defer to `abcd-ir::frame` once it landed (it did, d-P6).
-//! `abcd-opt/src/inline.rs` keeps its own copy (`abcd-opt` cannot be
-//! imported here); whether taint should adopt the canonical
-//! unconditional-0xF reading (dropping the non-static policy) is flagged
-//! to the orchestrator as a behavior-change decision, not folded in
-//! silently.
+//! `abcd-opt/src/inline.rs` keeps its own local slot helper (`abcd-opt`
+//! does not depend on `abcd-analysis`). See `design/decisions.md` (N66/N67)
+//! and `design/analysis.md` for the interprocedural frame-binding contract.
 
 use abcd_ir::{FuncId, Modifiers, Module};
 

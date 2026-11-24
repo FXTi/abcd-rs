@@ -15,7 +15,7 @@
 //! - **Struct-literal models** (the lift_unit.rs precedent) for shapes
 //!   the Builder cannot express: dangling ids, body-less external
 //!   methods, the CONSTRUCTOR access flag (the Builder drops it),
-//!   empty debug records, TypeSummaryOffset fields.
+//!   empty debug records, `typeSummaryOffset` `LiteralArrayRef` fields.
 
 use std::collections::HashMap;
 
@@ -399,52 +399,122 @@ fn field_initial_values_i64_f32_f64_and_none() {
 }
 
 #[test]
-fn type_summary_offset_field_yields_no_initial_value() {
-    // metadata.rs:252-256: the nested-offset field model has no runtime
-    // consumer; decode models it opaquely (encode hard-errors on it, so
-    // only a hand-built model reaches the lift).
+fn type_summary_offset_field_yields_no_initial_value_and_preserves_scope_names() {
+    // ADR-10 / #38 (overturning N8): non-zero `typeSummaryOffset` decodes to
+    // `FieldValue::LiteralArrayRef(offset)`. Because TS type summaries have
+    // zero runtime consumer, `lift_field` must yield `initial_value: None`
+    // AND must never overwrite `ClassData::scope_names` when both `scopeNames`
+    // and `typeSummaryOffset` appear on a `--merge-abc` record class.
     let mut strings = abcd_file::StringPool::default();
-    let field_name = strings.get_or_intern("typeSummaryOffset");
-    let class = abcd_file::Class {
-        descriptor: strings.get_or_intern("LModel;"),
-        name: strings.get_or_intern("LModel;"),
+    let scope_field = strings.get_or_intern(abcd_file::SCOPE_NAMES_FIELD);
+    let ts_field = strings.get_or_intern(abcd_file::TYPE_SUMMARY_OFFSET_FIELD);
+    let alpha_sid = strings.get_or_intern("alpha_scope");
+    let model_desc = strings.get_or_intern("LModel;");
+    let merged_desc = strings.get_or_intern("LMerged;");
+
+    // 1. Standalone `typeSummaryOffset` only: `initial_value == None`, `scope_names == None`.
+    let model_class = abcd_file::Class {
+        descriptor: model_desc,
+        name: model_desc,
         access_flags: AccessFlags::PUBLIC,
-        source_lang: FileSourceLang::EcmaScript,
+        source_lang: FileSourceLang::TypeScript,
         source_file: None,
         is_external: false,
         super_class: None,
         interfaces: Vec::new(),
         methods: Vec::new(),
         fields: vec![abcd_file::Field {
-            name: field_name,
+            name: ts_field,
             offset: 0,
             field_type: Type::U32,
             access_flags: AccessFlags::PUBLIC,
             is_external: false,
-            initial_value: Some(FieldValue::TypeSummaryOffset(0x40)),
+            initial_value: Some(FieldValue::LiteralArrayRef(0x40)),
             annotations: Default::default(),
         }],
         annotations: Default::default(),
     };
-    let desc = class.descriptor;
+
+    // 2. `--merge-abc` class with `scopeNames` BEFORE `typeSummaryOffset`:
+    //    `typeSummaryOffset` must NOT clobber `ClassData::scope_names`.
+    let merged_class = abcd_file::Class {
+        descriptor: merged_desc,
+        name: merged_desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::TypeScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        fields: vec![
+            abcd_file::Field {
+                name: scope_field,
+                offset: 4,
+                field_type: Type::U32,
+                access_flags: AccessFlags::PUBLIC,
+                is_external: false,
+                initial_value: Some(FieldValue::LiteralArrayRef(0x20)),
+                annotations: Default::default(),
+            },
+            abcd_file::Field {
+                name: ts_field,
+                offset: 8,
+                field_type: Type::U32,
+                access_flags: AccessFlags::PUBLIC,
+                is_external: false,
+                initial_value: Some(FieldValue::LiteralArrayRef(0x40)),
+                annotations: Default::default(),
+            },
+        ],
+        annotations: Default::default(),
+    };
+
     let file = abcd_file::File {
         version: Version::new(12, 0, 6, 0),
         checksum: 0,
         size: 0,
         file_type: FileType::Dynamic,
         strings,
-        classes: [(desc, class)].into_iter().collect(),
-        literal_arrays: Vec::new(),
+        classes: [(model_desc, model_class), (merged_desc, merged_class)]
+            .into_iter()
+            .collect(),
+        literal_arrays: vec![
+            abcd_file::LiteralArray {
+                values: vec![abcd_file::LiteralValue::String(alpha_sid)],
+            },
+            abcd_file::LiteralArray {
+                values: vec![abcd_file::LiteralValue::Integer(999)],
+            },
+        ],
         entity_map: Default::default(),
-        literal_array_offsets: Default::default(),
+        literal_array_offsets: HashMap::from([(0x20, 0), (0x40, 1)]),
         literal_array_header_offsets: Vec::new(),
     };
-    let m = lift_file(&file).expect("lift");
+    let mut m = lift_file(&file).expect("lift");
     verify_clean(&m);
-    let c = &m.classes[class_id_of(&m, "LModel;").index()];
+
+    let c_model = &m.classes[class_id_of(&m, "LModel;").index()];
     assert_eq!(
-        c.fields[0].initial_value, None,
-        "TypeSummaryOffset carries no liftable constant"
+        c_model.fields[0].initial_value, None,
+        "typeSummaryOffset carries no liftable constant"
+    );
+    assert_eq!(
+        c_model.scope_names, None,
+        "typeSummaryOffset must not populate ClassData::scope_names"
+    );
+
+    let alpha_sym = m.sym.intern("alpha_scope");
+    let c_merged = &m.classes[class_id_of(&m, "LMerged;").index()];
+    assert_eq!(c_merged.fields[0].initial_value, None);
+    assert_eq!(c_merged.fields[1].initial_value, None);
+    let scope_cid = c_merged
+        .scope_names
+        .expect("scopeNames field populates ClassData::scope_names");
+    assert_eq!(
+        m.consts.get(scope_cid),
+        Some(&Const::ArrayLiteral(vec![Const::String(alpha_sym)])),
+        "typeSummaryOffset LiteralArrayRef after scopeNames must not clobber scope_names"
     );
 }
 

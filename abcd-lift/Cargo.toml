@@ -1,6 +1,6 @@
 [package]
 name = "abcd-lift"
-description = "Lifter: decode (abcd_file::File) → IR (abcd_ir::Module) — layering: lift = decode→IR (design/ir-v0.2.md)"
+description = "Lifter: decode (abcd_file::File) → IR (abcd_ir::Module) — layering: lift = decode→IR (design/ir.md)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

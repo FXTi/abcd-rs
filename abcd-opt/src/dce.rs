@@ -1,27 +1,25 @@
-//! Aggressive Dead Code Elimination (ADCE) + CFG simplification — the
-//! v0.2 port of v0.1 `opt::dce`.
+//! Aggressive Dead Code Elimination (ADCE) + CFG simplification (`design/ir.md`).
 //!
 //! ADCE: mark essential roots (side-effecting instructions + terminators),
 //! propagate liveness backward along use-def chains, sweep dead
-//! instructions.
+//! instructions and unused `frame_init_consts`.
 //!
-//! ## Essentiality is DERIVED, not listed (N48/N50)
+//! ## Essentiality is DERIVED, not listed (`N48`/`N50`, `design/decisions.md`)
 //!
-//! v0.1 kept a hand-maintained `is_essential` list whose observable-load
-//! entries (GetIterator/GetAsyncIterator/LoadProperty/LoadPrivateProperty/
-//! TestPrivateProperty/CreateRegExp/LoadGlobalVar/TryLoadGlobalByName/
-//! LoadSuperProperty) each rest on vendored runtime evidence (getter
-//! calls, brand checks, ReferenceErrors). In v0.2 that evidence lives in
-//! ONE place — the T3 effects table
-//! ([`abcd_ir::Op::effects`], design/ir-v0.2.md §4.4): an instruction is
-//! essential iff it is a terminator or its effects record shows a write,
-//! a possible throw, or a possible call. Pure reads (lexical/global/module
-//! loads that cannot throw or call) and pure allocations stay
-//! dead-deletable, exactly as in v0.1.
+//! Observable load forms (`GetIterator`, `GetAsyncIterator`, `LoadProp`,
+//! `LoadPrivate`, `TestPrivate`, `AllocRegExp`, `TryGetGlobal`, `LoadSuper`)
+//! invoke user getters, check private brands, or raise `SyntaxError` /
+//! `ReferenceError` / `TypeError` even when their result is dead. Rather than
+//! maintaining a separate list in the optimizer, that runtime evidence lives in
+//! ONE place — the `T3` effects table ([`abcd_ir::Op::effects`],
+//! `design/ir.md`): an instruction is essential iff it is a terminator or its
+//! effects record shows a write, a possible throw, or a possible call. Pure
+//! reads (lexical/module loads that cannot throw or call) and pure allocations
+//! remain dead-deletable.
 //!
 //! CFG simplify: merge single-pred/single-succ block pairs, eliminate
 //! empty jump-only blocks, remove unreachable blocks — all
-//! exception-neutral (N11: reachability and predecessor rebuilds use the
+//! exception-neutral (`N11`: reachability and predecessor rebuilds use the
 //! AUGMENTED successor relation; merges/eliminations refuse to disturb
 //! try-region semantics or handler-phi edge values).
 
@@ -142,12 +140,12 @@ impl FuncPass for Adce {
 
 /// An instruction is essential if it has side effects or is a terminator.
 ///
-/// Derived from the T3 effects table (N48/N50): a write to any memory
-/// class, a possible throw, or a possible call makes the instruction
-/// observable even when its result is dead. Pure reads (e.g.
+/// Derived from the `T3` effects table (`N48`/`N50`, `design/ir.md`): a write
+/// to any memory class, a possible throw, or a possible call makes the
+/// instruction observable even when its result is dead. Pure reads (e.g.
 /// `GetLexVar`, `LoadModuleVar`, `GetResumeMode`) and pure allocations
 /// (e.g. `AllocObject`, `AllocArray`, `AllocClosure`) are dead-deletable
-/// when their result is unused — v0.1 parity.
+/// when their result is unused.
 fn is_essential(op: &Op) -> bool {
     if op.is_terminator() {
         return true;

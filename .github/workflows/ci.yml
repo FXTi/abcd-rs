@@ -14,7 +14,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
-  # Digest-pinned corpus image (design/archive/ci-rework-plan.md Track 2).
+  # Digest-pinned corpus image (see design/ci.md).
   # Bump deliberately: corpus suites hard-assert fixture counts (5517 rows /
   # 1149 passed) plus the 156-package wild OHOS hap set (`export-wild`).
   ARK_TEST_IMAGE: ghcr.io/fxti/arkcompiler-test@sha256:a39526126a10b9bc5fdde3f1560ad41c66403ca046d36157d7b771e16690f70b
@@ -95,8 +95,8 @@ jobs:
       # vendor/ and abcd-*-sys/*/generated/ (verified by vendor-verify);
       # build.rs compiles pure C++17 via cc with no Ruby or bindgen needed.
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
-      - run: cargo build --bins
-      - run: cargo test
+      - run: cargo build --workspace --bins
+      - run: cargo test --workspace
 
   build32:
     name: Build & Test (i686-linux)
@@ -110,11 +110,11 @@ jobs:
           targets: i686-unknown-linux-gnu
       - name: Install 32-bit toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
-      - run: cargo build --bins --target i686-unknown-linux-gnu
+      - run: cargo build --workspace --bins --target i686-unknown-linux-gnu
         env:
           CFLAGS: -m32
           CXXFLAGS: -m32
-      - run: cargo test --target i686-unknown-linux-gnu
+      - run: cargo test --workspace --target i686-unknown-linux-gnu
         env:
           CFLAGS: -m32
           CXXFLAGS: -m32
@@ -129,8 +129,8 @@ jobs:
       - uses: ./.github/actions/setup-workspace
         with:
           targets: i686-pc-windows-msvc
-      - run: cargo build --bins --target i686-pc-windows-msvc
-      - run: cargo test --target i686-pc-windows-msvc
+      - run: cargo build --workspace --bins --target i686-pc-windows-msvc
+      - run: cargo test --workspace --target i686-pc-windows-msvc
 
   arm32:
     name: Build & Test (armv7-linux)
@@ -144,12 +144,12 @@ jobs:
           targets: armv7-unknown-linux-gnueabihf
       - name: Install armv7 cross toolchain + qemu-user
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user libc6-armhf-cross libstdc++-12-dev-armhf-cross
-      - run: cargo build --bins --target armv7-unknown-linux-gnueabihf
+      - run: cargo build --workspace --bins --target armv7-unknown-linux-gnueabihf
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
           CXX_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-g++
-      - run: cargo test --target armv7-unknown-linux-gnueabihf
+      - run: cargo test --target armv7-unknown-linux-gnueabihf -p abcd-rs -p abcd-isa-sys -p abcd-isa -p abcd-file-sys -p abcd-file -p abcd-hap -p abcd-ir -p abcd-cli
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc

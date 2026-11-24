@@ -52,7 +52,7 @@ define_id!(
 );
 define_id!(
     /// Index into [`crate::module::Module::classes`] — the module's own
-    /// class table, never a file pool (N46 by construction).
+    /// class table, never a file pool (`design/decisions.md` N46).
     ClassId
 );
 define_id!(

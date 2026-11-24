@@ -464,7 +464,7 @@ fn base_through_movs(
 
 /// The method leaf of a call whose callee came through a `LoadProp`
 /// chain: `a.pop(...)` → `"pop"`. This is the key the prototype
-/// resolution path (t-P3, `crate::prototype`) qualifies with the
+/// resolution path (`crate::prototype`) qualifies with the
 /// receiver's family — `TryGetGlobal("a").pop` + receiver family
 /// `Array` ⇒ candidate `Array.prototype.pop`. Returns `None` when the
 /// callee is not a property load (bare global calls, direct calls).

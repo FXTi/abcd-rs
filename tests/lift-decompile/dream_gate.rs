@@ -15,9 +15,8 @@
 //!   any imports/exports/module_requests), hard-7 fallback ops present,
 //!   residual cross-arm notes, emitted byte count.
 //!
-//! The es2abc recompile + VM comparison + triage is driven by
-//! `scripts/dream-gate.py` (docker is local-only; see
-//! scripts/remote-test.sh).
+//! The `es2abc` recompile + VM comparison + triage runs in CI via
+//! `scripts/dream-gate.py` (`design/ci.md`).
 //!
 //! Run:
 //!
@@ -218,8 +217,7 @@ fn generate() -> usize {
 
 /// The full gate: generate, then run `scripts/dream-gate.py`
 /// (es2abc recompile + ark_js_vm behavior compare + triage) and assert
-/// the recorded acceptance floor. Docker is LOCAL-only
-/// (scripts/remote-test.sh).
+/// the recorded acceptance floor (executed in GitHub Actions CI; see `design/ci.md`).
 ///
 /// The histogram at d-P11 (2026-09-25): pass 1149 / decompile-bug 0 /
 /// es2abc-cant 0 / expected-fallback 0 / fixture-unsupported 0 (of

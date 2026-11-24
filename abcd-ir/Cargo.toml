@@ -1,12 +1,12 @@
 [package]
 name = "abcd-ir"
-description = "The SSA IR — format-independent program representation (design/ir-v0.2.md)"
+description = "The SSA IR — format-independent program representation (design/ir.md)"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 readme = "README.md"
 
-# DELIBERATE INVARIANT (design/ir-v0.2.md §1, design/ir.md §8 invariant 1):
+# DELIBERATE INVARIANT (design/ir.md):
 # this crate must NEVER depend on abcd-file, abcd-isa, abcd-file-sys, or
 # abcd-isa-sys. The IR describes a *program*, never a *file*; all container/
 # encoding knowledge lives in the lift/lower crates. This is enforced

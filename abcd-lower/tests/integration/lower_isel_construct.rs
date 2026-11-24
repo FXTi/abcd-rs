@@ -1,4 +1,4 @@
-//! P3 regression (V3, v0.2 port of `abcd-ir/tests/lower_isel_construct.rs`):
+//! Regression tests for construct-call lowering (`Op::Call { kind: CallKind::New, .. }`):
 //! construct calls round-trip as `newobjrange`, never as a plain call form.
 //!
 //! Vendor facts:
@@ -8,13 +8,9 @@
 //!   `wide.newobjrange imm:u16, v:in:top` (~:540): u16 argc, STILL a u8
 //!   start, and NO IC slot operand.
 //! - The constructor is the FIRST register of the range and argc counts
-//!   it (SlowRuntimeStub::NewObjRange passes the ctor as both func and
-//!   newTarget, interpreter-inl.cpp:4205). A plain call leaves NewTarget
-//!   undefined — the V3 failure mode.
-//!
-//! v0.2 mapping: `Op::Call { kind: CallKind::New, .. }` is the construct
-//! op (v0.1's `CallKind::Construct`). The opt-variant test of v0.1 has no
-//! v0.2 counterpart at P2 (passes land at P3); the verifier still runs.
+//!   it (`SlowRuntimeStub::NewObjRange` passes the ctor as both `func` and
+//!   `newTarget`, `interpreter-inl.cpp:4205`). A plain call leaves `NewTarget`
+//!   `undefined`.
 
 use crate::common;
 use abcd_ir::{CallKind, FunctionKind, Module, Op, verify_module};
@@ -228,8 +224,7 @@ fn construct_at_u8_boundary_keeps_narrow_newobjrange() {
 }
 
 /// (d) A construct call survives the structural verifier and lowers to
-/// `newobjrange`. (v0.1's opt-variant pin has no v0.2 counterpart at P2 —
-/// passes land at P3.)
+/// `newobjrange`.
 #[test]
 fn construct_verifies_and_lowers() {
     let (module, func) = build_construct(2);

@@ -1,4 +1,4 @@
-//! N27/N23 regression (v0.2 port of v0.1 `opt_merge_empty_phi.rs`): the
+//! N27/N23 regression (`design/decisions.md`): the
 //! optimizer must never leave an EMPTY phi (`Phi { entries: [] }`) on a
 //! reachable block whose result feeds a use.
 //!

@@ -897,7 +897,7 @@ fn annotation_array_element_huge_count_is_rejected() {
         let ann_cls = abc_builder_add_class(b, c"LAnno;".as_ptr());
         assert_ne!(ann_cls, u32::MAX);
         let elem_name = abc_builder_add_string(b, c"value".as_ptr());
-        let values = [42u32];
+        let values = [42u64];
         let elem = AbcAnnotationElemDefEx {
             name_string_handle: elem_name,
             tag: b'Q' as std::ffi::c_char,
@@ -2198,9 +2198,10 @@ fn builder_annotation_ex_edge_arms() {
     let g = GuardBuilder::new();
     unsafe {
         // 64-bit scalar array component types (tags R/S/U): each builds an
-        // ArrayValueItem of the matching 8-byte component type.
+        // ArrayValueItem of the matching 8-byte component type and produces a
+        // structurally valid ABC buffer.
         let name = abc_builder_add_string(g.b, c"v".as_ptr());
-        let values = [0x0102_0304u32, 0x0506_0708];
+        let values = [0x0102_0304_0506_0708u64, 0x1112_1314_1516_1718];
         for tag in *b"RSU" {
             let elem = AbcAnnotationElemDefEx {
                 name_string_handle: name,
@@ -2211,12 +2212,9 @@ fn builder_annotation_ex_edge_arms() {
                 array_values: values.as_ptr(),
                 array_count: 2,
             };
-            assert_ne!(
-                abc_builder_create_annotation_ex(g.b, g.cls, &elem, 1),
-                u32::MAX,
-                "tag {} array must build",
-                tag as char
-            );
+            let ann = abc_builder_create_annotation_ex(g.b, g.cls, &elem, 1);
+            assert_ne!(ann, u32::MAX, "tag {} array must build", tag as char);
+            abc_builder_class_add_annotation(g.b, g.cls, ann);
         }
         // Unresolvable entity handles per tag family: scalar entity refs
         // fall back to raw scalars; entity arrays fall back per element.
@@ -2243,6 +2241,7 @@ fn builder_annotation_ex_edge_arms() {
             array_values: std::ptr::null(),
             array_count: 0,
         });
+        let fallback_entity_arr = [0x7777u64];
         for tag in *b"VWXYZ@" {
             elems.push(AbcAnnotationElemDefEx {
                 name_string_handle: name,
@@ -2250,7 +2249,7 @@ fn builder_annotation_ex_edge_arms() {
                 is_array: 4,
                 scalar_value: 0,
                 scalar_value_64: 0,
-                array_values: [0x7777u32].as_ptr(),
+                array_values: fallback_entity_arr.as_ptr(),
                 array_count: 1,
             });
         }
@@ -2268,16 +2267,16 @@ fn builder_annotation_ex_edge_arms() {
             abc_builder_create_annotation(g.b, u32::MAX, std::ptr::null(), 0),
             u32::MAX
         );
-        // The R/S/U arrays make the file structurally inconsistent (the
-        // vendored ArrayValueItem sizes 8-byte components but the 32-bit
-        // builder ABI writes 4-byte items, so the item stream desyncs):
-        // finalize must still produce bytes — the coverage is in the build
-        // calls themselves — but the result is deliberately never decoded
-        // here (the model path reports UnsupportedAnnotationArrayType
-        // instead, phase05_fixes.rs).
         let mut out_len = 0u32;
         let ptr = abc_builder_finalize(g.b, &mut out_len);
-        assert!(!ptr.is_null(), "the R/S/U build must still finalize");
+        assert!(!ptr.is_null(), "the R/S/U build must finalize cleanly");
+        let built = std::slice::from_raw_parts(ptr, out_len as usize);
+        let reopened = abc_file_open(built.as_ptr(), built.len());
+        assert!(
+            !reopened.is_null(),
+            "finalized R/S/U annotation file must open"
+        );
+        abc_file_close(reopened);
     }
 }
 
@@ -2483,5 +2482,68 @@ fn builder_create_proto_ex_guards() {
         );
         let (f, _) = g.finalize_open();
         abc_file_close(f);
+    }
+}
+
+/// `abc_literal_enumerate_vals_checked` rejects null handles, header/index
+/// table offsets, odd scalar counts, unknown tags, and truncated items, while
+/// accepting empty and well-formed tagged literal arrays.
+#[test]
+fn literal_enumerate_vals_checked_guards() {
+    unsafe extern "C" fn count_val(_: *const AbcLiteralVal, ctx: *mut c_void) {
+        unsafe { *(ctx as *mut usize) += 1 };
+    }
+
+    unsafe {
+        assert_eq!(
+            abc_literal_enumerate_vals_checked(std::ptr::null(), 64, None, std::ptr::null_mut()),
+            -1
+        );
+
+        // Odd count, unknown tag, truncated payload, and truncated typed array.
+        let malformed_payloads: &[&[u8]] = &[
+            &[1, 0, 0, 0, 0x01, 0x01],             // odd scalar count = 1
+            &[2, 0, 0, 0, 0xfe, 0x00],             // unknown tag 0xfe
+            &[2, 0, 0, 0, 0x02, 0x2a, 0x00],       // truncated 4-byte INTEGER
+            &[2, 0, 0, 0, 0x0f, 3, 0, 0, 0, 1, 2], // ARRAY_U32 with 3 elems declared, <12B left
+        ];
+        for payload in malformed_payloads {
+            let data = minimal_file(payload);
+            let f = open(&data);
+            assert_eq!(
+                abc_literal_enumerate_vals_checked(f, 64, None, std::ptr::null_mut()),
+                -1,
+                "malformed payload {payload:?} must be rejected"
+            );
+            abc_file_close(f);
+        }
+
+        // Valid empty array (count == 0) and [count = 2][INTEGER 42].
+        let empty = minimal_file(&0u32.to_le_bytes());
+        let f_empty = open(&empty);
+        assert_eq!(
+            abc_literal_enumerate_vals_checked(f_empty, 64, None, std::ptr::null_mut()),
+            0
+        );
+        abc_file_close(f_empty);
+
+        let mut good_body = Vec::new();
+        good_body.extend_from_slice(&2u32.to_le_bytes());
+        good_body.push(0x02);
+        good_body.extend_from_slice(&42u32.to_le_bytes());
+        let good = minimal_file(&good_body);
+        let f_good = open(&good);
+        let mut seen = 0usize;
+        assert_eq!(
+            abc_literal_enumerate_vals_checked(
+                f_good,
+                64,
+                Some(count_val),
+                &mut seen as *mut usize as *mut c_void,
+            ),
+            0
+        );
+        assert_eq!(seen, 1);
+        abc_file_close(f_good);
     }
 }

@@ -1,18 +1,15 @@
-//! Roundtrip test for the v0.2 lower-to-encode entity relocation channel
-//! (port of `abcd-ir/tests/lower_method_body.rs`): decode → v0.2 lift →
-//! lower → `to_method_body` → `abcd_file::encode` → decode, asserting
-//! entity operands resolve to the same targets after the real relocation
-//! path (`MethodBody.entity_offsets` + `Builder::relocate_code_id`)
-//! rewrote the raw indices. Also covers the channel's hard errors for
-//! untraceable entity operands.
+//! Roundtrip tests for the lower-to-encode entity relocation and per-method
+//! `u16` compaction channel (`design/ir.md` §5, `design/decisions.md` `ADR-10`):
+//! decode → lift → lower → `to_method_body` → `abcd_file::encode` → decode,
+//! asserting entity operands resolve to the same targets after relocation
+//! (`MethodBody.entity_offsets` + `Builder::relocate_code_id`), plus hard
+//! errors for untraceable entity operands.
 //!
-//! v0.2 differences: emitted raw operands are IR identities (Sym /
-//! function-table index / ConstId), and the reverse resolution (content /
-//! function-table position / literal-shape content → source offset) lives
-//! in `to_method_body`. The S1/N2 name-collision regressions are
-//! non-issues BY CONSTRUCTION in v0.2 (method identity is the
-//! function-table index, never a name); the tests below pin the
-//! equivalent end-to-end behavior.
+//! Emitted raw operands in `LayoutResult` are IR identities (`Sym` /
+//! function-table `FuncId` / `ConstId`), which `to_method_body` resolves to
+//! source-file offsets and compacts into per-method `u16` placeholder indices.
+//! Name collisions between methods and strings (`S1`/`N2`) are impossible by
+//! construction because method identity is always the function-table index.
 
 use crate::common;
 use abcd_file::{AccessFlags, Builder, CodeEntity, File, LiteralValue, Type};
@@ -183,10 +180,9 @@ fn lowered_method_body_roundtrips_through_encode_relocation() {
     let result = lower_function(&module, caller_id).expect("lower caller");
     let body = to_method_body(&module, caller_id, &result, &file).expect("method body");
 
-    // The v0.2 relocation channel contract: raw operands are IR
-    // identities (Sym / FuncId / ConstId); the entries resolve them to
-    // the source offsets — the method by function-table position, the
-    // string by content, the literal shape by content.
+    // Relocation channel contract: IR entity identities resolve to source
+    // offsets — the method by function-table position, the string by content,
+    // and the literal shape by content.
     let targets = relocation_targets(&body);
     assert_eq!(targets[&EntityKind::MethodId], vec![entities.target_offset]);
     assert_eq!(targets[&EntityKind::StringId], vec![entities.string_offset]);
@@ -246,10 +242,9 @@ fn lowered_method_body_roundtrips_through_encode_relocation() {
     assert!(saw_method && saw_string && saw_array);
 }
 
-/// S1/N2 in v0.2: a string/method name collision ("A" the string vs "A"
-/// the method) is a non-issue by construction — the DefineFunc's identity
-/// is the function-table index, never the name. Pin the end-to-end
-/// behavior: both operands relocate to their own entities.
+/// `S1`/`N2`: a string/method name collision ("A" the string vs "A" the
+/// method) cannot alias because `DefineFunc` carries the function-table index,
+/// never the name.
 #[test]
 fn string_first_name_collision_relocates_method_operand_to_the_method() {
     let mut builder = Builder::new();
@@ -333,8 +328,8 @@ fn string_first_name_collision_relocates_method_operand_to_the_method() {
     assert!(saw_method && saw_string);
 }
 
-/// N2 in v0.2: two same-named methods referenced from one body keep their
-/// own function-table indices and relocate to their own offsets.
+/// `N2`: two same-named methods referenced from one body keep their own
+/// function-table indices and relocate to their own offsets.
 #[test]
 fn same_named_method_references_keep_their_own_offsets() {
     let mut builder = Builder::new();
@@ -649,7 +644,7 @@ fn deprecated_copydataproperties_lifts_and_lowers_to_the_modern_opcode() {
     );
 }
 
-// ─── c-COV A13: the N62 literal-dedup matcher matrix ────────────────────────
+// ─── N62 literal-dedup matcher matrix ────────────────────────────────────────
 //
 // `to_method_body`'s reverse literal-shape resolution
 // (`const_matches_literal_array`/`const_matches_literal_value`/

@@ -64,9 +64,8 @@ fn build_rich() -> Vec<u8> {
     );
     b.method_set_source_lang(m, SourceLang::EcmaScript);
 
-    // Debug info with a source file and a line table. Regression test for
-    // design/archive/review-isa-file.md #16 (line-number programs were emitted
-    // before layout, recording string offsets of 0).
+    // Debug info with a source file and a line table (regression test ensuring
+    // line-number programs flush after layout so string offsets are non-zero).
     let lnp = b.create_lnp();
     let debug = b.create_debug_info(lnp, 1);
     let src_file = b.add_string("main.js");

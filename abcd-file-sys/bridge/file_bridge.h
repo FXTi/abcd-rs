@@ -323,6 +323,13 @@ struct AbcLiteralVal {
 typedef void (*AbcLiteralValCb)(const struct AbcLiteralVal *val, void *ctx);
 void abc_literal_enumerate_vals(AbcLiteralAccessor *a, uint32_t array_off,
                                 AbcLiteralValCb cb, void *ctx);
+/* Strictly validate and enumerate a tagged literal array at `array_off`.
+ * Rejects out-of-bounds or header-table offsets, spans shorter than the u32
+ * item-count header, odd scalar `[tag][value]` counts, unknown tags, and
+ * truncated item payloads with -1. Pass `cb == NULL` to validate structure
+ * without collecting values. Returns 0 on valid tagged literal array, -1 on error. */
+int abc_literal_enumerate_vals_checked(const AbcFileHandle *f, uint32_t array_off,
+                                       AbcLiteralValCb cb, void *ctx);
 
 /* ========== Module Data Accessor ========== */
 
@@ -666,10 +673,10 @@ struct AbcAnnotationElemDefEx {
     uint32_t name_string_handle;
     char     tag;
     uint8_t  is_array;            /* 0=scalar32, 1=array, 2=scalar64, 3=entity_ref, 4=entity_array */
-    uint32_t scalar_value;        /* used when is_array == 0 */
+    uint32_t scalar_value;        /* used when is_array == 0 or 3 */
     uint64_t scalar_value_64;     /* used when is_array == 2 */
-    const uint32_t *array_values; /* used when is_array == 1 */
-    uint32_t array_count;         /* used when is_array == 1 */
+    const uint64_t *array_values; /* used when is_array == 1 or 4 (zero-extended for <=32-bit/entity items) */
+    uint32_t array_count;         /* used when is_array == 1 or 4 */
 };
 uint32_t abc_builder_create_annotation_ex(AbcBuilder *b, uint32_t class_handle,
     const struct AbcAnnotationElemDefEx *elements, uint32_t num_elements);

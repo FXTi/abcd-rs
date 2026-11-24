@@ -1,6 +1,6 @@
-//! Rung-1 alias-engine arm coverage (c-COV W10): direct engine queries
-//! over hand-built modules, one test per SKIP-ARM the corpus suites
-//! never query — Mov pass-through, ≥2-hop call results, ≥2-caller
+//! Rung-1 alias-engine arm coverage: direct engine queries
+//! over hand-built modules, one test per arm that corpus suites
+//! rarely exercise — Mov pass-through, ≥2-hop call results, ≥2-caller
 //! unbalanced fan-outs, cycle cuts, exception/const params, the
 //! implicit-slot bind table, and the partial/external/bodyless callee
 //! hops. Every test asserts the exact `QueryAnswer`, not just

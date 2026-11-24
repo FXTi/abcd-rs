@@ -1,6 +1,5 @@
-//! P1 regressions (B2, v0.2 port of
-//! `abcd-ir/tests/lower_parallel_copy_slots.rs`): value-level
-//! parallel-copy resolution misses slot-level hazards.
+//! Slot-level parallel-copy resolution regression tests: value-level
+//! parallel-copy ordering misses slot-level hazards after register coalescing.
 //!
 //! Coalescing lets distinct values share one register slot, so an order
 //! that is safe in value space can be unsafe in slot space, and a slot

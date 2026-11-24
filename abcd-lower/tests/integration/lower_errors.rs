@@ -1,7 +1,6 @@
-//! c-COV A11 (isel half): the `LowerError` battery — every unsupported-shape
-//! arm of `select_inst`/`select_call`/`const_load_bytecode` pinned with the
-//! exact error variant, plus the defensive dangling-id skips of the
-//! block/inst scan loops.
+//! `LowerError` regression suite: pins every unsupported-shape arm of
+//! `select_inst` / `select_call` / `const_load_bytecode` with its exact error
+//! variant, plus defensive dangling-id skips in block/inst scan loops.
 //!
 //! The lift never produces these shapes (the comments in `isel.rs` say so
 //! per arm), so the tests hand-build the IR with `V2Builder` and — where

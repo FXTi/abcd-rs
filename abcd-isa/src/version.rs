@@ -9,7 +9,7 @@ use std::fmt;
 /// use abcd_isa::Version;
 ///
 /// let v = Version::current();
-/// println!("ISA version: {v}");  // e.g. "13.0.1.0"
+/// println!("ISA version: {v}");  // e.g. "24.0.0.0"
 ///
 /// let file_ver = Version::new(12, 0, 6, 0);
 /// assert!(file_ver.is_in_supported_range());

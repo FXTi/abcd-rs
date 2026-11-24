@@ -1,5 +1,5 @@
-//! c-COV A11 (overflow half): the register/IC/window overflow hard errors of
-//! regalloc and isel — nothing is silently truncated.
+//! Register, IC-slot, and range-window overflow error tests for `regalloc`
+//! and `isel` — nothing is silently truncated.
 //!
 //! Two drivers:
 //!

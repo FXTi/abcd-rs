@@ -6,12 +6,11 @@ license.workspace = true
 version.workspace = true
 readme = "README.md"
 
-# Crate-graph invariant (design/ir-v0.2.md §2: "Deliberately NOT in the IR
-# (analysis-side concerns)"; design/analysis-strategy.md §5):
-# analysis infra: format-independent, never depends on abcd-file/abcd-isa/
-# abcd-lift/abcd-lower/abcd-opt. The LIBRARY consumes only `abcd-ir`; the
-# corpus tests under tests/ pull `abcd-file`/`abcd-lift` as DEV-dependencies
-# only (they drive decode → lift end-to-end to obtain real modules).
+# Crate-graph invariant (design/ir.md, design/analysis.md):
+# analysis infra is strictly format-independent and never depends on abcd-file /
+# abcd-isa / abcd-lift / abcd-lower / abcd-opt. The LIBRARY consumes only
+# `abcd-ir`; integration tests under `tests/` pull `abcd-file` and `abcd-lift`
+# as DEV-dependencies only to drive decode -> lift on real bytecode modules.
 [dependencies]
 abcd-ir = { workspace = true }
 

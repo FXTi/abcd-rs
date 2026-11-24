@@ -1,7 +1,7 @@
 //! # abcd-taint — interprocedural IFDS taint analysis on `abcd-ir`
 //!
-//! Taint-analysis engine (`design/analysis-strategy.md` §5.2–§5.5) built as a
-//! client of `abcd-analysis`'s [`abcd_analysis::dataflow::ifds::IfdsProblem`]
+//! Taint-analysis engine (`design/analysis.md`, `design/decisions.md`) built as
+//! a client of `abcd-analysis`'s [`abcd_analysis::dataflow::ifds::IfdsProblem`]
 //! tabulation solver:
 //!
 //! - [`fact`] — the fact domain: [`fact::Fact`] = `Λ` (zero fact) or a
@@ -15,8 +15,7 @@
 //!   endpoint flows over `{param(i), base, return, field(path), return-field(path)}`,
 //!   clears, `is_alias`, callback gap specifications, `exclusive` dispatch,
 //!   negative caching, and hit/miss telemetry.
-//! - [`gap`] — callback-gap propagation (analogous to FlowDroid's
-//!   `spawnAnalysisIntoClientCode`): summary call sites taking higher-order
+//! - [`gap`] — callback-gap propagation: summary call sites taking higher-order
 //!   callbacks (`Array.prototype.map`, `forEach`, `Promise.prototype.then`, …)
 //!   materialize synthetic call edges into resolved callback bodies and wire
 //!   tainted formals and return values back to the summary result.

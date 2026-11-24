@@ -1,9 +1,7 @@
-//! The on-the-fly call graph (design/analysis-strategy.md §5.4,
-//! design/flowdroid/driver-and-callgraph.md §5, and
-//! design/arkanalyzer/callgraph-and-pta.md §4).
+//! The on-the-fly call graph (`design/analysis.md`, `design/ir.md`).
 //!
-//! For a language whose call targets are *values*, there is no cheap CHA
-//! fallback: resolution is value flow. `CallGraph::build` performs the
+//! For a language whose call targets are *values*, there is no class-hierarchy
+//! (CHA) fallback: resolution is value flow. `CallGraph::build` performs the
 //! rung-0/rung-1-shared resolution step — a backward def-chain trace of
 //! the callee `ValueId` through `Mov` / `Phi` / `LoadConst` /
 //! `AllocClosure` / `DefineFunc` to function bodies — and records an
@@ -11,16 +9,15 @@
 //! cannot resolve (`TryGetGlobal` results, property loads, call returns,
 //! parameters, …). **Unresolved sites are never silently dropped.**
 //!
-//! This is deliberately the *seed* graph the analysis-strategy calls
-//! "name-based (RTA-analog) resolution refined by the same `points_to`
-//! mechanism as the alias ladder" (§5.4): the closure blind spot of the
-//! source-level ArkAnalyzer CHA/RTA does not exist here, because a stored
-//! lambda is an `AllocClosure`/`DefineFunc` site and the def-chain trace
-//! sees it. Co-evolution with a points-to engine (rebuilding as rung-1/2
+//! Because stored lambdas materialize as explicit `AllocClosure` /
+//! `DefineFunc` instructions in SSA IR, backward def-chain tracing resolves
+//! direct and local higher-order calls directly, and is then refined by the
+//! same `points_to` mechanisms across the precision ladder (`design/analysis.md`).
+//! Co-evolution with a points-to engine (rebuilding as rung-1/2
 //! queries refine callee sets) is a consumer-side discipline: the graph
 //! is an immutable snapshot keyed by [`InstId`], cheap to rebuild.
 //!
-//! Determinism (heros.md §5 item 4): construction walks functions,
+//! Determinism (`design/decisions.md` N20): construction walks functions,
 //! blocks, and instructions in arena order; target sets are sorted
 //! `BTreeSet`s; all maps are `BTreeMap`s. Two builds over the same module
 //! are equal, and the corpus smoke test pins this.
@@ -42,7 +39,7 @@ pub enum CallTargets {
     Resolved(Vec<FuncId>),
     /// The callee value could not be traced to any function body
     /// (global loads, property loads, call results, …). Explicit and
-    /// counted — never silently dropped (analysis-strategy §5.4).
+    /// counted — never silently dropped (`design/analysis.md`).
     UnknownCallees,
 }
 
@@ -50,7 +47,7 @@ pub enum CallTargets {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CallEdgeKind {
     /// [`CallKind::Direct`]: the callee value traced to a function body
-    /// (the statically bound case of the §5.3 binding table).
+    /// (the statically bound call convention in `design/ir.md`).
     Direct,
     /// A value-flow call (`Dynamic`, `Apply`, `New`, `Super*`) whose
     /// callee traced to function bodies through the def chain.
@@ -65,7 +62,7 @@ pub enum CallEdgeKind {
 pub struct CallEdge {
     /// The function containing the call.
     pub caller: FuncId,
-    /// The call's kind (§5.3 binding table).
+    /// The call's kind (`design/ir.md`).
     pub kind: CallKind,
     /// The edge classification.
     pub edge_kind: CallEdgeKind,
@@ -102,8 +99,8 @@ impl ResolutionHistogram {
 /// The call graph of a module: an immutable, deterministic snapshot.
 ///
 /// Consumed by the IFDS solver through [`CallGraphOracle`] only
-/// (analysis-strategy §5.4: the ICFG indirection keeps batch vs
-/// on-the-fly swappable).
+/// (`design/analysis.md`: the supergraph indirection keeps batch vs
+/// on-the-fly call-graph construction swappable).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CallGraph {
     /// Call instruction → edge.
@@ -238,20 +235,21 @@ impl CallGraph {
         h
     }
 
-    /// Rung-1 refinement pass (analysis-strategy §5.4: "one query
-    /// engine, two consumers"): re-resolve call sites the base trace
+    /// Rung-1 refinement pass (`design/analysis.md` — one demand-driven
+    /// query engine serving both alias keying and call resolution):
+    /// re-resolve call sites the base trace
     /// marked [`CallTargets::UnknownCallees`] by asking the alias
     /// engine's `points_to` for the callee VALUE's allocation sites and
     /// mapping closure sites back to their function bodies
     /// (`AllocClosure`/`CreateGenerator` → their `DefineFunc` chain).
-    /// This is the b3 case: `register(cb) { cb(); }` — the inner call's
+    /// For `register(cb) { cb(); }`, the inner call's
     /// callee is a parameter, opaque to the base trace, but the engine's
     /// caller fan-out traces it to the caller's `AllocClosure` site.
     ///
     /// Discipline:
-    /// - ONE pass over the base graph, no fixed point (the §5.4
-    ///   co-evolution loop — rebuilt graphs feeding finer queries — is a
-    ///   later-rung architecture; the engine itself reads only `base`).
+    /// - ONE pass over the base graph, no fixed point (whole-module
+    ///   call-graph/PTA co-evolution is handled at rung 2 in
+    ///   [`crate::dataflow::pta`]; the rung-1 engine reads only `base`).
     /// - Only fully-unknown sites are candidates; resolved-but-partial
     ///   edges are left untouched (widening those needs edge merging,
     ///   deferred with the fixed point).
@@ -853,9 +851,9 @@ mod tests {
         assert_eq!(CallGraph::build(&m), CallGraph::build(&m));
     }
 
-    /// The b3 case (analysis-strategy §5.4, one engine two consumers):
+    /// Higher-order callback dispatch (`design/analysis.md`):
     /// `register(cb) { cb(); }` — the inner call's param callee is
-    /// unknown to the base trace; the points_to refinement bridges it to
+    /// unknown to the base trace; the `points_to` refinement bridges it to
     /// the caller's closure body, and the refined graph's caller index
     /// records the new edge.
     #[test]

@@ -1,6 +1,6 @@
-//! Mechanism unit tests (task §6): one test per taint mechanism, each
-//! over a hand-built module (the builders in `tests/common` keep the IR
-//! invariants the verifier checks).
+//! Mechanism integration tests (`design/analysis.md`, `design/decisions.md`):
+//! one test per taint mechanism over a hand-built IR module (using the
+//! builders in `common` that preserve IR verifier invariants).
 
 use crate::common;
 use abcd_ir::{CallKind, Loc, Op};
@@ -126,7 +126,7 @@ fn access_path_cutoff() {
 }
 
 /// Exclusive semantics: a summary kills the call edge into the callee —
-/// never merged (summaries.md §2.1). A sanitizer summary (exclusive, no
+/// never merged (`design/analysis.md`). A sanitizer summary (exclusive, no
 /// flows) over a RESOLVED callee must suppress the body's flow.
 #[test]
 fn exclusive_summary_kills_call_edge() {
@@ -701,7 +701,7 @@ fn determinism_two_runs_identical() {
     assert_eq!(format!("{:?}", a.stats), format!("{:?}", b.stats));
 }
 
-/// The fact type's zero is distinct from every real fact (heros §2.4).
+/// The fact type's zero (`Λ`) is distinct from every real fact.
 #[test]
 fn zero_fact_is_distinct() {
     let mut m = mk_module();
@@ -859,8 +859,8 @@ fn call_binding_nonstatic_unannotated_overapprox() {
     );
 }
 
-// ── Rung 1 (t-P2): the on-demand alias engine behind the AliasOracle
-// seam (analysis-strategy §4.4 rung 1). Each test pins the rung-0
+// ── Rung 1: the on-demand alias engine behind the AliasOracle seam
+// (`design/analysis.md`). Each test pins the rung-0
 // behavior (the A/B control, `alias_rung: 0`) AND the rung-1 behavior —
 // the delta IS the mechanism.
 
@@ -1214,11 +1214,9 @@ fn rung1_summary_endpoint_matches_heap_field_taint() {
     // The endpoint match is NOT oracle-gated: it fires whenever
     // `site_info_at` resolves the argument's sites — the rung-0 local
     // walk suffices for a locally allocated argument like this one (the
-    // rung-1 engine matters when the endpoint value needs the
-    // interprocedural query; the compiled-probe A/B — e5 flips at both
-    // rungs, a4/a5/b3 only at rung 1 — is in the t-P2 report). What this
-    // test pins is that the match EXISTS at all: the pre-t-P2
-    // `match_endpoint` returned None for heap facts (the e5 FN).
+    // rung-1 engine matters when the endpoint value needs an
+    // interprocedural query). What this test pins is that heap-fact
+    // matching on summary endpoints works end-to-end.
     let rung0 = abcd_taint::run_taint(&build(), &config(0));
     assert_eq!(
         rung0.hits.len(),
@@ -1303,7 +1301,7 @@ fn rung1_determinism_two_runs_identical() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// t-P3: the prototype-resolution path (prototype.rs) — receiver-typed
+// Prototype-resolution path (prototype.rs) — receiver-typed
 // builtin summary lookup. One test per mechanism: alloc-kind→family,
 // constant/global-provenance family, multi-site merge, negative
 // control, precedence (direct name beats prototype; user object beats
@@ -1311,7 +1309,7 @@ fn rung1_determinism_two_runs_identical() {
 // GetIterator family, and the push alias flow.
 // ────────────────────────────────────────────────────────────────────
 
-/// The std config plus the full builtin registry (top-20 + the t-P3
+/// The std config plus the full builtin registry (including
 /// prototype-family entries).
 fn builtin_config() -> TaintConfig {
     TaintConfig {
@@ -1371,10 +1369,8 @@ fn prototype_family_alloc_array_pop() {
     let report = abcd_taint::run_taint(&m, &builtin_config());
     // TWO sink hits on the one print: the element fact fires BOTH of
     // pop's flows — Field([AnyIndex])→Return (leftover [], the precise
-    // carrier) and Base→Return (leftover [AnyIndex] appended — the
-    // registered leftover-append over-approximation, FlowDroid's
-    // cutSubFields=false default; harmless: the probe runner dedups
-    // sink hits by source line).
+    // carrier) and Base→Return (leftover [AnyIndex] appended; harmless:
+    // the probe runner dedups sink hits by source line).
     assert_eq!(report.hits.len(), 2, "the popped element is tainted");
     assert!(
         report
@@ -1814,12 +1810,12 @@ fn prototype_family_alloc_via_global_provenance() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// t-P4: the full gap propagator (gap.rs) — a summary's callback
+// Full callback-gap propagator (gap.rs) — a summary's callback
 // carries taint INTO the user callback's formals (gap enter) and the
 // callback's RESULT back onto the summary call's result (gap return),
 // through synthetic call edges layered onto the solver's call graph
 // (GapCallGraph). Registered drivers: Array.prototype.forEach/map/
-// filter (the canonical gap trio).
+// filter.
 // ────────────────────────────────────────────────────────────────────
 
 /// A STATIC callback `cb(e) { <body over e> }` skeleton: the es2abc
@@ -1843,8 +1839,7 @@ fn gap_cb_skeleton(
 /// Gap ENTER wiring: `a[i] = tainted; a.forEach(cb)` — the array's
 /// `[AnyIndex]` heap taint matches forEach's Field([AnyIndex]) enter
 /// rule (positive site intersection) and seeds the callback's formal;
-/// the print inside the callback body fires. This is the FlowDroid
-/// "spawn the normal analysis into user code" step: the callback body
+/// the print inside the callback body fires because the callback body
 /// is entered through an ordinary IFDS call edge (GapCallGraph), not a
 /// side-channel.
 #[test]
@@ -2092,8 +2087,8 @@ fn gap_for_each_discards_callback_return_but_runs_body() {
 }
 
 /// Exclusive × gap: an EXCLUSIVE summary with a callback must still run
-/// the user callback (the gap edge is not the callee-body edge —
-/// FlowDroid's spawnAnalysisIntoClientCode discipline), while the
+/// the user callback (the gap edge is distinct from the callee-body
+/// edge), while the
 /// exclusive bypass kill still applies to the summary call's operands
 /// (the tainted argument does not survive the call-to-return edge).
 #[test]
@@ -2228,10 +2223,8 @@ fn gap_nested_callbacks_terminate() {
         // let c = [e]; c.forEach(cb2) — the nested gap, its receiver a
         // LOCAL alloc (element taint re-keys onto c's site). The store
         // must come BEFORE the print: print's exclusive summary kills
-        // the operand taint on its own call-to-return edge
-        // (WrapperPropagationRule's killSource — the pinned
-        // exclusive-summary semantics), so a print first would sever
-        // the flow into the store.
+        // the operand taint on its own call-to-return edge, so a print
+        // first would sever the flow into the store.
         let c = alloc_array(&mut m, cb1_entry);
         let idx = load_number(&mut m, cb1_entry, 0.0);
         emit_void(
@@ -2422,10 +2415,11 @@ fn gap_mini_gap_tag_binds_first_formal_on_direct_call() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// t-P5: the miss-log-driven second tier — String.prototype.replace's
-// dual form (string replacement + the callback gap), the
-// constructor-result family arm (RegExp.prototype.test), split/join,
-// parseInt, and Object.assign's result identity.
+// String / RegExp / parseInt / Object.assign builtins —
+// String.prototype.replace's dual form (string replacement + the
+// callback gap), the constructor-result family arm
+// (RegExp.prototype.test), split/join, parseInt, and Object.assign's
+// result identity.
 // ────────────────────────────────────────────────────────────────────
 
 /// A string receiver typed through global-store provenance (the
@@ -2464,7 +2458,7 @@ fn tainted_string_global(
 /// a clean base taints nothing (the identity heuristic would — the
 /// clean assertion pins the summary's win). The string replacement is
 /// a provably non-callable constant: the gap scan must NOT count the
-/// site as an unresolved callback (the t-P5 refinement).
+/// site as an unresolved callback (`definitely_not_callable`).
 #[test]
 fn replace_string_form_flows() {
     let mut m = mk_module();
@@ -2527,7 +2521,7 @@ fn replace_string_form_flows() {
         report.summaries_applied
     );
     // The two CONSTANT-replacement sites contribute nothing to the gap
-    // counters (the t-P5 not-a-callback refinement); the
+    // counters (`definitely_not_callable` refinement); the
     // `c.replace("a", p)` site's replacement is a PARAM — possibly a
     // function — and honestly counts as unresolved.
     assert_eq!(report.gap_sites_resolved, 0);
@@ -2651,7 +2645,7 @@ fn replace_function_form_gap_enter() {
     assert_eq!(report.gap_sites_resolved, 1);
 }
 
-/// The constructor-result family arm (t-P5, prototype.rs §5): the
+/// Constructor-result family arm (prototype.rs §5): the
 /// receiver of `r.test(...)` is the result of `new RegExp(...)` — the
 /// shape es2abc lowers regexp literals to. RegExp.prototype.test
 /// applies, and its NO-FLOW model (a pure verdict) beats the identity
@@ -2911,11 +2905,11 @@ fn join_element_and_separator_flows() {
 }
 
 /// parseInt (direct global name): Param(0)→Return — a content-derived
-/// digit parse (the charCodeAt discipline); the radix is control. The
-/// t-P5 exclusive-policy review registers parseInt NON-exclusive (a
-/// pure READ of its operand: killSource would be a real FN for SSA
-/// re-use, and the callee-body kill is vacuous for a native), so the
-/// one tainted param threads all three call sites.
+/// digit parse (the charCodeAt discipline); the radix is control.
+/// `parseInt` is registered NON-exclusive (a pure READ of its operand:
+/// killing operand taint on the bypass edge would cause a false negative
+/// for SSA re-use, and the callee-body kill is vacuous for a native), so
+/// the one tainted param threads all three call sites.
 #[test]
 fn parseint_content_derived_radix_is_control() {
     let mut m = mk_module();
@@ -3003,7 +2997,7 @@ fn parseint_content_derived_radix_is_control() {
     );
 }
 
-/// Object.assign's result identity (t-P5 deepening): the call RESULT
+/// Object.assign's result identity: the call RESULT
 /// is param 0, so a tainted SOURCE argument flows to the result
 /// directly (Param(1)→Return) — the `let o = Object.assign({}, src)`
 /// shape needs no load through the mutated target.

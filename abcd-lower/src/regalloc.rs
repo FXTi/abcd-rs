@@ -1,27 +1,26 @@
-//! SSA-based register allocation (port of v0.1 `abcd_ir::lower::regalloc`
-//! onto the v0.2 IR).
+//! SSA-based chordal register allocation (`design/ir.md` §5,
+//! `design/decisions.md` `ADR-03`, `ADR-04`).
 //!
-//! 1. Exact backward dataflow liveness analysis.
-//! 2. Interference graph construction (SSA guarantees chordal graph).
+//! 1. Exact backward dataflow liveness analysis (including exception edges).
+//! 2. Interference graph construction (SSA guarantees chordality).
 //! 3. MCS (Maximum Cardinality Search) ordering + greedy coloring to
 //!    register homes. Every value is colored to a REGISTER: the
 //!    accumulator is not a coloring class but one physical location whose
-//!    content is tracked at emission time by isel ("acc-as-cache", B4).
+//!    content is tracked at emission time by isel ("acc-as-cache", `ADR-03`).
 //! 4. Boissinot SSA destruction: coalesce same-color phi operands, collect
 //!    the per-edge parallel copy sets for different colors. The copies are
 //!    resolved (sequentialized) at slot level at the emission point in
 //!    `layout`, because coalescing can make distinct values share a slot.
 //!
-//! v0.2 adaptations:
+//! IR representation notes:
 //!
 //! - phis are the leading [`Op::Phi`] prefix of `block.insts`, keyed by
-//!   `(Edge, value)` — the pred of an entry is `edge.from`;
+//!   `(Edge, value)` — the predecessor of an entry is `edge.from`;
 //! - exception values are first-class [`ValueDef::ExceptionParam`]
-//!   recorded on the try regions' [`Catch`](abcd_ir::Catch) entries
-//!   (v0.1's `exception_values`);
-//! - frame-initial values are [`ValueDef::Const`] constants (v0.1
-//!   materialized seed instructions at the entry top); they are colored
-//!   like any value and modeled as defined at the entry block's start.
+//!   recorded on the try regions' [`Catch`](abcd_ir::Catch) entries;
+//! - frame-initial values are [`ValueDef::Const`] constants recorded on
+//!   [`abcd_ir::FunctionData::frame_init_consts`]; they are colored like any
+//!   value and modeled as defined at the entry block's start.
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -149,10 +148,10 @@ pub fn compute_rpo(module: &Module, func_id: FuncId) -> Vec<BlockId> {
     analysis::compute_rpo(module, func_id)
 }
 
-/// All phi-instruction entries of a block: `(pred, incoming value, phi
-/// result)` — the v0.1 view of the v0.2 `(Edge, value)` phi entries.
-/// Duplicate `pred`s (a Normal and an Exceptional edge from one block)
-/// appear once per entry, like v0.1's per-edge list.
+/// All phi-instruction entries of a block as `(pred, incoming value, phi
+/// result)` triples derived from `(Edge, value)` phi entries. Duplicate
+/// `pred`s (a Normal and an Exceptional edge from one block) appear once per
+/// entry.
 fn phi_entries(module: &Module, block: BlockId) -> Vec<(BlockId, ValueId, ValueId)> {
     let mut out = Vec::new();
     let Some(bb) = module.block(block) else {
@@ -187,65 +186,6 @@ fn for_each_phi(module: &Module, block: BlockId, mut f: impl FnMut(&abcd_ir::Ins
     }
 }
 
-/// The frame-initial constant values owned by `func_id` — v0.1's
-/// entry-top seed literals.
-///
-/// `used_only` selects between the two v0.1 pipeline variants'
-/// behaviors, and is what makes ONE implementation byte-faithful to
-/// both:
-///
-/// - `false` (lift parity): include UNUSED constants. v0.1's lift
-///   creates the seed as an entry-top instruction and its lower emits
-///   the seed's load unconditionally (only the homing `Sta` is
-///   use-gated). Lift creates seeds lazily but a DISCARDED operand read
-///   can leave one unused, so unused seeds do occur at lift.
-/// - `true` (opt parity): only constants with at least one operand use
-///   in the function's instructions. v0.1's optimizer sweeps the seed
-///   instruction with ADCE once its last use is gone; the v0.2 seed is
-///   an instruction-less `ValueDef::Const` value, so nothing remains to
-///   sweep and the lower must skip it instead. (Post-pipeline, dead
-///   instructions are swept, so "used by any instruction" is exactly
-///   "used by a live instruction" — ADCE's survival criterion.)
-///
-/// v0.2's `ValueDef::Const` values carry no owning-function back-pointer,
-/// so attribution is two-tier:
-///
-/// - A USED const belongs to the function(s) whose instructions reference
-///   it (phi entries are operands). This is exact, not heuristic: the
-///   lift creates const values function-by-function (each `FnLift` owns
-///   its `SsaBuilder`) and wires each one into its own function's
-///   instructions, so the using function IS the owning function — v0.1's
-///   placement of the seed instruction. A cross-function use arises only
-///   from abcd-opt's inliner, which transplants const values verbatim
-///   into the caller exactly like v0.1 cloned the callee's entry seed
-///   instructions; every user then materializes its own seed copy, which
-///   is sound because a constant is pure (rematerializable).
-/// - An UNUSED const has no use to reverse-lookup, so it keeps the
-///   id-range attribution: the lift creates values function-by-function
-///   in function-table order, so each function's values form a
-///   contiguous id range, and the const is attributed to the function
-///   with the greatest anchor minimum ≤ the const's id (anchors: params,
-///   exception params, instruction results — all function-scoped by
-///   construction). v0.1-lift emits even unused seed loads, so the
-///   placement still matters under `used_only == false`.
-///
-/// The id range alone cannot see a DEGENERATE function — no params, no
-/// result-carrying instructions, no try regions (e.g. a 0-argument
-/// static method whose only bytecode is a bare `return`: the lift
-/// resolves the `Return` operand to the frame-initial constant without
-/// creating any anchor). Its used consts found no owner at all, or
-/// sorted into a neighboring function's range, and register allocation
-/// never colored them (`LowerError::UnallocatedOperand`). es2abc output
-/// never produces the shape — every method carries the implicit
-/// `[func][newtarget][this]` frame slots as params — so the corpus never
-/// tripped it; use-based attribution closes it.
-///
-/// Residual boundary: an UNUSED const of an anchor-less function has
-/// neither a use nor a range and stays unowned (never materialized).
-/// The placement is positionally unrecoverable — trailing consts of
-/// consecutive anchor-less functions are indistinguishable by id — and
-/// the lift does not produce the shape (a lazily created frame-initial
-/// const is wired into the instruction whose read created it).
 /// Per-function frame-initial constant values (`ValueDef::Const`, #30).
 ///
 /// Ownership is recorded directly on [`abcd_ir::FunctionData::frame_init_consts`]
@@ -344,14 +284,11 @@ pub fn allocate_with_options(
     }
 
     // Collect all values in the function, skipping suppressed results
-    // (v0.1-invisible expansion values — see `fusion`). The frame-initial
-    // constants owned by this function (v0.1's entry-top seed literals;
-    // use-gated — see `frame_init_consts`) come FIRST — v0.1's seeds are
-    // the entry block's first
-    // instructions, so v0.1's scan pushes them first, in reverse creation
-    // order (each new seed was inserted at entry index 0). The insertion
-    // order matters: MCS's heap pops equal (weight, rank) keys in
-    // heap-structural order.
+    // (fusion expansion intermediates — see `fusion`). The frame-initial
+    // constants owned by this function (`frame_init_consts`) come FIRST in
+    // reverse creation order (matching entry-top materialization order). The
+    // insertion order matters: MCS's heap pops equal `(weight, rank)` keys in
+    // deterministic rank order.
     let const_values = frame_init_consts(module, func_id);
     let entry = rpo.first().copied();
     let mut all_values: Vec<ValueId> = Vec::new();
@@ -522,9 +459,7 @@ pub fn allocate_with_options(
                     }
                 }
             }
-            // The frame-initial constants are entry-block defs (v0.1's
-            // seed literals are entry instructions, so they land in
-            // defs[entry] there).
+            // Frame-initial constants are defined at entry-block start.
             if Some(pred) == entry {
                 forbid.extend(const_values.iter().copied());
             }
@@ -599,8 +534,7 @@ pub fn allocate_with_options(
 
 /// Largest operand count among the function's range-form instructions —
 /// the arms where isel encodes a start register and the VM reads N
-/// consecutive slots (v0.1's `range_call_window_size` on the v0.2 op
-/// shapes): `Call{Dynamic, this: None}` with > 3 args (callrange),
+/// consecutive slots (`S2` / `N4`): `Call{Dynamic, this: None}` with > 3 args (callrange),
 /// `Call{Dynamic, this: Some}` with > 4 window values (callthisrange —
 /// the window holds [this, args...]), every `Call{Super}` (the
 /// supercall*range forms are always range), every `Call{New}` (the
@@ -638,7 +572,7 @@ fn range_call_window_size(module: &Module, rpo: &[BlockId]) -> usize {
                         CallKind::New => Some(args.len() + 1),
                         // Fixed-arity forms: apply passes (this, array) as
                         // two register operands, supercallspread one — no
-                        // consecutive window (v0.1 parity).
+                        // consecutive window.
                         CallKind::Apply | CallKind::SuperSpread => None,
                     };
                     if let Some(argc) = range_argc {
@@ -669,9 +603,8 @@ fn range_call_window_size(module: &Module, rpo: &[BlockId]) -> usize {
 /// values defined there (S6 — without these edges such values look dead
 /// past their definition, never interfere, and can all be colored Acc).
 ///
-/// `const_values` (the used frame-initial constants) are modeled as
-/// defined at the ENTRY block's start — v0.1 materialized their seed
-/// literals as the entry block's first instructions.
+/// `const_values` (frame-initial constants) are modeled as defined at the
+/// ENTRY block's start.
 fn compute_liveness(
     module: &Module,
     func_id: FuncId,
@@ -728,8 +661,7 @@ fn compute_liveness(
         block_def.insert(bb, defs);
     }
 
-    // The used frame-initial constants are defined at the entry block's
-    // start (v0.1's seed literals were the entry block's first insts).
+    // Frame-initial constants are defined at the entry block's start.
     if let Some(entry) = entry {
         for &c in const_values {
             block_def.entry(entry).or_default().insert(c);
@@ -805,9 +737,8 @@ fn compute_liveness(
 type InterferenceGraph = HashMap<ValueId, HashSet<ValueId>>;
 
 /// Build interference graph by scanning each block backward from live_out.
-/// After the entry block's backward walk, the used frame-initial constants
-/// are defined (v0.1's entry-top seed literals): each interferes with
-/// everything live across the entry block.
+/// After the entry block's backward walk, the frame-initial constants are
+/// defined: each interferes with everything live across the entry block.
 fn build_interference(
     module: &Module,
     rpo: &[BlockId],
@@ -850,10 +781,9 @@ fn build_interference(
             }
         }
 
-        // Entry block: define the used frame-initial constants at its
-        // start (v0.1's seed literals). Ascending id order is
-        // creation order — the pairwise edges are symmetric, so the
-        // resulting graph is order-independent.
+        // Entry block: define the frame-initial constants at its start.
+        // Ascending id order is creation order — the pairwise edges are
+        // symmetric, so the resulting graph is order-independent.
         if Some(bb) == entry {
             for &c in const_values {
                 for &v in &live {
@@ -903,13 +833,10 @@ fn mcs_color(
     let n = all_values.len();
     let val_set: HashSet<ValueId> = all_values.iter().copied().collect();
 
-    // MCS tie-breaking must match v0.1 byte-exactly. v0.1's heap pops
-    // (weight, value-id) max-first; v0.2's ABSOLUTE value ids are shifted
-    // by the suppressed expansion values (fusion) interleaved in the id
-    // space, which would flip equal-weight ties against v0.1. The
-    // non-suppressed values in id order are exactly v0.1's values in
-    // creation order (same translation algorithm), so rank among the
-    // non-suppressed is the correct tie-break key.
+    // Deterministic MCS tie-breaking (`N20`): `BinaryHeap` pops `(weight, rank)`
+    // max-first, where `rank` is the dense creation-order rank among the
+    // non-suppressed values (so suppressed fusion intermediates interleaved
+    // in the raw `ValueId` space cannot perturb tie-breaks).
     let mut sorted = all_values.to_vec();
     sorted.sort_unstable();
     let rank_of: HashMap<ValueId, u32> = sorted

@@ -1,23 +1,21 @@
-//! Emission-fusion analysis: find the v0.2 instructions that lowering
-//! fuses into an adjacent consumer, exactly inverting the lift's
-//! expansion mappings (compare.rs divergence rule 3).
+//! Emission-fusion pre-pass (`design/ir.md` §5): identifies single-use IR
+//! expansion instructions whose emission folds directly into an adjacent
+//! consumer bytecode.
 //!
-//! v0.2's lift MATERIALIZES what v0.1 packs into one instruction:
+//! `abcd-lift` decomposes several composite bytecodes into orthogonal IR ops:
 //!
 //! - `definefunc` → `DefineFunc` + `AllocClosure`;
 //! - `definemethod` → `DefineFunc` + `AllocClosure` + `DefineMethod`;
-//! - constant property indices → `LoadConst` + `LoadPropIdx`/`StorePropIdx`;
+//! - constant property indices → `LoadConst` + `LoadPropIdx`/`StorePropIdx`/`StoreOwnPropIdx`;
 //! - tolerant global loads → `LoadConst(undefined)` + `TryGetGlobal`.
 //!
-//! The materialized values are v0.1-invisible: v0.1's register allocator
-//! never sees them, so if the v0.2 allocator colored them they would
-//! perturb every other value's coloring and break byte identity with the
-//! v0.1 pipeline. This module computes, BEFORE register allocation, the
-//! set of instructions whose emission fuses into their consumer
-//! ([`Suppression::insts`]) and whose results must never be colored
-//! ([`Suppression::values`]). Register allocation then sees exactly the
-//! value universe v0.1 sees, and isel skips the suppressed instructions,
-//! emitting the fused bytecode at the consumer.
+//! If the register allocator colored those intermediate expansion values, they
+//! would consume registers and perturb interference coloring. This module
+//! computes, BEFORE register allocation, the set of instructions whose
+//! emission fuses into their consumer ([`Suppression::insts`]) and whose
+//! results must never be colored ([`Suppression::values`]). Instruction
+//! selection then skips the suppressed instructions and emits the single
+//! composite bytecode at the consumer.
 //!
 //! The fusion conditions are STATIC (adjacency, single-use, constant
 //! payload) — the pre-regalloc computation and the isel-time check always

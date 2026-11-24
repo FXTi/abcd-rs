@@ -1,4 +1,4 @@
-//! CfgSimplify/ADCE edge-arm coverage (c-COV W10): the self-loop merge
+//! CfgSimplify/ADCE edge-arm coverage: the self-loop merge
 //! and jump-only-self-loop guards, the exception-neutrality refusals,
 //! the converging-phi guard (both arms), the successor phi re-key on
 //! empty-jump elimination, dangling arena ids (blocks, insts, edge

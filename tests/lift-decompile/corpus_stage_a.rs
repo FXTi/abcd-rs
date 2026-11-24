@@ -1,8 +1,6 @@
-//! Opt-in corpus gate for Stage A expression recovery (d-P2,
-//! design/decompile.md §7): run [`abcd_decompile::recover_func`] + the
-//! debug dump over every function of every NON-test262 corpus fixture
-//! (2832 rows — the c-P3 scope; test262 decompile is a later phase per
-//! design/archive/test262-feasibility.md).
+//! Opt-in corpus gate for Stage A expression recovery (`design/decompile.md`):
+//! run [`abcd_decompile::recover_func`] + the debug dump over every function
+//! of every NON-test262 corpus fixture (2832 rows).
 //!
 //! Assertions:
 //!
@@ -61,9 +59,7 @@ const OUTCOME_NAMES: [&str; 5] = ["expressed", "plumbing", "elided", "fallback",
 #[ignore = "requires exported GHCR corpus and python3"]
 fn corpus_stage_a_gate() {
     let root = common::corpus_root();
-    // Scoped to the NON-test262 rows (c-P3): test262 decompile is a
-    // later phase per design/archive/test262-feasibility.md — the 2685 test262
-    // rows gate lift+verify (tests/file-lift) only.
+    // Scoped to the 2832 non-test262 corpus rows (`dream_gate_t262` covers test262).
     let paths = common::project_manifest_paths(&root);
     assert_eq!(
         paths.len(),

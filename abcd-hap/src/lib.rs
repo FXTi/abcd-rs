@@ -2,7 +2,7 @@
 //! (`.hap`, `.hsp`, `.app`, `.hqf`).
 //!
 //! Every container in scope is a plain ZIP archive with HarmonyOS-mandated
-//! entry names (see `design/abcd-hap-research.md`). This crate implements a
+//! entry names (see `design/hap-container.md`). This crate implements a
 //! hand-written central-directory ZIP reader for the restricted dialect the
 //! OpenHarmony packing tools produce: no spanned archives, no encryption, no
 //! ZIP64, methods {STORED, DEFLATE} only.
@@ -30,6 +30,7 @@
 //! ```
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![deny(missing_docs)]
 
 mod container;
 mod error;

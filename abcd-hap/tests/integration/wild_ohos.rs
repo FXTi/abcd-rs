@@ -1,14 +1,15 @@
 //! Wild-OHOS corpus instrument (local-only, never runs in CI):
-//! feed every .hap under a directory tree through abcd-hap extraction +
-//! abcd-file decode, and report compatibility stats.
+//! feed every `.hap` under a directory tree through `abcd-hap` extraction +
+//! `abcd-file` decode, and report compatibility stats.
 //!
-//! Run on dabai (the collection lives outside the workspace):
+//! Run locally against a wild `.hap` collection directory:
 //!
 //! ```text
-//! ABCD_HAP_WILD_DIR=/home/zjx/hap_collect/haps \
-//!   scripts/remote-test.sh test -p abcd-hap --release \
-//!     --test integration -- wild_ohos --ignored --nocapture
+//! ABCD_HAP_WILD_DIR=/path/to/haps cargo test -p abcd-hap --release -- --ignored --nocapture
 //! ```
+//!
+//! Standard crate and offline corpus verification runs via `./scripts/test-local.sh`
+//! (`./scripts/test-local.sh crate abcd-hap` and `./scripts/test-local.sh corpus`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,8 +31,13 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
 #[test]
 #[ignore]
 fn wild_ohos_hap_and_abc_compatibility_sweep() {
-    let root = std::env::var("ABCD_HAP_WILD_DIR")
-        .unwrap_or_else(|_| "/home/zjx/hap_collect/haps".to_string());
+    let Ok(root) = std::env::var("ABCD_HAP_WILD_DIR") else {
+        // Local instrument: SKIP (not fail) when ABCD_HAP_WILD_DIR is unset —
+        // coverage jobs run every #[ignore]d test with --include-ignored on
+        // runners that have no wild .hap directory.
+        eprintln!("wild_ohos: ABCD_HAP_WILD_DIR not set, skipping (local-only instrument)");
+        return;
+    };
     let mut haps = Vec::new();
     collect(Path::new(&root), &mut haps);
     haps.sort();

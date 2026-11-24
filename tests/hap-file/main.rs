@@ -180,12 +180,15 @@ fn splice_and_encode(file: &abcd_file::File, module: &abcd_ir::Module) -> Result
     abcd_file::encode(&rebuilt).map_err(|e| format!("encode: {e}"))
 }
 
-/// Full wild-OHOS `.hap` rewrite gate (#32): exercises `decode → lift → verify
-/// → [opt → verify →] lower → encode → decode → lift → verify` across every
-/// `.abc` module in all 156 wild `.hap` packages (`276` modules total:
-/// `242` modern modules rewritten end-to-end in both `v2lift` and `v2opt`,
-/// `14` legacy `0.0.0.2` read-only modules, and `20` `N54`
-/// `deprecated.defineclasswithbuffer` hard-error modules).
+/// Full wild-OHOS `.hap` rewrite & legacy analysis gate (#32, #38):
+/// - Modern `.abc` modules (`242` across `9.0.0.0`..`24.0.0.0`, including all
+///   `77` `typeSummaryOffset`-bearing system apps): exercises `decode → lift →
+///   verify → [opt → verify →] rewrite_file → encode → decode → lift → verify`
+///   with zero skips (`242/242` rewritten end-to-end).
+/// - Legacy `0.0.0.2` `.abc` modules (`34` across OpenHarmony 3.2/4.0,
+///   including all `20` `deprecated.defineclasswithbuffer` modules): exercises
+///   `decode → lift → verify → decompile_module` (`34/34` clean, while `encode`
+///   returns `Error::UnsupportedOutputVersion(0.0.0.2)` per `ADR-08`).
 #[test]
 #[ignore = "requires the exported wild corpus (image export-wild)"]
 fn exported_corpus_wild_hap_rewrite_gates() {
@@ -207,9 +210,7 @@ fn exported_corpus_wild_hap_rewrite_gates() {
     #[derive(Default)]
     struct RewriteTally {
         rewritten_ok: usize,
-        n8_type_summary: usize,
-        legacy_v002: usize,
-        n54_deprecated: usize,
+        legacy_v002_lifted_ok: usize,
         failures: Vec<String>,
     }
 
@@ -228,7 +229,7 @@ fn exported_corpus_wild_hap_rewrite_gates() {
             };
             for m in &modules {
                 let label = format!("{}#{}", pkg.path, m.entry_name);
-                let mut file = match abcd_file::decode(m.data.as_slice()) {
+                let file = match abcd_file::decode(m.data.as_slice()) {
                     Ok(f) => f,
                     Err(e) => {
                         tally.failures.push(format!("{label}: decode: {e}"));
@@ -237,9 +238,7 @@ fn exported_corpus_wild_hap_rewrite_gates() {
                 };
                 if file.version == abcd_file::Version::new(0, 0, 0, 2) {
                     match abcd_file::encode(&file) {
-                        Err(abcd_file::Error::UnsupportedOutputVersion(_)) => {
-                            tally.legacy_v002 += 1;
-                        }
+                        Err(abcd_file::Error::UnsupportedOutputVersion(_)) => {}
                         other => tally.failures.push(format!(
                             "{label}: expected UnsupportedOutputVersion(0.0.0.2), got {}",
                             other
@@ -256,10 +255,13 @@ fn exported_corpus_wild_hap_rewrite_gates() {
                                     "{label}: legacy 0.0.0.2 verify: {:?}",
                                     r.errors
                                 ));
+                            } else {
+                                let _ = abcd_decompile::decompile_module(
+                                    &ir,
+                                    &abcd_decompile::EmitOptions::default(),
+                                );
+                                tally.legacy_v002_lifted_ok += 1;
                             }
-                        }
-                        Err(abcd_lift::LiftError::UnsupportedDeprecatedDefineClassWithBuffer) => {
-                            tally.n54_deprecated += 1;
                         }
                         Err(e) => {
                             tally
@@ -268,46 +270,6 @@ fn exported_corpus_wild_hap_rewrite_gates() {
                         }
                     }
                     continue;
-                }
-
-                let has_type_summary = file.classes.values().any(|cls| {
-                    cls.fields.iter().any(|f| {
-                        matches!(
-                            f.initial_value,
-                            Some(abcd_file::FieldValue::TypeSummaryOffset(_))
-                        )
-                    })
-                });
-                if has_type_summary {
-                    match abcd_file::encode(&file) {
-                        Err(abcd_file::Error::TypeSummaryOffset { .. }) => {
-                            tally.n8_type_summary += 1;
-                        }
-                        other => {
-                            tally.failures.push(format!(
-                                "{label}: expected N8 TypeSummaryOffset error, got {}",
-                                other
-                                    .err()
-                                    .map(|e| e.to_string())
-                                    .unwrap_or_else(|| "Ok".to_string())
-                            ));
-                            continue;
-                        }
-                    }
-                    // Clear the opaque N8 field in the test harness so the full
-                    // rewrite + `_TypeOfInstruction` nested-literal-array encode +
-                    // post-rewrite lift/verify pipeline is exercised on all 77
-                    // typeSummary-bearing system apps too.
-                    for cls in file.classes.values_mut() {
-                        for field in &mut cls.fields {
-                            if matches!(
-                                field.initial_value,
-                                Some(abcd_file::FieldValue::TypeSummaryOffset(_))
-                            ) {
-                                field.initial_value = None;
-                            }
-                        }
-                    }
                 }
 
                 let ir = match abcd_lift::lift_file(&file) {
@@ -395,34 +357,25 @@ fn exported_corpus_wild_hap_rewrite_gates() {
     let mut total = RewriteTally::default();
     for t in tallies {
         total.rewritten_ok += t.rewritten_ok;
-        total.n8_type_summary += t.n8_type_summary;
-        total.legacy_v002 += t.legacy_v002;
-        total.n54_deprecated += t.n54_deprecated;
+        total.legacy_v002_lifted_ok += t.legacy_v002_lifted_ok;
         total.failures.extend(t.failures);
     }
 
     assert!(
         total.failures.is_empty(),
-        "wild .hap rewrite gate: {} failures (rewritten_ok={}, n8={}, legacy_v002={}, n54={}):\n{}",
+        "wild .hap rewrite gate: {} failures (rewritten_ok={}, legacy_v002_lifted_ok={}):\n{}",
         total.failures.len(),
         total.rewritten_ok,
-        total.n8_type_summary,
-        total.legacy_v002,
-        total.n54_deprecated,
+        total.legacy_v002_lifted_ok,
         total.failures.join("\n")
     );
     assert_eq!(
-        (
-            total.rewritten_ok,
-            total.n8_type_summary,
-            total.legacy_v002,
-            total.n54_deprecated,
-        ),
-        (242, 77, 34, 20),
+        (total.rewritten_ok, total.legacy_v002_lifted_ok),
+        (242, 34),
         "wild .hap rewrite module partition drifted"
     );
     eprintln!(
-        "hap-file rewrite gate: {} modern modules rewritten cleanly (incl. {} N8 typeSummary-checked), {} legacy 0.0.0.2 ({} N54 deprecated-class)",
-        total.rewritten_ok, total.n8_type_summary, total.legacy_v002, total.n54_deprecated
+        "hap-file rewrite gate: {} modern modules rewritten cleanly (242/242 = 100%), {} legacy 0.0.0.2 modules lifted+verified+decompiled cleanly (34/34 = 100%)",
+        total.rewritten_ok, total.legacy_v002_lifted_ok
     );
 }

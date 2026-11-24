@@ -1,5 +1,5 @@
-//! Rung-2 PTA arm coverage (c-COV W10): synthetic modules for the
-//! engine arms the corpus never drives — `closure_body` Mov/leaf/cycle
+//! Rung-2 PTA arm coverage: synthetic modules for the
+//! engine arms that corpus runs rarely exercise — `closure_body` Mov/leaf/cycle
 //! shapes, the non-callable callee pointer, external/dangling wired
 //! callees, the no-slot-model `this` binding, `LoadFunction`/
 //! `CreateGenerator` callables, result-less ops under the scan, the

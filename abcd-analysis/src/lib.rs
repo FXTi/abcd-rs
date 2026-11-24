@@ -1,8 +1,8 @@
 //! # abcd-analysis — static analysis infrastructure on `abcd-ir`
 //!
-//! Format-independent static analysis library (`design/analysis-strategy.md`
-//! §5): everything here consumes only [`abcd_ir`], never the container, ISA,
-//! lift, lower, or optimizer crates.
+//! Format-independent static analysis library (`design/analysis.md`,
+//! `design/ir.md`): everything here consumes only [`abcd_ir`], never the
+//! container, ISA, lift, lower, or optimizer crates.
 //!
 //! Four module families:
 //!

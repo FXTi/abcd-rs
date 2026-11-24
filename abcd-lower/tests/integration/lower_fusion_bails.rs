@@ -1,9 +1,9 @@
-//! c-COV A12: the fusion bail-out arms (fusion.rs). The lift's shapes
-//! always satisfy every fusion precondition (adjacent, integral, single-use,
-//! `LoadConst` payloads, no captures), so each early-return needs
+//! Fusion pre-pass (`fusion.rs`) precondition bail-out tests. `abcd-lift`
+//! shapes satisfy every fusion precondition (adjacent, integral, single-use,
+//! `LoadConst` payloads, no captures), so each early-return is verified with
 //! hand-built IR. Every shape here must leave the candidate UNFUSED
-//! (empty [`Suppression`]) — and the one end-to-end test pins that a
-//! declined define-chain lowers to the unfused `definefunc` + `mov`.
+//! (empty [`Suppression`]) — and the end-to-end test pins that a declined
+//! define-chain lowers to standalone `definefunc` + register copy.
 //!
 //! The dangling-id guards (fusion.rs:50,54,114,118,182,186) are covered by
 //! hand-built modules carrying a dangling block/inst id — the analysis must

@@ -2,7 +2,7 @@
 //!
 //! The emitter (`abcd_file::pandasm::emit_file`) is byte-identical to
 //! upstream `ark_disasm`, enforced per-push by the corpus byte-diff gate
-//! (`tests/file-isa/pandasm_dis.rs`, cli-plan.md §4.1). Output is raw
+//! (`tests/file-isa/pandasm_dis.rs`, design/cli.md §2, design/decisions.md ADR-11). Output is raw
 //! BYTES, not String: upstream prints string contents unescaped, so valid
 //! output is not necessarily UTF-8.
 

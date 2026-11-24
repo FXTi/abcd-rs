@@ -1,7 +1,5 @@
-//! c-COV A9 sweep: isel op arms that the measured (L1-synthetic) lower
-//! input never reaches — either because es2abc never emits the source
-//! opcode (the lift arm is corpus-dark too) or because the shape is a
-//! fusion-declined / robustness fallback the lift's output never hits.
+//! Synthetic instruction-selection coverage across rare and non-fused `Op`
+//! arms in `isel::select`.
 //!
 //! Every test builds the IR with `V2Builder` (or hand-pinned suppression
 //! where the fusion analysis would otherwise rewrite the shape) and lowers
@@ -686,7 +684,7 @@ fn get_async_iterator_emits_vendor_opcode() {
     );
 }
 
-/// `Op::IteratorReturn` (v0.1's CloseIterator) → `closeiterator imm, v`.
+/// `Op::IteratorReturn` → `closeiterator imm, v`.
 #[test]
 fn iterator_return_emits_closeiterator() {
     let mut module = Module::new();
@@ -771,7 +769,7 @@ fn throw_delete_super_property_emits_vendor_opcode() {
 // ── Call arms (isel.rs:2176, 2286, 2288) ────────────────────────────────
 
 /// A `super(...spread)` call with an EMPTY argument list (hand-built;
-/// v0.1's arm takes the `args.is_empty()` fallback to `Reg(0)`).
+/// `select_call` falls back to `Reg(0)` when `args.is_empty()`).
 #[test]
 fn super_spread_with_empty_args_falls_back_to_reg0() {
     let mut module = Module::new();

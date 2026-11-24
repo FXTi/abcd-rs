@@ -6,11 +6,11 @@
 //! standard worklist iteration to a fixed point, in RPO for forward
 //! problems and reverse-RPO for backward ones, so convergence is fast and
 //! — because every structure is iterated in a pinned order — the result
-//! is deterministic (heros.md §5 item 4: iteration order is a feature).
+//! is deterministic (`design/decisions.md` N20, `design/analysis.md`).
 //!
 //! Termination requires the client's lattice to have finite descending
-//! (toward the join) chain height and an honest `meet`; the framework has
-//! no widening hook, mirroring heros' discipline (heros.md §7 item 11).
+//! (toward the join) chain height and an associative/commutative/idempotent
+//! `meet`; the framework intentionally omits widening hooks.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -44,8 +44,8 @@ impl Default for SolveConfig {
 ///
 /// `Domain` is the per-program-point dataflow value (a bitset, a map, a
 /// lattice element — the framework is agnostic). `PartialEq` is the
-/// change detection; it must be semantic equality (heros.md §1.3's
-/// termination caveat applies here too).
+/// change detection; it must reflect semantic lattice equality so fixed-point
+/// iteration terminates cleanly.
 pub trait MonotoneFramework {
     /// The per-block dataflow value.
     type Domain: Clone + PartialEq;
@@ -56,8 +56,8 @@ pub trait MonotoneFramework {
     fn boundary(&self) -> Self::Domain;
 
     /// The initial (identity-of-meet, "top") value for interior blocks.
-    /// Sparse-by-default (heros.md §5 item 5): this value is what every
-    /// block starts at; it should be the cheapest element to construct.
+    /// Sparse-by-default: this value is what every block starts at, so it
+    /// should be the cheapest element to construct.
     fn initial(&self) -> Self::Domain;
 
     /// Join `other` into `acc` (`acc = acc ⊔ other`).
@@ -103,10 +103,10 @@ impl<D> DataflowResult<D> {
 /// `succ` is the successor relation the problem flows over (use
 /// [`crate::control::block_succs`] for Normal-only flow or
 /// [`crate::control::augmented_succs`] to make exceptional dispatch
-/// first-class — the default for value flow, T5). Only blocks reachable
+/// first-class — the default for value flow). Only blocks reachable
 /// from the entry (forward) / from any exit walking backward (backward)
 /// participate; unreachable blocks are absent from the result maps
-/// (TOP-as-absent, heros.md §5 item 5).
+/// (sparse TOP-as-absent representation).
 pub fn solve<P: MonotoneFramework>(
     module: &Module,
     func: FuncId,

@@ -128,12 +128,11 @@
 //! (v0.1 parity — and v0.1 lifts BOTH deprecated buffer forms to
 //! CreateArrayWithBuffer, so both fold to `AllocArray{shape:
 //! Some(shape)}` here, N59), and
-//! deprecated.defineclasswithbuffer is a HARD
-//! [`LiftError::UnsupportedDeprecatedDefineClassWithBuffer`] (N54 —
-//! the vendor runtime reads v1=lexenv, v2=proto
-//! (interpreter_assembly.cpp:4622-4648) where the historical lift
-//! read v1 as base and dropped v2; zero corpus coverage, so hard
-//! error per the N8/N51 ruling).
+//! `deprecated.defineclasswithbuffer` lifts to `DefineClass{ctor,
+//! heritage: Some(base), members, member_attrs, count}` with the
+//! vendor-grounded operand roles `v1 = lexenv`, `v2 = proto`
+//! (`interpreter_assembly.cpp:4624-4648`, `design/decisions.md`
+//! ADR-08, `#38` overturning `N54`).
 //!
 //! Super-property access by constant INDEX: the ISA has no such opcode
 //! — [`LiftError::UnsupportedSuperByIndex`], a hard error, never
@@ -336,7 +335,8 @@ impl<'l, 'f> FnLift<'l, 'f> {
     }
 
     /// The `this` value (N67): the this-role frame slot per the vendored
-    /// frame-slot model ([`abcd_ir::frame`] — design/ir-v0.2.md T4/§5.3),
+    /// frame-slot model ([`abcd_ir::frame`] — `design/ir.md` §2,
+    /// `design/decisions.md` ADR-05),
     /// resolved at entry seeding into [`FnLift::this_param`]. `ldthis`
     /// reads the frame's `thisObj`
     /// (`EcmaInterpreter::GetThis`, interpreter-inl.cpp:7907-7912), which
@@ -2217,16 +2217,51 @@ pub fn translate_bytecode(
             );
             fx.write_acc(block, v);
         }
-        Bytecode::DeprecatedDefineclasswithbuffer(..) => {
-            // N54: HARD ERROR (v0.1 parity). The vendor runtime reads v1
-            // as the LEXENV and v2 as the PROTO
-            // (interpreter_assembly.cpp:4622-4648,
-            // HandleDeprecatedDefineclasswithbufferPrefId16Imm16Imm16V8V8);
-            // this arm historically read v1 as the base (proto) and dropped
-            // v2 — double role corruption with zero corpus coverage (no
-            // evidence path). Maintainer ruling N8/N51: hard error, never
-            // a warning, never silent.
-            return Err(LiftError::UnsupportedDeprecatedDefineClassWithBuffer);
+        Bytecode::DeprecatedDefineclasswithbuffer(
+            method_eid,
+            lit_imm,
+            count_imm,
+            lexenv_reg,
+            proto_reg,
+        ) => {
+            // ADR-08 (#38, overturning N54): vendor
+            // `HandleDeprecatedDefineclasswithbufferPrefId16Imm16Imm16V8V8`
+            // (`ecmascript/interpreter/interpreter_assembly.cpp:4624-4648`)
+            // reads `v1` as `lexenv` and `v2` as `proto` (heritage), resolving
+            // `method_id` to the constructor and `imm1` to the member literal
+            // array (`entity_offsets` on decoded 0.0.0.2 files, with direct
+            // `literal_arrays` table-index fallback for synthetic modern bodies).
+            let (_name, ctor) = fx.resolve_method(*method_eid)?;
+            let raw_lit = lit_imm.0 as u32;
+            let (members, member_attrs) = if fx
+                .body
+                .entity_offsets
+                .contains_key(&(EntityKind::LiteralarrayId, raw_lit))
+            {
+                let lit_eid = EntityId(raw_lit);
+                let members = fx.resolve_literal(lit_eid)?;
+                let member_attrs = fx.resolve_class_member_attrs(lit_eid, false)?;
+                (members, member_attrs)
+            } else {
+                let members = resolve::const_for_literal_array(fx.lf, raw_lit)?;
+                let member_attrs =
+                    resolve::class_member_attrs_for_index(fx.lf.file, raw_lit, false)?;
+                (members, member_attrs)
+            };
+            let _lexenv = fx.read_reg(*lexenv_reg, block);
+            let base = fx.read_reg(*proto_reg, block);
+            let v = fx.emit_val(
+                block,
+                Op::DefineClass {
+                    ctor,
+                    heritage: Some(base),
+                    members,
+                    member_attrs,
+                    count: count_imm.0 as u16,
+                },
+                loc,
+            );
+            fx.write_acc(block, v);
         }
         Bytecode::DeprecatedResumegenerator(gen_reg) => {
             // Vendor: genobj is the register operand here

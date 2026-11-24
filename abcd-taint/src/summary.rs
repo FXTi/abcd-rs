@@ -1,6 +1,4 @@
-//! The minimal summary registry (design/flowdroid/summaries.md §"A
-//! minimal summary registry for a JS bytecode analyzer", adopted as-is
-//! by analysis-strategy.md §5.3).
+//! Builtin and library summary registry (`design/analysis.md`).
 //!
 //! One flat record per builtin, keyed by `(Sym, Arity)`. The registry
 //! owns its interner, so keys are module-independent and one registry
@@ -10,63 +8,57 @@
 //! ## What a summary can express
 //!
 //! - `flows`: `(from, to)` pairs over `{Param(i), Base, Return,
-//!   Field(path)}` — FlowDroid's `Parameter/Field/Return` trio minus
-//!   `GapBaseObject`/`Custom`. Leftover source fields append to the
-//!   sink path (FlowDroid's default `cutSubFields=false`).
-//! - `clears`: endpoints whose taint is killed (the `preventPropagation`
-//!   default: a cleared taint never enters the worklist again).
+//!   Field(path), ReturnField(path)}`. Leftover source fields below a
+//!   matched prefix append to the sink path.
+//! - `clears`: endpoints whose taint is killed (a cleared taint does not
+//!   survive the call-to-return edge).
 //! - `is_alias` on a flow: the reference itself is stored, not just the
 //!   data (mutators like `push` / `Object.assign`). At rung 0 the alias
 //!   trigger is a no-op (`Rung0AliasOracle::aliases_of_store` injects
 //!   nothing — aliasing is resolved at the fact key); the flag is
-//!   recorded for the rung-1 engine and for documentation.
-//! - `callback`: the gap specification (FlowDroid's gap mechanism,
-//!   summaries.md §1–2 — "invokes `param(i)` with elements of the base",
-//!   `forEach`/`map`/…). Two channels:
+//!   recorded for refined alias rungs and documentation.
+//! - `callback`: the callback-gap specification ("invokes `param(i)`
+//!   with elements of the base", `forEach`/`map`/…). Two channels:
 //!   1. the mini-gap tag — the callback value is tagged with an
 //!      `[AnyIndex]` field chain on the call-to-return edge; if user
 //!      code calls that value directly (resolvable by the call graph),
 //!      the tag maps onto the callback's first formal parameter;
-//!   2. the FULL gap propagator (t-P4) — when the callback value
-//!      resolves to user bodies (closure alloc / direct callee /
-//!      points-to), the summary call site grows a synthetic call edge
-//!      into each body ([`crate::gap`]): the gap's `enter` rules map
-//!      matching taint onto the callback's formals, the normal IFDS
-//!      runs the body, and the callback's RETURN flows back onto the
-//!      call result per `return_to_result` (map: the result array's
-//!      `[AnyIndex]` elements; forEach: `None` — the result is
-//!      undefined). An unresolved callback falls back to the tag alone
-//!      (honest documented imprecision — the wrapper counters record
-//!      it).
+//!   2. the full gap propagator — when the callback value resolves to
+//!      user bodies (closure alloc / direct callee / points-to), the
+//!      summary call site grows a synthetic call edge into each body
+//!      ([`crate::gap`]): the gap's `enter` rules map matching taint
+//!      onto the callback's formals, normal IFDS runs the body, and the
+//!      callback's RETURN flows back onto the call result per
+//!      `return_to_result` (map: the result array's `[AnyIndex]`
+//!      elements; forEach: `None` — the result is undefined). An
+//!      unresolved callback falls back to the tag alone (honest
+//!      documented imprecision — the wrapper counters record it).
 //! - `exclusive`: the summary is a COMPLETE model of the callee — the
-//!   call edge into the callee body is killed, never merged
-//!   (summaries.md §2.1: "exclusive summary wins over the callee's
-//!   body; the two are never merged"). The gap edge into the CALLBACK
-//!   body is NOT killed: exclusive-with-callback still runs the user
-//!   callback (FlowDroid's `spawnAnalysisIntoClientCode` discipline).
-//!   Default false.
+//!   call edge into the callee body is killed, never merged. The gap
+//!   edge into a resolved user CALLBACK body is NOT killed:
+//!   exclusive-with-callback still enters the user callback. Default
+//!   false.
 //!
-//! ## The fallback ladder (reader D, summaries.md §4)
+//! ## The fallback ladder (`design/analysis.md`)
 //!
 //! 1. summary hit → apply on the call-to-return edge (exclusive also
 //!    kills the call edge into the callee);
 //! 2. no summary, callee has a body → step into the body (normal IFDS);
 //!    incoming operand taints are killed on the bypass edge because the
-//!    body carries them (`killIncomingTaint = hasActiveBody`);
-//! 3. no summary, no body, receiver types to a prototype family (t-P3,
-//!    `crate::prototype`) → apply the `Family.prototype.m` summary
+//!    callee body carries them across call/return edges;
+//! 3. no summary, no body, receiver types to a prototype family
+//!    (`crate::prototype`) → apply the `Family.prototype.m` summary
 //!    ADDITIVELY (prototype-path applications are never exclusive — a
 //!    may-typed receiver must not kill);
 //! 4. no summary, callee is native/external/unknown-but-named →
 //!    conservative keep: the incoming taint passes through untouched
-//!    (never sanitizes), plus the identity heuristic `tainted base or
-//!    param ⇒ tainted return` (`IdentityTaintWrapper`'s rule);
+//!    (never sanitizes), plus the optional identity heuristic (`tainted
+//!    base or param ⇒ tainted return`);
 //! 5. no name resolvable at all → same conservative keep, counted
 //!    separately.
 //!
 //! Miss counters are first-class ([`RegistryStats`]): the named-miss log
-//! IS the backlog for what to summarize next (summaries.md §3 — that is
-//! how FlowDroid's corpus grew).
+//! tracks unresolved builtin candidates for summary expansion.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -74,7 +66,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use abcd_analysis::dataflow::heap::{FieldChain, FieldKey};
 use abcd_ir::{Sym, SymbolTable};
 
-/// A flow endpoint of a summary (summaries.md minimal schema).
+/// A flow endpoint of a summary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Endpoint {
     /// Call argument `i` (0-based over `Op::Call::args`).
@@ -92,11 +84,10 @@ pub enum Endpoint {
     ReturnField(FieldChain),
 }
 
-/// One gap-enter rule of a callback summary (FlowDroid's flows INTO a
-/// gap, summaries.md §1): taint matching `from` at the summary call
-/// site enters the callback body on formal `formal` (0-based over the
-/// callback's declared formals — the implicit frame slots are skipped
-/// by the N66 binding).
+/// One gap-enter rule of a callback summary: taint matching `from` at
+/// the summary call site enters the callback body on formal `formal`
+/// (0-based over the callback's declared formals — the implicit frame
+/// slots are skipped by the N66 binding).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GapEnter {
     /// The source endpoint at the summary call site (e.g.
@@ -107,8 +98,7 @@ pub struct GapEnter {
     pub formal: u16,
 }
 
-/// The full gap specification of a callback summary (FlowDroid's
-/// `GapDefinition` + its flows, summaries.md §1–2). The mini-gap tag
+/// Callback-gap specification for a higher-order summary. The mini-gap tag
 /// (the callback value's `[AnyIndex]` marker for DIRECT user calls of
 /// the value) keys off `param` alone; `enter`/`return_to_result` drive
 /// the full propagator ([`crate::gap`]) once the callback value
@@ -141,11 +131,11 @@ pub struct Flow {
     /// Sink endpoint.
     pub to: Endpoint,
     /// Whether the reference itself is stored (mutators), not just the
-    /// data — the alias-trigger marker for the rung-1 engine.
+    /// data — the alias-trigger marker for refined alias rungs.
     pub is_alias: bool,
 }
 
-/// A complete taint model of one builtin (summaries.md minimal schema).
+/// Taint propagation model for one builtin or library callable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Summary {
     /// Human-readable semantics note (also rendered in the report).
@@ -158,7 +148,7 @@ pub struct Summary {
     pub exclusive: bool,
     /// Gap: `Some(_)` = the builtin invokes argument `param` with
     /// elements of the base (may-call user code). The mini-gap tag
-    /// works off `param` alone; the full propagator (t-P4) consumes
+    /// works off `param` alone; the full propagator consumes
     /// `enter` / `return_to_result` when the callback value resolves.
     pub callback: Option<CallbackGap>,
 }
@@ -259,8 +249,7 @@ impl Summary {
     }
 }
 
-/// Registry miss/hit counters (from day one — summaries.md §2.1
-/// `getWrapperHits/Misses`; §3 the miss log is the growth process).
+/// Registry miss/hit counters (`design/analysis.md`).
 #[derive(Clone, Debug, Default)]
 pub struct RegistryStats {
     /// Summary lookups performed.
@@ -297,9 +286,8 @@ pub struct SummaryRegistry {
     stats: RefCell<RegistryStats>,
 }
 
-// `new` without `Default`: the c-COV deletion removed the zero-caller
-// Default impl; clippy::new_without_default would force one back, hence
-// the documented allow.
+// `new` without `Default`: callers construct either `new()` or `with_builtins()`
+// explicitly.
 #[allow(clippy::new_without_default)]
 impl SummaryRegistry {
     /// An empty registry.
@@ -413,9 +401,9 @@ pub enum FallbackStep {
     Unknown,
 }
 
-/// The top-20 builtin summaries, chosen by corpus frequency of
-/// global-name call sites (`tests/corpus_callee_names.rs` over the 1149
-/// runtime-passed fixtures; one line per builtin).
+/// The builtin summaries, seeded by corpus frequency of global-name
+/// call sites across the 1,149 runtime-passed fixtures plus prototype,
+/// higher-order callback, and `Promise` models (`design/analysis.md`).
 ///
 /// Corpus evidence (5625 call sites, 5079 with a resolvable name):
 /// `print` dominates at 3795; the rest of the head is user-defined test
@@ -426,24 +414,17 @@ pub enum FallbackStep {
 /// `Uint8Array` 18 (entries 1–9 below, corpus counts in their docs).
 /// Prototype-method calls (`a.pop`, `s.charCodeAt`, `r.test`, `s.next`,
 /// 18–54 each) resolve to USER-global-qualified names
-/// (`TryGetGlobal("a").pop`) — the t-P3 prototype-resolution path
+/// (`TryGetGlobal("a").pop`) — the prototype-resolution path
 /// (`crate::prototype`) types the receiver through points-to alloc
 /// kinds / constant def chains / global-store provenance and re-keys
 /// the lookup to the `X.prototype.m` entries at the bottom of this
 /// list (matched ONLY through that path, never through direct name
 /// resolution).
-/// Entries 10–20 are the canonical namespace builtins of reader D's
-/// minimal-registry set, registered preemptively (corpus frequency 0 —
-/// they are the first rung of the miss-log-driven backlog). The t-P5
-/// block at the end is the second rung: the miss log's actionable head
-/// (`String.prototype.replace` ×18, `RegExp.prototype.test` ×18 — the
-/// latter rescued by the t-P5 constructor-result family arm,
-/// `crate::prototype` §5) plus the probe-evidenced canonicals
-/// (`split`/`join`/`parseInt` — corpus reachability checked: split and
-/// parseInt appear in no corpus source, join only in a
-/// runtime-not-applicable fixture) and `Object.assign`'s
-/// result-identity deepening. The README's summary-library section
-/// carries the exclusive policy and the backlog classification.
+/// Entries 10–20 are canonical ECMAScript namespace builtins,
+/// registered preemptively alongside miss-log-driven prototype and
+/// global builtins (`String.prototype.replace`, `RegExp.prototype.test`,
+/// `String.prototype.split`, `Array.prototype.join`, `parseInt`,
+/// `Number.parseInt`, and `Promise` async propagation).
 pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
     use Endpoint::*;
     vec![
@@ -560,11 +541,11 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         ),
         // Object.assign: the mutator — each source's fields flow into
         // param 0 (alias: the reference is mutated, not copied). The
-        // result IS param 0 (assign returns its target — t-P5): param
+        // result IS param 0 (assign returns its target): param
         // taints therefore also flow to Return, so the
         // `let o = Object.assign({}, src)` shape is covered (probe
-        // e23; the field-precise heap carrier is the t-P2 endpoint
-        // match, probe e5).
+        // e23; field-precise heap taint matches via `match_flow_endpoint`,
+        // probe e5).
         ("Object.assign", None, {
             let mut s =
                 Summary::new("canonical; srcs → dst (mutates param 0); the result IS param 0");
@@ -614,7 +595,7 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
                 .flow(Param(0), Return)
                 .exclusive(),
         ),
-        // ── Prototype-family builtins (t-P3; matched through the ─────
+        // ── Prototype-family builtins (matched through the ───────────
         // receiver-type path, prototype.rs — NEVER through direct name
         // resolution, which produces user-global-qualified names like
         // `a.pop`). All entries are deliberately NON-exclusive: a
@@ -721,8 +702,8 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
                     Return,
                 ),
         ),
-        // ── The gap trio (t-P4; Array.prototype.forEach/map/filter) ──
-        // The canonical FlowDroid gap case: the builtin invokes the
+        // ── Higher-order array callbacks (forEach / map / filter) ────
+        // The builtin invokes the
         // callback (param 0) once per element of the base. All three
         // share the enter rules — the whole-receiver taint (Base) and
         // the `[AnyIndex]` element taint enter on the callback's formal
@@ -777,9 +758,9 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
             .gap_enter(Base, 0)
             .gap_enter(Field(FieldChain::new().pushed(FieldKey::AnyIndex, 5)), 0),
         ),
-        // ── t-P5: the miss-log-driven second tier ────────────────────
-        // String.prototype.replace (corpus ×18, regexp.js — the smoke's
-        // top actionable miss at t-P4). DUAL form, one key (both forms
+        // ── String / RegExp / parseInt builtins ──────────────────────
+        // String.prototype.replace (corpus ×18, regexp.js). DUAL form,
+        // one key (both forms
         // are arity 2):
         // - replacement is a STRING: the result's content derives from
         //   the base (the non-matched parts, plus `$`-substituted group
@@ -788,8 +769,8 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         //   PATTERN (param 0) only SELECTS what is replaced — control,
         //   not content (the repeat-count discipline; probe e17's clean
         //   sink pins it against the identity heuristic).
-        // - replacement is a FUNCTION: a gap (FlowDroid's
-        //   spawnAnalysisIntoClientCode). The callback receives
+        // - replacement is a FUNCTION: callback gap (`crate::gap`). The
+        //   callback receives
         //   `(match, …groups, offset, string)` — all base-derived, so
         //   Base enters on formal 0 (the match; the group/offset/string
         //   formals are pattern-arity-dependent, unmodeled) — and the
@@ -814,7 +795,7 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
             .gap_return(FieldChain::new()),
         ),
         // RegExp.prototype.test (corpus `r.test` ×18, regexp.js —
-        // rescued by the t-P5 constructor-result family arm: es2abc
+        // resolved via the constructor-result family arm: es2abc
         // lowers regexp literals to `new RegExp(...)`, so the receiver
         // types RegExp only through that arm). A pure match VERDICT —
         // the result is a fresh boolean that carries no content (the
@@ -836,7 +817,10 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         // control, not content.
         (
             "String.prototype.split",
-            None,
+            Some(
+                2,
+            )
+            .and(None),
             Summary::new(
                 "canonical; content-derived pieces → result array; separator/limit are control",
             )
@@ -865,12 +849,12 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
         // preemptive, probe e22): a content-derived digit parse — the
         // result number derives from the string's content (the
         // charCodeAt discipline), the radix is control.
-        // NON-EXCLUSIVE by the t-P5 exclusive-policy review: parseInt
-        // is a pure READ of its operand — the exclusive killSource
-        // (operand taint dies on the bypass edge) would be a real FN
+        // NON-EXCLUSIVE: parseInt
+        // is a pure READ of its operand — killing operand taint on the
+        // bypass edge would cause a false negative
         // for SSA re-use (`let t = …; parseInt(t); print(t)`), while
         // exclusive's buy (killing the callee-body edge) is vacuous
-        // for a native callee. The policy table is in the README.
+        // for a native callee.
         (
             "parseInt",
             None,
@@ -883,7 +867,7 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
             Summary::new("canonical; content-derived digit parse → number; radix is control")
                 .flow(Param(0), Return),
         ),
-        // ── Promise async propagation (#27 Phase 3) ──────────────────
+        // ── Promise async propagation ────────────────────────────────
         (
             "Promise.resolve",
             Some(1),

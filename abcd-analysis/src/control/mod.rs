@@ -1,5 +1,5 @@
-//! Control-flow analyses over the v0.2 IR (design/ir-v0.2.md §2 T5,
-//! design/analysis-strategy.md §5.1).
+//! Control-flow analyses over the SSA IR (`design/ir.md`,
+//! `design/analysis.md`).
 //!
 //! Successor relations come in two flavors, and choosing the right one is
 //! the whole game:
@@ -10,16 +10,15 @@
 //!   try→handler dispatch. Any analysis reasoning about reachability or
 //!   value flow must use the augmented relation — a try body may end in
 //!   `Throw`/`Unreachable` while the handler still reads values defined
-//!   there. v0.2 materializes the same relation as first-class
+//!   there. The IR materializes the same relation as first-class
 //!   [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) predecessors.
 //!
 //! On top of these sit the graph algorithms: reverse post-order
-//! ([`compute_rpo`], migrated from `abcd-lower`), reachability
-//! ([`reachable_blocks`]), Cooper–Harvey–Kennedy dominators
-//! ([`Dominators`]) and post-dominators ([`PostDominators`]),
-//! back-edge / natural-loop detection ([`back_edges`],
-//! [`natural_loop`]), and region structuring ([`structure_regions`] —
-//! the d-P1 region layer for the decompile track).
+//! ([`compute_rpo`]), reachability ([`reachable_blocks`]),
+//! Cooper–Harvey–Kennedy dominators ([`Dominators`]) and post-dominators
+//! ([`PostDominators`]), back-edge / natural-loop detection ([`back_edges`],
+//! [`natural_loop`]), and pattern-independent region structuring
+//! ([`structure_regions`] — `design/decompile.md` §4.2).
 //!
 //! ## The dominance contract with `abcd-ir`'s verifier
 //!

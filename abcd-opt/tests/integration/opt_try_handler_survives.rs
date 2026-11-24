@@ -1,7 +1,7 @@
-//! N11 regression (v0.2 port of v0.1 `opt_try_handler_survives.rs`): the
+//! N11 regression (`design/decisions.md`): the
 //! optimizer's unreachable-block removal must preserve catch handlers.
 //!
-//! In the v0.2 IR the invariant is structural (T5): catch handlers are
+//! The invariant is structural (`T5`, `design/ir.md`): catch handlers are
 //! reached through first-class `EdgeKind::Exceptional` edges sourced from
 //! the function's `TryRegion`s. `remove_unreachable_blocks` and
 //! `rebuild_predecessors` must use the AUGMENTED successor relation

@@ -335,9 +335,24 @@ fn array_tags_all_decode() {
             AnnotationElemValue::Array(vec![0xffffffff]),
         ),
         (
+            b.add_string("ai64"),
+            b'R',
+            AnnotationElemValue::Array64(vec![i64::MIN as u64, (-2i64) as u64]),
+        ),
+        (
+            b.add_string("au64"),
+            b'S',
+            AnnotationElemValue::Array64(vec![0x0123_4567_89ab_cdef, u64::MAX]),
+        ),
+        (
             b.add_string("af32"),
             b'T',
             AnnotationElemValue::Array(vec![1.5f32.to_bits()]),
+        ),
+        (
+            b.add_string("af64"),
+            b'U',
+            AnnotationElemValue::Array64(vec![(-2.5f64).to_bits(), 3.25f64.to_bits()]),
         ),
         (
             b.add_string("astr"),
@@ -380,10 +395,10 @@ fn array_tags_all_decode() {
     let file = decode(&data).expect("decode");
     let g = file.classes.values().find(|c| !c.is_external).unwrap();
     let ann = &g.annotations.compile_time[0];
-    assert_eq!(ann.elements.len(), 13);
+    assert_eq!(ann.elements.len(), 16);
 
     let vals: Vec<&AnnotationValue> = ann.elements.iter().map(|e| &e.value).collect();
-    // Scalar arrays decode per element type (K..Q, T).
+    // Scalar arrays decode per element type (K..U).
     assert_eq!(
         vals[0],
         &AnnotationValue::Array {
@@ -436,12 +451,36 @@ fn array_tags_all_decode() {
     assert_eq!(
         vals[7],
         &AnnotationValue::Array {
+            tag: b'R',
+            values: vec![AnnotationValue::I64(i64::MIN), AnnotationValue::I64(-2)]
+        }
+    );
+    assert_eq!(
+        vals[8],
+        &AnnotationValue::Array {
+            tag: b'S',
+            values: vec![
+                AnnotationValue::U64(0x0123_4567_89ab_cdef),
+                AnnotationValue::U64(u64::MAX)
+            ]
+        }
+    );
+    assert_eq!(
+        vals[9],
+        &AnnotationValue::Array {
             tag: b'T',
             values: vec![AnnotationValue::F32(1.5)]
         }
     );
+    assert_eq!(
+        vals[10],
+        &AnnotationValue::Array {
+            tag: b'U',
+            values: vec![AnnotationValue::F64(-2.5), AnnotationValue::F64(3.25)]
+        }
+    );
     // Entity arrays.
-    match vals[8] {
+    match vals[11] {
         AnnotationValue::Array { tag, values } => {
             assert_eq!(*tag, b'V');
             assert_eq!(values.len(), 1);
@@ -454,7 +493,7 @@ fn array_tags_all_decode() {
         }
         other => panic!("expected V array, got {other:?}"),
     }
-    match vals[9] {
+    match vals[12] {
         AnnotationValue::Array { tag, values } => {
             assert_eq!(*tag, b'W');
             match &values[0] {
@@ -466,7 +505,7 @@ fn array_tags_all_decode() {
         }
         other => panic!("expected W array, got {other:?}"),
     }
-    match vals[10] {
+    match vals[13] {
         AnnotationValue::Array { tag, values } => {
             assert_eq!(*tag, b'Y');
             match &values[0] {
@@ -478,7 +517,7 @@ fn array_tags_all_decode() {
         }
         other => panic!("expected Y array, got {other:?}"),
     }
-    match vals[11] {
+    match vals[14] {
         AnnotationValue::Array { tag, values } => {
             assert_eq!(*tag, b'X');
             match &values[0] {
@@ -491,7 +530,7 @@ fn array_tags_all_decode() {
         other => panic!("expected X array, got {other:?}"),
     }
     // The scalar '#' element decodes as the literal array's contents.
-    match vals[12] {
+    match vals[15] {
         AnnotationValue::LiteralArray(vals_la) => {
             // the referenced array holds one INTEGER 7
             assert_eq!(vals_la.len(), 1);
@@ -660,9 +699,24 @@ fn array_tags_all_encode_roundtrip() {
             AnnotationElemValue::Array(vec![0xffffffff]),
         ),
         (
+            b.add_string("ai64"),
+            b'R',
+            AnnotationElemValue::Array64(vec![i64::MIN as u64, (-2i64) as u64]),
+        ),
+        (
+            b.add_string("au64"),
+            b'S',
+            AnnotationElemValue::Array64(vec![0x0123_4567_89ab_cdef, u64::MAX]),
+        ),
+        (
             b.add_string("af32"),
             b'T',
             AnnotationElemValue::Array(vec![1.5f32.to_bits()]),
+        ),
+        (
+            b.add_string("af64"),
+            b'U',
+            AnnotationElemValue::Array64(vec![(-2.5f64).to_bits(), 3.25f64.to_bits()]),
         ),
         (
             b.add_string("astr"),
@@ -701,9 +755,9 @@ fn array_tags_all_encode_roundtrip() {
     let file = decode(&data).expect("decode");
     let g = file.classes.values().find(|c| !c.is_external).unwrap();
     let ann = &g.annotations.compile_time[0];
-    assert_eq!(ann.elements.len(), 13);
+    assert_eq!(ann.elements.len(), 16);
     // Spot-check the member references resolved to the LOCAL entities.
-    match &ann.elements[10].value {
+    match &ann.elements[13].value {
         AnnotationValue::Array { tag, values } => {
             assert_eq!(*tag, b'Y');
             match &values[0] {
@@ -715,7 +769,7 @@ fn array_tags_all_encode_roundtrip() {
         }
         other => panic!("expected Y array, got {other:?}"),
     }
-    match &ann.elements[11].value {
+    match &ann.elements[14].value {
         AnnotationValue::Array { tag, values } => {
             assert_eq!(*tag, b'X');
             match &values[0] {

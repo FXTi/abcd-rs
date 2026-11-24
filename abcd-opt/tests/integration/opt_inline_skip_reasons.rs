@@ -1,4 +1,4 @@
-//! Inline skip-reason coverage (c-COV W10): the eligibility arms no
+//! Inline skip-reason coverage: the eligibility arms no
 //! corpus function produces — `CalleeForeignValue` (all four emit
 //! sites), `CallBlockIsHandler`, `slot_roles`-driven `CallTypeUnknown`,
 //! the annotation-element arms, the `resolve_callee` Mov/guard/bound

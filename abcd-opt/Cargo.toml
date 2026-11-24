@@ -1,12 +1,12 @@
 [package]
 name = "abcd-opt"
-description = "Optimization passes for the SSA IR (abcd_ir::Module): peephole, SCCP, ADCE + CFG simplify, copyprop, inline (design/ir-v0.2.md)"
+description = "Optimization passes for the SSA IR (abcd_ir::Module): peephole, SCCP, ADCE + CFG simplify, copyprop, inline (design/ir.md)"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 readme = "README.md"
 
-# DELIBERATE INVARIANT (design/ir-v0.2.md §1, design/ir.md §8 invariant 1,
+# DELIBERATE INVARIANT (design/ir.md, design/decisions.md,
 # same enforcement mechanism as abcd-ir): layering is lift = decode→IR,
 # opt = IR→IR, lower = IR→file. The passes are FORMAT-INDEPENDENT — they
 # see `abcd_ir::Module` and nothing else. This crate's [dependencies]

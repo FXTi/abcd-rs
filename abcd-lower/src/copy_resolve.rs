@@ -12,8 +12,6 @@
 //! topological sort (emit copies whose destination slot is not the source of
 //! any pending copy), breaking remaining slot cycles through a reserved
 //! temporary slot. [`emit_copy`] maps one resolved slot pair to its bytecode.
-//!
-//! (Verbatim port of v0.1 `abcd_ir::lower::copy_resolve`.)
 
 use std::collections::HashSet;
 
@@ -40,9 +38,9 @@ pub enum CopyResolveError {
 /// returned in an order that preserves parallel-copy semantics when emitted
 /// sequentially.
 ///
-/// Every slot is a register (v0.1 B4: the accumulator is an emission-time
-/// resource, not a coloring class), so the resolved pairs all lower to the
-/// auto-widening `Mov` — acc never appears in copy slots.
+/// Every slot is a register (`ADR-03` / `B4`: the accumulator is an
+/// emission-time resource, not a coloring class), so the resolved pairs all
+/// lower to the auto-widening `Mov` — acc never appears in copy slots.
 pub fn resolve_slot_copies(
     copies: &[(RegSlot, RegSlot)],
     temp: Option<RegSlot>,

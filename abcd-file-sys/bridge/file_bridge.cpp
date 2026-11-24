@@ -257,8 +257,8 @@ void File::ThrowIfWithCheck(bool cond, const std::string_view &msg,
         throw helpers::FileAccessException(msg);
     }
 #else
+    (void)msg;
     if (cond) {
-        std::cerr << "FATAL: " << msg << std::endl;
         std::abort();
     }
 #endif
@@ -1512,6 +1512,143 @@ try {
     abc_literal_enumerate_vals_tolerant(&a->accessor.GetPandaFile(), array_off, cb, ctx);
 } catch (...) {
     return;
+}
+}
+
+static bool offset_overlaps_range(uint32_t off, uint32_t base, uint64_t byte_len) {
+    if (byte_len == 0) return false;
+    uint64_t end = static_cast<uint64_t>(base) + byte_len;
+    return static_cast<uint64_t>(off) >= static_cast<uint64_t>(base) &&
+           static_cast<uint64_t>(off) < end;
+}
+
+int abc_literal_enumerate_vals_checked(const AbcFileHandle *f, uint32_t array_off,
+                                       AbcLiteralValCb cb, void *ctx) {
+try {
+    if (!f || !f->file) return -1;
+    const File *file = f->file.get();
+    const auto *hdr = file->GetHeader();
+    if (offset_overlaps_range(array_off, hdr->foreign_off, hdr->foreign_size) ||
+        offset_overlaps_range(array_off, hdr->class_idx_off,
+                              static_cast<uint64_t>(hdr->num_classes) * sizeof(uint32_t)) ||
+        offset_overlaps_range(array_off, hdr->lnp_idx_off,
+                              static_cast<uint64_t>(hdr->num_lnps) * sizeof(uint32_t)) ||
+        offset_overlaps_range(array_off, hdr->literalarray_idx_off,
+                              static_cast<uint64_t>(hdr->num_literalarrays) * sizeof(uint32_t)) ||
+        offset_overlaps_range(array_off, hdr->index_section_off,
+                              static_cast<uint64_t>(hdr->num_indexes) * sizeof(File::IndexHeader))) {
+        return -1;
+    }
+
+    auto sp = file->GetSpanFromId(File::EntityId(array_off));
+    if (sp.Size() < sizeof(uint32_t)) return -1;
+    uint32_t count = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+    if (count > sp.Size()) return -1;
+
+    AbcLiteralVal out;
+    for (uint32_t i = 0; i < count; i += 2U) {
+        out.data.u64_val = 0;
+        out.str_data = nullptr;
+        out.str_utf16_len = 0;
+        if (sp.Size() < TAG_SIZE_BC) return -1;
+        uint8_t tag = sp[0];
+        sp = sp.SubSpan(TAG_SIZE_BC);
+        switch (tag) {
+            case 0x00:  // TAGVALUE / INTEGER_8
+                if (i + 1U >= count || sp.Size() < 1) return -1;
+                out.tag = 0x00;
+                out.data.u8_val = sp[0];
+                sp = sp.SubSpan(1);
+                break;
+            case 0x01:  // BOOL
+                if (i + 1U >= count || sp.Size() < 1) return -1;
+                out.tag = 0x01;
+                out.data.bool_val = sp[0];
+                sp = sp.SubSpan(1);
+                break;
+            case 0x02:  // INTEGER
+            case 0x03:  // FLOAT
+            case 0x17:  // LITERALBUFFERINDEX
+                if (i + 1U >= count || sp.Size() < 4) return -1;
+                out.tag = tag;
+                out.data.u32_val = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+                break;
+            case 0x04:  // DOUBLE
+                if (i + 1U >= count || sp.Size() < 8) return -1;
+                out.tag = tag;
+                out.data.u64_val = panda::panda_file::helpers::Read<sizeof(uint64_t)>(&sp);
+                break;
+            case 0x05:  // STRING
+            case 0x1c: {  // ETS_IMPLEMENTS
+                if (i + 1U >= count || sp.Size() < 4) return -1;
+                uint32_t str_off = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+                if (!File::EntityId(str_off).IsValid() || str_off >= hdr->file_size) return -1;
+                out.tag = tag;
+                out.data.u32_val = str_off;
+                break;
+            }
+            case 0x18:  // LITERALARRAY (child offset is validated on resolution/encode)
+            case 0x06:  // METHOD
+            case 0x07:  // GENERATORMETHOD
+            case 0x16:  // ASYNCGENERATORMETHOD
+            case 0x1a:  // GETTER
+            case 0x1b:  // SETTER
+                if (i + 1U >= count || sp.Size() < 4) return -1;
+                out.tag = tag;
+                out.data.u32_val = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&sp);
+                break;
+            case 0x08:  // ACCESSOR
+            case 0x19:  // BUILTINTYPEINDEX
+            case 0xff:  // NULLVALUE
+                if (i + 1U >= count || sp.Size() < 1) return -1;
+                out.tag = tag;
+                out.data.u8_val = sp[0];
+                sp = sp.SubSpan(1);
+                break;
+            case 0x09:  // METHODAFFILIATE
+                if (i + 1U >= count || sp.Size() < 2) return -1;
+                out.tag = tag;
+                out.data.u16_val = panda::panda_file::helpers::Read<sizeof(uint16_t)>(&sp);
+                break;
+            case 0x0a:  // ARRAY_U1
+            case 0x0b:  // ARRAY_U8
+            case 0x0c:  // ARRAY_I8
+            case 0x0d:  // ARRAY_U16
+            case 0x0e:  // ARRAY_I16
+            case 0x0f:  // ARRAY_U32
+            case 0x10:  // ARRAY_I32
+            case 0x11:  // ARRAY_U64
+            case 0x12:  // ARRAY_I64
+            case 0x13:  // ARRAY_F32
+            case 0x14:  // ARRAY_F64
+            case 0x15: {  // ARRAY_STRING
+                if (i != 0 || sp.Size() < sizeof(uint32_t)) return -1;
+                uint64_t elem_size = 1;
+                if (tag == 0x0d || tag == 0x0e) {
+                    elem_size = 2;
+                } else if (tag == 0x0f || tag == 0x10 || tag == 0x13 || tag == 0x15) {
+                    elem_size = 4;
+                } else if (tag == 0x11 || tag == 0x12 || tag == 0x14) {
+                    elem_size = 8;
+                }
+                auto len_sp = sp;
+                uint32_t arr_len = panda::panda_file::helpers::Read<sizeof(uint32_t)>(&len_sp);
+                if (static_cast<uint64_t>(len_sp.Size()) < static_cast<uint64_t>(arr_len) * elem_size) {
+                    return -1;
+                }
+                out.tag = tag;
+                out.data.u32_val = file->GetIdFromPointer(sp.data()).GetOffset();
+                if (cb) cb(&out, ctx);
+                return 0;
+            }
+            default:
+                return -1;
+        }
+        if (cb) cb(&out, ctx);
+    }
+    return 0;
+} catch (...) {
+    return -1;
 }
 }
 
@@ -3044,10 +3181,28 @@ try {
             name = b->strings[elements[i].name_string_handle];
         }
         if (elements[i].is_array == 1) {
-            // Scalar array
+            // Scalar array: construct ScalarValueItem matching ArrayValueItem::Write's
+            // std::variant expectation (uint32_t for K..Q, float for T, uint64_t for R/S,
+            // double for U).
             std::vector<ScalarValueItem> items;
+            items.reserve(elements[i].array_count);
+            char t = elements[i].tag;
             for (uint32_t j = 0; j < elements[i].array_count; j++) {
-                items.emplace_back(elements[i].array_values[j]);
+                uint64_t raw = elements[i].array_values[j];
+                if (t == 'R' || t == 'S') {
+                    items.emplace_back(raw);
+                } else if (t == 'U') {
+                    double dv;
+                    std::memcpy(&dv, &raw, sizeof(double));
+                    items.emplace_back(dv);
+                } else if (t == 'T') {
+                    uint32_t r32 = static_cast<uint32_t>(raw);
+                    float fv;
+                    std::memcpy(&fv, &r32, sizeof(float));
+                    items.emplace_back(fv);
+                } else {
+                    items.emplace_back(static_cast<uint32_t>(raw));
+                }
             }
             auto comp_type = component_type_from_tag(elements[i].tag);
             auto *arr_val = b->container.CreateItem<ArrayValueItem>(
@@ -3081,12 +3236,14 @@ try {
         } else if (elements[i].is_array == 4) {
             // Array of entity references
             std::vector<ScalarValueItem> items;
+            items.reserve(elements[i].array_count);
             for (uint32_t j = 0; j < elements[i].array_count; j++) {
-                BaseItem *entity = resolve_entity_by_tag(b, elements[i].tag, elements[i].array_values[j]);
+                uint32_t raw_h = static_cast<uint32_t>(elements[i].array_values[j]);
+                BaseItem *entity = resolve_entity_by_tag(b, elements[i].tag, raw_h);
                 if (entity) {
                     items.emplace_back(entity);
                 } else {
-                    items.emplace_back(elements[i].array_values[j]);
+                    items.emplace_back(raw_h);
                 }
             }
             auto comp_type = component_type_from_tag(elements[i].tag);

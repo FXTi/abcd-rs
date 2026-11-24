@@ -1,47 +1,27 @@
-# abcd-rs Design Documentation
+# `abcd-rs` Architecture & Design Documentation
 
-Architecture, format specifications, research surveys, and verification records for the `abcd-rs` ArkCompiler bytecode toolkit.
+Authoritative architecture specifications, engineering standards, and design decisions for the `abcd-rs` ArkCompiler bytecode toolkit.
 
-## Core Architecture & Subsystem Specs (Evergreen)
+> **Repository Documentation Rule**: `design/` contains **only** active as-built specifications and binding engineering guidance. Historical investigation logs, benchmark comparisons, and debugging narratives live in GitHub Issues and Commit Messages.
 
-| Document | Scope |
-|----------|-------|
-| [overview.md](overview.md) | 13-crate workspace architecture, strict dependency layering, data flow, and version compatibility |
-| [isa.md](isa.md) | ISA layer (`abcd-isa-sys` / `abcd-isa`): Ruby codegen, `Bytecode` model, modern + legacy `0.0.0.2` decode, encode, relocation |
-| [isa-compat.md](isa-compat.md) | Cross-version opcode compatibility matrix (`0.0.0.2`, `9.0.0.0` .. `24.0.0.0`) |
-| [file-format.md](file-format.md) | `.abc` container layer (`abcd-file-sys` / `abcd-file`): layout, `--merge-abc` fields, FFI bridge, `Builder`, `pandasm` |
-| [abcd-hap-research.md](abcd-hap-research.md) | OpenHarmony `.hap` / `.hsp` / `.app` / `.hqf` container format research and `abcd-hap` reader design |
-| [ir-v0.2.md](ir-v0.2.md) | Format-independent SSA IR (`abcd-ir`): 88-op taxonomy, `Effects`, `[func][new.target][this]` frame model, T1–T10 taint contract |
-| [ir.md](ir.md) | Lift / Opt / Lower algorithms (Braun SSA, SCCP, Effects-ADCE, chordal MCS register allocation, Boissinot out-of-SSA) |
-| [analysis-strategy.md](analysis-strategy.md) | Static analysis & taint architecture (`abcd-analysis` / `abcd-taint`): IFDS solver, rungs 0–2 PTA ladder, summaries & callback gaps |
-| [decompile.md](decompile.md) | Decompiler architecture (`abcd-decompile`): expression recovery, pattern-independent structuring, JS/TS emission & oracle gates |
-| [cli-plan.md](cli-plan.md) | `abcd` CLI command surface, container sniffing, exit-code contract, and `taint.toml` configuration |
-| [vendor-sync.md](vendor-sync.md) | Curated `vendor/` snapshot (`OpenHarmony-v7.0-Release`), offline codegen (`scripts/vendor-gen.py`), and upstream tag radar |
-| [ci.md](ci.md) | 21-job CI pipeline (`doc` + `vendor-verify` + 32-bit / 3-OS build matrix + corpus & `--merge-abc` VM oracle gates) |
-| [roadmap.md](roadmap.md) | Project milestones, architectural invariants, and engineering working agreements |
+---
 
-## Reference Surveys & Historical Records
+## Governance & Engineering Rules
 
-- **External framework surveys**:
-  - [hermes-ir-survey.md](hermes-ir-survey.md) — Meta Hermes IR survey informing `abcd-ir` v0.2
-  - [flowdroid/](flowdroid/) (`heros.md`, `soot-infoflow.md`, `driver-and-callgraph.md`, `summaries.md`) — FlowDroid / Heros source study informing `abcd-analysis` and `abcd-taint`
-  - [arkanalyzer/](arkanalyzer/) (`core-ir.md`, `callgraph-and-pta.md`, `dataflow-and-checkers.md`, `gaps-and-lessons.md`) — OpenHarmony ArkAnalyzer source study
-- **Historical campaign logs & engineering audits**:
-  - Archived under [`archive/`](archive/README.md) (`MEMORY.md`, `agent-roadmap.md`, FFI/bridge audits, coverage diagnoses, `test262` and wild-gate evaluation reports).
+- [**Project Engineering Standards (`standards.md`)**](standards.md) — Layering ring, zero input-depth recursion, linear scaling, bit-exact determinism, error honesty, C++ FFI firewall bounds, and zero-Docker local testing.
+- [**Architecture Decisions & `N*` Registry (`decisions.md`)**](decisions.md) — Canonical `ADR-01`–`ADR-12` rulings, quick lookup for `N*` source-comment tags, and retired legacy rulings.
+- [**Agent & Contributor Guide (`../AGENTS.md`)**](../AGENTS.md) — Crate ownership table, multi-agent Git coordination, and `./scripts/test-local.sh` commands.
 
-## End-to-end pipeline
+## Architecture & Subsystem Specifications
 
-```
-.hap/.hsp/.app/.hqf ──▶ abcd-hap ──▶ .abc bytes ◀──pandasm──▶ .pa text
-                                         │  ▲
-                               decode    ▼  │    encode
-                                     abcd-file (abcd-file-sys + abcd-isa)
-                                         │  ▲
-                                 lift    ▼  │    lower
-                                     abcd-ir (SSA) ──abcd-opt──▶ abcd-ir
-                                         │
-                                         ▼
-                                   abcd-analysis (CFG / Regions / IFDS / PTA)
-                                     ├──▶ abcd-taint     ──▶ taint flows
-                                     └──▶ abcd-decompile ──▶ .js / .ts
-```
+- [**Architecture Overview (`overview.md`)**](overview.md) — 13-crate dependency graph, pipeline data flow, and supported `.abc` format versions (`0.0.0.2`, `9.0.0.0`–`24.0.0.0`, and static ArkTS 1.2 `0.1.0.7`).
+- [**Roadmap (`roadmap.md`)**](roadmap.md) — Shipped capabilities and active `#33`–`#36` deep-water milestones.
+- [**ISA & Bytecode Layer (`isa.md`)**](isa.md) & [**ISA Compatibility (`isa-compat.md`)**](isa-compat.md) — Vendored `isa.yaml` codegen, typed `Bytecode` stream codec, entity relocation, and legacy `0.0.0.2` / static `0.1.0.7` version handling.
+- [**`.abc` File Format Layer (`file-format.md`)**](file-format.md) — `libpandafile` FFI bridge (`abcd-file-sys`), `File` container model (`abcd-file`), dual-bucket MUTF-8 strings, nested literal/module/annotation relocation, and `pandasm` `.pa` text disassembler/assembler.
+- [**OpenHarmony Containers (`hap-container.md`)**](hap-container.md) — Pure-Rust `.hap` / `.hsp` / `.app` / `.hqf` ZIP reader (`abcd-hap`), signing-block tolerance, and multi-module discovery.
+- [**SSA IR & Lift/Opt/Lower Pipeline (`ir.md`)**](ir.md) — Format-independent `88`-op SSA IR (`abcd-ir`), Braun SSA lifter (`abcd-lift`), `Effects`-driven optimization passes (`abcd-opt`), and chordal register allocation + `acc`-as-cache lowering (`abcd-lower`).
+- [**Static Analysis & Taint Engine (`analysis.md`)**](analysis.md) — Iterative CHK dominators, region structuring, monotone dataflow, IFDS solver, Rung `0`/`1`/`2` alias & `k=1` PTA ladder, cross-module ES linking (`abcd-analysis`), and OpenHarmony taint analysis (`abcd-taint`).
+- [**Decompiler (`decompile.md`)**](decompile.md) — Three-stage JS/TS decompiler (`abcd-decompile`), generator/`async`/`for await` state-machine folds, `--split-modules` bundle recovery, and `--arkui` declarative `@Component struct` sugar.
+- [**Command-Line Interface (`cli.md`)**](cli.md) — Unified `abcd` binary (`abcd-cli`), container auto-detection, exit codes, TOML taint configuration, and allocator policy.
+- [**CI & Verification Architecture (`ci.md`)**](ci.md) — `26`-job GitHub Actions pipeline, self-cleaning divergence ledgers, and local zero-Docker verification.
+- [**Vendor Snapshot Maintenance (`vendor-sync.md`)**](vendor-sync.md) — Managing `vendor/arkcompiler_runtime_core/`, `vendor/UPSTREAM.toml`, and `scripts/vendor-gen.py`.

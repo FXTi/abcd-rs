@@ -1,9 +1,10 @@
-//! Verifier skeleton (design/ir-v0.2.md §6.3: the verifier is a
-//! first-class contract, not a debug-build afterthought).
+//! Structural and SSA dominance verifier (`design/ir.md`,
+//! `design/decisions.md` N27/N38/N45/N64: the verifier is a first-class
+//! contract, not a debug-build afterthought).
 //!
 //! Checks, per function:
 //!
-//! - **SSA dominance (N45 port)**: every use is dominated by its def over
+//! - **SSA dominance (`N45`, `N64`)**: every use is dominated by its def over
 //!   **Normal** edges. Entry-defined values (params, entry-block
 //!   instruction results, constants) dominate everything.
 //!   `ExceptionParam` values are valid in their handler and its
@@ -12,14 +13,14 @@
 //!   over the full edge graph (dead code) are exempt — they legitimately
 //!   carry junk and CFG simplification removes them; so are blocks with
 //!   no Normal-edge path from entry (catch handlers: exception dispatch
-//!   is not Normal-edge dominance, exactly as in v0.1's N45 model).
-//! - **N27**: a phi on a *reachable* block with no predecessors is an
+//!   is not Normal-edge dominance).
+//! - **`N27`**: a phi on a *reachable* block with no predecessors is an
 //!   error (no incoming edge can carry it a value).
 //! - **Terminators**: exactly one per block, in last position.
 //! - **Arity**: fixed-arity ops match the taxonomy table
 //!   ([`Op::arity`]); a phi's entry count equals the block's predecessor
 //!   count.
-//! - **N38 (warning, not error)**: a handler phi joining distinct values
+//! - **`N38` (warning, not error)**: a handler phi joining distinct values
 //!   across exceptional edges is an imprecise join — passes must not
 //!   constant-fold it.
 //!
@@ -869,8 +870,8 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
     report
 }
 
-/// N45 use-def dominance over **Normal** edges, with the documented
-/// exception-model exemptions (ported from v0.1 `verify.rs`):
+/// `N45` use-def dominance over **Normal** edges, with the documented
+/// exception-model exemptions (`design/decisions.md` N45, N64):
 ///
 /// 1. Uses in blocks unreachable over the full edge graph are exempt
 ///    (dead code carries junk; same standing as the N27 exemption).
@@ -1237,7 +1238,7 @@ mod tests {
     use crate::op::BinOp;
     use crate::ty::Ty;
 
-    // ── Test scaffolding (hand-built modules; no builder in P0) ──────
+    // ── Test scaffolding (hand-built modules) ────────────────────────
 
     fn mk_module() -> Module {
         let mut m = Module::new();
@@ -1860,7 +1861,7 @@ mod tests {
         assert!(r.is_ok(), "got: {:?}", r.errors);
     }
 
-    // ── W12: one negative per remaining dark error arm ───────────────
+    // ── Negative coverage per error arm ──────────────────────────────
     //
     // Each test builds the minimal invalid shape from the arm→shape table
     // and asserts the exact VerifyErrorKind plus its Display message (the
@@ -3371,5 +3372,60 @@ mod tests {
             assert_eq!(format!("{w}"), want);
             assert!(std::error::Error::source(&w).is_some());
         }
+    }
+
+    #[test]
+    fn readme_quick_start_module_verifies_clean() {
+        let mut module = Module::new();
+        let desc = module.sym.intern("L_GLOBAL;");
+        module.classes.push(ClassData::new(desc, desc));
+
+        let fname = module.sym.intern("add");
+        let entry = BlockId::new(0);
+        module.blocks.push(Block::default());
+
+        let mut func = FunctionData::new(ClassId::new(0), fname, FunctionKind::Function);
+        func.blocks.push(entry);
+        for idx in 0..5u16 {
+            let vid = ValueId::new(module.values.len() as u32);
+            module.values.push(Value {
+                def: ValueDef::Param(idx),
+                ty: Ty::Any,
+            });
+            func.params.push(vid);
+        }
+        let (a, b) = (func.params[3], func.params[4]);
+        module.functions.push(func);
+
+        let sum_inst = InstId::new(0);
+        let sum_val = ValueId::new(module.values.len() as u32);
+        module.values.push(Value {
+            def: ValueDef::Inst(sum_inst),
+            ty: Ty::Any,
+        });
+        module.insts.push(Inst {
+            op: Op::BinaryOp {
+                op: BinOp::Add,
+                left: a,
+                right: b,
+            },
+            result: Some(sum_val),
+            block: entry,
+            loc: None,
+        });
+        let ret_inst = InstId::new(1);
+        module.insts.push(Inst {
+            op: Op::Return {
+                value: Some(sum_val),
+            },
+            result: None,
+            block: entry,
+            loc: None,
+        });
+        module.blocks[entry.index()]
+            .insts
+            .extend([sum_inst, ret_inst]);
+
+        assert!(verify_module(&module).is_ok());
     }
 }

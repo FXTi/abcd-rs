@@ -1,19 +1,20 @@
 //! # abcd-ir — the SSA IR
 //!
 //! Format-independent Static Single Assignment intermediate representation for
-//! ArkCompiler bytecode programs (`design/ir-v0.2.md`, background in
-//! `design/ir.md` §1–§8): identity tables, module/function arenas, the 88-op
-//! taxonomy, the effects table, the type lattice, and the structural verifier.
-//! Lifting (`abcd-lift`, container → IR), optimization (`abcd-opt`, IR → IR),
-//! and lowering (`abcd-lower`, IR → container) live in separate crates.
+//! ArkCompiler bytecode programs (`design/ir.md`; design rulings in
+//! `design/decisions.md`): identity tables, module/function arenas, the 88-op
+//! taxonomy, the effects table, the type lattice, the dual-dialect calling
+//! convention (`D6`), and the structural verifier. Lifting (`abcd-lift`,
+//! container → IR), optimization (`abcd-opt`, IR → IR), and lowering
+//! (`abcd-lower`, IR → container) live in separate crates.
 //!
 //! ## Format independence (structurally enforced)
 //!
 //! The IR describes a **program** — classes, functions, value flow, types,
 //! annotations, module records, debug info — never a serialized **file**.
 //! This crate's `Cargo.toml` declares **no dependency** on `abcd-file`,
-//! `abcd-isa`, `abcd-file-sys`, or `abcd-isa-sys`, and never may (`design/ir.md`
-//! §8 invariant 1):
+//! `abcd-isa`, `abcd-file-sys`, or `abcd-isa-sys`, and never may
+//! (`design/ir.md`):
 //!
 //! - file-header identity (`version`, `file_type`) stays outside the IR;
 //! - entity identity uses [`FuncId`], [`ClassId`], and [`SymbolTable`], never
@@ -23,8 +24,10 @@
 //!   raw literal-array table indices;
 //! - annotations merge into a single ordered [`Annotation`] list per site;
 //! - class/reference types carry a module [`ClassId`] ([`StaticTy::Reference`]);
-//! - register counts and accumulator slots do not exist in SSA (`frame` models
-//!   only the `[func][new.target][this]` calling convention);
+//! - register counts and accumulator slots do not exist in SSA ([`frame`] and
+//!   [`Dialect`] model the explicit calling convention: dynamic ECMAScript
+//!   `[func][new.target][this]` hidden leading slots vs static ArkTS `H = 0`
+//!   static / `params[0] = this` instance frames);
 //! - exception handlers are structured [`TryRegion`]s with explicit
 //!   [`EdgeKind::Exceptional`] CFG edges.
 //!
@@ -36,9 +39,9 @@
 //!   ([`Op::LoadProp`], [`Op::LoadPropIdx`], [`Op::LoadPropDyn`]).
 //! - **T3** — [`Op::effects`] is the single, mechanically derived source
 //!   of effect truth ([`Effects`]).
-//! - **T4** — one [`Op::Call`] with [`CallKind`] + the §5.3 binding
-//!   table; [`Op::DefineFunc`] carries explicit captures; `params` are
-//!   the vendored frame slots (see [`frame`]).
+//! - **T4** — one [`Op::Call`] with [`CallKind`] + the call-binding
+//!   table (`design/ir.md`); [`Op::DefineFunc`] carries explicit captures;
+//!   `params` follow the callee's [`FrameSlots`] per [`Dialect`] (see [`frame`]).
 //! - **T5** — [`EdgeKind::Exceptional`] edges are first-class CFG edges;
 //!   [`ValueDef::ExceptionParam`] is a real SSA value defined by the
 //!   dispatch.
@@ -50,8 +53,8 @@
 //! - **T8** — [`Inst::loc`] is propagated or dropped, never fabricated.
 //! - **T9** — every name is a [`Sym`]; entities are referenced by id,
 //!   never by file offset.
-//! - **T10** — params/return/exception wiring follows the §5.3 binding
-//!   table per [`CallKind`].
+//! - **T10** — params/return/exception wiring follows the call-binding
+//!   table (`design/ir.md`) per [`CallKind`] and [`FrameSlots`].
 //!
 //! ## Library rule
 //!
@@ -82,8 +85,8 @@ pub use function::{
 };
 pub use id::{BlockId, ClassId, ConstId, FieldId, FuncId, InstId, Sym, ValueId};
 pub use module::{
-    AnnValue, Annotation, ClassData, EsModule, ExportDecl, FieldData, FunctionKind, ImportDecl,
-    Modifiers, Module, ModuleRequest, Signature, SourceLang,
+    AnnValue, Annotation, ClassData, Dialect, EsModule, ExportDecl, FieldData, FunctionKind,
+    ImportDecl, Modifiers, Module, ModuleRequest, Signature, SourceLang,
 };
 pub use op::{
     Arity, BinOp, CallKind, CmpOp, ModuleVarKind, Op, PropKey, SuperCheck, SuperKey, UnOp,

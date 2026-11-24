@@ -1,5 +1,5 @@
-//! Successor relations (migrated verbatim from `abcd-lower::analysis`,
-//! v2-P5a; the lowering corpus byte-identity gate pins the move).
+//! CFG successor relations (`design/ir.md`, `design/analysis.md`; pinned
+//! by the lowering byte-identity gate).
 
 use abcd_ir::{BlockId, FuncId, Module, Op};
 
@@ -37,9 +37,8 @@ pub fn inst_succs(op: &Op) -> Vec<BlockId> {
 /// a terminator-level edge, so any analysis that reasons about
 /// reachability or value flow must use this relation — a try body may end
 /// in `Throw`/`Unreachable` while the handler still reads values defined
-/// there. This is the v0.1 `augmented_succs` contract; v0.2's
-/// [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) edges encode the same
-/// relation on the CFG.
+/// there. First-class [`EdgeKind::Exceptional`](abcd_ir::EdgeKind)
+/// predecessors encode the same relation on the CFG.
 ///
 /// Handler blocks no longer owned by `func` (partially pruned metadata)
 /// are skipped, so this never hands out dangling `BlockId`s.

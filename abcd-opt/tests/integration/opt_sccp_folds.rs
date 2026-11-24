@@ -1,4 +1,4 @@
-//! SCCP arm coverage (c-COV W10): the never-Top family (forward/cross
+//! SCCP arm coverage: the never-Top family (forward/cross
 //! operand references the in-order corpus never evaluates), the
 //! entry-block phi path, const-defined Null/Bool/Number resolution, the
 //! Null materialization, the `dead == target` branch fold, the

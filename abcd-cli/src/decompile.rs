@@ -1,6 +1,6 @@
 //! `abcd decompile` — bytecode → JavaScript via decode → lift → emit.
 //!
-//! Pipeline rules (design/decompile.md §3.2): the decompiler consumes the
+//! Pipeline rules (design/decompile.md §1): the decompiler consumes the
 //! lifted PRE-opt IR — no abcd-opt pass runs here, and the `inline` pass in
 //! particular must never run before decompile.
 

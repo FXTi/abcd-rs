@@ -10,11 +10,12 @@
 //!
 //! ## Format independence (structurally enforced)
 //!
-//! Every pass operates on [`abcd_ir::Module`] alone. This crate's
-//! `Cargo.toml` `[dependencies]` list **only** `abcd-ir` — never `abcd-file`,
-//! `abcd-isa`, `abcd-file-sys`, `abcd-isa-sys`, `abcd-lift`, or `abcd-lower`.
+//! Every pass operates on [`abcd_ir::Module`] alone (`design/ir.md`). This
+//! crate's `Cargo.toml` `[dependencies]` list **only** `abcd-ir` — never
+//! `abcd-file`, `abcd-isa`, `abcd-file-sys`, `abcd-isa-sys`, `abcd-lift`, or
+//! `abcd-lower`.
 //!
-//! ## ECMAScript & exception soundness invariants
+//! ## ECMAScript & exception soundness invariants (`design/decisions.md`)
 //!
 //! - **Operand evaluation order**: both fold engines evaluate non-commutative
 //!   binary/comparison operators in ArkCompiler's operand order (`vreg OP acc`,
@@ -55,7 +56,7 @@ pub mod sccp;
 
 use abcd_ir::{FuncId, Module};
 
-/// A function-level optimization pass (v0.1 `opt::FuncPass`).
+/// A function-level optimization pass.
 pub trait FuncPass {
     /// Run the pass on `func` within `module`.
     /// Returns `true` if the IR was modified.
@@ -97,7 +98,7 @@ pub(crate) fn to_uint32(n: f64) -> u32 {
 
 /// Run the full optimization pipeline on a single function.
 /// Pipeline: peephole → sccp → adce + cfg-simplify → copyprop → peephole
-/// → adce + cfg-simplify (v0.1 `opt::optimize_func`).
+/// → adce + cfg-simplify.
 /// Returns `true` if any pass modified the IR.
 pub fn optimize_func(module: &mut Module, func: FuncId) -> bool {
     let mut changed = false;
@@ -117,9 +118,8 @@ pub fn optimize_func(module: &mut Module, func: FuncId) -> bool {
     changed
 }
 
-/// Run the optimization pipeline on all functions in the module
-/// (v0.1 `opt::optimize_module`). Bodyless functions (external/native
-/// declarations) are skipped.
+/// Run the optimization pipeline on all functions in the module. Bodyless
+/// functions (external/native declarations) are skipped.
 pub fn optimize_module(module: &mut Module) -> bool {
     let func_count = module.functions.len();
     let mut changed = false;

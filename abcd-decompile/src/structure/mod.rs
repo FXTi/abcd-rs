@@ -219,8 +219,9 @@ pub enum SNode {
         body: Vec<SNode>,
     },
     /// `switch (disc) { case … }` — the cosmetic compare/branch-chain
-    /// re-detection fold output ([`crate::folds`]; the IR has no
-    /// `Switch` op by design — ir-v0.2 §9 resolution 2).
+    /// re-detection fold output ([`crate::folds`]; the IR lowers switch
+    /// cascades to compare/branch chains by design — `design/ir.md`,
+    /// `design/decisions.md`).
     Switch {
         /// The discriminant.
         disc: Expr,

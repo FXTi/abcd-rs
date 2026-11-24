@@ -1,5 +1,5 @@
-//! The op taxonomy (design/ir-v0.2.md §4.1, with §9's resolutions: **no
-//! `Switch`**, a **single** `LoadPropIdx`/`StorePropIdx`).
+//! The 88-variant semantic op taxonomy (`design/ir.md`): **no `Switch`**,
+//! and a **single** `LoadPropIdx`/`StorePropIdx`.
 //!
 //! [`Op`] is a *closed* enum of semantic variants — zero opcode concepts:
 //! width variants, typed/dynamic twins, and the call family all fold into
@@ -188,9 +188,12 @@ impl ModuleVarKind {
     }
 }
 
-/// Call kind — the §5.3 binding table (vendored frame-slot model,
-/// [`crate::frame::FrameSlots`], where `H` is the callee's leading implicit
-/// `[func][new.target][this]` slot count — `H = 3` under the `0xF` default):
+/// Call kind — the call-binding table (`design/ir.md`,
+/// [`crate::frame::FrameSlots`], where `H = slots.implicit_count()` is the
+/// callee's leading implicit slot count — `H = 3` under
+/// [`crate::Dialect::DynamicEcma`] `0xF` default, `H = 0` on
+/// [`crate::Dialect::StaticArkTS`] `static` methods, `H = 1` on
+/// [`crate::Dialect::StaticArkTS`] instance methods/constructors; `D6`):
 ///
 /// | kind | `this` slot | `new.target` slot | formals |
 /// |------|-------------|-------------------|---------|
@@ -213,29 +216,28 @@ pub enum CallKind {
     /// `None`.
     Dynamic,
     /// `func.apply(this, argsArray)` — vendor `apply imm, v_this, v_args`
-    /// (isa.yaml:1104, the func in the acc): the receiver is explicit and
+    /// (`isa.yaml:1104`, the func in the acc): the receiver is explicit and
     /// the single argument is an ARRAY spread over the formal parameters.
     /// Never an arity overload of [`CallKind::Dynamic`]: `Call::this` is
-    /// `Some(receiver)` and `Call::args` is exactly `[array]` (N16/N57;
-    /// v0.1 `CallKind::Apply`, isel emits the `apply` opcode).
+    /// `Some(receiver)` and `Call::args` is exactly `[array]`
+    /// (`design/decisions.md` N16/N57; lowers to the `apply` opcode).
     Apply,
     /// A `super(...)` call in a constructor with EXPLICIT arguments
     /// (vendor `supercallthisrange`/`supercallarrowrange`).
     Super,
     /// A `super(...args)` call spreading an argument ARRAY into the super
-    /// constructor — vendor `supercallspread imm, v_args` (isa.yaml).
+    /// constructor — vendor `supercallspread imm, v_args` (`isa.yaml`).
     /// `Call::this` is `None` (inherited) and `Call::args` is exactly
-    /// `[array]` (N58; v0.1 `CallKind::SuperCallSpread`, isel emits the
-    /// `supercallspread` opcode). Never a 1-argument [`CallKind::Super`].
+    /// `[array]` (`design/decisions.md` N58; lowers to `supercallspread`).
+    /// Never a 1-argument [`CallKind::Super`].
     SuperSpread,
-    /// Vendor `callruntime.supercallforwardallargs v_this` (isa.yaml): a
+    /// Vendor `callruntime.supercallforwardallargs v_this` (`isa.yaml`): a
     /// default derived constructor forwarding ALL of its own arguments to
-    /// the super constructor. v0.1's representation is kept verbatim
-    /// (`CallKind::SuperCall`, args = `[this]` — the enclosing `this`
-    /// models the forwarded argument list, lowering to
-    /// `supercallthisrange` argc=1), but the KIND stays distinct from
-    /// [`CallKind::Super`] so the lower never confuses the forward-all
-    /// form with an explicit-arguments super call (N58).
+    /// the super constructor. `Call::this` is `None` and `Call::args` is
+    /// `[this]` (the enclosing `this` models the forwarded argument list),
+    /// kept distinct from [`CallKind::Super`] so lowering never confuses the
+    /// forward-all form with an explicit 1-argument super call
+    /// (`design/decisions.md` N58).
     SuperForwardAllArgs,
     /// `new callee(args...)`.
     New,
@@ -258,7 +260,7 @@ pub enum PropKey {
     /// A statically known property name.
     Name(Sym),
     /// An integer index operand (constant-index detection is a def-chain
-    /// query for the analysis layer — §9 resolution 3).
+    /// query for the analysis layer — `design/ir.md`).
     Index(ValueId),
     /// A computed key operand.
     Dynamic(ValueId),
@@ -332,9 +334,9 @@ pub enum Op {
     /// Allocate an array (T7). `shape: None` is the empty array
     /// (`createemptyarray`); `Some(shape)` is an array with a literal
     /// shape (`createarraywithbuffer` — the literal array as a pooled
-    /// shape). The object/array tag is OPCODE-carried (N59): it is not
-    /// recoverable from the flat literal-buffer content, so it must
-    /// come from the op, mirroring [`Op::AllocObject`]'s treatment.
+    /// shape). The object/array tag is OPCODE-carried (`design/decisions.md`
+    /// N59): it is not recoverable from the flat literal-buffer content, so
+    /// it must come from the op, mirroring [`Op::AllocObject`]'s treatment.
     AllocArray {
         /// The array-literal shape constant, when present.
         shape: Option<ConstId>,
@@ -367,8 +369,8 @@ pub enum Op {
         /// The stored value.
         value: ValueId,
     },
-    /// Integer-indexed element access: `object[index]` (single op — §9
-    /// resolution 3).
+    /// Integer-indexed element access: `object[index]` (single op —
+    /// `design/ir.md`).
     LoadPropIdx {
         /// The receiver object.
         object: ValueId,
@@ -404,8 +406,8 @@ pub enum Op {
     /// property (vendor `stownbyname`(+withnameset)/`definefieldbyname`/
     /// `definepropertybyname`) — CreateDataProperty/DefineField
     /// semantics: NO setters, NO prototype-chain walk, unlike
-    /// [`Op::StoreProp`] (N60; v0.1 `InstData::StoreOwnProperty` with
-    /// `PropKind::ByName`, isel emits the `stownby*` family).
+    /// [`Op::StoreProp`] (`design/decisions.md` N60; lowers to the
+    /// `stownby*` family).
     StoreOwnPropName {
         /// The receiver object.
         object: ValueId,
@@ -415,8 +417,8 @@ pub enum Op {
         value: ValueId,
     },
     /// Computed-key own-property store (vendor
-    /// `stownbyvalue`(+withnameset)/`callruntime.definefieldbyvalue` —
-    /// v0.1 `PropKind::ByValue`).
+    /// `stownbyvalue`(+withnameset)/`callruntime.definefieldbyvalue`;
+    /// `design/decisions.md` N60).
     StoreOwnPropDyn {
         /// The receiver object.
         object: ValueId,
@@ -427,7 +429,7 @@ pub enum Op {
     },
     /// Integer-indexed own-property store (vendor
     /// `stownbyindex`/`wide.stownbyindex`/
-    /// `callruntime.definefieldbyindex` — v0.1 `PropKind::ByIndex`).
+    /// `callruntime.definefieldbyindex`; `design/decisions.md` N60).
     StoreOwnPropIdx {
         /// The receiver object.
         object: ValueId,
@@ -576,8 +578,7 @@ pub enum Op {
 
     // ── Lexical / global / module ──────────────────────────────────────
     /// Push a new lexical environment with `num_vars` slots, yielding it
-    /// (vendor `newlexenv` / `wide.newlexenv`, isa.yaml; v0.2's original
-    /// `GetLexEnv` renamed to the ISA-honest name and given its payload).
+    /// (vendor `newlexenv` / `wide.newlexenv`, `isa.yaml`).
     NewLexEnv {
         /// Number of variables in the new environment.
         num_vars: u16,
@@ -619,7 +620,8 @@ pub enum Op {
     /// side-effect-free: the vendored slow paths of both source forms
     /// (`ldglobalvar`, `tryldglobalbyname`) run `GetProperty` on the
     /// global's prototype chain — global getters are called and the
-    /// calls are abrupt-checked (see [`Op::effects`], N48/N50).
+    /// calls are abrupt-checked (see [`Op::effects`],
+    /// `design/decisions.md` N48/N50).
     TryGetGlobal {
         /// The global's name.
         name: Sym,
@@ -643,9 +645,10 @@ pub enum Op {
     /// runtime_stubs-inl.h:1793). The deprecated trio
     /// (stlet-/stclass-/stconstto-globalrecord, interpreter-inl.cpp
     /// :6260-6345, all `SlowRuntimeStub::StGlobalRecord`) lifts here too:
-    /// stconst→`is_const: true`, stlet/stclass→`false`. N72-C4: folding
-    /// this into `StoreGlobal` turned a top-level `let Array` into
-    /// `globalThis.Array = undefined`, clobbering the builtin.
+    /// stconst→`is_const: true`, stlet/stclass→`false`
+    /// (`design/decisions.md` N72: folding this into `StoreGlobal` would
+    /// turn a top-level `let Array` into `globalThis.Array = undefined`,
+    /// clobbering the builtin).
     StoreGlobalRecord {
         /// The binding's name.
         name: Sym,
@@ -657,8 +660,8 @@ pub enum Op {
     },
     /// Store a global by name, TOLERANT of absence (vendor
     /// `trystglobalbyname`): no ReferenceError when the global does not
-    /// exist — unlike the throwing [`Op::StoreGlobal`] (N61; v0.1
-    /// `InstData::TryStoreGlobalByName`).
+    /// exist — unlike the throwing [`Op::StoreGlobal`]
+    /// (`design/decisions.md` N61).
     TryStoreGlobal {
         /// The global's name.
         name: Sym,
@@ -693,8 +696,8 @@ pub enum Op {
     },
 
     // ── Calls / definitions ────────────────────────────────────────────
-    /// A call (T4; one semantic op for the whole callthis/callshort/
-    /// callrange family). Binding per [`CallKind`] (§5.3 table above).
+    /// A call (`T4`; one semantic op for the whole `callthis`/`callshort`/
+    /// `callrange` family). Binding per [`CallKind`] (`design/ir.md`).
     Call {
         /// The callee.
         callee: ValueId,
@@ -737,30 +740,24 @@ pub enum Op {
         /// fallback — consumers treat attributes as unknown).
         member_attrs: Vec<MemberAttrs>,
         /// The class constructor's `.length` (vendor
-        /// `defineclasswithbuffer imm2`, isa.yaml) — the runtime consumes
-        /// it via RuntimeSetClassConstructorLength (N15); modeled for
-        /// byte fidelity and semantics.
+        /// `defineclasswithbuffer imm2`, `isa.yaml`) — the runtime consumes
+        /// it via `RuntimeSetClassConstructorLength` (`design/decisions.md`
+        /// N15); modeled for byte fidelity and semantics.
         count: u16,
     },
     /// Define a SENDABLE (shared) class with a member buffer — vendor
     /// `callruntime.definesendableclass imm1:u16, method_id,
-    /// literalarray_id, imm2:u16, v:in:top`
-    /// (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:861-866).
+    /// literalarray_id, imm2:u16, v:in:top` (`isa.yaml:861-866`).
     ///
-    /// Distinct from [`Op::DefineClass`] (N53): the vendor runtime
-    /// builds the class through `SlowRuntimeStub::CreateSharedClass`
-    /// (arkcompiler_ets_runtime-master/ecmascript/interpreter/
-    /// interpreter_assembly.cpp:6157-6180,
+    /// Distinct from [`Op::DefineClass`] (`design/decisions.md` N53): the
+    /// vendor runtime builds the class through
+    /// `SlowRuntimeStub::CreateSharedClass`
+    /// (`arkcompiler_ets_runtime-master/ecmascript/interpreter/interpreter_assembly.cpp:6157-6180`,
     /// `HandleCallRuntimeDefineSendableClassPrefImm16Id16Id16Imm16V8` —
-    /// `ASSERT(res.IsJSSharedFunction())`), NOT the contemporary
+    /// `ASSERT(res.IsJSSharedFunction())`), NOT
     /// `defineclasswithbuffer`'s `SlowRuntimeStub::CreateClassWithBuffer`
-    /// (interpreter_assembly.cpp:6007/6033). v0.1 collapsed this opcode
-    /// into `InstData::DefineClassWithBuffer` and its isel re-emitted
-    /// the CONTEMPORARY `defineclasswithbuffer` — opcode-identity
-    /// corruption. The 24.0.0.0 sendable fixtures are runtime-N/A
-    /// (structural only, not in the 1149-fixture VM set), so no VM
-    /// evidence is possible; the distinction is anchored to the vendor
-    /// sources above.
+    /// (`interpreter_assembly.cpp:6007/6033`), so lowering must preserve the
+    /// sendable opcode identity.
     DefineSendableClass {
         /// The constructor in the module's function table.
         ctor: FuncId,
@@ -773,10 +770,10 @@ pub enum Op {
         /// Per-member attribute payloads (same shape as
         /// [`Op::DefineClass::member_attrs`]).
         member_attrs: Vec<MemberAttrs>,
-        /// The class constructor's `.length` (vendor imm2, isa.yaml) —
+        /// The class constructor's `.length` (vendor `imm2`, `isa.yaml`) —
         /// `CreateSharedClass` consumes it the way
-        /// `CreateClassWithBuffer` consumes the contemporary form's
-        /// (N15).
+        /// `CreateClassWithBuffer` consumes [`Op::DefineClass::count`]
+        /// (`design/decisions.md` N15).
         count: u16,
     },
 
@@ -981,21 +978,21 @@ pub enum Op {
     LoadSuper {
         /// The property key.
         key: SuperKey,
-        /// The thisValue of the super reference (N74-W4: the vendor
-        /// `ldsuperbyvalue imm, v` carries it in the register operand —
-        /// es2abc stages the current `this` there — while the KEY is the
-        /// acc; the byname form passes no register, so the lift reads
-        /// the frame's this-role value). Kept as a real operand so the
-        /// byte round-trip can restore the register.
+        /// The `thisValue` of the super reference (`design/decisions.md` N74:
+        /// vendor `ldsuperbyvalue imm, v` carries it in the register operand —
+        /// `es2abc` stages the current `this` there — while the KEY is the
+        /// acc; the `byname` form passes no register, so lift reads the
+        /// frame's `this`-role value). Kept as a real operand so byte
+        /// round-tripping can restore the register.
         this_value: ValueId,
     },
     /// Super-property store.
     StoreSuper {
         /// The property key.
         key: SuperKey,
-        /// The thisValue of the super reference (vendor
-        /// `stsuperbyvalue imm, v1, v2`: v1 = this, v2 = key, acc =
-        /// value — N74-W4).
+        /// The `thisValue` of the super reference (vendor
+        /// `stsuperbyvalue imm, v1, v2`: `v1 = this`, `v2 = key`, `acc =
+        /// value` — `design/decisions.md` N74).
         this_value: ValueId,
         /// The stored value.
         value: ValueId,
@@ -1021,8 +1018,9 @@ pub enum Op {
         /// The return value.
         value: Option<ValueId>,
     },
-    /// SSA phi: one entry per incoming edge (§5.1 — entries reference
-    /// `(Edge, ValueId)`; the value flows from the edge's source block).
+    /// SSA phi: one entry per incoming edge (`design/ir.md` — entries
+    /// reference `(Edge, ValueId)`; the value flows from the edge's source
+    /// block).
     Phi {
         /// `(incoming edge, value)` pairs.
         entries: Vec<(Edge, ValueId)>,
@@ -1031,9 +1029,9 @@ pub enum Op {
     Unreachable,
 
     // ── Debug ──────────────────────────────────────────────────────────
-    /// Vendor `debugger` (isa.yaml): a debugger breakpoint — observable
-    /// when a debugger is attached (v0.1 kept it essential; the effect
-    /// record models the potential debugger hook).
+    /// Vendor `debugger` (`isa.yaml`): a debugger breakpoint — observable
+    /// when a debugger is attached (modeled via the potential debugger-hook
+    /// call effect in [`Op::effects`]).
     Debugger,
 }
 
@@ -1530,7 +1528,7 @@ mod tests {
             },
             Op::Return { value: Some(v()) },
             Op::Unreachable,
-            // ── v2-P0.5 taxonomy growth: full ISA coverage ──
+            // ── Full ISA coverage ops ──
             Op::NewLexEnv { num_vars: 3 },
             Op::NewLexEnvWithName {
                 num_vars: 3,

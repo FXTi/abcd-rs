@@ -1,10 +1,10 @@
-//! N43 regression (v0.2 port of `abcd-ir/tests/lower_try_range_contiguity.rs`):
-//! reconstructed try ranges must cover ONLY protected instructions — no
-//! contiguity assumption over the flattened (RPO) order.
+//! `N43` (`ADR-04`) regression tests: reconstructed try ranges must cover ONLY
+//! protected instructions — no contiguity assumption over the flattened (RPO)
+//! order.
 //!
-//! v0.2 differences: try regions are structured `abcd_ir::TryRegion`s
-//! (`protected` blocks + `catches` with handler/exception/type_idx), and
-//! the catch-all sentinel is `type_idx: None` (v0.1's u32::MAX).
+//! Try regions are structured `abcd_ir::TryRegion`s (`protected` blocks +
+//! `catches` with `handler` / `exception` / `type_idx`), and the catch-all
+//! sentinel `type_idx: None` maps to `u32::MAX` in `.abc` containers.
 
 use crate::common;
 use abcd_ir::{Catch, FunctionKind, Module, Op, TryRegion, UnOp};

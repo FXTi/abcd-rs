@@ -81,9 +81,7 @@ for path in sorted(paths):
 /// corpus plus the gen-opcode fixtures, sorted for determinism).
 ///
 /// The Stage-A/Stage-B decompile corpus gates are scoped to this set
-/// (c-P3): test262 decompile is a later phase per
-/// `design/archive/test262-feasibility.md`, so the 2685 compiled test262 rows
-/// gate lift+verify (`tests/file-lift`) only.
+/// (`dream_gate_t262` covers the 2685 compiled test262 rows separately).
 pub fn project_manifest_paths(root: &Path) -> Vec<String> {
     let output = Command::new("python3")
         .arg("-c")

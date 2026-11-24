@@ -121,7 +121,21 @@ pub fn class_member_attrs(
     is_sendable: bool,
 ) -> Result<Vec<MemberAttrs>, LiftError> {
     let idx = literal_table_index(lf.file, body, id)?;
-    let raw_values = &lf.file.literal_arrays[idx as usize].values;
+    class_member_attrs_for_index(lf.file, idx, is_sendable)
+}
+
+/// Parse the per-member attribute payloads ([`MemberAttrs`]) out of the
+/// decoded literal array at `table_idx` (shared by entity-relocated modern /
+/// decoded-legacy class buffers and direct-table-index `deprecated.*` tests).
+pub fn class_member_attrs_for_index(
+    file: &File,
+    table_idx: u32,
+    is_sendable: bool,
+) -> Result<Vec<MemberAttrs>, LiftError> {
+    let Some(arr) = file.literal_arrays.get(table_idx as usize) else {
+        return Err(LiftError::LiteralArrayOutOfRange(table_idx));
+    };
+    let raw_values = &arr.values;
     // Sendable class buffers (`callruntime.definesendableclass`) append a
     // trailing `lit_offset` (`LiteralValue::LiteralArray` after decode, or
     // `LiteralValue::LiteralBufferIndex`) pointing to the field-type layout

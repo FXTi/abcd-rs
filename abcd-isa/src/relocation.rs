@@ -3,10 +3,13 @@ use abcd_isa_sys::{self as sys, EntityId};
 /// Errors when rewriting an entity operand without changing instruction size.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RelocationError {
+    /// The byte slice is empty, starts with an unassigned opcode, or is truncated.
     #[error("invalid or truncated instruction")]
     InvalidInstruction,
+    /// The instruction format does not carry an entity-ID operand at ordinal `{0}`.
     #[error("instruction has no entity operand {0}")]
     MissingOperand(u32),
+    /// The replacement entity ID `{0}` exceeds the encoded operand's bit width.
     #[error("entity id {0} does not fit the encoded operand")]
     IdOutOfRange(u32),
 }

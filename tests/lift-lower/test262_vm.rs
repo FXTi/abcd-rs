@@ -10,9 +10,9 @@
 //! `scripts/compare-rewritten-corpus.py`.
 //!
 //! Unlike the project corpus there is exactly ONE variant (v2lift): the
-//! gate is "the v0.2 lift→lower pipeline preserves whatever upstream
-//! es2abc+ark_js_vm did" (design/archive/test262-feasibility.md §3.3 — we never
-//! claim test262 conformance, only behavior preservation).
+//! gate verifies that the lift→lower pipeline preserves whatever upstream
+//! `es2abc` + `ark_js_vm` recorded (`design/ci.md` — behavior preservation,
+//! never claiming test262 conformance).
 //!
 //! ## Comparison policy for test262 rows (empirically established)
 //!

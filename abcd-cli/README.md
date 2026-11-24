@@ -1,67 +1,90 @@
 # abcd-cli
 
-Command-line interface (`abcd`) for the `abcd-rs` ArkCompiler bytecode toolkit.
+Unified command-line interface (`abcd`) for the `abcd-rs` ArkCompiler bytecode toolkit.
 
-Every bytecode-consuming subcommand accepts either a bare `.abc` file or an OpenHarmony application container (`.hap`, `.hsp`, `.app`, `.hqf`), sniffed by magic bytes (`PANDA\0\0\0` vs `PK\x03\x04` / `PK\x05\x06`). Multi-module containers (e.g. `.app` bundles or FA-model multi-ability `.hap`s) require an explicit `--module <NAME>` or `--all`.
+## 1. Purpose & Input Contract
 
-## Subcommands
+`abcd-cli` is a thin orchestration binary sitting atop `abcd-hap`, `abcd-file`, `abcd-lift`, `abcd-opt`, `abcd-lower`, `abcd-analysis`, `abcd-taint`, and `abcd-decompile`:
 
-| Command | Synopsis | Description |
-|---------|----------|-------------|
-| `extract` | `abcd extract <container> [-o <dir>] [--force]` | Extract `.abc` module(s) and `module.json` / `config.json` / `patch.json` from a container |
-| `info` | `abcd info [--verify] [--json] [--module <name> \| --all] <input>` | Print header version, file type, class/method/literal counts, and optional full decode verification |
-| `dis` | `abcd dis [-o <path>] [--module <name> \| --all] <input>` | Disassemble `.abc` to pandasm `.pa` text (byte-identical to upstream `ark_disasm`) |
-| `asm` | `abcd asm [-o <out.abc>] [--version M.m.p.b] [--check] <input.pa>` | Assemble pandasm `.pa` text into `.abc` |
-| `decompile` | `abcd decompile [-o <path>] [--ts] [--line-anchors] [--call-entry] [--module <name> \| --all] <input>` | Decompile bytecode to readable JavaScript (or TypeScript-annotated output on ≤11-format files) |
-| `rewrite` | `abcd rewrite [-o <path>] [--opt] [--check] [--module <name> \| --all] <input>` | Rewrite bytecode through `decode → lift → [opt] → lower → encode` |
-| `analyze` | `abcd analyze [--callgraph] [--dominators] [--json] [--module <name> \| --all] <input>` | Static analysis report over the lifted SSA IR (call-graph resolution histogram, per-site targets, dominator trees) |
-| `taint` | `abcd taint --config <taint.toml> [--json] [--module <name> \| --all] <input>` | Interprocedural IFDS taint analysis driven by a TOML source/sink/summary configuration |
+- **Automatic format sniffing ([`src/input.rs`](src/input.rs))**: every bytecode-consuming subcommand (`info`, `dis`, `decompile`, `rewrite`, `analyze`, `taint`) accepts both standalone `.abc` files (`PANDA\0\0\0`) and OpenHarmony ZIP containers (`.hap`, `.hsp`, `.app`, `.hqf`, `PK\x03\x04` unpacked in memory via `abcd_hap::abc_modules`).
+- **Explicit multi-module disambiguation**: single-module `.hap`/`.hsp`/`.hqf` archives run directly; multi-module `.app` bundles and per-ability `.hap`s never pick an arbitrary module silently and require `--module <NAME>` or `--all` (colliding package names disambiguate deterministically as `<module>__<entry-stem>`).
+- **Path-traversal containment**: container-supplied module names (`module.json` / `config.json`) and `--split-modules` relative paths are validated as inert path components before any filesystem write.
 
-## Exit codes & output conventions
+## 2. Subcommand Reference
 
-- `0` — success (results written to `stdout` or `-o <path>`).
-- `1` — user error (invalid CLI flags, missing files, ambiguous multi-module selection, invalid TOML config; diagnostics on `stderr`).
-- `2` — tool error (corrupt `.abc`/container input, decode/lift/lower/encode failure, `--verify` or `--check` rejection; diagnostics on `stderr`).
+| Subcommand | Synopsis | Pipeline & Key Flags |
+|------------|----------|----------------------|
+| `extract` | `abcd extract <container> [-o <dir>] [--force]` | Unpacks `<module>.abc` and `<module>.module.json` from a container; preflight-rejects existing targets without `--force`. |
+| `info` | `abcd info [--verify] [--json] [--module <name> \| --all] <input>` | Reports header version, file type (`dynamic`/`static`/`invalid`), checksum, entity counts, and optional full decode verification (`--verify`). |
+| `dis` | `abcd dis [-o <path>] [--module <name> \| --all] <input>` | Disassembles `.abc` to pandasm `.pa` raw bytes (`ADR-11`, byte-for-byte identical to upstream `ark_disasm`). |
+| `asm` | `abcd asm [-o <out.abc>] [--version <M.m.p.b>] [--check] <input.pa>` | Assembles pandasm `.pa` text into `.abc` with optional format version override and `--check` re-decode self-check. |
+| `decompile` | `abcd decompile [-o <path>] [--split-modules] [--arkui] [--ts] [--line-anchors] [--call-entry] [--module <name> \| --all] <input>` | Decompiles pre-opt SSA IR to JS, TypeScript annotations (`--ts`), `--merge-abc` multi-file trees (`--split-modules`), and ArkUI `@Component struct` / `build()` views (`--arkui`). |
+| `rewrite` | `abcd rewrite [-o <path>] [--opt] [--check] [--module <name> \| --all] <input>` | Rewrites `.abc` through `decode → lift → verify → [opt] → lower → encode` with optional `--opt` passes and `--check` readback verification. |
+| `analyze` | `abcd analyze [--callgraph] [--dominators] [--json] [--module <name> \| --all] <input>` | Emits IR arena summaries, call-graph resolution histograms, per-site targets (`--callgraph`), and RPO immediate-dominator trees (`--dominators`). |
+| `taint` | `abcd taint [--preset ohos] [--config <taint.toml>] [--link-modules] [--json] [--module <name> \| --all] <input>` | Runs interprocedural IFDS taint analysis with the built-in OpenHarmony rule pack (`--preset ohos`), custom TOML configs (`--config`), and cross-`.abc` linking (`--link-modules`). |
 
-## Taint configuration (`taint.toml`)
+## 3. Exit Codes, Stdio Discipline & Global Allocator
 
-`abcd taint --config <path>` parses a strict (`deny_unknown_fields`) TOML configuration mapping directly to `abcd_taint::TaintConfig`:
+Full specification in [`../design/cli.md`](../design/cli.md), [`../design/standards.md`](../design/standards.md), and [`../design/decisions.md`](../design/decisions.md):
+
+- **`0` — Success**: primary artifacts (`.pa`, `.js`/`.ts`/`.ets`, `.abc`, aligned text, or `--json` object/array) are written strictly to `stdout` or `-o <path>` with zero diagnostic chatter on `stdout`.
+- **`1` — User / Invocation Error**: invalid CLI flags (`clap` parse errors remapped from `2` to `1`), unreadable inputs, undisambiguated multi-module containers, existing `extract` targets without `--force`, unparseable `.pa` text, or invalid `taint.toml` / `--preset` arguments (`stderr`).
+- **`2` — Tool / Processing Error**: corrupt `.abc`/ZIP inputs, unsafe container module names, `decode`/`lift`/`verify`/`lower`/`encode` failures, I/O write errors, or `--verify`/`--check` failures (`stderr`; writer commands are all-or-nothing and never emit partial files).
+- **Binary-only `mimalloc` (`ADR-12`)**: `abcd-cli` ([`src/main.rs`](src/main.rs)) is the **only** crate in the workspace that sets `#[global_allocator]` (`mimalloc::MiMalloc` across Linux, macOS, and Windows MSVC); all library crates stay allocator-neutral and silent on stdio.
+- **Determinism & zero panics (`N20`)**: `#![cfg_attr(not(test), deny(clippy::unwrap_used))]` enforced across library modules (`#![deny(clippy::unwrap_used)]` in `main.rs`) with bit-exact deterministic output.
+
+## 4. Quick Start & `taint.toml` Schema
+
+```sh
+# Inspect and verify every module in an OpenHarmony .app bundle as JSON
+abcd info --all --verify --json bundle.app
+
+# Reconstruct a --merge-abc HAP into a multi-file ArkUI source tree
+abcd decompile app.hap --split-modules --arkui -o out_src/
+
+# Run whole-application cross-module OpenHarmony taint analysis
+abcd taint bundle.app --all --link-modules --preset ohos --json
+```
+
+`abcd taint --config <taint.toml>` parses a strict (`#[serde(deny_unknown_fields)]`) TOML document ([`src/taint_config.rs`](src/taint_config.rs)) mapping to `abcd_taint::TaintConfig` (combine with `--preset ohos` or `preset = "ohos"` to layer custom rules onto built-in OpenHarmony sources/sinks):
 
 ```toml
 # Optional engine toggles (shown with defaults):
+# preset = "ohos"
 builtin_summaries = true
 seed_all_functions = true
 follow_returns_past_seeds = true
 native_identity = true
+ohos_lifecycle = true
 max_field_chain = 5
-alias_rung = 2   # 0 = local def-chain, 1 = on-demand alias, 2 = whole-module k=1 PTA
+alias_rung = 2        # 0 = local def-chain, 1 = demand alias, 2 = k=1 Andersen PTA
 
 [[sources]]
-kind = "function_params"
-name = "func_main_0"   # "*" matches every function
-# params = [3, 4]      # optional parameter slot indices; omit for all slots
+kind = "function_params"   # or "global_load", "call_return", "module_import"
+name = "func_main_0"       # "*" matches every function; optional `params = [3, 4]`
 
 [[sources]]
-kind = "global_load"
-name = "TAINT"
+kind = "module_import"
+specifier = "@ohos.deviceInfo"
 
 [[sinks]]
 kind = "call"
-name = "console.log"   # bare global ("print") or qualified ("console.log")
+name = "console.log"       # bare global ("print") or qualified ("@ohos.hilog.info")
 
 [[extra_summaries]]
 name = "passthrough"
-arity = 1
+arity = 1                  # optional; omit for variadic; optional `callback_param = 0`
 exclusive = false
 flows = [{ from = "param:0", to = "return" }]
 alias_flows = []
 clears = []
 ```
 
-## Allocator
+## 5. Verification
 
-`abcd-cli` is the only crate in the workspace that sets `#[global_allocator]` (`mimalloc` across all target platforms); library crates never install a global allocator.
-
-## License
-
-Apache-2.0.
+```sh
+./scripts/test-local.sh crate abcd-cli
+cargo test -p abcd-cli
+cargo clippy -p abcd-cli --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p abcd-cli --no-deps
+```

@@ -1,4 +1,4 @@
-//! Stage C v1 — emission (design/decompile.md §4.3): precedence-correct
+//! Stage C — emission (`design/decompile.md` §4.3): precedence-correct
 //! expression printing, statement emission with indentation, module /
 //! class / function emission, and loud fallback comments (never silent).
 //!
@@ -18,26 +18,27 @@
 //!
 //! Every [`Stmt::Fallback`]/[`Stmt::Elided`]/[`Expr::Fallback`] and
 //! every hard-7 plumbing node prints as an annotated comment with the
-//! op name and source location — never silently dropped (gen1 lesson
-//! 6). [`DecompileStats::fallback_comments`] counts them per op for the
+//! op name and source location — never silently dropped
+//! (`design/decompile.md` §5, `design/decisions.md`).
+//! [`DecompileStats::fallback_comments`] counts them per op for the
 //! corpus gate.
 //!
-//! ## Remaining emitter notes
+//! ## Emitter invariants
 //!
 //! - Lexical bindings that `folds::scope_fold` cannot prove single-run
 //!   block-local hoist to function-top `let`/`var` declarations (`const`
 //!   vs `let` requires cross-closure reassignment proofs).
 //! - `SuperForwardAllArgs` prints `super(...arguments)`.
-//! - Template literals emit backtick raw+cooked forms (`d-P10`) when both
-//!   lists resolve, degrading loudly to cooked-only comments when raw
-//!   arrays are absent.
+//! - Template literals emit backtick raw+cooked forms when both lists
+//!   resolve, degrading loudly to cooked-only comments when raw arrays
+//!   are absent.
 //! - Multiple catch handlers per region (typed catches — no JS surface)
-//!   merge into the single `catch` clause with explicit bindings (`d-P8`).
+//!   merge into the single `catch` clause with explicit bindings.
 //! - Vendor bigint inc/dec polymorphism (`5n--` → `4n`) has no corpus
 //!   coverage under the pure `x - 1` form.
 //! - `--ts` annotations reflect only what the format carries: signatures
-//!   exist on ≤11-format files (fact #A7); 12+/24 functions keep bare
-//!   parameter lists under the flag (`d-P8`).
+//!   exist on ≤11-format files; 12+/24 functions keep bare parameter
+//!   lists under the flag.
 
 use std::collections::{BTreeMap, BTreeSet};
 

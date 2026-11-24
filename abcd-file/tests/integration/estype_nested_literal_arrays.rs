@@ -9,8 +9,8 @@ use std::process::Command;
 
 use abcd_file::{
     AccessFlags, Annotation, AnnotationElem, AnnotationElemDefEx, AnnotationElemValue,
-    AnnotationValue, Builder, Error, FieldValue, LiteralArray, LiteralArrayIdx, LiteralValue,
-    SourceLang, Type, Version, decode, encode,
+    AnnotationValue, Builder, Error, LiteralArray, LiteralArrayIdx, LiteralValue, SourceLang, Type,
+    Version, decode, encode,
 };
 
 /// Canonicalize a literal array iteratively by content (resolving `StringId`s,
@@ -617,7 +617,7 @@ fn wild_ohos40_settings_hap_estype_roundtrip() {
     assert!(out.status.success(), "unzip -p failed");
     let abc_bytes = out.stdout;
 
-    let mut file1 = decode(&abc_bytes).expect("decode Settings.hap ets/modules.abc");
+    let file1 = decode(&abc_bytes).expect("decode Settings.hap ets/modules.abc");
 
     let find_on_create_typeof = |file: &abcd_file::File| -> String {
         let cls = file
@@ -668,28 +668,8 @@ fn wild_ohos40_settings_hap_estype_roundtrip() {
     let estype_count_1 = count_typeof(&file1);
     assert!(estype_count_1 > 0);
 
-    match encode(&file1) {
-        Ok(reencoded) => {
-            let file2 = decode(&reencoded).expect("decode reencoded Settings.hap");
-            assert_eq!(count_typeof(&file2), estype_count_1);
-            assert_eq!(find_on_create_typeof(&file2), before_on_create);
-        }
-        Err(Error::TypeSummaryOffset { .. }) => {
-            for cls in file1.classes.values_mut() {
-                for field in &mut cls.fields {
-                    if matches!(field.initial_value, Some(FieldValue::TypeSummaryOffset(_))) {
-                        field.initial_value = None;
-                    }
-                }
-            }
-            let reencoded = encode(&file1)
-                .expect("encode Settings.hap after clearing opaque TypeSummaryOffset fields");
-            let file2 = decode(&reencoded).expect("decode reencoded Settings.hap");
-            assert_eq!(count_typeof(&file2), estype_count_1);
-            assert_eq!(find_on_create_typeof(&file2), before_on_create);
-        }
-        Err(other) => {
-            panic!("Settings.hap failed encode with unexpected error: {other}");
-        }
-    }
+    let reencoded = encode(&file1).expect("encode unmodified Settings.hap directly");
+    let file2 = decode(&reencoded).expect("decode reencoded Settings.hap");
+    assert_eq!(count_typeof(&file2), estype_count_1);
+    assert_eq!(find_on_create_typeof(&file2), before_on_create);
 }

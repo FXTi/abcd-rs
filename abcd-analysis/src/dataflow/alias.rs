@@ -1,17 +1,15 @@
-//! Rung 1 — the on-demand alias engine (design/analysis-strategy.md §4.4
-//! rung 1, the Boomerang-shaped rung of the precision ladder; the
-//! [`AliasOracle`] seam of §5.2 is sized for exactly this type).
+//! Rung 1 — the demand-driven balanced-parentheses alias engine
+//! (`design/analysis.md`, `design/decisions.md` N20/N66; inspired by
+//! Späth et al.'s Boomerang demand-driven points-to formulation).
 //!
 //! ## The query
 //!
 //! `points_to(base, at) -> AllocSiteSet`, answered by a **memoized,
-//! demand-driven backward def-use walk** — the analogue of FlowDroid's
-//! `computeAliases` triggers (heap writes whose base rung 0 cannot
-//! resolve; soot-infoflow.md §4.2) but computed per query with a cache
-//! instead of a second IFDS solver. The walk:
+//! demand-driven backward def-use walk** evaluated per queried SSA value
+//! rather than via a second whole-program dataflow pass. The walk:
 //!
 //! - `Mov` passes through; `Phi` unions its entries (`has_phi`); the four
-//!   keyed `Alloc*` ops contribute their site (rung-0 parity, T7);
+//!   keyed `Alloc*` ops contribute their site (rung-0 parity);
 //!   constants contribute nothing (they are not heap objects).
 //! - **Call results** hop interprocedurally: for every callee the call
 //!   graph resolved at that site, the callee's `Return` values are
@@ -22,22 +20,20 @@
 //!   checked against the graph), the parameter maps to `C`'s
 //!   corresponding caller-side value through the vendored frame-slot
 //!   model (N66, [`crate::frame`]) and the walk continues *in `C`'s
-//!   caller*. This is the balanced-parentheses discipline the IFDS
-//!   solver already has (heros.md §1.6), applied to the query's
+//!   caller*. This enforces balanced-parentheses CFL-reachability over
 //!   interprocedural hops: a value that flowed in through `C` is
 //!   resolved against `C`'s arguments and no other caller's.
 //! - With an **empty** context stack a parameter fans out to every
-//!   caller the graph records (the unbalanced regime, heros.md §1.7's
-//!   `followReturnsPastSeeds` analogue). Fan-out answers are marked
-//!   [`QueryAnswer::unbalanced`]: they are complete only *modulo the
-//!   recorded call graph*, so they are usable for may-direction
-//!   consumers (the call-graph bridge,
+//!   caller the graph records (the unbalanced return/caller regime).
+//!   Fan-out answers are marked [`QueryAnswer::unbalanced`]: they are
+//!   complete only *modulo the recorded call graph*, so they are usable for
+//!   may-direction consumers (the call-graph bridge,
 //!   [`crate::callgraph::CallGraph::refine_with_points_to`]) but NOT for
 //!   negative decisions (store keying, must-alias) — those fall back to
 //!   the rung-0 answer, never silently wrong.
 //! - Everything else (loads, globals, lexical slots, non-keyed ops) is
 //!   opaque: `has_unknown`. Heap *reads* are deliberately not resolved
-//!   backward through stores — that is rung 2's whole-program PTA.
+//!   backward through stores — that is rung 2's whole-module PTA.
 //!
 //! ## Soundness contract (the fallback rule)
 //!
@@ -45,33 +41,29 @@
 //! it is **complete and balanced** (no unknown, no cap cut, no unbalanced
 //! fan-out); otherwise it returns the rung-0 local def-chain answer
 //! ([`resolve_alloc_sites`]). The rung-0 answer is the sound floor: its
-//! empty-site/unknown conventions are exactly what the existing consumers
-//! (weak updates, unknown-base may-alias) were built on, so a query that
-//! gives up can never make the analysis *less* sound than rung 0 — only
-//! less precise.
+//! empty-site/unknown conventions are what weak updates and unknown-base
+//! may-alias rely on, so a query that gives up can never make the analysis
+//! *less* sound than rung 0 — only less precise.
 //!
 //! ## Bounds, memoization, determinism (N20)
 //!
 //! - The context stack is capped at [`DEFAULT_MAX_DEPTH`] call-result
-//!   hops; a cut marks `has_unknown` + `capped` (the answer degrades to
-//!   the rung-0 floor — the sound over-approximation, documented in §4.4
-//!   rung 1's "bounded with conservative fallback").
+//!   hops; a cut marks `has_unknown` + `capped` (degrading cleanly to the
+//!   rung-0 floor).
 //! - Recursion cycles (direct or mutual) are cut by an in-progress guard
 //!   and likewise degrade to unknown.
 //! - Answers are memoized per `(ValueId, context stack)`. SSA gives one
-//!   def per value (T1) and heap reads are opaque, so the answer is
-//!   point-independent: `at` is accepted for seam compatibility (rung 2's
-//!   flow-sensitive refinements will need it) and documented as unused.
-//!   A cycle-cut answer may be polluted by the query order's in-progress
-//!   set; it is cached conservatively (has_unknown ⇒ rung-0 fallback), is
-//!   deterministic because the driving solver's worklist is FIFO, and
-//!   tabulated replay of cut answers is explicitly a rung-2 refinement.
+//!   def per value and heap reads are opaque, so the answer is
+//!   point-independent: `at` is accepted for oracle-seam uniformity and
+//!   documented as unused. A cycle-cut answer may depend on the active
+//!   in-progress set; it is conservatively marked `has_unknown` (triggering
+//!   rung-0 fallback) and remains deterministic because the driving solver's
+//!   worklist is FIFO.
 //! - Iteration discipline: all sets are `BTreeSet`-ordered
 //!   ([`AllocSiteSet`]); `HashMap`s are lookup-only, never iterated;
 //!   caller/callee lists come from the call graph's sorted vectors.
-//!   Cost is Boomerang-class: paid per *queried* value, never a
-//!   whole-program relation — with the memo, each distinct
-//!   `(value, context)` pair is walked once.
+//!   Cost is paid per *queried* value rather than over the whole module —
+//!   with the memo, each distinct `(value, context)` pair is walked once.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -729,11 +721,10 @@ impl<'m> Rung1AliasOracle<'m> {
             }
             return;
         }
-        // Unbalanced (heros.md §1.7's followReturnsPastSeeds analogue):
-        // fan out to every caller the graph records. Complete only
-        // modulo the recorded graph — marked so negative-decision
-        // consumers fall back (module docs). The fan-out children run
-        // with an EMPTY context stack (the original passed a fresh one),
+        // Unbalanced caller fan-out: with an empty context stack, fan out to
+        // every caller recorded in the call graph. Complete only modulo the
+        // recorded graph — marked so negative-decision consumers fall back
+        // (module docs). The fan-out children run with an EMPTY context stack,
         // so the caller's is saved and restored by the resume frame.
         let callers = self.graph.callers_of(func).to_vec();
         if callers.is_empty() {

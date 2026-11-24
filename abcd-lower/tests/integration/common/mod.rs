@@ -1,11 +1,9 @@
-//! Shared test infrastructure for the abcd-lower regression tests:
-//! a minimal deterministic bytecode interpreter (ported verbatim from
-//! v0.1 `abcd-ir/tests/common`) and a small hand-builder for v0.2 IR
-//! modules (abcd-ir has no IRBuilder — tests construct modules directly).
+//! Shared test infrastructure for `abcd-lower` regression tests:
+//! a minimal deterministic bytecode interpreter and a lightweight hand-builder
+//! for `abcd-ir` modules.
 //!
-//! Every test target compiles this shared module separately and uses a
-//! different subset of the helpers — allow dead code module-wide (the
-//! same policy as v0.1's per-helper `#[allow(dead_code)]`s).
+//! Every test target uses a different subset of these helpers — allow dead code
+//! module-wide.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -16,9 +14,9 @@ use abcd_ir::{
 };
 use abcd_isa::Bytecode;
 
-// ─── v0.2 IR hand-builder ────────────────────────────────────────────────────
+// ─── IR hand-builder ─────────────────────────────────────────────────────────
 
-/// A minimal v0.2 module/function builder for lowering tests.
+/// A minimal `abcd_ir::Module` / function builder for lowering tests.
 pub struct V2Builder<'m> {
     /// The module under construction.
     pub module: &'m mut Module,
@@ -185,7 +183,7 @@ impl<'m> V2Builder<'m> {
     }
 }
 
-// ─── Minimal deterministic bytecode interpreter (v0.1 port) ─────────────────
+// ─── Minimal deterministic bytecode interpreter ──────────────────────────────
 
 /// What the machine observed when execution stopped.
 #[allow(dead_code)] // variants are constructed only when a path executes them

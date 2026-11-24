@@ -1117,10 +1117,17 @@ impl<'f> Emitter<'f> {
             .file
             .classes
             .values()
-            .flat_map(|c| c.fields.iter())
-            .filter_map(|f| match &f.initial_value {
-                Some(FieldValue::LiteralArrayRef(off)) => Some(*off),
-                _ => None,
+            .flat_map(|c| {
+                let c_is_scope = self.file.strings.resolve(c.descriptor)
+                    == Some(crate::ES_SCOPE_NAMES_RECORD_DESCRIPTOR);
+                c.fields.iter().filter_map(move |f| {
+                    let is_scope_field = c_is_scope
+                        || self.file.strings.resolve(f.name) == Some(crate::SCOPE_NAMES_FIELD);
+                    match (&f.initial_value, is_scope_field) {
+                        (Some(FieldValue::LiteralArrayRef(off)), true) => Some(*off),
+                        _ => None,
+                    }
+                })
             })
             .collect();
         let mut decoded: Vec<(u32, u32)> = self
@@ -1582,10 +1589,6 @@ fn field_u32_offset(field: &crate::model::Field) -> Option<u32> {
         Some(FieldValue::LiteralArrayRef(off)) => Some(*off),
         Some(FieldValue::ModuleRequestPhase(p)) => Some(p.source_offset),
         Some(FieldValue::JsonFileContent { source_offset, .. }) => Some(*source_offset),
-        // Upstream prints the offset (disassembler.cpp GetMetadataFieldValue
-        // SetValue) and only EXCLUDES it from module-literal classification
-        // — classify_field_offsets drops it by field name.
-        Some(FieldValue::TypeSummaryOffset(off)) => Some(*off),
         _ => None,
     }
 }
@@ -1975,7 +1978,7 @@ mod tests {
                 &mut file,
                 crate::TYPE_SUMMARY_OFFSET_FIELD,
                 Type::U32,
-                Some(FieldValue::TypeSummaryOffset(0x123)),
+                Some(FieldValue::LiteralArrayRef(0x123)),
             ),
             // A u32 field whose value is not an offset: nothing prints.
             bare_field(&mut file, "odd", Type::U32, Some(FieldValue::F64(1.0))),

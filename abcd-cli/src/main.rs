@@ -1,6 +1,6 @@
 //! `abcd` binary entry point: parse, dispatch, map errors to exit codes.
 //!
-//! Exit codes (design/cli-plan.md §3.4): 0 ok, 1 user error (bad args,
+//! Exit codes (design/cli.md §3): 0 ok, 1 user error (bad args,
 //! unreadable input, ambiguous module selection), 2 tool error (decode
 //! failure, write failure). Clap's own parse errors — which would exit 2
 //! by default — are remapped to 1 to fit that contract.
@@ -12,9 +12,8 @@ use std::process::ExitCode;
 use clap::Parser;
 
 // The final binary owns the global allocator (libraries never set one).
-// mimalloc is used across all platforms (Linux, macOS, Windows MSVC):
-// benchmarked at -43% wall time vs Windows CRT allocator and -26%..-42%
-// vs macOS libmalloc (see design/archive/MEMORY.md).
+// mimalloc is used across all target platforms (Linux, macOS, Windows MSVC);
+// see design/cli.md §4 and design/decisions.md (ADR-12).
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

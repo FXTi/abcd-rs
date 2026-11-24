@@ -1,6 +1,6 @@
-//! N67 regression (v0.2 lifter): `Bytecode::Ldthis` must bind the
-//! THIS-role frame slot of the vendored frame-slot model (design
-//! ir-v0.2.md T4/§5.3 — canonical; abcd_ir::frame), NOT `params[0]`.
+//! N67 regression: `Bytecode::Ldthis` must bind the THIS-role frame slot
+//! of the vendored frame-slot model (`design/ir.md` §2, `design/decisions.md`
+//! ADR-05; `abcd_ir::frame`), NOT `params[0]`.
 //!
 //! Vendor grounding (arkcompiler_ets_runtime-master): `ldthis` reads the
 //! frame's `thisObj` (`EcmaInterpreter::GetThis`,

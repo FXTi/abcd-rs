@@ -1,50 +1,28 @@
-# ISA compatibility facts (second-generation versions)
+# ISA & Format Version Compatibility
 
-Status: verified by diffing upstream `isa.yaml` from the OpenHarmony
-release branches against our vendored 24.0.0.0 table.
+ArkCompiler `.abc` files carry a 4-byte format version tuple `M.m.p.b` in the container header. `abcd-rs` handles dynamic ECMAScript/ArkTS 1.1 versions across OpenHarmony 3.2 through 7.0 (`API 9`–`24`) and schedules static ArkTS 1.2 (`0.1.0.7`) in `#36`.
 
-## Method
+---
 
-For each release branch, expand every instruction group × format pair and
-compare (mnemonic, format, opcode_idx) triples, plus the prefix table
-(names and prefix opcode bytes).
+## 1. Dynamic ISA Stability (`9.0.0.0` – `24.0.0.0`)
 
-## Results
+Across modern dynamic versions (`9.0.0.0`, `11.0.2.0`, `12.0.2.0`, `12.0.6.0`, `13.0.1.0`, `24.0.0.0`):
+1. **Additive Opcode Evolution**: Existing opcode byte assignments and operand layouts remain backward-compatible across `9.0.0.0` → `24.0.0.0`; newer SDK releases add prefixed extensions (e.g., `callruntime.*` sendable/lazy-module ops) without renumbering prior opcodes.
+2. **Container Layout Differences Live in `abcd-file`**: Version differences between `9.0.0.0`/`12.x` and `13.x`/`24.0.0.0` reside in the `.abc` container header and record conventions (e.g., header literal-array index table removal in `13.0.1.0+`, `--merge-abc` per-record `moduleRecordIdx`/`scopeNames` fields, and es2panda `#*#` internal method name mangling in `12.0.6.0+`), handled transparently in `abcd-file` and `abcd-lift`.
+3. **Output Version Selection**: `abcd_file::Builder::set_file_version` delegates directly to vendored `GetVersionByApi` / `api_version_map` so emitted `.abc` headers match upstream `es2abc` byte-for-byte.
 
-| File version | Branch | (mnemonic,format) pairs | not in 24 | opcode changed | prefixes |
-|--------------|--------|------------------------|-----------|----------------|----------|
-| 9.0.0.0 | OpenHarmony-4.0-Release | 294 | **0** | **0** | identical |
-| 11.0.2.0 | OpenHarmony-4.1-Release | 306 | **0** | **0** | identical |
-| 12.0.6.0 | OpenHarmony-5.0-Release | 323 | **0** | **0** | identical |
-| 24.0.0.0 | master (vendored) | 332 | — | — | — |
+---
 
-Prefix bytes are identical across all four versions: throw=254,
-wide=253, deprecated=252, callruntime=251.
+## 2. Legacy Pre-Freeze Format (`0.0.0.2`)
 
-The 24 table adds exactly 9 instructions, all new (no renumbering):
+Early OpenHarmony 3.2 / 4.0 system applications carry header version `0.0.0.2`, which predates the `9.0.0.0` opcode freeze and uses a distinct `ecma.*` prefixed opcode numbering plus a file-end global literal-array offset table:
+- **Decode & Analysis**: `abcd-file::decode` automatically dispatches `0.0.0.2` methods through `abcd_isa::decode_legacy` and resolves global literal-array indices into `MethodBody::entity_offsets`, allowing `abcd-lift`, `abcd-analysis`, `abcd-taint`, `abcd-decompile`, and `abcd dis` to operate seamlessly across all legacy wild `.hap` packages (`ADR-08`).
+- **Write Boundary**: Upstream `libpandafile`'s writer does not emit `0.0.0.2` containers; `abcd_file::encode` returns `Error::UnsupportedOutputVersion(0.0.0.2)` unless lowered onto a modern target version (`9.0.0.0`–`24.0.0.0`).
 
-- `callthis0withname` … `callthis3withname` (0xdd–0xe0)
-- `callthisrangewithname` (0xe1)
-- `wide.callthisrangewithname` (prefix secondary)
-- `callruntime.supercallforwardallargs`
-- `callruntime.ldsendablelocalmodulevar` / `callruntime.wideldsendablelocalmodulevar`
+---
 
-## Consequences
+## 3. Static ArkTS 1.2 Format (`0.1.0.7`, Roadmap `#36`)
 
-1. **The 24.0.0.0 table decodes every second-generation file correctly.**
-   No per-version opcode tables are needed on the read side; the version
-   differences live entirely in the *file container* (header fields,
-   literal-array tables, protos, annotation buckets — see
-   design/archive/vendor-audit.md §4), not in the ISA.
-2. Instruction *semantics* may still differ in detail across versions
-   (e.g. behavior of deprecated/callruntime entries); the table-level
-   compatibility proven here is about encodings and opcode identity.
-3. `modules.abc` (12.0.6.0) decodes fully with the 24 table: 2,946,777
-   instructions across 12,732 method bodies, zero unknown opcodes —
-   the empirical confirmation of the diff.
-4. **Pre-second-generation (`0.0.0.2`, OpenHarmony 3.0/3.1)**: wild OHOS
-   3.2/4.0 system images also carry legacy `0.0.0.2` `.abc` modules built
-   before the 2022-08-18 ISA overhaul (`0xff`-prefixed ECMAScript opcodes).
-   Those are decoded by `abcd_isa::decode_legacy` (`abcd-isa/src/legacy.rs`)
-   into the unified `Bytecode` enum, bringing all 156 wild OHOS `.hap`
-   packages (276 `.abc` modules) to 100% decode coverage.
+ArkTS 1.2 (`ets2panda` / `static_core`) emits statically typed Panda bytecode under header version `0.1.0.7`:
+- Uses typed register/accumulator instructions (`lda.str`, `ldai.64`, `call.short` / `call.virt`, typed array/object ops) without dynamic JS `[func][new.target][this]` hidden frame slots (`H = 0`).
+- Tracked in [`#36`](https://github.com/FXTi/abcd-rs/issues/36) to extend container/ISA decoding, `abcd-ir` static calling-convention & typed op lowering/lifting, static analysis, and decompilation.

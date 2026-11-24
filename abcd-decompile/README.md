@@ -1,438 +1,98 @@
 # abcd-decompile
 
-Bytecode → JS/TS decompiler on the v0.2 IR (design/decompile.md §4). A
-**pure consumer** of `abcd-ir` + `abcd-analysis` — the crate graph is the
-enforcement: no `abcd-file`/`abcd-isa`/`abcd-lift`/`abcd-lower`/`abcd-opt`
-in the library (the corpus tests pull `abcd-file` + `abcd-lift` as
-dev-dependencies only).
+Format-independent SSA IR → JavaScript / TypeScript / ArkTS decompiler ([`design/decompile.md`](../design/decompile.md)).
 
-**Pipeline rule** (design/decompile.md §3.2): the `abcd-opt` `inline`
-pass must never run before decompile — it destroys function boundaries,
-the one structural fact a reader cares most about.
+## Purpose, Layering & Pipeline Contract
 
-## Stage map
+`abcd-decompile` consumes a lifted `abcd_ir::Module` and emits readable, semantics-preserving JS/TS/ArkTS source code.
 
-| Stage | Status | What |
-|---|---|---|
-| **A — expression recovery** | **DONE** (d-P2) | SSA def-use → expression trees, block-local + phi wiring (`src/recover.rs`) |
-| **B — control-flow structuring** | **DONE** (d-P3) | region-tree consumption, desugar fold rules (`src/structure.rs`, `src/folds.rs`) |
-| **C — emission** | **DONE** (d-P4) | precedence-correct printing, modules/classes/functions, cross-arm tail-duplication fold, the recompile-and-run dream gate |
+- **Strict crate-graph boundary**: the library depends **only** on `abcd-ir` and `abcd-analysis` (plus `rayon` for deterministic parallel per-function preparation). It never depends on container or ISA crates (`abcd-file*`, `abcd-isa*`), nor on `abcd-lift`, `abcd-lower`, or `abcd-opt`.
+- **Pipeline contract (`design/decompile.md` §3.2)**: **never run `abcd-opt::inline` before decompilation**. Function inlining erases source call boundaries — the primary structural unit readers rely on — and expression recovery expects pre-inlined SSA definitions and `[func][new.target][this]` frame conventions ([`design/ir.md`](../design/ir.md)).
 
-## Verification gates (decompile → es2abc recompile → ark_js_vm)
+## Three-Stage Pipeline & Presentation Modes
 
-Three corpus gates under `tests/lift-decompile/` pin decompiler correctness:
+### Stage A — Expression Recovery (`src/recover.rs`)
 
-- **`dream_gate.rs`** (`1149 / 1149` pass, 0 divergences since d-P11): decompiles every runtime-passed project corpus fixture with `EmitOptions::call_entry`, recompiles with version-pinned `es2abc` (module mode when `Module` carries imports/exports/module_requests), and runs `scripts/compare-rewritten-corpus.py` against `ark_js_vm`.
-- **`dream_gate_t262.rs`** (`2676 / 2685` pass, 0 `decompile-bug`, 9 documented generator-machinery expected fallbacks in `scripts/test262-dream-divergences.json`): runs the same decompile → `es2abc` → `ark_js_vm` oracle across all 2,685 recorded `test262` fixtures.
-- **`wild_gate.rs`** (`64 / 64` modules across the core-25 wild OHOS `.hap` set): verifies zero panics, clean `verify_module`, `es2abc` recompilation acceptance, and exact per-package fallback counts against `scripts/wild-dream-divergences.json` (<1% global fallback tripwire).
+- **Def-use expression building (`src/recover.rs`, `src/expr.rs`)**: folds single-use pure SSA definitions into expression trees across block-local instructions using $O(1)$ prefix-sum `Op::effects()` barrier checks.
+- **Out-of-SSA parallel-copy scheduling (`src/recover.rs`)**: groups `Op::Phi` incoming copies per `(pred, to, exceptional)` edge, topologically orders acyclic updates with zero extra temporaries, and breaks true dependency cycles with fresh function-entry `phi` temporaries.
+- **Literal & template fidelity (`src/consts.rs`, `src/recover.rs`)**: renders shortest round-trip `f64` literals, MUTF-8 / lone-surrogate UTF-16 strings, RegExp flags, and raw + cooked `GetTemplateObject` pairs.
+- **Evidence-only naming (`src/names.rs`, `src/legalize.rs`)**: resolves module-var slots from TDZ guards and stored definitions (`DecompileIndex`), propagates seeded parent lexical environments and private names (`NameScopes`), and legalizes every emitted identifier.
 
-**Acceptance histogram (2026-09-23)**: **951 pass** / 108 decompile-bug
-/ 0 es2abc-cant / 54 expected-fallback / 36 fixture-unsupported (of
-1149). The residual buckets: try-projection approximations in the
-optimizer try-catch families (72), private-field brand + class-member
-static/instance metadata (buffer attribute payloads, not in the IR;
-private-property-in 15 + private-field 3), hard-7 async/generator
-machinery + G4 cooked-only templates (54, by construction), module
-fixtures whose slot↔name correspondence is IR gap G2 (36).
+### Stage B — Structuring & Desugaring (`src/structure/`, `src/folds/`, `src/classfold.rs`)
 
-**d-P5 histogram (2026-09-23, floor now 1023)**: **1023 pass** / 36
-decompile-bug / 0 es2abc-cant / 54 expected-fallback / 36
-fixture-unsupported (of 1149). The full 72-fixture optimizer
-try-projection family (`branch-elimination/test-under-try-catch`,
-`opt-try-catch-func/test-{nested,passes,raw}-try-catch`; 6 versions ×
-3 profiles) moved to pass with no regressions. Gate-found bugs FIXED
-in d-P5 (each proven by the oracle):
+- **Pattern-independent control flow (`src/structure/mod.rs`)**: consumes `abcd_analysis::control::structure_regions` to emit `Seq`, `If`, clean `While` / `DoWhile`, labeled `break` / `continue`, and irreducible dispatch loops without fragile CFG pattern matching.
+- **Laminar `TryRegion` projection (`src/structure/try_project.rs`)**: wraps protected regions, flushes exceptional-edge phis prior to `throw`, and hoists unprotected joins out of cut `If` / `Seq` / loop constructs.
+- **State-machine & iterator folds (`src/folds/machines/`, `src/folds/loops.rs`)**: reverses `es2abc` state machines back into `function*` (`yield`), `async` (`await`), `async function*`, `yield*`, `for await..of`, `for..of`, and `for..in`.
+- **Literals, scopes & classes (`src/folds/literals.rs`, `src/folds/control.rs`, `src/folds/scope.rs`, `src/classfold.rs`)**: reconstructs object/array/spread literals, object rest destructuring, `switch` cascades, alpha-equivalent `finally` blocks, block-scoped `let` / late-TDZ declarations, `...rest` parameters, and ES/TS classes with private-field initializers.
 
-- **RC1 — the try's join buried in a cut conditional.** A
-  mixed-coverage `If` with a protected head was wrapped whole in
-  `try/catch`; when one arm was terminal (throw), the acyclic tree had
-  absorbed the try's continuation into the other arm, making the join
-  unreachable from the catch path (missing post-try output). The
-  join hoist (`emit_cut_try`) splits the node into a protected
-  skeleton (inside the try) and an unprotected tail (after the
-  try/catch — where the VM's PC-range dispatch rejoins), guarded by
-  pure phase-1 analysis: clean per-arm prefix/suffix split, one
-  splitting arm, the other terminal-only, every handler continuation
-  targeting the same tail node, no outer finally-chain. A later rejoin
-  index is supported when the skipped prefix is try-path-only phi
-  wiring (it cannot throw, so over-protection is impossible). d-P16
-  (N69) extends the hoist to cut `Seq` nodes (a try spanning a loop
-  whose unprotected join nests below the protected run) — pre-fix the
-  per-level coalescing fragmented such regions into finally-style
-  wrappers and the catch path fell through into protected statements.
-- **RC2 — exception-edge phi flush after the terminal throw.** A
-  `throw`-terminated protected block's exceptional-edge phi assigns
-  are the register state the dispatching handler observes; emitted
-  after the `throw` they were dead, and handlers read `undefined`
-  temporaries. The flush now executes before the `throw`.
-- **RC3 — the finally chain stopped at shim-handled plans.** The
-  handler-protecting outer-try walk consulted only the innermost plan
-  containing a handler and stopped when that plan was already emitted
-  inside the handler's shim; larger finally plans were never
-  considered and their handler bodies were silently dropped. The walk
-  now scans the full laminar chain (visited-set guarded).
-- **Shim region closure.** A finally-idiom outer region also protects
-  the inner handler's (dispatch-entered, never Normal-reachable)
-  blocks, so the shim filter dropped it — its try/catch and its phi
-  temporaries' declarations never emitted (`ReferenceError`). Such
-  regions now ride along transitively.
-- **Loop-exit ordering trio.** (i) `emit_if` placed the head's
-  out-edge action before a non-empty arm — the arm (finally bodies,
-  loop-carried phi assigns) went dead; the action now follows the arm.
-  (ii) The cosmetic switch fold wrapped if-chains whose case arms
-  carry unlabeled loop breaks (the break then exited the switch, not
-  the loop — an infinite loop); the fold now bails on them. (iii) The
-  clean `while`/`do…while` forms place exit-phi assigns after the
-  loop, where any other unlabeled break out of the loop runs (and is
-  clobbered by) them; the clean forms are rejected for that shape
-  (`exit_phis_bypassed`), and the general `while (true)` form places
-  the assigns on the condition-exit edge.
+### Stage C — Emission & Presentation Modes (`src/emit/`, `src/split.rs`, `src/arkui.rs`)
 
-Residual decompile-bugs at d-P5 (36) were the other families:
-private-property-in 15, private-field 3, upstream/bytecode 18. d-P6
-cleared the private-member families (18) via the MemberAttrs projection
-+ the classfold instance-initializer reversal.
+- **Precedence-exact JS/TS printing (`src/emit/`)**: emits module imports/exports, classes, closures, statements, and optional TypeScript signature annotations from format metadata (`EmitOptions::ts` / `--ts`).
+- **Multi-module `--merge-abc` split (`src/split.rs`, `--split-modules`)**: partitions owning record classes into safe POSIX relative paths, isolates per-record ES module slots, extracts `jsonFileContent` `.json` assets, and rewrites `@bundle:` / `@package:` / `@normalized:` OHMUrls into relative imports.
+- **OpenHarmony ArkUI sugar (`src/arkui.rs`, `--arkui`)**: reconstructs `@Entry` / `@CustomDialog` / `@Component struct` declarations, state decorators (`@State`, `@Prop`, `@Link`, `@ObjectLink`, `@Provide`, `@Consume`, `@Storage*`, `@LocalStorage*`), and `build()` / `@Builder` UI trees from lowered `ViewPU` classes.
 
-**d-P7 histogram (2026-09-24, floor now 1059)**: **1059 pass** / **0
-decompile-bug** / 0 es2abc-cant / 54 expected-fallback / 36
-fixture-unsupported (of 1149). The last decompile-bug family —
-`upstream/bytecode/js/lexicalEnv/for-update-continue-1` (6 versions ×
-3 profiles) — moved to pass with no regressions. Root cause and fix:
+## Module Map
 
-- **RC — relative-level fallback naming broke cross-function captures
-  (G1).** Unnamed lexenv slots got the cosmetic fallback
-  `v{level}_{slot}` keyed by the ACCESS site's relative level. The name
-  of one frame therefore varied with the reader's own-frame depth: f6
-  writes `v31` as `v0_0` (its level 0), but f19 — two own frames deep —
-  reads it as `v1_0`, and reads f5 as `v2_1`; the module-top orphan
-  predeclarations (the G1 safety net) are never assigned, so the call
-  crashed (`TypeError: v2_1$1 is not a function`, oracle stderr
-  "undefined is not callable"). Fix (`names.rs`): the `NameScopes` chain
-  is SEEDED with the function's inherited environment — the parent's
-  env stack at the define site (`DefineFunc`/`DefineClass`/`AllocObject`
-  method refs), computed transitively — and the G1 fallback is keyed by
-  the frame's ABSOLUTE chain index (`v{abs}_{slot}`), which owner and
-  every capturing reader compute identically. Private-name resolution
-  deliberately keeps the legacy own-frames-only semantics (the
-  class-fold pipeline keys on it). Pinned red-first by
-  `golden_expr::t20_capture_consistent_fallback`; the t13 golden moved
-  to the absolute scheme (`v1_0` for a depth-1 unnamed frame).
-  Regression-safety: for currently-passing fixtures a name change only
-  occurs where the old name was an orphan fallback resolving to
-  `undefined` — i.e. dead reads or already-failing fixtures; the
-  empirical proof is the gate itself (1041 → 1059, nothing else moved).
+| Path | Role |
+|---|---|
+| `src/expr.rs`, `src/consts.rs`, `src/fitness.rs` | Internal expression AST, literal/MUTF-8 rendering, and per-op fitness / elision classification |
+| `src/recover.rs`, `src/names.rs`, `src/legalize.rs`, `src/dump.rs` | Stage A def-use recovery, parallel-phi scheduling, naming index, identifier legalizer, and deterministic dumps |
+| `src/structure/`, `src/folds/`, `src/classfold.rs` | Stage B region walker, `TryRegion` projection, state-machine / loop / scope / `finally` folds, and class reconstruction |
+| `src/emit/`, `src/split.rs`, `src/arkui.rs` | Stage C single-stream JS/TS printer, `--merge-abc` directory splitter, and ArkUI declarative pass |
 
-The pre-diagnosis's other two suspicions were NON-issues at runtime:
-the `var vN /* phi */` temps inside `while (true)` hoist to function
-scope, so they alias (not shadow) the outer same-named binding; and the
-finally-style duplicated try wrappers are behavior-preserving for this
-family. The VM-verified before/after: `TypeError … at f19` exit 255 →
-clean exit 0 with empty stdout (matching the baked oracle record).
+## Fallback-Honesty & Determinism Invariants
 
-## The d-P8 readability batch (emission quality only)
+Core invariants (see [`design/decompile.md`](../design/decompile.md) and [`design/decisions.md`](../design/decisions.md)):
 
-All five backlog folds landed with the dream gate UNCHANGED at **1059
-pass / 0 decompile-bug / 0 es2abc-cant / 54 expected-fallback / 36
-fixture-unsupported** (histogram verbatim re-verified after each
-item). Corpus fold counters: `finally_fold=18`, `scope_fold=237`,
-multi-catch merge `0` (corpus has no multi-handler regions), arrow
-recovery (no counter — kind-driven), `--ts` (flag, default off).
+1. **Loud fallbacks, never silent omission**: unrecovered ops and unfolded state-machine residuals render as explicit `Expr::Fallback` / `Stmt::Fallback` comments naming the op and source location, counted in `DecompileStats::fallback_comments`. The seven fitness-class-`H` ops (`IteratorReturn`, `IteratorThrow`, `DefineSendableClass`, `ResumeGenerator`, `GetResumeMode`, `AsyncResolve`, `AsyncReject`) and `ThrowDeleteSuperProperty` are never silently dropped; intentional `Throw*` / `AsyncFunctionEnter` guard elisions record `Stmt::Elided` markers (`DecompileStats::elided_comments`).
+2. **Self-cleaning divergence ledgers**: corpus and wild divergence manifests act as exact-set ratchets — newly passing fixtures or reduced fallback counts fail the gate until stale entries are removed.
+3. **Zero input-depth recursion**: AST/expression read walkers and CFG/region analyses over untrusted bytecode use explicit heap work-stacks so adversarial nesting cannot overflow the call stack.
+4. **Byte-for-byte determinism (`N20`)**: ordered maps/sets (`BTreeMap` / `BTreeSet`), canonical tie-breaking, and index-ordered Rayon collection guarantee identical output across runs and thread counts.
 
-1. **finally fold** (`folds.rs`, design §4.2 item 5): the es2abc
-   duplicated-finally idiom — a handler-protecting outer `try` whose
-   catch is a phi dispatch (switch on a phi, `case undefined:` runs the
-   finally body, `default:` skips it, rethrow-unless-hole with the
-   thrown temp tracing through the copy chain to the catch binding) —
-   re-factors into `finally { … }`. The inlined copies are stripped
-   only where PROVABLE: every `return`/exiting `break`/`continue` in
-   the protected construct must be preceded by an alpha-equivalent copy
-   (SSA temps unique per function make external names match verbatim;
-   copy-local consts are alpha-renamed by canonicalization), the
-   return-value guard (a copy rebinding the returned temp bails), and
-   the normal-completion fall-through must carry its own copy (sibling
-   tail). Any doubt keeps the duplicated form with its honesty notes
-   (s33). A sole inner try/catch unwraps to `try{…}catch{…}finally{…}`;
-   the dispatch's phi declarations are re-hoisted (module mode is
-   strict). Golden: s32 (fires), s33 (bails, duplication kept). Corpus:
-   18 (local/exception-finally × 6 versions × 3 profiles).
-2. **LexStore scope reconstruction** (`folds.rs::scope_fold`): the slot
-   initializations immediately following a `NewLexEnv*` push (level 0,
-   slot inside the frame) are the source's `let` declarations — the TDZ
-   hole + elided hole-guards prove every read is post-init. Converted
-   only when every store to that name lives in the same statement run
-   after the push, the name is not a parameter, and the name was not
-   already block-declared by the fold; otherwise the
-   `/* scope-push […] */` comment stays (partial consumption lists only
-   undeclared slots — s35). Declarations are uniformly `let` — `const`
-   needs a cross-function reassignment proof (a capturing closure can
-   store the slot), out of scope. Golden: s34/s35. Corpus: 237.
-3. **Multi-catch merge**: JS has one `catch`; extra typed handlers
-   merge into it in dispatch order with each extra exception param
-   BOUND to the clause binding (`const e$1 = e;`) — the file's type
-   table does not reach the IR (`type_idx` is a file entity index), so
-   no `instanceof` dispatch is recoverable and the merge says so.
-   Golden: s36. Corpus: 0 firings (no multi-handler regions).
-4. **`--ts` flag** (`EmitOptions::ts`, previously reserved):
-   `Signature` metadata drives `function f(x: T): R` annotations.
-   Verified BEFORE promising: signatures survive the lift ONLY on
-   ≤11-format files (fact #A7 — corpus: 9.0.0.0 = 1944/1944,
-   11.0.2.0 = 2124/2124 functions, 12+/24 = 0) and every corpus
-   annotation is `Ty::Any` (JS sources declare nothing), so on a JS
-   corpus the flag only adds `: any` on ≤11 fixtures. The full `Ty`
-   mapping renders anyway (DynPrim → primitives, `Static(Reference)` →
-   the class-table name with `L…;` unwrapping, unions, numerics →
-   `number`, `Void` → `void`) for ArkTS-derived modules. Misaligned or
-   absent signatures keep BARE parameter lists (never fabricated).
-   Class constructors never get a return annotation (TS forbids it).
-   `node --check` does not parse TS: the corpus gate validates the TS
-   sample through node's own `stripTypeScriptTypes` + a `vm.Script`
-   parse of the stripped output (TS-CHECK 40/40). Golden: s37.
-5. **Arrow recovery**: the earlier "not recoverable" note was WRONG at
-   the file level — es2abc marks arrows `NC_FUNCTION`/
-   `ASYNC_NC_FUNCTION` while concise methods/getters are `None`
-   (verified on all six corpus versions plus a compiled probe:
-   object-literal methods → `None`, arrows → NC). The lift now maps NC
-   → `FunctionKind::Arrow`/`AsyncArrow` (new IR variants) and closures
-   emit `(x) => { … }` / `async (x) => { … }`; `Function`-kind closures
-   are genuinely function expressions, so the caveat comment is gone
-   everywhere. Golden: s38. Corpus: 396 NC functions (66/version).
+## Verification Gates & Quick Start
 
-## The d-P9 module gate (G2 closed at the decompile side)
+End-to-end `decompile → es2abc → ark_js_vm` oracle suites under `tests/lift-decompile/` and `tests/merge-abc/` enforce semantic equivalence:
 
-**d-P9 histogram (2026-09-24, floor now 1095)**: **1095 pass** / **0
-decompile-bug** / **0 es2abc-cant** / 54 expected-fallback / **0
-fixture-unsupported** (of 1149). All 36 module fixtures
-(`local/module-exports` + `upstream/optimizer/…/test-constant-propagation`,
-6 versions × 3 profiles each) moved fixture-unsupported → pass.
+- **`dream_gate`** (`1,149 / 1,149` pass, 0 divergences): recompiles and executes every runtime-verified project corpus fixture across 6 bytecode versions × 3 profiles against `ark_js_vm`.
+- **`dream_gate_t262`** (`2,676 / 2,685` pass, 0 `decompile-bug`, 9 documented generator-machinery fallbacks in `scripts/test262-dream-divergences.json`): runs the full `es2abc` + `ark_js_vm` oracle across recorded `test262` fixtures.
+- **`wild_gate`** (`64 / 64` modules across the core-25 wild OpenHarmony `.hap` set): verifies zero panics, clean `verify_module`, `es2abc` recompilation acceptance, and `<1%` global fallback budget (`scripts/wild-dream-divergences.json`), alongside `--merge-abc` split-and-rebundle oracle tests.
 
-Diagnosis (per the d-P4 registration): the bucket was ONE failure, not
-two — the call-entry wrapper already emits module-var predeclarations at
-module scope (`let m{i};`), so `export { name }` had module scope to
-bind against; what was missing was the slot↔NAME correspondence: the
-export records' local names (`Box`, `add`, `answer`, `moduleVar`)
-existed nowhere in the emitted text. Fix, evidence-only (never
-fabricated — `names.rs::module_slot_names`):
+```rust,no_run
+use abcd_decompile::{EmitOptions, decompile_module, decompile_module_split};
+use abcd_ir::Module;
 
-1. **TDZ-guard names**: es2abc emits `throw.undefinedifholewithname
-   "name"` on every read of a module-level `let`/`const`; a guard whose
-   checked value is a `LoadModuleVar` result names that slot.
-2. **Stored named definitions**: `stmodulevar` of a `DefineFunc`/
-   `DefineClass` (traced through `Mov`/`AllocClosure`) binds the slot to
-   the declaration's file name — demangled for the 12.0.6+/13/24
-   es2panda internal-name scheme (`#*#add` → `add`, `#~@0=#Box` → `Box`;
-   segment after the LAST `#`, es2panda `util/helpers.h` tag constants;
-   ≤12.0.2 formats carry plain names).
+fn emit_sources(module: &Module) {
+    let opts = EmitOptions {
+        ts: false,
+        arkui: false,
+        ..EmitOptions::default()
+    };
 
-Honesty rules: contradictory names for one slot poison it; one name
-claimed by two slots poisons both; collisions with import locals /
-global-store predeclarations drop the slot — all keep the synthetic
-`m{i}` fallback (goldens g03/g04). Resolved names are reserved before
-parameter minting so no param/temp shadows a module binding; a
-function-scope class declared under the same name renames
-(`class Box$1 {…}; Box = Box$1;`). The `export { x as NAME }` /
-`import { NAME as x }` positions are ModuleExportNames (IdentifierName,
-reserved words legal): `export { Box as default }` now prints verbatim
-instead of the mangled `default_` (`legalize::is_ident_name`).
-`EmitOptions::call_entry` needed NO module-aware variant — the existing
-module-scope `let` + entry-call + trailing `export {}` shape recompiles
-and runs with identical behavior. No lift/IR change: resolution is a
-decompile-side projection of facts already in the IR (module records +
-ops), so lowered bytes are untouched by construction. Goldens:
-`tests/golden_module.rs` g01–g05. The dream-gate triage's module
-blanket-amnesty is gone: residual module compile failures of the
-`Export name 'x' is not defined` shape are the (empty) G2-residual
-bucket; anything else is decompile-bug/es2abc-cant like any fixture.
+    // Single-stream JS/TS output + fallback/fold statistics:
+    let single = decompile_module(module, &opts);
+    println!("{} ({} functions)", single.text, single.stats.functions);
 
-Gate-found decompiler bugs FIXED in d-P4 (each proven by the oracle):
-N36 operand order at expression construction, value-pure inc/dec,
-temporal escape hoisting (`var` at function top when a use leaves the
-def's block), own-frame lexenv declarations (closure capture shadowing),
-receiver-preserving `callthis*` (`obj.m()` / `.call(this, …)`), real
-`GetIterator` protocol calls, braced switch-case bodies, positive-only
-switch-test polarity, accessor descriptors without clobbering,
-`super(...arguments)`, orphan lexenv slot declarations, and N65
-`delobjprop` object/key roles in abcd-lift + abcd-lower (byte-neutral
-double inversion; pinned by `lift_unit::delobjprop_operand_roles` and
-`abcd-lower/tests/lower_delobjprop_roles.rs`).
+    // Multi-file `--merge-abc` directory-tree split:
+    let split = decompile_module_split(module, &opts);
+    for file in &split.files {
+        println!("{} ({:?}): {} bytes", file.rel_path, file.kind, file.text.len());
+    }
+}
+```
 
-## The d-P10 template gate (G4 closed at the decompile side)
+## Local Verification
 
-**d-P10 histogram (2026-09-25, floor now 1131)**: **1131 pass** / **0
-decompile-bug** / **0 es2abc-cant** / 18 expected-fallback / **0
-fixture-unsupported** (of 1149). All 36 template fixtures
-(`local/template` + `local/tagged-template`, 6 versions × 3 profiles
-each) moved expected-fallback → pass.
+Run the workspace pre-push suite from the repository root, or run package-scoped checks directly:
 
-**The cooked/raw encoding (vendor-pinned).** es2panda
-`compiler/base/literals.cpp` `Literals::GetTemplateObject` builds the
-literal operand imperatively: `rawArr` from each quasi's
-`element->Raw()`, `cookedArr` from `element->Cooked()`, then
-`templateArg = [rawArr, cookedArr]` — **raw at index 0, cooked at
-index 1** — via `createemptyarray` +
-`callruntime.definefieldbyvalue`. The runtime
-`ecmascript/template_string.cpp`
-`TemplateString::GetTemplateObject` reads `templateLiteral[0]` as the
-raw strings and `[1]` as the cooked strings, builds a frozen array of
-cooked with a frozen `.raw` array, and memoizes on the raw list
-(`TemplateMap`). Both string forms survive verbatim in the file's
-string table (e.g. the 12.0.2.0 template baseline carries cooked
-`a⏎b` at 0xa2 and raw `a\nb` at 0xa7 as adjacent entries).
+```sh
+./scripts/test-local.sh
 
-**Carry-through.** No lift/IR change: the raw strings were never
-dropped below the decompiler — the imperative build sequence is plain
-`AllocArray` + integer-keyed `StoreOwnPropDyn` ops whose string
-constants ARE the raw forms. What dropped raw was Stage A itself: the
-old `const_string_array_of` only recognized a const-pool array and
-kept one list. `recover.rs::template_strings_of` now resolves BOTH
-lists — from the const-pool pair form (`[[raw…],[cooked…]]`) or from
-the imperative build (pair-array slots 0/1, then each element array's
-integer-keyed own-stores, contiguity-checked) — through `Mov`
-passthroughs, honestly bailing to the cooked-only fallback when any
-element-array use is unaccounted for.
+# Package-scoped unit, golden integration, lint, and rustdoc gates:
+cargo test -p abcd-decompile
+cargo clippy -p abcd-decompile --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p abcd-decompile --no-deps
+```
 
-**Emission.** A resolved node emits as a real backtick literal with
-the raw text verbatim, identity-tagged: `((_=>_)`a${0}b`)` evaluates
-to exactly the template object the runtime would build (frozen,
-`.raw`-bearing; cache identity elided by design), so the surrounding
-tag-call structure — `tag(tpl, x)`, `String.raw.call(String, tpl)` —
-emits unchanged and behaves identically. Multi-quasi templates get
-inert `${0}` separators (a no-substitution template literal has
-exactly one quasi; the junction is safe — only an exact `${` opens an
-interpolation). Cooked-only emission (`"…" /*template: raw absent,
-cooked-only*/`) remains the documented fallback when raw is genuinely
-absent, and `"" /*template unresolved (raw+cooked absent)*/` when
-neither list resolves — both still counted in the fallback histogram
-and bucketed by the dream-gate triage. Goldens:
-`tests/golden_template.rs` g01–g10 (plain, multi-part, escape
-sequences, tagged call, `String.raw` this-call shape, const-pool pair,
-both fallbacks, `$`-junction safety).
+## License
 
-## The d-P11 generator gate (R4 closed — THE FULL 1149)
-
-**d-P11 histogram (2026-09-25, floor now 1149)**: **1149 pass** / **0
-decompile-bug** / **0 es2abc-cant** / **0 expected-fallback** / **0
-fixture-unsupported** (of 1149) — the entire runtime-passed oracle set
-decompiles, recompiles, and behaves identically. The last bucket (all
-18 `local/generator` fixtures, 6 versions × 3 profiles) moved
-expected-fallback → pass.
-
-**The lowering model (vendor-pinned).** es2abc lowers a `function*`
-body into an explicit state machine (es2panda
-`compiler/function/generatorFunctionBuilder.cpp` +
-`compiler/function/functionBuilder.cpp`
-`SuspendResumeExecution`/`resumeGenerator`/`HandleCompletion`):
-`Prepare` emits `CreateGeneratorObj(funcobj)` + the entry protocol
-suspend (`SuspendGenerator` of bare `undefined`) + the completion pair
-(`ResumeGenerator` → value, `GetResumeMode` → mode) + the dispatch
-`if (mode == RETURN) return value; if (mode == THROW) throw value;`
-(runtime `ecmascript/js_generator_object.h`
-`GeneratorResumeMode{RETURN=0,THROW=1,NEXT=2}`); each source `yield v`
-emits `CreateIterResultObject(v, false)` + the same suspend/pair/
-dispatch; `CleanUp` wraps the body in a catch-all rethrow. Two surface
-shapes per profile: inline immediates (baseline/debug-info) vs. shared
-const temps (optimized), uniform across all 6 corpus versions.
-
-**The fold** (`folds.rs::generator_machine_fold`, run before the other
-Stage-B folds so every dispatch is still a plain if-chain): per site,
-the iter-result wrap opens up (`yield {value:v, done:false}` →
-`yield v`), the completion pair and the mode dispatch dissolve into
-the dispatch's continuation (the real control flow), and a USED
-resumption value binds at the yield site (`const t = yield v`).
-All-or-nothing per function, gated on the entry site — a generator
-whose entry dispatch is not the vendor shape keeps ALL machinery as
-documented fallbacks (golden g05); with the entry folded, a later
-non-matching site keeps its own loud fallback. The funcObj temp and
-resolved mode-immediate consts are swept only when every use was
-consumed. Recompiled, es2abc re-lowers the identical state machine —
-behavior identical by construction, proven by the oracle.
-
-**The async family (G6 resolved at N68; machinery folded at the N68
-remainder).** The modern
-`asyncfunctionawaituncaught`/`asyncfunctionresolve`/
-`asyncfunctionreject` bytecodes carry the awaited/resolved value in
-the ACCUMULATOR (isa.yaml `acc: inout:top`; runtime
-`interpreter-inl.cpp` `ASYNCFUNCTIONAWAITUNCAUGHT_V8`); the lift
-models both operands (`Op::AwaitUncaught`/`AsyncResolve`/`AsyncReject`
-carry `funcobj` + `value`, N68/d-P12), the completion pair folds to
-`return v` / `throw v` (`folds::async_driver_fold`), and the
-suspend/resume machinery inside `async function` bodies folds back to
-plain `await` control flow (`folds::async_machine_fold`, the async
-counterpart of the generator fold): per vendor `functionBuilder.cpp`
-`Await`, each `await v` lowers to `AsyncFunctionAwaitUncaught` +
-`SuspendGenerator` + the `ResumeGenerator`/`GetResumeMode` pair + the
-ASYNC `HandleCompletion` dispatch (`if (mode == THROW) throw value;`
-only — no RETURN arm for the ASYNC builder kind). The fold dissolves
-that per site — the resumption value binds at the await site
-(`const t = await v`) when used — all-or-nothing per function, gated
-on the `AsyncFunctionEnter` entry protocol (the funcObj temp's uses
-must all be machinery), with the funcObj fallback temp swept once only
-dead catch-region phi assigns reference it. `AsyncGenerator` (`async function*`)
-and `yield*` delegation were subsequently closed in d-P14 (`folds::async_generator_machine_fold`
-over `Op::AsyncGeneratorResolve` + `CreateGeneratorObj`) and d-P15 (`folds::yield_star_fold`),
-behavior-pinned via Node execution in `tests/lift-decompile/{async_node,async_gen_node,yield_star_node}.rs`.
-Goldens: `tests/golden_generator.rs` g01–g06 (inline immediates,
-shared mode consts, bound yield result, yield-in-loop, entry-gate
-bail, async folds) and `tests/golden_async.rs` a01–a07 (plain await,
-dead resume value, await-in-loop, chained awaits, entry-gate bail,
-dispatch-mismatch bail, async-generator bail). The N70 residuals closed at d-P17: a
-plain-async `for await` driver decompiles to the LITERAL `for await
-(const x of …)` source form (`folds::match_for_await_driver` — the
-header's folded dispatch await temp, the `next.call(it)` phi call, the
-done arm's absorbed post-loop tail re-homed after the loop,
-loop-carried bookkeeping phis collapsed to their invariant sources),
-and the dead after-loop `throw <resume temp>` the break-routed
-dispatch left behind is swept under a whole-node unreachability proof
-(`folds::sweep_dead_loop_exit_throws` — unlabeled `while (true)`,
-every exit break statically dead, no labeled jumps, exceptional edges
-checked; any doubt keeps the block). Corpus fold counters:
-`gen_driver_sites=54 gen_driver_entry=18 gen_driver_bound=0` (18
-generator functions × entry + 2 yield sites each),
-`async_machine_sites=18 async_machine_bound=18` (all 18 async-await
-fixtures); d-P17 moves nothing corpus-side (`for_await_of=0
-dead_exit_throw=0` — the driver shape was extra-corpus until c-P3; its
-fixture is the corpus export's
-`24.0.0.0/local/yield-star/delegate-async/baseline/input.abc`,
-behavior-pinned by `tests/lift-decompile/yield_star_node.rs` including
-the rejection probe).
-
-## Crate map
-
-- `src/expr.rs` — internal expression AST: literals from `Const` (f64 bit-exact, shortest round-trip), legalized identifiers, named/index/dynamic property access, calls per `CallKind`, unary/binary/compare with precedence metadata, deferred `FuncId`/class references, `yield`/`yield*`/`await` nodes, object/array literal builders, raw+cooked template literals, tagged templates, and explicit `Fallback` nodes.
-- `src/recover.rs` — Stage A expression recovery: per-block def-use walk over `abcd_analysis::dataflow::UseDefChains` with `Op::effects()` barrier checks, `PhiAssign` records, `ExceptionParam` catch bindings, `AllocObject`/`AllocArray` builder hooks, and per-record module-slot binding resolution (`per_class_env`).
-- `src/structure/` — Stage B pattern-independent control-flow structuring over `abcd_analysis::control::regions`:
-  - `mod.rs` — region walker (`Seq`/`If`/`Loop`/`Switch`), labeled break/continue, irreducible dispatch escape hatch, and out-of-SSA phi placement.
-  - `try_project.rs` — laminar `TryPlan` wrapping, cut-try join hoisting (`emit_cut_try`, `try_loop_cut_do_while`), and continuation de-absorption (`emit_deabsorb_tower`).
-- `src/folds/` — JS desugaring and state-machine folds:
-  - `mod.rs` — Stage-B fold pipeline orchestration and `FoldStats`.
-  - `literals.rs` — object/array literal builders (`fold_literal_builders`), rest destructuring (`fold_rest_destructure`), and tagged-template recovery (`fold_tagged_templates`).
-  - `loops.rs` — `for..of`, `for await..of` (`match_for_await_driver`), dead loop-exit throw sweeping (`sweep_dead_loop_exit_throws`), and `for..in` (`fold_single_pass_for_ins`).
-  - `control.rs` — `switch` chain re-detection (`fold_switches`) and alpha-equivalent duplicated-`finally` folding (`fold_finally`).
-  - `scope.rs` — lexical slot scope reconstruction (`scope_fold`), TDZ-preserving `late_decl_fold`, and `rest_param_fold`.
-  - `machines/` — per-kind state-machine folds (`generator.rs`, `async_fn.rs`, `async_gen.rs`, `yield_star.rs`).
-- `src/classfold.rs` — ES/TS class reconstruction (`DefineClass` constructor + member literal buffer + instance field initializers + private fields/methods).
-- `src/emit/` — Stage C precedence-exact JS/TS emitter:
-  - `mod.rs` — single-stream module emission (`decompile_module`, `EmitOptions`, `DecompileStats`).
-  - `decl.rs` — class, method, function, closure, and TypeScript signature emission.
-  - `expr.rs` — precedence-exact expression and literal printing.
-- `src/split.rs` — `--merge-abc` multi-module directory tree output (`decompile_module_split`, `normalize_record_path`): partitions classes, functions, per-record `EsModule` slots, and `jsonFileContent` JSON records into safe relative paths while rewriting internal OHMUrl (`@bundle:`, `@package:`, `@normalized:`) specifiers into relative POSIX imports.
-- `src/arkui.rs` — opt-in OpenHarmony ArkUI declarative sugar pass (`EmitOptions::arkui` / `--arkui`): reconstructs `@Entry` / `@CustomDialog` / `@Component struct`, `@State` / `@Prop` / `@Link` / `@ObjectLink` / `@Provide` / `@Consume` / `@LocalStorage*` / `@Storage*` fields, `build()` and `@Builder` UI trees (`observeComponentCreation2`, custom child `$prop` bindings, `If`, `ForEach` / `LazyForEach`), and prototype-overflow methods while eliding synthetic `ViewPU` boilerplate.
-- `src/names.rs`, `src/legalize.rs`, `src/consts.rs`, `src/fitness.rs`, `src/dump.rs` — seeded lexical-env/private-name propagation (`NameScopes`), G2 & per-record module-slot resolution (`DecompileIndex::build` / `build_split`), identifier legalization, MUTF-8/lone-surrogate string & RegExp rendering, op fitness metadata, and deterministic Stage-A dumps.
-- `abcd-decompile/tests/integration/` — in-crate unit goldens for expressions, control-flow structuring, classes, modules, templates, generators, async functions, `--split-modules`, and `--arkui`.
-- `tests/lift-decompile/` & `tests/merge-abc/` — cross-crate corpus, `--merge-abc` re-bundle, and runtime gates (`corpus_stage_a`, `corpus_decompile`, `dream_gate`, `dream_gate_t262`, `wild_gate`, `merge-abc`, `async_node`, `async_gen_node`, `yield_star_node`).
-
-## The fallback-honesty rule
-
-Silent wrongness is worse than loud absence (gen1 lesson 6). Anything
-Stage A cannot express becomes an explicit node — `Expr::Fallback`,
-`Stmt::Fallback`, or a `/*hard-fallback*/`-tagged plumbing node — naming
-the op and the reason; the §5 guard family is elided **on purpose** with
-a recorded `Stmt::Elided` marker per site (op name + §5 reason + source
-loc). The corpus gate asserts: no op outside the documented set (the
-hard 7 + `ThrowDeleteSuperProperty`) ever falls back, and the hard 7 are
-never silently expressed.
-
-The hard 7 (fitness class H) at Stage A — all documented fallback nodes:
-`IteratorReturn`, `IteratorThrow` (iterator-cleanup protocol),
-`DefineSendableClass` (ArkTS sendable classes — no JS surface syntax),
-`ResumeGenerator`, `GetResumeMode` (generator-driver plumbing, R4),
-`AsyncResolve`, `AsyncReject` (async promise plumbing, R4).
+Apache-2.0.

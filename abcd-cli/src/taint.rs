@@ -1,5 +1,5 @@
 //! `abcd taint` — source→sink taint analysis over one module
-//! (design/cli-plan.md §2/§6, P3).
+//! (design/cli.md §2, design/analysis.md §3).
 //!
 //! Pipeline: `.abc` → [`abcd_file::decode`] → [`abcd_lift::lift_file`] →
 //! [`abcd_taint::run_taint`] with a [`TaintConfig`] parsed from the

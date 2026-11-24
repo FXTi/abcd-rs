@@ -1,6 +1,6 @@
-//! P1/P3 regression (v0.2 port of `abcd-ir/tests/lower_isel_acc_spill.rs`):
-//! an acc-held value needed as a register operand must read its own
-//! content, never whatever the last acc write left behind.
+//! `ADR-03` (`acc`-as-cache) regression tests: an acc-held value needed as a
+//! register operand must read its own content, never whatever the last acc
+//! write left behind.
 //!
 //! Under acc-as-cache every value has a register home, register operands
 //! always read their homes, and `ensure_acc` — the only acc writer

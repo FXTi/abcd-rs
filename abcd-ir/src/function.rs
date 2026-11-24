@@ -1,5 +1,5 @@
 //! Function graph: SSA bodies, blocks, edges, try regions, debug info
-//! (design/ir-v0.2.md §3, §5.1–§5.2).
+//! (`design/ir.md`).
 
 use crate::id::{BlockId, ClassId, ConstId, InstId, Sym, ValueId};
 use crate::module::{Annotation, FunctionKind, Modifiers, Signature};
@@ -57,8 +57,8 @@ pub struct Inst {
     /// The owning block.
     pub block: BlockId,
     /// Source location (T8): present whenever the source had line info.
-    /// Passes propagate or drop it — never fabricate it (§7 hard
-    /// contract).
+    /// Passes propagate or drop it — never fabricate it (`design/ir.md`
+    /// hard contract).
     pub loc: Option<Loc>,
 }
 
@@ -106,8 +106,8 @@ pub struct Catch {
     pub type_idx: Option<u32>,
 }
 
-/// A structured try region (§5.2): both structure (for lowering) and the
-/// source of [`EdgeKind::Exceptional`] edges — every protected block has
+/// A structured try region (`design/ir.md`): both structure (for lowering) and
+/// the source of [`EdgeKind::Exceptional`] edges — every protected block has
 /// an exceptional edge to every catch handler of the region.
 #[derive(Clone, Debug)]
 pub struct TryRegion {
@@ -117,8 +117,8 @@ pub struct TryRegion {
     pub catches: Vec<Catch>,
 }
 
-/// Per-function debug information (§7: program semantics — local names
-/// feed taint readability; line tables replay at lower per the #16 rule).
+/// Per-function debug information (`design/ir.md`: program semantics — local
+/// names feed taint readability; line tables replay at lower per `#16`).
 /// Tables key on [`InstId`], never on instruction offsets.
 #[derive(Clone, Debug, Default)]
 pub struct DebugData {
@@ -206,15 +206,21 @@ pub struct FunctionData {
     /// bodies; taint summaries register against `(name, arity)` keys
     /// outside the IR.
     pub is_external: bool,
-    /// SSA values for the parameters, in code-header argument order.
-    /// **Frame-slot model (T4/§5.3, canonical — [`crate::frame`]):** the
-    /// leading slots are the vendored implicit frame slots
-    /// `[func][new.target][this]` (per the callee's
-    /// `L_ESCallTypeAnnotation;` callType bits; absent → the `0xF`
-    /// default, the es2abc shape), then the source formals. The
-    /// this-role slot is [`crate::frame::this_param_index`] — NOT
-    /// `params[0]` (the FUNC slot under the `0xF` default; the earlier
-    /// "`params[0]` = `this`" convention is superseded, N66/N67).
+    /// SSA values for the parameters, in code-header argument order (`T4`,
+    /// `D6` — see [`crate::frame`]):
+    ///
+    /// - Under [`crate::Dialect::DynamicEcma`]: leading slots are the vendored
+    ///   implicit frame slots `[func][new.target][this]` (`H = 3` under
+    ///   [`crate::frame::FrameSlots::DEFAULT`], or decoded from
+    ///   `L_ESCallTypeAnnotation;`), followed by source formals at
+    ///   `params[H..]`. The `this` slot is [`crate::frame::this_param_index`]
+    ///   (`params[2]` under `0xF`, never `params[0]`; `design/decisions.md`
+    ///   N66/N67).
+    /// - Under [`crate::Dialect::StaticArkTS`]: zero hidden closure or
+    ///   `new.target` slots (`H = 0` via [`crate::frame::FrameSlots::NONE`] on
+    ///   `static` methods so `params[0..]` are declared formals; `H = 1` via
+    ///   [`crate::frame::FrameSlots::STATIC_INSTANCE`] on instance methods and
+    ///   constructors with `this` at `params[0]` and formals at `params[1..]`).
     pub params: Vec<ValueId>,
     /// Per-function frame-initial constant values ([`ValueDef::Const`], e.g.
     /// `Undefined` for unread virtual registers and `Hole` for unread
@@ -222,8 +228,8 @@ pub struct FunctionData {
     pub frame_init_consts: Vec<ValueId>,
     /// Blocks owned by this function; `blocks[0]` is the entry block.
     pub blocks: Vec<BlockId>,
-    /// Structured try regions (§5.2); also the source of exceptional CFG
-    /// edges.
+    /// Structured try regions (`design/ir.md`); also the source of exceptional
+    /// CFG edges.
     pub try_regions: Vec<TryRegion>,
     /// Debug information.
     pub debug: Option<DebugData>,

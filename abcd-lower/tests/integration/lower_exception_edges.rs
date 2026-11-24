@@ -1,20 +1,15 @@
-//! N13/N21 regression (v0.2 port of
-//! `abcd-ir/tests/lower_exception_edges.rs`): exception-edge value
-//! modeling.
+//! `N13` / `N21` (`ADR-04`) regression tests: exception-edge value modeling.
 //!
-//! N13 — vendored exception dispatch physically delivers the thrown object
-//! in the accumulator at handler entry. The v0.2 lift seeds every catch
+//! `N13` — vendored exception dispatch physically delivers the thrown object
+//! in the accumulator at handler entry. `abcd-lift` seeds every catch
 //! handler's acc location with a fresh [`ValueDef::ExceptionParam`] value
 //! (recorded on the region's `Catch`), register allocation gives it a
 //! register home, and isel materializes it with a `Sta(home)` prologue as
-//! the handler's first bytecode — exactly the vendored `sta vX`.
+//! the handler's first bytecode — matching the vendored `sta vX`.
 //!
-//! N21 — handler-edge phi semantics: no copy code may run on an exception
+//! `N21` — handler-edge phi semantics: no copy code may run on an exception
 //! edge; handler phis lower to pinned write-through stores, and any
-//! residual different-slot handler-edge copy is a hard LowerError.
-//!
-//! The lifted fixtures use the v0.2 lift (`abcd_lift::lift_file`) — the
-//! same bytecode inputs as the v0.1 originals.
+//! residual different-slot handler-edge copy is a hard `LowerError`.
 
 use crate::common;
 use std::collections::HashMap;

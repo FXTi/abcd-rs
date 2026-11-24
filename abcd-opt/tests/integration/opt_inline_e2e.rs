@@ -1,4 +1,4 @@
-//! D2 inline rewrite — end-to-end tests: real bytecode files →
+//! Function inlining end-to-end tests (`design/ir.md`): real bytecode files →
 //! `abcd_lift::lift_file` → `abcd_opt::inline::inline_module` →
 //! `abcd_ir::verify_module` → `abcd_lower::lower_function` → the
 //! deterministic simulator, with the inline-OFF run as the behavioral

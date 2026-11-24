@@ -118,6 +118,8 @@ pub enum AnnotationElemValue {
     Scalar(u32),
     Scalar64(u64),
     Array(Vec<u32>),
+    /// Array of 64-bit scalar values — I64/U64 raw bits or F64::to_bits() (is_array=1).
+    Array64(Vec<u64>),
     /// Entity reference: handle index resolved by tag on C++ side (is_array=3).
     EntityRef(u32),
     /// Array of entity references: handle indices resolved by tag (is_array=4).
@@ -977,15 +979,16 @@ impl Builder {
         })
     }
 
-    /// Create an annotation with extended elements (array support).
+    /// Create an annotation with extended elements (array and 64-bit support).
     pub fn create_annotation_ex(
         &mut self,
         cls: ClassHandle,
         elements: &[AnnotationElemDefEx],
     ) -> AnnotationHandle {
-        let ffi_elems: Vec<sys::AbcAnnotationElemDefEx> = elements
-            .iter()
-            .map(|e| match &e.value {
+        let mut widened_arrays: Vec<Vec<u64>> = Vec::new();
+        let mut ffi_elems: Vec<sys::AbcAnnotationElemDefEx> = Vec::with_capacity(elements.len());
+        for e in elements {
+            let elem = match &e.value {
                 AnnotationElemValue::Scalar(v) => sys::AbcAnnotationElemDefEx {
                     name_string_handle: e.name.0,
                     tag: e.tag as std::os::raw::c_char,
@@ -1004,7 +1007,22 @@ impl Builder {
                     array_values: std::ptr::null(),
                     array_count: 0,
                 },
-                AnnotationElemValue::Array(arr) => sys::AbcAnnotationElemDefEx {
+                AnnotationElemValue::Array(arr) => {
+                    let widened: Vec<u64> = arr.iter().map(|&x| u64::from(x)).collect();
+                    let ptr = widened.as_ptr();
+                    let len = widened.len() as u32;
+                    widened_arrays.push(widened);
+                    sys::AbcAnnotationElemDefEx {
+                        name_string_handle: e.name.0,
+                        tag: e.tag as std::os::raw::c_char,
+                        is_array: 1,
+                        scalar_value: 0,
+                        scalar_value_64: 0,
+                        array_values: ptr,
+                        array_count: len,
+                    }
+                }
+                AnnotationElemValue::Array64(arr) => sys::AbcAnnotationElemDefEx {
                     name_string_handle: e.name.0,
                     tag: e.tag as std::os::raw::c_char,
                     is_array: 1,
@@ -1022,25 +1040,34 @@ impl Builder {
                     array_values: std::ptr::null(),
                     array_count: 0,
                 },
-                AnnotationElemValue::EntityArray(arr) => sys::AbcAnnotationElemDefEx {
-                    name_string_handle: e.name.0,
-                    tag: e.tag as std::os::raw::c_char,
-                    is_array: 4,
-                    scalar_value: 0,
-                    scalar_value_64: 0,
-                    array_values: arr.as_ptr(),
-                    array_count: arr.len() as u32,
-                },
-            })
-            .collect();
-        AnnotationHandle(unsafe {
+                AnnotationElemValue::EntityArray(arr) => {
+                    let widened: Vec<u64> = arr.iter().map(|&x| u64::from(x)).collect();
+                    let ptr = widened.as_ptr();
+                    let len = widened.len() as u32;
+                    widened_arrays.push(widened);
+                    sys::AbcAnnotationElemDefEx {
+                        name_string_handle: e.name.0,
+                        tag: e.tag as std::os::raw::c_char,
+                        is_array: 4,
+                        scalar_value: 0,
+                        scalar_value_64: 0,
+                        array_values: ptr,
+                        array_count: len,
+                    }
+                }
+            };
+            ffi_elems.push(elem);
+        }
+        let handle = AnnotationHandle(unsafe {
             sys::abc_builder_create_annotation_ex(
                 self.raw,
                 cls.0,
                 ffi_elems.as_ptr(),
                 ffi_elems.len() as u32,
             )
-        })
+        });
+        drop(widened_arrays);
+        handle
     }
 
     // Annotation attachment helpers
@@ -1286,14 +1313,6 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     b.set_file_version(file.version)?;
     let pool = &file.strings;
 
-    // Helper: resolve a StringId to &str (lossy-safe for error formatting /
-    // ASCII sentinel checks), erroring on invalid ids.
-    let rs = |id: StringId| -> Result<&str, Error> {
-        pool.resolve(id).ok_or_else(|| Error::Malformed {
-            field: "string_id",
-            context: format!("dangling StringId {id:?} in file"),
-        })
-    };
     let rcstr = |id: StringId| -> Result<CString, Error> {
         let bytes = pool.to_mutf8_bytes(id).ok_or_else(|| Error::Malformed {
             field: "string_id",
@@ -1640,14 +1659,6 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 Some(FieldValue::I64(v)) => b.field_set_value_i64(field_h, *v),
                 Some(FieldValue::F32(v)) => b.field_set_value_f32(field_h, *v),
                 Some(FieldValue::F64(v)) => b.field_set_value_f64(field_h, *v),
-                // N8 write side stays honest: the value is a nested file
-                // offset with no relocation support — never emit it stale.
-                Some(FieldValue::TypeSummaryOffset(_)) => {
-                    return Err(Error::TypeSummaryOffset {
-                        class_descriptor: rs(cls.descriptor)?.to_owned(),
-                        field_off: field.offset,
-                    });
-                }
                 Some(FieldValue::JsonFileContent { content, .. }) => {
                     let sh = get_or_add_string_id(&mut b, &mut string_handles, pool, *content)?;
                     b.field_set_value_string(field_h, sh)?;
@@ -1849,16 +1860,10 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
 }
 
 /// Encode preflight over every annotation in the file (hard-errors rule):
-/// reject shapes the vendored writer cannot represent BEFORE any bytes are
-/// emitted, using an explicit iterative workstack.
-///
-/// Rejections:
-/// - 64-bit annotation ARRAY elements (`UnsupportedAnnotationArrayType`):
-///   the bridge array ABI is 32-bit only (finding #18).
-/// - out-of-bounds `LiteralValue::LiteralArray(idx)` inside an
-///   annotation-embedded literal array (`CodeRelocation` with site/owner
-///   context): dangling or unrecovered nested offsets fail loudly rather
-///   than being dropped or written stale.
+/// reject out-of-bounds `LiteralValue::LiteralArray(idx)` inside an
+/// annotation-embedded literal array (`CodeRelocation` with site/owner
+/// context) BEFORE any bytes are emitted, using an explicit iterative
+/// workstack.
 fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
     fn annotations(a: &Annotations) -> impl Iterator<Item = &Annotation> {
         a.compile_time
@@ -1915,17 +1920,7 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
         stack.push((owner, site, root));
         while let Some((cur_owner, cur_site, v)) = stack.pop() {
             match v {
-                AnnotationValue::Array { tag, values } => {
-                    if values.iter().any(|item| {
-                        matches!(
-                            item,
-                            AnnotationValue::I64(_)
-                                | AnnotationValue::U64(_)
-                                | AnnotationValue::F64(_)
-                        )
-                    }) {
-                        return Err(Error::UnsupportedAnnotationArrayType { tag: *tag });
-                    }
+                AnnotationValue::Array { values, .. } => {
                     for item in values.iter().rev() {
                         stack.push((cur_owner, cur_site, item));
                     }
@@ -2283,7 +2278,7 @@ enum PendingEncodeElem<'a> {
         name: StringHandle,
         tag: u8,
         remaining: std::slice::Iter<'a, AnnotationValue>,
-        handles: Vec<u32>,
+        handles: Vec<u64>,
     },
 }
 
@@ -2329,7 +2324,7 @@ fn encode_single_annotation(
                     mut remaining,
                     mut handles,
                 }) => {
-                    handles.push(child_h.0);
+                    handles.push(u64::from(child_h.0));
                     for item in &mut remaining {
                         if let AnnotationValue::Annotation(nested) = item {
                             let child_cls = resolve_class_for_ann(
@@ -2352,13 +2347,15 @@ fn encode_single_annotation(
                             });
                             break;
                         }
-                        handles.push(annotation_array_leaf_to_handle(item, tag, b, ctx)?);
+                        handles.push(annotation_array_leaf_to_handle(item, b, ctx)?);
                     }
                     if next_child.is_none() {
                         let value = if is_entity_array_tag(tag) {
-                            AnnotationElemValue::EntityArray(handles)
+                            AnnotationElemValue::EntityArray(
+                                handles.into_iter().map(|h| h as u32).collect(),
+                            )
                         } else {
-                            AnnotationElemValue::Array(handles)
+                            AnnotationElemValue::Array64(handles)
                         };
                         frame
                             .encoded_elems
@@ -2417,15 +2414,17 @@ fn encode_single_annotation(
                             });
                             break;
                         }
-                        handles.push(annotation_array_leaf_to_handle(item, *tag, b, ctx)?);
+                        handles.push(annotation_array_leaf_to_handle(item, b, ctx)?);
                     }
                     if next_child.is_some() {
                         break;
                     }
                     let value = if is_entity_array_tag(*tag) {
-                        AnnotationElemValue::EntityArray(handles)
+                        AnnotationElemValue::EntityArray(
+                            handles.into_iter().map(|h| h as u32).collect(),
+                        )
                     } else {
-                        AnnotationElemValue::Array(handles)
+                        AnnotationElemValue::Array64(handles)
                     };
                     frame.encoded_elems.push(AnnotationElemDefEx {
                         name,
@@ -2568,36 +2567,35 @@ fn is_entity_array_tag(tag: u8) -> bool {
     )
 }
 
-/// Convert a single non-Annotation array element to a u32 handle/value for the
-/// builder (`Annotation` elements are pushed onto the iterative frame stack by
-/// `encode_single_annotation`).
+/// Convert a single non-Annotation array element to a u64 raw bits / handle
+/// word for the builder (`Annotation` elements are pushed onto the iterative
+/// frame stack by `encode_single_annotation`).
 fn annotation_array_leaf_to_handle(
     val: &AnnotationValue,
-    tag: u8,
     b: &mut Builder,
     ctx: &mut AnnotationEncodeCtx<'_>,
-) -> Result<u32, Error> {
+) -> Result<u64, Error> {
     let raw = match val {
-        AnnotationValue::Bool(v) => *v as u32,
-        AnnotationValue::I8(v) => *v as u32,
-        AnnotationValue::U8(v) => *v as u32,
-        AnnotationValue::I16(v) => *v as u32,
-        AnnotationValue::U16(v) => *v as u32,
-        AnnotationValue::I32(v) => *v as u32,
-        AnnotationValue::U32(v) => *v,
-        AnnotationValue::I64(_) | AnnotationValue::U64(_) | AnnotationValue::F64(_) => {
-            return Err(Error::UnsupportedAnnotationArrayType { tag });
-        }
-        AnnotationValue::F32(v) => v.to_bits(),
+        AnnotationValue::Bool(v) => u64::from(*v),
+        AnnotationValue::I8(v) => u64::from(*v as u32),
+        AnnotationValue::U8(v) => u64::from(*v),
+        AnnotationValue::I16(v) => u64::from(*v as u32),
+        AnnotationValue::U16(v) => u64::from(*v),
+        AnnotationValue::I32(v) => u64::from(*v as u32),
+        AnnotationValue::U32(v) => u64::from(*v),
+        AnnotationValue::I64(v) => *v as u64,
+        AnnotationValue::U64(v) => *v,
+        AnnotationValue::F32(v) => u64::from(v.to_bits()),
+        AnnotationValue::F64(v) => v.to_bits(),
         AnnotationValue::String(sid) => {
             let h = get_or_add_string_id(b, ctx.string_handles, ctx.pool, *sid)?;
-            h.0
+            u64::from(h.0)
         }
         AnnotationValue::Record(sid) => {
             let h = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, *sid)?;
-            h.0
+            u64::from(h.0)
         }
-        AnnotationValue::Method { name, offset } => {
+        AnnotationValue::Method { name, offset } => u64::from(
             ctx.entities
                 .resolve_method(*name, *offset)
                 .ok_or_else(|| {
@@ -2606,9 +2604,9 @@ fn annotation_array_leaf_to_handle(
                         ctx.pool.resolve(*name).unwrap_or("<unknown>")
                     ))
                 })?
-                .0
-        }
-        AnnotationValue::Enum { name, offset } => {
+                .0,
+        ),
+        AnnotationValue::Enum { name, offset } => u64::from(
             ctx.entities
                 .resolve_field(*name, *offset)
                 .ok_or_else(|| {
@@ -2617,8 +2615,8 @@ fn annotation_array_leaf_to_handle(
                         ctx.pool.resolve(*name).unwrap_or("<unknown>")
                     ))
                 })?
-                .0
-        }
+                .0,
+        ),
         AnnotationValue::MethodHandle(mh) => {
             let entity_handle = if mh.handle_type.is_field_op() {
                 ctx.entities
@@ -2636,11 +2634,11 @@ fn annotation_array_leaf_to_handle(
                     mh.entity_offset
                 ))
             })?;
-            b.create_method_handle(mh.handle_type as u8, entity_handle).0
+            u64::from(b.create_method_handle(mh.handle_type as u8, entity_handle).0)
         }
         AnnotationValue::LiteralArray(_) => {
             match annotation_scalar_value_to_raw(val, b, ctx)? {
-                (_, AnnotationElemValue::EntityRef(h)) => h,
+                (_, AnnotationElemValue::EntityRef(h)) => u64::from(h),
                 _ => unreachable!("literal-array values encode as entity refs"),
             }
         }

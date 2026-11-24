@@ -127,3 +127,109 @@ fn degenerate_debug_item_is_hard_error() {
         "error cites the vendor failure: {msg}"
     );
 }
+
+/// Build a file with one method carrying a `SET_FILE` + `START_LOCAL` +
+/// multiple `END_LOCAL` line-number program, returning `(bytes, lnp_off)` so
+/// tests can mutate LNP opcodes/operands directly.
+fn build_lnp_with_local() -> (Vec<u8>, usize) {
+    let mut b = Builder::new();
+    b.set_api(12, "beta1");
+    let cls = b.add_global_class();
+    b.class_set_source_lang(cls, SourceLang::EcmaScript);
+    let proto = b.create_proto(Type::Tagged, &[]);
+    let m1 = b.class_add_method(cls, "m1", proto, AccessFlags::PUBLIC, &[0x65, 0x65], 2, 0);
+
+    let lnp = b.create_lnp();
+    let debug = b.create_debug_info(lnp, 1);
+    let src = b.add_string("main.js");
+    let vname = b.add_string("loc_var");
+    let vtype = b.add_string("I");
+    b.lnp_emit_set_file(lnp, debug, src);
+    b.lnp_emit_start_local(lnp, debug, 1, vname, vtype);
+    b.lnp_emit_end_local(lnp, 1);
+    b.lnp_emit_end_local(lnp, 1);
+    b.lnp_emit_end_local(lnp, 1);
+    b.lnp_emit_end(lnp);
+    b.method_set_debug_info(m1, debug);
+
+    let data = b.finalize().expect("finalize");
+    let num_lnps = u32::from_le_bytes(data[36..40].try_into().unwrap());
+    assert_eq!(num_lnps, 1);
+    let lnp_idx_off = u32::from_le_bytes(data[40..44].try_into().unwrap()) as usize;
+    let lnp_off =
+        u32::from_le_bytes(data[lnp_idx_off..lnp_idx_off + 4].try_into().unwrap()) as usize;
+    assert_eq!(data[lnp_off], 0x09, "SET_FILE opcode");
+    assert_eq!(data[lnp_off + 1], 0x03, "START_LOCAL opcode");
+    (data, lnp_off)
+}
+
+#[test]
+fn malformed_lnp_fatal_sites_return_error_with_silent_stderr() {
+    const CHILD_ENV: &str = "ABCD_TEST_SILENT_STDERR_CHILD";
+
+    if std::env::var_os(CHILD_ENV).is_some() {
+        // 1. ThrowIfWithCheck path (degenerate file_=EntityId(0)).
+        assert_eq!(
+            decode(&build_degenerate()).expect_err("degenerate debug item"),
+            Error::DebugInfoExtraction
+        );
+
+        // 2. LOG(FATAL, COMMON) path: unsupported LNP opcode 0x06 (RESTART_LOCAL).
+        let (mut bad_op, lnp_off) = build_lnp_with_local();
+        bad_op[lnp_off + 1] = 0x06;
+        assert_eq!(
+            decode(&bad_op).expect_err("RESTART_LOCAL LNP opcode"),
+            Error::DebugInfoExtraction
+        );
+
+        // 3. LOG_IF(!is_full, FATAL, COMMON) path: overlong SLEB128 register on START_LOCAL.
+        let (mut bad_reg, lnp_off) = build_lnp_with_local();
+        bad_reg[lnp_off + 2..lnp_off + 8].copy_from_slice(&[0x80; 6]);
+        assert_eq!(
+            decode(&bad_reg).expect_err("overlong SLEB128 register"),
+            Error::DebugInfoExtraction
+        );
+        return;
+    }
+
+    // Run in-process first for direct coverage/assertion visibility.
+    let (mut bad_op, lnp_off) = build_lnp_with_local();
+    bad_op[lnp_off + 1] = 0x06;
+    assert_eq!(
+        decode(&bad_op).expect_err("RESTART_LOCAL LNP opcode"),
+        Error::DebugInfoExtraction,
+        "LOG(FATAL) on unsupported LNP opcode must translate to Error::DebugInfoExtraction"
+    );
+
+    let (mut bad_reg, lnp_off) = build_lnp_with_local();
+    bad_reg[lnp_off + 2..lnp_off + 8].copy_from_slice(&[0x80; 6]);
+    assert_eq!(
+        decode(&bad_reg).expect_err("overlong SLEB128 register"),
+        Error::DebugInfoExtraction,
+        "LOG_IF(!is_full, FATAL) on malformed SLEB128 register must translate to Error::DebugInfoExtraction"
+    );
+
+    // Re-invoke this exact test in a child process and assert zero stderr pollution.
+    let exe = std::env::current_exe().expect("current test binary");
+    let out = std::process::Command::new(exe)
+        .env(CHILD_ENV, "1")
+        .args([
+            "--exact",
+            "debug_n55_decode::malformed_lnp_fatal_sites_return_error_with_silent_stderr",
+            "--nocapture",
+        ])
+        .output()
+        .expect("spawn child test process");
+    assert!(
+        out.status.success(),
+        "child test failed: status={:?}, stdout={}, stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "C++ bridge and logger shim must emit zero stderr bytes on malformed inputs, got: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

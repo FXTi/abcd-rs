@@ -1,10 +1,9 @@
-//! P1 end-to-end regression (B2, v0.2 port of
-//! `abcd-ir/tests/lower_phi_swap_loop.rs`): a real phi swap across a loop
+//! End-to-end phi-swap loop regression test: a real phi swap across a loop
 //! back-edge, lowered through the full `lower_function` pipeline
-//! (regalloc → isel → layout) and executed on the shared simulator.
+//! (`regalloc` → `isel` → `layout`) and executed on the shared simulator.
 //!
-//! Unlike the crafted-alloc tests in `lower_parallel_copy_slots.rs`, this
-//! test builds real IR with the v0.2 test builder and lets
+//! Unlike the crafted-allocation tests in `lower_parallel_copy_slots.rs`, this
+//! test builds real IR with `V2Builder` and lets
 //! `regalloc::allocate` pick the slots, produce the phi copy sets, and
 //! reserve the `copy_temp` register — proving the regalloc → layout path,
 //! not just crafted inputs.

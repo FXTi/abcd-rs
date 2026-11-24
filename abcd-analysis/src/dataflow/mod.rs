@@ -1,27 +1,24 @@
-//! Dataflow infrastructure (design/analysis-strategy.md §5.1–§5.2).
+//! Dataflow and pointer-analysis infrastructure (`design/analysis.md`).
 //!
 //! - [`framework`] — a generic monotone forward/backward block-level
-//!   framework over any successor relation. Future `abcd-opt` refactors
-//!   are intended consumers; nothing here is taint-specific.
+//!   framework over any successor relation.
 //! - [`usedef`] — use-def chains as a commodity, cached per function with
 //!   explicit invalidation.
-//! - [`ifds`] — the IFDS solver skeleton (heros.md §1: path-edge worklist,
-//!   `incoming`/`endSummary` tables with second-arriver replay, sparse
-//!   jump-function table, TOP-as-absent, deterministic iteration).
-//! - [`heap`] — heap v0 (analysis-strategy §4.4 rung 0): heap facts keyed
-//!   by `(AllocSite, field chain, k-capped)`, strong/weak updates, and the
-//!   [`heap::AliasOracle`] trait seam sized for a Boomerang-shaped rung-1
-//!   engine (§5.2).
-//! - [`alias`] — the rung-1 on-demand alias engine (§4.4 rung 1): a
-//!   memoized, demand-driven backward `points_to(base, at)` query with
-//!   the balanced-parentheses interprocedural discipline, a depth cap
-//!   with rung-0 fallback, and the full [`heap::AliasOracle`] impl
-//!   ([`alias::Rung1AliasOracle`]).
-//! - [`pta`] — the rung-2 whole-module context-sensitive pointer
-//!   analysis (§4.4 rung 2, APAK-shaped): abstract objects keyed by
-//!   `(alloc InstId, 1-call-site context)`, per-object field
-//!   sensitivity, delta worklist propagation, on-the-fly call-graph
-//!   co-evolution, and the lexical-environment identity channel
+//! - [`ifds`] — the Reps–Horwitz–Sagiv IFDS tabulation solver (start-anchored
+//!   path-edge worklist, `incoming`/`end_summary` tables with second-arriver
+//!   replay, sparse TOP-as-absent jump-function set, deterministic iteration).
+//! - [`heap`] — rung-0 allocation-site keying: heap facts keyed by
+//!   `(AllocSite, field chain, k-capped)`, strong/weak updates, and the
+//!   [`heap::AliasOracle`] interprocedural calling-context seam.
+//! - [`alias`] — rung-1 demand-driven alias engine: memoized backward
+//!   `points_to(base, at)` queries with Boomerang-style balanced-parentheses
+//!   call-stack CFL-reachability, depth cap with rung-0 fallback, and
+//!   [`alias::Rung1AliasOracle`].
+//! - [`pta`] — rung-2 whole-module `k=1` context-sensitive Andersen-style
+//!   subset pointer analysis: abstract objects keyed by
+//!   `(alloc InstId, 1-call-site context)`, per-object field sensitivity,
+//!   two-half delta worklist propagation, on-the-fly call-graph
+//!   co-evolution, and lexical-environment stack identity
 //!   ([`pta::Rung2AliasOracle`]).
 
 pub mod alias;

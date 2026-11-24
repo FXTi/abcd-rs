@@ -1,4 +1,4 @@
-//! Rung-matrix + driver arm coverage (c-COV W10): the `ABCD_TAINT_RUNG`
+//! Rung-matrix + driver arm coverage: the `ABCD_TAINT_RUNG`
 //! env only feeds `#[ignore]`d root-package suites, so the rung-0/1
 //! oracle arms are covered IN-CRATE by constructing
 //! `TaintConfig { alias_rung: 0/1/2, .. }` directly and running

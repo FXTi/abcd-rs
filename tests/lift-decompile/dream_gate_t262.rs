@@ -291,8 +291,7 @@ fn generate() -> usize {
 
 /// The full test262 gate: generate, then run `scripts/dream-gate.py`
 /// pointed at THIS gate root (es2abc recompile at 24.0.0.0/baseline,
-/// script mode; ark_js_vm recorded-behavior compare; triage). Docker is
-/// LOCAL-only (scripts/remote-test.sh).
+/// script mode; ark_js_vm recorded-behavior compare; triage in CI per `design/ci.md`).
 ///
 /// GATE FORM (test262 P3, decided from the first-contact measurement
 /// 2026-09-27, image sha256:45f4daf6): the compare gate is the B-plan

@@ -1,75 +1,71 @@
-//! The IFDS solver skeleton — a Rust port of heros' tabulation core
-//! (design/flowdroid/heros.md §1, §5; analysis-strategy.md §5.1 "keep the
-//! IFDS skeleton"), specialized to the binary lattice (IFDS, not IDE:
-//! phase-II value computation is deliberately absent — see the README).
+//! The IFDS tabulation solver (`design/analysis.md`, `design/decisions.md`
+//! N20): Reps–Horwitz–Sagiv interprocedural finite distributive subset
+//! tabulation (POPL'95) with Naeem–Lhoták–Rodriguez practical extensions
+//! (CC'10), specialized to the binary reachability lattice.
 //!
-//! ## What is kept verbatim from heros
+//! ## Core tabulation design
 //!
-//! - **Path-edge triples** `(source fact, target node, target fact)`,
-//!   source *statement* omitted (recoverable from the fact's anchor
-//!   function). Deviation from heros: no cached `hashCode` field — every
-//!   element is a small integer/newtype, so std's one-shot hashing of the
-//!   tuple is the precomputed-hash equivalent.
-//! - **The `incoming`/`endSummary` pair** keyed by `(start point, fact)`
-//!   with second-arriver replay (heros.md §1.4–§1.6): whichever of call
-//!   or exit arrives second replays the other's table. This is where
-//!   context sensitivity (same-level-realizable paths) falls out — no
-//!   explicit call stack anywhere.
+//! - **Start-anchored path-edge triples** `(source fact, target node, target fact)`:
+//!   the source statement is omitted because it is always the entry
+//!   instruction of the anchor function. Every tuple element is a compact
+//!   integer/newtype, so standard tuple hashing and equality run directly
+//!   without cached hash fields.
+//! - **The `incoming`/`end_summary` pair** keyed by `(start point, fact)`
+//!   with second-arriver replay: whichever of call-site entry or callee exit
+//!   arrives second replays the other's table. Context sensitivity
+//!   (same-level-realizable interprocedural paths) falls out of summary
+//!   tabulation directly without maintaining per-edge call stacks.
 //! - **TOP-as-absent / sparse-by-default**: the jump-function table IS
-//!   the path-edge set; an edge that was never propagated is absent
-//!   (heros.md §5 items 2, 3, 5). For the binary lattice the edge
-//!   function is degenerate, so existence is the whole content.
+//!   the path-edge set; an edge that was never propagated is absent.
+//!   Over the binary lattice the edge function is degenerate, so edge
+//!   existence carries the entire lattice value.
 //! - **The worklist + dedup chokepoint** (`IfdsSolver::propagate`):
 //!   an edge is (re-)processed iff it is new — idempotency, scheduling,
-//!   and summary storage from one mechanism.
+//!   and summary storage come from one mechanism.
 //! - **Dispatch rule**: a call node gets `process_call` only
-//!   (call-to-return edges carry the bypass flow); an exit node gets
-//!   `process_exit` AND, when it has successors, normal flow too — a
-//!   `Throw` in a protected block is both an exit and a normal node
-//!   (heros.md §1.2).
+//!   (call-to-return edges carry caller-local bypass flow); an exit node
+//!   gets `process_exit` AND, when it has intraprocedural successors, normal
+//!   flow too — an `Op::Throw` in a protected block is both a function exit
+//!   and an intraprocedural exceptional-dispatch source.
 //!
-//! ## What the v0.2 IR changes (heros.md §8)
+//! ## SSA IR supergraph representation (`design/ir.md`)
 //!
 //! - Nodes are [`InstId`]s; function identity is recovered via a
-//!   block→function index. Facts are client-defined but SHOULD be
-//!   newtypes over interned ids (`ValueId`-keyed, T1): then path-edge
-//!   hashing/equality are integer compares and the whole class of
-//!   identity-vs-equality hazards (heros.md §7 items 2–3) disappears.
-//! - Exceptional flow is first-class (T5): every may-throw instruction in
-//!   a protected block has an exceptional successor (the handler entry);
-//!   a call's return sites are a COLLECTION (normal continuation +
-//!   handler entries), which is exactly heros'
-//!   `getReturnSitesOfCallAt`-returns-many discipline. Function exits are
-//!   `Return` terminators and `Op::Throw` instructions (the only op with
-//!   an explicit thrown value); conditional throws in unprotected blocks
-//!   raise runtime-constructed errors that carry no user values, so they
-//!   are not exit nodes (documented modeling choice).
-//! - Determinism: FIFO worklist + insertion-ordered sets
-//!   ([`VecSet`], the LinkedHashMap discipline of heros.md §5 item 4)
-//!   everywhere the solver iterates; `HashMap`s are only ever looked up,
-//!   never iterated.
+//!   block→function index. Facts are client-defined and should be
+//!   newtypes over interned ids (`ValueId`-keyed) so path-edge hashing and
+//!   equality reduce to integer comparisons.
+//! - Exceptional flow is first-class: every may-throw instruction in
+//!   a protected block has an exceptional successor (the handler entry), and
+//!   a call's return sites form a COLLECTION (normal continuation +
+//!   handler entries) so callee-thrown values flow to caller catch handlers
+//!   via return-flow edges. Function exits are `Return` terminators and
+//!   `Op::Throw` instructions; conditional runtime throws in unprotected
+//!   blocks construct engine errors carrying no user SSA values, so they are
+//!   not modeled as value-carrying exits (handlers still observe them via
+//!   `ExceptionParam` when protected).
+//! - Determinism (N20): FIFO worklist + insertion-ordered sets
+//!   ([`VecSet`]) everywhere the solver iterates; `HashMap`s are lookup-only
+//!   and never iterated.
 //!
 //! ## The client contract ([`IfdsProblem`])
 //!
-//! `abcd-taint` (v2-P5b) plugs in its fact type + the four flow functions
-//! + seeds WITHOUT touching internals. The solver owns: the worklist,
-//!   anchoring, zero-fact propagation (when the source is the zero fact the
-//!   zero fact is always among the targets — the `autoAddZero`/`ZeroedFlow
-//! Functions` pattern, here unconditional), summary wiring, and
-//!   determinism. Flow functions receive the [`Module`] and push results
-//!   into a caller-provided `Vec` (no per-edge allocation); they must be
-//!   deterministic and must not treat `None` call/return-site arguments
-//!   (unbalanced returns) as unreachable.
+//! Downstream clients (`abcd-taint`) plug in their fact type + the four flow
+//! functions + seeds without touching solver internals. The solver owns the
+//! worklist, start-point anchoring, unconditional zero-fact (`Λ`)
+//! preservation (whenever the source is `zero()`, `zero()` is automatically
+//! retained among the targets), summary wiring, and deterministic ordering.
+//! Flow functions receive the [`Module`] and push results into a
+//! caller-provided `Vec`; they must be deterministic and tolerate `None`
+//! call/return-site arguments under unbalanced returns.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
 use abcd_ir::{BlockId, FuncId, InstId, Module, Op};
 
-/// An insertion-ordered set (the `LinkedHashSet` discipline, heros.md §5
-/// item 4, without an external dependency): membership is O(1),
-/// iteration is insertion order. Every structure the solver ITERATES is
-/// one of these (or a plain Vec); HashMaps are lookup-only.
+/// An insertion-ordered set (`design/decisions.md` N20): membership is
+/// `O(1)`, iteration follows insertion order. Every structure the solver
+/// ITERATES is a `VecSet` or `Vec`; `HashMap`s are lookup-only.
 #[derive(Clone, Debug)]
 pub struct VecSet<T> {
     items: Vec<T>,
@@ -122,10 +118,10 @@ impl<T: Clone + Eq + Hash> VecSet<T> {
     }
 }
 
-/// The call-graph seam the solver consumes (analysis-strategy.md §5.4:
-/// "the solver consumes the graph only through query methods", so batch
-/// vs on-the-fly stays swappable behind the trait — the ICFG indirection
-/// of driver.md §5). Implemented by [`crate::callgraph::CallGraph`].
+/// The call-graph seam the solver consumes (`design/analysis.md`:
+/// consuming call edges strictly through query methods keeps batch vs
+/// on-the-fly call graphs swappable). Implemented by
+/// [`crate::callgraph::CallGraph`].
 pub trait CallGraphOracle {
     /// The resolved callees of a call instruction; empty when the site is
     /// unresolved ([`crate::callgraph::CallTargets::UnknownCallees`]).
@@ -285,9 +281,8 @@ impl<'m> Supergraph<'m> {
     }
 
     /// Return sites of a call: ALL instruction successors — the normal
-    /// continuation AND the exceptional handler entries (heros'
-    /// `getReturnSitesOfCallAt` returning a collection; exceptions from
-    /// the callee flow to the caller's handlers through return flow).
+    /// continuation AND the exceptional handler entries (exceptions thrown
+    /// inside a callee propagate to caller catch handlers via return flow).
     fn return_sites_of_call(&self, call: InstId) -> &[InstId] {
         self.normal_succs(call)
     }
@@ -295,26 +290,25 @@ impl<'m> Supergraph<'m> {
 
 /// The client problem: fact type + the four flow functions + seeds.
 ///
-/// `Fact` should be a newtype over interned ids (analysis-strategy §5.1:
-/// "facts interned via `ValueId`"); it must be cheap to clone and have
-/// semantic `Eq`/`Hash`. The [`IfdsProblem::zero`] fact must not equal
-/// any real fact (heros.md §2 item 4).
+/// `Fact` should be a newtype over interned ids (`design/analysis.md`); it
+/// must be cheap to clone and have semantic `Eq`/`Hash`. The
+/// [`IfdsProblem::zero`] fact (`Λ`) must not equal any domain fact.
 pub trait IfdsProblem {
     /// The data-flow fact.
     type Fact: Clone + Eq + Hash + std::fmt::Debug;
 
-    /// The zero (Λ) fact — the "rest of the program state" placeholder.
+    /// The zero (Λ) fact — the tautological fact from which new facts can be generated.
     fn zero(&self) -> Self::Fact;
 
     /// Initial seeds: `(function, fact)` pairs, planted at the function's
-    /// start point. (Heros seeds per-statement; anchoring at start points
-    /// keeps the callee self-loop discipline uniform — heros.md §1.3.)
+    /// start point (anchoring at function entry points keeps the callee
+    /// self-loop summary discipline uniform).
     fn initial_seeds(&self) -> Vec<(FuncId, Self::Fact)>;
 
     /// Intraprocedural edge, including exceptional edges and phi-entry
     /// edges (`succ` may be a phi instruction; the incoming edge is
     /// recoverable from `curr`'s block). `succ` is passed so
-    /// branch-sensitive analyses can split (heros.md §2).
+    /// branch-sensitive analyses can split on the outgoing edge.
     fn normal_flow(
         &self,
         module: &Module,
@@ -337,10 +331,10 @@ pub trait IfdsProblem {
 
     /// Return edge out of `callee`'s `exit` instruction back to the call
     /// site. `call_site`/`return_site` are `None` under unbalanced
-    /// returns of caller-less functions (heros.md §1.7: the flow function
-    /// is still invoked — it may have side effects such as registering a
-    /// taint — and must null-tolerate the arguments).
-    // Each argument is a distinct heros flow-function input; a bundling
+    /// returns of caller-less functions (the flow function is still invoked
+    /// — it may record an external-return sink — and must tolerate `None`
+    /// call/return sites).
+    // Each argument is a distinct IFDS return-flow input; a bundling
     // struct would only rename the plumbing.
     #[allow(clippy::too_many_arguments)]
     fn return_flow(
@@ -369,16 +363,16 @@ pub trait IfdsProblem {
 /// Solver configuration.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IfdsConfig {
-    /// Follow returns past seeds (heros.md §1.7): when a callee was
-    /// entered only via a seed, its exit facts return to ALL call sites
-    /// the call graph knows — and when it has no callers at all, the
-    /// return flow function is still invoked once with `None` arguments.
+    /// Follow returns past seeds: when a callee was entered only via an
+    /// initial seed (`Λ`), its exit facts return to ALL call sites the call
+    /// graph knows — and when it has no callers at all, the return flow
+    /// function is still invoked once with `None` call/return sites.
     pub follow_returns_past_seeds: bool,
 }
 
 /// A path edge: `(source fact, target node, target fact)`. The source
-/// statement is omitted by design (heros.md §5 item 1) — it is the start
-/// point of the fact's anchor function.
+/// statement is omitted by design — it is always the start point of the
+/// fact's anchor function.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PathEdge<D> {
     /// The fact at the anchor function's start point.
@@ -431,20 +425,18 @@ pub struct IfdsSolver<'m, 'p, P: IfdsProblem, C: CallGraphOracle> {
     config: IfdsConfig,
     graph: Supergraph<'m>,
     /// The jump-function table for the binary lattice: the set of
-    /// propagated path edges (TOP-as-absent — heros.md §5 item 5).
+    /// propagated path edges (sparse TOP-as-absent representation).
     edge_set: HashSet<(P::Fact, InstId, P::Fact)>,
     /// Reverse index: `(target node, target fact)` → source facts
-    /// (heros' `nonEmptyReverseLookup`; `process_exit` iterates it for
-    /// caller-side continuation).
+    /// (`process_exit` iterates it for caller-side path continuation).
     by_target: HashMap<(InstId, P::Fact), VecSet<P::Fact>>,
     /// `(callee start point, callee entry fact)` → `(call site, fact at
-    /// the call)` — the summary-wiring key (heros.md §1.4 item 2).
+    /// the call)` — the incoming-call table for summary replay.
     incoming: FactPairIndex<P::Fact>,
     /// `(callee start point, anchor fact)` → `(exit node, exit fact)` —
-    /// computed summaries awaiting replay (heros.md §1.5 item 1).
+    /// computed procedure summaries awaiting replay.
     end_summary: FactPairIndex<P::Fact>,
-    /// The worklist (FIFO — deterministic; heros' executor queue,
-    /// single-threaded).
+    /// The worklist (deterministic single-threaded FIFO queue).
     worklist: VecDeque<PathEdge<P::Fact>>,
     /// Propagation order record (the result).
     ordered_edges: Vec<PathEdge<P::Fact>>,
@@ -471,9 +463,9 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         }
     }
 
-    /// The single chokepoint for the join and the worklist (heros.md
-    /// §1.3): an edge is processed iff it is new. For the binary lattice
-    /// the join is set union, so "strictly improved" = "absent before".
+    /// The single chokepoint for the join and the worklist: an edge is
+    /// processed iff it is new. Over the binary lattice the join is set
+    /// union, so "strictly improved" reduces to "absent before".
     fn propagate(&mut self, source: P::Fact, target_node: InstId, target_fact: P::Fact) {
         let key = (source.clone(), target_node, target_fact.clone());
         if !self.edge_set.insert(key) {
@@ -496,10 +488,9 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         self.worklist.push_back(edge);
     }
 
-    /// Compute a flow function's targets, enforcing the zero rule: when
-    /// the source is the zero fact, the zero fact is always among the
-    /// targets (`ZeroedFlowFunctions`, heros.md §1.8 — unconditional
-    /// here, so clients can never forget it).
+    /// Compute a flow function's targets, enforcing unconditional zero (`Λ`)
+    /// preservation: whenever `source == zero()`, `zero()` is guaranteed to
+    /// remain among the output facts.
     fn compute_targets(
         &self,
         source: &P::Fact,
@@ -514,10 +505,10 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         out
     }
 
-    /// Run phase I to the fixed point and return the reachability result.
+    /// Run tabulation to the fixed point and return the reachability result.
     pub fn solve(mut self) -> IfdsResult<P::Fact> {
-        // Seeds (heros.md §1.3: plant the zero self-loop at the start
-        // point, then propagate each seed fact from zero).
+        // Plant the zero self-loop `(Λ, sp, Λ)` at each seeded function's
+        // start point, then propagate each initial seed fact from `Λ`.
         let zero = self.problem.zero();
         for (func, fact) in self.problem.initial_seeds() {
             let Some(sp) = self.graph.start_point(func) else {
@@ -531,7 +522,7 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             let n = edge.target_node;
             if self.graph.is_call(n) {
                 // A call node is NEVER normal-flow processed: the
-                // call-to-return edge carries the bypass (heros.md §1.2).
+                // call-to-return edge carries the caller-local bypass.
                 self.process_call(edge);
             } else {
                 if self.graph.is_exit(n) {
@@ -551,8 +542,8 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         }
     }
 
-    /// Normal flow over intraprocedural successors (incl. exceptional
-    /// edges — heros.md §8 item 1: exceptional flow is native here).
+    /// Normal flow over intraprocedural successors (including first-class
+    /// exceptional edges).
     fn process_normal(&mut self, edge: PathEdge<P::Fact>) {
         let n = edge.target_node;
         for &succ in self.graph.normal_succs(n).to_vec().iter() {
@@ -565,7 +556,7 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         }
     }
 
-    /// Caller side (heros.md §1.4): callee entry + summary replay +
+    /// Caller-side tabulation: callee entry self-loops + summary replay +
     /// call-to-return bypass.
     fn process_call(&mut self, edge: PathEdge<P::Fact>) {
         let n = edge.target_node;
@@ -586,7 +577,7 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
                 self.propagate(d3.clone(), sp, d3.clone());
                 // Register the incoming edge, then replay any summaries
                 // computed before this call edge was seen (second-arriver
-                // replay, heros.md §1.4 item 2).
+                // replay).
                 self.incoming
                     .entry((sp, d3.clone()))
                     .or_default()
@@ -610,8 +601,8 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         }
 
         // Call-to-return flow: facts the callee cannot affect bypass the
-        // call (heros.md §1.4 item 3). This also covers UNKNOWN callees —
-        // caller-side facts always survive the call site.
+        // call. This also covers UNKNOWN callees — caller-side facts always
+        // survive across the call site.
         for ret_site in self.graph.return_sites_of_call(n).to_vec() {
             let d6s = self.compute_targets(&d2, |p, m, src, out| {
                 p.call_to_return_flow(m, n, ret_site, src, out);
@@ -622,7 +613,7 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
         }
     }
 
-    /// Callee side (heros.md §1.5): record the summary edge, then return
+    /// Callee-side tabulation: record the summary edge, then apply return
     /// flow to every recorded caller.
     fn process_exit(&mut self, edge: &PathEdge<P::Fact>) {
         let n = edge.target_node;
@@ -652,9 +643,8 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
                     p.return_flow(m, Some(*call_site), func, n, Some(ret_site), src, out);
                 });
                 for d5 in d5s {
-                    // Continue every caller-side path that reached
-                    // `(call_site, d4)` — the f3 iteration of heros.md
-                    // §1.5 item 2 over the reverse lookup.
+                    // Continue every caller-side path `(d3 -> call_site, d4)`
+                    // recorded in the reverse path-edge index.
                     let callers: Vec<P::Fact> = self
                         .by_target
                         .get(&(*call_site, d4.clone()))
@@ -667,7 +657,7 @@ impl<'m, 'p, P: IfdsProblem, C: CallGraphOracle> IfdsSolver<'m, 'p, P, C> {
             }
         }
 
-        // Unbalanced returns (heros.md §1.7): seeded-but-never-called
+        // Unbalanced returns (`follow_returns_past_seeds`): seeded-but-never-called
         // functions return to every known call site; caller-less
         // functions still get one return-flow invocation with `None`s.
         if self.config.follow_returns_past_seeds && d1 == self.problem.zero() && inc.is_empty() {

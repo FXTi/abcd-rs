@@ -1,21 +1,18 @@
 //! Analysis infrastructure shared by the passes: CFG traversal and value
-//! replacement (the v0.1 `abcd-ir/src/analysis/mod.rs` subset the
-//! optimizer used, ported to the v0.2 edge-typed CFG).
+//! replacement over the edge-typed SSA CFG (`design/ir.md`).
 //!
-//! v0.2 differences from v0.1 (T5): CFG edges are kinded
-//! ([`EdgeKind::Normal`] terminator successors vs
-//! [`EdgeKind::Exceptional`] try→handler dispatch), predecessor lists are
+//! CFG edges are kinded (`T5`): [`EdgeKind::Normal`] terminator successors vs
+//! [`EdgeKind::Exceptional`] try→handler dispatch; predecessor lists are
 //! `Vec<Edge>`, and phi entries key on full [`abcd_ir::Edge`]s. Successor
-//! iteration order matches v0.1 exactly (terminator successors first,
-//! then region handlers in region order) so pass output stays
-//! byte-comparable with the v0.1 oracle.
+//! iteration order is deterministic: terminator successors first, followed by
+//! protecting try-region handlers in region-then-catch order.
 
 use std::collections::{HashMap, HashSet};
 
 use abcd_ir::function::FunctionData;
 use abcd_ir::{BlockId, EdgeKind, FuncId, Module, Op, ValueId};
 
-/// Terminator (Normal-edge) successors of a block (v0.1 `block_succs`).
+/// Terminator ([`EdgeKind::Normal`]) successors of a block.
 ///
 /// Deliberately terminator-only: CFG-merge/redirect eligibility must not
 /// see exception edges (a try body may merge with its fallthrough
@@ -41,20 +38,20 @@ pub fn normal_succs(module: &Module, block: BlockId) -> Vec<BlockId> {
     }
 }
 
-/// Successors of `block` INCLUDING exception dispatch edges (v0.1
-/// `augmented_succs`): the terminator successors as
-/// [`EdgeKind::Normal`] edges plus, for every try region that protects
-/// `block`, each of the region's catch handlers as an
+/// Successors of `block` INCLUDING exception dispatch edges: the terminator
+/// successors as [`EdgeKind::Normal`] edges plus, for every try region that
+/// protects `block`, each of the region's catch handlers as an
 /// [`EdgeKind::Exceptional`] edge. Returns `(successor, kind)` pairs
 /// (the CFG stores edges successor-side as [`abcd_ir::Edge`], so the
 /// successor is not part of the edge record itself). Exception dispatch transfers control
 /// from any protected instruction to the handler without a
 /// terminator-level edge, so any analysis that reasons about
-/// reachability or value flow must use this relation (N11/N38(i)).
+/// reachability or value flow must use this relation (`N11`/`N38(i)`,
+/// `design/decisions.md`).
 ///
 /// Entries are deduplicated by `(successor, kind)` pair: a handler that
 /// is also a terminator successor legitimately appears twice, once per
-/// kind — the v0.2 verifier requires both pred forms. Handler blocks no
+/// kind — the IR verifier requires both pred forms. Handler blocks no
 /// longer owned by `func` (partially pruned metadata) are skipped, so
 /// this never hands out dangling [`BlockId`]s.
 ///
@@ -154,7 +151,7 @@ pub(crate) fn resolve_subst(replacements: &HashMap<ValueId, ValueId>, mut v: Val
 }
 
 /// Replace all uses of `old` with `new_val` across every instruction in
-/// `func` (v0.1 `replace_uses_in_func`). Returns the number of
+/// `func`. Returns the number of
 /// replacements made. Uses are enumerated exclusively through
 /// [`Op::operands_mut`], the single mutation point, so no operand role
 /// can be missed (phi entries, call args, branch conditions, …).

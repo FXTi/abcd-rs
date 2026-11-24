@@ -1,8 +1,8 @@
 //! Produce an encodable [`abcd_file::MethodBody`] from a lowered function.
 //!
 //! [`lower_function`](crate::lower_function) emits entity operands whose
-//! raw values are v0.2 IR identities (never source-file offsets —
-//! design/ir-v0.2.md §6.2):
+//! raw values are module-scoped IR identities (never source-file offsets —
+//! `design/ir.md` §1, `design/decisions.md` `ADR-01`):
 //!
 //! - `StringId` operands carry the raw [`Sym`] arena index;
 //! - `MethodId` operands carry the module function-table index
@@ -106,8 +106,8 @@ pub fn lower_module_bodies(
     results.into_iter().collect()
 }
 
-/// Module-scoped reverse entity resolver: v0.2 IR identities → source-file
-/// offsets (#29).
+/// Module-scoped reverse entity resolver: IR identities → source-file
+/// offsets (`design/ir.md` §5, `ADR-10`).
 ///
 /// Built once per `(Module, File)` pair and safe to share across threads
 /// (`Sync`). All lookups (`string_offset`, `method_offset`,

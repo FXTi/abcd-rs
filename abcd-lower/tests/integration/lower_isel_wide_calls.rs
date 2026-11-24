@@ -1,8 +1,7 @@
-//! P3 regression (S2 + N4, v0.2 port of
-//! `abcd-ir/tests/lower_isel_wide_calls.rs`): wide range-call selection,
+//! Regression tests (`S2` + `N4`, `ADR-03`): wide range-call selection,
 //! consecutive argument windows, and high-register acc routing.
 //!
-//! Vendor facts (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml):
+//! Vendor facts (`vendor/arkcompiler_runtime_core/static_core/isa/isa.yaml` / dynamic ISA):
 //! - `callrange imm1:u8, imm2:u8, v:in:top` (~:1082): u8 argc, u8 window
 //!   start. `wide.callrange imm:u16, v:in:top` (~:1087): u16 argc, but the
 //!   start register is STILL u8, and the wide form has NO IC slot operand.

@@ -1,105 +1,83 @@
 # abcd-rs
 
-[![CI](https://github.com/FXTi/abcd-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/FXTi/abcd-rs/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/github/FXTi/abcd-rs/graph/badge.svg)](https://codecov.io/github/FXTi/abcd-rs)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+A high-performance Rust toolkit for inspecting, disassembling, assembling, optimizing, rewriting, statically analyzing, and decompiling OpenHarmony / HarmonyOS NEXT ArkCompiler (`.abc`) bytecode and application packages (`.hap`, `.hsp`, `.app`, `.hqf`).
 
-A Rust toolkit for ArkCompiler bytecode (`.abc`) files and OpenHarmony application containers (`.hap`, `.hsp`, `.app`, `.hqf`) — decode, assemble/disassemble, optimize, analyze, taint-track, and decompile via a format-independent SSA intermediate representation.
+---
 
-## Workspace layout
+## Features
+
+- **Container & `.abc` Codec (`abcd-hap`, `abcd-file`, `abcd-isa`)**:
+  - Pure-Rust, zero-C reader for `.hap`, `.hsp`, `.app`, and `.hqf` packages (signing-block tolerant, borrowed Stored fast path).
+  - Full `.abc` `decode` & `encode` across modern formats (`9.0.0.0`–`24.0.0.0`, including `20+ MB` commercial `--merge-abc` bundles) plus legacy `0.0.0.2` decoding.
+  - Byte-identical `.pa` disassembler (`abcd dis`, `5,517/5,517` vs. upstream `ark_disasm`) and semantic `.pa` assembler (`abcd asm`).
+- **Format-Independent `88`-Op SSA IR & Rewriter (`abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`)**:
+  - Braun SSA lifting, `Effects`-driven optimization (`Peephole`, `SCCP`, `ADCE` + `CfgSimplify`, `CopyProp`, intra-module `inline`), chordal MCS register allocation, `acc`-as-cache instruction selection, and per-method `u16` entity compaction.
+- **Interprocedural Static & Taint Analysis (`abcd-analysis`, `abcd-taint`)**:
+  - Iterative Cooper–Harvey–Kennedy dominators, pattern-independent region trees, IFDS tabulation solver, `3`-rung alias & `k=1` whole-module pointer analysis (`PTA`) with on-the-fly call-graph co-evolution, cross-module ES linking, Stage/FA/ArkUI lifecycle synthesis, and curated `@ohos.*` / `@kit.*` security rules.
+- **JS / TS & ArkUI Decompiler (`abcd-decompile`)**:
+  - Three-stage expression, control-flow, and state-machine (`function*`, `async`, `async*`, `yield*`, `for await..of`) recovery (`1,149/1,149` corpus dream gate, `2,676/2,685` `test262` dream gate), `--split-modules` multi-file bundle recovery, and `--arkui` `@Component struct` reconstruction.
+
+---
+
+## Workspace Crates
 
 | Crate | Description |
-|-------|-------------|
-| [`abcd-isa-sys`](abcd-isa-sys) | C FFI bindings for the bytecode ISA (pre-generated ISA/FFI bindings + C++ bridge) |
-| [`abcd-isa`](abcd-isa) | Safe Rust API: bytecode decode/encode (including legacy `0.0.0.2`), entity relocation, versions |
-| [`abcd-file-sys`](abcd-file-sys) | C FFI bindings for the `.abc` container format (`libpandafile` accessors + builder) |
-| [`abcd-file`](abcd-file) | Safe Rust API: read / write / inspect `.abc` files + `ark_disasm`-compatible `pandasm` text disassembler/assembler |
-| [`abcd-hap`](abcd-hap) | Pure-Rust in-memory reader for OpenHarmony `.hap` / `.hsp` / `.app` / `.hqf` ZIP containers |
-| [`abcd-ir`](abcd-ir) | Format-independent SSA IR: module/class/function arenas, 88-op taxonomy, effects table, type lattice, verifier |
-| [`abcd-lift`](abcd-lift) | Lifter: container → IR (`abcd_file::File` → `abcd_ir::Module`, CFG + Braun SSA + `--merge-abc` metadata) |
-| [`abcd-opt`](abcd-opt) | SSA optimization passes (`IR → IR`): peephole, SCCP, ADCE + CFG simplify, copyprop, opt-in inliner |
-| [`abcd-lower`](abcd-lower) | Lowering: IR → bytecode (`abcd_ir::Module` → `abcd_file::MethodBody`, chordal MCS regalloc + `acc-as-cache` isel) |
-| [`abcd-analysis`](abcd-analysis) | Format-independent analysis infra: dominators, loops, region structuring, IFDS skeleton, alias ladder (rungs 0–2 PTA), call graph, cross-module ES linker, OHOS lifecycle harness |
-| [`abcd-taint`](abcd-taint) | Interprocedural IFDS taint analysis: access-path facts, summary registry, callback gap propagation, prototype resolution, OpenHarmony `@ohos.*`/`@kit.*` rule pack |
-| [`abcd-decompile`](abcd-decompile) | Bytecode → JS/TS/ArkTS decompiler on the lifted SSA IR (`--split-modules` tree recovery, `--arkui` component reconstruction, precedence-exact emission) |
-| [`abcd-cli`](abcd-cli) | The `abcd` CLI binary (`extract`, `info`, `dis`, `asm`, `decompile`, `rewrite`, `analyze`, `taint`) |
+| :--- | :--- |
+| [`abcd-isa-sys`](abcd-isa-sys/README.md) | Vendored C++17 `BytecodeEmitter` & version FFI bridge + pre-generated ISA tables |
+| [`abcd-isa`](abcd-isa/README.md) | Safe `Bytecode` enum, modern & legacy `0.0.0.2` decoders, encoder, and entity relocation |
+| [`abcd-file-sys`](abcd-file-sys/README.md) | Exception-guarded, span-clamped C99 FFI bridge over vendored `libpandafile` |
+| [`abcd-file`](abcd-file/README.md) | `.abc` `decode` / `encode`, lossless MUTF-8 `StringPool`, and `pandasm` `.pa` text layer |
+| [`abcd-hap`](abcd-hap/README.md) | Pure-Rust `.hap` / `.hsp` / `.app` / `.hqf` container reader |
+| [`abcd-ir`](abcd-ir/README.md) | Format-independent `88`-op SSA IR, `Effects`, `Ty`, `frame::FrameSlots`, and verifier |
+| [`abcd-lift`](abcd-lift/README.md) | `abcd_file::File` → `abcd_ir::Module` lifter |
+| [`abcd-opt`](abcd-opt/README.md) | SSA optimization passes (`Peephole`, `SCCP`, `ADCE`, `CopyProp`, `inline`) |
+| [`abcd-lower`](abcd-lower/README.md) | `abcd_ir::Module` → `abcd_file::File` register allocator & bytecode lowerer |
+| [`abcd-analysis`](abcd-analysis/README.md) | Dominators, region trees, IFDS solver, Rung `0`–`2` alias/PTA, call graph, and OHOS linker |
+| [`abcd-taint`](abcd-taint/README.md) | Access-path IFDS taint analyzer, callback-gap summaries, and OpenHarmony (`ohos`) preset |
+| [`abcd-decompile`](abcd-decompile/README.md) | Bytecode → JS/TS decompiler with `--split-modules` and `--arkui` modes |
+| [`abcd-cli`](abcd-cli/README.md) | Unified `abcd` command-line binary |
 
-*(The root `abcd-rs` Cargo package is a non-published container for the cross-crate integration and corpus suites under [`tests/`](tests).)*
+---
 
-```
-.hap/.hsp/.app/.hqf ──abcd-hap──▶ .abc bytes ◀──pandasm dis/asm──▶ .pa text
-                                      │  ▲
-                         decode       ▼  │       encode
-                                  abcd-file  (abcd-file-sys / abcd-isa underneath)
-                                      │  ▲
-                           lift       ▼  │       lower
-                                  abcd-ir (SSA) ──opt──▶ abcd-ir
-                                      │
-                                      ▼
-                                abcd-analysis
-                                  ├──▶ abcd-taint     ──▶ taint report
-                                  └──▶ abcd-decompile ──▶ .js / .ts source
-```
+## Building & Quick Start
 
-Layering invariant: **`abcd-ir`**, **`abcd-opt`**, **`abcd-analysis`**, **`abcd-taint`**, and **`abcd-decompile`** are strictly format-independent — their library `[dependencies]` never reference `abcd-file` or `abcd-isa`. Only **`abcd-lift`** and **`abcd-lower`** bridge between the container layer and the IR.
-
-## Quick start
-
-### CLI (`abcd`)
+Requires a stable Rust toolchain (`1.85+`, Edition 2024) and a standard host C++17 compiler (`clang++`, `g++`, or MSVC)—no Git submodules, Ruby, `bindgen`, or `libclang` are needed at build time.
 
 ```sh
-cargo run -p abcd-cli -- info modules.abc --verify
-cargo run -p abcd-cli -- extract app.hap -o extracted/
-cargo run -p abcd-cli -- dis modules.abc -o modules.pa
-cargo run -p abcd-cli -- decompile app.hap --module entry -o entry.js
-cargo run -p abcd-cli -- decompile app.hap --module entry --split-modules --arkui -o src_out/
-cargo run -p abcd-cli -- rewrite input.abc --opt --check -o opt.abc
-cargo run -p abcd-cli -- analyze input.abc --callgraph --dominators
-cargo run -p abcd-cli -- taint input.abc --config taint.toml
-cargo run -p abcd-cli -- taint app.hap --preset ohos
-cargo run -p abcd-cli -- taint app.app --all --link-modules --preset ohos
+cargo build --release -p abcd-cli
+
+# Inspect or disassemble an .abc file or .hap/.app package directly
+./target/release/abcd info app.hap
+./target/release/abcd dis app.hap --module entry -o entry.pa
+
+# Decompile a merged bundle into a source tree with ArkUI @Component sugar
+./target/release/abcd decompile app.hap --split-modules --arkui -o out_src/
+
+# Run cross-module OpenHarmony taint analysis
+./target/release/abcd taint app.hap --all --link-modules --preset ohos --json
+
+# Optimize and rewrite bytecode with post-encode verification
+./target/release/abcd rewrite input.abc --opt --check -o optimized.abc
 ```
 
-### Library API
+---
 
-```rust,no_run
-use abcd_file::{File, decode};
+## Testing & Documentation
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let data = std::fs::read("input.abc")?;
-    let file: File = decode(&data)?;
-    for (desc_id, class) in &file.classes {
-        let desc = file.strings.resolve(*desc_id).unwrap_or("<invalid>");
-        println!("{desc}: {} methods", class.methods.len());
-    }
-    Ok(())
-}
-```
-
-## Design documentation
-
-Architecture, format research, and subsystem designs live in [`design/`](design/README.md):
-
-- [Overview](design/overview.md) — 13-crate architecture, dependency graph, data flow, compatibility matrix
-- [ISA](design/isa.md) & [ISA Compatibility](design/isa-compat.md) — offline Ruby codegen, bytecode decode/encode, legacy `0.0.0.2` support
-- [File Format](design/file-format.md) & [HAP Containers](design/abcd-hap-research.md) — `.abc` container layout, `--merge-abc` records, FFI bridge, ZIP container reader
-- [IR v0.2](design/ir-v0.2.md) & [IR Background](design/ir.md) — SSA IR specification, frame-slot call contract, T1–T10 taint invariants, lift/opt/lower algorithms
-- [Analysis Strategy](design/analysis-strategy.md) — IFDS solver, rungs 0–2 alias/PTA ladder, summary & callback-gap model
-- [Decompiler](design/decompile.md) — Stages A/B/C expression recovery, region structuring, and JS/TS emission
-- [Vendor Sync](design/vendor-sync.md) & [CI/CD](design/ci.md) — curated `vendor/` snapshot, offline codegen verification, tag radar, and the 21-job CI pipeline
-
-## Building
+Local verification runs natively with **zero Docker / OrbStack dependency**:
 
 ```sh
-git clone https://github.com/FXTi/abcd-rs.git
-cd abcd-rs
-cargo build --release
+./scripts/test-local.sh quick    # Fast fmt + clippy + unit tests (<5s incremental)
+./scripts/test-local.sh full     # Full L1 static gates + synthetic workspace suite (<15s)
+./scripts/test-local.sh all      # Full L1 + local corpus suites when exports/ is present
 ```
 
-Building requires only a stable **Rust** toolchain and a **C++17** compiler (`clang++`, `g++`, or MSVC). Upstream `arkcompiler_runtime_core` C++ sources live in a lightweight, test-stripped snapshot under [`vendor/`](vendor) (`1.8 MB`, verified by per-file SHA-256 in [`vendor/UPSTREAM.toml`](vendor/UPSTREAM.toml)), and all Ruby/FFI bindings are pre-generated in the tree — no git submodules, Ruby, or `libclang`/`bindgen` are needed on any platform (including Windows).
+Cross-OS builds (`6` 64-bit + `3` 32-bit targets), nightly Rust/C++ AddressSanitizer, `llvm-cov` coverage, and Docker-backed `ark_js_vm` / `es2abc` oracle comparisons run across the **`26`-job CI pipeline** (`.github/workflows/ci.yml`).
 
-Maintainers updating the upstream snapshot, `.erb` templates, or C bridge headers run `python3 scripts/vendor-gen.py codegen` (requires Python 3, Ruby, and `rustfmt`; verified in CI by `vendor-verify`).
+- [**Architecture & Design Index (`design/README.md`)**](design/README.md)
+- [**Engineering Standards (`design/standards.md`)**](design/standards.md) & [**Design Decisions (`design/decisions.md`)**](design/decisions.md)
+- [**Contributor & Agent Guide (`AGENTS.md`)**](AGENTS.md)
 
 ## License
 
-Apache-2.0. [`vendor/arkcompiler_runtime_core/`](vendor/arkcompiler_runtime_core) vendors a curated subset of [OpenHarmony `arkcompiler_runtime_core`](https://github.com/openharmony/arkcompiler_runtime_core) (also Apache-2.0), pinned by SHA-256 manifest in [`vendor/UPSTREAM.toml`](vendor/UPSTREAM.toml).
+Apache-2.0.

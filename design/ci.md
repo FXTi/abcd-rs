@@ -1,57 +1,52 @@
-# CI/CD & Local Testing Design
+# Continuous Integration & Verification Architecture
 
-## Local developer & agent testing (`scripts/test-local.sh`)
+`abcd-rs` combines fast, zero-container local verification (`scripts/test-local.sh`) with a **`26`-job GitHub Actions CI pipeline** (`.github/workflows/ci.yml`) covering cross-platform compatibility, memory safety, code coverage, and full-corpus `ark_js_vm` / `es2abc` behavioral oracles.
 
-Local development and agent workflows **never invoke OrbStack or local Docker** (`scripts/test-local.sh` explicitly poisons `DOCKER_HOST`). Container-backed `es2abc` / `ark_js_vm` oracle comparisons and non-host OS/architecture builds run exclusively in GitHub Actions CI.
+---
 
-`.cargo/config.toml` sets `debug = "line-tables-only"` for `dev` and `test` profiles so panic backtraces preserve exact `file:line` frames without emitting multi-hundred-MB DWARF variable/type sections across the workspace's 35 test binaries.
+## 1. Local Zero-Container Workflow
 
-| Local Tier | Command | Dependencies | Scope |
-|---|---|---|---|
-| **Crate** | `scripts/test-local.sh crate <pkg>` | Pure Rust | Single-crate `--lib --tests` + `clippy --no-deps -D warnings` (sub-crate maintainer loop) |
-| **L1 — Fast** | `scripts/test-local.sh` (`fast`) | Pure Rust | Full workspace unit + synthetic integration tests across all 13 crates (`< 3s` warm) |
-| **L2 — Offline Corpus** | `scripts/test-local.sh corpus` | Local `exports/corpus` + `python3` + `node` (zero Docker) | All 5,517 corpus fixtures + 156 wild `.hap` packages (`decode`, `pandasm` byte-identity + `asm`, `lift + verify`, fused `analysis`, `taint` probes + smoke, `lower` 3-variant determinism, `decompile` Stage A/B/C + `wild_gate_offline` `--split-modules --arkui` + Node checks) |
-| **Pre-push** | `scripts/test-local.sh all` | Local `exports/corpus` (if present) | `fmt --check` + `clippy` + `rustdoc` + L1 + L2 |
+Local development **never** requires or invokes Docker / OrbStack:
 
-## CI pipeline topology (`.github/workflows/ci.yml`)
+| Mode | Command | What Runs |
+| :--- | :--- | :--- |
+| **Quick** | `./scripts/test-local.sh quick` | `cargo fmt --check`, `cargo clippy --workspace --lib --bins`, and fast workspace unit tests (`< 5s` incremental) |
+| **Full (L1)** | `./scripts/test-local.sh full` | `fmt`, `clippy --all-targets`, `cargo doc -D warnings`, `vendor-gen.py verify`, `fuzz` compile check, and all synthetic workspace tests (`< 15s`) |
+| **Corpus (L2)** | `./scripts/test-local.sh corpus` | Host-native `#[ignore]` corpus suites (`file-isa`, `hap-file`, `file-lift`, `lift-analysis`, `lift-taint`, `lift-decompile` offline gates) whenever `exports/` or `modules.abc` are present on disk |
+| **All** | `./scripts/test-local.sh all` | `full` + `corpus` |
 
-Global `RUSTFLAGS: "-D warnings"` enforces zero compiler warnings across every target. Upstream C++ sources and pre-generated Rust/C++ bindings are committed in `vendor/` and `abcd-*-sys/*/generated/`, so build and corpus runners need neither git submodule checkouts nor Ruby/`bindgen`. Member-crate integration tests are consolidated into one `tests/integration/main.rs` binary per crate to minimize linker overhead, and Docker oracle scripts (`scripts/compare-rewritten-corpus.py`, `scripts/dream-gate.py`) batch all fixture executions inside a single long-lived `--network none` container per invocation.
+---
 
-Corpus-heavy jobs run immediately after the five fast Tier-1 source/lint/rustdoc/deny/vendor-integrity gates succeed (`needs: [fmt, clippy, doc, deny, vendor-verify]`), executing in parallel with the cross-OS `build` matrix, and share `.github/actions/setup-workspace` + `.github/actions/export-corpus` for toolchain setup and digest-pinned corpus extraction.
+## 2. The `26`-Job GitHub Actions Pipeline
 
-### Tier 1 — Fast source, lint, rustdoc, fuzz-check, vendor-integrity, platform & 32-bit gates
+### Tier 1 — Fast Static Front Gates (`5` jobs)
+1. **`fmt`**: `cargo fmt --all -- --check`
+2. **`clippy`**: `cargo clippy --workspace --all-targets -- -D warnings` + `cargo check --manifest-path fuzz/Cargo.toml --bins`
+3. **`doc`**: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
+4. **`deny`**: `cargo-deny` license & advisory audit
+5. **`vendor-verify`**: `python3 scripts/vendor-gen.py verify` (locks `vendor/UPSTREAM.toml` SHA-256s + pre-generated ISA/FFI/enum bindings)
 
-| Job | Platform | Purpose |
-|-----|----------|---------|
-| `fmt` | Ubuntu | `cargo fmt --all -- --check` |
-| `clippy` | Ubuntu | `cargo clippy --workspace --all-targets -- -D warnings` + `cargo check --manifest-path fuzz/Cargo.toml --bins` |
-| `doc` | Ubuntu | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` (broken intra-doc link & rustdoc gate) |
-| `deny` | Ubuntu | `cargo deny` license and security-advisory audit |
-| `vendor-verify` | Ubuntu | `python3 scripts/vendor-gen.py verify` — SHA-256 audit of `vendor/arkcompiler_runtime_core/` against `vendor/UPSTREAM.toml` + byte-exact fresh Ruby/FFI codegen check |
-| `build` | Ubuntu / macOS / Windows (x86_64 + ARM64, 6 lanes) | `cargo build --bins` + non-ignored `cargo test` (including synthetic `--merge-abc` 4-pipeline e2e suite) across oldest supported runner images (`ubuntu-22.04`, `ubuntu-22.04-arm`, `macos-latest`, `macos-15-intel`, `windows-2022`, `windows-11-arm`) |
-| `build32` | Ubuntu (`i686-unknown-linux-gnu`) | 32-bit x86 pointer-width / FFI layout gate |
-| `win32` | Windows (`i686-pc-windows-msvc`) | 32-bit MSVC ABI + C++ bridge gate |
-| `arm32` | Ubuntu (`armv7-unknown-linux-gnueabihf` + QEMU) | 32-bit ARM alignment / signedness / FFI gate |
+### Tier 2 — Cross-OS & 32-Bit Build/Test Matrix (`9` jobs)
+- **`build` (`6` 64-bit lanes)**: `ubuntu-22.04` (`x86_64`), `ubuntu-22.04-arm` (`aarch64`), `macos-latest` (Apple Silicon), `macos-15-intel` (`x86_64`), `windows-2022` (`x86_64` MSVC), and `windows-11-arm` (`aarch64` MSVC)—each running `cargo build --workspace --bins` and `cargo test --workspace` (including `abcd-cli` + `mimalloc`).
+- **`build32` / `win32` / `arm32` (`3` 32-bit lanes)**: `i686-unknown-linux-gnu`, `i686-pc-windows-msvc`, and `armv7-unknown-linux-gnueabihf` (under `qemu-arm`).
 
-### Tier 2 — Digest-pinned corpus, `--merge-abc` oracle, VM oracle, coverage & sanitizer gates
+### Tier 3 — Corpus, Wild-OHOS & VM Oracle Gates (`10` jobs)
+Driven by the digest-pinned `ghcr.io/fxti/arkcompiler-test` image (`5,517` compiled fixtures across `6` versions × `3` profiles + `2,685` `test262` fixtures + `156` wild OpenHarmony `.hap` packages / `276` `.abc` modules):
+- **`file-isa`**: `5,517/5,517` byte-identical `abcd dis` vs. `ark_disasm`, `abcd asm` round-trip, and ISA stream parity.
+- **`hap-file`**: Extraction, decode, lift/verify across all `156` wild `.hap` packages (`276` `.abc` modules), plus full `v2lift`/`v2opt` binary rewrite & re-verify across all `242` modern wild modules.
+- **`wild-gate`**: Core-25 wild `.hap` `decompile → es2abc` recompilation, `--split-modules` & `--arkui` checks, and `scripts/wild-dream-divergences.json` fallback gate.
+- **`file-lift`**: `5,517/5,517` `decode → lift → verify_module` + optimizer verification.
+- **`lift-lower`**: Multi-module `--merge-abc` e2e oracle (`12.0.6.0`–`24.0.0.0`) + `1,149/1,149` `ark_js_vm` equivalence across `v2lift`, `v2opt`, and `v2inline`.
+- **`test262-vm`**: `2,685` `test262` bytecode rewrites compared against recorded `ark_js_vm` behavior (`scripts/test262-vm-divergences.json`).
+- **`lift-analysis` & `lift-taint`**: Dominator agreement, Rung-2 PTA call-graph determinism, compiled ground-truth taint probes, and OHOS taint probes.
+- **`lift-decompile` & `test262-dream`**: `1,149/1,149` corpus dream gate + Node async/generator/yield* runtime gates, and `2,676/2,685` `test262` `decompile → es2abc → ark_js_vm` dream gate.
 
-All corpus jobs pull the digest-pinned `ghcr.io/fxti/arkcompiler-test` image via `.github/actions/export-corpus`:
+### Tier 4 — Sanitizers & Coverage (`2` jobs)
+- **`asan`**: Nightly Rust + C++ bridge AddressSanitizer (`-Zsanitizer=address` + `-fsanitize=address`) over corpus compute suites (zero stack-size workarounds).
+- **`coverage`**: `cargo llvm-cov` workspace + C++ bridge instrumentation (`clang++-23`).
 
-| Job | Target / Script | What it proves |
-|-----|-----------------|----------------|
-| `file-isa` | `tests/file-isa` | All 5,517 `.abc` fixtures round-trip ISA bytecodes, match `ark_disasm` byte-for-byte (`pandasm::emit_file`), round-trip `pandasm` `asm` (text + binary), and preserve module/phase/entity records on rewrite |
-| `hap-file` | `tests/hap-file` | All 156 wild OHOS `.hap` packages (276 `.abc` modules, OHOS 3.2–7.0) unpack and decode cleanly in parallel |
-| `wild-gate` | `tests/lift-decompile` (`wild_gate_full`) | Core-25 wild OHOS `.hap` packages (64 `.abc` modules) decompile → `es2abc` recompile + `--split-modules --arkui` invariants + exact fallback ledger (`scripts/wild-dream-divergences.json`) |
-| `file-lift` | `tests/file-lift` | All 5,517 fixtures lift to `abcd-ir` and pass `verify_module` with zero errors |
-| `lift-lower` | `tests/lift-lower` + `tests/merge-abc` + `compare-rewritten-corpus.py` | Full rewrite (`v2lift`, `v2opt`, `v2inline`) passes `ark_js_vm` behavioral equivalence (`1,149 / 1,149`), plus `--merge-abc` multi-file `es2abc` → `decode/encode`, `pandasm`, `lift/[opt]/lower`, and `decompile` passes `ark_disasm` & `ark_js_vm` across `12.0.6.0`..`24.0.0.0` |
-| `test262-vm` | `tests/lift-lower` (`test262_vm`) + `compare-rewritten-corpus.py` | All `2,685 / 2,685` recorded `test262` fixtures pass rewrite + `ark_js_vm` behavioral comparison (`0` divergences in `scripts/test262-vm-divergences.json`) |
-| `lift-analysis` | `tests/lift-analysis` | Single-pass 5,517-fixture gate: CHK dominator agreement with `abcd-ir::verify`, region structuring totality & determinism, and call-graph + Rung-2 PTA determinism |
-| `lift-taint` | `tests/lift-taint` | Annotated taint probe ladder (`59` probes across rungs 0–2 + OHOS preset) + corpus taint determinism |
-| `lift-decompile` | `tests/lift-decompile` | Stage A (`corpus_stage_a`), full JS emission (`corpus_decompile`), project `dream_gate` (`1,149 / 1,149`), and Node behavioral tests (`async`, `async*`, `yield*`) |
-| `test262-dream` | `tests/lift-decompile` (`dream_gate_t262`) | `test262` decompile → `es2abc` → `ark_js_vm` (`2,676 / 2,685` pass, `0` `decompile-bug`, self-cleaning ledger `scripts/test262-dream-divergences.json`) |
-| `coverage` | `cargo llvm-cov` (`clang++-23`) | Full-estate Rust + C++ bridge coverage (including offline corpus & `wild_gate_offline` suites) uploaded to Codecov |
-| `asan` | Nightly `-Zsanitizer=address` + `-fsanitize=address` | Rust + C++ FFI AddressSanitizer / LeakSanitizer across workspace unit/integration suites and FFI/lowering corpus suites (`file-isa`, `file-lift`, `hap-file`, `lift-lower`) |
+---
 
-## Upstream snapshot tag radar (`.github/workflows/vendor-sync.yml`)
+## 3. Self-Cleaning Divergence Ledgers
 
-A scheduled weekly (and manually dispatchable) workflow compares `openharmony/arkcompiler_runtime_core`'s newest `OpenHarmony-*` tag against `vendor/UPSTREAM.toml`, runs `python3 scripts/vendor-gen.py sync` on a branch to refresh `vendor/` and all pre-generated bindings, runs `cargo build` + `cargo test`, and opens a single standing `vendor-bump` PR per tag with the diff summary and compatibility verdict.
+The JSON ledgers in `scripts/` (`pandasm-dis-divergences.json`, `pandasm-asm-divergences.json`, `test262-vm-divergences.json`, `test262-dream-divergences.json`, `wild-dream-divergences.json`) fail CI in **both** directions: regressions fail as undocumented divergences, and fixed entries fail as stale rows until deleted.

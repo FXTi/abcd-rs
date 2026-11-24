@@ -1,49 +1,93 @@
-# abcd-ir — the SSA IR
+# abcd-ir
 
-The format-independent SSA intermediate representation for ArkCompiler
-bytecode programs. This crate **is** the IR (as of v2-P4, 2026-09-21:
-the v0.1 `abcd-ir` crate was deleted — git history is the archive — and
-`abcd-ir2` was renamed `abcd-ir`).
+Format-independent Static Single Assignment (SSA) intermediate representation for ArkCompiler bytecode programs.
 
-The IR describes a **program** — classes, functions, value flow, types,
-annotations, module records, debug info — never a **file**. It has no
-dependency on the container/ISA crates (`abcd-file`, `abcd-isa`,
-`abcd-file-sys`, `abcd-isa-sys`) and never may: the crate graph is the
-enforcement mechanism.
+## Purpose & Layering Contract
 
-## Module map
+`abcd-ir` sits at the center of the `abcd-rs` compiler, analysis, and decompilation stack with **zero internal workspace dependencies** (`Cargo.toml` depends solely on `thiserror`). It is structurally incapable of importing `abcd-file`, `abcd-isa`, `abcd-file-sys`, or `abcd-isa-sys`:
 
-| Module | Contents |
-|--------|----------|
-| [`id`](src/id.rs) | Arena ids (`FuncId`, `ClassId`, `InstId`, `ValueId`, `BlockId`, …) — stable across pass pipelines |
-| [`symbol`](src/symbol.rs) | `SymbolTable` / `Sym` — content-keyed strings; every name is a `Sym` |
-| [`consts`](src/consts.rs) | `ConstPool` / `Const` — typed constant trees (literal arrays, method refs) |
-| [`frame`](src/frame.rs) | `FrameSlots` / `this_param_index` — vendored `[func][new.target][this]` implicit parameter-slot decoding (`L_ESCallTypeAnnotation;`) |
-| [`module`](src/module.rs) | `Module` — top-level program: functions, classes (including `--merge-abc` per-record `EsModule` & `scope_names`), imports/exports, annotations |
-| [`function`](src/function.rs) | `FunctionData` — CFG blocks, instructions, SSA values, try regions, debug data |
-| [`op`](src/op.rs) | The 88-variant op taxonomy — every instruction is one `Op` with explicit operands |
-| [`effects`](src/effects.rs) | `Effects` — the single, mechanically derived source of effect truth (`Op::effects`) |
-| [`ty`](src/ty.rs) | The type lattice (`Ty`, `StaticTy`) |
-| [`verify`](src/verify.rs) | The verifier — `verify_module` collects every fallible finding into a `VerifyReport` (no panics on data) |
+- **Program semantics, never container layout**: models classes, functions, SSA value flow, structured exception regions, types, annotations, ES module records, and line/column debug info — never file versions, raw 32-bit offsets, literal-array table indices, or virtual register / accumulator numbers.
+- **Explicit dual-dialect calling convention (`D6`)**: supports both dynamic ECMAScript/TypeScript (`Dialect::DynamicEcma` — hidden leading `[func][new.target][this]` frame slots, `H = 3` default overridden per function by `L_ESCallTypeAnnotation;`) and static ArkTS (`Dialect::StaticArkTS` / `SourceLang::ArkTS` — `H = 0` hidden slots on `static` methods, explicit `this` receiver at `params[0]` on instance methods and constructors).
+- **Single bridge boundary**: only `abcd-lift` (container → IR) and `abcd-lower` (IR → container) cross between bytecode encodings and `abcd-ir`; `abcd-opt`, `abcd-analysis`, `abcd-taint`, and `abcd-decompile` consume `abcd-ir` exclusively.
 
-## Pipeline
+## Core Arena & Module Architecture
 
-- **Lift** (`abcd-lift`): decode → IR (`abcd_file::File` → `abcd_ir::Module`)
-- **Optimize** (`abcd-opt`): IR → IR passes (peephole, SCCP, ADCE + CFG
-  simplify, copyprop; inline opt-in)
-- **Lower** (`abcd-lower`): IR → bytecode (`abcd_ir::Module` →
-  `abcd_file::MethodBody`)
-- **Analyze / Taint / Decompile** (`abcd-analysis`, `abcd-taint`,
-  `abcd-decompile`): pure IR consumers (dominators, regions, IFDS +
-  context-sensitive PTA, taint tracking, and JS/TS source recovery)
+| Component | Module | Responsibility |
+|-----------|--------|----------------|
+| `Module`, `ClassData`, `Dialect`, `SourceLang` | [`module`](src/module.rs) | Top-level program container, global arenas (`insts`, `blocks`, `values`), class/field metadata, ES & `--merge-abc` module records |
+| `FunctionData`, `Block`, `Edge`, `TryRegion` | [`function`](src/function.rs) | Per-function CFG, leading phi prefix, `EdgeKind::{Normal, Exceptional}` edges, `ValueDef::ExceptionParam`, debug tables |
+| `FuncId`, `ClassId`, `BlockId`, `InstId`, `ValueId`, `Sym`, `ConstId` | [`id`](src/id.rs) | Typed `u32` append-only arena indices with module-wide uniqueness |
+| `Op` (`88` variants), `CallKind`, `Arity` | [`op`](src/op.rs) | Closed semantic op taxonomy with single-point `operands()`, `operands_mut()`, `has_result()`, `is_terminator()`, and `arity()` |
+| `Effects`, `MemClasses`, `CallEffect`, `AllocKind` | [`effects`](src/effects.rs) | Mechanically derived `Op::effects()` table (reads, writes, `may_throw`, `may_call`, `allocs`) |
+| `Ty`, `DynPrim`, `StaticTy` | [`ty`](src/ty.rs) | Dynamic-first type lattice (`Any`, `DynPrim`, `Union`, `Unknown`) plus `ClassId`-indexed `StaticTy` annotations |
+| `SymbolTable` | [`symbol`](src/symbol.rs) | Append-only dual-bucket string interner preserving both valid UTF-8 and lone-surrogate MUTF-8 byte sequences |
+| `ConstPool`, `Const` | [`consts`](src/consts.rs) | Append-only typed constant pool (primitives, bit-exact `f64`, `BigInt`, `ArrayLiteral` / `ObjectLiteral` trees, `MethodRef`) |
+| `FrameSlots`, `this_param_index` | [`frame`](src/frame.rs) | Calling-convention slot resolver across `Dialect::DynamicEcma` (`L_ESCallTypeAnnotation;` / `0xF`) and `Dialect::StaticArkTS` |
+| `verify_module`, `verify_func`, `VerifyReport` | [`verify`](src/verify.rs) | Non-panicking structural, CFG-symmetry, arity, and Normal-edge SSA dominance verifier |
 
-## Design
+## Key Semantic Invariants
 
-The full design — op taxonomy, the §5.3 call-binding table, the
-taint-analysis contract (T1–T10), the migration plan — is
-[`design/ir-v0.2.md`](../design/ir-v0.2.md) (background:
-[`design/ir.md`](../design/ir.md) §1–§8).
+Full specification in [`../design/ir.md`](../design/ir.md) and design rulings in [`../design/decisions.md`](../design/decisions.md):
 
-## License
+1. **Stable append-only identity (`T1`, `T9`)**: arena ids and `SymbolTable` / `ConstPool` entries are never renumbered across pass pipelines, making `ValueId` and `InstId` stable keys for pointer/taint analyses.
+2. **Single-point op & effect truth (`T2`, `T3`, `T7`)**: named/indexed/dynamic property ops and allocation sites stay distinct; `Op::effects()` is exhaustive over all 88 variants so passes never maintain ad-hoc side-effect lists.
+3. **First-class exceptional control flow (`T5`, `N38`, `N45`, `N64`)**: every `TryRegion` protected block carries explicit `EdgeKind::Exceptional` edges to its catch handlers; `verify_func` enforces Normal-edge SSA dominance with unreachable-predecessor filtering (`N64`) and warns on imprecise exceptional handler joins (`N38`).
+4. **Dialect-explicit frame contract (`T4`, `T10`, `D6`, `N66`/`N67`)**: `FunctionData::params` layout follows `FrameSlots::of(module, func)` — `params[0..H]` hold implicit slots (`H = 3` under dynamic `0xF` where `this` is `params[2]`, `H = 0` on static ArkTS `static` methods, `H = 1` on static ArkTS instance methods) and `params[H..]` hold declared formals.
+5. **No panics on data**: `#![deny(missing_docs)]` and `#![cfg_attr(not(test), deny(clippy::unwrap_used))]` are enforced crate-wide; lookups return `Option` and `verify_module` collects all findings into `VerifyReport`.
 
-Apache-2.0.
+## Quick Start
+
+```rust
+use abcd_ir::{
+    BinOp, Block, BlockId, ClassData, ClassId, FunctionData, FunctionKind, Inst, InstId, Module,
+    Op, Ty, Value, ValueDef, ValueId, verify_module,
+};
+
+let mut module = Module::new();
+let desc = module.sym.intern("L_GLOBAL;");
+module.classes.push(ClassData::new(desc, desc));
+
+let fname = module.sym.intern("add");
+let entry = BlockId::new(0);
+module.blocks.push(Block::default());
+
+let mut func = FunctionData::new(ClassId::new(0), fname, FunctionKind::Function);
+func.blocks.push(entry);
+for idx in 0..5u16 {
+    // Dynamic default H = 3 ([func, new.target, this]) + 2 formals (a, b)
+    let vid = ValueId::new(module.values.len() as u32);
+    module.values.push(Value { def: ValueDef::Param(idx), ty: Ty::Any });
+    func.params.push(vid);
+}
+let (a, b) = (func.params[3], func.params[4]);
+module.functions.push(func);
+
+let sum_inst = InstId::new(0);
+let sum_val = ValueId::new(module.values.len() as u32);
+module.values.push(Value { def: ValueDef::Inst(sum_inst), ty: Ty::Any });
+module.insts.push(Inst {
+    op: Op::BinaryOp { op: BinOp::Add, left: a, right: b },
+    result: Some(sum_val),
+    block: entry,
+    loc: None,
+});
+let ret_inst = InstId::new(1);
+module.insts.push(Inst {
+    op: Op::Return { value: Some(sum_val) },
+    result: None,
+    block: entry,
+    loc: None,
+});
+module.blocks[entry.index()].insts.extend([sum_inst, ret_inst]);
+
+assert!(verify_module(&module).is_ok());
+```
+
+## Verification
+
+```sh
+./scripts/test-local.sh crate abcd-ir
+cargo test -p abcd-ir
+cargo clippy -p abcd-ir --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc -p abcd-ir --no-deps
+```

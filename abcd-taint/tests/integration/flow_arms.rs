@@ -1,4 +1,4 @@
-//! Flow-rule arm coverage (c-COV W10): the `problem.rs` arms no corpus
+//! Flow-rule arm coverage: the `problem.rs` arms no corpus
 //! fixture exercises — the store-rule kill/wildcard/re-key arms, the
 //! summary endpoint match/substitute arms (all mismatch families), the
 //! object-family ops (CopyDataProps/SetObjectWithProto/StorePrivate/

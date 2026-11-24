@@ -28,7 +28,8 @@ pub enum NodeStatus {
     /// rule. The node keeps every operand so the fold loses nothing.
     Plumbing,
     /// A documented fallback (fitness class H, or an N-class reconstruction
-    /// Stage A cannot complete). Loud, never silent (gen1 lesson 6).
+    /// Stage A cannot complete). Loud, never silent (`design/decompile.md` §5,
+    /// `design/decisions.md`).
     Fallback,
 }
 

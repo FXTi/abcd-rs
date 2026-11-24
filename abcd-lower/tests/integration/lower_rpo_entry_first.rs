@@ -1,5 +1,5 @@
-//! N10 regression (v0.2 port of `abcd-ir/tests/lower_rpo_entry_first.rs`):
-//! block ordering must be entry-first, unreachable blocks last.
+//! `N10` (`ADR-04`) regression tests: block ordering must be entry-first,
+//! unreachable blocks last.
 //!
 //! Catch handlers are unreachable in the terminator-successor model
 //! (exception dispatch is implicit — no `block_succs` edge). The rpo
@@ -187,11 +187,9 @@ fn lowered_try_function_executes_entry_code_at_pc0_not_handler() {
     );
 }
 
-/// Faithfulness pin: the diamond shape below must produce exactly the same
-/// flat stream as the v0.1 pipeline produces for the same shape (captured
-/// in v0.1's test suite at the B4 acc-as-cache refactor): the frame
-/// collapses to ONE register (cond/phi/x/y never interfere and share v0)
-/// and the copy-in prologue reads arg slot v1.
+/// Byte-shape pin for a diamond CFG under `ADR-03` (`acc`-as-cache): the frame
+/// collapses to ONE register (`cond`/`phi`/`x`/`y` never interfere and share `v0`)
+/// and the copy-in prologue reads arg slot `v1`.
 #[test]
 fn reachable_only_diamond_matches_v0_1_byte_shape() {
     let mut module = Module::new();

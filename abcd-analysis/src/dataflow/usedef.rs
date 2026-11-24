@@ -22,7 +22,7 @@ pub struct UseDefChains {
     /// (function block order, instruction order, operand order).
     uses: HashMap<ValueId, Vec<InstId>>,
     /// Value → phi instructions using it with the incoming edge each use
-    /// arrives on (phi uses are edge uses — design/ir-v0.2.md §5.1).
+    /// arrives on (phi uses are edge uses — `design/ir.md`).
     phi_uses: HashMap<ValueId, Vec<(InstId, abcd_ir::Edge)>>,
 }
 

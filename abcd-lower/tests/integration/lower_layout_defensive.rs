@@ -1,6 +1,6 @@
-//! c-COV A11 (layout half): the defensive skip arms of `layout::layout` and
-//! `reconstruct_try_blocks` — empty copy lists, dangling block ids in the
-//! RPO, isel results missing a block, and degenerate try regions.
+//! Defensive skip-arm tests for `layout::layout` and `reconstruct_try_blocks`:
+//! empty copy lists, dangling block ids in the RPO, `isel` results missing a
+//! block, and degenerate try regions.
 //!
 //! The first four drive `layout::layout` directly with a hand-built
 //! [`IselResult`]/[`RegAlloc`] (the shapes are inconsistent input by

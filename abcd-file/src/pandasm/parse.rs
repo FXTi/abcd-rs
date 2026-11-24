@@ -1515,15 +1515,6 @@ impl Parser {
             None => None,
             Some(text) => {
                 let name_str = lossy(&pf.name);
-                if name_str == crate::TYPE_SUMMARY_OFFSET_FIELD {
-                    // Mirrors encode's hard error (N8 revised): assembling a
-                    // raw nested offset would dangle — the write side never
-                    // emits it.
-                    return err(
-                        pf.line,
-                        "typeSummaryOffset fields are not representable".to_owned(),
-                    );
-                }
                 if name_str == crate::JSON_FILE_CONTENT_FIELD && field_type == Type::U32 {
                     // Upstream ark_disasm prints `u32 jsonFileContent = 0x…`
                     // as a raw u32 scalar without emitting the target string
@@ -1545,7 +1536,14 @@ impl Parser {
                         message: format!("field value `{text}` does not parse as hex"),
                     })
                 };
-                if name_str == crate::MODULE_REQUEST_PHASE_FIELD && field_type == Type::U32 {
+                if name_str == crate::TYPE_SUMMARY_OFFSET_FIELD && field_type == Type::U32 {
+                    let off = parse_hex_u32(text)?;
+                    Some(if off == 0 {
+                        FieldValue::I32(0)
+                    } else {
+                        FieldValue::LiteralArrayRef(off)
+                    })
+                } else if name_str == crate::MODULE_REQUEST_PHASE_FIELD && field_type == Type::U32 {
                     let off = parse_hex_u32(text)?;
                     // In `--merge-abc`, pair with the sibling `moduleRecordIdx`
                     // on the same record first; fall back to the file's first
@@ -3353,14 +3351,14 @@ mod tests {
     fn unsupported_constructs_are_hard_errors() {
         let input = doc(
             b"",
-            b".record R {\n\tu32 typeSummaryOffset = 0x40\n}\n",
+            b".record R {\n\tu32 jsonFileContent = 0x40\n}\n",
             b"",
             b"",
         );
         let err = parse_err(&input);
         assert_eq!(
             err.message,
-            "typeSummaryOffset fields are not representable"
+            "jsonFileContent fields are not representable in pandasm text"
         );
 
         let input = doc(b"", b".record R {\n\ti32 x = 0x1\n}\n", b"", b"");
@@ -3368,6 +3366,22 @@ mod tests {
         assert_eq!(
             err.message,
             "field initial value on a type the emitter never prints"
+        );
+
+        // `typeSummaryOffset` parses to I32(0) when zero and LiteralArrayRef(off) when non-zero.
+        let input = doc(
+            b"0 0x40 { 1 [ i32:7, ]}\n",
+            b".record R0 {\n\tu32 typeSummaryOffset = 0x0\n}\n.record R1 {\n\tu32 typeSummaryOffset = 0x40\n}\n",
+            b"",
+            b"",
+        );
+        let parsed = parse_file(&input).expect("typeSummaryOffset fields parse");
+        let r0 = parsed.class_by_str("LR0;").expect("R0");
+        assert_eq!(r0.fields[0].initial_value, Some(FieldValue::I32(0)));
+        let r1 = parsed.class_by_str("LR1;").expect("R1");
+        assert_eq!(
+            r1.fields[0].initial_value,
+            Some(FieldValue::LiteralArrayRef(0x40))
         );
     }
 

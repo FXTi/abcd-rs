@@ -1,6 +1,6 @@
-//! Typed constant pool (replaces v0.1 `LiteralArrayIdx` /
-//! `literal_array_offsets` — a literal-array *index* is a container shape;
-//! a [`Const`] is the semantic value).
+//! Typed constant pool (`design/ir.md`): literal-array table indices and
+//! container offsets stay in the file layer; the IR stores semantic
+//! [`Const`] values and trees.
 //!
 //! The pool is append-only (T1): pushing a constant never changes an
 //! existing [`ConstId`]. Array/object literal shapes are semantic
@@ -92,10 +92,7 @@ impl ConstPool {
         self.consts.len()
     }
 
-    /// Whether the pool is empty. Kept as the conventional pair of
-    /// `len` (clippy::len_without_is_empty requires it) even with no
-    /// caller yet — the c-COV deletion removed it once and the clippy
-    /// gate objected.
+    /// Whether the pool is empty.
     pub fn is_empty(&self) -> bool {
         self.consts.is_empty()
     }

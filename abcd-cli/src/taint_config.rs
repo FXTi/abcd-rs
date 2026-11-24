@@ -1,5 +1,4 @@
-//! TOML configuration for `abcd taint` (design/cli-plan.md §6 — ruled
-//! TOML, phase 3).
+//! TOML configuration for `abcd taint` (design/cli.md §2, design/analysis.md §3).
 //!
 //! The schema maps [`abcd_taint::TaintConfig`] field-by-field. Example:
 //!
@@ -10,7 +9,7 @@
 //! follow_returns_past_seeds = true
 //! native_identity = true
 //! max_field_chain = 5   # access-path k-limit (DEFAULT_MAX_FIELD_CHAIN)
-//! alias_rung = 2        # 0 | 1 | 2 (see analysis-strategy.md §4.4)
+//! alias_rung = 2        # 0 | 1 | 2 (see design/analysis.md §2.3)
 //!
 //! # Sources: name-keyed (SourceSpec).
 //! [[sources]]

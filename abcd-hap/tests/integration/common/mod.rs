@@ -1,7 +1,7 @@
 //! Synthetic ZIP builder shared by abcd-hap integration tests.
 //!
 //! All container bytes are generated in code — no binary fixtures live in
-//! the repo (design §3.5, option (a)). Low-level writers are public so
+//! the repo (see `design/hap-container.md`). Low-level writers are public so
 //! adversarial tests can compose malformed archives byte by byte.
 #![allow(dead_code)]
 

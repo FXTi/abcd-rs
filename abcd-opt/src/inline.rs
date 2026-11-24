@@ -1,17 +1,16 @@
-//! Function inlining for the v0.2 IR — the D2 (maintainer ruling
-//! 2026-09-21) rewrite of v0.1's quarantined inline pass (N44), built
-//! on [`abcd_ir::Module`]. **Opt-in only**: nothing here is wired into
-//! [`crate::optimize_module`]; the corpus gates (v2lift/v2opt
-//! byte-identity and the VM oracle) stay untouched. Callers opt in via
+//! Conservative intra-module function inlining over [`abcd_ir::Module`]
+//! (`design/ir.md`, `design/decisions.md` `D2`/`N44`). **Opt-in only**: nothing
+//! here is wired into [`crate::optimize_module`], preserving function
+//! boundaries for decompilation and corpus gates. Callers opt in via
 //! [`inline_module`].
 //!
-//! ## Why v0.1 failed, and how this construction kills N44
+//! ## Structural soundness by construction (`N44`)
 //!
-//! v0.1's inline produced module-INVALID IR: callee parameters were
-//! left unmapped, call-site predecessors were not rebuilt, and try
-//! regions were lost (4 structural verifier errors on one inline; the
-//! red proof on the v0.2 IR lives in `abcd-opt/tests/opt_inline_red.rs`).
-//! This rewrite kills each defect by construction:
+//! Naive call-site splicing produces module-invalid IR if callee parameters are
+//! left unmapped, post-split successor predecessors are not re-keyed, or caller
+//! try regions drop cloned blocks (pinned as red-proof tests in
+//! `abcd-opt/tests/integration/opt_inline_red.rs`). This pass prevents each
+//! defect by construction:
 //!
 //! - **Fresh identities**: the callee CFG is cloned with FRESH
 //!   `ValueId`s/`InstId`s/`BlockId`s (arena append — no id reuse, T1).
@@ -36,7 +35,7 @@
 //!   `Return`s become branches into the continuation, whose value
 //!   replaces the call result (directly for a single return, through a
 //!   phi for several).
-//! - **Exception semantics** (step H): v0.2's first-class
+//! - **Exception semantics** (step H): first-class
 //!   [`EdgeKind::Exceptional`] edges make the rule expressible — see
 //!   below.
 //!
@@ -53,13 +52,14 @@
 //! > cloned callee block and the continuation block join that region's
 //! > `protected` set (not just blocks containing potentially-throwing
 //! > instructions — the effects table deliberately does not model
-//! > coercion throws, design/ir-v0.2.md §4.4, and VM dispatch is by PC
+//! > coercion throws, `design/ir.md`, and VM dispatch is by PC
 //! > range, not instruction kind). Every catch handler of the region
 //! > gains an `EdgeKind::Exceptional` pred from each new protected
 //! > block, and every handler phi gains an entry for each new edge
 //! > carrying THE SAME value as the entry the original call block's
 //! > exceptional edge carried (the register state visible at the call —
-//! > the v0.2 model's block-granular imprecision, N38, is preserved
+//! > the IR's block-granular exception model, `N38` in
+//! > `design/decisions.md`, is preserved
 //! > exactly, neither narrowed nor widened).
 //!
 //! Callees with their OWN try regions are ineligible in this first
@@ -107,7 +107,7 @@
 //!   receiver; `this: None` binds exactly `undefined` (vendored
 //!   `setVregs`). `Direct` with `this: None` is malformed and skipped.
 //! - The call is not the LAST instruction of its block (block-terminal
-//!   call, N82 — v0.2 models control flow via explicit edges, not
+//!   call, `N82` — `abcd-ir` models control flow via explicit edges, not
 //!   terminator placement, so the shape can occur in unverified input).
 //!   The splice moves the post-call tail into the continuation block,
 //!   whose last instruction must be the moved terminator owning the
@@ -122,8 +122,8 @@
 //! ## `new.target` (T4)
 //!
 //! `LoadNewTarget` in the callee is BOUND per call kind, never left
-//! dangling: `Direct`/`Dynamic` → a pooled `undefined` constant (the
-//! §5.3 table: `new.target` is undefined outside construction); `New`
+//! dangling: `Direct`/`Dynamic` → a pooled `undefined` constant
+//! (`design/ir.md`: `new.target` is undefined outside construction); `New`
 //! → the call-site callee value. `New` call sites are currently always
 //! ineligible (the `new` result-override semantics — a constructor
 //! returning a non-object yields the fresh `this`, which no op can
@@ -131,7 +131,7 @@
 //! unit test and by skip statistics; the `Direct`/`Dynamic` arm is
 //! exercised end-to-end.
 //!
-//! ## Loc fidelity (design §7)
+//! ## Loc fidelity (`design/ir.md`)
 //!
 //! Cloned instructions keep their source [`Loc`](abcd_ir::Loc)s
 //! verbatim. Glue instructions created by the splice (the call block's
@@ -233,7 +233,7 @@ pub enum SkipReason {
     /// handler (handler identity would be disturbed).
     CallBlockIsHandler,
     /// The call is the LAST instruction of its block (block-terminal —
-    /// v0.2 models control flow via explicit edges, not terminator
+    /// `abcd-ir` models control flow via explicit edges, not terminator
     /// placement, so the IR can carry the shape even though the
     /// verifier's `MissingTerminator` rule excludes it from verified
     /// modules). The splice moves the post-call tail into the
@@ -701,7 +701,7 @@ fn eligibility(
     // empty-continuation bail AFTER steps A–E had already truncated
     // the call block, spliced a branch into the orphaned callee
     // clone, and leaked the clone/continuation blocks into the arena.
-    // (v0.2 models control flow via explicit edges, not terminator
+    // (`abcd-ir` models control flow via explicit edges, not terminator
     // placement, so the IR can carry the shape even though the
     // verifier's `MissingTerminator` rule excludes it from verified
     // modules — hence no corpus occurrence.)

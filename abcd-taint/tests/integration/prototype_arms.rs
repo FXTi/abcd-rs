@@ -1,4 +1,4 @@
-//! Prototype-resolver arm coverage (c-COV W10): the receiver-family
+//! Prototype-resolver arm coverage: the receiver-family
 //! arms the corpus never typed — Function/RegExp alloc kinds, the
 //! Number/Bool const wrappers, the direct `PrototypeResolver` walks
 //! (Mov/Phi/Const/cycle/dangling), the GetIterator non-builtin arm, the

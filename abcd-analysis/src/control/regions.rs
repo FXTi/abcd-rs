@@ -1,6 +1,5 @@
-//! Region structuring over the Normal-edge CFG (design/decompile.md §4.2,
-//! d-P1 infra phase): recursive region reduction producing a region tree
-//! per function.
+//! Region structuring over the Normal-edge CFG (`design/decompile.md` §4.2):
+//! iterative region reduction producing a region tree per function.
 //!
 //! The algorithm is pattern-independent in the sense of Yakdan et al.
 //! (NDSS'15) and Ramsey (2022): no block-shape matching drives the
@@ -473,9 +472,9 @@ pub struct TryPlan {
     /// The smallest tree node containing all reachable protected blocks
     /// (`None` when no protected block is Normal-reachable).
     pub span: Option<RegionId>,
-    /// Observation hook for d-P3: the protected boundary partially
-    /// overlaps a Loop or Irreducible tree node. es2abc try ranges are
-    /// bytecode-contiguous, not structure-aligned (a range may cover a
+    /// Observation hook for decompiler emission: the protected boundary
+    /// partially overlaps a Loop or Irreducible tree node. es2abc try ranges
+    /// are bytecode-contiguous, not structure-aligned (a range may cover a
     /// loop's header but not its latch), so this is NOT an error — but
     /// emission must place the `try {`/`catch` markers inside the cut
     /// region.
@@ -502,7 +501,7 @@ pub struct RegionTree {
     /// Forward edges from one conditional arm into its sibling arm (the
     /// es2abc `if (c) goto shared; …` / short-circuit idiom). NOT a
     /// structuring failure — the tree is truthful — but emission must
-    /// duplicate the shared tail or merge the conditions (a d-P3 fold),
+    /// duplicate the shared tail or merge the conditions during folding,
     /// so the shape is enumerable here.
     pub cross_arm_edges: Vec<(BlockId, BlockId)>,
     /// `TryRegion` projections.

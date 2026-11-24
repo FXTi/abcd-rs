@@ -1,17 +1,45 @@
-//! Low-level FFI bindings for the ArkCompiler bytecode ISA.
+//! Low-level FFI bindings for the ArkCompiler bytecode ISA (`24.0.0.0`).
 //!
-//! Built from the pre-generated ISA bindings (`src/generated/`, derived from
-//! upstream `isa.yaml` via `scripts/vendor-gen.py`) and the C++ `isa_bridge`.
-//! It exposes:
+//! Built from the Route A pre-generated ISA bindings (`src/generated/`, derived
+//! offline from `vendor/arkcompiler_runtime_core/isa/isa.yaml` and
+//! `bridge/isa_bridge.h` via `scripts/vendor-gen.py`) and compiled with pure
+//! `cc::Build` C++17 behind a C99 `extern "C"` bridge. It exposes:
 //!
-//! - Raw C FFI functions (`isa_*`)
-//! - A safe [`Bytecode`] enum with per-instruction variants and operand accessors
+//! - Raw C99 FFI functions (`isa_*`)
+//! - A safe [`Bytecode`] enum with per-mnemonic variants and operand views
 //! - Per-mnemonic constructor types in the [`insn`] module
-//! - Operand newtypes: [`Reg`], [`Imm`], [`EntityId`], [`Label`]
+//! - Operand newtypes and views: [`Reg`], [`Imm`], [`EntityId`], [`EntityKind`], [`Label`], [`Operand`]
 //! - Classification flags: [`BytecodeFlags`], [`ExceptionType`]
 //!
 //! Most users should depend on the safe `abcd-isa` crate instead, which wraps
-//! this crate in a safe `encode`/`decode` API.
+//! this crate in a safe `decode`, `decode_legacy`, `encode`, relocation, and
+//! version API.
+//!
+//! # Quick start
+//!
+//! ```
+//! use abcd_isa_sys::{
+//!     Bytecode, BytecodeFlags, EntityId, EntityKind, Imm, Label, Operand, Reg, insn,
+//! };
+//!
+//! let load_str: Bytecode = insn::LdaStr::new(EntityId(7));
+//! assert_eq!(load_str.mnemonic(), "lda.str");
+//! assert!(load_str.has_flag(BytecodeFlags::STRING_ID) && load_str.can_throw());
+//! assert_eq!(
+//!     load_str.entity_operands(),
+//!     vec![(EntityKind::StringId, EntityId(7))]
+//! );
+//!
+//! let call: Bytecode = insn::Callthisrange::new(Imm(0), Imm(2), Reg(4));
+//! assert!(call.is_range());
+//! assert_eq!(
+//!     call.operands(),
+//!     vec![Operand::Imm(0), Operand::Imm(2), Operand::Reg(4)]
+//! );
+//!
+//! let jump: Bytecode = insn::Jmp::new(Label(0));
+//! assert!(jump.is_jump() && jump.is_terminator());
+//! ```
 
 #![allow(
     non_upper_case_globals,

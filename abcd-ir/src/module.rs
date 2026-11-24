@@ -1,4 +1,4 @@
-//! Module graph: the top-level container (design/ir-v0.2.md §3).
+//! Module graph: the top-level program container (`design/ir.md`).
 //!
 //! A [`Module`] describes a *program*: classes, functions, value flow,
 //! types, annotations, module records, debug info. It owns the shared
@@ -6,7 +6,7 @@
 //! ([`Inst`], [`Block`], [`Value`]) that give ids module-wide uniqueness
 //! (T1). It never describes a *file*: no `version`, no `file_type`, no
 //! offsets, no register/acc numbering, no literal-array indices, no
-//! four-bucket annotations, no `num_vregs`/`num_args`.
+//! multi-bucket retention streams, no `num_vregs`/`num_args`.
 
 use crate::consts::ConstPool;
 use crate::function::{Block, FunctionData, Inst, Value};
@@ -62,6 +62,29 @@ impl std::ops::BitOrAssign for Modifiers {
     }
 }
 
+/// Calling-convention and execution dialect of a class or function (`D6`,
+/// `design/ir.md`, `design/decisions.md`).
+///
+/// `abcd-ir` unifies dynamic JS/TS and static ArkTS under one SSA IR while
+/// keeping their calling conventions explicit:
+///
+/// - [`Dialect::DynamicEcma`]: `es2abc` dynamic frames carrying hidden leading
+///   `[func][new.target][this]` slots ([`crate::frame::FrameSlots::DEFAULT`],
+///   `H = 3`, overridable per function via `L_ESCallTypeAnnotation;`).
+/// - [`Dialect::StaticArkTS`]: `static_core` / `ets2panda` typed frames with
+///   **zero** hidden closure or `new.target` slots (`H = 0` via
+///   [`crate::frame::FrameSlots::NONE`] on `static` methods; explicit receiver
+///   `this` at `params[0]` via [`crate::frame::FrameSlots::STATIC_INSTANCE`]
+///   on instance methods and constructors).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Dialect {
+    /// Dynamic ECMAScript / TypeScript (`es2abc` hidden-slot convention).
+    #[default]
+    DynamicEcma,
+    /// Static ArkTS (`static_core` / `ets2panda` typed convention, `#36`).
+    StaticArkTS,
+}
+
 /// The source language a class was authored in (semantic, not a format
 /// tag).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -70,8 +93,33 @@ pub enum SourceLang {
     EcmaScript,
     /// TypeScript.
     TypeScript,
-    /// ArkTS.
+    /// ArkTS (`static_core` / `ets2panda`).
     ArkTS,
+}
+
+impl SourceLang {
+    /// Execution and calling-convention [`Dialect`] for this source language (`D6`).
+    #[must_use]
+    pub const fn dialect(self) -> Dialect {
+        match self {
+            Self::EcmaScript | Self::TypeScript => Dialect::DynamicEcma,
+            Self::ArkTS => Dialect::StaticArkTS,
+        }
+    }
+
+    /// `true` when this source language uses [`Dialect::DynamicEcma`]
+    /// (`[func][new.target][this]` leading frame slots).
+    #[must_use]
+    pub const fn is_dynamic(self) -> bool {
+        matches!(self.dialect(), Dialect::DynamicEcma)
+    }
+
+    /// `true` when this source language uses [`Dialect::StaticArkTS`]
+    /// (`H = 0` hidden closure/`new.target` slots).
+    #[must_use]
+    pub const fn is_static(self) -> bool {
+        matches!(self.dialect(), Dialect::StaticArkTS)
+    }
 }
 
 /// Semantic function kind (replaces format-layer `FunctionKind`
@@ -94,9 +142,9 @@ pub enum FunctionKind {
     AsyncGenerator,
     /// An arrow function (the file's `NC_FUNCTION` — non-constructible,
     /// lexical `this`/`arguments`; concise methods are `None` at the
-    /// file level, never NC). d-P8.
+    /// file level, never NC).
     Arrow,
-    /// An async arrow function (the file's `ASYNC_NC_FUNCTION`). d-P8.
+    /// An async arrow function (the file's `ASYNC_NC_FUNCTION`).
     AsyncArrow,
 }
 
@@ -112,7 +160,7 @@ pub struct Signature {
 }
 
 /// An annotation element value. Elements reference only IR-owned
-/// identities (design/ir-v0.2.md §7): constants, classes, fields, names.
+/// identities (`design/ir.md`): constants, classes, fields, names.
 #[derive(Clone, Debug, PartialEq)]
 pub enum AnnValue {
     /// A constant from the module's [`ConstPool`].
@@ -125,9 +173,9 @@ pub enum AnnValue {
     Name(Sym),
 }
 
-/// A single annotation. The four v0.1 retention buckets fold into one
-/// list per attach site; folding for a specific container version is a
-/// lowering concern (FormatProfile), not IR content.
+/// A single annotation. Retention-bucket classification in legacy containers
+/// folds into one ordered list per attach site at lift; container-specific
+/// emission is a lowering concern (`FormatProfile`), not IR content.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Annotation {
     /// The annotation type.
@@ -217,10 +265,10 @@ pub struct EsModule {
     pub module_requests: Vec<ModuleRequest>,
 }
 
-/// One entry of a module's module-request list (N7): the specifier plus
-/// its lazy-import flag from the `moduleRequestPhaseIdx` blob. The list
-/// is in module-record request order; declarations reference specifiers
-/// by content ([`ImportDecl`]/[`ExportDecl`] carry the `Sym`).
+/// One entry of a module's module-request list (`design/decisions.md` N7):
+/// the specifier plus its lazy-import flag from the `moduleRequestPhaseIdx`
+/// blob. The list is in module-record request order; declarations reference
+/// specifiers by content ([`ImportDecl`]/[`ExportDecl`] carry the `Sym`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleRequest {
     /// The module specifier (`"./foo"`, `"std.core"`, …).
@@ -229,9 +277,9 @@ pub struct ModuleRequest {
     pub lazy: bool,
 }
 
-/// An import declaration — a semantic ES module record (the N7-era
-/// module-data model, with the file's `module_request_idx` pool indices
-/// resolved to the specifier symbols they denote).
+/// An import declaration — a semantic ES module record (with container
+/// `module_request_idx` pool indices resolved to the specifier symbols they
+/// denote; `design/decisions.md` N7).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportDecl {
     /// `import { import_name as local_name } from module_request`.
@@ -298,8 +346,8 @@ pub struct Module {
     pub imports: Vec<ImportDecl>,
     /// Export declarations.
     pub exports: Vec<ExportDecl>,
-    /// Module requests with their lazy-import flags (N7
-    /// `moduleRequestPhaseIdx` blobs), in module-record request order.
+    /// Module requests with their lazy-import flags (`moduleRequestPhaseIdx`
+    /// blobs; `design/decisions.md` N7), in module-record request order.
     pub module_requests: Vec<ModuleRequest>,
 
     /// Instruction arena.
@@ -354,5 +402,36 @@ impl Module {
     /// Look up a class; `None` for out-of-range ids.
     pub fn class(&self, id: ClassId) -> Option<&ClassData> {
         self.classes.get(id.index())
+    }
+
+    /// Execution and calling-convention [`Dialect`] of `func`, derived from
+    /// its owning [`ClassData::source_lang`] (`D6`). Defaults to
+    /// [`Dialect::DynamicEcma`] when `func.class_id` is absent (e.g. bare
+    /// synthetic test modules).
+    #[must_use]
+    pub fn func_dialect(&self, func: &FunctionData) -> Dialect {
+        self.class(func.class_id)
+            .map_or(Dialect::DynamicEcma, |c| c.source_lang.dialect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_lang_dialect_classification() {
+        assert_eq!(SourceLang::EcmaScript.dialect(), Dialect::DynamicEcma);
+        assert!(SourceLang::EcmaScript.is_dynamic());
+        assert!(!SourceLang::EcmaScript.is_static());
+
+        assert_eq!(SourceLang::TypeScript.dialect(), Dialect::DynamicEcma);
+        assert!(SourceLang::TypeScript.is_dynamic());
+        assert!(!SourceLang::TypeScript.is_static());
+
+        assert_eq!(SourceLang::ArkTS.dialect(), Dialect::StaticArkTS);
+        assert!(!SourceLang::ArkTS.is_dynamic());
+        assert!(SourceLang::ArkTS.is_static());
+        assert_eq!(Dialect::default(), Dialect::DynamicEcma);
     }
 }

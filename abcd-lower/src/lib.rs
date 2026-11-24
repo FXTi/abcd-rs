@@ -1,12 +1,13 @@
 //! # abcd-lower — lower converter: `abcd_ir::Module` → `abcd_file::File` / `MethodBody`
 //!
-//! Format-aware lowering layer (`design/ir-v0.2.md` §8, `design/ir.md` §7)
+//! Format-aware lowering layer (`design/ir.md` §5, `design/decisions.md`)
 //! that compiles the SSA IR ([`abcd_ir::Module`]) back to `.abc` bytecode and
 //! container structures: chordal maximum-cardinality-search register
 //! allocation, slot-level parallel-copy cycle breaking, accumulator-as-cache
 //! instruction selection, basic-block layout with edge trampolines, try-range
-//! reconstruction, entity relocation, in-place file rewriting ([`rewrite_file`]),
-//! and standalone whole-module lowering ([`lower_module`]).
+//! reconstruction, entity relocation and per-method `u16` compaction, in-place
+//! file rewriting ([`rewrite_file`]), and standalone whole-module lowering
+//! ([`lower_module`]).
 
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
@@ -227,14 +228,11 @@ pub fn lower_function_with_options(
         return Err(LowerError::EmptyFunction(func_id));
     }
 
-    // Step 0: Fusion analysis (BEFORE register allocation): the v0.2
-    // lift's expansion mappings materialize values
-    // v0.1 never had — DefineFunc/AllocClosure pairs, by-index constant
-    // loads, try-load-global defaults. Their results must never be
-    // colored, or the allocator's value universe would differ from
-    // v0.1's and every coloring (hence every emitted operand) could
-    // drift. The suppressed instructions fold into their consumers at
-    // instruction selection.
+    // Step 0: Fusion analysis (BEFORE register allocation): suppress
+    // single-use IR expansion intermediates (DefineFunc/AllocClosure chains,
+    // integral by-index constant loads, undefined TryGetGlobal defaults) so
+    // suppressed values are invisible to register coloring and fold directly
+    // into their consuming bytecode at instruction selection.
     let suppression = fusion::analyze(module, &func.blocks);
 
     // Step 1: Register allocation.
@@ -276,10 +274,10 @@ mod tests {
         Value, ValueDef, ValueId,
     };
 
-    /// N25 (v0.1 parity): the name is the runtime VALUE in the register
-    /// operand (vendor `throw.constassignment v:in:top, acc: none`,
-    /// isa.yaml:987-991) — lowering succeeds and emits the name's
-    /// register home, never a hardcoded Reg(0).
+    /// N25: the name is the runtime VALUE in the register operand (vendor
+    /// `throw.constassignment v:in:top, acc: none`, isa.yaml:987-991) —
+    /// lowering succeeds and emits the name's register home, never a
+    /// hardcoded Reg(0).
     #[test]
     fn const_assignment_lowers_with_the_name_register() {
         let mut module = Module::new();

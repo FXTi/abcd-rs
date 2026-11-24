@@ -1,4 +1,4 @@
-//! Shared input layer (design/cli-plan.md §3.2).
+//! Shared input layer (design/cli.md §1).
 //!
 //! Every bytecode-consuming command accepts both a bare `.abc` file and a
 //! container (`.hap` / `.hsp` / `.app` / `.hqf`). The kind is sniffed by

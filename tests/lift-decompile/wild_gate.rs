@@ -1,7 +1,6 @@
 //! The wild gate: the core-25 wild-OHOS subset promoted to a per-push CI
 //! gate, plus an offline zero-Docker companion gate (`wild_gate_offline`).
-//! Design: `design/archive/wild-gate-evaluation.md` — the maintainer-approved
-//! semantics are **A + B + the standing laws** (§6.E):
+//! Specification: `design/decompile.md` & `design/ci.md` — enforced invariants:
 //!
 //! - **A — recompile acceptance.** Per core-25 package: `abcd_hap`
 //!   container extract → per module `abcd_file::decode` →
@@ -32,14 +31,12 @@
 //!
 //! Skip-by-absence (the house rule for corpus suites): with no exported
 //! wild corpus the gate prints a skip line and returns; it is
-//! `#[ignore]`d and only runs where the corpus is exported (CI
-//! `wild-gate` job, dabai).
+//! `#[ignore]`d and runs where the corpus is exported (CI `wild-gate` job).
 //!
 //! The core-25 list is EMBEDDED below (not read from the manifest):
 //! a manifest change requires a corpus-image re-curation + digest bump
 //! anyway, and the embedded list makes that drift a compile-time-visible
-//! review act. Provenance: the q-P12 core-25 pick list, measured in
-//! `design/archive/wild-gate-evaluation.md` §3.2.
+//! review act.
 //!
 //! Ledger regeneration: run the gate once; it writes the observed
 //! per-package counts to `target/wild-gate/fallback-observed.json`

@@ -1,12 +1,9 @@
-//! N68/G6 pin (v0.2 lower): `Op::AwaitUncaught`/`Op::AsyncResolve`/
-//! `Op::AsyncReject` lower with the async FUNCTION OBJECT in the v0
+//! `N68` regression tests: `Op::AwaitUncaught` / `Op::AsyncResolve` /
+//! `Op::AsyncReject` lower with the async FUNCTION OBJECT in the `v0`
 //! register operand and the VALUE in the accumulator (vendor
 //! `asyncfunctionawaituncaught v:in:top, acc: inout:top`,
-//! isa.yaml:1311-1314; interpreter-inl.cpp:5357-5366; resolve
-//! :6577-6589; reject :6605-6617). The pre-N68 lower read the IR's
-//! single operand into the register — self-consistent with the mis-lift
-//! (double inversion) but semantically the funcobj rode the IR `value`
-//! slot and the acc was dropped.
+//! `isa.yaml:1311-1314`; `interpreter-inl.cpp:5357-5366`; resolve
+//! `:6577-6589`; reject `:6605-6617`).
 
 use crate::common;
 use abcd_ir::{FunctionKind, Module, Op};

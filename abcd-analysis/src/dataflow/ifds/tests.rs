@@ -566,7 +566,7 @@ fn phi_merge_propagates_taint() {
 }
 
 /// Two identical solver runs produce identical path-edge sequences
-/// (determinism, heros.md §5 item 4).
+/// (`design/decisions.md` N20 determinism).
 #[test]
 fn solver_is_deterministic() {
     let build = || {

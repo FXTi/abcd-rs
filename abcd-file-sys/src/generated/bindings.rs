@@ -492,6 +492,14 @@ unsafe extern "C" {
         ctx: *mut ::std::os::raw::c_void,
     );
 }
+unsafe extern "C" {
+    pub fn abc_literal_enumerate_vals_checked(
+        f: *const AbcFileHandle,
+        array_off: u32,
+        cb: AbcLiteralValCb,
+        ctx: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct AbcModuleAccessor {
@@ -1138,7 +1146,7 @@ pub struct AbcAnnotationElemDefEx {
     pub is_array: u8,
     pub scalar_value: u32,
     pub scalar_value_64: u64,
-    pub array_values: *const u32,
+    pub array_values: *const u64,
     pub array_count: u32,
 }
 unsafe extern "C" {

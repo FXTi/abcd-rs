@@ -1,4 +1,4 @@
-//! V4 regression (v0.2 port of v0.1 `opt_empty_jump_phi_guard.rs`):
+//! V4 regression (`design/decisions.md`):
 //! empty-jump elimination must not merge converging edges that carry
 //! DIFFERENT phi values.
 //!

@@ -1,8 +1,7 @@
 //! Shared helpers for `abcd-taint` corpus/integration tests.
 //!
-//! - Corpus harness (`corpus_root` / `runtime_passed_paths`): the
-//!   exported GHCR corpus + python3 manifest pattern of
-//!   `abcd-lift/tests/corpus_lift_verify.rs`, filtered to the 1149
+//! - Corpus harness (`corpus_root` / `runtime_passed_paths`): parses
+//!   the exported corpus `index.jsonl` manifest, filtered to the 1,149
 //!   runtime-passed fixtures (`runtime.status == "passed"`).
 //! - Hand-built IR module scaffolding for the mechanism/probe tests
 //!   (mirrors `abcd-analysis`'s cfg(test)-private testutil — duplicated

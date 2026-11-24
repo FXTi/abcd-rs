@@ -1,6 +1,5 @@
-//! N49 regression (v0.2 port of `abcd-ir/tests/lower_zero_extent_block.rs`):
-//! a block that emits zero bytecodes must be a hard
-//! `LowerError::ZeroExtentBlock`, never a silent layout.
+//! `N49` regression test: a block that emits zero bytecodes must fail with
+//! `LowerError::ZeroExtentBlock`, never produce a silent layout.
 //!
 //! `reconstruct_try_blocks` computes each block's flat extent as
 //! `[own offset, next greater offset)`. That formula is only sound when

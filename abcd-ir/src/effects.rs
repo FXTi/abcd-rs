@@ -1,17 +1,17 @@
-//! First-class per-op effects (design/ir-v0.2.md §4.2, requirement T3).
+//! First-class per-op effects (`design/ir.md`, requirement T3;
+//! `design/decisions.md` N48/N50).
 //!
 //! [`Op::effects`] is computed mechanically from the op itself plus its
 //! operand *shapes* — never hand-maintained per pass. This table is the
-//! single source of truth that replaces v0.1's `is_essential` hand list
-//! (N48/N50): DCE, reordering, and taint propagation all read effects
-//! from here.
+//! single source of effect truth: DCE, reordering, and taint propagation
+//! all read effects from here.
 //!
 //! Modelling notes (deliberate, documented):
 //!
 //! - JS coercion side effects of the dynamic compute ops (`BinaryOp`,
 //!   `UnaryOp`, `Compare` can invoke `valueOf`/`toString` on object
 //!   operands) are NOT modeled at the op level: the op alone cannot know
-//!   its operands' types (`ty` lives on values, not ops — §4.1). A
+//!   its operands' types (`ty` lives on values, not ops — `design/ir.md`). A
 //!   type-refined effect *refinement* (object-typed operand ⇒ may call)
 //!   is an analysis-layer extension over this baseline, not more entries
 //!   in this table.
@@ -26,9 +26,8 @@ use crate::op::Op;
 /// A set of memory classes an op may read or write.
 ///
 /// Memory is classified by *what is being accessed*, not by monolithic
-/// "the heap" (the Hermes `Unknown` collapse this design explicitly
-/// avoids — §6.3): field-sensitive taint tracks [`MemClasses::HEAP`]
-/// separately from lexical/global/module bindings.
+/// "the heap" (`design/ir.md`): field-sensitive taint tracks
+/// [`MemClasses::HEAP`] separately from lexical/global/module bindings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MemClasses(u8);
 
@@ -113,7 +112,7 @@ pub enum AllocKind {
     Unknown,
 }
 
-/// The effect record of one op (§4.2).
+/// The effect record of one op (`design/ir.md`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Effects {
     /// Memory classes read.
@@ -183,9 +182,8 @@ impl Op {
             // `acc: out:top`, no memory interaction).
             LoadNewTarget | LoadGlobalObject | LoadFunction => Effects::PURE,
 
-            // Vendor `asyncfunctionenter`: v0.1's proven DCE contract
-            // treats it as non-essential (dead-deletable when the result
-            // is unused) — modeled PURE to preserve that behavior.
+            // Vendor `asyncfunctionenter`: dead-deletable when its result is
+            // unused, so modeled PURE.
             AsyncFunctionEnter => Effects::PURE,
 
             // Allocation sites (T7).
@@ -369,15 +367,15 @@ impl Op {
             // Lexical / global / module bindings.
             GetLexVar { .. } => reads(MemClasses::LEX_ENV),
             // Lexical-environment lifecycle: pushing/popping an
-            // environment mutates the scope stack (v0.1 essential).
+            // environment mutates the scope stack.
             NewLexEnv { .. } | NewLexEnvWithName { .. } | PopLexEnv => writes(MemClasses::LEX_ENV),
             PutLexVar { .. } => writes(MemClasses::LEX_ENV),
             TryGetGlobal { .. } => Effects {
                 reads: MemClasses::GLOBAL,
-                // N48/N50: BOTH source forms (v0.1 `LoadGlobalVar` =
-                // `ldglobalvar`, `TryLoadGlobalByName` =
-                // `tryldglobalbyname`) were ADCE-essential — a dead
-                // result does not make the load dead. Vendor grounding:
+                // N48/N50 (design/decisions.md): BOTH source forms
+                // (`ldglobalvar` and `tryldglobalbyname`) are
+                // ADCE-essential — a dead result does not make the load
+                // dead. Vendor grounding:
                 // both handlers' slow paths run
                 // `JSTaggedValue::GetProperty` on the global's prototype
                 // chain, CALLING global getters, and abrupt-check the
@@ -491,8 +489,7 @@ impl Op {
             },
 
             // Vendor `debugger`: a breakpoint can invoke the attached
-            // debugger's hook — kept non-pure so DCE preserves it (v0.1's
-            // is_essential parity).
+            // debugger's hook — kept non-pure so DCE preserves it.
             Debugger => Effects {
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
@@ -533,7 +530,7 @@ mod tests {
     use crate::id::{ConstId, ValueId};
     use crate::op::{BinOp, CallKind};
 
-    /// The §4.2 spot table: pinned effect derivations.
+    /// Pinned effect derivations (`design/ir.md`).
     #[test]
     fn effects_spot_table() {
         let v = ValueId::new(0);
@@ -612,8 +609,7 @@ mod tests {
         assert!(e.writes.contains(MemClasses::LEX_ENV));
     }
 
-    /// The v2-P0.5 taxonomy-growth pins: the new ISA-coverage ops carry
-    /// the documented effect records.
+    /// Full-ISA op pins: extended ops carry their documented effect records.
     #[test]
     fn effects_taxonomy_growth_pins() {
         let v = ValueId::new(0);
@@ -696,18 +692,15 @@ mod tests {
             assert!(op.effects().may_throw, "{op:?}");
         }
 
-        // Debugger stays essential (v0.1 parity) via the hook call effect.
+        // Debugger stays essential via the hook call effect.
         assert!(!Op::Debugger.effects().is_pure());
     }
 
-    /// N48/N50: every entry of v0.1's ADCE essential OBSERVABLE-LOAD list
-    /// must derive non-pure from this table (a write, a possible throw,
-    /// or a possible call — the abcd-opt ADCE essentiality rule). The
-    /// v0.1 list: GetIterator, GetAsyncIterator, LoadProperty,
-    /// LoadPrivateProperty, TestPrivateProperty, CreateRegExp,
-    /// LoadGlobalVar, TryLoadGlobalByName, LoadSuperProperty.
+    /// N48/N50 (`design/decisions.md`): every ADCE-essential observable load
+    /// derives non-pure from this table (a write, a possible throw, or a
+    /// possible call — the `abcd-opt` ADCE essentiality rule).
     #[test]
-    fn effects_cover_v0_1_observable_loads() {
+    fn effects_cover_observable_loads() {
         let v = ValueId::new(0);
         let name = Sym::new(0);
         let essential = |op: Op| {
@@ -737,8 +730,8 @@ mod tests {
                 pattern: name,
                 flags: 0,
             },
-            // LoadGlobalVar (the throwing form) and TryLoadGlobalByName
-            // (the tolerant form) BOTH fold to TryGetGlobal.
+            // Both throwing (`ldglobalvar`) and absence-tolerant
+            // (`tryldglobalbyname`) forms fold to `TryGetGlobal`.
             Op::TryGetGlobal {
                 name,
                 default: None,
@@ -759,12 +752,11 @@ mod tests {
         for op in cases {
             assert!(
                 essential(op.clone()),
-                "v0.1-essential observable load must derive non-pure (N48/N50): {op:?}"
+                "observable load must derive non-pure (N48/N50): {op:?}"
             );
         }
 
-        // Control: the pure reads / pure allocations stay dead-deletable
-        // (v0.1 parity — they were NOT on the essential list).
+        // Control: pure reads / pure allocations stay dead-deletable.
         for op in [
             Op::GetLexVar { level: 0, slot: 0 },
             Op::LoadModuleVar {
@@ -785,7 +777,7 @@ mod tests {
         ] {
             assert!(
                 !essential(op.clone()),
-                "pure read/alloc must stay dead-deletable (v0.1 parity): {op:?}"
+                "pure read/alloc must stay dead-deletable: {op:?}"
             );
         }
     }

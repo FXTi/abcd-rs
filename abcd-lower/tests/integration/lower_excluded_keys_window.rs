@@ -1,9 +1,7 @@
-//! N9 regression (v0.2 port of
-//! `abcd-ir/tests/lower_excluded_keys_window.rs`):
-//! `createobjectwithexcludedkeys` must NOT assume the key registers are
-//! consecutive from the first key's home (the N4 landmine class), and
-//! must select the wide form when the key count exceeds the u8 imm of
-//! the narrow encoding.
+//! `N9` / `N4` (`ADR-03`) regression tests: `createobjectwithexcludedkeys`
+//! must NOT assume the key registers are consecutive from the first key's
+//! home, and must select the wide form when the key count exceeds the `u8`
+//! immediate of the narrow encoding.
 //!
 //! Vendor facts:
 //! - `createobjectwithexcludedkeys imm:u8, v1:in:top, v2:in:top`,

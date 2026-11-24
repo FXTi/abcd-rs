@@ -1,4 +1,4 @@
-//! Curated OpenHarmony (`@ohos.*` / `@kit.*`) taint rule pack (#27 Phase 3).
+//! Curated OpenHarmony (`@ohos.*` / `@kit.*`) taint rule pack (`design/analysis.md`).
 //!
 //! Provides a versioned, zero-dependency preset ([`ohos_preset`] /
 //! [`apply_ohos_preset`]) covering OpenHarmony Stage/FA lifecycle `Want`

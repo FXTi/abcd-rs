@@ -1,5 +1,5 @@
-//! Block layout and jump target resolution (port of v0.1
-//! `abcd_ir::lower::layout` onto the v0.2 IR).
+//! Block layout and jump target resolution (`design/ir.md` §5,
+//! `design/decisions.md` `ADR-04`).
 //!
 //! Arranges basic blocks in reverse post-order, flattens them into a linear
 //! bytecode sequence, and resolves Block references in jump instructions
@@ -20,9 +20,9 @@
 //! is inconsistent input and a hard [`LowerError::HandlerEdgeCopies`], and
 //! copies keyed to a block that is neither a terminator successor nor a
 //! catch handler of the predecessor are [`LowerError::InconsistentEdgeCopies`].
-//! v0.2 note: the exception-edge set comes from the function's structured
-//! [`TryRegion`](abcd_ir::TryRegion)s — the same information v0.2
-//! materializes as [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) preds.
+//! The exception-edge set comes from the function's structured
+//! [`TryRegion`](abcd_ir::TryRegion)s (mirrored by
+//! [`EdgeKind::Exceptional`](abcd_ir::EdgeKind) block predecessors).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -324,7 +324,7 @@ fn rewrite_branch_target(bc: &mut Bytecode, target: BlockId) {
 ///
 /// Multiple try blocks per code item are native to the format: the vendored
 /// writer stores a `std::vector<TryBlock>` per CodeItem
-/// (abcd-file-sys/arkcompiler_runtime_core/libpandafile/file_items.h:1370-1373,1426), our
+/// (`vendor/arkcompiler_runtime_core/static_core/libpandafile/file_items.h`), our
 /// encode path emits one file entry per model TryBlock
 /// (abcd-file/src/encode.rs:1313-1348), and decode enumerates every try
 /// block independently (abcd-file/src/decode.rs:1790-1839), so several
@@ -400,8 +400,8 @@ fn reconstruct_try_blocks(
         }
 
         // Build catch entries (shared by every run of this region).
-        // v0.2's `type_idx: Option<u32>` maps back to the file's u32::MAX
-        // catch-all sentinel.
+        // `Catch::type_idx: Option<u32>` maps `None` back to the container's
+        // `u32::MAX` catch-all sentinel.
         let catches: Vec<CatchBlock> = region
             .catches
             .iter()

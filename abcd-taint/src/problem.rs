@@ -2,7 +2,7 @@
 //! [`abcd_analysis::dataflow::ifds::IfdsProblem`] specialized to
 //! [`Fact`].
 //!
-//! ## Design rule (task / analysis-strategy §5.1)
+//! ## Design rule (`design/analysis.md`)
 //!
 //! Flow functions are driven by `Op::operands()` + `Op::has_result()` —
 //! the generic rule "a tainted operand taints the result" covers
@@ -10,18 +10,16 @@
 //! per-family rules ONLY where semantics demand:
 //!
 //! - **LoadProp family** (`LoadProp`/`LoadPropIdx`/`LoadPropDyn`):
-//!   access-path push/cut at the field key (soot-infoflow §2.2's
-//!   `cutFirstField` algebra), matching heap facts by alloc-site
-//!   intersection and local facts by positive-alias evidence.
+//!   access-path push/cut at the leading field key, matching heap facts by
+//!   alloc-site intersection and local facts by positive-alias evidence.
 //! - **StoreProp family** (incl. the `StoreOwnProp*` own-stores): the
 //!   stored value's taint is re-keyed to a heap fact
-//!   `(sites(object), key ++ fields)`; strong kills only under the
-//!   rung-0 must-alias proof (`update_kind == Strong`), weak otherwise.
+//!   `(sites(object), key ++ fields)`; strong kills only under a single-site
+//!   must-alias proof (`update_kind == Strong`), weak otherwise.
 //! - **Calls** ([`IfdsProblem::call_flow`] /
-//!   [`IfdsProblem::call_to_return_flow`]): the §5.3 binding table for
-//!   arg→param mapping, the summary wrapper on the call-to-return edge
-//!   (summaries.md §2.1 — the interception point), exclusive-kill of the
-//!   call edge into the callee, and the fallback ladder.
+//!   [`IfdsProblem::call_to_return_flow`]): N66 frame-slot arg→param
+//!   mapping, summary application on the call-to-return edge, exclusive-kill
+//!   of the call edge into the callee, and the fallback ladder.
 //! - **Return wiring** ([`IfdsProblem::return_flow`]): return value →
 //!   call result on the normal continuation; thrown value → the catch
 //!   handler's `ExceptionParam` binding on handler return sites (T5).
@@ -112,8 +110,8 @@ fn param_binding(module: &Module, callee: FuncId) -> ParamBinding {
 }
 
 /// The taint problem over a module + call graph + the rung-selected
-/// alias oracle ([`Oracle`]: rung-0 baseline or the rung-1 demand-driven
-/// engine) + summary registry + source/sink config.
+/// alias oracle ([`Oracle`]: rung-0 baseline, rung-1 demand-driven
+/// engine, or rung-2 whole-module PTA) + summary registry + source/sink config.
 pub struct TaintProblem<'m> {
     module: &'m Module,
     callgraph: &'m CallGraph,
@@ -142,17 +140,17 @@ pub struct TaintProblem<'m> {
     /// The applied-summary log: `(call site, summary name)` in
     /// application order — reported by the driver.
     applied: RefCell<Vec<(InstId, String)>>,
-    /// The t-P3 receiver-family memo (one entry per queried receiver
+    /// Receiver-family memo (one entry per queried receiver
     /// value; engine answers are point-independent at rung 1).
     proto_memo: RefCell<HashMap<ValueId, FamilyAnswer>>,
-    /// The t-P4 gap edges (eager scan, [`crate::gap`]): summary call
+    /// Callback-gap edges (eager scan, [`crate::gap`]): summary call
     /// site → resolved callback bodies. The driver layers them onto
     /// the solver's call graph (`GapCallGraph`); the flow functions
     /// consult them to recognize gap edges.
     gap_edges: BTreeMap<InstId, Vec<FuncId>>,
-    /// The e13 fresh-result memo (rung 2; [`TaintProblem::fresh_result_site`]).
+    /// Fresh-result memo (rung 2; [`TaintProblem::fresh_result_site`]).
     fresh_memo: RefCell<HashMap<ValueId, Option<InstId>>>,
-    /// Gap-wrapper counters (FlowDroid's gap-hit/miss analogue): call
+    /// Callback-gap counters: call
     /// sites whose callback summary applied AND the callback value
     /// resolved to at least one user body.
     gap_resolved: usize,
@@ -329,7 +327,7 @@ impl<'m> TaintProblem<'m> {
             gap_resolved: 0,
             gap_unresolved: 0,
         };
-        // The eager gap scan (t-P4, gap.rs): static edges, counter-free.
+        // Eager gap scan (gap.rs): static edges, counter-free.
         let (mut edges, resolved, unresolved) = problem.scan_gap_edges();
         for (call, cb_funcs) in source_cb_edges {
             let entry = edges.entry(call).or_default();
@@ -351,7 +349,7 @@ impl<'m> TaintProblem<'m> {
         &self.links
     }
 
-    /// The gap edges (t-P4 eager scan) — the driver layers them onto
+    /// Static callback-gap edges — the driver layers them onto
     /// the solver's call graph via [`crate::gap::GapCallGraph`].
     pub fn gap_edges(&self) -> &BTreeMap<InstId, Vec<FuncId>> {
         &self.gap_edges
@@ -363,7 +361,7 @@ impl<'m> TaintProblem<'m> {
         (self.gap_resolved, self.gap_unresolved)
     }
 
-    /// The eager gap scan (gap.rs §1): for every call site whose
+    /// The eager gap scan (`gap.rs`): for every call site whose
     /// winning summary declares a full callback gap, resolve the
     /// callback argument to user bodies. COUNTER-FREE by construction —
     /// classification peeks (`compute_class(call, true)`), so the
@@ -400,7 +398,7 @@ impl<'m> TaintProblem<'m> {
             };
             let funcs = gap::resolve_callback_funcs(self.module, &self.oracle.borrow(), cbv, call);
             if funcs.is_empty() {
-                // The not-a-callback refinement (t-P5): a slot filled
+                // Not-a-callback refinement: a slot filled
                 // with a provably non-callable constant (the dual-form
                 // `String.prototype.replace`'s string replacement) is
                 // not a gap site at all — counting it as unresolved
@@ -453,7 +451,7 @@ impl<'m> TaintProblem<'m> {
     /// Classify a call site on the fallback ladder (memoized; counters
     /// fire exactly once per site).
     ///
-    /// The lookup precedence (t-P3; documented in the README):
+    /// The lookup precedence (`design/analysis.md`):
     ///
     /// 1. **direct name match** — a summary registered under one of
     ///    the callee's def-chain name candidates wins (exclusive
@@ -497,7 +495,7 @@ impl<'m> TaintProblem<'m> {
                     // builtin summaries — counting them would dilute the
                     // backlog log (rung 2 resolves many more internal
                     // callees, whose FunctionData names enter the
-                    // candidate list; t-P6 hygiene).
+                    // candidate list).
                     if !n.starts_with('#') {
                         self.registry.record_miss(n);
                     }
@@ -587,7 +585,7 @@ impl<'m> TaintProblem<'m> {
         (class, tried)
     }
 
-    /// The t-P3 prototype-resolution path: `recv.m(...)` → the
+    /// Prototype-resolution path: `recv.m(...)` → the
     /// receiver's prototype families ([`crate::prototype`]) →
     /// `Family.prototype.m` candidates, in family order. Returns the
     /// first registered summary key; every miss appends its
@@ -679,7 +677,7 @@ impl<'m> TaintProblem<'m> {
     /// conservative may-alias answer for unknown bases; the refined
     /// rungs sharpen `object`'s sites through their engines).
     ///
-    /// Rung 2 addition (t-P6, the e13 mechanism): when `object`'s sites
+    /// Rung 2 addition (probe e13 mechanism): when `object`'s sites
     /// are unknown BUT it is the result of a summary call whose result
     /// no static flow reaches (a FRESH container — [`TaintProblem`]'s
     /// `fresh_result_site`), the load base keys by the call site: a
@@ -699,9 +697,8 @@ impl<'m> TaintProblem<'m> {
         }
     }
 
-    /// The e13 mechanism (t-P4's registered rung-2 idea, "summary
-    /// results as call-site-keyed allocations" — landed here,
-    /// taint-side): the call instruction of a summary-application whose
+    /// Fresh summary-result keying (probe e13): the call instruction of
+    /// a summary application whose
     /// result NO static flow reaches (`Param/Base/Field → Return*`
     /// would mean the result derives from — may alias — an input, and
     /// gap return channels key their facts precisely on the local
@@ -758,7 +755,7 @@ impl<'m> TaintProblem<'m> {
         !a.sites.is_empty() && a.sites.intersects(&b.sites)
     }
 
-    /// The access-path cut (`cutFirstField`, soot-infoflow §2.2): what
+    /// Access-path leading-field cut: what
     /// remains of `fields` after reading `key`. An empty chain means the
     /// base itself was tainted — any property read is tainted one step.
     fn cut_first(&self, fields: &FieldChain, key: FieldKey) -> Option<FieldChain> {
@@ -855,8 +852,8 @@ impl<'m> TaintProblem<'m> {
                 }
             }
         }
-        // The stored value's taint is re-keyed into the heap: the
-        // computeAliases analogue (soot-infoflow §4.2) — rung 1 injects
+        // The stored value's taint is re-keyed into the heap: store-base
+        // alias resolution (`Oracle::aliases_of_store`) — rung 1/2 injects
         // the REFINED key and the baseline is skipped; otherwise the
         // rung-0 keying stands (empty-site unknown-base wildcard
         // included — sound by construction).
@@ -995,7 +992,7 @@ impl<'m> TaintProblem<'m> {
     /// [`TaintProblem::local_alias_evidence`]), so this adds flows over
     /// rung 0 without re-keying any existing match. `Field(path)`
     /// endpoints additionally require the fact's chain to start with
-    /// `path` (the leftover below the path flows on — the t-P3 case:
+    /// `path` (the leftover below the path flows on — e.g.
     /// an `[AnyIndex]`-tagged array element read by
     /// `Array.prototype.pop` / `Iterator.prototype.next`). Returns the
     /// leftover chain and whether the match was heap-sourced (the
@@ -1153,7 +1150,7 @@ impl<'m> TaintProblem<'m> {
         }
     }
 
-    /// The gap enter mapping (t-P4; [`crate::gap`] §3): at a gap edge
+    /// Callback-gap enter mapping ([`crate::gap`]): at a gap edge
     /// `(call → cb_func)`, each of the gap's `enter` rules whose source
     /// endpoint matches the incoming fact seeds the callback's formal
     /// (the N66 frame-slot binding — formal 0 of an es2abc closure is
@@ -1245,8 +1242,8 @@ impl IfdsProblem for TaintProblem<'_> {
         };
 
         // ── Source generation fires on EVERY incoming edge, including
-        // the zero fact's (FlowDroid's SourcePropagationRule: a source
-        // statement produces taint from Λ).
+        // the zero fact (`Λ`), unconditionally producing taint at the
+        // source statement.
         if let Op::TryGetGlobal { name, .. } = &curr_inst.op
             && self.global_sources.contains(name)
             && let Some(result) = curr_inst.result
@@ -1428,7 +1425,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 }
                 out.push(source.clone());
             }
-            // ── Iterator protocol objects (t-P3) ───────────────────
+            // ── Iterator protocol objects ───────────────────────────
             Op::GetIterator { obj } => {
                 // `it = getiterator(obj)`: the iterator yields obj's
                 // elements, so obj's taint state transfers to it.
@@ -1552,8 +1549,9 @@ impl IfdsProblem for TaintProblem<'_> {
             Op::DefineFunc { .. } => {
                 // Captured taint marks the closure value with an EMPTY
                 // chain ("this function closes over tainted data").
-                // Rung 0 does NOT propagate capture taint into the body
-                // (known FN, ladder pointer in the README).
+                // Lexical captures propagate into the body via
+                // `GetLexVar`/`PutLexVar` (and `NewLexEnv` sites at rung 2;
+                // `design/analysis.md`), not via the function-object value.
                 let is_capture = curr_inst
                     .op
                     .operands()
@@ -1623,7 +1621,7 @@ impl IfdsProblem for TaintProblem<'_> {
         }
         let gap = self.gap_at(call, callee);
         // Exclusive summaries kill the call edge into the callee body —
-        // never merged (summaries.md §2.1). The GAP edge into the user
+        // never merged (`design/analysis.md`). The GAP edge into the user
         // callback is NOT killed (gap.rs §"Interaction with exclusive":
         // exclusive-with-callback still runs the callback).
         if gap.is_none()
@@ -1654,7 +1652,7 @@ impl IfdsProblem for TaintProblem<'_> {
             return;
         };
 
-        // ── The gap edge (t-P4) ──────────────────────────────────────
+        // ── Callback-gap edge ────────────────────────────────────────
         // The summary call site virtually invokes the callback with
         // (element, index, array) — the summary call's operands are NOT
         // the callback's arguments, so the normal arg→param binding does
@@ -1674,8 +1672,7 @@ impl IfdsProblem for TaintProblem<'_> {
             return;
         }
 
-        // The oracle learns the calling context (rung 0: no-op; the seam
-        // discipline of analysis-strategy §5.2 / infoflow.md §4.3).
+        // The oracle learns the calling context (rung 0: no-op; `design/analysis.md`).
         abcd_analysis::dataflow::heap::AliasOracle::inject_calling_context(
             &mut *self.oracle.borrow_mut(),
             call,
@@ -1715,8 +1712,7 @@ impl IfdsProblem for TaintProblem<'_> {
                     let formal_base = match binding {
                         ParamBinding::Precise { formal_base, .. } => formal_base,
                         // unreachable: the else branch guarantees Precise
-                        // (OverApproxAll was handled and returned above) —
-                        // c-COV diagnosis
+                        // (OverApproxAll was handled and returned above).
                         ParamBinding::OverApproxAll => unreachable!(),
                     };
                     match kind {
@@ -1731,8 +1727,7 @@ impl IfdsProblem for TaintProblem<'_> {
                         }
                         CallKind::Apply | CallKind::SuperSpread => {
                             // args[0] is an ARRAY spread over the formals: a
-                            // tainted array taints every formal (the
-                            // reflective-call mapper case of soot-infoflow).
+                            // tainted array conservatively taints every formal.
                             if args.first() == Some(v) {
                                 for &p in fd.params.iter().skip(formal_base) {
                                     out.push(Fact::of(fact.rebased(TaintBase::Local(p))));
@@ -1812,7 +1807,7 @@ impl IfdsProblem for TaintProblem<'_> {
             return;
         }
         let Some(v) = fact.local_base() else { return };
-        // The gap return channel (t-P4; gap.rs §4): at a gap edge the
+        // Callback-gap return channel (gap.rs): at a gap edge the
         // callback's RETURN value maps per the summary's
         // `return_to_result` instead of the normal value→result
         // rebasing (map: the result array's `[AnyIndex]` elements;
@@ -1926,7 +1921,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 let Some(summary) = self.registry.lookup(&name, args.len()) else {
                     return;
                 };
-                // Clears first (summaries.md §2.2 step 3).
+                // Clears are evaluated before flows.
                 let cleared = summary
                     .clears
                     .iter()
@@ -1964,11 +1959,10 @@ impl IfdsProblem for TaintProblem<'_> {
                         ));
                     }
                 }
-                // The incoming taint is RETAINED unless cleared
-                // (summaries.md §2.2:813-820); exclusive summaries
-                // additionally kill incoming operand taints the flows
-                // did not re-add (WrapperPropagationRule's killSource):
-                // the summary is the complete model of the operands' fate.
+                // The incoming taint is RETAINED unless cleared; exclusive
+                // summaries additionally kill incoming operand taints the
+                // flows did not re-add: the summary is the complete model
+                // of the operands' fate.
                 let retain = !(cleared || exclusive && on_operand);
                 if retain {
                     out.push(source.clone());
@@ -1981,16 +1975,15 @@ impl IfdsProblem for TaintProblem<'_> {
             }
             SiteClass::BodyStep => {
                 // The callee body carries operand taints through the
-                // call/return edges (FlowDroid's killIncomingTaint =
-                // hasActiveBody); everything else bypasses.
+                // call/return edges; everything else bypasses.
                 if !on_operand {
                     out.push(source.clone());
                 }
             }
             SiteClass::NativeKeep | SiteClass::UnknownKeep => {
                 // Conservative keep: taint passes through untouched —
-                // never sanitizes. Plus the identity heuristic (reader D
-                // ladder rung 3): tainted operand ⇒ tainted return.
+                // never sanitizes. Plus the optional identity heuristic:
+                // tainted operand ⇒ tainted return.
                 out.push(source.clone());
                 if self.config.native_identity
                     && on_operand

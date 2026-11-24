@@ -3,7 +3,7 @@
 //!
 //! ## Configuration
 //!
-//! Sources and sinks are NAME-keyed (analysis-strategy §5.3: the
+//! Sources and sinks are NAME-keyed (`design/analysis.md`: the
 //! registry and the config key on `Sym`; the driver interns spec strings
 //! per module so one config serves every module — corpus reality is that
 //! ~97% of call sites are `UnknownCallees`, so name matching through
@@ -109,15 +109,15 @@ pub struct TaintConfig {
     /// functions unreachable from the sources through the call graph are
     /// still analyzed for global-source tagging). Default true.
     pub seed_all_functions: bool,
-    /// heros `followReturnsPastSeeds` (unbalanced returns). Default true.
+    /// Propagate return flows past initial seeds (unbalanced returns). Default true.
     pub follow_returns_past_seeds: bool,
     /// The native/unknown fallback's identity heuristic: tainted
-    /// operand ⇒ tainted return (reader D ladder rung 3). Default true.
+    /// operand ⇒ tainted return. Default true.
     pub native_identity: bool,
     /// The access-path k-limit (default
-    /// [`DEFAULT_MAX_FIELD_CHAIN`] = 5, FlowDroid's conventional bound).
+    /// [`DEFAULT_MAX_FIELD_CHAIN`] = 5).
     pub max_field_chain: usize,
-    /// The alias-oracle rung (analysis-strategy §4.4): 0 = heap-v0 local
+    /// The alias-oracle rung (`design/analysis.md`): 0 = local
     /// def chains; 1 = the on-demand backward `points_to` engine
     /// (memoized, depth-capped, rung-0 fallback) plus the points_to-fed
     /// call-graph refinement; 2 = the whole-module context-sensitive
@@ -208,7 +208,7 @@ pub struct TaintReport {
     pub summary_misses: std::collections::BTreeMap<String, usize>,
     /// Total propagated path edges (solver work).
     pub path_edges: usize,
-    /// t-P4 gap-wrapper counters: callback-summary call sites whose
+    /// Callback-gap counters: callback-summary call sites whose
     /// callback value resolved to user bodies (the full gap propagator
     /// entered them).
     pub gap_sites_resolved: usize,
@@ -238,10 +238,10 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     let work_mod: &Module = augmented.as_ref().unwrap_or(module);
 
     let base_graph = CallGraph::build(work_mod);
-    // The alias ladder (analysis-strategy §4.4):
+    // The alias ladder (`design/analysis.md`):
     // - rung 0 solves against the base graph with def-chain answers;
     // - rung 1 builds the on-demand engine over the BASE graph and
-    //   refines the graph once with the engine's points_to (§5.4 — one
+    //   refines the graph once with the engine's points_to (one
     //   engine, two consumers; one pass, no fixed point);
     // - rung 2 runs the whole-module PTA: its co-evolution fixed point
     //   IS the call graph the solver runs against, and its fixed-point
@@ -290,7 +290,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     }
 
     let problem = TaintProblem::new(work_mod, callgraph, oracle, &registry, config);
-    // The t-P4 gap layer: the eager scan's callback edges ride the
+    // Callback-gap layer: the eager scan's callback edges ride the
     // solver's call-graph oracle (the base graph itself is untouched —
     // sink collection and path reconstruction keep consuming it).
     let gap_graph = GapCallGraph::new(callgraph, problem.gap_edges());
@@ -573,7 +573,7 @@ impl PathIndex {
 /// Best-effort backward-BFS path from the sink edge back to the seed,
 /// over the solver's path-edge set — and the seed itself.
 ///
-/// Heros anchoring (the subtlety this implements): intraprocedural
+/// Path-edge anchoring: intraprocedural
 /// edges keep the ORIGINAL anchor, which for the seed's own function is
 /// the ZERO fact (seeds are `(Zero, sp, fact)` edges); the anchor
 /// switches to the callee-entry fact at call boundaries. Predecessors

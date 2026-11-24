@@ -1,5 +1,5 @@
-//! Gap-propagator and callee-name def-chain arm coverage (c-COV W10,
-//! the longtail batch): callback values through `Mov`/`Phi` chains and
+//! Gap-propagator and callee-name def-chain arm coverage: callback
+//! values through `Mov`/`Phi` chains and
 //! pooled `MethodRef` constants, the non-closure-site and cycle/dangling
 //! guards, the not-a-callback refinement (const leaves), the
 //! GapCallGraph merge dedup, and the name-resolution Mov/Phi arms
@@ -698,7 +698,7 @@ fn names_guards_and_const_callee_names() {
     let entry = entry_of(&m, f);
     add_param(&mut m, f, 0);
     // Each call gets its OWN tainted param: a resolved body-step call
-    // kills its operand's fact downstream (killIncomingTaint).
+    // kills its operand's fact on the bypass edge.
     let p_a = add_param(&mut m, f, 1);
     let p_b = add_param(&mut m, f, 2);
     let p_c = add_param(&mut m, f, 3);

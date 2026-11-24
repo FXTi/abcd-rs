@@ -1,10 +1,11 @@
-//! The v0.2 type lattice (design/ir-v0.2.md §5.4, design/ir.md §5).
+//! The IR type lattice (`design/ir.md`).
 //!
 //! Dynamic-first: JS/TS values lift to [`Ty::Any`] / [`Ty::DynPrim`];
 //! ArkTS static types are *annotations* on the same instruction stream and
 //! never change dynamic semantics. File-bound payloads are illegal by
 //! construction: [`StaticTy::Reference`] carries a [`ClassId`] into the
-//! module's own class table — never a file string-pool index (N46).
+//! module's own class table — never a file string-pool index
+//! (`design/decisions.md` N46).
 //!
 //! `Signature` (a declaration, see [`crate::module::Signature`]) is kept
 //! separate from `Ty` (an analysis value).
@@ -17,7 +18,7 @@ use crate::id::ClassId;
 /// `Any` nor `Unknown` ever appears inside a `Union`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub enum Ty {
-    /// The full dynamic JS type (v0.1 `Tagged` folds into this).
+    /// The full dynamic JS tagged type.
     #[default]
     Any,
     /// A single dynamic primitive class.
@@ -77,8 +78,8 @@ pub enum StaticTy {
     F32,
     /// 64-bit float.
     F64,
-    /// A reference to a class in the module's own class table. Never a
-    /// file pool index (N46 is impossible by construction).
+    /// A reference to a class in the module's own class table — never a
+    /// file pool index (`design/decisions.md` N46).
     Reference(ClassId),
     /// No value (void methods).
     Void,

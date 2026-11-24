@@ -1,4 +1,4 @@
-//! abcd-cli — the `abcd` command-line binary (design/cli-plan.md §3).
+//! abcd-cli — the `abcd` command-line binary (design/cli.md).
 //!
 //! Subcommands: `extract` (container → `.abc` files), `info` (file summary,
 //! `--verify`, `--json`), `dis` (`.abc` → pandasm `.pa`, byte-identical to
@@ -9,8 +9,8 @@
 //! and containers are sniffed by magic bytes, and multi-module containers
 //! require an explicit `--module` / `--all` choice.
 //!
-//! Output conventions (§3.4): results on stdout, diagnostics on stderr,
-//! exit codes 0 ok / 1 user error / 2 tool error, no panics on data.
+//! Output conventions (design/cli.md §3): results on stdout, diagnostics on
+//! stderr, exit codes 0 ok / 1 user error / 2 tool error, no panics on data.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
@@ -45,7 +45,7 @@ pub enum CliError {
 }
 
 impl CliError {
-    /// Process exit code per design §3.4.
+    /// Process exit code per design/cli.md §3.
     pub fn exit_code(&self) -> u8 {
         match self {
             CliError::User(_) => 1,

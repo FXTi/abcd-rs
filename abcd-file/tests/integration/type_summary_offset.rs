@@ -1,31 +1,27 @@
-//! typeSummaryOffset field handling (N8, revised after the wild-OHOS sweep).
+//! `typeSummaryOffset` field decoding, validation, and full relocation.
 //!
-//! Vendor facts:
+//! Format facts:
 //! - `TYPE_SUMMARY_FIELD_NAME = "typeSummaryOffset"`
-//!   (abcd-file-sys/arkcompiler_runtime_core/libpandabase/include/libpandabase/utils/const_value.h:25).
-//! - Its value is a NESTED file offset (it points to a literal array
-//!   whose elements are themselves offsets) — arkcompiler_runtime_core
-//!   docs/changelogs/2022-08-18-isa-changelog.md item 5 ("The literalarray
-//!   which is referenced by TypeSummary contains the offsets of all
-//!   type-literalarray").
-//! - The 2026-09-20 "no upstream producer" assumption is WILD-DISPROVED:
-//!   4.x–5.x-era es2abc emits the field on AbilityStage/Application
-//!   classes (219/512 wild OpenHarmony haps carry it, 94 distinct offset
-//!   variants across 4.0→5.1).
-//!
-//! Contract (decode unlocked, write side stays honest):
-//! - Decode reads the u32 value as a fact and models it as
-//!   `FieldValue::TypeSummaryOffset` — an opaque source-file offset, never
-//!   a mis-routed module-data decode, never a bare `FieldValue::I32` that
-//!   would look like a scalar constant.
-//! - Encode/rewrite still HARD-ERRORS: the value is a nested file offset
-//!   and the rewriter has no relocation support for the indirection, so a
-//!   rewrite must not silently emit a dangling offset.
+//!   (`vendor/arkcompiler_runtime_core/libpandabase/include/libpandabase/utils/const_value.h`).
+//! - When non-zero, its u32 wire value is the source-file offset of a tagged
+//!   `LiteralArray` whose elements include `LiteralTag::LITERALARRAY` (`0x18`)
+//!   references to per-type literal arrays (2022-08-18 ISA changelog item 5;
+//!   emitted by OpenHarmony 4.x–5.x `es2abc` on AbilityStage/Application and
+//!   module records).
+//! - When zero (`TYPE_SUMMARY_OFFSET_NOT_FOUND`), it is an absent-summary
+//!   sentinel scalar (`FieldValue::I32(0)`).
+//! - Decode validates non-zero offsets as well-formed tagged literal arrays,
+//!   records them in `File::literal_arrays` (along with transitively nested
+//!   type literal arrays), and models the field as `FieldValue::LiteralArrayRef`
+//!   so `encode` relocates both levels cleanly.
 
-use abcd_file::{AccessFlags, Builder, FieldValue, SourceLang, Type, decode, encode};
+use abcd_file::{
+    AccessFlags, Builder, Error, FieldValue, LiteralValue, ModuleRecordDef, SourceLang, Type,
+    decode, encode, pandasm,
+};
 
-/// Build a minimal well-formed file (global class + entry method) and
-/// let `configure` add the class under test.
+/// Build a minimal well-formed file (global class + entry method) and let
+/// `configure` add records/literal arrays under test.
 fn build(configure: impl FnOnce(&mut Builder)) -> Vec<u8> {
     let mut b = Builder::new();
     b.set_api(12, "beta1");
@@ -46,118 +42,247 @@ fn build(configure: impl FnOnce(&mut Builder)) -> Vec<u8> {
     b.finalize().expect("finalize")
 }
 
-/// A u32 field named `typeSummaryOffset` on an ordinary record (the wild
-/// shape: es2abc hangs it on AbilityStage/Application classes) decodes to
-/// the opaque source-file offset.
+/// Resolve a `LiteralArrayRef(off)` field's summary literal array and expand
+/// any nested `LiteralValue::LiteralArray(idx)` children for structural comparison.
+fn resolve_summary_tree(file: &abcd_file::File, off: u32) -> Vec<String> {
+    let idx = *file
+        .literal_array_offsets
+        .get(&off)
+        .unwrap_or_else(|| panic!("summary offset {off:#x} must be in literal_array_offsets"));
+    let la = &file.literal_arrays[idx as usize];
+    la.values
+        .iter()
+        .map(|v| match v {
+            LiteralValue::LiteralArray(child_idx) => {
+                let child = &file.literal_arrays[child_idx.0 as usize];
+                let items: Vec<String> = child
+                    .values
+                    .iter()
+                    .map(|cv| match cv {
+                        LiteralValue::String(sid) => {
+                            format!("str:{}", file.strings.resolve(*sid).unwrap_or("?"))
+                        }
+                        other => format!("{other:?}"),
+                    })
+                    .collect();
+                format!("nested[{}]", items.join(", "))
+            }
+            LiteralValue::String(sid) => {
+                format!("str:{}", file.strings.resolve(*sid).unwrap_or("?"))
+            }
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
 #[test]
-fn type_summary_offset_decodes_as_opaque_offset() {
+fn type_summary_offset_with_nested_literal_arrays_roundtrips_and_relocates() {
     let data = build(|b| {
+        let type_a = b.add_literal_array("type_a");
+        b.literal_array_add_integer(type_a, 1);
+        let name_a = b.add_string("UserType");
+        b.literal_array_add_string(type_a, name_a);
+
+        let type_b = b.add_literal_array("type_b");
+        b.literal_array_add_integer(type_b, 2);
+        let name_b = b.add_string("OrderType");
+        b.literal_array_add_string(type_b, name_b);
+
+        let summary = b.add_literal_array("type_summary");
+        b.literal_array_add_integer(summary, 2);
+        b.literal_array_add_literalarray(summary, type_a);
+        b.literal_array_add_literalarray(summary, type_b);
+
         let cls = b.add_class("LTest;");
         b.class_set_source_lang(cls, SourceLang::EcmaScript);
         let f = b.class_add_field(cls, "typeSummaryOffset", Type::U32, AccessFlags::PUBLIC);
-        b.field_set_value_i32(f, 0x40);
+        b.field_set_value_literalarray(f, summary)
+            .expect("bind typeSummaryOffset to summary literal array");
     });
-    let file = decode(&data).expect("typeSummaryOffset must decode");
-    let cls = file
-        .classes
-        .values()
-        .find(|c| file.strings.resolve(c.descriptor) == Some("LTest;"))
-        .expect("LTest; class");
-    let field = cls
+
+    let mut file1 = decode(&data).expect("decode initial file");
+    let cls1 = file1.class_by_str("LTest;").expect("LTest;");
+    let f1 = cls1
         .fields
         .iter()
-        .find(|f| file.strings.resolve(f.name) == Some("typeSummaryOffset"))
+        .find(|f| file1.strings.resolve(f.name) == Some("typeSummaryOffset"))
         .expect("typeSummaryOffset field");
-    assert!(
-        matches!(
-            &field.initial_value,
-            Some(FieldValue::TypeSummaryOffset(0x40))
-        ),
-        "value must surface as the opaque-offset model, got {:?}",
-        field.initial_value
+    let orig_off = match f1.initial_value {
+        Some(FieldValue::LiteralArrayRef(off)) => off,
+        ref other => panic!("expected LiteralArrayRef, got {other:?}"),
+    };
+    let expected_tree = vec![
+        "Integer(2)".to_string(),
+        "nested[Integer(1), str:UserType]".to_string(),
+        "nested[Integer(2), str:OrderType]".to_string(),
+    ];
+    assert_eq!(resolve_summary_tree(&file1, orig_off), expected_tree);
+
+    // Inject extra strings/classes before re-encoding so item layout shifts,
+    // proving both the field offset and nested `0x18` entries relocate.
+    for i in 0..8 {
+        let pad_desc = format!("LPaddingClass{i}_WithLongDescriptorToShiftLayout;");
+        let sid = file1.strings.get_or_intern(&pad_desc);
+        file1.classes.insert(
+            sid,
+            abcd_file::Class {
+                descriptor: sid,
+                name: sid,
+                access_flags: AccessFlags::PUBLIC,
+                source_lang: SourceLang::EcmaScript,
+                source_file: None,
+                is_external: true,
+                super_class: None,
+                interfaces: Vec::new(),
+                methods: Vec::new(),
+                fields: Vec::new(),
+                annotations: abcd_file::Annotations::default(),
+            },
+        );
+    }
+
+    let reencoded = encode(&file1).expect("encode with relocated typeSummaryOffset");
+    let file2 = decode(&reencoded).expect("decode reencoded file");
+    let cls2 = file2.class_by_str("LTest;").expect("LTest; after reencode");
+    let f2 = cls2
+        .fields
+        .iter()
+        .find(|f| file2.strings.resolve(f.name) == Some("typeSummaryOffset"))
+        .expect("typeSummaryOffset field after reencode");
+    let new_off = match f2.initial_value {
+        Some(FieldValue::LiteralArrayRef(off)) => off,
+        ref other => panic!("expected LiteralArrayRef after reencode, got {other:?}"),
+    };
+    assert_ne!(
+        orig_off, new_off,
+        "padding classes must shift the summary literal array offset"
     );
+    assert_eq!(resolve_summary_tree(&file2, new_off), expected_tree);
+
+    // Pandasm text emit -> parse -> encode -> decode round-trip.
+    let pa = pandasm::emit_file(&file2, "summary.abc");
+    let parsed = pandasm::parse_file_with_version(&pa, file2.version)
+        .expect("pandasm parse with typeSummaryOffset");
+    let pa_encoded = encode(&parsed).expect("encode pandasm-parsed typeSummaryOffset");
+    let file3 = decode(&pa_encoded).expect("decode pandasm-roundtripped file");
+    let f3 = file3
+        .class_by_str("LTest;")
+        .expect("LTest;")
+        .fields
+        .iter()
+        .find(|f| file3.strings.resolve(f.name) == Some("typeSummaryOffset"))
+        .expect("typeSummaryOffset");
+    let off3 = match f3.initial_value {
+        Some(FieldValue::LiteralArrayRef(off)) => off,
+        ref other => panic!("expected LiteralArrayRef after pandasm roundtrip, got {other:?}"),
+    };
+    assert_eq!(resolve_summary_tree(&file3, off3), expected_tree);
 }
 
-/// Upstream attaches the field to the module record itself in some
-/// producers; the name guard must win over the `_ESModuleRecord` catch-all
-/// u32 arm so the value is not mis-routed into the module-data blob
-/// decoder.
 #[test]
-fn type_summary_offset_on_module_record_class_decodes() {
+fn type_summary_offset_on_module_record_class_roundtrips() {
     let data = build(|b| {
+        let leaf = b.add_literal_array("mod_type_leaf");
+        b.literal_array_add_integer(leaf, 99);
+        let summary = b.add_literal_array("mod_type_summary");
+        b.literal_array_add_integer(summary, 1);
+        b.literal_array_add_literalarray(summary, leaf);
+
+        let mod_la = b.add_literal_array("mod_data");
+        let req = b.add_string("./dep");
+        let local = b.add_string("depVal");
+        let imp = b.add_string("depVal");
+        b.literal_array_add_module_data(
+            mod_la,
+            &[req],
+            &[ModuleRecordDef::RegularImport {
+                local_name: local,
+                import_name: imp,
+                module_request_idx: 0,
+            }],
+        )
+        .expect("stage module data");
+
         let cls = b.add_class("L_ESModuleRecord;");
         b.class_set_source_lang(cls, SourceLang::EcmaScript);
-        let f = b.class_add_field(cls, "typeSummaryOffset", Type::U32, AccessFlags::PUBLIC);
-        b.field_set_value_i32(f, 0x40);
+        let mod_f = b.class_add_field(cls, "moduleRecordIdx", Type::U32, AccessFlags::PUBLIC);
+        b.field_set_value_literalarray(mod_f, mod_la)
+            .expect("bind module data");
+        let sum_f = b.class_add_field(cls, "typeSummaryOffset", Type::U32, AccessFlags::PUBLIC);
+        b.field_set_value_literalarray(sum_f, summary)
+            .expect("bind typeSummaryOffset");
     });
-    let file = decode(&data).expect("typeSummaryOffset on _ESModuleRecord must decode");
-    let cls = file
-        .classes
-        .values()
-        .find(|c| file.strings.resolve(c.descriptor) == Some("L_ESModuleRecord;"))
-        .expect("_ESModuleRecord class");
-    let field = cls
+
+    let file1 = decode(&data).expect("typeSummaryOffset on _ESModuleRecord must decode");
+    let reencoded = encode(&file1).expect("typeSummaryOffset on _ESModuleRecord must encode");
+    let file2 = decode(&reencoded).expect("reencoded _ESModuleRecord must decode");
+    let cls2 = file2
+        .class_by_str("L_ESModuleRecord;")
+        .expect("_ESModuleRecord");
+    let sum_f2 = cls2
         .fields
         .iter()
-        .find(|f| file.strings.resolve(f.name) == Some("typeSummaryOffset"))
+        .find(|f| file2.strings.resolve(f.name) == Some("typeSummaryOffset"))
         .expect("typeSummaryOffset field");
-    assert!(
-        matches!(
-            &field.initial_value,
-            Some(FieldValue::TypeSummaryOffset(0x40))
-        ),
-        "name guard must win over the module-data catch-all, got {:?}",
-        field.initial_value
+    let off2 = match sum_f2.initial_value {
+        Some(FieldValue::LiteralArrayRef(off)) => off,
+        ref other => panic!("expected LiteralArrayRef, got {other:?}"),
+    };
+    assert_eq!(
+        resolve_summary_tree(&file2, off2),
+        vec!["Integer(1)".to_string(), "nested[Integer(99)]".to_string()]
     );
 }
 
-/// A valueless field of that name carries no offset, so nothing can
-/// dangle: decode keeps it with no initial value.
 #[test]
-fn type_summary_offset_without_value_decodes() {
+fn type_summary_offset_zero_sentinel_and_valueless_roundtrip() {
     let data = build(|b| {
-        let cls = b.add_class("LTest;");
-        b.class_set_source_lang(cls, SourceLang::EcmaScript);
-        b.class_add_field(cls, "typeSummaryOffset", Type::U32, AccessFlags::PUBLIC);
+        let c_zero = b.add_class("LZero;");
+        b.class_set_source_lang(c_zero, SourceLang::EcmaScript);
+        let f = b.class_add_field(c_zero, "typeSummaryOffset", Type::U32, AccessFlags::PUBLIC);
+        b.field_set_value_i32(f, 0);
+
+        let c_none = b.add_class("LValueless;");
+        b.class_set_source_lang(c_none, SourceLang::EcmaScript);
+        b.class_add_field(c_none, "typeSummaryOffset", Type::U32, AccessFlags::PUBLIC);
     });
-    let file = decode(&data).expect("valueless typeSummaryOffset must decode");
-    let cls = file
-        .classes
-        .values()
-        .find(|c| file.strings.resolve(c.descriptor) == Some("LTest;"))
-        .expect("LTest; class");
-    let field = cls
-        .fields
-        .iter()
-        .find(|f| file.strings.resolve(f.name) == Some("typeSummaryOffset"))
-        .expect("typeSummaryOffset field");
-    assert_eq!(field.initial_value, None, "valueless field stays valueless");
+
+    let file1 = decode(&data).expect("decode zero/valueless typeSummaryOffset");
+    assert_eq!(
+        file1.class_by_str("LZero;").unwrap().fields[0].initial_value,
+        Some(FieldValue::I32(0))
+    );
+    assert_eq!(
+        file1.class_by_str("LValueless;").unwrap().fields[0].initial_value,
+        None
+    );
+
+    let reencoded = encode(&file1).expect("encode zero/valueless typeSummaryOffset");
+    let file2 = decode(&reencoded).expect("decode reencoded zero/valueless");
+    assert_eq!(
+        file2.class_by_str("LZero;").unwrap().fields[0].initial_value,
+        Some(FieldValue::I32(0))
+    );
+    assert_eq!(
+        file2.class_by_str("LValueless;").unwrap().fields[0].initial_value,
+        None
+    );
 }
 
-/// Write side stays honest: a decoded file carrying the field cannot be
-/// rewritten (the nested offset would dangle), so encode fails loudly
-/// instead of emitting bad bytes.
 #[test]
-fn type_summary_offset_rewrite_is_hard_error() {
-    let data = build(|b| {
-        let cls = b.add_class("LTest;");
-        b.class_set_source_lang(cls, SourceLang::EcmaScript);
-        let f = b.class_add_field(cls, "typeSummaryOffset", Type::U32, AccessFlags::PUBLIC);
-        b.field_set_value_i32(f, 0x40);
-    });
-    let file = decode(&data).expect("decode must succeed before rewrite is attempted");
-    let err = encode(&file).expect_err("rewrite of typeSummaryOffset must fail (write side)");
-    assert!(
-        matches!(err, abcd_file::Error::TypeSummaryOffset { .. }),
-        "dedicated variant, got: {err:?}"
-    );
-    let msg = err.to_string();
-    assert!(
-        msg.contains("typeSummaryOffset"),
-        "error must name the field: {msg}"
-    );
-    assert!(
-        msg.contains("2022-08-18"),
-        "error must cite the ISA changelog: {msg}"
-    );
+fn type_summary_offset_bogus_or_dangling_offsets_are_hard_errors() {
+    for bogus in [0x20u32, 0x40u32, 0xFFFF_FF00u32] {
+        let data = build(|b| {
+            let cls = b.add_class("LTest;");
+            b.class_set_source_lang(cls, SourceLang::EcmaScript);
+            let f = b.class_add_field(cls, "typeSummaryOffset", Type::U32, AccessFlags::PUBLIC);
+            b.field_set_value_i32(f, bogus as i32);
+        });
+        let err = decode(&data).expect_err("bogus typeSummaryOffset must fail loudly");
+        assert_eq!(
+            err,
+            Error::InvalidOffset(bogus),
+            "bogus offset {bogus:#x} must fail as InvalidOffset"
+        );
+    }
 }

@@ -1,33 +1,27 @@
-//! Rung 2 — the whole-module context-sensitive pointer analysis
-//! (design/analysis-strategy.md §4.4 rung 2, the APAK-shaped rung of the
-//! precision ladder; design/arkanalyzer/callgraph-and-pta.md §4 is the
-//! what-to-copy / what-to-rethink spec this module implements).
+//! Rung 2 — whole-module `k=1` context-sensitive Andersen-style subset
+//! pointer analysis (`design/analysis.md`, `design/ir.md`,
+//! `design/decisions.md` N20/N66).
 //!
-//! ## The shape (APAK-shaped, not APAK-cloned)
+//! ## Core algorithmic model
 //!
 //! An Andersen-style, subset-based, **field-sensitive, 1-call-site
-//! context-sensitive** pointer analysis over the whole module, with the
-//! ArkAnalyzer VPA lessons applied (callgraph-and-pta.md §4.1):
+//! context-sensitive** pointer analysis over the whole module:
 //!
-//! - **Abstract objects keyed by `(alloc InstId, context)`** — the VPA
-//!   `method + source position` key made strictly better (our `InstId`
-//!   is unique and stable, §4.1 item 1), widened by exactly the context
-//!   string the prototype never had. Context is **1-call-site**
-//!   (`None` = the module-wide base activation; `Some(call)` = the
-//!   activation entered through `call`), k-limited and documented — full
-//!   APAK fidelity (object sensitivity, deeper k, framework models) is
-//!   explicitly NOT promised; see the README's "honestly beyond" list.
-//! - **On-the-fly call-graph/PTA co-evolution** (§4.1 item 2): a call
+//! - **Abstract objects keyed by `(alloc InstId, context)`**: each allocation
+//!   site has a unique, stable [`InstId`] paired with a **1-call-site**
+//!   context (`None` = the module-wide base activation; `Some(call)` = the
+//!   activation entered through `call`), `k`-limited to depth 1. Deeper
+//!   call-string contexts and receiver-object sensitivity are intentionally
+//!   out of scope at this rung (`design/analysis.md`).
+//! - **On-the-fly call-graph/PTA co-evolution**: a call
 //!   site's callee value gaining a closure object wires the edge
 //!   (arguments → parameters through the N66 frame-slot model, callee
 //!   returns → the call result) and activates the callee body under
 //!   `Some(call)`; new edges feed propagation and new points-to feeds
 //!   resolution in ONE worklist. The output [`CallGraph`] therefore
-//!   upgrades where rungs 0–1 stayed name-based/def-chain-based:
-//!   callees loaded from object fields (c4's handler table), from
-//!   global bindings (d4's top-level thrower), and from own-property
-//!   method stores (e7's shadow) resolve through value flow.
-//! - **Per-object field sensitivity** (§4.1 item 3): each abstract
+//!   resolves callees loaded from object fields, array elements, global
+//!   bindings, and own-property method stores through value flow.
+//! - **Per-object field sensitivity**: each abstract
 //!   object has three field buckets — `Named(Sym)`, `Index`
 //!   (integer-index stores), `Dynamic` (computed-key stores) — matching
 //!   the [`crate::dataflow::heap::FieldKey`] vocabulary. Reads are
@@ -35,29 +29,31 @@
 //!   Dynamic`, an index read sees `Index ∪ Dynamic`, a computed read
 //!   sees every bucket (re-armed when a new bucket appears on an object
 //!   it already read).
-//! - **Delta worklist propagation** (§4.1 item 4, the VPA lesson):
-//!   the two-half rule — a new `(pointer, object)` fact replays down
-//!   every existing out-edge, and a new edge `s → t` immediately emits
-//!   `(t, o)` for every object already in `s`. Statement-level handlers
-//!   (stores/loads/calls) are indexed by the base pointer and fire once
-//!   per `(handler, object)` pair — no VPA-style quadratic re-sweeps.
-//! - **Scope gating** (§4.1 item 5): the module is the whole program;
+//! - **Two-half delta worklist propagation**: a new `(pointer, object)` fact
+//!   replays down every existing out-edge, and a new edge `s → t`
+//!   immediately emits `(t, o)` for every object already in `s`.
+//!   Statement-level handlers (stores/loads/calls) are indexed by base
+//!   pointer and fire once per `(handler, object)` pair without whole-graph
+//!   re-sweeps.
+//! - **Scope gating**: the module is the whole program;
 //!   every function gets a base (`None`-context) activation so alloc
 //!   sites in never-called code still key objects, and context-variant
 //!   activations appear only through resolved edges. Framework/native
-//!   behavior enters only through the taint layer's explicit summaries,
-//!   never by analyzing outside the module.
+//!   behavior enters only through explicit downstream summaries or lifecycle
+//!   harnesses ([`crate::ohos_lifecycle`]), never by reaching outside the
+//!   module.
 //!
-//! ## What is bytecode-rethought (§4.2)
+//! ## Bytecode-native function values
 //!
-//! There is **no CHA fallback**: Panda-bytecode values carry no declared
-//! types, so the call graph has ONE resolution mechanism — points-to on
-//! the callee value. Function values are first-class heap objects:
-//! `AllocClosure`/`CreateGenerator`/`DefineFunc`/`LoadConst(MethodRef)`/
-//! `LoadFunction` seed *callable* abstract objects whose body drives
-//! resolution. Allocation seeding covers all four keyed `Alloc*` kinds
-//! (T7) — object/array literals that never touch a `new` are first-class
-//! allocations, which closes the source-level closure hole at the root.
+//! There is **no CHA fallback**: dynamic Panda-bytecode values carry no
+//! declared receiver types, so the call graph uses ONE resolution mechanism
+//! — points-to on the callee value. Function values are first-class heap
+//! objects: `AllocClosure`/`CreateGenerator`/`DefineFunc`/
+//! `LoadConst(MethodRef)`/`LoadFunction` seed *callable* abstract objects
+//! whose body drives call resolution. Allocation seeding covers all four
+//! keyed `Alloc*` ops (`AllocObject`, `AllocArray`, `AllocClosure`,
+//! `AllocRegExp`), so object and array literals that never touch `new` are
+//! first-class allocations.
 //!
 //! ## The soundness contract (rung-0 floor, unchanged)
 //!
@@ -139,8 +135,8 @@ enum Obj {
     Unknown,
     /// An allocation-site object.
     Site {
-        /// The allocating instruction (`InstId` — strictly better than
-        /// VPA's `method + position` string, §4.1 item 1).
+        /// The allocating instruction (`InstId` — unique and stable across
+        /// the module arena).
         site: InstId,
         /// The activation context the allocation ran in.
         ctx: Ctx,
@@ -454,7 +450,9 @@ impl<'m> Pta<'m> {
         let id = self.handlers.len() as u32;
         self.handlers.push((base, handler));
         self.handlers_by_base.entry(base).or_default().push(id);
-        // unreachable under the activation-priority pump discipline (pta.rs:873-886 scans pending activations before the worklist; pts mutates only in the worklist loop) — c-COV diagnosis
+        // Defensive catch-up if `base` already carries facts (under the
+        // activation-priority pump discipline, pending activations scan
+        // before worklist facts populate `pts`).
         if let Some(objs) = self.pts.get(&base).cloned() {
             for o in objs {
                 self.fire(id, o);
@@ -1505,7 +1503,7 @@ fn join_stacks(a: &[EnvEntry], b: &[EnvEntry]) -> Vec<EnvEntry> {
                 sites: x.sites.clone(),
                 unknown: true,
             }),
-            // unreachable: len = max(a.len(), b.len()), so for i < len at least one side is Some — c-COV diagnosis
+            // Unreachable: `len = max(a.len(), b.len())`, so for `i < len` at least one side is `Some`.
             (None, None) => unreachable!(),
         }
     }

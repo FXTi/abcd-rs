@@ -1,8 +1,7 @@
-//! S3 regression (v0.2 port of `abcd-ir/tests/lower_copydataproperties.rs`):
-//! `Op::CopyDataProps` lowering.
+//! Regression tests for `Op::CopyDataProps` lowering.
 //!
 //! Operand roles follow the vendor signature `copydataproperties v:in:top,
-//! acc: inout:top` (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml): the register operand
+//! acc: inout:top` (`vendor/arkcompiler_runtime_core/` dynamic ISA): the register operand
 //! is the TARGET object, the accumulator carries the SOURCE and receives
 //! the result. The simulator halts at the `Copydataproperties` instruction
 //! (record-and-stop), so the test asserts exactly which value sits in which
@@ -76,9 +75,7 @@ fn copydataproperties_lowers_with_dst_in_register_and_src_in_acc() {
     assert_eq!(src, SRC, "acc must carry the source object");
 }
 
-/// The v0.1 opt-treatment pin (DCE keeps CopyDataProps as a side-effecting
-/// store) has no v0.2 counterpart at P2 — the verifier pin stands in: the
-/// op verifies and lowers.
+/// Structural verifier check for `CopyDataProps`.
 #[test]
 fn copydataproperties_verifies() {
     let (module, _func) = build_spread_function();

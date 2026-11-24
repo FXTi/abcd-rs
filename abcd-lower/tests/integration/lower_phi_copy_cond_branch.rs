@@ -1,8 +1,8 @@
-//! P1 regression (B1, v0.2 port of
-//! `abcd-ir/tests/lower_phi_copy_cond_branch.rs`): phi copies of a
-//! conditional predecessor must execute ONLY on their own edge.
+//! Conditional-edge phi-copy placement regression tests: phi copies of a
+//! conditional predecessor must execute ONLY on their own outgoing edge via
+//! dedicated trampolines.
 //!
-//! The module below is real IR built with the v0.2 test builder (entry
+//! The module below builds real IR with `V2Builder` (entry
 //! ends in `CondBranch`, successors s1/s2 end in `Return`). The
 //! `RegAlloc` and `IselResult` are hand-constructed (all fields are
 //! public) to pin the exact slot assignment the bug needs: s1's code

@@ -5,16 +5,15 @@
 //! invokes it through the lexical environment
 //! (`ldlexvar` + `callruntime.callinit`), and its body is a sequence of
 //! `this.#name = <constant>` definitions
-//! (`callruntime.defineprivateproperty`). The v0.2 IR models that
+//! (`callruntime.defineprivateproperty`). The SSA IR models that
 //! lowering faithfully (the ctor's `Call`, the initializer's
-//! `DefinePrivate`), so the decompiled class READ the private field but
-//! never INITIALIZED it — the store stayed in the out-of-class
-//! initializer (`this["p0_0"] = 4.0` — a PUBLIC property, a semantics
-//! divergence the VM oracle catches: `private-field` printed
-//! `undefined` instead of `4`).
+//! `DefinePrivate`), so without folding the decompiled class read the
+//! private field without initializing it inside the class body — leaving
+//! the store in the out-of-class initializer (`this["p0_0"] = 4.0`, a
+//! public property).
 //!
-//! This module reverses the lowering (a structuring-side fold, design
-//! decompile.md §6): when the pattern is EXACT, the initializer's
+//! This module reverses the lowering (a structuring-side fold,
+//! `design/decompile.md` §6): when the pattern is EXACT, the initializer's
 //! constant private definitions become `#name = <const>;` class-field
 //! declarations and the ctor's initializer call is elided. The pattern
 //! (every condition must hold — otherwise `None`, the status quo):

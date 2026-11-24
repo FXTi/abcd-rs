@@ -1,6 +1,5 @@
-//! The full gap propagator (t-P4; FlowDroid's gap mechanism,
-//! design/flowdroid/summaries.md §1–2 — `SummaryTaintWrapper`'s
-//! `spawnAnalysisIntoClientCode`, `getImplementors`).
+//! Callback-gap propagation (`design/analysis.md`): spawning IFDS analysis
+//! into user callback bodies invoked by summarized higher-order builtins.
 //!
 //! ## The mechanism
 //!
@@ -24,10 +23,10 @@
 //!    facts after the first cycle).
 //! 2. **Call-graph augmentation** — [`GapCallGraph`] wraps the base
 //!    graph and merges the gap callees into `callees_of_call_at` (and
-//!    the gap callers into `callers_of`, so the unbalanced-returns
-//!    discipline of heros §1.7 sees them). The IFDS solver then enters
+//!    the gap callers into `callers_of`, so unbalanced-return edges
+//!    also observe them). The IFDS solver then enters
 //!    the callback body through its ordinary call-edge machinery —
-//!    this is "spawning the normal analysis into user code", NOT a
+//!    spawning the normal IFDS tabulation into user code, NOT a
 //!    separate analysis.
 //! 3. **Gap enter** ([`crate::problem::TaintProblem`]'s `call_flow`):
 //!    at a gap edge the summary's `enter` rules map matching taint
@@ -46,9 +45,8 @@
 //! ## Interaction with `exclusive`
 //!
 //! An exclusive summary kills the call edge into the CALLEE's body —
-//! never the gap edge into the user callback
-//! (`spawnAnalysisIntoClientCode` is how FlowDroid's exclusive
-//! summaries stay sound across library→app callbacks). The exclusive
+//! never the gap edge into the user callback, keeping exclusive summaries
+//! sound across library-to-application callbacks. The exclusive
 //! bypass-edge kill in `call_to_return_flow` is likewise unaffected.
 //!
 //! ## The honest fallback
@@ -59,12 +57,12 @@
 //! (it fires if user code later calls the value directly), and taint
 //! never enters the callback body — an FN the wrapper counter
 //! `gap_sites_unresolved` records (see
-//! [`crate::driver::TaintReport`]). This mirrors FlowDroid: no
-//! implementors found ⇒ the gap flow stays inside the wrapper. A slot
+//! [`crate::driver::TaintReport`]): when no callable body can be resolved,
+//! the gap flow stays inside the wrapper. A slot
 //! provably filled with a non-callable CONSTANT (dual-form summaries —
 //! `String.prototype.replace`'s string replacement) is neither
 //! resolved nor unresolved: it is not a callback site at all
-//! ([`definitely_not_callable`], t-P5).
+//! ([`definitely_not_callable`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -212,10 +210,10 @@ pub fn definitely_not_callable(module: &Module, value: ValueId) -> bool {
 }
 
 /// The solver-facing call-graph oracle with the gap edges merged in
-/// (the ICFG indirection of analysis-strategy §5.4: the solver consumes
-/// the graph only through `CallGraphOracle`, so the gap layer is a
-/// pure wrapper — the base graph is untouched and every other consumer
-/// (sink collection, path reconstruction, classification) keeps it).
+/// (`design/analysis.md`: the solver consumes the graph only through
+/// `CallGraphOracle`, so the gap layer is a pure wrapper — the base graph
+/// is untouched and every other consumer (sink collection, path
+/// reconstruction, classification) keeps it).
 pub struct GapCallGraph<'m> {
     base: &'m CallGraph,
     /// Call sites with gap edges → the FULL callee list (base callees

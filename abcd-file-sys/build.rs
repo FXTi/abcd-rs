@@ -97,4 +97,5 @@ fn main() {
     println!("cargo:rerun-if-changed=bridge/");
     println!("cargo:rerun-if-changed=src/generated/");
     println!("cargo:rerun-if-changed={vendor_root}/");
+    println!("cargo:rerun-if-changed={vendor_shim}/utils/logger.h");
 }

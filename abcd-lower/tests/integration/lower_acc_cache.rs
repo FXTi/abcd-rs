@@ -1,6 +1,5 @@
-//! B4 regression (v0.2 port of `abcd-ir/tests/lower_acc_cache.rs`): the
-//! accumulator is a PHYSICAL emission-time resource, not a coloring class
-//! ("acc-as-cache").
+//! `ADR-03` (`B4`) regression tests: the accumulator is a PHYSICAL
+//! emission-time resource, not a coloring class ("acc-as-cache").
 //!
 //! Every value has a register home, every acc-writing instruction result
 //! with a use is homed by a `Sta`, and isel's emission-time acc tracker

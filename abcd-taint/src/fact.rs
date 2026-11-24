@@ -1,11 +1,11 @@
-//! The taint fact model (design/flowdroid/soot-infoflow.md §3 access-path
-//! discipline over `abcd-analysis`'s rung-0 heap keys).
+//! The taint fact model (`design/analysis.md`): access-path discipline
+//! over `abcd-analysis`'s heap and environment keys.
 //!
 //! A taint fact is an **access path**: a *base* plus a k-capped
 //! [`FieldChain`] below it. Bases come in five kinds:
 //!
-//! - [`TaintBase::Local`] — an SSA value (T1: the value *is* the taint
-//!   key). This is the soot-infoflow `x.f.g` case with a local base.
+//! - [`TaintBase::Local`] — an SSA value (the value *is* the taint
+//!   key, e.g. `x.f.g` rooted at local SSA value `x`).
 //! - [`TaintBase::Heap`] — a set of allocation sites (the rung-0 heap
 //!   key of `abcd-analysis::dataflow::heap`): taint written through
 //!   `obj.f = tainted` is re-keyed by the alloc sites of `obj`, so a
@@ -20,9 +20,8 @@
 //! - [`TaintBase::LexVar`] — a lexical-environment slot keyed by
 //!   `(level, slot)` only, deliberately NOT by function: closure bodies
 //!   read outer slots through shifted levels, so a per-function key
-//!   would break capture propagation. The cross-function merge is a
-//!   documented rung-0 over-approximation (the precision ladder pointer
-//!   is in the README).
+//!   would break capture propagation. At rung 2, precise accesses refine
+//!   this to `NewLexEnv` allocation sites (`design/analysis.md`).
 //!
 //! ## Weak updates
 //!
@@ -32,14 +31,14 @@
 //! kill of a matching heap/local-field fact only when
 //! [`abcd_analysis::dataflow::heap::update_kind`] says `Strong` (single
 //! site, no phi, no unknown in the base's def chain — the SSA substitute
-//! for a must-alias proof, infoflow.md §9 item 3). Everything else is a
-//! weak update: the old fact survives alongside the new one.
+//! for a must-alias proof). Everything else is a weak update: the old
+//! fact survives alongside the new one.
 //!
 //! ## The zero fact
 //!
-//! [`Fact::Zero`] is heros' Λ — the "rest of the program state"
-//! placeholder. It is distinct from every real fact by construction
-//! (heros.md §2 item 4) and the solver auto-propagates it.
+//! [`Fact::Zero`] is the IFDS `Λ` placeholder representing unconditional
+//! reachability ("rest of the program state"). It is distinct from every
+//! real taint fact by construction and auto-propagated by the solver.
 
 use abcd_analysis::dataflow::heap::{AllocSiteSet, FieldChain, FieldKey};
 use abcd_ir::{ClassId, Sym, ValueId};
@@ -86,9 +85,7 @@ impl TaintFact {
         }
     }
 
-    /// This fact re-based onto `base`, keeping the field chain (the
-    /// taint substitution of soot-infoflow's
-    /// `AccessPathFactory.copyWithNewValue`).
+    /// This fact re-based onto `base`, keeping the field chain intact.
     pub fn rebased(&self, base: TaintBase) -> Self {
         TaintFact {
             base,
@@ -123,7 +120,7 @@ impl TaintFact {
 /// The IFDS fact: Λ or a taint access path.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Fact {
-    /// The zero (Λ) fact — heros' "rest of the program state".
+    /// The zero (`Λ`) fact — unconditional reachability anchor.
     Zero,
     /// A real taint fact.
     Taint(TaintFact),

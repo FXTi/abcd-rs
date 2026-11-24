@@ -288,25 +288,26 @@ fn lift_field<'f>(
         Some(abcd_file::FieldValue::LiteralArrayRef(offset)) => {
             // Standalone `_ESScopeNamesRecord` field: the field NAME is the
             // source file; `--merge-abc` `scopeNames` field: attached to the
-            // owning record class itself.
-            let idx = lf
-                .file
-                .literal_array_offsets
-                .get(offset)
-                .copied()
-                .ok_or(LiftError::UnresolvedEntity(*offset))?;
-            let konst = resolve::const_for_literal_array(lf, idx)?;
-            if is_standalone_scope_record {
-                lf.scope_name_fields.push((name, konst));
-            } else {
-                *class_scope_names = Some(konst);
+            // owning record class itself. Other `LiteralArrayRef` fields
+            // (such as `typeSummaryOffset`, a compile-time TS type summary
+            // with zero runtime consumer — ADR-10 / #38) must NOT clobber
+            // `class_scope_names` and evaluate to `None`.
+            if is_standalone_scope_record
+                || lf.file.strings.resolve(field.name) == Some(abcd_file::SCOPE_NAMES_FIELD)
+            {
+                let idx = lf
+                    .file
+                    .literal_array_offsets
+                    .get(offset)
+                    .copied()
+                    .ok_or(LiftError::UnresolvedEntity(*offset))?;
+                let konst = resolve::const_for_literal_array(lf, idx)?;
+                if is_standalone_scope_record {
+                    lf.scope_name_fields.push((name, konst));
+                } else {
+                    *class_scope_names = Some(konst);
+                }
             }
-            None
-        }
-        Some(abcd_file::FieldValue::TypeSummaryOffset(_)) => {
-            // Nested file offset (2022-08-18 ISA changelog item 5) with no
-            // runtime consumer — there is no constant to lift, same as the
-            // other offset-valued field models above.
             None
         }
         Some(abcd_file::FieldValue::JsonFileContent { content, .. }) => {

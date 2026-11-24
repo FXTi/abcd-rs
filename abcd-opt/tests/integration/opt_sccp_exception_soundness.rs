@@ -1,6 +1,5 @@
-//! N38+N41+N47 regression (v0.2 port of v0.1
-//! `opt_sccp_exception_soundness.rs`): SCCP exception soundness ×3, the
-//! N47 exception-edge fallthrough, plus the peephole `null → 0.0`
+//! N38+N41+N47 regression (`design/decisions.md`): SCCP exception soundness ×3,
+//! the N47 exception-edge fallthrough, plus the peephole `null → 0.0`
 //! coercion ban.
 //!
 //! N38 — SCCP must model the CFG with the AUGMENTED successor relation

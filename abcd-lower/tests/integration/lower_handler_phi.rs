@@ -1,7 +1,6 @@
-//! c-COV A11 (handler-phi half): the N21 pinned-store emission keyed by a
-//! frame-initial const (isel.rs:613-618) and the handler-phi store
-//! collector's self-reference / co-located skips (regalloc.rs:1172,
-//! 1178-1182).
+//! `N21` (`ADR-04`) handler-phi tests: pinned-store emission keyed by a
+//! frame-initial const and the handler-phi store collector's self-reference /
+//! co-located slot skips.
 //!
 //! A phi in a catch handler means "the handler sees the variable as of the
 //! dynamic exception point"; the VM dispatches directly to the handler's

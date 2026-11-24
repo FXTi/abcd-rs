@@ -1,4 +1,4 @@
-//! v0.2-specific optimizer behavior pins (no v0.1 test counterpart):
+//! Optimizer behavior pins across `abcd-ir` ops (`design/ir.md`, `design/decisions.md`):
 //!
 //! - **N37 (opt side)**: folds must preserve `-0.0` bit-exactly
 //!   (`Const::Number` stores raw bits; a `LoadConst(-0.0)` must never be

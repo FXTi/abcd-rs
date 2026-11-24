@@ -1,5 +1,5 @@
 //! `abcd asm` — assemble pandasm `.pa` text into an `.abc` file
-//! (the round-trip direction of `abcd dis`; design/cli-plan.md §2, §4 P2).
+//! (the round-trip direction of `abcd dis`; design/cli.md §2, design/decisions.md ADR-11).
 //!
 //! Input is a pandasm TEXT file (the container/abc input layer does not
 //! apply). The parser (`abcd_file::pandasm::parse_file*`) is the one the

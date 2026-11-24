@@ -1,39 +1,34 @@
-//! Heap v0 — alloc-site-keyed heap facts, strong/weak updates, and the
-//! [`AliasOracle`] trait seam (design/analysis-strategy.md §4.4 rung 0 and
-//! §5.2, which is the spec for the trait surface).
+//! Rung 0 — allocation-site-keyed heap facts, strong/weak updates, and the
+//! [`AliasOracle`] trait seam (`design/analysis.md`, `design/ir.md`).
 //!
 //! ## The rung-0 model
 //!
 //! A heap location is keyed by `(AllocSite, FieldChain)` where the
 //! allocation site is the [`InstId`] of the `AllocObject` / `AllocArray` /
-//! `AllocClosure` / `AllocRegExp` instruction (T7) — unique, stable, and
-//! already in the IR, so rung 0 costs no additional analysis. Two SSA
-//! values alias when their def chains reach the same site
+//! `AllocClosure` / `AllocRegExp` instruction — unique, stable, and
+//! already in the IR, so rung 0 costs no additional whole-program pass. Two
+//! SSA values alias when their def chains reach the same site
 //! ([`resolve_alloc_sites`]); phi merges take the union of sites.
 //!
 //! **Strong update** is legal iff the store's base resolves to exactly one
-//! site with no phi in between ([`update_kind`]) — the SSA substitute for
-//! a must-alias analysis (infoflow.md §9 item 3); everything else is a
-//! weak update.
+//! site with no phi in between ([`update_kind`]) — the local SSA condition
+//! for must-alias; everything else is a weak update.
 //!
-//! Because facts are keyed by site rather than by local, aliasing is
-//! resolved *at the key*: a store through `x.f` and a load through `y.f`
-//! meet iff `x` and `y` share a site. That is why the rung-0 oracle's
-//! `computeAliases` trigger injects nothing — the
-//! `computeAliases` trigger of infoflow.md §4.2 is subsumed by key
-//! matching at rung 0. Rung 1 (a Boomerang-shaped demand-driven query
-//! engine) replaces that with memoized backward queries *without changing
-//! the key shape* — climbing the ladder only makes [`AllocSiteSet`]s more
-//! precise, never re-keys facts (analysis-strategy §5.2).
+//! Because facts are keyed by allocation site rather than by local variable,
+//! aliasing is resolved *at the fact key*: a store through `x.f` and a load
+//! through `y.f` meet iff `x` and `y` share a site, without requiring a
+//! separate backward alias-injection solver at heap writes. Rung 1
+//! ([`super::alias`]) and Rung 2 ([`super::pta`]) refine those site sets
+//! *without changing the key shape* — climbing the precision ladder only
+//! makes [`AllocSiteSet`]s sharper, never re-keys facts (`design/analysis.md`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use abcd_ir::{FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
 
-/// Default k-limit for field chains (access-path cutoff), FlowDroid's
-/// conventional bound: a chain that grows past this is truncated back to
-/// the prefix, merging everything below the cutoff into one abstract
-/// location (conservative, and what keeps the fact domain finite).
+/// Default k-limit for field chains (access-path cutoff): a chain that grows
+/// past `k` is truncated back to its prefix, merging deeper accesses into one
+/// abstract location so the fact domain stays finite.
 pub const DEFAULT_MAX_FIELD_CHAIN: usize = 5;
 
 /// One field-chain element (T2/T9: named / index / dynamic access are
@@ -143,7 +138,7 @@ impl AllocSiteSet {
 }
 
 /// The rung-0 heap fact key: `(AllocSiteSet, FieldChain)`
-/// (analysis-strategy §5.2 — this shape is stable across the whole
+/// (`design/analysis.md` — this shape is stable across the whole
 /// precision ladder; climbing only refines the site set).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HeapRef {
@@ -180,7 +175,7 @@ pub struct SiteInfo {
 
 impl SiteInfo {
     /// Whether the value is provably a single site with no phi in between
-    /// — the strong-update condition (analysis-strategy §4.4 rung 0).
+    /// — the strong-update condition (`design/analysis.md`).
     pub fn is_single_precise(&self) -> bool {
         self.sites.len() == 1 && !self.has_phi && !self.has_unknown
     }
@@ -205,10 +200,10 @@ pub fn update_kind(info: &SiteInfo) -> UpdateKind {
     }
 }
 
-/// Whether `op` allocates one of the four rung-0 keyed sites (T7;
-/// analysis-strategy §4.4 rung 0 names exactly these four — other
-/// allocating ops (`CreateIterResultObj`, `GetUnmappedArgs`, …) are
-/// *unkeyed* and conservatively count as unknown).
+/// Whether `op` allocates one of the four rung-0 keyed sites
+/// (`design/ir.md`, `design/analysis.md` — other allocating ops such as
+/// `CreateIterResultObj` or `GetUnmappedArgs` are *unkeyed* and
+/// conservatively count as unknown).
 pub fn is_keyed_alloc(op: &Op) -> bool {
     matches!(
         op,
@@ -302,28 +297,22 @@ pub fn key_may_alias(a: &HeapRef, b: &HeapRef) -> Tribool {
     Tribool::Unknown
 }
 
-/// Oracle for heap aliasing, implemented by heap-v0 (rung 0) initially
-/// and by a demand-driven query engine (rung 1) later WITHOUT call-site
-/// changes in the taint engine (analysis-strategy.md §5.2, generalized
-/// over the client's fact type `F` so `abcd-analysis` never depends on
-/// `abcd-taint`; modeled on FlowDroid's `IAliasingStrategy` policy
-/// interface, infoflow.md §9).
+/// Policy seam for heap aliasing across the precision ladder
+/// (`design/analysis.md`), generalized over the client's fact type `F` so
+/// `abcd-analysis` never depends on `abcd-taint`.
 ///
-/// Only the calling-context channel survives on the seam: the
-/// `may_alias`/`must_alias`/`aliases_of_store`/`needs_requery_on_return`/
-/// `points_to` surface had no production consumer (the taint problem keys
-/// facts by site set and uses the inherent oracle queries directly), so
-/// it was deleted as dead surface.
+/// Only the calling-context channel lives on the trait: downstream clients
+/// key facts directly by [`AllocSiteSet`] and invoke the inherent oracle
+/// queries (`resolve`, `site_info_at`, `lex_env_at`).
 pub trait AliasOracle<F> {
-    /// Interprocedural discipline, mirroring infoflow.md §4.3: the oracle
-    /// learns calling contexts so alias queries started in a callee
-    /// return to the right callers.
+    /// Record an observed interprocedural call edge `(call -> callee)` so
+    /// context-aware alias engines can track reachable calling contexts.
     fn inject_calling_context(&mut self, call: InstId, callee: FuncId, fact: &F);
 }
 
-/// The rung-0 oracle: def-chain answers only
-/// (analysis-strategy.md §4.4 rung 0). Cheap, total, and conservative;
-/// every "cannot decide" degrades to `Unknown`/weak.
+/// The rung-0 oracle: local SSA def-chain answers only (`design/analysis.md`).
+/// Cheap, total, and conservative; every undecidable case degrades to
+/// `Unknown`/weak.
 pub struct Rung0AliasOracle<'m> {
     module: &'m Module,
     memo: std::cell::RefCell<HashMap<ValueId, SiteInfo>>,

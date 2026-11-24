@@ -20,7 +20,8 @@
 //!    dropped when the handler is cleanup-shaped.
 //! 4. **`GetPropIterator`+`NextPropName` → `for…in`** (same probe).
 //! 5. **Compare/branch chains → `switch`** (cosmetic re-detection; the
-//!    IR has no `Switch` op by design — ir-v0.2 §9 resolution 2).
+//!    IR lowers switch cascades to compare/branch chains by design —
+//!    `design/ir.md`, `design/decisions.md`).
 //! 6. **Generator driver machinery → plain `yield` bodies** (d-P11,
 //!    R4): [`generator_machine_fold`] eliminates the es2abc generator
 //!    state-machine plumbing (`CreateGenerator` + entry

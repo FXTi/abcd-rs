@@ -10,14 +10,13 @@
 //! The degenerate shape is real: a 0-argument static method whose only
 //! bytecode is a bare `return` never writes the accumulator, so the
 //! lift resolves the `Return` operand to the frame-initial constant
-//! (design/ir-v0.2.md §5.1). es2abc's real output never produces it
-//! (every method carries the [func][newtarget][this] implicit frame
+//! (`design/ir.md` §3). es2abc's real output never produces it
+//! (every method carries the `[func][new.target][this]` implicit frame
 //! slots as params, anchoring the range), which is why the corpus never
 //! tripped it.
 //!
-//! The fix attributes a USED frame-initial const to the function(s)
-//! using it (use-based attribution, exactly v0.1's owning-function
-//! placement); the id-range rule remains the fallback for unused consts.
+//! `frame_init_consts` reads `FunctionData::frame_init_consts` and appends
+//! any unrecorded `ValueDef::Const` operand referenced in `func.blocks`.
 
 use crate::common;
 use abcd_ir::{Const, FuncId, FunctionKind, Module, Op, Ty, Value, ValueDef, ValueId};

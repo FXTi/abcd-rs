@@ -1,4 +1,4 @@
-//! N48/N50 regression (v0.2 port of v0.1 `opt_adce_observable_loads.rs`):
+//! N48/N50 regression (`design/decisions.md`):
 //! ADCE must keep OBSERVABLE loads even when their result is dead.
 //! Deleting a dead-result `o.p` drops a user getter call (and the
 //! nullish-receiver TypeError); deleting a dead `o.#x`/`#x in o` drops
@@ -8,14 +8,14 @@
 //! `GetIterator`/`GetAsyncIterator` skips the user @@iterator call
 //! entirely.
 //!
-//! v0.2 difference: essentiality is not a hand list in the pass — it is
-//! DERIVED from the T3 effects table (`Op::effects`,
-//! design/ir-v0.2.md §4.4): write / may-throw / may-call effects make an
+//! Essentiality is not a hand-maintained list in the pass — it is
+//! DERIVED from the `T3` effects table (`Op::effects`,
+//! `design/ir.md`): write / may-throw / may-call effects make an
 //! op essential. These tests pin the end-to-end behavior (dead-result
 //! observable loads survive ADCE); the table-level coverage pin lives in
-//! abcd-ir's effects tests (`effects_cover_v0_1_observable_loads`).
+//! `abcd-ir`'s effects tests.
 //!
-//! Vendored runtime evidence (unchanged from v0.1):
+//! Vendored runtime evidence:
 //!
 //! - GetIterator/GetAsyncIterator: `RuntimeGetIterator` reads
 //!   `@@iterator` and CALLS it via `EcmaInterpreter::Execute`

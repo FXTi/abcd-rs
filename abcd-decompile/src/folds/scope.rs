@@ -263,8 +263,8 @@ pub fn scope_fold(nodes: &mut [SNode], params: &[String], stats: &mut FoldStats)
             // count toward emit's hoisted `lex_decls` whenever the push
             // comment survives (an unprovable sibling slot keeps
             // `own > level`), printing a second `let n;` at the function
-            // top — a same-scope redeclaration (SyntaxError; wild-smoke
-            // Bug B). Rewrite them to plain assignment leaves so the
+            // top — a same-scope redeclaration (SyntaxError in strict/module
+            // JS). Rewrite them to plain assignment leaves so the
             // block declaration is the ONLY declaration of the name.
             for l in leaves.iter_mut().skip(p + 1) {
                 if let Leaf::Raw(Stmt::LexStore { name, value, .. }) = l

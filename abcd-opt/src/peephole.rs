@@ -1,19 +1,18 @@
-//! Peephole optimization: constant folding and identity elimination
-//! (v0.1 `opt::peephole`, ported to the v0.2 op taxonomy).
+//! Peephole optimization: local constant folding and identity elimination
+//! (`design/ir.md`, `design/decisions.md` `N36`–`N42`).
 //!
-//! v0.2 port notes:
+//! Key design invariants:
 //!
-//! - v0.1's comparisons lived in `InstData::BinaryOp`; v0.2 splits them
-//!   into [`Op::Compare`] ([`CmpOp`]). The fold rules are unchanged.
-//! - v0.1's `IsTrue`/`IsFalse` instructions are [`UnOp::IsTrue`]/
-//!   [`UnOp::IsFalse`] in v0.2.
-//! - Folded results become [`Op::LoadConst`] of a freshly pooled
-//!   [`Const`] (append-only pool; the instruction keeps its result value,
-//!   so no use rewrites are needed).
-//! - Constants are read from BOTH constant-carrying definitions:
+//! - Arithmetic folds operate on [`Op::BinaryOp`] ([`BinOp`]), relational and
+//!   equality folds on [`Op::Compare`] ([`CmpOp`]), and unary folds on
+//!   [`Op::UnaryOp`] ([`UnOp`], including `Minus`, `BitNot`, `LogicalNot`,
+//!   `IsTrue`, and `IsFalse`).
+//! - Folded results become [`Op::LoadConst`] of a freshly pooled [`Const`]
+//!   (append-only pool; the instruction keeps its result [`ValueId`], so no use
+//!   rewrites are needed).
+//! - Constants are resolved from BOTH constant-carrying definitions:
 //!   [`Op::LoadConst`] instructions and [`ValueDef::Const`] values
-//!   (v0.2's frame-initial values are const-defined, not seeded
-//!   instructions — a constant is a constant).
+//!   (frame-initial constants).
 
 use abcd_ir::{BinOp, BlockId, CmpOp, Const, FuncId, InstId, Module, Op, UnOp, ValueDef, ValueId};
 

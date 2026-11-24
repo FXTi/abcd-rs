@@ -1,6 +1,6 @@
 //! # abcd-lift — lift converter: `abcd_file::File` → `abcd_ir::Module`
 //!
-//! Format-aware lifting layer (`design/ir-v0.2.md` §8, `design/ir.md` §7)
+//! Format-aware lifting layer (`design/ir.md` §3, `design/decisions.md`)
 //! that translates decoded `.abc` containers ([`abcd_file::File`]) into the
 //! format-independent SSA IR ([`abcd_ir::Module`]). Alongside `abcd-lower`,
 //! this crate is the boundary between the `.abc`/ISA container layer and the
@@ -68,8 +68,9 @@ use ssa::RegOrAcc;
 
 pub use translate::{SuperKeyForm, super_key};
 
-/// Errors that can occur during lifting (v0.1 `LiftError` mirrored
-/// where sensible; no panics on data).
+/// Errors that can occur during lifting (no panics on untrusted data;
+/// `Unsupported*` variants are restricted to constructs with zero upstream VM
+/// semantics per `design/decisions.md` ADR-07).
 #[derive(Debug, thiserror::Error)]
 pub enum LiftError {
     /// An entity operand could not be resolved through the owning
@@ -138,21 +139,6 @@ pub enum LiftError {
         "unsupported fused compare-and-branch opcode `{0}` (ruling 2026-10-04): isa.yaml documents no comparison semantics (pc += imm only), the vendor interpreters FATAL/NOP-skip the family, and no producer emits it — please report this file to the abcd-rs maintainers"
     )]
     UnsupportedFusedCompareBranch(&'static str),
-    /// `deprecated.defineclasswithbuffer method_id, imm1:u16, imm2:u16,
-    /// v1:in:top, v2:in:top` (abcd-isa-sys/arkcompiler_runtime_core/isa/isa.yaml:1239-1244):
-    /// the vendor runtime reads v1 as the LEXENV and v2 as the PROTO
-    /// (arkcompiler_ets_runtime-master/ecmascript/interpreter/
-    /// interpreter_assembly.cpp:4622-4648,
-    /// `HandleDeprecatedDefineclasswithbufferPrefId16Imm16Imm16V8V8`),
-    /// but both lifters historically took v1 as the base (proto) and
-    /// DROPPED v2 — double role corruption (N54). Corpus coverage is
-    /// zero (reference.pa grep: none), so there is no evidence path
-    /// for a corrected lift — a hard error (maintainer ruling N8/N51:
-    /// hard error, never a warning, never silent), mirroring v0.1.
-    #[error(
-        "unsupported opcode `deprecated.defineclasswithbuffer` (N54): the vendor runtime reads v1=lexenv, v2=proto (interpreter_assembly.cpp:4622-4648) and zero corpus coverage makes the corrected roles unverifiable — please report this file to the abcd-rs maintainers"
-    )]
-    UnsupportedDeprecatedDefineClassWithBuffer,
     /// `throw.ifsupernotcorrectcall` carries a check-kind immediate the
     /// vendor does not define (0 = TDZ guard, 1 = re-bind guard).
     #[error(
@@ -332,7 +318,7 @@ impl<'f> Lifter<'f> {
     }
 }
 
-/// Lift an entire ABC file into an IR v0.2 [`Module`].
+/// Lift an entire ABC file into an [`abcd_ir::Module`].
 pub fn lift_file(file: &File) -> Result<Module, LiftError> {
     let mut lf = Lifter::new(file);
 

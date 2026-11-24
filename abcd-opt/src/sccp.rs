@@ -1,19 +1,19 @@
-//! Sparse Conditional Constant Propagation (Wegman-Zadeck 1991) — the
-//! v0.2 port of v0.1 `opt::sccp`.
+//! Sparse Conditional Constant Propagation (Wegman-Zadeck 1991; `design/ir.md`,
+//! `design/decisions.md` `N36`–`N42`, `N47`).
 //!
 //! Lattice: Top → Constant(val) → Bottom.
 //! Dual worklist: CFG edges (reachability) + SSA edges (value changes).
 //! After convergence: replace constants, fold dead branches.
 //!
-//! v0.2 port notes:
+//! Representation invariants:
 //!
-//! - CFG edges are kinded (T5): the worklist tracks
+//! - CFG edges are kinded (`T5`): the worklist tracks
 //!   `(from, to, kind)` triples and phi entries match on the full
 //!   [`Edge`] — an exceptional in-edge and a normal in-edge from the
 //!   same block are distinct lattice inputs.
 //! - Constants surface in two definition forms: [`Op::LoadConst`]
 //!   instructions (evaluated here) and [`ValueDef::Const`] values
-//!   (resolved on demand — the frame-initial values are const-defined,
+//!   (resolved on demand — frame-initial values are const-defined,
 //!   not seeded instructions).
 //! - Replacement writes [`Op::LoadConst`] of a freshly pooled [`Const`];
 //!   a folded PHI is moved out of the block's phi prefix (the verifier
@@ -37,11 +37,10 @@ enum LatticeVal {
     Bottom,             // Overdefined (multiple values possible)
 }
 
-/// Constant value representation. `Number` keeps the host `f64` (v0.1
-/// parity: the lattice meet compares numbers with host `==`, so
-/// `0.0 == -0.0` meet to whichever arrived first; conversion back to a
-/// pooled [`Const::Number`] is bit-exact, preserving `-0.0`/NaN payloads
-/// — N37).
+/// Constant value representation. `Number` keeps the host `f64` (the
+/// lattice meet compares numbers with host `==`, so `0.0 == -0.0` meet to
+/// whichever arrived first; conversion back to a pooled [`Const::Number`]
+/// is bit-exact, preserving `-0.0`/NaN payloads — `N37`).
 #[derive(Clone, Debug, PartialEq)]
 enum ConstVal {
     Number(f64),
@@ -438,10 +437,9 @@ fn evaluate_inst(
 
     match &inst.op {
         Op::LoadConst(cid) => match module.consts.get(*cid) {
-            // Only the scalar constants enter the lattice (v0.1 folded
-            // LiteralNumber/Bool/Null/Undefined/NaN/Infinity and forced
-            // everything else — strings, bigints, literal arrays, the
-            // hole — to Bottom).
+            // Only scalar constants (Number, Bool, Null, Undefined) enter the
+            // lattice; strings, bigints, literal arrays, and the hole evaluate
+            // to Bottom.
             Some(Const::Undefined) => Some(LatticeVal::Constant(ConstVal::Undefined)),
             Some(Const::Null) => Some(LatticeVal::Constant(ConstVal::Null)),
             Some(Const::Bool(b)) => Some(LatticeVal::Constant(ConstVal::Bool(*b))),
@@ -619,8 +617,8 @@ fn add_cfg_edges(
 
 /// The lattice value of `val`, resolving definition forms that are known
 /// without evaluation: const-defined values yield their scalar constant
-/// (non-scalars are Bottom — v0.1's default arm forced them there),
-/// exception parameters are Bottom (the exception object is unknown).
+/// (non-scalars are Bottom), exception parameters are Bottom (the
+/// exception object is unknown).
 fn get_lattice(
     module: &Module,
     lattice: &HashMap<ValueId, LatticeVal>,
@@ -733,8 +731,7 @@ fn eval_binop_lattice(op: BinOp, a: &ConstVal, b: &ConstVal) -> Option<LatticeVa
     }
 }
 
-/// Evaluate a comparison to a lattice value (v0.1's comparison arms of
-/// `eval_binop_lattice`, split out with the v0.2 taxonomy).
+/// Evaluate a [`CmpOp`] comparison over constant lattice inputs.
 fn eval_compare_lattice(op: CmpOp, a: &ConstVal, b: &ConstVal) -> Option<LatticeVal> {
     // N38(iii): JS loose equality does NOT ToNumber-coerce nullish
     // operands — `undefined == undefined` and `null == undefined` are
