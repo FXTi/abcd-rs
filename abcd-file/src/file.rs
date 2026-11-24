@@ -66,7 +66,10 @@ pub fn file_type(data: &[u8]) -> sys::FileType {
     if data.len() < 8 {
         return sys::FileType::Invalid;
     }
-    let t = unsafe { sys::abc_file_get_type(data.as_ptr(), data.len() as i32) };
+    let Ok(len) = i32::try_from(data.len()) else {
+        return sys::FileType::Invalid;
+    };
+    let t = unsafe { sys::abc_file_get_type(data.as_ptr(), len) };
     sys::FileType::try_from(t).unwrap_or(sys::FileType::Invalid)
 }
 
@@ -101,7 +104,7 @@ pub(crate) fn read_string_reporting_lossy(
         return Some((String::new(), false));
     }
     if units > 0 {
-        let mut buf = vec![0u16; units as usize];
+        let mut buf = vec![0u16; units];
         // SAFETY: buf holds exactly `units` UTF-16 units.
         let written =
             unsafe { sys::abc_file_get_string_utf16(file, offset, buf.as_mut_ptr(), buf.len()) };
@@ -118,7 +121,7 @@ pub(crate) fn read_string_reporting_lossy(
     if len == 0 {
         return None;
     }
-    let mut buf = vec![0u8; len + 1];
+    let mut buf = vec![0u8; len.checked_add(1)?];
     unsafe {
         sys::abc_file_get_string(file, offset, buf.as_mut_ptr() as *mut c_char, buf.len());
     }
@@ -139,7 +142,7 @@ pub(crate) fn read_string_raw_bytes(
     if len == 0 {
         return None;
     }
-    let mut buf = vec![0u8; len + 1];
+    let mut buf = vec![0u8; len.checked_add(1)?];
     let copied = unsafe {
         sys::abc_file_get_string(file, offset, buf.as_mut_ptr() as *mut c_char, buf.len())
     };

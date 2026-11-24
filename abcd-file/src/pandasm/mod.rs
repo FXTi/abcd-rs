@@ -744,7 +744,9 @@ impl<'f> Emitter<'f> {
         let mut catches: Vec<CatchLine> = Vec::new();
         'tries: for (try_idx, tb) in body.try_blocks.iter().enumerate() {
             let begin = tb.start;
-            let end = tb.start + tb.len;
+            let Some(end) = tb.start.checked_add(tb.len) else {
+                break 'tries;
+            };
             // Upstream range checks; failure aborts try-block enumeration.
             if begin >= count || end > count {
                 break 'tries;
@@ -761,7 +763,9 @@ impl<'f> Emitter<'f> {
                     }
                 };
                 let hbegin = cb.handler;
-                let hend = cb.handler + cb.len;
+                let Some(hend) = cb.handler.checked_add(cb.len) else {
+                    break 'tries;
+                };
                 if hbegin >= count || hend > count {
                     break 'tries;
                 }
@@ -2084,5 +2088,25 @@ mod tests {
             text.contains("2 0x99 \n"),
             "dangling array prints key-only: {text}"
         );
+    }
+
+    #[test]
+    fn overflowing_try_and_catch_spans_do_not_panic_on_emit() {
+        let mut file = file_at(DEFAULT_VERSION);
+        let mut body = body_of(vec![abcd_isa::insn::Returnundefined::new()]);
+        body.try_blocks.push(crate::TryBlock {
+            start: 1,
+            len: u32::MAX,
+            catches: vec![crate::CatchBlock {
+                type_idx: u32::MAX,
+                handler: 1,
+                len: u32::MAX,
+            }],
+        });
+        let m = bare_method(&mut file, "f", 0x100, Some(body));
+        add_class(&mut file, "L_GLOBAL;", vec![m], vec![]);
+        let out = emit_file(&file, "t.abc");
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains(".catchall"), "{text}");
     }
 }

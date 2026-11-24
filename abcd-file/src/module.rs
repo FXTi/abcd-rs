@@ -88,7 +88,10 @@ impl ModuleData {
 
         // Module requests.
         let n = cur.read_u32("module_requests_count")?;
-        let mut requests = Vec::with_capacity(n as usize);
+        let cap = usize::try_from(n)
+            .unwrap_or(usize::MAX)
+            .min(cur.values.len().saturating_sub(cur.pos));
+        let mut requests = Vec::with_capacity(cap);
         for _ in 0..n {
             requests.push(cur.read_string_id("module_request")?);
         }
@@ -204,6 +207,29 @@ impl<'a> Cursor<'a> {
                 field: "module_data",
                 context: format!("expected MethodAffiliate for {ctx}, got {other:?}"),
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_literal_values_rejects_overflowing_request_counts_cleanly() {
+        for bad_count in [0x4000_0001u32, u32::MAX] {
+            let err = ModuleData::from_literal_values(&[LiteralValue::Integer(bad_count)])
+                .expect_err("truncated module requests must fail");
+            assert!(
+                matches!(
+                    err,
+                    Error::Malformed {
+                        field: "module_data",
+                        ..
+                    }
+                ),
+                "expected Malformed/module_data for count {bad_count:#x}, got: {err:?}"
+            );
         }
     }
 }

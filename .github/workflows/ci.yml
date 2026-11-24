@@ -155,6 +155,7 @@ jobs:
           CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
           CXX_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-g++
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUNNER: qemu-arm -L /usr/arm-linux-gnueabihf
+          QEMU_LD_PREFIX: /usr/arm-linux-gnueabihf
 
   # ── Per-push corpus jobs ───────────────────────────────────────────
   # Depend directly on the five fast Tier-1 gates (`fmt`, `clippy`, `doc`,
@@ -326,6 +327,7 @@ jobs:
         with:
           corpus-mode: corpus
           corpus-image: ${{ env.ARK_TEST_IMAGE }}
+      - run: cargo test -p abcd-decompile --test integration --release -- --ignored --nocapture
       - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --test-threads=1 --skip dream_gate_generate --skip dream_gate_t262 --skip wild_gate
       - name: Upload the dream-gate report
         if: always()

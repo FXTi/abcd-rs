@@ -1479,7 +1479,7 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                                 };
                                 let handler_pc =
                                     byte_offsets.get(cb.handler as usize).copied().unwrap_or(0);
-                                let end = cb.handler + cb.len;
+                                let end = cb.handler.saturating_add(cb.len);
                                 let end_pc = byte_offsets
                                     .get(end as usize)
                                     .copied()
@@ -1487,17 +1487,22 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                                 Ok(CatchBlockDef {
                                     type_class,
                                     handler_pc,
-                                    code_size: end_pc - handler_pc,
+                                    code_size: end_pc.saturating_sub(handler_pc),
                                 })
                             })
                             .collect::<Result<_, Error>>()?;
                         let start_pc = byte_offsets.get(tb.start as usize).copied().unwrap_or(0);
-                        let end = tb.start + tb.len;
+                        let end = tb.start.saturating_add(tb.len);
                         let end_pc = byte_offsets
                             .get(end as usize)
                             .copied()
                             .unwrap_or(code_bytes.len() as u32);
-                        b.code_add_try_block(code_h, start_pc, end_pc - start_pc, &catches);
+                        b.code_add_try_block(
+                            code_h,
+                            start_pc,
+                            end_pc.saturating_sub(start_pc),
+                            &catches,
+                        );
                     }
                     b.method_set_code(m_h, code_h);
                 }
@@ -2743,7 +2748,7 @@ fn encode_debug_info(
     for entry in &dbg.line_table {
         let pc = index_to_offset(byte_offsets, entry.index, code_len);
         let pc_delta = pc.saturating_sub(cur_pc);
-        let line_delta = entry.line as i32 - prev_line as i32;
+        let line_delta = (entry.line as i32).wrapping_sub(prev_line as i32);
         if pc_delta > 0 {
             b.lnp_emit_advance_pc(lnp, debug_h, pc_delta);
             cur_pc = pc;

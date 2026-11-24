@@ -2364,3 +2364,103 @@ fn foreign_class_descriptor_unreadable_is_skipped() {
         file.classes.keys().collect::<Vec<_>>()
     );
 }
+
+/// Legacy header literal-array table counts and offsets that would overflow
+/// 32-bit `usize` (`u32::MAX`, `0x4000_0001`, wrapping `table_off + count * 4`)
+/// must never panic and must reject dangling buffer references cleanly.
+#[test]
+fn legacy_header_table_32bit_overflow_counts_and_offsets_are_hard_errors() {
+    let mut base = build_minimal_with_room();
+    // createobjectwithbuffer imm16 = 0; return.dyn
+    let stream = [0xff, 0x69, 0x00, 0x00, 0xa6];
+    make_legacy(&mut base, &stream);
+
+    for (count, table_off) in [
+        (0xffff_ffffu32, 0xffff_ffffu32),
+        (0xffff_ffff, 60),
+        (0x4000_0001, 60),
+        (0x4000_0000, 0),
+        (1, 0xffff_ffff),
+        (1, 0xffff_fffe),
+        (0, 0xffff_ffff),
+        (0x2000_0001, 0x8000_0000),
+    ] {
+        let mut data = base.clone();
+        write_u32(&mut data, NUM_LITERALARRAYS_OFF, count);
+        write_u32(&mut data, LITERALARRAY_IDX_OFF, table_off);
+        let err = decode(&data).expect_err("overflowing legacy header table must fail");
+        assert!(
+            matches!(
+                &err,
+                Error::Malformed {
+                    field: "legacy literal-array reference",
+                    ..
+                }
+            ),
+            "expected Malformed/legacy literal-array reference for ({count:#x}, {table_off:#x}), got: {err:?}"
+        );
+    }
+}
+
+/// Try-block and catch-block PC spans whose `start + len` or `handler + len`
+/// overflow `u32` return `Error::Malformed` instead of panicking or wrapping.
+#[test]
+fn try_and_catch_span_overflow_is_hard_error() {
+    let build_try = |start_pc: u32, length: u32, handler_pc: u32, code_size: u32| -> Vec<u8> {
+        let mut b = Builder::new();
+        b.set_api(12, "beta1");
+        let cls = b.add_global_class();
+        b.class_set_source_lang(cls, SourceLang::EcmaScript);
+        let code_bytes = [0x65u8, 0x65, 0x65, 0x65];
+        let code_h = b.create_code(&code_bytes, 1, 0);
+        b.code_add_try_block(
+            code_h,
+            start_pc,
+            length,
+            &[abcd_file::CatchBlockDef {
+                type_class: None,
+                handler_pc,
+                code_size,
+            }],
+        );
+        let proto = b.create_proto(Type::Tagged, &[]);
+        let m = b.class_add_method(
+            cls,
+            "func_main_0",
+            proto,
+            AccessFlags::PUBLIC,
+            &code_bytes,
+            1,
+            0,
+        );
+        b.method_set_source_lang(m, SourceLang::EcmaScript);
+        b.method_set_code(m, code_h);
+        b.finalize().expect("finalize")
+    };
+
+    let try_overflow = build_try(2, u32::MAX, 2, 1);
+    let err = decode(&try_overflow).expect_err("overflowing try_block span must fail");
+    assert!(
+        matches!(
+            &err,
+            Error::Malformed {
+                field: "try_block",
+                ..
+            }
+        ),
+        "expected Malformed/try_block, got: {err:?}"
+    );
+
+    let catch_overflow = build_try(0, 2, 2, u32::MAX);
+    let err = decode(&catch_overflow).expect_err("overflowing catch_block span must fail");
+    assert!(
+        matches!(
+            &err,
+            Error::Malformed {
+                field: "catch_block",
+                ..
+            }
+        ),
+        "expected Malformed/catch_block, got: {err:?}"
+    );
+}

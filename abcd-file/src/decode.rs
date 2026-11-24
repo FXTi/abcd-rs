@@ -333,11 +333,15 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                             if id.0 >= count {
                                 return Err(invalid());
                             }
-                            let entry = table_off as usize + id.0 as usize * 4;
-                            let bytes: [u8; 4] = data
-                                .get(entry..entry + 4)
-                                .and_then(|s| s.try_into().ok())
-                                .ok_or_else(invalid)?;
+                            let bytes: [u8; 4] =
+                                id.0.checked_mul(4)
+                                    .and_then(|n| table_off.checked_add(n))
+                                    .and_then(|entry| usize::try_from(entry).ok())
+                                    .and_then(|entry| {
+                                        entry.checked_add(4).and_then(|end| data.get(entry..end))
+                                    })
+                                    .and_then(|s| s.try_into().ok())
+                                    .ok_or_else(invalid)?;
                             let off = u32::from_le_bytes(bytes);
                             if off == 0 || off as usize >= data.len() {
                                 return Err(invalid());
@@ -436,9 +440,11 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                 if idx >= count {
                     return Err(invalid());
                 }
-                let entry = table_off as usize + idx as usize * 4;
-                let bytes: [u8; 4] = data
-                    .get(entry..entry + 4)
+                let bytes: [u8; 4] = idx
+                    .checked_mul(4)
+                    .and_then(|n| table_off.checked_add(n))
+                    .and_then(|entry| usize::try_from(entry).ok())
+                    .and_then(|entry| entry.checked_add(4).and_then(|end| data.get(entry..end)))
                     .and_then(|s| s.try_into().ok())
                     .ok_or_else(invalid)?;
                 let off = u32::from_le_bytes(bytes);
@@ -515,12 +521,13 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
 /// are the 8th and 9th). Returns `None` if the header is truncated.
 fn legacy_literalarray_table(data: &[u8]) -> Option<(u32, u32)> {
     let read = |off: usize| -> Option<u32> {
-        let bytes: [u8; 4] = data.get(off..off + 4)?.try_into().ok()?;
+        let bytes: [u8; 4] = data.get(off..off.checked_add(4)?)?.try_into().ok()?;
         Some(u32::from_le_bytes(bytes))
     };
     let count = read(44)?;
     let table_off = read(48)?;
-    let end = table_off as usize + count as usize * 4;
+    let byte_len = count.checked_mul(4)?;
+    let end = usize::try_from(table_off.checked_add(byte_len)?).ok()?;
     if end > data.len() {
         return None;
     }
@@ -707,13 +714,18 @@ fn decode_param_annotations(
         } else {
             &mut result.compile_time
         };
-        let len = num_params.max(
-            pairs
-                .iter()
-                .map(|&(i, _)| i as usize + 1)
-                .max()
-                .unwrap_or(0),
-        );
+        let max_end = pairs
+            .iter()
+            .try_fold(0usize, |acc, &(i, _)| {
+                i.checked_add(1)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .map(|n| acc.max(n))
+            })
+            .ok_or_else(|| Error::Malformed {
+                field: "param_annotations",
+                context: format!("param annotations item at offset {item_off:#x}"),
+            })?;
+        let len = num_params.max(max_end);
         bucket.resize(len, Vec::new());
         for (idx, off) in pairs {
             let anns = decode_annotation_list(f, &[off], entity_map, strings)?;
@@ -1254,27 +1266,44 @@ fn decode_code_at(
     let try_blocks = collect_try_blocks(f, method_off, cr)
         .into_iter()
         .map(|tb| {
+            let end_pc = tb
+                .start
+                .checked_add(tb.len)
+                .ok_or_else(|| Error::Malformed {
+                    field: "try_block",
+                    context: format!("method at offset {method_off:#x}: try span overflow"),
+                })?;
             let start = offset_to_index(tb.start);
-            let end = offset_to_index(tb.start + tb.len);
-            TryBlock {
-                start,
-                len: end - start,
-                catches: tb
-                    .catches
-                    .into_iter()
-                    .map(|cb| {
-                        let handler = offset_to_index(cb.handler);
-                        let handler_end = offset_to_index(cb.handler + cb.len);
-                        CatchBlock {
-                            type_idx: cb.type_idx,
-                            handler,
-                            len: handler_end - handler,
-                        }
+            let end = offset_to_index(end_pc);
+            let catches = tb
+                .catches
+                .into_iter()
+                .map(|cb| {
+                    let handler_end_pc =
+                        cb.handler
+                            .checked_add(cb.len)
+                            .ok_or_else(|| Error::Malformed {
+                                field: "catch_block",
+                                context: format!(
+                                    "method at offset {method_off:#x}: catch span overflow"
+                                ),
+                            })?;
+                    let handler = offset_to_index(cb.handler);
+                    let handler_end = offset_to_index(handler_end_pc);
+                    Ok(CatchBlock {
+                        type_idx: cb.type_idx,
+                        handler,
+                        len: handler_end.saturating_sub(handler),
                     })
-                    .collect(),
-            }
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            Ok(TryBlock {
+                start,
+                len: end.saturating_sub(start),
+                catches,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, Error>>()?;
 
     let num_vregs = unsafe { sys::abc_code_num_vregs(cr) };
     let num_args = unsafe { sys::abc_code_num_args(cr) };
@@ -1693,8 +1722,8 @@ fn decode_annotation_at(
                         frame.pending = Some(PendingAnnSlot::Array {
                             name,
                             tag: out.tag,
+                            decoded: Vec::with_capacity(offsets_iter.len().saturating_add(1)),
                             remaining: offsets_iter,
-                            decoded: Vec::with_capacity(arr.count as usize),
                         });
                         next_child = Some(open_ann_frame(f, first_off, entity_map, &mut visiting)?);
                         break;
@@ -1815,7 +1844,21 @@ fn read_annotation_array_raw(
         return Ok((avt, Vec::new()));
     }
 
-    let mut raw_values = vec![0u64; count as usize];
+    let file_size = unsafe { sys::abc_file_size(f) };
+    let max_by_span = file_size.saturating_sub(entity_offset) / element_size;
+    let alloc_count = count.min(max_by_span);
+    let alloc_len = usize::try_from(alloc_count).map_err(|_| Error::Malformed {
+        field: "annotation array data",
+        context: format!("annotation array at offset {entity_offset:#x}"),
+    })?;
+    let mut raw_values = Vec::new();
+    raw_values
+        .try_reserve_exact(alloc_len)
+        .map_err(|_| Error::Malformed {
+            field: "annotation array data",
+            context: format!("annotation array at offset {entity_offset:#x}"),
+        })?;
+    raw_values.resize(alloc_len, 0u64);
     let n = unsafe {
         sys::abc_annotation_array_read(
             f,
@@ -1823,7 +1866,7 @@ fn read_annotation_array_raw(
             element_size,
             count,
             raw_values.as_mut_ptr(),
-            count,
+            alloc_count,
         )
     };
     if n < 0 {
@@ -1832,16 +1875,16 @@ fn read_annotation_array_raw(
             context: format!("annotation array at offset {entity_offset:#x}"),
         });
     }
-    let n = n as usize;
-    if n < count as usize {
+    let n_u32 = n as u32;
+    if n_u32 < count {
         return Err(Error::Malformed {
             field: "annotation array data",
             context: format!(
-                "annotation array at offset {entity_offset:#x}: declared {count} elements, {n} readable"
+                "annotation array at offset {entity_offset:#x}: declared {count} elements, {n_u32} readable"
             ),
         });
     }
-    raw_values.truncate(n);
+    raw_values.truncate(n_u32 as usize);
     Ok((avt, raw_values))
 }
 
@@ -2963,5 +3006,105 @@ mod tests {
             ),
             "expected Malformed/annotation array data, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn legacy_literalarray_table_rejects_32bit_overflows() {
+        let mut buf = vec![0u8; 128];
+        let set_header = |buf: &mut [u8], count: u32, table_off: u32| {
+            buf[44..48].copy_from_slice(&count.to_le_bytes());
+            buf[48..52].copy_from_slice(&table_off.to_le_bytes());
+        };
+
+        // Valid table inside the buffer succeeds.
+        set_header(&mut buf, 2, 60);
+        assert_eq!(legacy_literalarray_table(&buf), Some((2, 60)));
+
+        // Every 32-bit `u32`/`usize` overflow or out-of-bounds combination
+        // returns `None` without panicking.
+        for (count, table_off) in [
+            (u32::MAX, u32::MAX),
+            (u32::MAX, 60),
+            (0x4000_0000, 0),
+            (0x4000_0001, 60),
+            (1, u32::MAX),
+            (1, u32::MAX - 2),
+            (0, u32::MAX),
+            (0x2000_0001, 0x8000_0000),
+        ] {
+            set_header(&mut buf, count, table_off);
+            assert_eq!(
+                legacy_literalarray_table(&buf),
+                None,
+                "expected None for count={count:#x}, table_off={table_off:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn annotation_array_32bit_overflowing_counts_are_hard_errors() {
+        let mut b = crate::Builder::new();
+        b.set_api(12, "beta1");
+        let cls = b.add_global_class();
+        b.class_set_source_lang(cls, crate::types::SourceLang::EcmaScript);
+        let s = b.add_string("probe_s");
+        let name = b.add_string("e");
+        let ann = b.create_annotation_ex(
+            cls,
+            &[crate::AnnotationElemDefEx {
+                name,
+                tag: b'V',
+                value: crate::AnnotationElemValue::EntityArray(vec![s.as_raw()]),
+            }],
+        );
+        b.class_add_runtime_annotation(cls, ann);
+        let proto = b.create_proto(crate::types::Type::Tagged, &[]);
+        let m = b.class_add_method(
+            cls,
+            "func_main_0",
+            proto,
+            crate::types::AccessFlags::PUBLIC,
+            &[0x65],
+            1,
+            0,
+        );
+        b.method_set_source_lang(m, crate::types::SourceLang::EcmaScript);
+        let data = b.finalize().expect("finalize");
+
+        let mut pat = vec![(7u8 << 1) | 1];
+        pat.extend_from_slice(b"probe_s");
+        pat.push(0);
+        let str_off = data
+            .windows(pat.len())
+            .position(|w| w == pat.as_slice())
+            .expect("string item") as u32;
+        let payload_pos = data
+            .windows(5)
+            .position(|w| w[0] == 1 && w[1..5] == str_off.to_le_bytes())
+            .expect("array payload") as u32;
+
+        let abc = crate::file::AbcFile::open(&data).expect("open");
+        let mut strings = StringPool::new();
+        let entity_map = HashMap::new();
+        for bad_count in [0x4000_0001u32, u32::MAX] {
+            let result = decode_annotation_array_elements(
+                abc.raw,
+                b'Q',
+                bad_count,
+                payload_pos,
+                &entity_map,
+                &mut strings,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Malformed {
+                        field: "annotation array data",
+                        ..
+                    })
+                ),
+                "expected Malformed for count {bad_count:#x}, got: {result:?}"
+            );
+        }
     }
 }

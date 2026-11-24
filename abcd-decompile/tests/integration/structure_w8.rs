@@ -4061,6 +4061,7 @@ fn cut_try_hoist_shared_entry() {
 /// was built for): the real es2abc shape rewrites to a do-while with
 /// the try/catch inside the body.
 #[test]
+#[ignore = "requires exported GHCR corpus"]
 fn golden_fixture_a9_t5_loop_cut() {
     let root = corpus_root();
     let rel = "24.0.0.0/test262/language/statements/try/S12.14_A9_T5/baseline/input.abc";
@@ -4086,6 +4087,7 @@ fn golden_fixture_a9_t5_loop_cut() {
 /// The A7_T2 ground truth (the de-absorption tower fixture): the real
 /// es2abc finally-tower collapses handler layers.
 #[test]
+#[ignore = "requires exported GHCR corpus"]
 fn golden_fixture_a7_t2_tower() {
     let root = corpus_root();
     let rel = "24.0.0.0/test262/language/statements/try/S12.14_A7_T2/baseline/input.abc";

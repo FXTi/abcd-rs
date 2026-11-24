@@ -23,13 +23,17 @@ mode="${1:-fast}"
 
 run_fast() {
     echo "==> [L1] Workspace unit & synthetic integration tests (zero external fixtures)"
-    cargo test --workspace
+    ABCD_CORPUS_ROOT="/nonexistent/abcd-l1-hermetic" \
+    ABCD_WILD_CORPUS_ROOT="/nonexistent/abcd-l1-hermetic" \
+        cargo test --workspace
 }
 
 run_crate() {
     local pkg="${1:?usage: scripts/test-local.sh crate <crate-name>}"
     echo "==> [Crate] ${pkg}: unit + integration + clippy"
-    cargo test -p "${pkg}" --lib --tests
+    ABCD_CORPUS_ROOT="/nonexistent/abcd-l1-hermetic" \
+    ABCD_WILD_CORPUS_ROOT="/nonexistent/abcd-l1-hermetic" \
+        cargo test -p "${pkg}" --lib --tests
     cargo clippy -p "${pkg}" --no-deps --all-targets -- -D warnings
 }
 
@@ -39,6 +43,7 @@ run_corpus() {
         exit 1
     fi
     echo "==> [L2] Offline corpus + wild .hap + Node gates (--release, zero Docker/OrbStack)"
+    cargo test -p abcd-decompile --test integration --release -- --ignored
     cargo test -p abcd-rs \
         --test file-isa \
         --test hap-file \

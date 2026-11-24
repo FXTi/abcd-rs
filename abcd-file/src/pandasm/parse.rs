@@ -1406,19 +1406,6 @@ impl Parser {
         // (excluded phase-blob slots) filled from the parsed phase fields.
         let mut literal_array_header_offsets = Vec::new();
         if self.version <= LAST_HEADER_LITERAL_VERSION && !self.key_index_to_offset.is_empty() {
-            let max_index = self
-                .key_index_to_offset
-                .iter()
-                .map(|(i, _)| *i)
-                .max()
-                .unwrap_or(0);
-            let mut table = vec![0u32; max_index as usize + 1];
-            let mut known = vec![false; max_index as usize + 1];
-            for (index, offset) in &self.key_index_to_offset {
-                table[*index as usize] = *offset;
-                known[*index as usize] = true;
-            }
-            // Gap fill: phase-blob offsets in field order.
             let phase_offsets: Vec<u32> = class_fields
                 .values()
                 .flat_map(|fields| fields.iter())
@@ -1427,6 +1414,32 @@ impl Parser {
                     _ => None,
                 })
                 .collect();
+            let max_index = self
+                .key_index_to_offset
+                .iter()
+                .map(|(i, _)| *i)
+                .max()
+                .unwrap_or(0);
+            let max_table_len = self
+                .key_index_to_offset
+                .len()
+                .saturating_add(phase_offsets.len())
+                .saturating_add(65_536);
+            let table_len = max_index
+                .checked_add(1)
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|&n| n <= max_table_len)
+                .ok_or_else(|| ParseError {
+                    line: 0,
+                    message: format!("LITERALS header index {max_index} out of range"),
+                })?;
+            let mut table = vec![0u32; table_len];
+            let mut known = vec![false; table_len];
+            for (index, offset) in &self.key_index_to_offset {
+                table[*index as usize] = *offset;
+                known[*index as usize] = true;
+            }
+            // Gap fill: phase-blob offsets in field order.
             let mut phase_iter = phase_offsets.iter();
             for slot in known.iter_mut().zip(table.iter_mut()) {
                 if !*slot.0 {
@@ -2393,7 +2406,7 @@ pub(crate) fn parse_literal_key(line: &[u8]) -> Option<(u32, u32, usize)> {
         return None;
     }
     let offset = u32::from_str_radix(std::str::from_utf8(&hex[..hex_len]).ok()?, 16).ok()?;
-    let value_start = sp + 1 + 2 + hex_len + 1;
+    let value_start = sp.checked_add(4)?.checked_add(hex_len)?;
     if value_start > line.len() {
         return None;
     }
@@ -4285,5 +4298,19 @@ mod tests {
         let file2 = parse_file_with_version(&out, Version::new(12, 0, 6, 0)).expect("re-parse");
         assert_eq!(super::super::emit_file(&file2, "t.abc"), input);
         crate::encode(&file).expect("encodes");
+    }
+
+    #[test]
+    fn literals_12x_overflowing_header_index_is_parse_error() {
+        for bad_idx in [0x4000_0001u32, u32::MAX] {
+            let lit = format!("{bad_idx} 0x10 {{ 1 [ i32:1, ]}}\n");
+            let input = doc(lit.as_bytes(), b"", b"", b"");
+            let err = parse_file_with_version(&input, Version::new(12, 0, 6, 0))
+                .expect_err("huge 12.x header index must fail cleanly");
+            assert!(
+                err.message.contains("LITERALS header index"),
+                "unexpected error for {bad_idx:#x}: {err}"
+            );
+        }
     }
 }
