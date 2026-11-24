@@ -25,12 +25,14 @@ use std::process::Command;
 use abcd_decompile::emit::{EmitOptions, decompile_module};
 use abcd_decompile::split::{SplitFileKind, decompile_module_split};
 use abcd_file::{
-    AccessFlags, Builder, FieldValue, File, JSON_FILE_CONTENT_FIELD, MODULE_RECORD_IDX_FIELD,
-    MODULE_REQUEST_PHASE_FIELD, ModuleRecordDef, SCOPE_NAMES_FIELD, SourceLang, Type, Version,
-    decode, encode, pandasm,
+    AccessFlags, Annotation, AnnotationElem, AnnotationValue, Builder, CatchBlock, FieldValue,
+    File, FunctionKind as FileFunctionKind, JSON_FILE_CONTENT_FIELD, LiteralArray, LiteralArrayIdx,
+    LiteralValue, MODULE_RECORD_IDX_FIELD, MODULE_REQUEST_PHASE_FIELD, Method, MethodBody,
+    ModuleRecordDef, SCOPE_NAMES_FIELD, SourceLang, TryBlock, Type, Version, decode, encode,
+    pandasm,
 };
-use abcd_ir::verify_module;
-use abcd_isa::{Bytecode, Imm, Reg, encode as encode_isa, insn};
+use abcd_ir::{Op, verify_module};
+use abcd_isa::{Bytecode, EntityId, EntityKind, Imm, Label, Reg, encode as encode_isa, insn};
 use abcd_lift::lift_file;
 use abcd_lower::{LowerOptions, lower_module_bodies};
 use abcd_opt::optimize_module;
@@ -342,15 +344,47 @@ fn rewrite_file_e2e(bytes: &[u8], optimize: bool) -> (Vec<u8>, bool) {
 
     let mut rebuilt = file.clone();
     let mut cursor = bodies.into_iter();
+    let mut bc_errs = Vec::new();
+    let mut method_idx = 0usize;
     for class in rebuilt.classes.values_mut() {
+        let cls_name = file
+            .strings
+            .resolve(class.descriptor)
+            .unwrap_or("?")
+            .to_string();
         for method in &mut class.methods {
             let slot = cursor.next().expect("method cursor");
             if method.body.is_some() {
-                method.body = Some(slot.expect("lowered body"));
+                let b = slot.expect("lowered body");
+                if let Err(e) = encode_isa(&b.bytecodes) {
+                    let m_name = file.strings.resolve(method.name).unwrap_or("?");
+                    let mut bad_insns = Vec::new();
+                    for (i, bc) in b.bytecodes.iter().enumerate() {
+                        if !matches!(bc, Bytecode::Jmp(_) | Bytecode::Jeqz(_) | Bytecode::Jnez(_))
+                            && encode_isa(std::slice::from_ref(bc)).is_err()
+                        {
+                            bad_insns.push(format!("[{i}] {bc:?}"));
+                        }
+                    }
+                    bc_errs.push(format!(
+                        "FuncId({method_idx}) {cls_name}::{m_name} (len={}, vregs={}, args={}): {e}; bad_nonbranch={bad_insns:?}",
+                        b.bytecodes.len(),
+                        b.num_vregs,
+                        b.num_args
+                    ));
+                }
+                method.body = Some(b);
             }
+            method_idx += 1;
         }
     }
     assert!(cursor.next().is_none());
+    assert!(
+        bc_errs.is_empty(),
+        "bytecode encode failed on {} methods (optimize={optimize}):\n{}",
+        bc_errs.len(),
+        bc_errs.join("\n")
+    );
 
     let encoded = encode(&rebuilt).expect("encode rewritten merge-abc");
     (encoded, changed)
@@ -542,17 +576,35 @@ fn merge_abc_docker_oracle() {
     std::fs::write(src.join("cfg.json"), "{\"base\":20,\"tag\":\"merge-ok\"}\n").expect("cfg.json");
     std::fs::write(
         src.join("helper.js"),
-        "export function makeAdder(seed) {\n  const step = 2;\n  return (x) => x + seed + step;\n}\n",
+        "export function makeAdder(seed) {\n\
+           const step = 2;\n\
+           return (x) => x + seed + step;\n\
+         }\n\
+         export function sumDown(n) {\n\
+           let acc = 0;\n\
+           while (n > 0) {\n\
+             acc += n;\n\
+             n = n - 1;\n\
+           }\n\
+           return acc;\n\
+         }\n\
+         export function pickEq(a, b) {\n\
+           if (a === b) {\n\
+             return a + b;\n\
+           }\n\
+           return a - b;\n\
+         }\n",
     )
     .expect("helper.js");
     std::fs::write(src.join("lazyMod.js"), "export const bonus = 10;\n").expect("lazyMod.js");
     std::fs::write(
         src.join("main.js"),
         "import cfg from \"./cfg.json\";\n\
-         import { makeAdder } from \"./helper\";\n\
+         import { makeAdder, sumDown, pickEq } from \"./helper\";\n\
          import lazy { bonus } from \"./lazyMod\";\n\
          const add = makeAdder(cfg.base);\n\
-         print(cfg.tag + \":\" + (add(10) + bonus));\n",
+         const guard = (sumDown(3) - 6) + (pickEq(5, 5) - 10);\n\
+         print(cfg.tag + \":\" + (add(10) + bonus + guard));\n",
     )
     .expect("main.js");
     std::fs::write(
@@ -768,4 +820,397 @@ print(json.dumps({"checked": checked}))
         "MERGE-ABC-ORACLE green: {}",
         String::from_utf8_lossy(&verify_out.stdout).trim()
     );
+}
+
+/// Build a multi-record `--merge-abc` bundle exercising all four #32
+/// commercial edge cases in one artifact:
+/// 1. `Lmain;::func_main_0`: `L_ESTypeAnnotation;._TypeOfInstruction` with a
+///    nested `LiteralValue::LiteralArray` surrounded by integer entries;
+/// 2. `Lhelper;::loopFromZero`: loop header at bytecode index `0` mutating an
+///    argument register (`a3`) + unfused `Stricteq + Jnez` where `v0` stays
+///    live across the branch;
+/// 3. `Lhelper;::catchAtZero`: `TryBlock` whose catch handler sits at bytecode
+///    index `0`;
+/// 4. `Lsendable;::func_main_0`: `callruntime.definesendableclass` whose class
+///    buffer carries a trailing field-type-layout `LiteralArray` reference.
+fn build_commercial_edge_merge_abc(version: Version) -> Vec<u8> {
+    let mut file = decode(&build_synthetic_merge_abc(version)).expect("decode base merge-abc");
+
+    // 1) Nested `_ESTypeAnnotation._TypeOfInstruction` on Lmain::func_main_0
+    let nested_type_idx = file.literal_arrays.len() as u32;
+    file.literal_arrays.push(LiteralArray {
+        values: vec![LiteralValue::Integer(1), LiteralValue::Integer(51)],
+    });
+    file.literal_array_offsets.insert(0x70_000, nested_type_idx);
+
+    let s_estype = file.strings.get_or_intern("L_ESTypeAnnotation;");
+    let s_typeof = file.strings.get_or_intern("_TypeOfInstruction");
+    file.classes.insert(
+        s_estype,
+        abcd_file::Class {
+            descriptor: s_estype,
+            name: s_estype,
+            access_flags: AccessFlags::PUBLIC,
+            source_lang: SourceLang::EcmaScript,
+            source_file: None,
+            is_external: false,
+            super_class: None,
+            interfaces: Vec::new(),
+            methods: Vec::new(),
+            fields: Vec::new(),
+            annotations: Default::default(),
+        },
+    );
+    let main_cls = file
+        .classes
+        .values_mut()
+        .find(|c| file.strings.resolve(c.descriptor) == Some("Lmain;"))
+        .expect("Lmain;");
+    main_cls.methods[0]
+        .annotations
+        .compile_time
+        .push(Annotation {
+            class_descriptor: s_estype,
+            elements: vec![AnnotationElem {
+                name: s_typeof,
+                value: AnnotationValue::LiteralArray(vec![
+                    LiteralValue::Integer(0),
+                    LiteralValue::LiteralArray(LiteralArrayIdx(nested_type_idx)),
+                    LiteralValue::Integer(4),
+                ]),
+            }],
+        });
+
+    // 2) Loop back-edge to offset 0 mutating param a3 + live compare operand,
+    // and 3) Catch handler at offset 0 on Lhelper;
+    let s_loop = file.strings.get_or_intern("loopFromZero");
+    let s_catch0 = file.strings.get_or_intern("catchAtZero");
+    file.entity_map.insert(0x80_010, s_loop);
+    file.entity_map.insert(0x80_020, s_catch0);
+    let helper_cls = file
+        .classes
+        .values_mut()
+        .find(|c| file.strings.resolve(c.descriptor) == Some("Lhelper;"))
+        .expect("Lhelper;");
+    helper_cls.methods.push(Method {
+        name: s_loop,
+        offset: 0x80_010,
+        access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+        function_kind: FileFunctionKind::Function,
+        source_lang: SourceLang::EcmaScript,
+        is_external: false,
+        return_type: Some(Type::Tagged),
+        arg_types: Vec::new(),
+        body: Some(MethodBody {
+            num_vregs: 2,
+            num_args: 4,
+            bytecodes: vec![
+                Bytecode::Lda(Reg(5)),              // [0] header0: acc = a3
+                Bytecode::Sta(Reg(0)),              // [1] v0 = a3 (kept live!)
+                Bytecode::Ldai(Imm(0)),             // [2] acc = 0
+                Bytecode::Stricteq(Imm(0), Reg(0)), // [3] acc = (0 === v0)
+                Bytecode::Jnez(Label(9)),           // [4] if 0 === v0 -> [9]
+                Bytecode::Lda(Reg(0)),              // [5] latch: v0 still live!
+                Bytecode::Dec(Imm(1)),              // [6] acc = v0 - 1
+                Bytecode::Sta(Reg(5)),              // [7] a3 = acc
+                Bytecode::Jmp(Label(0)),            // [8] back-edge to offset 0
+                Bytecode::Lda(Reg(0)),              // [9] exit
+                Bytecode::Return,                   // [10]
+            ],
+            entity_offsets: std::collections::HashMap::new(),
+            try_blocks: Vec::new(),
+            ic_size: Some(2),
+        }),
+        annotations: Default::default(),
+        param_annotations: Default::default(),
+        debug: None,
+    });
+    helper_cls.methods.push(Method {
+        name: s_catch0,
+        offset: 0x80_020,
+        access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+        function_kind: FileFunctionKind::Function,
+        source_lang: SourceLang::EcmaScript,
+        is_external: false,
+        return_type: Some(Type::Tagged),
+        arg_types: Vec::new(),
+        body: Some(MethodBody {
+            num_vregs: 1,
+            num_args: 3,
+            bytecodes: vec![
+                Bytecode::Sta(Reg(0)),    // [0] handler == 0 & entry target
+                Bytecode::Jeqz(Label(4)), // [1]
+                Bytecode::Ldundefined,    // [2] try [2..4)
+                Bytecode::Throw,          // [3]
+                Bytecode::Lda(Reg(0)),    // [4]
+                Bytecode::Return,         // [5]
+            ],
+            entity_offsets: std::collections::HashMap::new(),
+            try_blocks: vec![TryBlock {
+                start: 2,
+                len: 2,
+                catches: vec![CatchBlock {
+                    type_idx: u32::MAX,
+                    handler: 0,
+                    len: 2,
+                }],
+            }],
+            ic_size: None,
+        }),
+        annotations: Default::default(),
+        param_annotations: Default::default(),
+        debug: None,
+    });
+
+    // 4) Sendable class record with trailing field-type-layout literal array
+    let s_send_desc = file.strings.get_or_intern("Lsendable;");
+    let s_send_ctor = file.strings.get_or_intern("SendableBox");
+    let s_get_val = file.strings.get_or_intern("getVal");
+    let s_field_x = file.strings.get_or_intern("x");
+    let s_func_main = file.strings.get_or_intern("func_main_0");
+
+    let field_la_idx = file.literal_arrays.len() as u32;
+    file.literal_arrays.push(LiteralArray {
+        values: vec![
+            LiteralValue::String(s_field_x),
+            LiteralValue::Integer(2),
+            LiteralValue::Integer(1),
+        ],
+    });
+    file.literal_array_offsets.insert(0x70_100, field_la_idx);
+
+    let class_la_idx = file.literal_arrays.len() as u32;
+    file.literal_arrays.push(LiteralArray {
+        values: vec![
+            LiteralValue::String(s_get_val),
+            LiteralValue::Getter(0x80_200),
+            LiteralValue::MethodAffiliate(0),
+            LiteralValue::Integer(1),
+            LiteralValue::LiteralArray(LiteralArrayIdx(field_la_idx)),
+        ],
+    });
+    file.literal_array_offsets.insert(0x70_200, class_la_idx);
+
+    file.entity_map.insert(0x80_100, s_send_ctor);
+    file.entity_map.insert(0x80_200, s_get_val);
+    file.entity_map.insert(0x80_300, s_func_main);
+
+    file.classes.insert(
+        s_send_desc,
+        abcd_file::Class {
+            descriptor: s_send_desc,
+            name: s_send_desc,
+            access_flags: AccessFlags::PUBLIC,
+            source_lang: SourceLang::EcmaScript,
+            source_file: None,
+            is_external: false,
+            super_class: None,
+            interfaces: Vec::new(),
+            methods: vec![
+                Method {
+                    name: s_send_ctor,
+                    offset: 0x80_100,
+                    access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+                    function_kind: FileFunctionKind::SendableFunction,
+                    source_lang: SourceLang::EcmaScript,
+                    is_external: false,
+                    return_type: Some(Type::Tagged),
+                    arg_types: Vec::new(),
+                    body: Some(MethodBody {
+                        num_vregs: 0,
+                        num_args: 3,
+                        bytecodes: vec![Bytecode::Lda(Reg(2)), Bytecode::Return],
+                        entity_offsets: std::collections::HashMap::new(),
+                        try_blocks: Vec::new(),
+                        ic_size: None,
+                    }),
+                    annotations: Default::default(),
+                    param_annotations: Default::default(),
+                    debug: None,
+                },
+                Method {
+                    name: s_get_val,
+                    offset: 0x80_200,
+                    access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+                    function_kind: FileFunctionKind::SendableFunction,
+                    source_lang: SourceLang::EcmaScript,
+                    is_external: false,
+                    return_type: Some(Type::Tagged),
+                    arg_types: Vec::new(),
+                    body: Some(MethodBody {
+                        num_vregs: 0,
+                        num_args: 3,
+                        bytecodes: vec![Bytecode::Ldai(Imm(7)), Bytecode::Return],
+                        entity_offsets: std::collections::HashMap::new(),
+                        try_blocks: Vec::new(),
+                        ic_size: None,
+                    }),
+                    annotations: Default::default(),
+                    param_annotations: Default::default(),
+                    debug: None,
+                },
+                Method {
+                    name: s_func_main,
+                    offset: 0x80_300,
+                    access_flags: AccessFlags::PUBLIC | AccessFlags::STATIC,
+                    function_kind: FileFunctionKind::Function,
+                    source_lang: SourceLang::EcmaScript,
+                    is_external: false,
+                    return_type: Some(Type::Tagged),
+                    arg_types: Vec::new(),
+                    body: Some(MethodBody {
+                        num_vregs: 1,
+                        num_args: 3,
+                        bytecodes: vec![
+                            Bytecode::Ldhole,
+                            Bytecode::Sta(Reg(0)),
+                            Bytecode::CallruntimeDefinesendableclass(
+                                Imm(0),
+                                EntityId(0),
+                                EntityId(1),
+                                Imm(1),
+                                Reg(0),
+                            ),
+                            Bytecode::Return,
+                        ],
+                        entity_offsets: std::collections::HashMap::from([
+                            ((EntityKind::MethodId, 0), 0x80_100),
+                            ((EntityKind::LiteralarrayId, 1), 0x70_200),
+                        ]),
+                        try_blocks: Vec::new(),
+                        ic_size: None,
+                    }),
+                    annotations: Default::default(),
+                    param_annotations: Default::default(),
+                    debug: None,
+                },
+            ],
+            fields: Vec::new(),
+            annotations: Default::default(),
+        },
+    );
+
+    encode(&file).expect("encode commercial edge merge-abc")
+}
+
+fn assert_commercial_edge_invariants(file: &File) {
+    // 1) `_TypeOfInstruction` nested literal array survived without shifting
+    let main_cls = file.class_by_str("Lmain;").expect("Lmain;");
+    let m0 = &main_cls.methods[0];
+    let estype = m0
+        .annotations
+        .compile_time
+        .iter()
+        .chain(&m0.annotations.runtime)
+        .find(|a| file.strings.resolve(a.class_descriptor) == Some("L_ESTypeAnnotation;"))
+        .expect("L_ESTypeAnnotation; on Lmain::func_main_0");
+    let elem = estype
+        .elements
+        .iter()
+        .find(|e| file.strings.resolve(e.name) == Some("_TypeOfInstruction"))
+        .expect("_TypeOfInstruction");
+    let AnnotationValue::LiteralArray(items) = &elem.value else {
+        panic!(
+            "expected LiteralArray value on _TypeOfInstruction, got {:?}",
+            elem.value
+        );
+    };
+    assert_eq!(items.len(), 3, "nested literal array items must not shift");
+    assert_eq!(items[0], LiteralValue::Integer(0));
+    assert_eq!(items[2], LiteralValue::Integer(4));
+    let LiteralValue::LiteralArray(nested_idx) = items[1] else {
+        panic!("expected nested LiteralArray at item 1, got {:?}", items[1]);
+    };
+    let nested_la = file
+        .literal_arrays
+        .get(nested_idx.0 as usize)
+        .expect("nested _TypeOfInstruction target in File::literal_arrays");
+    assert_eq!(
+        nested_la.values,
+        vec![LiteralValue::Integer(1), LiteralValue::Integer(51)]
+    );
+
+    // 2) Zero dead fused register-compare branches anywhere in the file
+    for (_, method) in file.all_methods() {
+        let Some(body) = &method.body else { continue };
+        for bc in &body.bytecodes {
+            assert!(
+                !matches!(
+                    bc,
+                    Bytecode::Jeq(..)
+                        | Bytecode::Jne(..)
+                        | Bytecode::Jstricteq(..)
+                        | Bytecode::Jnstricteq(..)
+                ),
+                "lowered bytecode must never emit broken fused compare-branch: {bc:?}"
+            );
+        }
+    }
+
+    // 3) Re-lifting the rewritten file verifies cleanly and preserves Sendable member_attrs
+    let ir = lift_file(file).expect("lift commercial edge merge-abc");
+    let report = verify_module(&ir);
+    assert!(report.is_ok(), "verify failed: {:?}", report.errors);
+    let sendable_attrs: Vec<usize> = ir
+        .insts
+        .iter()
+        .filter_map(|inst| match &inst.op {
+            Op::DefineSendableClass { member_attrs, .. } => Some(member_attrs.len()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sendable_attrs,
+        vec![1],
+        "DefineSendableClass must preserve getter member_attrs across trailing field layout"
+    );
+}
+
+#[test]
+fn synthetic_merge_abc_commercial_edge_cases_across_versions() {
+    for version in MERGE_VERSIONS {
+        let raw = build_commercial_edge_merge_abc(version);
+        let decoded = decode(&raw).expect("decode commercial edge merge-abc");
+        assert_eq!(decoded.version, version);
+        assert_commercial_edge_invariants(&decoded);
+
+        let (rewritten_lift, _) = rewrite_file_e2e(&raw, false);
+        let decoded_lift = decode(&rewritten_lift).expect("decode v2lift commercial merge-abc");
+        assert_commercial_edge_invariants(&decoded_lift);
+
+        let (rewritten_opt, opt_changed) = rewrite_file_e2e(&raw, true);
+        assert!(
+            opt_changed,
+            "constant folding must fire on Lmain::func_main_0"
+        );
+        let decoded_opt = decode(&rewritten_opt).expect("decode v2opt commercial merge-abc");
+        assert_commercial_edge_invariants(&decoded_opt);
+    }
+}
+
+#[test]
+#[ignore = "requires local-only modules.abc (gitignored)"]
+fn modules_abc_commercial_bundle_rewrite_v2lift_and_v2opt() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("modules.abc");
+    if !path.exists() {
+        eprintln!("modules.abc absent at {} — skipped", path.display());
+        return;
+    }
+    let raw = std::fs::read(&path).expect("read modules.abc");
+
+    for optimize in [false, true] {
+        let tag = if optimize { "v2opt" } else { "v2lift" };
+        let (rewritten, _) = rewrite_file_e2e(&raw, optimize);
+        let relifted_file =
+            decode(&rewritten).unwrap_or_else(|e| panic!("re-decode modules.abc ({tag}): {e}"));
+        let relifted_ir = lift_file(&relifted_file)
+            .unwrap_or_else(|e| panic!("re-lift modules.abc ({tag}): {e}"));
+        assert_eq!(relifted_ir.functions.len(), 58_699);
+        let report = verify_module(&relifted_ir);
+        assert!(
+            report.is_ok(),
+            "post-rewrite verify failed on modules.abc ({tag}): {:?}",
+            &report.errors[..report.errors.len().min(10)]
+        );
+    }
 }

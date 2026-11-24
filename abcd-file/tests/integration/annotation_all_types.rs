@@ -985,12 +985,14 @@ fn annotation_embedded_literal_array_all_kinds_encode_roundtrip() {
         .expect("method name interned");
     file.entity_map.insert(0, target_name);
 
-    // NOTE: no nested `LiteralValue::LiteralArray` element here — the
-    // vendored writer/reader pair corrupts every item AFTER a LITERALARRAY
-    // item inside an annotation-embedded array (the nested reference is
-    // written but the trailing items decode shifted; upstream treats arrays
-    // of literal arrays as unrepresentable). The encoder's nested-LA error
-    // arm is covered in encode_errors.rs.
+    file.literal_arrays.push(abcd_file::LiteralArray {
+        values: vec![LiteralValue::Integer(0x4242), LiteralValue::String(str_sid)],
+    });
+
+    // Includes a nested `LiteralValue::LiteralArray` in the middle of the
+    // matrix followed by trailing items (#32-File: deferred `ann_la_*`
+    // population ensures nested references resolve to live builder handles
+    // without shifting subsequent elements).
     let matrix: Vec<LiteralValue> = vec![
         LiteralValue::Bool(true),
         LiteralValue::Integer8(5),
@@ -998,6 +1000,7 @@ fn annotation_embedded_literal_array_all_kinds_encode_roundtrip() {
         LiteralValue::Float(1.5),
         LiteralValue::Double(2.5),
         LiteralValue::String(str_sid),
+        LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(0)),
         LiteralValue::Method(target_off),
         LiteralValue::GeneratorMethod(target_off),
         LiteralValue::AsyncGeneratorMethod(target_off),

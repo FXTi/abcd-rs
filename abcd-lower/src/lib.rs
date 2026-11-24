@@ -199,6 +199,14 @@ pub enum LowerError {
     /// new container items.
     #[error("synthetic entity offset overflowed u32 address space")]
     SyntheticOffsetOverflow,
+    /// A single method references more than `u16::MAX + 1` distinct entities
+    /// of one [`abcd_isa::EntityKind`], exceeding the 16-bit bytecode `id:u16`
+    /// operand encoding limit.
+    #[error(
+        "function {0:?} references more than 65536 distinct entities of one kind, exceeding \
+         the u16 entity operand limit"
+    )]
+    EntityIndexOverflow(FuncId),
 }
 
 /// Lower a single IR function back to bytecodes with default [`LowerOptions`].

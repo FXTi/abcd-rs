@@ -11,7 +11,7 @@ Lowering converter from [`abcd_ir::Module`](../abcd-ir/README.md) back to ArkCom
    - Exact backward liveness over Normal + Exceptional edges.
    - Maximum Cardinality Search (MCS) + greedy coloring on the SSA interference graph, reserving low-register (`v0..v255`) scratch slots for `lda`/`sta` (`op_v_8`) and contiguous low-register call windows for `*range` calls.
    - Boissinot out-of-SSA parallel-copy scheduling with cycle breaking (and strict zero-copy enforcement on VM exception edges).
-3. **Instruction selection (`src/isel.rs`)**: `acc-as-cache` emission, compare-and-branch fusion (`jeq`/`jne`/`jstricteq`/`jnstricteq`), call-arity opcode selection, and `ReArrangeIc`-style 8-bit-first IC-slot assignment.
+3. **Instruction selection (`src/isel.rs`)**: `acc-as-cache` emission, unfused conditional branch selection (`jnez` — never the dead `jeq*`/`jne*`/`jstricteq*`/`jnstricteq*` fused family), call-arity opcode selection, and `ReArrangeIc`-style 8-bit-first IC-slot assignment.
 4. **Block layout & try-range reconstruction (`src/layout.rs`)**: RPO block placement, edge trampolines, label resolution, and `TryBlock` span reconstruction.
 5. **Entity relocation & `MethodBody` assembly (`src/method_body.rs`)**: `to_method_body` traces IR `Sym` / `FuncId` / `ConstId` operands back to source-file entity offsets and records recomputed IC-slot counts (`MethodBody::ic_size`) so `abcd_file::encode` synchronizes `_ESSlotNumberAnnotation`.
 
@@ -23,10 +23,7 @@ use abcd_ir::{FuncId, Module};
 use abcd_lower::{LowerError, LowerOptions, lower_function_with_options, to_method_body};
 
 fn lower_one(file: &File, module: &Module, func_id: FuncId) -> Result<MethodBody, LowerError> {
-    let opts = LowerOptions {
-        prune_unused_frame_init_consts: false, // set true after abcd_opt::optimize_module
-    };
-    let layout = lower_function_with_options(module, func_id, opts)?;
+    let layout = lower_function_with_options(module, func_id, LowerOptions::default())?;
     to_method_body(module, func_id, &layout, file)
 }
 ```

@@ -173,3 +173,256 @@ fn exported_corpus_wild_hap_gates() {
         negative.len()
     );
 }
+
+fn splice_and_encode(file: &abcd_file::File, module: &abcd_ir::Module) -> Result<Vec<u8>, String> {
+    let rebuilt = abcd_lower::rewrite_file(module, file, abcd_lower::LowerOptions::default())
+        .map_err(|e| format!("rewrite_file: {e}"))?;
+    abcd_file::encode(&rebuilt).map_err(|e| format!("encode: {e}"))
+}
+
+/// Full wild-OHOS `.hap` rewrite gate (#32): exercises `decode → lift → verify
+/// → [opt → verify →] lower → encode → decode → lift → verify` across every
+/// `.abc` module in all 156 wild `.hap` packages (`276` modules total:
+/// `242` modern modules rewritten end-to-end in both `v2lift` and `v2opt`,
+/// `14` legacy `0.0.0.2` read-only modules, and `20` `N54`
+/// `deprecated.defineclasswithbuffer` hard-error modules).
+#[test]
+#[ignore = "requires the exported wild corpus (image export-wild)"]
+fn exported_corpus_wild_hap_rewrite_gates() {
+    let root = wild_corpus_root();
+    let manifest_path = root.join("manifest.json");
+    if !manifest_path.exists() {
+        eprintln!("hap-file rewrite: no wild corpus at {root:?}, skipping (corpus not exported)");
+        return;
+    }
+    let manifest = Manifest::load(&manifest_path).unwrap_or_else(|e| {
+        panic!("wild manifest at {manifest_path:?} is unreadable/invalid: {e}");
+    });
+    let decode_ok: Vec<_> = manifest
+        .packages
+        .iter()
+        .filter(|p| p.expectation == Expectation::DecodeOk)
+        .collect();
+
+    #[derive(Default)]
+    struct RewriteTally {
+        rewritten_ok: usize,
+        n8_type_summary: usize,
+        legacy_v002: usize,
+        n54_deprecated: usize,
+        failures: Vec<String>,
+    }
+
+    let tallies: Vec<RewriteTally> = decode_ok
+        .par_iter()
+        .map(|pkg| {
+            let mut tally = RewriteTally::default();
+            let bytes = std::fs::read(root.join(&pkg.path))
+                .unwrap_or_else(|e| panic!("{}: unreadable package: {e}", pkg.path));
+            let modules = match abcd_hap::abc_modules(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    tally.failures.push(format!("{}: container: {e}", pkg.path));
+                    return tally;
+                }
+            };
+            for m in &modules {
+                let label = format!("{}#{}", pkg.path, m.entry_name);
+                let mut file = match abcd_file::decode(m.data.as_slice()) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tally.failures.push(format!("{label}: decode: {e}"));
+                        continue;
+                    }
+                };
+                if file.version == abcd_file::Version::new(0, 0, 0, 2) {
+                    match abcd_file::encode(&file) {
+                        Err(abcd_file::Error::UnsupportedOutputVersion(_)) => {
+                            tally.legacy_v002 += 1;
+                        }
+                        other => tally.failures.push(format!(
+                            "{label}: expected UnsupportedOutputVersion(0.0.0.2), got {}",
+                            other
+                                .err()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "Ok".to_string())
+                        )),
+                    }
+                    match abcd_lift::lift_file(&file) {
+                        Ok(ir) => {
+                            let r = abcd_ir::verify_module(&ir);
+                            if !r.is_ok() {
+                                tally.failures.push(format!(
+                                    "{label}: legacy 0.0.0.2 verify: {:?}",
+                                    r.errors
+                                ));
+                            }
+                        }
+                        Err(abcd_lift::LiftError::UnsupportedDeprecatedDefineClassWithBuffer) => {
+                            tally.n54_deprecated += 1;
+                        }
+                        Err(e) => {
+                            tally
+                                .failures
+                                .push(format!("{label}: legacy 0.0.0.2 lift: {e}"));
+                        }
+                    }
+                    continue;
+                }
+
+                let has_type_summary = file.classes.values().any(|cls| {
+                    cls.fields.iter().any(|f| {
+                        matches!(
+                            f.initial_value,
+                            Some(abcd_file::FieldValue::TypeSummaryOffset(_))
+                        )
+                    })
+                });
+                if has_type_summary {
+                    match abcd_file::encode(&file) {
+                        Err(abcd_file::Error::TypeSummaryOffset { .. }) => {
+                            tally.n8_type_summary += 1;
+                        }
+                        other => {
+                            tally.failures.push(format!(
+                                "{label}: expected N8 TypeSummaryOffset error, got {}",
+                                other
+                                    .err()
+                                    .map(|e| e.to_string())
+                                    .unwrap_or_else(|| "Ok".to_string())
+                            ));
+                            continue;
+                        }
+                    }
+                    // Clear the opaque N8 field in the test harness so the full
+                    // rewrite + `_TypeOfInstruction` nested-literal-array encode +
+                    // post-rewrite lift/verify pipeline is exercised on all 77
+                    // typeSummary-bearing system apps too.
+                    for cls in file.classes.values_mut() {
+                        for field in &mut cls.fields {
+                            if matches!(
+                                field.initial_value,
+                                Some(abcd_file::FieldValue::TypeSummaryOffset(_))
+                            ) {
+                                field.initial_value = None;
+                            }
+                        }
+                    }
+                }
+
+                let ir = match abcd_lift::lift_file(&file) {
+                    Ok(ir) => ir,
+                    Err(e) => {
+                        tally.failures.push(format!("{label}: lift: {e}"));
+                        continue;
+                    }
+                };
+                let pre = abcd_ir::verify_module(&ir);
+                if !pre.is_ok() {
+                    tally
+                        .failures
+                        .push(format!("{label}: pre-rewrite verify: {:?}", pre.errors));
+                    continue;
+                }
+
+                // 1) v2lift roundtrip + re-lift + re-verify
+                let v2lift_bytes = match splice_and_encode(&file, &ir) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tally.failures.push(format!("{label}: v2lift {e}"));
+                        continue;
+                    }
+                };
+                let relift_ok = abcd_file::decode(&v2lift_bytes)
+                    .map_err(|e| format!("re-decode: {e}"))
+                    .and_then(|f2| abcd_lift::lift_file(&f2).map_err(|e| format!("re-lift: {e}")))
+                    .and_then(|ir2| {
+                        let r = abcd_ir::verify_module(&ir2);
+                        if r.is_ok() {
+                            Ok(())
+                        } else {
+                            Err(format!("re-verify: {:?}", r.errors))
+                        }
+                    });
+                if let Err(e) = relift_ok {
+                    tally
+                        .failures
+                        .push(format!("{label}: v2lift post-check {e}"));
+                    continue;
+                }
+
+                // 2) v2opt roundtrip + re-lift + re-verify
+                let mut opt_ir = ir;
+                abcd_opt::optimize_module(&mut opt_ir);
+                let post_opt = abcd_ir::verify_module(&opt_ir);
+                if !post_opt.is_ok() {
+                    tally
+                        .failures
+                        .push(format!("{label}: post-opt verify: {:?}", post_opt.errors));
+                    continue;
+                }
+                let v2opt_bytes = match splice_and_encode(&file, &opt_ir) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tally.failures.push(format!("{label}: v2opt {e}"));
+                        continue;
+                    }
+                };
+                let relift_opt_ok = abcd_file::decode(&v2opt_bytes)
+                    .map_err(|e| format!("re-decode: {e}"))
+                    .and_then(|f2| abcd_lift::lift_file(&f2).map_err(|e| format!("re-lift: {e}")))
+                    .and_then(|ir2| {
+                        let r = abcd_ir::verify_module(&ir2);
+                        if r.is_ok() {
+                            Ok(())
+                        } else {
+                            Err(format!("re-verify: {:?}", r.errors))
+                        }
+                    });
+                if let Err(e) = relift_opt_ok {
+                    tally
+                        .failures
+                        .push(format!("{label}: v2opt post-check {e}"));
+                    continue;
+                }
+
+                tally.rewritten_ok += 1;
+            }
+            tally
+        })
+        .collect();
+
+    let mut total = RewriteTally::default();
+    for t in tallies {
+        total.rewritten_ok += t.rewritten_ok;
+        total.n8_type_summary += t.n8_type_summary;
+        total.legacy_v002 += t.legacy_v002;
+        total.n54_deprecated += t.n54_deprecated;
+        total.failures.extend(t.failures);
+    }
+
+    assert!(
+        total.failures.is_empty(),
+        "wild .hap rewrite gate: {} failures (rewritten_ok={}, n8={}, legacy_v002={}, n54={}):\n{}",
+        total.failures.len(),
+        total.rewritten_ok,
+        total.n8_type_summary,
+        total.legacy_v002,
+        total.n54_deprecated,
+        total.failures.join("\n")
+    );
+    assert_eq!(
+        (
+            total.rewritten_ok,
+            total.n8_type_summary,
+            total.legacy_v002,
+            total.n54_deprecated,
+        ),
+        (242, 77, 34, 20),
+        "wild .hap rewrite module partition drifted"
+    );
+    eprintln!(
+        "hap-file rewrite gate: {} modern modules rewritten cleanly (incl. {} N8 typeSummary-checked), {} legacy 0.0.0.2 ({} N54 deprecated-class)",
+        total.rewritten_ok, total.n8_type_summary, total.legacy_v002, total.n54_deprecated
+    );
+}

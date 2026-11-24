@@ -62,7 +62,9 @@ pub struct ResolvedMethodHandle {
 /// - String, Record, Method, Enum → interned [`StringId`](crate::StringId)
 /// - Annotation → recursively resolved nested [`Annotation`](crate::Annotation)
 /// - MethodHandle → resolved [`ResolvedMethodHandle`]
-/// - LiteralArray → raw entity offset (index into file's literal arrays)
+/// - LiteralArray → resolved [`LiteralValue`](crate::LiteralValue) items
+///   (nested [`LiteralValue::LiteralArray`](crate::LiteralValue::LiteralArray)
+///   items are rewritten to [`File::literal_arrays`](crate::File::literal_arrays) indices)
 /// - Array → element count preserved with original tag and entity offset
 #[derive(Clone, Debug, PartialEq)]
 pub enum AnnotationValue {

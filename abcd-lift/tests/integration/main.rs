@@ -8,6 +8,7 @@ mod lift_deprecated_arms;
 mod lift_deprecated_defineclasswithbuffer;
 mod lift_ldthis;
 mod lift_metadata_synth;
+mod lift_offset_zero_preds;
 mod lift_rare_arms;
 mod lift_resolve_synth;
 mod lift_store_own_prop;

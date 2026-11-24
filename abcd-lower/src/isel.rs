@@ -18,14 +18,16 @@
 //! - Frame-initial values are [`ValueDef::Const`] constants; like v0.1's
 //!   entry-top seed literals they are materialized at the entry block
 //!   top (later-created first — v0.1 inserted each seed at index 0).
-//! - v0.1's `BinOp` splits into [`Op::BinaryOp`]/[`Op::Compare`]; the
-//!   compare-branch fusion pattern-matches `Op::Compare` accordingly.
+//! - v0.1's `BinOp` splits into [`Op::BinaryOp`]/[`Op::Compare`]; comparisons
+//!   always emit unfused (`eq`/`noteq`/`stricteq`/`strictnoteq`/…) followed by
+//!   `jnez` at the branch, never the dead fused compare-and-branch family
+//!   (ruling 2026-10-04).
 
 use std::collections::{HashMap, HashSet};
 
 use abcd_ir::{
-    BinOp, BlockId, CallKind, CmpOp, Const, ConstId, FuncId, InstId, Module, Op, SuperCheck,
-    SuperKey, Sym, UnOp, ValueDef, ValueId,
+    BinOp, BlockId, CallKind, CmpOp, Const, ConstId, FuncId, Module, Op, SuperCheck, SuperKey, Sym,
+    UnOp, ValueDef, ValueId,
 };
 use abcd_isa::{Bytecode, BytecodeFlags, EntityId, EntityKind, Imm, Label, Reg};
 
@@ -633,8 +635,6 @@ pub fn select_with_options(
 
             select_inst(
                 node,
-                inst,
-                &block.insts,
                 func_id,
                 module,
                 alloc,
@@ -992,11 +992,6 @@ fn fused_definefunc_body(module: &Module, v: ValueId, suppression: &Suppression)
 
 /// Select bytecodes for a single IR instruction.
 ///
-/// `inst` and `block_insts` (the owning block's instruction list) are
-/// needed by the CondBranch compare-fusion soundness checks: fusion
-/// re-reads another instruction's operands, which is only valid when the
-/// comparison chain sits immediately before the branch in the same block.
-///
 /// `tracker` is the emission-time acc-content model (B4, acc-as-cache):
 /// every acc load goes through `ensure_acc`/`materialize_operands` (the
 /// only acc writers besides result homing), and every arm whose bytecode
@@ -1008,8 +1003,6 @@ fn fused_definefunc_body(module: &Module, v: ValueId, suppression: &Suppression)
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn select_inst(
     node: &abcd_ir::Inst,
-    inst: InstId,
-    block_insts: &[InstId],
     func_id: FuncId,
     module: &Module,
     alloc: &RegAlloc,
@@ -2044,31 +2037,18 @@ fn select_inst(
             true_dest,
             false_dest,
         } => {
-            // Try compare-branch fusion: if cond is IsTrue(CmpOp(a, b)),
-            // emit a fused Jeq/Jne/Jstricteq/Jnstricteq instead of Jnez.
-            // Fusion re-reads the COMPARISON's operands at this branch, so
-            // it fires only when that re-read is provably sound (S6; see
-            // try_fuse_cmp_branch). Otherwise fall back to the unfused
-            // path, which is sound: `cond` is the branch's own operand and
-            // the tracker reloads it from its home unless the acc provably
-            // still holds it (the common def→use chain).
-            if let Some(fused) = try_fuse_cmp_branch(
-                *cond,
-                *true_dest,
-                inst,
-                block_insts,
-                func_id,
-                module,
-                alloc,
-                codes,
-                tracker,
-            )? {
-                codes.push(fused);
-            } else {
-                ensure_acc(tracker, func_id, *cond, alloc, codes)?;
-                // Emit: if acc truthy → jump to true_dest, fall through to false_dest
-                codes.push(Bytecode::Jnez(Label(true_dest.0)));
-            }
+            // Ruling 2026-10-04 (#32): ArkCompiler's 24 fused compare-and-branch
+            // variants (`jeq*`/`jne*`/`jstricteq*`/`jnstricteq*` and the
+            // strict-zero/null/undefined acc-branch forms) document no
+            // comparison semantics in `isa.yaml`, FATAL in the C++ interpreter,
+            // NOP-skip in the assembly interpreter, and are hard-rejected by
+            // `abcd-lift` (`UnsupportedFusedCompareBranch`). `es2abc` always
+            // emits unfused comparisons (`eq`/`noteq`/`stricteq`/`strictnoteq`)
+            // followed by `jnez`/`jeqz`, and so do we: ensure `cond` is in
+            // `acc` (elided when the preceding instruction left it there) and
+            // emit `Jnez(true_dest)`.
+            ensure_acc(tracker, func_id, *cond, alloc, codes)?;
+            codes.push(Bytecode::Jnez(Label(true_dest.0)));
             // The fall-through to false_dest is implicit if it's the next block.
             // Layout will insert a Jmp if needed.
             let _ = false_dest;
@@ -2451,148 +2431,6 @@ fn fill_call_window(
         codes.push(Bytecode::Mov(dst, Reg(r)));
     }
     Ok(Reg(base))
-}
-
-/// Try to fuse a compare + branch into a single bytecode.
-///
-/// Pattern: `CondBranch(cond: IsTrue(Compare { op: Eq|StrictEq|..., left, right }), true_dest)`
-/// → `Jeq(right_reg, true_dest)` with left in acc.
-///
-/// Fusion re-reads the COMPARISON's operands (`left`, `right`) at the
-/// branch site, extending their live ranges beyond what register
-/// allocation computed: allocation lets them die at the comparison, and
-/// the comparison plus the `IsTrue` wrapper both write the accumulator.
-/// Fusing is therefore only sound when ALL of the following hold (S6):
-///
-/// 1. The comparison — and the `IsTrue` wrapper, if present — are the
-///    instructions immediately preceding this branch IN THE SAME BLOCK.
-///    Any instruction in between could reuse an operand slot whose live
-///    range ended at the comparison.
-/// 2. Both `left` and `right` are Reg-colored. Since B4 EVERY value is
-///    Reg-colored, so this holds by construction — the operands are read
-///    from their register homes, and the emission-time acc tracker makes
-///    the fused `ensure_acc(left)` reload `left` from its home (the acc at
-///    the branch provably holds `cond`, not `left`, so the tracker miss
-///    is correct, never a stale no-op).
-/// 3. Neither the comparison result nor the `IsTrue` result reuses an
-///    operand's slot. An operand that dies at the comparison does not
-///    interfere with those results, so the allocator may co-locate them;
-///    the fused re-read would then observe the result, not the operand.
-///
-/// Returns `Ok(Some(fused_bytecode))` if fusion succeeded, `Ok(None)`
-/// when any precondition fails — the caller then emits the unfused
-/// `ensure_acc(cond)` + `Jnez` sequence.
-#[allow(clippy::too_many_arguments)]
-fn try_fuse_cmp_branch(
-    cond: ValueId,
-    true_dest: BlockId,
-    branch_inst: InstId,
-    block_insts: &[InstId],
-    func_id: FuncId,
-    module: &Module,
-    alloc: &RegAlloc,
-    codes: &mut Vec<Bytecode>,
-    tracker: &mut AccContent,
-) -> Result<Option<Bytecode>, LowerError> {
-    let cond_inst = match module.value(cond).map(|v| v.def) {
-        Some(ValueDef::Inst(i)) => i,
-        _ => return Ok(None),
-    };
-    let Some(cond_node) = module.inst(cond_inst) else {
-        return Ok(None);
-    };
-
-    // Unwrap the IsTrue wrapper: the comparison is the instruction whose
-    // result feeds the branch, directly or through the wrapper.
-    let (cmp_inst, wrapper) = match &cond_node.op {
-        Op::UnaryOp {
-            op: UnOp::IsTrue,
-            operand,
-        } => match module.value(*operand).map(|v| v.def) {
-            Some(ValueDef::Inst(i)) => (i, Some(cond_inst)),
-            _ => return Ok(None),
-        },
-        // If cond is directly a comparison (without IsTrue wrapper), also fuse.
-        Op::Compare { .. } => (cond_inst, None),
-        _ => return Ok(None),
-    };
-    let Some(cmp_node) = module.inst(cmp_inst) else {
-        return Ok(None);
-    };
-    let Op::Compare { op, left, right } = &cmp_node.op else {
-        return Ok(None);
-    };
-
-    // Precondition 1: same-block adjacency — the block's instruction tail
-    // must be exactly [comparison, (IsTrue,) branch].
-    let tail: &[InstId] = match wrapper {
-        Some(w) => &[cmp_inst, w, branch_inst],
-        None => &[cmp_inst, branch_inst],
-    };
-    if !block_insts.ends_with(tail) {
-        return Ok(None);
-    }
-
-    // Precondition 2: both comparison operands Reg-colored.
-    let (Some(RegSlot::Reg(left_r)), Some(RegSlot::Reg(right_r))) = (
-        alloc.allocation.get(left).copied(),
-        alloc.allocation.get(right).copied(),
-    ) else {
-        return Ok(None);
-    };
-
-    // Precondition 3: the comparison/IsTrue results (the only stores
-    // between the comparison and the branch, by precondition 1) must not
-    // occupy an operand slot.
-    for result in [cmp_node.result, cond_node.result].into_iter().flatten() {
-        if let Some(RegSlot::Reg(r)) = alloc.allocation.get(&result).copied()
-            && (r == left_r || r == right_r)
-        {
-            return Ok(None);
-        }
-    }
-
-    fuse_cmp_branch(
-        *op, *left, *right, true_dest, func_id, alloc, codes, tracker,
-    )
-}
-
-/// Emit a fused compare-branch for a CmpOp comparison.
-///
-/// The comparison's operands materialize like any two-operand instruction:
-/// the register operand reads its home, then the acc operand loads
-/// (tracker-aware). Soundness preconditions (adjacency, Reg-colored
-/// operands, no result-slot sharing) are enforced by the caller,
-/// `try_fuse_cmp_branch`.
-#[allow(clippy::too_many_arguments)]
-fn fuse_cmp_branch(
-    op: CmpOp,
-    left: ValueId,
-    right: ValueId,
-    true_dest: BlockId,
-    func_id: FuncId,
-    alloc: &RegAlloc,
-    codes: &mut Vec<Bytecode>,
-    tracker: &mut AccContent,
-) -> Result<Option<Bytecode>, LowerError> {
-    // Only the Eq family has fused branch bytecodes in the ABC ISA; for
-    // Less/Greater/etc there is nothing to fuse.
-    if !matches!(
-        op,
-        CmpOp::Eq | CmpOp::NotEq | CmpOp::StrictEq | CmpOp::StrictNotEq
-    ) {
-        return Ok(None);
-    }
-    let label = Label(true_dest.0);
-    let regs = materialize_operands(tracker, func_id, &[right], Some(left), alloc, codes)?;
-    let r = regs[0];
-    Ok(Some(match op {
-        CmpOp::Eq => Bytecode::Jeq(r, label),
-        CmpOp::NotEq => Bytecode::Jne(r, label),
-        CmpOp::StrictEq => Bytecode::Jstricteq(r, label),
-        // Only StrictNotEq remains (guarded above).
-        _ => Bytecode::Jnstricteq(r, label),
-    }))
 }
 
 #[cfg(test)]

@@ -434,23 +434,58 @@ pub(crate) fn lift_method<'f>(
 
     let raw_cfg = build_cfg(body).ok_or(LiftError::EmptyBytecode)?;
 
-    // Create the function's blocks: raw block index → IR BlockId.
+    // #32: If raw block 0 (bytecode offset 0) has any incoming edge — a
+    // loop back-edge (`jmp 0` / `jnez 0`), a single-block self-loop at 0,
+    // or an exception handler targeting offset 0 — synthesize a pure,
+    // zero-predecessor pre-entry trampoline at `fd.blocks[0]` that
+    // unconditionally branches to `header0` (`block_map[&0]`, `fd.blocks[1]`).
+    // When raw block 0 has no incoming edges, `entry_block` IS `block_map[&0]`
+    // so block/inst/value numbering stays 100% unchanged.
+    let needs_pre_entry = raw_cfg
+        .blocks
+        .iter()
+        .any(|rb| rb.succs.contains(&0) || rb.catch_succs.contains(&0))
+        || body
+            .try_blocks
+            .iter()
+            .flat_map(|tb| &tb.catches)
+            .any(|c| c.handler == 0);
+
+    // Create the function's blocks: optional synthetic pre-entry first,
+    // then raw block index → IR BlockId in leader order.
     let entry_block = BlockId::new(lf.module.blocks.len() as u32);
     lf.module.blocks.push(Block::default());
     fd.blocks.push(entry_block);
     let mut block_map: HashMap<usize, BlockId> = HashMap::new();
-    block_map.insert(0, entry_block);
-    for bi in 1..raw_cfg.blocks.len() {
-        let bb = BlockId::new(lf.module.blocks.len() as u32);
-        lf.module.blocks.push(Block::default());
-        fd.blocks.push(bb);
-        block_map.insert(bi, bb);
+    if needs_pre_entry {
+        for bi in 0..raw_cfg.blocks.len() {
+            let bb = BlockId::new(lf.module.blocks.len() as u32);
+            lf.module.blocks.push(Block::default());
+            fd.blocks.push(bb);
+            block_map.insert(bi, bb);
+        }
+    } else {
+        block_map.insert(0, entry_block);
+        for bi in 1..raw_cfg.blocks.len() {
+            let bb = BlockId::new(lf.module.blocks.len() as u32);
+            lf.module.blocks.push(Block::default());
+            fd.blocks.push(bb);
+            block_map.insert(bi, bb);
+        }
     }
 
     // Predecessor edges (both kinds, materialized before SSA — the
     // empty-phi-free construction). Normal edges from terminator
-    // successors; Exceptional edges for every (protected block →
-    // handler) pair (the verifier's MissingExceptionalPred rule).
+    // successors (plus `pre_entry -> header0` when synthesized);
+    // Exceptional edges for every (protected block → handler) pair (the
+    // verifier's MissingExceptionalPred rule).
+    if needs_pre_entry {
+        let header0 = block_map[&0];
+        lf.module.blocks[header0.index()].preds.push(Edge {
+            from: entry_block,
+            kind: EdgeKind::Normal,
+        });
+    }
     for (bi, raw_block) in raw_cfg.blocks.iter().enumerate() {
         let ir_block = block_map[&bi];
         for &succ_bi in &raw_block.succs {
@@ -539,8 +574,15 @@ pub(crate) fn lift_method<'f>(
     // slot under `0xF` (the superseded convention, N66).
     fx.this_param = abcd_ir::frame::this_param_index(&fx.lf.module, &fd).map(|i| fd.params[i]);
 
-    // The entry block has no predecessors: seal it immediately.
+    // The entry block has no predecessors: seal it immediately. When a
+    // synthetic pre-entry trampoline was inserted (#32), emit its single
+    // unconditional Branch into `header0` (`pc: None` so debug line/scope
+    // extents attach exclusively to real bytecode instructions).
     fx.ssa.seal_block(entry_block, &mut fx.lf.module);
+    if needs_pre_entry {
+        let header0 = fx.block_map[&0];
+        fx.emit_void(entry_block, abcd_ir::Op::Branch { dest: header0 }, None);
+    }
 
     // Translate bytecodes block by block.
     let bytecodes = &body.bytecodes;
@@ -580,7 +622,8 @@ pub(crate) fn lift_method<'f>(
         }
 
         // Seal successors whose predecessors have all been processed
-        // (raw-block-order heuristic, v0.1 parity).
+        // (raw-block-order heuristic, v0.1 parity; `entry_block` is
+        // already sealed before `bi = 0`).
         let (succs, catch_succs) = {
             let raw = &fx.raw_cfg.blocks[bi];
             (raw.succs.clone(), raw.catch_succs.clone())
@@ -593,9 +636,11 @@ pub(crate) fn lift_method<'f>(
                         .preds
                         .iter()
                         .all(|edge| {
-                            fx.block_map
-                                .iter()
-                                .any(|(&rbi, &bb)| bb == edge.from && rbi <= bi)
+                            edge.from == entry_block
+                                || fx
+                                    .block_map
+                                    .iter()
+                                    .any(|(&rbi, &bb)| bb == edge.from && rbi <= bi)
                         });
                 if all_preds_done {
                     fx.ssa.seal_block(succ_bb, &mut fx.lf.module);

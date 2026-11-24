@@ -702,9 +702,16 @@ fn push_array(file: &mut File, offset: u32, values: Vec<LiteralValue>) -> u32 {
     idx
 }
 
-/// The resolved source offset of a shape operand in the produced body.
-fn resolved_offset(body: &abcd_file::MethodBody, shape: ConstId) -> u32 {
-    body.entity_offsets[&(EntityKind::LiteralarrayId, shape.0)]
+/// The resolved source offset of the first shape operand in the produced body
+/// (looking up its compacted method-local `u16` key in `entity_offsets`).
+fn resolved_offset(body: &abcd_file::MethodBody, _shape: ConstId) -> u32 {
+    let (kind, local_id) = body
+        .bytecodes
+        .iter()
+        .flat_map(|bc| bc.entity_operands())
+        .find(|(k, _)| *k == EntityKind::LiteralarrayId)
+        .expect("body must carry a LiteralarrayId operand");
+    body.entity_offsets[&(kind, local_id.0)]
 }
 
 /// Rare scalar tags: an 8-bit integer, a 32-bit float, and a builtin-type
@@ -977,4 +984,194 @@ fn literal_dedup_rejects_non_array_trees_and_oob_nested_indices() {
         ),
         "(b) expected UntraceableEntity, got {err:?}"
     );
+}
+
+/// #32 commercial `--merge-abc` regression (`94,065` `Sym`s in `modules.abc`):
+/// when `module.sym` holds `> 65,536` symbols, `isel` emits `Sym.0 >= 65,536`
+/// in `LayoutResult.bytecodes`, which exceeds the 16-bit `id:u16` encoding
+/// limit if left uncompacted. Verify that `to_method_body`, `rewrite_file`,
+/// and `lower_module` all compact per-method `EntityId`s into `u16` indices,
+/// pass `abcd_isa::encode` and `abcd_file::encode -> decode`, and preserve the
+/// target strings (`Sym >= 65,590`) without loss.
+#[test]
+fn symbols_above_65536_compact_and_roundtrip_across_all_body_builders() {
+    use abcd_file::{SourceLang, Version};
+    use abcd_ir::Modifiers;
+    use abcd_lower::{LowerOptions, lower_module, rewrite_file};
+
+    const TARGET_STR: &str = "high_sym_str_65590";
+    const TARGET_PROP: &str = "high_sym_prop_65591";
+
+    // Build a base `.abc` file that already contains TARGET_STR and TARGET_PROP
+    // so `to_method_body` (which resolves against an existing source `File`) as
+    // well as `rewrite_file` and `lower_module` can all be exercised.
+    let mut fb = Builder::new();
+    fb.set_api(12, "beta1");
+    let cls = fb.add_global_class();
+    fb.class_set_source_lang(cls, SourceLang::EcmaScript);
+    let proto = fb.create_proto(Type::Tagged, &[Type::Tagged]);
+    let placeholder = EntityId(0);
+    let (stub_code, stub_offs) = encode_bytecodes(&[
+        Bytecode::LdaStr(placeholder),
+        Bytecode::Ldobjbyname(Imm(0), placeholder),
+        Bytecode::Return,
+    ])
+    .expect("encode stub");
+    let m_h = fb.class_add_method(
+        cls,
+        "high_sym_fn",
+        proto,
+        AccessFlags::STATIC,
+        &stub_code,
+        0,
+        1,
+    );
+    fb.method_set_source_lang(m_h, SourceLang::EcmaScript);
+    let s_str = fb.add_string(TARGET_STR);
+    let s_prop = fb.add_string(TARGET_PROP);
+    fb.relocate_code_id(m_h, stub_offs[0], 0, CodeEntity::String(s_str))
+        .unwrap();
+    fb.relocate_code_id(m_h, stub_offs[1], 0, CodeEntity::String(s_prop))
+        .unwrap();
+    let base_bytes = fb.finalize().expect("finalize base file");
+    let base_file = abcd_file::decode(&base_bytes).expect("decode base file");
+    let fn_offset = method_by_name(&base_file, "high_sym_fn").offset;
+
+    // Construct an IR module with > 65,536 symbols BEFORE interning TARGET_STR
+    // and TARGET_PROP so their `Sym.0` indices sit well above `u16::MAX`.
+    let mut module = Module::new();
+    let global_desc = module.sym.intern("L_GLOBAL;");
+    let mut cls_data = abcd_ir::ClassData::new(global_desc, global_desc);
+    cls_data.modifiers = Modifiers::PUBLIC;
+    module.classes.push(cls_data);
+
+    let func = V2Builder::create_function(&mut module, "high_sym_fn", FunctionKind::Function);
+    module.functions[func.index()].modifiers = Modifiers::PUBLIC.union(Modifiers::STATIC);
+    module.classes[0].methods.push(func);
+
+    while module.sym.len() < 65_590 {
+        let idx = module.sym.len();
+        module.sym.intern(&format!("pad_sym_{idx}"));
+    }
+    let sym_str = module.sym.intern(TARGET_STR);
+    let sym_prop = module.sym.intern(TARGET_PROP);
+    let sym_synth = module.sym.intern("high_sym_synth_65592");
+    while module.sym.len() < 65_600 {
+        let idx = module.sym.len();
+        module.sym.intern(&format!("pad_tail_{idx}"));
+    }
+    assert!(sym_str.0 >= 65_590 && sym_prop.0 > u32::from(u16::MAX));
+    assert!(sym_synth.0 > u32::from(u16::MAX));
+
+    {
+        let mut b = V2Builder::new(&mut module, func);
+        let recv = b.create_param();
+        let cid = b.konst(Const::String(sym_str));
+        // Reference `sym_str` twice and `sym_prop` once to pin deduplication too.
+        let s1 = b.emit_val(Op::LoadConst(cid));
+        let _ = b.emit_val(Op::LoadProp {
+            object: recv,
+            name: sym_prop,
+        });
+        let s2 = b.emit_val(Op::LoadConst(cid));
+        let prop_val = b.emit_val(Op::LoadProp {
+            object: s1,
+            name: sym_prop,
+        });
+        let _ = s2;
+        b.emit_void(Op::Return {
+            value: Some(prop_val),
+        });
+    }
+    assert!(verify_module(&module).is_ok());
+
+    let lowered = lower_function(&module, func).expect("lower_function must succeed");
+    // Raw `LayoutResult` carries uncompacted `Sym.0 > 65,535` (confirming that
+    // direct `encode_bytecodes(&lowered.bytecodes)` would fail without compaction).
+    assert!(
+        lowered
+            .bytecodes
+            .iter()
+            .flat_map(|bc| bc.entity_operands())
+            .any(|(_, id)| id.0 > u32::from(u16::MAX)),
+        "pre-compaction LayoutResult must carry raw Sym >= 65536"
+    );
+
+    let assert_decoded_strings = |decoded: &File, expected: &[&str]| {
+        let m = method_by_name(decoded, "high_sym_fn");
+        let body = m.body.as_ref().expect("method body");
+        encode_bytecodes(&body.bytecodes).expect("decoded body bytecodes fit u16");
+        let resolved: Vec<&str> = body
+            .bytecodes
+            .iter()
+            .flat_map(|bc| bc.entity_operands())
+            .filter(|(k, _)| *k == EntityKind::StringId)
+            .map(|(k, id)| {
+                let off = body.entity_offsets[&(k, id.0)];
+                decoded.resolve_entity_str(off).expect("resolved string")
+            })
+            .collect();
+        for &target in expected {
+            assert!(
+                resolved.contains(&target),
+                "expected string {target:?} in resolved entity operands, got {resolved:?}"
+            );
+        }
+    };
+
+    // 1. `to_method_body` path:
+    let body = to_method_body(&module, func, &lowered, &base_file)
+        .expect("to_method_body must compact Sym >= 65536");
+    encode_bytecodes(&body.bytecodes)
+        .expect("to_method_body compacted bytecodes must pass abcd_isa::encode");
+    assert_eq!(
+        body.entity_offsets.len(),
+        2,
+        "duplicate uses of sym_str and sym_prop must deduplicate to 2 local StringId slots"
+    );
+    let spliced = splice_body(&base_file, fn_offset, &body);
+    let enc1 = abcd_file::encode(&spliced).expect("abcd_file::encode after to_method_body");
+    let dec1 = abcd_file::decode(&enc1).expect("decode after to_method_body");
+    assert_decoded_strings(&dec1, &[TARGET_STR, TARGET_PROP]);
+
+    // Also append a synthesized string (`sym_synth`, absent from `base_file`)
+    // to exercise `rewrite_file` and `lower_module` materialization at Sym > 65535.
+    {
+        let entry = module.functions[func.index()].blocks[0];
+        let ret_inst = module.blocks[entry.index()].insts.pop().unwrap();
+        let mut b = V2Builder::new(&mut module, func);
+        let synth_cid = b.konst(Const::String(sym_synth));
+        let v_synth = b.emit_val(Op::LoadConst(synth_cid));
+        let _ = ret_inst;
+        b.emit_void(Op::Return {
+            value: Some(v_synth),
+        });
+    }
+    assert!(verify_module(&module).is_ok());
+
+    // 2. `rewrite_file` path:
+    let rewritten = rewrite_file(&module, &base_file, LowerOptions::default())
+        .expect("rewrite_file must compact Sym >= 65536");
+    let rw_body = method_by_name(&rewritten, "high_sym_fn")
+        .body
+        .as_ref()
+        .expect("rewritten body");
+    encode_bytecodes(&rw_body.bytecodes)
+        .expect("rewrite_file compacted bytecodes must pass abcd_isa::encode");
+    let enc2 = abcd_file::encode(&rewritten).expect("abcd_file::encode after rewrite_file");
+    let dec2 = abcd_file::decode(&enc2).expect("decode after rewrite_file");
+    assert_decoded_strings(&dec2, &[TARGET_STR, TARGET_PROP, "high_sym_synth_65592"]);
+
+    // 3. `lower_module` standalone path:
+    let standalone = lower_module(&module, Version::new(12, 0, 6, 0))
+        .expect("lower_module must compact Sym >= 65536");
+    let st_body = method_by_name(&standalone, "high_sym_fn")
+        .body
+        .as_ref()
+        .expect("standalone body");
+    encode_bytecodes(&st_body.bytecodes)
+        .expect("lower_module compacted bytecodes must pass abcd_isa::encode");
+    let enc3 = abcd_file::encode(&standalone).expect("abcd_file::encode after lower_module");
+    let dec3 = abcd_file::decode(&enc3).expect("decode after lower_module");
+    assert_decoded_strings(&dec3, &[TARGET_STR, TARGET_PROP, "high_sym_synth_65592"]);
 }

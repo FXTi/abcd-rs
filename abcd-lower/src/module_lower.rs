@@ -29,7 +29,7 @@ use abcd_isa::EntityKind;
 use rayon::prelude::*;
 
 use crate::layout::LayoutResult;
-use crate::method_body::EntityResolver;
+use crate::method_body::{EntityResolver, relocate_and_compact_entities};
 use crate::{LowerError, LowerOptions, lower_function_with_options};
 
 const SLOT_NUMBER_ANN_DESC: &str = "L_ESSlotNumberAnnotation;";
@@ -703,56 +703,52 @@ impl<'m, 'f> Materializer<'m, 'f> {
             .map(|f| f.params.len())
             .unwrap_or_default();
 
-        let mut entity_offsets: HashMap<(EntityKind, u32), u32> = HashMap::new();
-        for bc in &result.bytecodes {
-            for (kind, id) in bc.entity_operands() {
-                let offset = match kind {
-                    EntityKind::StringId => {
-                        let sym = Sym::new(id.0);
-                        if let Some(r) = base_resolver
-                            && let Some(off) = r.string_offset(sym)
-                        {
-                            off
-                        } else {
-                            self.string_offset(sym)
-                                .ok_or(LowerError::UntraceableEntity {
-                                    func: func_id,
-                                    kind,
-                                    raw: id.0,
-                                })?
-                        }
+        let (bytecodes, entity_offsets) =
+            relocate_and_compact_entities(func_id, &result.bytecodes, |kind, raw| match kind {
+                EntityKind::StringId => {
+                    let sym = Sym::new(raw);
+                    if let Some(r) = base_resolver
+                        && let Some(off) = r.string_offset(sym)
+                    {
+                        Ok(off)
+                    } else {
+                        self.string_offset(sym)
+                            .ok_or(LowerError::UntraceableEntity {
+                                func: func_id,
+                                kind,
+                                raw,
+                            })
                     }
-                    EntityKind::MethodId => self.method_offset(FuncId::new(id.0)).ok_or(
-                        LowerError::UntraceableEntity {
+                }
+                EntityKind::MethodId => {
+                    self.method_offset(FuncId::new(raw))
+                        .ok_or(LowerError::UntraceableEntity {
                             func: func_id,
                             kind,
-                            raw: id.0,
-                        },
-                    )?,
-                    EntityKind::LiteralarrayId => {
-                        let cid = ConstId::new(id.0);
-                        if let Some(r) = base_resolver
-                            && let Some(off) = r.literal_array_offset(cid)
-                        {
-                            off
-                        } else {
-                            self.literal_array_offset(cid)
-                                .ok_or(LowerError::UntraceableEntity {
-                                    func: func_id,
-                                    kind,
-                                    raw: id.0,
-                                })?
-                        }
+                            raw,
+                        })
+                }
+                EntityKind::LiteralarrayId => {
+                    let cid = ConstId::new(raw);
+                    if let Some(r) = base_resolver
+                        && let Some(off) = r.literal_array_offset(cid)
+                    {
+                        Ok(off)
+                    } else {
+                        self.literal_array_offset(cid)
+                            .ok_or(LowerError::UntraceableEntity {
+                                func: func_id,
+                                kind,
+                                raw,
+                            })
                     }
-                };
-                entity_offsets.insert((kind, id.0), offset);
-            }
-        }
+                }
+            })?;
 
         Ok(MethodBody {
             num_vregs: u32::from(result.num_regs),
             num_args: param_count as u32,
-            bytecodes: result.bytecodes.clone(),
+            bytecodes,
             entity_offsets,
             try_blocks: result.try_blocks.clone(),
             ic_size: Some(result.ic_size),
@@ -780,44 +776,56 @@ impl<'m, 'f> Materializer<'m, 'f> {
             return Some(off);
         }
         let tree = self.module.consts.get(shape)?.clone();
-        let (_idx, off) = self.materialize_shape_tree(&tree, 0)?;
+        let (_idx, off) = self.materialize_shape_tree(&tree)?;
         self.synth_shape_offsets.insert(shape, off);
         Some(off)
     }
 
-    fn materialize_shape_tree(&mut self, tree: &Const, depth: u32) -> Option<(u32, u32)> {
-        if depth > 64 {
-            return None;
+    fn materialize_shape_tree(&mut self, tree: &Const) -> Option<(u32, u32)> {
+        let (root_cursor, root_cap) = ShapeCursor::from_const(tree)?;
+        let mut stack = vec![ShapeFrame {
+            cursor: root_cursor,
+            depth: 0,
+            values: Vec::with_capacity(root_cap),
+        }];
+
+        'outer: while let Some(mut frame) = stack.pop() {
+            while let Some(elem) = frame.cursor.next_elem() {
+                if matches!(elem, Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }) {
+                    let child_depth = frame.depth + 1;
+                    if child_depth > 64 {
+                        return None;
+                    }
+                    let (child_cursor, child_cap) = ShapeCursor::from_const(elem)?;
+                    stack.push(frame);
+                    stack.push(ShapeFrame {
+                        cursor: child_cursor,
+                        depth: child_depth,
+                        values: Vec::with_capacity(child_cap),
+                    });
+                    continue 'outer;
+                }
+                frame.values.push(self.materialize_scalar_elem(elem)?);
+            }
+
+            let idx = self.file.literal_arrays.len() as u32;
+            let off = self.alloc_offset().ok()?;
+            self.file.literal_arrays.push(LiteralArray {
+                values: frame.values,
+            });
+            self.file.literal_array_offsets.insert(off, idx);
+            if let Some(parent) = stack.last_mut() {
+                parent
+                    .values
+                    .push(LiteralValue::LiteralArray(LiteralArrayIdx(idx)));
+            } else {
+                return Some((idx, off));
+            }
         }
-        let values = match tree {
-            Const::ArrayLiteral(items) => {
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    out.push(self.materialize_literal_elem(item, depth)?);
-                }
-                out
-            }
-            Const::ObjectLiteral { keys, values } => {
-                if keys.len() != values.len() {
-                    return None;
-                }
-                let mut out = Vec::with_capacity(keys.len() * 2);
-                for (k, v) in keys.iter().zip(values.iter()) {
-                    out.push(self.materialize_literal_elem(k, depth)?);
-                    out.push(self.materialize_literal_elem(v, depth)?);
-                }
-                out
-            }
-            _ => return None,
-        };
-        let idx = self.file.literal_arrays.len() as u32;
-        let off = self.alloc_offset().ok()?;
-        self.file.literal_arrays.push(LiteralArray { values });
-        self.file.literal_array_offsets.insert(off, idx);
-        Some((idx, off))
+        None
     }
 
-    fn materialize_literal_elem(&mut self, c: &Const, depth: u32) -> Option<LiteralValue> {
+    fn materialize_scalar_elem(&mut self, c: &Const) -> Option<LiteralValue> {
         Some(match c {
             Const::Bool(b) => LiteralValue::Bool(*b),
             Const::Null | Const::Undefined | Const::Hole => LiteralValue::NullValue(0),
@@ -847,12 +855,69 @@ impl<'m, 'f> Materializer<'m, 'f> {
                     _ => LiteralValue::Method(off),
                 }
             }
-            nested @ (Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }) => {
-                let (child_idx, _) = self.materialize_shape_tree(nested, depth + 1)?;
-                LiteralValue::LiteralArray(LiteralArrayIdx(child_idx))
-            }
+            Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => return None,
         })
     }
+}
+
+enum ShapeCursor<'t> {
+    Array {
+        items: &'t [Const],
+        next: usize,
+    },
+    Object {
+        keys: &'t [Const],
+        values: &'t [Const],
+        next: usize,
+    },
+}
+
+impl<'t> ShapeCursor<'t> {
+    fn from_const(tree: &'t Const) -> Option<(Self, usize)> {
+        match tree {
+            Const::ArrayLiteral(items) => Some((Self::Array { items, next: 0 }, items.len())),
+            Const::ObjectLiteral { keys, values } => {
+                if keys.len() != values.len() {
+                    return None;
+                }
+                Some((
+                    Self::Object {
+                        keys,
+                        values,
+                        next: 0,
+                    },
+                    keys.len() * 2,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn next_elem(&mut self) -> Option<&'t Const> {
+        match self {
+            Self::Array { items, next } => {
+                let elem = items.get(*next)?;
+                *next += 1;
+                Some(elem)
+            }
+            Self::Object { keys, values, next } => {
+                let pair_idx = *next / 2;
+                let elem = if *next % 2 == 0 {
+                    keys.get(pair_idx)?
+                } else {
+                    values.get(pair_idx)?
+                };
+                *next += 1;
+                Some(elem)
+            }
+        }
+    }
+}
+
+struct ShapeFrame<'t> {
+    cursor: ShapeCursor<'t>,
+    depth: u32,
+    values: Vec<LiteralValue>,
 }
 
 fn modifiers_to_access_flags(m: Modifiers) -> AccessFlags {

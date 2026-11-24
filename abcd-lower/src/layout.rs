@@ -299,32 +299,11 @@ fn add_trampoline(
 /// Rewrite the target of a (conditional or unconditional) branch bytecode.
 /// No-op for non-branch bytecodes.
 fn rewrite_branch_target(bc: &mut Bytecode, target: BlockId) {
-    // unreachable in practice: the sole caller (layout.rs:202) passes the
-    // last bytecode of a conditional block, which isel only ever emits as
-    // unfused Jnez (isel.rs:2004) or fused Jeq/Jne/Jstricteq/Jnstricteq
-    // (isel.rs:2527-2531) — never Jmp (unconditional blocks take another
-    // path) and never Jeqz or the strict-eqz/null/undefined fused family
-    // (no producer in abcd-lower; kept for match exhaustiveness) — c-COV diagnosis
+    // Only `Jmp`, `Jeqz`, and `Jnez` are legal ArkCompiler branch instructions
+    // (ruling 2026-10-04: the 24 fused compare-and-branch variants FATAL/NOP-skip
+    // in vendor interpreters and are never emitted by `abcd-lower`).
     let label = match bc {
-        Bytecode::Jmp(l)
-        | Bytecode::Jeqz(l)
-        | Bytecode::Jnez(l)
-        | Bytecode::Jstricteqz(l)
-        | Bytecode::Jnstricteqz(l)
-        | Bytecode::Jeqnull(l)
-        | Bytecode::Jnenull(l)
-        | Bytecode::Jstricteqnull(l)
-        | Bytecode::Jnstricteqnull(l)
-        | Bytecode::Jequndefined(l)
-        | Bytecode::Jneundefined(l)
-        | Bytecode::Jstrictequndefined(l)
-        | Bytecode::Jnstrictequndefined(l) => l,
-        Bytecode::Jeq(_, l)
-        | Bytecode::Jne(_, l)
-        | Bytecode::Jstricteq(_, l)
-        | Bytecode::Jnstricteq(_, l) => l,
-        // unreachable: caller only passes branch bytecodes (see above) —
-        // c-COV diagnosis
+        Bytecode::Jmp(l) | Bytecode::Jeqz(l) | Bytecode::Jnez(l) => l,
         _ => return,
     };
     *label = Label(target.0);
@@ -454,35 +433,10 @@ fn reconstruct_try_blocks(
 
 /// Resolve Block-encoded labels in jump instructions to instruction indices.
 fn resolve_labels(bc: &mut Bytecode, offsets: &HashMap<BlockId, usize>) {
+    // Only `Jmp`, `Jeqz`, and `Jnez` are legal ArkCompiler branch bytecodes
+    // (ruling 2026-10-04).
     match bc {
-        Bytecode::Jmp(label) => {
-            if let Some(&off) = offsets.get(&BlockId::new(label.0)) {
-                *label = Label(off as u32);
-            }
-        }
-        // unreachable except Jnez: isel never emits Jeqz or the
-        // strict-eqz/null/undefined branch family (no producer in
-        // abcd-lower; kept for match exhaustiveness) — c-COV diagnosis
-        Bytecode::Jeqz(label)
-        | Bytecode::Jnez(label)
-        | Bytecode::Jstricteqz(label)
-        | Bytecode::Jnstricteqz(label)
-        | Bytecode::Jeqnull(label)
-        | Bytecode::Jnenull(label)
-        | Bytecode::Jstricteqnull(label)
-        | Bytecode::Jnstricteqnull(label)
-        | Bytecode::Jequndefined(label)
-        | Bytecode::Jneundefined(label)
-        | Bytecode::Jstrictequndefined(label)
-        | Bytecode::Jnstrictequndefined(label) => {
-            if let Some(&off) = offsets.get(&BlockId::new(label.0)) {
-                *label = Label(off as u32);
-            }
-        }
-        Bytecode::Jeq(_, label)
-        | Bytecode::Jne(_, label)
-        | Bytecode::Jstricteq(_, label)
-        | Bytecode::Jnstricteq(_, label) => {
+        Bytecode::Jmp(label) | Bytecode::Jeqz(label) | Bytecode::Jnez(label) => {
             if let Some(&off) = offsets.get(&BlockId::new(label.0)) {
                 *label = Label(off as u32);
             }

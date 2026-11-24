@@ -7,9 +7,9 @@
 //! design — the pipeline never produces them); the try-region skips go
 //! through `lower_function` on hand-built IR.
 //!
-//! The DEAD exhaustive-match arms (layout.rs:303-320, 455-466 — branch
-//! bytecodes with no producer in abcd-lower) are deliberately NOT tested;
-//! they are annotated in place (c-COV A14).
+//! Only legal ArkCompiler branch instructions (`Jmp`, `Jeqz`, `Jnez` —
+//! ruling 2026-10-04) participate in `rewrite_branch_target` and
+//! `resolve_labels`.
 
 use crate::common;
 use std::collections::HashMap;

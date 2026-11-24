@@ -1,11 +1,11 @@
 //! Encode-side error paths: builder-misuse rejections (cross-builder
 //! handles, bad relocation targets) and hand-built model errors (dangling
 //! StringIds, unresolvable entity references, nested annotation arrays,
-//! nested literal arrays inside annotation-embedded literal arrays (c-COV
-//! W5 ruling), out-of-range literal-array indices, oversized module request
-//! indices).
-//! Each test asserts the exact `Error` variant — the encoder fails loudly,
-//! never silently, on models it cannot represent (audit #6/#7 contract).
+//! out-of-range or cyclic nested literal-array indices, oversized module
+//! request indices), plus round-trip pins for in-bounds nested literal
+//! arrays inside annotation-embedded literal arrays (#32-File).
+//! Each error test asserts the exact `Error` variant — the encoder fails
+//! loudly, never silently, on models it cannot represent (audit #6/#7).
 
 use abcd_file::{
     AccessFlags, Annotation, AnnotationElem, AnnotationValue, Builder, CodeEntity, Error,
@@ -466,50 +466,46 @@ fn nested_annotation_arrays_rejected() {
     );
 }
 
-/// An annotation-embedded literal array carrying ANY nested literal-array
-/// reference — even an out-of-bounds one — is rejected by the validation
-/// pass BEFORE writing (c-COV W5). The write path's bounds-check arm in
-/// `encode_literal_value_simple` is defense-only after the ruling, so the
-/// observed error is the structured rejection, not the bounds error.
+/// An annotation-embedded literal array carrying an out-of-bounds nested
+/// literal-array index is rejected loudly by the preflight validation pass
+/// with full annotation/element/owner context.
 #[test]
 fn embedded_nested_literal_array_index_out_of_bounds() {
     let mut file = base_model();
     push_class_annotation(
         &mut file,
-        AnnotationValue::LiteralArray(vec![LiteralValue::LiteralArray(
-            abcd_file::LiteralArrayIdx(99),
-        )]),
+        AnnotationValue::LiteralArray(vec![
+            LiteralValue::Integer(10),
+            LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(99)),
+        ]),
     );
     let err = encode(&file).expect_err("out-of-bounds embedded nested array must fail");
-    assert!(
-        matches!(
-            err,
-            Error::NestedLiteralArrayInAnnotation {
-                item_index: 0,
-                nested_index: 99,
-                ..
-            }
-        ),
-        "unexpected error: {err:?}"
-    );
+    let Error::CodeRelocation(msg) = &err else {
+        panic!("expected CodeRelocation, got: {err:?}");
+    };
+    for fragment in [
+        "LAnno;",
+        "'e'",
+        "class L_GLOBAL;",
+        "nested literal array index 99",
+        "item 1",
+        "out of bounds",
+    ] {
+        assert!(
+            msg.contains(fragment),
+            "message must contain {fragment:?}: {msg}"
+        );
+    }
 }
 
-// ---------------------------------------------------------------------------
-// c-COV W5 ruling: nested LiteralValue::LiteralArray inside an
-// annotation-embedded literal array is REJECTED before writing (the vendored
-// writer/reader pair corrupts the shape; upstream pandasm cannot express it).
-// ---------------------------------------------------------------------------
-
-/// The core rejection: a nested literal-array reference at any position of
-/// an annotation-embedded literal array is a structured error, even when the
-/// referenced model table index is IN BOUNDS (the pre-fix bounds check would
-/// have accepted it and the writer would have corrupted the file: every item
-/// after the nested reference decodes shifted and the reference resolves to
-/// a wrong array).
+/// `#32-File`: an IN-BOUNDS nested literal-array reference inside an
+/// annotation-embedded literal array round-trips losslessly through
+/// `encode -> decode`, preserving items BOTH before (`Integer(10)`) and
+/// after (`Integer(20)`) the nested reference without shifting, as well as
+/// the referenced target array (`[Integer(0x1111)]`).
 #[test]
-fn embedded_nested_literal_array_rejected() {
+fn embedded_nested_literal_array_roundtrips() {
     let mut file = base_model();
-    // In-bounds target: the rejection is about the SHAPE, not the index.
     file.literal_arrays.push(abcd_file::LiteralArray {
         values: vec![LiteralValue::Integer(0x1111)],
     });
@@ -521,74 +517,96 @@ fn embedded_nested_literal_array_rejected() {
             LiteralValue::Integer(20),
         ]),
     );
-    let err = encode(&file)
-        .expect_err("a nested literal array in an annotation-embedded array must be rejected");
+    let encoded = encode(&file).expect("in-bounds embedded nested literal array must encode");
+    let file2 = decode(&encoded).expect("decode re-encoded");
+    let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
+    let AnnotationValue::LiteralArray(vals) = &g2.annotations.compile_time[0].elements[0].value
+    else {
+        panic!("expected AnnotationValue::LiteralArray");
+    };
+    assert_eq!(vals.len(), 3, "no trailing element shift/loss: {vals:?}");
+    assert_eq!(vals[0], LiteralValue::Integer(10));
+    assert_eq!(vals[2], LiteralValue::Integer(20));
+    let LiteralValue::LiteralArray(target_idx) = vals[1] else {
+        panic!("expected nested LiteralArray at item 1, got {:?}", vals[1]);
+    };
     assert_eq!(
-        err,
-        Error::NestedLiteralArrayInAnnotation {
-            annotation: "LAnno;".to_owned(),
-            element_name: "e".to_owned(),
-            owner: "class L_GLOBAL;".to_owned(),
-            item_index: 1,
-            nested_index: 0,
-        }
+        file2.literal_arrays[target_idx.0 as usize].values,
+        vec![LiteralValue::Integer(0x1111)]
     );
-    // The Display text carries the full field/context.
-    let msg = err.to_string();
-    for fragment in [
-        "LAnno;",
-        "'e'",
-        "class L_GLOBAL;",
-        "item 1",
-        "model table index 0",
-        "no representation inside annotation-embedded literal arrays",
-    ] {
-        assert!(
-            msg.contains(fragment),
-            "message must contain {fragment:?}: {msg}"
-        );
-    }
 }
 
-/// The owner context names the entity the annotation is attached to:
-/// method and field targets, in every annotation bucket.
+/// In-bounds nested literal-array references on method and field annotations
+/// round-trip losslessly, while out-of-bounds indices report the exact
+/// method/field owner context.
 #[test]
 fn embedded_nested_literal_array_owner_contexts() {
-    let nested = |file: &mut abcd_file::File| {
-        file.literal_arrays.push(abcd_file::LiteralArray {
-            values: vec![LiteralValue::Integer(1)],
-        });
+    let mk_ann = |file: &mut abcd_file::File, target_idx: u32| {
         let desc = file.strings.get_or_intern("LAnno;");
         let name = file.strings.get_or_intern("v");
         Annotation {
             class_descriptor: desc,
             elements: vec![AnnotationElem {
                 name,
-                value: AnnotationValue::LiteralArray(vec![LiteralValue::LiteralArray(
-                    abcd_file::LiteralArrayIdx(0),
-                )]),
+                value: AnnotationValue::LiteralArray(vec![
+                    LiteralValue::Integer(10),
+                    LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(target_idx)),
+                    LiteralValue::Integer(20),
+                ]),
             }],
         }
     };
 
-    // Method annotation (runtime bucket).
+    // Method annotation: in-bounds round-trips; out-of-bounds names method owner.
     let mut file = base_model();
-    let ann = nested(&mut file);
+    file.literal_arrays.push(abcd_file::LiteralArray {
+        values: vec![LiteralValue::Integer(77)],
+    });
+    let ann = mk_ann(&mut file, 0);
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
     cls.methods[0].annotations.runtime.push(ann);
-    let err = encode(&file).expect_err("method-owner nested array must fail");
+    let bytes = encode(&file).expect("in-bounds method-owner nested array must encode");
+    let file2 = decode(&bytes).expect("decode method-owner");
+    let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
+    let AnnotationValue::LiteralArray(m_vals) =
+        &g2.methods[0].annotations.compile_time[0].elements[0].value
+    else {
+        panic!("expected method LiteralArray");
+    };
+    assert_eq!(m_vals[0], LiteralValue::Integer(10));
+    assert_eq!(m_vals[2], LiteralValue::Integer(20));
+    let LiteralValue::LiteralArray(t_idx) = m_vals[1] else {
+        panic!("expected nested LiteralArray");
+    };
+    assert_eq!(
+        file2.literal_arrays[t_idx.0 as usize].values,
+        vec![LiteralValue::Integer(77)]
+    );
+
+    let mut bad_method = base_model();
+    let bad_ann = mk_ann(&mut bad_method, 99);
+    let cls = bad_method
+        .classes
+        .values_mut()
+        .find(|c| !c.is_external)
+        .unwrap();
+    cls.methods[0].annotations.runtime.push(bad_ann);
+    let err = encode(&bad_method).expect_err("OOB method-owner nested array must fail");
     assert!(
         matches!(
             err,
-            Error::NestedLiteralArrayInAnnotation { ref owner, item_index: 0, .. }
-                if owner == "method L_GLOBAL;::func_main_0"
+            Error::CodeRelocation(ref msg)
+                if msg.contains("method L_GLOBAL;::func_main_0") && msg.contains("index 99")
         ),
         "unexpected error: {err:?}"
     );
 
-    // Field annotation (type bucket).
+    // Field annotation: in-bounds round-trips; out-of-bounds names field owner.
     let mut file = base_model();
-    let ann = nested(&mut file);
+    file.literal_arrays.push(abcd_file::LiteralArray {
+        values: vec![LiteralValue::Integer(88)],
+    });
+    let ann = mk_ann(&mut file, 0);
     let field_name = file.strings.get_or_intern("fld");
     let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
     cls.fields.push(abcd_file::Field {
@@ -603,102 +621,228 @@ fn embedded_nested_literal_array_owner_contexts() {
             ..Default::default()
         },
     });
-    let err = encode(&file).expect_err("field-owner nested array must fail");
+    let bytes = encode(&file).expect("in-bounds field-owner nested array must encode");
+    let file2 = decode(&bytes).expect("decode field-owner");
+    let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
+    let AnnotationValue::LiteralArray(f_vals) =
+        &g2.fields[0].annotations.compile_time[0].elements[0].value
+    else {
+        panic!("expected field LiteralArray");
+    };
+    assert_eq!(f_vals[0], LiteralValue::Integer(10));
+    assert_eq!(f_vals[2], LiteralValue::Integer(20));
+    let LiteralValue::LiteralArray(t_idx) = f_vals[1] else {
+        panic!("expected nested LiteralArray");
+    };
+    assert_eq!(
+        file2.literal_arrays[t_idx.0 as usize].values,
+        vec![LiteralValue::Integer(88)]
+    );
+
+    let mut bad_field = base_model();
+    let bad_ann = mk_ann(&mut bad_field, 99);
+    let field_name = bad_field.strings.get_or_intern("fld");
+    let cls = bad_field
+        .classes
+        .values_mut()
+        .find(|c| !c.is_external)
+        .unwrap();
+    cls.fields.push(abcd_file::Field {
+        name: field_name,
+        offset: 0,
+        field_type: Type::I32,
+        access_flags: AccessFlags::PUBLIC,
+        is_external: false,
+        initial_value: None,
+        annotations: abcd_file::Annotations {
+            compile_time_type: vec![bad_ann],
+            ..Default::default()
+        },
+    });
+    let err = encode(&bad_field).expect_err("OOB field-owner nested array must fail");
     assert!(
         matches!(
             err,
-            Error::NestedLiteralArrayInAnnotation { ref owner, item_index: 0, .. }
-                if owner == "field L_GLOBAL;::fld"
+            Error::CodeRelocation(ref msg)
+                if msg.contains("field L_GLOBAL;::fld") && msg.contains("index 99")
         ),
         "unexpected error: {err:?}"
     );
 }
 
-/// When the embedded literal array sits inside a NESTED annotation, the
-/// reported site re-seats to the inner annotation and element.
+/// When an embedded literal array sits inside a NESTED annotation:
+/// - an out-of-bounds index `7` re-seats the error site to the inner
+///   annotation and element;
+/// - an in-bounds index `0` round-trips cleanly with surrounding items intact.
 #[test]
 fn embedded_nested_literal_array_nested_annotation_site() {
+    let build_nested = |in_bounds: bool| {
+        let mut file = base_model();
+        let target_idx = if in_bounds {
+            file.literal_arrays.push(abcd_file::LiteralArray {
+                values: vec![LiteralValue::Integer(555)],
+            });
+            0
+        } else {
+            7
+        };
+        let desc = file.strings.get_or_intern("LOuter;");
+        let inner_desc = file.strings.get_or_intern("LInner;");
+        let outer_name = file.strings.get_or_intern("outer");
+        let inner_name = file.strings.get_or_intern("inner");
+        push_class_annotation(
+            &mut file,
+            AnnotationValue::LiteralArray(vec![LiteralValue::Integer(1)]),
+        );
+        let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
+        cls.annotations.compile_time.push(Annotation {
+            class_descriptor: desc,
+            elements: vec![AnnotationElem {
+                name: outer_name,
+                value: AnnotationValue::Annotation(Box::new(Annotation {
+                    class_descriptor: inner_desc,
+                    elements: vec![AnnotationElem {
+                        name: inner_name,
+                        value: AnnotationValue::LiteralArray(vec![
+                            LiteralValue::Integer(1),
+                            LiteralValue::Integer(2),
+                            LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(target_idx)),
+                            LiteralValue::Integer(3),
+                        ]),
+                    }],
+                })),
+            }],
+        });
+        file
+    };
+
+    // Out-of-bounds error path.
+    let err = encode(&build_nested(false)).expect_err("nested-annotation OOB array must fail");
+    let Error::CodeRelocation(msg) = &err else {
+        panic!("expected CodeRelocation, got: {err:?}");
+    };
+    for fragment in [
+        "LInner;",
+        "'inner'",
+        "class L_GLOBAL;",
+        "index 7",
+        "item 2",
+        "out of bounds",
+    ] {
+        assert!(
+            msg.contains(fragment),
+            "message must contain {fragment:?}: {msg}"
+        );
+    }
+
+    // In-bounds round-trip path.
+    let bytes = encode(&build_nested(true)).expect("in-bounds nested-annotation array must encode");
+    let file2 = decode(&bytes).expect("decode nested-annotation array");
+    let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
+    let AnnotationValue::Annotation(inner) = &g2.annotations.compile_time[1].elements[0].value
+    else {
+        panic!("expected nested Annotation");
+    };
+    let AnnotationValue::LiteralArray(vals) = &inner.elements[0].value else {
+        panic!("expected inner LiteralArray");
+    };
+    assert_eq!(vals[0], LiteralValue::Integer(1));
+    assert_eq!(vals[1], LiteralValue::Integer(2));
+    assert_eq!(vals[3], LiteralValue::Integer(3));
+    let LiteralValue::LiteralArray(t_idx) = vals[2] else {
+        panic!("expected nested LiteralArray at item 2");
+    };
+    assert_eq!(
+        file2.literal_arrays[t_idx.0 as usize].values,
+        vec![LiteralValue::Integer(555)]
+    );
+}
+
+/// `#`-typed array elements (`AnnotationValue::Array { tag: b'#', ... }`):
+/// out-of-bounds nested indices fail preflight validation loudly; in-bounds
+/// nested indices encode cleanly (note: upstream treats `#` on disk as a
+/// scalar `LiteralArray` element, so test the OOB guard on `#` and full
+/// round-trip on `Z` array-of-annotations wrapping an embedded `LiteralArray`).
+#[test]
+fn embedded_nested_literal_array_through_array_element() {
+    // OOB through '#' array element -> rejected by preflight validation.
+    let mut bad = base_model();
+    push_class_annotation(
+        &mut bad,
+        AnnotationValue::Array {
+            tag: b'#',
+            values: vec![AnnotationValue::LiteralArray(vec![
+                LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(5)),
+            ])],
+        },
+    );
+    let err = encode(&bad).expect_err("OOB nested array through '#' element must fail");
+    assert!(
+        matches!(
+            err,
+            Error::CodeRelocation(ref msg)
+                if msg.contains("LAnno;") && msg.contains("index 5") && msg.contains("out of bounds")
+        ),
+        "unexpected error: {err:?}"
+    );
+
+    // In-bounds through 'Z' (ArrayAnnotation) element -> full encode -> decode round-trip!
     let mut file = base_model();
-    let desc = file.strings.get_or_intern("LOuter;");
+    file.literal_arrays.push(abcd_file::LiteralArray {
+        values: vec![LiteralValue::Integer(321)],
+    });
     let inner_desc = file.strings.get_or_intern("LInner;");
-    let outer_name = file.strings.get_or_intern("outer");
-    let inner_name = file.strings.get_or_intern("inner");
+    let inner_name = file.strings.get_or_intern("arr_la");
     push_class_annotation(
         &mut file,
-        AnnotationValue::LiteralArray(vec![LiteralValue::Integer(1)]), // decoy, valid
-    );
-    let cls = file.classes.values_mut().find(|c| !c.is_external).unwrap();
-    cls.annotations.compile_time.push(Annotation {
-        class_descriptor: desc,
-        elements: vec![AnnotationElem {
-            name: outer_name,
-            value: AnnotationValue::Annotation(Box::new(Annotation {
+        AnnotationValue::Array {
+            tag: b'Z',
+            values: vec![AnnotationValue::Annotation(Box::new(Annotation {
                 class_descriptor: inner_desc,
                 elements: vec![AnnotationElem {
                     name: inner_name,
                     value: AnnotationValue::LiteralArray(vec![
-                        LiteralValue::Integer(1),
-                        LiteralValue::Integer(2),
-                        LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(7)),
+                        LiteralValue::Integer(10),
+                        LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(0)),
+                        LiteralValue::Integer(20),
                     ]),
                 }],
-            })),
-        }],
-    });
-    let err = encode(&file).expect_err("nested-annotation embedded array must fail");
-    assert_eq!(
-        err,
-        Error::NestedLiteralArrayInAnnotation {
-            annotation: "LInner;".to_owned(),
-            element_name: "inner".to_owned(),
-            owner: "class L_GLOBAL;".to_owned(),
-            item_index: 2,
-            nested_index: 7,
-        }
-    );
-}
-
-/// A literal array reached through an array-typed ('#') annotation element
-/// is annotation-embedded too: the recursion must catch the nested
-/// reference inside it.
-#[test]
-fn embedded_nested_literal_array_through_array_element() {
-    let mut file = base_model();
-    file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(1)],
-    });
-    push_class_annotation(
-        &mut file,
-        AnnotationValue::Array {
-            tag: b'#',
-            values: vec![AnnotationValue::LiteralArray(vec![
-                LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(0)),
-            ])],
+            }))],
         },
     );
-    let err = encode(&file).expect_err("nested array through a '#' element must fail");
-    assert!(
-        matches!(
-            err,
-            Error::NestedLiteralArrayInAnnotation {
-                ref annotation,
-                item_index: 0,
-                nested_index: 0,
-                ..
-            } if annotation == "LAnno;"
-        ),
-        "unexpected error: {err:?}"
+    let bytes = encode(&file).expect("in-bounds nested array inside Z array element must encode");
+    let file2 = decode(&bytes).expect("decode Z array element");
+    let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
+    let AnnotationValue::Array { values, .. } = &g2.annotations.compile_time[0].elements[0].value
+    else {
+        panic!("expected Z array");
+    };
+    let AnnotationValue::Annotation(inner) = &values[0] else {
+        panic!("expected Annotation inside Z array");
+    };
+    let AnnotationValue::LiteralArray(vals) = &inner.elements[0].value else {
+        panic!("expected LiteralArray inside Z array Annotation");
+    };
+    assert_eq!(vals[0], LiteralValue::Integer(10));
+    assert_eq!(vals[2], LiteralValue::Integer(20));
+    let LiteralValue::LiteralArray(t_idx) = vals[1] else {
+        panic!("expected nested LiteralArray");
+    };
+    assert_eq!(
+        file2.literal_arrays[t_idx.0 as usize].values,
+        vec![LiteralValue::Integer(321)]
     );
 }
 
-/// Parameter annotations encode through the same annotation path
-/// (`encode_single_annotation`), so an embedded array there carries the
-/// same unrepresentable shape and is rejected with the param owner.
+/// Parameter annotations carrying an embedded literal array with a nested
+/// `LiteralValue::LiteralArray` reference round-trip cleanly when in-bounds,
+/// and report the parameter owner accurately when out-of-bounds.
 #[test]
-fn param_annotation_nested_literal_array_rejected() {
+fn param_annotation_nested_literal_array_roundtrip_and_oob() {
+    // In-bounds round-trip.
     let mut file = base_model();
     file.literal_arrays.push(abcd_file::LiteralArray {
-        values: vec![LiteralValue::Integer(1)],
+        values: vec![LiteralValue::Integer(999)],
     });
     let desc = file.strings.get_or_intern("LAnno;");
     let name = file.strings.get_or_intern("p");
@@ -710,27 +854,112 @@ fn param_annotation_nested_literal_array_rejected() {
         elements: vec![AnnotationElem {
             name,
             value: AnnotationValue::LiteralArray(vec![
-                LiteralValue::Integer(1),
+                LiteralValue::Integer(10),
                 LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(0)),
+                LiteralValue::Integer(20),
             ]),
         }],
     }]];
-    let err = encode(&file).expect_err("param-annotation nested array must fail");
+    let bytes = encode(&file).expect("in-bounds param-annotation nested array must encode");
+    let file2 = decode(&bytes).expect("decode param-annotation nested array");
+    let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
+    let AnnotationValue::LiteralArray(vals) =
+        &g2.methods[0].param_annotations.compile_time[0][0].elements[0].value
+    else {
+        panic!("expected param LiteralArray");
+    };
+    assert_eq!(vals[0], LiteralValue::Integer(10));
+    assert_eq!(vals[2], LiteralValue::Integer(20));
+    let LiteralValue::LiteralArray(t_idx) = vals[1] else {
+        panic!("expected nested LiteralArray");
+    };
+    assert_eq!(
+        file2.literal_arrays[t_idx.0 as usize].values,
+        vec![LiteralValue::Integer(999)]
+    );
+
+    // Out-of-bounds error path.
+    let mut bad = base_model();
+    let desc = bad.strings.get_or_intern("LAnno;");
+    let name = bad.strings.get_or_intern("p");
+    let cls = bad.classes.values_mut().find(|c| !c.is_external).unwrap();
+    let m = &mut cls.methods[0];
+    m.arg_types = vec![Type::Tagged];
+    m.param_annotations.runtime = vec![vec![Annotation {
+        class_descriptor: desc,
+        elements: vec![AnnotationElem {
+            name,
+            value: AnnotationValue::LiteralArray(vec![
+                LiteralValue::Integer(1),
+                LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(3)),
+            ]),
+        }],
+    }]];
+    let err = encode(&bad).expect_err("OOB param-annotation nested array must fail");
     assert!(
         matches!(
             err,
-            Error::NestedLiteralArrayInAnnotation { ref owner, item_index: 1, .. }
-                if owner == "parameter 0 of method L_GLOBAL;::func_main_0"
+            Error::CodeRelocation(ref msg)
+                if msg.contains("parameter 0 of method L_GLOBAL;::func_main_0")
+                    && msg.contains("item 1")
+                    && msg.contains("index 3")
         ),
         "unexpected error: {err:?}"
     );
 }
 
+/// Recursive ArkTS type descriptors in wild `.abc` modules (e.g. OpenHarmony
+/// `Settings.hap`) form cyclic `LiteralArray` reference graphs (`0 <-> 1`).
+/// Verify cyclic literal-array graphs referenced from an annotation-embedded
+/// literal array round-trip losslessly without hanging or corrupting items.
+#[test]
+fn cyclic_literal_array_type_graph_roundtrips() {
+    let mut file = base_model();
+    file.literal_arrays.push(abcd_file::LiteralArray {
+        values: vec![
+            LiteralValue::Integer(101),
+            LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(1)),
+        ],
+    });
+    file.literal_arrays.push(abcd_file::LiteralArray {
+        values: vec![
+            LiteralValue::Integer(202),
+            LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(0)),
+        ],
+    });
+    push_class_annotation(
+        &mut file,
+        AnnotationValue::LiteralArray(vec![
+            LiteralValue::Integer(10),
+            LiteralValue::LiteralArray(abcd_file::LiteralArrayIdx(0)),
+            LiteralValue::Integer(20),
+        ]),
+    );
+    let encoded = encode(&file).expect("cyclic literal-array type graph must encode");
+    let file2 = decode(&encoded).expect("decode cyclic literal-array type graph");
+    let g2 = file2.classes.values().find(|c| !c.is_external).unwrap();
+    let AnnotationValue::LiteralArray(vals) = &g2.annotations.compile_time[0].elements[0].value
+    else {
+        panic!("expected LiteralArray");
+    };
+    assert_eq!(vals[0], LiteralValue::Integer(10));
+    assert_eq!(vals[2], LiteralValue::Integer(20));
+    let LiteralValue::LiteralArray(idx0) = vals[1] else {
+        panic!("expected nested LiteralArray");
+    };
+    let arr0 = &file2.literal_arrays[idx0.0 as usize].values;
+    assert_eq!(arr0[0], LiteralValue::Integer(101));
+    let LiteralValue::LiteralArray(idx1) = arr0[1] else {
+        panic!("expected cycle edge 0 -> 1");
+    };
+    let arr1 = &file2.literal_arrays[idx1.0 as usize].values;
+    assert_eq!(arr1[0], LiteralValue::Integer(202));
+    assert_eq!(arr1[1], LiteralValue::LiteralArray(idx0));
+}
+
 /// Scoping guard: a PLAIN annotation-embedded literal array on a method
-/// parameter (no nested reference) is unaffected by the W5 rejection and
-/// round-trips. Param annotations consume `ann_la_*` builder handles during
-/// class configuration, so this also pins that the model literal-array
-/// handle arithmetic counts them (`count_annotation_literal_arrays`).
+/// parameter (plus a model literal array alongside it) round-trips cleanly
+/// and pins `count_annotation_literal_arrays`.
 #[test]
 fn param_annotation_plain_literal_array_unaffected() {
     let mut file = base_model();

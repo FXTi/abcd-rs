@@ -394,9 +394,21 @@ impl Machine {
                     self.acc -= self.reg(r.0);
                     pc += 1;
                 }
-                // `greater imm, v0` — acc = (acc > v0) (ic slot ignored).
+                // `less` / `lesseq` / `greater` / `greatereq` (ic slot ignored).
+                Bytecode::Less(_, r) => {
+                    self.acc = i64::from(self.acc < self.reg(r.0));
+                    pc += 1;
+                }
+                Bytecode::Lesseq(_, r) => {
+                    self.acc = i64::from(self.acc <= self.reg(r.0));
+                    pc += 1;
+                }
                 Bytecode::Greater(_, r) => {
                     self.acc = i64::from(self.acc > self.reg(r.0));
+                    pc += 1;
+                }
+                Bytecode::Greatereq(_, r) => {
+                    self.acc = i64::from(self.acc >= self.reg(r.0));
                     pc += 1;
                 }
                 // `eq imm, v0` — acc = (acc == v0) (ic slot ignored).
@@ -424,8 +436,20 @@ impl Machine {
                     self.acc = i64::from(self.acc != 0);
                     pc += 1;
                 }
+                // `isfalse` — acc = !ToBoolean(acc) (modeled as == 0).
+                Bytecode::Isfalse => {
+                    self.acc = i64::from(self.acc == 0);
+                    pc += 1;
+                }
                 Bytecode::Jmp(label) => {
                     pc = label.0 as usize;
+                }
+                Bytecode::Jeqz(label) => {
+                    if self.acc == 0 {
+                        pc = label.0 as usize;
+                    } else {
+                        pc += 1;
+                    }
                 }
                 Bytecode::Jnez(label) => {
                     if self.acc != 0 {
@@ -434,38 +458,28 @@ impl Machine {
                         pc += 1;
                     }
                 }
-                // `jeq v0, label` — jump if acc == v0.
-                Bytecode::Jeq(r, label) => {
-                    if self.acc == self.reg(r.0) {
-                        pc = label.0 as usize;
-                    } else {
-                        pc += 1;
-                    }
-                }
-                // `jne v0, label` — jump if acc != v0.
-                Bytecode::Jne(r, label) => {
-                    if self.acc != self.reg(r.0) {
-                        pc = label.0 as usize;
-                    } else {
-                        pc += 1;
-                    }
-                }
-                // `jstricteq v0, label` — the i64 machine has no tagged
-                // values, so strict equality coincides with `==`.
-                Bytecode::Jstricteq(r, label) => {
-                    if self.acc == self.reg(r.0) {
-                        pc = label.0 as usize;
-                    } else {
-                        pc += 1;
-                    }
-                }
-                // `jnstricteq v0, label` — negation of `jstricteq`.
-                Bytecode::Jnstricteq(r, label) => {
-                    if self.acc != self.reg(r.0) {
-                        pc = label.0 as usize;
-                    } else {
-                        pc += 1;
-                    }
+                // Ruling 2026-10-04 (#32): all 24 fused compare-and-branch
+                // opcode variants FATAL in the C++ interpreter and NOP-skip
+                // in the assembly interpreter — mirror the C++ interpreter's
+                // FATAL so any accidental emission fails loud immediately.
+                dead @ (Bytecode::Jeq(..)
+                | Bytecode::Jne(..)
+                | Bytecode::Jstricteq(..)
+                | Bytecode::Jnstricteq(..)
+                | Bytecode::Jstricteqz(..)
+                | Bytecode::Jnstricteqz(..)
+                | Bytecode::Jeqnull(..)
+                | Bytecode::Jnenull(..)
+                | Bytecode::Jstricteqnull(..)
+                | Bytecode::Jnstricteqnull(..)
+                | Bytecode::Jequndefined(..)
+                | Bytecode::Jneundefined(..)
+                | Bytecode::Jstrictequndefined(..)
+                | Bytecode::Jnstrictequndefined(..)) => {
+                    panic!(
+                        "dead fused compare-and-branch opcode executed in simulator \
+                         (ruling 2026-10-04): {dead:?}"
+                    );
                 }
                 Bytecode::Return => return Halt::Return(self.acc),
                 Bytecode::Returnundefined => return Halt::ReturnUndefined,

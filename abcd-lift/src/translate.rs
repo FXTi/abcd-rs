@@ -373,8 +373,9 @@ impl<'l, 'f> FnLift<'l, 'f> {
     pub fn resolve_class_member_attrs(
         &mut self,
         eid: EntityId,
+        is_sendable: bool,
     ) -> Result<Vec<abcd_ir::op::MemberAttrs>, LiftError> {
-        resolve::class_member_attrs(self.lf, self.body, eid)
+        resolve::class_member_attrs(self.lf, self.body, eid, is_sendable)
     }
 
     /// Emit a `LoadConst` for a scalar constant (deduplicated pool).
@@ -1076,7 +1077,7 @@ pub fn translate_bytecode(
         Bytecode::Defineclasswithbuffer(_ic, method_eid, lit_eid, count, base_reg) => {
             let (_name, ctor) = fx.resolve_method(*method_eid)?;
             let members = fx.resolve_literal(*lit_eid)?;
-            let member_attrs = fx.resolve_class_member_attrs(*lit_eid)?;
+            let member_attrs = fx.resolve_class_member_attrs(*lit_eid, false)?;
             let base = fx.read_reg(*base_reg, block);
             let v = fx.emit_val(
                 block,
@@ -1840,7 +1841,7 @@ pub fn translate_bytecode(
             // into DefineClassWithBuffer corrupted the opcode identity.
             let (_name, ctor) = fx.resolve_method(*method_eid)?;
             let members = fx.resolve_literal(*lit_eid)?;
-            let member_attrs = fx.resolve_class_member_attrs(*lit_eid)?;
+            let member_attrs = fx.resolve_class_member_attrs(*lit_eid, true)?;
             let base = fx.read_reg(*base_reg, block);
             let v = fx.emit_val(
                 block,

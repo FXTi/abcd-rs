@@ -120,12 +120,12 @@ pub enum LiteralValue {
     /// On the wire the payload is the target array's FILE OFFSET; decode
     /// rewrites it to a table index through
     /// [`File::literal_array_offsets`](crate::File::literal_array_offsets)
-    /// (header-table, method-index-region, scope-names, and — since v2-P1a —
-    /// transitively recovered nested targets). A payload whose target is
-    /// excluded (module-record / request-phase blobs) or unrecoverable stays
-    /// a raw file offset. Arrays decoded through the annotation path
-    /// (`AnnotationValue::LiteralArray`) are never rewritten: their payloads
-    /// stay raw offsets.
+    /// across both top-level literal arrays and annotation-embedded literal
+    /// arrays (`AnnotationValue::LiteralArray`), recovering nested targets
+    /// transitively (header-table, method-index-region, scope-names, and
+    /// annotation-embedded nested references). A payload whose target is
+    /// excluded (module-record / request-phase blobs) or unrecoverable fails
+    /// relocation loudly on [`encode`](crate::encode).
     LiteralArray(LiteralArrayIdx),
     /// Index into the literal buffer table.
     LiteralBufferIndex(LiteralArrayIdx),

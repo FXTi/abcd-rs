@@ -82,15 +82,9 @@ fn local_var_scope_survives_encode_roundtrip() {
 
 /// Finding #8: `LiteralValue::LiteralArray(idx)` holds a model table index,
 /// not a builder handle. With an annotation-embedded literal array present
-/// (which consumes builder handles during class configuration), a nested
-/// reference must still point at the right array after a roundtrip.
-///
-/// Note (c-COV W5 ruling): the annotation-EMBEDDED array itself may not
-/// carry a nested `LiteralValue::LiteralArray` reference — encode rejects
-/// that shape (`Error::NestedLiteralArrayInAnnotation`, covered in
-/// encode_errors.rs) because the vendored writer/reader pair corrupts it.
-/// This test therefore exercises the handle arithmetic with a PLAIN
-/// embedded array; the nested reference lives at model level.
+/// (which consumes builder handles during class configuration), nested
+/// references at both model level and annotation-embedded level must point
+/// at the right array after a roundtrip.
 #[test]
 fn nested_literal_array_resolves_to_model_table_index() {
     // Base file: just the global class. Pin a 12.x version so the literal

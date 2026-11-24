@@ -1281,6 +1281,7 @@ impl EntityHandles {
 /// Note: `ParamInfo::signature` is not preserved (C++ writer limitation).
 pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     validate_annotation_arrays(file)?;
+    validate_literal_array_graph(&file.literal_arrays)?;
     let mut b = Builder::new();
     b.set_file_version(file.version)?;
     let pool = &file.strings;
@@ -1311,6 +1312,13 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     // Field values that reference literal-array items (module-record blobs,
     // scope-names arrays), wired up after the literal-array section exists.
     let mut deferred_field_values: Vec<(FieldHandle, &FieldValue)> = Vec::new();
+    // Annotation-embedded literal arrays (`ann_la_*`): their builder items are
+    // created during class configuration to preserve item staging order
+    // (F-new-1), while their element payloads are populated AFTER all model
+    // literal-array handles and method handles exist so nested
+    // `LiteralValue::LiteralArray` and forward method references resolve to
+    // live builder handles instead of being dropped by the C++ bridge.
+    let mut deferred_ann_las: Vec<(LiteralArrayHandle, Vec<LiteralValue>)> = Vec::new();
     let mut ann_la_counter: u32 = 0;
     let ann_la_base = count_annotation_literal_arrays(file);
 
@@ -1526,10 +1534,8 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
                     entities: &entities,
-                    entity_map: &file.entity_map,
                     ann_la_counter: &mut ann_la_counter,
-                    ann_la_base,
-                    literal_array_count: file.literal_arrays.len(),
+                    deferred_ann_las: &mut deferred_ann_las,
                     pool,
                 };
                 encode_annotations_on(
@@ -1579,10 +1585,8 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
                     entities: &entities,
-                    entity_map: &file.entity_map,
                     ann_la_counter: &mut ann_la_counter,
-                    ann_la_base,
-                    literal_array_count: file.literal_arrays.len(),
+                    deferred_ann_las: &mut deferred_ann_las,
                     pool,
                 };
                 for (idx, param_h) in param_handles.iter().enumerate() {
@@ -1662,10 +1666,8 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     string_handles: &mut string_handles,
                     class_handles: &mut class_handles,
                     entities: &entities,
-                    entity_map: &file.entity_map,
                     ann_la_counter: &mut ann_la_counter,
-                    ann_la_base,
-                    literal_array_count: file.literal_arrays.len(),
+                    deferred_ann_las: &mut deferred_ann_las,
                     pool,
                 };
                 encode_annotations_on(
@@ -1683,10 +1685,8 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 string_handles: &mut string_handles,
                 class_handles: &mut class_handles,
                 entities: &entities,
-                entity_map: &file.entity_map,
                 ann_la_counter: &mut ann_la_counter,
-                ann_la_base,
-                literal_array_count: file.literal_arrays.len(),
+                deferred_ann_las: &mut deferred_ann_las,
                 pool,
             };
             encode_annotations_on(
@@ -1701,10 +1701,25 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     // --- Literal array contents ---
     // Model literal arrays are created after class configuration, so their
     // builder handles start after every annotation-embedded (`ann_la_*`)
-    // array: handle(i) = ann_la_base + i.
+    // array: handle(i) = ann_la_base + i. Populate `deferred_ann_las` now
+    // that all `literal_handles` exist on the builder.
     let literal_handles: Vec<_> = (0..file.literal_arrays.len())
         .map(|index| b.add_literal_array(&index.to_string()))
         .collect();
+    for (la_h, values) in &deferred_ann_las {
+        for val in values {
+            encode_literal_value(
+                &mut b,
+                &mut string_handles,
+                pool,
+                *la_h,
+                val,
+                &file.entity_map,
+                &entities,
+                &literal_handles,
+            )?;
+        }
+    }
     for (i, (la, &la_h)) in file.literal_arrays.iter().zip(&literal_handles).enumerate() {
         debug_assert_eq!(
             la_h.as_raw(),
@@ -1834,24 +1849,16 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
 }
 
 /// Encode preflight over every annotation in the file (hard-errors rule):
-/// reject the shapes the vendored writer cannot represent BEFORE any bytes
-/// are emitted.
+/// reject shapes the vendored writer cannot represent BEFORE any bytes are
+/// emitted, using an explicit iterative workstack.
 ///
-/// Two rejections:
+/// Rejections:
 /// - 64-bit annotation ARRAY elements (`UnsupportedAnnotationArrayType`):
 ///   the bridge array ABI is 32-bit only (finding #18).
-/// - a `LiteralValue::LiteralArray` nested inside an annotation-EMBEDDED
-///   literal array (c-COV W5 ruling): upstream pandasm has no representation
-///   for the shape and the vendored writer/reader pair corrupts it on
-///   encode → decode (every item after the nested reference decodes
-///   shifted; the reference resolves to a wrong array). TOP-LEVEL (model)
-///   literal-array nesting is unaffected — model arrays never pass through
-///   this pass.
-///
-/// The walk covers class/method/field annotations and method PARAMETER
-/// annotations: param annotations encode through the same
-/// `encode_single_annotation` → `annotation_value_to_raw` path, so an
-/// embedded array there carries the same unrepresentable shape.
+/// - out-of-bounds `LiteralValue::LiteralArray(idx)` inside an
+///   annotation-embedded literal array (`CodeRelocation` with site/owner
+///   context): dangling or unrecovered nested offsets fail loudly rather
+///   than being dropped or written stale.
 fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
     fn annotations(a: &Annotations) -> impl Iterator<Item = &Annotation> {
         a.compile_time
@@ -1896,108 +1903,123 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
         }
     }
 
-    fn value(
+    fn validate_root<'a>(
         pool: &StringPool,
+        literal_array_count: usize,
         owner: Owner,
         site: Site,
-        v: &AnnotationValue,
+        root: &'a AnnotationValue,
+        stack: &mut Vec<(Owner, Site, &'a AnnotationValue)>,
     ) -> Result<(), Error> {
-        match v {
-            AnnotationValue::Array { tag, values } => {
-                if values.iter().any(|item| {
-                    matches!(
-                        item,
-                        AnnotationValue::I64(_) | AnnotationValue::U64(_) | AnnotationValue::F64(_)
-                    )
-                }) {
-                    return Err(Error::UnsupportedAnnotationArrayType { tag: *tag });
-                }
-                for item in values {
-                    value(pool, owner, site, item)?;
-                }
-                Ok(())
-            }
-            AnnotationValue::Annotation(a) => {
-                for e in &a.elements {
-                    value(
-                        pool,
-                        owner,
-                        Site {
-                            annotation: a.class_descriptor,
-                            element: e.name,
-                        },
-                        &e.value,
-                    )?;
-                }
-                Ok(())
-            }
-            AnnotationValue::LiteralArray(values) => {
-                // c-COV W5: a nested literal-array reference here has no
-                // representation in the vendored writer (its encode arm is
-                // defense-only; this pass is what rejects the shape).
-                for (item_index, item) in values.iter().enumerate() {
-                    if let LiteralValue::LiteralArray(idx) = item {
-                        return Err(Error::NestedLiteralArrayInAnnotation {
-                            annotation: resolve(pool, site.annotation).to_owned(),
-                            element_name: resolve(pool, site.element).to_owned(),
-                            owner: owner_string(pool, owner),
-                            item_index,
-                            nested_index: idx.0,
-                        });
+        stack.clear();
+        stack.push((owner, site, root));
+        while let Some((cur_owner, cur_site, v)) = stack.pop() {
+            match v {
+                AnnotationValue::Array { tag, values } => {
+                    if values.iter().any(|item| {
+                        matches!(
+                            item,
+                            AnnotationValue::I64(_)
+                                | AnnotationValue::U64(_)
+                                | AnnotationValue::F64(_)
+                        )
+                    }) {
+                        return Err(Error::UnsupportedAnnotationArrayType { tag: *tag });
+                    }
+                    for item in values.iter().rev() {
+                        stack.push((cur_owner, cur_site, item));
                     }
                 }
-                Ok(())
+                AnnotationValue::Annotation(a) => {
+                    for e in a.elements.iter().rev() {
+                        stack.push((
+                            cur_owner,
+                            Site {
+                                annotation: a.class_descriptor,
+                                element: e.name,
+                            },
+                            &e.value,
+                        ));
+                    }
+                }
+                AnnotationValue::LiteralArray(values) => {
+                    for (item_index, item) in values.iter().enumerate() {
+                        if let LiteralValue::LiteralArray(idx) = item
+                            && (idx.0 as usize) >= literal_array_count
+                        {
+                            return Err(Error::CodeRelocation(format!(
+                                "annotation {} element '{}' on {}: nested literal array index {} at item {} out of bounds (table len {})",
+                                resolve(pool, cur_site.annotation),
+                                resolve(pool, cur_site.element),
+                                owner_string(pool, cur_owner),
+                                idx.0,
+                                item_index,
+                                literal_array_count,
+                            )));
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => Ok(()),
         }
+        Ok(())
     }
+
     let pool = &file.strings;
+    let literal_array_count = file.literal_arrays.len();
+    let mut stack: Vec<(Owner, Site, &AnnotationValue)> = Vec::new();
+
     for class in file.classes.values() {
         for ann in annotations(&class.annotations) {
             for e in &ann.elements {
-                value(
+                validate_root(
                     pool,
+                    literal_array_count,
                     Owner::Class(class.descriptor),
                     Site {
                         annotation: ann.class_descriptor,
                         element: e.name,
                     },
                     &e.value,
+                    &mut stack,
                 )?;
             }
         }
         for method in &class.methods {
             for ann in annotations(&method.annotations) {
                 for e in &ann.elements {
-                    value(
+                    validate_root(
                         pool,
+                        literal_array_count,
                         Owner::Method(class.descriptor, method.name),
                         Site {
                             annotation: ann.class_descriptor,
                             element: e.name,
                         },
                         &e.value,
+                        &mut stack,
                     )?;
                 }
             }
-            for (index, anns) in method
-                .param_annotations
-                .compile_time
-                .iter()
-                .chain(&method.param_annotations.runtime)
-                .enumerate()
-            {
-                for ann in anns {
-                    for e in &ann.elements {
-                        value(
-                            pool,
-                            Owner::MethodParam(class.descriptor, method.name, index),
-                            Site {
-                                annotation: ann.class_descriptor,
-                                element: e.name,
-                            },
-                            &e.value,
-                        )?;
+            for bucket in [
+                &method.param_annotations.compile_time,
+                &method.param_annotations.runtime,
+            ] {
+                for (index, anns) in bucket.iter().enumerate() {
+                    for ann in anns {
+                        for e in &ann.elements {
+                            validate_root(
+                                pool,
+                                literal_array_count,
+                                Owner::MethodParam(class.descriptor, method.name, index),
+                                Site {
+                                    annotation: ann.class_descriptor,
+                                    element: e.name,
+                                },
+                                &e.value,
+                                &mut stack,
+                            )?;
+                        }
                     }
                 }
             }
@@ -2005,14 +2027,16 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
         for field in &class.fields {
             for ann in annotations(&field.annotations) {
                 for e in &ann.elements {
-                    value(
+                    validate_root(
                         pool,
+                        literal_array_count,
                         Owner::Field(class.descriptor, field.name),
                         Site {
                             annotation: ann.class_descriptor,
                             element: e.name,
                         },
                         &e.value,
+                        &mut stack,
                     )?;
                 }
             }
@@ -2021,61 +2045,112 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
     Ok(())
 }
 
-/// Count the literal arrays that annotation encoding will create: exactly
-/// one `ann_la_*` builder array per `AnnotationValue::LiteralArray` element,
-/// recursing into nested annotations and array elements (both are handled by
-/// paths that create such arrays). PARAMETER annotations are included: they
-/// encode through the same `encode_single_annotation` path, so their
-/// embedded arrays consume builder handles during class configuration too.
+/// Validate that every nested `LiteralValue::LiteralArray(idx)` in
+/// `File::literal_arrays` points within `0..literal_arrays.len()`.
 ///
-/// The count determines the builder handle of every model literal array
-/// (created after class configuration): `handle(i) = count + i`.
-fn count_annotation_literal_arrays(file: &File) -> u32 {
-    fn in_value(v: &AnnotationValue) -> u32 {
-        match v {
-            AnnotationValue::LiteralArray(_) => 1,
-            AnnotationValue::Annotation(a) => a.elements.iter().map(|e| in_value(&e.value)).sum(),
-            AnnotationValue::Array { values, .. } => values.iter().map(in_value).sum(),
-            _ => 0,
+/// Note: reference CYCLES in `File::literal_arrays` are format-legal and
+/// emitted by `es2abc` for recursive ArkTS class/interface type descriptors
+/// in `L_ESTypeAnnotation;` (e.g. OpenHarmony `Settings.hap`); both `decode`
+/// (`offset_to_index` worklist) and `Builder` (`ComputeLayout` assigns all
+/// `LiteralArrayItem` offsets before `LiteralItem::Write` emits 4-byte IDs)
+/// handle cyclic literal-array graphs in linear time without recursion.
+fn validate_literal_array_graph(literal_arrays: &[LiteralArray]) -> Result<(), Error> {
+    let len = literal_arrays.len();
+    for la in literal_arrays {
+        for item in &la.values {
+            if let LiteralValue::LiteralArray(idx) = item
+                && (idx.0 as usize) >= len
+            {
+                return Err(Error::CodeRelocation(format!(
+                    "nested literal array index {} out of bounds",
+                    idx.0
+                )));
+            }
         }
     }
-    fn in_annotations(a: &Annotations) -> u32 {
-        a.compile_time
+    Ok(())
+}
+
+/// Count the literal arrays that annotation encoding will create: exactly
+/// one `ann_la_*` builder array per `AnnotationValue::LiteralArray` element,
+/// traversing nested annotations and array elements via an explicit iterative
+/// workstack. Parameter annotations are deduplicated per-parameter identically
+/// to the staging fold in `encode`.
+fn count_annotation_literal_arrays(file: &File) -> u32 {
+    fn push_annotations<'a>(a: &'a Annotations, stack: &mut Vec<&'a AnnotationValue>) {
+        for ann in a
+            .compile_time
             .iter()
             .chain(a.runtime.iter())
             .chain(a.compile_time_type.iter())
             .chain(a.runtime_type.iter())
-            .flat_map(|ann| ann.elements.iter())
-            .map(|e| in_value(&e.value))
-            .sum()
+        {
+            for e in &ann.elements {
+                stack.push(&e.value);
+            }
+        }
     }
-    fn in_param_annotations(p: &ParamAnnotations) -> u32 {
-        p.compile_time
-            .iter()
-            .chain(&p.runtime)
-            .flat_map(|anns| anns.iter())
-            .flat_map(|ann| ann.elements.iter())
-            .map(|e| in_value(&e.value))
-            .sum()
+
+    let mut stack: Vec<&AnnotationValue> = Vec::new();
+
+    for class in file.classes.values() {
+        push_annotations(&class.annotations, &mut stack);
+        for method in &class.methods {
+            push_annotations(&method.annotations, &mut stack);
+            let pa = &method.param_annotations;
+            let has_compile = pa.compile_time.iter().any(|v| !v.is_empty());
+            let has_runtime = pa.runtime.iter().any(|v| !v.is_empty());
+            if !method.is_external && (has_compile || has_runtime) {
+                let num_params = method
+                    .arg_types
+                    .len()
+                    .max(pa.compile_time.len())
+                    .max(pa.runtime.len());
+                let seal_as_runtime = !has_compile;
+                for idx in 0..num_params {
+                    if seal_as_runtime {
+                        for ann in pa.runtime.get(idx).into_iter().flatten() {
+                            for e in &ann.elements {
+                                stack.push(&e.value);
+                            }
+                        }
+                    } else {
+                        for ann in pa.compile_time.get(idx).into_iter().flatten().chain(
+                            pa.runtime.get(idx).into_iter().flatten().filter(|ra| {
+                                !pa.compile_time.get(idx).is_some_and(|c| c.contains(*ra))
+                            }),
+                        ) {
+                            for e in &ann.elements {
+                                stack.push(&e.value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for field in &class.fields {
+            push_annotations(&field.annotations, &mut stack);
+        }
     }
-    file.classes
-        .values()
-        .map(|class| {
-            in_annotations(&class.annotations)
-                + class
-                    .methods
-                    .iter()
-                    .map(|m| {
-                        in_annotations(&m.annotations) + in_param_annotations(&m.param_annotations)
-                    })
-                    .sum::<u32>()
-                + class
-                    .fields
-                    .iter()
-                    .map(|f| in_annotations(&f.annotations))
-                    .sum::<u32>()
-        })
-        .sum()
+
+    let mut count: u32 = 0;
+    while let Some(v) = stack.pop() {
+        match v {
+            AnnotationValue::LiteralArray(_) => count += 1,
+            AnnotationValue::Annotation(a) => {
+                for e in &a.elements {
+                    stack.push(&e.value);
+                }
+            }
+            AnnotationValue::Array { values, .. } => {
+                for item in values {
+                    stack.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    count
 }
 
 // ---------------------------------------------------------------------------
@@ -2093,16 +2168,8 @@ struct AnnotationEncodeCtx<'a> {
     string_handles: &'a mut HashMap<StringId, StringHandle>,
     class_handles: &'a mut HashMap<StringId, ClassHandle>,
     entities: &'a EntityHandles,
-    /// Source-offset → string map, used by the offset-0 name fallback for
-    /// hand-built models (same contract as the model literal-array path).
-    entity_map: &'a HashMap<u32, StringId>,
     ann_la_counter: &'a mut u32,
-    /// Handle of the first model literal array (= number of
-    /// annotation-embedded arrays, which are created first), plus the model
-    /// table length. Nested `LiteralValue::LiteralArray` references resolve
-    /// to `LiteralArrayHandle(ann_la_base + idx)`.
-    ann_la_base: u32,
-    literal_array_count: usize,
+    deferred_ann_las: &'a mut Vec<(LiteralArrayHandle, Vec<LiteralValue>)>,
     pool: &'a StringPool,
 }
 
@@ -2208,28 +2275,192 @@ fn encode_annotations_on(
     Ok(())
 }
 
-/// Encode one annotation (class reference + elements) into a builder handle.
+enum PendingEncodeElem<'a> {
+    Scalar {
+        name: StringHandle,
+    },
+    Array {
+        name: StringHandle,
+        tag: u8,
+        remaining: std::slice::Iter<'a, AnnotationValue>,
+        handles: Vec<u32>,
+    },
+}
+
+struct AnnEncodeFrame<'a> {
+    ann_cls: ClassHandle,
+    elems_iter: std::slice::Iter<'a, AnnotationElem>,
+    encoded_elems: Vec<AnnotationElemDefEx>,
+    pending: Option<PendingEncodeElem<'a>>,
+}
+
+/// Encode one annotation tree into a builder handle using an explicit
+/// iterative workstack, preserving left-to-right item creation order.
 fn encode_single_annotation(
     b: &mut Builder,
     ctx: &mut AnnotationEncodeCtx<'_>,
     ann: &Annotation,
 ) -> Result<AnnotationHandle, Error> {
-    let ann_cls = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, ann.class_descriptor)?;
+    use sys::AnnotationValueType as AVT;
 
-    let elems: Vec<AnnotationElemDefEx> = ann
-        .elements
-        .iter()
-        .map(|e| {
+    let root_cls = resolve_class_for_ann(b, ctx.class_handles, ctx.pool, ann.class_descriptor)?;
+    let mut stack = vec![AnnEncodeFrame {
+        ann_cls: root_cls,
+        elems_iter: ann.elements.iter(),
+        encoded_elems: Vec::with_capacity(ann.elements.len()),
+        pending: None,
+    }];
+    let mut completed: Option<AnnotationHandle> = None;
+
+    while let Some(frame) = stack.last_mut() {
+        let mut next_child: Option<AnnEncodeFrame<'_>> = None;
+        if let Some(child_h) = completed.take() {
+            match frame.pending.take() {
+                Some(PendingEncodeElem::Scalar { name }) => {
+                    frame.encoded_elems.push(AnnotationElemDefEx {
+                        name,
+                        tag: AVT::Annotation as u8,
+                        value: AnnotationElemValue::EntityRef(child_h.0),
+                    });
+                }
+                Some(PendingEncodeElem::Array {
+                    name,
+                    tag,
+                    mut remaining,
+                    mut handles,
+                }) => {
+                    handles.push(child_h.0);
+                    for item in &mut remaining {
+                        if let AnnotationValue::Annotation(nested) = item {
+                            let child_cls = resolve_class_for_ann(
+                                b,
+                                ctx.class_handles,
+                                ctx.pool,
+                                nested.class_descriptor,
+                            )?;
+                            frame.pending = Some(PendingEncodeElem::Array {
+                                name,
+                                tag,
+                                remaining,
+                                handles: std::mem::take(&mut handles),
+                            });
+                            next_child = Some(AnnEncodeFrame {
+                                ann_cls: child_cls,
+                                elems_iter: nested.elements.iter(),
+                                encoded_elems: Vec::with_capacity(nested.elements.len()),
+                                pending: None,
+                            });
+                            break;
+                        }
+                        handles.push(annotation_array_leaf_to_handle(item, tag, b, ctx)?);
+                    }
+                    if next_child.is_none() {
+                        let value = if is_entity_array_tag(tag) {
+                            AnnotationElemValue::EntityArray(handles)
+                        } else {
+                            AnnotationElemValue::Array(handles)
+                        };
+                        frame
+                            .encoded_elems
+                            .push(AnnotationElemDefEx { name, tag, value });
+                    }
+                }
+                None => {}
+            }
+        }
+        if let Some(child_frame) = next_child {
+            stack.push(child_frame);
+            continue;
+        }
+
+        for e in &mut frame.elems_iter {
             let name = get_or_add_string_id(b, ctx.string_handles, ctx.pool, e.name)?;
-            let (tag, value) = annotation_value_to_raw(&e.value, b, ctx)?;
-            Ok(AnnotationElemDefEx { name, tag, value })
-        })
-        .collect::<Result<_, Error>>()?;
+            match &e.value {
+                AnnotationValue::Annotation(nested) => {
+                    let child_cls = resolve_class_for_ann(
+                        b,
+                        ctx.class_handles,
+                        ctx.pool,
+                        nested.class_descriptor,
+                    )?;
+                    frame.pending = Some(PendingEncodeElem::Scalar { name });
+                    next_child = Some(AnnEncodeFrame {
+                        ann_cls: child_cls,
+                        elems_iter: nested.elements.iter(),
+                        encoded_elems: Vec::with_capacity(nested.elements.len()),
+                        pending: None,
+                    });
+                    break;
+                }
+                AnnotationValue::Array { tag, values } => {
+                    let mut remaining = values.iter();
+                    let mut handles = Vec::with_capacity(values.len());
+                    for item in &mut remaining {
+                        if let AnnotationValue::Annotation(nested) = item {
+                            let child_cls = resolve_class_for_ann(
+                                b,
+                                ctx.class_handles,
+                                ctx.pool,
+                                nested.class_descriptor,
+                            )?;
+                            frame.pending = Some(PendingEncodeElem::Array {
+                                name,
+                                tag: *tag,
+                                remaining,
+                                handles: std::mem::take(&mut handles),
+                            });
+                            next_child = Some(AnnEncodeFrame {
+                                ann_cls: child_cls,
+                                elems_iter: nested.elements.iter(),
+                                encoded_elems: Vec::with_capacity(nested.elements.len()),
+                                pending: None,
+                            });
+                            break;
+                        }
+                        handles.push(annotation_array_leaf_to_handle(item, *tag, b, ctx)?);
+                    }
+                    if next_child.is_some() {
+                        break;
+                    }
+                    let value = if is_entity_array_tag(*tag) {
+                        AnnotationElemValue::EntityArray(handles)
+                    } else {
+                        AnnotationElemValue::Array(handles)
+                    };
+                    frame.encoded_elems.push(AnnotationElemDefEx {
+                        name,
+                        tag: *tag,
+                        value,
+                    });
+                }
+                other => {
+                    let (tag, value) = annotation_scalar_value_to_raw(other, b, ctx)?;
+                    frame
+                        .encoded_elems
+                        .push(AnnotationElemDefEx { name, tag, value });
+                }
+            }
+        }
 
-    Ok(b.create_annotation_ex(ann_cls, &elems))
+        if let Some(child_frame) = next_child {
+            stack.push(child_frame);
+            continue;
+        }
+
+        let Some(finished) = stack.pop() else {
+            break;
+        };
+        let ann_h = b.create_annotation_ex(finished.ann_cls, &finished.encoded_elems);
+        if stack.is_empty() {
+            return Ok(ann_h);
+        }
+        completed = Some(ann_h);
+    }
+
+    Err(Error::Finalize)
 }
 
-fn annotation_value_to_raw(
+fn annotation_scalar_value_to_raw(
     val: &AnnotationValue,
     b: &mut Builder,
     ctx: &mut AnnotationEncodeCtx<'_>,
@@ -2280,24 +2511,6 @@ fn annotation_value_to_raw(
                 .ok_or_else(|| unresolved("enum", *name, *offset))?;
             (AVT::Enum as u8, AnnotationElemValue::EntityRef(fh.0))
         }
-        AnnotationValue::Annotation(nested) => {
-            let ann_cls =
-                resolve_class_for_ann(b, ctx.class_handles, ctx.pool, nested.class_descriptor)?;
-            let elems: Vec<AnnotationElemDefEx> = nested
-                .elements
-                .iter()
-                .map(|e| {
-                    let name = get_or_add_string_id(b, ctx.string_handles, ctx.pool, e.name)?;
-                    let (tag, value) = annotation_value_to_raw(&e.value, b, ctx)?;
-                    Ok(AnnotationElemDefEx { name, tag, value })
-                })
-                .collect::<Result<_, Error>>()?;
-            let ann_h = b.create_annotation_ex(ann_cls, &elems);
-            (
-                AVT::Annotation as u8,
-                AnnotationElemValue::EntityRef(ann_h.0),
-            )
-        }
         AnnotationValue::MethodHandle(mh) => {
             let entity_handle = if mh.handle_type.is_field_op() {
                 ctx.entities
@@ -2319,19 +2532,7 @@ fn annotation_value_to_raw(
             let id = format!("ann_la_{}", *ctx.ann_la_counter);
             *ctx.ann_la_counter += 1;
             let la_h = b.add_literal_array(&id);
-            for val in values {
-                encode_literal_value_simple(
-                    b,
-                    ctx.string_handles,
-                    ctx.pool,
-                    la_h,
-                    val,
-                    ctx.entities,
-                    ctx.entity_map,
-                    ctx.ann_la_base,
-                    ctx.literal_array_count,
-                )?;
-            }
+            ctx.deferred_ann_las.push((la_h, values.clone()));
             (
                 AVT::LiteralArray as u8,
                 AnnotationElemValue::EntityRef(la_h.0),
@@ -2341,16 +2542,8 @@ fn annotation_value_to_raw(
         AnnotationValue::StringNullptr => {
             (AVT::StringNullptr as u8, AnnotationElemValue::Scalar(0))
         }
-        AnnotationValue::Array { tag, values } => {
-            let handles: Vec<u32> = values
-                .iter()
-                .map(|v| annotation_array_elem_to_handle(v, *tag, b, ctx))
-                .collect::<Result<_, Error>>()?;
-            if is_entity_array_tag(*tag) {
-                (*tag, AnnotationElemValue::EntityArray(handles))
-            } else {
-                (*tag, AnnotationElemValue::Array(handles))
-            }
+        AnnotationValue::Annotation(_) | AnnotationValue::Array { .. } => {
+            unreachable!("compound annotation values are dispatched by encode_single_annotation")
         }
     };
     Ok(raw)
@@ -2375,13 +2568,10 @@ fn is_entity_array_tag(tag: u8) -> bool {
     )
 }
 
-/// Convert a single annotation array element to a u32 handle/value for the builder.
-///
-/// `tag` is the enclosing array's element tag, used only for error reporting.
-/// Entity elements (Method/Enum/Annotation/MethodHandle/LiteralArray) are
-/// resolved to real builder handles; unresolvable references fail instead of
-/// writing 0 (audit finding #7).
-fn annotation_array_elem_to_handle(
+/// Convert a single non-Annotation array element to a u32 handle/value for the
+/// builder (`Annotation` elements are pushed onto the iterative frame stack by
+/// `encode_single_annotation`).
+fn annotation_array_leaf_to_handle(
     val: &AnnotationValue,
     tag: u8,
     b: &mut Builder,
@@ -2395,9 +2585,6 @@ fn annotation_array_elem_to_handle(
         AnnotationValue::U16(v) => *v as u32,
         AnnotationValue::I32(v) => *v as u32,
         AnnotationValue::U32(v) => *v,
-        // The C bridge's array ABI currently accepts only 32-bit elements.
-        // Silently truncating these values produces a different annotation;
-        // fail explicitly until a 64-bit array ABI is available.
         AnnotationValue::I64(_) | AnnotationValue::U64(_) | AnnotationValue::F64(_) => {
             return Err(Error::UnsupportedAnnotationArrayType { tag });
         }
@@ -2451,13 +2638,16 @@ fn annotation_array_elem_to_handle(
             })?;
             b.create_method_handle(mh.handle_type as u8, entity_handle).0
         }
-        // Nested annotations and literal arrays encode as entity references;
-        // reuse the scalar conversion path.
-        AnnotationValue::Annotation(_) | AnnotationValue::LiteralArray(_) => {
-            match annotation_value_to_raw(val, b, ctx)? {
+        AnnotationValue::LiteralArray(_) => {
+            match annotation_scalar_value_to_raw(val, b, ctx)? {
                 (_, AnnotationElemValue::EntityRef(h)) => h,
-                _ => unreachable!("annotation/literal-array values encode as entity refs"),
+                _ => unreachable!("literal-array values encode as entity refs"),
             }
+        }
+        AnnotationValue::Annotation(_) => {
+            unreachable!(
+                "nested annotations are dispatched iteratively by encode_single_annotation"
+            )
         }
         AnnotationValue::Void | AnnotationValue::StringNullptr => 0,
         AnnotationValue::Array { .. } => {
@@ -2486,177 +2676,6 @@ fn resolve_class_for_ann(
     let h = b.add_foreign_class_cstr(&Builder::mutf8_cstr(&bytes)?);
     class_handles.insert(desc, h);
     Ok(h)
-}
-
-/// Simplified literal value encoding for annotation-embedded literal arrays.
-///
-/// Method references carry the SOURCE-FILE offset as identity and resolve
-/// through the same entity handles as the model literal-array path
-/// (F-new-2): writing the raw offset into the new file's different layout
-/// leaves a dangling reference (audit findings #6/#7 class), so an
-/// unresolvable reference is a hard error, never a silent raw value.
-///
-/// Nested `LiteralValue::LiteralArray` references carry a model table index
-/// into `File::literal_arrays`. Model arrays are created after all
-/// annotation-embedded ones, so the builder handle is
-/// `ann_la_base + idx` (`literal_array_count` bounds-checks `idx`).
-/// The shape itself is rejected up front by `validate_annotation_arrays`
-/// (c-COV W5: unrepresentable upstream, corrupted by the vendored
-/// writer/reader pair); the nested arm below is defense-only.
-#[allow(clippy::too_many_arguments)]
-fn encode_literal_value_simple(
-    b: &mut Builder,
-    string_handles: &mut HashMap<StringId, StringHandle>,
-    pool: &StringPool,
-    la: LiteralArrayHandle,
-    val: &LiteralValue,
-    entities: &EntityHandles,
-    entity_map: &HashMap<u32, StringId>,
-    ann_la_base: u32,
-    literal_array_count: usize,
-) -> Result<(), Error> {
-    use crate::literal::LiteralTag;
-    // Resolve a method entity offset to a MethodHandle: the offset is the
-    // unique entity identity; the name lookup via entity_map is only a
-    // fallback for hand-built models (offset 0). Same contract as
-    // encode_literal_value.
-    let resolve_method = |off: u32| -> Option<MethodHandle> {
-        if off != 0
-            && let Some(&mh) = entities.methods_by_offset.get(&off)
-        {
-            return Some(mh);
-        }
-        let sid = entity_map.get(&off)?;
-        entities.methods_by_name.get(sid).copied()
-    };
-    match val {
-        LiteralValue::Bool(v) => {
-            b.literal_array_add_u8(la, LiteralTag::Bool as u8);
-            b.literal_array_add_u8(la, *v as u8);
-        }
-        LiteralValue::Integer8(v) => {
-            b.literal_array_add_u8(la, LiteralTag::TagValue as u8);
-            b.literal_array_add_u8(la, *v);
-        }
-        LiteralValue::Integer(v) => {
-            b.literal_array_add_u8(la, LiteralTag::Integer as u8);
-            b.literal_array_add_u32(la, *v);
-        }
-        LiteralValue::Float(v) => {
-            b.literal_array_add_u8(la, LiteralTag::Float as u8);
-            b.literal_array_add_u32(la, v.to_bits());
-        }
-        LiteralValue::Double(v) => {
-            b.literal_array_add_u8(la, LiteralTag::Double as u8);
-            b.literal_array_add_u64(la, v.to_bits());
-        }
-        LiteralValue::String(sid) => {
-            b.literal_array_add_u8(la, LiteralTag::String as u8);
-            let sh = get_or_add_string_id(b, string_handles, pool, *sid)?;
-            b.literal_array_add_raw_string(la, sh);
-        }
-        LiteralValue::Method(off)
-        | LiteralValue::GeneratorMethod(off)
-        | LiteralValue::AsyncGeneratorMethod(off)
-        | LiteralValue::Getter(off)
-        | LiteralValue::Setter(off) => {
-            let tag = match val {
-                LiteralValue::Method(_) => LiteralTag::Method,
-                LiteralValue::GeneratorMethod(_) => LiteralTag::GeneratorMethod,
-                LiteralValue::AsyncGeneratorMethod(_) => LiteralTag::AsyncGeneratorMethod,
-                LiteralValue::Getter(_) => LiteralTag::Getter,
-                LiteralValue::Setter(_) => LiteralTag::Setter,
-                _ => unreachable!(),
-            };
-            b.literal_array_add_u8(la, tag as u8);
-            let mh = resolve_method(*off).ok_or_else(|| {
-                Error::CodeRelocation(format!(
-                    "annotation-embedded literal array method reference at offset {off:#x} cannot be resolved"
-                ))
-            })?;
-            b.literal_array_add_raw_method(la, mh);
-        }
-        LiteralValue::Accessor(v) => {
-            b.literal_array_add_u8(la, LiteralTag::Accessor as u8);
-            b.literal_array_add_u8(la, *v);
-        }
-        LiteralValue::MethodAffiliate(v) => {
-            b.literal_array_add_u8(la, LiteralTag::MethodAffiliate as u8);
-            b.literal_array_add_u16(la, *v);
-        }
-        LiteralValue::LiteralArray(idx) => {
-            // DEFENSE-ONLY (c-COV W5 ruling): validate_annotation_arrays
-            // rejects every nested literal-array reference inside an
-            // annotation-embedded literal array before encoding starts —
-            // the vendored writer/reader pair corrupts the shape and
-            // upstream pandasm cannot express it — so this arm is
-            // unreachable through `encode`. It stays so the writer path
-            // remains total; the bounds check below is the residual guard.
-            //
-            // idx is a model table index into File::literal_arrays, NOT a
-            // builder handle: annotation-embedded arrays occupy the low
-            // handle slots. Model arrays are created right after them, so
-            // the target handle is ann_la_base + idx. Route it through the
-            // reference API so the writer stores the array's final file
-            // offset.
-            if idx.0 as usize >= literal_array_count {
-                return Err(Error::CodeRelocation(format!(
-                    "nested literal array index {} out of bounds",
-                    idx.0
-                )));
-            }
-            let target = LiteralArrayHandle(ann_la_base + idx.0);
-            b.literal_array_add_literalarray(la, target);
-        }
-        LiteralValue::LiteralBufferIndex(idx) => {
-            b.literal_array_add_u8(la, LiteralTag::LiteralBufferIndex as u8);
-            b.literal_array_add_u32(la, idx.0);
-        }
-        LiteralValue::BuiltinTypeIndex(v) => {
-            b.literal_array_add_u8(la, LiteralTag::BuiltinTypeIndex as u8);
-            b.literal_array_add_u8(la, *v);
-        }
-        LiteralValue::EtsImplements(sid) => {
-            b.literal_array_add_u8(la, LiteralTag::EtsImplements as u8);
-            let sh = get_or_add_string_id(b, string_handles, pool, *sid)?;
-            b.literal_array_add_raw_string(la, sh);
-        }
-        LiteralValue::NullValue(v) => {
-            b.literal_array_add_u8(la, LiteralTag::NullValue as u8);
-            b.literal_array_add_u8(la, *v);
-        }
-        LiteralValue::ArrayU1(idx)
-        | LiteralValue::ArrayU8(idx)
-        | LiteralValue::ArrayI8(idx)
-        | LiteralValue::ArrayU16(idx)
-        | LiteralValue::ArrayI16(idx)
-        | LiteralValue::ArrayU32(idx)
-        | LiteralValue::ArrayI32(idx)
-        | LiteralValue::ArrayU64(idx)
-        | LiteralValue::ArrayI64(idx)
-        | LiteralValue::ArrayF32(idx)
-        | LiteralValue::ArrayF64(idx)
-        | LiteralValue::ArrayString(idx) => {
-            let tag = match val {
-                LiteralValue::ArrayU1(_) => LiteralTag::ArrayU1,
-                LiteralValue::ArrayU8(_) => LiteralTag::ArrayU8,
-                LiteralValue::ArrayI8(_) => LiteralTag::ArrayI8,
-                LiteralValue::ArrayU16(_) => LiteralTag::ArrayU16,
-                LiteralValue::ArrayI16(_) => LiteralTag::ArrayI16,
-                LiteralValue::ArrayU32(_) => LiteralTag::ArrayU32,
-                LiteralValue::ArrayI32(_) => LiteralTag::ArrayI32,
-                LiteralValue::ArrayU64(_) => LiteralTag::ArrayU64,
-                LiteralValue::ArrayI64(_) => LiteralTag::ArrayI64,
-                LiteralValue::ArrayF32(_) => LiteralTag::ArrayF32,
-                LiteralValue::ArrayF64(_) => LiteralTag::ArrayF64,
-                LiteralValue::ArrayString(_) => LiteralTag::ArrayString,
-                _ => unreachable!(),
-            };
-            b.literal_array_add_u8(la, tag as u8);
-            b.literal_array_add_u32(la, idx.0);
-        }
-    }
-    Ok(())
 }
 
 fn encode_debug_info(

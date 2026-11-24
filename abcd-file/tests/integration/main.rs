@@ -18,6 +18,7 @@ mod double_finalize;
 mod encode_errors;
 mod encode_shapes;
 mod entity_identity;
+mod estype_nested_literal_arrays;
 mod file_type;
 mod foreign_items;
 mod format_v24;

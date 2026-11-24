@@ -47,10 +47,13 @@ run_corpus() {
         --test lift-taint \
         --release -- --ignored
 
-    # Offline rewrite + opt + inline determinism over all 1,152 candidates (skipping Docker VM compare tests)
+    # Commercial --merge-abc bundle rewrite gate (runs against local modules.abc when present; skips Docker oracle)
+    cargo test -p abcd-rs --test merge-abc --release -- --ignored \
+        --skip merge_abc_docker_oracle
+
+    # Offline rewrite + opt + inline determinism + N53 sendable class (skipping Docker VM compare tests)
     cargo test -p abcd-rs --test lift-lower --release -- --ignored \
         --skip test262_vm \
-        --skip lower_sendable_class \
         --skip n72_args_array \
         --skip n73_segv
 

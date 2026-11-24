@@ -118,9 +118,23 @@ pub fn class_member_attrs(
     lf: &mut Lifter,
     body: &MethodBody,
     id: EntityId,
+    is_sendable: bool,
 ) -> Result<Vec<MemberAttrs>, LiftError> {
     let idx = literal_table_index(lf.file, body, id)?;
-    let values = &lf.file.literal_arrays[idx as usize].values;
+    let raw_values = &lf.file.literal_arrays[idx as usize].values;
+    // Sendable class buffers (`callruntime.definesendableclass`) append a
+    // trailing `lit_offset` (`LiteralValue::LiteralArray` after decode, or
+    // `LiteralValue::LiteralBufferIndex`) pointing to the field-type layout
+    // literal array after the `i32` non-static member count
+    // (`ClassInfoExtractor::BuildSendableClassInfoExtractor`). Strip that
+    // single trailing slot only for sendable classes so `defineclasswithbuffer`
+    // keeps rejecting unexpected nested arrays.
+    let values = match (is_sendable, raw_values.last()) {
+        (true, Some(LiteralValue::LiteralArray(_) | LiteralValue::LiteralBufferIndex(_))) => {
+            &raw_values[..raw_values.len() - 1]
+        }
+        _ => raw_values.as_slice(),
+    };
     let conservative = Vec::new();
     let mut kinds: Vec<FunctionKind> = Vec::new();
     let mut have_name = false;
@@ -165,7 +179,10 @@ pub fn class_member_attrs(
             // The trailing non-static member count (the vendor's "last
             // index" slot). Any other position/shape is ungrounded.
             LiteralValue::Integer(n) if last && !have_name && pending_kind.is_none() => {
-                non_static = Some(*n as usize);
+                let Ok(count) = usize::try_from(*n) else {
+                    return Ok(conservative);
+                };
+                non_static = Some(count);
             }
             _ => return Ok(conservative),
         }
