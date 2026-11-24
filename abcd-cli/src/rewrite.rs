@@ -10,7 +10,7 @@
 //! The whole-file lowering pattern mirrors the corpus pipeline
 //! (tests/lift-lower/rewrite_pipeline.rs): the lifted module is verified
 //! (`abcd_ir::verify_module`), every function is lowered individually, and
-//! the resulting bodies are spliced into a clone of the decoded file —
+//! the resulting bodies are spliced into the decoded file in place —
 //! function `i` is the `i`-th method in `File::classes` iteration order
 //! (the lift's pass-1 reservation order), so a per-method cursor joins the
 //! two tables.
@@ -89,7 +89,7 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     let ctx = || format!("rewrite {} ({})", module.name, module.provenance);
 
     // Stage 1: decode the input bytes.
-    let file = abcd_file::decode(&module.abc)
+    let mut file = abcd_file::decode(&module.abc)
         .map_err(|e| CliError::Tool(format!("{}: decode failed: {e}", ctx())))?;
 
     // Stage 2: lift the whole file to the IR, then verify it (same order
@@ -110,7 +110,7 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     let optimized_changed = opts.optimize && abcd_opt::optimize_module(&mut ir);
 
     // Stage 4: lower every function back to a MethodBody and splice the
-    // bodies into a clone of the decoded file.
+    // bodies into the decoded file in place.
     //
     // `FuncId`s are collected from `ClassData::methods` (never constructed
     // by path) and validated to cover the function table contiguously —
@@ -166,10 +166,20 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
         }
         bodies.push(slot);
     }
+    drop(resolver);
+    drop(ir);
 
-    let mut rebuilt = file.clone();
+    let (methods, input_instructions) = shape(&file);
+    let before_body_tags: Vec<&'static str> = if opts.check {
+        file.all_methods()
+            .map(|(_, m)| body_state(&m.body))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut cursor = bodies.into_iter();
-    for class in rebuilt.classes.values_mut() {
+    for class in file.classes.values_mut() {
         for method in &mut class.methods {
             let body = cursor.next().ok_or_else(|| {
                 CliError::Tool(format!("{}: lowered method-slot count mismatch", ctx()))
@@ -186,11 +196,13 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
     }
     debug_assert!(cursor.next().is_none());
 
-    // Stage 5: encode the rebuilt file.
-    let abc = abcd_file::encode(&rebuilt)
-        .map_err(|e| CliError::Tool(format!("{}: encode failed: {e}", ctx())))?;
+    let unchecked_output_instructions = if opts.check { 0 } else { shape(&file).1 };
 
-    let (methods, input_instructions) = shape(&file);
+    // Stage 5: encode the rewritten file, then drop the in-memory File before
+    // `--check` re-decodes `abc` so two `File` models never coexist in RAM.
+    let abc = abcd_file::encode(&file)
+        .map_err(|e| CliError::Tool(format!("{}: encode failed: {e}", ctx())))?;
+    drop(file);
 
     // Stage 6 (optional): `--check` self-check. `abcd_file::decode` is a
     // full structural decode — header, index regions, and every method
@@ -207,31 +219,30 @@ pub fn rewrite(module: &InputModule, opts: RewriteOptions) -> Result<RewrittenMo
                 ctx()
             ))
         })?;
-        let (out_methods, _) = shape(&checked);
+        let (out_methods, out_instructions) = shape(&checked);
         if out_methods != methods {
             return Err(CliError::Tool(format!(
                 "{}: --check failed: method count changed {methods} -> {out_methods}",
                 ctx()
             )));
         }
-        for ((_, before), (_, after)) in file.all_methods().zip(checked.all_methods()) {
-            match (&before.body, &after.body) {
-                (Some(_), Some(after_body)) if !after_body.bytecodes.is_empty() => {}
-                (None, None) => {}
-                (before_body, after_body) => {
-                    return Err(CliError::Tool(format!(
-                        "{}: --check failed: method body presence changed \
-                         ({} -> {})",
-                        ctx(),
-                        body_state(before_body),
-                        body_state(after_body),
-                    )));
-                }
+        for (before_tag, (_, after)) in before_body_tags.into_iter().zip(checked.all_methods()) {
+            let after_tag = body_state(&after.body);
+            let ok = match before_tag {
+                "no body" => after_tag == "no body",
+                _ => after_tag == "body",
+            };
+            if !ok {
+                return Err(CliError::Tool(format!(
+                    "{}: --check failed: method body presence changed \
+                     ({before_tag} -> {after_tag})",
+                    ctx(),
+                )));
             }
         }
-        shape(&checked).1
+        out_instructions
     } else {
-        shape(&rebuilt).1
+        unchecked_output_instructions
     };
 
     Ok(RewrittenModule {

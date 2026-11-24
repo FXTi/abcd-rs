@@ -45,8 +45,8 @@ mod parse;
 
 pub use parse::{DEFAULT_VERSION, ParseError, parse_file, parse_file_with_version};
 
-use std::collections::BTreeMap;
-use std::io::Write as _;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{self, Write as _};
 
 use abcd_isa::{Bytecode, BytecodeFlags, EntityKind, Operand};
 
@@ -61,11 +61,25 @@ use crate::{LiteralValue, StringId, Version};
 /// (vendored `LAST_CONTAINS_LITERAL_IN_HEADER_VERSION`, file.h:546).
 const LAST_HEADER_LITERAL_VERSION: Version = Version::new(12, 0, 6, 0);
 
+/// Stream the complete pandasm text of `file` to `out`, byte-identical to
+/// upstream `ark_disasm <path> out.pa`. `source_name` is the input file's
+/// basename (upstream `GetFileNameByPath`), printed in the `# source binary:`
+/// header.
+pub fn emit_file_to_writer<W: io::Write>(
+    file: &File,
+    source_name: &str,
+    out: &mut W,
+) -> io::Result<()> {
+    Emitter::new(file).emit_to_writer(source_name, out)
+}
+
 /// Emit the complete pandasm text of `file`, byte-identical to upstream
 /// `ark_disasm <path> out.pa`. `source_name` is the input file's basename
 /// (upstream `GetFileNameByPath`), printed in the `# source binary:` header.
 pub fn emit_file(file: &File, source_name: &str) -> Vec<u8> {
-    Emitter::new(file).emit(source_name)
+    let mut out = Vec::new();
+    let _ = emit_file_to_writer(file, source_name, &mut out);
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +525,7 @@ struct CatchLine {
     catch_end: String,
 }
 
-struct PaFunction {
+struct FnHeader {
     /// Full (class-prefixed, ctor-renamed) name, raw bytes.
     name: Vec<u8>,
     params: Vec<Vec<u8>>,
@@ -523,17 +537,9 @@ struct PaFunction {
     is_external: bool,
     is_ctor: bool,
     is_cctor: bool,
-    /// `(annotation name, element lines)` in file order; elements of a
-    /// repeated name merge into its first entry (upstream `find_if` quirk).
-    annotations: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
-    /// Rendered body: `(label bound before this instruction?, text)`.
-    insns: Vec<(Option<String>, Vec<u8>)>,
-    /// Bare `:` line quirk: a label bound past the last instruction.
-    trailing_empty_label: bool,
-    catches: Vec<CatchLine>,
 }
 
-impl PaFunction {
+impl FnHeader {
     /// `GetFunctionSignatureFromName`: `name:(type,type,…)`.
     fn signature(&self) -> Vec<u8> {
         let mut sig = self.name.clone();
@@ -557,22 +563,54 @@ struct PaRecord {
     fields: Vec<Vec<u8>>,
 }
 
+type LiteralTables<'f> = (BTreeMap<Vec<u8>, u32>, BTreeMap<Vec<u8>, &'f ModuleData>);
+
 struct Emitter<'f> {
     file: &'f File,
     /// STRING section: offset → raw bytes (upstream `string_offset_to_name_`,
     /// a map sorted by offset).
     strings: BTreeMap<u32, Vec<u8>>,
-    /// `_ESModuleRecord`-style u32 field values (module blob offsets), in
-    /// class file order × field order.
-    module_literals: Vec<u32>,
+    /// `_ESModuleRecord`-style u32 field values (module blob offsets).
+    module_literals: HashSet<u32>,
+    /// Pre-indexed `method.offset → (owner_desc, class, method)` (first match
+    /// in class/method iteration order).
+    method_by_offset: HashMap<u32, (StringId, &'f Class, &'f Method)>,
+    /// Pre-indexed `table_idx → source_offset` for `literal_offset_of`.
+    rev_literal_offsets: HashMap<u32, u32>,
+    /// Pre-indexed `md.source_offset → &ModuleData` (first match in
+    /// class/field iteration order).
+    module_data_by_offset: HashMap<u32, &'f ModuleData>,
 }
 
 impl<'f> Emitter<'f> {
     fn new(file: &'f File) -> Self {
+        let mut method_by_offset = HashMap::new();
+        let mut module_data_by_offset = HashMap::new();
+        for (&desc, class) in &file.classes {
+            for m in &class.methods {
+                method_by_offset.entry(m.offset).or_insert((desc, class, m));
+            }
+            for field in &class.fields {
+                if let Some(FieldValue::ModuleData(md)) = &field.initial_value {
+                    module_data_by_offset.entry(md.source_offset).or_insert(md);
+                }
+            }
+        }
+        let mut rev_literal_offsets: HashMap<u32, u32> =
+            HashMap::with_capacity(file.literal_array_offsets.len());
+        for (&off, &idx) in &file.literal_array_offsets {
+            rev_literal_offsets
+                .entry(idx)
+                .and_modify(|existing| *existing = (*existing).min(off))
+                .or_insert(off);
+        }
         Emitter {
             file,
             strings: BTreeMap::new(),
-            module_literals: Vec::new(),
+            module_literals: HashSet::new(),
+            method_by_offset,
+            rev_literal_offsets,
+            module_data_by_offset,
         }
     }
 
@@ -604,12 +642,9 @@ impl<'f> Emitter<'f> {
     /// name + `:(` + param types + `)`. Falls back to the bare entity name
     /// with an empty parameter list when the method is not a decoded class
     /// method (external — no corpus coverage).
-    fn method_signature_by_offset(&mut self, offset: u32) -> Vec<u8> {
-        for (desc, class) in &self.file.classes {
-            if let Some(m) = class.methods.iter().find(|m| m.offset == offset) {
-                let fun = self.build_function(*desc, class, m, false);
-                return fun.signature();
-            }
+    fn method_signature_by_offset(&self, offset: u32) -> Vec<u8> {
+        if let Some(&(desc, class, m)) = self.method_by_offset.get(&offset) {
+            return self.build_fn_header(desc, class, m).signature();
         }
         let mut sig = match self.file.resolve_entity(offset) {
             Some(sid) => self.str_bytes(sid),
@@ -621,75 +656,92 @@ impl<'f> Emitter<'f> {
 
     // -- function construction (upstream GetMethod/AddMethodToTables) -------
 
-    /// Build the pandasm function for one method. `process_body` controls
-    /// whether instructions are rendered and strings registered (upstream
-    /// runs this even for later-dropped duplicate signatures).
-    fn build_function(
-        &mut self,
-        owner_desc: StringId,
-        class: &Class,
-        method: &Method,
-        process_body: bool,
-    ) -> PaFunction {
+    /// Build header metadata and signature components for one method without
+    /// rendering its body.
+    fn build_fn_header(&self, owner_desc: StringId, class: &Class, method: &Method) -> FnHeader {
         let raw_name = self.str_bytes(method.name);
-        let mut fun = PaFunction {
-            name: self.full_method_name(owner_desc, method.name),
-            params: Vec::new(),
-            return_type: "",
+        let is_static = method.is_static();
+        let is_ctor = raw_name == b".ctor";
+        let is_cctor = raw_name == b".cctor";
+        let mut name = self.full_method_name(owner_desc, method.name);
+        let mut params = Vec::new();
+        // GetMetaData: non-static methods gain a leading `this` parameter.
+        if !is_static {
+            params.push(self.class_name(class.descriptor));
+        }
+        if is_ctor {
+            replace_once(&mut name, b".ctor", b"_ctor_");
+        } else if is_cctor {
+            replace_once(&mut name, b".cctor", b"_cctor_");
+        }
+        let return_type = if let Some(body) = &method.body {
+            for _ in 0..body.num_args {
+                params.push(b"any".to_vec());
+            }
+            "any"
+        } else {
+            ""
+        };
+        FnHeader {
+            name,
+            params,
+            return_type,
             language: if method.is_external {
                 SourceLang::EcmaScript // upstream DEFUALT_SOURCE_LANG
             } else {
                 method.source_lang
             },
-            is_static: method.is_static(),
+            is_static,
             is_external: method.is_external,
-            is_ctor: raw_name == b".ctor",
-            is_cctor: raw_name == b".cctor",
-            annotations: Vec::new(),
-            insns: Vec::new(),
-            trailing_empty_label: false,
-            catches: Vec::new(),
-        };
-        // GetMetaData: non-static methods gain a leading `this` parameter.
-        if !fun.is_static {
-            fun.params.push(self.class_name(class.descriptor));
+            is_ctor,
+            is_cctor,
         }
-        if fun.is_ctor {
-            replace_once(&mut fun.name, b".ctor", b"_ctor_");
-        } else if fun.is_cctor {
-            replace_once(&mut fun.name, b".cctor", b"_cctor_");
+    }
+
+    fn register_string_offset(&mut self, off: u32) {
+        if !self.strings.contains_key(&off) {
+            let bytes = self
+                .file
+                .resolve_entity(off)
+                .map(|sid| self.str_bytes(sid))
+                .unwrap_or_else(|| b"!invalid:string".to_vec());
+            self.strings.insert(off, bytes);
         }
-        if let Some(body) = &method.body {
-            fun.return_type = "any";
-            for _ in 0..body.num_args {
-                fun.params.push(b"any".to_vec());
+    }
+
+    fn register_body_strings(&mut self, body: &MethodBody) {
+        for bc in &body.bytecodes {
+            for (kind, id) in bc.entity_operands() {
+                if kind == EntityKind::StringId
+                    && let Some(&off) = body.entity_offsets.get(&(kind, id.0))
+                {
+                    self.register_string_offset(off);
+                }
             }
-            if process_body {
-                self.build_body(&mut fun, body);
-            }
         }
-        fun
     }
 
     /// Method annotations (upstream `GetMethodAnnotations` — the
     /// compile-time `ANNOTATION` tag list), rendered as header blocks.
-    fn build_annotations(&mut self, fun: &mut PaFunction, method: &Method) {
+    fn collect_annotations(&self, method: &Method) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
+        let mut annotations = Vec::new();
         for ann in &method.annotations.compile_time {
-            self.render_annotation(fun, ann);
+            self.render_annotation(&mut annotations, ann);
         }
+        annotations
     }
 
-    fn render_annotation(&mut self, fun: &mut PaFunction, ann: &Annotation) {
+    fn render_annotation(&self, annotations: &mut Vec<(Vec<u8>, Vec<Vec<u8>>)>, ann: &Annotation) {
         let mut name = self.str_bytes(ann.class_descriptor);
         name.pop(); // strip the trailing ';' of the descriptor
         if name.is_empty() {
             return;
         }
-        let idx = match fun.annotations.iter().position(|(n, _)| *n == name) {
+        let idx = match annotations.iter().position(|(n, _)| *n == name) {
             Some(i) => i,
             None => {
-                fun.annotations.push((name, Vec::new()));
-                fun.annotations.len() - 1
+                annotations.push((name, Vec::new()));
+                annotations.len() - 1
             }
         };
         for elem in &ann.elements {
@@ -729,13 +781,18 @@ impl<'f> Emitter<'f> {
                 // UNREACHABLE); skip the rest deterministically.
                 _ => continue,
             };
-            fun.annotations[idx].1.push(line);
+            annotations[idx].1.push(line);
         }
     }
 
     // -- instructions (upstream GetInstructions) ----------------------------
 
-    fn build_body(&mut self, fun: &mut PaFunction, body: &MethodBody) {
+    fn build_body_into(
+        &mut self,
+        body: &MethodBody,
+        insn_buf: &mut Vec<u8>,
+        insn_ranges: &mut Vec<(usize, usize)>,
+    ) -> (BTreeMap<u32, String>, bool, Vec<CatchLine>) {
         let count = body.bytecodes.len() as u32;
         // Label table: instruction index → name. Try/catch labels allocate
         // first (upstream GetExceptions runs before the instruction walk).
@@ -792,29 +849,29 @@ impl<'f> Emitter<'f> {
                 });
             }
         }
-        fun.catches = catches;
 
         // Instruction walk: jump labels allocate as `jump_label_{table len}`.
         // Labels attach AFTER the full walk (upstream AddLabels): a label
         // allocated by a later jump still prints on its target line.
-        let mut texts: Vec<Vec<u8>> = Vec::with_capacity(body.bytecodes.len());
+        insn_buf.clear();
+        insn_ranges.clear();
+        insn_ranges.reserve(body.bytecodes.len());
         for bc in &body.bytecodes {
-            texts.push(self.render_instruction(bc, body, &mut labels));
+            let start = insn_buf.len();
+            self.render_instruction_into(bc, body, &mut labels, insn_buf);
+            insn_ranges.push((start, insn_buf.len()));
         }
-        fun.trailing_empty_label = labels.contains_key(&count);
-        fun.insns = texts
-            .into_iter()
-            .enumerate()
-            .map(|(i, text)| (labels.get(&(i as u32)).cloned(), text))
-            .collect();
+        let trailing_empty_label = labels.contains_key(&count);
+        (labels, trailing_empty_label, catches)
     }
 
-    fn render_instruction(
+    fn render_instruction_into(
         &mut self,
         bc: &Bytecode,
         body: &MethodBody,
         labels: &mut BTreeMap<u32, String>,
-    ) -> Vec<u8> {
+        out: &mut Vec<u8>,
+    ) {
         let operands = bc.operands();
         // Upstream call-arg trimming (CALL-flagged pandasm opcodes) is
         // not needed here: BytecodeFlags::CALL exists in the ISA schema
@@ -822,12 +879,11 @@ impl<'f> Emitter<'f> {
         // abcd-isa/tests/bytecode.rs has_flag_call_not_assigned), so the
         // trim_call_args/method_proto machinery was deleted as dead.
         let float = bc.has_flag(BytecodeFlags::FLOAT);
-        let mut out = bc.mnemonic().as_bytes().to_vec();
+        out.extend_from_slice(bc.mnemonic().as_bytes());
         for (i, op) in operands.iter().enumerate() {
             out.extend_from_slice(if i == 0 { b" " } else { b", " });
-            self.render_operand(bc, float, op, body, labels, &mut out);
+            self.render_operand(bc, float, op, body, labels, out);
         }
-        out
     }
 
     fn render_operand(
@@ -859,9 +915,10 @@ impl<'f> Emitter<'f> {
             Operand::Label(l) => {
                 let count = body.bytecodes.len() as u32;
                 if l < count {
-                    let next = format!("jump_label_{}", labels.len());
-                    let name = labels.entry(l).or_insert(next);
-                    let name = name.clone();
+                    let next_idx = labels.len();
+                    let name = labels
+                        .entry(l)
+                        .or_insert_with(|| format!("jump_label_{next_idx}"));
                     out.extend_from_slice(name.as_bytes());
                 } else {
                     // Upstream: an out-of-bounds jump keeps the raw decimal
@@ -877,14 +934,11 @@ impl<'f> Emitter<'f> {
         let offset = body.entity_offsets.get(&(kind, id)).copied();
         match (kind, offset) {
             (EntityKind::StringId, Some(off)) => {
-                let bytes = self
-                    .file
-                    .resolve_entity(off)
-                    .map(|sid| self.str_bytes(sid))
-                    .unwrap_or_else(|| b"!invalid:string".to_vec());
-                self.strings.entry(off).or_insert_with(|| bytes.clone());
+                self.register_string_offset(off);
                 out.push(b'"');
-                out.extend_from_slice(&bytes);
+                if let Some(bytes) = self.strings.get(&off) {
+                    out.extend_from_slice(bytes);
+                }
                 out.push(b'"');
             }
             (EntityKind::MethodId, Some(off)) => {
@@ -892,8 +946,7 @@ impl<'f> Emitter<'f> {
                 out.extend_from_slice(&sig);
             }
             (EntityKind::LiteralarrayId, Some(off)) => {
-                let text = self.literal_array_by_offset(off);
-                out.extend_from_slice(&text);
+                self.literal_array_by_offset_into(off, out);
             }
             _ => {
                 let _ = write!(out, "!invalid:entity:{kind:?}:{id}");
@@ -901,16 +954,16 @@ impl<'f> Emitter<'f> {
         }
     }
 
-    /// The literal-array operand text (`{ N [ … ]}`) for a source offset.
-    fn literal_array_by_offset(&self, offset: u32) -> Vec<u8> {
+    /// Append the literal-array operand text (`{ N [ … ]}`) for a source offset.
+    fn literal_array_by_offset_into(&self, offset: u32, out: &mut Vec<u8>) {
         match self
             .file
             .literal_array_offsets
             .get(&offset)
             .and_then(|idx| self.file.literal_arrays.get(*idx as usize))
         {
-            Some(array) => self.serialize_literal_array(&array.values),
-            None => b"!invalid:literalarray".to_vec(),
+            Some(array) => self.serialize_literal_array_into(&array.values, out),
+            None => out.extend_from_slice(b"!invalid:literalarray"),
         }
     }
 
@@ -918,24 +971,25 @@ impl<'f> Emitter<'f> {
     /// render as the empty string (the section line keeps its trailing
     /// space). Upstream drops TAGVALUE-tagged items (`FillLiteralData`'s
     /// early return); our `Integer8` is that tag.
-    fn serialize_literal_array(&self, values: &[LiteralValue]) -> Vec<u8> {
+    fn serialize_literal_array_into(&self, values: &[LiteralValue], out: &mut Vec<u8>) {
         // Integer8 is filtered out here (the upstream TAGVALUE drop), so
         // serialize_literal_item has no Integer8 arm — one would be dead.
-        let items: Vec<&LiteralValue> = values
+        let count = values
             .iter()
             .filter(|v| !matches!(v, LiteralValue::Integer8(_)))
-            .collect();
-        if items.is_empty() {
-            return Vec::new();
+            .count();
+        if count == 0 {
+            return;
         }
-        let mut out = b"{ ".to_vec();
-        let _ = write!(out, "{} [ ", items.len());
-        for v in items {
-            self.serialize_literal_item(v, &mut out);
+        let _ = write!(out, "{{ {count} [ ");
+        for v in values
+            .iter()
+            .filter(|v| !matches!(v, LiteralValue::Integer8(_)))
+        {
+            self.serialize_literal_item(v, out);
             out.extend_from_slice(b", ");
         }
         out.extend_from_slice(b"]}");
-        out
     }
 
     fn serialize_literal_item(&self, v: &LiteralValue, out: &mut Vec<u8>) {
@@ -1004,11 +1058,9 @@ impl<'f> Emitter<'f> {
     /// Reverse a decode-rewritten literal-array table index to its source
     /// file offset (identity when the target was never decoded).
     fn literal_offset_of(&self, idx: crate::LiteralArrayIdx) -> u32 {
-        self.file
-            .literal_array_offsets
-            .iter()
-            .find(|(_, i)| **i == idx.0)
-            .map(|(o, _)| *o)
+        self.rev_literal_offsets
+            .get(&idx.0)
+            .copied()
             .unwrap_or(idx.0)
     }
 
@@ -1046,7 +1098,7 @@ impl<'f> Emitter<'f> {
                     && !is_scope_record
                     && name != crate::SCOPE_NAMES_FIELD
                 {
-                    self.module_literals.push(offset);
+                    self.module_literals.insert(offset);
                 }
             }
         }
@@ -1055,9 +1107,9 @@ impl<'f> Emitter<'f> {
     /// The LITERALS section tables: regular literal arrays and module
     /// arrays, both keyed by `"{index} 0x{offset}"` (sorted as strings —
     /// upstream `std::map<std::string, …>`).
-    fn collect_literal_tables(&self) -> (BTreeMap<Vec<u8>, u32>, BTreeMap<Vec<u8>, ModuleData>) {
+    fn collect_literal_tables(&self) -> LiteralTables<'f> {
         let mut regular: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
-        let mut modules: BTreeMap<Vec<u8>, ModuleData> = BTreeMap::new();
+        let mut modules: BTreeMap<Vec<u8>, &'f ModuleData> = BTreeMap::new();
         if self.file.version <= LAST_HEADER_LITERAL_VERSION {
             self.collect_header_literal_tables(&mut regular, &mut modules);
         } else {
@@ -1074,10 +1126,10 @@ impl<'f> Emitter<'f> {
     fn collect_header_literal_tables(
         &self,
         regular: &mut BTreeMap<Vec<u8>, u32>,
-        modules: &mut BTreeMap<Vec<u8>, ModuleData>,
+        modules: &mut BTreeMap<Vec<u8>, &'f ModuleData>,
     ) {
         if !self.file.literal_array_header_offsets.is_empty() {
-            let phase_offsets: std::collections::HashSet<u32> = self
+            let phase_offsets: HashSet<u32> = self
                 .file
                 .classes
                 .values()
@@ -1115,9 +1167,9 @@ impl<'f> Emitter<'f> {
     fn collect_header_literal_tables_fallback(
         &self,
         regular: &mut BTreeMap<Vec<u8>, u32>,
-        modules: &mut BTreeMap<Vec<u8>, ModuleData>,
+        modules: &mut BTreeMap<Vec<u8>, &'f ModuleData>,
     ) {
-        let scope_offsets: std::collections::HashSet<u32> = self
+        let scope_offsets: HashSet<u32> = self
             .file
             .classes
             .values()
@@ -1140,7 +1192,7 @@ impl<'f> Emitter<'f> {
             .iter()
             .map(|(o, i)| (*o, *i))
             .collect();
-        decoded.sort_by_key(|(_, i)| *i);
+        decoded.sort_by_key(|(o, i)| (*i, *o));
         let mut index: u32 = 0;
         for (offset, _) in decoded.iter().filter(|(o, _)| !scope_offsets.contains(o)) {
             regular.insert(format!("{index} 0x{offset:x}").into_bytes(), *offset);
@@ -1150,10 +1202,7 @@ impl<'f> Emitter<'f> {
         for class in self.file.classes.values() {
             for field in &class.fields {
                 if let Some(FieldValue::ModuleData(md)) = &field.initial_value {
-                    modules.insert(
-                        format!("{index} 0x{:x}", md.source_offset).into_bytes(),
-                        md.clone(),
-                    );
+                    modules.insert(format!("{index} 0x{:x}", md.source_offset).into_bytes(), md);
                     index += 1;
                 }
             }
@@ -1172,7 +1221,7 @@ impl<'f> Emitter<'f> {
     fn collect_simulated_literal_tables(
         &self,
         regular: &mut BTreeMap<Vec<u8>, u32>,
-        modules: &mut BTreeMap<Vec<u8>, ModuleData>,
+        modules: &mut BTreeMap<Vec<u8>, &'f ModuleData>,
     ) {
         let mut processed = sim::U32Set::new();
         let mut nest = sim::U32Set::new();
@@ -1248,112 +1297,134 @@ impl<'f> Emitter<'f> {
         }
     }
 
-    fn module_data_at(&self, offset: u32) -> Option<ModuleData> {
-        self.file
-            .classes
-            .values()
-            .flat_map(|c| c.fields.iter())
-            .find_map(|f| match &f.initial_value {
-                Some(FieldValue::ModuleData(md)) if md.source_offset == offset => Some(md.clone()),
-                _ => None,
-            })
+    fn module_data_at(&self, offset: u32) -> Option<&'f ModuleData> {
+        self.module_data_by_offset.get(&offset).copied()
     }
 
     // -- emission -----------------------------------------------------------
 
-    fn emit(mut self, source_name: &str) -> Vec<u8> {
-        let mut out = Vec::new();
-        let _ = write!(out, "# source binary: {source_name}\n\n");
-        out.extend_from_slice(b"# ====================\n# LITERALS\n\n");
+    fn emit_to_writer<W: io::Write>(mut self, source_name: &str, out: &mut W) -> io::Result<()> {
+        write!(out, "# source binary: {source_name}\n\n")?;
+        out.write_all(b"# ====================\n# LITERALS\n\n")?;
 
         self.classify_field_offsets();
 
         // GetRecords runs before GetLiteralArrays upstream and registers
-        // strings during instruction processing; build the program first.
+        // strings during instruction processing (including duplicate-signature
+        // methods that are subsequently dropped from `functions`).
         let mut records: BTreeMap<Vec<u8>, PaRecord> = BTreeMap::new();
-        let mut functions: BTreeMap<Vec<u8>, PaFunction> = BTreeMap::new();
-        self.build_records_and_functions(&mut records, &mut functions);
+        let mut functions: BTreeMap<Vec<u8>, (StringId, &'f Class, &'f Method)> = BTreeMap::new();
+        self.index_records_and_functions(&mut records, &mut functions);
 
+        let mut scratch = Vec::new();
         let (regular, modules) = self.collect_literal_tables();
         for (key, offset) in &regular {
-            out.extend_from_slice(key);
-            out.push(b' ');
+            scratch.clear();
+            scratch.extend_from_slice(key);
+            scratch.push(b' ');
             if let Some(array) = self
                 .file
                 .literal_array_offsets
                 .get(offset)
                 .and_then(|idx| self.file.literal_arrays.get(*idx as usize))
             {
-                out.extend_from_slice(&self.serialize_literal_array(&array.values));
+                self.serialize_literal_array_into(&array.values, &mut scratch);
             }
-            out.push(b'\n');
+            scratch.push(b'\n');
+            out.write_all(&scratch)?;
         }
         for (key, md) in &modules {
-            out.extend_from_slice(key);
-            out.push(b' ');
-            self.serialize_module_array(md, &mut out);
-            out.push(b'\n');
+            scratch.clear();
+            scratch.extend_from_slice(key);
+            scratch.push(b' ');
+            self.serialize_module_array(md, &mut scratch);
+            scratch.push(b'\n');
+            out.write_all(&scratch)?;
         }
-        out.push(b'\n');
+        drop(regular);
+        drop(modules);
+        out.write_all(b"\n")?;
 
-        out.extend_from_slice(b"# ====================\n# RECORDS\n\n");
+        out.write_all(b"# ====================\n# RECORDS\n\n")?;
         for record in records.values() {
-            self.emit_record(record, &mut out);
+            scratch.clear();
+            self.emit_record(record, &mut scratch);
+            if !scratch.is_empty() {
+                out.write_all(&scratch)?;
+            }
         }
+        drop(records);
 
-        out.extend_from_slice(b"# ====================\n# METHODS\n\n");
-        for function in functions.values() {
-            self.emit_function(function, &mut out);
+        out.write_all(b"# ====================\n# METHODS\n\n")?;
+        let mut insn_buf = Vec::new();
+        let mut insn_ranges = Vec::new();
+        for &(desc, class, method) in functions.values() {
+            scratch.clear();
+            self.render_method(
+                desc,
+                class,
+                method,
+                &mut insn_buf,
+                &mut insn_ranges,
+                &mut scratch,
+            );
+            out.write_all(&scratch)?;
         }
+        drop(functions);
+        drop(insn_buf);
+        drop(insn_ranges);
 
-        out.extend_from_slice(b"# ====================\n# STRING\n\n");
+        out.write_all(b"# ====================\n# STRING\n\n")?;
         for (offset, bytes) in &self.strings {
-            let _ = write!(out, "[offset:0x{offset:x}, name_value:");
-            out.extend_from_slice(bytes);
-            out.extend_from_slice(b"]\n");
+            scratch.clear();
+            let _ = write!(scratch, "[offset:0x{offset:x}, name_value:");
+            scratch.extend_from_slice(bytes);
+            scratch.extend_from_slice(b"]\n");
+            out.write_all(&scratch)?;
         }
-        out
+        Ok(())
     }
 
-    fn build_records_and_functions(
+    fn index_records_and_functions(
         &mut self,
         records: &mut BTreeMap<Vec<u8>, PaRecord>,
-        functions: &mut BTreeMap<Vec<u8>, PaFunction>,
+        functions: &mut BTreeMap<Vec<u8>, (StringId, &'f Class, &'f Method)>,
     ) {
-        for (desc, class) in &self.file.classes {
-            let record_name = self.class_name(*desc);
+        for (&desc, class) in &self.file.classes {
+            let record_name = self.class_name(desc);
             // GetRecord processes methods even for duplicate record names;
             // only the record TABLE insert is first-wins.
             if !class.is_external {
                 for method in &class.methods {
-                    let mut fun = self.build_function(*desc, class, method, true);
-                    let sig = fun.signature();
-                    if functions.contains_key(&sig) {
-                        // Duplicate signature: strings already registered,
-                        // the function itself is dropped (upstream emplace).
-                        continue;
+                    if let Some(body) = &method.body {
+                        self.register_body_strings(body);
                     }
-                    self.build_annotations(&mut fun, method);
-                    functions.insert(sig, fun);
+                    let sig = self.build_fn_header(desc, class, method).signature();
+                    functions.entry(sig).or_insert((desc, class, method));
                 }
             }
-            let is_external = class.is_external;
-            let language = if is_external {
-                SourceLang::EcmaScript
-            } else {
-                class.source_lang
-            };
-            let fields = if is_external {
-                Vec::new()
-            } else {
-                self.render_fields(class)
-            };
-            records.entry(record_name.clone()).or_insert(PaRecord {
-                name: record_name,
-                language,
-                is_external,
-                fields,
-            });
+            if !records.contains_key(&record_name) {
+                let is_external = class.is_external;
+                let language = if is_external {
+                    SourceLang::EcmaScript
+                } else {
+                    class.source_lang
+                };
+                let fields = if is_external {
+                    Vec::new()
+                } else {
+                    self.render_fields(class)
+                };
+                records.insert(
+                    record_name.clone(),
+                    PaRecord {
+                        name: record_name,
+                        language,
+                        is_external,
+                        fields,
+                    },
+                );
+            }
         }
     }
 
@@ -1494,8 +1565,17 @@ impl<'f> Emitter<'f> {
         out.extend_from_slice(b"}\n\n");
     }
 
-    fn emit_function(&self, fun: &PaFunction, out: &mut Vec<u8>) {
-        for (name, elements) in &fun.annotations {
+    fn render_method(
+        &mut self,
+        owner_desc: StringId,
+        class: &Class,
+        method: &Method,
+        insn_buf: &mut Vec<u8>,
+        insn_ranges: &mut Vec<(usize, usize)>,
+        out: &mut Vec<u8>,
+    ) {
+        let annotations = self.collect_annotations(method);
+        for (name, elements) in &annotations {
             out.extend_from_slice(name);
             out.extend_from_slice(b":\n");
             if !elements.is_empty() {
@@ -1508,11 +1588,12 @@ impl<'f> Emitter<'f> {
                 out.push(b'\n');
             }
         }
-        let _ = writeln!(out, ".language {}", language_str(fun.language));
-        let _ = write!(out, ".function {} ", fun.return_type);
-        out.extend_from_slice(&fun.name);
+        let hdr = self.build_fn_header(owner_desc, class, method);
+        let _ = writeln!(out, ".language {}", language_str(hdr.language));
+        let _ = write!(out, ".function {} ", hdr.return_type);
+        out.extend_from_slice(&hdr.name);
         out.push(b'(');
-        for (i, p) in fun.params.iter().enumerate() {
+        for (i, p) in hdr.params.iter().enumerate() {
             if i > 0 {
                 out.extend_from_slice(b", ");
             }
@@ -1524,16 +1605,16 @@ impl<'f> Emitter<'f> {
         // unordered_set order for multi-attribute sets is pinned by no
         // corpus fixture, so insertion order is used.
         let mut attrs: Vec<&str> = Vec::new();
-        if fun.is_static {
+        if hdr.is_static {
             attrs.push("static");
         }
-        if fun.is_external {
+        if hdr.is_external {
             attrs.push("external");
         }
-        if fun.is_ctor {
+        if hdr.is_ctor {
             attrs.push("ctor");
         }
-        if fun.is_cctor {
+        if hdr.is_cctor {
             attrs.push("cctor");
         }
         if !attrs.is_empty() {
@@ -1542,37 +1623,41 @@ impl<'f> Emitter<'f> {
             out.push(b'>');
         }
         out.extend_from_slice(b" {\n");
-        for (label, insn) in &fun.insns {
-            if let Some(label) = label {
-                out.extend_from_slice(label.as_bytes());
+        if let Some(body) = &method.body {
+            let (labels, trailing_empty_label, catches) =
+                self.build_body_into(body, insn_buf, insn_ranges);
+            for (i, &(start, end)) in insn_ranges.iter().enumerate() {
+                if let Some(label) = labels.get(&(i as u32)) {
+                    out.extend_from_slice(label.as_bytes());
+                    out.extend_from_slice(b":\n");
+                }
+                out.push(b'\t');
+                out.extend_from_slice(&insn_buf[start..end]);
+                out.push(b'\n');
+            }
+            if trailing_empty_label {
                 out.extend_from_slice(b":\n");
             }
-            out.push(b'\t');
-            out.extend_from_slice(insn);
-            out.push(b'\n');
-        }
-        if fun.trailing_empty_label {
-            out.extend_from_slice(b":\n");
-        }
-        if !fun.catches.is_empty() {
-            out.push(b'\n');
-            for catch in &fun.catches {
-                if catch.exception_record.is_empty() {
-                    out.extend_from_slice(b".catchall ");
-                } else {
-                    out.extend_from_slice(b".catch ");
-                    out.extend_from_slice(&catch.exception_record);
-                    out.extend_from_slice(b", ");
-                }
-                let _ = write!(
-                    out,
-                    "{}, {}, {}",
-                    catch.try_begin, catch.try_end, catch.catch_begin
-                );
-                if !catch.catch_end.is_empty() {
-                    let _ = write!(out, ", {}", catch.catch_end);
-                }
+            if !catches.is_empty() {
                 out.push(b'\n');
+                for catch in &catches {
+                    if catch.exception_record.is_empty() {
+                        out.extend_from_slice(b".catchall ");
+                    } else {
+                        out.extend_from_slice(b".catch ");
+                        out.extend_from_slice(&catch.exception_record);
+                        out.extend_from_slice(b", ");
+                    }
+                    let _ = write!(
+                        out,
+                        "{}, {}, {}",
+                        catch.try_begin, catch.try_end, catch.catch_begin
+                    );
+                    if !catch.catch_end.is_empty() {
+                        let _ = write!(out, ", {}", catch.catch_end);
+                    }
+                    out.push(b'\n');
+                }
             }
         }
         out.extend_from_slice(b"}\n\n");
@@ -2108,5 +2193,69 @@ mod tests {
         let out = emit_file(&file, "t.abc");
         let text = String::from_utf8_lossy(&out);
         assert!(!text.contains(".catchall"), "{text}");
+    }
+
+    #[test]
+    fn duplicate_signature_still_registers_string_operands_and_streams_identically() {
+        let mut file = file_at(DEFAULT_VERSION);
+        let s1 = file.strings.get_or_intern("kept_str");
+        let s2 = file.strings.get_or_intern("dropped_dup_str");
+        file.entity_map.insert(0x200, s1);
+        file.entity_map.insert(0x300, s2);
+
+        let mut e1 = HashMap::new();
+        e1.insert((EntityKind::StringId, 0), 0x200);
+        let b1 = MethodBody {
+            entity_offsets: e1,
+            ..body_of(vec![
+                abcd_isa::insn::LdaStr::new(abcd_isa::EntityId(0)),
+                abcd_isa::insn::Returnundefined::new(),
+            ])
+        };
+        let mut e2 = HashMap::new();
+        e2.insert((EntityKind::StringId, 0), 0x300);
+        let b2 = MethodBody {
+            entity_offsets: e2,
+            ..body_of(vec![
+                abcd_isa::insn::LdaStr::new(abcd_isa::EntityId(0)),
+                abcd_isa::insn::Returnundefined::new(),
+            ])
+        };
+        let m1 = bare_method(&mut file, "dup", 0x100, Some(b1));
+        let m2 = bare_method(&mut file, "dup", 0x104, Some(b2));
+        add_class(&mut file, "L_GLOBAL;", vec![m1, m2], vec![]);
+
+        let expected = emit_file(&file, "dup.abc");
+        let mut streamed = Vec::new();
+        emit_file_to_writer(&file, "dup.abc", &mut streamed).expect("stream to vec");
+        assert_eq!(streamed, expected);
+
+        let text = String::from_utf8_lossy(&expected);
+        assert!(
+            text.contains("[offset:0x200, name_value:kept_str]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[offset:0x300, name_value:dropped_dup_str]\n"),
+            "duplicate-signature method must still register its string operands: {text}"
+        );
+        assert!(text.contains("\tlda.str \"kept_str\"\n"), "{text}");
+        assert!(
+            !text.contains("\tlda.str \"dropped_dup_str\"\n"),
+            "second duplicate-signature method body must not emit: {text}"
+        );
+
+        struct FailingWriter;
+        impl io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = emit_file_to_writer(&file, "dup.abc", &mut FailingWriter)
+            .expect_err("broken writer must propagate io::Error");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 }

@@ -56,7 +56,7 @@ mod model;
 pub use model::*;
 
 mod decode;
-pub use decode::decode;
+pub use decode::{FileSummary, VerifySummary, decode, inspect_summary, inspect_summary_zeropadded};
 // V-I1 vendor-name pins: compared against the vendor's own constants by
 // tests/file-sys-file/main.rs (via the bridge's abc_vendor_* exports) or
 // behaviorally pinned in tests/module_record_fields.rs.

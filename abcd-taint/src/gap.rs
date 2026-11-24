@@ -121,41 +121,44 @@ pub fn resolve_callback_funcs(
         .collect()
 }
 
-/// The def-chain worker (cycle-guarded).
+/// The iterative def-chain worker (cycle-guarded, zero call-stack recursion).
 fn trace_value(
     module: &Module,
     value: ValueId,
     visiting: &mut HashSet<ValueId>,
     funcs: &mut BTreeSet<FuncId>,
 ) {
-    if !visiting.insert(value) {
-        return;
-    }
-    let Some(v) = module.value(value) else {
-        return;
-    };
-    let ValueDef::Inst(iid) = v.def else {
-        return;
-    };
-    match module.inst(iid).map(|i| &i.op) {
-        Some(Op::Mov { src }) => trace_value(module, *src, visiting, funcs),
-        Some(Op::Phi { entries }) => {
-            for (_, incoming) in entries {
-                trace_value(module, *incoming, visiting, funcs);
+    let mut stack = vec![value];
+    while let Some(cur) = stack.pop() {
+        if !visiting.insert(cur) {
+            continue;
+        }
+        let Some(v) = module.value(cur) else {
+            continue;
+        };
+        let ValueDef::Inst(iid) = v.def else {
+            continue;
+        };
+        match module.inst(iid).map(|i| &i.op) {
+            Some(Op::Mov { src }) => stack.push(*src),
+            Some(Op::Phi { entries }) => {
+                for (_, incoming) in entries.iter().rev() {
+                    stack.push(*incoming);
+                }
             }
-        }
-        Some(Op::DefineFunc { body, .. }) => {
-            funcs.insert(*body);
-        }
-        Some(Op::AllocClosure { func }) | Some(Op::CreateGenerator { func }) => {
-            trace_value(module, *func, visiting, funcs)
-        }
-        Some(Op::LoadConst(c)) => {
-            if let Some(Const::MethodRef(f)) = module.consts.get(*c) {
-                funcs.insert(*f);
+            Some(Op::DefineFunc { body, .. }) => {
+                funcs.insert(*body);
             }
+            Some(Op::AllocClosure { func }) | Some(Op::CreateGenerator { func }) => {
+                stack.push(*func);
+            }
+            Some(Op::LoadConst(c)) => {
+                if let Some(Const::MethodRef(f)) = module.consts.get(*c) {
+                    funcs.insert(*f);
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
 }
 
@@ -172,26 +175,6 @@ fn trace_value(
 /// params, call results — and MethodRef constants, which ARE callable)
 /// answers false.
 pub fn definitely_not_callable(module: &Module, value: ValueId) -> bool {
-    fn walk(module: &Module, value: ValueId, visiting: &mut HashSet<ValueId>) -> bool {
-        if !visiting.insert(value) {
-            return true; // a cycle carries no callable leaf
-        }
-        let Some(v) = module.value(value) else {
-            return false;
-        };
-        match v.def {
-            ValueDef::Const(c) => const_not_callable(module, c),
-            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => false,
-            ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
-                Some(Op::Mov { src }) => walk(module, *src, visiting),
-                Some(Op::Phi { entries }) => entries
-                    .iter()
-                    .all(|(_, incoming)| walk(module, *incoming, visiting)),
-                Some(Op::LoadConst(c)) => const_not_callable(module, *c),
-                _ => false,
-            },
-        }
-    }
     fn const_not_callable(module: &Module, c: abcd_ir::ConstId) -> bool {
         matches!(
             module.consts.get(c),
@@ -206,7 +189,39 @@ pub fn definitely_not_callable(module: &Module, value: ValueId) -> bool {
             )
         )
     }
-    walk(module, value, &mut HashSet::new())
+    let mut visiting = HashSet::new();
+    let mut stack = vec![value];
+    while let Some(cur) = stack.pop() {
+        if !visiting.insert(cur) {
+            continue; // a cycle carries no callable leaf
+        }
+        let Some(v) = module.value(cur) else {
+            return false;
+        };
+        match v.def {
+            ValueDef::Const(c) => {
+                if !const_not_callable(module, c) {
+                    return false;
+                }
+            }
+            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => return false,
+            ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
+                Some(Op::Mov { src }) => stack.push(*src),
+                Some(Op::Phi { entries }) => {
+                    for (_, incoming) in entries.iter().rev() {
+                        stack.push(*incoming);
+                    }
+                }
+                Some(Op::LoadConst(c)) => {
+                    if !const_not_callable(module, *c) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            },
+        }
+    }
+    true
 }
 
 /// The solver-facing call-graph oracle with the gap edges merged in

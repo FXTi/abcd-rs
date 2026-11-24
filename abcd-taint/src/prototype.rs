@@ -101,8 +101,10 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use abcd_ir::{Const, InstId, Module, Op, Sym, ValueDef, ValueId};
+use abcd_analysis::module_link::ModuleLinkTable;
+use abcd_ir::{Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
 
+use crate::names::{ClassPropStores, callee_name_candidates, callee_name_candidates_indexed};
 use crate::oracle::Oracle;
 
 /// A prototype family — the receiver-type approximation unit. The
@@ -193,6 +195,17 @@ pub struct PrototypeResolver<'o, 'm> {
     module: &'m Module,
     oracle: &'o Oracle<'m>,
     memo: &'o RefCell<HashMap<ValueId, FamilyAnswer>>,
+    links: Option<&'o ModuleLinkTable>,
+    prop_stores: Option<&'o ClassPropStores>,
+    global_stores: Option<&'o HashMap<Sym, Vec<ValueId>>>,
+}
+
+enum ProtoStep {
+    StartCompute { value: ValueId, at: InstId },
+    FinishCompute,
+    FinishGetIterator,
+    FinishPromiseChain,
+    Walk(ValueId),
 }
 
 impl<'o, 'm> PrototypeResolver<'o, 'm> {
@@ -207,6 +220,29 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
             module,
             oracle,
             memo,
+            links: None,
+            prop_stores: None,
+            global_stores: None,
+        }
+    }
+
+    /// Build a resolver wired with precomputed module linkage and store indexes
+    /// so `call_return_family` and `global_store_families` run in `O(1)` per hop.
+    pub(crate) fn with_indexes(
+        module: &'m Module,
+        oracle: &'o Oracle<'m>,
+        memo: &'o RefCell<HashMap<ValueId, FamilyAnswer>>,
+        links: &'o ModuleLinkTable,
+        prop_stores: &'o ClassPropStores,
+        global_stores: &'o HashMap<Sym, Vec<ValueId>>,
+    ) -> Self {
+        PrototypeResolver {
+            module,
+            oracle,
+            memo,
+            links: Some(links),
+            prop_stores: Some(prop_stores),
+            global_stores: Some(global_stores),
         }
     }
 
@@ -215,156 +251,188 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
         if let Some(a) = self.memo.borrow().get(&value) {
             return a.clone();
         }
-        let mut visiting = HashSet::new();
-        let ans = self.compute(value, at, &mut visiting);
+        let ans = self.compute_iterative(value, at);
         self.memo.borrow_mut().insert(value, ans.clone());
         ans
     }
 
-    /// The unmemoized answer; `visiting` is shared across the whole
-    /// recursive walk so phi back-edge cycles terminate (marked
-    /// imprecise).
-    fn compute(&self, value: ValueId, at: InstId, visiting: &mut HashSet<ValueId>) -> FamilyAnswer {
-        let mut ans = FamilyAnswer {
-            families: BTreeSet::new(),
-            precise: true,
-        };
-        // 1. Site kinds, rung-aware (the engine's interprocedural
-        //    answer when it is precise, else the local walk).
-        let info = self.oracle.site_info_at(value, at);
-        for site in info.sites.iter() {
-            if let Some(f) = self.module.inst(site).and_then(|i| family_of_alloc(&i.op)) {
-                ans.families.insert(f);
-            }
-        }
-        if info.has_unknown {
-            ans.precise = false;
-        }
-        // 1b. The MAY-direction arm: the engine's
-        //    resolution-complete fan-out answers (unbalanced — a param
-        //    receiver whose callers are all recorded in the call graph)
-        //    type receivers for the ADDITIVE prototype path, exactly the
-        //    consumer discipline of `CallGraph::refine_with_points_to`
-        //    (callee resolution accepts the same answers). Sites the
-        //    precise arm already reported contribute nothing new;
-        //    anything beyond them marks the answer imprecise.
-        for site in self.oracle.may_sites_at(value, at).iter() {
-            if info.sites.iter().any(|s| s == site) {
-                continue;
-            }
-            if let Some(f) = self.module.inst(site).and_then(|i| family_of_alloc(&i.op)) {
-                ans.families.insert(f);
-                ans.precise = false;
-            }
-        }
-        // 2. The def-chain walk for the non-site sources (constants,
-        //    global-store provenance, GetIterator).
-        self.walk(value, visiting, &mut ans);
-        if ans.families.is_empty() {
-            ans.precise = false;
-        }
-        ans
-    }
+    /// Iterative explicit-stack answer computation; `visiting` is shared across
+    /// the whole walk so phi back-edge cycles terminate (marked imprecise) with
+    /// zero call-stack recursion.
+    fn compute_iterative(&self, root_value: ValueId, root_at: InstId) -> FamilyAnswer {
+        let mut visiting = HashSet::new();
+        let mut ans_stack: Vec<FamilyAnswer> = Vec::new();
+        let mut steps: Vec<ProtoStep> = vec![ProtoStep::StartCompute {
+            value: root_value,
+            at: root_at,
+        }];
 
-    /// The def-chain walk for the families `site_info_at` cannot
-    /// carry: constants, global stores, iterator protocol objects.
-    /// `Mov`/`Phi` pass through; keyed allocs insert their kind
-    /// directly (values reached through a NESTED hop never pass the
-    /// site walk above); everything else marks the answer imprecise
-    /// without inventing a family.
-    fn walk(&self, value: ValueId, visiting: &mut HashSet<ValueId>, ans: &mut FamilyAnswer) {
-        if !visiting.insert(value) {
-            ans.precise = false;
-            return;
-        }
-        let Some(v) = self.module.value(value) else {
-            ans.precise = false;
-            return;
-        };
-        match v.def {
-            ValueDef::Const(c) => {
-                if let Some(f) = self.module.consts.get(c).and_then(family_of_const) {
-                    ans.families.insert(f);
-                }
-            }
-            ValueDef::Param(_) | ValueDef::ExceptionParam(_) => {
-                ans.precise = false;
-            }
-            ValueDef::Inst(iid) => match self.module.inst(iid).map(|i| &i.op) {
-                Some(Op::Mov { src }) => self.walk(*src, visiting, ans),
-                Some(Op::Phi { entries }) => {
-                    for (_, incoming) in entries {
-                        self.walk(*incoming, visiting, ans);
+        while let Some(step) = steps.pop() {
+            match step {
+                ProtoStep::StartCompute { value, at } => {
+                    let mut ans = FamilyAnswer {
+                        families: BTreeSet::new(),
+                        precise: true,
+                    };
+                    // 1. Site kinds, rung-aware (the engine's interprocedural
+                    //    answer when it is precise, else the local walk).
+                    let info = self.oracle.site_info_at(value, at);
+                    for site in info.sites.iter() {
+                        if let Some(f) = self.module.inst(site).and_then(|i| family_of_alloc(&i.op))
+                        {
+                            ans.families.insert(f);
+                        }
                     }
-                }
-                Some(Op::LoadConst(c)) => {
-                    if let Some(f) = self.module.consts.get(*c).and_then(family_of_const) {
-                        ans.families.insert(f);
-                    }
-                }
-                Some(Op::GetIterator { obj }) => {
-                    // The iterator protocol object of a BUILTIN
-                    // iterable only: a user object with a custom
-                    // @@iterator (family Object) or an unknown source
-                    // types nothing. The shared `visiting` set guards
-                    // phi back-edge cycles.
-                    let src = self.compute(*obj, iid, visiting);
-                    if !src.families.is_empty()
-                        && src
-                            .families
-                            .iter()
-                            .all(|f| matches!(f, ProtoFamily::Array | ProtoFamily::Str))
-                    {
-                        ans.families.insert(ProtoFamily::Iterator);
-                    } else {
+                    if info.has_unknown {
                         ans.precise = false;
                     }
+                    // 1b. The MAY-direction arm: resolution-complete fan-out answers.
+                    for site in self.oracle.may_sites_at(value, at).iter() {
+                        if info.sites.iter().any(|s| s == site) {
+                            continue;
+                        }
+                        if let Some(f) = self.module.inst(site).and_then(|i| family_of_alloc(&i.op))
+                        {
+                            ans.families.insert(f);
+                            ans.precise = false;
+                        }
+                    }
+                    ans_stack.push(ans);
+                    steps.push(ProtoStep::FinishCompute);
+                    steps.push(ProtoStep::Walk(value));
                 }
-                Some(Op::TryGetGlobal { name, .. }) => {
-                    self.global_store_families(*name, visiting, ans);
-                }
-                Some(Op::Call {
-                    kind: abcd_ir::CallKind::New,
-                    callee,
-                    ..
-                }) => {
-                    // `new <builtin ctor>(...)` — constructor-result
-                    // arm (module docs §5): es2abc lowers regexp
-                    // literals to `new RegExp(...)`, so this is the arm
-                    // that types the corpus' `r.test` receivers.
-                    self.constructor_family(*callee, visiting, ans);
-                }
-                Some(Op::Call { callee, args, .. }) => {
-                    self.call_return_family(*callee, args, iid, visiting, ans);
-                }
-                Some(op) if family_of_alloc(op).is_some() => {
-                    // Insert directly: values reached through a NESTED
-                    // hop (global-store provenance, GetIterator's
-                    // iterable) never pass through the site walk
-                    // above, which runs only on the top-level
-                    // receiver (idempotent for direct receivers).
-                    if let Some(f) = family_of_alloc(op) {
-                        ans.families.insert(f);
+                ProtoStep::FinishCompute => {
+                    if let Some(top) = ans_stack.last_mut()
+                        && top.families.is_empty()
+                    {
+                        top.precise = false;
                     }
                 }
-                Some(_) => {
-                    ans.precise = false;
+                ProtoStep::FinishGetIterator => {
+                    let src = ans_stack.pop().unwrap_or_default();
+                    if let Some(parent) = ans_stack.last_mut() {
+                        if !src.families.is_empty()
+                            && src
+                                .families
+                                .iter()
+                                .all(|f| matches!(f, ProtoFamily::Array | ProtoFamily::Str))
+                        {
+                            parent.families.insert(ProtoFamily::Iterator);
+                        } else {
+                            parent.precise = false;
+                        }
+                    }
                 }
-                None => {
-                    ans.precise = false;
+                ProtoStep::FinishPromiseChain => {
+                    let recv = ans_stack.pop().unwrap_or_default();
+                    if let Some(parent) = ans_stack.last_mut()
+                        && recv.families.contains(&ProtoFamily::Promise)
+                    {
+                        parent.families.insert(ProtoFamily::Promise);
+                    }
                 }
-            },
+                ProtoStep::Walk(value) => {
+                    if !visiting.insert(value) {
+                        if let Some(top) = ans_stack.last_mut() {
+                            top.precise = false;
+                        }
+                        continue;
+                    }
+                    let Some(v) = self.module.value(value) else {
+                        if let Some(top) = ans_stack.last_mut() {
+                            top.precise = false;
+                        }
+                        continue;
+                    };
+                    match v.def {
+                        ValueDef::Const(c) => {
+                            if let Some(f) = self.module.consts.get(c).and_then(family_of_const)
+                                && let Some(top) = ans_stack.last_mut()
+                            {
+                                top.families.insert(f);
+                            }
+                        }
+                        ValueDef::Param(_) | ValueDef::ExceptionParam(_) => {
+                            if let Some(top) = ans_stack.last_mut() {
+                                top.precise = false;
+                            }
+                        }
+                        ValueDef::Inst(iid) => match self.module.inst(iid).map(|i| &i.op) {
+                            Some(Op::Mov { src }) => steps.push(ProtoStep::Walk(*src)),
+                            Some(Op::Phi { entries }) => {
+                                for (_, incoming) in entries.iter().rev() {
+                                    steps.push(ProtoStep::Walk(*incoming));
+                                }
+                            }
+                            Some(Op::LoadConst(c)) => {
+                                if let Some(f) =
+                                    self.module.consts.get(*c).and_then(family_of_const)
+                                    && let Some(top) = ans_stack.last_mut()
+                                {
+                                    top.families.insert(f);
+                                }
+                            }
+                            Some(Op::GetIterator { obj }) => {
+                                steps.push(ProtoStep::FinishGetIterator);
+                                steps.push(ProtoStep::StartCompute {
+                                    value: *obj,
+                                    at: iid,
+                                });
+                            }
+                            Some(Op::TryGetGlobal { name, .. }) => {
+                                if let Some(top) = ans_stack.last_mut() {
+                                    top.precise = false;
+                                }
+                                let stored = self.global_stored_values(*name);
+                                for sv in stored.into_iter().rev() {
+                                    steps.push(ProtoStep::Walk(sv));
+                                }
+                            }
+                            Some(Op::Call {
+                                kind: abcd_ir::CallKind::New,
+                                callee,
+                                ..
+                            }) => {
+                                if let Some(top) = ans_stack.last_mut() {
+                                    self.constructor_family(*callee, &mut visiting, top);
+                                }
+                            }
+                            Some(Op::Call { callee, args, .. }) => {
+                                if let Some(chain_recv) =
+                                    self.call_return_family(*callee, args, iid, &mut ans_stack)
+                                {
+                                    steps.push(ProtoStep::FinishPromiseChain);
+                                    steps.push(ProtoStep::StartCompute {
+                                        value: chain_recv.0,
+                                        at: chain_recv.1,
+                                    });
+                                }
+                            }
+                            Some(op) if family_of_alloc(op).is_some() => {
+                                if let Some(f) = family_of_alloc(op)
+                                    && let Some(top) = ans_stack.last_mut()
+                                {
+                                    top.families.insert(f);
+                                }
+                            }
+                            Some(_) | None => {
+                                if let Some(top) = ans_stack.last_mut() {
+                                    top.precise = false;
+                                }
+                            }
+                        },
+                    }
+                }
+            }
         }
+
+        ans_stack.pop().unwrap_or_default()
     }
 
     /// Constructor-result arm: `callee` of a `kind: New` call
     /// is walked through `Mov`/`Phi` to a `TryGetGlobal(name)` leaf; a
     /// KNOWN builtin constructor name types the constructed value with
-    /// the matching family. Imprecise by construction (the constructor
-    /// binding is a mutable global — a shadowed `RegExp` defeats it;
-    /// the same may-direction discipline as global-store provenance).
-    /// Anything else (user class, computed callee, unknown name)
-    /// contributes no family.
+    /// the matching family.
     fn constructor_family(
         &self,
         callee: ValueId,
@@ -372,61 +440,79 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
         ans: &mut FamilyAnswer,
     ) {
         ans.precise = false;
-        let Some(v) = self.module.value(callee) else {
-            return;
-        };
-        let ValueDef::Inst(iid) = v.def else {
-            return;
-        };
-        match self.module.inst(iid).map(|i| &i.op) {
-            Some(Op::Mov { src }) => self.constructor_family(*src, visiting, ans),
-            Some(Op::Phi { entries }) => {
-                for (_, incoming) in entries {
-                    if visiting.insert(*incoming) {
-                        self.constructor_family(*incoming, visiting, ans);
+        let mut stack = vec![callee];
+        let mut mov_seen = HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !mov_seen.insert(cur) {
+                continue;
+            }
+            let Some(v) = self.module.value(cur) else {
+                continue;
+            };
+            let ValueDef::Inst(iid) = v.def else {
+                continue;
+            };
+            match self.module.inst(iid).map(|i| &i.op) {
+                Some(Op::Mov { src }) => stack.push(*src),
+                Some(Op::Phi { entries }) => {
+                    let mut next = Vec::new();
+                    for (_, incoming) in entries {
+                        if visiting.insert(*incoming) {
+                            next.push(*incoming);
+                        }
+                    }
+                    for inc in next.into_iter().rev() {
+                        stack.push(inc);
                     }
                 }
-            }
-            Some(Op::TryGetGlobal { name, .. }) => {
-                let family = match self.module.sym.resolve(*name) {
-                    Some("Array") => Some(ProtoFamily::Array),
-                    Some("Object") => Some(ProtoFamily::Object),
-                    Some("RegExp") => Some(ProtoFamily::RegExp),
-                    Some("String") => Some(ProtoFamily::Str),
-                    Some("Number") => Some(ProtoFamily::Num),
-                    Some("Boolean") => Some(ProtoFamily::Bool),
-                    Some("Promise") => Some(ProtoFamily::Promise),
-                    _ => None,
-                };
-                if let Some(f) = family {
-                    ans.families.insert(f);
+                Some(Op::TryGetGlobal { name, .. }) => {
+                    let family = match self.module.sym.resolve(*name) {
+                        Some("Array") => Some(ProtoFamily::Array),
+                        Some("Object") => Some(ProtoFamily::Object),
+                        Some("RegExp") => Some(ProtoFamily::RegExp),
+                        Some("String") => Some(ProtoFamily::Str),
+                        Some("Number") => Some(ProtoFamily::Num),
+                        Some("Boolean") => Some(ProtoFamily::Bool),
+                        Some("Promise") => Some(ProtoFamily::Promise),
+                        _ => None,
+                    };
+                    if let Some(f) = family {
+                        ans.families.insert(f);
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
     /// Infer `ProtoFamily::Promise` for `Promise.resolve`/`all`/`race`,
     /// chained `.then`/`.catch`/`.finally`, calls to `async` functions, and
     /// Promise-returning `@ohos.*` / `@kit.*` calls (when not passed a
-    /// trailing `(err, data)` callback).
+    /// trailing `(err, data)` callback). Returns `Some((recv_obj, load_inst))`
+    /// when a chained `.then`/`.catch`/`.finally` receiver needs to be computed.
     fn call_return_family(
         &self,
         callee: ValueId,
         args: &[ValueId],
         at: InstId,
-        visiting: &mut HashSet<ValueId>,
-        ans: &mut FamilyAnswer,
-    ) {
+        ans_stack: &mut [FamilyAnswer],
+    ) -> Option<(ValueId, InstId)> {
+        let ans = ans_stack.last_mut()?;
         ans.precise = false;
-        let cands = crate::names::callee_name_candidates(self.module, callee);
+        let cands = match self.links {
+            Some(links) => {
+                let caller = links.inst_func(self.module, at).unwrap_or(FuncId::new(0));
+                callee_name_candidates_indexed(self.module, links, self.prop_stores, caller, callee)
+            }
+            None => callee_name_candidates(self.module, callee),
+        };
         for c in &cands {
             if matches!(
                 c.as_str(),
                 "Promise.resolve" | "Promise.reject" | "Promise.all" | "Promise.race"
             ) {
                 ans.families.insert(ProtoFamily::Promise);
-                return;
+                return None;
             }
             // `@ohos.*` / `@kit.*` async calls return a Promise unless called in
             // synchronous (`*Sync`) or trailing-callback form.
@@ -441,7 +527,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                 });
                 if !has_cb_arg {
                     ans.families.insert(ProtoFamily::Promise);
-                    return;
+                    return None;
                 }
             }
         }
@@ -453,10 +539,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                         self.module.sym.resolve(*name),
                         Some("then" | "catch" | "finally")
                     ) {
-                        let recv = self.compute(*object, ciid, visiting);
-                        if recv.families.contains(&ProtoFamily::Promise) {
-                            ans.families.insert(ProtoFamily::Promise);
-                        }
+                        return Some((*object, ciid));
                     }
                 }
                 Some(Op::DefineFunc { body, .. }) => {
@@ -498,25 +581,26 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                 _ => {}
             }
         }
+        None
     }
 
-    /// Global-store provenance: union the families of every value the
-    /// module stores into `name` (flow-insensitive — the fact model's
-    /// `Global`-base discipline). No stores (host-provided global) or
-    /// any untypable store = imprecise; the answer NEVER gets a
-    /// precise flag through a global hop (cross-script mutation).
-    fn global_store_families(
-        &self,
-        name: Sym,
-        visiting: &mut HashSet<ValueId>,
-        ans: &mut FamilyAnswer,
-    ) {
-        ans.precise = false;
+    /// Global-store provenance values for `name` (flow-insensitive — uses the
+    /// precomputed map when available, otherwise scans `self.module` once).
+    fn global_stored_values(&self, name: Sym) -> Vec<ValueId> {
+        if let Some(gs) = self.global_stores {
+            return gs.get(&name).cloned().unwrap_or_default();
+        }
         let mut stored: Vec<ValueId> = Vec::new();
         for f in &self.module.functions {
             for &b in &f.blocks {
-                for &iid in &self.module.blocks[b.index()].insts {
-                    match &self.module.insts[iid.index()].op {
+                let Some(bb) = self.module.block(b) else {
+                    continue;
+                };
+                for &iid in &bb.insts {
+                    let Some(inst) = self.module.inst(iid) else {
+                        continue;
+                    };
+                    match &inst.op {
                         Op::StoreGlobal { name: n, value }
                         | Op::StoreGlobalRecord { name: n, value, .. }
                         | Op::TryStoreGlobal { name: n, value }
@@ -529,8 +613,6 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                 }
             }
         }
-        for value in stored {
-            self.walk(value, visiting, ans);
-        }
+        stored
     }
 }

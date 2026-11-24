@@ -6,16 +6,18 @@
 //! sequences). Valid Unicode strings — including embedded `U+0000`, astral
 //! planes, and BMP Private Use Area code points (`U+E000..=U+F8FF`, used
 //! heavily for HarmonyOS IconFont / SymbolGlyph icons) — are stored as native
-//! UTF-8 `Box<str>` entries (`as_str` returns `Some(&str)`).
+//! UTF-8 `Arc<str>` entries (`as_str` returns `Some(&str)`), sharing a single
+//! heap allocation between the index table and the deduplication map.
 //!
 //! Strings that contain lone surrogates (or ill-formed byte sequences) have
 //! no lossless UTF-8 `str` representation; they are stored in a separate
-//! byte-keyed bucket carrying BOTH their exact MUTF-8 wire bytes and their
-//! replacement-character (`U+FFFD`) display string, with zero sentinel
-//! mangling in `str` space.
+//! byte-keyed bucket carrying BOTH their exact MUTF-8 wire bytes (`Arc<[u8]>`,
+//! shared with the lookup map) and their replacement-character (`U+FFFD`)
+//! display string, with zero sentinel mangling in `str` space.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Handle to an interned entry in [`StringPool`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -37,20 +39,21 @@ impl StringId {
 
 #[derive(Clone, Debug)]
 enum PoolEntry {
-    /// Lossless valid UTF-8 string.
-    Utf8(Box<str>),
+    /// Lossless valid UTF-8 string (shared with `utf8_to_id`).
+    Utf8(Arc<str>),
     /// MUTF-8 byte sequence with no lossless UTF-8 `str` form (e.g. ECMAScript
-    /// lone surrogates). Deduplicated by exact `raw` wire bytes; `lossy` holds
-    /// the clean `U+FFFD`-substituted display text (never sentinel-mangled).
-    RawMutf8 { raw: Box<[u8]>, lossy: Box<str> },
+    /// lone surrogates). Deduplicated by exact `raw` wire bytes (`Arc<[u8]>`
+    /// shared with `raw_to_id`); `lossy` holds the clean `U+FFFD`-substituted
+    /// display text (never sentinel-mangled).
+    RawMutf8 { raw: Arc<[u8]>, lossy: Arc<str> },
 }
 
 /// Append-only, deduplicating MUTF-8 / UTF-8 string pool.
 #[derive(Clone, Debug, Default)]
 pub struct StringPool {
     entries: Vec<PoolEntry>,
-    utf8_to_id: HashMap<Box<str>, StringId>,
-    raw_to_id: HashMap<Box<[u8]>, StringId>,
+    utf8_to_id: HashMap<Arc<str>, StringId>,
+    raw_to_id: HashMap<Arc<[u8]>, StringId>,
 }
 
 impl StringPool {
@@ -66,9 +69,9 @@ impl StringPool {
             return id;
         }
         let id = StringId(self.entries.len() as u32);
-        let boxed: Box<str> = s.into();
-        self.entries.push(PoolEntry::Utf8(boxed.clone()));
-        self.utf8_to_id.insert(boxed, id);
+        let shared: Arc<str> = Arc::from(s);
+        self.entries.push(PoolEntry::Utf8(Arc::clone(&shared)));
+        self.utf8_to_id.insert(shared, id);
         id
     }
 
@@ -94,12 +97,12 @@ impl StringPool {
             return id;
         }
         let id = StringId(self.entries.len() as u32);
-        let raw_box: Box<[u8]> = raw.into();
+        let raw_shared: Arc<[u8]> = Arc::from(raw);
         self.entries.push(PoolEntry::RawMutf8 {
-            raw: raw_box.clone(),
-            lossy: lossy.into(),
+            raw: Arc::clone(&raw_shared),
+            lossy: Arc::from(lossy),
         });
-        self.raw_to_id.insert(raw_box, id);
+        self.raw_to_id.insert(raw_shared, id);
         id
     }
 
@@ -394,5 +397,29 @@ mod tests {
         assert_eq!(pool.lossy_count(), 0);
         assert_eq!(pool.as_str(id), Some("\0\u{1F600}"));
         assert_eq!(pool.to_mutf8_bytes(id).as_deref(), Some(&cesu[..]));
+    }
+
+    #[test]
+    fn pool_shares_single_arc_allocation_between_entries_and_lookup_maps() {
+        let mut pool = StringPool::new();
+        let id_utf8 = pool.get_or_intern("shared_utf8_entry");
+        let raw_surrogate = [0xED, 0xA0, 0xB4];
+        let id_raw = pool.intern_mutf8(&raw_surrogate);
+
+        let entry_str = pool.as_str(id_utf8).unwrap();
+        let (map_key_str, _) = pool.utf8_to_id.get_key_value("shared_utf8_entry").unwrap();
+        assert!(
+            std::ptr::eq(entry_str, &**map_key_str),
+            "UTF-8 entry and lookup map key must share one backing allocation"
+        );
+        assert_eq!(Arc::strong_count(map_key_str), 2);
+
+        let entry_raw = pool.raw_mutf8(id_raw).unwrap();
+        let (map_key_raw, _) = pool.raw_to_id.get_key_value(&raw_surrogate[..]).unwrap();
+        assert!(
+            std::ptr::eq(entry_raw, &**map_key_raw),
+            "raw MUTF-8 entry and lookup map key must share one backing allocation"
+        );
+        assert_eq!(Arc::strong_count(map_key_raw), 2);
     }
 }

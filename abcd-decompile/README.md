@@ -27,8 +27,8 @@ Format-independent SSA IR → JavaScript / TypeScript / ArkTS decompiler ([`desi
 
 ### Stage C — Emission & Presentation Modes (`src/emit/`, `src/split.rs`, `src/arkui.rs`)
 
-- **Precedence-exact JS/TS printing (`src/emit/`)**: emits module imports/exports, classes, closures, statements, and optional TypeScript signature annotations from format metadata (`EmitOptions::ts` / `--ts`).
-- **Multi-module `--merge-abc` split (`src/split.rs`, `--split-modules`)**: partitions owning record classes into safe POSIX relative paths, isolates per-record ES module slots, extracts `jsonFileContent` `.json` assets, and rewrites `@bundle:` / `@package:` / `@normalized:` OHMUrls into relative imports.
+- **Precedence-exact JS/TS printing (`src/emit/`)**: emits module imports/exports, classes, closures, statements, and optional TypeScript signature annotations from format metadata (`EmitOptions::ts` / `--ts`), both buffered (`decompile_module`) and streaming (`decompile_module_to_writer`) in bounded parallel batches.
+- **Multi-module `--merge-abc` split (`src/split.rs`, `--split-modules`)**: partitions owning record classes into safe POSIX relative paths, isolates per-record ES module slots, extracts `jsonFileContent` `.json` assets, and rewrites `@bundle:` / `@package:` / `@normalized:` OHMUrls into relative imports, both buffered (`decompile_module_split`) and streaming (`decompile_module_split_each`).
 - **OpenHarmony ArkUI sugar (`src/arkui.rs`, `--arkui`)**: reconstructs `@Entry` / `@CustomDialog` / `@Component struct` declarations, state decorators (`@State`, `@Prop`, `@Link`, `@ObjectLink`, `@Provide`, `@Consume`, `@Storage*`, `@LocalStorage*`), and `build()` / `@Builder` UI trees from lowered `ViewPU` classes.
 
 ## Module Map

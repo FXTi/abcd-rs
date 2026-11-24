@@ -190,14 +190,15 @@ fn run_dis(args: &DisArgs) -> Result<(), CliError> {
     let module = modules
         .first()
         .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
-    let pa = dis::disassemble(module)?;
     match &args.output {
         Some(path) => {
-            std::fs::write(path, &pa)
-                .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
-            println!("{}: {} bytes -> {}", module.name, pa.len(), path.display());
+            let size = dis::disassemble_to_path(module, path)?;
+            println!("{}: {size} bytes -> {}", module.name, path.display());
         }
-        None => dis::print_raw(&pa)?,
+        None => {
+            let stdout = std::io::stdout();
+            dis::disassemble_to_writer(module, stdout.lock())?;
+        }
     }
     Ok(())
 }
@@ -214,11 +215,29 @@ fn run_extract(args: &ExtractArgs) -> Result<(), CliError> {
 
 fn run_info(args: &InfoArgs) -> Result<(), CliError> {
     let selection = selection_of(&args.select.module, args.select.all);
-    let modules = input::load(&args.input, selection)?;
-    let reports: Vec<info::InfoReport> = modules
-        .iter()
-        .map(|m| info::report(m, args.verify))
-        .collect::<Result<_, _>>()?;
+    let source_name = args.input.display().to_string();
+    let padded = input::read_padded_file(&args.input)?;
+    let logical = &padded[..padded.len() - 16];
+    let reports: Vec<info::InfoReport> = if !input::is_container(logical) {
+        let stem = input::file_stem(&source_name);
+        if let ModuleSelection::Named(want) = selection
+            && want != stem
+        {
+            return Err(CliError::User(format!(
+                "{source_name} has no module named {want:?}; available modules: {stem}"
+            )));
+        }
+        let report = info::report_zeropadded(&stem, &source_name, &padded, args.verify)?;
+        drop(padded);
+        vec![report]
+    } else {
+        let modules = input::load_bytes(logical, &source_name, selection)?;
+        drop(padded);
+        modules
+            .iter()
+            .map(|m| info::report(m, args.verify))
+            .collect::<Result<_, _>>()?
+    };
     println!("{}", info::render(&reports, args.json)?);
     Ok(())
 }
@@ -288,14 +307,15 @@ fn run_decompile(args: &DecompileArgs) -> Result<(), CliError> {
     let module = modules
         .first()
         .ok_or_else(|| CliError::Tool("no module loaded".to_string()))?;
-    let js = decompile::decompile(module, opts)?.text;
     match &args.output {
         Some(path) => {
-            std::fs::write(path, &js)
-                .map_err(|e| CliError::Tool(format!("cannot write {}: {e}", path.display())))?;
-            println!("{}: {} bytes -> {}", module.name, js.len(), path.display());
+            let size = decompile::decompile_to_path(module, opts, path)?;
+            println!("{}: {size} bytes -> {}", module.name, path.display());
         }
-        None => print!("{js}"),
+        None => {
+            let stdout = std::io::stdout();
+            decompile::decompile_to_writer(module, opts, stdout.lock())?;
+        }
     }
     Ok(())
 }

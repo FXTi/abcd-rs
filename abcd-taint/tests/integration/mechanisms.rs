@@ -3046,3 +3046,525 @@ fn assign_result_carries_source_taint() {
         "the assign summary applied"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Algorithmic scaling & IFDS explosion regressions (Issue #33)
+// ────────────────────────────────────────────────────────────────────
+
+/// Multi-hundred-instruction chain regression: dead intermediate SSA
+/// temporaries (`v_i` defined at instruction `i` and consumed only at
+/// `i + 1`) must be pruned by backward SSA local liveness so `path_edges`
+/// scales linearly `O(L)` rather than quadratically `O(L^2)`, including
+/// across `native_identity = true` unknown calls and wildcard `Heap(empty)`
+/// property-load amplification.
+#[test]
+fn liveness_pruning_scales_linearly_on_long_chains() {
+    let build_chain = |steps: usize| {
+        let mut m = mk_module();
+        let f = add_func_named(&mut m, "func_main_0");
+        let entry = entry_of(&m, f);
+        add_param(&mut m, f, 0);
+        let p = add_param(&mut m, f, 1);
+
+        // Also seed a wildcard `Heap(empty).[item]` fact (unknown base store)
+        // so every property load in the chain generates a fresh tainted local.
+        let unk = try_get_global(&mut m, entry, "unknownContainer");
+        let item_sym = intern(&mut m, "item");
+        emit_void(
+            &mut m,
+            entry,
+            Op::StoreProp {
+                object: unk,
+                name: item_sym,
+                value: p,
+            },
+        );
+
+        let one = load_number(&mut m, entry, 1.0);
+        let helper_fn = try_get_global(&mut m, entry, "nativeTransform");
+        let mut cur = try_get_global(&mut m, entry, "SEED");
+        for i in 0..steps {
+            cur = if i % 3 == 0 {
+                add(&mut m, entry, cur, one)
+            } else if i % 3 == 1 {
+                emit(
+                    &mut m,
+                    entry,
+                    Op::Call {
+                        callee: helper_fn,
+                        this: None,
+                        args: vec![cur],
+                        kind: CallKind::Dynamic,
+                    },
+                )
+            } else {
+                emit(
+                    &mut m,
+                    entry,
+                    Op::LoadProp {
+                        object: cur,
+                        name: item_sym,
+                    },
+                )
+            };
+        }
+        print_call(&mut m, entry, vec![cur]);
+        emit_void(&mut m, entry, Op::Return { value: None });
+        m
+    };
+
+    let cfg = TaintConfig {
+        sources: vec![
+            SourceSpec::FunctionParams {
+                name: "func_main_0".to_owned(),
+                params: None,
+            },
+            SourceSpec::GlobalLoad {
+                name: "SEED".to_owned(),
+            },
+        ],
+        sinks: vec![SinkSpec::Call {
+            name: "print".to_owned(),
+        }],
+        alias_rung: 0,
+        ..TaintConfig::default()
+    };
+
+    let rep_250 = abcd_taint::run_taint(&build_chain(250), &cfg);
+    let rep_500 = abcd_taint::run_taint(&build_chain(500), &cfg);
+
+    assert!(
+        !rep_250.hits.is_empty() && !rep_500.hits.is_empty(),
+        "taint reaches the final sink across all 500 steps"
+    );
+    assert!(
+        !rep_500.hits[0].path.is_empty(),
+        "witness path reconstruction remains intact"
+    );
+    // Without liveness pruning, 500 chained temporaries generate >125,000
+    // path edges and quadruple (~4.0x) when doubling from 250 to 500.
+    // With liveness pruning, total edges stay O(L) (< 6,000 at L=500) and
+    // doubling L scales by ~2.0x.
+    assert!(
+        rep_500.path_edges < 6_000,
+        "expected O(L) path_edges (< 6,000), got {} (250-step had {})",
+        rep_500.path_edges,
+        rep_250.path_edges
+    );
+    assert!(
+        rep_500.path_edges * 10 <= rep_250.path_edges * 22,
+        "expected near-2x linear scaling from L=250 ({}) to L=500 ({})",
+        rep_250.path_edges,
+        rep_500.path_edges
+    );
+}
+
+/// IFDS `0 -> d` unconditional source generators (`GlobalLoad`,
+/// `ModuleImport`, `CallReturn`) must fire ONLY on `Fact::Zero`, never
+/// cross-multiplying unrelated incoming procedure-entry taint facts.
+#[test]
+fn ifds_zero_sources_do_not_cross_multiply_incoming_facts() {
+    use abcd_ir::module::{EsModule, ImportDecl, Modifiers, ModuleRequest};
+    use abcd_ir::op::ModuleVarKind;
+
+    let mut m = mk_module();
+    let s_dev = m.sym.intern("@ohos.deviceInfo");
+    let s_odid = m.sym.intern("ODID");
+    m.classes[0].es_module = Some(EsModule {
+        imports: vec![ImportDecl::Regular {
+            local_name: s_odid,
+            import_name: s_odid,
+            module_request: s_dev,
+        }],
+        exports: Vec::new(),
+        module_requests: vec![ModuleRequest {
+            specifier: s_dev,
+            lazy: false,
+        }],
+    });
+
+    // Callee entered with 6 distinct tainted parameters from `func_main_0`,
+    // while also containing GlobalLoad, ModuleImport, and CallReturn sources.
+    let worker = add_func_named(&mut m, "worker");
+    m.func_mut(worker).unwrap().modifiers = Modifiers::STATIC;
+    let (g_src, m_src, c_src);
+    {
+        let wb = entry_of(&m, worker);
+        for i in 0..9 {
+            add_param(&mut m, worker, i);
+        }
+        g_src = try_get_global(&mut m, wb, "HOST_SECRET");
+        m_src = emit(
+            &mut m,
+            wb,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::External,
+            },
+        );
+        let api = try_get_global(&mut m, wb, "readClipboard");
+        c_src = emit(
+            &mut m,
+            wb,
+            Op::Call {
+                callee: api,
+                this: None,
+                args: Vec::new(),
+                kind: CallKind::Dynamic,
+            },
+        );
+        print_call(&mut m, wb, vec![g_src]);
+        print_call(&mut m, wb, vec![m_src]);
+        print_call(&mut m, wb, vec![c_src]);
+        emit_void(&mut m, wb, Op::Return { value: None });
+    }
+
+    let main_fn = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&m, main_fn);
+    add_param(&mut m, main_fn, 0);
+    let mut call_args = Vec::new();
+    for i in 1..=6 {
+        call_args.push(add_param(&mut m, main_fn, i));
+    }
+    let wref = load_method_ref(&mut m, entry, worker);
+    push_inst(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: wref,
+            this: None,
+            args: call_args,
+            kind: CallKind::Direct,
+        },
+    );
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let cfg = TaintConfig {
+        sources: vec![
+            SourceSpec::FunctionParams {
+                name: "func_main_0".to_owned(),
+                params: None,
+            },
+            SourceSpec::GlobalLoad {
+                name: "HOST_SECRET".to_owned(),
+            },
+            SourceSpec::ModuleImport {
+                specifier: "@ohos.deviceInfo".to_owned(),
+                import_name: None,
+            },
+            SourceSpec::CallReturn {
+                name: "readClipboard".to_owned(),
+            },
+        ],
+        sinks: vec![SinkSpec::Call {
+            name: "print".to_owned(),
+        }],
+        ..TaintConfig::default()
+    };
+
+    let (report, result) = run_taint_full(&m, &cfg);
+    assert_eq!(report.hits.len(), 3, "all three 0->d sources reach print");
+    for src_val in [g_src, m_src, c_src] {
+        let anchors: Vec<&Fact> = result
+            .path_edges()
+            .iter()
+            .filter(|e| e.target_fact == Fact::of(TaintFact::local(src_val)))
+            .map(|e| &e.source_fact)
+            .collect();
+        assert!(
+            !anchors.is_empty(),
+            "expected path edges for generated source {src_val:?}"
+        );
+        assert!(
+            anchors.iter().all(|a| matches!(a, Fact::Zero)),
+            "0->d source {src_val:?} must only anchor to Fact::Zero, got {anchors:?}"
+        );
+    }
+}
+
+/// Soundness guard for all four implicit SSA local-use channels during
+/// liveness pruning:
+/// 1. `call_base_value` at `Op::Call` (`this: None`, receiver only on earlier `LoadProp`),
+/// 2. `await_resume` (`AwaitUncaught` -> dead gap -> `ResumeGenerator`),
+/// 3. `ctor_this` at `Op::Return { value: None }` inside `FunctionKind::Constructor`,
+/// 4. Rung-2 interprocedural alias evidence (`site_info_at(v)` non-empty when Rung-0 sites empty).
+#[test]
+fn liveness_preserves_implicit_uses_and_interprocedural_aliases() {
+    use abcd_ir::module::{FunctionKind, Modifiers};
+
+    let mut m = mk_module();
+
+    // (3) Constructor storing `this.secret = arg` then running dead instructions before `return;`.
+    let ctor = add_func_named(&mut m, "BoxCtor");
+    {
+        let fd = m.func_mut(ctor).unwrap();
+        fd.kind = FunctionKind::Constructor;
+        fd.modifiers = Modifiers::STATIC;
+        let cb = entry_of(&m, ctor);
+        add_param(&mut m, ctor, 0);
+        add_param(&mut m, ctor, 1);
+        let this_v = add_param(&mut m, ctor, 2);
+        let arg_v = add_param(&mut m, ctor, 3);
+        let sec = intern(&mut m, "secret");
+        emit_void(
+            &mut m,
+            cb,
+            Op::StoreProp {
+                object: this_v,
+                name: sec,
+                value: arg_v,
+            },
+        );
+        let _dead1 = load_number(&mut m, cb, 1.0);
+        let _dead2 = load_number(&mut m, cb, 2.0);
+        emit_void(&mut m, cb, Op::Return { value: None });
+    }
+
+    // (4) Factory + identity helper for Rung-2 interprocedural local alias evidence.
+    let mk_obj = add_func_named(&mut m, "mkObj");
+    m.func_mut(mk_obj).unwrap().modifiers = Modifiers::STATIC;
+    {
+        let mb = entry_of(&m, mk_obj);
+        for i in 0..3 {
+            add_param(&mut m, mk_obj, i);
+        }
+        let o = alloc_object(&mut m, mb);
+        emit_void(&mut m, mb, Op::Return { value: Some(o) });
+    }
+    let id_fn = add_func_named(&mut m, "idObj");
+    m.func_mut(id_fn).unwrap().modifiers = Modifiers::STATIC;
+    {
+        let ib = entry_of(&m, id_fn);
+        for i in 0..3 {
+            add_param(&mut m, id_fn, i);
+        }
+        let x = add_param(&mut m, id_fn, 3);
+        emit_void(&mut m, ib, Op::Return { value: Some(x) });
+    }
+
+    let f = add_func_named(&mut m, "func_main_0");
+    let entry = entry_of(&m, f);
+    add_param(&mut m, f, 0);
+    let p = add_param(&mut m, f, 1);
+    let p_assign = add_param(&mut m, f, 2);
+
+    // (1) `call_base_value`: `recv` is a `Call` result (`site_info_at` empty),
+    // `callee = recv.send`, followed by dead ops where `recv` is never mentioned
+    // again, then `callee()` (`this: None`) whose summary reads `Endpoint::Base`.
+    let get_recv = try_get_global(&mut m, entry, "makeTaintedRecv");
+    let recv = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: get_recv,
+            this: None,
+            args: vec![p],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let send_sym = intern(&mut m, "send");
+    let send_callee = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: recv,
+            name: send_sym,
+        },
+    );
+    let _pad_a = load_number(&mut m, entry, 10.0);
+    let _pad_b = load_number(&mut m, entry, 20.0);
+    let base_res = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: send_callee,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::Dynamic,
+        },
+    );
+    print_call(&mut m, entry, vec![base_res]);
+
+    // (2) `await_resume`: `awaited` is an instruction temporary, unused across
+    // intervening ops until `ResumeGenerator(gen_obj)`.
+    let gen_obj = emit(&mut m, entry, Op::AsyncFunctionEnter);
+    let awaited = add(&mut m, entry, p, _pad_a);
+    let _ = emit(
+        &mut m,
+        entry,
+        Op::AwaitUncaught {
+            funcobj: gen_obj,
+            value: awaited,
+        },
+    );
+    let _pad_c = load_number(&mut m, entry, 30.0);
+    let _pad_d = load_number(&mut m, entry, 40.0);
+    let resumed = emit(&mut m, entry, Op::ResumeGenerator { genobj: gen_obj });
+    print_call(&mut m, entry, vec![resumed]);
+
+    // (3) Invoke `new BoxCtor(p)` and read `.secret`.
+    let ctor_ref = load_method_ref(&mut m, entry, ctor);
+    let inst = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: ctor_ref,
+            this: None,
+            args: vec![p],
+            kind: CallKind::New,
+        },
+    );
+    let sec = intern(&mut m, "secret");
+    let ctor_read = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: inst,
+            name: sec,
+        },
+    );
+    print_call(&mut m, entry, vec![ctor_read]);
+
+    // (4) Rung-2 interprocedural alias: `box1 = mkObj(); box2 = idObj(box1);`
+    // `Object.assign(box1, p)` taints `Local(box1)` (empty fields); `box1` has NO
+    // further uses, while `box2.secret` reads through `local_alias_evidence`.
+    let mk_ref = load_method_ref(&mut m, entry, mk_obj);
+    let box1 = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: mk_ref,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::Direct,
+        },
+    );
+    let id_ref = load_method_ref(&mut m, entry, id_fn);
+    let box2 = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: id_ref,
+            this: None,
+            args: vec![box1],
+            kind: CallKind::Direct,
+        },
+    );
+    let obj_glob = try_get_global(&mut m, entry, "Object");
+    let assign_sym = intern(&mut m, "assign");
+    let assign_fn = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: obj_glob,
+            name: assign_sym,
+        },
+    );
+    let _ = emit(
+        &mut m,
+        entry,
+        Op::Call {
+            callee: assign_fn,
+            this: None,
+            args: vec![box1, p_assign],
+            kind: CallKind::Dynamic,
+        },
+    );
+    let _pad_e = load_number(&mut m, entry, 50.0);
+    let _pad_f = load_number(&mut m, entry, 60.0);
+    let alias_read = emit(
+        &mut m,
+        entry,
+        Op::LoadProp {
+            object: box2,
+            name: sec,
+        },
+    );
+    print_call(&mut m, entry, vec![alias_read]);
+    emit_void(&mut m, entry, Op::Return { value: None });
+
+    let mut cfg = builtin_config();
+    cfg.extra_summaries.push((
+        "makeTaintedRecv.send".to_owned(),
+        Some(0),
+        Summary::new("base -> return").flow(Endpoint::Base, Endpoint::Return),
+    ));
+    let report = abcd_taint::run_taint(&m, &cfg);
+    for expected in [base_res, resumed, ctor_read, alias_read] {
+        assert!(
+            report
+                .hits
+                .iter()
+                .any(|h| h.fact.local_base() == Some(expected)),
+            "missing expected hit for {expected:?}: {:?}",
+            report.hits
+        );
+    }
+}
+
+/// 256 KiB small-stack regression (`AGENTS.md` §3.1): deep `Mov` / `LoadProp`
+/// chains must complete without call-stack overflow across name resolution,
+/// prototype resolution, liveness analysis, and IFDS taint solving.
+#[test]
+fn small_stack_256k_deep_def_chains_no_overflow() {
+    let handle = std::thread::Builder::new()
+        .name("taint-256k".to_owned())
+        .stack_size(256 * 1024)
+        .spawn(|| {
+            let mut m = mk_module();
+            let f = add_func_named(&mut m, "func_main_0");
+            let entry = entry_of(&m, f);
+            add_param(&mut m, f, 0);
+            let p = add_param(&mut m, f, 1);
+
+            let arr = alloc_array(&mut m, entry);
+            let mut recv = arr;
+            for _ in 0..2_500 {
+                recv = emit(&mut m, entry, Op::Mov { src: recv });
+            }
+            let push_sym = intern(&mut m, "push");
+            let mut callee = emit(
+                &mut m,
+                entry,
+                Op::LoadProp {
+                    object: recv,
+                    name: push_sym,
+                },
+            );
+            for _ in 0..2_500 {
+                callee = emit(&mut m, entry, Op::Mov { src: callee });
+            }
+            let _ = emit(
+                &mut m,
+                entry,
+                Op::Call {
+                    callee,
+                    this: None,
+                    args: vec![p],
+                    kind: CallKind::Dynamic,
+                },
+            );
+            let pop_val = method_call(&mut m, entry, arr, "pop", Vec::new());
+            print_call(&mut m, entry, vec![pop_val]);
+            emit_void(&mut m, entry, Op::Return { value: None });
+
+            let cands = abcd_taint::names::callee_name_candidates(&m, callee);
+            assert!(cands.is_empty());
+
+            let cfg = TaintConfig {
+                alias_rung: 0,
+                ..builtin_config()
+            };
+            let report = abcd_taint::run_taint(&m, &cfg);
+            assert!(
+                report
+                    .hits
+                    .iter()
+                    .any(|h| h.fact.local_base() == Some(pop_val)),
+                "deep mov/loadprop chain preserved array push->pop taint: {:?}",
+                report.hits
+            );
+        })
+        .expect("spawn 256k thread");
+    handle.join().expect("256k thread must not overflow stack");
+}

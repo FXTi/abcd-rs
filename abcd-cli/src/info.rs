@@ -1,13 +1,12 @@
 //! `abcd info` — readelf-style summary of an .abc file.
 //!
-//! The report shows exactly what the decoded [`abcd_file::File`] model
-//! carries — nothing is invented. `--verify` is a full eager decode: abcd-
-//! file's decoder already walks every method body and decodes each bytecode
-//! instruction (a bad instruction is a hard decode error), so a successful
-//! decode IS the verification; the flag makes the verdict explicit and
-//! binds it to the process exit code (0 pass, 2 fail).
+//! The report shows header metadata and entity counts matching the decoded
+//! [`abcd_file::File`] model via [`abcd_file::inspect_summary`] — nothing is
+//! invented. `--verify` streams debug-info extraction and every method body's
+//! bytecode instruction and try-block verification, making the verdict
+//! explicit and binding it to the process exit code (0 pass, 2 fail).
 
-use abcd_file::FileType;
+use abcd_file::{FileSummary, FileType, VerifySummary};
 use serde::Serialize;
 
 use crate::CliError;
@@ -74,62 +73,88 @@ pub struct VerifyReport {
     pub verdict: &'static str,
 }
 
-/// Decode one module and build its report. With `verify`, the decode
-/// failure that would already be a tool error is additionally reported as
-/// the verification verdict by the caller (exit code 2 either way).
+/// Inspect one module and build its report. With `verify`, full streaming
+/// bytecode and debug-info verification runs and any failure is reported as a
+/// tool error (exit code 2 either way).
 pub fn report(module: &InputModule, verify: bool) -> Result<InfoReport, CliError> {
-    let file = abcd_file::decode(&module.abc).map_err(|e| {
+    let summary: FileSummary = abcd_file::inspect_summary(&module.abc, verify).map_err(|e| {
         CliError::Tool(format!(
             "failed to decode {} ({}): {e}",
             module.name, module.provenance
         ))
     })?;
+    Ok(build_report(
+        &module.name,
+        &module.provenance,
+        module.abc.len(),
+        summary,
+    ))
+}
 
-    let methods: Vec<_> = file.all_methods().collect();
-    let methods_with_body = methods.iter().filter(|(_, m)| m.body.is_some()).count();
-    let debug_infos = methods.iter().filter(|(_, m)| m.debug.is_some()).count();
+/// Zero-copy twin of [`report`] over an `.abc` buffer whose trailing 16 bytes
+/// are `[0u8; 16]` (`logical_len = padded_abc.len() - 16`), delegating to
+/// [`abcd_file::inspect_summary_zeropadded`].
+pub fn report_zeropadded(
+    name: &str,
+    provenance: &str,
+    padded_abc: &[u8],
+    verify: bool,
+) -> Result<InfoReport, CliError> {
+    let summary: FileSummary = abcd_file::inspect_summary_zeropadded(padded_abc, verify)
+        .map_err(|e| CliError::Tool(format!("failed to decode {name} ({provenance}): {e}")))?;
+    Ok(build_report(
+        name,
+        provenance,
+        padded_abc.len().saturating_sub(16),
+        summary,
+    ))
+}
 
-    let verify_report = verify.then(|| {
-        let instructions_decoded = methods
-            .iter()
-            .filter_map(|(_, m)| m.body.as_ref())
-            .map(|b| b.bytecodes.len())
-            .sum();
-        VerifyReport {
-            methods_checked: methods_with_body,
+fn build_report(
+    name: &str,
+    provenance: &str,
+    input_bytes: usize,
+    summary: FileSummary,
+) -> InfoReport {
+    let verify_report = summary.verify.map(
+        |VerifySummary {
+             methods_checked,
+             instructions_decoded,
+         }| VerifyReport {
+            methods_checked,
             instructions_decoded,
             verdict: "ok",
-        }
-    });
+        },
+    );
 
-    let file_type = match file.file_type {
+    let file_type = match summary.file_type {
         FileType::Static => "static",
         FileType::Dynamic => "dynamic",
         FileType::Invalid => "invalid",
     };
 
-    Ok(InfoReport {
-        module: module.name.clone(),
-        provenance: module.provenance.clone(),
-        input_bytes: module.abc.len(),
-        format_version: file.version.to_string(),
+    InfoReport {
+        module: name.to_string(),
+        provenance: provenance.to_string(),
+        input_bytes,
+        format_version: summary.version.to_string(),
         file_type: file_type.to_string(),
-        checksum: file.checksum,
-        header_size: file.size,
+        checksum: summary.checksum,
+        header_size: summary.size,
         counts: Counts {
-            strings: file.strings.len(),
-            classes: file.classes.len(),
-            external_classes: file.classes.values().filter(|c| c.is_external).count(),
-            methods: methods.len(),
-            methods_with_body,
-            fields: file.classes.values().map(|c| c.fields.len()).sum(),
-            literal_arrays: file.literal_arrays.len(),
-            entity_index_entries: file.entity_map.len(),
-            debug_infos,
-            lossy_strings: file.strings.lossy_count(),
+            strings: summary.strings,
+            classes: summary.classes,
+            external_classes: summary.external_classes,
+            methods: summary.methods,
+            methods_with_body: summary.methods_with_body,
+            fields: summary.fields,
+            literal_arrays: summary.literal_arrays,
+            entity_index_entries: summary.entity_index_entries,
+            debug_infos: summary.debug_infos,
+            lossy_strings: summary.lossy_strings,
         },
         verify: verify_report,
-    })
+    }
 }
 
 /// Human-readable rendering of one report (goes to stdout).

@@ -178,18 +178,20 @@ pub fn resolve_config(
 
 /// Decode, lift, and run the taint analysis over one module.
 pub fn report(module: &InputModule, config: &TaintConfig) -> Result<TaintCliReport, CliError> {
-    let file = abcd_file::decode(&module.abc).map_err(|e| {
-        CliError::Tool(format!(
-            "failed to decode {} ({}): {e}",
-            module.name, module.provenance
-        ))
-    })?;
-    let ir = abcd_lift::lift_file(&file).map_err(|e| {
-        CliError::Tool(format!(
-            "failed to lift {} ({}): {e}",
-            module.name, module.provenance
-        ))
-    })?;
+    let ir = {
+        let file = abcd_file::decode(&module.abc).map_err(|e| {
+            CliError::Tool(format!(
+                "failed to decode {} ({}): {e}",
+                module.name, module.provenance
+            ))
+        })?;
+        abcd_lift::lift_file(&file).map_err(|e| {
+            CliError::Tool(format!(
+                "failed to lift {} ({}): {e}",
+                module.name, module.provenance
+            ))
+        })?
+    };
     let mut run_cfg = config.clone();
     if run_cfg.manifest_json.is_none()
         && let Some(mj) = &module.module_json
@@ -216,15 +218,17 @@ pub fn report_linked(
     let mut names = Vec::with_capacity(modules.len());
     let mut provs = Vec::with_capacity(modules.len());
     for m in modules {
-        let file = abcd_file::decode(&m.abc).map_err(|e| {
-            CliError::Tool(format!(
-                "failed to decode {} ({}): {e}",
-                m.name, m.provenance
-            ))
-        })?;
-        let ir = abcd_lift::lift_file(&file).map_err(|e| {
-            CliError::Tool(format!("failed to lift {} ({}): {e}", m.name, m.provenance))
-        })?;
+        let ir = {
+            let file = abcd_file::decode(&m.abc).map_err(|e| {
+                CliError::Tool(format!(
+                    "failed to decode {} ({}): {e}",
+                    m.name, m.provenance
+                ))
+            })?;
+            abcd_lift::lift_file(&file).map_err(|e| {
+                CliError::Tool(format!("failed to lift {} ({}): {e}", m.name, m.provenance))
+            })?
+        };
         if let Some(mj) = &m.module_json
             && let Ok(txt) = std::str::from_utf8(mj)
         {
@@ -236,6 +240,8 @@ pub fn report_linked(
     }
     let refs: Vec<(&str, &Module)> = lifted.iter().map(|(n, m)| (n.as_str(), m)).collect();
     let merged_ir = abcd_analysis::module_link::merge_ir_modules(&refs);
+    drop(refs);
+    drop(lifted);
     let mut run_cfg = config.clone();
     if run_cfg.manifest_json.is_none() && !manifests.is_empty() {
         run_cfg.manifest_json = Some(manifests.join("\n"));

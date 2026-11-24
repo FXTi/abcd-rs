@@ -2,8 +2,11 @@
 //! directory tree output & OHMUrl normalization) and Phase 3 (`--arkui`
 //! OpenHarmony ArkUI declarative sugar recovery).
 
-use abcd_decompile::emit::{EmitOptions, decompile_module};
-use abcd_decompile::split::{SplitFileKind, decompile_module_split, normalize_record_path};
+use abcd_decompile::emit::{EmitOptions, decompile_module, decompile_module_to_writer};
+use abcd_decompile::split::{
+    SplitFile, SplitFileKind, decompile_module_split, decompile_module_split_each,
+    normalize_record_path,
+};
 use abcd_ir::consts::Const;
 use abcd_ir::function::{Block, FunctionData, Inst, Value};
 use abcd_ir::id::{BlockId, ClassId, FuncId, ValueId};
@@ -1121,4 +1124,152 @@ fn arkui_reconstructs_entry_struct_decorators_builders_and_ui_tree() {
     );
     assert!(t.contains("ChildBadge({ active: $active })"), "{t}");
     assert!(t.contains(".width(\"100%\")"), "{t}");
+
+    // 3. Streaming writer matches `decompile_module` byte-for-byte under `--arkui`.
+    let mut streamed = Vec::new();
+    let streamed_stats = decompile_module_to_writer(
+        &m,
+        &EmitOptions {
+            arkui: true,
+            ..Default::default()
+        },
+        &mut streamed,
+    )
+    .expect("stream arkui");
+    assert_eq!(String::from_utf8(streamed).expect("utf8"), ark.text);
+    assert_eq!(streamed_stats, ark.stats);
+}
+
+#[test]
+fn split_each_multi_batch_matches_decompile_module_split_and_propagates_errors() {
+    let mut m = Module::new();
+    let _synth = add_record_class(&mut m, "L_ESModuleRecord;");
+
+    // Build 150 records (> 2 * 64-record batches), mixing Module, Script, and Json
+    // records with cross-batch OHMUrl imports and orphan lexenv slots.
+    let total_records = 150usize;
+    let target_math_req = m.sym.intern("@bundle:com.demo/app/ets/mod_145");
+    let s_val = m.sym.intern("val");
+
+    for idx in 0..total_records {
+        let desc = format!("Lcom.demo/app/ets/mod_{idx};");
+        let cid = add_record_class(&mut m, &desc);
+        if idx % 17 == 5 {
+            let json_name = m.sym.intern("jsonFileContent");
+            let json_payload = m.sym.intern(&format!("{{\"idx\":{idx}}}"));
+            let json_cid = m.consts.push(Const::String(json_payload));
+            m.classes[cid.index()].fields.push(FieldData {
+                name: json_name,
+                ty: Ty::Any,
+                modifiers: abcd_ir::Modifiers::NONE,
+                initial_value: Some(json_cid),
+                annotations: Vec::new(),
+            });
+            continue;
+        }
+
+        if idx % 2 == 0 {
+            let mut imports = Vec::new();
+            let mut reqs = Vec::new();
+            if idx < 70 {
+                // Cross-batch import into batch 3 (`mod_145`).
+                reqs.push(ModuleRequest {
+                    specifier: target_math_req,
+                    lazy: false,
+                });
+                imports.push(ImportDecl::Regular {
+                    local_name: s_val,
+                    import_name: s_val,
+                    module_request: target_math_req,
+                });
+            }
+            m.classes[cid.index()].es_module = Some(EsModule {
+                module_requests: reqs,
+                imports,
+                exports: vec![ExportDecl::Local {
+                    local_name: s_val,
+                    export_name: s_val,
+                }],
+            });
+        }
+
+        let helper = add_fn_in_class(&mut m, cid, &format!("helper_{idx}"), FunctionKind::Arrow);
+        {
+            let x = add_param(&mut m, helper);
+            let b = entry_of(&m, helper);
+            if idx % 13 == 0 {
+                let lex = emit_val(&mut m, b, Op::GetLexVar { level: 2, slot: 1 });
+                let sum = emit_val(
+                    &mut m,
+                    b,
+                    Op::BinaryOp {
+                        op: abcd_ir::op::BinOp::Add,
+                        left: x,
+                        right: lex,
+                    },
+                );
+                emit_void(&mut m, b, Op::Return { value: Some(sum) });
+            } else {
+                emit_void(&mut m, b, Op::Return { value: Some(x) });
+            }
+        }
+
+        let f_main = add_fn_in_class(&mut m, cid, "func_main_0", FunctionKind::Function);
+        {
+            let b = entry_of(&m, f_main);
+            let df = emit_val(
+                &mut m,
+                b,
+                Op::DefineFunc {
+                    body: helper,
+                    captures: vec![],
+                    length: 1,
+                },
+            );
+            let cl = emit_val(&mut m, b, Op::AllocClosure { func: df });
+            if idx % 2 == 0 {
+                emit_void(
+                    &mut m,
+                    b,
+                    Op::StoreModuleVar {
+                        index: 0,
+                        value: cl,
+                    },
+                );
+            }
+            emit_void(&mut m, b, Op::Return { value: Some(cl) });
+        }
+    }
+
+    let opts = EmitOptions::default();
+    let expected = decompile_module_split(&m, &opts);
+    assert_eq!(expected.files.len(), total_records);
+
+    let mut streamed_files: Vec<SplitFile> = Vec::new();
+    let streamed_stats = decompile_module_split_each(&m, &opts, |sf| -> Result<(), &'static str> {
+        streamed_files.push(sf);
+        Ok(())
+    })
+    .expect("infallible callback");
+
+    assert_eq!(streamed_files, expected.files);
+    assert_eq!(streamed_stats, expected.stats);
+    // Verify cross-batch OHMUrl rewrite worked identically.
+    assert!(
+        streamed_files[0]
+            .text
+            .contains("import { val } from \"./mod_145\";"),
+        "unexpected mod_0 text:\n{}",
+        streamed_files[0].text
+    );
+
+    // Verify early callback error stops streaming cleanly without panicking.
+    let mut seen = 0usize;
+    let err = decompile_module_split_each(&m, &opts, |_sf| {
+        seen += 1;
+        if seen == 70 { Err("disk full") } else { Ok(()) }
+    })
+    .expect_err("must propagate callback error");
+    assert_eq!(err, "disk full");
+    assert_eq!(seen, 70);
 }

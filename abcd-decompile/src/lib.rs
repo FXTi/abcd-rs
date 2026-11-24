@@ -16,8 +16,9 @@
 //!   `for..of` / `for..in` / `for await..of`, and generator / async /
 //!   async-generator / `yield*` state-machine folds.
 //! - **Stage C — emission** ([`emit`]): precedence-exact pretty-printing
-//!   ([`decompile_module`]), module imports/exports, and explicit fallback /
-//!   elided-guard annotations.
+//!   ([`decompile_module`], [`decompile_module_to_writer`],
+//!   [`decompile_module_split`], [`decompile_module_split_each`]), module
+//!   imports/exports, and explicit fallback / elided-guard annotations.
 //!
 //! ## Pipeline rules (`design/decompile.md` §3.2)
 //!
@@ -46,9 +47,12 @@ pub mod recover;
 pub mod split;
 pub mod structure;
 
-pub use emit::{DecompiledModule, EmitOptions, decompile_module};
+pub use emit::{
+    DecompileStats, DecompiledModule, EmitOptions, decompile_module, decompile_module_to_writer,
+};
 pub use recover::{RecoveredFunc, recover_func};
 pub use split::{
-    SplitDecompiledModule, SplitFile, SplitFileKind, decompile_module_split, normalize_record_path,
+    SplitDecompiledModule, SplitFile, SplitFileKind, decompile_module_split,
+    decompile_module_split_each, normalize_record_path,
 };
 pub use structure::{SNode, Structured, structure_func};

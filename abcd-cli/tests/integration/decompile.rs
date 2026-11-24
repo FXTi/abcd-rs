@@ -151,3 +151,45 @@ fn write_split_emits_js_and_ets_trees() {
     assert_eq!(n_ets, 1);
     assert!(ets_dir.join("index.ets").exists());
 }
+
+#[test]
+fn streaming_decompile_matches_in_memory_and_preserves_target_on_error() {
+    let m = module(&common::tiny_abc(), "modules.abc");
+    let opts = DecompileOptions {
+        call_entry: true,
+        ..Default::default()
+    };
+    let expected = decompile::decompile(&m, opts).expect("decompile").text;
+
+    let mut streamed = Vec::new();
+    let n_writer = decompile::decompile_to_writer(&m, opts, &mut streamed).expect("to_writer");
+    assert_eq!(n_writer, expected.len());
+    assert_eq!(streamed, expected.as_bytes());
+
+    let dir = common::tempdir("decompile-stream");
+    let out_path = dir.join("modules.js");
+    let n_path = decompile::decompile_to_path(&m, opts, &out_path).expect("to_path");
+    assert_eq!(n_path, expected.len());
+    assert_eq!(std::fs::read_to_string(&out_path).unwrap(), expected);
+
+    let bad_decode = module(b"corrupt", "bad.abc");
+    let missing = dir.join("never_created.js");
+    assert!(decompile::decompile_to_path(&bad_decode, opts, &missing).is_err());
+    assert!(
+        !missing.exists(),
+        "decode failure must not create an empty output file"
+    );
+
+    let bad_lift = module(&common::lift_fail_abc(), "liftfail.abc");
+    assert!(decompile::decompile_to_path(&bad_lift, opts, &missing).is_err());
+    assert!(
+        !missing.exists(),
+        "lift failure must not create an empty output file"
+    );
+    assert!(decompile::decompile_to_path(&bad_lift, opts, &out_path).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&out_path).unwrap(),
+        expected,
+        "lift failure must not truncate an existing output file"
+    );
+}

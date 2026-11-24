@@ -452,7 +452,9 @@ try {
     }
     try {
         constexpr size_t PADDING = 16;  // slack for 4/5-byte block reads (#A3)
-        std::vector<uint8_t> padded(data, data + len);
+        std::vector<uint8_t> padded;
+        padded.reserve(len + PADDING);
+        padded.assign(data, data + len);
         padded.resize(len + PADDING, 0);
         auto *bytes = reinterpret_cast<std::byte *>(padded.data());
         panda::os::mem::ConstBytePtr ptr(bytes, len, nullptr);
@@ -462,6 +464,51 @@ try {
             return nullptr;
         }
         return new (std::nothrow) AbcFileHandle(std::move(padded), std::move(file));
+    } catch (const std::exception &e) {
+        g_open_error = e.what();
+        return nullptr;
+    }
+} catch (...) {
+    return nullptr;
+}
+}
+
+AbcFileHandle *abc_file_open_zeropadded(const uint8_t *data, size_t padded_len) {
+try {
+    g_open_error.clear();
+    constexpr size_t PADDING = 16;  // slack for 4/5-byte block reads (#A3)
+    if (!data || padded_len < sizeof(File::Header) + PADDING) {
+        g_open_error = "buffer too small for file header and zero padding";
+        return nullptr;
+    }
+    const size_t orig_len = padded_len - PADDING;
+    if (std::memcmp(data, File::MAGIC.data(), File::MAGIC_SIZE) != 0) {
+        g_open_error = "bad magic";
+        return nullptr;
+    }
+    auto *header = reinterpret_cast<const File::Header *>(data);
+    if (header->file_size > orig_len) {
+        g_open_error = "declared file_size exceeds buffer";
+        return nullptr;
+    }
+    for (size_t i = orig_len; i < padded_len; ++i) {
+        if (data[i] != 0) {
+            g_open_error = "missing required 16-byte trailing zero padding";
+            return nullptr;
+        }
+    }
+    try {
+        // ConstBytePtr is MapPtr<std::byte, MapPtrType::CONST>: its constructor
+        // takes std::byte *, while Get() exposes only const std::byte * and a
+        // null deleter never mutates or frees the borrowed slice.
+        auto *bytes = const_cast<std::byte *>(reinterpret_cast<const std::byte *>(data));
+        panda::os::mem::ConstBytePtr ptr(bytes, orig_len, nullptr);
+        auto file = File::OpenFromMemory(std::move(ptr));
+        if (!file) {
+            g_open_error = "OpenFromMemory failed";
+            return nullptr;
+        }
+        return new (std::nothrow) AbcFileHandle(std::vector<uint8_t>{}, std::move(file));
     } catch (const std::exception &e) {
         g_open_error = e.what();
         return nullptr;

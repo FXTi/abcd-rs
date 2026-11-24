@@ -512,6 +512,2388 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
 }
 
 // ---------------------------------------------------------------------------
+// Lightweight streaming summary & verifier (`inspect_summary`)
+// ---------------------------------------------------------------------------
+
+/// Bytecode verification counts produced by [`inspect_summary`] when `verify`
+/// is `true`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifySummary {
+    pub methods_checked: usize,
+    pub instructions_decoded: usize,
+}
+
+/// Lightweight header and entity summary of an `.abc` file produced by
+/// [`inspect_summary`] without materializing an owned [`File`] in memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSummary {
+    pub version: crate::Version,
+    pub checksum: u32,
+    pub size: u32,
+    pub file_type: crate::FileType,
+    pub strings: usize,
+    pub lossy_strings: usize,
+    pub classes: usize,
+    pub external_classes: usize,
+    pub methods: usize,
+    pub methods_with_body: usize,
+    pub fields: usize,
+    pub literal_arrays: usize,
+    pub entity_index_entries: usize,
+    pub debug_infos: usize,
+    pub verify: Option<VerifySummary>,
+}
+
+/// Compact open-addressed `u32` hash set using `u32::MAX` as the empty slot
+/// sentinel (with an explicit side flag for `u32::MAX` itself). Avoids std
+/// `HashSet` per-bucket metadata overhead when tracking ~100k file offsets.
+#[derive(Default)]
+struct CompactU32Set {
+    slots: Vec<u32>,
+    len: usize,
+    has_max: bool,
+}
+
+impl CompactU32Set {
+    #[inline]
+    fn mix(mut x: u32) -> usize {
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        x ^= x >> 16;
+        x as usize
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len + usize::from(self.has_max)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.slots
+            .iter()
+            .copied()
+            .filter(|&v| v != u32::MAX)
+            .chain(self.has_max.then_some(u32::MAX))
+    }
+
+    #[inline]
+    fn contains(&self, v: u32) -> bool {
+        if v == u32::MAX {
+            return self.has_max;
+        }
+        if self.slots.is_empty() {
+            return false;
+        }
+        let mask = self.slots.len() - 1;
+        let mut idx = Self::mix(v) & mask;
+        loop {
+            let cur = self.slots[idx];
+            if cur == v {
+                return true;
+            }
+            if cur == u32::MAX {
+                return false;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    fn insert(&mut self, v: u32) -> bool {
+        if v == u32::MAX {
+            let added = !self.has_max;
+            self.has_max = true;
+            return added;
+        }
+        if (self.len + 1) * 10 >= self.slots.len() * 7 {
+            let new_cap = if self.slots.is_empty() {
+                64
+            } else {
+                self.slots.len() * 2
+            };
+            self.rehash(new_cap);
+        }
+        let mask = self.slots.len() - 1;
+        let mut idx = Self::mix(v) & mask;
+        loop {
+            let cur = self.slots[idx];
+            if cur == v {
+                return false;
+            }
+            if cur == u32::MAX {
+                self.slots[idx] = v;
+                self.len += 1;
+                return true;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    fn rehash(&mut self, new_cap: usize) {
+        let old = std::mem::replace(&mut self.slots, vec![u32::MAX; new_cap]);
+        let mask = new_cap - 1;
+        for v in old {
+            if v == u32::MAX {
+                continue;
+            }
+            let mut idx = Self::mix(v) & mask;
+            while self.slots[idx] != u32::MAX {
+                idx = (idx + 1) & mask;
+            }
+            self.slots[idx] = v;
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SymId {
+    Utf8(u32),
+    Lossy(u32),
+}
+
+/// Zero-copy / flat-arena string deduplicator matching [`StringPool`] set
+/// cardinalities (`len` and `lossy_count`) without allocating per-string heap
+/// boxes for in-file ASCII strings.
+struct SummaryStrings<'a> {
+    data: &'a [u8],
+    arena: Vec<u8>,
+    /// `(tagged_start, byte_len)`: high bit `0x8000_0000` selects `arena`,
+    /// otherwise `data`.
+    utf8_spans: Vec<(u32, u32)>,
+    utf8_buckets: Vec<u32>,
+    raw_lossy: HashMap<Box<[u8]>, u32>,
+    seen_lossy_offsets: CompactU32Set,
+    seen_utf8_offsets: CompactU32Set,
+    utf16_scratch: Vec<u16>,
+    ascii_scratch: Vec<u8>,
+}
+
+impl<'a> SummaryStrings<'a> {
+    const ARENA_TAG: u32 = 0x8000_0000;
+
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            arena: Vec::new(),
+            utf8_spans: Vec::new(),
+            utf8_buckets: Vec::new(),
+            raw_lossy: HashMap::new(),
+            seen_lossy_offsets: CompactU32Set::default(),
+            seen_utf8_offsets: CompactU32Set::default(),
+            utf16_scratch: Vec::new(),
+            ascii_scratch: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.utf8_spans.len() + self.raw_lossy.len()
+    }
+
+    #[inline]
+    fn lossy_count(&self) -> usize {
+        self.raw_lossy.len()
+    }
+
+    #[inline]
+    fn hash_bytes(bytes: &[u8]) -> usize {
+        // Deterministic 64-bit FNV-1a + finalizer mix.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h ^= h >> 33;
+        h as usize
+    }
+
+    #[inline]
+    fn span_bytes<'s>(data: &'s [u8], arena: &'s [u8], (tagged, len): (u32, u32)) -> &'s [u8] {
+        let len = len as usize;
+        if tagged & Self::ARENA_TAG != 0 {
+            let start = (tagged & !Self::ARENA_TAG) as usize;
+            &arena[start..start + len]
+        } else {
+            let start = tagged as usize;
+            &data[start..start + len]
+        }
+    }
+
+    fn resolve_utf8(&self, sym: SymId) -> Option<&str> {
+        match sym {
+            SymId::Utf8(idx) => {
+                let span = *self.utf8_spans.get(idx as usize)?;
+                std::str::from_utf8(Self::span_bytes(self.data, &self.arena, span)).ok()
+            }
+            SymId::Lossy(_) => None,
+        }
+    }
+
+    fn ensure_utf8_capacity(&mut self) {
+        if (self.utf8_spans.len() + 1) * 10 < self.utf8_buckets.len() * 7 {
+            return;
+        }
+        let new_cap = if self.utf8_buckets.is_empty() {
+            128
+        } else {
+            self.utf8_buckets.len() * 2
+        };
+        self.utf8_buckets.clear();
+        self.utf8_buckets.resize(new_cap, u32::MAX);
+        let mask = new_cap - 1;
+        for (id, &span) in self.utf8_spans.iter().enumerate() {
+            let bytes = Self::span_bytes(self.data, &self.arena, span);
+            let mut bkt = Self::hash_bytes(bytes) & mask;
+            while self.utf8_buckets[bkt] != u32::MAX {
+                bkt = (bkt + 1) & mask;
+            }
+            self.utf8_buckets[bkt] = id as u32;
+        }
+    }
+
+    fn intern_in_place_utf8(&mut self, start: usize, len: usize) -> SymId {
+        if start >= Self::ARENA_TAG as usize {
+            let s = &self.data[start..start + len];
+            return self.intern_utf8_bytes_copy(s);
+        }
+        self.ensure_utf8_capacity();
+        let candidate = &self.data[start..start + len];
+        let mask = self.utf8_buckets.len() - 1;
+        let mut bkt = Self::hash_bytes(candidate) & mask;
+        loop {
+            let cur = self.utf8_buckets[bkt];
+            if cur == u32::MAX {
+                let id = self.utf8_spans.len() as u32;
+                self.utf8_spans.push((start as u32, len as u32));
+                self.utf8_buckets[bkt] = id;
+                return SymId::Utf8(id);
+            }
+            let existing = Self::span_bytes(self.data, &self.arena, self.utf8_spans[cur as usize]);
+            if existing == candidate {
+                return SymId::Utf8(cur);
+            }
+            bkt = (bkt + 1) & mask;
+        }
+    }
+
+    fn intern_utf8_bytes_copy(&mut self, candidate: &[u8]) -> SymId {
+        self.ensure_utf8_capacity();
+        let mask = self.utf8_buckets.len() - 1;
+        let mut bkt = Self::hash_bytes(candidate) & mask;
+        loop {
+            let cur = self.utf8_buckets[bkt];
+            if cur == u32::MAX {
+                let arena_off = self.arena.len() as u32;
+                self.arena.extend_from_slice(candidate);
+                let id = self.utf8_spans.len() as u32;
+                self.utf8_spans
+                    .push((Self::ARENA_TAG | arena_off, candidate.len() as u32));
+                self.utf8_buckets[bkt] = id;
+                return SymId::Utf8(id);
+            }
+            let existing = Self::span_bytes(self.data, &self.arena, self.utf8_spans[cur as usize]);
+            if existing == candidate {
+                return SymId::Utf8(cur);
+            }
+            bkt = (bkt + 1) & mask;
+        }
+    }
+
+    #[inline]
+    fn intern_utf8_str(&mut self, s: &str) -> SymId {
+        self.intern_utf8_bytes_copy(s.as_bytes())
+    }
+
+    fn intern_lossy_raw(&mut self, raw: &[u8]) -> SymId {
+        if let Some(&idx) = self.raw_lossy.get(raw) {
+            return SymId::Lossy(idx);
+        }
+        let idx = self.raw_lossy.len() as u32;
+        self.raw_lossy.insert(raw.into(), idx);
+        SymId::Lossy(idx)
+    }
+
+    /// Fast validated in-place ASCII item check matching `GetStringData` +
+    /// `convert_string_utf16_bounded`: `offset > sizeof(Header)` (`60`), valid
+    /// ULEB128 tag, `utf16_len` bytes in `0x01..=0x7F` (or empty), followed
+    /// immediately by a `0x00` NUL byte inside `self.data`.
+    #[inline]
+    fn try_ascii_span(&self, offset: u32) -> Option<(usize, usize)> {
+        if offset <= 60 {
+            return None;
+        }
+        let mut sp = self.data.get(offset as usize..)?;
+        let header_before = sp.len();
+        let tag_len = read_uleb128_slice(&mut sp)?;
+        let prefix_len = header_before - sp.len();
+        let utf16_len = (tag_len >> 1) as usize;
+        if sp.len() <= utf16_len || sp[utf16_len] != 0 {
+            return None;
+        }
+        let payload = &sp[..utf16_len];
+        if !payload.iter().all(|&b| (1..=0x7F).contains(&b)) {
+            return None;
+        }
+        Some((offset as usize + prefix_len, utf16_len))
+    }
+
+    /// Equivalent to [`crate::file::intern_string`] (lossless UTF-8 or raw
+    /// MUTF-8 bucket), returning the interned [`SymId`].
+    fn intern_offset_lossy_sym(
+        &mut self,
+        f: *const sys::AbcFileHandle,
+        offset: u32,
+    ) -> Option<SymId> {
+        if let Some((start, len)) = self.try_ascii_span(offset) {
+            self.seen_lossy_offsets.insert(offset);
+            return Some(self.intern_in_place_utf8(start, len));
+        }
+        let (text, lossy) = crate::file::read_string_reporting_lossy(f, offset)?;
+        self.seen_lossy_offsets.insert(offset);
+        if !lossy {
+            return Some(self.intern_utf8_str(&text));
+        }
+        match crate::file::read_string_raw_bytes(f, offset) {
+            Some(raw) => Some(self.intern_lossy_raw(&raw)),
+            None => Some(self.intern_utf8_str(&text)),
+        }
+    }
+
+    /// Equivalent to [`crate::file::intern_string`] when the caller only needs
+    /// validity (`bool`), skipping repeat offsets in O(1).
+    fn intern_offset_lossy(&mut self, f: *const sys::AbcFileHandle, offset: u32) -> bool {
+        if self.seen_lossy_offsets.contains(offset) {
+            return true;
+        }
+        self.intern_offset_lossy_sym(f, offset).is_some()
+    }
+
+    /// Equivalent to `read_string(f, offset).map(|s| strings.get_or_intern(&s))`,
+    /// returning the interned [`SymId`].
+    fn intern_offset_utf8_sym(
+        &mut self,
+        f: *const sys::AbcFileHandle,
+        offset: u32,
+    ) -> Option<SymId> {
+        if let Some((start, len)) = self.try_ascii_span(offset) {
+            self.seen_utf8_offsets.insert(offset);
+            return Some(self.intern_in_place_utf8(start, len));
+        }
+        let text = read_string(f, offset)?;
+        self.seen_utf8_offsets.insert(offset);
+        Some(self.intern_utf8_str(&text))
+    }
+
+    /// Equivalent to `read_string(f, offset).map(|s| strings.get_or_intern(&s)).is_some()`,
+    /// skipping repeat offsets in O(1).
+    fn intern_offset_utf8(&mut self, f: *const sys::AbcFileHandle, offset: u32) -> bool {
+        if self.seen_utf8_offsets.contains(offset) {
+            return true;
+        }
+        self.intern_offset_utf8_sym(f, offset).is_some()
+    }
+
+    /// Equivalent to `read_method_name(mr)` + `strings.get_or_intern`, reusing
+    /// one scratch UTF-16 buffer across methods.
+    fn intern_method_name(&mut self, mr: *const sys::AbcMethodAccessor) -> bool {
+        let units = unsafe { sys::abc_method_get_name_utf16(mr, std::ptr::null_mut(), 0) };
+        if units == 0 {
+            return false;
+        }
+        self.utf16_scratch.clear();
+        self.utf16_scratch.resize(units, 0);
+        let written =
+            unsafe { sys::abc_method_get_name_utf16(mr, self.utf16_scratch.as_mut_ptr(), units) };
+        if written != units {
+            return false;
+        }
+        if self.utf16_scratch.iter().all(|&u| u < 0x80) {
+            let mut ascii = std::mem::take(&mut self.ascii_scratch);
+            ascii.clear();
+            ascii.extend(self.utf16_scratch.iter().map(|&u| u as u8));
+            self.intern_utf8_bytes_copy(&ascii);
+            self.ascii_scratch = ascii;
+            return true;
+        }
+        let Ok(s) = String::from_utf16(&self.utf16_scratch) else {
+            return false;
+        };
+        self.intern_utf8_str(&s);
+        true
+    }
+}
+
+#[inline]
+fn read_uleb128_slice(sp: &mut &[u8]) -> Option<u32> {
+    let mut result = 0u32;
+    for i in 0..5usize {
+        let &b = sp.get(i)?;
+        if i == 4 && (b & 0xF0) != 0 {
+            return None;
+        }
+        result |= u32::from(b & 0x7F) << (7 * i);
+        if (b & 0x80) == 0 {
+            *sp = &sp[i + 1..];
+            return Some(result);
+        }
+    }
+    None
+}
+
+#[inline]
+fn read_sleb128_slice(sp: &mut &[u8]) -> Option<i32> {
+    let mut result = 0u32;
+    for i in 0..5usize {
+        let &b = sp.get(i)?;
+        if i == 4 {
+            if (b & 0x80) != 0 {
+                return None;
+            }
+            let top = b & 0x78;
+            if top != 0 && top != 0x78 {
+                return None;
+            }
+        }
+        result |= u32::from(b & 0x7F) << (7 * i);
+        if (b & 0x80) == 0 {
+            let shift = 7 * (i + 1);
+            if shift < 32 && (b & 0x40) != 0 {
+                result |= !0u32 << shift;
+            }
+            *sp = &sp[i + 1..];
+            return Some(result as i32);
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct ClassSummary {
+    is_external: bool,
+    methods: usize,
+    methods_with_body: usize,
+    fields: usize,
+    debug_infos: usize,
+    instructions_decoded: usize,
+}
+
+/// Inspect an `.abc` file and return header metadata and entity counts matching
+/// [`decode`] with minimal peak memory:
+///
+/// - When `verify == false`, opens the header and walks classes, methods,
+///   fields, annotations, debug items, and transitive literal arrays **without**
+///   invoking `abc_debug_info_open` (which eagerly materializes every method's
+///   line/column/local-var tables in C++) and **without** retaining
+///   `Vec<MethodBody>` in RAM.
+/// - When `verify == true`, additionally runs `abc_debug_info_open` and full
+///   try-block / jump-target verification per method while streaming one method
+///   at a time, returning [`VerifySummary`].
+pub fn inspect_summary(data: &[u8], verify: bool) -> Result<FileSummary, Error> {
+    use crate::file::AbcFile;
+
+    let abc = AbcFile::open(data)?;
+    inspect_summary_with_handle(abc, data, verify)
+}
+
+/// Zero-copy counterpart to [`inspect_summary`] over a caller-owned slice
+/// carrying `16` trailing zero padding bytes (`logical_data =
+/// &padded_data[..padded_data.len() - 16]`).
+///
+/// Rejects buffers shorter than `16` bytes, buffers whose `16` trailing bytes
+/// are not all zero, and malformed `.abc` headers.
+pub fn inspect_summary_zeropadded(padded_data: &[u8], verify: bool) -> Result<FileSummary, Error> {
+    use crate::file::AbcFile;
+
+    const ZERO_PADDING: usize = 16;
+    let Some(logical_len) = padded_data.len().checked_sub(ZERO_PADDING) else {
+        return Err(Error::Open(
+            "buffer too small for file header and zero padding".into(),
+        ));
+    };
+    if padded_data[logical_len..].iter().any(|&b| b != 0) {
+        return Err(Error::Open(
+            "missing required 16-byte trailing zero padding".into(),
+        ));
+    }
+    let logical_data = &padded_data[..logical_len];
+    let abc = AbcFile::open_zeropadded(padded_data)?;
+    inspect_summary_with_handle(abc, logical_data, verify)
+}
+
+fn inspect_summary_with_handle(
+    abc: crate::file::AbcFile<'_>,
+    data: &[u8],
+    verify: bool,
+) -> Result<FileSummary, Error> {
+    let f = abc.raw;
+    let version = abc.version();
+    let legacy = version == abcd_isa::Version::new(0, 0, 0, 2);
+    let legacy_lit_table = if legacy {
+        legacy_literalarray_table(data)
+    } else {
+        None
+    };
+    let checksum = abc.checksum();
+    let size = abc.size();
+    let file_type = crate::file::file_type(data);
+    let file_bytes = data
+        .get(..size as usize)
+        .ok_or_else(|| Error::Open("declared file_size exceeds buffer".into()))?;
+
+    let mut strings = SummaryStrings::new(file_bytes);
+
+    let debug_raw = if verify {
+        let raw = unsafe { sys::abc_debug_info_open(f) };
+        if raw.is_null() {
+            return Err(Error::DebugInfoExtraction);
+        }
+        raw
+    } else {
+        std::ptr::null_mut()
+    };
+    let _debug_guard = (!debug_raw.is_null()).then(|| {
+        HandleGuard(Some(move || unsafe {
+            sys::abc_debug_info_close(debug_raw)
+        }))
+    });
+
+    // Pass 1: initial entity_map offsets (classes, methods, fields).
+    let mut initial_entities = CompactU32Set::default();
+    let mut valid_method_names = CompactU32Set::default();
+    let num_classes = unsafe { sys::abc_file_num_classes(f) };
+    for i in 0..num_classes {
+        let class_off = unsafe { sys::abc_file_class_offset(f, i) };
+        if class_off == ABSENT {
+            continue;
+        }
+        if is_external(f, class_off) {
+            if strings.intern_offset_lossy(f, class_off) {
+                initial_entities.insert(class_off);
+            }
+            continue;
+        }
+        let cr = unsafe { sys::abc_class_open(f, class_off) };
+        if cr.is_null() {
+            continue;
+        }
+        let _cg = HandleGuard(Some(|| unsafe { sys::abc_class_close(cr) }));
+
+        if read_class_descriptor_summary(f, cr, &mut strings).is_some() {
+            initial_entities.insert(unsafe { sys::abc_class_get_class_id(cr) });
+        }
+        for off in collect_offsets_void(cr, sys::abc_class_enumerate_methods) {
+            let mr = unsafe { sys::abc_method_open(f, off) };
+            if mr.is_null() {
+                continue;
+            }
+            let _mg = HandleGuard(Some(|| unsafe { sys::abc_method_close(mr) }));
+            if strings.intern_method_name(mr) {
+                valid_method_names.insert(off);
+                initial_entities.insert(unsafe { sys::abc_method_get_method_id(mr) });
+            }
+        }
+        for off in collect_offsets_void(cr, sys::abc_class_enumerate_fields) {
+            let fr = unsafe { sys::abc_field_open(f, off) };
+            if fr.is_null() {
+                continue;
+            }
+            let _fg = HandleGuard(Some(|| unsafe { sys::abc_field_close(fr) }));
+            let name_off = unsafe { sys::abc_field_name_off(fr) };
+            if name_off != ABSENT && strings.intern_offset_lossy(f, name_off) {
+                initial_entities.insert(unsafe { sys::abc_field_get_field_id(fr) });
+            }
+        }
+    }
+
+    // Pass 2: stream classes, methods, fields, and annotations without
+    // retaining MethodBody / Field / Annotation vectors.
+    let mut classes: BTreeMap<SymId, ClassSummary> = BTreeMap::new();
+    let mut extra_entities = CompactU32Set::default();
+    let mut module_data_offsets = CompactU32Set::default();
+    let mut scope_names_offsets = CompactU32Set::default();
+    let mut phase_blob_offsets = CompactU32Set::default();
+    let mut referenced_literal_offsets = CompactU32Set::default();
+    let mut ann_nested_raw_targets: Vec<u32> = Vec::new();
+
+    for i in 0..num_classes {
+        let class_off = unsafe { sys::abc_file_class_offset(f, i) };
+        if class_off == ABSENT {
+            continue;
+        }
+        if is_external(f, class_off) {
+            if let Some(desc_sym) = strings.intern_offset_lossy_sym(f, class_off) {
+                classes.insert(
+                    desc_sym,
+                    ClassSummary {
+                        is_external: true,
+                        ..ClassSummary::default()
+                    },
+                );
+            }
+            continue;
+        }
+        let cr = unsafe { sys::abc_class_open(f, class_off) };
+        if cr.is_null() {
+            continue;
+        }
+        let _cg = HandleGuard(Some(|| unsafe { sys::abc_class_close(cr) }));
+
+        let Some(desc_sym) = read_class_descriptor_summary(f, cr, &mut strings) else {
+            continue;
+        };
+        let class_id = unsafe { sys::abc_class_get_class_id(cr) };
+        if !strings.intern_offset_utf8(f, class_id) {
+            let desc_text = strings.resolve_utf8(desc_sym).unwrap_or("?").to_owned();
+            return Err(Error::Malformed {
+                field: "name",
+                context: format!("class {desc_text}"),
+            });
+        }
+        let is_mod_rec_cls = strings.resolve_utf8(desc_sym) == Some(ES_MODULE_RECORD_DESCRIPTOR);
+        let is_scope_rec_cls =
+            strings.resolve_utf8(desc_sym) == Some(ES_SCOPE_NAMES_RECORD_DESCRIPTOR);
+
+        let sf_off = unsafe { sys::abc_class_source_file_off(cr) };
+
+        let mut cls_summary = ClassSummary {
+            is_external: is_external(f, class_id),
+            ..ClassSummary::default()
+        };
+
+        for method_off in collect_offsets_void(cr, sys::abc_class_enumerate_methods) {
+            inspect_method_at(
+                f,
+                data,
+                file_bytes,
+                method_off,
+                class_id,
+                sf_off,
+                debug_raw,
+                verify,
+                legacy,
+                legacy_lit_table,
+                &valid_method_names,
+                &initial_entities,
+                &mut extra_entities,
+                &mut strings,
+                &mut referenced_literal_offsets,
+                &mut ann_nested_raw_targets,
+                &mut cls_summary,
+            )?;
+        }
+
+        for field_off in collect_offsets_void(cr, sys::abc_class_enumerate_fields) {
+            inspect_field_at(
+                f,
+                field_off,
+                desc_sym,
+                is_mod_rec_cls,
+                is_scope_rec_cls,
+                &initial_entities,
+                &mut strings,
+                &mut module_data_offsets,
+                &mut scope_names_offsets,
+                &mut phase_blob_offsets,
+                &mut ann_nested_raw_targets,
+            )?;
+            cls_summary.fields += 1;
+        }
+
+        for enumerate in [
+            sys::abc_class_enumerate_annotations,
+            sys::abc_class_enumerate_runtime_annotations,
+            sys::abc_class_enumerate_type_annotations,
+            sys::abc_class_enumerate_runtime_type_annotations,
+        ] {
+            for ann_off in collect_offsets_int(cr, enumerate) {
+                inspect_annotation_at(
+                    f,
+                    ann_off,
+                    &initial_entities,
+                    &mut strings,
+                    &mut ann_nested_raw_targets,
+                )?;
+            }
+        }
+
+        if sf_off != ABSENT {
+            let _ = strings.intern_offset_utf8(f, sf_off);
+        }
+
+        classes.insert(desc_sym, cls_summary);
+    }
+
+    // Release C++ DebugInfoExtractor immediately if it was opened for `verify`.
+    drop(_debug_guard);
+
+    // Seed scope-names and plausible annotation-embedded nested literal arrays.
+    for off in scope_names_offsets.iter() {
+        referenced_literal_offsets.insert(off);
+    }
+    for target in ann_nested_raw_targets {
+        if is_plausible_literal_array_offset(
+            target,
+            size,
+            &module_data_offsets,
+            &phase_blob_offsets,
+        ) {
+            referenced_literal_offsets.insert(target);
+        }
+    }
+
+    let literal_arrays = count_literal_arrays_summary(
+        f,
+        size,
+        &mut strings,
+        &referenced_literal_offsets,
+        &module_data_offsets,
+        &phase_blob_offsets,
+    )?;
+
+    drop(abc);
+
+    let total_classes = classes.len();
+    let mut external_classes = 0usize;
+    let mut methods = 0usize;
+    let mut methods_with_body = 0usize;
+    let mut fields = 0usize;
+    let mut debug_infos = 0usize;
+    let mut instructions_decoded = 0usize;
+    for c in classes.values() {
+        if c.is_external {
+            external_classes += 1;
+        }
+        methods += c.methods;
+        methods_with_body += c.methods_with_body;
+        fields += c.fields;
+        debug_infos += c.debug_infos;
+        instructions_decoded += c.instructions_decoded;
+    }
+
+    Ok(FileSummary {
+        version,
+        checksum,
+        size,
+        file_type,
+        strings: strings.len(),
+        lossy_strings: strings.lossy_count(),
+        classes: total_classes,
+        external_classes,
+        methods,
+        methods_with_body,
+        fields,
+        literal_arrays,
+        entity_index_entries: initial_entities.len() + extra_entities.len(),
+        debug_infos,
+        verify: verify.then_some(VerifySummary {
+            methods_checked: methods_with_body,
+            instructions_decoded,
+        }),
+    })
+}
+
+fn read_class_descriptor_summary(
+    f: *const sys::AbcFileHandle,
+    cr: *const sys::AbcClassAccessor,
+    strings: &mut SummaryStrings<'_>,
+) -> Option<SymId> {
+    let class_id = unsafe { sys::abc_class_get_class_id(cr) };
+    if let Some(sym) = strings.intern_offset_utf8_sym(f, class_id) {
+        return Some(sym);
+    }
+    let ptr = unsafe { sys::abc_class_get_descriptor(cr) };
+    if ptr.is_null() {
+        return None;
+    }
+    let cstr = unsafe { CStr::from_ptr(ptr as *const _) };
+    Some(strings.intern_utf8_str(&cstr.to_string_lossy()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_method_at(
+    f: *const sys::AbcFileHandle,
+    raw_data: &[u8],
+    file_bytes: &[u8],
+    method_off: u32,
+    class_id: u32,
+    class_source_file_off: u32,
+    debug_raw: *mut sys::AbcDebugInfo,
+    verify: bool,
+    legacy: bool,
+    legacy_lit_table: Option<(u32, u32)>,
+    valid_method_names: &CompactU32Set,
+    initial_entities: &CompactU32Set,
+    extra_entities: &mut CompactU32Set,
+    strings: &mut SummaryStrings<'_>,
+    referenced_literal_offsets: &mut CompactU32Set,
+    ann_nested_raw_targets: &mut Vec<u32>,
+    cls_summary: &mut ClassSummary,
+) -> Result<(), Error> {
+    let mr = unsafe { sys::abc_method_open(f, method_off) };
+    if mr.is_null() {
+        return Err(Error::InvalidOffset(method_off));
+    }
+    let _mg = HandleGuard(Some(|| unsafe { sys::abc_method_close(mr) }));
+
+    let method_id = unsafe { sys::abc_method_get_method_id(mr) };
+    if !valid_method_names.contains(method_off) && !strings.intern_method_name(mr) {
+        return Err(Error::Malformed {
+            field: "name",
+            context: format!("method at offset {method_id:#x}"),
+        });
+    }
+
+    let code_off = unsafe { sys::abc_method_code_off(mr) };
+    if code_off != ABSENT {
+        cls_summary.methods_with_body += 1;
+        cls_summary.instructions_decoded += inspect_code_at(
+            f,
+            raw_data,
+            method_off,
+            code_off,
+            legacy,
+            legacy_lit_table,
+            initial_entities,
+            extra_entities,
+            strings,
+            referenced_literal_offsets,
+        )?;
+    }
+
+    let num_params = {
+        let has_valid = unsafe { sys::abc_method_has_valid_proto(mr) } != 0;
+        if !has_valid {
+            0usize
+        } else {
+            let proto_id = unsafe { sys::abc_method_get_proto_id(mr) };
+            if proto_id == ABSENT {
+                0usize
+            } else {
+                inspect_proto_types(f, proto_id, initial_entities)?
+            }
+        }
+    };
+
+    for enumerate in [
+        sys::abc_method_enumerate_annotations,
+        sys::abc_method_enumerate_runtime_annotations,
+        sys::abc_method_enumerate_type_annotations,
+        sys::abc_method_enumerate_runtime_type_annotations,
+    ] {
+        for ann_off in collect_offsets_int(mr, enumerate) {
+            inspect_annotation_at(
+                f,
+                ann_off,
+                initial_entities,
+                strings,
+                ann_nested_raw_targets,
+            )?;
+        }
+    }
+
+    let debug_off = unsafe { sys::abc_method_debug_info_off(mr) };
+    if debug_off != ABSENT {
+        cls_summary.debug_infos += 1;
+        if verify {
+            intern_debug_info_from_extractor(debug_raw, method_id, strings);
+        } else {
+            scan_debug_info_strings_raw(
+                f,
+                file_bytes,
+                class_id,
+                class_source_file_off,
+                mr,
+                debug_off,
+                strings,
+            )?;
+        }
+    }
+
+    inspect_param_annotations(
+        f,
+        mr,
+        num_params,
+        initial_entities,
+        strings,
+        ann_nested_raw_targets,
+    )?;
+
+    cls_summary.methods += 1;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_code_at(
+    f: *const sys::AbcFileHandle,
+    data: &[u8],
+    method_off: u32,
+    code_off: u32,
+    legacy: bool,
+    legacy_lit_table: Option<(u32, u32)>,
+    initial_entities: &CompactU32Set,
+    extra_entities: &mut CompactU32Set,
+    strings: &mut SummaryStrings<'_>,
+    referenced_literal_offsets: &mut CompactU32Set,
+) -> Result<usize, Error> {
+    let cr = unsafe { sys::abc_code_open(f, code_off) };
+    if cr.is_null() {
+        return Err(Error::InvalidOffset(code_off));
+    }
+    let _cg = HandleGuard(Some(|| unsafe { sys::abc_code_close(cr) }));
+
+    let raw_insns = {
+        let ptr = unsafe { sys::abc_code_instructions(cr) };
+        let len = unsafe { sys::abc_code_code_size(cr) } as usize;
+        if ptr.is_null() || len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(ptr, len) }
+        }
+    };
+    let decoded = if legacy {
+        abcd_isa::decode_legacy(raw_insns)
+    } else {
+        abcd_isa::decode(raw_insns)
+    }
+    .map_err(|source| Error::BytecodeDecode {
+        method_offset: method_off,
+        source,
+    })?;
+
+    // Validate try-block and catch-block spans without retaining TryBlock Vecs.
+    validate_try_block_spans(method_off, cr)?;
+
+    let insn_count = decoded.len();
+    for (bytecode, _) in &decoded {
+        for (kind, id) in bytecode.entity_operands() {
+            use abcd_isa::EntityKind;
+            if !matches!(
+                kind,
+                EntityKind::StringId | EntityKind::MethodId | EntityKind::LiteralarrayId
+            ) {
+                continue;
+            }
+            let invalid = || Error::Malformed {
+                field: "bytecode entity reference",
+                context: format!(
+                    "{} in method {:#x}: {:?} index {}",
+                    bytecode.mnemonic(),
+                    method_off,
+                    kind,
+                    id.0
+                ),
+            };
+            if legacy {
+                let offset = match kind {
+                    EntityKind::StringId => {
+                        let off = id.0;
+                        if off == 0 || off as usize >= data.len() {
+                            return Err(invalid());
+                        }
+                        off
+                    }
+                    EntityKind::MethodId => {
+                        let index = u16::try_from(id.0).map_err(|_| invalid())?;
+                        let offset =
+                            unsafe { sys::abc_resolve_offset_by_index(f, method_off, index) };
+                        if offset == ABSENT {
+                            return Err(invalid());
+                        }
+                        offset
+                    }
+                    EntityKind::LiteralarrayId => {
+                        let Some((count, table_off)) = legacy_lit_table else {
+                            return Err(invalid());
+                        };
+                        if id.0 >= count {
+                            return Err(invalid());
+                        }
+                        let bytes: [u8; 4] =
+                            id.0.checked_mul(4)
+                                .and_then(|n| table_off.checked_add(n))
+                                .and_then(|entry| usize::try_from(entry).ok())
+                                .and_then(|entry| {
+                                    entry.checked_add(4).and_then(|end| data.get(entry..end))
+                                })
+                                .and_then(|s| s.try_into().ok())
+                                .ok_or_else(invalid)?;
+                        let off = u32::from_le_bytes(bytes);
+                        if off == 0 || off as usize >= data.len() {
+                            return Err(invalid());
+                        }
+                        off
+                    }
+                };
+                if kind == EntityKind::LiteralarrayId {
+                    referenced_literal_offsets.insert(offset);
+                    continue;
+                }
+                if initial_entities.contains(offset) || extra_entities.contains(offset) {
+                    continue;
+                }
+                if kind == EntityKind::StringId {
+                    if !strings.intern_offset_lossy(f, offset) {
+                        return Err(invalid());
+                    }
+                    extra_entities.insert(offset);
+                    continue;
+                }
+                let accessor = unsafe { sys::abc_method_open(f, offset) };
+                if accessor.is_null() {
+                    return Err(invalid());
+                }
+                let _guard = HandleGuard(Some(|| unsafe { sys::abc_method_close(accessor) }));
+                if !strings.intern_method_name(accessor) {
+                    return Err(invalid());
+                }
+                extra_entities.insert(offset);
+                continue;
+            }
+
+            let index = u16::try_from(id.0).map_err(|_| invalid())?;
+            let offset = unsafe { sys::abc_resolve_offset_by_index(f, method_off, index) };
+            if offset == ABSENT {
+                return Err(invalid());
+            }
+            if kind == EntityKind::LiteralarrayId {
+                referenced_literal_offsets.insert(offset);
+                continue;
+            }
+            if initial_entities.contains(offset) || extra_entities.contains(offset) {
+                continue;
+            }
+            if kind == EntityKind::StringId {
+                if !strings.intern_offset_lossy(f, offset) {
+                    return Err(invalid());
+                }
+                extra_entities.insert(offset);
+                continue;
+            }
+            let accessor = unsafe { sys::abc_method_open(f, offset) };
+            if accessor.is_null() {
+                return Err(invalid());
+            }
+            let _guard = HandleGuard(Some(|| unsafe { sys::abc_method_close(accessor) }));
+            if !strings.intern_method_name(accessor) {
+                return Err(invalid());
+            }
+            extra_entities.insert(offset);
+        }
+
+        if legacy {
+            use abcd_isa::Bytecode as B;
+            let global_idx = match bytecode {
+                B::DeprecatedCreateobjectwithbuffer(abcd_isa::Imm(i))
+                | B::DeprecatedCreatearraywithbuffer(abcd_isa::Imm(i))
+                | B::DeprecatedCreateobjecthavingmethod(abcd_isa::Imm(i))
+                | B::DeprecatedDefineclasswithbuffer(_, abcd_isa::Imm(i), _, _, _) => *i,
+                _ => continue,
+            };
+            let invalid = || Error::Malformed {
+                field: "legacy literal-array reference",
+                context: format!(
+                    "{} in method {:#x}: global index {global_idx}",
+                    bytecode.mnemonic(),
+                    method_off,
+                ),
+            };
+            let Ok(idx) = u32::try_from(global_idx) else {
+                return Err(invalid());
+            };
+            let Some((count, table_off)) = legacy_lit_table else {
+                return Err(invalid());
+            };
+            if idx >= count {
+                return Err(invalid());
+            }
+            let bytes: [u8; 4] = idx
+                .checked_mul(4)
+                .and_then(|n| table_off.checked_add(n))
+                .and_then(|entry| usize::try_from(entry).ok())
+                .and_then(|entry| entry.checked_add(4).and_then(|end| data.get(entry..end)))
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(invalid)?;
+            let off = u32::from_le_bytes(bytes);
+            if off == 0 || off as usize >= data.len() {
+                return Err(invalid());
+            }
+            referenced_literal_offsets.insert(off);
+        }
+    }
+
+    Ok(insn_count)
+}
+
+fn validate_try_block_spans(method_off: u32, cr: *mut sys::AbcCodeAccessor) -> Result<(), Error> {
+    struct SpanCheckCtx {
+        try_overflow: bool,
+        catch_overflow: bool,
+    }
+    unsafe extern "C" fn cb(
+        try_info: *const sys::AbcTryBlockInfo,
+        catches: *const sys::AbcCatchBlockInfo,
+        ctx_raw: *mut c_void,
+    ) -> i32 {
+        let ctx = unsafe { &mut *(ctx_raw as *mut SpanCheckCtx) };
+        if ctx.try_overflow || ctx.catch_overflow {
+            return 0;
+        }
+        let info = unsafe { &*try_info };
+        if info.start_pc.checked_add(info.length).is_none() {
+            ctx.try_overflow = true;
+            return 0;
+        }
+        let catch_slice = if info.num_catches > 0 {
+            unsafe { std::slice::from_raw_parts(catches, info.num_catches as usize) }
+        } else {
+            &[]
+        };
+        for c in catch_slice {
+            if c.handler_pc.checked_add(c.code_size).is_none() {
+                ctx.catch_overflow = true;
+                return 0;
+            }
+        }
+        0
+    }
+    let mut ctx = SpanCheckCtx {
+        try_overflow: false,
+        catch_overflow: false,
+    };
+    unsafe {
+        sys::abc_code_enumerate_try_blocks_full(
+            cr,
+            Some(cb),
+            &mut ctx as *mut SpanCheckCtx as *mut c_void,
+        );
+    }
+    if ctx.try_overflow {
+        return Err(Error::Malformed {
+            field: "try_block",
+            context: format!("method at offset {method_off:#x}: try span overflow"),
+        });
+    }
+    if ctx.catch_overflow {
+        return Err(Error::Malformed {
+            field: "catch_block",
+            context: format!("method at offset {method_off:#x}: catch span overflow"),
+        });
+    }
+    Ok(())
+}
+
+fn inspect_proto_types(
+    f: *const sys::AbcFileHandle,
+    proto_off: u32,
+    initial_entities: &CompactU32Set,
+) -> Result<usize, Error> {
+    let pr = unsafe { sys::abc_proto_open(f, proto_off) };
+    if pr.is_null() {
+        return Err(Error::InvalidOffset(proto_off));
+    }
+    let _pg = HandleGuard(Some(|| unsafe { sys::abc_proto_close(pr) }));
+
+    let ref_num = unsafe { sys::abc_proto_get_ref_num(pr) };
+    let mut next_ref = 0u32;
+    let mut check_type = |raw: TypeId, ctx: &str| -> Result<(), Error> {
+        if raw == TypeId::Reference {
+            if next_ref >= ref_num {
+                return Err(Error::Malformed {
+                    field: "reference_type",
+                    context: ctx.to_string(),
+                });
+            }
+            let off = unsafe { sys::abc_proto_get_reference_type(pr, next_ref) };
+            next_ref += 1;
+            if off == u32::MAX || !initial_entities.contains(off) {
+                return Err(Error::Malformed {
+                    field: "reference_type",
+                    context: ctx.to_string(),
+                });
+            }
+            Ok(())
+        } else {
+            Type::from_raw(raw, None).map(|_| ())
+        }
+    };
+
+    let raw_ret = TypeId::try_from(unsafe { sys::abc_proto_get_return_type(pr) })?;
+    check_type(raw_ret, "return type")?;
+
+    let num_args = unsafe { sys::abc_proto_num_args(pr) };
+    for i in 0..num_args {
+        let raw = TypeId::try_from(unsafe { sys::abc_proto_get_arg_type(pr, i) })?;
+        check_type(raw, &format!("arg {i}"))?;
+    }
+    Ok(num_args as usize)
+}
+
+fn inspect_param_annotations(
+    f: *const sys::AbcFileHandle,
+    mr: *mut sys::AbcMethodAccessor,
+    num_params: usize,
+    initial_entities: &CompactU32Set,
+    strings: &mut SummaryStrings<'_>,
+    ann_nested_raw_targets: &mut Vec<u32>,
+) -> Result<(), Error> {
+    let _ = num_params;
+    for item_off in [
+        unsafe { sys::abc_method_get_param_annotation_id(mr) },
+        unsafe { sys::abc_method_get_runtime_param_annotation_id(mr) },
+    ] {
+        if item_off == ABSENT {
+            continue;
+        }
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        unsafe extern "C" fn cb(param_idx: u32, annotation_off: u32, ctx: *mut c_void) -> i32 {
+            let pairs = unsafe { &mut *(ctx as *mut Vec<(u32, u32)>) };
+            pairs.push((param_idx, annotation_off));
+            0
+        }
+        let rc = unsafe {
+            sys::abc_param_annotations_enumerate(
+                f,
+                item_off,
+                Some(cb),
+                &mut pairs as *mut Vec<(u32, u32)> as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(Error::Malformed {
+                field: "param_annotations",
+                context: format!("param annotations item at offset {item_off:#x}"),
+            });
+        }
+        if pairs.is_empty() {
+            continue;
+        }
+        for &(i, _) in &pairs {
+            if i.checked_add(1)
+                .and_then(|n| usize::try_from(n).ok())
+                .is_none()
+            {
+                return Err(Error::Malformed {
+                    field: "param_annotations",
+                    context: format!("param annotations item at offset {item_off:#x}"),
+                });
+            }
+        }
+        for (_, off) in pairs {
+            inspect_annotation_at(f, off, initial_entities, strings, ann_nested_raw_targets)?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_field_at(
+    f: *const sys::AbcFileHandle,
+    field_off: u32,
+    class_desc_sym: SymId,
+    is_mod_rec_cls: bool,
+    is_scope_rec_cls: bool,
+    initial_entities: &CompactU32Set,
+    strings: &mut SummaryStrings<'_>,
+    module_data_offsets: &mut CompactU32Set,
+    scope_names_offsets: &mut CompactU32Set,
+    phase_blob_offsets: &mut CompactU32Set,
+    ann_nested_raw_targets: &mut Vec<u32>,
+) -> Result<(), Error> {
+    let fr = unsafe { sys::abc_field_open(f, field_off) };
+    if fr.is_null() {
+        return Err(Error::InvalidOffset(field_off));
+    }
+    let _fg = HandleGuard(Some(|| unsafe { sys::abc_field_close(fr) }));
+
+    let field_id = unsafe { sys::abc_field_get_field_id(fr) };
+    let name_off = unsafe { sys::abc_field_name_off(fr) };
+    let name_sym = if name_off == ABSENT {
+        return Err(Error::Malformed {
+            field: "name",
+            context: format!("field at offset {field_id:#x}"),
+        });
+    } else {
+        strings
+            .intern_offset_lossy_sym(f, name_off)
+            .ok_or_else(|| Error::Malformed {
+                field: "name",
+                context: format!("field at offset {field_id:#x}"),
+            })?
+    };
+
+    let type_raw = unsafe { sys::abc_field_type(fr) };
+    let type_id = TypeId::try_from(unsafe { sys::abc_field_type_id(fr) })?;
+    if type_id == TypeId::Reference {
+        if !initial_entities.contains(type_raw) {
+            let fname = strings.resolve_utf8(name_sym).unwrap_or("?").to_owned();
+            return Err(Error::Malformed {
+                field: "field_type",
+                context: format!("field {fname:?}"),
+            });
+        }
+    } else {
+        Type::from_raw(type_id, None)?;
+    }
+
+    let u32_val = if type_id == TypeId::U32 {
+        let mut v = 0i32;
+        (unsafe { sys::abc_field_get_value_i32(fr, &mut v) } != 0).then_some(v)
+    } else {
+        match type_id {
+            TypeId::U1
+            | TypeId::I8
+            | TypeId::U8
+            | TypeId::I16
+            | TypeId::U16
+            | TypeId::I32
+            | TypeId::Tagged => {
+                let mut v = 0i32;
+                unsafe { sys::abc_field_get_value_i32(fr, &mut v) };
+            }
+            TypeId::I64 | TypeId::U64 => {
+                let mut v = 0i64;
+                unsafe { sys::abc_field_get_value_i64(fr, &mut v) };
+            }
+            TypeId::F32 => {
+                let mut v = 0.0f32;
+                unsafe { sys::abc_field_get_value_f32(fr, &mut v) };
+            }
+            TypeId::F64 => {
+                let mut v = 0.0f64;
+                unsafe { sys::abc_field_get_value_f64(fr, &mut v) };
+            }
+            TypeId::Void | TypeId::Reference | TypeId::U32 => {}
+        }
+        None
+    };
+
+    if let Some(off) = u32_val {
+        let field_name = strings.resolve_utf8(name_sym);
+        if field_name == Some(TYPE_SUMMARY_OFFSET_FIELD) {
+            let offset = off as u32;
+            if offset != 0 {
+                if initial_entities.contains(offset)
+                    || unsafe {
+                        sys::abc_literal_enumerate_vals_checked(
+                            f,
+                            offset,
+                            None,
+                            std::ptr::null_mut(),
+                        )
+                    } != 0
+                {
+                    return Err(Error::InvalidOffset(offset));
+                }
+                scope_names_offsets.insert(offset);
+            }
+        } else if field_name == Some(MODULE_REQUEST_PHASE_FIELD) {
+            let class_desc = strings
+                .resolve_utf8(class_desc_sym)
+                .unwrap_or("?")
+                .to_owned();
+            let offset = u32::try_from(off).map_err(|_| {
+                Error::ModuleData(format!(
+                    "{class_desc} field at {field_off:#x}: negative blob offset {off}"
+                ))
+            })?;
+            inspect_module_request_phase_at(f, offset).map_err(|e| {
+                Error::ModuleData(format!(
+                    "{class_desc} moduleRequestPhaseIdx field at {field_off:#x}: {e}"
+                ))
+            })?;
+            phase_blob_offsets.insert(offset);
+        } else if is_mod_rec_cls || field_name == Some(MODULE_RECORD_IDX_FIELD) {
+            let class_desc = strings
+                .resolve_utf8(class_desc_sym)
+                .unwrap_or("?")
+                .to_owned();
+            let offset = u32::try_from(off).map_err(|_| {
+                Error::ModuleData(format!(
+                    "{class_desc} field at {field_off:#x}: negative blob offset {off}"
+                ))
+            })?;
+            inspect_module_data_at(f, offset, strings).map_err(|e| {
+                Error::ModuleData(format!("{class_desc} field at {field_off:#x}: {e}"))
+            })?;
+            module_data_offsets.insert(offset);
+        } else if is_scope_rec_cls || field_name == Some(SCOPE_NAMES_FIELD) {
+            let class_desc = strings
+                .resolve_utf8(class_desc_sym)
+                .unwrap_or("?")
+                .to_owned();
+            let offset = u32::try_from(off).map_err(|_| {
+                Error::ModuleData(format!(
+                    "{class_desc} field at {field_off:#x}: negative blob offset {off}"
+                ))
+            })?;
+            scope_names_offsets.insert(offset);
+        } else if field_name == Some(JSON_FILE_CONTENT_FIELD) {
+            let offset = off as u32;
+            if offset == 0 || !strings.intern_offset_lossy(f, offset) {
+                return Err(Error::InvalidString(offset));
+            }
+        }
+    }
+
+    for enumerate in [
+        sys::abc_field_enumerate_annotations,
+        sys::abc_field_enumerate_runtime_annotations,
+        sys::abc_field_enumerate_type_annotations,
+        sys::abc_field_enumerate_runtime_type_annotations,
+    ] {
+        for ann_off in collect_offsets_int(fr, enumerate) {
+            inspect_annotation_at(
+                f,
+                ann_off,
+                initial_entities,
+                strings,
+                ann_nested_raw_targets,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn inspect_module_request_phase_at(f: *const sys::AbcFileHandle, offset: u32) -> Result<(), Error> {
+    unsafe extern "C" fn noop(_flag: u8, _ctx: *mut c_void) {}
+    let n =
+        unsafe { sys::abc_module_request_phase_read(f, offset, Some(noop), std::ptr::null_mut()) };
+    if n < 0 {
+        return Err(Error::ModuleData(format!(
+            "module-request-phase blob at {offset:#x} is unreadable"
+        )));
+    }
+    Ok(())
+}
+
+fn inspect_module_data_at(
+    f: *const sys::AbcFileHandle,
+    offset: u32,
+    strings: &mut SummaryStrings<'_>,
+) -> Result<(), Error> {
+    let mr = unsafe { sys::abc_module_open(f, offset) };
+    if mr.is_null() {
+        return Err(Error::InvalidOffset(offset));
+    }
+    let _mg = HandleGuard(Some(|| unsafe { sys::abc_module_close(mr) }));
+
+    let num_requests = unsafe { sys::abc_module_num_requests(mr) };
+    for i in 0..num_requests {
+        let off = unsafe { sys::abc_module_request_off(mr, i) };
+        if off == ABSENT || !strings.intern_offset_utf8(f, off) {
+            return Err(Error::InvalidString(off));
+        }
+    }
+
+    struct RawRec {
+        tag: u8,
+        export_off: u32,
+        import_off: u32,
+        local_off: u32,
+    }
+    unsafe extern "C" fn collect_rec(
+        tag: u8,
+        export_off: u32,
+        _request_idx: u32,
+        import_off: u32,
+        local_off: u32,
+        ctx: *mut c_void,
+    ) {
+        unsafe { &mut *(ctx as *mut Vec<RawRec>) }.push(RawRec {
+            tag,
+            export_off,
+            import_off,
+            local_off,
+        });
+    }
+    let mut raw: Vec<RawRec> = Vec::new();
+    unsafe {
+        sys::abc_module_enumerate_records(
+            mr,
+            Some(collect_rec),
+            &mut raw as *mut Vec<RawRec> as *mut c_void,
+        );
+    }
+    for rec in raw {
+        match rec.tag {
+            t if t == sys::ModuleTag_REGULAR_IMPORT => {
+                if !strings.intern_offset_utf8(f, rec.local_off) {
+                    return Err(Error::InvalidString(rec.local_off));
+                }
+                if !strings.intern_offset_utf8(f, rec.import_off) {
+                    return Err(Error::InvalidString(rec.import_off));
+                }
+            }
+            t if t == sys::ModuleTag_NAMESPACE_IMPORT => {
+                if !strings.intern_offset_utf8(f, rec.local_off) {
+                    return Err(Error::InvalidString(rec.local_off));
+                }
+            }
+            t if t == sys::ModuleTag_LOCAL_EXPORT => {
+                if !strings.intern_offset_utf8(f, rec.local_off) {
+                    return Err(Error::InvalidString(rec.local_off));
+                }
+                if !strings.intern_offset_utf8(f, rec.export_off) {
+                    return Err(Error::InvalidString(rec.export_off));
+                }
+            }
+            t if t == sys::ModuleTag_INDIRECT_EXPORT => {
+                if !strings.intern_offset_utf8(f, rec.export_off) {
+                    return Err(Error::InvalidString(rec.export_off));
+                }
+                if !strings.intern_offset_utf8(f, rec.import_off) {
+                    return Err(Error::InvalidString(rec.import_off));
+                }
+            }
+            t if t == sys::ModuleTag_STAR_EXPORT => {}
+            other => {
+                return Err(Error::ModuleData(format!(
+                    "unknown module record tag {other:#x} in blob at {offset:#x}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_foreign_entity_name_summary(
+    f: *const sys::AbcFileHandle,
+    initial_entities: &CompactU32Set,
+    strings: &mut SummaryStrings<'_>,
+    off: u32,
+) {
+    if initial_entities.contains(off) {
+        return;
+    }
+    let name_off = unsafe { sys::abc_foreign_item_name_off(f, off) };
+    if name_off == ABSENT || !strings.intern_offset_utf8(f, name_off) {
+        strings.intern_utf8_str("");
+    }
+}
+
+struct SummaryAnnFrame {
+    off: u32,
+    ar: OpenAnnotation,
+    count: u32,
+    next_idx: u32,
+    pending_array: Option<std::vec::IntoIter<u32>>,
+}
+
+fn open_summary_ann_frame(
+    f: *const sys::AbcFileHandle,
+    off: u32,
+    initial_entities: &CompactU32Set,
+    visiting: &mut HashSet<u32>,
+) -> Result<SummaryAnnFrame, Error> {
+    if !visiting.insert(off) {
+        return Err(Error::Malformed {
+            field: "nested annotation",
+            context: format!("cyclic annotation reference at offset {off:#x}"),
+        });
+    }
+    let ar = unsafe { sys::abc_annotation_open(f, off) };
+    if ar.is_null() {
+        visiting.remove(&off);
+        return Err(Error::InvalidOffset(off));
+    }
+    let ar = OpenAnnotation(ar);
+    let class_off = unsafe { sys::abc_annotation_class_off(ar.0) };
+    if !initial_entities.contains(class_off) {
+        visiting.remove(&off);
+        return Err(Error::Malformed {
+            field: "class_descriptor",
+            context: format!("annotation at offset {off:#x}"),
+        });
+    }
+    let count = unsafe { sys::abc_annotation_count(ar.0) };
+    Ok(SummaryAnnFrame {
+        off,
+        ar,
+        count,
+        next_idx: 0,
+        pending_array: None,
+    })
+}
+
+/// Iterative annotation validator & string/literal-offset collector (zero
+/// recursion, active-path cycle detection, zero `Annotation` heap allocation).
+fn inspect_annotation_at(
+    f: *const sys::AbcFileHandle,
+    root_off: u32,
+    initial_entities: &CompactU32Set,
+    strings: &mut SummaryStrings<'_>,
+    ann_nested_raw_targets: &mut Vec<u32>,
+) -> Result<(), Error> {
+    use sys::AnnotationValueType as AVT;
+
+    let mut visiting: HashSet<u32> = HashSet::new();
+    let mut stack = vec![open_summary_ann_frame(
+        f,
+        root_off,
+        initial_entities,
+        &mut visiting,
+    )?];
+
+    while let Some(frame) = stack.last_mut() {
+        if let Some(mut remaining) = frame.pending_array.take()
+            && let Some(next_off) = remaining.next()
+        {
+            frame.pending_array = Some(remaining);
+            let child = open_summary_ann_frame(f, next_off, initial_entities, &mut visiting)?;
+            stack.push(child);
+            continue;
+        }
+
+        let mut next_child: Option<SummaryAnnFrame> = None;
+        while frame.next_idx < frame.count {
+            let idx = frame.next_idx;
+            frame.next_idx += 1;
+            let off = frame.off;
+            let ar = frame.ar.0;
+
+            let mut out = sys::AbcAnnotationElem {
+                name_off: 0,
+                tag: 0,
+                value: 0,
+            };
+            if unsafe { sys::abc_annotation_get_element(ar, idx, &mut out) } != 0 {
+                return Err(Error::Malformed {
+                    field: "annotation element",
+                    context: format!("annotation at offset {off:#x}, element {idx}"),
+                });
+            }
+            if !strings.intern_offset_utf8(f, out.name_off) {
+                return Err(Error::InvalidString(out.name_off));
+            }
+            let tag = AVT::try_from(out.tag).unwrap_or(AVT::Unknown);
+            match tag {
+                AVT::U1
+                | AVT::I8
+                | AVT::U8
+                | AVT::I16
+                | AVT::U16
+                | AVT::I32
+                | AVT::U32
+                | AVT::F32
+                | AVT::Void
+                | AVT::StringNullptr
+                | AVT::Unknown => {}
+                AVT::I64 => {
+                    let mut v = 0i64;
+                    if unsafe { sys::abc_annotation_get_value_i64(ar, idx, &mut v) } != 0 {
+                        return Err(Error::Malformed {
+                            field: "annotation element value",
+                            context: format!(
+                                "annotation at offset {off:#x}, element {idx} (tag {tag:?})"
+                            ),
+                        });
+                    }
+                }
+                AVT::U64 => {
+                    let mut v = 0u64;
+                    if unsafe { sys::abc_annotation_get_value_u64(ar, idx, &mut v) } != 0 {
+                        return Err(Error::Malformed {
+                            field: "annotation element value",
+                            context: format!(
+                                "annotation at offset {off:#x}, element {idx} (tag {tag:?})"
+                            ),
+                        });
+                    }
+                }
+                AVT::F64 => {
+                    let mut v = 0.0f64;
+                    if unsafe { sys::abc_annotation_get_value_f64(ar, idx, &mut v) } != 0 {
+                        return Err(Error::Malformed {
+                            field: "annotation element value",
+                            context: format!(
+                                "annotation at offset {off:#x}, element {idx} (tag {tag:?})"
+                            ),
+                        });
+                    }
+                }
+                AVT::String => {
+                    if !strings.intern_offset_utf8(f, out.value) {
+                        return Err(Error::InvalidString(out.value));
+                    }
+                }
+                AVT::Record => {
+                    if !initial_entities.contains(out.value) {
+                        return Err(Error::InvalidOffset(out.value));
+                    }
+                }
+                AVT::Method | AVT::Enum => {
+                    resolve_foreign_entity_name_summary(f, initial_entities, strings, out.value);
+                }
+                AVT::Annotation => {
+                    next_child = Some(open_summary_ann_frame(
+                        f,
+                        out.value,
+                        initial_entities,
+                        &mut visiting,
+                    )?);
+                    break;
+                }
+                AVT::MethodHandle => {
+                    let mut handle_type_raw = 0u8;
+                    let mut entity_off = 0u32;
+                    if unsafe {
+                        sys::abc_method_handle_read(
+                            f,
+                            out.value,
+                            &mut handle_type_raw,
+                            &mut entity_off,
+                        )
+                    } != 0
+                    {
+                        return Err(Error::Malformed {
+                            field: "method_handle",
+                            context: format!("annotation at offset {off:#x}, element {idx}"),
+                        });
+                    }
+                    if MethodHandleType::from_u8(handle_type_raw).is_none() {
+                        return Err(Error::Malformed {
+                            field: "method_handle_type",
+                            context: format!(
+                                "annotation at offset {off:#x}, element {idx}: unknown handle type {handle_type_raw:#x}"
+                            ),
+                        });
+                    }
+                    if !initial_entities.contains(entity_off) {
+                        strings.intern_utf8_str("");
+                    }
+                }
+                AVT::LiteralArray => {
+                    inspect_checked_literal_array_at(
+                        f,
+                        out.value,
+                        strings,
+                        ann_nested_raw_targets,
+                    )?;
+                }
+                AVT::ArrayAnnotation => {
+                    let mut arr = sys::AbcAnnotationArrayVal {
+                        count: 0,
+                        entity_off: 0,
+                    };
+                    if unsafe { sys::abc_annotation_get_array_element(ar, idx, &mut arr) } != 0 {
+                        return Err(Error::Malformed {
+                            field: "annotation array element",
+                            context: format!("annotation at offset {off:#x}, element {idx}"),
+                        });
+                    }
+                    let (_, raw_values) =
+                        read_annotation_array_raw(f, out.tag, arr.count, arr.entity_off)?;
+                    let mut offsets_iter = raw_values
+                        .into_iter()
+                        .map(|v| v as u32)
+                        .collect::<Vec<_>>()
+                        .into_iter();
+                    if let Some(first_off) = offsets_iter.next() {
+                        frame.pending_array = Some(offsets_iter);
+                        next_child = Some(open_summary_ann_frame(
+                            f,
+                            first_off,
+                            initial_entities,
+                            &mut visiting,
+                        )?);
+                        break;
+                    }
+                }
+                AVT::Array
+                | AVT::ArrayU1
+                | AVT::ArrayI8
+                | AVT::ArrayU8
+                | AVT::ArrayI16
+                | AVT::ArrayU16
+                | AVT::ArrayI32
+                | AVT::ArrayU32
+                | AVT::ArrayI64
+                | AVT::ArrayU64
+                | AVT::ArrayF32
+                | AVT::ArrayF64
+                | AVT::ArrayString
+                | AVT::ArrayRecord
+                | AVT::ArrayMethod
+                | AVT::ArrayEnum
+                | AVT::ArrayMethodHandle => {
+                    let mut arr = sys::AbcAnnotationArrayVal {
+                        count: 0,
+                        entity_off: 0,
+                    };
+                    if unsafe { sys::abc_annotation_get_array_element(ar, idx, &mut arr) } != 0 {
+                        return Err(Error::Malformed {
+                            field: "annotation array element",
+                            context: format!("annotation at offset {off:#x}, element {idx}"),
+                        });
+                    }
+                    let (avt, raw_values) =
+                        read_annotation_array_raw(f, out.tag, arr.count, arr.entity_off)?;
+                    for raw in raw_values {
+                        match avt {
+                            AVT::ArrayU1
+                            | AVT::ArrayI8
+                            | AVT::ArrayU8
+                            | AVT::ArrayI16
+                            | AVT::ArrayU16
+                            | AVT::ArrayI32
+                            | AVT::ArrayU32
+                            | AVT::ArrayI64
+                            | AVT::ArrayU64
+                            | AVT::ArrayF32
+                            | AVT::ArrayF64 => {}
+                            AVT::ArrayString => {
+                                if !strings.intern_offset_utf8(f, raw as u32) {
+                                    return Err(Error::InvalidString(raw as u32));
+                                }
+                            }
+                            AVT::ArrayRecord => {
+                                if !initial_entities.contains(raw as u32) {
+                                    return Err(Error::InvalidOffset(raw as u32));
+                                }
+                            }
+                            AVT::ArrayMethod | AVT::ArrayEnum => {
+                                resolve_foreign_entity_name_summary(
+                                    f,
+                                    initial_entities,
+                                    strings,
+                                    raw as u32,
+                                );
+                            }
+                            AVT::ArrayMethodHandle => {
+                                let mut handle_type_raw = 0u8;
+                                let mut entity_off = 0u32;
+                                if unsafe {
+                                    sys::abc_method_handle_read(
+                                        f,
+                                        raw as u32,
+                                        &mut handle_type_raw,
+                                        &mut entity_off,
+                                    )
+                                } != 0
+                                {
+                                    return Err(Error::Malformed {
+                                        field: "method_handle",
+                                        context: format!(
+                                            "annotation array at offset {:#x}",
+                                            arr.entity_off
+                                        ),
+                                    });
+                                }
+                                if MethodHandleType::from_u8(handle_type_raw).is_none() {
+                                    return Err(Error::Malformed {
+                                        field: "method_handle_type",
+                                        context: format!(
+                                            "annotation array at offset {:#x}: unknown handle type {handle_type_raw:#x}",
+                                            arr.entity_off
+                                        ),
+                                    });
+                                }
+                                if !initial_entities.contains(entity_off) {
+                                    strings.intern_utf8_str("");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(child) = next_child {
+            stack.push(child);
+            continue;
+        }
+
+        let Some(finished) = stack.pop() else {
+            break;
+        };
+        visiting.remove(&finished.off);
+        if stack.is_empty() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+struct SummaryLiteralCbCtx<'a, 's> {
+    file: *const sys::AbcFileHandle,
+    strings: &'s mut SummaryStrings<'a>,
+    nested: &'s mut Vec<u32>,
+}
+
+unsafe extern "C" fn summary_literal_val_cb(val: *const sys::AbcLiteralVal, ctx: *mut c_void) {
+    let ctx = unsafe { &mut *(ctx as *mut SummaryLiteralCbCtx<'_, '_>) };
+    let v = unsafe { &*val };
+    let Ok(tag) = crate::literal::LiteralTag::try_from(v.tag) else {
+        return;
+    };
+    match tag {
+        crate::literal::LiteralTag::String | crate::literal::LiteralTag::EtsImplements => {
+            let off = unsafe { v.data.u32_val };
+            if !ctx.strings.intern_offset_lossy(ctx.file, off) {
+                ctx.strings.intern_utf8_str("");
+            }
+        }
+        crate::literal::LiteralTag::LiteralArray => {
+            ctx.nested.push(unsafe { v.data.u32_val });
+        }
+        _ => {}
+    }
+}
+
+fn inspect_checked_literal_array_at(
+    f: *const sys::AbcFileHandle,
+    offset: u32,
+    strings: &mut SummaryStrings<'_>,
+    nested_out: &mut Vec<u32>,
+) -> Result<(), Error> {
+    let mut ctx = SummaryLiteralCbCtx {
+        file: f,
+        strings,
+        nested: nested_out,
+    };
+    let rc = unsafe {
+        sys::abc_literal_enumerate_vals_checked(
+            f,
+            offset,
+            Some(summary_literal_val_cb),
+            &mut ctx as *mut SummaryLiteralCbCtx<'_, '_> as *mut c_void,
+        )
+    };
+    if rc != 0 {
+        return Err(Error::InvalidOffset(offset));
+    }
+    Ok(())
+}
+
+fn count_literal_arrays_summary(
+    f: *const sys::AbcFileHandle,
+    file_size: u32,
+    strings: &mut SummaryStrings<'_>,
+    referenced_offsets: &CompactU32Set,
+    module_data_offsets: &CompactU32Set,
+    phase_blob_offsets: &CompactU32Set,
+) -> Result<usize, Error> {
+    let n = unsafe { sys::abc_file_num_literalarrays(f) };
+    let mut offsets = Vec::new();
+    let mut seen = CompactU32Set::default();
+    if n != 0 {
+        for i in 0..n {
+            let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
+            if off != ABSENT
+                && !module_data_offsets.contains(off)
+                && !phase_blob_offsets.contains(off)
+                && seen.insert(off)
+            {
+                offsets.push(off);
+            }
+        }
+    }
+    let mut referenced: Vec<u32> = referenced_offsets
+        .iter()
+        .filter(|&off| {
+            off != ABSENT
+                && !seen.contains(off)
+                && !module_data_offsets.contains(off)
+                && !phase_blob_offsets.contains(off)
+        })
+        .collect();
+    referenced.sort_unstable();
+    for off in referenced {
+        if seen.insert(off) {
+            offsets.push(off);
+        }
+    }
+    if offsets.is_empty() {
+        return Ok(0);
+    }
+
+    let first_off = offsets[0];
+    let lr = unsafe { sys::abc_literal_open(f, first_off) };
+    if lr.is_null() {
+        return Err(Error::InvalidOffset(first_off));
+    }
+    let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
+
+    let mut decoded = 0usize;
+    let mut raw_nested = Vec::new();
+    while decoded < offsets.len() {
+        let mut batch_nested = Vec::new();
+        for &off in &offsets[decoded..] {
+            raw_nested.clear();
+            let mut ctx = SummaryLiteralCbCtx {
+                file: f,
+                strings,
+                nested: &mut raw_nested,
+            };
+            unsafe {
+                sys::abc_literal_enumerate_vals(
+                    lr,
+                    off,
+                    Some(summary_literal_val_cb),
+                    &mut ctx as *mut SummaryLiteralCbCtx<'_, '_> as *mut c_void,
+                );
+            }
+            for &target in &raw_nested {
+                if is_plausible_literal_array_offset(
+                    target,
+                    file_size,
+                    module_data_offsets,
+                    phase_blob_offsets,
+                ) && !seen.contains(target)
+                {
+                    batch_nested.push(target);
+                }
+            }
+        }
+        decoded = offsets.len();
+        batch_nested.sort_unstable();
+        batch_nested.dedup();
+        for off in batch_nested {
+            if seen.insert(off) {
+                offsets.push(off);
+            }
+        }
+    }
+    Ok(offsets.len())
+}
+
+fn intern_debug_info_from_extractor(
+    debug_raw: *mut sys::AbcDebugInfo,
+    method_off: u32,
+    strings: &mut SummaryStrings<'_>,
+) {
+    for ptr in [
+        unsafe { sys::abc_debug_get_source_file(debug_raw, method_off) },
+        unsafe { sys::abc_debug_get_source_code(debug_raw, method_off) },
+    ] {
+        if !ptr.is_null() {
+            let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+            if !s.is_empty() {
+                strings.intern_utf8_str(&s);
+            }
+        }
+    }
+
+    unsafe extern "C" fn local_cb(info: *const sys::AbcLocalVarInfo, ctx: *mut c_void) -> i32 {
+        let strings = unsafe { &mut *(ctx as *mut SummaryStrings<'_>) };
+        let i = unsafe { &*info };
+        for ptr in [i.name, i.type_, i.type_signature] {
+            if ptr.is_null() {
+                strings.intern_utf8_str("");
+            } else {
+                let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+                strings.intern_utf8_str(&s);
+            }
+        }
+        0
+    }
+    unsafe {
+        sys::abc_debug_get_local_vars(
+            debug_raw,
+            method_off,
+            Some(local_cb),
+            strings as *mut SummaryStrings<'_> as *mut c_void,
+        );
+    }
+
+    unsafe extern "C" fn param_cb(info: *const sys::AbcParamInfo, ctx: *mut c_void) -> i32 {
+        let strings = unsafe { &mut *(ctx as *mut SummaryStrings<'_>) };
+        let i = unsafe { &*info };
+        for ptr in [i.name, i.signature] {
+            if ptr.is_null() {
+                strings.intern_utf8_str("");
+            } else {
+                let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+                strings.intern_utf8_str(&s);
+            }
+        }
+        0
+    }
+    unsafe {
+        sys::abc_debug_get_parameter_info(
+            debug_raw,
+            method_off,
+            Some(param_cb),
+            strings as *mut SummaryStrings<'_> as *mut c_void,
+        );
+    }
+}
+
+fn intern_debug_cstr_at(
+    file_bytes: &[u8],
+    offset: u32,
+    intern_empty: bool,
+    strings: &mut SummaryStrings<'_>,
+) -> Result<(), Error> {
+    if offset <= 60 || (offset as usize) >= file_bytes.len() {
+        return Err(Error::DebugInfoExtraction);
+    }
+    let mut sp = &file_bytes[offset as usize..];
+    let before = sp.len();
+    read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+    let prefix_len = before - sp.len();
+    let nul_pos = sp
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or(Error::DebugInfoExtraction)?;
+    if nul_pos == 0 {
+        if intern_empty {
+            strings.intern_utf8_str("");
+        }
+        return Ok(());
+    }
+    let raw = &sp[..nul_pos];
+    if std::str::from_utf8(raw).is_ok() {
+        strings.intern_in_place_utf8(offset as usize + prefix_len, nul_pos);
+    } else {
+        let lossy = String::from_utf8_lossy(raw);
+        strings.intern_utf8_str(&lossy);
+    }
+    Ok(())
+}
+
+fn primitive_type_signature(type_id_raw: u8) -> Option<&'static str> {
+    match TypeId::try_from(type_id_raw).ok()? {
+        TypeId::Void => Some("V"),
+        TypeId::U1 => Some("Z"),
+        TypeId::I8 => Some("B"),
+        TypeId::U8 => Some("H"),
+        TypeId::I16 => Some("S"),
+        TypeId::U16 => Some("C"),
+        TypeId::I32 => Some("I"),
+        TypeId::U32 => Some("U"),
+        TypeId::I64 => Some("J"),
+        TypeId::U64 => Some("Q"),
+        TypeId::F32 => Some("F"),
+        TypeId::F64 => Some("D"),
+        TypeId::Reference => Some("L"),
+        TypeId::Tagged => Some("A"),
+    }
+}
+
+/// Zero-allocation Rust LNP / `DebugInfoItem` scanner used when `verify == false`
+/// so `inspect_summary` avoids `abc_debug_info_open` while preserving exact
+/// string-pool parity and N55 malformed-LNP diagnostics.
+fn scan_debug_info_strings_raw(
+    f: *const sys::AbcFileHandle,
+    file_bytes: &[u8],
+    class_id: u32,
+    class_source_file_off: u32,
+    mr: *mut sys::AbcMethodAccessor,
+    debug_off: u32,
+    strings: &mut SummaryStrings<'_>,
+) -> Result<(), Error> {
+    if debug_off <= 60 || (debug_off as usize) >= file_bytes.len() {
+        return Err(Error::DebugInfoExtraction);
+    }
+    let mut sp = &file_bytes[debug_off as usize..];
+    let _line_start = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+    let num_params = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+
+    // Mirror DebugInfoExtractor::ExtractMethodParams.
+    let has_valid_proto = unsafe { sys::abc_method_has_valid_proto(mr) } != 0;
+    let proto_id = unsafe { sys::abc_method_get_proto_id(mr) };
+    let pr = if has_valid_proto || num_params > 0 {
+        let p = unsafe { sys::abc_proto_open(f, proto_id) };
+        if p.is_null() {
+            return Err(Error::DebugInfoExtraction);
+        }
+        p
+    } else {
+        std::ptr::null_mut()
+    };
+    let _pg = (!pr.is_null()).then(|| HandleGuard(Some(|| unsafe { sys::abc_proto_close(pr) })));
+
+    if num_params > 0 {
+        let is_static =
+            (unsafe { sys::abc_method_access_flags(mr) } & sys::AbcAccessFlags_ABC_ACC_STATIC) != 0;
+        let proto_num_args = if pr.is_null() {
+            0
+        } else {
+            unsafe { sys::abc_proto_num_args(pr) }
+        };
+        let proto_ref_num = if pr.is_null() {
+            0
+        } else {
+            unsafe { sys::abc_proto_get_ref_num(pr) }
+        };
+        let mut idx_arg = 0u32;
+        let mut idx_ref = if has_valid_proto
+            && !pr.is_null()
+            && unsafe { sys::abc_proto_get_return_type(pr) } == TypeId::Reference as u8
+        {
+            1u32
+        } else {
+            0u32
+        };
+        let mut first_param = true;
+
+        for _ in 0..num_params {
+            let param_id = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+            if param_id > 60 && !has_valid_proto {
+                intern_debug_cstr_at(file_bytes, param_id, true, strings)?;
+                strings.intern_utf8_str("A");
+                continue;
+            }
+            if param_id <= 60 {
+                first_param = false;
+                strings.intern_utf8_str("");
+                continue;
+            }
+            intern_debug_cstr_at(file_bytes, param_id, true, strings)?;
+            if first_param && !is_static {
+                intern_debug_cstr_at(file_bytes, class_id, true, strings)?;
+            } else {
+                if idx_arg >= proto_num_args {
+                    return Err(Error::DebugInfoExtraction);
+                }
+                let arg_tid = unsafe { sys::abc_proto_get_arg_type(pr, idx_arg) };
+                idx_arg += 1;
+                if arg_tid == TypeId::Reference as u8 {
+                    if idx_ref >= proto_ref_num {
+                        return Err(Error::DebugInfoExtraction);
+                    }
+                    let ref_off = unsafe { sys::abc_proto_get_reference_type(pr, idx_ref) };
+                    idx_ref += 1;
+                    intern_debug_cstr_at(file_bytes, ref_off, true, strings)?;
+                } else {
+                    let sig =
+                        primitive_type_signature(arg_tid).ok_or(Error::DebugInfoExtraction)?;
+                    strings.intern_utf8_str(sig);
+                }
+            }
+            first_param = false;
+        }
+    }
+
+    let cp_size = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)? as usize;
+    if sp.len() < cp_size {
+        return Err(Error::DebugInfoExtraction);
+    }
+    let mut cp = &sp[..cp_size];
+    sp = &sp[cp_size..];
+    let lnp_idx = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+
+    // Header layout: num_lnps at 36..40, lnp_idx_off at 40..44.
+    let num_lnps = u32::from_le_bytes(
+        file_bytes
+            .get(36..40)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(Error::DebugInfoExtraction)?,
+    );
+    let lnp_idx_off = u32::from_le_bytes(
+        file_bytes
+            .get(40..44)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(Error::DebugInfoExtraction)?,
+    );
+    if lnp_idx >= num_lnps {
+        return Err(Error::DebugInfoExtraction);
+    }
+    let entry_off = lnp_idx
+        .checked_mul(4)
+        .and_then(|n| lnp_idx_off.checked_add(n))
+        .and_then(|o| usize::try_from(o).ok())
+        .ok_or(Error::DebugInfoExtraction)?;
+    let lnp_off = u32::from_le_bytes(
+        file_bytes
+            .get(entry_off..entry_off + 4)
+            .and_then(|s| s.try_into().ok())
+            .ok_or(Error::DebugInfoExtraction)?,
+    );
+    if lnp_off <= 60 || (lnp_off as usize) >= file_bytes.len() {
+        return Err(Error::DebugInfoExtraction);
+    }
+
+    let mut prog = &file_bytes[lnp_off as usize..];
+    let mut file_off = if class_source_file_off == ABSENT {
+        0
+    } else {
+        class_source_file_off
+    };
+    let mut source_code_off = 0u32;
+    let mut started_regs: Vec<i32> = Vec::new();
+
+    loop {
+        let &opcode = prog.first().ok_or(Error::DebugInfoExtraction)?;
+        prog = &prog[1..];
+        match opcode {
+            0x00 => break, // END_SEQUENCE
+            0x01 => {
+                // ADVANCE_PC
+                read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+            }
+            0x02 => {
+                // ADVANCE_LINE
+                read_sleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+            }
+            0x03 => {
+                // START_LOCAL
+                let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
+                let name_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let type_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                intern_debug_cstr_at(file_bytes, name_id, true, strings)?;
+                intern_debug_cstr_at(file_bytes, type_id, true, strings)?;
+                started_regs.push(reg);
+            }
+            0x04 => {
+                // START_LOCAL_EXTENDED
+                let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
+                let name_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let type_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                let sig_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+                intern_debug_cstr_at(file_bytes, name_id, true, strings)?;
+                intern_debug_cstr_at(file_bytes, type_id, true, strings)?;
+                intern_debug_cstr_at(file_bytes, sig_id, true, strings)?;
+                started_regs.push(reg);
+            }
+            0x05 => {
+                // END_LOCAL
+                let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
+                if !started_regs.contains(&reg) {
+                    return Err(Error::DebugInfoExtraction);
+                }
+            }
+            0x06 => {
+                // RESTART_LOCAL (unsupported fatal in vendor)
+                return Err(Error::DebugInfoExtraction);
+            }
+            0x07 | 0x08 => {
+                // SET_PROLOGUE_END / SET_EPILOGUE_BEGIN: note upstream handler
+                // leaves `res` unchanged from previous instruction (`bool res = false`),
+                // terminating the loop if no prior opcode set `res = true`!
+            }
+            0x09 => {
+                // SET_FILE
+                file_off = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+            }
+            0x0a => {
+                // SET_SOURCE_CODE
+                source_code_off = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+            }
+            0x0b => {
+                // SET_COLUMN
+                read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
+            }
+            _ => {
+                // Special opcode (>= 0x0c)
+            }
+        }
+    }
+
+    // N55: GetFile() reads GetStringData(file_), throwing if !file_.IsValid().
+    intern_debug_cstr_at(file_bytes, file_off, false, strings)?;
+    if source_code_off > 60 {
+        intern_debug_cstr_at(file_bytes, source_code_off, false, strings)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Internal decode helpers
 // ---------------------------------------------------------------------------
 
@@ -2029,21 +4411,39 @@ fn decode_literal_array_at(
     Ok(ctx.values)
 }
 
+trait U32OffsetSet {
+    fn contains_offset(&self, off: u32) -> bool;
+}
+
+impl U32OffsetSet for HashSet<u32> {
+    #[inline]
+    fn contains_offset(&self, off: u32) -> bool {
+        self.contains(&off)
+    }
+}
+
+impl U32OffsetSet for CompactU32Set {
+    #[inline]
+    fn contains_offset(&self, off: u32) -> bool {
+        self.contains(off)
+    }
+}
+
 /// Minimum byte offset past the 60-byte `panda_file::File::Header` where a
 /// 4-byte `num_lit` count header of a tagged literal array can reside,
 /// excluding untagged module-record and module-request-phase blobs.
-fn is_plausible_literal_array_offset(
+fn is_plausible_literal_array_offset<S: U32OffsetSet>(
     off: u32,
     file_size: u32,
-    module_data_offsets: &HashSet<u32>,
-    phase_blob_offsets: &HashSet<u32>,
+    module_data_offsets: &S,
+    phase_blob_offsets: &S,
 ) -> bool {
     const HEADER_SIZE: u32 = 60;
     off != ABSENT
         && off >= HEADER_SIZE
         && u64::from(off) + 4 <= u64::from(file_size)
-        && !module_data_offsets.contains(&off)
-        && !phase_blob_offsets.contains(&off)
+        && !module_data_offsets.contains_offset(off)
+        && !phase_blob_offsets.contains_offset(off)
 }
 
 /// Seed `out` with plausible nested `LiteralValue::LiteralArray` offsets found
@@ -3105,6 +5505,143 @@ mod tests {
                 ),
                 "expected Malformed for count {bad_count:#x}, got: {result:?}"
             );
+        }
+    }
+
+    #[test]
+    fn compact_u32_set_iter_covers_rehash_and_max_sentinel() {
+        let mut set = CompactU32Set::default();
+        assert_eq!(set.iter().count(), 0);
+
+        let mut expected: Vec<u32> = (0..100).map(|i| i * 97 + 13).collect();
+        expected.push(0);
+        expected.push(u32::MAX);
+        for &v in &expected {
+            assert!(set.insert(v));
+            assert!(!set.insert(v));
+            assert!(set.contains(v));
+        }
+        assert_eq!(set.len(), expected.len());
+
+        let mut got: Vec<u32> = set.iter().collect();
+        got.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn inspect_summary_zeropadded_parity_and_tail_validation() {
+        let mut b = crate::Builder::new();
+        b.set_api(12, "beta1");
+
+        let _foreign_cls = b.add_foreign_class("LForeignBase;");
+        let cls = b.add_global_class();
+        b.class_set_source_lang(cls, crate::types::SourceLang::EcmaScript);
+        let sf = b.add_string("entry.ts");
+        b.class_set_source_file(cls, sf);
+
+        // Nested tagged literal arrays + scope-names literal array.
+        let la_leaf = b.add_literal_array("la_leaf");
+        let leaf_str = b.add_string("leaf_val");
+        b.literal_array_add_string(la_leaf, leaf_str);
+        b.literal_array_add_integer(la_leaf, 42);
+
+        let la_root = b.add_literal_array("la_root");
+        b.literal_array_add_literalarray(la_root, la_leaf);
+
+        let scope_la = b.add_literal_array("scope_la");
+        let scope_str = b.add_string("local_x");
+        b.literal_array_add_string(scope_la, scope_str);
+        let scope_field = b.class_add_field(
+            cls,
+            SCOPE_NAMES_FIELD,
+            crate::types::Type::U32,
+            crate::types::AccessFlags::PUBLIC,
+        );
+        b.field_set_value_literalarray(scope_field, scope_la)
+            .expect("scopeNames field");
+
+        // Untagged module-record blob and module-request-phase blob (excluded from literal_arrays).
+        let req = b.add_string("./dep");
+        let imp = b.add_string("foo");
+        let loc = b.add_string("foo_local");
+        let mod_la = b.add_literal_array("mod_la");
+        b.literal_array_add_module_data(
+            mod_la,
+            &[req],
+            &[crate::ModuleRecordDef::RegularImport {
+                local_name: loc,
+                import_name: imp,
+                module_request_idx: 0,
+            }],
+        )
+        .expect("module data");
+        let mod_field = b.class_add_field(
+            cls,
+            MODULE_RECORD_IDX_FIELD,
+            crate::types::Type::U32,
+            crate::types::AccessFlags::PUBLIC,
+        );
+        b.field_set_value_literalarray(mod_field, mod_la)
+            .expect("moduleRecordIdx field");
+
+        let phase_la = b.add_literal_array("phase_la");
+        b.literal_array_add_module_request_phase(phase_la, &[1])
+            .expect("phase blob");
+        let phase_field = b.class_add_field(
+            cls,
+            MODULE_REQUEST_PHASE_FIELD,
+            crate::types::Type::U32,
+            crate::types::AccessFlags::PUBLIC,
+        );
+        b.field_set_value_literalarray(phase_field, phase_la)
+            .expect("moduleRequestPhaseIdx field");
+
+        let proto = b.create_proto(crate::types::Type::Tagged, &[]);
+        let m = b.class_add_method(
+            cls,
+            "func_main_0",
+            proto,
+            crate::types::AccessFlags::PUBLIC,
+            &[0x65], // returnundefined
+            1,
+            0,
+        );
+        b.method_set_source_lang(m, crate::types::SourceLang::EcmaScript);
+
+        let data = b.finalize().expect("finalize");
+        let decoded = decode(&data).expect("decode");
+
+        let mut padded = data.clone();
+        padded.extend_from_slice(&[0u8; 16]);
+
+        for verify in [false, true] {
+            let expected = inspect_summary(&data, verify).expect("inspect_summary");
+            let actual =
+                inspect_summary_zeropadded(&padded, verify).expect("inspect_summary_zeropadded");
+            assert_eq!(actual, expected, "parity mismatch for verify={verify}");
+            assert_eq!(actual.classes, decoded.classes.len());
+            assert_eq!(actual.literal_arrays, decoded.literal_arrays.len());
+            assert_eq!(actual.strings, decoded.strings.len());
+            assert_eq!(actual.entity_index_entries, decoded.entity_map.len());
+        }
+
+        // Every non-zero byte in the 16-byte trailing padding must be rejected.
+        for tail_idx in 0..16 {
+            let mut bad = padded.clone();
+            bad[data.len() + tail_idx] = 0xAA;
+            assert!(
+                matches!(inspect_summary_zeropadded(&bad, false), Err(Error::Open(_))),
+                "non-zero tail byte at {tail_idx} must fail"
+            );
+        }
+
+        // Unpadded or short buffers must be rejected cleanly.
+        for short in [&[][..], &[0u8; 15][..], &[0u8; 16][..], data.as_slice()] {
+            assert!(matches!(
+                inspect_summary_zeropadded(short, false),
+                Err(Error::Open(_))
+            ));
         }
     }
 }

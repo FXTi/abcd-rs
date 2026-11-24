@@ -192,21 +192,19 @@ pub(crate) fn arkui_main_struct_names(pre: &crate::emit::PreparedFunc) -> BTreeS
 /// `registerNamedRoute` / `loadDocument` registration calls around `@Component`
 /// classes. Returns `true` if handled.
 pub(crate) fn try_emit_arkui_main(em: &mut Emitter<'_>, func: FuncId, out: &mut String) -> bool {
-    let Some(pre) = em
-        .prepared
-        .get(func.index())
-        .and_then(|s| s.as_ref())
-        .cloned()
-    else {
-        return false;
-    };
-
-    let env = collect_const_bindings(&pre.body);
-    let mut plan = MainArkUiPlan::default();
-    scan_main_body(&pre.body, &env, &mut plan);
-    if !plan.has_view_class {
+    if em.module.func(func).is_none() {
         return false;
     }
+    let (env, plan) = {
+        let pre = em.peek_prepared(func, true);
+        let env = collect_const_bindings(&pre.body);
+        let mut plan = MainArkUiPlan::default();
+        scan_main_body(&pre.body, &env, &mut plan);
+        if !plan.has_view_class {
+            return false;
+        }
+        (env, plan)
+    };
 
     let (rf, body) = em.func_nodes(func, true);
     em.stats.functions += 1;
@@ -653,11 +651,8 @@ fn emit_arkui_struct(
             continue;
         }
 
-        let is_builder = em
-            .prepared
-            .get(mfid.index())
-            .and_then(|s| s.as_ref())
-            .is_some_and(|p| body_has_observe_creation(&p.body));
+        let is_builder = em.module.func(mfid).is_some()
+            && body_has_observe_creation(&em.peek_prepared(mfid, false).body);
         if is_builder {
             em.stats.class_methods += 1;
             let (rf, mbody) = em.func_nodes(mfid, false);
@@ -710,33 +705,35 @@ fn clean_component_name(raw: &str) -> String {
 
 fn collect_const_bindings(nodes: &[SNode]) -> BTreeMap<String, Expr> {
     let mut map = BTreeMap::new();
-    fn walk(nodes: &[SNode], map: &mut BTreeMap<String, Expr>) {
-        for n in nodes {
-            match n {
-                SNode::Stmts(leaves) => {
-                    for l in leaves {
-                        match l {
-                            Leaf::Raw(Stmt::Declare { name, value, .. }) => {
-                                map.insert(name.clone(), value.clone());
-                            }
-                            Leaf::Raw(Stmt::LexStore { name, value, .. }) => {
-                                map.entry(name.clone()).or_insert_with(|| value.clone());
-                            }
-                            _ => {}
+    let mut stack: Vec<std::slice::Iter<'_, SNode>> = vec![nodes.iter()];
+    while let Some(iter) = stack.last_mut() {
+        let Some(n) = iter.next() else {
+            stack.pop();
+            continue;
+        };
+        match n {
+            SNode::Stmts(leaves) => {
+                for l in leaves {
+                    match l {
+                        Leaf::Raw(Stmt::Declare { name, value, .. }) => {
+                            map.insert(name.clone(), value.clone());
                         }
+                        Leaf::Raw(Stmt::LexStore { name, value, .. }) => {
+                            map.entry(name.clone()).or_insert_with(|| value.clone());
+                        }
+                        _ => {}
                     }
                 }
-                SNode::If {
-                    then, otherwise, ..
-                } => {
-                    walk(then, map);
-                    walk(otherwise, map);
-                }
-                _ => {}
             }
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                stack.push(otherwise.iter());
+                stack.push(then.iter());
+            }
+            _ => {}
         }
     }
-    walk(nodes, &mut map);
     map
 }
 
@@ -806,16 +803,30 @@ fn is_finalize_construction_polyfill(
     false
 }
 
-fn expr_mentions_finalize_str(e: &Expr, env: &BTreeMap<String, Expr>) -> bool {
-    match resolve_expr(e, env) {
-        Expr::Lit(Lit::String(s)) => s == "finalizeConstruction",
-        Expr::Unary { operand, .. } => expr_mentions_finalize_str(operand, env),
-        Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } => {
-            expr_mentions_finalize_str(left, env) || expr_mentions_finalize_str(right, env)
+fn expr_mentions_finalize_str(root: &Expr, env: &BTreeMap<String, Expr>) -> bool {
+    let mut stack: Vec<&Expr> = vec![root];
+    let mut budget = 4096usize;
+    while let Some(e) = stack.pop() {
+        if budget == 0 {
+            break;
         }
-        Expr::Call { args, .. } => args.iter().any(|a| expr_mentions_finalize_str(a, env)),
-        _ => false,
+        budget -= 1;
+        match resolve_expr(e, env) {
+            Expr::Lit(Lit::String(s)) if s == "finalizeConstruction" => return true,
+            Expr::Unary { operand, .. } => stack.push(operand),
+            Expr::Binary { left, right, .. } | Expr::Compare { left, right, .. } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            Expr::Call { args, .. } => {
+                for a in args.iter().rev() {
+                    stack.push(a);
+                }
+            }
+            _ => {}
+        }
     }
+    false
 }
 
 fn is_pure_arkui_main_setup(value: &Expr, env: &BTreeMap<String, Expr>) -> bool {
@@ -1030,7 +1041,12 @@ fn extract_arkui_fields(em: &mut Emitter<'_>, ctor_body: &[SNode]) -> Vec<ArkFie
 }
 
 fn walk_ctor_stmts(nodes: &[SNode], f: &mut impl FnMut(&Stmt)) {
-    for n in nodes {
+    let mut stack: Vec<std::slice::Iter<'_, SNode>> = vec![nodes.iter()];
+    while let Some(iter) = stack.last_mut() {
+        let Some(n) = iter.next() else {
+            stack.pop();
+            continue;
+        };
         match n {
             SNode::Stmts(leaves) => {
                 for l in leaves {
@@ -1042,8 +1058,8 @@ fn walk_ctor_stmts(nodes: &[SNode], f: &mut impl FnMut(&Stmt)) {
             SNode::If {
                 then, otherwise, ..
             } => {
-                walk_ctor_stmts(then, f);
-                walk_ctor_stmts(otherwise, f);
+                stack.push(otherwise.iter());
+                stack.push(then.iter());
             }
             _ => {}
         }

@@ -51,6 +51,10 @@ const char *abc_vendor_scope_names_field_name(void);
 typedef struct AbcFileHandle AbcFileHandle;
 
 AbcFileHandle *abc_file_open(const uint8_t *data, size_t len);
+/* Borrow a caller-owned buffer whose last 16 bytes are zero padding
+ * (`orig_len = padded_len - 16`), avoiding any C++ buffer allocation.
+ * The caller must keep `data[0..padded_len]` alive until `abc_file_close`. */
+AbcFileHandle *abc_file_open_zeropadded(const uint8_t *data, size_t padded_len);
 void abc_file_close(AbcFileHandle *f);
 /* Reason for the last failed abc_file_open (thread-local; empty on success). */
 const char *abc_file_open_error(void);

@@ -17,7 +17,7 @@ Format-independent Static Single Assignment (SSA) intermediate representation fo
 | `Module`, `ClassData`, `Dialect`, `SourceLang` | [`module`](src/module.rs) | Top-level program container, global arenas (`insts`, `blocks`, `values`), class/field metadata, ES & `--merge-abc` module records |
 | `FunctionData`, `Block`, `Edge`, `TryRegion` | [`function`](src/function.rs) | Per-function CFG, leading phi prefix, `EdgeKind::{Normal, Exceptional}` edges, `ValueDef::ExceptionParam`, debug tables |
 | `FuncId`, `ClassId`, `BlockId`, `InstId`, `ValueId`, `Sym`, `ConstId` | [`id`](src/id.rs) | Typed `u32` append-only arena indices with module-wide uniqueness |
-| `Op` (`88` variants), `CallKind`, `Arity` | [`op`](src/op.rs) | Closed semantic op taxonomy with single-point `operands()`, `operands_mut()`, `has_result()`, `is_terminator()`, and `arity()` |
+| `Op` (`88` variants), `CallKind`, `Arity` | [`op`](src/op.rs) | Closed semantic op taxonomy with single-point `operands()`, `for_each_operand()`, `has_operand()`, `operands_mut()`, `has_result()`, `is_terminator()`, and `arity()` |
 | `Effects`, `MemClasses`, `CallEffect`, `AllocKind` | [`effects`](src/effects.rs) | Mechanically derived `Op::effects()` table (reads, writes, `may_throw`, `may_call`, `allocs`) |
 | `Ty`, `DynPrim`, `StaticTy` | [`ty`](src/ty.rs) | Dynamic-first type lattice (`Any`, `DynPrim`, `Union`, `Unknown`) plus `ClassId`-indexed `StaticTy` annotations |
 | `SymbolTable` | [`symbol`](src/symbol.rs) | Append-only dual-bucket string interner preserving both valid UTF-8 and lone-surrogate MUTF-8 byte sequences |

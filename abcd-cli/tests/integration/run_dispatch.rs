@@ -192,6 +192,26 @@ fn info_all_json_multi_module() {
     run_argv(&["abcd", "info", &app, "--all", "--json"]).expect("info --all --json");
 }
 
+#[test]
+fn info_bare_abc_module_selection_and_padded_reader() {
+    let (dir, abc) = tiny_abc_file("dispatch-info-bare-sel");
+    let padded = abcd_cli::input::read_padded_file(&dir.join("tiny.abc")).expect("padded read");
+    let raw = common::tiny_abc();
+    assert_eq!(padded.len(), raw.len() + 16);
+    assert_eq!(&padded[..raw.len()], raw.as_slice());
+    assert_eq!(&padded[raw.len()..], &[0u8; 16]);
+
+    run_argv(&["abcd", "info", &abc, "--module", "tiny"]).expect("matching --module");
+    run_argv(&["abcd", "info", &abc, "--all"]).expect("--all on bare abc");
+
+    let err = run_argv(&["abcd", "info", &abc, "--module", "other"]).unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert_eq!(
+        err.to_string(),
+        format!("{abc} has no module named \"other\"; available modules: tiny")
+    );
+}
+
 // ---- dis ----
 
 #[test]

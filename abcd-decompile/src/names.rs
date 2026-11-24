@@ -19,6 +19,7 @@
 //! [`crate::legalize::Legalizer`]'s job at mint time.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use abcd_ir::ValueDef;
 use abcd_ir::consts::Const;
@@ -71,6 +72,9 @@ impl RecordModuleEnv {
 pub struct DecompileIndex {
     /// `func.index()` → first defining parent function in module order.
     parents: Vec<Option<FuncId>>,
+    /// `func.index()` → precomputed inherited lexical-environment chain
+    /// captured from `parents[func]` (`None` when empty).
+    seed_chains: Vec<Option<Arc<[EnvFrame]>>>,
     /// Resolved G2 module-variable slot names (`module_slot_names(module)`).
     pub slot_names: BTreeMap<u32, String>,
     /// Optional per-class isolated ES module slot tables (`build_split`).
@@ -107,6 +111,8 @@ impl DecompileIndex {
             }
         }
 
+        let seed_chains = precompute_seed_chains(module, &parents);
+
         let mut class_ctors = HashSet::new();
         for inst in &module.insts {
             if let Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } = &inst.op {
@@ -133,6 +139,7 @@ impl DecompileIndex {
 
         Self {
             parents,
+            seed_chains,
             slot_names: module_slot_names(module),
             per_class_env: None,
             class_ctors,
@@ -153,6 +160,74 @@ impl DecompileIndex {
     pub fn parent_of(&self, func: FuncId) -> Option<FuncId> {
         self.parents.get(func.index()).copied().flatten()
     }
+
+    /// Precomputed inherited lexical-environment seed chain of `func` (`O(1)`).
+    #[inline]
+    pub(crate) fn seed_of(&self, func: FuncId) -> &[EnvFrame] {
+        self.seed_chains
+            .get(func.index())
+            .and_then(Option::as_deref)
+            .unwrap_or(&[])
+    }
+}
+
+/// Precompute inherited lexical-environment chains for every child function in
+/// `module` in ONE top-down pass over parent functions using an explicit heap
+/// workstack and cycle guard (zero call-stack recursion, zero redundant ancestor
+/// re-walks).
+fn precompute_seed_chains(
+    module: &Module,
+    parents: &[Option<FuncId>],
+) -> Vec<Option<Arc<[EnvFrame]>>> {
+    let n = module.functions.len();
+    let mut is_parent = vec![false; n];
+    for p in parents.iter().flatten() {
+        if let Some(flag) = is_parent.get_mut(p.index()) {
+            *flag = true;
+        }
+    }
+
+    // 0 = uncomputed, 1 = on active ancestor stack (cycle guard), 2 = computed.
+    let mut state = vec![0u8; n];
+    let mut seed_chains: Vec<Option<Arc<[EnvFrame]>>> = vec![None; n];
+    let mut work: Vec<FuncId> = Vec::new();
+
+    for start in 0..n {
+        if !is_parent[start] || state[start] != 0 {
+            continue;
+        }
+        let mut cur = FuncId::new(start as u32);
+        loop {
+            let ci = cur.index();
+            if ci >= n || state[ci] != 0 {
+                break;
+            }
+            state[ci] = 1;
+            work.push(cur);
+            match parents[ci] {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+
+        while let Some(p) = work.pop() {
+            let pi = p.index();
+            let seed = seed_chains
+                .get(pi)
+                .and_then(Option::as_deref)
+                .unwrap_or(&[]);
+            let scopes = NameScopes::build_seeded(module, p, seed, true);
+            for (child, chain) in scopes.defines {
+                let ci = child.index();
+                if ci < n && parents[ci] == Some(p) && state[ci] != 2 && !chain.is_empty() {
+                    seed_chains[ci] = Some(chain);
+                }
+            }
+            state[pi] = 2;
+        }
+    }
+
+    seed_chains
 }
 
 /// One lexical-environment frame (one `NewLexEnv*`).
@@ -188,14 +263,24 @@ pub struct NameScopes {
     /// `(inst, resolved raw name)` for every lexvar/private-name op.
     resolved: BTreeMap<InstId, String>,
     /// Child function → the env chain captured at its definition site
-    /// (first site in augmented-RPO wins — deterministic).
-    defines: BTreeMap<FuncId, Vec<EnvFrame>>,
+    /// (first site in augmented-RPO wins — deterministic). Populated only
+    /// when `record_defines` is enabled, sharing a single [`Arc`] across
+    /// sibling functions defined at the same lexical stack state.
+    defines: BTreeMap<FuncId, Arc<[EnvFrame]>>,
 }
 
 impl NameScopes {
     /// The resolved raw name of a lexvar/private-name instruction.
     pub fn name_of(&self, inst: InstId) -> Option<&str> {
         self.resolved.get(&inst).map(String::as_str)
+    }
+
+    /// Whether any resolved raw name in this scope table sanitizes to the
+    /// synthetic unnamed-lexenv fallback shape (`v<digits>_<digits>`).
+    pub(crate) fn has_fallback_lexenv_name(&self) -> bool {
+        self.resolved
+            .values()
+            .any(|raw| crate::emit::is_fallback_lexenv_name(&sanitize(raw)))
     }
 
     /// Build the chain of `func` in `module`, seeded with the
@@ -205,49 +290,57 @@ impl NameScopes {
     }
 
     /// [`NameScopes::build`] using a pre-built [`DecompileIndex`] when
-    /// available (`O(1)` parent lookup instead of scanning `module.functions`).
+    /// available (`O(1)` precomputed seed lookup instead of rescanning and
+    /// re-running `build_seeded` on ancestor functions).
     pub fn build_with_index(
         module: &Module,
         func_id: FuncId,
         index: Option<&DecompileIndex>,
     ) -> Self {
-        let mut visiting = Vec::new();
-        let seed = Self::inherited_chain(module, func_id, index, &mut visiting);
-        Self::build_seeded(module, func_id, seed)
+        match index {
+            Some(idx) => Self::build_seeded(module, func_id, idx.seed_of(func_id), false),
+            None => {
+                let seed = Self::inherited_chain(module, func_id);
+                Self::build_seeded(module, func_id, &seed, false)
+            }
+        }
     }
 
-    /// The env chain a function INHERITS: the parent's env stack at the
-    /// definition site. `visiting` guards define-site cycles (a malformed
-    /// module could nest functions mutually; degrade to no seed).
-    fn inherited_chain(
-        module: &Module,
-        func: FuncId,
-        index: Option<&DecompileIndex>,
-        visiting: &mut Vec<FuncId>,
-    ) -> Vec<EnvFrame> {
-        if visiting.contains(&func) {
-            return Vec::new();
+    /// The env chain a function INHERITS when no [`DecompileIndex`] is
+    /// available: iterative ancestor collection with a cycle guard (malformed
+    /// mutually nested functions degrade to no seed), walked top-down with zero
+    /// call-stack recursion.
+    fn inherited_chain(module: &Module, func: FuncId) -> Arc<[EnvFrame]> {
+        let mut chain: Vec<(FuncId, FuncId)> = Vec::new();
+        let mut visited: HashSet<FuncId> = HashSet::new();
+        visited.insert(func);
+        let mut cur = func;
+        while let Some(parent) = parent_of(module, cur) {
+            if !visited.insert(parent) {
+                break;
+            }
+            chain.push((cur, parent));
+            cur = parent;
         }
-        let parent_opt = match index {
-            Some(idx) => idx.parent_of(func),
-            None => parent_of(module, func),
-        };
-        let Some(parent) = parent_opt else {
-            return Vec::new();
-        };
-        if visiting.contains(&parent) {
-            return Vec::new();
+        let mut seed: Arc<[EnvFrame]> = Arc::from([]);
+        for &(child, parent) in chain.iter().rev() {
+            let mut scopes = Self::build_seeded(module, parent, &seed, true);
+            seed = scopes
+                .defines
+                .remove(&child)
+                .unwrap_or_else(|| Arc::from([]));
         }
-        visiting.push(func);
-        let seed = Self::inherited_chain(module, parent, index, visiting);
-        visiting.pop();
-        let scopes = Self::build_seeded(module, parent, seed);
-        scopes.defines.get(&func).cloned().unwrap_or_default()
+        seed
     }
 
     /// Build with an explicit seed chain (the inherited environment;
     /// empty for functions with no known definition site).
-    fn build_seeded(module: &Module, func_id: FuncId, seed: Vec<EnvFrame>) -> Self {
+    fn build_seeded(
+        module: &Module,
+        func_id: FuncId,
+        seed: &[EnvFrame],
+        record_defines: bool,
+    ) -> Self {
         let seed_len = seed.len();
         let mut scopes = NameScopes {
             resolved: BTreeMap::new(),
@@ -286,7 +379,8 @@ impl NameScopes {
                     });
                 }
             }
-            let mut stack = meet.unwrap_or_else(|| seed.clone());
+            let mut stack = meet.unwrap_or_else(|| seed.to_vec());
+            let mut cached_arc: Option<Arc<[EnvFrame]>> = None;
             if let Some(block) = module.block(b) {
                 for &iid in &block.insts {
                     let Some(inst) = module.inst(iid) else {
@@ -295,8 +389,10 @@ impl NameScopes {
                     step_inst(
                         module,
                         &mut stack,
+                        &mut cached_arc,
                         seed_len,
-                        inst.op.clone(),
+                        record_defines,
+                        &inst.op,
                         iid,
                         &mut scopes,
                     );
@@ -320,24 +416,24 @@ fn common_prefix(a: &[EnvFrame], b: &[EnvFrame]) -> Vec<EnvFrame> {
 /// captured chain is the site's env stack).
 fn defined_children(module: &Module, op: &Op) -> Vec<FuncId> {
     fn method_refs(module: &Module, cid: ConstId, out: &mut Vec<FuncId>) {
-        if let Some(c) = module.consts.get(cid) {
-            method_refs_const(c, out);
-        }
-    }
-    fn method_refs_const(c: &Const, out: &mut Vec<FuncId>) {
-        match c {
-            Const::MethodRef(f) => out.push(*f),
-            Const::ArrayLiteral(items) => {
-                for i in items {
-                    method_refs_const(i, out);
+        if let Some(root) = module.consts.get(cid) {
+            let mut stack: Vec<&Const> = vec![root];
+            while let Some(c) = stack.pop() {
+                match c {
+                    Const::MethodRef(f) => out.push(*f),
+                    Const::ArrayLiteral(items) => {
+                        for i in items.iter().rev() {
+                            stack.push(i);
+                        }
+                    }
+                    Const::ObjectLiteral { keys, values } => {
+                        for i in values.iter().rev().chain(keys.iter().rev()) {
+                            stack.push(i);
+                        }
+                    }
+                    _ => {}
                 }
             }
-            Const::ObjectLiteral { keys, values } => {
-                for i in keys.iter().chain(values.iter()) {
-                    method_refs_const(i, out);
-                }
-            }
-            _ => {}
         }
     }
     let mut out = Vec::new();
@@ -387,21 +483,43 @@ fn parent_of(module: &Module, func: FuncId) -> Option<FuncId> {
 /// scoped to the function's OWN frames (the legacy behavior — the
 /// private-name printing/class-fold pipeline keys on it), and define
 /// ops record the captured chain for their children.
+#[allow(clippy::too_many_arguments)]
 fn step_inst(
     module: &Module,
     stack: &mut Vec<EnvFrame>,
+    cached_arc: &mut Option<Arc<[EnvFrame]>>,
     seed_len: usize,
-    op: Op,
+    record_defines: bool,
+    op: &Op,
     iid: InstId,
     scopes: &mut NameScopes,
 ) {
     // Record the captured chain for defined children BEFORE the op's
     // own effect (define ops do not push/pop the chain).
-    for child in defined_children(module, &op) {
-        scopes.defines.entry(child).or_insert_with(|| stack.clone());
+    if record_defines
+        && matches!(
+            op,
+            Op::DefineFunc { .. }
+                | Op::DefineClass { .. }
+                | Op::DefineSendableClass { .. }
+                | Op::AllocObject { .. }
+        )
+    {
+        for child in defined_children(module, op) {
+            scopes.defines.entry(child).or_insert_with(|| {
+                if stack.is_empty() {
+                    Arc::from([])
+                } else {
+                    cached_arc
+                        .get_or_insert_with(|| Arc::from(stack.as_slice()))
+                        .clone()
+                }
+            });
+        }
     }
-    match &op {
+    match op {
         Op::NewLexEnv { num_vars } => {
+            *cached_arc = None;
             stack.push(EnvFrame {
                 slots: vec![None; *num_vars as usize],
                 priv_names: Vec::new(),
@@ -411,6 +529,7 @@ fn step_inst(
             num_vars,
             scope_names,
         } => {
+            *cached_arc = None;
             let names = string_array(module, *scope_names).unwrap_or_default();
             let mut slots: Vec<Option<String>> = names.into_iter().map(Some).collect();
             slots.resize(*num_vars as usize, None);
@@ -420,10 +539,12 @@ fn step_inst(
             });
         }
         Op::PopLexEnv => {
+            *cached_arc = None;
             stack.pop();
         }
         Op::CreatePrivateNames { names, .. } => {
             if let Some(top) = stack.last_mut() {
+                *cached_arc = None;
                 for n in string_array(module, *names).unwrap_or_default() {
                     top.priv_names.push(Some(n));
                 }
@@ -515,24 +636,23 @@ fn augmented_rpo(module: &Module, func_id: FuncId) -> Vec<BlockId> {
     }
     let mut visited = std::collections::BTreeSet::new();
     let mut post = Vec::new();
-    fn dfs(
-        b: BlockId,
-        succs: &BTreeMap<BlockId, Vec<BlockId>>,
-        visited: &mut std::collections::BTreeSet<BlockId>,
-        post: &mut Vec<BlockId>,
-    ) {
-        if !visited.insert(b) {
-            return;
-        }
-        if let Some(s) = succs.get(&b) {
-            for &s in s {
-                dfs(s, succs, visited, post);
+    if let Some(entry) = func.entry()
+        && visited.insert(entry)
+    {
+        let mut stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
+        while let Some((b, idx)) = stack.last_mut() {
+            let cur = *b;
+            let next_succ = succs.get(&cur).and_then(|s| s.get(*idx)).copied();
+            if let Some(s) = next_succ {
+                *idx += 1;
+                if visited.insert(s) {
+                    stack.push((s, 0));
+                }
+            } else {
+                stack.pop();
+                post.push(cur);
             }
         }
-        post.push(b);
-    }
-    if let Some(entry) = func.entry() {
-        dfs(entry, &succs, &mut visited, &mut post);
     }
     post.reverse();
     for &b in &func.blocks {
@@ -1153,5 +1273,84 @@ mod tests {
             names,
             BTreeMap::from([(3u32, "myFunc".to_string()), (4u32, "other".to_string())])
         );
+    }
+
+    #[test]
+    fn name_scopes_cached_index_matches_uncached_and_survives_deep_chain_on_256k_stack() {
+        let mut m = mk_module();
+        let depth = 3_000usize;
+        // Build reverse-numbered functions so parents have HIGHER FuncId than children,
+        // exercising out-of-order top-down seed precomputation in `DecompileIndex::build`.
+        let fids: Vec<FuncId> = (0..depth)
+            .map(|i| add_fn(&mut m, &format!("nest_{i}")))
+            .collect();
+        let outer_sym = m.sym.intern("capturedOuter");
+        let scope_arr = m
+            .consts
+            .push(Const::ArrayLiteral(vec![Const::String(outer_sym)]));
+
+        // Root is `fids[depth - 1]`, defining `fids[depth - 2]` -> ... -> `fids[0]`.
+        let root_b = entry_of(&m, fids[depth - 1]);
+        let _ = emit_val(
+            &mut m,
+            root_b,
+            Op::NewLexEnvWithName {
+                num_vars: 1,
+                scope_names: scope_arr,
+            },
+        );
+        for k in (1..depth).rev() {
+            let b = entry_of(&m, fids[k]);
+            let _ = emit_val(
+                &mut m,
+                b,
+                Op::DefineFunc {
+                    body: fids[k - 1],
+                    captures: Vec::new(),
+                    length: 0,
+                },
+            );
+            push_inst(&mut m, b, Op::Return { value: None });
+        }
+        let leaf_b = entry_of(&m, fids[0]);
+        let leaf_get = push_inst(&mut m, leaf_b, Op::GetLexVar { level: 0, slot: 0 });
+        push_inst(&mut m, leaf_b, Op::Return { value: None });
+
+        // Also add a mutual cycle (`cyc_a <-> cyc_b`) to verify cycle safety.
+        let cyc_a = add_fn(&mut m, "cyc_a");
+        let cyc_b = add_fn(&mut m, "cyc_b");
+        for (src, dst) in [(cyc_a, cyc_b), (cyc_b, cyc_a)] {
+            let b = entry_of(&m, src);
+            let _ = emit_val(
+                &mut m,
+                b,
+                Op::DefineFunc {
+                    body: dst,
+                    captures: Vec::new(),
+                    length: 0,
+                },
+            );
+            push_inst(&mut m, b, Op::Return { value: None });
+        }
+
+        std::thread::scope(|s| {
+            let handle = std::thread::Builder::new()
+                .name("names-256k-stack".to_string())
+                .stack_size(256 * 1024)
+                .spawn_scoped(s, || {
+                    let index = DecompileIndex::build(&m);
+                    let cached = NameScopes::build_with_index(&m, fids[0], Some(&index));
+                    assert_eq!(cached.name_of(leaf_get), Some("capturedOuter"));
+                    assert!(!cached.has_fallback_lexenv_name());
+
+                    let uncached = NameScopes::build(&m, fids[0]);
+                    assert_eq!(uncached.name_of(leaf_get), Some("capturedOuter"));
+
+                    let _ = NameScopes::build_with_index(&m, cyc_a, Some(&index));
+                    let _ = NameScopes::build(&m, cyc_a);
+                })
+                .expect("spawn 256k scoped thread");
+            handle.join().expect("256k thread must not stack-overflow");
+        });
     }
 }

@@ -117,3 +117,25 @@ fn render_in_text_mode_produces_the_text_report() {
     );
     assert!(out.contains("file type:       dynamic"), "{out}");
 }
+
+#[test]
+fn report_zeropadded_matches_report() {
+    let raw = common::tiny_abc();
+    let modules = input::load_bytes(&raw, "modules.abc", ModuleSelection::Single).unwrap();
+    let mut padded = raw.clone();
+    padded.extend_from_slice(&[0u8; 16]);
+
+    for verify in [false, true] {
+        let expected = info::report(&modules[0], verify).unwrap();
+        let actual = info::report_zeropadded("modules", "modules.abc", &padded, verify).unwrap();
+        assert_eq!(actual.input_bytes, raw.len());
+        assert_eq!(
+            serde_json::to_value(&actual).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+    }
+
+    // Missing zero-padding is rejected as a tool error (exit code 2).
+    let err = info::report_zeropadded("modules", "modules.abc", &raw, false).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+}

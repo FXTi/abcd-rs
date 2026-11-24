@@ -168,18 +168,20 @@ const ENTRY_NAME: &str = "func_main_0";
 
 /// Decode, lift, and analyze one module.
 pub fn report(module: &InputModule, opts: AnalyzeOptions) -> Result<AnalyzeReport, CliError> {
-    let file = abcd_file::decode(&module.abc).map_err(|e| {
-        CliError::Tool(format!(
-            "failed to decode {} ({}): {e}",
-            module.name, module.provenance
-        ))
-    })?;
-    let ir = abcd_lift::lift_file(&file).map_err(|e| {
-        CliError::Tool(format!(
-            "failed to lift {} ({}): {e}",
-            module.name, module.provenance
-        ))
-    })?;
+    let ir = {
+        let file = abcd_file::decode(&module.abc).map_err(|e| {
+            CliError::Tool(format!(
+                "failed to decode {} ({}): {e}",
+                module.name, module.provenance
+            ))
+        })?;
+        abcd_lift::lift_file(&file).map_err(|e| {
+            CliError::Tool(format!(
+                "failed to lift {} ({}): {e}",
+                module.name, module.provenance
+            ))
+        })?
+    };
 
     let graph = CallGraph::build(&ir);
     let histogram = graph.histogram(&ir);

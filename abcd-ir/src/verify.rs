@@ -656,7 +656,8 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             // Taxonomy arity drift guard (fixed-arity ops only; variadic
             // ops are constrained by their own rules, e.g. phi/preds).
             if let crate::op::Arity::Exact(n) = inst.op.arity() {
-                let actual = inst.op.operands().len();
+                let mut actual = 0usize;
+                inst.op.for_each_operand(|_| actual += 1);
                 if actual != n {
                     report.errors.push(err(
                         Some(bb),
@@ -772,11 +773,7 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             let Some(inst) = module.inst(inst_id) else {
                 continue;
             };
-            let uses: Vec<ValueId> = match &inst.op {
-                Op::Phi { entries } => entries.iter().map(|(_, v)| *v).collect(),
-                _ => inst.op.operands(),
-            };
-            for val in uses {
+            inst.op.for_each_operand(|val| {
                 if module.value(val).is_none() {
                     report.errors.push(err(
                         Some(bb),
@@ -786,7 +783,7 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                 } else if let Some(kind) = ownership(val) {
                     report.errors.push(err(Some(bb), Some(inst_id), kind));
                 }
-            }
+            });
         }
     }
 
@@ -1082,8 +1079,8 @@ fn verify_dominance(
                 continue;
             }
 
-            for val in inst.op.operands() {
-                let Some(v) = module.value(val) else { continue };
+            inst.op.for_each_operand(|val| {
+                let Some(v) = module.value(val) else { return };
                 match v.def {
                     ValueDef::Param(_) | ValueDef::Const(_) => {}
                     ValueDef::ExceptionParam(h) => {
@@ -1100,7 +1097,7 @@ fn verify_dominance(
                     }
                     ValueDef::Inst(def_inst) => {
                         let Some(def) = module.inst(def_inst) else {
-                            continue;
+                            return;
                         };
                         if def.block == bb {
                             // Same block: the definition must precede the
@@ -1113,16 +1110,16 @@ fn verify_dominance(
                                     VerifyErrorKind::UseBeforeDef { value: val },
                                 ));
                             }
-                            continue;
+                            return;
                         }
                         let Some(&di) = index.get(&def.block) else {
-                            continue;
+                            return;
                         };
                         // Exemption 4 (entry-defined) and exemptions 1-2
                         // (dead blocks; blocks with no Normal-edge path
                         // from entry — handlers).
                         if di == entry_i || !normal_reachable(bi) {
-                            continue;
+                            return;
                         }
                         if !dominates(di, bi) {
                             report.errors.push(err(
@@ -1136,7 +1133,7 @@ fn verify_dominance(
                         }
                     }
                 }
-            }
+            });
         }
     }
 }

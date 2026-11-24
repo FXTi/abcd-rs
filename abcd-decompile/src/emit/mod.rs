@@ -40,7 +40,9 @@
 //!   exist on ≤11-format files; 12+/24 functions keep bare parameter
 //!   lists under the flag.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 
 use abcd_ir::function::Loc;
 use abcd_ir::module::{ExportDecl, FunctionKind, ImportDecl, Module, Signature};
@@ -97,7 +99,7 @@ pub struct EmitOptions {
 }
 
 /// Emission counters (the corpus gate prints them verbatim).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DecompileStats {
     /// Functions decompiled.
     pub functions: usize,
@@ -132,30 +134,48 @@ pub struct DecompiledModule {
     pub stats: DecompileStats,
 }
 
+/// Maximum total functions (roots + transitive inline closures/methods)
+/// materialized as [`PreparedFunc`] ASTs in a single parallel batch (`512`),
+/// bounding peak AST memory even when each top-level `func_main_0` pulls in
+/// dozens of inline class/closure bodies.
+pub(crate) const MAX_BATCH_PREPARED_FUNCS: usize = 512;
+
+/// Number of candidate functions scanned per parallel chunk during the
+/// lightweight Stage-A orphan lexical-slot pass.
+const ORPHAN_SCAN_BATCH: usize = 512;
+
+/// Cap retained capacity of the reusable per-function string buffer (`1 MiB`)
+/// so a single outlier function never pins a huge allocation across the run.
+const MAX_RETAINED_FN_BUF: usize = 1024 * 1024;
+
 /// Decompile a whole module to JS text.
 pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule {
+    let mut buf = Vec::new();
+    let stats = decompile_module_to_writer(module, opts, &mut buf).unwrap_or_default();
+    let text = String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned());
+    DecompiledModule { text, stats }
+}
+
+/// Stream a decompiled module directly to `out` without buffering all function
+/// ASTs or the full module source text in memory.
+///
+/// Top-level functions and their transitive inline functions (closures, class
+/// constructors/methods, object-shape methods, and `--arkui` prototype methods)
+/// are prepared in bounded parallel batches, emitted in deterministic
+/// [`FuncId`] order, written per function to `out`, and immediately dropped.
+/// Output bytes and [`DecompileStats`] are 100% identical to
+/// [`decompile_module`].
+pub fn decompile_module_to_writer<W: Write>(
+    module: &Module,
+    opts: &EmitOptions,
+    out: &mut W,
+) -> std::io::Result<DecompileStats> {
     // Consumed functions: closure bodies, class ctors, and every
     // MethodRef in the const pool (emitted inline, never top-level).
     let consumed = consumed_functions(module);
     let index = DecompileIndex::build(module);
-
-    // Parallel per-function recovery + structuring + folds (#29): each
-    // function is a pure read-only `(&Module, &DecompileIndex)` consumer,
-    // and collecting orphan lexenv names during the same parallel pass
-    // eliminates the duplicate whole-module `recover_func` sweep.
-    let (prepared, orphan_sets): (Vec<PreparedFunc>, Vec<BTreeSet<String>>) =
-        (0..module.functions.len())
-            .into_par_iter()
-            .map(|i| {
-                let func = FuncId::new(i as u32);
-                let top_level = !consumed.contains(&func);
-                prepare_func(module, Some(&index), func, top_level)
-            })
-            .unzip();
-    let mut orphan_names = BTreeSet::new();
-    for s in orphan_sets {
-        orphan_names.extend(s);
-    }
+    let orphan_names = collect_module_orphan_lexenv_names(module, &index);
 
     let mut em = Emitter {
         module,
@@ -167,14 +187,20 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         current_kind: FunctionKind::Function,
         class_depth: 0,
         hoisted: BTreeSet::new(),
-        prepared: prepared.into_iter().map(Some).collect(),
-        reused: BTreeMap::new(),
+        prepared: BTreeMap::new(),
     };
-    let mut out = String::new();
-    out.push_str("// Decompiled by abcd-decompile (abcd-rs) — Stage B + emission v1.\n");
-    out.push_str("// Fallback honesty: `/* fallback Op … */` marks unrecoverable ops; `/* elided … */` marks deliberately dropped compiler guards.\n");
+    out.write_all(
+        "// Decompiled by abcd-decompile (abcd-rs) — Stage B + emission v1.\n".as_bytes(),
+    )?;
+    out.write_all(
+        "// Fallback honesty: `/* fallback Op … */` marks unrecoverable ops; `/* elided … */` marks deliberately dropped compiler guards.\n"
+            .as_bytes(),
+    )?;
     if opts.ts {
-        out.push_str("// TypeScript mode: annotations come from IR signatures (≤11-format files only, format fact #A7); functions without signatures keep bare parameter lists.\n");
+        out.write_all(
+            "// TypeScript mode: annotations come from IR signatures (≤11-format files only, format fact #A7); functions without signatures keep bare parameter lists.\n"
+                .as_bytes(),
+        )?;
     }
 
     // Imports (1:1 enum mapping).
@@ -190,9 +216,9 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
                 let spec = render_sym_string(module, *module_request);
                 em.fn_names.reserve(&local);
                 if local == import {
-                    out.push_str(&format!("import {{ {local} }} from {spec};\n"));
+                    writeln!(out, "import {{ {local} }} from {spec};")?;
                 } else {
-                    out.push_str(&format!("import {{ {import} as {local} }} from {spec};\n"));
+                    writeln!(out, "import {{ {import} as {local} }} from {spec};")?;
                 }
             }
             ImportDecl::Namespace {
@@ -202,7 +228,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
                 let local = sanitize(&sym_str(module, *local_name));
                 let spec = render_sym_string(module, *module_request);
                 em.fn_names.reserve(&local);
-                out.push_str(&format!("import * as {local} from {spec};\n"));
+                writeln!(out, "import * as {local} from {spec};")?;
             }
         }
     }
@@ -237,7 +263,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
         }
     }
     for g in &globals {
-        out.push_str(&format!("var {g};\n"));
+        writeln!(out, "var {g};")?;
     }
     // N74 residual (decl-lex-configurable-global): a name stored ONLY
     // via StoreGlobalRecord is a source-level LEXICAL global
@@ -248,7 +274,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     // undefined). Hoist as `let` instead: `sttoglobalrecord`, the
     // declarative record — the global object stays untouched.
     for g in record_globals.difference(&globals) {
-        out.push_str(&format!("let {g};\n"));
+        writeln!(out, "let {g};")?;
     }
     // N74-W4: the hoisted `var` initializes the binding at module
     // evaluation, destroying the undeclared-read/TDZ windows (a sloppy
@@ -285,37 +311,67 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
             .cloned()
             .unwrap_or_else(|| crate::names::module_slot_fallback(*s));
         em.fn_names.reserve(&name);
-        out.push_str(&format!("let {name};\n"));
+        writeln!(out, "let {name};")?;
     }
 
     // Orphan lexical-slot predeclarations (G1; see
     // `orphan_lexenv_names_in_func`).
     for name in orphan_names {
         em.fn_names.reserve(&name);
-        out.push_str(&format!("let {name}; /* orphan lexenv slot (G1) */\n"));
+        writeln!(out, "let {name}; /* orphan lexenv slot (G1) */")?;
     }
 
-    // Top-level functions.
+    // Top-level functions in bounded parallel batches.
+    let top_funcs: Vec<FuncId> = (0..module.functions.len())
+        .map(|i| FuncId::new(i as u32))
+        .filter(|f| !consumed.contains(f))
+        .collect();
     let mut entry_call: Option<String> = None;
-    for i in 0..module.functions.len() {
-        let f = FuncId::new(i as u32);
-        if consumed.contains(&f) {
-            continue;
+    let mut fn_buf = String::new();
+    let mut cursor = 0usize;
+    while cursor < top_funcs.len() {
+        let (take, batch_fids) =
+            next_bounded_top_batch(module, &top_funcs[cursor..], MAX_BATCH_PREPARED_FUNCS);
+        let chunk = &top_funcs[cursor..cursor + take];
+        cursor += take;
+        let prepared_batch: Vec<(FuncId, PreparedFunc)> = batch_fids
+            .into_par_iter()
+            .map(|fid| {
+                let top_level = !consumed.contains(&fid);
+                (fid, prepare_func_only(module, Some(&index), fid, top_level))
+            })
+            .collect();
+        em.prepared = prepared_batch.into_iter().collect();
+
+        for &f in chunk {
+            fn_buf.clear();
+            if opts.arkui
+                && !opts.call_entry
+                && module
+                    .func(f)
+                    .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
+                && crate::arkui::try_emit_arkui_main(&mut em, f, &mut fn_buf)
+            {
+                out.write_all(fn_buf.as_bytes())?;
+                if fn_buf.capacity() > MAX_RETAINED_FN_BUF {
+                    fn_buf = String::new();
+                }
+                continue;
+            }
+            let emitted = em.emit_top_level_function(f, &mut fn_buf);
+            if opts.call_entry && emitted.1 == "func_main_0" {
+                entry_call = Some(emitted.0);
+            }
+            out.write_all(fn_buf.as_bytes())?;
+            if fn_buf.capacity() > MAX_RETAINED_FN_BUF {
+                fn_buf = String::new();
+            }
         }
-        if opts.arkui
-            && !opts.call_entry
-            && module
-                .func(f)
-                .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
-            && crate::arkui::try_emit_arkui_main(&mut em, f, &mut out)
-        {
-            continue;
-        }
-        let emitted = em.emit_top_level_function(f, &mut out);
-        if opts.call_entry && emitted.1 == "func_main_0" {
-            entry_call = Some(emitted.0);
-        }
+        // Drop any remaining ASTs in this batch (e.g. skipped synthetic ArkUI methods)
+        // before starting the next batch.
+        em.prepared.clear();
     }
+
     // The recompile gate: invoke the module entry point WITH the
     // script-level receiver. The VM binds a script main's `this` to
     // the global object at entry (ark sloppy script semantics; the
@@ -326,7 +382,7 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
     // globalThis in a script, undefined in a module (matching module
     // semantics — the plain call already behaved correctly there).
     if let Some(name) = entry_call {
-        out.push_str(&format!("{name}.call(this);\n"));
+        writeln!(out, "{name}.call(this);")?;
     }
 
     // Exports (1:1 enum mapping). The local side is a module-scope
@@ -341,9 +397,9 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
                 let local = sanitize(&sym_str(module, *local_name));
                 let export = module_facing_name(&sym_str(module, *export_name));
                 if local == export {
-                    out.push_str(&format!("export {{ {local} }};\n"));
+                    writeln!(out, "export {{ {local} }};")?;
                 } else {
-                    out.push_str(&format!("export {{ {local} as {export} }};\n"));
+                    writeln!(out, "export {{ {local} as {export} }};")?;
                 }
             }
             ExportDecl::Indirect {
@@ -354,19 +410,17 @@ pub fn decompile_module(module: &Module, opts: &EmitOptions) -> DecompiledModule
                 let import = module_facing_name(&sym_str(module, *import_name));
                 let export = module_facing_name(&sym_str(module, *export_name));
                 let spec = render_sym_string(module, *module_request);
-                out.push_str(&format!("export {{ {import} as {export} }} from {spec};\n"));
+                writeln!(out, "export {{ {import} as {export} }} from {spec};")?;
             }
             ExportDecl::Star { module_request } => {
                 let spec = render_sym_string(module, *module_request);
-                out.push_str(&format!("export * from {spec};\n"));
+                writeln!(out, "export * from {spec};")?;
             }
         }
     }
 
-    DecompiledModule {
-        text: out,
-        stats: em.stats,
-    }
+    out.flush()?;
+    Ok(em.stats)
 }
 
 /// A module-facing name (`export { x as NAME }`, `import { NAME as x
@@ -410,50 +464,164 @@ pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId>
     consumed
 }
 
-/// Walk a const (recursively) for `MethodRef` functions.
+/// Walk a const (iteratively via explicit heap workstack) for `MethodRef` functions.
 pub(in crate::emit) fn collect_method_refs(
     module: &Module,
     cid: abcd_ir::ConstId,
     out: &mut BTreeSet<FuncId>,
 ) {
-    let Some(c) = module.consts.get(cid) else {
-        return;
-    };
-    match c {
-        Const::MethodRef(f) => {
-            out.insert(*f);
-        }
-        Const::ArrayLiteral(items) => {
-            for i in items {
-                collect_method_refs_const(i, out);
-            }
-        }
-        Const::ObjectLiteral { keys, values } => {
-            for i in keys.iter().chain(values.iter()) {
-                collect_method_refs_const(i, out);
-            }
-        }
-        _ => {}
+    if let Some(c) = module.consts.get(cid) {
+        collect_method_refs_const(c, out);
     }
 }
 
-pub(in crate::emit) fn collect_method_refs_const(c: &Const, out: &mut BTreeSet<FuncId>) {
-    match c {
-        Const::MethodRef(f) => {
-            out.insert(*f);
-        }
-        Const::ArrayLiteral(items) => {
-            for i in items {
-                collect_method_refs_const(i, out);
+pub(in crate::emit) fn collect_method_refs_const(root: &Const, out: &mut BTreeSet<FuncId>) {
+    let mut stack: Vec<&Const> = vec![root];
+    while let Some(c) = stack.pop() {
+        match c {
+            Const::MethodRef(f) => {
+                out.insert(*f);
             }
-        }
-        Const::ObjectLiteral { keys, values } => {
-            for i in keys.iter().chain(values.iter()) {
-                collect_method_refs_const(i, out);
+            Const::ArrayLiteral(items) => {
+                for i in items.iter().rev() {
+                    stack.push(i);
+                }
             }
+            Const::ObjectLiteral { keys, values } => {
+                for i in values.iter().rev().chain(keys.iter().rev()) {
+                    stack.push(i);
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
+}
+
+/// Try to insert `roots` and all inline functions transitively referenced from
+/// them (`DefineFunc`, `DefineClass`/`DefineSendableClass` ctor & `MethodRef`
+/// members, and `AllocObject` shape `MethodRef`s) into `visited` using an
+/// explicit heap workstack and cycle guard.
+///
+/// When `abort_over` is `Some(limit)` and `visited.len()` exceeds `limit`,
+/// rolls back every [`FuncId`] added by this call and returns `false` (leaving
+/// `visited` untouched).
+pub(crate) fn try_extend_batch_funcs(
+    module: &Module,
+    roots: &[FuncId],
+    visited: &mut BTreeSet<FuncId>,
+    abort_over: Option<usize>,
+) -> bool {
+    let mut added: Vec<FuncId> = Vec::new();
+    let mut stack: Vec<FuncId> = Vec::new();
+    let mut inline_refs = BTreeSet::new();
+
+    for &r in roots {
+        if visited.insert(r) {
+            added.push(r);
+            stack.push(r);
+            if let Some(limit) = abort_over
+                && visited.len() > limit
+            {
+                for f in added {
+                    visited.remove(&f);
+                }
+                return false;
+            }
+        }
+    }
+
+    while let Some(fid) = stack.pop() {
+        let Some(fd) = module.func(fid) else {
+            continue;
+        };
+        for &bid in &fd.blocks {
+            let Some(block) = module.block(bid) else {
+                continue;
+            };
+            for &iid in &block.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                match &inst.op {
+                    Op::DefineFunc { body, .. } => {
+                        if visited.insert(*body) {
+                            added.push(*body);
+                            stack.push(*body);
+                        }
+                    }
+                    Op::DefineClass { ctor, members, .. }
+                    | Op::DefineSendableClass { ctor, members, .. } => {
+                        if visited.insert(*ctor) {
+                            added.push(*ctor);
+                            stack.push(*ctor);
+                        }
+                        inline_refs.clear();
+                        collect_method_refs(module, *members, &mut inline_refs);
+                        for &m in &inline_refs {
+                            if visited.insert(m) {
+                                added.push(m);
+                                stack.push(m);
+                            }
+                        }
+                    }
+                    Op::AllocObject { shape } => {
+                        inline_refs.clear();
+                        collect_method_refs(module, *shape, &mut inline_refs);
+                        for &m in &inline_refs {
+                            if visited.insert(m) {
+                                added.push(m);
+                                stack.push(m);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(limit) = abort_over
+                    && visited.len() > limit
+                {
+                    for f in added {
+                        visited.remove(&f);
+                    }
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Collect `roots` plus every inline [`FuncId`] transitively referenced from
+/// them in deterministic ascending [`FuncId`] order.
+#[cfg(test)]
+pub(crate) fn collect_batch_funcs(module: &Module, roots: &[FuncId]) -> Vec<FuncId> {
+    let mut visited = BTreeSet::new();
+    let _ = try_extend_batch_funcs(module, roots, &mut visited, None);
+    visited.into_iter().collect()
+}
+
+/// Select a non-empty prefix `&top_funcs[..take]` (`take >= 1` whenever
+/// `!top_funcs.is_empty()`) whose total transitive function set stays within
+/// `max_prepared` functions (always taking at least `top_funcs[0]` even if that
+/// single root transitively owns `> max_prepared` functions), returning
+/// `(take, batch_fids)`.
+pub(crate) fn next_bounded_top_batch(
+    module: &Module,
+    top_funcs: &[FuncId],
+    max_prepared: usize,
+) -> (usize, Vec<FuncId>) {
+    let mut visited = BTreeSet::new();
+    let mut take = 0usize;
+    for (idx, &root) in top_funcs.iter().enumerate() {
+        let limit = (idx > 0).then_some(max_prepared);
+        if !try_extend_batch_funcs(module, &[root], &mut visited, limit) {
+            break;
+        }
+        take = idx + 1;
+        if visited.len() >= max_prepared {
+            break;
+        }
+    }
+    (take, visited.into_iter().collect())
 }
 
 pub(crate) struct Emitter<'m> {
@@ -480,12 +648,11 @@ pub(crate) struct Emitter<'m> {
     /// is not defined` — a class declared inside a `try` block, used
     /// after it.)
     pub(crate) hoisted: BTreeSet<String>,
-    /// Precomputed per-function Stage A + Stage B + Folds output (taken on
-    /// first emission; cloned into `reused` only if tail duplication emits
-    /// the same inline function more than once).
-    pub(crate) prepared: Vec<Option<PreparedFunc>>,
-    /// Snapshot cache for functions emitted more than once.
-    pub(crate) reused: BTreeMap<FuncId, PreparedFunc>,
+    /// Bounded batch of precomputed per-function Stage A + Stage B + Folds
+    /// outputs. Entries are removed (never cloned) on first emission and
+    /// dropped immediately after each function finishes emitting; the `< 0.1%`
+    /// tail-duplicated inline closures re-run `prepare_func_only` on demand.
+    pub(crate) prepared: BTreeMap<FuncId, PreparedFunc>,
 }
 
 #[derive(Clone)]
@@ -497,6 +664,179 @@ pub(crate) struct PreparedFunc {
     pub(crate) fold_stats: FoldStats,
 }
 
+/// Whether `name` matches the synthetic unnamed-lexenv fallback shape
+/// `v<digits>_<digits>`.
+pub(crate) fn is_fallback_lexenv_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    if !b.starts_with(b"v") {
+        return false;
+    }
+    let rest = &name[1..];
+    let Some((a, bb)) = rest.split_once('_') else {
+        return false;
+    };
+    !a.is_empty()
+        && !bb.is_empty()
+        && a.bytes().all(|c| c.is_ascii_digit())
+        && bb.bytes().all(|c| c.is_ascii_digit())
+}
+
+/// Whether any resolved module/namespace slot name in `index` happens to have
+/// the `v<digits>_<digits>` shape.
+pub(crate) fn index_has_fallback_module_slot(index: &DecompileIndex) -> bool {
+    if index
+        .slot_names
+        .values()
+        .any(|n| is_fallback_lexenv_name(n))
+    {
+        return true;
+    }
+    if let Some(per_cls) = &index.per_class_env {
+        for env in per_cls.values() {
+            if env
+                .external_slots
+                .values()
+                .chain(env.local_slots.values())
+                .chain(env.namespace_slots.values())
+                .any(|n| is_fallback_lexenv_name(n))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Sound prefilter for [`orphan_lexenv_names_in_func`]: returns `false` only
+/// when Stage A recovery of `func` cannot possibly emit a `Stmt::LexStore` or
+/// `Expr::Ident` matching `v<digits>_<digits>`.
+pub(crate) fn func_may_have_orphan_lexenv(
+    module: &Module,
+    func: FuncId,
+    index: &DecompileIndex,
+    has_fallback_module_slot: bool,
+) -> bool {
+    let Some(fd) = module.func(func) else {
+        return false;
+    };
+    if let Some(dbg) = &fd.debug {
+        for &psym in &dbg.param_names {
+            if is_fallback_lexenv_name(&sanitize(&sym_str(module, psym))) {
+                return true;
+            }
+        }
+        for ln in &dbg.local_names {
+            if is_fallback_lexenv_name(&sanitize(&sym_str(module, ln.name))) {
+                return true;
+            }
+        }
+    }
+    let mut has_lexvar = false;
+    for &bid in &fd.blocks {
+        let Some(block) = module.block(bid) else {
+            continue;
+        };
+        for &iid in &block.insts {
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
+            match &inst.op {
+                Op::GetLexVar { .. } | Op::PutLexVar { .. } => has_lexvar = true,
+                Op::TryGetGlobal { name, .. } => {
+                    if is_fallback_lexenv_name(&sanitize(&sym_str(module, *name))) {
+                        return true;
+                    }
+                }
+                Op::LoadModuleVar { .. } | Op::GetModuleNamespace { .. }
+                    if has_fallback_module_slot =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if !has_lexvar {
+        return false;
+    }
+    let scopes = crate::names::NameScopes::build_with_index(module, func, Some(index));
+    if scopes.has_fallback_lexenv_name() {
+        return true;
+    }
+    for &bid in &fd.blocks {
+        let Some(block) = module.block(bid) else {
+            continue;
+        };
+        for &iid in &block.insts {
+            if let Some(inst) = module.inst(iid)
+                && matches!(inst.op, Op::GetLexVar { .. } | Op::PutLexVar { .. })
+                && scopes.name_of(iid).is_none()
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Collect orphan lexenv names across `fids` in bounded parallel chunks,
+/// running only Stage A on candidate functions and dropping each
+/// [`RecoveredFunc`] immediately inside the worker closure.
+pub(crate) fn collect_orphans_for_funcs(
+    module: &Module,
+    index: &DecompileIndex,
+    fids: &[FuncId],
+    has_fallback_module_slot: bool,
+) -> BTreeSet<String> {
+    let candidates: Vec<FuncId> = fids
+        .par_iter()
+        .copied()
+        .filter(|&fid| func_may_have_orphan_lexenv(module, fid, index, has_fallback_module_slot))
+        .collect();
+    let mut orphan_names = BTreeSet::new();
+    for chunk in candidates.chunks(ORPHAN_SCAN_BATCH) {
+        let sets: Vec<BTreeSet<String>> = chunk
+            .par_iter()
+            .map(|&fid| {
+                let rf = recover_func_with_index(module, fid, index);
+                orphan_lexenv_names_in_func(&rf)
+            })
+            .collect();
+        for s in sets {
+            orphan_names.extend(s);
+        }
+    }
+    orphan_names
+}
+
+/// Collect orphan lexenv names across the entire module without retaining
+/// recovered ASTs.
+pub(crate) fn collect_module_orphan_lexenv_names(
+    module: &Module,
+    index: &DecompileIndex,
+) -> BTreeSet<String> {
+    let has_fallback_slot = index_has_fallback_module_slot(index);
+    let candidates: Vec<FuncId> = (0..module.functions.len())
+        .into_par_iter()
+        .map(|i| FuncId::new(i as u32))
+        .filter(|&fid| func_may_have_orphan_lexenv(module, fid, index, has_fallback_slot))
+        .collect();
+    let mut orphan_names = BTreeSet::new();
+    for chunk in candidates.chunks(ORPHAN_SCAN_BATCH) {
+        let sets: Vec<BTreeSet<String>> = chunk
+            .par_iter()
+            .map(|&fid| {
+                let rf = recover_func_with_index(module, fid, index);
+                orphan_lexenv_names_in_func(&rf)
+            })
+            .collect();
+        for s in sets {
+            orphan_names.extend(s);
+        }
+    }
+    orphan_names
+}
+
 /// Orphan lexical bindings (IR gap G1): unnamed lexenv slots get
 /// fallback names `v{level}_{slot}`; when the slot's OWNING function
 /// never stores to it textually (write-only-from-inner-closure), no
@@ -504,39 +844,28 @@ pub(crate) struct PreparedFunc {
 /// gate: for-update-continue-1, "v2_1 is not defined"). Declaring the
 /// fallback names at module top is sound under textual nesting:
 /// functions that DO declare the name shadow it locally.
-pub(in crate::emit) fn orphan_lexenv_names_in_func(rf: &RecoveredFunc) -> BTreeSet<String> {
-    fn is_fallback(name: &str) -> bool {
-        let b = name.as_bytes();
-        // v<digits>_<digits>
-        if !b.starts_with(b"v") {
-            return false;
-        }
-        let rest = &name[1..];
-        let Some((a, bb)) = rest.split_once('_') else {
-            return false;
-        };
-        !a.is_empty()
-            && !bb.is_empty()
-            && a.bytes().all(|c| c.is_ascii_digit())
-            && bb.bytes().all(|c| c.is_ascii_digit())
-    }
-    fn walk_expr(e: &Expr, out: &mut BTreeSet<String>) {
-        if let Expr::Ident(name) = e
-            && is_fallback(name)
-        {
-            out.insert(name.clone());
-        }
-        for c in crate::folds::expr_children(e) {
-            walk_expr(c, out);
+pub(crate) fn orphan_lexenv_names_in_func(rf: &RecoveredFunc) -> BTreeSet<String> {
+    fn walk_expr(root: &Expr, out: &mut BTreeSet<String>) {
+        let mut stack: Vec<&Expr> = vec![root];
+        while let Some(e) = stack.pop() {
+            if let Expr::Ident(name) = e
+                && is_fallback_lexenv_name(name)
+            {
+                out.insert(name.clone());
+            }
+            for c in crate::folds::expr_children(e).into_iter().rev() {
+                stack.push(c);
+            }
         }
     }
     let mut out = BTreeSet::new();
     for b in &rf.blocks {
         for st in &b.stmts {
-            if let Stmt::LexStore { name, .. } = st
-                && is_fallback(&sanitize(name))
-            {
-                out.insert(sanitize(name));
+            if let Stmt::LexStore { name, .. } = st {
+                let clean = sanitize(name);
+                if is_fallback_lexenv_name(&clean) {
+                    out.insert(clean);
+                }
             }
             for e in stmt_exprs(st) {
                 walk_expr(e, &mut out);
@@ -546,18 +875,7 @@ pub(in crate::emit) fn orphan_lexenv_names_in_func(rf: &RecoveredFunc) -> BTreeS
     out
 }
 
-/// Pure per-function pipeline: Stage A → orphan scan → Stage B → folds.
-pub(crate) fn prepare_func(
-    module: &Module,
-    index: Option<&DecompileIndex>,
-    func: FuncId,
-    top_level: bool,
-) -> (PreparedFunc, BTreeSet<String>) {
-    let mut rf = match index {
-        Some(idx) => recover_func_with_index(module, func, idx),
-        None => recover_func(module, func),
-    };
-    let orphans = orphan_lexenv_names_in_func(&rf);
+fn finish_prepare(module: &Module, mut rf: RecoveredFunc, top_level: bool) -> PreparedFunc {
     let mut structured = structure_func(module, &rf);
     let mut fstats = FoldStats::default();
     folds::generator_machine_fold(&mut structured.body, rf.kind, &mut fstats);
@@ -574,37 +892,76 @@ pub(crate) fn prepare_func(
         rf.hidden_params,
         &mut fstats,
     );
-    (
-        PreparedFunc {
-            top_level,
-            rf,
-            body: structured.body,
-            struct_stats: structured.stats,
-            fold_stats: fstats,
-        },
-        orphans,
-    )
+    PreparedFunc {
+        top_level,
+        rf,
+        body: structured.body,
+        struct_stats: structured.stats,
+        fold_stats: fstats,
+    }
+}
+
+/// Pure per-function pipeline: Stage A → Stage B → folds (without orphan scan).
+pub(crate) fn prepare_func_only(
+    module: &Module,
+    index: Option<&DecompileIndex>,
+    func: FuncId,
+    top_level: bool,
+) -> PreparedFunc {
+    let rf = match index {
+        Some(idx) => recover_func_with_index(module, func, idx),
+        None => recover_func(module, func),
+    };
+    finish_prepare(module, rf, top_level)
+}
+
+/// Pure per-function pipeline: Stage A → orphan scan → Stage B → folds.
+pub(crate) fn prepare_func(
+    module: &Module,
+    index: Option<&DecompileIndex>,
+    func: FuncId,
+    top_level: bool,
+) -> (PreparedFunc, BTreeSet<String>) {
+    let rf = match index {
+        Some(idx) => recover_func_with_index(module, func, idx),
+        None => recover_func(module, func),
+    };
+    let orphans = orphan_lexenv_names_in_func(&rf);
+    (finish_prepare(module, rf, top_level), orphans)
 }
 
 /// The full per-function pipeline: Stage A → Stage B → folds.
 impl<'m> Emitter<'m> {
-    /// Consume (or reuse) the precomputed Stage A → Stage B → folds output.
+    /// Inspect (or prepare on-demand) `func` without consuming its batch slot.
+    pub(crate) fn peek_prepared(&mut self, func: FuncId, top_level: bool) -> Cow<'_, PreparedFunc> {
+        if !self.prepared.contains_key(&func) {
+            let pre = prepare_func_only(self.module, self.index, func, top_level);
+            self.prepared.insert(func, pre);
+        }
+        if let Some(p) = self.prepared.get(&func)
+            && p.top_level == top_level
+        {
+            return Cow::Borrowed(p);
+        }
+        Cow::Owned(prepare_func_only(self.module, self.index, func, top_level))
+    }
+
+    /// Consume the precomputed Stage A → Stage B → folds output (removing it
+    /// from `self.prepared` so its AST is freed immediately after emission), or
+    /// recompute on demand for the `< 0.1%` tail-duplicated inline closures.
     pub(crate) fn func_nodes(
         &mut self,
         func: FuncId,
         top_level: bool,
     ) -> (RecoveredFunc, Vec<SNode>) {
         self.stats.function_bodies += 1;
-        let p = if let Some(slot) = self.prepared.get_mut(func.index())
-            && let Some(pre) = slot.take()
-            && pre.top_level == top_level
-        {
-            self.reused.insert(func, pre.clone());
-            pre
-        } else if let Some(cached) = self.reused.get(&func).filter(|p| p.top_level == top_level) {
-            cached.clone()
-        } else {
-            prepare_func(self.module, self.index, func, top_level).0
+        let p = match self.prepared.remove(&func) {
+            Some(pre) if pre.top_level == top_level => pre,
+            Some(other) => {
+                self.prepared.insert(func, other);
+                prepare_func_only(self.module, self.index, func, top_level)
+            }
+            None => prepare_func_only(self.module, self.index, func, top_level),
         };
         self.stats.structure =
             merge_struct_stats(std::mem::take(&mut self.stats.structure), &p.struct_stats);
@@ -1145,13 +1502,18 @@ impl<'m> Emitter<'m> {
 /// (a `let` redeclaration of a parameter is a SyntaxError).
 pub(crate) fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
     fn walk(
-        nodes: &[SNode],
+        root_nodes: &[SNode],
         out: &mut Vec<String>,
         seen: &mut BTreeSet<String>,
         own: usize,
         pushes: &mut usize,
     ) {
-        for n in nodes {
+        let mut stack: Vec<std::slice::Iter<'_, SNode>> = vec![root_nodes.iter()];
+        while let Some(iter) = stack.last_mut() {
+            let Some(n) = iter.next() else {
+                stack.pop();
+                continue;
+            };
             match n {
                 SNode::Stmts(leaves) => {
                     for l in leaves {
@@ -1179,23 +1541,25 @@ pub(crate) fn lex_decls(nodes: &[SNode], params: &[String]) -> Vec<String> {
                 SNode::If {
                     then, otherwise, ..
                 } => {
-                    walk(then, out, seen, own, pushes);
-                    walk(otherwise, out, seen, own, pushes);
+                    stack.push(otherwise.iter());
+                    stack.push(then.iter());
                 }
                 SNode::While { body, .. }
                 | SNode::DoWhile { body, .. }
                 | SNode::Labeled { body, .. }
                 | SNode::ForOf { body, .. }
-                | SNode::ForIn { body, .. } => walk(body, out, seen, own, pushes),
+                | SNode::ForIn { body, .. } => {
+                    stack.push(body.iter());
+                }
                 SNode::Try { body, catches, .. } => {
-                    walk(body, out, seen, own, pushes);
-                    for c in catches {
-                        walk(&c.body, out, seen, own, pushes);
+                    for c in catches.iter().rev() {
+                        stack.push(c.body.iter());
                     }
+                    stack.push(body.iter());
                 }
                 SNode::Switch { cases, .. } => {
-                    for c in cases {
-                        walk(&c.body, out, seen, own, pushes);
+                    for c in cases.iter().rev() {
+                        stack.push(c.body.iter());
                     }
                 }
                 SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
@@ -1257,126 +1621,177 @@ pub(in crate::emit) fn stmt_exprs(s: &Stmt) -> Vec<&Expr> {
 pub(in crate::emit) fn escaped_temps(nodes: &[SNode]) -> BTreeSet<String> {
     /// A position: scope path + node index within it + leaf index.
     type Pos = (Vec<usize>, usize, usize);
-    fn collect_uses(e: &Expr, pos: &Pos, uses: &mut Vec<(String, Pos)>) {
-        if let Expr::Temp { name, .. } = e {
-            uses.push((name.clone(), pos.clone()));
-        }
-        for c in crate::folds::expr_children(e) {
-            collect_uses(c, pos, uses);
+    enum EscapeFrame<'a> {
+        EnterNodes { nodes: &'a [SNode], idx: usize },
+        PushPath(usize),
+        PopPath,
+        DoWhileCond(&'a Expr),
+    }
+    fn collect_uses(root: &Expr, pos: &Pos, uses: &mut Vec<(String, Pos)>) {
+        let mut stack: Vec<&Expr> = vec![root];
+        while let Some(e) = stack.pop() {
+            if let Expr::Temp { name, .. } = e {
+                uses.push((name.clone(), pos.clone()));
+            }
+            for c in crate::folds::expr_children(e).into_iter().rev() {
+                stack.push(c);
+            }
         }
     }
     fn walk(
-        nodes: &[SNode],
+        root_nodes: &[SNode],
         path: &mut Vec<usize>,
         decls: &mut BTreeMap<String, Vec<Pos>>,
         uses: &mut Vec<(String, Pos)>,
     ) {
-        for (i, n) in nodes.iter().enumerate() {
-            match n {
-                SNode::Stmts(leaves) => {
-                    for (li, l) in leaves.iter().enumerate() {
-                        let pos: Pos = (path.clone(), i, li);
-                        match l {
-                            Leaf::Raw(Stmt::Declare { name, value, .. }) => {
-                                collect_uses(value, &pos, uses);
-                                // A name can be declared in several
-                                // disjoint blocks (the cross-arm fold
-                                // duplicates tails) — a use escapes only
-                                // when it escapes ALL of them.
-                                decls.entry(name.clone()).or_default().push(pos);
-                            }
-                            Leaf::Raw(s) => {
-                                for e in stmt_exprs(s) {
-                                    collect_uses(e, &pos, uses);
+        let mut frames: Vec<EscapeFrame<'_>> = vec![EscapeFrame::EnterNodes {
+            nodes: root_nodes,
+            idx: 0,
+        }];
+        while let Some(frame) = frames.pop() {
+            match frame {
+                EscapeFrame::PushPath(p) => path.push(p),
+                EscapeFrame::PopPath => {
+                    path.pop();
+                }
+                EscapeFrame::DoWhileCond(cond) => {
+                    collect_uses(cond, &(path.clone(), usize::MAX, usize::MAX), uses);
+                }
+                EscapeFrame::EnterNodes { nodes, idx } => {
+                    if idx >= nodes.len() {
+                        continue;
+                    }
+                    let i = idx;
+                    let n = &nodes[i];
+                    frames.push(EscapeFrame::EnterNodes {
+                        nodes,
+                        idx: idx + 1,
+                    });
+                    match n {
+                        SNode::Stmts(leaves) => {
+                            for (li, l) in leaves.iter().enumerate() {
+                                let pos: Pos = (path.clone(), i, li);
+                                match l {
+                                    Leaf::Raw(Stmt::Declare { name, value, .. }) => {
+                                        collect_uses(value, &pos, uses);
+                                        // A name can be declared in several
+                                        // disjoint blocks (the cross-arm fold
+                                        // duplicates tails) — a use escapes only
+                                        // when it escapes ALL of them.
+                                        decls.entry(name.clone()).or_default().push(pos);
+                                    }
+                                    Leaf::Raw(s) => {
+                                        for e in stmt_exprs(s) {
+                                            collect_uses(e, &pos, uses);
+                                        }
+                                    }
+                                    Leaf::Destructure { obj, .. } => collect_uses(obj, &pos, uses),
+                                    Leaf::Decl { value: Some(v), .. }
+                                    | Leaf::Assign { value: v, .. } => collect_uses(v, &pos, uses),
+                                    _ => {}
                                 }
                             }
-                            Leaf::Destructure { obj, .. } => collect_uses(obj, &pos, uses),
-                            Leaf::Decl { value: Some(v), .. } | Leaf::Assign { value: v, .. } => {
-                                collect_uses(v, &pos, uses)
-                            }
-                            _ => {}
                         }
+                        SNode::If {
+                            cond,
+                            then,
+                            otherwise,
+                        } => {
+                            collect_uses(cond, &(path.clone(), i, usize::MAX), uses);
+                            frames.push(EscapeFrame::PopPath);
+                            frames.push(EscapeFrame::PopPath);
+                            frames.push(EscapeFrame::EnterNodes {
+                                nodes: otherwise,
+                                idx: 0,
+                            });
+                            frames.push(EscapeFrame::PushPath(1));
+                            frames.push(EscapeFrame::PopPath);
+                            frames.push(EscapeFrame::EnterNodes {
+                                nodes: then,
+                                idx: 0,
+                            });
+                            frames.push(EscapeFrame::PushPath(0));
+                            frames.push(EscapeFrame::PushPath(i));
+                        }
+                        SNode::While { cond, body, .. } => {
+                            if let Some(c) = cond {
+                                collect_uses(c, &(path.clone(), i, usize::MAX), uses);
+                            }
+                            frames.push(EscapeFrame::PopPath);
+                            frames.push(EscapeFrame::PopPath);
+                            frames.push(EscapeFrame::EnterNodes {
+                                nodes: body,
+                                idx: 0,
+                            });
+                            frames.push(EscapeFrame::PushPath(0));
+                            frames.push(EscapeFrame::PushPath(i));
+                        }
+                        SNode::DoWhile { body, cond, .. } => {
+                            // JS scope: the do-while condition is INSIDE the
+                            // loop body's block (`do { const x … } while (x)`
+                            // is legal), after the last body position.
+                            frames.push(EscapeFrame::PopPath);
+                            frames.push(EscapeFrame::PopPath);
+                            frames.push(EscapeFrame::DoWhileCond(cond));
+                            frames.push(EscapeFrame::EnterNodes {
+                                nodes: body,
+                                idx: 0,
+                            });
+                            frames.push(EscapeFrame::PushPath(0));
+                            frames.push(EscapeFrame::PushPath(i));
+                        }
+                        SNode::Labeled { body, .. }
+                        | SNode::ForOf { body, .. }
+                        | SNode::ForIn { body, .. } => {
+                            if let SNode::ForOf { iter: head, .. }
+                            | SNode::ForIn { obj: head, .. } = n
+                            {
+                                collect_uses(head, &(path.clone(), i, usize::MAX), uses);
+                            }
+                            frames.push(EscapeFrame::PopPath);
+                            frames.push(EscapeFrame::EnterNodes {
+                                nodes: body,
+                                idx: 0,
+                            });
+                            frames.push(EscapeFrame::PushPath(i));
+                        }
+                        SNode::Try { body, catches, .. } => {
+                            frames.push(EscapeFrame::PopPath);
+                            for (k, c) in catches.iter().enumerate().rev() {
+                                frames.push(EscapeFrame::PopPath);
+                                frames.push(EscapeFrame::EnterNodes {
+                                    nodes: &c.body,
+                                    idx: 0,
+                                });
+                                frames.push(EscapeFrame::PushPath(1 + k));
+                            }
+                            frames.push(EscapeFrame::PopPath);
+                            frames.push(EscapeFrame::EnterNodes {
+                                nodes: body,
+                                idx: 0,
+                            });
+                            frames.push(EscapeFrame::PushPath(0));
+                            frames.push(EscapeFrame::PushPath(i));
+                        }
+                        SNode::Switch { disc, cases } => {
+                            collect_uses(disc, &(path.clone(), i, usize::MAX), uses);
+                            for t in cases.iter().flat_map(|c| c.tests.iter()) {
+                                collect_uses(t, &(path.clone(), i, usize::MAX), uses);
+                            }
+                            frames.push(EscapeFrame::PopPath);
+                            for (k, c) in cases.iter().enumerate().rev() {
+                                frames.push(EscapeFrame::PopPath);
+                                frames.push(EscapeFrame::EnterNodes {
+                                    nodes: &c.body,
+                                    idx: 0,
+                                });
+                                frames.push(EscapeFrame::PushPath(k));
+                            }
+                            frames.push(EscapeFrame::PushPath(i));
+                        }
+                        SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
                     }
                 }
-                SNode::If {
-                    cond,
-                    then,
-                    otherwise,
-                } => {
-                    collect_uses(cond, &(path.clone(), i, usize::MAX), uses);
-                    path.push(i);
-                    path.push(0);
-                    walk(then, path, decls, uses);
-                    path.pop();
-                    path.push(1);
-                    walk(otherwise, path, decls, uses);
-                    path.pop();
-                    path.pop();
-                }
-                SNode::While { cond, body, .. } => {
-                    if let Some(c) = cond {
-                        collect_uses(c, &(path.clone(), i, usize::MAX), uses);
-                    }
-                    path.push(i);
-                    path.push(0);
-                    walk(body, path, decls, uses);
-                    path.pop();
-                    path.pop();
-                }
-                SNode::DoWhile { body, cond, .. } => {
-                    path.push(i);
-                    path.push(0);
-                    walk(body, path, decls, uses);
-                    // JS scope: the do-while condition is INSIDE the
-                    // loop body's block (`do { const x … } while (x)`
-                    // is legal), after the last body position.
-                    collect_uses(cond, &(path.clone(), usize::MAX, usize::MAX), uses);
-                    path.pop();
-                    path.pop();
-                }
-                SNode::Labeled { body, .. } => {
-                    path.push(i);
-                    walk(body, path, decls, uses);
-                    path.pop();
-                }
-                SNode::ForOf { iter, body, .. } => {
-                    collect_uses(iter, &(path.clone(), i, usize::MAX), uses);
-                    path.push(i);
-                    walk(body, path, decls, uses);
-                    path.pop();
-                }
-                SNode::ForIn { obj, body, .. } => {
-                    collect_uses(obj, &(path.clone(), i, usize::MAX), uses);
-                    path.push(i);
-                    walk(body, path, decls, uses);
-                    path.pop();
-                }
-                SNode::Try { body, catches, .. } => {
-                    path.push(i);
-                    path.push(0);
-                    walk(body, path, decls, uses);
-                    path.pop();
-                    for (k, c) in catches.iter().enumerate() {
-                        path.push(1 + k);
-                        walk(&c.body, path, decls, uses);
-                        path.pop();
-                    }
-                    path.pop();
-                }
-                SNode::Switch { disc, cases } => {
-                    collect_uses(disc, &(path.clone(), i, usize::MAX), uses);
-                    for t in cases.iter().flat_map(|c| c.tests.iter()) {
-                        collect_uses(t, &(path.clone(), i, usize::MAX), uses);
-                    }
-                    path.push(i);
-                    for (k, c) in cases.iter().enumerate() {
-                        path.push(k);
-                        walk(&c.body, path, decls, uses);
-                        path.pop();
-                    }
-                    path.pop();
-                }
-                SNode::Break { .. } | SNode::Continue { .. } | SNode::Honest(_) => {}
             }
         }
     }

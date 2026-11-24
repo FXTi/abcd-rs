@@ -17,17 +17,64 @@
 //! Resolved-callee [`abcd_ir::FunctionData`] names are matched by the driver on
 //! top of these candidates (directly-resolved internal functions).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use abcd_analysis::module_link::{ModuleLinkTable, ModuleSlotRef};
 use abcd_analysis::ohos_lifecycle::OHOS_CONTEXT_GLOBAL;
 use abcd_ir::{CallKind, ClassId, Const, FuncId, Module, Op, Sym, ValueDef, ValueId};
 
+/// Pre-indexed `(ClassId, prop_name)` -> `(method FuncId, stored ValueId)` table
+/// so SDK receiver field lookups (`this.controller = new WebviewController()`)
+/// run in `O(1)` per property access instead of rescanning class bodies.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ClassPropStores {
+    by_class_prop: HashMap<(ClassId, Sym), Vec<(FuncId, ValueId)>>,
+}
+
+impl ClassPropStores {
+    /// Build the `(ClassId, prop_name)` property-store index over `module`.
+    pub(crate) fn build(module: &Module) -> Self {
+        let mut by_class_prop: HashMap<(ClassId, Sym), Vec<(FuncId, ValueId)>> = HashMap::new();
+        for (ci, cls) in module.classes.iter().enumerate() {
+            let cid = ClassId::new(ci as u32);
+            for &mfid in &cls.methods {
+                let Some(fd) = module.func(mfid) else {
+                    continue;
+                };
+                for &b in &fd.blocks {
+                    let Some(bb) = module.block(b) else { continue };
+                    for &iid in &bb.insts {
+                        let Some(inst) = module.inst(iid) else {
+                            continue;
+                        };
+                        if let Op::StoreProp { name, value, .. }
+                        | Op::StoreOwnPropName { name, value, .. } = &inst.op
+                        {
+                            by_class_prop
+                                .entry((cid, *name))
+                                .or_default()
+                                .push((mfid, *value));
+                        }
+                    }
+                }
+            }
+        }
+        Self { by_class_prop }
+    }
+
+    fn get(&self, cid: ClassId, prop_name: Sym) -> &[(FuncId, ValueId)] {
+        self.by_class_prop
+            .get(&(cid, prop_name))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
 /// All candidate names for a callee value, most-qualified first, in
-/// deterministic def-chain order. Recursion is cycle-guarded.
+/// deterministic def-chain order. Iterative workstack with cycle guard.
 pub fn callee_name_candidates(module: &Module, callee: ValueId) -> Vec<String> {
     let links = ModuleLinkTable::build(module);
-    let caller = owner_func_of_value(module, callee).unwrap_or(FuncId::new(0));
+    let caller = owner_func_of_value(module, &links, callee).unwrap_or(FuncId::new(0));
     callee_name_candidates_with_links(module, &links, caller, callee)
 }
 
@@ -42,143 +89,279 @@ pub fn callee_name_candidates_with_links(
     caller: FuncId,
     callee: ValueId,
 ) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut visiting = HashSet::new();
-    resolve_into(module, Some(links), caller, callee, &mut visiting, &mut out);
-    out
+    callee_name_candidates_indexed(module, links, None, caller, callee)
 }
 
-/// The recursive worker.
-fn resolve_into(
+/// Indexed variant of [`callee_name_candidates_with_links`] reusing a prebuilt
+/// [`ClassPropStores`] table across call sites.
+pub(crate) fn callee_name_candidates_indexed(
+    module: &Module,
+    links: &ModuleLinkTable,
+    prop_stores: Option<&ClassPropStores>,
+    caller: FuncId,
+    callee: ValueId,
+) -> Vec<String> {
+    resolve_iterative(module, Some(links), prop_stores, caller, callee)
+}
+
+enum ResolveStep {
+    Enter {
+        func: FuncId,
+        value: ValueId,
+    },
+    StartObjectPrefix {
+        func: FuncId,
+        object: ValueId,
+        name: Sym,
+    },
+    FinishObjectPrefix {
+        func: FuncId,
+        object: ValueId,
+        name: Sym,
+    },
+    StartSdkStore {
+        func: FuncId,
+        value: ValueId,
+    },
+    FinishSdkStore,
+    FinishCall {
+        kind: CallKind,
+    },
+}
+
+/// Iterative def-chain name resolver (zero call-stack recursion).
+fn resolve_iterative(
     module: &Module,
     links: Option<&ModuleLinkTable>,
-    func: FuncId,
-    value: ValueId,
-    visiting: &mut HashSet<(FuncId, ValueId)>,
-    out: &mut Vec<String>,
-) {
-    if !visiting.insert((func, value)) {
-        return;
-    }
-    let Some(v) = module.value(value) else {
-        return;
-    };
-    if let ValueDef::Inst(iid) = v.def {
-        match module.inst(iid).map(|i| &i.op) {
-            Some(Op::Mov { src })
-            | Some(Op::Await { value: src })
-            | Some(Op::AwaitUncaught { value: src, .. }) => {
-                resolve_into(module, links, func, *src, visiting, out);
-            }
-            Some(Op::ResumeGenerator { genobj }) => {
-                // Pair async-machine `AwaitUncaught(funcobj, awaited)` -> `ResumeGenerator(funcobj)`
-                // so `const rdb = await relationalStore.getRdbStore(...); rdb.executeSql(...)`
-                // preserves receiver provenance across `await`.
-                if let Some(inst) = module.inst(iid)
-                    && let Some(bb) = module.block(inst.block)
-                {
-                    for &prev_iid in &bb.insts {
-                        if prev_iid == iid {
-                            break;
-                        }
-                        if let Some(Op::AwaitUncaught { funcobj, value }) =
-                            module.inst(prev_iid).map(|i| &i.op)
-                            && funcobj == genobj
+    prop_stores: Option<&ClassPropStores>,
+    root_func: FuncId,
+    root_value: ValueId,
+) -> Vec<String> {
+    let mut visiting: HashSet<(FuncId, ValueId)> = HashSet::new();
+    let mut bufs: Vec<Vec<String>> = vec![Vec::new()];
+    let mut stack: Vec<ResolveStep> = vec![ResolveStep::Enter {
+        func: root_func,
+        value: root_value,
+    }];
+
+    while let Some(step) = stack.pop() {
+        match step {
+            ResolveStep::Enter { func, value } => {
+                if !visiting.insert((func, value)) {
+                    continue;
+                }
+                let Some(v) = module.value(value) else {
+                    continue;
+                };
+                let ValueDef::Inst(iid) = v.def else {
+                    continue;
+                };
+                match module.inst(iid).map(|i| &i.op) {
+                    Some(Op::Mov { src })
+                    | Some(Op::Await { value: src })
+                    | Some(Op::AwaitUncaught { value: src, .. }) => {
+                        stack.push(ResolveStep::Enter { func, value: *src });
+                    }
+                    Some(Op::ResumeGenerator { genobj }) => {
+                        // Pair async-machine `AwaitUncaught(funcobj, awaited)` -> `ResumeGenerator(funcobj)`
+                        // so `const rdb = await relationalStore.getRdbStore(...); rdb.executeSql(...)`
+                        // preserves receiver provenance across `await`.
+                        if let Some(inst) = module.inst(iid)
+                            && let Some(bb) = module.block(inst.block)
                         {
-                            resolve_into(module, links, func, *value, visiting, out);
-                        }
-                    }
-                }
-            }
-            Some(Op::Phi { entries }) => {
-                for (_, incoming) in entries {
-                    resolve_into(module, links, func, *incoming, visiting, out);
-                }
-            }
-            Some(Op::TryGetGlobal { name, .. }) => {
-                if let Some(s) = module.sym.resolve(*name) {
-                    if s == OHOS_CONTEXT_GLOBAL {
-                        push_unique(out, "UIAbilityContext".to_owned());
-                    } else {
-                        push_unique(out, s.to_owned());
-                    }
-                }
-            }
-            Some(Op::LoadModuleVar { index, kind }) => {
-                if let Some(links) = links
-                    && let Some(cid) = links.func_class(func)
-                {
-                    if kind.is_local() {
-                        if links.has_multi_record_esm() {
-                            for &(def_fn, def_val) in links.stored_values(ModuleSlotRef {
-                                class_id: cid,
-                                slot: *index,
-                            }) {
-                                resolve_into(module, Some(links), def_fn, def_val, visiting, out);
+                            let mut awaited_vals = Vec::new();
+                            for &prev_iid in &bb.insts {
+                                if prev_iid == iid {
+                                    break;
+                                }
+                                if let Some(Op::AwaitUncaught { funcobj, value }) =
+                                    module.inst(prev_iid).map(|i| &i.op)
+                                    && funcobj == genobj
+                                {
+                                    awaited_vals.push(*value);
+                                }
                             }
-                        }
-                    } else if let Some(target) = links.external_load(cid, *index) {
-                        for &(spec_sym, imp_sym) in &target.external_imports {
-                            let raw_spec = module.sym.resolve(spec_sym).unwrap_or("");
-                            let imp = module.sym.resolve(imp_sym).unwrap_or("");
-                            emit_external_import_names(raw_spec, imp, out);
-                        }
-                        for &slot_ref in &target.slots {
-                            for &(def_fn, def_val) in links.stored_values(slot_ref) {
-                                resolve_into(module, Some(links), def_fn, def_val, visiting, out);
+                            for val in awaited_vals.into_iter().rev() {
+                                stack.push(ResolveStep::Enter { func, value: val });
                             }
                         }
                     }
-                }
-            }
-            Some(Op::GetModuleNamespace { index }) => {
-                if let Some(links) = links
-                    && let Some(cid) = links.func_class(func)
-                    && let Some(ext_sym) = links.namespace_external(cid, *index)
-                {
-                    let raw_spec = module.sym.resolve(ext_sym).unwrap_or("");
-                    let norm = normalize_sdk_specifier(raw_spec);
-                    push_unique(out, norm);
-                }
-            }
-            Some(Op::LoadProp { object, name }) => {
-                // Qualified names through the receiver chain:
-                // `TryGetGlobal("console").log` -> `"console.log"`,
-                // `LoadModuleVar("@ohos.net.http").createHttp` -> `"@ohos.net.http.createHttp"`.
-                if let Some(leaf) = module.sym.resolve(*name) {
-                    if is_viewpu_intrinsic(leaf) {
-                        push_unique(out, format!("ViewPU.{leaf}"));
+                    Some(Op::Phi { entries }) => {
+                        for (_, incoming) in entries.iter().rev() {
+                            stack.push(ResolveStep::Enter {
+                                func,
+                                value: *incoming,
+                            });
+                        }
                     }
-                    // Internal namespace member: `import * as ns from "./lib"; ns.foo()`.
-                    if let Some(links) = links
-                        && let Some(cid) = links.func_class(func)
-                        && let Some(req_idx) = peel_namespace_index(module, *object)
-                        && let Some(slots) = links.resolve_namespace_member(cid, req_idx, *name)
-                    {
-                        for &sr in slots {
-                            for &(def_fn, def_val) in links.stored_values(sr) {
-                                resolve_into(module, Some(links), def_fn, def_val, visiting, out);
+                    Some(Op::TryGetGlobal { name, .. }) => {
+                        if let Some(s) = module.sym.resolve(*name)
+                            && let Some(out) = bufs.last_mut()
+                        {
+                            if s == OHOS_CONTEXT_GLOBAL {
+                                push_unique(out, "UIAbilityContext".to_owned());
+                            } else {
+                                push_unique(out, s.to_owned());
                             }
                         }
                     }
-
-                    let mut prefix = Vec::new();
-                    resolve_into(module, links, func, *object, visiting, &mut prefix);
-
-                    // `this.context` on Ability/Extension instances or SDK receivers
-                    // stored into component instance fields (`this.controller = new webview.WebviewController()`):
-                    // these already include `leaf`, so push directly into `out`.
-                    if prefix.is_empty() {
-                        if leaf == "context" && is_this_or_lex_receiver(module, *object) {
+                    Some(Op::LoadModuleVar { index, kind }) => {
+                        if let Some(links) = links
+                            && let Some(cid) = links.func_class(func)
+                        {
+                            if kind.is_local() {
+                                if links.has_multi_record_esm() {
+                                    let stored = links.stored_values(ModuleSlotRef {
+                                        class_id: cid,
+                                        slot: *index,
+                                    });
+                                    for &(def_fn, def_val) in stored.iter().rev() {
+                                        stack.push(ResolveStep::Enter {
+                                            func: def_fn,
+                                            value: def_val,
+                                        });
+                                    }
+                                }
+                            } else if let Some(target) = links.external_load(cid, *index) {
+                                if let Some(out) = bufs.last_mut() {
+                                    for &(spec_sym, imp_sym) in &target.external_imports {
+                                        let raw_spec = module.sym.resolve(spec_sym).unwrap_or("");
+                                        let imp = module.sym.resolve(imp_sym).unwrap_or("");
+                                        emit_external_import_names(raw_spec, imp, out);
+                                    }
+                                }
+                                let mut pending = Vec::new();
+                                for &slot_ref in &target.slots {
+                                    for &(def_fn, def_val) in links.stored_values(slot_ref) {
+                                        pending.push((def_fn, def_val));
+                                    }
+                                }
+                                for (def_fn, def_val) in pending.into_iter().rev() {
+                                    stack.push(ResolveStep::Enter {
+                                        func: def_fn,
+                                        value: def_val,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Some(Op::GetModuleNamespace { index }) => {
+                        if let Some(links) = links
+                            && let Some(cid) = links.func_class(func)
+                            && let Some(ext_sym) = links.namespace_external(cid, *index)
+                            && let Some(out) = bufs.last_mut()
+                        {
+                            let raw_spec = module.sym.resolve(ext_sym).unwrap_or("");
+                            let norm = normalize_sdk_specifier(raw_spec);
+                            push_unique(out, norm);
+                        }
+                    }
+                    Some(Op::LoadProp { object, name }) => {
+                        // Qualified names through the receiver chain:
+                        // `TryGetGlobal("console").log` -> `"console.log"`,
+                        // `LoadModuleVar("@ohos.net.http").createHttp` -> `"@ohos.net.http.createHttp"`.
+                        if let Some(leaf) = module.sym.resolve(*name) {
+                            if is_viewpu_intrinsic(leaf)
+                                && let Some(out) = bufs.last_mut()
+                            {
+                                push_unique(out, format!("ViewPU.{leaf}"));
+                            }
+                            stack.push(ResolveStep::StartObjectPrefix {
+                                func,
+                                object: *object,
+                                name: *name,
+                            });
+                            // Internal namespace member: `import * as ns from "./lib"; ns.foo()`.
+                            if let Some(links) = links
+                                && let Some(cid) = links.func_class(func)
+                                && let Some(req_idx) = peel_namespace_index(module, *object)
+                                && let Some(slots) =
+                                    links.resolve_namespace_member(cid, req_idx, *name)
+                            {
+                                let mut ns_defs = Vec::new();
+                                for &sr in slots {
+                                    for &(def_fn, def_val) in links.stored_values(sr) {
+                                        ns_defs.push((def_fn, def_val));
+                                    }
+                                }
+                                for (def_fn, def_val) in ns_defs.into_iter().rev() {
+                                    stack.push(ResolveStep::Enter {
+                                        func: def_fn,
+                                        value: def_val,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    Some(Op::Call { callee, kind, .. }) => {
+                        bufs.push(Vec::new());
+                        stack.push(ResolveStep::FinishCall { kind: *kind });
+                        stack.push(ResolveStep::Enter {
+                            func,
+                            value: *callee,
+                        });
+                    }
+                    Some(Op::LoadConst(c)) => {
+                        if let Some(Const::MethodRef(f)) = module.consts.get(*c)
+                            && let Some(fd) = module.func(*f)
+                            && let Some(s) = module.sym.resolve(fd.name)
+                            && let Some(out) = bufs.last_mut()
+                        {
+                            push_unique(out, s.to_owned());
+                        }
+                    }
+                    Some(Op::DefineFunc { body, .. }) => {
+                        if let Some(fd) = module.func(*body)
+                            && let Some(s) = module.sym.resolve(fd.name)
+                            && let Some(out) = bufs.last_mut()
+                        {
+                            push_unique(out, s.to_owned());
+                        }
+                    }
+                    Some(Op::AllocClosure { func: inner })
+                    | Some(Op::CreateGenerator { func: inner }) => {
+                        stack.push(ResolveStep::Enter {
+                            func,
+                            value: *inner,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            ResolveStep::StartObjectPrefix { func, object, name } => {
+                bufs.push(Vec::new());
+                stack.push(ResolveStep::FinishObjectPrefix { func, object, name });
+                stack.push(ResolveStep::Enter {
+                    func,
+                    value: object,
+                });
+            }
+            ResolveStep::FinishObjectPrefix { func, object, name } => {
+                let prefix = bufs.pop().unwrap_or_default();
+                let Some(leaf) = module.sym.resolve(name) else {
+                    continue;
+                };
+                if prefix.is_empty() {
+                    if leaf == "context" && is_this_or_lex_receiver(module, object) {
+                        if let Some(out) = bufs.last_mut() {
                             push_unique(out, "UIAbilityContext".to_owned());
-                        } else if let Some(cid) = links
-                            .and_then(|l| l.func_class(func))
-                            .or_else(|| module.func(func).map(|f| f.class_id))
-                        {
-                            collect_sdk_field_prefixes(module, links, cid, *name, visiting, out);
+                        }
+                    } else if let Some(cid) = links
+                        .and_then(|l| l.func_class(func))
+                        .or_else(|| module.func(func).map(|f| f.class_id))
+                    {
+                        let stores: Vec<(FuncId, ValueId)> = match prop_stores {
+                            Some(ps) => ps.get(cid, name).to_vec(),
+                            None => scan_class_prop_stores(module, cid, name),
+                        };
+                        for (mfid, val) in stores.into_iter().rev() {
+                            stack.push(ResolveStep::StartSdkStore {
+                                func: mfid,
+                                value: val,
+                            });
                         }
                     }
-
+                } else if let Some(out) = bufs.last_mut() {
                     for base in &prefix {
                         if let Some(canon) = kit_canonical_alias(base, leaf) {
                             push_unique(out, canon.to_owned());
@@ -187,63 +370,95 @@ fn resolve_into(
                     }
                 }
             }
-            Some(Op::Call { callee, kind, .. }) => {
-                let mut callee_names = Vec::new();
-                resolve_into(module, links, func, *callee, visiting, &mut callee_names);
-                if *kind == CallKind::New {
-                    for cn in callee_names {
-                        if cn.starts_with("@ohos.") || cn.starts_with("@kit.") {
-                            push_unique(out, cn);
+            ResolveStep::StartSdkStore { func, value } => {
+                bufs.push(Vec::new());
+                stack.push(ResolveStep::FinishSdkStore);
+                stack.push(ResolveStep::Enter { func, value });
+            }
+            ResolveStep::FinishSdkStore => {
+                let sub = bufs.pop().unwrap_or_default();
+                if let Some(out) = bufs.last_mut() {
+                    for cand in sub {
+                        if cand.starts_with("@ohos.")
+                            || cand.starts_with("@kit.")
+                            || cand == "UIAbilityContext"
+                        {
+                            push_unique(out, cand);
                         }
                     }
-                } else {
-                    for cn in &callee_names {
-                        if let Some(ret_ty) = sdk_factory_return_type(cn) {
-                            push_unique(out, ret_ty.to_owned());
+                }
+            }
+            ResolveStep::FinishCall { kind } => {
+                let callee_names = bufs.pop().unwrap_or_default();
+                if let Some(out) = bufs.last_mut() {
+                    if kind == CallKind::New {
+                        for cn in callee_names {
+                            if cn.starts_with("@ohos.") || cn.starts_with("@kit.") {
+                                push_unique(out, cn);
+                            }
+                        }
+                    } else {
+                        for cn in &callee_names {
+                            if let Some(ret_ty) = sdk_factory_return_type(cn) {
+                                push_unique(out, ret_ty.to_owned());
+                            }
                         }
                     }
                 }
             }
-            Some(Op::LoadConst(c)) => {
-                if let Some(Const::MethodRef(f)) = module.consts.get(*c)
-                    && let Some(fd) = module.func(*f)
-                    && let Some(s) = module.sym.resolve(fd.name)
-                {
-                    push_unique(out, s.to_owned());
-                }
-            }
-            Some(Op::DefineFunc { body, .. }) => {
-                if let Some(fd) = module.func(*body)
-                    && let Some(s) = module.sym.resolve(fd.name)
-                {
-                    push_unique(out, s.to_owned());
-                }
-            }
-            Some(Op::AllocClosure { func: inner }) | Some(Op::CreateGenerator { func: inner }) => {
-                resolve_into(module, links, func, *inner, visiting, out);
-            }
-            _ => {}
         }
+    }
+
+    bufs.pop().unwrap_or_default()
+}
+
+fn owner_func_of_value(module: &Module, links: &ModuleLinkTable, val: ValueId) -> Option<FuncId> {
+    match module.value(val)?.def {
+        ValueDef::Inst(iid) => links.inst_func(module, iid),
+        ValueDef::ExceptionParam(b) => module
+            .block(b)
+            .and_then(|bb| bb.insts.first())
+            .and_then(|&iid| links.inst_func(module, iid))
+            .or_else(|| {
+                module
+                    .functions
+                    .iter()
+                    .position(|f| f.blocks.contains(&b))
+                    .map(|i| FuncId::new(i as u32))
+            }),
+        ValueDef::Param(_) | ValueDef::Const(_) => module
+            .functions
+            .iter()
+            .position(|f| f.params.contains(&val))
+            .map(|i| FuncId::new(i as u32)),
     }
 }
 
-fn owner_func_of_value(module: &Module, val: ValueId) -> Option<FuncId> {
-    let block = match module.value(val)?.def {
-        ValueDef::Inst(iid) => module.inst(iid)?.block,
-        ValueDef::ExceptionParam(b) => b,
-        ValueDef::Param(_) | ValueDef::Const(_) => {
-            return module
-                .functions
-                .iter()
-                .position(|f| f.params.contains(&val))
-                .map(|i| FuncId::new(i as u32));
-        }
+fn scan_class_prop_stores(module: &Module, cid: ClassId, prop_name: Sym) -> Vec<(FuncId, ValueId)> {
+    let mut stores = Vec::new();
+    let Some(cls) = module.classes.get(cid.index()) else {
+        return stores;
     };
-    module
-        .functions
-        .iter()
-        .position(|f| f.blocks.contains(&block))
-        .map(|i| FuncId::new(i as u32))
+    for &mfid in &cls.methods {
+        let Some(fd) = module.func(mfid) else {
+            continue;
+        };
+        for &b in &fd.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if let Op::StoreProp { name, value, .. } | Op::StoreOwnPropName { name, value, .. } =
+                    &inst.op
+                    && *name == prop_name
+                {
+                    stores.push((mfid, *value));
+                }
+            }
+        }
+    }
+    stores
 }
 
 fn peel_namespace_index(module: &Module, mut v: ValueId) -> Option<u32> {
@@ -276,51 +491,6 @@ fn is_this_or_lex_receiver(module: &Module, mut v: ValueId) -> bool {
         }
     }
     false
-}
-
-/// Scan property writes to `prop_name` within `cid` for SDK-typed receiver
-/// instances (e.g. `this.controller = new webview.WebviewController()`).
-/// Strictly gated to `@ohos.*` / `@kit.*` / `UIAbilityContext` prefixes so
-/// ordinary JS objects are never affected.
-fn collect_sdk_field_prefixes(
-    module: &Module,
-    links: Option<&ModuleLinkTable>,
-    cid: ClassId,
-    prop_name: Sym,
-    visiting: &mut HashSet<(FuncId, ValueId)>,
-    out: &mut Vec<String>,
-) {
-    let Some(cls) = module.classes.get(cid.index()) else {
-        return;
-    };
-    for &mfid in &cls.methods {
-        let Some(fd) = module.func(mfid) else {
-            continue;
-        };
-        for &b in &fd.blocks {
-            let Some(bb) = module.block(b) else { continue };
-            for &iid in &bb.insts {
-                let Some(inst) = module.inst(iid) else {
-                    continue;
-                };
-                if let Op::StoreProp { name, value, .. } | Op::StoreOwnPropName { name, value, .. } =
-                    &inst.op
-                    && *name == prop_name
-                {
-                    let mut sub = Vec::new();
-                    resolve_into(module, links, mfid, *value, visiting, &mut sub);
-                    for cand in sub {
-                        if cand.starts_with("@ohos.")
-                            || cand.starts_with("@kit.")
-                            || cand == "UIAbilityContext"
-                        {
-                            push_unique(out, cand);
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 fn is_viewpu_intrinsic(leaf: &str) -> bool {
@@ -433,33 +603,49 @@ pub fn call_base_value(module: &Module, call: &abcd_ir::Inst) -> Option<ValueId>
     if let Some(t) = this {
         return Some(*t);
     }
-    let mut visiting = std::collections::HashSet::new();
-    base_through_movs(module, *callee, &mut visiting)
+    base_through_movs(module, *callee)
 }
 
-fn base_through_movs(
-    module: &Module,
-    value: ValueId,
-    visiting: &mut std::collections::HashSet<ValueId>,
-) -> Option<ValueId> {
-    if !visiting.insert(value) {
-        return None;
-    }
+fn base_through_movs(module: &Module, value: ValueId) -> Option<ValueId> {
     let v = module.value(value)?;
     let ValueDef::Inst(iid) = v.def else {
         return None;
     };
     match module.inst(iid).map(|i| &i.op)? {
-        Op::Mov { src } => base_through_movs(module, *src, visiting),
-        // Loop rotation: the callee phi merges the pre-loop LoadProp
-        // with the phi itself; every entry reaches the same LoadProp
-        // in that shape (first-found is exact there, may otherwise).
-        Op::Phi { entries } => entries
-            .iter()
-            .find_map(|(_, incoming)| base_through_movs(module, *incoming, visiting)),
-        Op::LoadProp { object, .. } => Some(*object),
-        _ => None,
+        Op::LoadProp { object, .. } => return Some(*object),
+        Op::Mov { .. } | Op::Phi { .. } => {}
+        _ => return None,
     }
+    let mut visiting = HashSet::new();
+    let mut stack = vec![value];
+    while let Some(cur) = stack.pop() {
+        if !visiting.insert(cur) {
+            continue;
+        }
+        let Some(cv) = module.value(cur) else {
+            continue;
+        };
+        let ValueDef::Inst(ciid) = cv.def else {
+            continue;
+        };
+        let Some(op) = module.inst(ciid).map(|i| &i.op) else {
+            continue;
+        };
+        match op {
+            Op::Mov { src } => stack.push(*src),
+            // Loop rotation: the callee phi merges the pre-loop LoadProp
+            // with the phi itself; every entry reaches the same LoadProp
+            // in that shape (first-found is exact there, may otherwise).
+            Op::Phi { entries } => {
+                for (_, incoming) in entries.iter().rev() {
+                    stack.push(*incoming);
+                }
+            }
+            Op::LoadProp { object, .. } => return Some(*object),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The method leaf of a call whose callee came through a `LoadProp`
@@ -472,30 +658,46 @@ pub fn call_method_leaf(module: &Module, call: &abcd_ir::Inst) -> Option<Sym> {
     let Op::Call { callee, .. } = &call.op else {
         return None;
     };
-    let mut visiting = std::collections::HashSet::new();
-    leaf_through_movs(module, *callee, &mut visiting)
+    leaf_through_movs(module, *callee)
 }
 
-fn leaf_through_movs(
-    module: &Module,
-    value: ValueId,
-    visiting: &mut std::collections::HashSet<ValueId>,
-) -> Option<Sym> {
-    if !visiting.insert(value) {
-        return None;
-    }
+fn leaf_through_movs(module: &Module, value: ValueId) -> Option<Sym> {
     let v = module.value(value)?;
     let ValueDef::Inst(iid) = v.def else {
         return None;
     };
     match module.inst(iid).map(|i| &i.op)? {
-        Op::Mov { src } => leaf_through_movs(module, *src, visiting),
-        // Loop-rotated method calls: the callee phi merges the
-        // pre-loop LoadProp with the phi itself (for-of's `next`).
-        Op::Phi { entries } => entries
-            .iter()
-            .find_map(|(_, incoming)| leaf_through_movs(module, *incoming, visiting)),
-        Op::LoadProp { name, .. } => Some(*name),
-        _ => None,
+        Op::LoadProp { name, .. } => return Some(*name),
+        Op::Mov { .. } | Op::Phi { .. } => {}
+        _ => return None,
     }
+    let mut visiting = HashSet::new();
+    let mut stack = vec![value];
+    while let Some(cur) = stack.pop() {
+        if !visiting.insert(cur) {
+            continue;
+        }
+        let Some(cv) = module.value(cur) else {
+            continue;
+        };
+        let ValueDef::Inst(ciid) = cv.def else {
+            continue;
+        };
+        let Some(op) = module.inst(ciid).map(|i| &i.op) else {
+            continue;
+        };
+        match op {
+            Op::Mov { src } => stack.push(*src),
+            // Loop-rotated method calls: the callee phi merges the
+            // pre-loop LoadProp with the phi itself (for-of's `next`).
+            Op::Phi { entries } => {
+                for (_, incoming) in entries.iter().rev() {
+                    stack.push(*incoming);
+                }
+            }
+            Op::LoadProp { name, .. } => return Some(*name),
+            _ => {}
+        }
+    }
+    None
 }

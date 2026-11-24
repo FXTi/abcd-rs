@@ -41,6 +41,7 @@ mod proto_queries;
 mod roundtrip;
 mod string_boundaries;
 mod string_terminator_mutation;
+mod summary_and_streaming;
 mod trycatch;
 mod type_summary_offset;
 mod unicode_strings;

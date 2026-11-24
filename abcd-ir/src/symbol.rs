@@ -7,7 +7,7 @@
 //!
 //! Valid Unicode strings (including embedded `U+0000`, astral planes, and BMP
 //! Private Use Area code points `U+E000..=U+F8FF`) are stored as lossless
-//! UTF-8 `Box<str>` entries ([`SymbolTable::as_str`] returns `Some(&str)`).
+//! UTF-8 `Arc<str>` entries ([`SymbolTable::as_str`] returns `Some(&str)`).
 //! ECMAScript strings containing lone surrogates (`U+D800..=U+DFFF`, encoded
 //! in MUTF-8 as `ED A0..BF 80..BF`) are stored in a separate byte-keyed
 //! bucket carrying their exact MUTF-8 / UTF-16 identity without any sentinel
@@ -15,16 +15,17 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::id::Sym;
 
 #[derive(Clone, Debug)]
 enum SymEntry {
     /// Lossless valid UTF-8 string.
-    Utf8(Box<str>),
+    Utf8(Arc<str>),
     /// Lossy MUTF-8 byte sequence (lone surrogates), deduplicated by exact
     /// wire bytes. `lossy` holds the clean `U+FFFD`-substituted display text.
-    RawMutf8 { raw: Box<[u8]>, lossy: Box<str> },
+    RawMutf8 { raw: Arc<[u8]>, lossy: Arc<str> },
 }
 
 /// Deduplicating, append-only symbol table supporting both valid UTF-8
@@ -32,8 +33,8 @@ enum SymEntry {
 #[derive(Clone, Debug, Default)]
 pub struct SymbolTable {
     entries: Vec<SymEntry>,
-    utf8_to_sym: HashMap<Box<str>, Sym>,
-    raw_to_sym: HashMap<Box<[u8]>, Sym>,
+    utf8_to_sym: HashMap<Arc<str>, Sym>,
+    raw_to_sym: HashMap<Arc<[u8]>, Sym>,
 }
 
 impl SymbolTable {
@@ -50,9 +51,9 @@ impl SymbolTable {
             return sym;
         }
         let sym = Sym(self.entries.len() as u32);
-        let boxed: Box<str> = s.into();
-        self.entries.push(SymEntry::Utf8(boxed.clone()));
-        self.utf8_to_sym.insert(boxed, sym);
+        let shared: Arc<str> = Arc::from(s);
+        self.entries.push(SymEntry::Utf8(Arc::clone(&shared)));
+        self.utf8_to_sym.insert(shared, sym);
         sym
     }
 
@@ -62,6 +63,9 @@ impl SymbolTable {
     pub fn intern_raw_mutf8(&mut self, raw: &[u8]) -> Sym {
         if let Some(text) = mutf8_decode_utf8(raw) {
             return self.intern(&text);
+        }
+        if let Some(&sym) = self.raw_to_sym.get(raw) {
+            return sym;
         }
         let lossy = String::from_utf8_lossy(raw);
         self.intern_lossy_raw(&lossy, raw)
@@ -74,12 +78,12 @@ impl SymbolTable {
             return sym;
         }
         let sym = Sym(self.entries.len() as u32);
-        let raw_box: Box<[u8]> = raw.into();
+        let raw_arc: Arc<[u8]> = Arc::from(raw);
         self.entries.push(SymEntry::RawMutf8 {
-            raw: raw_box.clone(),
-            lossy: lossy.into(),
+            raw: Arc::clone(&raw_arc),
+            lossy: Arc::from(lossy),
         });
-        self.raw_to_sym.insert(raw_box, sym);
+        self.raw_to_sym.insert(raw_arc, sym);
         sym
     }
 
@@ -231,11 +235,11 @@ fn mutf8_to_utf16_lossy(raw: &[u8]) -> Vec<u16> {
     units
 }
 
-fn mutf8_decode_utf8(raw: &[u8]) -> Option<String> {
+fn mutf8_decode_utf8(raw: &[u8]) -> Option<Cow<'_, str>> {
     if !raw.contains(&0)
         && let Ok(s) = std::str::from_utf8(raw)
     {
-        return Some(s.to_owned());
+        return Some(Cow::Borrowed(s));
     }
     let mut units = Vec::with_capacity(raw.len());
     let mut i = 0;
@@ -279,12 +283,48 @@ fn mutf8_decode_utf8(raw: &[u8]) -> Option<String> {
             return None;
         }
     }
-    String::from_utf16(&units).ok()
+    String::from_utf16(&units).ok().map(Cow::Owned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_table_is_send_and_sync_and_shares_arc_backing() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SymbolTable>();
+
+        let mut t = SymbolTable::new();
+        let utf8 = t.intern("shared_utf8_symbol");
+        let raw = t.intern_raw_mutf8(&[0xED, 0xA0, 0xB4]);
+        let cloned = t.clone();
+
+        assert_eq!(
+            t.as_str(utf8).unwrap().as_ptr(),
+            cloned.as_str(utf8).unwrap().as_ptr(),
+            "cloned SymbolTable must share Arc<str> backing"
+        );
+        assert_eq!(
+            t.raw_mutf8(raw).unwrap().as_ptr(),
+            cloned.raw_mutf8(raw).unwrap().as_ptr(),
+            "cloned SymbolTable must share Arc<[u8]> backing"
+        );
+        assert_eq!(
+            t.resolve(raw).unwrap().as_ptr(),
+            cloned.resolve(raw).unwrap().as_ptr(),
+            "cloned SymbolTable must share lossy Arc<str> backing"
+        );
+
+        let (key_arc, &mapped) = t.utf8_to_sym.get_key_value("shared_utf8_symbol").unwrap();
+        assert_eq!(mapped, utf8);
+        assert_eq!(key_arc.as_ptr(), t.as_str(utf8).unwrap().as_ptr());
+
+        let (raw_key_arc, &raw_mapped) =
+            t.raw_to_sym.get_key_value(&[0xED, 0xA0, 0xB4][..]).unwrap();
+        assert_eq!(raw_mapped, raw);
+        assert_eq!(raw_key_arc.as_ptr(), t.raw_mutf8(raw).unwrap().as_ptr());
+    }
 
     #[test]
     fn intern_is_stable_and_deduplicating() {

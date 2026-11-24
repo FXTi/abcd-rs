@@ -322,6 +322,24 @@ impl<'f> Lifter<'f> {
 pub fn lift_file(file: &File) -> Result<Module, LiftError> {
     let mut lf = Lifter::new(file);
 
+    let total_classes = file.classes.len();
+    let total_methods: usize = file.classes.values().map(|c| c.methods.len()).sum();
+    let total_bytecodes: usize = file
+        .all_methods()
+        .filter_map(|(_, m)| m.body.as_ref())
+        .map(|b| b.bytecodes.len())
+        .sum();
+    lf.module.classes.reserve(total_classes);
+    lf.module.functions.reserve_exact(total_methods);
+    lf.method_to_func.reserve(total_methods);
+    lf.class_to_id.reserve(total_classes);
+    lf.func_bases.reserve(total_classes);
+    lf.module.insts.reserve_exact(total_bytecodes);
+    lf.module.values.reserve_exact(total_bytecodes);
+    lf.module
+        .blocks
+        .reserve_exact(total_methods.saturating_mul(5));
+
     // Pass 1 — identity tables: pre-fill the class-table and
     // function-table slots so every forward reference (DefineFunc,
     // Const::MethodRef, super_class, Type::Reference) resolves to a
@@ -364,6 +382,26 @@ pub fn lift_file(file: &File) -> Result<Module, LiftError> {
     // Module records → imports/exports/module-requests.
     metadata::emit_module_records(&mut lf)?;
 
+    for cls in &mut lf.module.classes {
+        cls.interfaces.shrink_to_fit();
+        cls.fields.shrink_to_fit();
+        cls.methods.shrink_to_fit();
+        cls.annotations.shrink_to_fit();
+        if let Some(es) = &mut cls.es_module {
+            es.imports.shrink_to_fit();
+            es.exports.shrink_to_fit();
+            es.module_requests.shrink_to_fit();
+        }
+    }
+    lf.module.classes.shrink_to_fit();
+    lf.module.functions.shrink_to_fit();
+    lf.module.blocks.shrink_to_fit();
+    lf.module.insts.shrink_to_fit();
+    lf.module.values.shrink_to_fit();
+    lf.module.imports.shrink_to_fit();
+    lf.module.exports.shrink_to_fit();
+    lf.module.module_requests.shrink_to_fit();
+
     Ok(lf.module)
 }
 
@@ -395,6 +433,8 @@ pub(crate) fn lift_method<'f>(
             return Err(LiftError::NoBody);
         }
         fd.params = metadata::external_params(lf, method);
+        fd.params.shrink_to_fit();
+        fd.annotations.shrink_to_fit();
         lf.module.functions[func_id.index()] = fd;
         return Ok(());
     };
@@ -658,6 +698,31 @@ pub(crate) fn lift_method<'f>(
     // locals with scope extents, param names, source file/code).
     metadata::finish_debug(&mut fx);
 
+    let Module {
+        functions, blocks, ..
+    } = &mut fx.lf.module;
+    let fd = &mut functions[func_id.index()];
+    fd.params.shrink_to_fit();
+    fd.frame_init_consts.shrink_to_fit();
+    fd.blocks.shrink_to_fit();
+    for region in &mut fd.try_regions {
+        region.protected.shrink_to_fit();
+        region.catches.shrink_to_fit();
+    }
+    fd.try_regions.shrink_to_fit();
+    fd.annotations.shrink_to_fit();
+    if let Some(dbg) = &mut fd.debug {
+        dbg.line_table.shrink_to_fit();
+        dbg.column_table.shrink_to_fit();
+        dbg.local_names.shrink_to_fit();
+        dbg.param_names.shrink_to_fit();
+    }
+    for &bid in &fd.blocks {
+        let blk = &mut blocks[bid.index()];
+        blk.insts.shrink_to_fit();
+        blk.preds.shrink_to_fit();
+    }
+
     Ok(())
 }
 
@@ -799,6 +864,10 @@ fn sweep_dead_blocks(fx: &mut translate::FnLift) {
 
     // Remove the dead blocks and prune dependent metadata: try-region
     // coverage/handler references.
+    for &bb in &dead {
+        module.blocks[bb.index()].insts.shrink_to_fit();
+        module.blocks[bb.index()].preds.shrink_to_fit();
+    }
     let func = &mut module.functions[func_id.index()];
     func.blocks.retain(|bb| !dead.contains(bb));
     for region in &mut func.try_regions {
@@ -852,4 +921,96 @@ pub(crate) fn emit_inst(
         bb.insts.push(inst_id);
     }
     (inst_id, result)
+}
+
+#[cfg(test)]
+mod tests {
+    use abcd_file::{AccessFlags, Builder, CatchBlockDef, Type, decode};
+    use abcd_isa::{Bytecode, Reg, encode as encode_bytecodes};
+
+    use super::lift_file;
+
+    #[test]
+    fn lift_file_shrinks_arena_and_per_function_capacities() {
+        let mut b = Builder::new();
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        let proto = b.create_proto(Type::Void, &[]);
+        for idx in 0..8 {
+            let (insns, _) = encode_bytecodes(&[
+                Bytecode::Lda(Reg(0)),
+                Bytecode::Return,
+                Bytecode::Sta(Reg(1)),
+                Bytecode::Lda(Reg(1)),
+                Bytecode::Return,
+            ])
+            .unwrap();
+            let code = b.create_code(&insns, 2, 3);
+            b.code_add_try_block(
+                code,
+                0,
+                2,
+                &[CatchBlockDef {
+                    type_class: None,
+                    handler_pc: 2,
+                    code_size: 3,
+                }],
+            );
+            let m = b.class_add_method(
+                cls,
+                &format!("f{idx}"),
+                proto,
+                AccessFlags::STATIC,
+                &[],
+                0,
+                0,
+            );
+            b.method_set_code(m, code);
+        }
+        let file = decode(&b.finalize().unwrap()).unwrap();
+        let m = lift_file(&file).unwrap();
+        assert!(abcd_ir::verify_module(&m).errors.is_empty());
+
+        assert_eq!(m.classes.capacity(), m.classes.len());
+        assert_eq!(m.functions.capacity(), m.functions.len());
+        assert_eq!(m.blocks.capacity(), m.blocks.len());
+        assert_eq!(m.insts.capacity(), m.insts.len());
+        assert_eq!(m.values.capacity(), m.values.len());
+        assert_eq!(m.imports.capacity(), m.imports.len());
+        assert_eq!(m.exports.capacity(), m.exports.len());
+        assert_eq!(m.module_requests.capacity(), m.module_requests.len());
+
+        for c in &m.classes {
+            assert_eq!(c.interfaces.capacity(), c.interfaces.len());
+            assert_eq!(c.fields.capacity(), c.fields.len());
+            assert_eq!(c.methods.capacity(), c.methods.len());
+            assert_eq!(c.annotations.capacity(), c.annotations.len());
+            if let Some(es) = &c.es_module {
+                assert_eq!(es.imports.capacity(), es.imports.len());
+                assert_eq!(es.exports.capacity(), es.exports.len());
+                assert_eq!(es.module_requests.capacity(), es.module_requests.len());
+            }
+        }
+        for f in &m.functions {
+            assert_eq!(f.params.capacity(), f.params.len());
+            assert_eq!(f.frame_init_consts.capacity(), f.frame_init_consts.len());
+            assert_eq!(f.blocks.capacity(), f.blocks.len());
+            assert_eq!(f.try_regions.capacity(), f.try_regions.len());
+            assert_eq!(f.annotations.capacity(), f.annotations.len());
+            for r in &f.try_regions {
+                assert_eq!(r.protected.capacity(), r.protected.len());
+                assert_eq!(r.catches.capacity(), r.catches.len());
+            }
+            if let Some(dbg) = &f.debug {
+                assert_eq!(dbg.line_table.capacity(), dbg.line_table.len());
+                assert_eq!(dbg.column_table.capacity(), dbg.column_table.len());
+                assert_eq!(dbg.local_names.capacity(), dbg.local_names.len());
+                assert_eq!(dbg.param_names.capacity(), dbg.param_names.len());
+            }
+        }
+        for blk in &m.blocks {
+            assert_eq!(blk.insts.capacity(), blk.insts.len());
+            assert_eq!(blk.preds.capacity(), blk.preds.len());
+        }
+    }
 }

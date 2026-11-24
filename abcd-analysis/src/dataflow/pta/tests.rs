@@ -776,3 +776,84 @@ fn two_runs_are_identical() {
     assert_eq!(ta, tb, "tables identical");
     assert_eq!(sa, sb, "stats identical");
 }
+
+#[test]
+fn nested_closure_capture_propagates_through_lex_free_middle_function() {
+    let mut m = mk_module();
+    // inner: GetLexVar(0, 0) — captures outer's env through middle (which has no lex ops).
+    let inner = add_func_named(&mut m, "inner");
+    let get_in_inner;
+    let inner_ret;
+    {
+        let b = entry_of(&m, inner);
+        inner_ret = emit(&mut m, b, Op::GetLexVar { level: 0, slot: 0 });
+        let ValueDef::Inst(i) = m.value(inner_ret).unwrap().def else {
+            panic!()
+        };
+        get_in_inner = i;
+        emit_void(
+            &mut m,
+            b,
+            Op::Return {
+                value: Some(inner_ret),
+            },
+        );
+    }
+    // middle: no NewLexEnv/PopLexEnv; defines and calls inner.
+    let middle = add_func_named(&mut m, "middle");
+    {
+        let b = entry_of(&m, middle);
+        let clo_inner = closure_of(&mut m, b, inner);
+        push_inst(
+            &mut m,
+            b,
+            Op::Call {
+                callee: clo_inner,
+                this: None,
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+    // outer: NewLexEnv; PutLexVar(0, 0, obj); defines and calls middle.
+    let outer = add_func_named(&mut m, "outer");
+    let env_outer;
+    let stored_obj;
+    {
+        let b = entry_of(&m, outer);
+        env_outer = new_lex_env(&mut m, b);
+        stored_obj = alloc_object(&mut m, b);
+        emit_void(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: stored_obj,
+            },
+        );
+        let clo_mid = closure_of(&mut m, b, middle);
+        push_inst(
+            &mut m,
+            b,
+            Op::Call {
+                callee: clo_mid,
+                this: None,
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+        );
+        emit_void(&mut m, b, Op::Return { value: None });
+    }
+
+    let out = run(&m);
+    let (_, tables, stats) = out.into_parts();
+    let oracle = Rung2AliasOracle::new(&m, tables, stats);
+    let env = oracle.lex_env_at(get_in_inner, 0);
+    assert!(!env.has_unknown);
+    assert_eq!(env.sites, AllocSiteSet::one(env_outer));
+    let ans = oracle.query(inner_ret, get_in_inner);
+    assert!(!ans.has_unknown);
+    assert_eq!(ans.sites, oracle.query(stored_obj, env_outer).sites);
+}

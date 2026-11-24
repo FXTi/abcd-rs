@@ -49,11 +49,43 @@ pub fn is_container(bytes: &[u8]) -> bool {
     bytes.len() >= ZIP_MAGIC.len() && &bytes[..ZIP_MAGIC.len()] == ZIP_MAGIC
 }
 
+/// Read `path` into a single allocation carrying a trailing 16-byte `[0u8; 16]`
+/// sentinel (`logical_len = buf.len() - 16`), suitable for zero-copy inspection
+/// via [`abcd_file::inspect_summary_zeropadded`].
+pub fn read_padded_file(path: &Path) -> Result<Vec<u8>, CliError> {
+    use std::io::Read;
+
+    let io_err = |e: std::io::Error| CliError::User(format!("cannot read {}: {e}", path.display()));
+    let mut file = std::fs::File::open(path).map_err(io_err)?;
+    let len = usize::try_from(file.metadata().map_err(io_err)?.len())
+        .map_err(|_| CliError::User(format!("cannot read {}: file too large", path.display())))?;
+    let cap = len
+        .checked_add(16)
+        .ok_or_else(|| CliError::User(format!("cannot read {}: file too large", path.display())))?;
+    let mut buf = Vec::with_capacity(cap);
+    file.read_to_end(&mut buf).map_err(io_err)?;
+    buf.extend_from_slice(&[0u8; 16]);
+    Ok(buf)
+}
+
 /// Read `path` and resolve it to module(s) per `selection`.
 pub fn load(path: &Path, selection: ModuleSelection<'_>) -> Result<Vec<InputModule>, CliError> {
     let bytes = std::fs::read(path)
         .map_err(|e| CliError::User(format!("cannot read {}: {e}", path.display())))?;
-    load_bytes(&bytes, &path.display().to_string(), selection)
+    let source_name = path.display().to_string();
+    let modules = if is_container(&bytes) {
+        let mods = container_modules(&bytes, &source_name)?;
+        drop(bytes);
+        mods
+    } else {
+        vec![InputModule {
+            name: file_stem(&source_name),
+            abc: bytes,
+            module_json: None,
+            provenance: source_name.clone(),
+        }]
+    };
+    select(modules, &source_name, selection)
 }
 
 /// In-memory twin of [`load`] (tests drive this directly). `source_name` is
@@ -178,7 +210,7 @@ fn module_json_name(json: &[u8]) -> Option<String> {
 }
 
 /// Stem of the final path component (`dir/entry.hap` → `entry`).
-fn file_stem(path: &str) -> String {
+pub(crate) fn file_stem(path: &str) -> String {
     let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
     match base.rsplit_once('.') {
         Some((stem, _ext)) if !stem.is_empty() => stem.to_string(),

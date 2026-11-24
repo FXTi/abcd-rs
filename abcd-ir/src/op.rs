@@ -6,9 +6,10 @@
 //! this set at lift; encoding selection is a lowering concern.
 //!
 //! Every consumer (passes, verifier, analyses) compiles against ONLY the
-//! single-point interfaces [`Op::operands`], [`Op::operands_mut`],
-//! [`Op::has_result`], and [`Op::is_terminator`] — never against a
-//! hand-maintained variant list, so variant lists cannot drift.
+//! single-point interfaces [`Op::operands`], [`Op::for_each_operand`],
+//! [`Op::has_operand`], [`Op::operands_mut`], [`Op::has_result`], and
+//! [`Op::is_terminator`] — never against a hand-maintained variant list, so
+//! variant lists cannot drift.
 
 use crate::function::Edge;
 use crate::id::{BlockId, ConstId, FuncId, Sym, ValueId};
@@ -1036,21 +1037,33 @@ pub enum Op {
 }
 
 impl Op {
-    /// All SSA operands (uses) of this op. Block/const/symbol/func
-    /// payloads are not SSA operands and are not returned.
-    pub fn operands(&self) -> Vec<ValueId> {
+    /// Internal short-circuiting visitor over all SSA operands (uses) in
+    /// canonical [`Op::operands`] order. Single source of operand truth for
+    /// [`Op::for_each_operand`], [`Op::has_operand`], and [`Op::operands`].
+    #[inline]
+    fn try_for_each_operand<F>(&self, mut f: F) -> std::ops::ControlFlow<()>
+    where
+        F: FnMut(ValueId) -> std::ops::ControlFlow<()>,
+    {
         use Op::*;
+        use std::ops::ControlFlow::Continue;
         match self {
-            BinaryOp { left, right, .. } | Compare { left, right, .. } => vec![*left, *right],
-            UnaryOp { operand, .. } => vec![*operand],
-            Mov { src } => vec![*src],
-            LoadConst(_) | AllocObject { .. } | AllocArray { .. } | AllocRegExp { .. } => vec![],
-            AllocClosure { func } => vec![*func],
-            LoadProp { object, .. } => vec![*object],
-            StoreProp { object, value, .. } => vec![*object, *value],
-            StoreOwnPropName { object, value, .. } => vec![*object, *value],
+            BinaryOp { left, right, .. } | Compare { left, right, .. } => {
+                f(*left)?;
+                f(*right)?;
+            }
+            UnaryOp { operand, .. } => f(*operand)?,
+            Mov { src } => f(*src)?,
+            LoadConst(_) | AllocObject { .. } | AllocArray { .. } | AllocRegExp { .. } => {}
+            AllocClosure { func } => f(*func)?,
+            LoadProp { object, .. } => f(*object)?,
+            StoreProp { object, value, .. } | StoreOwnPropName { object, value, .. } => {
+                f(*object)?;
+                f(*value)?;
+            }
             LoadPropIdx { object, index } | LoadPropDyn { object, key: index } => {
-                vec![*object, *index]
+                f(*object)?;
+                f(*index)?;
             }
             StorePropIdx {
                 object,
@@ -1061,8 +1074,8 @@ impl Op {
                 object,
                 key: index,
                 value,
-            } => vec![*object, *index, *value],
-            StoreOwnPropDyn {
+            }
+            | StoreOwnPropDyn {
                 object,
                 key: index,
                 value,
@@ -1071,106 +1084,212 @@ impl Op {
                 object,
                 index,
                 value,
-            } => vec![*object, *index, *value],
-            DefineMethod { object, func, .. } => vec![*object, *func],
-            DeleteProp { object, key } => vec![*object, *key],
+            } => {
+                f(*object)?;
+                f(*index)?;
+                f(*value)?;
+            }
+            DefineMethod { object, func, .. } => {
+                f(*object)?;
+                f(*func)?;
+            }
+            DeleteProp { object, key } => {
+                f(*object)?;
+                f(*key)?;
+            }
             TestProp { object, key } => {
-                let mut v = vec![*object];
+                f(*object)?;
                 match key {
                     PropKey::Name(_) => {}
-                    PropKey::Index(k) | PropKey::Dynamic(k) => v.push(*k),
+                    PropKey::Index(k) | PropKey::Dynamic(k) => f(*k)?,
                 }
-                v
             }
-            CopyDataProps { dst, src } => vec![*dst, *src],
-            SetObjectWithProto { proto, obj } => vec![*proto, *obj],
-            ArraySpread { dst, index, src } => vec![*dst, *index, *src],
+            CopyDataProps { dst, src } => {
+                f(*dst)?;
+                f(*src)?;
+            }
+            SetObjectWithProto { proto, obj } => {
+                f(*proto)?;
+                f(*obj)?;
+            }
+            ArraySpread { dst, index, src } => {
+                f(*dst)?;
+                f(*index)?;
+                f(*src)?;
+            }
             CreateObjectWithExcludedKeys { obj, keys } => {
-                let mut v = vec![*obj];
-                v.extend(keys.iter());
-                v
+                f(*obj)?;
+                for &k in keys {
+                    f(k)?;
+                }
             }
             DefineGetterSetterByValue {
                 obj,
                 key,
                 getter,
                 setter,
-            } => vec![*obj, *key, *getter, *setter],
-            GetTemplateObject { literal } => vec![*literal],
-            CreateIterResultObj { value, done } => vec![*value, *done],
-            GetIterator { obj } | GetPropIterator { obj } | GetAsyncIterator { obj } => vec![*obj],
+            } => {
+                f(*obj)?;
+                f(*key)?;
+                f(*getter)?;
+                f(*setter)?;
+            }
+            GetTemplateObject { literal } => f(*literal)?,
+            CreateIterResultObj { value, done } => {
+                f(*value)?;
+                f(*done)?;
+            }
+            GetIterator { obj } | GetPropIterator { obj } | GetAsyncIterator { obj } => f(*obj)?,
             IteratorNext { iterator }
             | IteratorReturn { iterator }
-            | IteratorThrow { iterator } => {
-                vec![*iterator]
+            | IteratorThrow { iterator }
+            | NextPropName { iterator } => f(*iterator)?,
+            NewLexEnv { .. }
+            | NewLexEnvWithName { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | CreatePrivateNames { .. }
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | AsyncFunctionEnter
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | Debugger => {}
+            PutLexVar { value, .. } => f(*value)?,
+            TryGetGlobal { default, .. } => {
+                if let Some(v) = default {
+                    f(*v)?;
+                }
             }
-            NextPropName { iterator } => vec![*iterator],
-            NewLexEnv { .. } | NewLexEnvWithName { .. } | PopLexEnv | GetLexVar { .. } => vec![],
-            CreatePrivateNames { .. } => vec![],
-            LoadNewTarget | LoadGlobalObject | LoadFunction => vec![],
-            GetUnmappedArgs | CopyRestArgs { .. } | AsyncFunctionEnter => vec![],
-            ThrowNotExists | ThrowPatternNonCoercible | ThrowDeleteSuperProperty | Debugger => {
-                vec![]
-            }
-            PutLexVar { value, .. } => vec![*value],
-            TryGetGlobal { default, .. } => default.iter().copied().collect(),
             StoreGlobal { value, .. }
             | StoreGlobalRecord { value, .. }
             | TryStoreGlobal { value, .. }
-            | StoreModuleVar { value, .. } => {
-                vec![*value]
-            }
-            LoadModuleVar { .. } | GetModuleNamespace { .. } => vec![],
-            DynamicImport { specifier } => vec![*specifier],
+            | StoreModuleVar { value, .. } => f(*value)?,
+            LoadModuleVar { .. } | GetModuleNamespace { .. } => {}
+            DynamicImport { specifier } => f(*specifier)?,
             Call {
                 callee, this, args, ..
             } => {
-                let mut v = vec![*callee];
-                v.extend(this.iter());
-                v.extend(args.iter());
-                v
+                f(*callee)?;
+                if let Some(t) = this {
+                    f(*t)?;
+                }
+                for &arg in args {
+                    f(arg)?;
+                }
             }
-            DefineFunc { captures, .. } => captures.iter().map(|(_, v)| *v).collect(),
+            DefineFunc { captures, .. } => {
+                for &(_, v) in captures {
+                    f(v)?;
+                }
+            }
             DefineClass { heritage, .. } | DefineSendableClass { heritage, .. } => {
-                heritage.iter().copied().collect()
+                if let Some(h) = heritage {
+                    f(*h)?;
+                }
             }
-            LoadPrivate { obj, .. } | TestPrivate { obj, .. } => vec![*obj],
+            LoadPrivate { obj, .. } | TestPrivate { obj, .. } => f(*obj)?,
             StorePrivate { obj, value, .. } | DefinePrivate { obj, value, .. } => {
-                vec![*obj, *value]
+                f(*obj)?;
+                f(*value)?;
             }
             Throw { value }
             | ThrowIfSuperNotCalled { value, .. }
             | ThrowConstAssignment { name: value }
             | ThrowIfNotObject { value }
             | ThrowUndefinedIfHoleWithName { value, .. }
-            | Await { value } => vec![*value],
+            | Await { value } => f(*value)?,
             AwaitUncaught { funcobj, value }
             | AsyncResolve { funcobj, value }
-            | AsyncReject { funcobj, value } => vec![*funcobj, *value],
-            ThrowUndefinedIfHole { name, value } => vec![*name, *value],
-            CreateGenerator { func } => vec![*func],
-            SuspendGenerator { genobj, value } => vec![*genobj, *value],
-            ResumeGenerator { genobj } | GetResumeMode { genobj } => vec![*genobj],
+            | AsyncReject { funcobj, value } => {
+                f(*funcobj)?;
+                f(*value)?;
+            }
+            ThrowUndefinedIfHole { name, value } => {
+                f(*name)?;
+                f(*value)?;
+            }
+            CreateGenerator { func } => f(*func)?,
+            SuspendGenerator { genobj, value } => {
+                f(*genobj)?;
+                f(*value)?;
+            }
+            ResumeGenerator { genobj } | GetResumeMode { genobj } => f(*genobj)?,
             LoadSuper { key, this_value } => match key {
-                SuperKey::Name(_) => vec![*this_value],
-                SuperKey::Dynamic(k) => vec![*k, *this_value],
+                SuperKey::Name(_) => f(*this_value)?,
+                SuperKey::Dynamic(k) => {
+                    f(*k)?;
+                    f(*this_value)?;
+                }
             },
             StoreSuper {
                 key,
                 this_value,
                 value,
             } => {
-                let mut v = vec![*value, *this_value];
+                f(*value)?;
+                f(*this_value)?;
                 if let SuperKey::Dynamic(k) = key {
-                    v.push(*k);
+                    f(*k)?;
                 }
-                v
             }
-            Branch { .. } | Unreachable => vec![],
-            CondBranch { cond, .. } => vec![*cond],
-            Return { value } => value.iter().copied().collect(),
-            Phi { entries } => entries.iter().map(|(_, v)| *v).collect(),
+            Branch { .. } | Unreachable => {}
+            CondBranch { cond, .. } => f(*cond)?,
+            Return { value } => {
+                if let Some(v) = value {
+                    f(*v)?;
+                }
+            }
+            Phi { entries } => {
+                for &(_, v) in entries {
+                    f(v)?;
+                }
+            }
         }
+        Continue(())
+    }
+
+    /// Visit each SSA operand (use) of this op in exact [`Op::operands`]
+    /// order without allocating. Block/const/symbol/func payloads are not SSA
+    /// operands and are not visited.
+    #[inline]
+    pub fn for_each_operand<F: FnMut(ValueId)>(&self, mut f: F) {
+        let _ = self.try_for_each_operand(|v| {
+            f(v);
+            std::ops::ControlFlow::Continue(())
+        });
+    }
+
+    /// Return `true` iff `target` appears among this op's SSA operands,
+    /// short-circuiting on the first match without allocating.
+    #[inline]
+    pub fn has_operand(&self, target: ValueId) -> bool {
+        self.try_for_each_operand(|v| {
+            if v == target {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+    }
+
+    /// All SSA operands (uses) of this op. Block/const/symbol/func
+    /// payloads are not SSA operands and are not returned.
+    ///
+    /// Prefer [`Op::for_each_operand`] or [`Op::has_operand`] in hot loops
+    /// when a heap-allocated `Vec` is not needed.
+    pub fn operands(&self) -> Vec<ValueId> {
+        let mut out = match self.arity() {
+            Arity::Exact(n) => Vec::with_capacity(n),
+            Arity::Variadic => Vec::new(),
+        };
+        self.for_each_operand(|v| out.push(v));
+        out
     }
 
     /// Mutable views of all SSA operands, in the same order as
@@ -1609,5 +1728,371 @@ mod tests {
                 assert_eq!(op.operands().len(), n, "{op:?}");
             }
         }
+    }
+
+    /// All 88 variants' operand accessors (`operands`, `for_each_operand`,
+    /// `has_operand`, `operands_mut`) and fixed `arity()` agree in exact
+    /// order on distinct `ValueId`s.
+    #[test]
+    fn all_88_variants_operand_visitors_agree_in_order() {
+        use crate::function::EdgeKind;
+
+        let mut next_id = 1u32;
+        let mut v = || {
+            let id = ValueId::new(next_id);
+            next_id += 1;
+            id
+        };
+        let s = Sym::new(0);
+        let c = ConstId::new(0);
+        let f = FuncId::new(0);
+        let b = BlockId::new(0);
+        let edge = |idx| Edge {
+            from: BlockId::new(idx),
+            kind: EdgeKind::Normal,
+        };
+
+        let mut ops = vec![
+            // Compute (5)
+            Op::BinaryOp {
+                op: BinOp::Add,
+                left: v(),
+                right: v(),
+            },
+            Op::UnaryOp {
+                op: UnOp::Minus,
+                operand: v(),
+            },
+            Op::Compare {
+                op: CmpOp::Eq,
+                left: v(),
+                right: v(),
+            },
+            Op::Mov { src: v() },
+            Op::LoadConst(c),
+            // Objects / arrays (23)
+            Op::AllocObject { shape: c },
+            Op::AllocArray { shape: Some(c) },
+            Op::AllocRegExp {
+                pattern: s,
+                flags: 0,
+            },
+            Op::AllocClosure { func: v() },
+            Op::LoadProp {
+                object: v(),
+                name: s,
+            },
+            Op::StoreProp {
+                object: v(),
+                name: s,
+                value: v(),
+            },
+            Op::LoadPropIdx {
+                object: v(),
+                index: v(),
+            },
+            Op::StorePropIdx {
+                object: v(),
+                index: v(),
+                value: v(),
+            },
+            Op::LoadPropDyn {
+                object: v(),
+                key: v(),
+            },
+            Op::StorePropDyn {
+                object: v(),
+                key: v(),
+                value: v(),
+            },
+            Op::StoreOwnPropName {
+                object: v(),
+                name: s,
+                value: v(),
+            },
+            Op::StoreOwnPropDyn {
+                object: v(),
+                key: v(),
+                value: v(),
+            },
+            Op::StoreOwnPropIdx {
+                object: v(),
+                index: v(),
+                value: v(),
+            },
+            Op::DefineMethod {
+                object: v(),
+                name: s,
+                func: v(),
+                length: 1,
+            },
+            Op::DeleteProp {
+                object: v(),
+                key: v(),
+            },
+            Op::TestProp {
+                object: v(),
+                key: PropKey::Name(s),
+            },
+            Op::TestProp {
+                object: v(),
+                key: PropKey::Index(v()),
+            },
+            Op::TestProp {
+                object: v(),
+                key: PropKey::Dynamic(v()),
+            },
+            Op::CopyDataProps { dst: v(), src: v() },
+            Op::SetObjectWithProto {
+                proto: v(),
+                obj: v(),
+            },
+            Op::ArraySpread {
+                dst: v(),
+                index: v(),
+                src: v(),
+            },
+            Op::CreateObjectWithExcludedKeys {
+                obj: v(),
+                keys: vec![v(), v()],
+            },
+            Op::DefineGetterSetterByValue {
+                obj: v(),
+                key: v(),
+                getter: v(),
+                setter: v(),
+            },
+            Op::GetTemplateObject { literal: v() },
+            Op::CreateIterResultObj {
+                value: v(),
+                done: v(),
+            },
+            // Iteration (7)
+            Op::GetIterator { obj: v() },
+            Op::GetAsyncIterator { obj: v() },
+            Op::IteratorNext { iterator: v() },
+            Op::IteratorReturn { iterator: v() },
+            Op::IteratorThrow { iterator: v() },
+            Op::GetPropIterator { obj: v() },
+            Op::NextPropName { iterator: v() },
+            // Lexical / global / module (13)
+            Op::NewLexEnv { num_vars: 2 },
+            Op::NewLexEnvWithName {
+                num_vars: 2,
+                scope_names: c,
+            },
+            Op::PopLexEnv,
+            Op::GetLexVar { level: 0, slot: 1 },
+            Op::PutLexVar {
+                level: 0,
+                slot: 1,
+                value: v(),
+            },
+            Op::TryGetGlobal {
+                name: s,
+                default: None,
+            },
+            Op::TryGetGlobal {
+                name: s,
+                default: Some(v()),
+            },
+            Op::StoreGlobal {
+                name: s,
+                value: v(),
+            },
+            Op::StoreGlobalRecord {
+                name: s,
+                value: v(),
+                is_const: true,
+            },
+            Op::TryStoreGlobal {
+                name: s,
+                value: v(),
+            },
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::Local,
+            },
+            Op::StoreModuleVar {
+                index: 0,
+                value: v(),
+            },
+            Op::GetModuleNamespace { index: 0 },
+            Op::DynamicImport { specifier: v() },
+            // Calls / definitions (4)
+            Op::Call {
+                callee: v(),
+                this: None,
+                args: vec![],
+                kind: CallKind::Dynamic,
+            },
+            Op::Call {
+                callee: v(),
+                this: Some(v()),
+                args: vec![v(), v()],
+                kind: CallKind::Direct,
+            },
+            Op::DefineFunc {
+                body: f,
+                captures: vec![(s, v()), (s, v())],
+                length: 2,
+            },
+            Op::DefineClass {
+                ctor: f,
+                heritage: None,
+                members: c,
+                member_attrs: Vec::new(),
+                count: 0,
+            },
+            Op::DefineClass {
+                ctor: f,
+                heritage: Some(v()),
+                members: c,
+                member_attrs: Vec::new(),
+                count: 1,
+            },
+            Op::DefineSendableClass {
+                ctor: f,
+                heritage: Some(v()),
+                members: c,
+                member_attrs: Vec::new(),
+                count: 1,
+            },
+            // Private properties (5)
+            Op::LoadPrivate {
+                level: 0,
+                slot: 0,
+                obj: v(),
+            },
+            Op::StorePrivate {
+                level: 0,
+                slot: 0,
+                obj: v(),
+                value: v(),
+            },
+            Op::DefinePrivate {
+                level: 0,
+                slot: 0,
+                obj: v(),
+                value: v(),
+            },
+            Op::TestPrivate {
+                level: 0,
+                slot: 0,
+                obj: v(),
+            },
+            Op::CreatePrivateNames { count: 1, names: c },
+            // Exceptions (9)
+            Op::Throw { value: v() },
+            Op::ThrowIfSuperNotCalled {
+                value: v(),
+                kind: SuperCheck::NotCalled,
+            },
+            Op::ThrowUndefinedIfHole {
+                name: v(),
+                value: v(),
+            },
+            Op::ThrowUndefinedIfHoleWithName {
+                name: s,
+                value: v(),
+            },
+            Op::ThrowNotExists,
+            Op::ThrowPatternNonCoercible,
+            Op::ThrowDeleteSuperProperty,
+            Op::ThrowConstAssignment { name: v() },
+            Op::ThrowIfNotObject { value: v() },
+            // Generator / async (9)
+            Op::CreateGenerator { func: v() },
+            Op::SuspendGenerator {
+                genobj: v(),
+                value: v(),
+            },
+            Op::ResumeGenerator { genobj: v() },
+            Op::GetResumeMode { genobj: v() },
+            Op::Await { value: v() },
+            Op::AwaitUncaught {
+                funcobj: v(),
+                value: v(),
+            },
+            Op::AsyncFunctionEnter,
+            Op::AsyncResolve {
+                funcobj: v(),
+                value: v(),
+            },
+            Op::AsyncReject {
+                funcobj: v(),
+                value: v(),
+            },
+            // Frame / special value loaders (5)
+            Op::LoadNewTarget,
+            Op::LoadGlobalObject,
+            Op::LoadFunction,
+            Op::GetUnmappedArgs,
+            Op::CopyRestArgs { start_index: 1 },
+            // Super (2)
+            Op::LoadSuper {
+                key: SuperKey::Name(s),
+                this_value: v(),
+            },
+            Op::LoadSuper {
+                key: SuperKey::Dynamic(v()),
+                this_value: v(),
+            },
+            Op::StoreSuper {
+                key: SuperKey::Name(s),
+                this_value: v(),
+                value: v(),
+            },
+            Op::StoreSuper {
+                key: SuperKey::Dynamic(v()),
+                this_value: v(),
+                value: v(),
+            },
+            // Control (5)
+            Op::Branch { dest: b },
+            Op::CondBranch {
+                cond: v(),
+                true_dest: b,
+                false_dest: b,
+            },
+            Op::Return { value: None },
+            Op::Return { value: Some(v()) },
+            Op::Phi {
+                entries: vec![(edge(0), v()), (edge(1), v())],
+            },
+            Op::Unreachable,
+            // Debug (1)
+            Op::Debugger,
+        ];
+
+        let absent = ValueId::new(u32::MAX);
+        let mut distinct_discriminants = std::collections::HashSet::new();
+        for op in &mut ops {
+            distinct_discriminants.insert(std::mem::discriminant(op));
+            let vec_ops = op.operands();
+            let mut visited = Vec::new();
+            op.for_each_operand(|val| visited.push(val));
+            assert_eq!(visited, vec_ops, "for_each_operand order mismatch: {op:?}");
+
+            let mut_ops: Vec<ValueId> = op.operands_mut().into_iter().map(|r| *r).collect();
+            assert_eq!(mut_ops, vec_ops, "operands_mut order mismatch: {op:?}");
+
+            for &operand in &vec_ops {
+                assert!(
+                    op.has_operand(operand),
+                    "missing operand {operand} in {op:?}"
+                );
+            }
+            assert!(!op.has_operand(absent), "unexpected absent match in {op:?}");
+
+            if let Arity::Exact(n) = op.arity() {
+                assert_eq!(vec_ops.len(), n, "arity mismatch: {op:?}");
+            }
+        }
+        assert_eq!(
+            distinct_discriminants.len(),
+            88,
+            "test must cover all 88 Op variants"
+        );
     }
 }

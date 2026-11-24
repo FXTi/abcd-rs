@@ -92,3 +92,35 @@ fn write_all_aborts_the_batch_on_a_bad_module() {
     assert!(dir.join("tiny.pa").exists(), "the good module was written");
     assert!(!dir.join("bad.pa").exists(), "the bad module was not");
 }
+
+#[test]
+fn streaming_disassemble_matches_in_memory_and_preserves_target_on_decode_error() {
+    let modules =
+        input::load_bytes(&common::tiny_abc(), "tiny.abc", ModuleSelection::Single).expect("load");
+    let expected = dis::disassemble(&modules[0]).expect("disassemble");
+
+    let mut streamed = Vec::new();
+    let n_writer = dis::disassemble_to_writer(&modules[0], &mut streamed).expect("to_writer");
+    assert_eq!(n_writer, expected.len());
+    assert_eq!(streamed, expected);
+
+    let dir = common::tempdir("dis-stream");
+    let out_path = dir.join("tiny.pa");
+    let n_path = dis::disassemble_to_path(&modules[0], &out_path).expect("to_path");
+    assert_eq!(n_path, expected.len());
+    assert_eq!(std::fs::read(&out_path).unwrap(), expected);
+
+    let bad = input::load_bytes(b"corrupt", "bad.abc", ModuleSelection::Single).expect("load");
+    let missing_path = dir.join("never_created.pa");
+    assert!(dis::disassemble_to_path(&bad[0], &missing_path).is_err());
+    assert!(
+        !missing_path.exists(),
+        "decode failure must not create an empty output file"
+    );
+    assert!(dis::disassemble_to_path(&bad[0], &out_path).is_err());
+    assert_eq!(
+        std::fs::read(&out_path).unwrap(),
+        expected,
+        "decode failure must not truncate an existing output file"
+    );
+}

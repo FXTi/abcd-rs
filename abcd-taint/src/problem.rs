@@ -32,20 +32,24 @@
 //! operand→result rule.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::heap::{AllocSiteSet, UpdateKind};
 use abcd_analysis::dataflow::heap::{FieldChain, FieldKey, update_kind};
 use abcd_analysis::dataflow::ifds::{CallGraphOracle, IfdsProblem};
 use abcd_analysis::module_link::ModuleLinkTable;
-use abcd_ir::{CallKind, ClassId, Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
+use abcd_ir::op::{PropKey, SuperKey};
+use abcd_ir::{
+    BlockId, CallKind, ClassId, Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId,
+};
 
 use crate::driver::{SourceSpec, TaintConfig};
 use crate::fact::{Fact, TaintBase, TaintFact};
 use crate::gap;
 use crate::names::{
-    call_base_value, call_method_leaf, callee_name_candidates_with_links, normalize_sdk_specifier,
+    ClassPropStores, call_base_value, call_method_leaf, callee_name_candidates_indexed,
+    normalize_sdk_specifier,
 };
 use crate::oracle::Oracle;
 use crate::prototype::{FamilyAnswer, PrototypeResolver};
@@ -116,6 +120,24 @@ pub struct TaintProblem<'m> {
     module: &'m Module,
     callgraph: &'m CallGraph,
     links: ModuleLinkTable,
+    prop_stores: ClassPropStores,
+    global_stores: HashMap<Sym, Vec<ValueId>>,
+    /// Dense `BlockId::index() -> Option<FuncId>` owning-function index.
+    block_to_func: Vec<Option<FuncId>>,
+    /// Dense `BlockId::index() -> Option<ValueId>` catch-handler exception parameter
+    /// (first matching catch in function/region/catch order, matching `handler_exception_at`).
+    handler_block_exc: Vec<Option<ValueId>>,
+    /// Scoped `(FuncId, handler BlockId) -> exception ValueId` for intraprocedural throws.
+    func_handler_exc: HashMap<(FuncId, BlockId), ValueId>,
+    /// Per-function backward SSA local liveness for pruning dead `TaintBase::Local` facts.
+    liveness: LocalLiveness,
+    /// Lazy memo per `ValueId::index()`: `0 = unknown`, `1 = dead-prunable`,
+    /// `2 = has aliasing property loads in its owning function`.
+    value_keep_flag: RefCell<Vec<u8>>,
+    /// Per-function lazy index of property loads with non-empty `site_info_at(object).sites`.
+    func_alias_loads: RefCell<Vec<Option<FuncAliasLoads>>>,
+    /// Cached `(func_idx, matching_load_indices)` for locals with `value_keep_flag == 2`.
+    value_alias_loads: RefCell<HashMap<ValueId, ValueAliasLoads>>,
     oracle: RefCell<Oracle<'m>>,
     registry: &'m SummaryRegistry,
     config: &'m TaintConfig,
@@ -140,6 +162,8 @@ pub struct TaintProblem<'m> {
     /// The applied-summary log: `(call site, summary name)` in
     /// application order — reported by the driver.
     applied: RefCell<Vec<(InstId, String)>>,
+    /// Fast dedup set accompanying `applied` so logging stays `O(1)` per fact.
+    applied_seen: RefCell<HashSet<InstId>>,
     /// Receiver-family memo (one entry per queried receiver
     /// value; engine answers are point-independent at rung 1).
     proto_memo: RefCell<HashMap<ValueId, FamilyAnswer>>,
@@ -218,6 +242,9 @@ impl<'m> TaintProblem<'m> {
             }
         }
         let links = ModuleLinkTable::build(module);
+        let prop_stores = ClassPropStores::build(module);
+        let global_stores = build_global_stores_map(module);
+        let (block_to_func, handler_block_exc, func_handler_exc) = build_exception_indexes(module);
         let mut module_import_sources = HashSet::new();
         for spec in &config.sources {
             if let SourceSpec::ModuleImport {
@@ -264,8 +291,13 @@ impl<'m> TaintProblem<'m> {
                 let Op::Call { callee, args, .. } = &inst.op else {
                     continue;
                 };
-                let mut cands =
-                    callee_name_candidates_with_links(module, &links, edge.caller, *callee);
+                let mut cands = callee_name_candidates_indexed(
+                    module,
+                    &links,
+                    Some(&prop_stores),
+                    edge.caller,
+                    *callee,
+                );
                 for f in callgraph.callees_of_call_at(call) {
                     if let Some(fd) = module.func(*f)
                         && let Some(n) = module.sym.resolve(fd.name)
@@ -304,11 +336,24 @@ impl<'m> TaintProblem<'m> {
         }
 
         let await_resume = build_await_resume_map(module);
+        let liveness = LocalLiveness::build(module, &await_resume);
+        let value_keep_flag = RefCell::new(vec![0u8; module.values.len()]);
+        let func_alias_loads = RefCell::new((0..module.functions.len()).map(|_| None).collect());
+        let value_alias_loads = RefCell::new(HashMap::new());
 
         let mut problem = TaintProblem {
             module,
             callgraph,
             links,
+            prop_stores,
+            global_stores,
+            block_to_func,
+            handler_block_exc,
+            func_handler_exc,
+            liveness,
+            value_keep_flag,
+            func_alias_loads,
+            value_alias_loads,
             oracle: RefCell::new(oracle),
             registry,
             config,
@@ -321,6 +366,7 @@ impl<'m> TaintProblem<'m> {
             site_class: RefCell::new(HashMap::new()),
             counted: RefCell::new(HashSet::new()),
             applied: RefCell::new(Vec::new()),
+            applied_seen: RefCell::new(HashSet::new()),
             proto_memo: RefCell::new(HashMap::new()),
             gap_edges: BTreeMap::new(),
             fresh_memo: RefCell::new(HashMap::new()),
@@ -347,6 +393,11 @@ impl<'m> TaintProblem<'m> {
     /// Borrow the cross-module linkage index.
     pub fn links(&self) -> &ModuleLinkTable {
         &self.links
+    }
+
+    /// Borrow the prebuilt per-class property-store index.
+    pub(crate) fn prop_stores(&self) -> &ClassPropStores {
+        &self.prop_stores
     }
 
     /// Static callback-gap edges — the driver layers them onto
@@ -525,8 +576,13 @@ impl<'m> TaintProblem<'m> {
             .links
             .inst_func(self.module, call)
             .unwrap_or(FuncId::new(0));
-        let mut names =
-            callee_name_candidates_with_links(self.module, &self.links, caller, *callee);
+        let mut names = callee_name_candidates_indexed(
+            self.module,
+            &self.links,
+            Some(&self.prop_stores),
+            caller,
+            *callee,
+        );
         // Resolved callees contribute their FunctionData names (directly
         // resolved internal functions named like a builtin match too).
         let callees = self.callgraph.callees_of_call_at(call);
@@ -605,7 +661,14 @@ impl<'m> TaintProblem<'m> {
         let leaf = self.module.sym.resolve(leaf)?.to_owned();
         let base = call_base_value(self.module, call_inst)?;
         let oracle = self.oracle.borrow();
-        let resolver = PrototypeResolver::new(self.module, &oracle, &self.proto_memo);
+        let resolver = PrototypeResolver::with_indexes(
+            self.module,
+            &oracle,
+            &self.proto_memo,
+            &self.links,
+            &self.prop_stores,
+            &self.global_stores,
+        );
         let answer = resolver.families_of(base, call);
         drop(oracle);
         let mut hit = None;
@@ -625,51 +688,139 @@ impl<'m> TaintProblem<'m> {
         hit
     }
 
-    /// All `ValueId` operands of a call that taint can ride on:
-    /// callee, `this`, args.
-    fn call_operands(call_op: &Op) -> Vec<ValueId> {
-        call_op.operands()
-    }
-
     /// Whether `return_site` is the entry instruction of a catch handler
     /// of the calling function (then the callee's RETURN value does not
     /// flow there — only thrown values do). Returns the handler's
-    /// exception binding when it is one.
+    /// exception binding when it is one (`O(1)` pre-indexed lookup).
     fn handler_exception_at(&self, return_site: InstId) -> Option<ValueId> {
         let rs_inst = self.module.inst(return_site)?;
-        for f in &self.module.functions {
-            for region in &f.try_regions {
-                for catch in &region.catches {
-                    if catch.handler == rs_inst.block {
-                        return Some(catch.exception);
-                    }
-                }
-            }
-        }
-        None
+        self.handler_block_exc
+            .get(rs_inst.block.index())
+            .copied()
+            .flatten()
     }
 
     /// The catch binding of the handler whose entry block is
     /// `succ_block`, restricted to try regions of the function owning
-    /// `from_block` (intraprocedural throw dispatch).
-    fn handler_exception_for(
-        &self,
-        from_block: abcd_ir::BlockId,
-        succ_block: abcd_ir::BlockId,
-    ) -> Option<ValueId> {
-        let func = self
-            .module
-            .functions
-            .iter()
-            .find(|f| f.blocks.contains(&from_block))?;
-        for region in &func.try_regions {
-            for catch in &region.catches {
-                if catch.handler == succ_block {
-                    return Some(catch.exception);
-                }
+    /// `from_block` (intraprocedural throw dispatch; `O(1)` pre-indexed lookup).
+    fn handler_exception_for(&self, from_block: BlockId, succ_block: BlockId) -> Option<ValueId> {
+        let fid = self
+            .block_to_func
+            .get(from_block.index())
+            .copied()
+            .flatten()?;
+        self.func_handler_exc.get(&(fid, succ_block)).copied()
+    }
+
+    /// Whether `TaintBase::Local(v)` must survive pass-through onto `target_inst`.
+    ///
+    /// - If `v` has at least one direct or implicit SSA use at or after `target_inst`
+    ///   in `target_inst`'s function, it stays live (`true`).
+    /// - Entry `ValueDef::Param` and `ValueDef::Const` values (`O(1)` per function)
+    ///   stay live so parameter-seeded functions continue classifying reachable calls.
+    /// - Dead instruction-defined temporaries (`ValueDef::Inst`) and handler
+    ///   `ExceptionParam`s can only ever match downstream via `load_rule`'s
+    ///   `local_alias_evidence(v, object, at)` (`object != v`). Unless `v`'s
+    ///   allocation sites positively intersect `site_info_at(object).sites` at
+    ///   some `LoadProp*` instruction reachable at or after `target_inst`, `v`
+    ///   is soundly pruned (`false`).
+    fn should_retain_local_at(&self, v: ValueId, target_inst: InstId) -> bool {
+        if self.liveness.is_live_at(target_inst, v) {
+            return true;
+        }
+        match self.module.value(v).map(|val| val.def) {
+            None | Some(ValueDef::Param(_) | ValueDef::Const(_)) => return true,
+            Some(ValueDef::Inst(_) | ValueDef::ExceptionParam(_)) => {}
+        }
+        let idx = v.index();
+        let cached = self.value_keep_flag.borrow().get(idx).copied().unwrap_or(0);
+        if cached == 1 {
+            return false;
+        }
+        let Some(&loc) = self.liveness.inst_loc.get(target_inst.index()) else {
+            return true;
+        };
+        if loc.func == UNSEEN_FUNC {
+            return true;
+        }
+        let func_idx = loc.func as usize;
+        let has_func_entry = self
+            .func_alias_loads
+            .borrow()
+            .get(func_idx)
+            .is_some_and(Option::is_some);
+        if !has_func_entry {
+            let built = {
+                let oracle = self.oracle.borrow();
+                FuncAliasLoads::build(self.module, FuncId::new(loc.func), &oracle)
+            };
+            if let Some(slot) = self.func_alias_loads.borrow_mut().get_mut(func_idx) {
+                *slot = Some(built);
             }
         }
-        None
+        if cached == 2
+            && let Some(entry) = self.value_alias_loads.borrow().get(&v)
+            && entry.func == loc.func
+        {
+            let fal_borrow = self.func_alias_loads.borrow();
+            let Some(Some(fal)) = fal_borrow.get(func_idx) else {
+                return true;
+            };
+            return fal.any_reachable_at(loc, &entry.load_ids);
+        }
+
+        let v_sites = self.oracle.borrow().site_info_at(v, InstId::new(0)).sites;
+        if v_sites.is_empty() {
+            if let Some(slot) = self.value_keep_flag.borrow_mut().get_mut(idx) {
+                *slot = 1;
+            }
+            return false;
+        }
+
+        let matching = {
+            let fal_borrow = self.func_alias_loads.borrow();
+            let Some(Some(fal)) = fal_borrow.get(func_idx) else {
+                return true;
+            };
+            fal.matching_loads_for(v, &v_sites)
+        };
+        if matching.is_empty() {
+            if let Some(slot) = self.value_keep_flag.borrow_mut().get_mut(idx) {
+                *slot = 1;
+            }
+            return false;
+        }
+        let matching_box = matching.into_boxed_slice();
+        let reachable = {
+            let fal_borrow = self.func_alias_loads.borrow();
+            let Some(Some(fal)) = fal_borrow.get(func_idx) else {
+                return true;
+            };
+            fal.any_reachable_at(loc, &matching_box)
+        };
+        if let Some(slot) = self.value_keep_flag.borrow_mut().get_mut(idx) {
+            *slot = 2;
+        }
+        self.value_alias_loads.borrow_mut().insert(
+            v,
+            ValueAliasLoads {
+                func: loc.func,
+                load_ids: matching_box,
+            },
+        );
+        reachable
+    }
+
+    /// Emit pass-through survival of `source` into `target_inst`, pruning dead
+    /// non-aliased SSA local temporaries.
+    fn push_passthrough_at(&self, source: &Fact, target_inst: InstId, out: &mut Vec<Fact>) {
+        if let Fact::Taint(tf) = source
+            && let TaintBase::Local(v) = tf.base
+            && !self.should_retain_local_at(v, target_inst)
+        {
+            return;
+        }
+        out.push(source.clone());
     }
 
     /// Whether a load through `object` may pick up a heap fact keyed by
@@ -915,18 +1066,7 @@ impl<'m> TaintProblem<'m> {
     }
 
     fn ctor_this_of(&self, fid: FuncId) -> Option<ValueId> {
-        let fd = self.module.func(fid)?;
-        if fd.kind != abcd_ir::FunctionKind::Constructor {
-            return None;
-        }
-        let ParamBinding::Precise {
-            this_slot: Some(slot),
-            ..
-        } = param_binding(self.module, fid)
-        else {
-            return None;
-        };
-        fd.params.get(slot).copied()
+        ctor_this_of_module(self.module, fid)
     }
 
     /// The generic operand→result rule (Mov/binop/unop/compare/
@@ -935,7 +1075,7 @@ impl<'m> TaintProblem<'m> {
     fn generic_propagate(&self, inst: &abcd_ir::Inst, fact: &TaintFact, out: &mut Vec<Fact>) {
         let Some(result) = inst.result else { return };
         let Some(v) = fact.local_base() else { return };
-        if inst.op.operands().contains(&v) {
+        if op_uses_value(&inst.op, v) {
             out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
         }
     }
@@ -1241,34 +1381,35 @@ impl IfdsProblem for TaintProblem<'_> {
             return;
         };
 
-        // ── Source generation fires on EVERY incoming edge, including
-        // the zero fact (`Λ`), unconditionally producing taint at the
-        // source statement.
-        if let Op::TryGetGlobal { name, .. } = &curr_inst.op
-            && self.global_sources.contains(name)
-            && let Some(result) = curr_inst.result
-        {
-            out.push(Fact::of(TaintFact::local(result)));
-            if self.config.ohos_lifecycle
-                && module.sym.resolve(*name)
-                    == Some(abcd_analysis::ohos_lifecycle::OHOS_WANT_GLOBAL)
+        // ── Unconditional IFDS `0 -> d` source generation fires ONLY on the
+        // zero fact (`Λ`), anchoring every generated source fact at `(func, Zero)`
+        // rather than cross-multiplying unrelated incoming procedure-entry facts.
+        let Fact::Taint(fact) = source else {
+            if let Op::TryGetGlobal { name, .. } = &curr_inst.op
+                && self.global_sources.contains(name)
+                && let Some(result) = curr_inst.result
             {
-                let d1 = TaintFact::local(result).pushed(FieldKey::AnyDynamic, self.cap());
-                let d2 = d1.pushed(FieldKey::AnyDynamic, self.cap());
-                out.push(Fact::of(d1));
-                out.push(Fact::of(d2));
+                out.push(Fact::of(TaintFact::local(result)));
+                if self.config.ohos_lifecycle
+                    && module.sym.resolve(*name)
+                        == Some(abcd_analysis::ohos_lifecycle::OHOS_WANT_GLOBAL)
+                {
+                    let d1 = TaintFact::local(result).pushed(FieldKey::AnyDynamic, self.cap());
+                    let d2 = d1.pushed(FieldKey::AnyDynamic, self.cap());
+                    out.push(Fact::of(d1));
+                    out.push(Fact::of(d2));
+                }
             }
-        }
-        if let Op::LoadModuleVar { index, kind } = &curr_inst.op
-            && !kind.is_local()
-            && let Some(cid) = self.links.inst_class(module, curr)
-            && self.module_import_sources.contains(&(cid, *index))
-            && let Some(result) = curr_inst.result
-        {
-            out.push(Fact::of(TaintFact::local(result)));
-        }
-
-        let Fact::Taint(fact) = source else { return };
+            if let Op::LoadModuleVar { index, kind } = &curr_inst.op
+                && !kind.is_local()
+                && let Some(cid) = self.links.inst_class(module, curr)
+                && self.module_import_sources.contains(&(cid, *index))
+                && let Some(result) = curr_inst.result
+            {
+                out.push(Fact::of(TaintFact::local(result)));
+            }
+            return;
+        };
 
         // ── Phi-entry edges: an incoming value listed for THIS edge
         // additionally maps to the phi result (phi merges union sites via
@@ -1287,13 +1428,13 @@ impl IfdsProblem for TaintProblem<'_> {
                     }
                 }
             }
-            out.push(source.clone());
+            self.push_passthrough_at(source, succ, out);
             return;
         }
 
         // ── Exception dispatch: `throw v` taints the catch binding (T5).
         if let Op::Throw { value } = &curr_inst.op {
-            out.push(source.clone());
+            self.push_passthrough_at(source, succ, out);
             if fact.base == TaintBase::Local(*value)
                 && let Some(exc) = self.handler_exception_for(curr_inst.block, succ_inst.block)
             {
@@ -1312,7 +1453,7 @@ impl IfdsProblem for TaintProblem<'_> {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
                 self.generic_propagate(curr_inst, fact, out); // the `default` operand
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::StoreGlobal { name, value }
             | Op::StoreGlobalRecord { name, value, .. }
@@ -1320,7 +1461,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 if fact.base == TaintBase::Local(*value) {
                     out.push(Fact::of(fact.rebased(TaintBase::Global(*name))));
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             // ── Module variables (per-record + cross-module ES linking) ──
             Op::LoadModuleVar { index, kind } => {
@@ -1342,7 +1483,7 @@ impl IfdsProblem for TaintProblem<'_> {
                         out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                     }
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::StoreModuleVar { index, value } => {
                 let cid = self
@@ -1352,7 +1493,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 if fact.base == TaintBase::Local(*value) {
                     out.push(Fact::of(fact.rebased(TaintBase::ModuleVar(cid, *index))));
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             // ── Lexical environment slots ────────────────────────────
             Op::GetLexVar { level, slot } => {
@@ -1390,7 +1531,7 @@ impl IfdsProblem for TaintProblem<'_> {
                         ));
                     }
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::PutLexVar { level, slot, value } => {
                 if fact.base == TaintBase::Local(*value) {
@@ -1423,7 +1564,7 @@ impl IfdsProblem for TaintProblem<'_> {
                         None => out.push(Fact::of(fact.rebased(TaintBase::LexVar(*level, *slot)))),
                     }
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             // ── Iterator protocol objects ───────────────────────────
             Op::GetIterator { obj } => {
@@ -1445,7 +1586,7 @@ impl IfdsProblem for TaintProblem<'_> {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
                 self.generic_propagate(curr_inst, fact, out);
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             // ── Loads (access-path cut + namespace export lookup) ────
             Op::LoadProp { object, name } => {
@@ -1460,15 +1601,15 @@ impl IfdsProblem for TaintProblem<'_> {
                 {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::LoadPropIdx { object, .. } => {
                 self.load_rule(fact, *object, FieldKey::AnyIndex, curr, out);
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::LoadPropDyn { object, .. } => {
                 self.load_rule(fact, *object, FieldKey::AnyDynamic, curr, out);
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             // ── Stores (heap re-keying + strong/weak kills) ──────────
             Op::StoreProp {
@@ -1482,17 +1623,17 @@ impl IfdsProblem for TaintProblem<'_> {
                 value,
             } => {
                 if self.store_rule(fact, *object, FieldKey::Named(*name), *value, curr, out) {
-                    out.push(source.clone());
+                    self.push_passthrough_at(source, succ, out);
                 }
             }
             Op::StorePropIdx { object, value, .. } | Op::StoreOwnPropIdx { object, value, .. } => {
                 if self.store_rule(fact, *object, FieldKey::AnyIndex, *value, curr, out) {
-                    out.push(source.clone());
+                    self.push_passthrough_at(source, succ, out);
                 }
             }
             Op::StorePropDyn { object, value, .. } | Op::StoreOwnPropDyn { object, value, .. } => {
                 if self.store_rule(fact, *object, FieldKey::AnyDynamic, *value, curr, out) {
-                    out.push(source.clone());
+                    self.push_passthrough_at(source, succ, out);
                 }
             }
             // ── Object-family ops with bespoke taint semantics ───────
@@ -1501,7 +1642,7 @@ impl IfdsProblem for TaintProblem<'_> {
                 if fact.base == TaintBase::Local(*src) {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(*dst))));
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::SetObjectWithProto { proto, obj } => {
                 // obj's prototype chain now reads through proto.
@@ -1510,7 +1651,7 @@ impl IfdsProblem for TaintProblem<'_> {
                         TaintFact::local(*obj).pushed(FieldKey::AnyDynamic, self.cap()),
                     ));
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::StorePrivate { obj, value, .. } | Op::DefinePrivate { obj, value, .. } => {
                 // No FieldKey for private names at rung 0: record "some
@@ -1531,7 +1672,7 @@ impl IfdsProblem for TaintProblem<'_> {
                         ));
                     }
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::DefineMethod { object, func, .. } => {
                 if fact.base == TaintBase::Local(*func) {
@@ -1544,7 +1685,7 @@ impl IfdsProblem for TaintProblem<'_> {
                         .pushed(FieldKey::AnyDynamic, self.cap()),
                     ));
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::DefineFunc { .. } => {
                 // Captured taint marks the closure value with an EMPTY
@@ -1552,15 +1693,13 @@ impl IfdsProblem for TaintProblem<'_> {
                 // Lexical captures propagate into the body via
                 // `GetLexVar`/`PutLexVar` (and `NewLexEnv` sites at rung 2;
                 // `design/analysis.md`), not via the function-object value.
-                let is_capture = curr_inst
-                    .op
-                    .operands()
-                    .iter()
-                    .any(|&v| fact.base == TaintBase::Local(v));
+                let is_capture = fact
+                    .local_base()
+                    .is_some_and(|v| op_uses_value(&curr_inst.op, v));
                 if is_capture && let Some(result) = curr_inst.result {
                     out.push(Fact::of(TaintFact::local(result)));
                 }
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             Op::ResumeGenerator { .. } => {
                 if let Some(&awaited_val) = self.await_resume.get(&curr)
@@ -1570,12 +1709,12 @@ impl IfdsProblem for TaintProblem<'_> {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
                 self.generic_propagate(curr_inst, fact, out);
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
             // ── Everything else: the generic operand→result rule ─────
             _ => {
                 self.generic_propagate(curr_inst, fact, out);
-                out.push(source.clone());
+                self.push_passthrough_at(source, succ, out);
             }
         }
     }
@@ -1897,22 +2036,25 @@ impl IfdsProblem for TaintProblem<'_> {
         source: &Fact,
         out: &mut Vec<Fact>,
     ) {
-        let is_handler_site = self.handler_exception_at(return_site).is_some();
-        if self.call_return_sources.contains(&call)
-            && !is_handler_site
-            && let Some(result) = module.inst(call).and_then(|i| i.result)
-        {
-            out.push(Fact::of(TaintFact::local(result)));
-        }
-        let Fact::Taint(fact) = source else { return };
+        let Fact::Taint(fact) = source else {
+            if self.call_return_sources.contains(&call)
+                && self.handler_exception_at(return_site).is_none()
+                && let Some(result) = module.inst(call).and_then(|i| i.result)
+            {
+                out.push(Fact::of(TaintFact::local(result)));
+            }
+            return;
+        };
         let Some(call_inst) = module.inst(call) else {
             return;
         };
         let Op::Call { args, .. } = &call_inst.op else {
             return;
         };
-        let operands = Self::call_operands(&call_inst.op);
-        let on_operand = fact.local_base().is_some_and(|v| operands.contains(&v));
+        let is_handler_site = self.handler_exception_at(return_site).is_some();
+        let on_operand = fact
+            .local_base()
+            .is_some_and(|v| op_uses_value(&call_inst.op, v));
 
         match self.classify(call) {
             SiteClass::Summary { name, exclusive } => {
@@ -1965,26 +2107,25 @@ impl IfdsProblem for TaintProblem<'_> {
                 // of the operands' fate.
                 let retain = !(cleared || exclusive && on_operand);
                 if retain {
-                    out.push(source.clone());
+                    self.push_passthrough_at(source, return_site, out);
                 }
-                // Log once per (site, fact-free) application.
-                let mut applied = self.applied.borrow_mut();
-                if !applied.iter().any(|(i, n)| *i == call && *n == name) {
-                    applied.push((call, name));
+                // Log once per (site, fact-free) application (`O(1)` dedup).
+                if self.applied_seen.borrow_mut().insert(call) {
+                    self.applied.borrow_mut().push((call, name));
                 }
             }
             SiteClass::BodyStep => {
                 // The callee body carries operand taints through the
                 // call/return edges; everything else bypasses.
                 if !on_operand {
-                    out.push(source.clone());
+                    self.push_passthrough_at(source, return_site, out);
                 }
             }
             SiteClass::NativeKeep | SiteClass::UnknownKeep => {
                 // Conservative keep: taint passes through untouched —
                 // never sanitizes. Plus the optional identity heuristic:
                 // tainted operand ⇒ tainted return.
-                out.push(source.clone());
+                self.push_passthrough_at(source, return_site, out);
                 if self.config.native_identity
                     && on_operand
                     && !is_handler_site
@@ -1994,6 +2135,923 @@ impl IfdsProblem for TaintProblem<'_> {
                 }
             }
         }
+    }
+}
+
+fn ctor_this_of_module(module: &Module, fid: FuncId) -> Option<ValueId> {
+    let fd = module.func(fid)?;
+    if fd.kind != abcd_ir::FunctionKind::Constructor {
+        return None;
+    }
+    let ParamBinding::Precise {
+        this_slot: Some(slot),
+        ..
+    } = param_binding(module, fid)
+    else {
+        return None;
+    };
+    fd.params.get(slot).copied()
+}
+
+/// Visit every SSA [`ValueId`] operand of `op` in [`Op::operands`] order
+/// without heap allocation.
+pub(crate) fn for_each_op_operand(op: &Op, mut f: impl FnMut(ValueId)) {
+    use Op::*;
+    match op {
+        BinaryOp { left, right, .. } | Compare { left, right, .. } => {
+            f(*left);
+            f(*right);
+        }
+        UnaryOp { operand, .. } => f(*operand),
+        Mov { src } => f(*src),
+        LoadConst(_) | AllocObject { .. } | AllocArray { .. } | AllocRegExp { .. } => {}
+        AllocClosure { func } => f(*func),
+        LoadProp { object, .. } => f(*object),
+        StoreProp { object, value, .. } | StoreOwnPropName { object, value, .. } => {
+            f(*object);
+            f(*value);
+        }
+        LoadPropIdx { object, index } | LoadPropDyn { object, key: index } => {
+            f(*object);
+            f(*index);
+        }
+        StorePropIdx {
+            object,
+            index,
+            value,
+        }
+        | StorePropDyn {
+            object,
+            key: index,
+            value,
+        }
+        | StoreOwnPropDyn {
+            object,
+            key: index,
+            value,
+        }
+        | StoreOwnPropIdx {
+            object,
+            index,
+            value,
+        } => {
+            f(*object);
+            f(*index);
+            f(*value);
+        }
+        DefineMethod { object, func, .. } => {
+            f(*object);
+            f(*func);
+        }
+        DeleteProp { object, key } => {
+            f(*object);
+            f(*key);
+        }
+        TestProp { object, key } => {
+            f(*object);
+            match key {
+                PropKey::Name(_) => {}
+                PropKey::Index(k) | PropKey::Dynamic(k) => f(*k),
+            }
+        }
+        CopyDataProps { dst, src } => {
+            f(*dst);
+            f(*src);
+        }
+        SetObjectWithProto { proto, obj } => {
+            f(*proto);
+            f(*obj);
+        }
+        ArraySpread { dst, index, src } => {
+            f(*dst);
+            f(*index);
+            f(*src);
+        }
+        CreateObjectWithExcludedKeys { obj, keys } => {
+            f(*obj);
+            for &k in keys {
+                f(k);
+            }
+        }
+        DefineGetterSetterByValue {
+            obj,
+            key,
+            getter,
+            setter,
+        } => {
+            f(*obj);
+            f(*key);
+            f(*getter);
+            f(*setter);
+        }
+        GetTemplateObject { literal } => f(*literal),
+        CreateIterResultObj { value, done } => {
+            f(*value);
+            f(*done);
+        }
+        GetIterator { obj } | GetPropIterator { obj } | GetAsyncIterator { obj } => f(*obj),
+        IteratorNext { iterator }
+        | IteratorReturn { iterator }
+        | IteratorThrow { iterator }
+        | NextPropName { iterator } => f(*iterator),
+        NewLexEnv { .. }
+        | NewLexEnvWithName { .. }
+        | PopLexEnv
+        | GetLexVar { .. }
+        | CreatePrivateNames { .. }
+        | LoadNewTarget
+        | LoadGlobalObject
+        | LoadFunction
+        | GetUnmappedArgs
+        | CopyRestArgs { .. }
+        | AsyncFunctionEnter
+        | ThrowNotExists
+        | ThrowPatternNonCoercible
+        | ThrowDeleteSuperProperty
+        | Debugger
+        | LoadModuleVar { .. }
+        | GetModuleNamespace { .. }
+        | Branch { .. }
+        | Unreachable => {}
+        PutLexVar { value, .. }
+        | StoreGlobal { value, .. }
+        | StoreGlobalRecord { value, .. }
+        | TryStoreGlobal { value, .. }
+        | StoreModuleVar { value, .. } => f(*value),
+        TryGetGlobal { default, .. } => {
+            if let Some(d) = default {
+                f(*d);
+            }
+        }
+        DynamicImport { specifier } => f(*specifier),
+        Call {
+            callee, this, args, ..
+        } => {
+            f(*callee);
+            if let Some(t) = this {
+                f(*t);
+            }
+            for &a in args {
+                f(a);
+            }
+        }
+        DefineFunc { captures, .. } => {
+            for &(_, v) in captures {
+                f(v);
+            }
+        }
+        DefineClass { heritage, .. } | DefineSendableClass { heritage, .. } => {
+            if let Some(h) = heritage {
+                f(*h);
+            }
+        }
+        LoadPrivate { obj, .. } | TestPrivate { obj, .. } => f(*obj),
+        StorePrivate { obj, value, .. } | DefinePrivate { obj, value, .. } => {
+            f(*obj);
+            f(*value);
+        }
+        Throw { value }
+        | ThrowIfSuperNotCalled { value, .. }
+        | ThrowConstAssignment { name: value }
+        | ThrowIfNotObject { value }
+        | ThrowUndefinedIfHoleWithName { value, .. }
+        | Await { value } => f(*value),
+        AwaitUncaught { funcobj, value }
+        | AsyncResolve { funcobj, value }
+        | AsyncReject { funcobj, value } => {
+            f(*funcobj);
+            f(*value);
+        }
+        ThrowUndefinedIfHole { name, value } => {
+            f(*name);
+            f(*value);
+        }
+        CreateGenerator { func } => f(*func),
+        SuspendGenerator { genobj, value } => {
+            f(*genobj);
+            f(*value);
+        }
+        ResumeGenerator { genobj } | GetResumeMode { genobj } => f(*genobj),
+        LoadSuper { key, this_value } => {
+            if let SuperKey::Dynamic(k) = key {
+                f(*k);
+            }
+            f(*this_value);
+        }
+        StoreSuper {
+            key,
+            this_value,
+            value,
+        } => {
+            f(*value);
+            f(*this_value);
+            if let SuperKey::Dynamic(k) = key {
+                f(*k);
+            }
+        }
+        CondBranch { cond, .. } => f(*cond),
+        Return { value } => {
+            if let Some(v) = value {
+                f(*v);
+            }
+        }
+        Phi { entries } => {
+            for &(_, v) in entries {
+                f(v);
+            }
+        }
+    }
+}
+
+/// Zero-allocation check equivalent to `op.operands().contains(&target)`.
+pub(crate) fn op_uses_value(op: &Op, target: ValueId) -> bool {
+    let mut found = false;
+    for_each_op_operand(op, |v| {
+        if v == target {
+            found = true;
+        }
+    });
+    found
+}
+
+#[allow(clippy::type_complexity)]
+fn build_exception_indexes(
+    module: &Module,
+) -> (
+    Vec<Option<FuncId>>,
+    Vec<Option<ValueId>>,
+    HashMap<(FuncId, BlockId), ValueId>,
+) {
+    let mut block_to_func = vec![None; module.blocks.len()];
+    let mut handler_block_exc = vec![None; module.blocks.len()];
+    let mut func_handler_exc = HashMap::new();
+    for (fi, f) in module.functions.iter().enumerate() {
+        let fid = FuncId::new(fi as u32);
+        for &b in &f.blocks {
+            if let Some(slot) = block_to_func.get_mut(b.index()) {
+                slot.get_or_insert(fid);
+            }
+        }
+        for region in &f.try_regions {
+            for catch in &region.catches {
+                if let Some(slot) = handler_block_exc.get_mut(catch.handler.index()) {
+                    slot.get_or_insert(catch.exception);
+                }
+                func_handler_exc
+                    .entry((fid, catch.handler))
+                    .or_insert(catch.exception);
+            }
+        }
+    }
+    (block_to_func, handler_block_exc, func_handler_exc)
+}
+
+fn build_global_stores_map(module: &Module) -> HashMap<Sym, Vec<ValueId>> {
+    let mut out: HashMap<Sym, Vec<ValueId>> = HashMap::new();
+    for f in &module.functions {
+        for &b in &f.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                match &inst.op {
+                    Op::StoreGlobal { name, value }
+                    | Op::StoreGlobalRecord { name, value, .. }
+                    | Op::TryStoreGlobal { name, value } => {
+                        out.entry(*name).or_default().push(*value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+const UNSEEN_FUNC: u32 = u32::MAX;
+const MULTI_FUNC_VAL: u32 = u32::MAX - 1;
+const UNUSED_BLOCK: u32 = u32::MAX;
+const MULTI_USE_BLOCK: u32 = u32::MAX - 1;
+
+#[derive(Clone, Copy)]
+struct InstLivenessLoc {
+    func: u32,
+    block_local: u32,
+    pos: u32,
+}
+
+#[derive(Clone, Copy)]
+struct FuncLivenessMeta {
+    words_per_block: usize,
+    live_out_word_offset: usize,
+    val_base_offset: usize,
+}
+
+/// Compact per-function backward SSA liveness index over [`Module`].
+struct LocalLiveness {
+    inst_loc: Vec<InstLivenessLoc>,
+    func_meta: Vec<FuncLivenessMeta>,
+    aug_live_out_words: Vec<u64>,
+    val_slot: Vec<(u32, u32)>,
+    multi_func_val_slot: HashMap<(u32, u32), u32>,
+    single_block_last_use: Vec<(u32, u32)>,
+    multi_block_last_use: HashMap<(u32, u32, u32), u32>,
+}
+
+impl LocalLiveness {
+    fn build(module: &Module, await_resume: &HashMap<InstId, ValueId>) -> Self {
+        let mut inst_loc = vec![
+            InstLivenessLoc {
+                func: UNSEEN_FUNC,
+                block_local: 0,
+                pos: 0,
+            };
+            module.insts.len()
+        ];
+        let mut func_meta = Vec::with_capacity(module.functions.len());
+        let mut aug_live_out_words: Vec<u64> = Vec::new();
+        let mut val_slot = vec![(UNSEEN_FUNC, 0u32); module.values.len()];
+        let mut multi_func_val_slot: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut single_block_last_use: Vec<(u32, u32)> = Vec::new();
+        let mut multi_block_last_use: HashMap<(u32, u32, u32), u32> = HashMap::new();
+
+        let mut block_to_local = vec![UNSEEN_FUNC; module.blocks.len()];
+        let mut val_to_local = vec![u32::MAX; module.values.len()];
+        let mut touched_vals: Vec<usize> = Vec::new();
+
+        for (fi, f) in module.functions.iter().enumerate() {
+            let fid_u32 = fi as u32;
+            let fid = FuncId::new(fid_u32);
+            if f.blocks.is_empty() {
+                func_meta.push(FuncLivenessMeta {
+                    words_per_block: 0,
+                    live_out_word_offset: aug_live_out_words.len(),
+                    val_base_offset: single_block_last_use.len(),
+                });
+                continue;
+            }
+
+            let mut local_blocks: Vec<BlockId> = Vec::with_capacity(f.blocks.len());
+            for &b in &f.blocks {
+                if let Some(slot) = block_to_local.get_mut(b.index())
+                    && *slot == UNSEEN_FUNC
+                {
+                    *slot = local_blocks.len() as u32;
+                    local_blocks.push(b);
+                }
+            }
+            let num_blocks = local_blocks.len();
+            let ctor_this = ctor_this_of_module(module, fid);
+
+            let mut intern_val = |v: ValueId| -> Option<u32> {
+                let vi = v.index();
+                let slot = val_to_local.get_mut(vi)?;
+                if *slot == u32::MAX {
+                    let lidx = touched_vals.len() as u32;
+                    *slot = lidx;
+                    touched_vals.push(vi);
+                    let vs = &mut val_slot[vi];
+                    if vs.0 == UNSEEN_FUNC {
+                        *vs = (fid_u32, lidx);
+                    } else if vs.0 != MULTI_FUNC_VAL {
+                        let (prev_f, prev_lidx) = *vs;
+                        *vs = (MULTI_FUNC_VAL, 0);
+                        multi_func_val_slot.insert((prev_f, vi as u32), prev_lidx);
+                        multi_func_val_slot.insert((fid_u32, vi as u32), lidx);
+                    } else {
+                        multi_func_val_slot.insert((fid_u32, vi as u32), lidx);
+                    }
+                }
+                Some(*slot)
+            };
+
+            for &p in &f.params {
+                let _ = intern_val(p);
+            }
+            for region in &f.try_regions {
+                for catch in &region.catches {
+                    let _ = intern_val(catch.exception);
+                }
+            }
+            for (b_local, &b) in local_blocks.iter().enumerate() {
+                let Some(bb) = module.block(b) else { continue };
+                for (pos, &iid) in bb.insts.iter().enumerate() {
+                    if let Some(loc_slot) = inst_loc.get_mut(iid.index())
+                        && loc_slot.func == UNSEEN_FUNC
+                    {
+                        *loc_slot = InstLivenessLoc {
+                            func: fid_u32,
+                            block_local: b_local as u32,
+                            pos: pos as u32,
+                        };
+                    }
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
+                    if let Some(res) = inst.result {
+                        let _ = intern_val(res);
+                    }
+                    for_each_op_operand(&inst.op, |u| {
+                        let _ = intern_val(u);
+                    });
+                    if matches!(inst.op, Op::Call { .. })
+                        && let Some(base_v) = call_base_value(module, inst)
+                    {
+                        let _ = intern_val(base_v);
+                    }
+                    if matches!(inst.op, Op::ResumeGenerator { .. })
+                        && let Some(&aw) = await_resume.get(&iid)
+                    {
+                        let _ = intern_val(aw);
+                    }
+                    if matches!(inst.op, Op::Return { .. })
+                        && let Some(ct) = ctor_this
+                    {
+                        let _ = intern_val(ct);
+                    }
+                }
+            }
+
+            let num_vals = touched_vals.len();
+            let words = num_vals.div_ceil(64);
+            let live_out_word_offset = aug_live_out_words.len();
+            let val_base_offset = single_block_last_use.len();
+            func_meta.push(FuncLivenessMeta {
+                words_per_block: words,
+                live_out_word_offset,
+                val_base_offset,
+            });
+
+            if words == 0 {
+                for &b in &local_blocks {
+                    block_to_local[b.index()] = UNSEEN_FUNC;
+                }
+                continue;
+            }
+
+            single_block_last_use.resize(val_base_offset + num_vals, (UNUSED_BLOCK, 0));
+
+            let mut norm_succs: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+            let mut norm_preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+            let mut exc_succs: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+            let mut exc_preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+            let mut entry_exc_kill = vec![0u64; num_blocks * words];
+
+            for (b_local, &b) in local_blocks.iter().enumerate() {
+                for s in abcd_analysis::control::block_succs(module, b) {
+                    if let Some(&s_local) = block_to_local.get(s.index())
+                        && s_local != UNSEEN_FUNC
+                    {
+                        let sl = s_local as usize;
+                        if !norm_succs[b_local].contains(&sl) {
+                            norm_succs[b_local].push(sl);
+                            norm_preds[sl].push(b_local);
+                        }
+                    }
+                }
+            }
+            for region in &f.try_regions {
+                let mut handlers = Vec::new();
+                for catch in &region.catches {
+                    if let Some(&hl) = block_to_local.get(catch.handler.index())
+                        && hl != UNSEEN_FUNC
+                    {
+                        let hl_usize = hl as usize;
+                        if !handlers.contains(&hl_usize) {
+                            handlers.push(hl_usize);
+                        }
+                        if let Some(&lidx) = val_to_local.get(catch.exception.index())
+                            && lidx != u32::MAX
+                        {
+                            let li = lidx as usize;
+                            entry_exc_kill[hl_usize * words + li / 64] |= 1u64 << (li % 64);
+                        }
+                    }
+                }
+                for &prot_b in &region.protected {
+                    if let Some(&pl) = block_to_local.get(prot_b.index())
+                        && pl != UNSEEN_FUNC
+                    {
+                        let pl_usize = pl as usize;
+                        for &hl in &handlers {
+                            if !exc_succs[pl_usize].contains(&hl) {
+                                exc_succs[pl_usize].push(hl);
+                                exc_preds[hl].push(pl_usize);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let mut gen_bits = vec![0u64; num_blocks * words];
+            let mut kill_bits = vec![0u64; num_blocks * words];
+
+            for (b_local, &b) in local_blocks.iter().enumerate() {
+                let Some(bb) = module.block(b) else { continue };
+                let b_u32 = b_local as u32;
+                let base_w = b_local * words;
+
+                let mut record_use =
+                    |v: ValueId, pos_u32: u32, gen_s: &mut [u64], kill_s: &mut [u64]| {
+                        let Some(&lidx) = val_to_local.get(v.index()) else {
+                            return;
+                        };
+                        if lidx == u32::MAX {
+                            return;
+                        }
+                        let li = lidx as usize;
+                        let w = li / 64;
+                        let mask = 1u64 << (li % 64);
+                        gen_s[w] |= mask;
+                        kill_s[w] &= !mask;
+
+                        let sb = &mut single_block_last_use[val_base_offset + li];
+                        if sb.0 == UNUSED_BLOCK {
+                            *sb = (b_u32, pos_u32);
+                        } else if sb.0 == b_u32 {
+                            // Reverse iteration visits the maximum position first.
+                        } else if sb.0 != MULTI_USE_BLOCK {
+                            let (prev_b, prev_max) = *sb;
+                            *sb = (MULTI_USE_BLOCK, 0);
+                            multi_block_last_use.insert((fid_u32, prev_b, lidx), prev_max);
+                            multi_block_last_use.insert((fid_u32, b_u32, lidx), pos_u32);
+                        } else {
+                            multi_block_last_use
+                                .entry((fid_u32, b_u32, lidx))
+                                .or_insert(pos_u32);
+                        }
+                    };
+
+                let gen_slice = &mut gen_bits[base_w..base_w + words];
+                let kill_slice = &mut kill_bits[base_w..base_w + words];
+
+                for (pos, &iid) in bb.insts.iter().enumerate().rev() {
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
+                    if let Some(res) = inst.result
+                        && let Some(&lidx) = val_to_local.get(res.index())
+                        && lidx != u32::MAX
+                    {
+                        let li = lidx as usize;
+                        let w = li / 64;
+                        let mask = 1u64 << (li % 64);
+                        gen_slice[w] &= !mask;
+                        kill_slice[w] |= mask;
+                    }
+                    let pos_u32 = pos as u32;
+                    for_each_op_operand(&inst.op, |u| {
+                        record_use(u, pos_u32, gen_slice, kill_slice);
+                    });
+                    if matches!(inst.op, Op::Call { .. })
+                        && let Some(base_v) = call_base_value(module, inst)
+                    {
+                        record_use(base_v, pos_u32, gen_slice, kill_slice);
+                    }
+                    if matches!(inst.op, Op::ResumeGenerator { .. })
+                        && let Some(&aw) = await_resume.get(&iid)
+                    {
+                        record_use(aw, pos_u32, gen_slice, kill_slice);
+                    }
+                    if matches!(inst.op, Op::Return { .. })
+                        && let Some(ct) = ctor_this
+                    {
+                        record_use(ct, pos_u32, gen_slice, kill_slice);
+                    }
+                }
+            }
+
+            let mut live_in = gen_bits.clone();
+            let mut queue: VecDeque<usize> = (0..num_blocks).rev().collect();
+            let mut in_queue = vec![true; num_blocks];
+
+            while let Some(b_local) = queue.pop_front() {
+                in_queue[b_local] = false;
+                let base_w = b_local * words;
+                let mut changed = false;
+                for w in 0..words {
+                    let mut norm_out = 0u64;
+                    for &s in &norm_succs[b_local] {
+                        norm_out |= live_in[s * words + w];
+                    }
+                    let mut exc_out = 0u64;
+                    for &h in &exc_succs[b_local] {
+                        exc_out |= live_in[h * words + w] & !entry_exc_kill[h * words + w];
+                    }
+                    let new_in =
+                        (norm_out & !kill_bits[base_w + w]) | gen_bits[base_w + w] | exc_out;
+                    if new_in != live_in[base_w + w] {
+                        live_in[base_w + w] = new_in;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    for &p in norm_preds[b_local].iter().chain(exc_preds[b_local].iter()) {
+                        if !in_queue[p] {
+                            in_queue[p] = true;
+                            queue.push_back(p);
+                        }
+                    }
+                }
+            }
+
+            aug_live_out_words.reserve(num_blocks * words);
+            for b_local in 0..num_blocks {
+                for w in 0..words {
+                    let mut aug_out = 0u64;
+                    for &s in &norm_succs[b_local] {
+                        aug_out |= live_in[s * words + w];
+                    }
+                    for &h in &exc_succs[b_local] {
+                        aug_out |= live_in[h * words + w] & !entry_exc_kill[h * words + w];
+                    }
+                    aug_live_out_words.push(aug_out);
+                }
+            }
+
+            for &b in &local_blocks {
+                block_to_local[b.index()] = UNSEEN_FUNC;
+            }
+            for vi in touched_vals.drain(..) {
+                val_to_local[vi] = u32::MAX;
+            }
+        }
+
+        Self {
+            inst_loc,
+            func_meta,
+            aug_live_out_words,
+            val_slot,
+            multi_func_val_slot,
+            single_block_last_use,
+            multi_block_last_use,
+        }
+    }
+
+    fn is_live_at(&self, at_inst: InstId, v: ValueId) -> bool {
+        let Some(&loc) = self.inst_loc.get(at_inst.index()) else {
+            return true;
+        };
+        if loc.func == UNSEEN_FUNC {
+            return true;
+        }
+        let Some(&(v_func, raw_lidx)) = self.val_slot.get(v.index()) else {
+            return true;
+        };
+        let lidx = if v_func == loc.func {
+            raw_lidx
+        } else if v_func == MULTI_FUNC_VAL {
+            let Some(&idx) = self.multi_func_val_slot.get(&(loc.func, v.index() as u32)) else {
+                return false;
+            };
+            idx
+        } else {
+            return false;
+        };
+        let Some(&meta) = self.func_meta.get(loc.func as usize) else {
+            return true;
+        };
+        if meta.words_per_block == 0 {
+            return false;
+        }
+        let word_idx = meta.live_out_word_offset
+            + (loc.block_local as usize) * meta.words_per_block
+            + (lidx as usize / 64);
+        if self
+            .aug_live_out_words
+            .get(word_idx)
+            .is_some_and(|&w| ((w >> (lidx % 64)) & 1) != 0)
+        {
+            return true;
+        }
+        let Some(&(ublk, max_pos)) = self
+            .single_block_last_use
+            .get(meta.val_base_offset + lidx as usize)
+        else {
+            return true;
+        };
+        if ublk == loc.block_local {
+            max_pos >= loc.pos
+        } else if ublk == MULTI_USE_BLOCK {
+            self.multi_block_last_use
+                .get(&(loc.func, loc.block_local, lidx))
+                .is_some_and(|&mp| mp >= loc.pos)
+        } else {
+            false
+        }
+    }
+}
+
+struct ValueAliasLoads {
+    func: u32,
+    load_ids: Box<[u32]>,
+}
+
+struct AliasLoadSite {
+    block_local: u32,
+    pos: u32,
+    object: ValueId,
+}
+
+/// Per-function reachability index over property loads whose `object` has
+/// non-empty `site_info_at` allocation sites (built lazily at most once per
+/// function when a dead local taint fact is tested for pruning).
+struct FuncAliasLoads {
+    loads: Vec<AliasLoadSite>,
+    words_per_block: usize,
+    reach_out_words: Vec<u64>,
+    site_to_loads: HashMap<InstId, Vec<u32>>,
+}
+
+impl FuncAliasLoads {
+    fn empty() -> Self {
+        Self {
+            loads: Vec::new(),
+            words_per_block: 0,
+            reach_out_words: Vec::new(),
+            site_to_loads: HashMap::new(),
+        }
+    }
+
+    fn build(module: &Module, fid: FuncId, oracle: &Oracle) -> Self {
+        let Some(f) = module.func(fid) else {
+            return Self::empty();
+        };
+        if f.blocks.is_empty() {
+            return Self::empty();
+        }
+        let mut local_blocks: Vec<BlockId> = Vec::with_capacity(f.blocks.len());
+        let mut block_to_local: HashMap<BlockId, usize> = HashMap::with_capacity(f.blocks.len());
+        for &b in &f.blocks {
+            if let std::collections::hash_map::Entry::Vacant(e) = block_to_local.entry(b) {
+                e.insert(local_blocks.len());
+                local_blocks.push(b);
+            }
+        }
+
+        let mut loads = Vec::new();
+        let mut site_to_loads: HashMap<InstId, Vec<u32>> = HashMap::new();
+        for (b_local, &b) in local_blocks.iter().enumerate() {
+            let Some(bb) = module.block(b) else { continue };
+            for (pos, &iid) in bb.insts.iter().enumerate() {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                let (Op::LoadProp { object, .. }
+                | Op::LoadPropIdx { object, .. }
+                | Op::LoadPropDyn { object, .. }) = &inst.op
+                else {
+                    continue;
+                };
+                let obj_sites = oracle.site_info_at(*object, iid).sites;
+                if obj_sites.is_empty() {
+                    continue;
+                }
+                let load_idx = loads.len() as u32;
+                loads.push(AliasLoadSite {
+                    block_local: b_local as u32,
+                    pos: pos as u32,
+                    object: *object,
+                });
+                for site in obj_sites.iter() {
+                    site_to_loads.entry(site).or_default().push(load_idx);
+                }
+            }
+        }
+
+        if loads.is_empty() {
+            return Self::empty();
+        }
+
+        let num_blocks = local_blocks.len();
+        let words = loads.len().div_ceil(64);
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); num_blocks];
+
+        for (b_local, &b) in local_blocks.iter().enumerate() {
+            for s in abcd_analysis::control::block_succs(module, b) {
+                if let Some(&sl) = block_to_local.get(&s)
+                    && !succs[b_local].contains(&sl)
+                {
+                    succs[b_local].push(sl);
+                    preds[sl].push(b_local);
+                }
+            }
+        }
+        for region in &f.try_regions {
+            let mut handlers = Vec::new();
+            for catch in &region.catches {
+                if let Some(&hl) = block_to_local.get(&catch.handler)
+                    && !handlers.contains(&hl)
+                {
+                    handlers.push(hl);
+                }
+            }
+            for &prot_b in &region.protected {
+                if let Some(&pl) = block_to_local.get(&prot_b) {
+                    for &hl in &handlers {
+                        if !succs[pl].contains(&hl) {
+                            succs[pl].push(hl);
+                            preds[hl].push(pl);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut reach_in = vec![0u64; num_blocks * words];
+        for (k, ld) in loads.iter().enumerate() {
+            reach_in[(ld.block_local as usize) * words + k / 64] |= 1u64 << (k % 64);
+        }
+        let mut queue: VecDeque<usize> = (0..num_blocks).rev().collect();
+        let mut in_queue = vec![true; num_blocks];
+        while let Some(b_local) = queue.pop_front() {
+            in_queue[b_local] = false;
+            let base_w = b_local * words;
+            let mut changed = false;
+            for w in 0..words {
+                let mut out_bits = reach_in[base_w + w];
+                for &s in &succs[b_local] {
+                    out_bits |= reach_in[s * words + w];
+                }
+                if out_bits != reach_in[base_w + w] {
+                    reach_in[base_w + w] = out_bits;
+                    changed = true;
+                }
+            }
+            if changed {
+                for &p in &preds[b_local] {
+                    if !in_queue[p] {
+                        in_queue[p] = true;
+                        queue.push_back(p);
+                    }
+                }
+            }
+        }
+
+        let mut reach_out_words = Vec::with_capacity(num_blocks * words);
+        for succ_list in &succs {
+            for w in 0..words {
+                let mut out_bits = 0u64;
+                for &s in succ_list {
+                    out_bits |= reach_in[s * words + w];
+                }
+                reach_out_words.push(out_bits);
+            }
+        }
+
+        Self {
+            loads,
+            words_per_block: words,
+            reach_out_words,
+            site_to_loads,
+        }
+    }
+
+    fn matching_loads_for(&self, v: ValueId, v_sites: &AllocSiteSet) -> Vec<u32> {
+        if self.loads.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for site in v_sites.iter() {
+            let Some(cands) = self.site_to_loads.get(&site) else {
+                continue;
+            };
+            for &k in cands {
+                if let Some(ld) = self.loads.get(k as usize)
+                    && ld.object != v
+                    && !out.contains(&k)
+                {
+                    out.push(k);
+                }
+            }
+        }
+        out
+    }
+
+    fn any_reachable_at(&self, loc: InstLivenessLoc, load_ids: &[u32]) -> bool {
+        if self.words_per_block == 0 {
+            return false;
+        }
+        let b_base = (loc.block_local as usize) * self.words_per_block;
+        for &k in load_ids {
+            let ku = k as usize;
+            let Some(ld) = self.loads.get(ku) else {
+                continue;
+            };
+            if ld.block_local == loc.block_local && ld.pos >= loc.pos {
+                return true;
+            }
+            if self
+                .reach_out_words
+                .get(b_base + ku / 64)
+                .is_some_and(|&w| ((w >> (ku % 64)) & 1) != 0)
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -2185,6 +3243,326 @@ fn collect_jsbridge_seeds(
         };
         if !formals.is_empty() {
             param_seeds.push((mfid, formals));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use abcd_ir::op::{BinOp, CmpOp, ModuleVarKind, SuperCheck, UnOp};
+    use abcd_ir::{ConstId, Edge, EdgeKind};
+
+    #[test]
+    fn op_uses_value_and_visitor_match_operands_table() {
+        let v0 = ValueId::new(10);
+        let v1 = ValueId::new(11);
+        let v2 = ValueId::new(12);
+        let v3 = ValueId::new(13);
+        let absent = ValueId::new(99);
+        let s = Sym::new(0);
+        let c = ConstId::new(0);
+        let b = BlockId::new(0);
+        let f = FuncId::new(0);
+        let edge = Edge {
+            from: b,
+            kind: EdgeKind::Normal,
+        };
+
+        let ops = vec![
+            Op::BinaryOp {
+                op: BinOp::Add,
+                left: v0,
+                right: v1,
+            },
+            Op::UnaryOp {
+                op: UnOp::Minus,
+                operand: v0,
+            },
+            Op::Compare {
+                op: CmpOp::Eq,
+                left: v0,
+                right: v1,
+            },
+            Op::Mov { src: v0 },
+            Op::LoadConst(c),
+            Op::AllocObject { shape: c },
+            Op::AllocArray { shape: Some(c) },
+            Op::AllocRegExp {
+                pattern: s,
+                flags: 0,
+            },
+            Op::AllocClosure { func: v0 },
+            Op::LoadProp {
+                object: v0,
+                name: s,
+            },
+            Op::StoreProp {
+                object: v0,
+                name: s,
+                value: v1,
+            },
+            Op::LoadPropIdx {
+                object: v0,
+                index: v1,
+            },
+            Op::StorePropIdx {
+                object: v0,
+                index: v1,
+                value: v2,
+            },
+            Op::LoadPropDyn {
+                object: v0,
+                key: v1,
+            },
+            Op::StorePropDyn {
+                object: v0,
+                key: v1,
+                value: v2,
+            },
+            Op::StoreOwnPropName {
+                object: v0,
+                name: s,
+                value: v1,
+            },
+            Op::StoreOwnPropDyn {
+                object: v0,
+                key: v1,
+                value: v2,
+            },
+            Op::StoreOwnPropIdx {
+                object: v0,
+                index: v1,
+                value: v2,
+            },
+            Op::DefineMethod {
+                object: v0,
+                name: s,
+                func: v1,
+                length: 1,
+            },
+            Op::DeleteProp {
+                object: v0,
+                key: v1,
+            },
+            Op::TestProp {
+                object: v0,
+                key: PropKey::Name(s),
+            },
+            Op::TestProp {
+                object: v0,
+                key: PropKey::Index(v1),
+            },
+            Op::TestProp {
+                object: v0,
+                key: PropKey::Dynamic(v1),
+            },
+            Op::CopyDataProps { dst: v0, src: v1 },
+            Op::SetObjectWithProto { proto: v0, obj: v1 },
+            Op::ArraySpread {
+                dst: v0,
+                index: v1,
+                src: v2,
+            },
+            Op::CreateObjectWithExcludedKeys {
+                obj: v0,
+                keys: vec![v1, v2],
+            },
+            Op::DefineGetterSetterByValue {
+                obj: v0,
+                key: v1,
+                getter: v2,
+                setter: v3,
+            },
+            Op::GetTemplateObject { literal: v0 },
+            Op::CreateIterResultObj {
+                value: v0,
+                done: v1,
+            },
+            Op::GetIterator { obj: v0 },
+            Op::GetAsyncIterator { obj: v0 },
+            Op::IteratorNext { iterator: v0 },
+            Op::IteratorReturn { iterator: v0 },
+            Op::IteratorThrow { iterator: v0 },
+            Op::GetPropIterator { obj: v0 },
+            Op::NextPropName { iterator: v0 },
+            Op::NewLexEnv { num_vars: 2 },
+            Op::NewLexEnvWithName {
+                num_vars: 2,
+                scope_names: c,
+            },
+            Op::PopLexEnv,
+            Op::GetLexVar { level: 0, slot: 1 },
+            Op::PutLexVar {
+                level: 0,
+                slot: 1,
+                value: v0,
+            },
+            Op::TryGetGlobal {
+                name: s,
+                default: None,
+            },
+            Op::TryGetGlobal {
+                name: s,
+                default: Some(v0),
+            },
+            Op::StoreGlobal { name: s, value: v0 },
+            Op::StoreGlobalRecord {
+                name: s,
+                value: v0,
+                is_const: true,
+            },
+            Op::TryStoreGlobal { name: s, value: v0 },
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::Local,
+            },
+            Op::StoreModuleVar {
+                index: 0,
+                value: v0,
+            },
+            Op::GetModuleNamespace { index: 0 },
+            Op::DynamicImport { specifier: v0 },
+            Op::Call {
+                callee: v0,
+                this: Some(v1),
+                args: vec![v2, v3],
+                kind: CallKind::Dynamic,
+            },
+            Op::Call {
+                callee: v0,
+                this: None,
+                args: vec![],
+                kind: CallKind::Direct,
+            },
+            Op::DefineFunc {
+                body: f,
+                captures: vec![(s, v0), (s, v1)],
+                length: 0,
+            },
+            Op::DefineClass {
+                ctor: f,
+                heritage: Some(v0),
+                members: c,
+                member_attrs: Vec::new(),
+                count: 0,
+            },
+            Op::DefineSendableClass {
+                ctor: f,
+                heritage: None,
+                members: c,
+                member_attrs: Vec::new(),
+                count: 0,
+            },
+            Op::LoadPrivate {
+                level: 0,
+                slot: 0,
+                obj: v0,
+            },
+            Op::StorePrivate {
+                level: 0,
+                slot: 0,
+                obj: v0,
+                value: v1,
+            },
+            Op::DefinePrivate {
+                level: 0,
+                slot: 0,
+                obj: v0,
+                value: v1,
+            },
+            Op::TestPrivate {
+                level: 0,
+                slot: 0,
+                obj: v0,
+            },
+            Op::CreatePrivateNames { count: 1, names: c },
+            Op::Throw { value: v0 },
+            Op::ThrowIfSuperNotCalled {
+                value: v0,
+                kind: SuperCheck::NotCalled,
+            },
+            Op::ThrowUndefinedIfHole {
+                name: v0,
+                value: v1,
+            },
+            Op::ThrowUndefinedIfHoleWithName { name: s, value: v0 },
+            Op::ThrowNotExists,
+            Op::ThrowPatternNonCoercible,
+            Op::ThrowDeleteSuperProperty,
+            Op::ThrowConstAssignment { name: v0 },
+            Op::ThrowIfNotObject { value: v0 },
+            Op::CreateGenerator { func: v0 },
+            Op::SuspendGenerator {
+                genobj: v0,
+                value: v1,
+            },
+            Op::ResumeGenerator { genobj: v0 },
+            Op::GetResumeMode { genobj: v0 },
+            Op::Await { value: v0 },
+            Op::AwaitUncaught {
+                funcobj: v0,
+                value: v1,
+            },
+            Op::AsyncFunctionEnter,
+            Op::AsyncResolve {
+                funcobj: v0,
+                value: v1,
+            },
+            Op::AsyncReject {
+                funcobj: v0,
+                value: v1,
+            },
+            Op::LoadNewTarget,
+            Op::LoadGlobalObject,
+            Op::LoadFunction,
+            Op::GetUnmappedArgs,
+            Op::CopyRestArgs { start_index: 0 },
+            Op::LoadSuper {
+                key: SuperKey::Name(s),
+                this_value: v0,
+            },
+            Op::LoadSuper {
+                key: SuperKey::Dynamic(v1),
+                this_value: v0,
+            },
+            Op::StoreSuper {
+                key: SuperKey::Name(s),
+                this_value: v0,
+                value: v1,
+            },
+            Op::StoreSuper {
+                key: SuperKey::Dynamic(v2),
+                this_value: v0,
+                value: v1,
+            },
+            Op::Branch { dest: b },
+            Op::CondBranch {
+                cond: v0,
+                true_dest: b,
+                false_dest: b,
+            },
+            Op::Return { value: Some(v0) },
+            Op::Return { value: None },
+            Op::Phi {
+                entries: vec![(edge, v0), (edge, v1)],
+            },
+            Op::Unreachable,
+            Op::Debugger,
+        ];
+
+        for op in &ops {
+            let expected = op.operands();
+            let mut visited = Vec::new();
+            for_each_op_operand(op, |v| visited.push(v));
+            assert_eq!(visited, expected, "visitor mismatch on {op:?}");
+            for cand in [v0, v1, v2, v3, absent] {
+                assert_eq!(
+                    op_uses_value(op, cand),
+                    expected.contains(&cand),
+                    "op_uses_value mismatch on {op:?} for {cand:?}"
+                );
+            }
         }
     }
 }

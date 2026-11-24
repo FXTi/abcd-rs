@@ -7,7 +7,8 @@
 //! and rewriting internal OHMUrl (`@bundle:`, `@package:`, `@normalized:`)
 //! specifiers into navigable POSIX relative imports.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::convert::Infallible;
 
 use abcd_ir::consts::Const;
 use abcd_ir::id::{ClassId, FuncId};
@@ -17,11 +18,15 @@ use rayon::prelude::*;
 
 use crate::consts::{render_pool_string, render_sym_string, sym_str};
 use crate::emit::{
-    DecompileStats, EmitOptions, Emitter, PreparedFunc, consumed_functions, merge_fold_stats,
-    merge_struct_stats, module_facing_name, prepare_func,
+    DecompileStats, EmitOptions, Emitter, MAX_BATCH_PREPARED_FUNCS, PreparedFunc,
+    collect_orphans_for_funcs, consumed_functions, func_may_have_orphan_lexenv,
+    index_has_fallback_module_slot, merge_fold_stats, merge_struct_stats, module_facing_name,
+    next_bounded_top_batch, orphan_lexenv_names_in_func, prepare_func, prepare_func_only,
+    try_extend_batch_funcs,
 };
 use crate::legalize::{Legalizer, is_legal_ident, sanitize};
 use crate::names::{DecompileIndex, module_slot_fallback};
+use crate::recover::recover_func_with_index;
 
 /// Kind of a split output file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,8 +39,8 @@ pub enum SplitFileKind {
     Json,
 }
 
-/// One file produced by [`decompile_module_split`].
-#[derive(Clone, Debug)]
+/// One file produced by [`decompile_module_split`] or [`decompile_module_split_each`].
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SplitFile {
     /// Safe POSIX-separated relative output path (e.g. `"pages/Index.js"` or
     /// `"cfg.json"`), guaranteed free of `..`, leading `/`, drive prefixes,
@@ -196,6 +201,16 @@ fn is_windows_reserved(stem: &str) -> bool {
         .any(|&r| base.eq_ignore_ascii_case(r))
 }
 
+/// Whether `cls` carries a `--merge-abc` `jsonFileContent` string field.
+fn has_json_content(module: &Module, cls: &ClassData) -> bool {
+    cls.fields.iter().any(|f| {
+        sym_str(module, f.name) == "jsonFileContent"
+            && f.initial_value
+                .and_then(|cid| module.consts.get(cid))
+                .is_some_and(|c| matches!(c, Const::String(_)))
+    })
+}
+
 /// Extract the JSON payload from a `--merge-abc` JSON record class
 /// (`jsonFileContent` field carrying a `Const::String`).
 fn json_content_of(module: &Module, cls: &ClassData) -> Option<String> {
@@ -222,6 +237,34 @@ fn json_content_of(module: &Module, cls: &ClassData) -> Option<String> {
 /// - On standalone single-module `.abc` files (`L_GLOBAL;`), emits a single
 ///   file named after `L_GLOBAL;`'s `source_file` (or `index.<ext>`).
 pub fn decompile_module_split(module: &Module, opts: &EmitOptions) -> SplitDecompiledModule {
+    let mut files = Vec::new();
+    let stats = match decompile_module_split_each(module, opts, |sf| -> Result<(), Infallible> {
+        files.push(sf);
+        Ok(())
+    }) {
+        Ok(stats) => stats,
+        Err(never) => match never {},
+    };
+    SplitDecompiledModule { files, stats }
+}
+
+/// Partition and stream each emitted [`SplitFile`] of `module` in deterministic
+/// class-table order to `on_file` without buffering all function ASTs or all
+/// [`SplitFile`] payloads in memory.
+///
+/// Records are prepared in adaptive parallel batches capped at `512` total
+/// transitive functions (`MAX_BATCH_PREPARED_FUNCS`), delivered one-by-one to
+/// `on_file` in exact `planned` order, and their ASTs are dropped before
+/// starting the next batch. Behavior, file contents, and [`DecompileStats`] are
+/// 100% shared and byte-identical with [`decompile_module_split`].
+pub fn decompile_module_split_each<F, E>(
+    module: &Module,
+    opts: &EmitOptions,
+    mut on_file: F,
+) -> Result<DecompileStats, E>
+where
+    F: FnMut(SplitFile) -> Result<(), E>,
+{
     let ext = if opts.arkui {
         "ets"
     } else if opts.ts {
@@ -232,28 +275,14 @@ pub fn decompile_module_split(module: &Module, opts: &EmitOptions) -> SplitDecom
 
     let consumed = consumed_functions(module);
     let index = DecompileIndex::build_split(module);
+    let has_fallback_slot = index_has_fallback_module_slot(&index);
 
-    let (prepared_vec, orphan_sets): (Vec<PreparedFunc>, Vec<BTreeSet<String>>) =
-        (0..module.functions.len())
-            .into_par_iter()
-            .map(|i| {
-                let func = FuncId::new(i as u32);
-                let top_level = !consumed.contains(&func);
-                prepare_func(module, Some(&index), func, top_level)
-            })
-            .unzip();
-
-    // Group top-level unconsumed functions and orphan lexenv names by `ClassId`.
+    // Group all functions and top-level unconsumed functions by `ClassId`.
+    let mut class_all_funcs: HashMap<ClassId, Vec<FuncId>> = HashMap::new();
     let mut class_funcs: HashMap<ClassId, Vec<FuncId>> = HashMap::new();
-    let mut class_orphans: HashMap<ClassId, BTreeSet<String>> = HashMap::new();
     for (fi, fdata) in module.functions.iter().enumerate() {
         let fid = FuncId::new(fi as u32);
-        if let Some(orphans) = orphan_sets.get(fi) {
-            class_orphans
-                .entry(fdata.class_id)
-                .or_default()
-                .extend(orphans.iter().cloned());
-        }
+        class_all_funcs.entry(fdata.class_id).or_default().push(fid);
         if !consumed.contains(&fid) {
             class_funcs.entry(fdata.class_id).or_default().push(fid);
         }
@@ -271,7 +300,7 @@ pub fn decompile_module_split(module: &Module, opts: &EmitOptions) -> SplitDecom
         if SYNTHETIC_DESCRIPTORS.contains(&desc.as_str()) {
             continue;
         }
-        let json_text = json_content_of(module, cls);
+        let is_json = has_json_content(module, cls);
         let has_funcs = class_funcs.get(&cid).is_some_and(|v| !v.is_empty());
         let has_esm = cls.es_module.is_some()
             || (is_standalone
@@ -279,11 +308,10 @@ pub fn decompile_module_split(module: &Module, opts: &EmitOptions) -> SplitDecom
                 && (!module.imports.is_empty()
                     || !module.exports.is_empty()
                     || !module.module_requests.is_empty()));
-        if json_text.is_none() && !has_funcs && !has_esm {
+        if !is_json && !has_funcs && !has_esm {
             continue;
         }
 
-        let is_json = json_text.is_some();
         let base_path = if is_standalone && desc == "L_GLOBAL;" {
             cls.source_file
                 .map(|sf| sym_str(module, sf))
@@ -310,7 +338,6 @@ pub fn decompile_module_split(module: &Module, opts: &EmitOptions) -> SplitDecom
             rel_path,
             record_name,
             kind,
-            json_text,
         });
     }
 
@@ -322,90 +349,221 @@ pub fn decompile_module_split(module: &Module, opts: &EmitOptions) -> SplitDecom
         }
     }
 
-    let mut prepared_slots: Vec<Option<PreparedFunc>> =
-        prepared_vec.into_iter().map(Some).collect();
-    let mut files = Vec::with_capacity(planned.len());
     let mut total_stats = DecompileStats::default();
+    let mut batch_start = 0usize;
 
-    for (my_idx, plan) in planned.iter().enumerate() {
-        if let Some(json_text) = &plan.json_text {
-            files.push(SplitFile {
-                rel_path: plan.rel_path.clone(),
-                record_name: plan.record_name.clone(),
-                kind: SplitFileKind::Json,
-                text: json_text.clone(),
-                stats: DecompileStats::default(),
-            });
-            continue;
+    while batch_start < planned.len() {
+        let mut visited_fids: BTreeSet<FuncId> = BTreeSet::new();
+        let mut single_oversized = false;
+        let mut batch_end = batch_start;
+
+        while batch_end < planned.len() && batch_end - batch_start < MAX_BATCH_PREPARED_FUNCS {
+            let plan = &planned[batch_end];
+            if plan.kind == SplitFileKind::Json {
+                batch_end += 1;
+                continue;
+            }
+            let tfs = class_funcs.get(&plan.cid).map(Vec::as_slice).unwrap_or(&[]);
+            if batch_end == batch_start {
+                if tfs.len() > 1
+                    && !try_extend_batch_funcs(
+                        module,
+                        tfs,
+                        &mut visited_fids,
+                        Some(MAX_BATCH_PREPARED_FUNCS),
+                    )
+                {
+                    single_oversized = true;
+                    batch_end = batch_start + 1;
+                    break;
+                }
+                if !single_oversized && tfs.len() <= 1 {
+                    let _ = try_extend_batch_funcs(module, tfs, &mut visited_fids, None);
+                }
+                batch_end = batch_start + 1;
+                if visited_fids.len() >= MAX_BATCH_PREPARED_FUNCS {
+                    break;
+                }
+            } else {
+                if !try_extend_batch_funcs(
+                    module,
+                    tfs,
+                    &mut visited_fids,
+                    Some(MAX_BATCH_PREPARED_FUNCS),
+                ) {
+                    break;
+                }
+                batch_end += 1;
+                if visited_fids.len() >= MAX_BATCH_PREPARED_FUNCS {
+                    break;
+                }
+            }
         }
 
-        let cls = &module.classes[plan.cid.index()];
-        let fallback_esm;
-        let esm: Option<&EsModule> = if let Some(e) = &cls.es_module {
-            Some(e)
-        } else if is_standalone
-            && (!module.imports.is_empty()
-                || !module.exports.is_empty()
-                || !module.module_requests.is_empty())
-        {
-            fallback_esm = EsModule {
-                imports: module.imports.clone(),
-                exports: module.exports.clone(),
-                module_requests: module.module_requests.clone(),
-            };
-            Some(&fallback_esm)
+        let batch_plans = &planned[batch_start..batch_end];
+        let mut batch_prepared: BTreeMap<FuncId, PreparedFunc> = BTreeMap::new();
+        let mut batch_orphans: HashMap<ClassId, BTreeSet<String>> = HashMap::new();
+
+        if single_oversized {
+            let cid = batch_plans[0].cid;
+            if let Some(all_fids) = class_all_funcs.get(&cid) {
+                let orphans =
+                    collect_orphans_for_funcs(module, &index, all_fids, has_fallback_slot);
+                if !orphans.is_empty() {
+                    batch_orphans.insert(cid, orphans);
+                }
+            }
         } else {
-            None
-        };
+            let batch_cids: HashSet<ClassId> = batch_plans
+                .iter()
+                .filter(|p| p.kind != SplitFileKind::Json)
+                .map(|p| p.cid)
+                .collect();
+            let emit_fids: Vec<FuncId> = visited_fids.iter().copied().collect();
 
-        // Collect all functions transitively reachable inside this record
-        // (methods of `plan.cid` so globals/slots stay strictly per-record).
-        let record_funcs: &[FuncId] = &cls.methods;
-        let top_funcs = class_funcs.get(&plan.cid).map(Vec::as_slice).unwrap_or(&[]);
-        let orphans = class_orphans.remove(&plan.cid).unwrap_or_default();
+            let mut extra_orphan_fids: Vec<FuncId> = Vec::new();
+            for plan in batch_plans {
+                if plan.kind == SplitFileKind::Json {
+                    continue;
+                }
+                if let Some(all_fids) = class_all_funcs.get(&plan.cid) {
+                    for &fid in all_fids {
+                        if !visited_fids.contains(&fid)
+                            && func_may_have_orphan_lexenv(module, fid, &index, has_fallback_slot)
+                        {
+                            extra_orphan_fids.push(fid);
+                        }
+                    }
+                }
+            }
 
-        let mut em = Emitter {
-            module,
-            index: Some(&index),
-            opts,
-            stats: DecompileStats::default(),
-            fn_names: Legalizer::new(),
-            current_fn_has_fallback: false,
-            current_kind: FunctionKind::Function,
-            class_depth: 0,
-            hoisted: BTreeSet::new(),
-            prepared: std::mem::take(&mut prepared_slots),
-            reused: BTreeMap::new(),
-        };
+            type BatchPrepItem = (FuncId, PreparedFunc, Option<(ClassId, BTreeSet<String>)>);
+            let prepared_and_orphans: Vec<BatchPrepItem> = emit_fids
+                .into_par_iter()
+                .map(|fid| {
+                    let top_level = !consumed.contains(&fid);
+                    let owner_cid = module.func(fid).map(|fd| fd.class_id);
+                    let need_orphans = owner_cid.is_some_and(|c| batch_cids.contains(&c))
+                        && func_may_have_orphan_lexenv(module, fid, &index, has_fallback_slot);
+                    if let Some(cid) = owner_cid
+                        && need_orphans
+                    {
+                        let (pre, orphans) = prepare_func(module, Some(&index), fid, top_level);
+                        (fid, pre, Some((cid, orphans)))
+                    } else {
+                        let pre = prepare_func_only(module, Some(&index), fid, top_level);
+                        (fid, pre, None)
+                    }
+                })
+                .collect();
 
-        let text = emit_single_record(
-            &mut em,
-            plan.cid,
-            &plan.rel_path,
-            esm,
-            record_funcs,
-            top_funcs,
-            orphans,
-            &planned,
-            &spec_to_idx,
-            my_idx,
-        );
-        prepared_slots = std::mem::take(&mut em.prepared);
-        let file_stats = em.stats;
-        accumulate_stats(&mut total_stats, &file_stats);
-        files.push(SplitFile {
-            rel_path: plan.rel_path.clone(),
-            record_name: plan.record_name.clone(),
-            kind: plan.kind,
-            text,
-            stats: file_stats,
-        });
+            for (fid, pre, maybe_orphans) in prepared_and_orphans {
+                batch_prepared.insert(fid, pre);
+                if let Some((cid, orphans)) = maybe_orphans
+                    && !orphans.is_empty()
+                {
+                    batch_orphans.entry(cid).or_default().extend(orphans);
+                }
+            }
+
+            if !extra_orphan_fids.is_empty() {
+                let extra: Vec<(ClassId, BTreeSet<String>)> = extra_orphan_fids
+                    .into_par_iter()
+                    .filter_map(|fid| {
+                        let cid = module.func(fid)?.class_id;
+                        let rf = recover_func_with_index(module, fid, &index);
+                        let orphans = orphan_lexenv_names_in_func(&rf);
+                        (!orphans.is_empty()).then_some((cid, orphans))
+                    })
+                    .collect();
+                for (cid, orphans) in extra {
+                    batch_orphans.entry(cid).or_default().extend(orphans);
+                }
+            }
+        }
+
+        for (offset, plan) in batch_plans.iter().enumerate() {
+            let my_idx = batch_start + offset;
+            if plan.kind == SplitFileKind::Json {
+                let json_text =
+                    json_content_of(module, &module.classes[plan.cid.index()]).unwrap_or_default();
+                on_file(SplitFile {
+                    rel_path: plan.rel_path.clone(),
+                    record_name: plan.record_name.clone(),
+                    kind: SplitFileKind::Json,
+                    text: json_text,
+                    stats: DecompileStats::default(),
+                })?;
+                continue;
+            }
+
+            let cls = &module.classes[plan.cid.index()];
+            let fallback_esm;
+            let esm: Option<&EsModule> = if let Some(e) = &cls.es_module {
+                Some(e)
+            } else if is_standalone
+                && (!module.imports.is_empty()
+                    || !module.exports.is_empty()
+                    || !module.module_requests.is_empty())
+            {
+                fallback_esm = EsModule {
+                    imports: module.imports.clone(),
+                    exports: module.exports.clone(),
+                    module_requests: module.module_requests.clone(),
+                };
+                Some(&fallback_esm)
+            } else {
+                None
+            };
+
+            let record_funcs: &[FuncId] = &cls.methods;
+            let top_funcs = class_funcs.get(&plan.cid).map(Vec::as_slice).unwrap_or(&[]);
+            let orphans = batch_orphans.remove(&plan.cid).unwrap_or_default();
+
+            let mut em = Emitter {
+                module,
+                index: Some(&index),
+                opts,
+                stats: DecompileStats::default(),
+                fn_names: Legalizer::new(),
+                current_fn_has_fallback: false,
+                current_kind: FunctionKind::Function,
+                class_depth: 0,
+                hoisted: BTreeSet::new(),
+                prepared: std::mem::take(&mut batch_prepared),
+            };
+
+            let text = emit_single_record(
+                &mut em,
+                plan.cid,
+                &plan.rel_path,
+                esm,
+                record_funcs,
+                top_funcs,
+                orphans,
+                &consumed,
+                single_oversized,
+                &planned,
+                &spec_to_idx,
+                my_idx,
+            );
+            batch_prepared = std::mem::take(&mut em.prepared);
+            let file_stats = em.stats;
+            accumulate_stats(&mut total_stats, &file_stats);
+            on_file(SplitFile {
+                rel_path: plan.rel_path.clone(),
+                record_name: plan.record_name.clone(),
+                kind: plan.kind,
+                text,
+                stats: file_stats,
+            })?;
+        }
+
+        // `batch_prepared` and `batch_orphans` drop here before the next batch.
+        batch_start = batch_end;
     }
 
-    SplitDecompiledModule {
-        files,
-        stats: total_stats,
-    }
+    Ok(total_stats)
 }
 
 fn is_standalone_single_module(module: &Module) -> bool {
@@ -416,10 +574,7 @@ fn is_standalone_single_module(module: &Module) -> bool {
         if SYNTHETIC_DESCRIPTORS.contains(&desc.as_str()) {
             continue;
         }
-        if cls.methods.is_empty()
-            && cls.es_module.is_none()
-            && json_content_of(module, cls).is_none()
-        {
+        if cls.methods.is_empty() && cls.es_module.is_none() && !has_json_content(module, cls) {
             continue;
         }
         non_synth += 1;
@@ -479,7 +634,6 @@ struct PlannedRecord {
     rel_path: String,
     record_name: String,
     kind: SplitFileKind,
-    json_text: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -491,6 +645,8 @@ fn emit_single_record(
     record_funcs: &[FuncId],
     top_funcs: &[FuncId],
     orphan_names: BTreeSet<String>,
+    consumed: &BTreeSet<FuncId>,
+    chunk_top_funcs: bool,
     planned: &[PlannedRecord],
     spec_to_idx: &HashMap<String, usize>,
     my_idx: usize,
@@ -621,20 +777,18 @@ fn emit_single_record(
 
     // 3. Per-record local module-slot predeclarations (never duplicating `import` locals
     //    or top-level `--arkui` `struct` declarations!).
-    let arkui_structs: BTreeSet<String> = if opts.arkui && !opts.call_entry {
-        top_funcs
-            .iter()
-            .filter(|&&f| {
-                module
-                    .func(f)
-                    .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
-            })
-            .filter_map(|&f| em.prepared.get(f.index()).and_then(|s| s.as_ref()))
-            .flat_map(crate::arkui::arkui_main_struct_names)
-            .collect()
-    } else {
-        BTreeSet::new()
-    };
+    let mut arkui_structs = BTreeSet::new();
+    if opts.arkui && !opts.call_entry {
+        for &f in top_funcs {
+            if module
+                .func(f)
+                .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
+            {
+                let pre = em.peek_prepared(f, true);
+                arkui_structs.extend(crate::arkui::arkui_main_struct_names(&pre));
+            }
+        }
+    }
     for sname in &arkui_structs {
         em.fn_names.reserve(sname);
     }
@@ -687,19 +841,54 @@ fn emit_single_record(
 
     // 5. Top-level functions of this record.
     let mut entry_call: Option<String> = None;
-    for &f in top_funcs {
-        if opts.arkui
-            && !opts.call_entry
-            && module
-                .func(f)
-                .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
-            && crate::arkui::try_emit_arkui_main(em, f, &mut out)
-        {
-            continue;
+    if chunk_top_funcs {
+        let mut cursor = 0usize;
+        while cursor < top_funcs.len() {
+            let (take, batch_fids) =
+                next_bounded_top_batch(module, &top_funcs[cursor..], MAX_BATCH_PREPARED_FUNCS);
+            let chunk = &top_funcs[cursor..cursor + take];
+            cursor += take;
+            let prepared_batch: Vec<(FuncId, PreparedFunc)> = batch_fids
+                .into_par_iter()
+                .map(|fid| {
+                    let top_level = !consumed.contains(&fid);
+                    (fid, prepare_func_only(module, em.index, fid, top_level))
+                })
+                .collect();
+            em.prepared = prepared_batch.into_iter().collect();
+
+            for &f in chunk {
+                if opts.arkui
+                    && !opts.call_entry
+                    && module
+                        .func(f)
+                        .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
+                    && crate::arkui::try_emit_arkui_main(em, f, &mut out)
+                {
+                    continue;
+                }
+                let emitted = em.emit_top_level_function(f, &mut out);
+                if opts.call_entry && emitted.1 == "func_main_0" {
+                    entry_call = Some(emitted.0);
+                }
+            }
+            em.prepared.clear();
         }
-        let emitted = em.emit_top_level_function(f, &mut out);
-        if opts.call_entry && emitted.1 == "func_main_0" {
-            entry_call = Some(emitted.0);
+    } else {
+        for &f in top_funcs {
+            if opts.arkui
+                && !opts.call_entry
+                && module
+                    .func(f)
+                    .is_some_and(|fd| sym_str(module, fd.name) == "func_main_0")
+                && crate::arkui::try_emit_arkui_main(em, f, &mut out)
+            {
+                continue;
+            }
+            let emitted = em.emit_top_level_function(f, &mut out);
+            if opts.call_entry && emitted.1 == "func_main_0" {
+                entry_call = Some(emitted.0);
+            }
         }
     }
     if let Some(name) = entry_call {

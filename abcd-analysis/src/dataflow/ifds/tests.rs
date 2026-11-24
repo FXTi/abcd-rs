@@ -594,7 +594,110 @@ fn solver_is_deterministic() {
     cg2.add(call2, sink2);
     let r1 = solve_micro(&m1, &cg1, vec![(f1, Fact::Zero)]);
     let r2 = solve_micro(&m2, &cg2, vec![(f2, Fact::Zero)]);
+    assert_eq!(r1.path_edge_count(), r2.path_edge_count());
+    assert_eq!(r1.raw_path_edges(), r2.raw_path_edges());
     assert_eq!(r1.path_edges(), r2.path_edges());
+}
+
+/// Lazy `path_edges` remains unmaterialized until requested, agrees with
+/// `raw_path_edges` / `fact_by_id` / `id_of_fact`, and preserves `Clone`
+/// across both uninitialized and initialized states.
+#[test]
+fn lazy_path_edges_and_raw_accessors_agree() {
+    let mut m = mk_module();
+    let f = add_func(&mut m);
+    let entry = entry_of(&m, f);
+    add_param(&mut m, f, 0);
+    let s = load_string(&mut m, entry, "secret");
+    let copy = emit(&mut m, entry, Op::Mov { src: s });
+    emit_void(&mut m, entry, Op::Return { value: Some(copy) });
+
+    let cg = MapCallGraph::default();
+    let result = solve_micro(&m, &cg, vec![(f, Fact::Zero)]);
+
+    assert!(result.path_edges.get().is_none());
+    let uninit_clone = result.clone();
+    assert!(uninit_clone.path_edges.get().is_none());
+
+    let raw = result.raw_path_edges();
+    assert_eq!(result.path_edge_count(), raw.len());
+    assert_eq!(result.id_of_fact(&Fact::Zero), Some(0));
+    assert_eq!(result.fact_by_id(0), Some(&Fact::Zero));
+    let copy_id = result.id_of_fact(&Fact::V(copy)).unwrap();
+    assert_eq!(result.fact_by_id(copy_id), Some(&Fact::V(copy)));
+    assert_eq!(result.fact_by_id(u32::MAX), None);
+
+    let materialized = result.path_edges();
+    assert!(result.path_edges.get().is_some());
+    assert_eq!(materialized.len(), raw.len());
+    for (&(src, target_node, dst), edge) in raw.iter().zip(materialized.iter()) {
+        assert_eq!(result.fact_by_id(src), Some(&edge.source_fact));
+        assert_eq!(target_node, edge.target_node);
+        assert_eq!(result.fact_by_id(dst), Some(&edge.target_fact));
+    }
+
+    let init_clone = result.clone();
+    assert!(init_clone.path_edges.get().is_some());
+    assert_eq!(init_clone.path_edges(), materialized);
+    assert_eq!(uninit_clone.path_edges(), materialized);
+}
+
+/// Compact-set promotion (>8 facts and >8 incoming call sites) preserves
+/// exact insertion order in `facts_at` and `is_reached`.
+#[test]
+fn compact_sets_promote_past_eight_preserving_order() {
+    let mut m = mk_module();
+    let id = add_func_named(&mut m, "id");
+    let id_entry = entry_of(&m, id);
+    add_param(&mut m, id, 0);
+    let p = add_param(&mut m, id, 1);
+    emit_void(&mut m, id_entry, Op::Return { value: Some(p) });
+
+    let f = add_func_named(&mut m, "caller");
+    let entry = entry_of(&m, f);
+    add_param(&mut m, f, 0);
+    let mut seeded_params = Vec::new();
+    for idx in 1..=12 {
+        seeded_params.push(Fact::V(add_param(&mut m, f, idx)));
+    }
+
+    let mut cg = MapCallGraph::default();
+    let mut call_facts = Vec::new();
+    for _ in 0..12 {
+        let s = load_string(&mut m, entry, "secret");
+        call_facts.push(Fact::V(s));
+        let idref = load_method_ref(&mut m, entry, id);
+        let r = emit(
+            &mut m,
+            entry,
+            Op::Call {
+                callee: idref,
+                this: None,
+                args: vec![s],
+                kind: abcd_ir::CallKind::Direct,
+            },
+        );
+        let call_iid = match m.value(r).unwrap().def {
+            abcd_ir::ValueDef::Inst(i) => i,
+            _ => panic!(),
+        };
+        cg.add(call_iid, id);
+        call_facts.push(Fact::V(r));
+    }
+    emit_void(&mut m, entry, Op::Return { value: None });
+    let sp_iid = m.block(entry).unwrap().insts[0];
+    let ret_iid = *m.block(entry).unwrap().insts.last().unwrap();
+
+    let mut seeds = vec![(f, Fact::Zero)];
+    for &pf in &seeded_params {
+        seeds.push((f, pf));
+    }
+    let result = solve_micro(&m, &cg, seeds);
+    assert_eq!(result.facts_at(sp_iid, &Fact::Zero), seeded_params);
+    assert!(result.is_reached(ret_iid, &Fact::Zero));
+    for fact in seeded_params.iter().chain(call_facts.iter()) {
+        assert!(result.is_reached(ret_iid, fact), "missing {fact:?}");
+    }
 }
 
 /// Emit a `Call` with no result (void sink call); returns the InstId.

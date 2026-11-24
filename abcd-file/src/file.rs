@@ -35,6 +35,24 @@ impl<'data> AbcFile<'data> {
         })
     }
 
+    /// Open an ABC file without allocating a C++ copy buffer by borrowing a
+    /// slice whose last 16 bytes are zero padding (`orig_len = padded_data.len() - 16`).
+    pub fn open_zeropadded(padded_data: &'data [u8]) -> Result<Self, Error> {
+        let raw = unsafe { sys::abc_file_open_zeropadded(padded_data.as_ptr(), padded_data.len()) };
+        if raw.is_null() {
+            // SAFETY: abc_file_open_error returns a thread-local NUL-terminated
+            // string set by the failed open call.
+            let reason = unsafe { CStr::from_ptr(sys::abc_file_open_error()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::Open(reason));
+        }
+        Ok(Self {
+            raw,
+            _data: PhantomData,
+        })
+    }
+
     /// File format version.
     pub fn version(&self) -> Version {
         let mut out = [0u8; 4];
@@ -265,5 +283,52 @@ mod tests {
         let file = AbcFile::open(&data).unwrap();
         let raw = read_string_raw_bytes(file.raw, offset);
         assert_eq!(raw.as_deref(), Some(&[0xED, 0xA0, 0xB4][..]));
+    }
+
+    #[test]
+    fn open_zeropadded_borrows_and_rejects_bad_tail_or_bounds() {
+        let mut builder = crate::Builder::new();
+        builder.add_foreign_class("LForeign;");
+        let data = builder.finalize().unwrap();
+        let expected = AbcFile::open(&data).unwrap();
+
+        let mut padded = data.clone();
+        padded.extend_from_slice(&[0u8; 16]);
+
+        let zf = AbcFile::open_zeropadded(&padded).unwrap();
+        assert_eq!(zf.version(), expected.version());
+        assert_eq!(zf.checksum(), expected.checksum());
+        assert_eq!(zf.size(), expected.size());
+        let cls_off = unsafe { sys::abc_file_class_offset(zf.raw, 0) };
+        assert_eq!(read_string(zf.raw, cls_off).as_deref(), Some("LForeign;"));
+        drop(zf);
+
+        // Every non-zero byte in the 16-byte trailing padding must be rejected.
+        for tail_idx in 0..16 {
+            let mut bad = padded.clone();
+            bad[data.len() + tail_idx] = 1;
+            assert!(
+                matches!(AbcFile::open_zeropadded(&bad), Err(Error::Open(_))),
+                "tail byte {tail_idx} must be rejected"
+            );
+        }
+
+        // Buffers shorter than Header + 16 must be rejected.
+        for len in [0usize, 15, 16, 75] {
+            let short = vec![0u8; len];
+            assert!(matches!(
+                AbcFile::open_zeropadded(&short),
+                Err(Error::Open(_))
+            ));
+        }
+
+        // Declared file_size exceeding logical length (even within padded_len) must fail.
+        let mut inflated = padded.clone();
+        let bad_size = (data.len() as u32) + 1;
+        inflated[16..20].copy_from_slice(&bad_size.to_le_bytes());
+        assert!(matches!(
+            AbcFile::open_zeropadded(&inflated),
+            Err(Error::Open(_))
+        ));
     }
 }

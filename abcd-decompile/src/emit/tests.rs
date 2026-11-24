@@ -87,8 +87,7 @@ fn emitter<'m>(module: &'m Module, opts: &'m EmitOptions) -> Emitter<'m> {
         current_kind: FunctionKind::Function,
         class_depth: 0,
         hoisted: BTreeSet::new(),
-        prepared: Vec::new(),
-        reused: BTreeMap::new(),
+        prepared: BTreeMap::new(),
     }
 }
 
@@ -887,4 +886,530 @@ fn escaped_temps_leaf_arms() {
         SNode::Honest("note".to_string()),
     ];
     assert!(escaped_temps(&nodes).is_empty());
+}
+
+// ── Streaming, batching, orphan equivalence & 256 KiB stack tests (#33) ──
+
+#[test]
+fn orphan_lexenv_prefilter_matches_naive_full_module_scan() {
+    use abcd_ir::function::{Catch, DebugData, LocalName, LocalScope, TryRegion};
+    use abcd_ir::op::ModuleVarKind;
+
+    let mut m = mk_module();
+
+    // 1. Plain functions without lexvars (majority path skipped by prefilter).
+    for k in 0..40 {
+        let f = add_fn(&mut m, &format!("plain_{k}"));
+        let b = entry_of(&m, f);
+        let c = m.consts.push(Const::number(k as f64));
+        let v = emit_val(&mut m, b, Op::LoadConst(c));
+        push_inst(&mut m, b, Op::Return { value: Some(v) });
+    }
+
+    // 2. Function with unnamed `NewLexEnv` + `PutLexVar` / `GetLexVar` (`v0_0`, `v1_2`).
+    let f_lex = add_fn(&mut m, "with_lex");
+    {
+        let b = entry_of(&m, f_lex);
+        let _env = emit_val(&mut m, b, Op::NewLexEnv { num_vars: 2 });
+        let c = m.consts.push(Const::number(1.0));
+        let v = emit_val(&mut m, b, Op::LoadConst(c));
+        push_inst(
+            &mut m,
+            b,
+            Op::PutLexVar {
+                level: 0,
+                slot: 1,
+                value: v,
+            },
+        );
+        let rd = emit_val(&mut m, b, Op::GetLexVar { level: 3, slot: 2 });
+        push_inst(&mut m, b, Op::Return { value: Some(rd) });
+    }
+
+    // 3. Function reading a global whose identifier happens to match `v<d>_<d>`.
+    let f_glob = add_fn(&mut m, "with_fallback_global");
+    {
+        let b = entry_of(&m, f_glob);
+        let gsym = m.sym.intern("v4_7");
+        let g = emit_val(
+            &mut m,
+            b,
+            Op::TryGetGlobal {
+                name: gsym,
+                default: None,
+            },
+        );
+        push_inst(&mut m, b, Op::Return { value: Some(g) });
+    }
+
+    // 4. Function whose debug param_names and catch local_names match `v<d>_<d>`.
+    let f_dbg = add_fn(&mut m, "with_fallback_debug");
+    {
+        let _this = add_param(&mut m, f_dbg);
+        let p = add_param(&mut m, f_dbg);
+        let b0 = entry_of(&m, f_dbg);
+        let bh = BlockId::new(m.blocks.len() as u32);
+        m.blocks.push(Block::default());
+        m.func_mut(f_dbg).unwrap().blocks.push(bh);
+        m.block_mut(bh)
+            .unwrap()
+            .preds
+            .push(abcd_ir::function::Edge {
+                from: b0,
+                kind: abcd_ir::function::EdgeKind::Exceptional,
+            });
+        let exc = ValueId::new(m.values.len() as u32);
+        m.values.push(Value {
+            def: ValueDef::ExceptionParam(bh),
+            ty: Ty::Any,
+        });
+        m.func_mut(f_dbg).unwrap().try_regions.push(TryRegion {
+            protected: vec![b0],
+            catches: vec![Catch {
+                handler: bh,
+                exception: exc,
+                type_idx: None,
+            }],
+        });
+        let call_res = emit_val(
+            &mut m,
+            b0,
+            Op::Call {
+                callee: p,
+                this: None,
+                args: vec![],
+                kind: CallKind::Direct,
+            },
+        );
+        push_inst(
+            &mut m,
+            b0,
+            Op::Return {
+                value: Some(call_res),
+            },
+        );
+        let handler_ret = push_inst(&mut m, bh, Op::Return { value: Some(exc) });
+
+        let psym = m.sym.intern("v5_6");
+        let lsym = m.sym.intern("v7_8");
+        m.func_mut(f_dbg).unwrap().debug = Some(DebugData {
+            param_names: vec![psym],
+            local_names: vec![LocalName {
+                name: lsym,
+                ty: None,
+                scope: Some(LocalScope {
+                    start: handler_ret,
+                    end: handler_ret,
+                }),
+            }],
+            ..DebugData::default()
+        });
+    }
+
+    // 5. Module slot resolved via TDZ guard to `v9_10`, read in a separate function.
+    let f_mod_tdz = add_fn(&mut m, "mod_tdz");
+    {
+        let b = entry_of(&m, f_mod_tdz);
+        let mv = emit_val(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::Local,
+            },
+        );
+        let msym = m.sym.intern("v9_10");
+        push_inst(
+            &mut m,
+            b,
+            Op::ThrowUndefinedIfHoleWithName {
+                name: msym,
+                value: mv,
+            },
+        );
+        push_inst(&mut m, b, Op::Return { value: Some(mv) });
+    }
+    let f_mod_reader = add_fn(&mut m, "mod_reader");
+    {
+        let b = entry_of(&m, f_mod_reader);
+        let mv = emit_val(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::Local,
+            },
+        );
+        let mv2 = emit_val(
+            &mut m,
+            b,
+            Op::LoadModuleVar {
+                index: 0,
+                kind: ModuleVarKind::Local,
+            },
+        );
+        let sum = emit_val(
+            &mut m,
+            b,
+            Op::BinaryOp {
+                op: BinOp::Add,
+                left: mv2,
+                right: mv,
+            },
+        );
+        push_inst(&mut m, b, Op::Return { value: Some(sum) });
+    }
+
+    // 5b. Named `NewLexEnvWithName` + `GetLexVar`/`PutLexVar` MUST be skipped by
+    //     `func_may_have_orphan_lexenv` when no fallback `v<d>_<d>` slot exists.
+    let f_named_parent = add_fn(&mut m, "named_parent");
+    let f_named_child = add_fn(&mut m, "named_child");
+    {
+        let b_p = entry_of(&m, f_named_parent);
+        let s_x = m.sym.intern("namedSlot");
+        let arr = m.consts.push(Const::ArrayLiteral(vec![Const::String(s_x)]));
+        let _ = emit_val(
+            &mut m,
+            b_p,
+            Op::NewLexEnvWithName {
+                num_vars: 1,
+                scope_names: arr,
+            },
+        );
+        let c = m.consts.push(Const::number(42.0));
+        let v = emit_val(&mut m, b_p, Op::LoadConst(c));
+        push_inst(
+            &mut m,
+            b_p,
+            Op::PutLexVar {
+                level: 0,
+                slot: 0,
+                value: v,
+            },
+        );
+        let df = emit_val(
+            &mut m,
+            b_p,
+            Op::DefineFunc {
+                body: f_named_child,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        push_inst(&mut m, b_p, Op::Return { value: Some(df) });
+
+        let b_c = entry_of(&m, f_named_child);
+        let rd = emit_val(&mut m, b_c, Op::GetLexVar { level: 0, slot: 0 });
+        push_inst(&mut m, b_c, Op::Return { value: Some(rd) });
+    }
+
+    let index = DecompileIndex::build(&m);
+    assert!(!func_may_have_orphan_lexenv(
+        &m,
+        f_named_parent,
+        &index,
+        false
+    ));
+    assert!(!func_may_have_orphan_lexenv(
+        &m,
+        f_named_child,
+        &index,
+        false
+    ));
+    assert!(func_may_have_orphan_lexenv(&m, f_lex, &index, false));
+    let fast = collect_module_orphan_lexenv_names(&m, &index);
+    let mut naive = BTreeSet::new();
+    for i in 0..m.functions.len() {
+        let rf = recover_func_with_index(&m, FuncId::new(i as u32), &index);
+        naive.extend(orphan_lexenv_names_in_func(&rf));
+    }
+    assert_eq!(fast, naive);
+    for expected in ["v0_1", "v3_2", "v4_7", "v5_6", "v7_8", "v9_10"] {
+        assert!(fast.contains(expected), "missing {expected} in {fast:?}");
+    }
+}
+
+#[test]
+fn decompile_module_to_writer_multi_batch_and_shared_inline_closures_match() {
+    let mut m = mk_module();
+
+    // Shared inline closure referenced BOTH twice inside one function (tail-dup
+    // simulation) AND across multiple 256-function batches.
+    let shared_inline = add_fn(&mut m, "shared_cb");
+    {
+        let _this = add_param(&mut m, shared_inline);
+        let x = add_param(&mut m, shared_inline);
+        let b = entry_of(&m, shared_inline);
+        push_inst(&mut m, b, Op::Return { value: Some(x) });
+    }
+
+    // Span >2 full bounded batches AND attach 25 inline closures to several roots so
+    // `next_bounded_top_batch` exercises adaptive transitive batch capping (`<= 512`).
+    let total_top = MAX_BATCH_PREPARED_FUNCS + 80;
+    for k in 0..total_top {
+        let name = if k == total_top - 1 {
+            "func_main_0".to_string()
+        } else {
+            format!("top_fn_{k}")
+        };
+        let f = add_fn(&mut m, &name);
+        let _this = add_param(&mut m, f);
+        let b = entry_of(&m, f);
+        if k < 30 {
+            let mut acc_v = None;
+            for j in 0..25 {
+                let child = add_fn(&mut m, &format!("inline_{k}_{j}"));
+                let _cthis = add_param(&mut m, child);
+                let cb = entry_of(&m, child);
+                let cc = m.consts.push(Const::number((k * 100 + j) as f64));
+                let cv = emit_val(&mut m, cb, Op::LoadConst(cc));
+                push_inst(&mut m, cb, Op::Return { value: Some(cv) });
+                let df = emit_val(
+                    &mut m,
+                    b,
+                    Op::DefineFunc {
+                        body: child,
+                        captures: vec![],
+                        length: 0,
+                    },
+                );
+                let cl = emit_val(&mut m, b, Op::AllocClosure { func: df });
+                acc_v = Some(match acc_v {
+                    None => cl,
+                    Some(prev) => emit_val(
+                        &mut m,
+                        b,
+                        Op::BinaryOp {
+                            op: BinOp::Add,
+                            left: cl,
+                            right: prev,
+                        },
+                    ),
+                });
+            }
+            push_inst(&mut m, b, Op::Return { value: acc_v });
+            continue;
+        }
+        if k % 100 == 0 {
+            // Emit `shared_inline` twice inside the same function AND across batches.
+            let df1 = emit_val(
+                &mut m,
+                b,
+                Op::DefineFunc {
+                    body: shared_inline,
+                    captures: vec![],
+                    length: 1,
+                },
+            );
+            let cl1 = emit_val(&mut m, b, Op::AllocClosure { func: df1 });
+            let df2 = emit_val(
+                &mut m,
+                b,
+                Op::DefineFunc {
+                    body: shared_inline,
+                    captures: vec![],
+                    length: 1,
+                },
+            );
+            let cl2 = emit_val(&mut m, b, Op::AllocClosure { func: df2 });
+            let pair = emit_val(
+                &mut m,
+                b,
+                Op::BinaryOp {
+                    op: BinOp::Add,
+                    left: cl2,
+                    right: cl1,
+                },
+            );
+            push_inst(&mut m, b, Op::Return { value: Some(pair) });
+        } else {
+            let c = m.consts.push(Const::number(k as f64));
+            let v = emit_val(&mut m, b, Op::LoadConst(c));
+            push_inst(&mut m, b, Op::Return { value: Some(v) });
+        }
+    }
+
+    for opts in [
+        EmitOptions::default(),
+        EmitOptions {
+            ts: true,
+            call_entry: true,
+            ..EmitOptions::default()
+        },
+    ] {
+        let buffered = decompile_module(&m, &opts);
+        let mut raw_out = Vec::new();
+        let writer_stats =
+            decompile_module_to_writer(&m, &opts, &mut raw_out).expect("stream to Vec");
+        let streamed_text = String::from_utf8(raw_out).expect("UTF-8");
+        assert_eq!(streamed_text, buffered.text);
+        assert_eq!(writer_stats, buffered.stats);
+        assert_eq!(writer_stats.functions, total_top);
+    }
+
+    // Verify I/O write error propagates cleanly without panicking.
+    struct FailAfter {
+        rem: usize,
+    }
+    impl Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.rem == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated sink failure",
+                ));
+            }
+            let n = buf.len().min(self.rem);
+            self.rem -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut failing = FailAfter { rem: 128 };
+    let err = decompile_module_to_writer(&m, &EmitOptions::default(), &mut failing)
+        .expect_err("must surface BrokenPipe");
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[test]
+fn emit_walkers_survive_deep_nesting_and_cycles_on_256k_stack() {
+    // Build 5,000-deep trees (a recursive debug-build walker uses >1 MiB of call
+    // stack at depth 5,000 and overflows a 256 KiB stack immediately).
+    let mut deep_expr = Expr::Ident("v12_34".to_string());
+    for _ in 0..5_000 {
+        deep_expr = Expr::Unary {
+            op: UnOp::LogicalNot,
+            operand: Box::new(deep_expr),
+        };
+    }
+    let rf = RecoveredFunc {
+        func: FuncId::new(0),
+        name: "deep".to_string(),
+        kind: FunctionKind::Function,
+        params: Vec::new(),
+        hidden_params: 0,
+        blocks: vec![crate::recover::BlockStmts {
+            block: BlockId::new(0),
+            preds: Vec::new(),
+            stmts: vec![Stmt::Expr(deep_expr)],
+        }],
+        histogram: BTreeMap::new(),
+    };
+
+    let mut deep_const = Const::MethodRef(FuncId::new(7));
+    for _ in 0..5_000 {
+        deep_const = Const::ArrayLiteral(vec![deep_const]);
+    }
+
+    let mut deep_nodes = vec![SNode::Stmts(vec![
+        Leaf::Raw(Stmt::ScopePush { names: vec![None] }),
+        Leaf::Raw(Stmt::LexStore {
+            level: 0,
+            slot: 0,
+            name: "inner_lex".to_string(),
+            value: Expr::Temp {
+                value: ValueId::new(0),
+                name: "esc_tmp".to_string(),
+            },
+        }),
+    ])];
+    for step in 0..4_000 {
+        deep_nodes = if step % 2 == 0 {
+            vec![SNode::If {
+                cond: id("c"),
+                then: deep_nodes,
+                otherwise: Vec::new(),
+            }]
+        } else {
+            vec![SNode::DoWhile {
+                label: None,
+                body: deep_nodes,
+                cond: id("c"),
+            }]
+        };
+    }
+    deep_nodes.insert(
+        0,
+        SNode::If {
+            cond: id("c0"),
+            then: vec![SNode::Stmts(vec![Leaf::Raw(Stmt::Declare {
+                name: "esc_tmp".to_string(),
+                mutable: false,
+                value: num(1.0),
+                value_id: ValueId::new(0),
+            })])],
+            otherwise: Vec::new(),
+        },
+    );
+
+    // Flat 5,000-function DefineFunc chain + cycle (`f_4999 -> f_0`).
+    let mut m = mk_module();
+    let chain_len = 5_000usize;
+    let chain: Vec<FuncId> = (0..chain_len)
+        .map(|i| add_fn(&mut m, &format!("f_{i}")))
+        .collect();
+    for i in 0..chain_len {
+        let b = entry_of(&m, chain[i]);
+        let next = chain[(i + 1) % chain_len];
+        let _ = emit_val(
+            &mut m,
+            b,
+            Op::DefineFunc {
+                body: next,
+                captures: vec![],
+                length: 0,
+            },
+        );
+        push_inst(&mut m, b, Op::Return { value: None });
+    }
+
+    std::thread::scope(|s| {
+        let handle = std::thread::Builder::new()
+            .name("emit-256k-stack".to_string())
+            .stack_size(256 * 1024)
+            .spawn_scoped(s, || {
+                let orphans = orphan_lexenv_names_in_func(&rf);
+                assert_eq!(orphans, BTreeSet::from(["v12_34".to_string()]));
+
+                let mut mrefs = BTreeSet::new();
+                collect_method_refs_const(&deep_const, &mut mrefs);
+                assert_eq!(mrefs, BTreeSet::from([FuncId::new(7)]));
+
+                assert_eq!(lex_decls(&deep_nodes, &[]), vec!["inner_lex".to_string()]);
+                assert_eq!(
+                    escaped_temps(&deep_nodes),
+                    BTreeSet::from(["esc_tmp".to_string()])
+                );
+
+                let batch = collect_batch_funcs(&m, &[chain[0]]);
+                assert_eq!(batch.len(), chain_len);
+            })
+            .expect("spawn 256k scoped thread");
+        handle.join().expect("256k thread must not stack-overflow");
+    });
+
+    // Iteratively dismantle deep trees so test teardown itself uses O(1) stack.
+    let mut rf = rf;
+    if let Some(Stmt::Expr(mut cur)) = rf.blocks[0].stmts.pop() {
+        while let Expr::Unary { operand, .. } = cur {
+            cur = *operand;
+        }
+    }
+    while let Const::ArrayLiteral(mut v) = deep_const {
+        deep_const = v.pop().unwrap_or(Const::Null);
+    }
+    while let Some(node) = deep_nodes.pop() {
+        match node {
+            SNode::If {
+                then, otherwise, ..
+            } => {
+                deep_nodes.extend(then);
+                deep_nodes.extend(otherwise);
+            }
+            SNode::DoWhile { body, .. } => deep_nodes.extend(body),
+            _ => {}
+        }
+    }
 }

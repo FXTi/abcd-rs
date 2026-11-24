@@ -39,13 +39,13 @@ use abcd_analysis::dataflow::ifds::{IfdsConfig, IfdsResult, IfdsSolver};
 use abcd_analysis::dataflow::pta::{PtaConfig, Rung2AliasOracle};
 use abcd_analysis::module_link::ModuleLinkTable;
 use abcd_analysis::ohos_lifecycle::synthesize_ohos_harness;
-use abcd_ir::{FuncId, InstId, Loc, Module, Op, ValueId};
+use abcd_ir::{FuncId, InstId, Loc, Module, Op};
 
 use crate::fact::{Fact, TaintFact};
 use crate::gap::GapCallGraph;
-use crate::names::{call_base_value, callee_name_candidates_with_links};
+use crate::names::{ClassPropStores, call_base_value, callee_name_candidates_indexed};
 use crate::oracle::Oracle;
-use crate::problem::TaintProblem;
+use crate::problem::{TaintProblem, op_uses_value};
 use crate::summary::{RegistryStats, Summary, SummaryRegistry};
 
 /// A taint source specification (name-keyed).
@@ -304,7 +304,14 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     );
     let result = solver.solve();
 
-    let hits = collect_hits(work_mod, problem.links(), config, callgraph, &result);
+    let hits = collect_hits(
+        work_mod,
+        problem.links(),
+        problem.prop_stores(),
+        config,
+        callgraph,
+        &result,
+    );
     let applied = problem
         .applied_summaries()
         .into_iter()
@@ -323,39 +330,44 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         summary_misses: resolve_map(&stats.misses_named),
         stats,
         summaries_applied: applied,
-        path_edges: result.path_edges().len(),
+        path_edges: result.path_edge_count(),
         gap_sites_resolved,
         gap_sites_unresolved,
         alias_rung_used: rung_used,
     };
-    let path_index = PathIndex::build(work_mod, &result);
     report.hits.retain(|h| h.call.index() < orig_inst_len);
-    for hit in &mut report.hits {
-        let (mut seed, mut path) =
-            reconstruct_path(work_mod, &gap_graph, &result, &path_index, hit);
-        if augmented.is_some() {
-            path.retain(|step| step.inst.index() < orig_inst_len);
-            if path.is_empty()
-                && let Some(inst) = module.inst(hit.call)
-            {
-                path.push(PathStep {
-                    inst: hit.call,
-                    loc: inst.loc,
-                    op: op_tag(&inst.op),
-                });
+    if !report.hits.is_empty() {
+        let path_index = PathIndex::build(work_mod, &result);
+        for hit in &mut report.hits {
+            let (mut seed, mut path) =
+                reconstruct_path(work_mod, &gap_graph, &result, &path_index, hit);
+            if augmented.is_some() {
+                path.retain(|step| step.inst.index() < orig_inst_len);
+                if path.is_empty()
+                    && let Some(inst) = module.inst(hit.call)
+                {
+                    path.push(PathStep {
+                        inst: hit.call,
+                        loc: inst.loc,
+                        op: op_tag(&inst.op),
+                    });
+                }
+                if seed.0.index() >= orig_func_len {
+                    let first_inst = path.first().map(|s| s.inst).unwrap_or(hit.call);
+                    let user_func = path_index
+                        .func_of_inst(module, first_inst)
+                        .filter(|f| f.index() < orig_func_len)
+                        .unwrap_or(FuncId::new(0));
+                    seed = (user_func, Fact::Zero);
+                }
             }
-            if seed.0.index() >= orig_func_len {
-                let first_inst = path.first().map(|s| s.inst).unwrap_or(hit.call);
-                let user_func = func_of_inst(module, first_inst).unwrap_or(FuncId::new(0));
-                seed = (user_func, Fact::Zero);
-            }
+            hit.seed = seed;
+            hit.path = path;
         }
-        hit.seed = seed;
-        hit.path = path;
+        report.hits.sort_by(|a, b| {
+            (a.call, &a.position, &a.fact, &a.sink).cmp(&(b.call, &b.position, &a.fact, &b.sink))
+        });
     }
-    report.hits.sort_by(|a, b| {
-        (a.call, &a.position, &a.fact, &a.sink).cmp(&(b.call, &b.position, &b.fact, &b.sink))
-    });
     (report, result)
 }
 
@@ -363,10 +375,14 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
 fn collect_hits(
     module: &Module,
     links: &ModuleLinkTable,
+    prop_stores: &ClassPropStores,
     config: &TaintConfig,
     callgraph: &CallGraph,
     result: &IfdsResult<Fact>,
 ) -> Vec<SinkHit> {
+    if config.sinks.is_empty() {
+        return Vec::new();
+    }
     let zero = Fact::Zero;
     let mut hits = Vec::new();
     for (iid, edge) in callgraph.sites() {
@@ -379,7 +395,8 @@ fn collect_hits(
         else {
             continue;
         };
-        let mut names = callee_name_candidates_with_links(module, links, edge.caller, *callee);
+        let mut names =
+            callee_name_candidates_indexed(module, links, Some(prop_stores), edge.caller, *callee);
         for f in callgraph.callees_of_call_at(iid) {
             if let Some(fd) = module.func(*f)
                 && let Some(n) = module.sym.resolve(fd.name)
@@ -423,16 +440,6 @@ fn collect_hits(
     hits
 }
 
-/// The function owning an instruction.
-fn func_of_inst(module: &Module, inst: InstId) -> Option<FuncId> {
-    let block = module.inst(inst)?.block;
-    module
-        .functions
-        .iter()
-        .position(|f| f.blocks.contains(&block))
-        .map(|i| FuncId::new(i as u32))
-}
-
 /// Instruction predecessors for path reconstruction: the previous
 /// instruction in the block, or the last instruction of each predecessor
 /// block (Normal and Exceptional edges alike).
@@ -460,54 +467,12 @@ fn inst_preds(module: &Module, inst: InstId) -> Vec<InstId> {
     out
 }
 
-/// The solver's return-site computation for a call, replicated for path
-/// reconstruction (the supergraph is solver-internal): the normal
-/// continuation plus handler entries when the call may throw.
-fn return_sites_of(module: &Module, call: InstId) -> Vec<InstId> {
-    let Some(inst) = module.inst(call) else {
-        return Vec::new();
-    };
-    let Some(block) = module.block(inst.block) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    if let Some(pos) = block.insts.iter().position(|&x| x == call) {
-        if pos + 1 < block.insts.len() {
-            out.push(block.insts[pos + 1]);
-        } else {
-            for s in abcd_analysis::control::block_succs(module, inst.block) {
-                if let Some(first) = module.block(s).and_then(|b| b.insts.first()) {
-                    out.push(*first);
-                }
-            }
-        }
-    }
-    if inst.op.effects().may_throw
-        && let Some(f) = module
-            .functions
-            .iter()
-            .find(|f| f.blocks.contains(&inst.block))
-    {
-        for region in &f.try_regions {
-            if !region.protected.contains(&inst.block) {
-                continue;
-            }
-            for catch in &region.catches {
-                if let Some(first) = module.block(catch.handler).and_then(|b| b.insts.first())
-                    && !out.contains(first)
-                {
-                    out.push(*first);
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Indices over the path-edge set for backward reconstruction.
 struct PathIndex {
-    /// `(anchor, target node)` → edge indices.
-    by_anchor_node: HashMap<(Fact, InstId), Vec<usize>>,
+    /// Dense `BlockId::index() -> Option<FuncId>` owning-function index.
+    block_to_func: Vec<Option<FuncId>>,
+    /// `(anchor fact ID, target node)` → edge indices.
+    by_anchor_node: HashMap<(u32, InstId), Vec<usize>>,
     /// target node → edge indices (any anchor).
     by_node: HashMap<InstId, Vec<usize>>,
     /// start point → function.
@@ -520,18 +485,62 @@ struct PathIndex {
 
 impl PathIndex {
     fn build(module: &Module, result: &IfdsResult<Fact>) -> Self {
-        let mut by_anchor_node: HashMap<(Fact, InstId), Vec<usize>> = HashMap::new();
+        let mut block_to_func = vec![None; module.blocks.len()];
+        for (fi, f) in module.functions.iter().enumerate() {
+            let func = FuncId::new(fi as u32);
+            for &b in &f.blocks {
+                if let Some(slot) = block_to_func.get_mut(b.index()) {
+                    slot.get_or_insert(func);
+                }
+            }
+        }
+
+        // Pre-index exceptional handler entry instructions per protected block
+        // once (`O(|try_regions|)`) so call return-site indexing never scans
+        // `module.functions`.
+        let mut block_exc_handlers: Vec<Vec<InstId>> = vec![Vec::new(); module.blocks.len()];
+        for (fi, f) in module.functions.iter().enumerate() {
+            let func = FuncId::new(fi as u32);
+            for region in &f.try_regions {
+                let mut catch_entries = Vec::new();
+                for catch in &region.catches {
+                    if let Some(&first) =
+                        module.block(catch.handler).and_then(|bb| bb.insts.first())
+                        && !catch_entries.contains(&first)
+                    {
+                        catch_entries.push(first);
+                    }
+                }
+                if catch_entries.is_empty() {
+                    continue;
+                }
+                for &prot_b in &region.protected {
+                    if block_to_func.get(prot_b.index()).copied().flatten() != Some(func) {
+                        continue;
+                    }
+                    let slot = &mut block_exc_handlers[prot_b.index()];
+                    for &first in &catch_entries {
+                        if !slot.contains(&first) {
+                            slot.push(first);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut by_anchor_node: HashMap<(u32, InstId), Vec<usize>> = HashMap::new();
         let mut by_node: HashMap<InstId, Vec<usize>> = HashMap::new();
-        for (i, e) in result.path_edges().iter().enumerate() {
+        for (i, &(src_id, target_node, _dst_id)) in result.raw_path_edges().iter().enumerate() {
             by_anchor_node
-                .entry((e.source_fact.clone(), e.target_node))
+                .entry((src_id, target_node))
                 .or_default()
                 .push(i);
-            by_node.entry(e.target_node).or_default().push(i);
+            by_node.entry(target_node).or_default().push(i);
         }
         let mut func_of_sp = HashMap::new();
         let mut exits_of: HashMap<FuncId, Vec<InstId>> = HashMap::new();
         let mut calls_at_return_site: HashMap<InstId, Vec<InstId>> = HashMap::new();
+        let mut rs_buf: Vec<InstId> = Vec::new();
         for (fi, f) in module.functions.iter().enumerate() {
             let func = FuncId::new(fi as u32);
             if let Some(sp) = f
@@ -544,7 +553,7 @@ impl PathIndex {
             let mut exits = Vec::new();
             for &b in &f.blocks {
                 let Some(bb) = module.block(b) else { continue };
-                for &iid in &bb.insts {
+                for (pos, &iid) in bb.insts.iter().enumerate() {
                     let Some(inst) = module.inst(iid) else {
                         continue;
                     };
@@ -552,7 +561,44 @@ impl PathIndex {
                         exits.push(iid);
                     }
                     if matches!(inst.op, Op::Call { .. }) {
-                        for rs in return_sites_of(module, iid) {
+                        rs_buf.clear();
+                        if inst.block == b {
+                            if pos + 1 < bb.insts.len() {
+                                rs_buf.push(bb.insts[pos + 1]);
+                            } else {
+                                for s in abcd_analysis::control::block_succs(module, b) {
+                                    if let Some(&first) =
+                                        module.block(s).and_then(|sb| sb.insts.first())
+                                    {
+                                        rs_buf.push(first);
+                                    }
+                                }
+                            }
+                        } else if let Some(actual_bb) = module.block(inst.block)
+                            && let Some(actual_pos) = actual_bb.insts.iter().position(|&x| x == iid)
+                        {
+                            if actual_pos + 1 < actual_bb.insts.len() {
+                                rs_buf.push(actual_bb.insts[actual_pos + 1]);
+                            } else {
+                                for s in abcd_analysis::control::block_succs(module, inst.block) {
+                                    if let Some(&first) =
+                                        module.block(s).and_then(|sb| sb.insts.first())
+                                    {
+                                        rs_buf.push(first);
+                                    }
+                                }
+                            }
+                        }
+                        if inst.op.effects().may_throw
+                            && let Some(exc_list) = block_exc_handlers.get(inst.block.index())
+                        {
+                            for &first in exc_list {
+                                if !rs_buf.contains(&first) {
+                                    rs_buf.push(first);
+                                }
+                            }
+                        }
+                        for &rs in &rs_buf {
                             calls_at_return_site.entry(rs).or_default().push(iid);
                         }
                     }
@@ -561,12 +607,18 @@ impl PathIndex {
             exits_of.insert(func, exits);
         }
         PathIndex {
+            block_to_func,
             by_anchor_node,
             by_node,
             func_of_sp,
             exits_of,
             calls_at_return_site,
         }
+    }
+
+    fn func_of_inst(&self, module: &Module, inst: InstId) -> Option<FuncId> {
+        let block = module.inst(inst)?.block;
+        self.block_to_func.get(block.index()).copied().flatten()
     }
 }
 
@@ -596,7 +648,7 @@ fn reconstruct_path(
     index: &PathIndex,
     hit: &SinkHit,
 ) -> ((FuncId, Fact), Vec<PathStep>) {
-    let edges = result.path_edges();
+    let edges = result.raw_path_edges();
 
     let step_of = |inst: InstId| -> PathStep {
         let i = module.inst(inst);
@@ -610,18 +662,32 @@ fn reconstruct_path(
     let fallback = || {
         (
             (
-                func_of_inst(module, hit.call).unwrap_or(FuncId::new(0)),
+                index
+                    .func_of_inst(module, hit.call)
+                    .unwrap_or(FuncId::new(0)),
                 Fact::Zero,
             ),
             vec![step_of(hit.call)],
         )
     };
 
-    let Some(start_edge) = edges
-        .iter()
-        .position(|e| e.target_node == hit.call && e.target_fact == Fact::Taint(hit.fact.clone()))
+    let zero_id = result.id_of_fact(&Fact::Zero);
+    let Some(hit_fact_id) = result.id_of_fact(&Fact::Taint(hit.fact.clone())) else {
+        return fallback();
+    };
+    let Some(start_edge) = index
+        .by_node
+        .get(&hit.call)
+        .and_then(|cands| cands.iter().copied().find(|&ei| edges[ei].2 == hit_fact_id))
     else {
         return fallback();
+    };
+
+    let fact_local_base = |fact_id: u32| -> Option<abcd_ir::ValueId> {
+        result
+            .fact_by_id(fact_id)
+            .and_then(Fact::taint)
+            .and_then(TaintFact::local_base)
     };
 
     let mut visited: HashSet<usize> = HashSet::new();
@@ -632,13 +698,12 @@ fn reconstruct_path(
     let mut seed_edge = None;
 
     while let Some(ei) = queue.pop_front() {
-        let e = &edges[ei];
-        let n = e.target_node;
+        let (src_id, n, dst_id) = edges[ei];
         // Terminal: a seed edge (Zero, sp, non-zero fact).
-        if e.source_fact == Fact::Zero
+        if Some(src_id) == zero_id
             && let Some(&func) = index.func_of_sp.get(&n)
         {
-            if e.target_fact != Fact::Zero {
+            if Some(dst_id) != zero_id {
                 seed_edge = Some((ei, func));
                 break;
             }
@@ -648,26 +713,19 @@ fn reconstruct_path(
             break; // cap: report the partial path
         }
         let mut preds: Vec<usize> = Vec::new();
-        if e.source_fact == e.target_fact
-            && e.source_fact != Fact::Zero
-            && index.func_of_sp.contains_key(&n)
-        {
+        if src_id == dst_id && Some(src_id) != zero_id && index.func_of_sp.contains_key(&n) {
             // Callee-anchor self-loop: call edges into this function,
             // restricted to caller facts on the call's operands (the
             // only facts call_flow can map).
             let func = index.func_of_sp[&n];
             for call in callgraph.callers_of(func) {
-                let operands: Vec<ValueId> = module
-                    .inst(*call)
-                    .map(|i| i.op.operands())
-                    .unwrap_or_default();
+                let Some(call_inst) = module.inst(*call) else {
+                    continue;
+                };
                 if let Some(cands) = index.by_node.get(call) {
                     preds.extend(cands.iter().copied().filter(|&pi| {
-                        edges[pi]
-                            .target_fact
-                            .taint()
-                            .and_then(|t| t.local_base())
-                            .is_some_and(|v| operands.contains(&v))
+                        fact_local_base(edges[pi].2)
+                            .is_some_and(|v| op_uses_value(&call_inst.op, v))
                     }));
                 }
             }
@@ -678,13 +736,10 @@ fn reconstruct_path(
             // not the intraprocedural bypass.
             let mut via_exit: Option<Vec<usize>> = None;
             if let Some(calls) = index.calls_at_return_site.get(&n) {
+                let dst_local = fact_local_base(dst_id);
                 'calls: for c in calls {
                     let result_val = module.inst(*c).and_then(|i| i.result);
-                    let on_result = e
-                        .target_fact
-                        .taint()
-                        .and_then(|t| t.local_base())
-                        .is_some_and(|v| Some(v) == result_val);
+                    let on_result = dst_local.is_some_and(|v| Some(v) == result_val);
                     if !on_result {
                         continue;
                     }
@@ -698,10 +753,12 @@ fn reconstruct_path(
                                     _ => None,
                                 });
                                 if let Some(cands) = index.by_node.get(exit) {
-                                    exit_preds.extend(cands.iter().copied().filter(|&pi| {
-                                        edges[pi].target_fact.taint().and_then(|t| t.local_base())
-                                            == exit_val
-                                    }));
+                                    exit_preds.extend(
+                                        cands
+                                            .iter()
+                                            .copied()
+                                            .filter(|&pi| fact_local_base(edges[pi].2) == exit_val),
+                                    );
                                 }
                             }
                         }
@@ -716,13 +773,13 @@ fn reconstruct_path(
                 preds.extend(exit_preds);
             } else {
                 for p in inst_preds(module, n) {
-                    if let Some(cands) = index.by_anchor_node.get(&(e.source_fact.clone(), p)) {
+                    if let Some(cands) = index.by_anchor_node.get(&(src_id, p)) {
                         // Prefer the exact-fact (pass-through) predecessor;
                         // widen only at transforming instructions.
                         let exact: Vec<usize> = cands
                             .iter()
                             .copied()
-                            .filter(|&pi| edges[pi].target_fact == e.target_fact)
+                            .filter(|&pi| edges[pi].2 == dst_id)
                             .collect();
                         if exact.is_empty() {
                             preds.extend(cands.iter().copied());
@@ -734,8 +791,7 @@ fn reconstruct_path(
                 if let Some(calls) = index.calls_at_return_site.get(&n) {
                     for c in calls {
                         // The call edge with the same anchor (bypass).
-                        if let Some(cands) = index.by_anchor_node.get(&(e.source_fact.clone(), *c))
-                        {
+                        if let Some(cands) = index.by_anchor_node.get(&(src_id, *c)) {
                             preds.extend(cands.iter().copied());
                         }
                     }
@@ -756,7 +812,10 @@ fn reconstruct_path(
     let Some((seed_ei, seed_func)) = seed_edge else {
         return fallback();
     };
-    let seed = (seed_func, edges[seed_ei].target_fact.clone());
+    let Some(seed_fact) = result.fact_by_id(edges[seed_ei].2).cloned() else {
+        return fallback();
+    };
+    let seed = (seed_func, seed_fact);
 
     // Rebuild seed → sink along the child links.
     let mut chain = vec![seed_ei];
@@ -768,10 +827,7 @@ fn reconstruct_path(
             break;
         }
     }
-    let path = chain
-        .into_iter()
-        .map(|ei| step_of(edges[ei].target_node))
-        .collect();
+    let path = chain.into_iter().map(|ei| step_of(edges[ei].1)).collect();
     (seed, path)
 }
 

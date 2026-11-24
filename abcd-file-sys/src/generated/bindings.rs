@@ -27,6 +27,9 @@ unsafe extern "C" {
     pub fn abc_file_open(data: *const u8, len: usize) -> *mut AbcFileHandle;
 }
 unsafe extern "C" {
+    pub fn abc_file_open_zeropadded(data: *const u8, padded_len: usize) -> *mut AbcFileHandle;
+}
+unsafe extern "C" {
     pub fn abc_file_close(f: *mut AbcFileHandle);
 }
 unsafe extern "C" {

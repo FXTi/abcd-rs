@@ -162,3 +162,21 @@ fn nested_module_without_manifest_uses_the_container_entry_stem() {
         modules[0].provenance
     );
 }
+
+#[test]
+fn load_from_disk_moves_bare_abc_and_enforces_selection() {
+    let dir = common::tempdir("input-load-bare");
+    let path = dir.join("modules.abc");
+    let abc = common::tiny_abc();
+    std::fs::write(&path, &abc).unwrap();
+
+    let single = input::load(&path, ModuleSelection::Single).expect("load single");
+    assert_eq!(single.len(), 1);
+    assert_eq!(single[0].name, "modules");
+    assert_eq!(single[0].abc, abc);
+    assert_eq!(single[0].provenance, path.display().to_string());
+
+    let err = input::load(&path, ModuleSelection::Named("other")).unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert!(err.to_string().contains("has no module named"), "{err}");
+}

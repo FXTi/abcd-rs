@@ -101,6 +101,7 @@
 //! (sound, loud).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use abcd_ir::{CallKind, ClassId, Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
 
@@ -271,13 +272,13 @@ struct ValueAnswer {
 /// end of [`analyze`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rung2Tables {
-    /// Value → stripped answer (keyed sites + completeness).
-    answers: BTreeMap<ValueId, ValueAnswer>,
-    /// Instruction → lexical-environment stack BEFORE it, innermost
+    /// Value index → stripped answer (keyed sites + completeness).
+    answers: Vec<ValueAnswer>,
+    /// Instruction index → lexical-environment stack BEFORE it, innermost
     /// last.
-    env_stack_at: BTreeMap<InstId, Vec<EnvEntry>>,
-    /// Every `NewLexEnv`/`NewLexEnvWithName` instruction.
-    env_sites: BTreeSet<InstId>,
+    env_stack_at: Vec<Arc<[EnvEntry]>>,
+    /// Instruction index → whether it is a `NewLexEnv`/`NewLexEnvWithName`.
+    env_sites: Vec<bool>,
 }
 
 /// The outcome of [`analyze`]: the co-evolved call graph plus the
@@ -333,7 +334,7 @@ struct Pta<'m> {
     module: &'m Module,
     config: &'m PtaConfig,
     links: ModuleLinkTable,
-    env_stack_at: &'m BTreeMap<InstId, Vec<EnvEntry>>,
+    env_stack_at: &'m [Arc<[EnvEntry]>],
     /// Points-to sets.
     pts: BTreeMap<Ptr, BTreeSet<Obj>>,
     /// Subset edges `s → t`.
@@ -342,6 +343,8 @@ struct Pta<'m> {
     worklist: BTreeSet<(Ptr, Obj)>,
     /// Activations requested so far.
     activated: BTreeSet<(FuncId, Ctx)>,
+    /// Activations requested but not yet scanned (pop min).
+    pending_activations: BTreeSet<(FuncId, Ctx)>,
     /// Activations already scanned.
     scanned: BTreeSet<(FuncId, Ctx)>,
     /// Handlers in registration (scan) order — the id is the index.
@@ -350,9 +353,9 @@ struct Pta<'m> {
     handlers_by_base: HashMap<Ptr, Vec<u32>>,
     /// `(handler, object)` pairs already fired.
     fired: BTreeSet<(u32, Obj)>,
-    /// Objects each dynamic-read load has fired on (the bucket re-arm
-    /// index): handler id → objects.
-    dyn_loads: BTreeMap<u32, Vec<Obj>>,
+    /// Dynamic-read `(handler id, object)` pairs indexed by `(site, ctx)`
+    /// (lookup-only map; `BTreeSet` values preserve deterministic `(id, o)` order).
+    dyn_loads_by_obj: HashMap<(InstId, Ctx), BTreeSet<(u32, Obj)>>,
     /// Buckets known per object `(site, ctx)` — a NEW bucket re-arms
     /// the dynamic reads that already fired on the object.
     buckets: BTreeMap<(InstId, Ctx), BTreeSet<Slot>>,
@@ -370,11 +373,7 @@ struct Pta<'m> {
 }
 
 impl<'m> Pta<'m> {
-    fn new(
-        module: &'m Module,
-        config: &'m PtaConfig,
-        env_stack_at: &'m BTreeMap<InstId, Vec<EnvEntry>>,
-    ) -> Self {
+    fn new(module: &'m Module, config: &'m PtaConfig, env_stack_at: &'m [Arc<[EnvEntry]>]) -> Self {
         let mut returns_of: HashMap<FuncId, Vec<ValueId>> = HashMap::new();
         for (fi, f) in module.functions.iter().enumerate() {
             let func = FuncId::new(fi as u32);
@@ -402,11 +401,12 @@ impl<'m> Pta<'m> {
             edges: BTreeMap::new(),
             worklist: BTreeSet::new(),
             activated: BTreeSet::new(),
+            pending_activations: BTreeSet::new(),
             scanned: BTreeSet::new(),
             handlers: Vec::new(),
             handlers_by_base: HashMap::new(),
             fired: BTreeSet::new(),
-            dyn_loads: BTreeMap::new(),
+            dyn_loads_by_obj: HashMap::new(),
             buckets: BTreeMap::new(),
             wired: BTreeSet::new(),
             call_targets: BTreeMap::new(),
@@ -435,9 +435,10 @@ impl<'m> Pta<'m> {
             return;
         }
         self.stats.flow_edges += 1;
-        if let Some(objs) = self.pts.get(&s).cloned() {
-            for o in objs {
-                self.worklist.insert((t, o));
+        let Pta { pts, worklist, .. } = self;
+        if let Some(objs) = pts.get(&s) {
+            for &o in objs {
+                worklist.insert((t, o));
             }
         }
     }
@@ -500,7 +501,10 @@ impl<'m> Pta<'m> {
                                 Read::Named(n) => vec![Slot::Named(n), Slot::Dynamic],
                                 Read::Index => vec![Slot::Index, Slot::Dynamic],
                                 Read::All => {
-                                    self.dyn_loads.entry(id).or_default().push(o);
+                                    self.dyn_loads_by_obj
+                                        .entry((site, ctx))
+                                        .or_default()
+                                        .insert((id, o));
                                     self.buckets
                                         .get(&(site, ctx))
                                         .map(|b| b.iter().copied().collect())
@@ -526,18 +530,10 @@ impl<'m> Pta<'m> {
         if !self.buckets.entry((site, ctx)).or_default().insert(slot) {
             return Vec::new();
         }
-        let rearm: Vec<(u32, Obj)> = self
-            .dyn_loads
-            .iter()
-            .flat_map(|(id, objs)| {
-                objs.iter().filter_map(move |o| match o {
-                    Obj::Site {
-                        site: s, ctx: c, ..
-                    } if *s == site && *c == ctx => Some((*id, *o)),
-                    _ => None,
-                })
-            })
-            .collect();
+        let Some(loads) = self.dyn_loads_by_obj.get(&(site, ctx)) else {
+            return Vec::new();
+        };
+        let rearm: Vec<(u32, Obj)> = loads.iter().copied().collect();
         for &(id, o) in &rearm {
             self.fired.remove(&(id, o));
         }
@@ -684,7 +680,9 @@ impl<'m> Pta<'m> {
 
     /// Queue an activation for scanning (idempotent).
     fn activate(&mut self, func: FuncId, ctx: Ctx) {
-        self.activated.insert((func, ctx));
+        if self.activated.insert((func, ctx)) {
+            self.pending_activations.insert((func, ctx));
+        }
     }
 
     /// Scan one activation: seed allocations and register statement
@@ -906,11 +904,12 @@ impl<'m> Pta<'m> {
                         }
                     }
                     Op::PutLexVar { level, slot, value } => {
-                        if let Some(stack) = self.env_stack_at.get(&iid)
+                        let env_stack_at = self.env_stack_at;
+                        if let Some(stack) = env_stack_at.get(iid.index())
                             && (*level as usize) < stack.len()
                         {
-                            let entry = stack[stack.len() - 1 - *level as usize].clone();
-                            for env_site in entry.sites {
+                            let entry = &stack[stack.len() - 1 - *level as usize];
+                            for &env_site in &entry.sites {
                                 self.add_edge(
                                     local(*value),
                                     Ptr::LexVar(env_site, *slot, ctx.is_some()),
@@ -920,12 +919,13 @@ impl<'m> Pta<'m> {
                     }
                     Op::GetLexVar { level, slot } => {
                         if let Some(r) = inst.result {
-                            if let Some(stack) = self.env_stack_at.get(&iid)
+                            let env_stack_at = self.env_stack_at;
+                            if let Some(stack) = env_stack_at.get(iid.index())
                                 && (*level as usize) < stack.len()
                             {
-                                let entry = stack[stack.len() - 1 - *level as usize].clone();
+                                let entry = &stack[stack.len() - 1 - *level as usize];
                                 if !entry.unknown && !entry.sites.is_empty() {
-                                    for env_site in entry.sites {
+                                    for &env_site in &entry.sites {
                                         self.add_edge(Ptr::LexVar(env_site, *slot, true), local(r));
                                         self.add_edge(
                                             Ptr::LexVar(env_site, *slot, false),
@@ -1056,20 +1056,14 @@ impl<'m> Pta<'m> {
         let mut post_pass_done = false;
         loop {
             loop {
-                let next = self
-                    .activated
-                    .iter()
-                    .find(|a| !self.scanned.contains(*a))
-                    .copied();
-                if let Some((func, ctx)) = next {
+                if let Some((func, ctx)) = self.pending_activations.pop_first() {
                     self.scanned.insert((func, ctx));
                     self.scan(func, ctx);
                     continue;
                 }
-                let Some((p, o)) = self.worklist.iter().next().copied() else {
+                let Some((p, o)) = self.worklist.pop_first() else {
                     break;
                 };
-                self.worklist.remove(&(p, o));
                 *steps += 1;
                 if *steps > self.config.step_budget {
                     self.stats.capped = true;
@@ -1080,16 +1074,22 @@ impl<'m> Pta<'m> {
                 }
                 self.stats.facts += 1;
                 // Delta half one: replay down existing out-edges.
-                if let Some(targets) = self.edges.get(&p).cloned() {
-                    for t in targets {
-                        self.worklist.insert((t, o));
+                let Pta {
+                    edges, worklist, ..
+                } = self;
+                if let Some(targets) = edges.get(&p) {
+                    for &t in targets {
+                        worklist.insert((t, o));
                     }
                 }
                 // Statement handlers registered on this base pointer.
-                if let Some(ids) = self.handlers_by_base.get(&p).cloned() {
-                    for id in ids {
-                        self.fire(id, o);
-                    }
+                let handler_len = self.handlers_by_base.get(&p).map_or(0, Vec::len);
+                for hi in 0..handler_len {
+                    let Some(&id) = self.handlers_by_base.get(&p).and_then(|ids| ids.get(hi))
+                    else {
+                        break;
+                    };
+                    self.fire(id, o);
                 }
             }
             if post_pass_done {
@@ -1194,10 +1194,10 @@ pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutc
             entry.2 = true;
         }
     }
-    let mut answers = BTreeMap::new();
+    let mut answers = Vec::with_capacity(module.values.len());
     for v in 0..module.values.len() {
         let vid = ValueId::new(v as u32);
-        answers.insert(vid, value_answer(module, vid, acc.get(&vid)));
+        answers.push(value_answer(module, vid, acc.get(&vid)));
     }
 
     // Balanced lexical-capture answers: when an enclosing function owning
@@ -1219,7 +1219,7 @@ pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutc
                 };
                 if let Op::GetLexVar { level, slot } = &inst.op
                     && let Some(res_vid) = inst.result
-                    && let Some(stack) = env_stack_at.get(&iid)
+                    && let Some(stack) = env_stack_at.get(iid.index())
                     && (*level as usize) < stack.len()
                 {
                     let entry = &stack[stack.len() - 1 - *level as usize];
@@ -1252,7 +1252,9 @@ pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutc
                         if union.is_empty() {
                             ans.has_unknown = true;
                         }
-                        answers.insert(res_vid, ans);
+                        if let Some(slot_ans) = answers.get_mut(res_vid.index()) {
+                            *slot_ans = ans;
+                        }
                     }
                 }
             }
@@ -1333,30 +1335,105 @@ fn value_answer(
     }
 }
 
+/// Apply one instruction's lexical-environment transfer to `state`, returning
+/// `true` iff `state` mutated.
+fn step_env_inst(op: &Op, iid: InstId, max_depth: usize, state: &mut Vec<EnvEntry>) -> bool {
+    match op {
+        Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
+            state.push(EnvEntry {
+                sites: BTreeSet::from([iid]),
+                unknown: false,
+            });
+            // Depth cap: drop the OUTERMOST environments (level indexing is
+            // from the innermost end).
+            if state.len() > max_depth {
+                let overflow = state.len() - max_depth;
+                state.drain(0..overflow);
+            }
+            true
+        }
+        Op::PopLexEnv => {
+            if state.pop().is_none() {
+                state.push(EnvEntry {
+                    sites: BTreeSet::new(),
+                    unknown: true,
+                });
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The lexical-environment analysis: per-instruction environment stacks
 /// plus the capture fixed point (see module docs). Context-insensitive:
 /// recursion merges; the depth cap drops outer environments (deep
 /// levels answer unknown — sound).
-fn env_analysis(
-    module: &Module,
-    max_depth: usize,
-) -> (BTreeMap<InstId, Vec<EnvEntry>>, BTreeSet<InstId>, usize) {
-    // Environment allocation sites per function; capture points
+fn env_analysis(module: &Module, max_depth: usize) -> (Vec<Arc<[EnvEntry]>>, Vec<bool>, usize) {
+    // Environment allocation sites per instruction; capture points
     // (AllocClosure/CreateGenerator sites + unwrapped DefineFunc sites)
-    // per defined body.
-    let mut env_sites: BTreeSet<InstId> = BTreeSet::new();
+    // per defined body; per-function lexical-op presence and block reachability.
+    let mut env_sites = vec![false; module.insts.len()];
+    let mut has_lex_ops = vec![false; module.functions.len()];
+    let mut block_func = vec![None; module.blocks.len()];
+    let mut block_reached = vec![false; module.blocks.len()];
+    let mut inst_reached = vec![false; module.insts.len()];
     // body → capture instructions (in deterministic discovery order).
     let mut capture_points: BTreeMap<FuncId, BTreeSet<InstId>> = BTreeMap::new();
-    for f in &module.functions {
+
+    for (fi, f) in module.functions.iter().enumerate() {
+        let func = FuncId::new(fi as u32);
+        for &b in &f.blocks {
+            if let Some(slot) = block_func.get_mut(b.index()) {
+                *slot = Some(func);
+            }
+        }
+        let mut sweeps = 0usize;
+        loop {
+            let mut changed = false;
+            sweeps += 1;
+            for &b in &f.blocks {
+                if block_reached.get(b.index()).copied().unwrap_or(false) {
+                    continue;
+                }
+                let Some(bb) = module.block(b) else { continue };
+                let reached = bb.preds.is_empty()
+                    || bb.preds.iter().any(|pred| {
+                        block_func.get(pred.from.index()) == Some(&Some(func))
+                            && block_reached
+                                .get(pred.from.index())
+                                .copied()
+                                .unwrap_or(false)
+                    });
+                if reached && let Some(slot) = block_reached.get_mut(b.index()) {
+                    *slot = true;
+                    changed = true;
+                }
+            }
+            if !changed || sweeps >= 64 {
+                break;
+            }
+        }
+
         for &b in &f.blocks {
             let Some(bb) = module.block(b) else { continue };
+            let b_reached = block_reached.get(b.index()).copied().unwrap_or(false);
             for &iid in &bb.insts {
                 let Some(inst) = module.inst(iid) else {
                     continue;
                 };
+                if b_reached && let Some(slot) = inst_reached.get_mut(iid.index()) {
+                    *slot = true;
+                }
                 match &inst.op {
                     Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
-                        env_sites.insert(iid);
+                        if let Some(slot) = env_sites.get_mut(iid.index()) {
+                            *slot = true;
+                        }
+                        has_lex_ops[fi] = true;
+                    }
+                    Op::PopLexEnv => {
+                        has_lex_ops[fi] = true;
                     }
                     Op::AllocClosure { func } | Op::CreateGenerator { func } => {
                         if let Some(body) = closure_body(module, *func) {
@@ -1374,91 +1451,137 @@ fn env_analysis(
         }
     }
 
-    // Per-function stack computation given the captured chain at entry:
-    // a forward dataflow over blocks (CFG join = bottom-aligned
-    // elementwise union, padding one-sided positions with unknown
-    // entries — genuinely different stack shapes at a join are
-    // uncertainty).
-    let compute_stacks =
-        |captured: &BTreeMap<FuncId, Vec<EnvEntry>>| -> BTreeMap<InstId, Vec<EnvEntry>> {
-            let mut stack_at: BTreeMap<InstId, Vec<EnvEntry>> = BTreeMap::new();
-            for (fi, f) in module.functions.iter().enumerate() {
-                let func = FuncId::new(fi as u32);
-                let entry_state = captured.get(&func).cloned().unwrap_or_default();
-                // block → state at block EXIT (successors join on it).
-                let mut out_state: BTreeMap<abcd_ir::BlockId, Vec<EnvEntry>> = BTreeMap::new();
-                let mut changed = true;
-                let mut sweeps = 0usize;
-                while changed && sweeps < 64 {
-                    changed = false;
-                    sweeps += 1;
-                    for &b in &f.blocks {
-                        let Some(bb) = module.block(b) else { continue };
-                        // Join predecessors (a pred-less block starts from
-                        // the captured chain — the function entry).
-                        let mut state: Option<Vec<EnvEntry>> = if bb.preds.is_empty() {
-                            Some(entry_state.clone())
-                        } else {
-                            None
-                        };
-                        for pred in &bb.preds {
-                            if let Some(ps) = out_state.get(&pred.from) {
-                                state = Some(match state.take() {
-                                    None => ps.clone(),
-                                    Some(cur) => join_stacks(&cur, ps),
-                                });
-                            }
-                        }
-                        let Some(mut state) = state else {
-                            continue; // not reached yet this sweep
-                        };
-                        // Transfer: record per-inst stacks (BEFORE the inst).
-                        for &iid in &bb.insts {
-                            let Some(inst) = module.inst(iid) else {
-                                continue;
-                            };
-                            stack_at.insert(iid, state.clone());
-                            match &inst.op {
-                                Op::NewLexEnv { .. } | Op::NewLexEnvWithName { .. } => {
-                                    state.push(EnvEntry {
-                                        sites: BTreeSet::from([iid]),
-                                        unknown: false,
-                                    });
-                                    // Depth cap: drop the OUTERMOST
-                                    // environments (level indexing is from
-                                    // the innermost end).
-                                    if state.len() > max_depth {
-                                        let overflow = state.len() - max_depth;
-                                        state.drain(0..overflow);
-                                    }
-                                }
-                                Op::PopLexEnv if state.pop().is_none() => {
-                                    state.push(EnvEntry {
-                                        sites: BTreeSet::new(),
-                                        unknown: true,
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
-                        if out_state.get(&b) != Some(&state) {
-                            out_state.insert(b, state);
-                            changed = true;
+    let empty_stack: Arc<[EnvEntry]> = Arc::from([]);
+    let mut func_stacks: Vec<Arc<[EnvEntry]>> = vec![Arc::clone(&empty_stack); module.insts.len()];
+
+    // Recompute one function's instruction stacks in `func_stacks` given its
+    // entry capture chain.
+    let compute_func_stacks =
+        |fi: usize, entry_state: &[EnvEntry], func_stacks: &mut [Arc<[EnvEntry]>]| {
+            let f = &module.functions[fi];
+            if !has_lex_ops[fi] {
+                // Fast path: without NewLexEnv/PopLexEnv inside `f`, every
+                // reachable instruction shares the entry stack identically.
+                let entry_arc: Arc<[EnvEntry]> = if entry_state.is_empty() {
+                    Arc::clone(&empty_stack)
+                } else {
+                    Arc::from(entry_state)
+                };
+                for &b in &f.blocks {
+                    if !block_reached.get(b.index()).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let Some(bb) = module.block(b) else { continue };
+                    for &iid in &bb.insts {
+                        if module.inst(iid).is_some()
+                            && let Some(slot) = func_stacks.get_mut(iid.index())
+                        {
+                            *slot = Arc::clone(&entry_arc);
                         }
                     }
                 }
+                return;
             }
-            stack_at
+
+            // Phase 1: converge block `out_state` to fixed point without touching
+            // per-instruction `func_stacks` on intermediate sweeps.
+            let mut in_state: HashMap<abcd_ir::BlockId, Vec<EnvEntry>> = HashMap::new();
+            let mut out_state: HashMap<abcd_ir::BlockId, Vec<EnvEntry>> = HashMap::new();
+            let mut changed = true;
+            let mut sweeps = 0usize;
+            while changed && sweeps < 64 {
+                changed = false;
+                sweeps += 1;
+                for &b in &f.blocks {
+                    let Some(bb) = module.block(b) else { continue };
+                    let mut state: Option<Vec<EnvEntry>> = if bb.preds.is_empty() {
+                        Some(entry_state.to_vec())
+                    } else {
+                        None
+                    };
+                    for pred in &bb.preds {
+                        if let Some(ps) = out_state.get(&pred.from) {
+                            state = Some(match state.take() {
+                                None => ps.clone(),
+                                Some(cur) => join_stacks(&cur, ps),
+                            });
+                        }
+                    }
+                    let Some(mut state) = state else {
+                        continue;
+                    };
+                    in_state.insert(b, state.clone());
+                    for &iid in &bb.insts {
+                        let Some(inst) = module.inst(iid) else {
+                            continue;
+                        };
+                        step_env_inst(&inst.op, iid, max_depth, &mut state);
+                    }
+                    if out_state.get(&b) != Some(&state) {
+                        out_state.insert(b, state);
+                        changed = true;
+                    }
+                }
+            }
+
+            // Phase 2: materialize per-instruction `Arc<[EnvEntry]>` in ONE final
+            // pass, reusing `Arc::clone` across consecutive non-lex instructions.
+            for &b in &f.blocks {
+                let Some(bb) = module.block(b) else { continue };
+                let Some(entry_vec) = in_state.get(&b) else {
+                    continue;
+                };
+                let mut state = entry_vec.clone();
+                let mut cur_arc: Arc<[EnvEntry]> = if state.is_empty() {
+                    Arc::clone(&empty_stack)
+                } else {
+                    Arc::from(state.as_slice())
+                };
+                for &iid in &bb.insts {
+                    let Some(inst) = module.inst(iid) else {
+                        continue;
+                    };
+                    if let Some(slot) = func_stacks.get_mut(iid.index()) {
+                        *slot = Arc::clone(&cur_arc);
+                    }
+                    if step_env_inst(&inst.op, iid, max_depth, &mut state) {
+                        cur_arc = if state.is_empty() {
+                            Arc::clone(&empty_stack)
+                        } else {
+                            Arc::from(state.as_slice())
+                        };
+                    }
+                }
+            }
         };
 
     // The capture fixed point: captured[body] = union of the stacks at
     // the body's capture points. Monotone over a finite lattice
     // (entries are subsets of the finite env-site set, depth capped).
     let mut captured: BTreeMap<FuncId, Vec<EnvEntry>> = BTreeMap::new();
+    let mut dirty_funcs = vec![false; module.functions.len()];
     let mut rounds = 0usize;
     loop {
         rounds += 1;
-        let stacks = compute_stacks(&captured);
+        if rounds == 1 {
+            // Round 1: `captured` is empty everywhere — functions without lex
+            // ops already hold `empty_stack`, so only compute `has_lex_ops[fi]`.
+            for (fi, &has_lex) in has_lex_ops.iter().enumerate() {
+                if has_lex {
+                    compute_func_stacks(fi, &[], &mut func_stacks);
+                }
+            }
+        } else {
+            for (fi, dirty) in dirty_funcs.iter_mut().enumerate() {
+                if *dirty {
+                    *dirty = false;
+                    let func = FuncId::new(fi as u32);
+                    let entry = captured.get(&func).map_or(&[][..], Vec::as_slice);
+                    compute_func_stacks(fi, entry, &mut func_stacks);
+                }
+            }
+        }
+
         let mut changed = false;
         for (body, points) in &capture_points {
             // Alternative capture points UNION (the body may be defined
@@ -1467,21 +1590,29 @@ fn env_analysis(
             // are genuinely uncertain — a may-semantics union).
             let mut chain: Option<Vec<EnvEntry>> = None;
             for p in points {
-                if let Some(stack) = stacks.get(p) {
+                if inst_reached.get(p.index()).copied().unwrap_or(false)
+                    && let Some(stack) = func_stacks.get(p.index())
+                {
                     chain = Some(match chain.take() {
-                        None => stack.clone(),
+                        None => stack.to_vec(),
                         Some(cur) => join_stacks(&cur, stack),
                     });
                 }
             }
             let chain = chain.unwrap_or_default();
+            let prev_effective = captured.get(body).map_or(&[][..], Vec::as_slice);
+            if prev_effective != chain.as_slice()
+                && let Some(slot) = dirty_funcs.get_mut(body.index())
+            {
+                *slot = true;
+            }
             if captured.get(body) != Some(&chain) {
                 captured.insert(*body, chain);
                 changed = true;
             }
         }
         if !changed {
-            return (stacks, env_sites, rounds);
+            return (func_stacks, env_sites, rounds);
         }
     }
 }
@@ -1550,7 +1681,7 @@ impl<'m> Rung2AliasOracle<'m> {
         let answer = self
             .tables
             .answers
-            .get(&base)
+            .get(base.index())
             .cloned()
             .unwrap_or(ValueAnswer {
                 has_unknown: true,
@@ -1584,7 +1715,7 @@ impl<'m> Rung2AliasOracle<'m> {
     /// The lexical environment a `GetLexVar`/`PutLexVar` at `at` with
     /// scope-chain `level` denotes (see module docs).
     pub fn lex_env_at(&self, at: InstId, level: u16) -> EnvAnswer {
-        let Some(stack) = self.tables.env_stack_at.get(&at) else {
+        let Some(stack) = self.tables.env_stack_at.get(at.index()) else {
             return EnvAnswer {
                 has_unknown: true,
                 ..EnvAnswer::default()
@@ -1612,7 +1743,11 @@ impl<'m> Rung2AliasOracle<'m> {
     /// taint layer's may-direction env fallback: an imprecise
     /// `GetLexVar` may read any env-keyed fact).
     pub fn is_env_site(&self, site: InstId) -> bool {
-        self.tables.env_sites.contains(&site)
+        self.tables
+            .env_sites
+            .get(site.index())
+            .copied()
+            .unwrap_or(false)
     }
 }
 
