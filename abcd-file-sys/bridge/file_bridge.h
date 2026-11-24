@@ -51,8 +51,11 @@ const char *abc_vendor_scope_names_field_name(void);
 typedef struct AbcFileHandle AbcFileHandle;
 
 AbcFileHandle *abc_file_open(const uint8_t *data, size_t len);
-/* Borrow a caller-owned buffer whose last 16 bytes are zero padding
- * (`orig_len = padded_len - 16`), avoiding any C++ buffer allocation.
+/* Open a caller-owned buffer whose last 16 bytes are zero padding
+ * (`orig_len = padded_len - 16`). Borrows `data` without any C++ buffer
+ * allocation when `data` is 8-byte aligned (`alignof(uint64_t)`); otherwise
+ * copies `data[0..padded_len]` into an owned aligned buffer so internal
+ * header, index, and bit-region spans never perform misaligned accesses.
  * The caller must keep `data[0..padded_len]` alive until `abc_file_close`. */
 AbcFileHandle *abc_file_open_zeropadded(const uint8_t *data, size_t padded_len);
 void abc_file_close(AbcFileHandle *f);
@@ -592,7 +595,7 @@ void abc_builder_method_set_function_kind(AbcBuilder *b, uint32_t method_handle,
 void abc_builder_method_set_debug_info(AbcBuilder *b, uint32_t method_handle, uint32_t debug_handle);
 
 /* Bridge handle categories (not ABC on-disk values). */
-enum AbcCodeEntityKind {
+enum AbcCodeEntityKind : unsigned int {
     ABC_CODE_STRING, ABC_CODE_METHOD, ABC_CODE_LITERAL_ARRAY,
     ABC_CODE_CLASS, ABC_CODE_FIELD
 };

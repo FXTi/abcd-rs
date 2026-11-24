@@ -2547,3 +2547,242 @@ fn literal_enumerate_vals_checked_guards() {
         abc_file_close(f_good);
     }
 }
+
+/// Misaligned caller slices (`addr % 4 != 0` and `addr % 8 != 0`) must open
+/// and classify cleanly in `abc_file_get_type`, `abc_file_open`, and
+/// `abc_file_open_zeropadded` without misaligned `File::Header` / span /
+/// `BitMemoryRegion` accesses (Issue #40).
+#[test]
+fn misaligned_header_and_zeropadded_open_regression() {
+    const PADDING: usize = 16;
+    let rich = unsafe { build_rich() };
+    let len = rich.len();
+    let padded_len = len + PADDING;
+
+    // 8-byte-aligned backing storage (`Vec<u64>`) so byte offset `shift` has
+    // exact alignment `(base + shift) % 8 == shift`.
+    let words = (padded_len + 8).div_ceil(8);
+    let mut aligned_words = vec![0u64; words];
+    let aligned_buf: &mut [u8] = unsafe {
+        std::slice::from_raw_parts_mut(aligned_words.as_mut_ptr().cast::<u8>(), words * 8)
+    };
+    assert_eq!(aligned_buf.as_ptr() as usize % 8, 0);
+
+    // Populate at offset 1 -> guaranteed `addr % 4 == 1` (`addr % 4 != 0`).
+    aligned_buf.fill(0);
+    aligned_buf[1..1 + len].copy_from_slice(&rich);
+    let unaligned = &aligned_buf[1..1 + len];
+    assert_ne!(unaligned.as_ptr() as usize % 4, 0);
+
+    unsafe {
+        // 1. `abc_file_get_type` on dynamic, static, and malformed misaligned slices.
+        assert_eq!(
+            abc_file_get_type(unaligned.as_ptr(), len as i32),
+            FileType::Dynamic as i8
+        );
+
+        let mut static_words = vec![0u64; words];
+        let static_buf: &mut [u8] =
+            std::slice::from_raw_parts_mut(static_words.as_mut_ptr().cast::<u8>(), words * 8);
+        static_buf[1..1 + len].copy_from_slice(&rich);
+        static_buf[1 + 12..1 + 16].copy_from_slice(&[0, 1, 0, 7]); // File::STATIC_VERSION
+        let unaligned_static = &static_buf[1..1 + len];
+        assert_ne!(unaligned_static.as_ptr() as usize % 4, 0);
+        assert_eq!(
+            abc_file_get_type(unaligned_static.as_ptr(), len as i32),
+            FileType::Static as i8
+        );
+        assert_eq!(
+            abc_file_get_type(unaligned_static.as_ptr(), (len - 1) as i32),
+            FileType::Invalid as i8
+        );
+        static_buf[1] = b'X';
+        assert_eq!(
+            abc_file_get_type(static_buf[1..1 + len].as_ptr(), len as i32),
+            FileType::Invalid as i8
+        );
+
+        // 2. `abc_file_open` on a `addr % 4 != 0` slice (positive + header guard).
+        let f = abc_file_open(unaligned.as_ptr(), len);
+        assert!(!f.is_null());
+        assert_eq!(abc_file_size(f), len as u32);
+        assert_eq!(abc_file_validate_checksum(f), 1);
+        assert_eq!(abc_file_num_classes(f), 4);
+        abc_file_close(f);
+
+        // Inflated `file_size` on a misaligned slice must be rejected cleanly.
+        static_buf.fill(0);
+        static_buf[1..1 + len].copy_from_slice(&rich);
+        write_u32(&mut static_buf[1..1 + len], 16, (len + 64) as u32);
+        assert!(abc_file_open(static_buf[1..1 + len].as_ptr(), len).is_null());
+        assert!(
+            abc_file_open_zeropadded(static_buf[1..1 + padded_len].as_ptr(), padded_len).is_null()
+        );
+
+        // Nonzero byte in trailing 16-byte padding on a misaligned slice fails.
+        static_buf.fill(0);
+        static_buf[1..1 + len].copy_from_slice(&rich);
+        static_buf[1 + len + 15] = 1;
+        assert!(
+            abc_file_open_zeropadded(static_buf[1..1 + padded_len].as_ptr(), padded_len).is_null()
+        );
+
+        // 3. `abc_file_open_zeropadded` across misaligned (`shift = 1` with
+        // `addr % 4 != 0`, `shift = 4` with `addr % 8 != 0`) and 8-byte-aligned
+        // (`shift = 0`, zero-copy borrow) slices, exercising header, class/proto
+        // index spans, and debug-info `BitMemoryRegion` reads.
+        for shift in [1usize, 4, 0] {
+            aligned_buf.fill(0);
+            aligned_buf[shift..shift + len].copy_from_slice(&rich);
+            let slice = &aligned_buf[shift..shift + padded_len];
+            if shift == 1 {
+                assert_ne!(slice.as_ptr() as usize % 4, 0);
+            } else if shift == 4 {
+                assert_ne!(slice.as_ptr() as usize % 8, 0);
+            } else {
+                assert_eq!(slice.as_ptr() as usize % 8, 0);
+            }
+
+            let h = abc_file_open_zeropadded(slice.as_ptr(), padded_len);
+            assert!(
+                !h.is_null(),
+                "zeropadded open at shift={shift} must succeed"
+            );
+            assert_eq!(abc_file_size(h), len as u32);
+            assert_eq!(abc_file_validate_checksum(h), 1);
+            let cls_off = abc_file_get_class_id(h, c"L_GLOBAL;".as_ptr());
+            assert_ne!(cls_off, u32::MAX);
+            let (methods, fields) = class_members(h, cls_off);
+            assert_eq!(methods.len(), 1);
+            assert_eq!(fields.len(), 1);
+
+            let ma = abc_method_open(h, methods[0]);
+            assert!(!ma.is_null());
+            let proto_off = abc_method_get_proto_id(ma);
+            abc_method_close(ma);
+            let pa = abc_proto_open(h, proto_off);
+            assert!(!pa.is_null());
+            assert_eq!(abc_proto_num_args(pa), 1);
+            abc_proto_close(pa);
+
+            let dbg = abc_debug_info_open(h);
+            assert!(!dbg.is_null());
+            let src = abc_debug_get_source_file(dbg, methods[0]);
+            assert!(!src.is_null());
+            assert_eq!(std::ffi::CStr::from_ptr(src).to_bytes(), b"m.js");
+            abc_debug_info_close(dbg);
+
+            abc_file_close(h);
+        }
+    }
+}
+
+/// Concurrent multi-threaded stress test (8 threads x 64 iterations) exercising
+/// `g_builder_version_mutex` across `abc_builder_new`, `abc_builder_set_api`,
+/// `abc_builder_create_proto`, `abc_builder_deduplicate`, `abc_builder_finalize`,
+/// and `abc_builder_free` (Issue #40).
+#[test]
+fn builder_concurrent_api_version_stress() {
+    const THREADS: usize = 8;
+    const ITERS: usize = 64;
+
+    // Include both short ("beta1"/"beta2"/"") and >23-byte non-SSO `sub_api`
+    // strings across API 11 / 12 / 16 so concurrent `GetSubApi` / `SetSubApi`
+    // copies and assignments exercise heap-backed `std::string` buffers too.
+    const POLICIES: &[(u8, &std::ffi::CStr, [u8; 4])] = &[
+        (
+            11,
+            c"sub_api_v11_heap_allocated_tag_alpha_0001",
+            [11, 0, 2, 0],
+        ),
+        (12, c"beta1", [12, 0, 2, 0]),
+        (
+            16,
+            c"sub_api_v16_heap_allocated_tag_omega_0002",
+            [12, 0, 6, 0],
+        ),
+        (12, c"beta2", [12, 0, 2, 0]),
+        (11, c"", [11, 0, 2, 0]),
+        (
+            12,
+            c"sub_api_v12_release_heap_allocated_0003",
+            [12, 0, 6, 0],
+        ),
+    ];
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+    let mut handles = Vec::with_capacity(THREADS);
+
+    for tid in 0..THREADS {
+        let barrier = std::sync::Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            for iter in 0..ITERS {
+                let (api, sub_api, expected_ver) = POLICIES[(tid + iter) % POLICIES.len()];
+                unsafe {
+                    let b = abc_builder_new();
+                    assert!(!b.is_null());
+                    abc_builder_set_api(b, api, sub_api.as_ptr());
+
+                    let cls = abc_builder_add_global_class(b);
+                    assert_ne!(cls, u32::MAX);
+                    let arg_tys = [Type_TypeId_I32, Type_TypeId_TAGGED];
+                    let proto = abc_builder_create_proto(
+                        b,
+                        Type_TypeId_TAGGED,
+                        arg_tys.as_ptr(),
+                        arg_tys.len() as u32,
+                    );
+                    assert_ne!(proto, u32::MAX);
+
+                    let code: [u8; 1] = [0x65]; // returnundefined
+                    let m = abc_builder_class_add_method_with_proto(
+                        b,
+                        cls,
+                        c"func_main_0".as_ptr(),
+                        proto,
+                        AbcAccessFlags_ABC_ACC_PUBLIC,
+                        code.as_ptr(),
+                        code.len() as u32,
+                        1,
+                        2,
+                    );
+                    assert_ne!(m, u32::MAX);
+
+                    let lnp = abc_builder_create_lnp(b);
+                    let dbg = abc_builder_create_debug_info(b, lnp, 1);
+                    let src = abc_builder_add_string(b, c"stress.js".as_ptr());
+                    abc_builder_lnp_emit_set_file(b, lnp, dbg, src);
+                    abc_builder_lnp_emit_end(b, lnp);
+                    abc_builder_method_set_debug_info(b, m, dbg);
+
+                    abc_builder_deduplicate(b);
+
+                    let mut out_len = 0u32;
+                    let ptr = abc_builder_finalize(b, &mut out_len);
+                    assert!(
+                        !ptr.is_null(),
+                        "concurrent finalize failed at ({tid}, {iter})"
+                    );
+                    let bytes = std::slice::from_raw_parts(ptr, out_len as usize);
+                    assert_eq!(
+                        &bytes[12..16],
+                        &expected_ver,
+                        "API version leak across concurrent builders at ({tid}, {iter})"
+                    );
+
+                    let f = abc_file_open(bytes.as_ptr(), bytes.len());
+                    assert!(!f.is_null());
+                    assert_eq!(abc_file_validate_checksum(f), 1);
+                    abc_file_close(f);
+
+                    abc_builder_free(b);
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("stress worker panicked");
+    }
+}

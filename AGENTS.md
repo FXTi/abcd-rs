@@ -25,7 +25,7 @@ For binding architectural rules and historical design rulings, read:
 | **Semantic SSA IR** | `abcd-ir` | *(none — zero internal workspace dependencies)* |
 | **IR Passes & Analysis** | `abcd-opt`, `abcd-analysis`, `abcd-taint`, `abcd-decompile` | `abcd-opt`, `abcd-analysis` → `abcd-ir`; `abcd-taint`, `abcd-decompile` → `abcd-ir`, `abcd-analysis` |
 | **Format Converters** | `abcd-lift`, `abcd-lower` | `abcd-lift` → `abcd-file`, `abcd-ir`, `abcd-isa`; `abcd-lower` → `abcd-ir`, `abcd-analysis`, `abcd-file`, `abcd-isa` |
-| **CLI & Integration** | `abcd-cli`, root `abcd-rs` (`tests/*`), `fuzz` | Top-level consumers; `abcd-cli` is the **only** crate permitted to set `#[global_allocator]` |
+| **CLI & Integration** | `abcd-cli`, root `abcd-rs` (`tests/*`) | Top-level consumers; `abcd-cli` is the **only** crate permitted to set `#[global_allocator]` |
 
 ### Multi-Agent Coordination Rule
 - **Sub-crate threads** own code, unit/integration tests, and `README.md` strictly inside their assigned crate directory (`abcd-<name>/**`). Sub-crate threads must **never** run mutating `git` commands (`commit`, `checkout`, `restore`, `clean`, `push`).
@@ -47,7 +47,7 @@ For binding architectural rules and historical design rulings, read:
 
 ## 4. Local Verification & CI Policy
 
-- **Absolute Ban on Local Docker / OrbStack**: Never invoke `docker` or `orbctl` on the local developer machine. Cross-OS builds, 32-bit targets, AddressSanitizer, coverage, and Docker-backed `ark_js_vm` / `es2abc` oracle comparisons run exclusively on GitHub Actions CI (`26` jobs).
+- **Absolute Ban on Local Docker / OrbStack**: Never invoke `docker` or `orbctl` on the local developer machine. Cross-OS builds, 32-bit targets, `ASan` / `UBSan` / `TSan` sanitizers, coverage, and Docker-backed `ark_js_vm` / `es2abc` oracle comparisons run exclusively on GitHub Actions CI (`28` jobs).
 - **Standard Local Gate Runner**:
   ```sh
   ./scripts/test-local.sh quick    # fmt + clippy + fast unit tests (<5s incremental)

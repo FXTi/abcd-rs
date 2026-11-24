@@ -88,7 +88,7 @@ This document establishes the binding architectural, algorithmic, safety, and te
 
 1. **Local vs. CI Responsibility Split**:
    - **Local hosts never run OrbStack or Docker.** Developers and agents run `./scripts/test-local.sh {quick|full|corpus|all}` natively.
-   - **GitHub Actions CI (`26` jobs)** owns the 6-OS 64-bit matrix, 3-target 32-bit matrix (including QEMU `armv7`), nightly AddressSanitizer (Rust + C++), `llvm-cov` coverage, `cargo-deny`, `fuzz` compile check, and all Docker-backed `ark_js_vm` / `es2abc` / Node execution gates.
+   - **GitHub Actions CI (`28` jobs)** owns the 6-OS 64-bit matrix, 3-target 32-bit matrix (including QEMU `armv7`), full-surface `ASan` / `UBSan` / `TSan` sanitizer gates (Rust + C++), `llvm-cov` coverage, `cargo-deny`, and all Docker-backed `ark_js_vm` / `es2abc` / Node execution gates.
    - Cross-platform CI lanes compile and test the entire workspace (`cargo test --workspace`), ensuring `abcd-cli` and `mimalloc` stay green across Linux, macOS, Windows MSVC/ARM64, and 32-bit targets.
 2. **Self-Cleaning Divergence Ledgers**:
    - Every ledger under `scripts/*-divergences.json` enforces **two-way assertions**: an unlisted failure breaks CI, and a listed entry that starts passing **also** breaks CI until removed from the ledger.

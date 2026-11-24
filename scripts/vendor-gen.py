@@ -756,8 +756,11 @@ def generate_c_bridge_bindings(
             out_lines.append("}")
             continue
 
-        # Case 3: `enum Name { A, B, ... }`
-        m_enum = re.fullmatch(r"enum ([A-Za-z_][A-Za-z0-9_]*)\s*\{(.*)\}", norm)
+        # Case 3: `enum Name (: unsigned int)? { A, B, ... }`
+        m_enum = re.fullmatch(
+            r"enum ([A-Za-z_][A-Za-z0-9_]*)(?:\s*:\s*unsigned int)?\s*\{(.*)\}",
+            norm,
+        )
         if m_enum:
             ename, ebody = m_enum.group(1), m_enum.group(2)
             if not ename.startswith(ty_pref):

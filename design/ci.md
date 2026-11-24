@@ -1,6 +1,6 @@
 # Continuous Integration & Verification Architecture
 
-`abcd-rs` combines fast, zero-container local verification (`scripts/test-local.sh`) with a **`26`-job GitHub Actions CI pipeline** (`.github/workflows/ci.yml`) covering cross-platform compatibility, memory safety, code coverage, and full-corpus `ark_js_vm` / `es2abc` behavioral oracles.
+`abcd-rs` combines fast, zero-container local verification (`scripts/test-local.sh`) with a **`28`-job GitHub Actions CI pipeline** (`.github/workflows/ci.yml`) covering cross-platform compatibility, full-surface memory/UB/concurrency sanitizers, code coverage, and full-corpus `ark_js_vm` / `es2abc` behavioral oracles.
 
 ---
 
@@ -10,18 +10,18 @@ Local development **never** requires or invokes Docker / OrbStack:
 
 | Mode | Command | What Runs |
 | :--- | :--- | :--- |
-| **Quick** | `./scripts/test-local.sh quick` | `cargo fmt --check`, `cargo clippy --workspace --lib --bins`, and fast workspace unit tests (`< 5s` incremental) |
-| **Full (L1)** | `./scripts/test-local.sh full` | `fmt`, `clippy --all-targets`, `cargo doc -D warnings`, `vendor-gen.py verify`, `fuzz` compile check, and all synthetic workspace tests (`< 15s`) |
+| **Quick** | `./scripts/test-local.sh quick` | `cargo fmt --check`, `cargo clippy --workspace --all-targets`, and fast workspace unit tests (`< 5s` incremental) |
+| **Full (L1)** | `./scripts/test-local.sh full` | `fmt`, `clippy --all-targets`, `cargo doc -D warnings`, `vendor-gen.py verify`, and all synthetic workspace tests (`< 15s`) |
 | **Corpus (L2)** | `./scripts/test-local.sh corpus` | Host-native `#[ignore]` corpus suites (`file-isa`, `hap-file`, `file-lift`, `lift-analysis`, `lift-taint`, `lift-decompile` offline gates) whenever `exports/` or `modules.abc` are present on disk |
 | **All** | `./scripts/test-local.sh all` | `full` + `corpus` |
 
 ---
 
-## 2. The `26`-Job GitHub Actions Pipeline
+## 2. The `28`-Job GitHub Actions Pipeline
 
 ### Tier 1 — Fast Static Front Gates (`5` jobs)
 1. **`fmt`**: `cargo fmt --all -- --check`
-2. **`clippy`**: `cargo clippy --workspace --all-targets -- -D warnings` + `cargo check --manifest-path fuzz/Cargo.toml --bins`
+2. **`clippy`**: `cargo clippy --workspace --all-targets -- -D warnings`
 3. **`doc`**: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`
 4. **`deny`**: `cargo-deny` license & advisory audit
 5. **`vendor-verify`**: `python3 scripts/vendor-gen.py verify` (locks `vendor/UPSTREAM.toml` SHA-256s + pre-generated ISA/FFI/enum bindings)
@@ -41,8 +41,8 @@ Driven by the digest-pinned `ghcr.io/fxti/arkcompiler-test` image (`5,517` compi
 - **`lift-analysis` & `lift-taint`**: Dominator agreement, Rung-2 PTA call-graph determinism, compiled ground-truth taint probes, and OHOS taint probes.
 - **`lift-decompile` & `test262-dream`**: `1,149/1,149` corpus dream gate + Node async/generator/yield* runtime gates, and `2,676/2,685` `test262` `decompile → es2abc → ark_js_vm` dream gate.
 
-### Tier 4 — Sanitizers & Coverage (`2` jobs)
-- **`asan`**: Nightly Rust + C++ bridge AddressSanitizer (`-Zsanitizer=address` + `-fsanitize=address`) over corpus compute suites (zero stack-size workarounds).
+### Tier 4 — Full-Surface Sanitizers & Coverage (`4` jobs)
+- **`asan` / `ubsan` / `tsan`**: Three symmetric nightly Clang + Rust `-Zbuild-std` sanitizer gates (**AddressSanitizer**, **UndefinedBehaviorSanitizer** + `-Zub-checks=yes`, and **ThreadSanitizer**) instrumenting and executing **the exact same workspace + corpus-compute code surface** (`cargo test --workspace --lib --tests` + `file-isa`, `file-lift`, `hap-file`, `lift-lower`—zero stack-size workarounds).
 - **`coverage`**: `cargo llvm-cov` workspace + C++ bridge instrumentation (`clang++-23`).
 
 ---

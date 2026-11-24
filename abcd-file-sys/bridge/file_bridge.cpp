@@ -24,6 +24,7 @@
 #include "utils/leb128.h"
 #include "utils/const_value.h"  // ark:: vendor name constants (V-I1 pins)
 
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -311,13 +312,14 @@ PandaFileType GetFileType(const uint8_t *data, int32_t size) {
         return PandaFileType::FILE_FORMAT_INVALID;
     }
 
-    auto *header = reinterpret_cast<const File::Header *>(data);
+    File::Header header{};
+    std::memcpy(&header, data, sizeof(header));
     uint32_t actual_size = static_cast<uint32_t>(size);
-    if (actual_size != header->file_size) {
+    if (actual_size != header.file_size) {
         return PandaFileType::FILE_FORMAT_INVALID;
     }
 
-    if (File::MAGIC != header->magic) {
+    if (File::MAGIC != header.magic) {
         return PandaFileType::FILE_FORMAT_INVALID;
     }
 
@@ -325,7 +327,7 @@ PandaFileType GetFileType(const uint8_t *data, int32_t size) {
     // FILE_TYPE_STATIC_FLAG / OLD_STATIC_VERSION markers; upstream now treats
     // exactly STATIC_VERSION {0,1,0,7} as the static-era marker
     // (libpandafile/file.cpp GetFileType at 4fba38e). Mirrors upstream.
-    if (header->version == File::STATIC_VERSION) {
+    if (header.version == File::STATIC_VERSION) {
         return PandaFileType::FILE_STATIC;
     }
     return PandaFileType::FILE_DYNAMIC;
@@ -437,7 +439,9 @@ try {
         g_open_error = "buffer too small for file header";
         return nullptr;
     }
-    if (std::memcmp(data, File::MAGIC.data(), File::MAGIC_SIZE) != 0) {
+    File::Header header{};
+    std::memcpy(&header, data, sizeof(header));
+    if (header.magic != File::MAGIC) {
         g_open_error = "bad magic";
         return nullptr;
     }
@@ -445,8 +449,7 @@ try {
     // allocating the padded copy. Vendor Spans are sized from file_size and
     // bounds-check only via ASSERT (compiled out under NDEBUG), so an
     // inflated file_size would turn later reads into heap OOB.
-    auto *header = reinterpret_cast<const File::Header *>(data);
-    if (header->file_size > len) {
+    if (header.file_size > len) {
         g_open_error = "declared file_size exceeds buffer";
         return nullptr;
     }
@@ -482,12 +485,13 @@ try {
         return nullptr;
     }
     const size_t orig_len = padded_len - PADDING;
-    if (std::memcmp(data, File::MAGIC.data(), File::MAGIC_SIZE) != 0) {
+    File::Header header{};
+    std::memcpy(&header, data, sizeof(header));
+    if (header.magic != File::MAGIC) {
         g_open_error = "bad magic";
         return nullptr;
     }
-    auto *header = reinterpret_cast<const File::Header *>(data);
-    if (header->file_size > orig_len) {
+    if (header.file_size > orig_len) {
         g_open_error = "declared file_size exceeds buffer";
         return nullptr;
     }
@@ -498,17 +502,28 @@ try {
         }
     }
     try {
-        // ConstBytePtr is MapPtr<std::byte, MapPtrType::CONST>: its constructor
-        // takes std::byte *, while Get() exposes only const std::byte * and a
-        // null deleter never mutates or frees the borrowed slice.
-        auto *bytes = const_cast<std::byte *>(reinterpret_cast<const std::byte *>(data));
+        // Vendor File casts internal spans to const File::Header * /
+        // const uint32_t * and BitMemoryRegion aligns down to uint64_t.
+        // Borrow directly only when `data` satisfies 8-byte alignment;
+        // otherwise copy into an owned aligned buffer.
+        std::vector<uint8_t> aligned_buf;
+        std::byte *bytes = nullptr;
+        if (reinterpret_cast<uintptr_t>(data) % alignof(uint64_t) != 0) {
+            aligned_buf.assign(data, data + padded_len);
+            bytes = reinterpret_cast<std::byte *>(aligned_buf.data());
+        } else {
+            // ConstBytePtr is MapPtr<std::byte, MapPtrType::CONST>: its constructor
+            // takes std::byte *, while Get() exposes only const std::byte * and a
+            // null deleter never mutates or frees the borrowed slice.
+            bytes = const_cast<std::byte *>(reinterpret_cast<const std::byte *>(data));
+        }
         panda::os::mem::ConstBytePtr ptr(bytes, orig_len, nullptr);
         auto file = File::OpenFromMemory(std::move(ptr));
         if (!file) {
             g_open_error = "OpenFromMemory failed";
             return nullptr;
         }
-        return new (std::nothrow) AbcFileHandle(std::vector<uint8_t>{}, std::move(file));
+        return new (std::nothrow) AbcFileHandle(std::move(aligned_buf), std::move(file));
     } catch (const std::exception &e) {
         g_open_error = e.what();
         return nullptr;
@@ -2205,6 +2220,9 @@ private:
 
 AbcBuilder *abc_builder_new(void) {
 try {
+    // ItemContainer's member LineNumberProgramIndexItem -> IndexItem reads
+    // ItemContainer::GetApi() / GetSubApi() during default construction.
+    std::lock_guard<std::mutex> lock(g_builder_version_mutex);
     return new (std::nothrow) AbcBuilder();
 } catch (...) {
     return nullptr;

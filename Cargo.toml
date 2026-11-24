@@ -10,7 +10,6 @@ publish = false
 
 [workspace]
 resolver = "2"
-exclude = ["fuzz"]
 members = [
     "abcd-isa-sys",
     "abcd-isa",
