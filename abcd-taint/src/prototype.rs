@@ -129,6 +129,8 @@ pub enum ProtoFamily {
     Bool,
     /// `GetIterator` results over builtin array/string iterables.
     Iterator,
+    /// `Promise` instances (`new Promise`, `Promise.resolve`, `async` calls, `@ohos.*` async APIs).
+    Promise,
 }
 
 impl ProtoFamily {
@@ -144,6 +146,7 @@ impl ProtoFamily {
             ProtoFamily::Num => "Number.prototype",
             ProtoFamily::Bool => "Boolean.prototype",
             ProtoFamily::Iterator => "Iterator.prototype",
+            ProtoFamily::Promise => "Promise.prototype",
         }
     }
 }
@@ -333,6 +336,9 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                     // that types the corpus' `r.test` receivers.
                     self.constructor_family(*callee, visiting, ans);
                 }
+                Some(Op::Call { callee, args, .. }) => {
+                    self.call_return_family(*callee, args, iid, visiting, ans);
+                }
                 Some(op) if family_of_alloc(op).is_some() => {
                     // Insert directly: values reached through a NESTED
                     // hop (global-store provenance, GetIterator's
@@ -391,6 +397,7 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                     Some("String") => Some(ProtoFamily::Str),
                     Some("Number") => Some(ProtoFamily::Num),
                     Some("Boolean") => Some(ProtoFamily::Bool),
+                    Some("Promise") => Some(ProtoFamily::Promise),
                     _ => None,
                 };
                 if let Some(f) = family {
@@ -398,6 +405,100 @@ impl<'o, 'm> PrototypeResolver<'o, 'm> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Infer `ProtoFamily::Promise` for `Promise.resolve`/`all`/`race`,
+    /// chained `.then`/`.catch`/`.finally`, calls to `async` functions, and
+    /// Promise-returning `@ohos.*` / `@kit.*` calls (when not passed a
+    /// trailing `(err, data)` callback).
+    fn call_return_family(
+        &self,
+        callee: ValueId,
+        args: &[ValueId],
+        at: InstId,
+        visiting: &mut HashSet<ValueId>,
+        ans: &mut FamilyAnswer,
+    ) {
+        ans.precise = false;
+        let cands = crate::names::callee_name_candidates(self.module, callee);
+        for c in &cands {
+            if matches!(
+                c.as_str(),
+                "Promise.resolve" | "Promise.reject" | "Promise.all" | "Promise.race"
+            ) {
+                ans.families.insert(ProtoFamily::Promise);
+                return;
+            }
+            // `@ohos.*` / `@kit.*` async calls return a Promise unless called in
+            // synchronous (`*Sync`) or trailing-callback form.
+            if (c.starts_with("@ohos.") || c.starts_with("@kit."))
+                && !c.ends_with("Sync")
+                && !c.ends_with("createHttp")
+                && !c.ends_with("getSystemPasteboard")
+            {
+                let has_cb_arg = args.last().is_some_and(|&last| {
+                    !crate::gap::resolve_callback_funcs(self.module, self.oracle, last, at)
+                        .is_empty()
+                });
+                if !has_cb_arg {
+                    ans.families.insert(ProtoFamily::Promise);
+                    return;
+                }
+            }
+        }
+        // Chained `.then` / `.catch` / `.finally` on a Promise receiver.
+        if let Some(ValueDef::Inst(ciid)) = self.module.value(callee).map(|v| v.def) {
+            match self.module.inst(ciid).map(|i| &i.op) {
+                Some(Op::LoadProp { object, name }) => {
+                    if matches!(
+                        self.module.sym.resolve(*name),
+                        Some("then" | "catch" | "finally")
+                    ) {
+                        let recv = self.compute(*object, ciid, visiting);
+                        if recv.families.contains(&ProtoFamily::Promise) {
+                            ans.families.insert(ProtoFamily::Promise);
+                        }
+                    }
+                }
+                Some(Op::DefineFunc { body, .. }) => {
+                    if self.module.func(*body).is_some_and(|fd| {
+                        matches!(
+                            fd.kind,
+                            abcd_ir::FunctionKind::Async | abcd_ir::FunctionKind::AsyncArrow
+                        )
+                    }) {
+                        ans.families.insert(ProtoFamily::Promise);
+                    }
+                }
+                Some(Op::AllocClosure { func }) => {
+                    if let Some(ValueDef::Inst(df_iid)) = self.module.value(*func).map(|v| v.def)
+                        && let Some(Op::DefineFunc { body, .. }) =
+                            self.module.inst(df_iid).map(|i| &i.op)
+                        && self.module.func(*body).is_some_and(|fd| {
+                            matches!(
+                                fd.kind,
+                                abcd_ir::FunctionKind::Async | abcd_ir::FunctionKind::AsyncArrow
+                            )
+                        })
+                    {
+                        ans.families.insert(ProtoFamily::Promise);
+                    }
+                }
+                Some(Op::LoadConst(cid)) => {
+                    if let Some(Const::MethodRef(f)) = self.module.consts.get(*cid)
+                        && self.module.func(*f).is_some_and(|fd| {
+                            matches!(
+                                fd.kind,
+                                abcd_ir::FunctionKind::Async | abcd_ir::FunctionKind::AsyncArrow
+                            )
+                        })
+                    {
+                        ans.families.insert(ProtoFamily::Promise);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

@@ -82,6 +82,7 @@ use super::heap::{AliasOracle, AllocSiteSet, SiteInfo, is_keyed_alloc, resolve_a
 use super::ifds::CallGraphOracle;
 use crate::callgraph::{CallGraph, CallTargets};
 use crate::frame::frame_slots_of;
+use crate::module_link::{ModuleLinkTable, ModuleSlotRef};
 
 /// Default interprocedural depth cap: the maximum number of call-result
 /// hops the context stack may hold. Generous for closure-heavy ArkTS
@@ -185,6 +186,13 @@ enum QueryTask {
         pending: VecDeque<ValueId>,
         acc: QueryAnswer,
     },
+    /// Cross-module `LoadModuleVar` / namespace accumulation: fold one
+    /// `(exporting FuncId, stored ValueId)` definition per resume.
+    ModuleHop {
+        key: QueryKey,
+        pending: VecDeque<(FuncId, ValueId)>,
+        acc: QueryAnswer,
+    },
     /// Call-result accumulation (`ctx` carries `call` until the frame
     /// completes): fold one callee-return answer per resume, then
     /// schedule the next `(callee, returned value)` hop.
@@ -227,6 +235,7 @@ enum Bind {
 pub struct Rung1AliasOracle<'m> {
     module: &'m Module,
     graph: &'m CallGraph,
+    links: ModuleLinkTable,
     max_depth: usize,
     /// Block → owning function.
     block_func: Vec<Option<FuncId>>,
@@ -299,9 +308,11 @@ impl<'m> Rung1AliasOracle<'m> {
                 *slot = block_func[b.index()];
             }
         }
+        let links = ModuleLinkTable::build(module);
         Rung1AliasOracle {
             module,
             graph,
+            links,
             max_depth,
             block_func,
             value_func,
@@ -404,6 +415,23 @@ impl<'m> Rung1AliasOracle<'m> {
                                 acc,
                             });
                             stack.push(QueryTask::Enter { value: v, func });
+                        }
+                        None => self.finish_query(key, acc, &mut results),
+                    }
+                }
+                QueryTask::ModuleHop {
+                    key,
+                    mut pending,
+                    mut acc,
+                } => {
+                    acc.union_with(&results.pop().expect("module hop answer"));
+                    match pending.pop_front() {
+                        Some((def_fn, def_val)) => {
+                            stack.push(QueryTask::ModuleHop { key, pending, acc });
+                            stack.push(QueryTask::Enter {
+                                value: def_val,
+                                func: def_fn,
+                            });
                         }
                         None => self.finish_query(key, acc, &mut results),
                     }
@@ -527,6 +555,57 @@ impl<'m> Rung1AliasOracle<'m> {
                     results,
                 ),
                 Some(Op::Call { .. }) => self.enter_call_result(key, iid, ctx, stack, results),
+                Some(Op::LoadModuleVar { index, kind }) => {
+                    let Some(cid) = self.links.func_class(func) else {
+                        return self.finish_query(key, QueryAnswer::unknown(), results);
+                    };
+                    let mut pending = VecDeque::new();
+                    let mut has_unknown = false;
+                    if kind.is_local() {
+                        if self.links.has_multi_record_esm() {
+                            let defs = self.links.stored_values(ModuleSlotRef {
+                                class_id: cid,
+                                slot: *index,
+                            });
+                            if defs.is_empty() {
+                                has_unknown = true;
+                            } else {
+                                pending.extend(defs.iter().copied());
+                            }
+                        } else {
+                            has_unknown = true;
+                        }
+                    } else if let Some(target) = self.links.external_load(cid, *index) {
+                        if target.unresolved_external || target.slots.is_empty() {
+                            has_unknown = true;
+                        }
+                        for &slot_ref in &target.slots {
+                            let defs = self.links.stored_values(slot_ref);
+                            if defs.is_empty() {
+                                has_unknown = true;
+                            } else {
+                                pending.extend(defs.iter().copied());
+                            }
+                        }
+                    } else {
+                        has_unknown = true;
+                    }
+                    match pending.pop_front() {
+                        Some((def_fn, def_val)) => {
+                            let acc = QueryAnswer {
+                                has_phi: !pending.is_empty(),
+                                has_unknown,
+                                ..QueryAnswer::default()
+                            };
+                            stack.push(QueryTask::ModuleHop { key, pending, acc });
+                            stack.push(QueryTask::Enter {
+                                value: def_val,
+                                func: def_fn,
+                            });
+                        }
+                        None => self.finish_query(key, QueryAnswer::unknown(), results),
+                    }
+                }
                 Some(_) => self.finish_query(key, QueryAnswer::unknown(), results),
                 None => self.finish_query(key, QueryAnswer::unknown(), results),
             },

@@ -22,3 +22,4 @@ mod common;
 mod corpus_callee_names;
 mod corpus_taint_smoke;
 mod probes;
+mod probes_ohos;

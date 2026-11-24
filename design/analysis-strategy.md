@@ -1,12 +1,15 @@
 # Analysis Strategy — IFDS Tabulation & the Rung 0–2 Pointer-Analysis Ladder
 
-> **Status: SHIPPED (`abcd-analysis` + `abcd-taint`, v2-P5a/P5b + t-P1..t-P6).**
+> **Status: SHIPPED (`abcd-analysis` + `abcd-taint`, v2-P5a/P5b + t-P1..t-P6 + #27).**
 > All three precision rungs specified here — Rung 0 alloc-site heap-v0, Rung 1
 > on-demand backward alias queries, and Rung 2 whole-module `k=1`
 > context-sensitive PTA with on-the-fly call-graph co-evolution and
 > lexical-environment identity — are implemented and active by default
 > (`alias_rung = 2`), alongside the summary registry, full callback-gap
-> propagator (`t-P4`), and receiver-prototype resolver (`t-P3`/`t-P5`). See
+> propagator (`t-P4`), receiver-prototype resolver (`t-P3`/`t-P5`), cross-module
+> ES `import`/`export` linker (`module_link`), OpenHarmony Stage/FA/ArkUI
+> lifecycle harness (`ohos_lifecycle`), and `@ohos.*`/`@kit.*` rule pack
+> (`abcd_taint::ohos`). See
 > [`abcd-analysis/README.md`](../abcd-analysis/README.md) and
 > [`abcd-taint/README.md`](../abcd-taint/README.md) for current module maps; the
 > architectural rationale and paradigm evaluation are preserved below.

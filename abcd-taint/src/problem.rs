@@ -40,12 +40,15 @@ use abcd_analysis::callgraph::CallGraph;
 use abcd_analysis::dataflow::heap::{AllocSiteSet, UpdateKind};
 use abcd_analysis::dataflow::heap::{FieldChain, FieldKey, update_kind};
 use abcd_analysis::dataflow::ifds::{CallGraphOracle, IfdsProblem};
-use abcd_ir::{CallKind, FuncId, InstId, Module, Op, Sym, ValueId};
+use abcd_analysis::module_link::ModuleLinkTable;
+use abcd_ir::{CallKind, ClassId, Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
 
 use crate::driver::{SourceSpec, TaintConfig};
 use crate::fact::{Fact, TaintBase, TaintFact};
 use crate::gap;
-use crate::names::{call_base_value, call_method_leaf, callee_name_candidates};
+use crate::names::{
+    call_base_value, call_method_leaf, callee_name_candidates_with_links, normalize_sdk_specifier,
+};
 use crate::oracle::Oracle;
 use crate::prototype::{FamilyAnswer, PrototypeResolver};
 use crate::summary::{CallbackGap, Endpoint, FallbackStep, SummaryRegistry};
@@ -114,14 +117,24 @@ fn param_binding(module: &Module, callee: FuncId) -> ParamBinding {
 pub struct TaintProblem<'m> {
     module: &'m Module,
     callgraph: &'m CallGraph,
+    links: ModuleLinkTable,
     oracle: RefCell<Oracle<'m>>,
     registry: &'m SummaryRegistry,
     config: &'m TaintConfig,
     /// `(func, param indices)` seeds, resolved from the config's
-    /// function-name source specs at construction.
+    /// function-name source specs and JSBridge proxy registrations at construction.
     param_seeds: Vec<(FuncId, Vec<ValueId>)>,
     /// Module-interned names whose `TryGetGlobal` results are sources.
     global_sources: HashSet<Sym>,
+    /// Call sites whose return values are tainted via `SourceSpec::CallReturn`.
+    call_return_sources: HashSet<InstId>,
+    /// Trailing `(err, data)` / `(data)` callback edges at `CallReturn` source sites.
+    source_cb_edges: BTreeMap<InstId, Vec<FuncId>>,
+    /// `(ClassId, ext_slot)` external imports tainted via `SourceSpec::ModuleImport`.
+    module_import_sources: HashSet<(ClassId, u32)>,
+    /// Async-machine `ResumeGenerator` instruction -> awaited `ValueId` from
+    /// preceding `AwaitUncaught` in the same block.
+    await_resume: HashMap<InstId, ValueId>,
     /// Per-site fallback-ladder classification (memo).
     site_class: RefCell<HashMap<InstId, SiteClass>>,
     /// Sites already counted (counters are per-site, not per-fact).
@@ -206,14 +219,107 @@ impl<'m> TaintProblem<'m> {
                 }
             }
         }
+        let links = ModuleLinkTable::build(module);
+        let mut module_import_sources = HashSet::new();
+        for spec in &config.sources {
+            if let SourceSpec::ModuleImport {
+                specifier,
+                import_name,
+            } = spec
+            {
+                let want_spec = normalize_sdk_specifier(specifier);
+                for ci in 0..module.classes.len() {
+                    let cid = ClassId::new(ci as u32);
+                    let mut ext_idx = 0u32;
+                    while let Some(target) = links.external_load(cid, ext_idx) {
+                        let matched = target.external_imports.iter().any(|&(s_sym, i_sym)| {
+                            let s_str = module.sym.resolve(s_sym).unwrap_or("");
+                            let i_str = module.sym.resolve(i_sym).unwrap_or("");
+                            (s_str == specifier || normalize_sdk_specifier(s_str) == want_spec)
+                                && import_name.as_deref().is_none_or(|w| w == i_str)
+                        });
+                        if matched {
+                            module_import_sources.insert((cid, ext_idx));
+                        }
+                        ext_idx += 1;
+                    }
+                }
+            }
+        }
+
+        let call_source_names: HashSet<&str> = config
+            .sources
+            .iter()
+            .filter_map(|s| match s {
+                SourceSpec::CallReturn { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let mut call_return_sources = HashSet::new();
+        let mut source_cb_edges: BTreeMap<InstId, Vec<FuncId>> = BTreeMap::new();
+        if !call_source_names.is_empty() || config.ohos_lifecycle {
+            for (call, edge) in callgraph.sites() {
+                let Some(inst) = module.inst(call) else {
+                    continue;
+                };
+                let Op::Call { callee, args, .. } = &inst.op else {
+                    continue;
+                };
+                let mut cands =
+                    callee_name_candidates_with_links(module, &links, edge.caller, *callee);
+                for f in callgraph.callees_of_call_at(call) {
+                    if let Some(fd) = module.func(*f)
+                        && let Some(n) = module.sym.resolve(fd.name)
+                        && !cands.iter().any(|x| x == n)
+                    {
+                        cands.push(n.to_owned());
+                    }
+                }
+                if !call_source_names.is_empty()
+                    && cands.iter().any(|c| call_source_names.contains(c.as_str()))
+                {
+                    call_return_sources.insert(call);
+                    if let Some(&last_arg) = args.last() {
+                        let cb_funcs = gap::resolve_callback_funcs(module, &oracle, last_arg, call);
+                        if !cb_funcs.is_empty() {
+                            source_cb_edges.insert(call, cb_funcs);
+                        }
+                    }
+                }
+                if config.ohos_lifecycle
+                    && cands
+                        .iter()
+                        .any(|c| c == "@ohos.web.webview.WebviewController.registerJavaScriptProxy")
+                    && let Some(&proxy_obj) = args.first()
+                {
+                    collect_jsbridge_seeds(
+                        module,
+                        &oracle,
+                        proxy_obj,
+                        args.get(2).copied(),
+                        call,
+                        &mut param_seeds,
+                    );
+                }
+            }
+        }
+
+        let await_resume = build_await_resume_map(module);
+
         let mut problem = TaintProblem {
             module,
             callgraph,
+            links,
             oracle: RefCell::new(oracle),
             registry,
             config,
             param_seeds,
             global_sources,
+            call_return_sources,
+            source_cb_edges: source_cb_edges.clone(),
+            module_import_sources,
+            await_resume,
             site_class: RefCell::new(HashMap::new()),
             counted: RefCell::new(HashSet::new()),
             applied: RefCell::new(Vec::new()),
@@ -224,11 +330,25 @@ impl<'m> TaintProblem<'m> {
             gap_unresolved: 0,
         };
         // The eager gap scan (t-P4, gap.rs): static edges, counter-free.
-        let (edges, resolved, unresolved) = problem.scan_gap_edges();
+        let (mut edges, resolved, unresolved) = problem.scan_gap_edges();
+        for (call, cb_funcs) in source_cb_edges {
+            let entry = edges.entry(call).or_default();
+            for f in cb_funcs {
+                if !entry.contains(&f) {
+                    entry.push(f);
+                }
+            }
+            entry.sort();
+        }
         problem.gap_edges = edges;
         problem.gap_resolved = resolved;
         problem.gap_unresolved = unresolved;
         problem
+    }
+
+    /// Borrow the cross-module linkage index.
+    pub fn links(&self) -> &ModuleLinkTable {
+        &self.links
     }
 
     /// The gap edges (t-P4 eager scan) — the driver layers them onto
@@ -269,11 +389,13 @@ impl<'m> TaintProblem<'m> {
             let Some(cb_gap) = &summary.callback else {
                 continue;
             };
-            if cb_gap.enter.is_empty() {
+            if cb_gap.enter.is_empty() && !cb_gap.spawn_always {
                 continue; // mini-gap only — nothing to spawn
             }
             let Some(&cbv) = args.get(cb_gap.param as usize) else {
-                unresolved += 1; // the callback argument is absent entirely
+                if !cb_gap.spawn_always {
+                    unresolved += 1; // the callback argument is absent entirely
+                }
                 continue;
             };
             let funcs = gap::resolve_callback_funcs(self.module, &self.oracle.borrow(), cbv, call);
@@ -284,11 +406,13 @@ impl<'m> TaintProblem<'m> {
                 // not a gap site at all — counting it as unresolved
                 // would dilute the honest-fallback counter with sites
                 // that have no user code to spawn into.
-                if !gap::definitely_not_callable(self.module, cbv) {
+                if !cb_gap.spawn_always && !gap::definitely_not_callable(self.module, cbv) {
                     unresolved += 1;
                 }
             } else {
-                resolved += 1;
+                if !cb_gap.spawn_always {
+                    resolved += 1;
+                }
                 edges.insert(call, funcs);
             }
         }
@@ -399,7 +523,12 @@ impl<'m> TaintProblem<'m> {
             return (SiteClass::UnknownKeep, Vec::new());
         };
         let argc = args.len();
-        let mut names = callee_name_candidates(self.module, *callee);
+        let caller = self
+            .links
+            .inst_func(self.module, call)
+            .unwrap_or(FuncId::new(0));
+        let mut names =
+            callee_name_candidates_with_links(self.module, &self.links, caller, *callee);
         // Resolved callees contribute their FunctionData names (directly
         // resolved internal functions named like a builtin match too).
         let callees = self.callgraph.callees_of_call_at(call);
@@ -732,25 +861,75 @@ impl<'m> TaintProblem<'m> {
         // rung-0 keying stands (empty-site unknown-base wildcard
         // included — sound by construction).
         if fact.base == TaintBase::Local(value) {
-            let injected = {
-                let oracle = self.oracle.borrow();
-                oracle.aliases_of_store(fact, object, key, at, self.cap())
-            };
-            if !injected.is_empty() {
-                out.extend(injected.into_iter().map(Fact::of));
-            } else {
-                let sites = self.oracle.borrow().resolve(object).sites;
-                let mut chain = FieldChain::new().pushed(key, self.cap());
-                for &k in fact.fields.elements() {
-                    chain = chain.pushed(k, self.cap());
-                }
+            let mut chain = FieldChain::new().pushed(key, self.cap());
+            for &k in fact.fields.elements() {
+                chain = chain.pushed(k, self.cap());
+            }
+            if let Some(this_param) = self.new_ctor_this_param(object, at) {
+                // Keep constructor `this.field = v` local to `this_param`
+                // until `return_flow` binds it to the specific `CallKind::New`
+                // call site via IFDS's context-sensitive summary replay.
                 out.push(Fact::of(TaintFact {
-                    base: TaintBase::Heap(sites),
+                    base: TaintBase::Local(this_param),
                     fields: chain,
                 }));
+            } else {
+                let injected = {
+                    let oracle = self.oracle.borrow();
+                    oracle.aliases_of_store(fact, object, key, at, self.cap())
+                };
+                if !injected.is_empty() {
+                    out.extend(injected.into_iter().map(Fact::of));
+                } else {
+                    let sites = self.oracle.borrow().resolve(object).sites;
+                    out.push(Fact::of(TaintFact {
+                        base: TaintBase::Heap(sites),
+                        fields: chain,
+                    }));
+                }
             }
         }
         survive
+    }
+
+    /// When `at` is inside a `FunctionKind::Constructor` whose recorded callers
+    /// are all `CallKind::New`, return its `this` parameter `ValueId` if
+    /// `object` is that `this` parameter.
+    fn new_ctor_this_param(&self, object: ValueId, at: InstId) -> Option<ValueId> {
+        let fid = self.links.inst_func(self.module, at)?;
+        let this_param = self.ctor_this_of(fid)?;
+        if object != this_param {
+            return None;
+        }
+        let callers = self.callgraph.callers_of(fid);
+        if callers.is_empty() {
+            return None;
+        }
+        let all_new = callers.iter().all(|&c| {
+            matches!(
+                self.module.inst(c).map(|i| &i.op),
+                Some(Op::Call {
+                    kind: CallKind::New,
+                    ..
+                })
+            )
+        });
+        all_new.then_some(this_param)
+    }
+
+    fn ctor_this_of(&self, fid: FuncId) -> Option<ValueId> {
+        let fd = self.module.func(fid)?;
+        if fd.kind != abcd_ir::FunctionKind::Constructor {
+            return None;
+        }
+        let ParamBinding::Precise {
+            this_slot: Some(slot),
+            ..
+        } = param_binding(self.module, fid)
+        else {
+            return None;
+        };
+        fd.params.get(slot).copied()
     }
 
     /// The generic operand→result rule (Mov/binop/unop/compare/
@@ -1073,6 +1252,23 @@ impl IfdsProblem for TaintProblem<'_> {
             && let Some(result) = curr_inst.result
         {
             out.push(Fact::of(TaintFact::local(result)));
+            if self.config.ohos_lifecycle
+                && module.sym.resolve(*name)
+                    == Some(abcd_analysis::ohos_lifecycle::OHOS_WANT_GLOBAL)
+            {
+                let d1 = TaintFact::local(result).pushed(FieldKey::AnyDynamic, self.cap());
+                let d2 = d1.pushed(FieldKey::AnyDynamic, self.cap());
+                out.push(Fact::of(d1));
+                out.push(Fact::of(d2));
+            }
+        }
+        if let Op::LoadModuleVar { index, kind } = &curr_inst.op
+            && !kind.is_local()
+            && let Some(cid) = self.links.inst_class(module, curr)
+            && self.module_import_sources.contains(&(cid, *index))
+            && let Some(result) = curr_inst.result
+        {
+            out.push(Fact::of(TaintFact::local(result)));
         }
 
         let Fact::Taint(fact) = source else { return };
@@ -1129,19 +1325,35 @@ impl IfdsProblem for TaintProblem<'_> {
                 }
                 out.push(source.clone());
             }
-            // ── Module variables ─────────────────────────────────────
+            // ── Module variables (per-record + cross-module ES linking) ──
             Op::LoadModuleVar { index, kind } => {
-                if kind.is_local()
-                    && fact.base == TaintBase::ModuleVar(*index)
-                    && let Some(result) = curr_inst.result
-                {
-                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                let cid = self
+                    .links
+                    .inst_class(module, curr)
+                    .unwrap_or(ClassId::new(0));
+                if let Some(result) = curr_inst.result {
+                    if kind.is_local() {
+                        if fact.base == TaintBase::ModuleVar(cid, *index) {
+                            out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                        }
+                    } else if let Some(target) = self.links.external_load(cid, *index)
+                        && target
+                            .slots
+                            .iter()
+                            .any(|sr| fact.base == TaintBase::ModuleVar(sr.class_id, sr.slot))
+                    {
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                    }
                 }
                 out.push(source.clone());
             }
             Op::StoreModuleVar { index, value } => {
+                let cid = self
+                    .links
+                    .inst_class(module, curr)
+                    .unwrap_or(ClassId::new(0));
                 if fact.base == TaintBase::Local(*value) {
-                    out.push(Fact::of(fact.rebased(TaintBase::ModuleVar(*index))));
+                    out.push(Fact::of(fact.rebased(TaintBase::ModuleVar(cid, *index))));
                 }
                 out.push(source.clone());
             }
@@ -1238,9 +1450,19 @@ impl IfdsProblem for TaintProblem<'_> {
                 self.generic_propagate(curr_inst, fact, out);
                 out.push(source.clone());
             }
-            // ── Loads (access-path cut) ──────────────────────────────
+            // ── Loads (access-path cut + namespace export lookup) ────
             Op::LoadProp { object, name } => {
                 self.load_rule(fact, *object, FieldKey::Named(*name), curr, out);
+                if let Some(result) = curr_inst.result
+                    && let Some(cid) = self.links.inst_class(module, curr)
+                    && let Some(req_idx) = peel_ns_index(module, *object)
+                    && let Some(slots) = self.links.resolve_namespace_member(cid, req_idx, *name)
+                    && slots
+                        .iter()
+                        .any(|sr| fact.base == TaintBase::ModuleVar(sr.class_id, sr.slot))
+                {
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                }
                 out.push(source.clone());
             }
             Op::LoadPropIdx { object, .. } => {
@@ -1342,6 +1564,16 @@ impl IfdsProblem for TaintProblem<'_> {
                 }
                 out.push(source.clone());
             }
+            Op::ResumeGenerator { .. } => {
+                if let Some(&awaited_val) = self.await_resume.get(&curr)
+                    && fact.base == TaintBase::Local(awaited_val)
+                    && let Some(result) = curr_inst.result
+                {
+                    out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                }
+                self.generic_propagate(curr_inst, fact, out);
+                out.push(source.clone());
+            }
             // ── Everything else: the generic operand→result rule ─────
             _ => {
                 self.generic_propagate(curr_inst, fact, out);
@@ -1358,6 +1590,37 @@ impl IfdsProblem for TaintProblem<'_> {
         source: &Fact,
         out: &mut Vec<Fact>,
     ) {
+        let is_source_cb = self
+            .source_cb_edges
+            .get(&call)
+            .is_some_and(|fs| fs.contains(&callee));
+        if is_source_cb {
+            if matches!(source, Fact::Zero)
+                && let Some(fd) = module.func(callee)
+            {
+                match param_binding(module, callee) {
+                    ParamBinding::Precise { formal_base, .. } => {
+                        let formal_count = fd.params.len().saturating_sub(formal_base);
+                        let data_idx = if formal_count >= 2 { 1 } else { 0 };
+                        if let Some(&p) = fd.params.get(formal_base + data_idx) {
+                            out.push(Fact::of(TaintFact::local(p)));
+                        }
+                    }
+                    ParamBinding::OverApproxAll => {
+                        for &p in &fd.params {
+                            out.push(Fact::of(TaintFact::local(p)));
+                        }
+                    }
+                }
+                return;
+            }
+            if let Fact::Taint(fact) = source
+                && fact.is_state_base()
+            {
+                out.push(source.clone());
+            }
+            return;
+        }
         let gap = self.gap_at(call, callee);
         // Exclusive summaries kill the call edge into the callee body —
         // never merged (summaries.md §2.1). The GAP edge into the user
@@ -1559,6 +1822,30 @@ impl IfdsProblem for TaintProblem<'_> {
 
         match &exit_inst.op {
             Op::Return { value } => {
+                // Context-sensitive `CallKind::New` constructor `this.field`
+                // exit wiring: re-key `Local(this_param).fields` onto THIS
+                // specific `New` call site (`Heap({call})` + `Local(result)`).
+                if !fact.fields.is_empty()
+                    && self.ctor_this_of(callee) == Some(v)
+                    && let (Some(call), Some(rs)) = (call_site, return_site)
+                    && self.handler_exception_at(rs).is_none()
+                    && matches!(
+                        module.inst(call).map(|i| &i.op),
+                        Some(Op::Call {
+                            kind: CallKind::New,
+                            ..
+                        })
+                    )
+                {
+                    out.push(Fact::of(TaintFact {
+                        base: TaintBase::Heap(AllocSiteSet::one(call)),
+                        fields: fact.fields.clone(),
+                    }));
+                    if let Some(Some(result)) = module.inst(call).map(|i| i.result) {
+                        out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
+                    }
+                    return;
+                }
                 if value != &Some(v) {
                     return; // callee-local taint that is not returned dies here
                 }
@@ -1615,6 +1902,13 @@ impl IfdsProblem for TaintProblem<'_> {
         source: &Fact,
         out: &mut Vec<Fact>,
     ) {
+        let is_handler_site = self.handler_exception_at(return_site).is_some();
+        if self.call_return_sources.contains(&call)
+            && !is_handler_site
+            && let Some(result) = module.inst(call).and_then(|i| i.result)
+        {
+            out.push(Fact::of(TaintFact::local(result)));
+        }
         let Fact::Taint(fact) = source else { return };
         let Some(call_inst) = module.inst(call) else {
             return;
@@ -1624,7 +1918,6 @@ impl IfdsProblem for TaintProblem<'_> {
         };
         let operands = Self::call_operands(&call_inst.op);
         let on_operand = fact.local_base().is_some_and(|v| operands.contains(&v));
-        let is_handler_site = self.handler_exception_at(return_site).is_some();
 
         match self.classify(call) {
             SiteClass::Summary { name, exclusive } => {
@@ -1707,6 +2000,198 @@ impl IfdsProblem for TaintProblem<'_> {
                     out.push(Fact::of(fact.rebased(TaintBase::Local(result))));
                 }
             }
+        }
+    }
+}
+
+fn peel_ns_index(module: &Module, mut v: ValueId) -> Option<u32> {
+    for _ in 0..8 {
+        let ValueDef::Inst(iid) = module.value(v)?.def else {
+            return None;
+        };
+        match &module.inst(iid)?.op {
+            Op::Mov { src } => v = *src,
+            Op::GetModuleNamespace { index } => return Some(*index),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn build_await_resume_map(module: &Module) -> HashMap<InstId, ValueId> {
+    let mut out = HashMap::new();
+    for bb in &module.blocks {
+        let mut last_await: HashMap<ValueId, ValueId> = HashMap::new();
+        for &iid in &bb.insts {
+            let Some(inst) = module.inst(iid) else {
+                continue;
+            };
+            match &inst.op {
+                Op::AwaitUncaught { funcobj, value } => {
+                    last_await.insert(*funcobj, *value);
+                }
+                Op::ResumeGenerator { genobj } => {
+                    if let Some(&val) = last_await.get(genobj) {
+                        out.insert(iid, val);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// Discover methods exposed on `proxy_obj` via
+/// `WebviewController.registerJavaScriptProxy(proxy_obj, name, methodList)`
+/// and seed their formal parameters as untrusted JSBridge inputs.
+fn collect_jsbridge_seeds(
+    module: &Module,
+    oracle: &Oracle,
+    proxy_obj: ValueId,
+    method_list: Option<ValueId>,
+    at: InstId,
+    param_seeds: &mut Vec<(FuncId, Vec<ValueId>)>,
+) {
+    let allowed_names: Option<HashSet<String>> = method_list.and_then(|ml| {
+        let ValueDef::Inst(iid) = module.value(ml)?.def else {
+            return None;
+        };
+        let Op::AllocArray {
+            shape: Some(arr_cid),
+        } = &module.inst(iid)?.op
+        else {
+            return None;
+        };
+        let Const::ArrayLiteral(items) = module.consts.get(*arr_cid)? else {
+            return None;
+        };
+        let mut set = HashSet::new();
+        for it in items {
+            if let Const::String(s) = it
+                && let Some(txt) = module.sym.resolve(*s)
+            {
+                set.insert(txt.to_owned());
+            }
+        }
+        (!set.is_empty()).then_some(set)
+    });
+
+    let name_allowed = |mname: &str| -> bool {
+        !mname.is_empty()
+            && mname != "constructor"
+            && !mname.starts_with("#~@")
+            && allowed_names.as_ref().is_none_or(|s| s.contains(mname))
+    };
+
+    let mut candidate_funcs: Vec<FuncId> = Vec::new();
+    let mut sites: Vec<InstId> = oracle.may_sites_at(proxy_obj, at).iter().collect();
+    if let Some(ValueDef::Inst(def_iid)) = module.value(proxy_obj).map(|v| v.def)
+        && !sites.contains(&def_iid)
+    {
+        sites.push(def_iid);
+    }
+
+    for site in sites {
+        let Some(site_inst) = module.inst(site) else {
+            continue;
+        };
+        match &site_inst.op {
+            Op::AllocObject { shape } => {
+                if let Some(Const::ObjectLiteral { keys, values }) = module.consts.get(*shape) {
+                    for (k, v) in keys.iter().zip(values.iter()) {
+                        if let (Const::String(ks), Const::MethodRef(mfid)) = (k, v)
+                            && let Some(mname) = module.sym.resolve(*ks)
+                            && name_allowed(mname)
+                        {
+                            candidate_funcs.push(*mfid);
+                        }
+                    }
+                }
+                if let Some(obj_val) = site_inst.result {
+                    for inst in &module.insts {
+                        match &inst.op {
+                            Op::StoreProp {
+                                object,
+                                name,
+                                value,
+                            }
+                            | Op::StoreOwnPropName {
+                                object,
+                                name,
+                                value,
+                            } if *object == obj_val => {
+                                if let Some(mname) = module.sym.resolve(*name)
+                                    && name_allowed(mname)
+                                {
+                                    for f in gap::resolve_callback_funcs(module, oracle, *value, at)
+                                    {
+                                        candidate_funcs.push(f);
+                                    }
+                                }
+                            }
+                            Op::DefineMethod {
+                                object, name, func, ..
+                            } if *object == obj_val => {
+                                if let Some(mname) = module.sym.resolve(*name)
+                                    && name_allowed(mname)
+                                {
+                                    for f in gap::resolve_callback_funcs(module, oracle, *func, at)
+                                    {
+                                        candidate_funcs.push(f);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Op::Call {
+                callee,
+                kind: CallKind::New,
+                ..
+            } => {
+                if let Some(ValueDef::Inst(cls_iid)) = module.value(*callee).map(|v| v.def)
+                    && let Some(
+                        Op::DefineClass { members, .. } | Op::DefineSendableClass { members, .. },
+                    ) = module.inst(cls_iid).map(|i| &i.op)
+                    && let Some(Const::ArrayLiteral(items)) = module.consts.get(*members)
+                {
+                    let mut pending: Option<&str> = None;
+                    for it in items {
+                        match it {
+                            Const::String(s) => pending = module.sym.resolve(*s),
+                            Const::MethodRef(mfid) => {
+                                if let Some(mname) = pending.take()
+                                    && name_allowed(mname)
+                                {
+                                    candidate_funcs.push(*mfid);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    candidate_funcs.sort();
+    candidate_funcs.dedup();
+    for mfid in candidate_funcs {
+        let Some(fd) = module.func(mfid) else {
+            continue;
+        };
+        let formals: Vec<ValueId> = match param_binding(module, mfid) {
+            ParamBinding::Precise { formal_base, .. } => {
+                fd.params.iter().skip(formal_base).copied().collect()
+            }
+            ParamBinding::OverApproxAll => fd.params.clone(),
+        };
+        if !formals.is_empty() {
+            param_seeds.push((mfid, formals));
         }
     }
 }

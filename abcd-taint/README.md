@@ -20,8 +20,8 @@ default k=5, configurable). Bases:
 | `Local(ValueId)` | an SSA value (T1: the value *is* the key) | function-local: dies at returns unless mapped |
 | `Heap(AllocSiteSet)` | objects by allocation site (rung-0 heap key) | global: crosses calls/returns/phis unchanged |
 | `Global(Sym)` | a named global binding | global, **never killed** (mutable across scripts) |
-| `ModuleVar(u32)` | a module-variable slot | global |
-| `LexVar(level, slot)` | a lexical-env slot, function-agnostic (closure bodies read outer slots at shifted levels) | global, cross-function merge is a documented over-approximation |
+| `ModuleVar(ClassId, u32)` | a per-record module-variable slot `(record ClassId, local_slot)` linked across ES imports/exports via `abcd_analysis::module_link::ModuleLinkTable` | global |
+| `LexVar(level, slot)` | a lexical-env slot, function-agnostic (closure bodies read outer slots at shifted levels; refined at rung 2 via `NewLexEnv` site identity) | global, cross-function merge is a documented over-approximation |
 
 Weak updates are the default (monotone set union); a store **strong-kills** a
 matching heap/local-field fact only when `update_kind == Strong` (base provably
@@ -268,11 +268,20 @@ iterator value (the one builtin op whose element channel is static).
 ## Sources, sinks, driver, report
 
 ```rust
-SourceSpec::FunctionParams { name, params }  // e.g. all params of func_main_0
-SourceSpec::GlobalLoad { name }              // every TryGetGlobal(name) result
-SinkSpec::Call { name }                      // name-matched call sites
+SourceSpec::FunctionParams { name, params }          // e.g. all params of func_main_0
+SourceSpec::GlobalLoad { name }                      // every TryGetGlobal(name) result
+SourceSpec::CallReturn { name }                      // return value + trailing (err, data) callback
+SourceSpec::ModuleImport { specifier, import_name }  // ES module binding import
+SinkSpec::Call { name }                              // name-matched call sites
+let config = abcd_taint::ohos_preset();              // or custom TaintConfig
 let report = abcd_taint::run_taint(&module, &config);
 ```
+
+### Cross-module ES linking & OpenHarmony (`ohos`) rule pack (#27)
+
+- **Cross-module propagation (`ModuleLinkTable`)**: `StoreModuleVar` facts key per `(ClassId, local_slot)`; external `LoadModuleVar` and `GetModuleNamespace` property reads resolve across direct, `export { x as y } from`, and cycle-guarded `export *` chains in `--merge-abc` bundles (and across `.hap`/`.hsp` containers merged via `abcd_analysis::module_link::merge_ir_modules` / `abcd taint --all --link-modules`).
+- **Stage/FA & ArkUI lifecycle harness (`TaintConfig::ohos_lifecycle`)**: synthesizes `__abcd_ohos_harness__` (via `abcd_analysis::ohos_lifecycle`) on multi-record or OpenHarmony component modules, executing `func_main_0` initializers in topological dependency order, allocating distinct concrete `AllocObject` `this` receivers per `UIAbility`/`*ExtensionAbility`/`ViewPU` class, wiring `this.context` (`UIAbilityContext`), and passing tainted `Want` (`__ohos_want__`) into Ability/Extension hooks.
+- **`@ohos.*` & `@kit.*` rule pack (`abcd_taint::ohos`)**: `ohos_preset()` / `abcd taint --preset ohos` provides curated sources (`Want`, `@ohos.geoLocationManager`, `@ohos.pasteboard`, `@ohos.identifier.oaid`, `@ohos.telephony.*`, `@ohos.contact`, `@ohos.data.preferences`, `@ohos.data.relationalStore`, `@ohos.deviceInfo`, and WebView `registerJavaScriptProxy` JSBridge whitelists), sinks (`@ohos.net.http`, `@ohos.net.socket`, `@ohos.web.webview`, `@ohos.file.fs`, `UIAbilityContext.startAbility*`, `RdbStore.executeSql`, `@ohos.hilog.*`), `@kit.*` → `@ohos.*` canonical alias mapping, two-step factory/constructor receiver typing, and async `Promise.then` / `AwaitUncaught`→`ResumeGenerator` / `(err, data)` callback support. Ground-truth precision probes live in `tests/lift-taint/probes_ohos.rs`.
 
 The driver builds the on-the-fly call graph + the rung-selected alias
 oracle (`TaintConfig::alias_rung`: 2 = the whole-module PTA, default, bounded by `TaintConfig::pta_step_budget`;

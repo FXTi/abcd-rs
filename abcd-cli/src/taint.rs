@@ -160,6 +160,22 @@ pub fn load_config(path: &Path) -> Result<TaintConfig, CliError> {
         .map_err(|e| CliError::User(format!("{}: {e}", path.display())))
 }
 
+/// Build an effective [`TaintConfig`] from optional `--config` TOML and/or
+/// `--preset` flags.
+pub fn resolve_config(
+    config_path: Option<&Path>,
+    preset: Option<&str>,
+) -> Result<TaintConfig, CliError> {
+    let mut cfg = match config_path {
+        Some(p) => load_config(p)?,
+        None => TaintConfig::default(),
+    };
+    if let Some(name) = preset {
+        crate::taint_config::apply_preset_by_name(&mut cfg, name)?;
+    }
+    Ok(cfg)
+}
+
 /// Decode, lift, and run the taint analysis over one module.
 pub fn report(module: &InputModule, config: &TaintConfig) -> Result<TaintCliReport, CliError> {
     let file = abcd_file::decode(&module.abc).map_err(|e| {
@@ -174,8 +190,64 @@ pub fn report(module: &InputModule, config: &TaintConfig) -> Result<TaintCliRepo
             module.name, module.provenance
         ))
     })?;
-    let report = abcd_taint::run_taint(&ir, config);
-    Ok(build_report(module, config, &ir, &report))
+    let mut run_cfg = config.clone();
+    if run_cfg.manifest_json.is_none()
+        && let Some(mj) = &module.module_json
+        && let Ok(txt) = std::str::from_utf8(mj)
+    {
+        run_cfg.manifest_json = Some(txt.to_owned());
+    }
+    let report = abcd_taint::run_taint(&ir, &run_cfg);
+    Ok(build_report(module, &run_cfg, &ir, &report))
+}
+
+/// Decode, lift, link all `modules` into one unified [`Module`] via
+/// [`abcd_analysis::module_link::merge_ir_modules`], and run whole-application
+/// cross-module taint analysis.
+pub fn report_linked(
+    modules: &[InputModule],
+    config: &TaintConfig,
+) -> Result<TaintCliReport, CliError> {
+    if modules.len() == 1 {
+        return report(&modules[0], config);
+    }
+    let mut lifted: Vec<(String, Module)> = Vec::with_capacity(modules.len());
+    let mut manifests = Vec::new();
+    let mut names = Vec::with_capacity(modules.len());
+    let mut provs = Vec::with_capacity(modules.len());
+    for m in modules {
+        let file = abcd_file::decode(&m.abc).map_err(|e| {
+            CliError::Tool(format!(
+                "failed to decode {} ({}): {e}",
+                m.name, m.provenance
+            ))
+        })?;
+        let ir = abcd_lift::lift_file(&file).map_err(|e| {
+            CliError::Tool(format!("failed to lift {} ({}): {e}", m.name, m.provenance))
+        })?;
+        if let Some(mj) = &m.module_json
+            && let Ok(txt) = std::str::from_utf8(mj)
+        {
+            manifests.push(txt.to_owned());
+        }
+        names.push(m.name.clone());
+        provs.push(m.provenance.clone());
+        lifted.push((m.name.clone(), ir));
+    }
+    let refs: Vec<(&str, &Module)> = lifted.iter().map(|(n, m)| (n.as_str(), m)).collect();
+    let merged_ir = abcd_analysis::module_link::merge_ir_modules(&refs);
+    let mut run_cfg = config.clone();
+    if run_cfg.manifest_json.is_none() && !manifests.is_empty() {
+        run_cfg.manifest_json = Some(manifests.join("\n"));
+    }
+    let synthetic_in = InputModule {
+        name: names.join("+"),
+        abc: Vec::new(),
+        module_json: None,
+        provenance: provs.join(" + "),
+    };
+    let rep = abcd_taint::run_taint(&merged_ir, &run_cfg);
+    Ok(build_report(&synthetic_in, &run_cfg, &merged_ir, &rep))
 }
 
 /// Project the driver's [`TaintReport`] onto the serializable CLI
@@ -275,7 +347,13 @@ fn render_fact(ir: &Module, fact: &TaintFact) -> String {
             format!("heap {{{inner}}}")
         }
         TaintBase::Global(sym) => format!("global {}", resolve_sym(ir, *sym)),
-        TaintBase::ModuleVar(slot) => format!("modulevar {slot}"),
+        TaintBase::ModuleVar(cid, slot) => {
+            if cid.index() == 0 && ir.classes.len() <= 1 {
+                format!("modulevar {slot}")
+            } else {
+                format!("modulevar c{}:{slot}", cid.index())
+            }
+        }
         TaintBase::LexVar(level, slot) => format!("lexvar {level}:{slot}"),
     };
     for key in fact.fields.elements() {

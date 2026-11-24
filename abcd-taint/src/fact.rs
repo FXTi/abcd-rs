@@ -42,7 +42,7 @@
 //! (heros.md §2 item 4) and the solver auto-propagates it.
 
 use abcd_analysis::dataflow::heap::{AllocSiteSet, FieldChain, FieldKey};
-use abcd_ir::{Sym, ValueId};
+use abcd_ir::{ClassId, Sym, ValueId};
 
 /// The base of an access path (see module docs).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -53,8 +53,8 @@ pub enum TaintBase {
     Heap(AllocSiteSet),
     /// A named global binding.
     Global(Sym),
-    /// A module-variable slot.
-    ModuleVar(u32),
+    /// A per-record module-variable slot `(record ClassId, local_slot)`.
+    ModuleVar(ClassId, u32),
     /// A lexical-environment slot `(level, slot)` — function-agnostic
     /// (see module docs).
     LexVar(u16, u16),

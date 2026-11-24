@@ -31,6 +31,7 @@ use abcd_ir::{CallKind, Const, FuncId, InstId, Module, Op, ValueDef, ValueId};
 
 use crate::dataflow::alias::Rung1AliasOracle;
 use crate::dataflow::ifds::CallGraphOracle;
+use crate::module_link::{ModuleLinkTable, ModuleSlotRef};
 
 /// The targets of one call site.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +124,7 @@ impl CallGraph {
     /// Build the graph: every [`Op::Call`] in the module, resolved by
     /// backward callee-value tracing, in deterministic order.
     pub fn build(module: &Module) -> CallGraph {
+        let links = ModuleLinkTable::build(module);
         let mut graph = CallGraph::default();
         for (fi, f) in module.functions.iter().enumerate() {
             let caller = FuncId::new(fi as u32);
@@ -137,7 +139,7 @@ impl CallGraph {
                     let Op::Call { callee, kind, .. } = &inst.op else {
                         continue;
                     };
-                    let resolution = resolve_callee(module, caller, *callee);
+                    let resolution = resolve_callee(module, &links, caller, *callee, *kind);
                     let complete = resolution.complete;
                     let (edge_kind, targets) = if resolution.funcs.is_empty() {
                         (CallEdgeKind::UnknownCallees, CallTargets::UnknownCallees)
@@ -373,10 +375,24 @@ impl CallGraphOracle for CallGraph {
 /// complete; consumers needing soundness at partial sites must check
 /// [`Resolution::complete`]… which is why partial traces currently count
 /// as resolved-but-incomplete — see the module docs and README).
-fn resolve_callee(module: &Module, current: FuncId, callee: ValueId) -> Resolution {
+fn resolve_callee(
+    module: &Module,
+    links: &ModuleLinkTable,
+    current: FuncId,
+    callee: ValueId,
+    call_kind: CallKind,
+) -> Resolution {
     let mut funcs = BTreeSet::new();
     let mut visiting = HashSet::new();
-    let complete = trace(module, current, callee, &mut funcs, &mut visiting);
+    let complete = trace(
+        module,
+        links,
+        current,
+        callee,
+        call_kind,
+        &mut funcs,
+        &mut visiting,
+    );
     Resolution { funcs, complete }
 }
 
@@ -387,16 +403,18 @@ fn resolve_callee(module: &Module, current: FuncId, callee: ValueId) -> Resoluti
 /// unobservable — the worklist reproduces the recursive walk exactly.
 fn trace(
     module: &Module,
-    current: FuncId,
+    links: &ModuleLinkTable,
+    initial_func: FuncId,
     value: ValueId,
+    call_kind: CallKind,
     funcs: &mut BTreeSet<FuncId>,
-    visiting: &mut HashSet<ValueId>,
+    visiting: &mut HashSet<(FuncId, ValueId)>,
 ) -> bool {
     let mut complete = true;
-    let mut stack = vec![value];
-    while let Some(value) = stack.pop() {
-        if !visiting.insert(value) {
-            // Phi cycles: the value is already being traced; its
+    let mut stack = vec![(initial_func, value)];
+    while let Some((current, value)) = stack.pop() {
+        if !visiting.insert((current, value)) {
+            // Phi / re-export cycles: the value is already being traced; its
             // contribution arrives through the in-progress visit.
             // Complete.
             continue;
@@ -414,7 +432,7 @@ fn trace(
                 _ => complete = false,
             },
             ValueDef::Inst(iid) => match module.inst(iid).map(|i| &i.op) {
-                Some(Op::Mov { src }) => stack.push(*src),
+                Some(Op::Mov { src }) => stack.push((current, *src)),
                 Some(Op::LoadConst(c)) => match module.consts.get(*c) {
                     // A pooled method reference is a function value (class
                     // member buffers use the same constant kind).
@@ -425,16 +443,118 @@ fn trace(
                 },
                 Some(Op::Phi { entries }) => {
                     for (_, v) in entries {
-                        stack.push(*v);
+                        stack.push((current, *v));
                     }
                 }
-                Some(Op::AllocClosure { func }) => stack.push(*func),
-                Some(Op::CreateGenerator { func }) => stack.push(*func),
+                Some(Op::AllocClosure { func }) => stack.push((current, *func)),
+                Some(Op::CreateGenerator { func }) => stack.push((current, *func)),
                 Some(Op::DefineFunc { body, .. }) => {
                     funcs.insert(*body);
                 }
+                Some(Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. })
+                    if call_kind == CallKind::New =>
+                {
+                    funcs.insert(*ctor);
+                }
                 Some(Op::LoadFunction) => {
                     funcs.insert(current);
+                }
+                Some(Op::LoadModuleVar { index, kind }) => {
+                    let Some(cid) = links.func_class(current) else {
+                        complete = false;
+                        continue;
+                    };
+                    if kind.is_local() {
+                        if !links.has_multi_record_esm() {
+                            complete = false;
+                            continue;
+                        }
+                        let defs = links.stored_values(ModuleSlotRef {
+                            class_id: cid,
+                            slot: *index,
+                        });
+                        if defs.is_empty() {
+                            complete = false;
+                        } else {
+                            for &(def_fn, def_val) in defs {
+                                stack.push((def_fn, def_val));
+                            }
+                        }
+                    } else if let Some(target) = links.external_load(cid, *index) {
+                        if target.unresolved_external || target.slots.is_empty() {
+                            complete = false;
+                        }
+                        for &slot_ref in &target.slots {
+                            let defs = links.stored_values(slot_ref);
+                            if defs.is_empty() {
+                                complete = false;
+                            } else {
+                                for &(def_fn, def_val) in defs {
+                                    stack.push((def_fn, def_val));
+                                }
+                            }
+                        }
+                    } else {
+                        complete = false;
+                    }
+                }
+                Some(Op::LoadProp { object, name }) => {
+                    // Namespace import call: `import * as ns from "./sub"; ns.fn(...)`.
+                    let mut obj_cur = *object;
+                    for _ in 0..8 {
+                        let Some(ValueDef::Inst(oiid)) = module.value(obj_cur).map(|ov| ov.def)
+                        else {
+                            break;
+                        };
+                        match module.inst(oiid).map(|i| &i.op) {
+                            Some(Op::Mov { src }) => obj_cur = *src,
+                            Some(Op::GetModuleNamespace { index }) => {
+                                if let Some(cid) = links.func_class(current)
+                                    && let Some(slots) =
+                                        links.resolve_namespace_member(cid, *index, *name)
+                                    && !slots.is_empty()
+                                {
+                                    for &slot_ref in slots {
+                                        let defs = links.stored_values(slot_ref);
+                                        if defs.is_empty() {
+                                            complete = false;
+                                        } else {
+                                            for &(def_fn, def_val) in defs {
+                                                stack.push((def_fn, def_val));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    complete = false;
+                                }
+                                break;
+                            }
+                            _ => {
+                                complete = false;
+                                break;
+                            }
+                        }
+                        if matches!(
+                            module.value(obj_cur).map(|ov| ov.def),
+                            Some(ValueDef::Inst(ni))
+                                if !matches!(
+                                    module.inst(ni).map(|i| &i.op),
+                                    Some(Op::Mov { .. } | Op::GetModuleNamespace { .. })
+                                )
+                        ) {
+                            complete = false;
+                            break;
+                        }
+                    }
+                    if !matches!(
+                        module.value(obj_cur).and_then(|ov| match ov.def {
+                            ValueDef::Inst(oiid) => module.inst(oiid).map(|i| &i.op),
+                            _ => None,
+                        }),
+                        Some(Op::GetModuleNamespace { .. })
+                    ) {
+                        complete = false;
+                    }
                 }
                 _ => complete = false,
             },

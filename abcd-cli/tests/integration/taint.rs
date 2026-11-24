@@ -631,3 +631,143 @@ fn alias_flows_register_as_aliasing_flows() {
     assert_eq!(summary.flows[0].from, abcd_taint::Endpoint::Param(0));
     assert_eq!(summary.flows[0].to, abcd_taint::Endpoint::Base);
 }
+
+// ---- `--preset ohos` & `--link-modules` (#27) ----
+
+#[test]
+fn preset_ohos_resolves_and_rejects_unknown_presets() {
+    let cfg = taint::resolve_config(None, Some("ohos")).unwrap();
+    assert!(!cfg.sources.is_empty());
+    assert!(!cfg.sinks.is_empty());
+    assert!(cfg.ohos_lifecycle);
+
+    let err = taint::resolve_config(None, Some("unknown_preset")).unwrap_err();
+    assert_eq!(err.exit_code(), 1);
+    assert!(err.to_string().contains("unknown taint preset"), "{err}");
+}
+
+#[test]
+fn report_linked_connects_cross_module_exports_to_ohos_sink() {
+    use abcd_file::ModuleRecordDef;
+
+    let placeholder = EntityId(u16::MAX as u32);
+
+    // Module 1 (`shared/sec`): exports `getOAID()` result in slot 0.
+    let sec_abc = {
+        let mut b = Builder::new();
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        b.class_set_source_lang(cls, SourceLang::EcmaScript);
+        let es_rec = b.add_class("L_ESModuleRecord;");
+        let es_field = b.class_add_field(es_rec, "sec", Type::U32, AccessFlags::PUBLIC);
+        let req_oaid = b.add_string("@ohos.identifier.oaid");
+        let s_get = b.add_string("getOAID");
+        let s_tok = b.add_string("tok");
+        let lit = b.add_literal_array("sec_mod");
+        b.literal_array_add_module_data(
+            lit,
+            &[req_oaid],
+            &[
+                ModuleRecordDef::RegularImport {
+                    local_name: s_get,
+                    import_name: s_get,
+                    module_request_idx: 0,
+                },
+                ModuleRecordDef::LocalExport {
+                    local_name: s_tok,
+                    export_name: s_tok,
+                },
+            ],
+        )
+        .unwrap();
+        b.field_set_value_literalarray(es_field, lit).unwrap();
+        let proto = b.create_proto(Type::Void, &[]);
+        let (code, _) = abcd_isa::encode(&[
+            Bytecode::Ldexternalmodulevar(Imm(0)),
+            Bytecode::Callarg0(Imm(0)),
+            Bytecode::Stmodulevar(Imm(0)),
+            Bytecode::Returnundefined,
+        ])
+        .unwrap();
+        b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 2, 3);
+        b.deduplicate();
+        b.finalize().unwrap()
+    };
+
+    // Module 2 (`entry/app`): imports `tok` from `../shared/sec` and logs via `@ohos.hilog.info`.
+    let app_abc = {
+        let mut b = Builder::new();
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        b.class_set_source_lang(cls, SourceLang::EcmaScript);
+        let es_rec = b.add_class("L_ESModuleRecord;");
+        let es_field = b.class_add_field(es_rec, "app", Type::U32, AccessFlags::PUBLIC);
+        let req_sec = b.add_string("../shared/sec");
+        let req_hl = b.add_string("@ohos.hilog");
+        let s_tok = b.add_string("tok");
+        let s_hl = b.add_string("hilog");
+        let s_def = b.add_string("default");
+        let lit = b.add_literal_array("app_mod");
+        b.literal_array_add_module_data(
+            lit,
+            &[req_sec, req_hl],
+            &[
+                ModuleRecordDef::RegularImport {
+                    local_name: s_tok,
+                    import_name: s_tok,
+                    module_request_idx: 0,
+                },
+                ModuleRecordDef::RegularImport {
+                    local_name: s_hl,
+                    import_name: s_def,
+                    module_request_idx: 1,
+                },
+            ],
+        )
+        .unwrap();
+        b.field_set_value_literalarray(es_field, lit).unwrap();
+        let proto = b.create_proto(Type::Void, &[]);
+        let (code, offsets) = abcd_isa::encode(&[
+            Bytecode::Ldexternalmodulevar(Imm(0)),
+            Bytecode::Sta(Reg(0)),
+            Bytecode::Ldexternalmodulevar(Imm(1)),
+            Bytecode::Sta(Reg(1)),
+            Bytecode::Ldobjbyname(Imm(0), placeholder),
+            Bytecode::Sta(Reg(2)),
+            Bytecode::Ldai(Imm(0)),
+            Bytecode::Sta(Reg(3)),
+            Bytecode::LdaStr(placeholder),
+            Bytecode::Sta(Reg(4)),
+            Bytecode::Lda(Reg(2)),
+            Bytecode::Callthis3(Imm(2), Reg(1), Reg(3), Reg(4), Reg(0)),
+            Bytecode::Returnundefined,
+        ])
+        .unwrap();
+        let m = b.class_add_method(cls, "func_main_0", proto, AccessFlags::STATIC, &code, 6, 3);
+        let s_info = b.add_string("info");
+        b.relocate_code_id(m, offsets[4], 0, CodeEntity::String(s_info))
+            .unwrap();
+        let s_tag = b.add_string("TAG");
+        b.relocate_code_id(m, offsets[8], 0, CodeEntity::String(s_tag))
+            .unwrap();
+        b.deduplicate();
+        b.finalize().unwrap()
+    };
+
+    let m1 = input::InputModule {
+        name: "shared/sec".to_string(),
+        abc: sec_abc,
+        module_json: None,
+        provenance: "app.app::sec.hsp".to_string(),
+    };
+    let m2 = input::InputModule {
+        name: "entry/app".to_string(),
+        abc: app_abc,
+        module_json: None,
+        provenance: "app.app::entry.hap".to_string(),
+    };
+    let cfg = taint::resolve_config(None, Some("ohos")).unwrap();
+    let rep = taint::report_linked(&[m1, m2], &cfg).unwrap();
+    assert_eq!(rep.hits.len(), 1, "{rep:?}");
+    assert_eq!(rep.hits[0].sink, "@ohos.hilog.info");
+}

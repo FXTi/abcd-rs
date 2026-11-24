@@ -117,7 +117,8 @@ pub struct GapEnter {
 pub struct CallbackGap {
     /// Which call argument is the callback value.
     pub param: u16,
-    /// Taint INTO the callback's formals (empty = mini-gap only).
+    /// Taint INTO the callback's formals (empty = mini-gap only unless
+    /// `spawn_always` is set).
     pub enter: Vec<GapEnter>,
     /// Where the callback's RETURN flows at the summary call site:
     /// `Some(chain)` = onto the call result with `chain` prepended to
@@ -126,6 +127,10 @@ pub struct CallbackGap {
     /// (forEach: the result is undefined; filter: the predicate's
     /// boolean does not taint the result array).
     pub return_to_result: Option<FieldChain>,
+    /// Spawn a synthetic gap call edge into resolved callback bodies even
+    /// when `enter` is empty (e.g. ArkUI `observeComponentCreation2` and
+    /// `Button.onClick` closures that read/write `Heap(this_site)` state).
+    pub spawn_always: bool,
 }
 
 /// One propagation rule of a summary.
@@ -211,6 +216,19 @@ impl Summary {
             param,
             enter: Vec::new(),
             return_to_result: None,
+            spawn_always: false,
+        });
+        self
+    }
+
+    /// Spawn a gap call edge into resolved callback bodies at `param` even
+    /// when no formal-parameter `enter` taint mapping is declared.
+    pub fn spawn_callback(mut self, param: u16) -> Self {
+        self.callback = Some(CallbackGap {
+            param,
+            enter: Vec::new(),
+            return_to_result: None,
+            spawn_always: true,
         });
         self
     }
@@ -864,6 +882,35 @@ pub fn builtin_summaries() -> Vec<(&'static str, Option<usize>, Summary)> {
             None,
             Summary::new("canonical; content-derived digit parse → number; radix is control")
                 .flow(Param(0), Return),
+        ),
+        // ── Promise async propagation (#27 Phase 3) ──────────────────
+        (
+            "Promise.resolve",
+            Some(1),
+            Summary::new("canonical; value taint → resolved Promise")
+                .flow(Param(0), Return)
+                .exclusive(),
+        ),
+        (
+            "Promise.prototype.then",
+            None,
+            Summary::new("gap: fulfilled Promise taint → onFulfilled(val); cb return → chained Promise")
+                .callback(0)
+                .gap_enter(Base, 0)
+                .gap_return(FieldChain::new()),
+        ),
+        (
+            "Promise.prototype.catch",
+            Some(1),
+            Summary::new("fulfilled Promise taint passes through catch")
+                .flow(Base, Return),
+        ),
+        (
+            "Promise.prototype.finally",
+            Some(1),
+            Summary::new("fulfilled Promise taint passes through finally")
+                .flow(Base, Return)
+                .callback(0),
         ),
     ]
 }

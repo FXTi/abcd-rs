@@ -106,12 +106,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use abcd_ir::{Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
+use abcd_ir::{CallKind, ClassId, Const, FuncId, InstId, Module, Op, Sym, ValueDef, ValueId};
 
 use super::alias::QueryAnswer;
 use super::heap::{AliasOracle, AllocSiteSet, SiteInfo, is_keyed_alloc, resolve_alloc_sites};
 use crate::callgraph::{CallEdge, CallEdgeKind, CallGraph, CallTargets};
 use crate::frame::frame_slots_of;
+use crate::module_link::{ModuleLinkTable, ModuleSlotRef};
 
 /// Default propagation-step budget (worklist pops). Generous — corpus
 /// modules are small; the cap exists so a pathological module degrades
@@ -175,8 +176,10 @@ enum Ptr {
     Field(InstId, Ctx, Slot),
     /// A named global binding (the module-global object's field — d4).
     Global(Sym),
-    /// A module-variable slot.
-    ModuleVar(u32),
+    /// A per-record module-variable slot `(ClassId, local_slot)`.
+    ModuleVar(ClassId, u32),
+    /// A lexical-environment slot `(NewLexEnv InstId, slot, is_recorded_ctx)`.
+    LexVar(InstId, u16, bool),
 }
 
 /// Which buckets a load reads.
@@ -333,6 +336,8 @@ fn closure_body(module: &Module, func: ValueId) -> Option<FuncId> {
 struct Pta<'m> {
     module: &'m Module,
     config: &'m PtaConfig,
+    links: ModuleLinkTable,
+    env_stack_at: &'m BTreeMap<InstId, Vec<EnvEntry>>,
     /// Points-to sets.
     pts: BTreeMap<Ptr, BTreeSet<Obj>>,
     /// Subset edges `s → t`.
@@ -369,7 +374,11 @@ struct Pta<'m> {
 }
 
 impl<'m> Pta<'m> {
-    fn new(module: &'m Module, config: &'m PtaConfig) -> Self {
+    fn new(
+        module: &'m Module,
+        config: &'m PtaConfig,
+        env_stack_at: &'m BTreeMap<InstId, Vec<EnvEntry>>,
+    ) -> Self {
         let mut returns_of: HashMap<FuncId, Vec<ValueId>> = HashMap::new();
         for (fi, f) in module.functions.iter().enumerate() {
             let func = FuncId::new(fi as u32);
@@ -387,9 +396,12 @@ impl<'m> Pta<'m> {
             }
             returns_of.insert(func, returns);
         }
+        let links = ModuleLinkTable::build(module);
         Pta {
             module,
             config,
+            links,
+            env_stack_at,
             pts: BTreeMap::new(),
             edges: BTreeMap::new(),
             worklist: BTreeSet::new(),
@@ -574,14 +586,28 @@ impl<'m> Pta<'m> {
         };
         let (callee_val, this, args, kind) = (*callee_val, *this, args.clone(), *kind);
         let local = |v: ValueId| Ptr::Local(v, caller_ctx);
+        // For `new Cls(...)` into an internal constructor body, materialize a
+        // concrete instance allocation keyed by the `New` call instruction so
+        // constructor field writes (`this.f = v`) and caller reads (`inst.f`)
+        // meet on a concrete site.
+        let constructed_instance = (kind == CallKind::New).then_some(Obj::Site {
+            site: call,
+            ctx: caller_ctx,
+            callable: None,
+            keyed: true,
+        });
         match frame_slots_of(self.module, callee) {
             Some(slots) if fd.params.len() >= slots.implicit_count() => {
                 // Implicit slots, ordered func, newTarget, this (N66).
                 if slots.func {
                     self.add_edge(local(callee_val), Ptr::Local(fd.params[0], callee_ctx));
                 }
-                if let (Some(this_idx), Some(t)) = (slots.this_index(), this) {
-                    self.add_edge(local(t), Ptr::Local(fd.params[this_idx], callee_ctx));
+                if let Some(this_idx) = slots.this_index() {
+                    if let Some(t) = this {
+                        self.add_edge(local(t), Ptr::Local(fd.params[this_idx], callee_ctx));
+                    } else if let Some(inst_obj) = constructed_instance {
+                        self.add_fact(Ptr::Local(fd.params[this_idx], callee_ctx), inst_obj);
+                    }
                 }
                 let formal_base = slots.implicit_count();
                 match kind {
@@ -621,6 +647,9 @@ impl<'m> Pta<'m> {
         }
         // Returns → the call result, in the caller's context.
         if let Some(result) = self.module.inst(call).and_then(|i| i.result) {
+            if let Some(inst_obj) = constructed_instance {
+                self.add_fact(Ptr::Local(result, caller_ctx), inst_obj);
+            }
             let returns = self.returns_of.get(&callee).cloned().unwrap_or_default();
             for v in returns {
                 self.add_edge(Ptr::Local(v, callee_ctx), Ptr::Local(result, caller_ctx));
@@ -699,6 +728,19 @@ impl<'m> Pta<'m> {
                                     site: iid,
                                     ctx,
                                     callable: Some(*body),
+                                    keyed: false,
+                                },
+                            );
+                        }
+                    }
+                    Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
+                        if let Some(r) = inst.result {
+                            self.add_fact(
+                                local(r),
+                                Obj::Site {
+                                    site: iid,
+                                    ctx,
+                                    callable: Some(*ctor),
                                     keyed: false,
                                 },
                             );
@@ -838,15 +880,132 @@ impl<'m> Pta<'m> {
                             self.add_fact(local(r), Obj::Unknown);
                         }
                     }
+                    Op::PutLexVar { level, slot, value } => {
+                        if let Some(stack) = self.env_stack_at.get(&iid)
+                            && (*level as usize) < stack.len()
+                        {
+                            let entry = stack[stack.len() - 1 - *level as usize].clone();
+                            for env_site in entry.sites {
+                                self.add_edge(
+                                    local(*value),
+                                    Ptr::LexVar(env_site, *slot, ctx.is_some()),
+                                );
+                            }
+                        }
+                    }
+                    Op::GetLexVar { level, slot } => {
+                        if let Some(r) = inst.result {
+                            if let Some(stack) = self.env_stack_at.get(&iid)
+                                && (*level as usize) < stack.len()
+                            {
+                                let entry = stack[stack.len() - 1 - *level as usize].clone();
+                                if !entry.unknown && !entry.sites.is_empty() {
+                                    for env_site in entry.sites {
+                                        self.add_edge(Ptr::LexVar(env_site, *slot, true), local(r));
+                                        self.add_edge(
+                                            Ptr::LexVar(env_site, *slot, false),
+                                            local(r),
+                                        );
+                                    }
+                                } else {
+                                    self.add_fact(local(r), Obj::Unknown);
+                                }
+                            } else {
+                                self.add_fact(local(r), Obj::Unknown);
+                            }
+                        }
+                    }
                     Op::StoreModuleVar { index, value } => {
-                        self.add_edge(local(*value), Ptr::ModuleVar(*index));
+                        self.add_edge(local(*value), Ptr::ModuleVar(fd.class_id, *index));
                     }
                     Op::LoadModuleVar { index, kind } => {
                         if let Some(r) = inst.result {
                             if kind.is_local() {
-                                self.add_edge(Ptr::ModuleVar(*index), local(r));
+                                let slot_ref = ModuleSlotRef {
+                                    class_id: fd.class_id,
+                                    slot: *index,
+                                };
+                                self.add_edge(Ptr::ModuleVar(fd.class_id, *index), local(r));
+                                if !self.links.has_multi_record_esm()
+                                    || self.links.stored_values(slot_ref).is_empty()
+                                {
+                                    self.add_fact(local(r), Obj::Unknown);
+                                }
+                            } else if let Some(target) =
+                                self.links.external_load(fd.class_id, *index).cloned()
+                            {
+                                for &slot_ref in &target.slots {
+                                    self.add_edge(
+                                        Ptr::ModuleVar(slot_ref.class_id, slot_ref.slot),
+                                        local(r),
+                                    );
+                                }
+                                let any_empty = target
+                                    .slots
+                                    .iter()
+                                    .any(|&sr| self.links.stored_values(sr).is_empty());
+                                if target.unresolved_external
+                                    || target.slots.is_empty()
+                                    || any_empty
+                                {
+                                    self.add_fact(local(r), Obj::Unknown);
+                                }
+                            } else {
+                                self.add_fact(local(r), Obj::Unknown);
                             }
-                            self.add_fact(local(r), Obj::Unknown);
+                        }
+                    }
+                    Op::GetModuleNamespace { index } => {
+                        if let Some(r) = inst.result {
+                            if let Some(target_cid) =
+                                self.links.namespace_target(fd.class_id, *index)
+                            {
+                                self.add_fact(
+                                    local(r),
+                                    Obj::Site {
+                                        site: iid,
+                                        ctx: None,
+                                        callable: None,
+                                        keyed: false,
+                                    },
+                                );
+                                if let Some(exports) =
+                                    self.links.namespace_exports(target_cid).cloned()
+                                {
+                                    for (export_sym, slots) in exports {
+                                        self.note_bucket(iid, None, Slot::Named(export_sym));
+                                        for sr in slots {
+                                            self.add_edge(
+                                                Ptr::ModuleVar(sr.class_id, sr.slot),
+                                                Ptr::Field(iid, None, Slot::Named(export_sym)),
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                self.add_fact(local(r), Obj::Unknown);
+                            }
+                        }
+                    }
+                    Op::Await { value } | Op::AwaitUncaught { value, .. } => {
+                        if let Some(r) = inst.result {
+                            self.add_edge(local(*value), local(r));
+                        }
+                    }
+                    Op::ResumeGenerator { genobj } => {
+                        if let Some(r) = inst.result {
+                            // Pair async-machine `AwaitUncaught(funcobj, val)` -> `ResumeGenerator(funcobj)`.
+                            for &prev_iid in &bb.insts {
+                                if prev_iid == iid {
+                                    break;
+                                }
+                                if let Some(Op::AwaitUncaught { funcobj, value, .. }) =
+                                    self.module.inst(prev_iid).map(|i| &i.op)
+                                    && funcobj == genobj
+                                {
+                                    self.add_edge(local(*value), local(r));
+                                }
+                            }
                         }
                     }
                     Op::Call { callee, .. } => {
@@ -943,7 +1102,8 @@ impl<'m> Pta<'m> {
 /// graph assembly (base edges ∪ PTA edges), the stripped value answers,
 /// and the lexical-environment tables.
 pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutcome {
-    let mut engine = Pta::new(module, config);
+    let (env_stack_at, env_sites, env_rounds) = env_analysis(module, config.max_env_depth);
+    let mut engine = Pta::new(module, config, &env_stack_at);
     engine.run();
     let stats_engine = engine.stats;
 
@@ -1011,8 +1171,65 @@ pub fn analyze(module: &Module, base: &CallGraph, config: &PtaConfig) -> PtaOutc
         answers.insert(vid, value_answer(module, vid, acc.get(&vid)));
     }
 
-    // ── Lexical environments ─────────────────────────────────────────
-    let (env_stack_at, env_sites, env_rounds) = env_analysis(module, config.max_env_depth);
+    // Balanced lexical-capture answers: when an enclosing function owning
+    // `env_site` has recorded call-site contexts (`ctx.is_some()`), ignore the
+    // synthetic `ctx == None` parameter `Obj::Unknown` marker on its captured
+    // lexical slots (mirroring `value_answer`'s parameter rule).
+    let recorded_funcs: BTreeSet<FuncId> = engine
+        .scanned
+        .iter()
+        .filter_map(|&(f, c)| c.map(|_| f))
+        .collect();
+    for (fi, f) in module.functions.iter().enumerate() {
+        let _ = fi;
+        for &b in &f.blocks {
+            let Some(bb) = module.block(b) else { continue };
+            for &iid in &bb.insts {
+                let Some(inst) = module.inst(iid) else {
+                    continue;
+                };
+                if let Op::GetLexVar { level, slot } = &inst.op
+                    && let Some(res_vid) = inst.result
+                    && let Some(stack) = env_stack_at.get(&iid)
+                    && (*level as usize) < stack.len()
+                {
+                    let entry = &stack[stack.len() - 1 - *level as usize];
+                    if !entry.unknown && !entry.sites.is_empty() {
+                        let mut union = BTreeSet::new();
+                        for &env_site in &entry.sites {
+                            let use_rec = engine
+                                .links
+                                .inst_func(module, env_site)
+                                .is_some_and(|of| recorded_funcs.contains(&of));
+                            if let Some(objs) =
+                                engine.pts.get(&Ptr::LexVar(env_site, *slot, use_rec))
+                            {
+                                union.extend(objs.iter().copied());
+                            }
+                        }
+                        let mut ans = ValueAnswer::default();
+                        for o in &union {
+                            match o {
+                                Obj::Unknown => ans.has_unknown = true,
+                                Obj::Site { site, keyed, .. } => {
+                                    if *keyed {
+                                        ans.sites.union_with(&AllocSiteSet::one(*site));
+                                    } else {
+                                        ans.has_unknown = true;
+                                    }
+                                }
+                            }
+                        }
+                        if union.is_empty() {
+                            ans.has_unknown = true;
+                        }
+                        answers.insert(res_vid, ans);
+                    }
+                }
+            }
+        }
+    }
+
     let stats = PtaStats {
         env_rounds,
         ..stats_engine

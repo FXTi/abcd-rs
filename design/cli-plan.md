@@ -29,7 +29,7 @@ in `[workspace.dependencies]` (currently unused — reserved for this).
 | `abcd rewrite` | file→lift→opt→lower→file | .abc → rewritten .abc | Identity or optimizing rewrite (normalization, future instrumentation hook). A **writer** — phase 2. |
 | `abcd decompile` | abcd-decompile | .abc → .js/.ts/.ets | EmitOptions surfaced as flags (`--line-anchors`, `--ts`, `--call-entry`, `--arkui`, plus `--split-modules -o <dir>` for multi-record `--merge-abc` trees). |
 | `abcd analyze` | abcd-analysis | .abc → callgraph/dominator/region reports | Needs an output format decision (text tree vs `--json`). |
-| `abcd taint` | abcd-taint | .abc + source/sink config → findings | TaintConfig has sources/sinks/builtin_summaries/seed flags; CLI needs a small config file format (TOML/JSON) or repeated flags. |
+| `abcd taint` | abcd-taint | .abc + `--config <toml>` and/or `--preset ohos` (`--link-modules` with `--all`) → findings | Supports TOML source/sink/summary configs, built-in `--preset ohos` OpenHarmony SDK + lifecycle rule pack, `module.json` entry discovery, and whole-container cross-`.abc` linking. |
 
 Non-goals (explicitly out): packing containers (we are unpack-only by design),
 signing, any VM execution (the oracle stays a test-side docker concern), an

@@ -36,6 +36,8 @@ use abcd_ir::{FuncId, InstId, ValueId};
 use crate::fact::{TaintBase, TaintFact};
 
 /// The oracle the [`crate::problem::TaintProblem`] runs against.
+// Instantiated once per `TaintProblem` (never stored in collections).
+#[allow(clippy::large_enum_variant)]
 pub enum Oracle<'m> {
     /// Rung 0: local def chains only.
     Rung0(Rung0AliasOracle<'m>),

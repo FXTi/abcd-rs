@@ -151,13 +151,17 @@ fn run_analyze(args: &AnalyzeArgs) -> Result<(), CliError> {
 }
 
 fn run_taint(args: &TaintArgs) -> Result<(), CliError> {
-    let config = taint::load_config(&args.config)?;
+    let config = taint::resolve_config(args.config.as_deref(), args.preset.as_deref())?;
     let selection = selection_of(&args.select.module, args.select.all);
     let modules = input::load(&args.input, selection)?;
-    let reports: Vec<taint::TaintCliReport> = modules
-        .iter()
-        .map(|m| taint::report(m, &config))
-        .collect::<Result<_, _>>()?;
+    let reports: Vec<taint::TaintCliReport> = if args.link_modules {
+        vec![taint::report_linked(&modules, &config)?]
+    } else {
+        modules
+            .iter()
+            .map(|m| taint::report(m, &config))
+            .collect::<Result<_, _>>()?
+    };
     println!("{}", taint::render(&reports, args.json)?);
     Ok(())
 }

@@ -39,6 +39,8 @@ pub mod callgraph;
 pub mod control;
 pub mod dataflow;
 pub mod frame;
+pub mod module_link;
+pub mod ohos_lifecycle;
 
 #[cfg(test)]
 mod testutil;

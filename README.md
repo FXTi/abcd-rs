@@ -19,9 +19,9 @@ A Rust toolkit for ArkCompiler bytecode (`.abc`) files and OpenHarmony applicati
 | [`abcd-lift`](abcd-lift) | Lifter: container → IR (`abcd_file::File` → `abcd_ir::Module`, CFG + Braun SSA + `--merge-abc` metadata) |
 | [`abcd-opt`](abcd-opt) | SSA optimization passes (`IR → IR`): peephole, SCCP, ADCE + CFG simplify, copyprop, opt-in inliner |
 | [`abcd-lower`](abcd-lower) | Lowering: IR → bytecode (`abcd_ir::Module` → `abcd_file::MethodBody`, chordal MCS regalloc + `acc-as-cache` isel) |
-| [`abcd-analysis`](abcd-analysis) | Format-independent analysis infra: dominators, loops, region structuring, IFDS skeleton, alias ladder (rungs 0–2 PTA), call graph |
-| [`abcd-taint`](abcd-taint) | Interprocedural IFDS taint analysis: access-path facts, summary registry, callback gap propagation, prototype resolution |
-| [`abcd-decompile`](abcd-decompile) | Bytecode → JS/TS decompiler on the lifted SSA IR (expression recovery, pattern-independent structuring, precedence-exact emission) |
+| [`abcd-analysis`](abcd-analysis) | Format-independent analysis infra: dominators, loops, region structuring, IFDS skeleton, alias ladder (rungs 0–2 PTA), call graph, cross-module ES linker, OHOS lifecycle harness |
+| [`abcd-taint`](abcd-taint) | Interprocedural IFDS taint analysis: access-path facts, summary registry, callback gap propagation, prototype resolution, OpenHarmony `@ohos.*`/`@kit.*` rule pack |
+| [`abcd-decompile`](abcd-decompile) | Bytecode → JS/TS/ArkTS decompiler on the lifted SSA IR (`--split-modules` tree recovery, `--arkui` component reconstruction, precedence-exact emission) |
 | [`abcd-cli`](abcd-cli) | The `abcd` CLI binary (`extract`, `info`, `dis`, `asm`, `decompile`, `rewrite`, `analyze`, `taint`) |
 
 *(The root `abcd-rs` Cargo package is a non-published container for the cross-crate integration and corpus suites under [`tests/`](tests).)*
@@ -56,6 +56,8 @@ cargo run -p abcd-cli -- decompile app.hap --module entry --split-modules --arku
 cargo run -p abcd-cli -- rewrite input.abc --opt --check -o opt.abc
 cargo run -p abcd-cli -- analyze input.abc --callgraph --dominators
 cargo run -p abcd-cli -- taint input.abc --config taint.toml
+cargo run -p abcd-cli -- taint app.hap --preset ohos
+cargo run -p abcd-cli -- taint app.app --all --link-modules --preset ohos
 ```
 
 ### Library API

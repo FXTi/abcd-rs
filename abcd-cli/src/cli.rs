@@ -182,14 +182,23 @@ pub struct AnalyzeArgs {
     pub select: SelectArgs,
 }
 
-/// `abcd taint <input> --config <PATH> [--json]`.
+/// `abcd taint <input> [--config <PATH>] [--preset <NAME>] [--link-modules] [--json]`.
 #[derive(Debug, Args)]
 pub struct TaintArgs {
     /// Input file: bare .abc or a container (.hap/.hsp/.app/.hqf).
     pub input: PathBuf,
-    /// TOML taint configuration (sources, sinks, summaries).
-    #[arg(long, value_name = "PATH")]
-    pub config: PathBuf,
+    /// TOML taint configuration (sources, sinks, summaries). Optional when
+    /// --preset is given; when both are passed, preset rules merge with the
+    /// TOML config.
+    #[arg(long, value_name = "PATH", required_unless_present = "preset")]
+    pub config: Option<PathBuf>,
+    /// Built-in taint rule preset (`ohos` for OpenHarmony SDK + lifecycle modeling).
+    #[arg(long, value_name = "NAME")]
+    pub preset: Option<String>,
+    /// Link all selected container modules (`--all`) into a single unified IR
+    /// module so cross-container `@bundle:` imports resolve end-to-end.
+    #[arg(long = "link-modules")]
+    pub link_modules: bool,
     /// Emit a machine-readable JSON report instead of text.
     #[arg(long)]
     pub json: bool,
@@ -471,8 +480,31 @@ mod tests {
         let Command::Taint(a) = cli.command else {
             panic!("expected taint");
         };
-        assert_eq!(a.config, PathBuf::from("t.toml"));
+        assert_eq!(a.config, Some(PathBuf::from("t.toml")));
+        assert_eq!(a.preset, None);
+        assert!(!a.link_modules);
         assert!(a.json);
+    }
+
+    #[test]
+    fn taint_preset_and_link_modules() {
+        let cli = parse(&[
+            "abcd",
+            "taint",
+            "app.app",
+            "--all",
+            "--link-modules",
+            "--preset",
+            "ohos",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Taint(a) = cli.command else {
+            panic!("expected taint");
+        };
+        assert_eq!(a.config, None);
+        assert_eq!(a.preset.as_deref(), Some("ohos"));
+        assert!(a.link_modules && a.select.all && a.json);
     }
 
     // ---- asm ----

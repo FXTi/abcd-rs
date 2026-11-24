@@ -75,6 +75,8 @@ fn default_alias_rung() -> u8 {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TaintToml {
+    /// Optional built-in rule preset (`"ohos"`).
+    preset: Option<String>,
     /// Taint sources.
     #[serde(default)]
     sources: Vec<SourceToml>,
@@ -93,6 +95,9 @@ struct TaintToml {
     /// Unknown-call identity heuristic (default true).
     #[serde(default = "driver_default_true")]
     native_identity: bool,
+    /// Synthesize OpenHarmony lifecycle harness when applicable (default true).
+    #[serde(default = "driver_default_true")]
+    ohos_lifecycle: bool,
     /// Access-path k-limit (default `DEFAULT_MAX_FIELD_CHAIN` = 5).
     #[serde(default = "default_max_field_chain")]
     max_field_chain: usize,
@@ -120,6 +125,18 @@ enum SourceToml {
     GlobalLoad {
         /// The global's name.
         name: String,
+    },
+    /// Return value (and trailing `(err, data)` callback data arg) of `name`.
+    CallReturn {
+        /// Qualified callee name (e.g. `"@ohos.pasteboard.SystemPasteboard.getData"`).
+        name: String,
+    },
+    /// Binding imported from ES module `specifier`.
+    ModuleImport {
+        /// Module specifier (e.g. `"@ohos.deviceInfo"`).
+        specifier: String,
+        /// Optional exported binding name; absent = all bindings.
+        import_name: Option<String>,
     },
 }
 
@@ -247,6 +264,19 @@ pub fn parse(text: &str) -> Result<TaintConfig, CliError> {
     raw.into_config()
 }
 
+/// Apply a named preset (`"ohos"`) onto `config`, rejecting unknown preset names.
+pub fn apply_preset_by_name(config: &mut TaintConfig, preset: &str) -> Result<(), CliError> {
+    match preset {
+        "ohos" => {
+            abcd_taint::apply_ohos_preset(config);
+            Ok(())
+        }
+        other => Err(CliError::User(format!(
+            "unknown taint preset {other:?} (expected \"ohos\")"
+        ))),
+    }
+}
+
 impl TaintToml {
     /// Validate and lower to the driver's [`TaintConfig`].
     fn into_config(self) -> Result<TaintConfig, CliError> {
@@ -264,6 +294,14 @@ impl TaintToml {
                     SourceSpec::FunctionParams { name, params }
                 }
                 SourceToml::GlobalLoad { name } => SourceSpec::GlobalLoad { name },
+                SourceToml::CallReturn { name } => SourceSpec::CallReturn { name },
+                SourceToml::ModuleImport {
+                    specifier,
+                    import_name,
+                } => SourceSpec::ModuleImport {
+                    specifier,
+                    import_name,
+                },
             })
             .collect();
         let sinks = self
@@ -277,7 +315,7 @@ impl TaintToml {
         for s in &self.extra_summaries {
             extra_summaries.push(s.build()?);
         }
-        Ok(TaintConfig {
+        let mut cfg = TaintConfig {
             sources,
             sinks,
             builtin_summaries: self.builtin_summaries,
@@ -287,10 +325,14 @@ impl TaintToml {
             native_identity: self.native_identity,
             max_field_chain: self.max_field_chain,
             alias_rung: self.alias_rung,
-            // Not exposed in the TOML schema (a test/operator knob):
-            // the engine default applies.
             pta_step_budget: None,
-        })
+            ohos_lifecycle: self.ohos_lifecycle,
+            manifest_json: None,
+        };
+        if let Some(preset) = &self.preset {
+            apply_preset_by_name(&mut cfg, preset)?;
+        }
+        Ok(cfg)
     }
 }
 

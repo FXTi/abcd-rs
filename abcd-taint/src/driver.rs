@@ -37,11 +37,13 @@ use abcd_analysis::dataflow::heap::{DEFAULT_MAX_FIELD_CHAIN, Rung0AliasOracle};
 use abcd_analysis::dataflow::ifds::CallGraphOracle;
 use abcd_analysis::dataflow::ifds::{IfdsConfig, IfdsResult, IfdsSolver};
 use abcd_analysis::dataflow::pta::{PtaConfig, Rung2AliasOracle};
+use abcd_analysis::module_link::ModuleLinkTable;
+use abcd_analysis::ohos_lifecycle::synthesize_ohos_harness;
 use abcd_ir::{FuncId, InstId, Loc, Module, Op, ValueId};
 
 use crate::fact::{Fact, TaintFact};
 use crate::gap::GapCallGraph;
-use crate::names::{call_base_value, callee_name_candidates};
+use crate::names::{call_base_value, callee_name_candidates_with_links};
 use crate::oracle::Oracle;
 use crate::problem::TaintProblem;
 use crate::summary::{RegistryStats, Summary, SummaryRegistry};
@@ -62,6 +64,22 @@ pub enum SourceSpec {
     GlobalLoad {
         /// The global's name.
         name: String,
+    },
+    /// Every call whose callee-name candidates match `name` taints its return
+    /// value (and, when invoked with a trailing `(err, data)` / `(data)`
+    /// callback closure, enters taint onto the callback's data parameter).
+    CallReturn {
+        /// Canonical or qualified callee name (e.g.
+        /// `"@ohos.pasteboard.SystemPasteboard.getData"`).
+        name: String,
+    },
+    /// Every ES module import binding from `specifier` (optionally restricted
+    /// to `import_name`) is tainted at load.
+    ModuleImport {
+        /// Module specifier (e.g. `"@ohos.deviceInfo"` or `"./secret"`).
+        specifier: String,
+        /// Exported binding name; `None` matches all bindings from `specifier`.
+        import_name: Option<String>,
     },
 }
 
@@ -116,6 +134,12 @@ pub struct TaintConfig {
     /// facing a pathological module (and tests pinning the degrade arm)
     /// can exercise it without a 25M-step module.
     pub pta_step_budget: Option<usize>,
+    /// Synthesize OpenHarmony Stage/FA Ability, ExtensionAbility, ArkUI `ViewPU`,
+    /// and multi-record `func_main_0` lifecycle harness when applicable
+    /// (default `true`; no-op on plain single-module JS inputs).
+    pub ohos_lifecycle: bool,
+    /// Optional `module.json` / `config.json` text for `srcEntry` discovery.
+    pub manifest_json: Option<String>,
 }
 
 impl Default for TaintConfig {
@@ -131,6 +155,8 @@ impl Default for TaintConfig {
             max_field_chain: DEFAULT_MAX_FIELD_CHAIN,
             alias_rung: 2,
             pta_step_budget: None,
+            ohos_lifecycle: true,
+            manifest_json: None,
         }
     }
 }
@@ -202,7 +228,16 @@ pub fn run_taint(module: &Module, config: &TaintConfig) -> TaintReport {
 /// Run the analysis, also returning the raw solver result (for tests
 /// that assert on facts at arbitrary program points).
 pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, IfdsResult<Fact>) {
-    let base_graph = CallGraph::build(module);
+    let orig_func_len = module.functions.len();
+    let orig_inst_len = module.insts.len();
+    let augmented = if config.ohos_lifecycle {
+        synthesize_ohos_harness(module, config.manifest_json.as_deref()).map(|(m, _)| m)
+    } else {
+        None
+    };
+    let work_mod: &Module = augmented.as_ref().unwrap_or(module);
+
+    let base_graph = CallGraph::build(work_mod);
     // The alias ladder (analysis-strategy §4.4):
     // - rung 0 solves against the base graph with def-chain answers;
     // - rung 1 builds the on-demand engine over the BASE graph and
@@ -213,12 +248,12 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     //   tables are the oracle. A step-budget cut degrades to the rung-1
     //   pipeline, recorded in `alias_rung_used` (loud, never silent).
     let rung1_pipeline = || {
-        let engine = Rung1AliasOracle::new(module, &base_graph);
-        let refined = CallGraph::refine_with_points_to(module, &base_graph, &engine);
+        let engine = Rung1AliasOracle::new(work_mod, &base_graph);
+        let refined = CallGraph::refine_with_points_to(work_mod, &base_graph, &engine);
         (refined, Oracle::Rung1(engine), 1u8)
     };
     let (refined, oracle, rung_used) = match config.alias_rung {
-        0 => (None, Oracle::Rung0(Rung0AliasOracle::new(module)), 0u8),
+        0 => (None, Oracle::Rung0(Rung0AliasOracle::new(work_mod)), 0u8),
         2 => {
             let pta_config = PtaConfig {
                 step_budget: config
@@ -226,7 +261,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
                     .unwrap_or(abcd_analysis::dataflow::pta::DEFAULT_STEP_BUDGET),
                 ..PtaConfig::default()
             };
-            let outcome = abcd_analysis::dataflow::pta::analyze(module, &base_graph, &pta_config);
+            let outcome = abcd_analysis::dataflow::pta::analyze(work_mod, &base_graph, &pta_config);
             if outcome.stats().capped {
                 let (g, o, u) = rung1_pipeline();
                 (Some(g), o, u)
@@ -234,7 +269,7 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
                 let (graph, tables, stats) = outcome.into_parts();
                 (
                     Some(graph),
-                    Oracle::Rung2(Rung2AliasOracle::new(module, tables, stats)),
+                    Oracle::Rung2(Rung2AliasOracle::new(work_mod, tables, stats)),
                     2u8,
                 )
             }
@@ -254,13 +289,13 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         registry.register(name, *arity, summary.clone());
     }
 
-    let problem = TaintProblem::new(module, callgraph, oracle, &registry, config);
+    let problem = TaintProblem::new(work_mod, callgraph, oracle, &registry, config);
     // The t-P4 gap layer: the eager scan's callback edges ride the
     // solver's call-graph oracle (the base graph itself is untouched —
     // sink collection and path reconstruction keep consuming it).
     let gap_graph = GapCallGraph::new(callgraph, problem.gap_edges());
     let solver = IfdsSolver::new(
-        module,
+        work_mod,
         &problem,
         &gap_graph,
         IfdsConfig {
@@ -269,8 +304,12 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
     );
     let result = solver.solve();
 
-    let hits = collect_hits(module, config, callgraph, &result);
-    let applied = problem.applied_summaries();
+    let hits = collect_hits(work_mod, problem.links(), config, callgraph, &result);
+    let applied = problem
+        .applied_summaries()
+        .into_iter()
+        .filter(|(iid, _)| iid.index() < orig_inst_len)
+        .collect();
     let (gap_sites_resolved, gap_sites_unresolved) = problem.gap_counts();
     let stats = registry.stats();
     let resolve_map = |m: &std::collections::BTreeMap<abcd_ir::Sym, usize>| {
@@ -289,9 +328,28 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
         gap_sites_unresolved,
         alias_rung_used: rung_used,
     };
-    let path_index = PathIndex::build(module, &result);
+    let path_index = PathIndex::build(work_mod, &result);
+    report.hits.retain(|h| h.call.index() < orig_inst_len);
     for hit in &mut report.hits {
-        let (seed, path) = reconstruct_path(module, callgraph, &result, &path_index, hit);
+        let (mut seed, mut path) =
+            reconstruct_path(work_mod, &gap_graph, &result, &path_index, hit);
+        if augmented.is_some() {
+            path.retain(|step| step.inst.index() < orig_inst_len);
+            if path.is_empty()
+                && let Some(inst) = module.inst(hit.call)
+            {
+                path.push(PathStep {
+                    inst: hit.call,
+                    loc: inst.loc,
+                    op: op_tag(&inst.op),
+                });
+            }
+            if seed.0.index() >= orig_func_len {
+                let first_inst = path.first().map(|s| s.inst).unwrap_or(hit.call);
+                let user_func = func_of_inst(module, first_inst).unwrap_or(FuncId::new(0));
+                seed = (user_func, Fact::Zero);
+            }
+        }
         hit.seed = seed;
         hit.path = path;
     }
@@ -304,13 +362,14 @@ pub fn run_taint_full(module: &Module, config: &TaintConfig) -> (TaintReport, If
 /// Scan call sites for sink matches with tainted operands.
 fn collect_hits(
     module: &Module,
+    links: &ModuleLinkTable,
     config: &TaintConfig,
     callgraph: &CallGraph,
     result: &IfdsResult<Fact>,
 ) -> Vec<SinkHit> {
     let zero = Fact::Zero;
     let mut hits = Vec::new();
-    for (iid, _edge) in callgraph.sites() {
+    for (iid, edge) in callgraph.sites() {
         let Some(inst) = module.inst(iid) else {
             continue;
         };
@@ -320,7 +379,7 @@ fn collect_hits(
         else {
             continue;
         };
-        let mut names = callee_name_candidates(module, *callee);
+        let mut names = callee_name_candidates_with_links(module, links, edge.caller, *callee);
         for f in callgraph.callees_of_call_at(iid) {
             if let Some(fd) = module.func(*f)
                 && let Some(n) = module.sym.resolve(fd.name)
@@ -532,7 +591,7 @@ impl PathIndex {
 ///    indices).
 fn reconstruct_path(
     module: &Module,
-    callgraph: &CallGraph,
+    callgraph: &impl CallGraphOracle,
     result: &IfdsResult<Fact>,
     index: &PathIndex,
     hit: &SinkHit,
