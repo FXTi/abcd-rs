@@ -16,9 +16,9 @@
 //!   interpreter-inl.cpp:285-291/:731-732/:1471-1472, :739/:1482;
 //!   interpreter_assembly.cpp:3653-3657, :3695).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use abcd_ir::{BlockId, ConstId, InstId, Module, Op, Ty, Value, ValueDef, ValueId};
+use abcd_ir::{BlockId, ConstId, Edge, InstId, Module, Op, Ty, Value, ValueDef, ValueId};
 
 use crate::emit_inst;
 
@@ -34,6 +34,25 @@ pub enum RegOrAcc {
 /// Per-block SSA state: maps each virtual location to its current SSA
 /// value.
 type BlockDefs = HashMap<RegOrAcc, ValueId>;
+
+/// Explicit stack frame for iterative Braun SSA resolution.
+enum SsaFrame {
+    /// Begin reading `loc` in `block` (walks sealed single-predecessor
+    /// chains iteratively in O(1) stack space).
+    EnterRead { loc: RegOrAcc, block: BlockId },
+    /// After resolving the value at the head of a single-predecessor chain
+    /// `[b_0, b_1, ..., b_k]`, record `write_variable(loc, b_i, val)` in
+    /// reverse order (`b_k` down to `b_0`) to match recursive unwinding.
+    FinishChain { loc: RegOrAcc, chain: Vec<BlockId> },
+    /// Iteratively populate `Op::Phi` operands across `preds` for `phi_val`.
+    FillPhi {
+        loc: RegOrAcc,
+        phi_val: ValueId,
+        preds: Vec<Edge>,
+        next_idx: usize,
+        entries: Vec<(Edge, ValueId)>,
+    },
+}
 
 /// SSA construction context using the Braun algorithm.
 pub struct SsaBuilder {
@@ -79,50 +98,171 @@ impl SsaBuilder {
         self.defs.entry(block).or_default().insert(loc, val);
     }
 
-    /// Read a variable in `block`. If not locally defined, recursively
-    /// searches predecessors and inserts phi nodes as needed.
+    /// Read a variable in `block`. If not locally defined, iteratively
+    /// searches predecessors on an explicit heap stack and inserts phi
+    /// nodes as needed.
     pub fn read_variable(&mut self, loc: RegOrAcc, block: BlockId, module: &mut Module) -> ValueId {
         if let Some(val) = self.defs.get(&block).and_then(|m| m.get(&loc)).copied() {
             return val;
         }
-        self.read_variable_recursive(loc, block, module)
+        self.run_ssa_stack(vec![SsaFrame::EnterRead { loc, block }], module)
     }
 
-    fn read_variable_recursive(
-        &mut self,
-        loc: RegOrAcc,
-        block: BlockId,
-        module: &mut Module,
-    ) -> ValueId {
-        let preds = module.blocks[block.index()].preds.clone();
-        // Predecessor edges are fully built before SSA construction
-        // starts, so a block with no predecessors (the entry block, or
-        // code unreachable from it) can never gain phi operands later.
-        // A location read there has no reaching definition: resolve to
-        // the Ark frame-initial value instead of an invalid zero-entry
-        // phi.
-        let val = if preds.is_empty() {
-            self.frame_initial(loc, module)
-        } else if !self.is_sealed(block) {
-            // Block not sealed yet — create an incomplete phi.
-            let phi_val = self.emit_empty_phi(block, module);
-            self.incomplete_phis
-                .entry(block)
-                .or_default()
-                .push((loc, phi_val));
-            phi_val
-        } else if preds.len() == 1 {
-            // Single predecessor — no phi needed, just recurse.
-            self.read_variable(loc, preds[0].from, module)
-        } else {
-            // Multiple predecessors — insert a phi and fill it.
-            let phi_val = self.emit_empty_phi(block, module);
-            // Write before recursing to break cycles.
-            self.write_variable(loc, block, phi_val);
-            self.add_phi_operands(loc, block, phi_val, module)
-        };
-        self.write_variable(loc, block, val);
-        val
+    /// Drive Braun SSA resolution and phi-operand filling without native
+    /// call-stack recursion.
+    fn run_ssa_stack(&mut self, mut stack: Vec<SsaFrame>, module: &mut Module) -> ValueId {
+        let mut returned: Option<ValueId> = None;
+
+        'frames: while let Some(frame) = stack.pop() {
+            match frame {
+                SsaFrame::EnterRead { loc, block } => {
+                    debug_assert!(returned.is_none());
+                    let mut cur = block;
+                    let mut chain: Vec<BlockId> = Vec::new();
+                    let mut seen_large: Option<HashSet<BlockId>> = None;
+
+                    let resolved = loop {
+                        if let Some(val) = self.defs.get(&cur).and_then(|m| m.get(&loc)).copied() {
+                            break Some(val);
+                        }
+
+                        let in_chain = if let Some(set) = &seen_large {
+                            set.contains(&cur)
+                        } else {
+                            chain.contains(&cur)
+                        };
+                        if in_chain {
+                            // Unreachable sealed single-predecessor cycle: break
+                            // the cycle with a self-referential 1-entry phi on `cur`.
+                            let phi_val = self.emit_empty_phi(cur, module);
+                            let pred_edge = module.blocks[cur.index()].preds[0];
+                            let phi_inst = match module.values[phi_val.index()].def {
+                                ValueDef::Inst(inst) => inst,
+                                _ => unreachable!("phi_val must be an instruction result"),
+                            };
+                            module.insts[phi_inst.index()].op = Op::Phi {
+                                entries: vec![(pred_edge, phi_val)],
+                            };
+                            self.write_variable(loc, cur, phi_val);
+                            break Some(phi_val);
+                        }
+
+                        let preds_len = module.blocks[cur.index()].preds.len();
+                        if preds_len == 0 {
+                            // Predecessor edges are fully built before SSA
+                            // construction starts, so a zero-predecessor block
+                            // (entry, or unreachable island head) resolves to
+                            // the Ark frame-initial constant instead of an
+                            // invalid zero-entry phi.
+                            let val = self.frame_initial(loc, module);
+                            self.write_variable(loc, cur, val);
+                            break Some(val);
+                        } else if !self.is_sealed(cur) {
+                            let phi_val = self.emit_empty_phi(cur, module);
+                            self.incomplete_phis
+                                .entry(cur)
+                                .or_default()
+                                .push((loc, phi_val));
+                            self.write_variable(loc, cur, phi_val);
+                            break Some(phi_val);
+                        } else if preds_len == 1 {
+                            let next = module.blocks[cur.index()].preds[0].from;
+                            if let Some(set) = &mut seen_large {
+                                set.insert(cur);
+                            } else if chain.len() == 64 {
+                                let mut set: HashSet<BlockId> = chain.iter().copied().collect();
+                                set.insert(cur);
+                                seen_large = Some(set);
+                            }
+                            chain.push(cur);
+                            cur = next;
+                        } else {
+                            // Multiple predecessors on a sealed block: insert an
+                            // empty phi and write before recursing to break cycles.
+                            let phi_val = self.emit_empty_phi(cur, module);
+                            self.write_variable(loc, cur, phi_val);
+                            chain.push(cur);
+                            let preds = module.blocks[cur.index()].preds.clone();
+                            let cap = preds.len();
+                            stack.push(SsaFrame::FinishChain {
+                                loc,
+                                chain: std::mem::take(&mut chain),
+                            });
+                            stack.push(SsaFrame::FillPhi {
+                                loc,
+                                phi_val,
+                                preds,
+                                next_idx: 0,
+                                entries: Vec::with_capacity(cap),
+                            });
+                            break None;
+                        }
+                    };
+
+                    if let Some(val) = resolved {
+                        for &b in chain.iter().rev() {
+                            self.write_variable(loc, b, val);
+                        }
+                        returned = Some(val);
+                    }
+                }
+                SsaFrame::FinishChain { loc, chain } => {
+                    let Some(val) = returned else {
+                        unreachable!("FinishChain resumed without child return value");
+                    };
+                    for &b in chain.iter().rev() {
+                        self.write_variable(loc, b, val);
+                    }
+                }
+                SsaFrame::FillPhi {
+                    loc,
+                    phi_val,
+                    preds,
+                    mut next_idx,
+                    mut entries,
+                } => {
+                    if let Some(val) = returned.take() {
+                        entries.push((preds[next_idx - 1], val));
+                    }
+
+                    while next_idx < preds.len() {
+                        let edge = preds[next_idx];
+                        next_idx += 1;
+                        if let Some(val) =
+                            self.defs.get(&edge.from).and_then(|m| m.get(&loc)).copied()
+                        {
+                            entries.push((edge, val));
+                        } else {
+                            let child_block = edge.from;
+                            stack.push(SsaFrame::FillPhi {
+                                loc,
+                                phi_val,
+                                preds,
+                                next_idx,
+                                entries,
+                            });
+                            stack.push(SsaFrame::EnterRead {
+                                loc,
+                                block: child_block,
+                            });
+                            continue 'frames;
+                        }
+                    }
+
+                    let phi_inst = match module.values[phi_val.index()].def {
+                        ValueDef::Inst(inst) => inst,
+                        _ => unreachable!("phi_val must be an instruction result"),
+                    };
+                    module.insts[phi_inst.index()].op = Op::Phi { entries };
+                    returned = Some(self.try_remove_trivial_phi(phi_val, phi_inst, module));
+                }
+            }
+        }
+
+        match returned {
+            Some(val) => val,
+            None => unreachable!("SSA stack finished without producing a ValueId"),
+        }
     }
 
     /// The frame-initial value for a location with no reaching
@@ -187,7 +327,7 @@ impl SsaBuilder {
     }
 
     /// Fill phi operands by reading the variable from each predecessor
-    /// edge.
+    /// edge on the explicit SSA stack.
     fn add_phi_operands(
         &mut self,
         loc: RegOrAcc,
@@ -196,21 +336,17 @@ impl SsaBuilder {
         module: &mut Module,
     ) -> ValueId {
         let preds = module.blocks[block.index()].preds.clone();
-        let mut entries = Vec::with_capacity(preds.len());
-        for edge in &preds {
-            let val = self.read_variable(loc, edge.from, module);
-            entries.push((*edge, val));
-        }
-
-        // Find the phi instruction for this value and update its
-        // entries.
-        let phi_inst = match module.values[phi_val.index()].def {
-            ValueDef::Inst(inst) => inst,
-            _ => unreachable!("phi_val must be an instruction result"),
-        };
-        module.insts[phi_inst.index()].op = Op::Phi { entries };
-
-        self.try_remove_trivial_phi(phi_val, phi_inst, module)
+        let cap = preds.len();
+        self.run_ssa_stack(
+            vec![SsaFrame::FillPhi {
+                loc,
+                phi_val,
+                preds,
+                next_idx: 0,
+                entries: Vec::with_capacity(cap),
+            }],
+            module,
+        )
     }
 
     /// If a phi is trivial (all operands are the same value or the phi
@@ -264,5 +400,144 @@ impl SsaBuilder {
         // dead phis — a pass-layer concern.)
 
         replacement
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use abcd_ir::{Block, Const, EdgeKind};
+
+    fn fresh_builder() -> (Module, SsaBuilder) {
+        let mut module = Module::new();
+        let undef = module.consts.push(Const::Undefined);
+        let hole = module.consts.push(Const::Hole);
+        let ssa = SsaBuilder::new(undef, hole);
+        (module, ssa)
+    }
+
+    fn push_block(module: &mut Module) -> BlockId {
+        let id = BlockId::new(module.blocks.len() as u32);
+        module.blocks.push(Block::default());
+        id
+    }
+
+    fn add_normal_edge(module: &mut Module, from: BlockId, to: BlockId) {
+        module.blocks[to.index()].preds.push(Edge {
+            from,
+            kind: EdgeKind::Normal,
+        });
+    }
+
+    #[test]
+    fn deep_linear_chain_uses_constant_stack() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let (mut module, mut ssa) = fresh_builder();
+                let n = 5_000usize;
+                let mut blocks = Vec::with_capacity(n);
+                for i in 0..n {
+                    let bb = push_block(&mut module);
+                    if i > 0 {
+                        add_normal_edge(&mut module, blocks[i - 1], bb);
+                    }
+                    blocks.push(bb);
+                }
+                let param = ValueId::new(module.values.len() as u32);
+                module.values.push(Value {
+                    def: ValueDef::Param(0),
+                    ty: Ty::Any,
+                });
+                ssa.write_variable(RegOrAcc::Reg(0), blocks[0], param);
+                for &bb in &blocks {
+                    ssa.seal_block(bb, &mut module);
+                }
+
+                let tail = blocks[n - 1];
+                assert_eq!(
+                    ssa.read_variable(RegOrAcc::Reg(0), tail, &mut module),
+                    param
+                );
+                let uninit = ssa.read_variable(RegOrAcc::Reg(1), tail, &mut module);
+                assert!(matches!(
+                    module.values[uninit.index()].def,
+                    ValueDef::Const(_)
+                ));
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn deep_diamond_chain_uses_constant_stack() {
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let (mut module, mut ssa) = fresh_builder();
+                let diamonds = 2_000usize;
+                let entry = push_block(&mut module);
+                let v0 = ValueId::new(module.values.len() as u32);
+                module.values.push(Value {
+                    def: ValueDef::Param(0),
+                    ty: Ty::Any,
+                });
+                let v1 = ValueId::new(module.values.len() as u32);
+                module.values.push(Value {
+                    def: ValueDef::Param(1),
+                    ty: Ty::Any,
+                });
+                // Reg(0) stays constant across all diamonds (trivial-phi collapse);
+                // Reg(1) gets redefined on one arm of the first diamond (non-trivial phi chain).
+                ssa.write_variable(RegOrAcc::Reg(0), entry, v0);
+                ssa.write_variable(RegOrAcc::Reg(1), entry, v0);
+                ssa.seal_block(entry, &mut module);
+
+                let mut prev = entry;
+                for i in 0..diamonds {
+                    let left = push_block(&mut module);
+                    let right = push_block(&mut module);
+                    let merge = push_block(&mut module);
+                    add_normal_edge(&mut module, prev, left);
+                    add_normal_edge(&mut module, prev, right);
+                    add_normal_edge(&mut module, left, merge);
+                    add_normal_edge(&mut module, right, merge);
+                    if i == 0 {
+                        ssa.write_variable(RegOrAcc::Reg(1), right, v1);
+                    }
+                    ssa.seal_block(left, &mut module);
+                    ssa.seal_block(right, &mut module);
+                    ssa.seal_block(merge, &mut module);
+                    prev = merge;
+                }
+
+                // Trivial phis collapse all 2,000 diamonds back to `v0`.
+                assert_eq!(ssa.read_variable(RegOrAcc::Reg(0), prev, &mut module), v0);
+                // Non-trivial phi at diamond 0 survives and propagates cleanly.
+                let joined = ssa.read_variable(RegOrAcc::Reg(1), prev, &mut module);
+                assert_ne!(joined, v0);
+                assert_ne!(joined, v1);
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn unreachable_single_pred_cycle_terminates() {
+        let (mut module, mut ssa) = fresh_builder();
+        let entry = push_block(&mut module);
+        let b1 = push_block(&mut module);
+        let b2 = push_block(&mut module);
+        let b3 = push_block(&mut module);
+        // Sealed dead cycle b1 <-> b2 feeding b3.
+        add_normal_edge(&mut module, b2, b1);
+        add_normal_edge(&mut module, b1, b2);
+        add_normal_edge(&mut module, b2, b3);
+        for bb in [entry, b1, b2, b3] {
+            ssa.seal_block(bb, &mut module);
+        }
+
+        let val = ssa.read_variable(RegOrAcc::Reg(0), b3, &mut module);
+        assert!(matches!(module.values[val.index()].def, ValueDef::Inst(_)));
     }
 }

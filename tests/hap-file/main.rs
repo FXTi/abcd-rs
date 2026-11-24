@@ -22,6 +22,7 @@
 
 mod wild_manifest;
 
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use wild_manifest::{Expectation, Manifest};
 
@@ -75,25 +76,31 @@ fn exported_corpus_wild_hap_gates() {
         .filter(|p| p.expectation == Expectation::NegativeInvalidOpcode)
         .collect();
 
-    // ── decode-ok gate: container extraction AND every module decode ──
+    // ── decode-ok gate: container extraction AND every module decode (rayon) ──
+    let per_pkg: Vec<(usize, Vec<String>)> = decode_ok
+        .par_iter()
+        .map(|pkg| {
+            let bytes = std::fs::read(root.join(&pkg.path))
+                .unwrap_or_else(|e| panic!("{}: unreadable package: {e}", pkg.path));
+            match abcd_hap::abc_modules(&bytes) {
+                Ok(modules) => {
+                    let mut errs = Vec::new();
+                    for m in &modules {
+                        if let Err(e) = abcd_file::decode(m.data.as_slice()) {
+                            errs.push(format!("{}: {}: {e}", pkg.path, m.entry_name));
+                        }
+                    }
+                    (modules.len(), errs)
+                }
+                Err(e) => (0, vec![format!("{}: container: {e}", pkg.path)]),
+            }
+        })
+        .collect();
     let mut failures: Vec<String> = Vec::new();
     let mut modules_total = 0usize;
-    for pkg in &decode_ok {
-        let bytes = std::fs::read(root.join(&pkg.path))
-            .unwrap_or_else(|e| panic!("{}: unreadable package: {e}", pkg.path));
-        let modules = match abcd_hap::abc_modules(&bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                failures.push(format!("{}: container: {e}", pkg.path));
-                continue;
-            }
-        };
-        for m in &modules {
-            modules_total += 1;
-            if let Err(e) = abcd_file::decode(m.data.as_slice()) {
-                failures.push(format!("{}: {}: {e}", pkg.path, m.entry_name));
-            }
-        }
+    for (count, errs) in per_pkg {
+        modules_total += count;
+        failures.extend(errs);
     }
     assert!(
         failures.is_empty(),

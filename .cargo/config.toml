@@ -1,0 +1,9 @@
+# Workspace-local Cargo profile tuning (#37).
+# Preserve DWARF line tables so panic backtraces carry exact file:line locations,
+# while omitting full variable/type DIEs that bloat the 35 test binaries and slow
+# incremental linking and macOS syspolicyd/XProtect scans.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

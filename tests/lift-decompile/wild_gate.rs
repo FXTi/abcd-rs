@@ -1,5 +1,5 @@
-//! The wild gate: the core-25 wild-OHOS subset promoted from the
-//! local-only smoke instrument (`wild_smoke.rs`) to a per-push CI gate.
+//! The wild gate: the core-25 wild-OHOS subset promoted to a per-push CI
+//! gate, plus an offline zero-Docker companion gate (`wild_gate_offline`).
 //! Design: `design/archive/wild-gate-evaluation.md` — the maintainer-approved
 //! semantics are **A + B + the standing laws** (§6.E):
 //!
@@ -57,6 +57,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use abcd_decompile::emit::{EmitOptions, decompile_module};
+use abcd_decompile::split::decompile_module_split;
 use rayon::prelude::*;
 
 /// The core-25 selection (q-P12 pick list; evaluation §2/§3.2). Paths
@@ -438,11 +439,122 @@ fn recompile(jobs: usize) {
     assert!(out.status.success(), "scripts/dream-gate.py failed: {text}");
 }
 
-/// The main gate: A (recompile acceptance) + B (fallback ledger +
-/// tripwire) + the standing laws, over the core-25 wild set.
+/// Offline zero-Docker gate over the core-25 wild set (#37):
+/// 1. Unpacks all 25 `.hap` packages (`64` `.abc` modules, `65,530` functions),
+///    running `decode -> lift -> verify_module -> decompile_module` and checking
+///    the exact self-cleaning fallback ledger (`scripts/wild-dream-divergences.json`).
+/// 2. Exercises `decompile_module_split` with `EmitOptions { arkui: true, .. }`
+///    across every core-25 module to guard path normalization, `--arkui` ViewPU
+///    recovery, and split-output determinism with zero Docker dependency.
+fn assert_split_arkui_on_wild(packages: &[WildPackage], root: &Path) -> usize {
+    let arkui_opts = EmitOptions {
+        arkui: true,
+        ..EmitOptions::default()
+    };
+    let mut work: Vec<(String, String, Vec<u8>)> = Vec::new();
+    for pkg in packages {
+        let bytes = std::fs::read(root.join(&pkg.path)).expect("read wild package");
+        let modules = abcd_hap::abc_modules(&bytes).expect("extract wild abc modules");
+        for m in &modules {
+            work.push((
+                pkg.path.clone(),
+                m.entry_name.clone(),
+                m.data.as_slice().to_vec(),
+            ));
+        }
+    }
+    let split_files_total: usize = work
+        .par_iter()
+        .map(|(pkg, entry, data)| {
+            let rel = format!("{pkg}#{entry}");
+            let file = abcd_file::decode(data).expect("decode wild module");
+            let module = abcd_lift::lift_file(&file).expect("lift wild module");
+            let split1 = decompile_module_split(&module, &arkui_opts);
+            let split2 = decompile_module_split(&module, &arkui_opts);
+            assert_eq!(
+                split1.files.len(),
+                split2.files.len(),
+                "non-deterministic split file count in {rel}"
+            );
+            for (a, b) in split1.files.iter().zip(&split2.files) {
+                assert_eq!(a.rel_path, b.rel_path, "non-deterministic path in {rel}");
+                assert_eq!(a.text, b.text, "non-deterministic arkui text in {rel}");
+                assert!(
+                    !a.rel_path.is_empty()
+                        && !a.rel_path.starts_with('/')
+                        && !a.rel_path.contains('\\')
+                        && !a.rel_path.split('/').any(|seg| seg == ".."),
+                    "unsafe split output path {:?} in {rel}",
+                    a.rel_path
+                );
+            }
+            split1.files.len()
+        })
+        .sum();
+    assert!(
+        split_files_total >= EXPECTED_MODULES,
+        "expected >= {EXPECTED_MODULES} split files across core-25, got {split_files_total}"
+    );
+    split_files_total
+}
+
 #[test]
-#[ignore = "requires the exported wild corpus, python3, and docker (CI wild-gate job / dabai)"]
-fn wild_gate() {
+#[ignore = "requires the exported wild corpus (offline, zero docker)"]
+fn wild_gate_offline() {
+    let root = wild_corpus_root();
+    let Some(packages) = select_core25(&root) else {
+        return;
+    };
+    let outs = generate(&packages);
+    assert_fallback_ledger_and_write_observed(&outs);
+    let split_files_total = assert_split_arkui_on_wild(&packages, &root);
+    eprintln!(
+        "WILD-GATE-OFFLINE green: {} packages / {} modules, ledger exact, split+arkui emitted {} files",
+        packages.len(),
+        outs.len(),
+        split_files_total
+    );
+}
+
+fn assert_fallback_ledger_and_write_observed(outs: &[ModuleOut]) {
+    let gate = gate_root();
+    std::fs::create_dir_all(&gate).expect("create gate root");
+    let mut per_pkg: FallbackCounts = BTreeMap::new();
+    let mut total_fallbacks = 0usize;
+    let mut total_functions = 0usize;
+    for out in outs {
+        total_fallbacks += out.functions_with_fallbacks;
+        total_functions += out.ir_functions;
+        let entry = per_pkg.entry(out.pkg.clone()).or_insert([0, 0]);
+        entry[0] += out.functions_with_fallbacks;
+        entry[1] += out.ir_functions;
+    }
+    let observed: FallbackCounts = per_pkg.into_iter().filter(|(_, [fb, _])| *fb > 0).collect();
+    std::fs::write(
+        gate.join("fallback-observed.json"),
+        serde_json::to_string_pretty(&observed).expect("serialize observed"),
+    )
+    .expect("write observed fallback counts");
+    let ledger = load_ledger(&ledger_path());
+    let violations = check_fallback_ledger(&observed, &ledger, total_fallbacks, total_functions);
+    let rate = total_fallbacks as f64 / total_functions.max(1) as f64 * 100.0;
+    eprintln!(
+        "WILD-GATE fallback accounting: {total_fallbacks}/{total_functions} = {rate:.3}% \
+         (tripwire {FALLBACK_TRIPWIRE_PERCENT}%), ledger rows={}",
+        ledger.len()
+    );
+    assert!(
+        violations.is_empty(),
+        "wild-gate fallback ledger violations:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// The full CI gate: A (Docker es2abc recompile acceptance) + B (fallback
+/// ledger + tripwire) + the standing laws, over the core-25 wild set.
+#[test]
+#[ignore = "requires the exported wild corpus, python3, and docker (CI wild-gate job)"]
+fn wild_gate_full() {
     let root = wild_corpus_root();
     let Some(packages) = select_core25(&root) else {
         return; // skip-by-absence: no exported wild corpus.
@@ -473,40 +585,9 @@ fn wild_gate() {
     }
     std::fs::write(gate.join("decompile-manifest.jsonl"), manifest).expect("write manifest");
 
-    // ── B: fallback ledger + global tripwire ─────────────────────────
-    // Per-package pairs over ALL of the package's modules (a fallback-
-    // free module still contributes its IR functions to the pair).
-    let mut per_pkg: FallbackCounts = BTreeMap::new();
-    let mut total_fallbacks = 0usize;
-    let mut total_functions = 0usize;
-    for out in &outs {
-        total_fallbacks += out.functions_with_fallbacks;
-        total_functions += out.ir_functions;
-        let entry = per_pkg.entry(out.pkg.clone()).or_insert([0, 0]);
-        entry[0] += out.functions_with_fallbacks;
-        entry[1] += out.ir_functions;
-    }
-    let observed: FallbackCounts = per_pkg.into_iter().filter(|(_, [fb, _])| *fb > 0).collect();
-    // The observed counts land in target/ on EVERY run (green or red):
-    // the relist workflow copies this map into the ledger.
-    std::fs::write(
-        gate.join("fallback-observed.json"),
-        serde_json::to_string_pretty(&observed).expect("serialize observed"),
-    )
-    .expect("write observed fallback counts");
-    let ledger = load_ledger(&ledger_path());
-    let violations = check_fallback_ledger(&observed, &ledger, total_fallbacks, total_functions);
-    let rate = total_fallbacks as f64 / total_functions.max(1) as f64 * 100.0;
-    eprintln!(
-        "WILD-GATE fallback accounting: {total_fallbacks}/{total_functions} = {rate:.3}% \
-         (tripwire {FALLBACK_TRIPWIRE_PERCENT}%), ledger rows={}",
-        ledger.len()
-    );
-    assert!(
-        violations.is_empty(),
-        "wild-gate fallback ledger violations:\n  {}",
-        violations.join("\n  ")
-    );
+    // ── B: fallback ledger + global tripwire + split/arkui invariants ─
+    assert_fallback_ledger_and_write_observed(&outs);
+    let _split_files = assert_split_arkui_on_wild(&packages, &root);
 
     // ── A: es2abc recompile acceptance ───────────────────────────────
     recompile(4);

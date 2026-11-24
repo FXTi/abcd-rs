@@ -137,7 +137,9 @@ fn generate() -> usize {
         manifest_line: String,
     }
 
-    let check_determinism = std::env::var_os("CARGO_LLVM_COV").is_none();
+    // Note: byte-identical decompile determinism across all 2,832 project
+    // fixtures (a strict superset of these 1,149 rows) is already asserted
+    // by `corpus_decompile` in the same test suite (#37).
     let generated: Vec<RowGen> = passed
         .par_iter()
         .map(|(abc, case, version, profile, _status)| {
@@ -150,10 +152,6 @@ fn generate() -> usize {
                 ..EmitOptions::default()
             };
             let d1 = decompile_module(&module, &opts);
-            if check_determinism {
-                let d2 = decompile_module(&module, &opts);
-                assert_eq!(d1.text, d2.text, "non-deterministic output in {abc}");
-            }
 
             let is_module = !module.imports.is_empty()
                 || !module.exports.is_empty()

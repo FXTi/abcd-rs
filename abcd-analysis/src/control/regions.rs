@@ -102,9 +102,167 @@ use std::rc::Rc;
 use abcd_ir::{BlockId, EdgeKind, FuncId, Module, TryRegion};
 
 use super::dom::{Dominators, PostDominators};
-use super::loops::{back_edges_in_blocks, natural_loop};
+use super::loops::back_edges_in_blocks;
 use super::reach::reachable_from;
 use super::succs::block_succs;
+
+/// Fixed-width dense bitset over `0..u_len` universe block indices.
+///
+/// Because `u_blocks` is sorted by [`BlockId`], iterating set bits in
+/// ascending word/bit order yields elements in exact `BTreeSet<BlockId>`
+/// order while replacing heap-allocated B-tree operations with `O(|U|/64)`
+/// word bitwise operations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BitSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl BitSet {
+    #[inline]
+    fn empty(word_len: usize) -> Self {
+        Self {
+            words: vec![0u64; word_len],
+            len: 0,
+        }
+    }
+
+    #[inline]
+    fn full(u_len: usize, word_len: usize) -> Self {
+        let mut words = vec![!0u64; word_len];
+        let rem = u_len & 63;
+        if rem != 0
+            && let Some(last) = words.last_mut()
+        {
+            *last = (1u64 << rem) - 1;
+        }
+        Self { words, len: u_len }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    fn contains(&self, idx: u32) -> bool {
+        (self.words[(idx >> 6) as usize] & (1u64 << (idx & 63))) != 0
+    }
+
+    #[inline]
+    fn insert(&mut self, idx: u32) -> bool {
+        let w = &mut self.words[(idx >> 6) as usize];
+        let mask = 1u64 << (idx & 63);
+        if (*w & mask) == 0 {
+            *w |= mask;
+            self.len += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, idx: u32) -> bool {
+        let w = &mut self.words[(idx >> 6) as usize];
+        let mask = 1u64 << (idx & 63);
+        if (*w & mask) != 0 {
+            *w &= !mask;
+            self.len -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove_all(&mut self, other: &BitSet) {
+        if other.len == 0 || self.len == 0 {
+            return;
+        }
+        let mut removed = 0usize;
+        for (w, &ow) in self.words.iter_mut().zip(other.words.iter()) {
+            let ov = *w & ow;
+            if ov != 0 {
+                *w &= !ow;
+                removed += ov.count_ones() as usize;
+            }
+        }
+        self.len -= removed;
+    }
+
+    fn intersect_with(&mut self, other: &BitSet) {
+        let mut new_len = 0usize;
+        for (w, &ow) in self.words.iter_mut().zip(other.words.iter()) {
+            *w &= ow;
+            new_len += w.count_ones() as usize;
+        }
+        self.len = new_len;
+    }
+
+    fn difference(&self, other: &BitSet) -> BitSet {
+        let mut words = Vec::with_capacity(self.words.len());
+        let mut len = 0usize;
+        for (&w, &ow) in self.words.iter().zip(other.words.iter()) {
+            let d = w & !ow;
+            len += d.count_ones() as usize;
+            words.push(d);
+        }
+        BitSet { words, len }
+    }
+
+    fn is_subset(&self, sup: &BitSet) -> bool {
+        if self.len > sup.len {
+            return false;
+        }
+        for (&w, &sw) in self.words.iter().zip(sup.words.iter()) {
+            if (w & !sw) != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[inline]
+    fn iter(&self) -> BitSetIter<'_> {
+        BitSetIter {
+            words: &self.words,
+            wi: 0,
+            cur: 0,
+        }
+    }
+
+    fn to_blocks(&self, u_blocks: &[BlockId]) -> Vec<BlockId> {
+        let mut out = Vec::with_capacity(self.len);
+        for bi in self.iter() {
+            out.push(u_blocks[bi as usize]);
+        }
+        out
+    }
+}
+
+struct BitSetIter<'a> {
+    words: &'a [u64],
+    wi: usize,
+    cur: u64,
+}
+
+impl Iterator for BitSetIter<'_> {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        while self.cur == 0 {
+            if self.wi >= self.words.len() {
+                return None;
+            }
+            self.cur = self.words[self.wi];
+            self.wi += 1;
+        }
+        let tz = self.cur.trailing_zeros();
+        self.cur &= self.cur - 1;
+        Some(((self.wi - 1) as u32) * 64 + tz)
+    }
+}
 
 /// Index of a region node in [`RegionTree::nodes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -446,13 +604,21 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
 
     let normal_succs = subgraph.succ;
 
-    // The universe: blocks Normal-reachable from the entry.
+    // The universe: blocks Normal-reachable from the entry, sorted by `BlockId`.
     let universe: BTreeSet<BlockId> = reachable_from(entry, normal_succs).into_iter().collect();
+    let u_blocks: Vec<BlockId> = universe.iter().copied().collect();
+    let u_len = u_blocks.len();
+    let word_len = u_len.div_ceil(64);
+    let mut u_idx: HashMap<BlockId, u32> = HashMap::with_capacity(u_len);
+    for (i, &b) in u_blocks.iter().enumerate() {
+        u_idx.insert(b, i as u32);
+    }
+
     let dead_blocks: Vec<BlockId> = subgraph
         .blocks
         .iter()
         .copied()
-        .filter(|b| !universe.contains(b))
+        .filter(|b| !u_idx.contains_key(b))
         .collect();
 
     let dom = Dominators::from_entry(func, Some(entry), normal_succs);
@@ -465,18 +631,11 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
     // exit but not a continuation, and must not poison the merge).
     let postdom = PostDominators::over_blocks(func, subgraph.blocks, normal_succs);
 
-    // Dense `0..universe.len()` index so per-block tables stay `O(|universe|)`
-    // rather than `O(module.blocks.len())`.
-    let u_len = universe.len();
-    let mut u_idx: HashMap<BlockId, usize> = HashMap::with_capacity(u_len);
-    for (i, &b) in universe.iter().enumerate() {
-        u_idx.insert(b, i);
-    }
-
-    // Universe-filtered successor/predecessor tables (successors in
-    // terminator order, deduped; predecessors sorted, deduped).
-    let mut succs: Vec<Vec<BlockId>> = vec![Vec::new(); u_len];
-    let mut preds: Vec<Vec<BlockId>> = vec![Vec::new(); u_len];
+    // Universe-filtered successor/predecessor tables over dense `0..u_len`
+    // indices (successors in terminator order, deduped; predecessors sorted,
+    // deduped).
+    let mut succs: Vec<Vec<u32>> = vec![Vec::new(); u_len];
+    let mut preds: Vec<Vec<u32>> = vec![Vec::new(); u_len];
     // Blocks with a Normal predecessor OUTSIDE the universe (the N45
     // model: handler sub-CFGs are structured separately, so their
     // Normal out-edges into the shared continuation are invisible in
@@ -484,60 +643,74 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
     // target: the handler side can only reach it by falling out of a
     // catch clause onto it, so it must never be buried inside a
     // conditional arm (N76).
-    let mut external_preds: BTreeSet<BlockId> = BTreeSet::new();
-    for (&b, &bi) in &u_idx {
-        let mut seen = BTreeSet::new();
-        succs[bi] = normal_succs(b)
-            .into_iter()
-            .filter(|s| universe.contains(s) && seen.insert(*s))
-            .collect();
-        if let Some(bb) = module.block(b) {
-            if bb
-                .preds
-                .iter()
-                .any(|e| e.kind == EdgeKind::Normal && !universe.contains(&e.from))
+    let mut external_preds = BitSet::empty(word_len);
+    for (bi, &b) in u_blocks.iter().enumerate() {
+        let mut seen: Vec<u32> = Vec::new();
+        for s in normal_succs(b) {
+            if let Some(&si) = u_idx.get(&s)
+                && !seen.contains(&si)
             {
-                external_preds.insert(b);
+                seen.push(si);
             }
-            preds[bi] = bb
-                .preds
-                .iter()
-                .filter(|e| e.kind == EdgeKind::Normal && universe.contains(&e.from))
-                .map(|e| e.from)
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
+        }
+        succs[bi] = seen;
+        if let Some(bb) = module.block(b) {
+            let mut p_vec: Vec<u32> = Vec::new();
+            for e in &bb.preds {
+                if e.kind == EdgeKind::Normal {
+                    if let Some(&pi) = u_idx.get(&e.from) {
+                        p_vec.push(pi);
+                    } else {
+                        external_preds.insert(bi as u32);
+                    }
+                }
+            }
+            p_vec.sort_unstable();
+            p_vec.dedup();
+            preds[bi] = p_vec;
         }
     }
 
     // The natural-loop forest: dominance back edges merged by header.
     let be = back_edges_in_blocks(subgraph.blocks, &dom, normal_succs);
-    let loop_preds = |b: BlockId| u_idx.get(&b).map(|&i| preds[i].clone()).unwrap_or_default();
-    let mut by_header: BTreeMap<BlockId, BTreeSet<BlockId>> = BTreeMap::new();
+    let mut by_header_u: BTreeMap<u32, BitSet> = BTreeMap::new();
+    let mut dead_loop_headers: BTreeSet<BlockId> = BTreeSet::new();
+    let mut nl_stack: Vec<u32> = Vec::new();
     for &(latch, header) in &be {
-        by_header
-            .entry(header)
-            .or_default()
-            .extend(natural_loop(header, latch, &loop_preds));
+        if let (Some(&hi), Some(&li)) = (u_idx.get(&header), u_idx.get(&latch)) {
+            let members = by_header_u.entry(hi).or_insert_with(|| {
+                let mut bs = BitSet::empty(word_len);
+                bs.insert(hi);
+                bs
+            });
+            nl_stack.clear();
+            nl_stack.push(li);
+            while let Some(m) = nl_stack.pop() {
+                if m == hi || !members.insert(m) {
+                    continue;
+                }
+                for &p in &preds[m as usize] {
+                    if !members.contains(p) {
+                        nl_stack.push(p);
+                    }
+                }
+            }
+        } else {
+            dead_loop_headers.insert(header);
+        }
     }
-    let empty_slice: &[BlockId] = &[];
-    let succs_of =
-        |b: BlockId| -> &[BlockId] { u_idx.get(&b).map_or(empty_slice, |&i| succs[i].as_slice()) };
-    let preds_of =
-        |b: BlockId| -> &[BlockId] { u_idx.get(&b).map_or(empty_slice, |&i| preds[i].as_slice()) };
-    let mut loops: Vec<LoopInfo> = Vec::new();
-    for (header, blocks) in &by_header {
-        let blocks_vec: Vec<BlockId> = blocks.iter().copied().collect();
-        let block_set = blocks;
-        let header_exits = succs_of(*header).iter().any(|s| !block_set.contains(s));
-        let latches: Vec<BlockId> = preds_of(*header)
+
+    let mut paired_loops: Vec<(LoopInfo, BitSet)> =
+        Vec::with_capacity(by_header_u.len() + dead_loop_headers.len());
+    for (&hi, block_bits) in &by_header_u {
+        let header = u_blocks[hi as usize];
+        let blocks_vec = block_bits.to_blocks(&u_blocks);
+        let header_exits = succs[hi as usize].iter().any(|&s| !block_bits.contains(s));
+        let latch_exits = preds[hi as usize]
             .iter()
             .copied()
-            .filter(|p| block_set.contains(p))
-            .collect();
-        let latch_exits = latches
-            .iter()
-            .any(|&l| succs_of(l).iter().any(|s| !block_set.contains(s)));
+            .filter(|&p| block_bits.contains(p))
+            .any(|l| succs[l as usize].iter().any(|&s| !block_bits.contains(s)));
         let kind = if header_exits {
             LoopKind::While
         } else if latch_exits {
@@ -546,27 +719,55 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
             // No exit on header or latch (infinite or mid-body exits only).
             LoopKind::While
         };
-        loops.push(LoopInfo {
-            header: *header,
-            kind,
-            blocks: blocks_vec,
-            parent: None,
-        });
+        paired_loops.push((
+            LoopInfo {
+                header,
+                kind,
+                blocks: blocks_vec,
+                parent: None,
+            },
+            block_bits.clone(),
+        ));
     }
-    // Parent links: the smallest strict superset loop.
+    if !dead_loop_headers.is_empty() {
+        for dh in dead_loop_headers {
+            paired_loops.push((
+                LoopInfo {
+                    header: dh,
+                    kind: LoopKind::While,
+                    blocks: vec![dh],
+                    parent: None,
+                },
+                BitSet::empty(word_len),
+            ));
+        }
+        paired_loops.sort_by_key(|(info, _)| info.header);
+    }
+    let mut loops: Vec<LoopInfo> = Vec::with_capacity(paired_loops.len());
+    let mut loop_bits: Vec<BitSet> = Vec::with_capacity(paired_loops.len());
+    for (info, bits) in paired_loops {
+        loops.push(info);
+        loop_bits.push(bits);
+    }
+
+    // Parent links: the smallest strict superset loop (`O(|U|/64)` word subset test).
     for i in 0..loops.len() {
-        let sub: BTreeSet<BlockId> = loops[i].blocks.iter().copied().collect();
+        let i_len = loops[i].blocks.len();
+        if loop_bits[i].is_empty() {
+            continue;
+        }
         let mut parent: Option<usize> = None;
-        for (j, other) in loops.iter().enumerate() {
-            if i == j || other.blocks.len() <= loops[i].blocks.len() {
+        for j in 0..loops.len() {
+            let j_len = loops[j].blocks.len();
+            if i == j || j_len <= i_len || loop_bits[j].is_empty() {
                 continue;
             }
-            let sup: BTreeSet<BlockId> = other.blocks.iter().copied().collect();
-            let smaller = match parent {
-                None => true,
-                Some(p) => loops[p].blocks.len() > other.blocks.len(),
-            };
-            if sub.is_subset(&sup) && smaller {
+            if let Some(p) = parent
+                && loops[p].blocks.len() <= j_len
+            {
+                continue;
+            }
+            if loop_bits[i].is_subset(&loop_bits[j]) {
                 parent = Some(j);
             }
         }
@@ -574,11 +775,19 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
     }
 
     // Irreducible cores: cycles in the graph minus dominance back edges.
-    let back: BTreeSet<(BlockId, BlockId)> = be.iter().copied().collect();
-    let mut removed = back.clone();
+    let mut removed: HashSet<(u32, u32)> = HashSet::with_capacity(be.len() * 2);
+    for &(u, v) in &be {
+        if let (Some(&ui), Some(&vi)) = (u_idx.get(&u), u_idx.get(&v)) {
+            removed.insert((ui, vi));
+        }
+    }
     let mut irreducible = Vec::new();
-    while let Some((blocks, cycle_edges)) = find_cycle(&universe, &succs_of, &removed) {
-        removed.extend(cycle_edges.iter().copied());
+    while let Some((blocks, cycle_edges_idx)) = find_cycle(u_len, &u_blocks, &succs, &removed) {
+        let mut cycle_edges = Vec::with_capacity(cycle_edges_idx.len());
+        for (ui, vi) in cycle_edges_idx {
+            removed.insert((ui, vi));
+            cycle_edges.push((u_blocks[ui as usize], u_blocks[vi as usize]));
+        }
         irreducible.push(IrreducibleCore {
             blocks,
             cycle_edges,
@@ -586,27 +795,24 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
     }
 
     // Innermost natural loop per block (the tail-arm decomposition's
-    // fold-compatibility bail — see `Builder::structure_shared_tail`).
+    // fold-compatibility bail — see `Builder::shared_tail_plan`).
     let mut block_loop: Vec<Option<usize>> = vec![None; u_len];
-    for (i, l) in loops.iter().enumerate() {
-        let set_len = l.blocks.len();
-        for &b in &l.blocks {
-            if let Some(&bi) = u_idx.get(&b) {
-                block_loop[bi] = match block_loop[bi] {
-                    Some(j) if loops[j].blocks.len() <= set_len => Some(j),
-                    _ => Some(i),
-                };
-            }
+    for (i, bits) in loop_bits.iter().enumerate() {
+        let set_len = loops[i].blocks.len();
+        for bi in bits.iter() {
+            let slot = &mut block_loop[bi as usize];
+            *slot = match *slot {
+                Some(j) if loops[j].blocks.len() <= set_len => Some(j),
+                _ => Some(i),
+            };
         }
     }
-    let loop_sets: Vec<BTreeSet<BlockId>> = loops
-        .iter()
-        .map(|l| l.blocks.iter().copied().collect())
-        .collect();
 
     // Build the tree.
     let mut builder = Builder {
+        u_blocks,
         u_idx,
+        word_len,
         succs,
         preds,
         dom,
@@ -616,29 +822,75 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
         cross_arms: Vec::new(),
         external_preds,
         block_loop,
-        loop_sets,
+        loop_bits,
+        scratch_unvisited: vec![0u64; word_len],
+        scratch_queue: Vec::with_capacity(u_len),
     };
-    let root = if universe.is_empty() {
+    let root = if u_len == 0 {
         None
     } else {
-        Some(builder.structure_set(universe.clone(), entry, &BTreeSet::new()))
+        let entry_idx = builder.u_idx[&entry];
+        let full = BitSet::full(u_len, word_len);
+        let empty_disabled = BitSet::empty(word_len);
+        Some(builder.structure_set(full, entry_idx, &empty_disabled))
     };
 
     // Classify every Normal edge in the universe (RPO order, then
     // successor order — fully deterministic).
-    let rpo_index: BTreeMap<BlockId, usize> = builder
-        .dom
-        .rpo()
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| (b, i))
+    let mut rpo_pos: Vec<Option<usize>> = vec![None; u_len];
+    for (pos, &b) in builder.dom.rpo().iter().enumerate() {
+        if let Some(&bi) = builder.u_idx.get(&b) {
+            rpo_pos[bi as usize] = Some(pos);
+        }
+    }
+    let mut header_loop: Vec<Option<usize>> = vec![None; u_len];
+    for (li, l) in loops.iter().enumerate() {
+        if !builder.loop_bits[li].is_empty()
+            && let Some(&hi) = builder.u_idx.get(&l.header)
+        {
+            header_loop[hi as usize] = Some(li);
+        }
+    }
+    let loop_key = |i: usize| (loops[i].blocks.len(), loops[i].header);
+    let mut innermost_loop: Vec<Option<usize>> = vec![None; u_len];
+    for (li, bits) in builder.loop_bits.iter().enumerate() {
+        for bi in bits.iter() {
+            let slot = &mut innermost_loop[bi as usize];
+            match *slot {
+                None => *slot = Some(li),
+                Some(prev) if loop_key(li) < loop_key(prev) => *slot = Some(li),
+                Some(_) => {}
+            }
+        }
+    }
+    let mut loops_desc: Vec<usize> = (0..loops.len())
+        .filter(|&i| !builder.loop_bits[i].is_empty())
         .collect();
+    loops_desc.sort_by(|&a, &b| (loop_key(b), b).cmp(&(loop_key(a), a)));
+
     let mut edges = Vec::new();
     let rpo_blocks: Vec<BlockId> = builder.dom.rpo().to_vec();
     for u in rpo_blocks {
-        let u_succs: Vec<BlockId> = builder.succs_of(u).to_vec();
-        for v in u_succs {
-            let class = classify_edge(u, v, &loops, &rpo_index, &mut builder.escape_hatches);
+        let Some(&ui) = builder.u_idx.get(&u) else {
+            continue;
+        };
+        let u_succ_len = builder.succs[ui as usize].len();
+        for si in 0..u_succ_len {
+            let vi = builder.succs[ui as usize][si];
+            let v = builder.u_blocks[vi as usize];
+            let class = classify_edge(
+                u,
+                ui,
+                v,
+                vi,
+                &loops,
+                &builder.loop_bits,
+                &header_loop,
+                &innermost_loop,
+                &loops_desc,
+                &rpo_pos,
+                &mut builder.escape_hatches,
+            );
             edges.push(ClassifiedEdge {
                 from: u,
                 to: v,
@@ -652,7 +904,8 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
         module,
         subgraph,
         entry,
-        &universe,
+        &builder.u_idx,
+        word_len,
         root.map(|_| &builder.nodes[..]),
         root,
     );
@@ -674,9 +927,11 @@ pub fn structure_subgraph(module: &Module, subgraph: &CfgSubgraph<'_>) -> Region
 
 /// The iterative structurer's working state.
 struct Builder {
-    u_idx: HashMap<BlockId, usize>,
-    succs: Vec<Vec<BlockId>>,
-    preds: Vec<Vec<BlockId>>,
+    u_blocks: Vec<BlockId>,
+    u_idx: HashMap<BlockId, u32>,
+    word_len: usize,
+    succs: Vec<Vec<u32>>,
+    preds: Vec<Vec<u32>>,
     dom: Dominators,
     postdom: PostDominators,
     nodes: Vec<RegionNode>,
@@ -684,32 +939,18 @@ struct Builder {
     cross_arms: Vec<(BlockId, BlockId)>,
     /// Universe blocks with a Normal predecessor outside the universe
     /// (handler-side rejoin targets — see `structure_regions`).
-    external_preds: BTreeSet<BlockId>,
-    /// Innermost natural loop per universe block (index into `loop_sets`).
+    external_preds: BitSet,
+    /// Innermost natural loop per universe block (index into `loop_bits`).
     block_loop: Vec<Option<usize>>,
     /// Natural-loop block sets, indexed by `block_loop`.
-    loop_sets: Vec<BTreeSet<BlockId>>,
+    loop_bits: Vec<BitSet>,
+    /// Reusable bitmask buffer for `reach` / `rev_reach`.
+    scratch_unvisited: Vec<u64>,
+    /// Reusable BFS queue for `reach` / `rev_reach` / exit-tail absorption.
+    scratch_queue: Vec<u32>,
 }
 
 impl Builder {
-    #[inline]
-    fn succs_of(&self, b: BlockId) -> &[BlockId] {
-        self.u_idx
-            .get(&b)
-            .map_or(&[], |&i| self.succs[i].as_slice())
-    }
-
-    #[inline]
-    fn preds_of(&self, b: BlockId) -> &[BlockId] {
-        self.u_idx
-            .get(&b)
-            .map_or(&[], |&i| self.preds[i].as_slice())
-    }
-
-    #[inline]
-    fn loop_of(&self, b: BlockId) -> Option<usize> {
-        self.u_idx.get(&b).and_then(|&i| self.block_loop[i])
-    }
     fn push_node(&mut self, node: RegionNode) -> RegionId {
         let id = RegionId(self.nodes.len() as u32);
         self.nodes.push(node);
@@ -729,19 +970,20 @@ impl Builder {
     /// but not continuations). `None` for infinite loops and for loops
     /// whose exit tails never reconverge (those structure as
     /// [`RegionNode::Alternates`] continuations).
-    fn loop_merge(&self, body: &BTreeSet<BlockId>) -> Option<BlockId> {
-        let mut targets = BTreeSet::new();
-        for &b in body {
-            for &s in self.succs_of(b) {
-                if !body.contains(&s) && !self.succs_of(s).is_empty() {
+    fn loop_merge(&self, body: &BitSet) -> Option<BlockId> {
+        let mut targets = BitSet::empty(self.word_len);
+        for b in body.iter() {
+            for &s in &self.succs[b as usize] {
+                if !body.contains(s) && !self.succs[s as usize].is_empty() {
                     targets.insert(s);
                 }
             }
         }
         let mut iter = targets.iter();
-        let first = *iter.next()?;
+        let first = self.u_blocks[iter.next()? as usize];
         let mut chain = self.postdom.post_dominator_chain(first);
-        for &t in iter {
+        for ti in iter {
+            let t = self.u_blocks[ti as usize];
             let other = self.postdom.post_dominator_chain(t);
             // The chains are ordered from the block upward; the first
             // common element is the deepest common post-dominator.
@@ -760,66 +1002,112 @@ impl Builder {
     }
 
     /// Forward reachability from `from` over `succs`, restricted to
-    /// `within`, never entering `avoid`.
+    /// `within`, never entering `avoid_a` or `avoid_b`.
     fn reach(
-        &self,
-        from: BlockId,
-        within: &BTreeSet<BlockId>,
-        avoid: &BTreeSet<BlockId>,
-    ) -> BTreeSet<BlockId> {
-        let mut seen = BTreeSet::new();
-        if !within.contains(&from) || avoid.contains(&from) {
-            return seen;
+        &mut self,
+        from: u32,
+        within: &BitSet,
+        avoid_a: Option<u32>,
+        avoid_b: Option<u32>,
+    ) -> BitSet {
+        self.scratch_unvisited.copy_from_slice(&within.words);
+        if let Some(a) = avoid_a {
+            self.scratch_unvisited[(a >> 6) as usize] &= !(1u64 << (a & 63));
         }
-        seen.insert(from);
-        let mut queue = VecDeque::from([from]);
-        while let Some(b) = queue.pop_front() {
-            for &s in self.succs_of(b) {
-                if within.contains(&s) && !avoid.contains(&s) && seen.insert(s) {
-                    queue.push_back(s);
+        if let Some(b) = avoid_b {
+            self.scratch_unvisited[(b >> 6) as usize] &= !(1u64 << (b & 63));
+        }
+        let from_mask = 1u64 << (from & 63);
+        let from_slot = &mut self.scratch_unvisited[(from >> 6) as usize];
+        if (*from_slot & from_mask) == 0 {
+            return BitSet::empty(self.word_len);
+        }
+        *from_slot &= !from_mask;
+        self.scratch_queue.clear();
+        self.scratch_queue.push(from);
+        let mut head = 0usize;
+        while head < self.scratch_queue.len() {
+            let b = self.scratch_queue[head];
+            head += 1;
+            for &s in &self.succs[b as usize] {
+                let mask = 1u64 << (s & 63);
+                let slot = &mut self.scratch_unvisited[(s >> 6) as usize];
+                if (*slot & mask) != 0 {
+                    *slot &= !mask;
+                    self.scratch_queue.push(s);
                 }
             }
         }
-        seen
+        let mut words = within.words.clone();
+        if let Some(a) = avoid_a {
+            words[(a >> 6) as usize] &= !(1u64 << (a & 63));
+        }
+        if let Some(b) = avoid_b {
+            words[(b >> 6) as usize] &= !(1u64 << (b & 63));
+        }
+        for (w, &u) in words.iter_mut().zip(self.scratch_unvisited.iter()) {
+            *w ^= u;
+        }
+        BitSet {
+            words,
+            len: self.scratch_queue.len(),
+        }
     }
 
     /// Reverse reachability from `sources` over `preds`, restricted to
     /// `within`, never entering `avoid`.
-    fn rev_reach(
-        &self,
-        sources: &[BlockId],
-        within: &BTreeSet<BlockId>,
-        avoid: &BTreeSet<BlockId>,
-    ) -> BTreeSet<BlockId> {
-        let mut seen = BTreeSet::new();
-        let mut queue = VecDeque::new();
+    fn rev_reach(&mut self, sources: &[u32], within: &BitSet, avoid: u32) -> BitSet {
+        self.scratch_unvisited.copy_from_slice(&within.words);
+        self.scratch_unvisited[(avoid >> 6) as usize] &= !(1u64 << (avoid & 63));
+        self.scratch_queue.clear();
         for &s in sources {
-            if within.contains(&s) && !avoid.contains(&s) && seen.insert(s) {
-                queue.push_back(s);
+            let mask = 1u64 << (s & 63);
+            let slot = &mut self.scratch_unvisited[(s >> 6) as usize];
+            if (*slot & mask) != 0 {
+                *slot &= !mask;
+                self.scratch_queue.push(s);
             }
         }
-        while let Some(b) = queue.pop_front() {
-            for &p in self.preds_of(b) {
-                if within.contains(&p) && !avoid.contains(&p) && seen.insert(p) {
-                    queue.push_back(p);
+        if self.scratch_queue.is_empty() {
+            return BitSet::empty(self.word_len);
+        }
+        let mut head = 0usize;
+        while head < self.scratch_queue.len() {
+            let b = self.scratch_queue[head];
+            head += 1;
+            for &p in &self.preds[b as usize] {
+                let mask = 1u64 << (p & 63);
+                let slot = &mut self.scratch_unvisited[(p >> 6) as usize];
+                if (*slot & mask) != 0 {
+                    *slot &= !mask;
+                    self.scratch_queue.push(p);
                 }
             }
         }
-        seen
+        let mut words = within.words.clone();
+        words[(avoid >> 6) as usize] &= !(1u64 << (avoid & 63));
+        for (w, &u) in words.iter_mut().zip(self.scratch_unvisited.iter()) {
+            *w ^= u;
+        }
+        BitSet {
+            words,
+            len: self.scratch_queue.len(),
+        }
     }
 
     /// A collapsed escape-hatch node for a set that resisted structuring.
-    fn irreducible_node(&mut self, set: &BTreeSet<BlockId>) -> RegionId {
+    fn irreducible_node(&mut self, set: &BitSet) -> RegionId {
         let mut edges = Vec::new();
-        for &b in set {
-            for &s in self.succs_of(b) {
-                if set.contains(&s) {
-                    edges.push((b, s));
+        for b in set.iter() {
+            let b_id = self.u_blocks[b as usize];
+            for &s in &self.succs[b as usize] {
+                if set.contains(s) {
+                    edges.push((b_id, self.u_blocks[s as usize]));
                 }
             }
         }
         self.push_node(RegionNode::Irreducible {
-            blocks: set.iter().copied().collect(),
+            blocks: set.to_blocks(&self.u_blocks),
             edges,
         })
     }
@@ -827,11 +1115,11 @@ impl Builder {
 
 /// Pending labeled arms of an alternates decomposition: per-entry block
 /// sets in entry order.
-type ArmSets = VecDeque<(BlockId, BTreeSet<BlockId>)>;
+type ArmSets = VecDeque<(u32, BitSet)>;
 
 /// The shared-tail decomposition plan: tail entry, tail set, pending
 /// prefix arms.
-type SharedTailPlan = (BlockId, BTreeSet<BlockId>, ArmSets);
+type SharedTailPlan = (u32, BitSet, ArmSets);
 
 /// One work item of the iterative structuring driver.
 ///
@@ -850,22 +1138,19 @@ type SharedTailPlan = (BlockId, BTreeSet<BlockId>, ArmSets);
 enum Task {
     /// `structure_set(set, entry, disabled)`.
     Set {
-        set: BTreeSet<BlockId>,
-        entry: BlockId,
-        disabled: Rc<BTreeSet<BlockId>>,
+        set: BitSet,
+        entry: u32,
+        disabled: Rc<BitSet>,
     },
     /// `structure_continuation(set, disabled)`.
-    Cont {
-        set: BTreeSet<BlockId>,
-        disabled: Rc<BTreeSet<BlockId>>,
-    },
+    Cont { set: BitSet, disabled: Rc<BitSet> },
     /// `peel_loop` resume after the body is structured; `child` is the
     /// body region.
     LoopBody {
-        entry: BlockId,
+        entry: u32,
         kind: LoopKind,
-        remainder: BTreeSet<BlockId>,
-        disabled: Rc<BTreeSet<BlockId>>,
+        remainder: BitSet,
+        disabled: Rc<BitSet>,
     },
     /// `peel_loop` resume after the continuation is structured; `child`
     /// is the continuation region.
@@ -874,9 +1159,9 @@ enum Task {
     /// tail body. `pending` holds the per-entry non-empty exclusive
     /// prefixes, in entry order.
     TailBody {
-        t0: BlockId,
+        t0: u32,
         pending: ArmSets,
-        disabled: Rc<BTreeSet<BlockId>>,
+        disabled: Rc<BitSet>,
     },
     /// Labeled-arm accumulation (disjoint alternates arms and shared-tail
     /// prefix arms alike): on entry `child` is the body of the arm
@@ -884,8 +1169,8 @@ enum Task {
     Arms {
         pending: ArmSets,
         arms: Vec<RegionId>,
-        last: Option<BlockId>,
-        disabled: Rc<BTreeSet<BlockId>>,
+        last: Option<u32>,
+        disabled: Rc<BitSet>,
     },
     /// `structure_acyclic` resume after a child region that simply gets
     /// appended to `items`: the loop-header handoff and the continuation
@@ -897,10 +1182,10 @@ enum Task {
         items: Vec<RegionId>,
         head: BlockId,
         merge: Option<BlockId>,
-        rest: BTreeSet<BlockId>,
-        else_set: BTreeSet<BlockId>,
-        else_entry: BlockId,
-        disabled: Rc<BTreeSet<BlockId>>,
+        rest: BitSet,
+        else_set: BitSet,
+        else_entry: u32,
+        disabled: Rc<BitSet>,
     },
     /// `structure_acyclic` resume after the else arm; `child` is the else
     /// region (`None` for an empty arm).
@@ -908,9 +1193,9 @@ enum Task {
         items: Vec<RegionId>,
         head: BlockId,
         merge: Option<BlockId>,
-        rest: BTreeSet<BlockId>,
+        rest: BitSet,
         then_r: Option<RegionId>,
-        disabled: Rc<BTreeSet<BlockId>>,
+        disabled: Rc<BitSet>,
     },
     /// `structure_acyclic` handler-rejoin demotion resume; `child` is the
     /// single conditional arm (`None` when empty).
@@ -918,8 +1203,8 @@ enum Task {
         items: Vec<RegionId>,
         head: BlockId,
         cond_arm_is_then: bool,
-        rest: BTreeSet<BlockId>,
-        disabled: Rc<BTreeSet<BlockId>>,
+        rest: BitSet,
+        disabled: Rc<BitSet>,
     },
 }
 
@@ -930,12 +1215,7 @@ impl Builder {
     ///
     /// Iterative driver over the explicit [`Task`] stack — see the enum
     /// docs for why this is not recursion.
-    fn structure_set(
-        &mut self,
-        set: BTreeSet<BlockId>,
-        entry: BlockId,
-        disabled: &BTreeSet<BlockId>,
-    ) -> RegionId {
+    fn structure_set(&mut self, set: BitSet, entry: u32, disabled: &BitSet) -> RegionId {
         let mut stack: Vec<Task> = vec![Task::Set {
             set,
             entry,
@@ -960,7 +1240,7 @@ impl Builder {
                 } => {
                     let body_r = child.expect("loop body region");
                     let loop_r = self.push_node(RegionNode::Loop {
-                        header: entry,
+                        header: self.u_blocks[entry as usize],
                         kind,
                         body: body_r,
                     });
@@ -985,7 +1265,7 @@ impl Builder {
                 } => {
                     let tail_body = child.expect("shared-tail body region");
                     let arms = vec![self.push_node(RegionNode::Labeled {
-                        label: t0,
+                        label: self.u_blocks[t0 as usize],
                         body: tail_body,
                     })];
                     stack.push(Task::Arms {
@@ -1003,7 +1283,10 @@ impl Builder {
                 } => {
                     if let Some(e) = last {
                         let body = child.expect("alternates arm region");
-                        arms.push(self.push_node(RegionNode::Labeled { label: e, body }));
+                        arms.push(self.push_node(RegionNode::Labeled {
+                            label: self.u_blocks[e as usize],
+                            body,
+                        }));
                     }
                     match pending.pop_front() {
                         Some((e, set)) => {
@@ -1122,28 +1405,43 @@ impl Builder {
         &mut self,
         stack: &mut Vec<Task>,
         child: &mut Option<RegionId>,
-        set: BTreeSet<BlockId>,
-        entry: BlockId,
-        disabled: Rc<BTreeSet<BlockId>>,
+        set: BitSet,
+        entry: u32,
+        disabled: Rc<BitSet>,
     ) {
-        debug_assert!(set.contains(&entry));
+        debug_assert!(set.contains(entry));
         // Single-entry invariant: only `entry` may have predecessors
         // outside the set. Violations are irreducible/multi-entry shapes.
-        let extra: Vec<BlockId> = set
-            .iter()
-            .copied()
-            .filter(|&b| b != entry && self.preds_of(b).iter().any(|p| !set.contains(p)))
-            .collect();
+        let mut extra: Vec<BlockId> = Vec::new();
+        let set_words = &set.words;
+        for (wi, &word_val) in set_words.iter().enumerate() {
+            let mut w = word_val;
+            while w != 0 {
+                let tz = w.trailing_zeros();
+                w &= w - 1;
+                let b = ((wi as u32) << 6) | tz;
+                if b == entry {
+                    continue;
+                }
+                for &p in &self.preds[b as usize] {
+                    if (set_words[(p >> 6) as usize] & (1u64 << (p & 63))) == 0 {
+                        extra.push(self.u_blocks[b as usize]);
+                        break;
+                    }
+                }
+            }
+        }
         if !extra.is_empty() {
             self.escape_hatches.push(EscapeHatch::MultiEntry {
-                blocks: set.iter().copied().collect(),
+                blocks: set.to_blocks(&self.u_blocks),
                 entries: extra,
             });
             *child = Some(self.irreducible_node(&set));
             return;
         }
         // Loop peel: any in-set predecessor of the entry is a latch.
-        if !disabled.contains(&entry) && self.preds_of(entry).iter().any(|p| set.contains(p)) {
+        if !disabled.contains(entry) && self.preds[entry as usize].iter().any(|&p| set.contains(p))
+        {
             self.start_loop(stack, set, entry, disabled);
             return;
         }
@@ -1162,25 +1460,16 @@ impl Builder {
     /// termination/after-point (reconverging with break tails there), not
     /// exit paths. Absorption is what keeps break/continue tails from
     /// surfacing as bogus multi-entry continuations.
-    fn start_loop(
-        &mut self,
-        stack: &mut Vec<Task>,
-        set: BTreeSet<BlockId>,
-        entry: BlockId,
-        disabled: Rc<BTreeSet<BlockId>>,
-    ) {
-        let latches: Vec<BlockId> = self
-            .preds_of(entry)
+    fn start_loop(&mut self, stack: &mut Vec<Task>, set: BitSet, entry: u32, disabled: Rc<BitSet>) {
+        let latches: Vec<u32> = self.preds[entry as usize]
             .iter()
             .copied()
-            .filter(|p| set.contains(p))
+            .filter(|&p| set.contains(p))
             .collect();
-        let avoid = BTreeSet::from([entry]);
-        let mut body = self.rev_reach(&latches, &set, &avoid);
+        let mut body = self.rev_reach(&latches, &set, entry);
         body.insert(entry);
 
-        // Exit-tail absorption to a fixpoint (sorted iteration keeps it
-        // deterministic regardless of growth order). Two modes:
+        // Exit-tail absorption to the unique monotone least fixed point:
         //
         // - If the loop has a merge (the common post-dominator of its
         //   non-leaf exit targets) inside `set`, the merge is the loop's
@@ -1192,49 +1481,71 @@ impl Builder {
         //   function), exclude the header's and latches' own exit targets
         //   from absorption — they are the loop's normal
         //   termination/after-point, not exit paths.
-        let merge = self.loop_merge(&body).filter(|m| set.contains(m));
-        let excluded: BTreeSet<BlockId> = match merge {
-            Some(m) => BTreeSet::from([m]),
+        let merge_bi = self
+            .loop_merge(&body)
+            .and_then(|mb| self.u_idx.get(&mb).copied())
+            .filter(|&m| set.contains(m));
+        let mut excluded = BitSet::empty(self.word_len);
+        match merge_bi {
+            Some(m) => {
+                excluded.insert(m);
+            }
             None => {
-                let mut ex = BTreeSet::new();
-                for b in std::iter::once(&entry).chain(latches.iter()) {
-                    ex.extend(
-                        self.succs_of(*b)
-                            .iter()
-                            .copied()
-                            .filter(|s| !body.contains(s)),
-                    );
-                }
-                ex
-            }
-        };
-        loop {
-            let mut grew = false;
-            for &x in &set {
-                if body.contains(&x) || excluded.contains(&x) {
-                    continue;
-                }
-                let ps: Vec<BlockId> = self
-                    .preds_of(x)
-                    .iter()
-                    .copied()
-                    .filter(|p| set.contains(p))
-                    .collect();
-                if !ps.is_empty() && ps.iter().all(|p| body.contains(p)) {
-                    body.insert(x);
-                    grew = true;
+                for &b in std::iter::once(&entry).chain(latches.iter()) {
+                    for &s in &self.succs[b as usize] {
+                        if !body.contains(s) {
+                            excluded.insert(s);
+                        }
+                    }
                 }
             }
-            if !grew {
-                break;
+        }
+        // Worklist propagation over out-edges of `body` (`O(|body| + |edges(body)|)`):
+        // a candidate `x` can satisfy `∅ ≠ (preds(x) ∩ set) ⊆ body` only
+        // after one of its predecessors joins `body`.
+        self.scratch_queue.clear();
+        for b in body.iter() {
+            for &s in &self.succs[b as usize] {
+                if set.contains(s) && !body.contains(s) && !excluded.contains(s) {
+                    self.scratch_queue.push(s);
+                }
+            }
+        }
+        let mut head = 0usize;
+        while head < self.scratch_queue.len() {
+            let x = self.scratch_queue[head];
+            head += 1;
+            if body.contains(x) {
+                continue;
+            }
+            let mut has_in_set_pred = false;
+            let mut all_in_body = true;
+            for &p in &self.preds[x as usize] {
+                if set.contains(p) {
+                    has_in_set_pred = true;
+                    if !body.contains(p) {
+                        all_in_body = false;
+                        break;
+                    }
+                }
+            }
+            if has_in_set_pred && all_in_body {
+                body.insert(x);
+                for &s in &self.succs[x as usize] {
+                    if set.contains(s) && !body.contains(s) && !excluded.contains(s) {
+                        self.scratch_queue.push(s);
+                    }
+                }
             }
         }
 
         // Loop kind by header-test position (local to this body).
-        let header_exits = self.succs_of(entry).iter().any(|s| !body.contains(s));
+        let header_exits = self.succs[entry as usize]
+            .iter()
+            .any(|&s| !body.contains(s));
         let latch_exits = latches
             .iter()
-            .any(|&l| self.succs_of(l).iter().any(|s| !body.contains(s)));
+            .any(|&l| self.succs[l as usize].iter().any(|&s| !body.contains(s)));
         let kind = if header_exits {
             LoopKind::While
         } else if latch_exits {
@@ -1247,9 +1558,7 @@ impl Builder {
         disabled2.insert(entry);
         let disabled2 = Rc::new(disabled2);
         let mut remainder = set;
-        for b in &body {
-            remainder.remove(b);
-        }
+        remainder.remove_all(&body);
         stack.push(Task::LoopBody {
             entry,
             kind,
@@ -1272,18 +1581,19 @@ impl Builder {
         &mut self,
         stack: &mut Vec<Task>,
         child: &mut Option<RegionId>,
-        set: BTreeSet<BlockId>,
-        disabled: Rc<BTreeSet<BlockId>>,
+        set: BitSet,
+        disabled: Rc<BitSet>,
     ) {
-        let entries: Vec<BlockId> = set
-            .iter()
-            .copied()
-            .filter(|&b| self.preds_of(b).iter().any(|p| !set.contains(p)))
-            .collect();
+        let mut entries: Vec<u32> = Vec::new();
+        for b in set.iter() {
+            if self.preds[b as usize].iter().any(|&p| !set.contains(p)) {
+                entries.push(b);
+            }
+        }
         match entries.len() {
             0 => {
                 self.escape_hatches.push(EscapeHatch::Stranded {
-                    blocks: set.iter().copied().collect(),
+                    blocks: set.to_blocks(&self.u_blocks),
                 });
                 *child = Some(self.irreducible_node(&set));
             }
@@ -1293,15 +1603,14 @@ impl Builder {
                 disabled,
             }),
             _ => {
-                let avoid = BTreeSet::new();
-                let slices: Vec<BTreeSet<BlockId>> = entries
+                let slices: Vec<BitSet> = entries
                     .iter()
-                    .map(|&e| self.reach(e, &set, &avoid))
+                    .map(|&e| self.reach(e, &set, None, None))
                     .collect();
-                let mut covered: BTreeSet<BlockId> = BTreeSet::new();
+                let mut covered = BitSet::empty(self.word_len);
                 let mut disjoint = true;
                 for slice in &slices {
-                    for &b in slice {
+                    for b in slice.iter() {
                         if !covered.insert(b) {
                             disjoint = false;
                         }
@@ -1327,14 +1636,17 @@ impl Builder {
                         }
                         None => {
                             self.escape_hatches.push(EscapeHatch::MultiEntry {
-                                blocks: set.iter().copied().collect(),
-                                entries,
+                                blocks: set.to_blocks(&self.u_blocks),
+                                entries: entries
+                                    .iter()
+                                    .map(|&e| self.u_blocks[e as usize])
+                                    .collect(),
                             });
                             *child = Some(self.irreducible_node(&set));
                         }
                     }
                 } else {
-                    let pending: ArmSets = entries.iter().copied().zip(slices).collect();
+                    let pending: ArmSets = entries.into_iter().zip(slices).collect();
                     stack.push(Task::Arms {
                         pending,
                         arms: Vec::new(),
@@ -1349,40 +1661,16 @@ impl Builder {
     /// Shared-tail decomposition of a multi-entry set whose per-entry
     /// slices OVERLAP (the switch fall-through shape: `case A: …` falls
     /// into `case B: …`, and `B` is also a direct dispatch target).
-    ///
-    /// `tail` = the blocks reachable from EVERY entry. When the tail is
-    /// non-empty, suffix-closed within the set (no edge loops back into
-    /// an exclusive prefix), the exclusive prefixes are pairwise
-    /// disjoint, and every edge into the tail — from the prefixes or
-    /// from outside the set — lands on ONE block `t0`, the set
-    /// structures as
-    ///
-    /// ```text
-    /// Alternates([Labeled(t0, tail), Labeled(e1, prefix1), …])
-    /// ```
-    ///
-    /// with the TAIL AS THE FIRST ARM: the labeled-alternates emission
-    /// nests the prefix arms inside the tail arm's label, so a prefix
-    /// arm's out-edge to `t0` emits as `break L$t0` — landing exactly
-    /// at the tail's start — and the tail arm itself falls through to
-    /// the continuation. This is the source-shaped form the state-
-    /// variable escape hatch (design §4.2.4) previously flattened.
-    ///
-    /// This is the pure precondition half of the decomposition (the
-    /// structuring itself is scheduled by [`Task::TailBody`] /
-    /// [`Task::Arms`]): it returns the tail entry, the tail set, and the
-    /// per-entry non-empty exclusive prefixes in entry order, or `None`
-    /// (the caller escapes to the hatch) when any precondition fails.
     fn shared_tail_plan(
         &self,
-        set: &BTreeSet<BlockId>,
-        entries: &[BlockId],
-        slices: &[BTreeSet<BlockId>],
+        set: &BitSet,
+        entries: &[u32],
+        slices: &[BitSet],
     ) -> Option<SharedTailPlan> {
         // The tail: reachable from every entry.
         let mut tail = slices.first()?.clone();
         for slice in &slices[1..] {
-            tail = tail.intersection(slice).copied().collect();
+            tail.intersect_with(slice);
         }
         if tail.is_empty() {
             return None;
@@ -1390,38 +1678,33 @@ impl Builder {
         // Suffix-closed: no edge from the tail back into an exclusive
         // prefix (that would be a cycle crossing the split — genuinely
         // irreducible).
-        for &b in &tail {
-            for &s in self.succs_of(b) {
-                if set.contains(&s) && !tail.contains(&s) {
+        for b in tail.iter() {
+            for &s in &self.succs[b as usize] {
+                if set.contains(s) && !tail.contains(s) {
                     return None;
                 }
             }
         }
         // Exclusive prefixes: pairwise disjoint, and with the tail they
         // cover the set exactly.
-        let prefixes: Vec<BTreeSet<BlockId>> = slices
-            .iter()
-            .map(|s| s.difference(&tail).copied().collect())
-            .collect();
-        let mut seen: BTreeSet<BlockId> = BTreeSet::new();
+        let prefixes: Vec<BitSet> = slices.iter().map(|s| s.difference(&tail)).collect();
+        let mut seen = BitSet::empty(self.word_len);
         for prefix in &prefixes {
-            for &b in prefix {
+            for b in prefix.iter() {
                 if !seen.insert(b) {
                     return None;
                 }
             }
         }
-        if seen.len() + tail.len() != set.len() {
+        if seen.len + tail.len != set.len {
             return None;
         }
         // Single tail entry `t0`: every edge into the tail — from a
-        // prefix or from outside the set — targets it. (An outside edge
-        // landing mid-tail has no label to break to; mid-tail entries
-        // from prefixes would need multiple tail labels.)
-        let mut t0: Option<BlockId> = None;
-        for &b in &tail {
-            for &p in self.preds_of(b) {
-                if tail.contains(&p) {
+        // prefix or from outside the set — targets it.
+        let mut t0: Option<u32> = None;
+        for b in tail.iter() {
+            for &p in &self.preds[b as usize] {
+                if tail.contains(p) {
                     continue;
                 }
                 match t0 {
@@ -1434,28 +1717,18 @@ impl Builder {
         let t0 = t0?;
         // Fold-compatibility bail: an arm entry targeted by an edge
         // from a loop that is not wholly inside this set would force a
-        // LABELED break/continue at that loop's exit — but the
-        // vendor-machinery folds (the for-in driver, the generator
-        // state machines) pattern-match the es2abc plumbing WITH plain
-        // unlabeled exits, and restructuring them into the alternates
-        // breaks the fold (the loop then emits raw self-assigning
-        // plumbing that never advances — a HANG, dream gate: test262
-        // built-ins/Object/keys/15.2.3.14-5-12). Keep the honest
-        // state-machine escape hatch for those; the hatch is what the
-        // folds have always tolerated.
+        // LABELED break/continue at that loop's exit.
         let arm_entry_has_loop_pred = std::iter::once(&t0).chain(entries.iter()).any(|&e| {
-            self.preds_of(e).iter().any(|&p| match self.loop_of(p) {
-                Some(l) => !self.loop_sets[l].is_subset(set),
-                None => false,
-            })
+            self.preds[e as usize]
+                .iter()
+                .any(|&p| match self.block_loop[p as usize] {
+                    Some(l) => !self.loop_bits[l].is_subset(set),
+                    None => false,
+                })
         });
         if arm_entry_has_loop_pred {
             return None;
         }
-        // Arms: the tail first (it falls through to the continuation),
-        // then one arm per entry with a non-empty exclusive prefix.
-        // Entries that ARE `t0` need no prefix arm — `break L$t0` from
-        // the preceding siblings lands at the tail directly.
         let pending: ArmSets = entries
             .iter()
             .copied()
@@ -1473,9 +1746,9 @@ impl Builder {
         &mut self,
         stack: &mut Vec<Task>,
         child: &mut Option<RegionId>,
-        set: BTreeSet<BlockId>,
-        entry: BlockId,
-        disabled: Rc<BTreeSet<BlockId>>,
+        set: BitSet,
+        entry: u32,
+        disabled: Rc<BitSet>,
     ) {
         let mut items: Vec<RegionId> = Vec::new();
         let mut rest = set;
@@ -1483,7 +1756,8 @@ impl Builder {
         loop {
             // A loop header reached mid-run: hand the whole remainder over
             // (the peel structures it and its continuation).
-            if !disabled.contains(&cur) && self.preds_of(cur).iter().any(|p| rest.contains(p)) {
+            if !disabled.contains(cur) && self.preds[cur as usize].iter().any(|&p| rest.contains(p))
+            {
                 stack.push(Task::AcycAppend { items });
                 stack.push(Task::Set {
                     set: rest,
@@ -1492,112 +1766,96 @@ impl Builder {
                 });
                 return;
             }
-            rest.remove(&cur);
-            let succs_in: Vec<BlockId> = self
-                .succs_of(cur)
-                .iter()
-                .copied()
-                .filter(|s| rest.contains(s))
-                .collect();
-            match succs_in.len() {
+            rest.remove(cur);
+            let cur_block = self.u_blocks[cur as usize];
+            let mut s0: Option<u32> = None;
+            let mut s1: Option<u32> = None;
+            let mut in_len = 0usize;
+            for &s in &self.succs[cur as usize] {
+                if rest.contains(s) {
+                    match in_len {
+                        0 => s0 = Some(s),
+                        1 => s1 = Some(s),
+                        _ => {}
+                    }
+                    in_len += 1;
+                }
+            }
+            match in_len {
                 0 => {
-                    items.push(self.push_node(RegionNode::Block(cur)));
+                    items.push(self.push_node(RegionNode::Block(cur_block)));
                     break;
                 }
                 1 => {
-                    items.push(self.push_node(RegionNode::Block(cur)));
-                    cur = succs_in[0];
+                    items.push(self.push_node(RegionNode::Block(cur_block)));
+                    cur = s0.expect("in_len == 1");
                 }
                 _ => {
-                    let (t, f) = (succs_in[0], succs_in[1]);
+                    let (t, f) = (s0.expect("in_len >= 2"), s1.expect("in_len >= 2"));
                     // Two-arm conditional. The merge is the head's
                     // immediate post-dominator (when inside the region);
                     // arms are what each entry reaches without passing the
-                    // merge AND without entering the other arm's entry —
-                    // the es2abc idiom `if (c0) goto shared; else {…}`
-                    // makes one arm entry reachable from the other arm,
-                    // and letting reachability flow through it would
-                    // swallow the sibling arm (and, via bypass edges, the
-                    // whole downstream).
-                    let merge = self.postdom.ipostdom(cur).filter(|m| rest.contains(m));
-                    let mut then_avoid: BTreeSet<BlockId> = merge.into_iter().collect();
-                    then_avoid.insert(f);
-                    let mut else_avoid: BTreeSet<BlockId> = merge.into_iter().collect();
-                    else_avoid.insert(t);
-                    let mut then_set = self.reach(t, &rest, &then_avoid);
-                    let mut else_set = self.reach(f, &rest, &else_avoid);
+                    // merge AND without entering the other arm's entry.
+                    let merge_bi = self
+                        .postdom
+                        .ipostdom(cur_block)
+                        .and_then(|mb| self.u_idx.get(&mb).copied())
+                        .filter(|&m| rest.contains(m));
+                    let merge = merge_bi.map(|m| self.u_blocks[m as usize]);
+                    let mut then_set = self.reach(t, &rest, merge_bi, Some(f));
+                    let mut else_set = self.reach(f, &rest, merge_bi, Some(t));
                     // Blocks reachable from both arms without passing the
                     // merge are shared: demote them to the continuation,
                     // never duplicate.
-                    let overlap: Vec<BlockId> = then_set.intersection(&else_set).copied().collect();
-                    for b in overlap {
-                        then_set.remove(&b);
-                        else_set.remove(&b);
+                    if !then_set.is_empty() && !else_set.is_empty() {
+                        let mut removed = 0usize;
+                        for (tw, ew) in then_set.words.iter_mut().zip(else_set.words.iter_mut()) {
+                            let ov = *tw & *ew;
+                            if ov != 0 {
+                                *tw &= !ov;
+                                *ew &= !ov;
+                                removed += ov.count_ones() as usize;
+                            }
+                        }
+                        then_set.len -= removed;
+                        else_set.len -= removed;
                     }
                     // Edges from one arm into the sibling arm (the
-                    // goto-shared idiom) are recorded as cross-arm hints:
-                    // the tree is truthful, and emission duplicates the
-                    // shared block or merges the conditions (d-P3).
+                    // goto-shared idiom) are recorded as cross-arm hints.
                     let mut cross: Vec<(BlockId, BlockId)> = Vec::new();
-                    for (arm, sibling) in [(&then_set, &else_set), (&else_set, &then_set)] {
-                        for &b in arm {
-                            for &s in self.succs_of(b) {
-                                if sibling.contains(&s) {
-                                    cross.push((b, s));
+                    if !then_set.is_empty() && !else_set.is_empty() {
+                        for (arm, sibling) in [(&then_set, &else_set), (&else_set, &then_set)] {
+                            for b in arm.iter() {
+                                let b_id = self.u_blocks[b as usize];
+                                for &s in &self.succs[b as usize] {
+                                    if sibling.contains(s) {
+                                        cross.push((b_id, self.u_blocks[s as usize]));
+                                    }
                                 }
                             }
                         }
                     }
-                    // Handler-rejoin demotion (N76): an arm entry with a
-                    // Normal predecessor OUTSIDE the universe is a
-                    // handler sub-CFG's continuation target — reachable
-                    // from the handler path only by falling out of a
-                    // catch clause onto it, which is physically
-                    // impossible while the block sits inside a
-                    // conditional arm. That side is therefore not a
-                    // conditional arm at all: it is the continuation
-                    // (test262 try/S12.14_A7_T1's B101 finally-dispatch
-                    // epilogue, A15's switch tails). Only when there is
-                    // no merge (a real merge already places the join
-                    // correctly) and at most one side is affected.
-                    //
-                    // (The sibling arm-entry re-entry shape — every
-                    // cross edge landing on the sibling's entry — is
-                    // deliberately NOT demoted: in loop-carried dispatch
-                    // chains it is the es2abc state-machine idiom the
-                    // generator/async machine folds pattern-match, and
-                    // restructuring it breaks them; the d-P3
-                    // tail-duplication fold owns that shape.)
+                    // Handler-rejoin demotion (N76).
                     let mut demote: Option<bool> = None;
                     if merge.is_none()
-                        && self.external_preds.contains(&t) != self.external_preds.contains(&f)
+                        && self.external_preds.contains(t) != self.external_preds.contains(f)
                     {
-                        demote = Some(self.external_preds.contains(&f));
+                        demote = Some(self.external_preds.contains(f));
                     }
-                    // …and only when the conditional arm's exits are
-                    // EXACTLY the demoted entry (or leave the region
-                    // entirely — those carry structural break/continue
-                    // actions): an arm exit landing PAST the demoted
-                    // entry would have to skip part of the continuation,
-                    // which the `if (c) { arm } <continuation>` shape
-                    // cannot express (the d-P3 duplication fold keeps
-                    // those — golden_structure s24's arm rejoins two
-                    // blocks later). The demoted side also must not
-                    // reach back INTO the arm.
                     let demote = demote.filter(|&cond_arm_is_then| {
                         let (arm_set, demoted_set, demoted_entry) = if cond_arm_is_then {
                             (&then_set, &else_set, f)
                         } else {
                             (&else_set, &then_set, t)
                         };
-                        let exits_ok = arm_set.iter().all(|&b| {
-                            self.succs_of(b).iter().all(|s| {
-                                arm_set.contains(s) || *s == demoted_entry || !rest.contains(s)
+                        let exits_ok = arm_set.iter().all(|b| {
+                            self.succs[b as usize].iter().all(|&s| {
+                                arm_set.contains(s) || s == demoted_entry || !rest.contains(s)
                             })
                         });
                         let no_reentry = demoted_set
                             .iter()
-                            .all(|&b| self.succs_of(b).iter().all(|s| !arm_set.contains(s)));
+                            .all(|b| self.succs[b as usize].iter().all(|&s| !arm_set.contains(s)));
                         exits_ok && no_reentry
                     });
                     if let Some(cond_arm_is_then) = demote {
@@ -1606,19 +1864,15 @@ impl Builder {
                         } else {
                             (else_set, f)
                         };
-                        for b in &arm_set {
-                            rest.remove(b);
-                        }
+                        rest.remove_all(&arm_set);
                         stack.push(Task::AcycDemote {
                             items,
-                            head: cur,
+                            head: cur_block,
                             cond_arm_is_then,
                             rest,
                             disabled: disabled.clone(),
                         });
                         if arm_set.is_empty() {
-                            // An empty arm structures to `None` without a
-                            // child task.
                             *child = None;
                         } else {
                             stack.push(Task::Set {
@@ -1630,15 +1884,11 @@ impl Builder {
                         return;
                     }
                     self.cross_arms.extend(cross);
-                    for b in &then_set {
-                        rest.remove(b);
-                    }
-                    for b in &else_set {
-                        rest.remove(b);
-                    }
+                    rest.remove_all(&then_set);
+                    rest.remove_all(&else_set);
                     stack.push(Task::AcycThen {
                         items,
-                        head: cur,
+                        head: cur_block,
                         merge,
                         rest,
                         else_set,
@@ -1646,8 +1896,6 @@ impl Builder {
                         disabled: disabled.clone(),
                     });
                     if then_set.is_empty() {
-                        // An empty arm structures to `None` without a
-                        // child task.
                         *child = None;
                     } else {
                         stack.push(Task::Set {
@@ -1664,7 +1912,7 @@ impl Builder {
         // consumed; record and collapse anything left over.
         if !rest.is_empty() {
             self.escape_hatches.push(EscapeHatch::Stranded {
-                blocks: rest.iter().copied().collect(),
+                blocks: rest.to_blocks(&self.u_blocks),
             });
             let r = self.irreducible_node(&rest);
             items.push(r);
@@ -1673,107 +1921,109 @@ impl Builder {
     }
 }
 
-/// Classify one Normal edge against the loop forest.
+/// Classify one Normal edge against the loop forest using `O(1)` bitset
+/// membership queries.
+#[allow(clippy::too_many_arguments)]
 fn classify_edge(
     u: BlockId,
+    ui: u32,
     v: BlockId,
+    vi: u32,
     loops: &[LoopInfo],
-    rpo_index: &BTreeMap<BlockId, usize>,
+    loop_bits: &[BitSet],
+    header_loop: &[Option<usize>],
+    innermost_loop: &[Option<usize>],
+    loops_desc: &[usize],
+    rpo_pos: &[Option<usize>],
     escapes: &mut Vec<EscapeHatch>,
 ) -> EdgeClass {
-    let containing: Vec<usize> = loops
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.blocks.contains(&u))
-        .map(|(i, _)| i)
-        .collect();
-    let key = |i: usize| (loops[i].blocks.len(), loops[i].header);
-    let innermost = containing.iter().copied().min_by_key(|&i| key(i));
-    if let Some(&target) = containing.iter().find(|&&i| loops[i].header == v) {
-        return EdgeClass::Continue {
-            header: v,
-            labeled: innermost != Some(target),
-        };
-    }
-    let outermost_exited = containing
-        .iter()
-        .copied()
-        .filter(|&i| !loops[i].blocks.contains(&v))
-        .max_by_key(|&i| key(i));
-    if let Some(outer) = outermost_exited {
-        return EdgeClass::Break {
-            header: loops[outer].header,
-            labeled: innermost != Some(outer),
-        };
+    if let Some(inner) = innermost_loop[ui as usize] {
+        if let Some(target) = header_loop[vi as usize]
+            && loop_bits[target].contains(ui)
+        {
+            return EdgeClass::Continue {
+                header: v,
+                labeled: inner != target,
+            };
+        }
+        if let Some(outer) = loops_desc
+            .iter()
+            .copied()
+            .find(|&li| loop_bits[li].contains(ui) && !loop_bits[li].contains(vi))
+        {
+            return EdgeClass::Break {
+                header: loops[outer].header,
+                labeled: inner != outer,
+            };
+        }
     }
     // Not a loop edge. A backward edge here means a cycle the forest did
     // not claim (irreducible) — record it.
-    if rpo_index.get(&v) < rpo_index.get(&u) {
+    if rpo_pos[vi as usize] < rpo_pos[ui as usize] {
         escapes.push(EscapeHatch::CrossEdge { from: u, to: v });
     }
     EdgeClass::Internal
 }
 
-/// A cycle witness: the cycle's blocks (sorted) and edges (cycle order).
-type CycleWitness = (Vec<BlockId>, Vec<(BlockId, BlockId)>);
+/// A cycle witness: the cycle's blocks (sorted) and dense edges (cycle order).
+type CycleWitness = (Vec<BlockId>, Vec<(u32, u32)>);
 
 /// Find one cycle in the graph minus `removed` edges, deterministically
 /// (start nodes in sorted order, successors in terminator order). Returns
-/// the cycle's blocks (sorted) and edges (cycle order).
-fn find_cycle<'a>(
-    universe: &BTreeSet<BlockId>,
-    succs_of: &dyn Fn(BlockId) -> &'a [BlockId],
-    removed: &BTreeSet<(BlockId, BlockId)>,
+/// the cycle's blocks (sorted) and dense edges (cycle order).
+fn find_cycle(
+    u_len: usize,
+    u_blocks: &[BlockId],
+    succs: &[Vec<u32>],
+    removed: &HashSet<(u32, u32)>,
 ) -> Option<CycleWitness> {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Color {
-        Gray,
-        Black,
-    }
-    let mut state: BTreeMap<BlockId, Color> = BTreeMap::new();
-    for &start in universe {
-        if state.contains_key(&start) {
+    let mut state: Vec<u8> = vec![0u8; u_len]; // 0 = Unvisited, 1 = Gray, 2 = Black
+    let mut path: Vec<u32> = Vec::new();
+    let mut stack: Vec<(u32, usize)> = Vec::new();
+    for start in 0..u_len as u32 {
+        if state[start as usize] != 0 {
             continue;
         }
-        // Iterative DFS with an explicit path stack.
-        let mut path: Vec<BlockId> = Vec::new();
-        let mut stack: Vec<(BlockId, usize)> = vec![(start, 0)];
-        state.insert(start, Color::Gray);
+        path.clear();
+        stack.clear();
+        stack.push((start, 0));
+        state[start as usize] = 1;
         path.push(start);
         while let Some((node, next)) = stack.last_mut() {
             let node = *node;
-            let node_succs = succs_of(node);
+            let node_succs = &succs[node as usize];
             let mut advanced = false;
             while *next < node_succs.len() {
                 let s = node_succs[*next];
                 *next += 1;
-                if removed.contains(&(node, s)) || !universe.contains(&s) {
+                if removed.contains(&(node, s)) {
                     continue;
                 }
-                match state.get(&s) {
-                    None => {
-                        state.insert(s, Color::Gray);
+                match state[s as usize] {
+                    0 => {
+                        state[s as usize] = 1;
                         stack.push((s, 0));
                         path.push(s);
                         advanced = true;
                         break;
                     }
-                    Some(Color::Gray) => {
-                        // Cycle: the path segment from s to node, closed by
-                        // (node → s).
+                    1 => {
+                        // Cycle: the path segment from s to node, closed by (node → s).
                         let pos = path.iter().position(|&b| b == s).expect("gray on path");
-                        let mut blocks: Vec<BlockId> = path[pos..].to_vec();
-                        let mut edges: Vec<(BlockId, BlockId)> =
-                            blocks.windows(2).map(|w| (w[0], w[1])).collect();
+                        let seg = &path[pos..];
+                        let mut blocks: Vec<BlockId> =
+                            seg.iter().map(|&bi| u_blocks[bi as usize]).collect();
+                        let mut edges: Vec<(u32, u32)> =
+                            seg.windows(2).map(|w| (w[0], w[1])).collect();
                         edges.push((node, s));
                         blocks.sort();
                         return Some((blocks, edges));
                     }
-                    Some(Color::Black) => {}
+                    _ => {}
                 }
             }
             if !advanced {
-                state.insert(node, Color::Black);
+                state[node as usize] = 2;
                 stack.pop();
                 path.pop();
             }
@@ -1788,7 +2038,8 @@ fn project_try_regions(
     module: &Module,
     subgraph: &CfgSubgraph<'_>,
     func_entry: BlockId,
-    universe: &BTreeSet<BlockId>,
+    u_idx: &HashMap<BlockId, u32>,
+    word_len: usize,
     nodes: Option<&[RegionNode]>,
     root: Option<RegionId>,
 ) -> (Vec<TryPlan>, Vec<RegionError>) {
@@ -1827,23 +2078,18 @@ fn project_try_regions(
             }
         }
         for (j, prev) in earlier.iter().enumerate() {
-            let inter: BTreeSet<_> = protected.intersection(prev).collect();
-            if !inter.is_empty() && !protected.is_subset(prev) && !prev.is_subset(&protected) {
+            let has_inter = protected.intersection(prev).next().is_some();
+            if has_inter && !protected.is_subset(prev) && !prev.is_subset(&protected) {
                 errors.push(RegionError::InterleavedTryRegions { a: j, b: i });
             }
         }
         earlier.push(protected.clone());
 
         // Single-entry assertion, per Normal-connected component of the
-        // protected sub-CFG: each component must have at most one NORMAL
-        // entry — a block that is the function entry or has a Normal
-        // predecessor outside the protected set. Components with zero
-        // Normal entries are dispatch-entered handler-side sub-CFGs (an
-        // outer try legitimately protects inner catch-handler blocks,
-        // whose predecessors are exceptional) or dead cycles — not a
-        // containment violation.
+        // protected sub-CFG.
         let mut surface_entry: Option<BlockId> = None;
         let mut unseen: BTreeSet<BlockId> = protected.clone();
+        let first_prot = tr.protected.first().copied();
         while let Some(&start) = unseen.iter().next() {
             // One undirected Normal-connected component within protected.
             let mut component = vec![start];
@@ -1870,10 +2116,9 @@ fn project_try_regions(
                     entries: entries.clone(),
                 });
             }
-            // The plan entry is the Normal entry of the component
-            // containing the region's first protected block (or its first
-            // block, for dispatch-entered components).
-            if component.contains(&tr.protected[0]) {
+            if let Some(fp) = first_prot
+                && component.contains(&fp)
+            {
                 surface_entry = match entries.len() {
                     1 => Some(entries[0]),
                     0 => Some(component[0]),
@@ -1882,16 +2127,17 @@ fn project_try_regions(
             }
         }
 
-        // Tree projection walk over the reachable protected blocks:
-        // records the span (the smallest node containing the protected
-        // set) and whether the boundary cuts a Loop/Irreducible node
-        // (an emission observation, not an error — see
-        // [`TryPlan::cuts_structured_region`]).
-        let p_eff: BTreeSet<BlockId> = protected.intersection(universe).copied().collect();
+        // Tree projection walk over the reachable protected blocks.
+        let mut p_eff = BitSet::empty(word_len);
+        for &b in &protected {
+            if let Some(&bi) = u_idx.get(&b) {
+                p_eff.insert(bi);
+            }
+        }
         let mut span = None;
         let mut cuts = false;
         if let (Some(nodes), Some(root_id), false) = (nodes, root, p_eff.is_empty()) {
-            walk_region(nodes, root_id, &p_eff, &mut span, &mut cuts);
+            walk_region(nodes, root_id, u_idx, &p_eff, &mut span, &mut cuts);
         }
 
         plans.push(TryPlan {
@@ -1915,7 +2161,8 @@ fn project_try_regions(
 fn walk_region(
     nodes: &[RegionNode],
     root: RegionId,
-    p: &BTreeSet<BlockId>,
+    u_idx: &HashMap<BlockId, u32>,
+    p: &BitSet,
     span: &mut Option<RegionId>,
     cuts: &mut bool,
 ) -> (usize, usize) {
@@ -1927,6 +2174,7 @@ fn walk_region(
         Enter(RegionId),
         Exit(RegionId),
     }
+    let in_prot = |b: BlockId| -> bool { u_idx.get(&b).is_some_and(|&bi| p.contains(bi)) };
     let mut stack = vec![W::Enter(root)];
     let mut results: Vec<(usize, usize)> = Vec::new();
     while let Some(w) = stack.pop() {
@@ -1959,11 +2207,10 @@ fn walk_region(
             W::Exit(id) => {
                 let node = &nodes[id.index()];
                 let (in_p, total) = match node {
-                    RegionNode::Block(b) => (usize::from(p.contains(b)), 1),
-                    RegionNode::Irreducible { blocks, .. } => (
-                        blocks.iter().filter(|b| p.contains(b)).count(),
-                        blocks.len(),
-                    ),
+                    RegionNode::Block(b) => (usize::from(in_prot(*b)), 1),
+                    RegionNode::Irreducible { blocks, .. } => {
+                        (blocks.iter().filter(|&&b| in_prot(b)).count(), blocks.len())
+                    }
                     RegionNode::Seq(children) | RegionNode::Alternates(children) => {
                         let mut total = (0, 0);
                         for r in results.drain(results.len() - children.len()..) {
@@ -1982,7 +2229,7 @@ fn walk_region(
                         ..
                     } => {
                         let n = usize::from(then.is_some()) + usize::from(otherwise.is_some());
-                        let mut total = (usize::from(p.contains(head)), 1);
+                        let mut total = (usize::from(in_prot(*head)), 1);
                         for r in results.drain(results.len() - n..) {
                             total.0 += r.0;
                             total.1 += r.1;
@@ -1999,7 +2246,7 @@ fn walk_region(
                     *cuts = true;
                 }
                 // Deepest node containing the whole protected set wins.
-                if in_p == p.len() && span.is_none() {
+                if in_p == p.len && span.is_none() {
                     *span = Some(id);
                 }
                 results.push((in_p, total));

@@ -462,54 +462,71 @@ impl<'m> Pta<'m> {
         }
     }
 
-    /// Fire one handler on one object (once per pair).
-    fn fire(&mut self, id: u32, o: Obj) {
-        if !self.fired.insert((id, o)) {
-            return;
+    /// Fire one handler on one object (once per pair), driving any bucket
+    /// re-arm cascade over an explicit stack rather than mutual recursion.
+    fn fire(&mut self, first_id: u32, first_o: Obj) {
+        enum FireStep {
+            Fire(u32, Obj),
+            AddEdge(Ptr, Ptr),
         }
-        let (_, handler) = self.handlers[id as usize];
-        match handler {
-            Handler::Store { value, slot } => {
-                let Obj::Site { site, ctx, .. } = o else {
-                    // A store through an unknown base may reach any
-                    // field; the taint layer's own unknown-base
-                    // wildcard already over-approximates that — the
-                    // value's flow is unaffected, nothing to wire.
-                    return;
-                };
-                self.note_bucket(site, ctx, slot);
-                self.add_edge(value, Ptr::Field(site, ctx, slot));
-            }
-            Handler::Load { result, read } => {
-                let Obj::Site { site, ctx, .. } = o else {
-                    self.add_fact(result, Obj::Unknown);
-                    return;
-                };
-                let slots: Vec<Slot> = match read {
-                    Read::Named(n) => vec![Slot::Named(n), Slot::Dynamic],
-                    Read::Index => vec![Slot::Index, Slot::Dynamic],
-                    Read::All => {
-                        self.dyn_loads.entry(id).or_default().push(o);
-                        self.buckets
-                            .get(&(site, ctx))
-                            .map(|b| b.iter().copied().collect())
-                            .unwrap_or_default()
+        let mut stack = vec![FireStep::Fire(first_id, first_o)];
+        while let Some(step) = stack.pop() {
+            match step {
+                FireStep::AddEdge(s, t) => self.add_edge(s, t),
+                FireStep::Fire(id, o) => {
+                    if !self.fired.insert((id, o)) {
+                        continue;
                     }
-                };
-                for slot in slots {
-                    self.add_edge(Ptr::Field(site, ctx, slot), result);
+                    let (_, handler) = self.handlers[id as usize];
+                    match handler {
+                        Handler::Store { value, slot } => {
+                            let Obj::Site { site, ctx, .. } = o else {
+                                // A store through an unknown base may reach any
+                                // field; the taint layer's own unknown-base
+                                // wildcard already over-approximates that — the
+                                // value's flow is unaffected, nothing to wire.
+                                continue;
+                            };
+                            stack.push(FireStep::AddEdge(value, Ptr::Field(site, ctx, slot)));
+                            let rearm = self.note_bucket_rearms(site, ctx, slot);
+                            for (rid, ro) in rearm.into_iter().rev() {
+                                stack.push(FireStep::Fire(rid, ro));
+                            }
+                        }
+                        Handler::Load { result, read } => {
+                            let Obj::Site { site, ctx, .. } = o else {
+                                self.add_fact(result, Obj::Unknown);
+                                continue;
+                            };
+                            let slots: Vec<Slot> = match read {
+                                Read::Named(n) => vec![Slot::Named(n), Slot::Dynamic],
+                                Read::Index => vec![Slot::Index, Slot::Dynamic],
+                                Read::All => {
+                                    self.dyn_loads.entry(id).or_default().push(o);
+                                    self.buckets
+                                        .get(&(site, ctx))
+                                        .map(|b| b.iter().copied().collect())
+                                        .unwrap_or_default()
+                                }
+                            };
+                            for slot in slots {
+                                self.add_edge(Ptr::Field(site, ctx, slot), result);
+                            }
+                        }
+                        Handler::Call { call, caller_ctx } => {
+                            self.resolve_call(call, caller_ctx, o);
+                        }
+                    }
                 }
             }
-            Handler::Call { call, caller_ctx } => self.resolve_call(call, caller_ctx, o),
         }
     }
 
-    /// Note a bucket on an object; a NEW bucket re-arms the dynamic
-    /// reads that already fired on it (a computed read sees every
-    /// bucket, including ones created after the read first fired).
-    fn note_bucket(&mut self, site: InstId, ctx: Ctx, slot: Slot) {
+    /// Record a bucket on an object and return any `(handler_id, obj)` dynamic
+    /// reads that need to re-fire (already cleared from `self.fired`).
+    fn note_bucket_rearms(&mut self, site: InstId, ctx: Ctx, slot: Slot) -> Vec<(u32, Obj)> {
         if !self.buckets.entry((site, ctx)).or_default().insert(slot) {
-            return;
+            return Vec::new();
         }
         let rearm: Vec<(u32, Obj)> = self
             .dyn_loads
@@ -523,8 +540,18 @@ impl<'m> Pta<'m> {
                 })
             })
             .collect();
-        for (id, o) in rearm {
+        for &(id, o) in &rearm {
             self.fired.remove(&(id, o));
+        }
+        rearm
+    }
+
+    /// Note a bucket on an object; a NEW bucket re-arms the dynamic
+    /// reads that already fired on it (a computed read sees every
+    /// bucket, including ones created after the read first fired).
+    fn note_bucket(&mut self, site: InstId, ctx: Ctx, slot: Slot) {
+        let rearm = self.note_bucket_rearms(site, ctx, slot);
+        for (id, o) in rearm {
             self.fire(id, o);
         }
     }
@@ -1025,48 +1052,52 @@ impl<'m> Pta<'m> {
 
     /// The main loop: activations (in `(FuncId, ctx)` order) and facts
     /// (pop-min) through one deterministic worklist, to the fixed
-    /// point (or the budget cut). `post_pass` distinguishes the
-    /// re-entry after the empty-bucket post-pass (which runs at most
-    /// once — adding `Unknown` never empties a bucket).
-    fn pump(&mut self, steps: &mut usize, post_pass: bool) {
+    /// point (or the budget cut), followed by at most one empty-bucket
+    /// post-pass (adding `Unknown` never empties a bucket).
+    fn pump(&mut self, steps: &mut usize) {
+        let mut post_pass_done = false;
         loop {
-            let next = self
-                .activated
-                .iter()
-                .find(|a| !self.scanned.contains(*a))
-                .copied();
-            if let Some((func, ctx)) = next {
-                self.scanned.insert((func, ctx));
-                self.scan(func, ctx);
-                continue;
+            loop {
+                let next = self
+                    .activated
+                    .iter()
+                    .find(|a| !self.scanned.contains(*a))
+                    .copied();
+                if let Some((func, ctx)) = next {
+                    self.scanned.insert((func, ctx));
+                    self.scan(func, ctx);
+                    continue;
+                }
+                let Some((p, o)) = self.worklist.iter().next().copied() else {
+                    break;
+                };
+                self.worklist.remove(&(p, o));
+                *steps += 1;
+                if *steps > self.config.step_budget {
+                    self.stats.capped = true;
+                    return;
+                }
+                if !self.pts.entry(p).or_default().insert(o) {
+                    continue;
+                }
+                self.stats.facts += 1;
+                // Delta half one: replay down existing out-edges.
+                if let Some(targets) = self.edges.get(&p).cloned() {
+                    for t in targets {
+                        self.worklist.insert((t, o));
+                    }
+                }
+                // Statement handlers registered on this base pointer.
+                if let Some(ids) = self.handlers_by_base.get(&p).cloned() {
+                    for id in ids {
+                        self.fire(id, o);
+                    }
+                }
             }
-            let Some((p, o)) = self.worklist.iter().next().copied() else {
+            if post_pass_done {
                 break;
-            };
-            self.worklist.remove(&(p, o));
-            *steps += 1;
-            if *steps > self.config.step_budget {
-                self.stats.capped = true;
-                return;
             }
-            if !self.pts.entry(p).or_default().insert(o) {
-                continue;
-            }
-            self.stats.facts += 1;
-            // Delta half one: replay down existing out-edges.
-            if let Some(targets) = self.edges.get(&p).cloned() {
-                for t in targets {
-                    self.worklist.insert((t, o));
-                }
-            }
-            // Statement handlers registered on this base pointer.
-            if let Some(ids) = self.handlers_by_base.get(&p).cloned() {
-                for id in ids {
-                    self.fire(id, o);
-                }
-            }
-        }
-        if !post_pass {
+            post_pass_done = true;
             // The empty-bucket post-pass: a load whose buckets stayed
             // empty reads an inherited/reflected/native property —
             // opaque. Runs once: adding Unknown never empties a bucket.
@@ -1078,8 +1109,8 @@ impl<'m> Pta<'m> {
                     added = true;
                 }
             }
-            if added {
-                self.pump(steps, true);
+            if !added {
+                break;
             }
         }
     }
@@ -1094,7 +1125,7 @@ impl<'m> Pta<'m> {
             }
         }
         let mut steps = 0usize;
-        self.pump(&mut steps, false);
+        self.pump(&mut steps);
     }
 }
 

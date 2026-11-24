@@ -196,32 +196,112 @@ pub fn const_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<ConstI
     Ok(lf.const_shape(tree))
 }
 
-/// Convert the literal array at `table_idx` into its [`Const`] tree
-/// (memoized, cycle-guarded). Literal shapes are inline TREES in v0.2's
-/// constant pool — a nested array is embedded by value, so this returns
-/// the tree itself rather than a pool reference.
-fn const_tree_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<Const, LiftError> {
+/// Step outcome when converting one [`LiteralValue`] without native
+/// call-stack recursion.
+enum LitStep {
+    /// Immediate scalar, string, or method-ref constant.
+    Ready(Const),
+    /// Nested literal-array reference at `table_idx` to expand on the
+    /// explicit work stack.
+    NestedArray(u32),
+}
+
+/// Active frame on the iterative literal-array conversion stack.
+struct LitFrame<'f> {
+    table_idx: u32,
+    values: &'f [LiteralValue],
+    next_elem: usize,
+    consts: Vec<Const>,
+}
+
+/// Look up `table_idx` in the memo cache or validate and activate a new
+/// [`LitFrame`] for iterative expansion.
+fn enter_literal_array<'f>(
+    lf: &mut Lifter<'f>,
+    table_idx: u32,
+) -> Result<Result<Const, LitFrame<'f>>, LiftError> {
     if let Some(tree) = lf.lit_cache.get(&table_idx) {
-        return Ok(tree.clone());
+        return Ok(Ok(tree.clone()));
     }
-    if (table_idx as usize) >= lf.file.literal_arrays.len() {
+    let file = lf.file;
+    let Some(arr) = file.literal_arrays.get(table_idx as usize) else {
         return Err(LiftError::LiteralArrayOutOfRange(table_idx));
-    }
+    };
     if !lf.lit_active.insert(table_idx) {
         return Err(LiftError::LiteralArrayCycle(table_idx));
     }
-    let result = (|| {
-        let values = lf.file.literal_arrays[table_idx as usize].values.clone();
-        let mut consts = Vec::with_capacity(values.len());
-        for v in &values {
-            consts.push(const_for_literal_value(lf, v)?);
+    Ok(Err(LitFrame {
+        table_idx,
+        values: &arr.values,
+        next_elem: 0,
+        consts: Vec::with_capacity(arr.values.len()),
+    }))
+}
+
+/// Convert the literal array at `table_idx` into its [`Const`] tree
+/// iteratively (memoized, cycle-guarded, O(1) native stack). Literal
+/// shapes are inline TREES in v0.2's constant pool — a nested array is
+/// embedded by value, so this returns the tree itself rather than a pool
+/// reference.
+fn const_tree_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<Const, LiftError> {
+    let first = match enter_literal_array(lf, table_idx)? {
+        Ok(cached) => return Ok(cached),
+        Err(frame) => frame,
+    };
+    let mut stack = vec![first];
+
+    while let Some(next_elem) = stack.last().map(|f| f.next_elem) {
+        let top_idx = stack.len() - 1;
+        let values = stack[top_idx].values;
+        if next_elem < values.len() {
+            let v = &values[next_elem];
+            stack[top_idx].next_elem += 1;
+            let step = match step_literal_value(lf, v) {
+                Ok(s) => s,
+                Err(e) => {
+                    for f in &stack {
+                        lf.lit_active.remove(&f.table_idx);
+                    }
+                    return Err(e);
+                }
+            };
+            match step {
+                LitStep::Ready(c) => {
+                    if let Some(parent) = stack.last_mut() {
+                        parent.consts.push(c);
+                    }
+                }
+                LitStep::NestedArray(child_idx) => match enter_literal_array(lf, child_idx) {
+                    Ok(Ok(cached)) => {
+                        if let Some(parent) = stack.last_mut() {
+                            parent.consts.push(cached);
+                        }
+                    }
+                    Ok(Err(child_frame)) => stack.push(child_frame),
+                    Err(e) => {
+                        for f in &stack {
+                            lf.lit_active.remove(&f.table_idx);
+                        }
+                        return Err(e);
+                    }
+                },
+            }
+        } else {
+            let Some(finished) = stack.pop() else {
+                break;
+            };
+            lf.lit_active.remove(&finished.table_idx);
+            let tree = Const::ArrayLiteral(finished.consts);
+            lf.lit_cache.insert(finished.table_idx, tree.clone());
+            if let Some(parent) = stack.last_mut() {
+                parent.consts.push(tree);
+            } else {
+                return Ok(tree);
+            }
         }
-        Ok(Const::ArrayLiteral(consts))
-    })();
-    lf.lit_active.remove(&table_idx);
-    let tree = result?;
-    lf.lit_cache.insert(table_idx, tree.clone());
-    Ok(tree)
+    }
+
+    unreachable!("literal-array stack always returns when popping the root frame")
 }
 
 /// Convert one literal value to a [`Const`] (N52: every reference is
@@ -230,17 +310,26 @@ pub(crate) fn const_for_literal_value(
     lf: &mut Lifter,
     v: &LiteralValue,
 ) -> Result<Const, LiftError> {
+    match step_literal_value(lf, v)? {
+        LitStep::Ready(c) => Ok(c),
+        LitStep::NestedArray(idx) => const_tree_for_literal_array(lf, idx),
+    }
+}
+
+/// Classify a single [`LiteralValue`] into an immediate [`Const`] or a
+/// nested literal-array index without recursing.
+fn step_literal_value(lf: &mut Lifter, v: &LiteralValue) -> Result<LitStep, LiftError> {
     Ok(match v {
-        LiteralValue::Bool(b) => Const::Bool(*b),
-        LiteralValue::Integer8(n) => Const::number(*n as f64),
-        LiteralValue::Integer(n) => Const::number(*n as f64),
-        LiteralValue::Float(f) => Const::number(*f as f64),
-        LiteralValue::Double(d) => Const::number(*d),
+        LiteralValue::Bool(b) => LitStep::Ready(Const::Bool(*b)),
+        LiteralValue::Integer8(n) => LitStep::Ready(Const::number(*n as f64)),
+        LiteralValue::Integer(n) => LitStep::Ready(Const::number(*n as f64)),
+        LiteralValue::Float(f) => LitStep::Ready(Const::number(*f as f64)),
+        LiteralValue::Double(d) => LitStep::Ready(Const::number(*d)),
         LiteralValue::String(sid) | LiteralValue::EtsImplements(sid) => {
             let sym = lf
                 .sym_of_file_sid(*sid)
                 .ok_or(LiftError::UnresolvedEntity(0))?;
-            Const::String(sym)
+            LitStep::Ready(Const::String(sym))
         }
         // Method references resolve offset → FuncId through the pass-1
         // method table (kind-precise identity, S1/N2).
@@ -248,17 +337,19 @@ pub(crate) fn const_for_literal_value(
         | LiteralValue::GeneratorMethod(offset)
         | LiteralValue::AsyncGeneratorMethod(offset)
         | LiteralValue::Getter(offset)
-        | LiteralValue::Setter(offset) => Const::MethodRef(func_of_offset(lf, *offset)?),
+        | LiteralValue::Setter(offset) => {
+            LitStep::Ready(Const::MethodRef(func_of_offset(lf, *offset)?))
+        }
         // Small numeric payloads with no dedicated Const variant
         // (accessor-kind tag, affiliate index, builtin-type index) —
         // content preserved as numbers (documented).
-        LiteralValue::Accessor(n) => Const::number(*n as f64),
-        LiteralValue::MethodAffiliate(n) => Const::number(*n as f64),
-        LiteralValue::BuiltinTypeIndex(n) => Const::number(*n as f64),
-        LiteralValue::NullValue(_) => Const::Null,
+        LiteralValue::Accessor(n) => LitStep::Ready(Const::number(*n as f64)),
+        LiteralValue::MethodAffiliate(n) => LitStep::Ready(Const::number(*n as f64)),
+        LiteralValue::BuiltinTypeIndex(n) => LitStep::Ready(Const::number(*n as f64)),
+        LiteralValue::NullValue(_) => LitStep::Ready(Const::Null),
         // Nested literal arrays: decode rewrites THIS variant's payload
         // to a table index (decode.rs "Rewrite nested references").
-        LiteralValue::LiteralArray(idx) => const_tree_for_literal_array(lf, idx.0)?,
+        LiteralValue::LiteralArray(idx) => LitStep::NestedArray(idx.0),
         // LiteralBufferIndex payloads are NOT rewritten by decode —
         // they are raw file offsets (same N52 class as the typed
         // arrays; corpus: sendable-class fixtures carry
@@ -266,7 +357,7 @@ pub(crate) fn const_for_literal_value(
         LiteralValue::LiteralBufferIndex(raw) => {
             let idx = typed_array_table_index(lf.file, raw.0)
                 .ok_or(LiftError::UnresolvedEntity(raw.0))?;
-            const_tree_for_literal_array(lf, idx)?
+            LitStep::NestedArray(idx)
         }
         // Typed ARRAY_* payloads are RAW FILE OFFSETS in the v0.1 file
         // model (N52 — decode rewrites only `LiteralArray`); resolve
@@ -289,7 +380,7 @@ pub(crate) fn const_for_literal_value(
             // Element-type tag (u8/i32/f64/string…) is not part of
             // v0.2's Const — the elements carry their values; the tag
             // is a lowering concern (documented divergence).
-            const_tree_for_literal_array(lf, idx)?
+            LitStep::NestedArray(idx)
         }
     })
 }

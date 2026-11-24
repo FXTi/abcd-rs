@@ -441,24 +441,74 @@ fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
         }
         AnnotationValue::Void => AnnValue::Const(lf.const_scalar(Const::Undefined)),
         AnnotationValue::StringNullptr => AnnValue::Const(lf.const_scalar(Const::Null)),
-        AnnotationValue::Array { values, .. } => {
+        AnnotationValue::Array { .. } => {
             // Typed element tag is not part of v0.2's Const
-            // (documented); elements convert to constants, with
-            // name-carrying payloads preserved as string constants
+            // (documented); elements convert to constants iteratively,
+            // with name-carrying payloads preserved as string constants
             // (documented policy).
-            let consts = values
-                .iter()
-                .map(|v| annotation_value_as_const(lf, v))
-                .collect();
-            AnnValue::Const(lf.const_shape(Const::ArrayLiteral(consts)))
+            let arr = annotation_value_as_const(lf, v);
+            AnnValue::Const(lf.const_shape(arr))
         }
     }
 }
 
+/// Active frame on the iterative annotation-array conversion stack.
+struct AnnArrayFrame<'a> {
+    values: &'a [AnnotationValue],
+    next_idx: usize,
+    consts: Vec<Const>,
+}
+
 /// Convert an annotation value inside an annotation ARRAY to a
-/// [`Const`] (scalars/strings/methods exact; name-carrying payloads as
-/// string constants — documented).
-fn annotation_value_as_const(lf: &mut Lifter, v: &AnnotationValue) -> Const {
+/// [`Const`] iteratively (scalars/strings/methods exact; name-carrying
+/// payloads as string constants — documented).
+fn annotation_value_as_const(lf: &mut Lifter, root: &AnnotationValue) -> Const {
+    let AnnotationValue::Array { values, .. } = root else {
+        return scalar_annotation_value_as_const(lf, root);
+    };
+    let mut stack = vec![AnnArrayFrame {
+        values,
+        next_idx: 0,
+        consts: Vec::with_capacity(values.len()),
+    }];
+    while let Some(next_idx) = stack.last().map(|f| f.next_idx) {
+        let top_idx = stack.len() - 1;
+        let slice = stack[top_idx].values;
+        if next_idx < slice.len() {
+            let elem = &slice[next_idx];
+            stack[top_idx].next_idx += 1;
+            if let AnnotationValue::Array {
+                values: child_vals, ..
+            } = elem
+            {
+                stack.push(AnnArrayFrame {
+                    values: child_vals,
+                    next_idx: 0,
+                    consts: Vec::with_capacity(child_vals.len()),
+                });
+            } else {
+                let c = scalar_annotation_value_as_const(lf, elem);
+                if let Some(parent) = stack.last_mut() {
+                    parent.consts.push(c);
+                }
+            }
+        } else {
+            let Some(finished) = stack.pop() else {
+                break;
+            };
+            let arr = Const::ArrayLiteral(finished.consts);
+            if let Some(parent) = stack.last_mut() {
+                parent.consts.push(arr);
+            } else {
+                return arr;
+            }
+        }
+    }
+    unreachable!("annotation-array stack always returns when popping the root frame")
+}
+
+/// Convert a single non-`Array` [`AnnotationValue`] element to a [`Const`].
+fn scalar_annotation_value_as_const(lf: &mut Lifter, v: &AnnotationValue) -> Const {
     match v {
         AnnotationValue::Bool(b) => Const::Bool(*b),
         AnnotationValue::I8(x) => Const::number(*x as f64),
@@ -504,12 +554,9 @@ fn annotation_value_as_const(lf: &mut Lifter, v: &AnnotationValue) -> Const {
         }
         AnnotationValue::Void => Const::Undefined,
         AnnotationValue::StringNullptr => Const::Null,
-        AnnotationValue::Array { values, .. } => Const::ArrayLiteral(
-            values
-                .iter()
-                .map(|v| annotation_value_as_const(lf, v))
-                .collect(),
-        ),
+        AnnotationValue::Array { .. } => {
+            unreachable!("handled iteratively by annotation_value_as_const")
+        }
     }
 }
 

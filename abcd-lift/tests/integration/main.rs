@@ -1,6 +1,5 @@
 //! Consolidated integration test suite for `abcd-lift`.
 
-mod bench_ffi;
 mod lift_alloc_array_buffer;
 mod lift_apply;
 mod lift_async_acc_value;

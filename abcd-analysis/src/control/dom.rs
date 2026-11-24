@@ -84,6 +84,45 @@ struct BlockTree {
     rpo_index: HashMap<BlockId, usize>,
     /// RPO position → RPO position of immediate dominator (`None` for roots).
     idom: Vec<Option<usize>>,
+    /// Euler-tour entry timestamp in the immediate-dominator forest (indexed by RPO position).
+    tin: Vec<u32>,
+    /// Euler-tour exit timestamp in the immediate-dominator forest (indexed by RPO position).
+    tout: Vec<u32>,
+}
+
+/// Iterative Euler-tour timestamps over the immediate-dominator forest so
+/// ancestry (`dominates`) answers in `O(1)` time without walking `idom` chains.
+fn compute_euler_tour(idom: &[Option<usize>]) -> (Vec<u32>, Vec<u32>) {
+    let n = idom.len();
+    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut roots: Vec<u32> = Vec::new();
+    for (pos, &parent) in idom.iter().enumerate() {
+        match parent {
+            Some(p) if p != pos => children[p].push(pos as u32),
+            _ => roots.push(pos as u32),
+        }
+    }
+    let mut tin = vec![0u32; n];
+    let mut tout = vec![0u32; n];
+    let mut timer = 0u32;
+    let mut stack: Vec<(u32, bool)> = Vec::with_capacity(n * 2);
+    for &r in roots.iter().rev() {
+        stack.push((r, false));
+    }
+    while let Some((u, exiting)) = stack.pop() {
+        let ui = u as usize;
+        if exiting {
+            tout[ui] = timer;
+        } else {
+            timer += 1;
+            tin[ui] = timer;
+            stack.push((u, true));
+            for &c in children[ui].iter().rev() {
+                stack.push((c, false));
+            }
+        }
+    }
+    (tin, tout)
 }
 
 impl BlockTree {
@@ -92,6 +131,8 @@ impl BlockTree {
             rpo: Vec::new(),
             rpo_index: HashMap::new(),
             idom: Vec::new(),
+            tin: Vec::new(),
+            tout: Vec::new(),
         }
     }
 
@@ -155,10 +196,13 @@ impl BlockTree {
                     break;
                 }
             }
+            let (tin, tout) = compute_euler_tour(&idom);
             BlockTree {
                 rpo,
                 rpo_index,
                 idom,
+                tin,
+                tout,
             }
         } else {
             // Virtual super-root sits at extended RPO position 0; real nodes
@@ -208,13 +252,16 @@ impl BlockTree {
             }
             // Strip virtual root `0`: real roots (`ext_idom == Some(0)`)
             // become `None`, other real nodes shift down by 1.
-            let idom = (1..total)
+            let idom: Vec<Option<usize>> = (1..total)
                 .map(|ext_pos| ext_idom[ext_pos].and_then(|d| (d != 0).then(|| d - 1)))
                 .collect();
+            let (tin, tout) = compute_euler_tour(&idom);
             BlockTree {
                 rpo,
                 rpo_index,
                 idom,
+                tin,
+                tout,
             }
         }
     }
@@ -239,24 +286,10 @@ impl BlockTree {
         if a == b {
             return true;
         }
-        let mut cur = match self.position(b) {
-            Some(p) => p,
-            None => return false,
+        let (Some(pa), Some(pb)) = (self.position(a), self.position(b)) else {
+            return false;
         };
-        loop {
-            match self.idom.get(cur).copied().flatten() {
-                None => return false,
-                Some(next) => {
-                    if next == cur {
-                        return false;
-                    }
-                    if self.rpo[next] == a {
-                        return true;
-                    }
-                    cur = next;
-                }
-            }
-        }
+        self.tin[pa] <= self.tin[pb] && self.tout[pb] <= self.tout[pa]
     }
 
     /// The full dominator set of `b` (`b` itself included), in chain order

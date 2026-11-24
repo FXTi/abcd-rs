@@ -646,3 +646,86 @@ fn literal_table_index_unregistered_entity_id() {
     let err = lift_file(&file).expect_err("unregistered literal-array id");
     assert!(matches!(err, LiftError::UnresolvedEntity(5)), "got {err:?}");
 }
+
+// ── Deep-nesting iterative stack guards (#37-B) ──────────────────────
+
+#[test]
+fn deep_literal_array_chain_lifts_without_recursion_overflow() {
+    // 512-deep nested LiteralArray chain (0 → 1 → … → 511 → [42]),
+    // plus a 4,000-deep chain ending in a cycle to verify iterative
+    // traversal and active-set cleanup on error.
+    let depth = 512usize;
+    let mut arrays = Vec::with_capacity(depth);
+    for i in 0..depth {
+        if i + 1 < depth {
+            arrays.push(vec![LiteralValue::LiteralArray(LiteralArrayIdx(
+                (i + 1) as u32,
+            ))]);
+        } else {
+            arrays.push(vec![LiteralValue::Integer(42)]);
+        }
+    }
+    let file = literal_consumer_file(
+        vec![
+            Bytecode::DeprecatedCreatearraywithbuffer(Imm(0)),
+            Bytecode::Returnundefined,
+        ],
+        arrays,
+        HashMap::new(),
+    );
+    let shape = lifted_array_shape(&file);
+    let mut cur = &shape;
+    for _ in 0..depth - 1 {
+        let Const::ArrayLiteral(elems) = cur else {
+            panic!("expected nested ArrayLiteral");
+        };
+        assert_eq!(elems.len(), 1);
+        cur = &elems[0];
+    }
+    assert_eq!(cur, &Const::ArrayLiteral(vec![Const::number(42.0)]));
+
+    let cyc_depth = 4_000usize;
+    let mut cyc_arrays = Vec::with_capacity(cyc_depth);
+    for i in 0..cyc_depth {
+        let next = if i + 1 < cyc_depth { i + 1 } else { 0 };
+        cyc_arrays.push(vec![LiteralValue::LiteralArray(LiteralArrayIdx(
+            next as u32,
+        ))]);
+    }
+    let cyc_file = literal_consumer_file(
+        vec![
+            Bytecode::DeprecatedCreatearraywithbuffer(Imm(0)),
+            Bytecode::Returnundefined,
+        ],
+        cyc_arrays,
+        HashMap::new(),
+    );
+    let err = lift_file(&cyc_file).expect_err("4000-deep literal cycle");
+    assert!(
+        matches!(err, LiftError::LiteralArrayCycle(0)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn unreachable_sealed_single_pred_cycle_lifts_and_verifies() {
+    // B0: returnundefined; B1: jmp 2; B2: ldtrue, jeqz 1; B3: lda v0, return.
+    // B1 <-> B2 is an unreachable cycle of in-degree-1 blocks sealed before
+    // B3 reads v0; iterative Braun SSA breaks the cycle and dead-island
+    // sweep removes B1..B3 cleanly.
+    use abcd_isa::Label;
+    let file = literal_consumer_file(
+        vec![
+            Bytecode::Returnundefined, // 0 (B0)
+            Bytecode::Jmp(Label(2)),   // 1 (B1 → B2)
+            Bytecode::Ldtrue,          // 2 (B2)
+            Bytecode::Jeqz(Label(1)),  // 3 (B2 → B1 or fallthrough B3)
+            Bytecode::Lda(Reg(0)),     // 4 (B3 reads v0 across B1 <-> B2)
+            Bytecode::Return,          // 5
+        ],
+        Vec::new(),
+        HashMap::new(),
+    );
+    let m = lift_file(&file).expect("lift dead cycle without hanging");
+    verify_clean(&m);
+}

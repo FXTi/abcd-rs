@@ -1448,3 +1448,72 @@ fn out_of_range_module_request_idx_is_malformed() {
         "got {err:?}"
     );
 }
+
+#[test]
+fn deep_nested_annotation_array_lifts_iteratively() {
+    use abcd_file::{Annotation as FileAnnotation, AnnotationElem, AnnotationValue};
+
+    let depth = 512usize;
+    let mut nested = AnnotationValue::Bool(true);
+    for _ in 0..depth {
+        nested = AnnotationValue::Array {
+            tag: b'K',
+            values: vec![nested],
+        };
+    }
+
+    let mut strings = abcd_file::StringPool::default();
+    let desc = strings.get_or_intern("LModel;");
+    let ann_desc = strings.get_or_intern("LAnn;");
+    let arr_name = strings.get_or_intern("arr");
+    let class = abcd_file::Class {
+        descriptor: desc,
+        name: desc,
+        access_flags: AccessFlags::PUBLIC,
+        source_lang: FileSourceLang::EcmaScript,
+        source_file: None,
+        is_external: false,
+        super_class: None,
+        interfaces: Vec::new(),
+        methods: Vec::new(),
+        fields: Vec::new(),
+        annotations: abcd_file::Annotations {
+            compile_time: vec![FileAnnotation {
+                class_descriptor: ann_desc,
+                elements: vec![AnnotationElem {
+                    name: arr_name,
+                    value: nested,
+                }],
+            }],
+            ..Default::default()
+        },
+    };
+    let file = abcd_file::File {
+        version: Version::new(12, 0, 6, 0),
+        checksum: 0,
+        size: 0,
+        file_type: FileType::Dynamic,
+        strings,
+        classes: [(desc, class)].into_iter().collect(),
+        literal_arrays: Vec::new(),
+        entity_map: Default::default(),
+        literal_array_offsets: Default::default(),
+        literal_array_header_offsets: Vec::new(),
+    };
+
+    let m = lift_file(&file).expect("lift 512-deep annotation array");
+    verify_clean(&m);
+    let ann = &m.classes[class_id_of(&m, "LModel;").index()].annotations[0];
+    let AnnValue::Const(cid) = ann.elements[0].1 else {
+        panic!("expected pooled ArrayLiteral const");
+    };
+    let mut cur = m.consts.get(cid).expect("const");
+    for _ in 0..depth {
+        let Const::ArrayLiteral(elems) = cur else {
+            panic!("expected ArrayLiteral");
+        };
+        assert_eq!(elems.len(), 1);
+        cur = &elems[0];
+    }
+    assert_eq!(cur, &Const::Bool(true));
+}

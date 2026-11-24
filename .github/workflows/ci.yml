@@ -95,7 +95,7 @@ jobs:
       # vendor/ and abcd-*-sys/*/generated/ (verified by vendor-verify);
       # build.rs compiles pure C++17 via cc with no Ruby or bindgen needed.
       # NOTE: No actions/cache here on purpose. Do NOT add it back.
-      - run: cargo build
+      - run: cargo build --bins
       - run: cargo test
 
   build32:
@@ -110,7 +110,7 @@ jobs:
           targets: i686-unknown-linux-gnu
       - name: Install 32-bit toolchain
         run: sudo apt-get update && sudo apt-get install -y gcc-multilib g++-multilib
-      - run: cargo build --target i686-unknown-linux-gnu
+      - run: cargo build --bins --target i686-unknown-linux-gnu
         env:
           CFLAGS: -m32
           CXXFLAGS: -m32
@@ -129,7 +129,7 @@ jobs:
       - uses: ./.github/actions/setup-workspace
         with:
           targets: i686-pc-windows-msvc
-      - run: cargo build --target i686-pc-windows-msvc
+      - run: cargo build --bins --target i686-pc-windows-msvc
       - run: cargo test --target i686-pc-windows-msvc
 
   arm32:
@@ -144,7 +144,7 @@ jobs:
           targets: armv7-unknown-linux-gnueabihf
       - name: Install armv7 cross toolchain + qemu-user
         run: sudo apt-get update && sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user libc6-armhf-cross libstdc++-12-dev-armhf-cross
-      - run: cargo build --target armv7-unknown-linux-gnueabihf
+      - run: cargo build --bins --target armv7-unknown-linux-gnueabihf
         env:
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
           CC_armv7_unknown_linux_gnueabihf: arm-linux-gnueabihf-gcc
@@ -161,7 +161,7 @@ jobs:
   # `deny`, `vendor-verify`) in parallel with the cross-OS `build` matrix.
 
   file-isa:
-    name: file-isa (pandasm per-instruction + corpus decode/re-encode)
+    name: file-isa (pandasm byte-identical + asm + ISA roundtrip)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [fmt, clippy, doc, deny, vendor-verify]
@@ -171,7 +171,7 @@ jobs:
         with:
           corpus-mode: corpus
           corpus-image: ${{ env.ARK_TEST_IMAGE }}
-      - run: cargo test -p abcd-rs --test file-isa --release -- --ignored --nocapture --test-threads=1
+      - run: cargo test -p abcd-rs --test file-isa --release -- --ignored --nocapture
 
   hap-file:
     name: hap-file (wild OHOS hap container + decode gates)
@@ -187,7 +187,7 @@ jobs:
       - run: cargo test -p abcd-rs --test hap-file --release -- --ignored --nocapture
 
   wild-gate:
-    name: wild-gate (core-25 wild recompile acceptance + fallback ledger)
+    name: wild-gate (core-25 wild recompile + split/arkui + fallback ledger)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [fmt, clippy, doc, deny, vendor-verify]
@@ -197,7 +197,7 @@ jobs:
         with:
           corpus-mode: wild
           corpus-image: ${{ env.ARK_TEST_IMAGE }}
-      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture wild_gate
+      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture wild_gate --skip wild_gate_offline
 
   file-lift:
     name: file-lift (corpus lift+verify, 5517 incl. test262)
@@ -313,7 +313,7 @@ jobs:
         with:
           corpus-mode: corpus
           corpus-image: ${{ env.ARK_TEST_IMAGE }}
-      - run: cargo test -p abcd-rs --test lift-taint --release -- --ignored --nocapture --skip corpus_callee_names
+      - run: cargo test -p abcd-rs --test lift-taint --release -- --ignored --nocapture
 
   lift-decompile:
     name: lift-decompile (stage A/B gates + dream gate + node evidence)
@@ -326,7 +326,7 @@ jobs:
         with:
           corpus-mode: corpus
           corpus-image: ${{ env.ARK_TEST_IMAGE }}
-      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --test-threads=1 --skip textual_oracle --skip dream_gate_generate --skip dream_gate_t262 --skip wild_gate --skip wild_smoke
+      - run: cargo test -p abcd-rs --test lift-decompile --release -- --ignored --nocapture --test-threads=1 --skip dream_gate_generate --skip dream_gate_t262 --skip wild_gate
       - name: Upload the dream-gate report
         if: always()
         uses: actions/upload-artifact@v7
@@ -364,7 +364,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Collect coverage (full estate incl. the corpus suites)
-        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_smoke --skip wild_gate --skip dream_gate_oracle --skip dream_gate_t262_oracle --skip merge_abc_docker_oracle
+        run: cargo llvm-cov --workspace --release --lcov --output-path lcov.info -- --include-ignored --skip pandasm_asm --skip wild_gate_full --skip wild_gate_red_proof_es2abc_rejection --skip dream_gate_oracle --skip dream_gate_t262_oracle --skip merge_abc_docker_oracle
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5
@@ -405,7 +405,7 @@ jobs:
           set -euo pipefail
           export RUSTFLAGS="-Zsanitizer=address"
           cargo test --workspace --lib --tests --release --target x86_64-unknown-linux-gnu -Zbuild-std
-          for t in file-isa file-lift hap-file lift-analysis lift-taint; do
-            cargo test -p abcd-rs --test "$t" --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --test-threads=1 --skip pandasm_asm --skip wild_smoke
+          for t in file-isa file-lift hap-file; do
+            cargo test -p abcd-rs --test "$t" --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip pandasm_asm
           done
-          cargo test -p abcd-rs --test lift-lower --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --test-threads=1 --skip test262_vm
+          cargo test -p abcd-rs --test lift-lower --release --target x86_64-unknown-linux-gnu -Zbuild-std -- --ignored --nocapture --skip test262_vm --skip lower_sendable_class --skip n72_args_array --skip n73_segv

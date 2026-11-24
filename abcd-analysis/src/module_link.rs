@@ -313,33 +313,32 @@ impl ModuleLinkTable {
         }
         let mut init_order = Vec::new();
         let mut visited_cls = BTreeSet::new();
-        fn dfs_init(
-            cid: ClassId,
-            dep_edges: &BTreeMap<ClassId, Vec<ClassId>>,
-            main_of_class: &BTreeMap<ClassId, FuncId>,
-            visited: &mut BTreeSet<ClassId>,
-            out: &mut Vec<FuncId>,
-        ) {
-            if !visited.insert(cid) {
-                return;
+        let mut dfs_stack: Vec<(ClassId, usize)> = Vec::new();
+        for &root_cid in main_of_class.keys() {
+            if !visited_cls.insert(root_cid) {
+                continue;
             }
-            if let Some(deps) = dep_edges.get(&cid) {
-                for &d in deps {
-                    dfs_init(d, dep_edges, main_of_class, visited, out);
+            dfs_stack.push((root_cid, 0));
+            while let Some((cid, next_idx)) = dfs_stack.last_mut() {
+                let cur_cid = *cid;
+                let deps = dep_edges.get(&cur_cid).map(Vec::as_slice).unwrap_or(&[]);
+                let mut pushed = false;
+                while *next_idx < deps.len() {
+                    let d = deps[*next_idx];
+                    *next_idx += 1;
+                    if visited_cls.insert(d) {
+                        dfs_stack.push((d, 0));
+                        pushed = true;
+                        break;
+                    }
+                }
+                if !pushed {
+                    if let Some(&fid) = main_of_class.get(&cur_cid) {
+                        init_order.push(fid);
+                    }
+                    dfs_stack.pop();
                 }
             }
-            if let Some(&fid) = main_of_class.get(&cid) {
-                out.push(fid);
-            }
-        }
-        for &cid in main_of_class.keys() {
-            dfs_init(
-                cid,
-                &dep_edges,
-                &main_of_class,
-                &mut visited_cls,
-                &mut init_order,
-            );
         }
 
         ModuleLinkTable {
@@ -452,135 +451,222 @@ where
 {
     fn resolve_export(
         &self,
-        cid: ClassId,
-        export_name: &str,
+        root_cid: ClassId,
+        root_export_name: &str,
         visited: &mut HashSet<(ClassId, String)>,
         out: &mut ExternalSlotTarget,
     ) {
-        if !visited.insert((cid, export_name.to_owned())) {
-            return;
-        }
-        if export_name == "default"
-            && let Some(&jc) = self.json_by_class.get(&cid)
-        {
-            out.json_consts.push(jc);
-            return;
-        }
-        let Some(esm) = self.esm_by_class.get(&cid) else {
-            out.unresolved_external = true;
-            return;
-        };
-
-        let mut matched_direct = false;
-        for exp in &esm.exports {
-            match exp {
-                ExportDecl::Local {
-                    local_name,
-                    export_name: ename,
-                } if sym_str(self.module, *ename) == export_name => {
-                    matched_direct = true;
-                    let lname = sym_str(self.module, *local_name);
-                    if let Some(&slot) =
-                        self.local_name_to_slot.get(&cid).and_then(|m| m.get(lname))
-                    {
-                        out.slots.push(ModuleSlotRef {
-                            class_id: cid,
-                            slot,
-                        });
-                    }
-                }
-                ExportDecl::Indirect {
-                    export_name: ename,
-                    import_name,
-                    module_request,
-                } if sym_str(self.module, *ename) == export_name => {
-                    matched_direct = true;
-                    let iname = sym_str(self.module, *import_name);
-                    if let Some(next_cid) = (self.resolve_spec)(cid, *module_request) {
-                        if iname == "*" {
-                            // `export * as ns from "./sub"` re-exports namespace:
-                            // conservatively union all local slots of `next_cid`.
-                            let mut names = BTreeSet::new();
-                            self.collect_exported_names(next_cid, &mut HashSet::new(), &mut names);
-                            for n in names {
-                                self.resolve_export(next_cid, &n, visited, out);
-                            }
-                        } else {
-                            self.resolve_export(next_cid, iname, visited, out);
-                        }
-                    } else {
-                        out.unresolved_external = true;
-                        out.external_imports.push((*module_request, *import_name));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if matched_direct || export_name == "default" {
-            if !matched_direct {
-                out.unresolved_external = true;
-            }
-            return;
+        enum ResolveStep {
+            Call {
+                cid: ClassId,
+                export_name: String,
+            },
+            PushLocal(ModuleSlotRef),
+            PushExternalImport {
+                req: Sym,
+                name: Sym,
+            },
+            MarkUnresolved,
+            StarStep {
+                next_cid: ClassId,
+                export_name: String,
+            },
+            StarAfterChild {
+                before_count: usize,
+                saved_unres: bool,
+            },
+            StarFinish,
         }
 
-        // ECMA-262 §16.2.1.6.2: `export * from` forwards non-`default` bindings.
-        let mut found_star = false;
-        for exp in &esm.exports {
-            if let ExportDecl::Star { module_request } = exp {
-                if let Some(next_cid) = (self.resolve_spec)(cid, *module_request) {
-                    let before = out.slots.len() + out.json_consts.len();
-                    let saved_unres = out.unresolved_external;
-                    out.unresolved_external = false;
-                    self.resolve_export(next_cid, export_name, visited, out);
-                    if out.slots.len() + out.json_consts.len() > before {
-                        found_star = true;
-                    }
-                    out.unresolved_external = saved_unres;
-                } else {
+        let mut stack: Vec<ResolveStep> = vec![ResolveStep::Call {
+            cid: root_cid,
+            export_name: root_export_name.to_owned(),
+        }];
+        let mut star_found: Vec<bool> = Vec::new();
+
+        while let Some(step) = stack.pop() {
+            match step {
+                ResolveStep::PushLocal(slot_ref) => out.slots.push(slot_ref),
+                ResolveStep::PushExternalImport { req, name } => {
+                    out.unresolved_external = true;
+                    out.external_imports.push((req, name));
+                }
+                ResolveStep::MarkUnresolved => {
                     out.unresolved_external = true;
                 }
+                ResolveStep::StarStep {
+                    next_cid,
+                    export_name,
+                } => {
+                    let before_count = out.slots.len() + out.json_consts.len();
+                    let saved_unres = out.unresolved_external;
+                    out.unresolved_external = false;
+                    stack.push(ResolveStep::StarAfterChild {
+                        before_count,
+                        saved_unres,
+                    });
+                    stack.push(ResolveStep::Call {
+                        cid: next_cid,
+                        export_name,
+                    });
+                }
+                ResolveStep::StarAfterChild {
+                    before_count,
+                    saved_unres,
+                } => {
+                    if out.slots.len() + out.json_consts.len() > before_count
+                        && let Some(top) = star_found.last_mut()
+                    {
+                        *top = true;
+                    }
+                    out.unresolved_external = saved_unres;
+                }
+                ResolveStep::StarFinish => {
+                    let found = star_found.pop().unwrap_or(false);
+                    if !found {
+                        out.unresolved_external = true;
+                    }
+                }
+                ResolveStep::Call { cid, export_name } => {
+                    if !visited.insert((cid, export_name.clone())) {
+                        continue;
+                    }
+                    if export_name == "default"
+                        && let Some(&jc) = self.json_by_class.get(&cid)
+                    {
+                        out.json_consts.push(jc);
+                        continue;
+                    }
+                    let Some(esm) = self.esm_by_class.get(&cid) else {
+                        out.unresolved_external = true;
+                        continue;
+                    };
+
+                    let mut matched_direct = false;
+                    let mut direct_actions: Vec<ResolveStep> = Vec::new();
+                    for exp in &esm.exports {
+                        match exp {
+                            ExportDecl::Local {
+                                local_name,
+                                export_name: ename,
+                            } if sym_str(self.module, *ename) == export_name => {
+                                matched_direct = true;
+                                let lname = sym_str(self.module, *local_name);
+                                if let Some(&slot) =
+                                    self.local_name_to_slot.get(&cid).and_then(|m| m.get(lname))
+                                {
+                                    direct_actions.push(ResolveStep::PushLocal(ModuleSlotRef {
+                                        class_id: cid,
+                                        slot,
+                                    }));
+                                }
+                            }
+                            ExportDecl::Indirect {
+                                export_name: ename,
+                                import_name,
+                                module_request,
+                            } if sym_str(self.module, *ename) == export_name => {
+                                matched_direct = true;
+                                let iname = sym_str(self.module, *import_name);
+                                if let Some(next_cid) = (self.resolve_spec)(cid, *module_request) {
+                                    if iname == "*" {
+                                        // `export * as ns from "./sub"` re-exports namespace:
+                                        // conservatively union all local slots of `next_cid`.
+                                        let mut names = BTreeSet::new();
+                                        self.collect_exported_names(
+                                            next_cid,
+                                            &mut HashSet::new(),
+                                            &mut names,
+                                        );
+                                        for n in names {
+                                            direct_actions.push(ResolveStep::Call {
+                                                cid: next_cid,
+                                                export_name: n,
+                                            });
+                                        }
+                                    } else {
+                                        direct_actions.push(ResolveStep::Call {
+                                            cid: next_cid,
+                                            export_name: iname.to_owned(),
+                                        });
+                                    }
+                                } else {
+                                    direct_actions.push(ResolveStep::PushExternalImport {
+                                        req: *module_request,
+                                        name: *import_name,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if matched_direct || export_name == "default" {
+                        if !matched_direct {
+                            out.unresolved_external = true;
+                        } else {
+                            for act in direct_actions.into_iter().rev() {
+                                stack.push(act);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // ECMA-262 §16.2.1.6.2: `export * from` forwards non-`default` bindings.
+                    star_found.push(false);
+                    stack.push(ResolveStep::StarFinish);
+                    for exp in esm.exports.iter().rev() {
+                        if let ExportDecl::Star { module_request } = exp {
+                            if let Some(next_cid) = (self.resolve_spec)(cid, *module_request) {
+                                stack.push(ResolveStep::StarStep {
+                                    next_cid,
+                                    export_name: export_name.clone(),
+                                });
+                            } else {
+                                stack.push(ResolveStep::MarkUnresolved);
+                            }
+                        }
+                    }
+                }
             }
-        }
-        if !found_star {
-            out.unresolved_external = true;
         }
     }
 
     fn collect_exported_names(
         &self,
-        cid: ClassId,
+        root_cid: ClassId,
         visited: &mut HashSet<ClassId>,
         out: &mut BTreeSet<String>,
     ) {
-        if !visited.insert(cid) {
-            return;
-        }
-        if self.json_by_class.contains_key(&cid) {
-            out.insert("default".to_owned());
-        }
-        let Some(esm) = self.esm_by_class.get(&cid) else {
-            return;
-        };
-        for exp in &esm.exports {
-            match exp {
-                ExportDecl::Local { export_name, .. }
-                | ExportDecl::Indirect { export_name, .. } => {
-                    let s = sym_str(self.module, *export_name);
-                    if !s.is_empty() {
-                        out.insert(s.to_owned());
+        let mut stack: Vec<(ClassId, bool)> = vec![(root_cid, true)];
+        while let Some((cid, is_root)) = stack.pop() {
+            if !visited.insert(cid) {
+                continue;
+            }
+            if is_root && self.json_by_class.contains_key(&cid) {
+                out.insert("default".to_owned());
+            }
+            let Some(esm) = self.esm_by_class.get(&cid) else {
+                continue;
+            };
+            let mut star_children: Vec<ClassId> = Vec::new();
+            for exp in &esm.exports {
+                match exp {
+                    ExportDecl::Local { export_name, .. }
+                    | ExportDecl::Indirect { export_name, .. } => {
+                        let s = sym_str(self.module, *export_name);
+                        if !s.is_empty() && (is_root || s != "default") {
+                            out.insert(s.to_owned());
+                        }
                     }
-                }
-                ExportDecl::Star { module_request } => {
-                    if let Some(next_cid) = (self.resolve_spec)(cid, *module_request) {
-                        let mut sub = BTreeSet::new();
-                        self.collect_exported_names(next_cid, visited, &mut sub);
-                        for s in sub {
-                            if s != "default" {
-                                out.insert(s);
-                            }
+                    ExportDecl::Star { module_request } => {
+                        if let Some(next_cid) = (self.resolve_spec)(cid, *module_request) {
+                            star_children.push(next_cid);
                         }
                     }
                 }
+            }
+            for next_cid in star_children.into_iter().rev() {
+                stack.push((next_cid, false));
             }
         }
     }
@@ -961,10 +1047,35 @@ fn map_sym_from(src: &Module, dst: &mut Module, s: Sym) -> Sym {
 
 fn remap_ty(ty: &Ty, map_cid: &impl Fn(ClassId) -> ClassId) -> Ty {
     match ty {
-        Ty::Static(StaticTy::Reference(c)) => Ty::Static(StaticTy::Reference(map_cid(*c))),
-        Ty::Union(tys) => Ty::Union(tys.iter().map(|t| remap_ty(t, map_cid)).collect()),
-        other => other.clone(),
+        Ty::Static(StaticTy::Reference(c)) => return Ty::Static(StaticTy::Reference(map_cid(*c))),
+        Ty::Union(_) => {}
+        other => return other.clone(),
     }
+    enum TyStep<'a> {
+        Enter(&'a Ty),
+        MakeUnion(usize),
+    }
+    let mut stack = vec![TyStep::Enter(ty)];
+    let mut results: Vec<Ty> = Vec::new();
+    while let Some(step) = stack.pop() {
+        match step {
+            TyStep::Enter(Ty::Static(StaticTy::Reference(c))) => {
+                results.push(Ty::Static(StaticTy::Reference(map_cid(*c))));
+            }
+            TyStep::Enter(Ty::Union(tys)) => {
+                stack.push(TyStep::MakeUnion(tys.len()));
+                for t in tys.iter().rev() {
+                    stack.push(TyStep::Enter(t));
+                }
+            }
+            TyStep::Enter(other) => results.push(other.clone()),
+            TyStep::MakeUnion(n) => {
+                let members = results.split_off(results.len() - n);
+                results.push(Ty::Union(members));
+            }
+        }
+    }
+    results.pop().unwrap_or(Ty::Any)
 }
 
 fn remap_const(
@@ -974,27 +1085,66 @@ fn remap_const(
     map_fid: &impl Fn(FuncId) -> FuncId,
 ) -> Const {
     match c {
-        Const::String(s) => Const::String(map_sym_from(src, dst, *s)),
-        Const::BigInt(s) => Const::BigInt(map_sym_from(src, dst, *s)),
-        Const::MethodRef(f) => Const::MethodRef(map_fid(*f)),
-        Const::ArrayLiteral(items) => Const::ArrayLiteral(
-            items
-                .iter()
-                .map(|it| remap_const(it, src, dst, map_fid))
-                .collect(),
-        ),
-        Const::ObjectLiteral { keys, values } => Const::ObjectLiteral {
-            keys: keys
-                .iter()
-                .map(|it| remap_const(it, src, dst, map_fid))
-                .collect(),
-            values: values
-                .iter()
-                .map(|it| remap_const(it, src, dst, map_fid))
-                .collect(),
-        },
-        other => other.clone(),
+        Const::String(s) => return Const::String(map_sym_from(src, dst, *s)),
+        Const::BigInt(s) => return Const::BigInt(map_sym_from(src, dst, *s)),
+        Const::MethodRef(f) => return Const::MethodRef(map_fid(*f)),
+        Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => {}
+        other => return other.clone(),
     }
+    enum ConstStep<'a> {
+        Enter(&'a Const),
+        MakeArray(usize),
+        MakeObject { keys_len: usize, values_len: usize },
+    }
+    let mut stack = vec![ConstStep::Enter(c)];
+    let mut results: Vec<Const> = Vec::new();
+    while let Some(step) = stack.pop() {
+        match step {
+            ConstStep::Enter(Const::String(s)) => {
+                results.push(Const::String(map_sym_from(src, dst, *s)));
+            }
+            ConstStep::Enter(Const::BigInt(s)) => {
+                results.push(Const::BigInt(map_sym_from(src, dst, *s)));
+            }
+            ConstStep::Enter(Const::MethodRef(f)) => {
+                results.push(Const::MethodRef(map_fid(*f)));
+            }
+            ConstStep::Enter(Const::ArrayLiteral(items)) => {
+                stack.push(ConstStep::MakeArray(items.len()));
+                for it in items.iter().rev() {
+                    stack.push(ConstStep::Enter(it));
+                }
+            }
+            ConstStep::Enter(Const::ObjectLiteral { keys, values }) => {
+                stack.push(ConstStep::MakeObject {
+                    keys_len: keys.len(),
+                    values_len: values.len(),
+                });
+                // Push `values` first so `keys` pop and intern symbols first,
+                // matching the original traversal order.
+                for it in values.iter().rev() {
+                    stack.push(ConstStep::Enter(it));
+                }
+                for it in keys.iter().rev() {
+                    stack.push(ConstStep::Enter(it));
+                }
+            }
+            ConstStep::Enter(other) => results.push(other.clone()),
+            ConstStep::MakeArray(n) => {
+                let items = results.split_off(results.len() - n);
+                results.push(Const::ArrayLiteral(items));
+            }
+            ConstStep::MakeObject {
+                keys_len,
+                values_len,
+            } => {
+                let values = results.split_off(results.len() - values_len);
+                let keys = results.split_off(results.len() - keys_len);
+                results.push(Const::ObjectLiteral { keys, values });
+            }
+        }
+    }
+    results.pop().unwrap_or(Const::Undefined)
 }
 
 fn remap_ann_val(
@@ -1793,5 +1943,96 @@ mod tests {
                 slot: 0
             }]
         );
+    }
+
+    #[test]
+    fn deep_reexport_init_and_nested_remap_run_on_small_stack() {
+        const DEPTH: usize = 300;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut m1 = Module::new();
+                let s_val = m1.sym.intern("val");
+                for i in 0..DEPTH {
+                    let desc = m1.sym.intern(&format!("L@bundle:app/m{i};"));
+                    let name = m1.sym.intern(&format!("@bundle:app/m{i}"));
+                    let cid = ClassId::new(i as u32);
+                    m1.classes.push(ClassData::new(desc, name));
+                    let mut exports = Vec::new();
+                    let mut requests = Vec::new();
+                    let mut imports = Vec::new();
+                    if i == 0 {
+                        exports.push(ExportDecl::Local {
+                            local_name: s_val,
+                            export_name: s_val,
+                        });
+                    } else {
+                        let prev = m1.sym.intern(&format!("@bundle:app/m{}", i - 1));
+                        exports.push(ExportDecl::Star {
+                            module_request: prev,
+                        });
+                        requests.push(ModuleRequest {
+                            specifier: prev,
+                            lazy: false,
+                        });
+                        if i + 1 == DEPTH {
+                            imports.push(ImportDecl::Regular {
+                                local_name: s_val,
+                                import_name: s_val,
+                                module_request: prev,
+                            });
+                        }
+                    }
+                    m1.classes[cid.index()].es_module = Some(EsModule {
+                        imports,
+                        exports,
+                        module_requests: requests,
+                    });
+                    let (_, b, _) =
+                        push_fn_with_params(&mut m1, cid, "func_main_0", FunctionKind::Function, 3);
+                    if i == 0 {
+                        let c1 = m1.consts.push(Const::number(1.0));
+                        let (_, v) = emit_val(&mut m1, b, Op::LoadConst(c1));
+                        emit_void(&mut m1, b, Op::StoreModuleVar { index: 0, value: v });
+                    }
+                    emit_void(&mut m1, b, Op::Return { value: None });
+                }
+
+                // Deeply nested `Ty::Union` and `Const::ArrayLiteral` / `Const::ObjectLiteral`
+                // for iterative `remap_ty` and `remap_const`.
+                let mut deep_ty = Ty::Static(StaticTy::Reference(ClassId::new(0)));
+                let mut deep_const = Const::String(s_val);
+                for _ in 0..DEPTH {
+                    deep_ty = Ty::Union(vec![deep_ty]);
+                    deep_const = Const::ObjectLiteral {
+                        keys: vec![Const::String(s_val)],
+                        values: vec![Const::ArrayLiteral(vec![deep_const])],
+                    };
+                }
+                m1.values[0].ty = deep_ty;
+                let _ = m1.consts.push(deep_const);
+
+                let mut m2 = Module::new();
+                let dg = m2.sym.intern("L_GLOBAL;");
+                let ng = m2.sym.intern("_GLOBAL");
+                m2.classes.push(ClassData::new(dg, ng));
+
+                let merged = merge_ir_modules(&[("bundle", &m1), ("extra", &m2)]);
+                let links = ModuleLinkTable::build(&merged);
+                assert_eq!(links.init_order().len(), DEPTH);
+                let resolved = links
+                    .external_load(ClassId::new((DEPTH - 1) as u32), 0)
+                    .expect("leaf import");
+                assert!(!resolved.unresolved_external);
+                assert_eq!(
+                    resolved.slots,
+                    vec![ModuleSlotRef {
+                        class_id: ClassId::new(0),
+                        slot: 0
+                    }]
+                );
+            })
+            .expect("spawn");
+        handle.join().expect("small stack must not overflow");
     }
 }

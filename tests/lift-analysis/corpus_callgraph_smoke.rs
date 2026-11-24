@@ -1,154 +1,111 @@
-//! Opt-in corpus smoke test for the on-the-fly call graph
-//! (design/analysis-strategy.md §5.4; gate 3 of v2-P5a):
-//!
-//! 1. build the call graph for every fixture (all 5517 rows) — no panics,
-//!    and every call site is recorded (resolved OR explicitly unknown);
-//! 2. build it TWICE per module and assert the graphs are equal
-//!    (deterministic construction);
-//! 3. print the aggregated resolution-rate histogram
-//!    (resolved internal / resolved external / mixed / unknown).
-//!
-//! Run:
-//!
-//! ```text
-//! cargo test -p abcd-rs --test lift-analysis --release -- --ignored corpus_callgraph_smoke
-//! ```
-//!
-//! Migrated from `abcd-analysis/tests/corpus_callgraph_smoke.rs` to the
-//! root package's `tests/lift-analysis/` target; the shared helpers
-//! moved to the root package's `tests/common/`.
+//! Corpus check for base `CallGraph` + Rung-2 `pta::analyze` completeness and
+//! N20 determinism.
 
-use crate::common;
+use abcd_analysis::callgraph::{CallGraph, CallTargets, ResolutionHistogram};
+use abcd_analysis::dataflow::pta::{PtaConfig, PtaStats};
+use abcd_ir::Module;
 
-use abcd_analysis::callgraph::{CallGraph, CallTargets};
-use abcd_analysis::dataflow::pta::PtaConfig;
-use abcd_lift::lift_file;
-use rayon::prelude::*;
-
-/// One fixture's aggregate contribution (all assertion work happens
-/// inside the parallel map; these are the order-independent counts).
 #[derive(Default)]
-struct FixtureStats {
-    functions: usize,
-    histogram: abcd_analysis::callgraph::ResolutionHistogram,
-    rung2_histogram: abcd_analysis::callgraph::ResolutionHistogram,
-    pta_stats: abcd_analysis::dataflow::pta::PtaStats,
-    pta_capped: usize,
+pub(crate) struct FixtureStats {
+    pub functions: usize,
+    pub histogram: ResolutionHistogram,
+    pub rung2_histogram: ResolutionHistogram,
+    pub pta_stats: PtaStats,
+    pub pta_capped: usize,
 }
 
-#[test]
-#[ignore = "requires exported GHCR corpus and python3"]
-fn callgraph_smoke_all_fixtures() {
-    let root = common::corpus_root();
-    let paths = common::manifest_paths(&root);
-    assert_eq!(paths.len(), 5517, "expected the full 5517-fixture corpus");
+impl FixtureStats {
+    pub fn merge(&mut self, b: Self) {
+        self.functions += b.functions;
+        self.histogram.resolved_internal += b.histogram.resolved_internal;
+        self.histogram.resolved_external += b.histogram.resolved_external;
+        self.histogram.resolved_mixed += b.histogram.resolved_mixed;
+        self.histogram.unknown += b.histogram.unknown;
+        self.rung2_histogram.resolved_internal += b.rung2_histogram.resolved_internal;
+        self.rung2_histogram.resolved_external += b.rung2_histogram.resolved_external;
+        self.rung2_histogram.resolved_mixed += b.rung2_histogram.resolved_mixed;
+        self.rung2_histogram.unknown += b.rung2_histogram.unknown;
+        self.pta_stats.activations += b.pta_stats.activations;
+        self.pta_stats.facts += b.pta_stats.facts;
+        self.pta_stats.flow_edges += b.pta_stats.flow_edges;
+        self.pta_stats.call_edges_resolved += b.pta_stats.call_edges_resolved;
+        self.pta_stats.call_sites_partial += b.pta_stats.call_sites_partial;
+        self.pta_stats.env_rounds += b.pta_stats.env_rounds;
+        self.pta_capped += b.pta_capped;
+    }
+}
 
-    // Parallel per-fixture call-graph + rung-2 PTA checks (rayon);
-    // counts fold order-independently.
-    let total = paths
-        .par_iter()
-        .map(|relative| {
-            let data = std::fs::read(root.join(relative)).expect("read fixture");
-            let file = abcd_file::decode(&data).expect("decode fixture");
-            let module = lift_file(&file).expect("lift fixture");
-            let mut out = FixtureStats {
-                functions: module.functions.len(),
-                ..FixtureStats::default()
-            };
+pub(crate) fn check_fixture(module: &Module, relative: &str) -> FixtureStats {
+    let mut out = FixtureStats {
+        functions: module.functions.len(),
+        ..FixtureStats::default()
+    };
 
-            let g1 = CallGraph::build(&module);
-            let g2 = CallGraph::build(&module);
-            assert_eq!(
-                g1, g2,
-                "call graph construction must be deterministic: {relative}"
-            );
+    let g1 = CallGraph::build(module);
+    let g2 = CallGraph::build(module);
+    assert_eq!(
+        g1, g2,
+        "call graph construction must be deterministic: {relative}"
+    );
 
-            // Every Op::Call in the module has an edge record — resolved or
-            // explicitly unknown (never silently dropped).
-            for (fi, f) in module.functions.iter().enumerate() {
-                for &b in &f.blocks {
-                    for &iid in &module.blocks[b.index()].insts {
-                        if matches!(module.insts[iid.index()].op, abcd_ir::Op::Call { .. }) {
-                            let edge = g1.edge_at(iid).unwrap_or_else(|| {
-                                panic!("call site {iid} in function {fi} of {relative} has no edge")
-                            });
-                            match &edge.targets {
-                                CallTargets::Resolved(targets) => {
-                                    assert!(!targets.is_empty());
-                                    for t in targets {
-                                        assert!(module.func(*t).is_some());
-                                    }
-                                }
-                                CallTargets::UnknownCallees => {}
+    for (fi, f) in module.functions.iter().enumerate() {
+        for &b in &f.blocks {
+            for &iid in &module.blocks[b.index()].insts {
+                if matches!(module.insts[iid.index()].op, abcd_ir::Op::Call { .. }) {
+                    let edge = g1.edge_at(iid).unwrap_or_else(|| {
+                        panic!("call site {iid} in function {fi} of {relative} has no edge")
+                    });
+                    match &edge.targets {
+                        CallTargets::Resolved(targets) => {
+                            assert!(!targets.is_empty());
+                            for t in targets {
+                                assert!(module.func(*t).is_some());
                             }
                         }
+                        CallTargets::UnknownCallees => {}
                     }
                 }
             }
+        }
+    }
 
-            let h = g1.histogram(&module);
-            out.histogram.resolved_internal += h.resolved_internal;
-            out.histogram.resolved_external += h.resolved_external;
-            out.histogram.resolved_mixed += h.resolved_mixed;
-            out.histogram.unknown += h.unknown;
+    let h = g1.histogram(module);
+    out.histogram.resolved_internal += h.resolved_internal;
+    out.histogram.resolved_external += h.resolved_external;
+    out.histogram.resolved_mixed += h.resolved_mixed;
+    out.histogram.unknown += h.unknown;
 
-            // ── Rung 2 (t-P6): the whole-module PTA over the same module —
-            // its co-evolved graph is the rung-2 call graph. Two runs must
-            // be byte-identical (N20 determinism), the resolution histogram
-            // is reported against the base (the rung-2 upgrade IS the
-            // unknown-bucket shrink), and budget cuts are counted (loud).
-            let out1 = abcd_analysis::dataflow::pta::analyze(&module, &g1, &PtaConfig::default());
-            let out2 = abcd_analysis::dataflow::pta::analyze(&module, &g1, &PtaConfig::default());
-            assert_eq!(
-                out1.graph(),
-                out2.graph(),
-                "rung-2 PTA must be deterministic: {relative}"
-            );
-            let s = out1.stats();
-            out.pta_stats.activations += s.activations;
-            out.pta_stats.facts += s.facts;
-            out.pta_stats.flow_edges += s.flow_edges;
-            out.pta_stats.call_edges_resolved += s.call_edges_resolved;
-            out.pta_stats.call_sites_partial += s.call_sites_partial;
-            out.pta_stats.env_rounds += s.env_rounds;
-            if s.capped {
-                out.pta_capped += 1;
-            }
-            let h2 = out1.graph().histogram(&module);
-            out.rung2_histogram.resolved_internal += h2.resolved_internal;
-            out.rung2_histogram.resolved_external += h2.resolved_external;
-            out.rung2_histogram.resolved_mixed += h2.resolved_mixed;
-            out.rung2_histogram.unknown += h2.unknown;
-            // The rung-2 graph records every call site too (resolved or
-            // explicitly unknown — never dropped).
-            assert_eq!(
-                out1.graph().site_count(),
-                g1.site_count(),
-                "rung-2 graph covers every call site: {relative}"
-            );
-            out
-        })
-        .reduce(FixtureStats::default, |mut a, b| {
-            a.functions += b.functions;
-            a.histogram.resolved_internal += b.histogram.resolved_internal;
-            a.histogram.resolved_external += b.histogram.resolved_external;
-            a.histogram.resolved_mixed += b.histogram.resolved_mixed;
-            a.histogram.unknown += b.histogram.unknown;
-            a.rung2_histogram.resolved_internal += b.rung2_histogram.resolved_internal;
-            a.rung2_histogram.resolved_external += b.rung2_histogram.resolved_external;
-            a.rung2_histogram.resolved_mixed += b.rung2_histogram.resolved_mixed;
-            a.rung2_histogram.unknown += b.rung2_histogram.unknown;
-            a.pta_stats.activations += b.pta_stats.activations;
-            a.pta_stats.facts += b.pta_stats.facts;
-            a.pta_stats.flow_edges += b.pta_stats.flow_edges;
-            a.pta_stats.call_edges_resolved += b.pta_stats.call_edges_resolved;
-            a.pta_stats.call_sites_partial += b.pta_stats.call_sites_partial;
-            a.pta_stats.env_rounds += b.pta_stats.env_rounds;
-            a.pta_capped += b.pta_capped;
-            a
-        });
+    let out1 = abcd_analysis::dataflow::pta::analyze(module, &g1, &PtaConfig::default());
+    let out2 = abcd_analysis::dataflow::pta::analyze(module, &g1, &PtaConfig::default());
+    assert_eq!(
+        out1.graph(),
+        out2.graph(),
+        "rung-2 PTA must be deterministic: {relative}"
+    );
+    let s = out1.stats();
+    out.pta_stats.activations += s.activations;
+    out.pta_stats.facts += s.facts;
+    out.pta_stats.flow_edges += s.flow_edges;
+    out.pta_stats.call_edges_resolved += s.call_edges_resolved;
+    out.pta_stats.call_sites_partial += s.call_sites_partial;
+    out.pta_stats.env_rounds += s.env_rounds;
+    if s.capped {
+        out.pta_capped += 1;
+    }
+    let h2 = out1.graph().histogram(module);
+    out.rung2_histogram.resolved_internal += h2.resolved_internal;
+    out.rung2_histogram.resolved_external += h2.resolved_external;
+    out.rung2_histogram.resolved_mixed += h2.resolved_mixed;
+    out.rung2_histogram.unknown += h2.unknown;
+    assert_eq!(
+        out1.graph().site_count(),
+        g1.site_count(),
+        "rung-2 graph covers every call site: {relative}"
+    );
+    out
+}
 
-    let fixtures = paths.len();
+pub(crate) fn report_and_assert(fixtures: usize, total: FixtureStats) {
     let functions = total.functions;
     let total_histogram = total.histogram;
     let rung2_histogram = total.rung2_histogram;

@@ -596,39 +596,55 @@ fn resolve_heritage_name(
     in_func: FuncId,
     val: ValueId,
 ) -> Option<String> {
-    let root = peel_mov(module, val);
-    let ValueDef::Inst(iid) = module.value(root)?.def else {
-        return None;
+    let mut cur = val;
+    let mut suffixes: Vec<&str> = Vec::new();
+    let mut visited: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
+    let mut acc = loop {
+        let root = peel_mov(module, cur);
+        if !visited.insert(root) {
+            return None;
+        }
+        let ValueDef::Inst(iid) = module.value(root)?.def else {
+            return None;
+        };
+        match &module.inst(iid)?.op {
+            Op::TryGetGlobal { name, .. } => break sym_str(module, *name).to_owned(),
+            Op::LoadProp { object, name } => {
+                let leaf = sym_str(module, *name);
+                if classify_base_class_name(leaf).is_some() {
+                    break leaf.to_owned();
+                }
+                suffixes.push(leaf);
+                cur = *object;
+            }
+            Op::LoadModuleVar { index, kind } if !kind.is_local() => {
+                let cid = links.func_class(in_func)?;
+                let target = links.external_load(cid, *index)?;
+                let mut resolved: Option<String> = None;
+                for &(spec, imp) in &target.external_imports {
+                    let imp_s = sym_str(module, imp);
+                    let spec_s = sym_str(module, spec);
+                    if imp_s != "default" && classify_base_class_name(imp_s).is_some() {
+                        resolved = Some(imp_s.to_owned());
+                        break;
+                    }
+                    if let Some(tail) = spec_s.rsplit(['.', ':']).next()
+                        && classify_base_class_name(tail).is_some()
+                    {
+                        resolved = Some(tail.to_owned());
+                        break;
+                    }
+                }
+                break resolved?;
+            }
+            _ => return None,
+        }
     };
-    match &module.inst(iid)?.op {
-        Op::TryGetGlobal { name, .. } => Some(sym_str(module, *name).to_owned()),
-        Op::LoadProp { object, name } => {
-            let leaf = sym_str(module, *name);
-            if classify_base_class_name(leaf).is_some() {
-                return Some(leaf.to_owned());
-            }
-            let prefix = resolve_heritage_name(module, links, in_func, *object)?;
-            Some(format!("{prefix}.{leaf}"))
-        }
-        Op::LoadModuleVar { index, kind } if !kind.is_local() => {
-            let cid = links.func_class(in_func)?;
-            let target = links.external_load(cid, *index)?;
-            for &(spec, imp) in &target.external_imports {
-                let imp_s = sym_str(module, imp);
-                let spec_s = sym_str(module, spec);
-                if imp_s != "default" && classify_base_class_name(imp_s).is_some() {
-                    return Some(imp_s.to_owned());
-                }
-                if let Some(tail) = spec_s.rsplit(['.', ':']).next()
-                    && classify_base_class_name(tail).is_some()
-                {
-                    return Some(tail.to_owned());
-                }
-            }
-            None
-        }
-        _ => None,
+    for suf in suffixes.into_iter().rev() {
+        acc.push('.');
+        acc.push_str(suf);
     }
+    Some(acc)
 }
 
 fn infer_kind_from_methods(
@@ -999,5 +1015,115 @@ mod tests {
         assert!(!this1.has_unknown && this1.sites.len() == 1);
         assert!(!this2.has_unknown && this2.sites.len() == 1);
         assert!(!this1.sites.intersects(&this2.sites));
+    }
+
+    #[test]
+    fn deep_and_cyclic_heritage_loadprop_runs_on_small_stack() {
+        const DEPTH: usize = 500;
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut m = Module::new();
+                let d = m.sym.intern("L@bundle:com.app/entry/ets/Deep;");
+                let n = m.sym.intern("@bundle:com.app/entry/ets/Deep");
+                let cid = ClassId::new(0);
+                m.classes.push(ClassData::new(d, n));
+
+                let (ctor_deep, b_cd, _) =
+                    add_fn(&mut m, cid, "DeepComp", FunctionKind::Constructor, 3);
+                emit_inst_void(&mut m, b_cd, Op::Return { value: None });
+                let (ctor_cyc, b_cc, _) =
+                    add_fn(&mut m, cid, "CyclicComp", FunctionKind::Constructor, 3);
+                emit_inst_void(&mut m, b_cc, Op::Return { value: None });
+
+                let (main_fid, b_main, _) =
+                    add_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 3);
+                let s_uiab = m.sym.intern("UIAbility");
+                let mut cur = emit_inst_val(
+                    &mut m,
+                    b_main,
+                    Op::TryGetGlobal {
+                        name: s_uiab,
+                        default: None,
+                    },
+                );
+                let s_seg = m.sym.intern("sub");
+                for _ in 0..DEPTH {
+                    cur = emit_inst_val(
+                        &mut m,
+                        b_main,
+                        Op::LoadProp {
+                            object: cur,
+                            name: s_seg,
+                        },
+                    );
+                }
+                let deep_chain = cur;
+                let deep_heritage = emit_inst_val(
+                    &mut m,
+                    b_main,
+                    Op::LoadProp {
+                        object: cur,
+                        name: s_uiab,
+                    },
+                );
+                let empty_mem = m.consts.push(Const::ArrayLiteral(Vec::new()));
+                let _ = emit_inst_val(
+                    &mut m,
+                    b_main,
+                    Op::DefineClass {
+                        ctor: ctor_deep,
+                        heritage: Some(deep_heritage),
+                        members: empty_mem,
+                        member_attrs: Vec::new(),
+                        count: 0,
+                    },
+                );
+
+                // Cyclic `LoadProp` chain (`v_cyc = LoadProp(v_cyc, "sub")`):
+                // must terminate cleanly as `None` via the cycle guard.
+                let cyc_iid = InstId::new(m.insts.len() as u32);
+                let cyc_vid = ValueId::new(m.values.len() as u32);
+                m.insts.push(Inst {
+                    op: Op::LoadProp {
+                        object: cyc_vid,
+                        name: s_seg,
+                    },
+                    result: Some(cyc_vid),
+                    block: b_main,
+                    loc: None,
+                });
+                m.values.push(Value {
+                    def: ValueDef::Inst(cyc_iid),
+                    ty: Ty::Any,
+                });
+                m.blocks[b_main.index()].insts.push(cyc_iid);
+                let _ = emit_inst_val(
+                    &mut m,
+                    b_main,
+                    Op::DefineClass {
+                        ctor: ctor_cyc,
+                        heritage: Some(cyc_vid),
+                        members: empty_mem,
+                        member_attrs: Vec::new(),
+                        count: 0,
+                    },
+                );
+                emit_inst_void(&mut m, b_main, Op::Return { value: None });
+
+                let links = ModuleLinkTable::build(&m);
+                let full_name =
+                    resolve_heritage_name(&m, &links, main_fid, deep_chain).expect("deep chain");
+                assert!(full_name.starts_with("UIAbility.sub."));
+                assert_eq!(full_name.matches(".sub").count(), DEPTH);
+                assert!(resolve_heritage_name(&m, &links, main_fid, cyc_vid).is_none());
+
+                let comps = discover_components(&m, &links, None);
+                assert_eq!(comps.len(), 1);
+                assert_eq!(comps[0].ctor, ctor_deep);
+                assert_eq!(comps[0].kind, OhosComponentKind::Ability);
+            })
+            .expect("spawn");
+        handle.join().expect("small stack must not overflow");
     }
 }
