@@ -379,7 +379,9 @@ try {
     }
     *out_len = output.size();
     *out_buf = new uint8_t[output.size()];
-    std::memcpy(*out_buf, output.data(), output.size());
+    if (!output.empty()) {
+        std::memcpy(*out_buf, output.data(), output.size());
+    }
     return 0;
 } catch (...) {
     return ISA_BUILD_INTERNAL_ERROR;
