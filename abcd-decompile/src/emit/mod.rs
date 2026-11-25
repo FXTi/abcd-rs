@@ -497,10 +497,8 @@ pub(in crate::emit) fn collect_method_refs(
                     }
                 }
             }
-            Const::LiteralBufferRef(inner) => {
-                if visited.insert(*inner) {
-                    stack.push(*inner);
-                }
+            Const::LiteralBufferRef(inner) if visited.insert(*inner) => {
+                stack.push(*inner);
             }
             _ => {}
         }

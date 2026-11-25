@@ -231,13 +231,10 @@ pub fn layout(
             if let Some(last) = codes.last_mut() {
                 rewrite_branch_target(last, true_target);
             }
-            match false_target {
-                Some(tramp) => codes.push(Bytecode::Jmp(Label(tramp.0))),
-                None => {
-                    if !can_fallthrough_to(false_dest) {
-                        codes.push(Bytecode::Jmp(Label(false_dest.0)));
-                    }
-                }
+            if let Some(tramp) = false_target {
+                codes.push(Bytecode::Jmp(Label(tramp.0)));
+            } else if !can_fallthrough_to(false_dest) {
+                codes.push(Bytecode::Jmp(Label(false_dest.0)));
             }
         } else {
             // R3-A3: Query outgoing copies of `bb` in O(log E + out_degree) via

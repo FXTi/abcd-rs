@@ -812,11 +812,10 @@ fn remap_ann_slice(elems: &mut [AnnotationElem], remap: &impl Fn(&mut MethodIdx)
             AnnotationValue::Method {
                 method: Some(midx), ..
             } => remap(midx),
-            AnnotationValue::MethodHandle(rmh) => {
-                if let Some(midx) = &mut rmh.target_method {
-                    remap(midx);
-                }
-            }
+            AnnotationValue::MethodHandle(abcd_file::ResolvedMethodHandle {
+                target_method: Some(midx),
+                ..
+            }) => remap(midx),
             AnnotationValue::LiteralArray(vals) => {
                 for v in vals {
                     if let Some(midx) = v.method_idx_mut() {

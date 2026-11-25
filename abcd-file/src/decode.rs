@@ -4791,20 +4791,18 @@ fn collect_annotation_nested_literal_offsets(
             AnnotationValue::LiteralArray(values) => {
                 for item in values {
                     match item {
-                        LiteralValue::LiteralArray(idx) => {
+                        LiteralValue::LiteralArray(idx)
                             if is_plausible_literal_array_offset(
                                 idx.0,
                                 file_size,
                                 module_data_offsets,
                                 phase_blob_offsets,
-                            ) {
-                                out.insert(idx.0);
-                            }
+                            ) =>
+                        {
+                            out.insert(idx.0);
                         }
-                        LiteralValue::LiteralBufferIndex(idx) => {
-                            if is_valid_lit_array(idx.0) {
-                                out.insert(idx.0);
-                            }
+                        LiteralValue::LiteralBufferIndex(idx) if is_valid_lit_array(idx.0) => {
+                            out.insert(idx.0);
                         }
                         LiteralValue::ArrayU1(idx)
                         | LiteralValue::ArrayU8(idx)
@@ -5088,38 +5086,34 @@ fn decode_literal_arrays<'a>(
             }
             for value in &ctx.values {
                 match value {
-                    LiteralValue::LiteralArray(idx) => {
-                        let target = idx.0;
+                    LiteralValue::LiteralArray(idx)
                         if is_plausible_literal_array_offset(
-                            target,
+                            idx.0,
                             file_size,
                             module_data_offsets,
                             phase_blob_offsets,
-                        ) && !seen.contains(target)
-                        {
-                            nested.push(target);
-                        }
+                        ) && !seen.contains(idx.0) =>
+                    {
+                        nested.push(idx.0);
                     }
-                    LiteralValue::LiteralBufferIndex(idx) => {
-                        let target = idx.0;
+                    LiteralValue::LiteralBufferIndex(idx)
                         if is_plausible_literal_array_offset(
-                            target,
+                            idx.0,
                             file_size,
                             module_data_offsets,
                             phase_blob_offsets,
-                        ) && !seen.contains(target)
+                        ) && !seen.contains(idx.0)
                             // SAFETY: `f` is live; null callback validates structural array span.
                             && unsafe {
                                 sys::abc_literal_enumerate_vals_checked(
                                     f,
-                                    target,
+                                    idx.0,
                                     None,
                                     std::ptr::null_mut(),
                                 )
-                            } == 0
-                        {
-                            nested.push(target);
-                        }
+                            } == 0 =>
+                    {
+                        nested.push(idx.0);
                     }
                     _ => {}
                 }
