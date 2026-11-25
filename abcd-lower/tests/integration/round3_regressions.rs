@@ -1351,3 +1351,303 @@ fn deep_5000_nested_literal_shape_lowers_and_resolves_on_256kib_stack() {
         .join()
         .expect("5000-deep literal shape must not overflow 256 KiB stack");
 }
+
+#[test]
+fn definefieldbyvalue_emits_key_then_obj_for_dyn_and_unfused_idx_and_roundtrips() {
+    let mut module = Module::new();
+    let func = V2Builder::create_function(&mut module, "define_field_dyn", FunctionKind::Function);
+    module.classes[0].methods.push(func);
+    {
+        let mut b = V2Builder::new(&mut module, func);
+        let p_obj = b.create_param();
+        let p_key = b.create_param();
+        let p_idx = b.create_param();
+        let p_val = b.create_param();
+        b.emit_void(Op::StoreOwnPropDyn {
+            object: p_obj,
+            key: p_key,
+            value: p_val,
+            kind: OwnStoreKind::ClassField,
+        });
+        b.emit_void(Op::StoreOwnPropIdx {
+            object: p_obj,
+            index: p_idx,
+            value: p_val,
+            kind: OwnStoreKind::ClassField,
+        });
+        b.emit_void(Op::Return { value: None });
+    }
+    assert!(verify_module(&module).is_ok());
+
+    let lowered = lower_function(&module, func).expect("definefieldbyvalue must lower");
+    let field_ops: Vec<(Reg, Reg)> = lowered
+        .bytecodes
+        .iter()
+        .filter_map(|bc| match *bc {
+            Bytecode::CallruntimeDefinefieldbyvalue(_, key_r, obj_r) => Some((key_r, obj_r)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        field_ops,
+        vec![(Reg(1), Reg(0)), (Reg(2), Reg(0))],
+        "callruntime.definefieldbyvalue must pass (key_reg, obj_reg)"
+    );
+
+    let file = lower_module(&module, Version::new(12, 0, 6, 0)).expect("lower_module");
+    let encoded = abcd_file::encode(&file).expect("encode");
+    let decoded = abcd_file::decode(&encoded).expect("decode");
+    let relifted = lift_file(&decoded).expect("lift_file");
+    let rf = &relifted.functions[0];
+    let lifted_stores: Vec<(abcd_ir::ValueId, abcd_ir::ValueId)> = rf
+        .blocks
+        .iter()
+        .flat_map(|&bb| &relifted.blocks[bb.index()].insts)
+        .filter_map(|&iid| match relifted.insts[iid.index()].op {
+            Op::StoreOwnPropDyn {
+                object,
+                key,
+                kind: OwnStoreKind::ClassField,
+                ..
+            } => Some((object, key)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lifted_stores,
+        vec![(rf.params[0], rf.params[1]), (rf.params[0], rf.params[2])],
+        "round-tripped definefieldbyvalue must preserve object vs key operands"
+    );
+}
+
+#[test]
+fn supercallthisrange_suppresses_ldfunction_for_single_and_csed_multi_branch_super() {
+    // 1. Single-site `LoadFunction` + `CallKind::Super` (`v2lift` shape).
+    let mut m1 = Module::new();
+    let f1 = V2Builder::create_function(&mut m1, "ctor1", FunctionKind::Constructor);
+    {
+        let mut b = V2Builder::new(&mut m1, f1);
+        let p0 = b.create_param();
+        let lf = b.emit_val(Op::LoadFunction);
+        let sup = b.emit_val(Op::Call {
+            callee: lf,
+            this: None,
+            args: vec![p0],
+            kind: CallKind::Super,
+        });
+        b.emit_void(Op::Return { value: Some(sup) });
+    }
+    let res1 = lower_function(&m1, f1).expect("single supercallthisrange must lower");
+    assert!(
+        !res1
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Ldfunction)),
+        "single-site super(...) must never emit Bytecode::Ldfunction: {:?}",
+        res1.bytecodes
+    );
+    assert!(
+        res1.bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Supercallthisrange(_, Imm(1), _)))
+    );
+
+    // 2. Two-branch diamond sharing one CSE'd `LoadFunction` (`v2opt` shape).
+    let mut m2 = Module::new();
+    let f2 = V2Builder::create_function(&mut m2, "ctor2", FunctionKind::Constructor);
+    {
+        let mut b = V2Builder::new(&mut m2, f2);
+        let entry = b.entry();
+        let b_then = b.create_block();
+        let b_else = b.create_block();
+        b.add_predecessor(b_then, entry);
+        b.add_predecessor(b_else, entry);
+
+        let flag = b.create_param();
+        let arg = b.create_param();
+        let lf = b.emit_val(Op::LoadFunction);
+        b.emit_void(Op::CondBranch {
+            cond: flag,
+            true_dest: b_then,
+            false_dest: b_else,
+        });
+
+        b.set_insert_block(b_then);
+        let s1 = b.emit_val(Op::Call {
+            callee: lf,
+            this: None,
+            args: vec![arg],
+            kind: CallKind::Super,
+        });
+        b.emit_void(Op::Return { value: Some(s1) });
+
+        b.set_insert_block(b_else);
+        let s2 = b.emit_val(Op::Call {
+            callee: lf,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::Super,
+        });
+        b.emit_void(Op::Return { value: Some(s2) });
+    }
+    let res2 = lower_function(&m2, f2).expect("CSE'd supercallthisrange must lower");
+    assert!(
+        !res2
+            .bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Ldfunction)),
+        "CSE'd multi-branch super(...) must never emit Bytecode::Ldfunction: {:?}",
+        res2.bytecodes
+    );
+    assert_eq!(
+        res2.bytecodes
+            .iter()
+            .filter(|bc| matches!(bc, Bytecode::Supercallthisrange(..)))
+            .count(),
+        2
+    );
+
+    // 3. `LoadFunction` also used by `Return` must keep `Bytecode::Ldfunction`.
+    let mut m3 = Module::new();
+    let f3 = V2Builder::create_function(&mut m3, "ctor3", FunctionKind::Constructor);
+    {
+        let mut b = V2Builder::new(&mut m3, f3);
+        let lf = b.emit_val(Op::LoadFunction);
+        let _ = b.emit_val(Op::Call {
+            callee: lf,
+            this: None,
+            args: Vec::new(),
+            kind: CallKind::Super,
+        });
+        b.emit_void(Op::Return { value: Some(lf) });
+    }
+    let res3 = lower_function(&m3, f3).expect("dual-use LoadFunction must lower");
+    assert!(
+        res3.bytecodes
+            .iter()
+            .any(|bc| matches!(bc, Bytecode::Ldfunction))
+    );
+}
+
+#[test]
+fn catch_handler_with_normal_backedge_reloads_exception_param_into_acc() {
+    let mut module = Module::new();
+    let func =
+        V2Builder::create_function(&mut module, "handler_acc_reload", FunctionKind::Function);
+    {
+        let mut b = V2Builder::new(&mut module, func);
+        let entry = b.entry();
+        let h = b.create_block();
+        let loop_body = b.create_block();
+        let done = b.create_block();
+
+        b.add_exceptional_predecessor(h, entry);
+        b.add_predecessor(h, loop_body);
+        b.add_predecessor(loop_body, h);
+        b.add_predecessor(done, h);
+        let exc = b.create_exception_param(h);
+
+        let c0 = b.konst(Const::number(0.0));
+        let v0 = b.emit_val(Op::LoadConst(c0));
+        b.emit_void(Op::Return { value: Some(v0) });
+
+        // Inside `h` itself, `Add2` reads `left` (`exc`) in `acc` (`add2 ic, right_reg`).
+        // Because `loop_body` jumps back to `h` skipping `Sta(exc_home)` with
+        // `acc == 999`, `isel` must NOT assume `acc` holds `exc` at `h` body start!
+        b.set_insert_block(h);
+        let (phi_iid, phi_opt) = b.emit(Op::Phi {
+            entries: Vec::new(),
+        });
+        let i_phi = phi_opt.unwrap();
+        let sum_in_h = b.emit_val(Op::BinaryOp {
+            op: BinOp::Add,
+            left: exc,
+            right: i_phi,
+        });
+        let c1 = b.konst(Const::number(1.0));
+        let one = b.emit_val(Op::LoadConst(c1));
+        let cmp = b.emit_val(Op::Compare {
+            op: CmpOp::Less,
+            left: i_phi,
+            right: one,
+        });
+        b.emit_void(Op::CondBranch {
+            cond: cmp,
+            true_dest: loop_body,
+            false_dest: done,
+        });
+
+        b.set_insert_block(loop_body);
+        let c1_b = b.konst(Const::number(1.0));
+        let one_b = b.emit_val(Op::LoadConst(c1_b));
+        let i_next = b.emit_val(Op::BinaryOp {
+            op: BinOp::Add,
+            left: i_phi,
+            right: one_b,
+        });
+        let c999 = b.konst(Const::number(999.0));
+        let _clobber = b.emit_val(Op::LoadConst(c999));
+        b.emit_void(Op::Branch { dest: h });
+
+        b.set_insert_block(done);
+        b.emit_void(Op::Return {
+            value: Some(sum_in_h),
+        });
+
+        module.insts[phi_iid.index()].op = Op::Phi {
+            entries: vec![
+                (
+                    Edge {
+                        from: entry,
+                        kind: EdgeKind::Exceptional,
+                    },
+                    v0,
+                ),
+                (
+                    Edge {
+                        from: loop_body,
+                        kind: EdgeKind::Normal,
+                    },
+                    i_next,
+                ),
+            ],
+        };
+        module.functions[func.index()].try_regions.push(TryRegion {
+            protected: vec![entry],
+            catches: vec![Catch {
+                handler: h,
+                exception: exc,
+                type_class: None,
+            }],
+        });
+    }
+    assert!(verify_module(&module).is_ok());
+
+    let lowered = lower_function(&module, func).expect("handler loop must lower");
+    let cb = &lowered.try_blocks[0].catches[0];
+    let h_start = cb.handler as usize;
+    let h_end = (cb.handler + cb.len) as usize;
+    let Bytecode::Sta(exc_reg) = lowered.bytecodes[h_start] else {
+        panic!(
+            "expected handler prologue Sta at pc {h_start}: {:?}",
+            lowered.bytecodes
+        );
+    };
+    assert!(
+        lowered.bytecodes[h_start + 1..h_end]
+            .iter()
+            .any(|bc| matches!(*bc, Bytecode::Lda(r) if r == exc_reg)),
+        "handler with normal predecessor must emit explicit Lda({exc_reg:?}) after prologue: {:?}",
+        &lowered.bytecodes[h_start..h_end]
+    );
+
+    let ret0_pc = lowered
+        .bytecodes
+        .iter()
+        .position(|bc| matches!(bc, Bytecode::Return))
+        .unwrap();
+    let mut m = Machine::new();
+    assert_eq!(m.run_until(&lowered.bytecodes, 0, ret0_pc), Halt::Stopped);
+    m.acc = 40;
+    assert_eq!(m.run_at(&lowered.bytecodes, h_start), Halt::Return(41));
+}

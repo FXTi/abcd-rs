@@ -23,7 +23,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use abcd_ir::{BlockId, Const, InstId, Module, Op, UnOp, ValueDef, ValueId};
+use abcd_ir::{BlockId, CallKind, Const, InstId, Module, Op, UnOp, ValueDef, ValueId};
 
 /// The result of fusion analysis for one function.
 #[derive(Debug, Default)]
@@ -62,14 +62,23 @@ pub(crate) fn const_u32_index(c: &Const) -> Option<u32> {
 type SingleConsumerMap = HashMap<ValueId, Option<InstId>>;
 type InstPosMap = HashMap<InstId, (BlockId, usize)>;
 
-/// Precompute single-use consumers and `(BlockId, pos)` instruction positions
-/// in a single `O(B + I)` pass (`#61` `R3-X7`).
-fn index_uses_and_positions(
-    module: &Module,
-    blocks: &[BlockId],
-) -> (SingleConsumerMap, InstPosMap) {
+struct UseIndex {
+    single_consumer: SingleConsumerMap,
+    inst_pos: InstPosMap,
+    load_functions: Vec<(InstId, ValueId)>,
+    total_uses: HashMap<ValueId, u32>,
+    super_callee_uses: HashMap<ValueId, u32>,
+}
+
+/// Precompute single-use consumers, `(BlockId, pos)` instruction positions, and
+/// `Op::LoadFunction` / `CallKind::Super` use counts in a single `O(B + I)` pass
+/// (`#61` `R3-X7`).
+fn index_uses_and_positions(module: &Module, blocks: &[BlockId]) -> UseIndex {
     let mut single_consumer: SingleConsumerMap = HashMap::new();
     let mut inst_pos: InstPosMap = HashMap::new();
+    let mut load_functions: Vec<(InstId, ValueId)> = Vec::new();
+    let mut total_uses: HashMap<ValueId, u32> = HashMap::new();
+    let mut super_callee_uses: HashMap<ValueId, u32> = HashMap::new();
     for &bb in blocks {
         let Some(block) = module.block(bb) else {
             continue;
@@ -79,7 +88,21 @@ fn index_uses_and_positions(
             let Some(inst) = module.inst(iid) else {
                 continue;
             };
+            if matches!(inst.op, Op::LoadFunction)
+                && let Some(res) = inst.result
+            {
+                load_functions.push((iid, res));
+            }
+            if let Op::Call {
+                callee,
+                kind: CallKind::Super,
+                ..
+            } = &inst.op
+            {
+                *super_callee_uses.entry(*callee).or_insert(0) += 1;
+            }
             inst.op.for_each_operand(|v| {
+                *total_uses.entry(v).or_insert(0) += 1;
                 single_consumer
                     .entry(v)
                     .and_modify(|slot| *slot = None)
@@ -87,7 +110,13 @@ fn index_uses_and_positions(
             });
         }
     }
-    (single_consumer, inst_pos)
+    UseIndex {
+        single_consumer,
+        inst_pos,
+        load_functions,
+        total_uses,
+        super_callee_uses,
+    }
 }
 
 /// The payload of a [`Op::LoadConst`] when it is a valid `0..=u32::MAX` index.
@@ -131,7 +160,26 @@ fn single_use(
 /// Compute the suppression set for one function.
 pub fn analyze(module: &Module, blocks: &[BlockId]) -> Suppression {
     let mut out = Suppression::default();
-    let (single_consumer, inst_pos) = index_uses_and_positions(module, blocks);
+    let UseIndex {
+        single_consumer,
+        inst_pos,
+        load_functions,
+        total_uses,
+        super_callee_uses,
+    } = index_uses_and_positions(module, blocks);
+
+    // `supercallthisrange` / `wide.supercallthisrange` has `acc: out:top` and
+    // reads `thisFunc` from the VM frame header (`ark_js_vm` FATAL-aborts on
+    // `ldfunction`). Suppress `Op::LoadFunction` whenever its result has >= 1
+    // use as `callee` of `CallKind::Super` and zero uses in any other operand
+    // slot (covering both single-site `v2lift` and multi-branch CSE'd `v2opt`).
+    for (load_fn_iid, fn_val) in load_functions {
+        let sc = super_callee_uses.get(&fn_val).copied().unwrap_or(0);
+        if sc >= 1 && total_uses.get(&fn_val).copied().unwrap_or(0) == sc {
+            out.insts.insert(load_fn_iid);
+            out.values.insert(fn_val);
+        }
+    }
 
     for &bb in blocks {
         let Some(block) = module.block(bb) else {

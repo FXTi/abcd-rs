@@ -433,8 +433,39 @@ def main():
         }
     print(json.dumps(report, indent=2, sort_keys=True))
     if args.expect_divergences:
-        return 0 if not undocumented and not stale else 1
-    return 0 if report["passed"] == len(compared) else 1
+        if undocumented or stale:
+            print(
+                f"[compare-rewritten-corpus] undocumented={len(undocumented)} stale={len(stale)}",
+                file=sys.stderr,
+            )
+            failure_by_abc = {r["abc"]: r for r in compared if not r["passed"]}
+            for path in undocumented[:25]:
+                detail = failure_by_abc.get(path)
+                if detail is None:
+                    print(f"  UNDOCUMENTED (missing): {path}", file=sys.stderr)
+                else:
+                    mm = detail.get("mismatches", [])
+                    err = ((detail.get("oracle") or {}).get("stderr") or "").splitlines()[:2]
+                    print(f"  UNDOCUMENTED {mm}: {path} | {' // '.join(err)}", file=sys.stderr)
+            for path in stale[:25]:
+                print(f"  STALE: {path}", file=sys.stderr)
+            return 1
+        return 0
+    if report["passed"] != len(compared):
+        failing_rows = [r for r in compared if not r["passed"]]
+        print(
+            f"[compare-rewritten-corpus] failed={len(failing_rows)}/{len(compared)}",
+            file=sys.stderr,
+        )
+        for detail in failing_rows[:25]:
+            oracle = detail.get("oracle") or {}
+            err = (oracle.get("stderr") or oracle.get("error") or "").splitlines()[:2]
+            print(
+                f"  FAIL: {detail['abc']} (exit={oracle.get('exit_code')}) | {' // '.join(err)}",
+                file=sys.stderr,
+            )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

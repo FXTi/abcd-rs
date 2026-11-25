@@ -876,3 +876,122 @@ fn r3_x3_competing_nested_catch_handler_phis_do_not_clobber() {
         "competing handler phis H1 ({h1_lda:?}) and H2 ({h2_lda:?}) must NEVER share a register!"
     );
 }
+
+#[test]
+fn r3_definefieldbyvalue_preserves_key_obj_operand_order() {
+    let mut sp = StringPool::new();
+    let val_sid = sp.get_or_intern("a\\nb");
+    let file = build_test_file(
+        vec![
+            Bytecode::Createemptyarray(Imm(0)),
+            Bytecode::Sta(Reg(0)),         // v0 = array object
+            Bytecode::Mov(Reg(1), Reg(4)), // v1 = a2 (dynamic key param 2)
+            Bytecode::LdaStr(EntityId(0)),
+            Bytecode::CallruntimeDefinefieldbyvalue(Imm(1), Reg(1), Reg(0)),
+            Bytecode::Lda(Reg(0)),
+            Bytecode::Return,
+        ],
+        vec![((EntityKind::StringId, 0), EntityRef::string(val_sid))],
+        vec![],
+        sp,
+        2,
+        3,
+        vec![],
+        None,
+    );
+
+    for opt in [false, true] {
+        let (redecoded, body) = roundtrip_main(&file, opt);
+        assert!(
+            body.bytecodes
+                .iter()
+                .any(|bc| matches!(bc, Bytecode::CallruntimeDefinefieldbyvalue(..))),
+            "opt={opt}: expected CallruntimeDefinefieldbyvalue in {:?}",
+            body.bytecodes
+        );
+        let relifted = lift_file(&redecoded).expect("re-lift");
+        let f0 = relifted
+            .functions
+            .iter()
+            .find(|f| relifted.sym.as_str(f.name) == Some("func_main_0"))
+            .expect("func_main_0 in relifted");
+        let mut saw_store = false;
+        for &bb in &f0.blocks {
+            for &iid in &relifted.blocks[bb.index()].insts {
+                if let abcd_ir::Op::StoreOwnPropDyn {
+                    object,
+                    key,
+                    kind: abcd_ir::OwnStoreKind::ClassField,
+                    ..
+                } = &relifted.insts[iid.index()].op
+                {
+                    saw_store = true;
+                    let abcd_ir::ValueDef::Inst(obj_def) = relifted.values[object.index()].def
+                    else {
+                        panic!("opt={opt}: expected object to come from AllocArray");
+                    };
+                    assert!(
+                        matches!(
+                            relifted.insts[obj_def.index()].op,
+                            abcd_ir::Op::AllocArray { .. }
+                        ),
+                        "opt={opt}: object must remain AllocArray (not swapped with key): {:?}",
+                        relifted.insts[obj_def.index()].op
+                    );
+                    assert!(
+                        matches!(
+                            relifted.values[key.index()].def,
+                            abcd_ir::ValueDef::Param(2)
+                        ),
+                        "opt={opt}: key must remain Param(2), got {:?}",
+                        relifted.values[key.index()].def
+                    );
+                }
+            }
+        }
+        assert!(saw_store, "opt={opt}: expected re-lifted StoreOwnPropDyn");
+    }
+}
+
+#[test]
+fn r3_supercallthisrange_suppresses_ldfunction_in_v2lift_and_v2opt() {
+    let file = build_test_file(
+        vec![
+            Bytecode::Lda(Reg(5)),                                // [0] a3 (cond)
+            Bytecode::Jeqz(Label(6)),                             // [1] if falsy -> else
+            Bytecode::Ldai(Imm(1)),                               // [2] then: arg = 1
+            Bytecode::Sta(Reg(0)),                                // [3]
+            Bytecode::Supercallthisrange(Imm(0), Imm(1), Reg(0)), // [4]
+            Bytecode::Return,                                     // [5]
+            Bytecode::Ldai(Imm(2)),                               // [6] else: arg = 2
+            Bytecode::Sta(Reg(0)),                                // [7]
+            Bytecode::Supercallthisrange(Imm(2), Imm(1), Reg(0)), // [8]
+            Bytecode::Return,                                     // [9]
+        ],
+        vec![],
+        vec![],
+        StringPool::new(),
+        2,
+        4,
+        vec![],
+        None,
+    );
+
+    for opt in [false, true] {
+        let (_, body) = roundtrip_main(&file, opt);
+        assert!(
+            !body
+                .bytecodes
+                .iter()
+                .any(|bc| matches!(bc, Bytecode::Ldfunction)),
+            "opt={opt}: Supercallthisrange must NEVER emit Bytecode::Ldfunction: {:?}",
+            body.bytecodes
+        );
+        let super_calls = body
+            .bytecodes
+            .iter()
+            .filter(|bc| matches!(bc, Bytecode::Supercallthisrange(..)))
+            .count();
+        assert_eq!(super_calls, 2, "opt={opt}: expected 2 Supercallthisrange");
+    }
+}

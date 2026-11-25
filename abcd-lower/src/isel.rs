@@ -566,17 +566,29 @@ pub fn select_with_options(
 
         // N13 + R3-X4 + R3-M2: Home `acc` into every used `ExceptionParam` of `bb`
         // and record the prologue length so normal CFG jumps skip over it.
+        // When `bb` also has any normal incoming edge, jumps/fallthroughs enter at
+        // `start + prol_len` with arbitrary `acc`, so `acc` only provably holds
+        // `exc` past the prologue when `bb` has no normal predecessors.
         if let Some(excs) = handler_exc.get(&bb) {
+            let has_normal_pred = block
+                .preds
+                .iter()
+                .any(|e| e.kind == abcd_ir::EdgeKind::Normal);
             let prol_start = codes.len();
             for &exc in excs {
                 if let Some(&RegSlot::Reg(home)) = alloc.allocation.get(&exc) {
                     emit_sta_home(func_id, home, alloc, &mut codes)?;
-                    tracker = AccContent::Holds(exc);
+                    if !has_normal_pred {
+                        tracker = AccContent::Holds(exc);
+                    }
                 }
             }
             let prol_len = codes.len() - prol_start;
             if prol_len > 0 {
                 handler_prologue_len.insert(bb, prol_len);
+            }
+            if has_normal_pred {
+                tracker = AccContent::Unknown;
             }
         }
 
@@ -1444,7 +1456,8 @@ impl<'a> IselCtx<'a> {
                         Bytecode::Stownbyvaluewithnameset(self.ic.two(), regs[0], regs[1])
                     }
                     OwnStoreKind::ClassField => {
-                        Bytecode::CallruntimeDefinefieldbyvalue(self.ic.two(), regs[0], regs[1])
+                        // isa.yaml:826: `callruntime.definefieldbyvalue imm:u8, v1:key, v2:obj`
+                        Bytecode::CallruntimeDefinefieldbyvalue(self.ic.two(), regs[1], regs[0])
                     }
                     OwnStoreKind::DefineProperty => unreachable!("rejected above"),
                 };
@@ -1507,7 +1520,8 @@ impl<'a> IselCtx<'a> {
                             Bytecode::Stownbyvalue(self.ic.two(), regs[0], regs[1])
                         }
                         OwnStoreKind::ClassField => {
-                            Bytecode::CallruntimeDefinefieldbyvalue(self.ic.two(), regs[0], regs[1])
+                            // isa.yaml:826: `callruntime.definefieldbyvalue imm:u8, v1:key, v2:obj`
+                            Bytecode::CallruntimeDefinefieldbyvalue(self.ic.two(), regs[1], regs[0])
                         }
                         _ => unreachable!("checked above"),
                     };
@@ -2542,7 +2556,11 @@ impl<'a> IselCtx<'a> {
         tracker: &mut AccContent,
     ) -> Result<(), LowerError> {
         let start = fill_call_window(self.func_id, args, self.alloc, codes)?;
-        ensure_acc(tracker, self.func_id, callee, self.alloc, codes)?;
+        // `supercallthisrange` / `wide.supercallthisrange` has `acc: out:top`
+        // (`thisFunc` is read from the VM frame header, never from `acc`).
+        if !matches!(form, RangeForm::SuperCallThis) {
+            ensure_acc(tracker, self.func_id, callee, self.alloc, codes)?;
+        }
 
         let window = args.len();
         let argc = match form {
