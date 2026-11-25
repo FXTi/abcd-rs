@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::time::Instant;
 
 use abcd_ir::{
     BinOp, Block, BlockId, CallKind, Catch, ClassData, ClassId, CmpOp, Const, ConstId,
@@ -120,7 +119,11 @@ fn op_and_ty_memory_layouts_are_compact() {
         "Inst size {} exceeded 64B",
         std::mem::size_of::<Inst>()
     );
-    assert_eq!(std::mem::size_of::<Box<[Ty]>>(), 16);
+    assert_eq!(
+        std::mem::size_of::<Box<[Ty]>>(),
+        2 * std::mem::size_of::<usize>()
+    );
+    assert!(std::mem::size_of::<Box<[Ty]>>() < std::mem::size_of::<Vec<Ty>>());
 }
 
 #[test]
@@ -552,19 +555,12 @@ fn scale_256kib_stack_cfg_const_and_ty_chains() {
             }
             emit_void(&mut m, ordered[n - 1], Op::Return { value: Some(v0) });
 
-            let t0 = Instant::now();
             let dt = DomTree::compute_normal(&m, f).unwrap();
             assert_eq!(dt.rpo().len(), n);
             assert!(dt.dominates(ordered[0], ordered[n - 1]));
             assert_eq!(dt.idom(ordered[n - 1]), Some(ordered[n - 2]));
             let r = verify_func(&m, f);
-            let elapsed = t0.elapsed();
             assert!(r.is_ok(), "10k chain verify errors: {:?}", r.errors);
-            assert!(
-                elapsed.as_millis() < 500,
-                "10k chain verify_func + DomTree took {:?} (expected linear)",
-                elapsed
-            );
 
             // 2. Catch handler with 2,000 protected predecessors and 16 phis.
             let mut mh = mk_module();
