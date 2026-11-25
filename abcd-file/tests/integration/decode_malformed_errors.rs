@@ -226,34 +226,45 @@ fn set_legacy_version(data: &mut [u8]) {
 /// Read a method's final (post-relocation) code bytes through the sys
 /// layer (same walk as legacy_decode.rs / decode_rare_arms.rs).
 fn method_code(data: &[u8], method_offset: u32) -> Vec<u8> {
-    let f = unsafe { abcd_file_sys::abc_file_open(data.as_ptr(), data.len()) };
-    assert!(!f.is_null(), "abc_file_open failed");
-    let mr = unsafe { abcd_file_sys::abc_method_open(f, method_offset) };
-    assert!(!mr.is_null(), "abc_method_open failed");
-    let code_off = unsafe { abcd_file_sys::abc_method_code_off(mr) };
-    unsafe { abcd_file_sys::abc_method_close(mr) };
-    assert_ne!(code_off, u32::MAX, "method has no code item");
-    let cr = unsafe { abcd_file_sys::abc_code_open(f, code_off) };
-    assert!(!cr.is_null(), "abc_code_open failed");
-    let ptr = unsafe { abcd_file_sys::abc_code_instructions(cr) };
-    let len = unsafe { abcd_file_sys::abc_code_code_size(cr) } as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-    unsafe { abcd_file_sys::abc_code_close(cr) };
-    unsafe { abcd_file_sys::abc_file_close(f) };
-    bytes
+    // SAFETY: `data` outlives `f`; all handles are checked for null and closed
+    // in reverse open order.
+    unsafe {
+        let f = abcd_file_sys::abc_file_open(data.as_ptr(), data.len());
+        assert!(!f.is_null(), "abc_file_open failed");
+        let mr = abcd_file_sys::abc_method_open(f, method_offset);
+        assert!(!mr.is_null(), "abc_method_open failed");
+        let code_off = abcd_file_sys::abc_method_code_off(mr);
+        abcd_file_sys::abc_method_close(mr);
+        assert_ne!(code_off, u32::MAX, "method has no code item");
+        let cr = abcd_file_sys::abc_code_open(f, code_off);
+        assert!(!cr.is_null(), "abc_code_open failed");
+        let ptr = abcd_file_sys::abc_code_instructions(cr);
+        let len = abcd_file_sys::abc_code_code_size(cr) as usize;
+        let bytes = if ptr.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(ptr, len).to_vec()
+        };
+        abcd_file_sys::abc_code_close(cr);
+        abcd_file_sys::abc_file_close(f);
+        bytes
+    }
 }
 
 /// A method's proto item offset, learned through the sys layer.
 fn method_proto_offset(data: &[u8], method_offset: u32) -> u32 {
-    let f = unsafe { abcd_file_sys::abc_file_open(data.as_ptr(), data.len()) };
-    assert!(!f.is_null(), "abc_file_open failed");
-    let mr = unsafe { abcd_file_sys::abc_method_open(f, method_offset) };
-    assert!(!mr.is_null(), "abc_method_open failed");
-    let proto = unsafe { abcd_file_sys::abc_method_get_proto_id(mr) };
-    unsafe { abcd_file_sys::abc_method_close(mr) };
-    unsafe { abcd_file_sys::abc_file_close(f) };
-    assert_ne!(proto, u32::MAX, "method has no proto");
-    proto
+    // SAFETY: `data` outlives `f`; handles are checked for null and closed.
+    unsafe {
+        let f = abcd_file_sys::abc_file_open(data.as_ptr(), data.len());
+        assert!(!f.is_null(), "abc_file_open failed");
+        let mr = abcd_file_sys::abc_method_open(f, method_offset);
+        assert!(!mr.is_null(), "abc_method_open failed");
+        let proto = abcd_file_sys::abc_method_get_proto_id(mr);
+        abcd_file_sys::abc_method_close(mr);
+        abcd_file_sys::abc_file_close(f);
+        assert_ne!(proto, u32::MAX, "method has no proto");
+        proto
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,10 +477,10 @@ fn corrupt_class_index_entry_trips_debug_extractor_first() {
     assert_eq!(num_classes, 1, "fixture has exactly one class");
     let table = header_field(&data, CLASS_IDX_OFF) as usize;
     write_u32(&mut data, table, u32::MAX);
-    let err = decode(&data).expect_err("the extractor dies before the class passes");
+    let err = decode(&data).expect_err("ABSENT class-index entry must fail");
     assert!(
-        matches!(err, Error::DebugInfoExtraction),
-        "expected DebugInfoExtraction, got: {err:?}"
+        matches!(err, Error::InvalidOffset(u32::MAX)),
+        "expected InvalidOffset(u32::MAX), got: {err:?}"
     );
 }
 
@@ -676,16 +687,10 @@ fn method_unknown_function_kind_decodes_none() {
     let m_off = m.offset as usize;
     assert_eq!(&data[m_off + 8..m_off + 10], &[0x81, 0x02]);
     data[m_off + 9] = 0x1E;
-    let file = decode(&data).expect("an unknown function kind is not fatal");
-    let m = file
-        .all_methods()
-        .find(|(_, m)| file.strings.resolve(m.name) == Some("func_main_0"))
-        .expect("method present")
-        .1;
-    assert_eq!(
-        m.function_kind,
-        abcd_file::FunctionKind::None,
-        "an unknown kind byte must degrade to None"
+    let err = decode(&data).expect_err("an unknown function kind must be a hard error");
+    assert!(
+        matches!(err, Error::UnknownFunctionKind(0x0F)),
+        "expected UnknownFunctionKind(0x0F), got: {err:?}"
     );
 }
 
@@ -1649,15 +1654,12 @@ fn literal_array_unreadable_string_interns_empty() {
 
     let item = locate_string_item(&data, "victimstr");
     inflate_string_item_len(&mut data, item);
-    let file = decode(&data).expect("an unreadable literal string is not an error");
-    let values = &file.literal_arrays[0].values;
-    assert_eq!(values.len(), 2);
-    match &values[0] {
-        abcd_file::LiteralValue::String(sid) => {
-            assert_eq!(file.strings.resolve(*sid), Some(""));
-        }
-        other => panic!("expected String element, got {other:?}"),
-    }
+    let err = decode(&data).expect_err("an unreadable literal string must fail loudly");
+    assert!(
+        matches!(err, Error::InvalidString(o) if o == item as u32),
+        "expected InvalidString({:#x}), got: {err:?}",
+        item
+    );
 }
 
 /// Build a file with an ArrayMethodHandle ('@') annotation element holding
@@ -1947,9 +1949,9 @@ fn legacy_buffer_imm_without_header_table_is_hard_error() {
     // createobjectwithbuffer imm16 = 0; return.dyn
     let stream = [0xff, 0x69, 0x00, 0x00, 0xa6];
     make_legacy(&mut data, &stream);
-    // Corrupt the header literal-array table geometry so the table read
-    // overruns the file and yields None.
-    write_u32(&mut data, NUM_LITERALARRAYS_OFF, 0x4000_0000);
+    // Mark the header literal-array table as absent (`INVALID_INDEX = u32::MAX`)
+    // so header validation passes and `legacy_literalarray_table` yields `None`.
+    write_u32(&mut data, NUM_LITERALARRAYS_OFF, u32::MAX);
     let err = decode(&data).expect_err("a buffer reference without a table must fail");
     assert!(
         matches!(
@@ -2316,9 +2318,9 @@ fn legacy_defineclasswithbuffer_without_table_is_hard_error() {
         0xff, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xa6,
     ];
     make_legacy(&mut data, &stream);
-    // Corrupt the header literal-array table geometry so the table read
-    // overruns the file and yields None.
-    write_u32(&mut data, NUM_LITERALARRAYS_OFF, 0x4000_0000);
+    // Mark the header literal-array table as absent (`INVALID_INDEX = u32::MAX`)
+    // so header validation passes and `legacy_literalarray_table` yields `None`.
+    write_u32(&mut data, NUM_LITERALARRAYS_OFF, u32::MAX);
     let err = decode(&data).expect_err("a class buffer reference without a table must fail");
     assert!(
         matches!(
@@ -2392,12 +2394,13 @@ fn legacy_header_table_32bit_overflow_counts_and_offsets_are_hard_errors() {
         assert!(
             matches!(
                 &err,
-                Error::Malformed {
-                    field: "legacy literal-array reference",
-                    ..
-                }
+                Error::Open(_)
+                    | Error::Malformed {
+                        field: "legacy literal-array reference",
+                        ..
+                    }
             ),
-            "expected Malformed/legacy literal-array reference for ({count:#x}, {table_off:#x}), got: {err:?}"
+            "expected Open or Malformed/legacy literal-array reference for ({count:#x}, {table_off:#x}), got: {err:?}"
         );
     }
 }

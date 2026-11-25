@@ -23,29 +23,14 @@ macro_rules! handle_type {
     };
 }
 
-/// Convert a Rust UTF-8 string to MUTF-8 (modified UTF-8) bytes.
-///
-/// MUTF-8 encodes U+0000 as the two-byte overlong sequence `C0 80`, so the
-/// result never contains a `0x00` byte regardless of the input; astral
-/// characters keep their standard 4-byte UTF-8 encoding (panda's MUTF-8
-/// differs from UTF-8 only in the NUL rule — upstream utf.cpp:131-138).
-pub(crate) fn mutf8_bytes(s: &str) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(s.len());
-    for ch in s.chars() {
-        if ch == '\0' {
-            bytes.extend_from_slice(&[0xC0, 0x80]);
-        } else {
-            let mut buf = [0u8; 4];
-            bytes.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    bytes
-}
-
-/// `mutf8_bytes` as a `CString` (always succeeds: MUTF-8 output contains
-/// no 0x00 byte by construction).
+/// Convert a Rust UTF-8 string to canonical MUTF-8 (`C0 80` for U+0000,
+/// 6-byte CESU-8 surrogate pairs for U+10000+) wrapped in a [`CString`].
 fn c_mutf8(s: &str) -> CString {
-    CString::new(mutf8_bytes(s)).expect("MUTF-8 contains no NUL")
+    let mut bytes = crate::string_pool::mutf8_encode_cow(s).into_owned();
+    bytes.push(0);
+    // SAFETY: `mutf8_encode_cow` encodes every `\0` as `0xC0 0x80` and never
+    // emits a `0x00` byte, so the trailing byte pushed above is the sole NUL.
+    unsafe { CString::from_vec_with_nul_unchecked(bytes) }
 }
 
 handle_type!(StringHandle);
@@ -222,7 +207,7 @@ pub struct Builder {
 impl Builder {
     /// Create a new builder.
     pub fn new() -> Self {
-        // SAFETY: no preconditions.
+        // SAFETY: `abc_builder_new` has no pointer preconditions.
         let raw = unsafe { sys::abc_builder_new() };
         assert!(!raw.is_null(), "abc_builder_new returned null");
         Self { raw }
@@ -233,6 +218,11 @@ impl Builder {
     }
 
     fn mutf8_cstr(raw: &[u8]) -> Result<CString, Error> {
+        if raw.iter().any(|&b| b >= 0xF0)
+            && let Some(decoded) = crate::string_pool::mutf8_decode_utf8(raw)
+        {
+            return Ok(c_mutf8(&decoded));
+        }
         CString::new(raw.to_vec()).map_err(|_| Error::Malformed {
             field: "string",
             context: "raw MUTF-8 bytes contain an embedded NUL".to_owned(),
@@ -242,6 +232,7 @@ impl Builder {
     /// Set the API policy before adding items.
     pub fn set_api(&mut self, version: u8, sub_api: &str) {
         let c_sub = self.mutf8_of(sub_api);
+        // SAFETY: `self.raw` is a live `AbcBuilder` and `c_sub` is NUL-terminated.
         unsafe { sys::abc_builder_set_api(self.raw, version, c_sub.as_ptr()) };
     }
 
@@ -249,7 +240,7 @@ impl Builder {
     /// policy. Call before adding items. An unsupported version leaves the
     /// existing selection unchanged.
     pub fn set_file_version(&mut self, version: crate::Version) -> Result<(), Error> {
-        // SAFETY: the builder is live and as_bytes provides all four bytes.
+        // SAFETY: `self.raw` is live and `as_bytes` provides all four version bytes.
         if unsafe { sys::abc_builder_set_file_version(self.raw, version.as_bytes().as_ptr()) } == 0
         {
             return Err(Error::UnsupportedOutputVersion(version));
@@ -262,12 +253,14 @@ impl Builder {
     /// Add a string, returning its handle.
     pub fn add_string(&mut self, s: &str) -> StringHandle {
         let c_str = self.mutf8_of(s);
+        // SAFETY: `self.raw` is live and `c_str` is a valid NUL-terminated MUTF-8 string.
         StringHandle(unsafe { sys::abc_builder_add_string(self.raw, c_str.as_ptr()) })
     }
 
     /// Add a raw MUTF-8 string (e.g. lone-surrogate wire bytes, #30).
     pub fn add_string_mutf8(&mut self, raw: &[u8]) -> Result<StringHandle, Error> {
         let c_str = Self::mutf8_cstr(raw)?;
+        // SAFETY: `self.raw` is live and `c_str` is NUL-terminated.
         Ok(StringHandle(unsafe {
             sys::abc_builder_add_string(self.raw, c_str.as_ptr())
         }))
@@ -278,53 +271,64 @@ impl Builder {
     /// Add a class with the given descriptor (e.g. `"LMyClass;"`).
     pub fn add_class(&mut self, descriptor: &str) -> ClassHandle {
         let c_desc = self.mutf8_of(descriptor);
+        // SAFETY: `self.raw` is live and `c_desc` is NUL-terminated.
         ClassHandle(unsafe { sys::abc_builder_add_class(self.raw, c_desc.as_ptr()) })
     }
 
     pub(crate) fn add_class_cstr(&mut self, c_desc: &CString) -> ClassHandle {
+        // SAFETY: `self.raw` is live and `c_desc` is NUL-terminated.
         ClassHandle(unsafe { sys::abc_builder_add_class(self.raw, c_desc.as_ptr()) })
     }
 
     /// Add a foreign (external) class.
     pub fn add_foreign_class(&mut self, descriptor: &str) -> ClassHandle {
         let c_desc = self.mutf8_of(descriptor);
+        // SAFETY: `self.raw` is live and `c_desc` is NUL-terminated.
         ClassHandle(unsafe { sys::abc_builder_add_foreign_class(self.raw, c_desc.as_ptr()) })
     }
 
     /// Add a foreign class from raw MUTF-8 descriptor bytes (#30).
     pub fn add_foreign_class_mutf8(&mut self, raw: &[u8]) -> Result<ClassHandle, Error> {
         let c_desc = Self::mutf8_cstr(raw)?;
+        // SAFETY: `self.raw` is live and `c_desc` is NUL-terminated.
         Ok(ClassHandle(unsafe {
             sys::abc_builder_add_foreign_class(self.raw, c_desc.as_ptr())
         }))
     }
 
     pub(crate) fn add_foreign_class_cstr(&mut self, c_desc: &CString) -> ClassHandle {
+        // SAFETY: `self.raw` is live and `c_desc` is NUL-terminated.
         ClassHandle(unsafe { sys::abc_builder_add_foreign_class(self.raw, c_desc.as_ptr()) })
     }
 
     /// Add the global class (`L_GLOBAL;`).
     pub fn add_global_class(&mut self) -> ClassHandle {
+        // SAFETY: `self.raw` is a live `AbcBuilder`.
         ClassHandle(unsafe { sys::abc_builder_add_global_class(self.raw) })
     }
 
     pub fn class_set_access_flags(&mut self, cls: ClassHandle, flags: AccessFlags) {
+        // SAFETY: `self.raw` is live; `cls.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_class_set_access_flags(self.raw, cls.0, flags.bits()) };
     }
 
     pub fn class_set_source_lang(&mut self, cls: ClassHandle, lang: SourceLang) {
+        // SAFETY: `self.raw` is live; `cls.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_class_set_source_lang(self.raw, cls.0, lang as u8) };
     }
 
     pub fn class_set_super_class(&mut self, cls: ClassHandle, super_cls: ClassHandle) {
+        // SAFETY: `self.raw` is live; both class handles are bounds-checked in C++.
         unsafe { sys::abc_builder_class_set_super_class(self.raw, cls.0, super_cls.0) };
     }
 
     pub fn class_add_interface(&mut self, cls: ClassHandle, iface: ClassHandle) {
+        // SAFETY: `self.raw` is live; both class handles are bounds-checked in C++.
         unsafe { sys::abc_builder_class_add_interface(self.raw, cls.0, iface.0) };
     }
 
     pub fn class_set_source_file(&mut self, cls: ClassHandle, file: StringHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_class_set_source_file(self.raw, cls.0, file.0) };
     }
 
@@ -338,14 +342,14 @@ impl Builder {
         } else {
             arg_bytes.as_ptr()
         };
+        // SAFETY: `self.raw` is live; `ptr` is null when `args` is empty or valid
+        // for `args.len()` bytes for the duration of the call.
         ProtoHandle(unsafe {
             sys::abc_builder_create_proto(self.raw, ret_type.as_raw_u8(), ptr, args.len() as u32)
         })
     }
 
     /// Create a proto with reference type support.
-    ///
-    /// `class_map` resolves reference type descriptors to ClassHandles.
     pub fn create_proto_ex(
         &mut self,
         ret_type: &Type,
@@ -366,6 +370,8 @@ impl Builder {
         } else {
             params.as_ptr()
         };
+        // SAFETY: `self.raw` is live; `ptr` is null when `params` is empty or valid
+        // for `params.len()` elements for the duration of the call.
         ProtoHandle(unsafe {
             sys::abc_builder_create_proto_ex(
                 self.raw,
@@ -380,7 +386,10 @@ impl Builder {
     // --- Methods ---
 
     /// Add a method to a class with inline code.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "builder method creation mirrors the C bridge entry point"
+    )]
     pub fn class_add_method(
         &mut self,
         cls: ClassHandle,
@@ -395,7 +404,10 @@ impl Builder {
         self.class_add_method_cstr(cls, &c_name, proto, flags, code, num_vregs, num_args)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "builder method creation mirrors the C bridge entry point"
+    )]
     pub(crate) fn class_add_method_cstr(
         &mut self,
         cls: ClassHandle,
@@ -406,6 +418,8 @@ impl Builder {
         num_vregs: u32,
         num_args: u32,
     ) -> MethodHandle {
+        // SAFETY: `self.raw` is live, `c_name` is NUL-terminated, and `code` is
+        // valid for `code.len()` bytes during the call.
         MethodHandle(unsafe {
             sys::abc_builder_class_add_method_with_proto(
                 self.raw,
@@ -440,6 +454,7 @@ impl Builder {
         proto: ProtoHandle,
         flags: AccessFlags,
     ) -> MethodHandle {
+        // SAFETY: `self.raw` is live and `c_name` is NUL-terminated.
         MethodHandle(unsafe {
             sys::abc_builder_add_foreign_method(
                 self.raw,
@@ -452,22 +467,31 @@ impl Builder {
     }
 
     pub fn method_set_source_lang(&mut self, m: MethodHandle, lang: SourceLang) {
+        // SAFETY: `self.raw` is live; `m.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_method_set_source_lang(self.raw, m.0, lang as u8) };
     }
 
     pub fn method_set_function_kind(&mut self, m: MethodHandle, kind: FunctionKind) {
-        unsafe { sys::abc_builder_method_set_function_kind(self.raw, m.0, kind as u8) };
+        self.method_set_function_kind_raw(m, kind as u8);
+    }
+
+    pub(crate) fn method_set_function_kind_raw(&mut self, m: MethodHandle, raw_kind: u8) {
+        // SAFETY: `self.raw` is live; `m.0` is bounds-checked in C++.
+        unsafe { sys::abc_builder_method_set_function_kind(self.raw, m.0, raw_kind) };
     }
 
     pub fn method_set_debug_info(&mut self, m: MethodHandle, debug: DebugInfoHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_method_set_debug_info(self.raw, m.0, debug.0) };
     }
 
     pub fn method_set_code(&mut self, m: MethodHandle, code: CodeHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_method_set_code(self.raw, m.0, code.0) };
     }
 
     pub fn method_add_param(&mut self, m: MethodHandle, ty: Type) -> ParamHandle {
+        // SAFETY: `self.raw` is live; `m.0` is bounds-checked in C++.
         ParamHandle(unsafe { sys::abc_builder_method_add_param(self.raw, m.0, ty.as_raw_u8()) })
     }
 
@@ -478,6 +502,7 @@ impl Builder {
         ty: Type,
         class: Option<ClassHandle>,
     ) -> ParamHandle {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         ParamHandle(unsafe {
             sys::abc_builder_method_add_param_ex(
                 self.raw,
@@ -488,11 +513,13 @@ impl Builder {
         })
     }
 
-    /// Seal staged param annotations into a ParamAnnotationsItem
-    /// (`is_runtime`: false = compile-time, true = runtime). The vendored
-    /// MethodParamItem keeps a single annotation vector per param; sealing
-    /// snapshots whatever is staged at that moment.
+    /// Seal staged param annotations into a `ParamAnnotationsItem`
+    /// (`is_runtime`: `false` = compile-time `PARAM_ANNOTATION`, `true` =
+    /// runtime `RUNTIME_PARAM_ANNOTATION`). The vendored `MethodParamItem`
+    /// keeps a single annotation vector per param; sealing snapshots whatever
+    /// is staged at that moment.
     pub fn method_seal_param_annotations(&mut self, m: MethodHandle, is_runtime: bool) {
+        // SAFETY: `self.raw` is live; `m.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_method_seal_param_annotations(self.raw, m.0, is_runtime as i32) };
     }
 
@@ -517,6 +544,7 @@ impl Builder {
         ty: Type,
         flags: AccessFlags,
     ) -> FieldHandle {
+        // SAFETY: `self.raw` is live and `c_name` is NUL-terminated.
         FieldHandle(unsafe {
             sys::abc_builder_class_add_field(
                 self.raw,
@@ -549,6 +577,7 @@ impl Builder {
         ref_class: ClassHandle,
         flags: AccessFlags,
     ) -> FieldHandle {
+        // SAFETY: `self.raw` is live and `c_name` is NUL-terminated.
         FieldHandle(unsafe {
             sys::abc_builder_class_add_field_ex(
                 self.raw,
@@ -573,24 +602,29 @@ impl Builder {
         c_name: &CString,
         ty: Type,
     ) -> FieldHandle {
+        // SAFETY: `self.raw` is live and `c_name` is NUL-terminated.
         FieldHandle(unsafe {
             sys::abc_builder_add_foreign_field(self.raw, cls.0, c_name.as_ptr(), ty.as_raw_u8())
         })
     }
 
     pub fn field_set_value_i32(&mut self, f: FieldHandle, value: i32) {
+        // SAFETY: `self.raw` is live; `f.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_field_set_value_i32(self.raw, f.0, value) };
     }
 
     pub fn field_set_value_i64(&mut self, f: FieldHandle, value: i64) {
+        // SAFETY: `self.raw` is live; `f.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_field_set_value_i64(self.raw, f.0, value) };
     }
 
     pub fn field_set_value_f32(&mut self, f: FieldHandle, value: f32) {
+        // SAFETY: `self.raw` is live; `f.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_field_set_value_f32(self.raw, f.0, value) };
     }
 
     pub fn field_set_value_f64(&mut self, f: FieldHandle, value: f64) {
+        // SAFETY: `self.raw` is live; `f.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_field_set_value_f64(self.raw, f.0, value) };
     }
 
@@ -633,6 +667,7 @@ impl Builder {
 
     /// Create a standalone code item.
     pub fn create_code(&mut self, insns: &[u8], num_vregs: u32, num_args: u32) -> CodeHandle {
+        // SAFETY: `self.raw` is live and `insns` is valid for `insns.len()` bytes.
         CodeHandle(unsafe {
             sys::abc_builder_create_code(
                 self.raw,
@@ -660,6 +695,7 @@ impl Builder {
                 code_size: c.code_size,
             })
             .collect();
+        // SAFETY: `self.raw` is live and `ffi_catches` is valid for `ffi_catches.len()` items.
         unsafe {
             sys::abc_builder_code_add_try_block(
                 self.raw,
@@ -677,34 +713,33 @@ impl Builder {
     /// Create a literal array with the given ID string.
     pub fn add_literal_array(&mut self, id: &str) -> LiteralArrayHandle {
         let c_id = self.mutf8_of(id);
+        // SAFETY: `self.raw` is live and `c_id` is NUL-terminated.
         LiteralArrayHandle(unsafe { sys::abc_builder_add_literal_array(self.raw, c_id.as_ptr()) })
     }
-
-    // The literal-array section stores pairs of items: a one-byte tag followed
-    // by the encoded value, and the section count is the total number of
-    // items (2 per logical literal). The typed conveniences below therefore
-    // emit a complete `[tag][value]` pair; the `add_u*` methods are the raw
-    // single-item primitives used to build those pairs.
 
     /// Append a raw one-byte item. Combine with a preceding tag item (e.g.
     /// `literal_array_add_u8(la, LiteralTag::Accessor as u8)`) to form a
     /// complete literal.
     pub fn literal_array_add_u8(&mut self, la: LiteralArrayHandle, val: u8) {
+        // SAFETY: `self.raw` is live; `la.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_literal_array_add_u8(self.raw, la.0, val) };
     }
 
     /// Append a raw two-byte item; see [`Self::literal_array_add_u8`].
     pub fn literal_array_add_u16(&mut self, la: LiteralArrayHandle, val: u16) {
+        // SAFETY: `self.raw` is live; `la.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_literal_array_add_u16(self.raw, la.0, val) };
     }
 
     /// Append a raw four-byte item; see [`Self::literal_array_add_u8`].
     pub fn literal_array_add_u32(&mut self, la: LiteralArrayHandle, val: u32) {
+        // SAFETY: `self.raw` is live; `la.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_literal_array_add_u32(self.raw, la.0, val) };
     }
 
     /// Append a raw eight-byte item; see [`Self::literal_array_add_u8`].
     pub fn literal_array_add_u64(&mut self, la: LiteralArrayHandle, val: u64) {
+        // SAFETY: `self.raw` is live; `la.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_literal_array_add_u64(self.raw, la.0, val) };
     }
 
@@ -749,17 +784,18 @@ impl Builder {
         self.literal_array_add_raw_literalarray(la, ref_la);
     }
 
-    // Raw value items without a tag. Callers that already emitted the tag
-    // item (e.g. the model-driven literal encoder) use these directly.
     pub(crate) fn literal_array_add_raw_bool(&mut self, la: LiteralArrayHandle, val: bool) {
+        // SAFETY: `self.raw` is live; `la.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_literal_array_add_bool(self.raw, la.0, val as u8) };
     }
 
     pub(crate) fn literal_array_add_raw_string(&mut self, la: LiteralArrayHandle, s: StringHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_literal_array_add_string(self.raw, la.0, s.0) };
     }
 
     pub(crate) fn literal_array_add_raw_method(&mut self, la: LiteralArrayHandle, m: MethodHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_literal_array_add_method(self.raw, la.0, m.0) };
     }
 
@@ -768,6 +804,7 @@ impl Builder {
         la: LiteralArrayHandle,
         ref_la: LiteralArrayHandle,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_literal_array_add_literalarray(self.raw, la.0, ref_la.0) };
     }
 
@@ -843,6 +880,7 @@ impl Builder {
         handle_type: u8,
         entity_handle: u32,
     ) -> MethodHandleItemHandle {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         MethodHandleItemHandle(unsafe {
             sys::abc_builder_create_method_handle(self.raw, handle_type, entity_handle)
         })
@@ -852,19 +890,39 @@ impl Builder {
 
     /// Create a line number program.
     pub fn create_lnp(&mut self) -> LnpHandle {
+        // SAFETY: `self.raw` is a live `AbcBuilder`.
         LnpHandle(unsafe { sys::abc_builder_create_lnp(self.raw) })
     }
 
     pub fn lnp_emit_end(&mut self, lnp: LnpHandle) {
+        // SAFETY: `self.raw` is live; `lnp.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_lnp_emit_end(self.raw, lnp.0) };
     }
 
     pub fn lnp_emit_advance_pc(&mut self, lnp: LnpHandle, debug: DebugInfoHandle, value: u32) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_lnp_emit_advance_pc(self.raw, lnp.0, debug.0, value) };
     }
 
     pub fn lnp_emit_advance_line(&mut self, lnp: LnpHandle, debug: DebugInfoHandle, value: i32) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_lnp_emit_advance_line(self.raw, lnp.0, debug.0, value) };
+    }
+
+    /// Emit a DWARF special opcode (or `ADVANCE_PC` + `ADVANCE_LINE` +
+    /// `EmitSpecialOpcode(0, 0)` fallback when the delta exceeds the compact
+    /// single-byte range), recording a `(pc, line)` row in the line table.
+    pub fn lnp_emit_special_opcode(
+        &mut self,
+        lnp: LnpHandle,
+        debug: DebugInfoHandle,
+        pc_inc: u32,
+        line_inc: i32,
+    ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
+        unsafe {
+            sys::abc_builder_lnp_emit_special_opcode(self.raw, lnp.0, debug.0, pc_inc, line_inc);
+        }
     }
 
     pub fn lnp_emit_column(
@@ -874,6 +932,7 @@ impl Builder {
         pc_inc: u32,
         column: u32,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_lnp_emit_column(self.raw, lnp.0, debug.0, pc_inc, column) };
     }
 
@@ -885,6 +944,7 @@ impl Builder {
         name: StringHandle,
         type_handle: StringHandle,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe {
             sys::abc_builder_lnp_emit_start_local(
                 self.raw,
@@ -906,6 +966,7 @@ impl Builder {
         type_handle: StringHandle,
         type_sig: StringHandle,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe {
             sys::abc_builder_lnp_emit_start_local_extended(
                 self.raw,
@@ -920,6 +981,7 @@ impl Builder {
     }
 
     pub fn lnp_emit_end_local(&mut self, lnp: LnpHandle, reg: i32) {
+        // SAFETY: `self.raw` is live; `lnp.0` is bounds-checked in C++.
         unsafe { sys::abc_builder_lnp_emit_end_local(self.raw, lnp.0, reg) };
     }
 
@@ -929,6 +991,7 @@ impl Builder {
         debug: DebugInfoHandle,
         source_file: StringHandle,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_lnp_emit_set_file(self.raw, lnp.0, debug.0, source_file.0) };
     }
 
@@ -938,6 +1001,7 @@ impl Builder {
         debug: DebugInfoHandle,
         source_code: StringHandle,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe {
             sys::abc_builder_lnp_emit_set_source_code(self.raw, lnp.0, debug.0, source_code.0);
         }
@@ -945,11 +1009,13 @@ impl Builder {
 
     /// Create a debug info item.
     pub fn create_debug_info(&mut self, lnp: LnpHandle, line_number: u32) -> DebugInfoHandle {
+        // SAFETY: `self.raw` is live; `lnp.0` is bounds-checked in C++.
         DebugInfoHandle(unsafe { sys::abc_builder_create_debug_info(self.raw, lnp.0, line_number) })
     }
 
     /// Add a parameter name to a debug info item.
     pub fn debug_add_param(&mut self, debug: DebugInfoHandle, name: StringHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_debug_add_param(self.raw, debug.0, name.0) };
     }
 
@@ -969,6 +1035,7 @@ impl Builder {
                 value: e.value,
             })
             .collect();
+        // SAFETY: `self.raw` is live and `ffi_elems` is valid for `ffi_elems.len()` items.
         AnnotationHandle(unsafe {
             sys::abc_builder_create_annotation(
                 self.raw,
@@ -1058,6 +1125,8 @@ impl Builder {
             };
             ffi_elems.push(elem);
         }
+        // SAFETY: `self.raw` is live; `ffi_elems`, `widened_arrays`, and `elements`
+        // all remain alive until after `abc_builder_create_annotation_ex` returns.
         let handle = AnnotationHandle(unsafe {
             sys::abc_builder_create_annotation_ex(
                 self.raw,
@@ -1070,67 +1139,106 @@ impl Builder {
         handle
     }
 
-    // Annotation attachment helpers
+    // Annotation attachment helpers.
+    // Note: upstream OpenHarmony `ItemContainer` (`ClassItem`, `MethodItem`,
+    // `FieldItem`) stores a single unified `annotations_` vector emitted under
+    // the `ANNOTATION` tag, so the runtime/type convenience methods below fold
+    // into that list on serialization.
+
+    /// Attach an annotation to a class (`ClassTag::ANNOTATION`).
     pub fn class_add_annotation(&mut self, cls: ClassHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_class_add_annotation(self.raw, cls.0, ann.0) };
     }
+    /// Attach a runtime annotation to a class (folded into `ClassItem::AddAnnotation`
+    /// by the vendored OpenHarmony `ItemContainer` writer).
     pub fn class_add_runtime_annotation(&mut self, cls: ClassHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_class_add_runtime_annotation(self.raw, cls.0, ann.0) };
     }
+    /// Attach a type annotation to a class (folded into `ClassItem::AddAnnotation`
+    /// by the vendored OpenHarmony `ItemContainer` writer).
     pub fn class_add_type_annotation(&mut self, cls: ClassHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_class_add_type_annotation(self.raw, cls.0, ann.0) };
     }
+    /// Attach a runtime type annotation to a class (folded into
+    /// `ClassItem::AddAnnotation` by the vendored OpenHarmony `ItemContainer` writer).
     pub fn class_add_runtime_type_annotation(&mut self, cls: ClassHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_class_add_runtime_type_annotation(self.raw, cls.0, ann.0) };
     }
 
+    /// Attach an annotation to a method (`MethodTag::ANNOTATION`).
     pub fn method_add_annotation(&mut self, m: MethodHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_method_add_annotation(self.raw, m.0, ann.0) };
     }
+    /// Attach a runtime annotation to a method (folded into `MethodItem::AddAnnotation`
+    /// by the vendored OpenHarmony `ItemContainer` writer).
     pub fn method_add_runtime_annotation(&mut self, m: MethodHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_method_add_runtime_annotation(self.raw, m.0, ann.0) };
     }
+    /// Attach a type annotation to a method (folded into `MethodItem::AddAnnotation`
+    /// by the vendored OpenHarmony `ItemContainer` writer).
     pub fn method_add_type_annotation(&mut self, m: MethodHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_method_add_type_annotation(self.raw, m.0, ann.0) };
     }
+    /// Attach a runtime type annotation to a method (folded into
+    /// `MethodItem::AddAnnotation` by the vendored OpenHarmony `ItemContainer` writer).
     pub fn method_add_runtime_type_annotation(&mut self, m: MethodHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_method_add_runtime_type_annotation(self.raw, m.0, ann.0) };
     }
 
+    /// Stage an annotation on a method parameter; call
+    /// [`Self::method_seal_param_annotations`] to emit the table.
     pub fn method_param_add_annotation(
         &mut self,
         m: MethodHandle,
         param: ParamHandle,
         ann: AnnotationHandle,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_method_param_add_annotation(self.raw, m.0, param.0, ann.0) };
     }
+    /// Stage a runtime parameter annotation (shares `MethodParamItem`'s staged
+    /// annotation vector; select retention via [`Self::method_seal_param_annotations`]).
     pub fn method_param_add_runtime_annotation(
         &mut self,
         m: MethodHandle,
         param: ParamHandle,
         ann: AnnotationHandle,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe {
             sys::abc_builder_method_param_add_runtime_annotation(self.raw, m.0, param.0, ann.0);
         }
     }
+    /// Stage a type parameter annotation (shares `MethodParamItem`'s staged
+    /// annotation vector; select retention via [`Self::method_seal_param_annotations`]).
     pub fn method_param_add_type_annotation(
         &mut self,
         m: MethodHandle,
         param: ParamHandle,
         ann: AnnotationHandle,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe {
             sys::abc_builder_method_param_add_type_annotation(self.raw, m.0, param.0, ann.0);
         }
     }
+    /// Stage a runtime type parameter annotation (shares `MethodParamItem`'s
+    /// staged annotation vector; select retention via [`Self::method_seal_param_annotations`]).
     pub fn method_param_add_runtime_type_annotation(
         &mut self,
         m: MethodHandle,
         param: ParamHandle,
         ann: AnnotationHandle,
     ) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe {
             sys::abc_builder_method_param_add_runtime_type_annotation(
                 self.raw, m.0, param.0, ann.0,
@@ -1138,30 +1246,44 @@ impl Builder {
         }
     }
 
+    /// Attach an annotation to a field (`FieldTag::ANNOTATION`).
     pub fn field_add_annotation(&mut self, f: FieldHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_field_add_annotation(self.raw, f.0, ann.0) };
     }
+    /// Attach a runtime annotation to a field (folded into `FieldItem::AddAnnotation`
+    /// by the vendored OpenHarmony `ItemContainer` writer).
     pub fn field_add_runtime_annotation(&mut self, f: FieldHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_field_add_runtime_annotation(self.raw, f.0, ann.0) };
     }
+    /// Attach a type annotation to a field (folded into `FieldItem::AddAnnotation`
+    /// by the vendored OpenHarmony `ItemContainer` writer).
     pub fn field_add_type_annotation(&mut self, f: FieldHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_field_add_type_annotation(self.raw, f.0, ann.0) };
     }
+    /// Attach a runtime type annotation to a field (folded into
+    /// `FieldItem::AddAnnotation` by the vendored OpenHarmony `ItemContainer` writer).
     pub fn field_add_runtime_type_annotation(&mut self, f: FieldHandle, ann: AnnotationHandle) {
+        // SAFETY: `self.raw` is live; handles are bounds-checked in C++.
         unsafe { sys::abc_builder_field_add_runtime_type_annotation(self.raw, f.0, ann.0) };
     }
 
     // --- Deduplication ---
 
     pub fn deduplicate(&mut self) {
+        // SAFETY: `self.raw` is a live `AbcBuilder`.
         unsafe { sys::abc_builder_deduplicate(self.raw) };
     }
 
     pub fn deduplicate_code_and_debug_info(&mut self) {
+        // SAFETY: `self.raw` is a live `AbcBuilder`.
         unsafe { sys::abc_builder_deduplicate_code_and_debug_info(self.raw) };
     }
 
     pub fn deduplicate_annotations(&mut self) {
+        // SAFETY: `self.raw` is a live `AbcBuilder`.
         unsafe { sys::abc_builder_deduplicate_annotations(self.raw) };
     }
 
@@ -1245,14 +1367,23 @@ impl Drop for Builder {
 
 use crate::{StringId, StringPool};
 
+/// Configuration options for [`encode_with_options`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EncodeOptions {
+    /// When `true`, run [`crate::inspect_summary`] (`verify = true`) over the
+    /// finalized `.abc` bytes before returning them, mapping any failure to
+    /// [`Error::FinalizeValidation`]. Defaults to `false`.
+    pub verify: bool,
+}
+
 /// Handles of encoded methods/fields, resolvable from decoded reference
 /// payloads.
 ///
 /// References inside a decoded file carry entity offsets (method/field item
 /// offsets) or interned names. Names are not unique — two classes routinely
-/// define a method of the same name — so the offset map is authoritative and
-/// the name map only serves hand-built models whose entities all carry
-/// offset 0.
+/// define a method of the same name — so a non-zero offset resolves solely
+/// through the offset map, and the name map only serves hand-built models
+/// whose references carry offset `0`.
 #[derive(Default)]
 struct EntityHandles {
     methods_by_offset: HashMap<u32, MethodHandle>,
@@ -1277,36 +1408,48 @@ impl EntityHandles {
     }
 
     /// Resolve a method reference. A non-zero offset is the entity's unique
-    /// identity; the name map is only a fallback for hand-built models.
+    /// identity; the name map is ONLY consulted when `offset == 0`
+    /// (hand-built models).
     fn resolve_method(&self, name: StringId, offset: u32) -> Option<MethodHandle> {
-        if offset != 0
-            && let Some(&h) = self.methods_by_offset.get(&offset)
-        {
-            return Some(h);
+        if offset != 0 {
+            return self.methods_by_offset.get(&offset).copied();
         }
         self.methods_by_name.get(&name).copied()
     }
 
     /// Resolve a field reference (see [`Self::resolve_method`]).
     fn resolve_field(&self, name: StringId, offset: u32) -> Option<FieldHandle> {
-        if offset != 0
-            && let Some(&h) = self.fields_by_offset.get(&offset)
-        {
-            return Some(h);
+        if offset != 0 {
+            return self.fields_by_offset.get(&offset).copied();
         }
         self.fields_by_name.get(&name).copied()
     }
 }
 
-/// Encode a decoded [`File`] back to ABC bytes.
+/// Encode a decoded [`File`] back to ABC bytes using [`EncodeOptions::default`].
 ///
 /// Source entity operands are resolved through each method body's index map
-/// and relocated after the upstream writer assigns new indices. The output
-/// is checked by this crate's decoder before being returned. This readback
-/// check does not prove runtime equivalence or complete metadata preservation.
+/// and relocated after the upstream writer assigns new indices. Pass
+/// [`EncodeOptions { verify: true }`](EncodeOptions) to [`encode_with_options`]
+/// when post-finalize readback verification is desired.
 ///
-/// Note: `ParamInfo::signature` is not preserved (C++ writer limitation).
+/// Note: `ParamInfo::signature` is derived from method prototypes on decode and
+/// is not stored separately in `DebugInfoItem`.
 pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
+    encode_with_options(file, EncodeOptions::default())
+}
+
+/// Encode a decoded [`File`] back to ABC bytes with explicit [`EncodeOptions`].
+pub fn encode_with_options(file: &File, options: EncodeOptions) -> Result<Vec<u8>, Error> {
+    if file.file_type != crate::FileType::Dynamic {
+        return Err(Error::Malformed {
+            field: "file_type",
+            context: format!(
+                "cannot encode {:?} file as dynamic ArkTS/JS bytecode",
+                file.file_type
+            ),
+        });
+    }
     validate_annotation_arrays(file)?;
     validate_literal_array_graph(&file.literal_arrays)?;
     let mut b = Builder::new();
@@ -1321,22 +1464,14 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
         Builder::mutf8_cstr(&bytes)
     };
 
-    // --- Collect all strings and build handle map ---
-    let mut string_handles: HashMap<StringId, StringHandle> = HashMap::new();
+    // Dense `StringId::index() -> Option<StringHandle>` table (zero hashing).
+    let mut string_handles: Vec<Option<StringHandle>> = vec![None; pool.len()];
 
     // --- Create classes (foreign first, then normal) ---
     let mut class_handles: HashMap<StringId, ClassHandle> = HashMap::new();
     let mut entities = EntityHandles::default();
     let mut code_references = Vec::new();
-    // Field values that reference literal-array items (module-record blobs,
-    // scope-names arrays), wired up after the literal-array section exists.
     let mut deferred_field_values: Vec<(FieldHandle, &FieldValue)> = Vec::new();
-    // Annotation-embedded literal arrays (`ann_la_*`): their builder items are
-    // created during class configuration to preserve item staging order
-    // (F-new-1), while their element payloads are populated AFTER all model
-    // literal-array handles and method handles exist so nested
-    // `LiteralValue::LiteralArray` and forward method references resolve to
-    // live builder handles instead of being dropped by the C++ bridge.
     let mut deferred_ann_las: Vec<(LiteralArrayHandle, Vec<LiteralValue>)> = Vec::new();
     let mut ann_la_counter: u32 = 0;
     let ann_la_base = count_annotation_literal_arrays(file);
@@ -1360,7 +1495,6 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
         }
     }
 
-    // Helper: resolve a descriptor StringId to a ClassHandle (may need to create foreign).
     let resolve_class_id = |b: &mut Builder,
                             map: &mut HashMap<StringId, ClassHandle>,
                             pool: &StringPool,
@@ -1380,7 +1514,13 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
 
     // --- Configure each class ---
     for (&desc, cls) in &file.classes {
-        let cls_h = class_handles[&desc];
+        let cls_h = class_handles
+            .get(&desc)
+            .copied()
+            .ok_or_else(|| Error::Malformed {
+                field: "class_descriptor",
+                context: format!("missing class handle for {desc:?}"),
+            })?;
 
         b.class_set_access_flags(cls_h, cls.access_flags);
         b.class_set_source_lang(cls_h, cls.source_lang);
@@ -1424,7 +1564,6 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
             let method_h = if method.is_external {
                 b.add_foreign_method_cstr(cls_h, &method_name_cstr, proto, method.access_flags)
             } else {
-                // Encode bytecodes
                 let (code_bytes, byte_offsets) = if let Some(ref body) = method.body {
                     abcd_isa::encode(&body.bytecodes)
                         .map_err(|e| Error::BytecodeEncode(e.to_string()))?
@@ -1444,9 +1583,6 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     .as_ref()
                     .is_some_and(|b| !b.try_blocks.is_empty());
 
-                // When try-blocks exist, pass empty code to class_add_method
-                // and attach a separate CodeHandle with try-blocks via method_set_code.
-                // This avoids creating an orphaned code item.
                 let inline_code = if has_try_blocks { &[][..] } else { &code_bytes };
                 let m_h = b.class_add_method_cstr(
                     cls_h,
@@ -1458,12 +1594,39 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     num_args,
                 );
 
-                // Try blocks
+                // Try blocks (strictly validated against instruction indices).
                 if let Some(ref body) = method.body
                     && !body.try_blocks.is_empty()
                 {
+                    let code_byte_len = code_bytes.len() as u32;
+                    let method_label = pool.resolve(method.name).unwrap_or("<method>");
+                    let checked_pc = |idx: u32, field: &'static str| -> Result<u32, Error> {
+                        let i = idx as usize;
+                        if let Some(&off) = byte_offsets.get(i) {
+                            Ok(off)
+                        } else if i == byte_offsets.len() {
+                            Ok(code_byte_len)
+                        } else {
+                            Err(Error::Malformed {
+                                field,
+                                context: format!(
+                                    "method {method_label}: instruction index {idx} out of bounds (insn count {})",
+                                    byte_offsets.len()
+                                ),
+                            })
+                        }
+                    };
                     let code_h = b.create_code(&code_bytes, num_vregs, num_args);
                     for tb in &body.try_blocks {
+                        let tb_end =
+                            tb.start
+                                .checked_add(tb.len)
+                                .ok_or_else(|| Error::Malformed {
+                                    field: "try_block",
+                                    context: format!("method {method_label}: try span overflow"),
+                                })?;
+                        let start_pc = checked_pc(tb.start, "try_block")?;
+                        let end_pc = checked_pc(tb_end, "try_block")?;
                         let catches: Vec<CatchBlockDef> = tb
                             .catches
                             .iter()
@@ -1471,32 +1634,38 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                                 let type_class = if cb.type_idx == u32::MAX {
                                     None
                                 } else {
-                                    file.resolve_entity(cb.type_idx)
-                                        .map(|d| {
-                                            resolve_class_id(&mut b, &mut class_handles, pool, d)
-                                        })
-                                        .transpose()?
+                                    let desc_sid = file.resolve_entity(cb.type_idx).ok_or_else(
+                                        || {
+                                            Error::CodeRelocation(format!(
+                                                "method {method_label}: catch type offset {:#x} cannot be resolved",
+                                                cb.type_idx
+                                            ))
+                                        },
+                                    )?;
+                                    Some(resolve_class_id(
+                                        &mut b,
+                                        &mut class_handles,
+                                        pool,
+                                        desc_sid,
+                                    )?)
                                 };
-                                let handler_pc =
-                                    byte_offsets.get(cb.handler as usize).copied().unwrap_or(0);
-                                let end = cb.handler.saturating_add(cb.len);
-                                let end_pc = byte_offsets
-                                    .get(end as usize)
-                                    .copied()
-                                    .unwrap_or(code_bytes.len() as u32);
+                                let cb_end = cb.handler.checked_add(cb.len).ok_or_else(|| {
+                                    Error::Malformed {
+                                        field: "catch_block",
+                                        context: format!(
+                                            "method {method_label}: catch span overflow"
+                                        ),
+                                    }
+                                })?;
+                                let handler_pc = checked_pc(cb.handler, "catch_block")?;
+                                let handler_end_pc = checked_pc(cb_end, "catch_block")?;
                                 Ok(CatchBlockDef {
                                     type_class,
                                     handler_pc,
-                                    code_size: end_pc.saturating_sub(handler_pc),
+                                    code_size: handler_end_pc.saturating_sub(handler_pc),
                                 })
                             })
                             .collect::<Result<_, Error>>()?;
-                        let start_pc = byte_offsets.get(tb.start as usize).copied().unwrap_or(0);
-                        let end = tb.start.saturating_add(tb.len);
-                        let end_pc = byte_offsets
-                            .get(end as usize)
-                            .copied()
-                            .unwrap_or(code_bytes.len() as u32);
                         b.code_add_try_block(
                             code_h,
                             start_pc,
@@ -1528,23 +1697,29 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
             };
 
             b.method_set_source_lang(method_h, method.source_lang);
-            b.method_set_function_kind(method_h, method.function_kind);
+            let raw_hi = ((method.access_flags.bits() >> 8) & 0xFF) as u8;
+            let sendable = sys::FunctionKind_SENDABLE_FUNCTION;
+            let raw_kind = if (raw_hi & !0x07) == sendable {
+                let base = raw_hi & 0x07;
+                if (method.function_kind == FunctionKind::SendableFunction
+                    && base == sys::FunctionKind_FUNCTION)
+                    || (base != 0
+                        && base != sys::FunctionKind_CONCURRENT_FUNCTION
+                        && (method.function_kind as u8) == base)
+                {
+                    raw_hi
+                } else {
+                    method.function_kind as u8
+                }
+            } else {
+                method.function_kind as u8
+            };
+            b.method_set_function_kind_raw(method_h, raw_kind);
 
-            // Track method handle for literal array method references.
             entities.insert_method(method, method_h);
 
             // Method annotations
             {
-                // N73: a lowered body carries its recomputed IC-slot
-                // consumption (`MethodBody::ic_size`); the source file's
-                // `_ESSlotNumberAnnotation`/`SlotNumber` is then STALE
-                // (the runtime sizes the method's ProfileTypeInfo array
-                // from it and indexes the array with the unchecked slot
-                // immediate — a shortfall is an out-of-bounds heap
-                // access, the N73 VM SIGSEGV). Sync the annotation to
-                // the lowered count. Decoded bodies carry `ic_size:
-                // None`, so plain decode → encode keeps the source
-                // annotation byte-identical.
                 let synced_annotations;
                 let annotations = match method.body.as_ref().and_then(|b| b.ic_size) {
                     Some(ic_size) => {
@@ -1571,23 +1746,10 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
             }
 
             // --- Parameter annotations ---
-            // Contract (maintainer ruling, same precedent as the annotation
-            // category fold, review finding #9): decode keeps both buckets;
-            // encode folds them. The vendored MethodParamItem has a single
-            // annotation vector per param and sealing snapshots it
-            // (ParamAnnotationsItem ctor, vendor file_items.cpp:424), so the
-            // fold stages the per-param union of both buckets through the
-            // compile-time adder and seals ONCE as compile-time — unless the
-            // compile-time bucket is empty, in which case the runtime bucket
-            // is staged alone and sealed as runtime.
             let pa = &method.param_annotations;
             let has_compile = pa.compile_time.iter().any(|v| !v.is_empty());
             let has_runtime = pa.runtime.iter().any(|v| !v.is_empty());
             if !method.is_external && (has_compile || has_runtime) {
-                // Params must exist before annotations can attach to them
-                // (the bridge drops out-of-range param indices). Hand-built
-                // models may carry param annotations without arg_types; pad
-                // with TAGGED params.
                 let num_params = method
                     .arg_types
                     .len()
@@ -1614,9 +1776,6 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                     pool,
                 };
                 for (idx, param_h) in param_handles.iter().enumerate() {
-                    // Per-param union of both buckets; the runtime bucket may
-                    // already contain compile-time annotations (vendor seal
-                    // snapshots the shared vector), so dedup by value.
                     let staged: Vec<&Annotation> = if seal_as_runtime {
                         pa.runtime.get(idx).into_iter().flatten().collect()
                     } else {
@@ -1651,14 +1810,8 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
                 b.class_add_field_cstr(cls_h, &field_name_cstr, ty, field.access_flags)
             };
 
-            // Track field handle for annotation references.
             entities.insert_field(field, field_h);
 
-            // Initial value. Offset-reference values (module-record and
-            // scope-names blobs) are deferred: their literal-array items are
-            // only created after class configuration (creation order is
-            // significant to the vendored writer), and the field value must
-            // reference the item so the writer relocates it at layout time.
             match &field.initial_value {
                 Some(FieldValue::I32(v)) => b.field_set_value_i32(field_h, *v),
                 Some(FieldValue::I64(v)) => b.field_set_value_i64(field_h, *v),
@@ -1715,52 +1868,35 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
     }
 
     // --- Literal array contents ---
-    // Model literal arrays are created after class configuration, so their
-    // builder handles start after every annotation-embedded (`ann_la_*`)
-    // array: handle(i) = ann_la_base + i. Populate `deferred_ann_las` now
-    // that all `literal_handles` exist on the builder.
     let literal_handles: Vec<_> = (0..file.literal_arrays.len())
         .map(|index| b.add_literal_array(&index.to_string()))
         .collect();
-    for (la_h, values) in &deferred_ann_las {
-        for val in values {
-            encode_literal_value(
-                &mut b,
-                &mut string_handles,
-                pool,
-                *la_h,
-                val,
-                &file.entity_map,
-                &entities,
-                &literal_handles,
-            )?;
+    {
+        let mut lit_ctx = LiteralEncodeCtx {
+            string_handles: &mut string_handles,
+            pool,
+            entity_map: &file.entity_map,
+            entities: &entities,
+            literal_handles: &literal_handles,
+        };
+        for (la_h, values) in &deferred_ann_las {
+            for val in values {
+                encode_literal_value(&mut b, &mut lit_ctx, *la_h, val)?;
+            }
         }
-    }
-    for (i, (la, &la_h)) in file.literal_arrays.iter().zip(&literal_handles).enumerate() {
-        debug_assert_eq!(
-            la_h.as_raw(),
-            ann_la_base + i as u32,
-            "model literal-array handles must follow annotation-embedded ones"
-        );
-        for val in &la.values {
-            encode_literal_value(
-                &mut b,
-                &mut string_handles,
-                pool,
-                la_h,
-                val,
-                &file.entity_map,
-                &entities,
-                &literal_handles,
-            )?;
+        for (i, (la, &la_h)) in file.literal_arrays.iter().zip(&literal_handles).enumerate() {
+            debug_assert_eq!(
+                la_h.as_raw(),
+                ann_la_base + i as u32,
+                "model literal-array handles must follow annotation-embedded ones"
+            );
+            for val in &la.values {
+                encode_literal_value(&mut b, &mut lit_ctx, la_h, val)?;
+            }
         }
     }
 
     // --- Module-record blobs and scope-names field references ---
-    // These literal arrays are created at the same point as model literal
-    // arrays (after all class configuration; creation order is significant
-    // to the vendored writer — F-new-1), so their handles follow the model
-    // arrays and never disturb the `ann_la_base` handle arithmetic above.
     let mut module_la_counter: u32 = 0;
     for (field_h, value) in deferred_field_values {
         match value {
@@ -1807,12 +1943,11 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
         }
     }
 
-    // All entities now have handles, including forward method/literal refs.
-    // Register dependencies AND deferred operand updates; upstream owns the
-    // final method-local index ordering, which may differ from the input.
+    // Relocate bytecode entity operands.
     for (owner, offsets, body) in code_references {
         for (instruction, &byte_offset) in body.bytecodes.iter().zip(&offsets) {
-            for (ordinal, (kind, id)) in instruction.entity_operands().into_iter().enumerate() {
+            let (ops, len) = instruction.entity_operands_inline();
+            for (ordinal, &(kind, id)) in ops[..len].iter().enumerate() {
                 use abcd_isa::EntityKind;
                 let unresolved = || {
                     Error::CodeRelocation(format!(
@@ -1855,12 +1990,12 @@ pub fn encode(file: &File) -> Result<Vec<u8>, Error> {
         }
     }
 
-    // --- Deduplicate and finalize ---
-    // DeduplicateItems computes a layout pass first: its hash computation
-    // reads per-item index ranges that only ComputeLayout populates.
     b.deduplicate();
     let output = b.finalize()?;
-    crate::decode(&output).map_err(|e| Error::FinalizeValidation(e.to_string()))?;
+    if options.verify {
+        crate::inspect_summary(&output, true)
+            .map_err(|e| Error::FinalizeValidation(e.to_string()))?;
+    }
     Ok(output)
 }
 
@@ -1878,8 +2013,6 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
             .chain(a.runtime_type.iter())
     }
 
-    /// Entity the annotation is attached to. `Copy` and formatted only when
-    /// an error is actually built, so the hot path carries no allocation.
     #[derive(Clone, Copy)]
     enum Owner {
         Class(StringId),
@@ -1888,8 +2021,6 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
         MethodParam(StringId, StringId, usize),
     }
 
-    /// The annotation element whose value tree is being validated. Nested
-    /// annotations re-seat the site at their own descriptor/element names.
     #[derive(Clone, Copy)]
     struct Site {
         annotation: StringId,
@@ -2045,15 +2176,6 @@ fn validate_annotation_arrays(file: &File) -> Result<(), Error> {
     Ok(())
 }
 
-/// Validate that every nested `LiteralValue::LiteralArray(idx)` in
-/// `File::literal_arrays` points within `0..literal_arrays.len()`.
-///
-/// Note: reference CYCLES in `File::literal_arrays` are format-legal and
-/// emitted by `es2abc` for recursive ArkTS class/interface type descriptors
-/// in `L_ESTypeAnnotation;` (e.g. OpenHarmony `Settings.hap`); both `decode`
-/// (`offset_to_index` worklist) and `Builder` (`ComputeLayout` assigns all
-/// `LiteralArrayItem` offsets before `LiteralItem::Write` emits 4-byte IDs)
-/// handle cyclic literal-array graphs in linear time without recursion.
 fn validate_literal_array_graph(literal_arrays: &[LiteralArray]) -> Result<(), Error> {
     let len = literal_arrays.len();
     for la in literal_arrays {
@@ -2071,11 +2193,6 @@ fn validate_literal_array_graph(literal_arrays: &[LiteralArray]) -> Result<(), E
     Ok(())
 }
 
-/// Count the literal arrays that annotation encoding will create: exactly
-/// one `ann_la_*` builder array per `AnnotationValue::LiteralArray` element,
-/// traversing nested annotations and array elements via an explicit iterative
-/// workstack. Parameter annotations are deduplicated per-parameter identically
-/// to the staging fold in `encode`.
 fn count_annotation_literal_arrays(file: &File) -> u32 {
     fn push_annotations<'a>(a: &'a Annotations, stack: &mut Vec<&'a AnnotationValue>) {
         for ann in a
@@ -2163,9 +2280,8 @@ enum AnnotationTarget {
     Field(FieldHandle),
 }
 
-/// Shared mutable state for annotation encoding.
 struct AnnotationEncodeCtx<'a> {
-    string_handles: &'a mut HashMap<StringId, StringHandle>,
+    string_handles: &'a mut [Option<StringHandle>],
     class_handles: &'a mut HashMap<StringId, ClassHandle>,
     entities: &'a EntityHandles,
     ann_la_counter: &'a mut u32,
@@ -2173,37 +2289,6 @@ struct AnnotationEncodeCtx<'a> {
     pool: &'a StringPool,
 }
 
-/// N73: re-synchronize the `_ESSlotNumberAnnotation`/`SlotNumber` value
-/// with a lowered body's actual IC-slot consumption.
-///
-/// The runtime reads the slot count from this annotation
-/// (arkcompiler_ets_runtime-master/ecmascript/jspandafile/
-/// method_literal.cpp:51-77, `KSLOT_NUMBER_ANNOTATION` →
-/// `SetSlotSize`), allocates the method's `ProfileTypeInfo` array with
-/// exactly that many slots (`RuntimeNotifyInlineCache` →
-/// `NewProfileTypeInfo(icSlotSize)`, runtime_stubs-inl.h:1242), and the
-/// interpreter's IC paths index it with the instruction's slot
-/// immediate without a bounds check (interpreter-inl.cpp:2235-2253,
-/// :2556-2565). A rewrite that consumes more IC slots than the source
-/// bytecode did (the N73 case: three `wide.callthisrangewithname` — no
-/// IC — folded to narrow `callthisrange` — a 2-slot IC each, +6 slots
-/// over the annotated 319) leaves the VM indexing past the array:
-/// heap corruption and a delayed SIGSEGV.
-///
-/// Upstream regenerates the annotation from the post-rearrangement slot
-/// count for every function (`FunctionEmitter::GenSlotNumberAnnotation`,
-/// es2panda/compiler/core/emitter/emitter.cpp:614-632), which is
-/// exactly what this sync reproduces.
-///
-/// The update is in-place over every bucket. When the method carries no
-/// `_ESSlotNumberAnnotation` the sync is skipped: adding one requires the
-/// annotation RECORD (`L_ESSlotNumberAnnotation;`) to exist in the file,
-/// and fabricating records is out of encode's scope. Every
-/// frontend-produced (es2abc/es2panda) method carries the annotation —
-/// `GenSlotNumberAnnotation` is unconditional — so all
-/// decode → lift → lower → encode corpus paths are covered; only
-/// hand-built models without the record (encode-only unit tests) take the
-/// skip, and their pre-N73 behavior is unchanged.
 fn sync_slot_number_annotation(
     anns: &Annotations,
     pool: &crate::StringPool,
@@ -2233,17 +2318,15 @@ fn sync_slot_number_annotation(
     synced
 }
 
-#[allow(clippy::type_complexity)]
+type AttachAnnotationFn = fn(&mut Builder, &AnnotationTarget, AnnotationHandle);
+
 fn encode_annotations_on(
     b: &mut Builder,
     ctx: &mut AnnotationEncodeCtx<'_>,
     anns: &Annotations,
     target: AnnotationTarget,
 ) -> Result<(), Error> {
-    let groups: [(
-        &[Annotation],
-        fn(&mut Builder, &AnnotationTarget, AnnotationHandle),
-    ); 4] = [
+    let groups: [(&[Annotation], AttachAnnotationFn); 4] = [
         (&anns.compile_time, |b, t, a| match t {
             AnnotationTarget::Class(h) => b.class_add_annotation(*h, a),
             AnnotationTarget::Method(h) => b.method_add_annotation(*h, a),
@@ -2294,8 +2377,6 @@ struct AnnEncodeFrame<'a> {
     pending: Option<PendingEncodeElem<'a>>,
 }
 
-/// Encode one annotation tree into a builder handle using an explicit
-/// iterative workstack, preserving left-to-right item creation order.
 fn encode_single_annotation(
     b: &mut Builder,
     ctx: &mut AnnotationEncodeCtx<'_>,
@@ -2471,9 +2552,6 @@ fn annotation_scalar_value_to_raw(
 ) -> Result<(u8, AnnotationElemValue), Error> {
     use sys::AnnotationValueType as AVT;
 
-    // Unresolvable entity references (e.g. foreign members, which never
-    // enter EntityHandles) must fail loudly — writing Scalar(0) would
-    // silently produce a different annotation (audit findings #6/#7).
     let unresolved = |kind: &str, name: StringId, offset: u32| {
         Error::CodeRelocation(format!(
             "annotation {kind} reference '{}' at offset {offset:#x} cannot be resolved",
@@ -2553,11 +2631,6 @@ fn annotation_scalar_value_to_raw(
     Ok(raw)
 }
 
-/// Returns true if the annotation array tag refers to entity-reference
-/// elements. Tag chars follow upstream pandasm::Value::GetArrayTypeAsChar
-/// (audit finding #B1): K..U are scalar arrays (K=U1 … T=F32, U=F64),
-/// V=String, W=Record, X=Method, Y=Enum, Z=Annotation, @=MethodHandle;
-/// '#' (LiteralArray) is also an entity reference.
 fn is_entity_array_tag(tag: u8) -> bool {
     use sys::AnnotationValueType as AVT;
     matches!(
@@ -2572,9 +2645,6 @@ fn is_entity_array_tag(tag: u8) -> bool {
     )
 }
 
-/// Convert a single non-Annotation array element to a u64 raw bits / handle
-/// word for the builder (`Annotation` elements are pushed onto the iterative
-/// frame stack by `encode_single_annotation`).
 fn annotation_array_leaf_to_handle(
     val: &AnnotationValue,
     b: &mut Builder,
@@ -2662,7 +2732,6 @@ fn annotation_array_leaf_to_handle(
     Ok(raw)
 }
 
-/// Resolve a class descriptor for annotation encoding.
 fn resolve_class_for_ann(
     b: &mut Builder,
     class_handles: &mut HashMap<StringId, ClassHandle>,
@@ -2681,28 +2750,51 @@ fn resolve_class_for_ann(
     Ok(h)
 }
 
+#[derive(Clone, Copy)]
+enum LnpEventKind {
+    EndLocal {
+        reg: i32,
+    },
+    Line {
+        line: u32,
+    },
+    Column {
+        column: u32,
+    },
+    StartLocal {
+        reg: i32,
+        name: StringHandle,
+        type_name: StringHandle,
+        type_sig: Option<StringHandle>,
+    },
+}
+
+impl LnpEventKind {
+    const fn priority(&self) -> u8 {
+        match self {
+            Self::EndLocal { .. } => 0,
+            Self::Line { .. } => 1,
+            Self::Column { .. } => 2,
+            Self::StartLocal { .. } => 3,
+        }
+    }
+}
+
+struct LnpEvent {
+    pc: u32,
+    seq: usize,
+    kind: LnpEventKind,
+}
+
 fn encode_debug_info(
     b: &mut Builder,
-    string_handles: &mut HashMap<StringId, StringHandle>,
+    string_handles: &mut [Option<StringHandle>],
     pool: &StringPool,
     method_h: MethodHandle,
     dbg: &MethodDebugInfo,
     byte_offsets: &[u32],
     code_len: u32,
 ) -> Result<(), Error> {
-    // Skip if debug info is completely empty (no meaningful content).
-    // Empty strings are not content (the emitters below skip them too):
-    // the vendored extractor's GetSourceFile/GetSourceCode return ""
-    // for missing entries (debug_info_extractor.cpp:318-333), and
-    // counting an empty string as content would emit a degenerate
-    // debug item whose LNP never SET_FILEs; the vendored extractor
-    // then reads string offset 0 (GetSpanFromId throws
-    // INVALID_FILE_OFFSET, file.h:190) and the whole file's debug
-    // region dies on the next decode. Since the N55 decode fix, decode
-    // no longer invents `source_file: Some("")` for debug-less methods
-    // (they get `debug: None`) and maps a real "" answer to `None` —
-    // this guard now covers hand-built models and genuinely contentless
-    // debug items.
     let non_empty = |sid: StringId| !pool.resolve(sid).unwrap_or("").is_empty();
     let has_content = !dbg.line_table.is_empty()
         || !dbg.column_table.is_empty()
@@ -2718,7 +2810,6 @@ fn encode_debug_info(
     let first_line = dbg.line_table.first().map_or(0, |e| e.line);
     let debug_h = b.create_debug_info(lnp, first_line);
 
-    // Source file / source code
     if let Some(sf) = dbg.source_file {
         let sf_str = pool.resolve(sf).unwrap_or("");
         if !sf_str.is_empty() {
@@ -2734,67 +2825,222 @@ fn encode_debug_info(
         }
     }
 
-    // Params (signature not preserved — C++ writer limitation)
     for p in &dbg.params {
         let nh = get_or_add_string_id(b, string_handles, pool, p.name)?;
         b.debug_add_param(debug_h, nh);
     }
 
-    // Line table — emit as (advance_pc, advance_line) deltas.
-    // `cur_pc` tracks the LNP program counter across the whole program;
-    // the line table, column table, and local variables share one stream.
-    let mut cur_pc: u32 = 0;
-    let mut prev_line: u32 = first_line;
-    for entry in &dbg.line_table {
-        let pc = index_to_offset(byte_offsets, entry.index, code_len);
-        let pc_delta = pc.saturating_sub(cur_pc);
-        let line_delta = (entry.line as i32).wrapping_sub(prev_line as i32);
-        if pc_delta > 0 {
-            b.lnp_emit_advance_pc(lnp, debug_h, pc_delta);
-            cur_pc = pc;
-        }
-        if line_delta != 0 {
-            b.lnp_emit_advance_line(lnp, debug_h, line_delta);
-        }
-        prev_line = entry.line;
+    // `ProcessBegin()` in `DebugInfoExtractor` unconditionally pushes
+    // `{ offset: 0, line: first_line }` before executing the first opcode.
+    // Skip `line_table[0]` when it already sits at PC 0 so it is not duplicated.
+    let skip_initial_line = dbg
+        .line_table
+        .first()
+        .is_some_and(|first| index_to_offset(byte_offsets, first.index, code_len) == 0);
+    let line_slice = if skip_initial_line {
+        &dbg.line_table[1..]
+    } else {
+        &dbg.line_table[..]
+    };
+
+    // Determine the final PC so local variables spanning to the end of the
+    // method close via `ProcessVars()` at `END_SEQUENCE` instead of emitting a
+    // trailing `END_LOCAL` that could overwrite a nested inner variable on the
+    // same register (`DebugInfoExtractor::HandleEndLocal` scans `rbegin()`
+    // without skipping already-closed entries).
+    let mut final_unclosed_pc = code_len;
+    for entry in line_slice {
+        final_unclosed_pc =
+            final_unclosed_pc.max(index_to_offset(byte_offsets, entry.index, code_len));
+    }
+    for entry in &dbg.column_table {
+        final_unclosed_pc =
+            final_unclosed_pc.max(index_to_offset(byte_offsets, entry.index, code_len));
+    }
+    for lv in &dbg.local_vars {
+        let s = index_to_offset(byte_offsets, lv.start, code_len);
+        let e = index_to_offset(byte_offsets, lv.end, code_len).max(s);
+        final_unclosed_pc = final_unclosed_pc.max(e);
     }
 
-    // Column table
-    let mut prev_col_pc: u32 = 0;
+    let mut events =
+        Vec::with_capacity(line_slice.len() + dbg.column_table.len() + dbg.local_vars.len() * 2);
+    let mut seq = 0usize;
+
+    for entry in line_slice {
+        let pc = index_to_offset(byte_offsets, entry.index, code_len);
+        events.push(LnpEvent {
+            pc,
+            seq,
+            kind: LnpEventKind::Line { line: entry.line },
+        });
+        seq += 1;
+    }
+
     for entry in &dbg.column_table {
         let pc = index_to_offset(byte_offsets, entry.index, code_len);
-        let pc_delta = pc.saturating_sub(prev_col_pc);
-        b.lnp_emit_column(lnp, debug_h, pc_delta, entry.column);
-        prev_col_pc = pc;
-        cur_pc = cur_pc.saturating_add(pc_delta);
+        events.push(LnpEvent {
+            pc,
+            seq,
+            kind: LnpEventKind::Column {
+                column: entry.column,
+            },
+        });
+        seq += 1;
     }
 
-    // Local variables — advance the program counter to each scope boundary
-    // so start_local/end_local span the variable's live range (the line and
-    // column tables above have already moved the pc past zero).
+    let mut has_implicit_end_local = false;
     for lv in &dbg.local_vars {
         let name_h = get_or_add_string_id(b, string_handles, pool, lv.name)?;
         let type_h = get_or_add_string_id(b, string_handles, pool, lv.type_name)?;
-        let start_pc = index_to_offset(byte_offsets, lv.start, code_len);
-        let start_delta = start_pc.saturating_sub(cur_pc);
-        if start_delta > 0 {
-            b.lnp_emit_advance_pc(lnp, debug_h, start_delta);
-            cur_pc = start_pc;
-        }
-        let sig_str = pool.resolve(lv.type_signature).unwrap_or("");
-        if !sig_str.is_empty() {
-            let sig_h = get_or_add_string_id(b, string_handles, pool, lv.type_signature)?;
-            b.lnp_emit_start_local_extended(lnp, debug_h, lv.reg_number, name_h, type_h, sig_h);
+        let sig_h = if lv.type_signature == lv.type_name {
+            None
         } else {
-            b.lnp_emit_start_local(lnp, debug_h, lv.reg_number, name_h, type_h);
+            Some(get_or_add_string_id(
+                b,
+                string_handles,
+                pool,
+                lv.type_signature,
+            )?)
+        };
+        let start_pc = index_to_offset(byte_offsets, lv.start, code_len);
+        let end_pc = index_to_offset(byte_offsets, lv.end, code_len).max(start_pc);
+
+        if end_pc == start_pc {
+            // Zero-length range: start then immediately end at `start_pc`
+            // unless `end_pc == 0 == final_unclosed_pc` (empty program).
+            events.push(LnpEvent {
+                pc: start_pc,
+                seq,
+                kind: LnpEventKind::StartLocal {
+                    reg: lv.reg_number,
+                    name: name_h,
+                    type_name: type_h,
+                    type_sig: sig_h,
+                },
+            });
+            seq += 1;
+            if end_pc > 0 && end_pc < final_unclosed_pc {
+                events.push(LnpEvent {
+                    pc: end_pc,
+                    seq,
+                    kind: LnpEventKind::EndLocal { reg: lv.reg_number },
+                });
+                seq += 1;
+            } else if end_pc > 0 {
+                has_implicit_end_local = true;
+            }
+            continue;
         }
-        let end_pc = index_to_offset(byte_offsets, lv.end, code_len);
-        let end_delta = end_pc.saturating_sub(cur_pc);
-        if end_delta > 0 {
-            b.lnp_emit_advance_pc(lnp, debug_h, end_delta);
-            cur_pc = end_pc;
+
+        events.push(LnpEvent {
+            pc: start_pc,
+            seq,
+            kind: LnpEventKind::StartLocal {
+                reg: lv.reg_number,
+                name: name_h,
+                type_name: type_h,
+                type_sig: sig_h,
+            },
+        });
+        seq += 1;
+
+        if end_pc < final_unclosed_pc {
+            events.push(LnpEvent {
+                pc: end_pc,
+                seq,
+                kind: LnpEventKind::EndLocal { reg: lv.reg_number },
+            });
+            seq += 1;
+        } else if end_pc > 0 {
+            has_implicit_end_local = true;
         }
-        b.lnp_emit_end_local(lnp, lv.reg_number);
+    }
+
+    // Sort by `(pc, priority, seq)`: at any PC, `EndLocal` runs before
+    // `StartLocal` (except zero-length `[pc, pc)` where `EndLocal` shares `pc`
+    // — wait: for zero-length `[pc, pc)` with `pc > 0`, `StartLocal` must
+    // precede its own `EndLocal`! Handle zero-length `EndLocal` via `seq` only
+    // or emit after `StartLocal`).
+    events.sort_by_key(|ev| (ev.pc, ev.kind.priority(), ev.seq));
+
+    // Re-check zero-length `[pc, pc)` locals where `start_pc == end_pc < final_unclosed_pc`:
+    // ensure no `EndLocal` precedes its matching `StartLocal` on an unstarted register.
+    let mut active_regs: Vec<i32> = Vec::new();
+    let mut deferred_same_pc_ends: Vec<i32> = Vec::new();
+    let mut cur_pc: u32 = 0;
+    let mut prev_line: u32 = first_line;
+    let mut idx = 0usize;
+
+    while idx < events.len() {
+        let group_pc = events[idx].pc;
+        let group_end = events[idx..]
+            .iter()
+            .position(|e| e.pc != group_pc)
+            .map_or(events.len(), |off| idx + off);
+
+        deferred_same_pc_ends.clear();
+        for ev in &events[idx..group_end] {
+            match ev.kind {
+                LnpEventKind::EndLocal { reg } => {
+                    if let Some(pos) = active_regs.iter().rposition(|&r| r == reg) {
+                        if group_pc > cur_pc {
+                            b.lnp_emit_advance_pc(lnp, debug_h, group_pc - cur_pc);
+                            cur_pc = group_pc;
+                        }
+                        b.lnp_emit_end_local(lnp, reg);
+                        active_regs.remove(pos);
+                    } else {
+                        deferred_same_pc_ends.push(reg);
+                    }
+                }
+                LnpEventKind::Line { line } => {
+                    let pc_delta = group_pc - cur_pc;
+                    let line_delta = (line as i32).wrapping_sub(prev_line as i32);
+                    b.lnp_emit_special_opcode(lnp, debug_h, pc_delta, line_delta);
+                    cur_pc = group_pc;
+                    prev_line = line;
+                }
+                LnpEventKind::Column { column } => {
+                    let pc_delta = group_pc - cur_pc;
+                    b.lnp_emit_column(lnp, debug_h, pc_delta, column);
+                    cur_pc = group_pc;
+                }
+                LnpEventKind::StartLocal {
+                    reg,
+                    name,
+                    type_name,
+                    type_sig,
+                } => {
+                    if group_pc > cur_pc {
+                        b.lnp_emit_advance_pc(lnp, debug_h, group_pc - cur_pc);
+                        cur_pc = group_pc;
+                    }
+                    if let Some(sig) = type_sig {
+                        b.lnp_emit_start_local_extended(lnp, debug_h, reg, name, type_name, sig);
+                    } else {
+                        b.lnp_emit_start_local(lnp, debug_h, reg, name, type_name);
+                    }
+                    active_regs.push(reg);
+                }
+            }
+        }
+        for &reg in &deferred_same_pc_ends {
+            if let Some(pos) = active_regs.iter().rposition(|&r| r == reg) {
+                if group_pc > cur_pc {
+                    b.lnp_emit_advance_pc(lnp, debug_h, group_pc - cur_pc);
+                    cur_pc = group_pc;
+                }
+                b.lnp_emit_end_local(lnp, reg);
+                active_regs.remove(pos);
+            }
+        }
+
+        idx = group_end;
+    }
+
+    if has_implicit_end_local && final_unclosed_pc > cur_pc {
+        b.lnp_emit_advance_pc(lnp, debug_h, final_unclosed_pc - cur_pc);
     }
 
     b.lnp_emit_end(lnp);
@@ -2802,31 +3048,30 @@ fn encode_debug_info(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+struct LiteralEncodeCtx<'a> {
+    string_handles: &'a mut [Option<StringHandle>],
+    pool: &'a StringPool,
+    entity_map: &'a HashMap<u32, StringId>,
+    entities: &'a EntityHandles,
+    literal_handles: &'a [LiteralArrayHandle],
+}
+
 fn encode_literal_value(
     b: &mut Builder,
-    string_handles: &mut HashMap<StringId, StringHandle>,
-    pool: &StringPool,
+    ctx: &mut LiteralEncodeCtx<'_>,
     la: LiteralArrayHandle,
     val: &LiteralValue,
-    entity_map: &HashMap<u32, StringId>,
-    entities: &EntityHandles,
-    literal_handles: &[LiteralArrayHandle],
 ) -> Result<(), Error> {
-    // Helper: resolve a method entity offset to a MethodHandle. The offset
-    // is the unique entity identity; the name lookup via entity_map is only
-    // a fallback for hand-built models (offset 0).
+    // A non-zero offset is the unique entity identity; the name lookup via
+    // `entity_map` at offset `0` only serves hand-built offsetless models.
     let resolve_method = |off: u32| -> Option<MethodHandle> {
-        if off != 0
-            && let Some(&mh) = entities.methods_by_offset.get(&off)
-        {
-            return Some(mh);
+        if off != 0 {
+            return ctx.entities.methods_by_offset.get(&off).copied();
         }
-        let sid = entity_map.get(&off)?;
-        entities.methods_by_name.get(sid).copied()
+        let sid = ctx.entity_map.get(&0)?;
+        ctx.entities.methods_by_name.get(sid).copied()
     };
 
-    // Literal arrays are stored as flat (tag_u8, value) pairs.
     match val {
         LiteralValue::Bool(v) => {
             b.literal_array_add_u8(la, LiteralTag::Bool as u8);
@@ -2850,12 +3095,9 @@ fn encode_literal_value(
         }
         LiteralValue::String(sid) => {
             b.literal_array_add_u8(la, LiteralTag::String as u8);
-            let sh = get_or_add_string_id(b, string_handles, pool, *sid)?;
+            let sh = get_or_add_string_id(b, ctx.string_handles, ctx.pool, *sid)?;
             b.literal_array_add_raw_string(la, sh);
         }
-        // Method references: an unresolvable offset must fail loudly —
-        // falling back to writing the source-file offset into the new
-        // file's different layout silently corrupts the array (#6).
         LiteralValue::Method(off) => {
             let mh = resolve_method(*off).ok_or_else(|| {
                 Error::CodeRelocation(format!(
@@ -2910,12 +3152,7 @@ fn encode_literal_value(
             b.literal_array_add_u16(la, *v);
         }
         LiteralValue::LiteralArray(idx) => {
-            // idx is a model table index into File::literal_arrays, NOT a
-            // builder handle: annotation-embedded arrays occupy other handle
-            // slots. Resolve through the handle table and route the result
-            // through the reference API so the writer stores the array's
-            // final file offset.
-            let target = literal_handles.get(idx.0 as usize).ok_or_else(|| {
+            let target = ctx.literal_handles.get(idx.0 as usize).ok_or_else(|| {
                 Error::CodeRelocation(format!(
                     "nested literal array index {} out of bounds",
                     idx.0
@@ -2933,7 +3170,7 @@ fn encode_literal_value(
         }
         LiteralValue::EtsImplements(sid) => {
             b.literal_array_add_u8(la, LiteralTag::EtsImplements as u8);
-            let sh = get_or_add_string_id(b, string_handles, pool, *sid)?;
+            let sh = get_or_add_string_id(b, ctx.string_handles, ctx.pool, *sid)?;
             b.literal_array_add_raw_string(la, sh);
         }
         LiteralValue::NullValue(v) => {
@@ -2992,7 +3229,6 @@ fn encode_literal_value(
     Ok(())
 }
 
-/// Convert an instruction index to a byte offset using the offset table.
 fn index_to_offset(byte_offsets: &[u32], index: u32, code_len: u32) -> u32 {
     byte_offsets
         .get(index as usize)
@@ -3000,14 +3236,14 @@ fn index_to_offset(byte_offsets: &[u32], index: u32, code_len: u32) -> u32 {
         .unwrap_or(code_len)
 }
 
-/// Resolve a StringId through the pool and add it to the builder's string table.
 fn get_or_add_string_id(
     b: &mut Builder,
-    string_handles: &mut HashMap<StringId, StringHandle>,
+    string_handles: &mut [Option<StringHandle>],
     pool: &StringPool,
     sid: StringId,
 ) -> Result<StringHandle, Error> {
-    if let Some(&h) = string_handles.get(&sid) {
+    let idx = sid.index();
+    if let Some(&Some(h)) = string_handles.get(idx) {
         return Ok(h);
     }
     let h = if let Some(raw) = pool.raw_mutf8(sid) {
@@ -3019,16 +3255,16 @@ fn get_or_add_string_id(
         })?;
         b.add_string(s)
     };
-    string_handles.insert(sid, h);
+    if let Some(slot) = string_handles.get_mut(idx) {
+        *slot = Some(h);
+    }
     Ok(h)
 }
 
-/// Convert a decoded module record into the handle-based builder form,
-/// interning its name strings into the output file.
 fn module_record_def(
     rec: &ModuleRecord,
     b: &mut Builder,
-    string_handles: &mut HashMap<StringId, StringHandle>,
+    string_handles: &mut [Option<StringHandle>],
     pool: &StringPool,
 ) -> Result<ModuleRecordDef, Error> {
     let mut gs =
@@ -3115,7 +3351,6 @@ mod tests {
 
     #[test]
     fn handles_resolve_by_offset_when_names_collide() {
-        // Same name in two classes; only the offset disambiguates.
         let mut pool = StringPool::default();
         let name = pool.get_or_intern("foo");
         let mut entities = EntityHandles::default();
@@ -3129,12 +3364,12 @@ mod tests {
         assert_eq!(entities.resolve_method(name, 200), Some(MethodHandle(2)));
         assert_eq!(entities.resolve_field(name, 300), Some(FieldHandle(3)));
         assert_eq!(entities.resolve_field(name, 400), Some(FieldHandle(4)));
+        assert_eq!(entities.resolve_method(name, 999), None);
+        assert_eq!(entities.resolve_field(name, 999), None);
     }
 
     #[test]
     fn handles_fall_back_to_name_for_offsetless_models() {
-        // Hand-built models carry offset 0; name lookup (last insert wins)
-        // must still work, preserving pre-#6 behavior.
         let mut pool = StringPool::default();
         let name = pool.get_or_intern("bar");
         let mut entities = EntityHandles::default();
@@ -3144,7 +3379,17 @@ mod tests {
 
         assert_eq!(entities.resolve_method(name, 0), Some(MethodHandle(10)));
         assert_eq!(entities.resolve_field(name, 0), Some(FieldHandle(20)));
-        // Unknown offsets on an offset-carrying resolver do not resolve.
-        assert_eq!(entities.resolve_method(name, 999), Some(MethodHandle(10)));
+        // Unknown non-zero offsets must never silently alias by name (#44 R1-H6 #7).
+        assert_eq!(entities.resolve_method(name, 999), None);
+        assert_eq!(entities.resolve_field(name, 999), None);
+    }
+
+    #[test]
+    fn c_mutf8_encodes_nul_and_astral_without_panicking() {
+        let cs = c_mutf8("a\0\u{1F600}z");
+        assert_eq!(
+            cs.as_bytes(),
+            &[b'a', 0xC0, 0x80, 0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80, b'z']
+        );
     }
 }

@@ -306,6 +306,87 @@ bool ContainsLiteralArrayInHeader(const std::array<uint8_t, File::VERSION_SIZE> 
     return IsVersionLessOrEqual(version, LAST_CONTAINS_LITERAL_IN_HEADER_VERSION);
 }
 
+// Validate outer File::Header table bounds and 4-byte alignment before
+// constructing a panda_file::File. Upstream GetClasses / GetLiteralArrays /
+// GetLineNumberProgramIndex / GetIndexHeaders / ValidateChecksum rely on
+// debug-only ASSERTs in Span::SubSpan, which compile out under NDEBUG (#43).
+static bool validate_abc_header(const panda::panda_file::File::Header &header,
+                                size_t buf_len,
+                                std::string *err_out) {
+    using HdrFile = panda::panda_file::File;
+    auto set_err = [&](const char *msg) {
+        if (err_out != nullptr) {
+            *err_out = msg;
+        }
+        return false;
+    };
+
+    if (header.magic != HdrFile::MAGIC) {
+        return set_err("bad magic");
+    }
+    if (header.file_size < sizeof(HdrFile::Header)) {
+        return set_err("declared file_size smaller than header");
+    }
+    if (static_cast<size_t>(header.file_size) > buf_len) {
+        return set_err("declared file_size exceeds buffer");
+    }
+
+    const uint64_t fsize = header.file_size;
+    constexpr uint64_t kHdrSize = sizeof(HdrFile::Header);
+
+    auto check_table = [&](uint32_t off, uint32_t count, uint64_t elem_size,
+                           uint64_t align, bool allow_invalid_sentinel,
+                           const char *label) -> bool {
+        if (allow_invalid_sentinel && count == panda::panda_file::INVALID_INDEX) {
+            return true;
+        }
+        if (count == 0) {
+            if (allow_invalid_sentinel && off == panda::panda_file::INVALID_OFFSET) {
+                return true;
+            }
+            if (static_cast<uint64_t>(off) > fsize) {
+                return set_err(label);
+            }
+            return true;
+        }
+        if (static_cast<uint64_t>(off) < kHdrSize) {
+            return set_err(label);
+        }
+        if (align > 1 && (static_cast<uint64_t>(off) % align) != 0) {
+            return set_err(label);
+        }
+        const uint64_t byte_len = static_cast<uint64_t>(count) * elem_size;
+        if (byte_len > fsize || static_cast<uint64_t>(off) > fsize - byte_len) {
+            return set_err(label);
+        }
+        return true;
+    };
+
+    if (!check_table(header.foreign_off, header.foreign_size, 1, 1, false,
+                     "invalid foreign region in header")) {
+        return false;
+    }
+    if (!check_table(header.class_idx_off, header.num_classes, sizeof(uint32_t),
+                     alignof(uint32_t), false, "invalid class index table in header")) {
+        return false;
+    }
+    if (!check_table(header.lnp_idx_off, header.num_lnps, sizeof(uint32_t),
+                     alignof(uint32_t), false, "invalid lnp index table in header")) {
+        return false;
+    }
+    if (!check_table(header.literalarray_idx_off, header.num_literalarrays,
+                     sizeof(uint32_t), alignof(uint32_t), true,
+                     "invalid literalarray index table in header")) {
+        return false;
+    }
+    if (!check_table(header.index_section_off, header.num_indexes,
+                     sizeof(HdrFile::IndexHeader), alignof(uint32_t), false,
+                     "invalid index section table in header")) {
+        return false;
+    }
+    return true;
+}
+
 PandaFileType GetFileType(const uint8_t *data, int32_t size) {
     // Ported from upstream file.cpp (merged here; see review finding #4).
     if (data == nullptr || size < 0 || static_cast<uint32_t>(size) < sizeof(File::Header)) {
@@ -319,7 +400,7 @@ PandaFileType GetFileType(const uint8_t *data, int32_t size) {
         return PandaFileType::FILE_FORMAT_INVALID;
     }
 
-    if (File::MAGIC != header.magic) {
+    if (!validate_abc_header(header, actual_size, nullptr)) {
         return PandaFileType::FILE_FORMAT_INVALID;
     }
 
@@ -441,16 +522,7 @@ try {
     }
     File::Header header{};
     std::memcpy(&header, data, sizeof(header));
-    if (header.magic != File::MAGIC) {
-        g_open_error = "bad magic";
-        return nullptr;
-    }
-    // #3: reject a header whose declared file_size exceeds the buffer before
-    // allocating the padded copy. Vendor Spans are sized from file_size and
-    // bounds-check only via ASSERT (compiled out under NDEBUG), so an
-    // inflated file_size would turn later reads into heap OOB.
-    if (header.file_size > len) {
-        g_open_error = "declared file_size exceeds buffer";
+    if (!panda::panda_file::validate_abc_header(header, len, &g_open_error)) {
         return nullptr;
     }
     try {
@@ -487,12 +559,7 @@ try {
     const size_t orig_len = padded_len - PADDING;
     File::Header header{};
     std::memcpy(&header, data, sizeof(header));
-    if (header.magic != File::MAGIC) {
-        g_open_error = "bad magic";
-        return nullptr;
-    }
-    if (header.file_size > orig_len) {
-        g_open_error = "declared file_size exceeds buffer";
+    if (!panda::panda_file::validate_abc_header(header, orig_len, &g_open_error)) {
         return nullptr;
     }
     for (size_t i = orig_len; i < padded_len; ++i) {
@@ -1235,10 +1302,10 @@ try {
         AbcTryBlockInfo ti;
         ti.start_pc = try_block.GetStartPc();
         ti.length = try_block.GetLength();
-        ti.num_catches = try_block.GetNumCatches();
+        uint32_t wire_catches = try_block.GetNumCatches();
 
         std::vector<AbcCatchBlockInfo> catches;
-        catches.reserve(ti.num_catches);
+        catches.reserve(std::min<size_t>(wire_catches, 256));
         try_block.EnumerateCatchBlocks([&](CodeDA::CatchBlock &catch_block) {
             AbcCatchBlockInfo ci;
             ci.type_idx = catch_block.GetTypeIdx();
@@ -1247,6 +1314,7 @@ try {
             catches.push_back(ci);
             return true;  // continue
         });
+        ti.num_catches = static_cast<uint32_t>(catches.size());
 
         cb(&ti, catches.data(), ctx);
         return true;  // continue
@@ -2105,6 +2173,7 @@ enum AbcLnpOp : uint8_t {
     ABC_LNP_OP_END = 0,
     ABC_LNP_OP_ADVANCE_PC,
     ABC_LNP_OP_ADVANCE_LINE,
+    ABC_LNP_OP_SPECIAL,
     ABC_LNP_OP_COLUMN,
     ABC_LNP_OP_START_LOCAL,
     ABC_LNP_OP_START_LOCAL_EXTENDED,
@@ -2957,6 +3026,20 @@ static void abc_builder_flush_lnp_staging(AbcBuilder *b) {
                 if (op.debug >= b->debug_infos.size()) continue;
                 lnp->EmitAdvanceLine(b->debug_infos[op.debug]->GetConstantPool(), op.b);
                 break;
+            case ABC_LNP_OP_SPECIAL: {
+                if (op.debug >= b->debug_infos.size()) continue;
+                if (!lnp->EmitSpecialOpcode(op.a, op.b)) {
+                    auto *cp = b->debug_infos[op.debug]->GetConstantPool();
+                    if (op.a != 0) {
+                        lnp->EmitAdvancePc(cp, op.a);
+                    }
+                    if (op.b != 0) {
+                        lnp->EmitAdvanceLine(cp, op.b);
+                    }
+                    lnp->EmitSpecialOpcode(0, 0);
+                }
+                break;
+            }
             case ABC_LNP_OP_COLUMN:
                 if (op.debug >= b->debug_infos.size()) continue;
                 lnp->EmitColumn(b->debug_infos[op.debug]->GetConstantPool(), op.a, op.c);
@@ -3037,6 +3120,18 @@ try {
     if (lnp_handle >= b->lnps.size()) return;
     if (debug_handle >= b->debug_infos.size()) return;
     b->lnp_staging.push_back({ABC_LNP_OP_ADVANCE_LINE, lnp_handle, debug_handle, 0, value, 0, 0});
+} catch (...) {
+    return;
+}
+}
+
+void abc_builder_lnp_emit_special_opcode(AbcBuilder *b, uint32_t lnp_handle,
+                                          uint32_t debug_handle,
+                                          uint32_t pc_inc, int32_t line_inc) {
+try {
+    if (lnp_handle >= b->lnps.size()) return;
+    if (debug_handle >= b->debug_infos.size()) return;
+    b->lnp_staging.push_back({ABC_LNP_OP_SPECIAL, lnp_handle, debug_handle, pc_inc, line_inc, 0, 0});
 } catch (...) {
     return;
 }

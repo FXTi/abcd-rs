@@ -116,11 +116,10 @@ pub fn format_scientific6(v: f64) -> String {
         return if v.is_sign_negative() { "-inf" } else { "inf" }.to_owned();
     }
     let s = format!("{v:.6e}");
-    let epos = s.find('e').expect("scientific format has an exponent");
-    let exp: i32 = s[epos + 1..].parse().expect("scientific exponent");
+    let (mantissa, exp_str) = s.split_once('e').unwrap_or((&s, "0"));
+    let exp: i32 = exp_str.parse().unwrap_or(0);
     format!(
-        "{}e{}{:02}",
-        &s[..epos],
+        "{mantissa}e{}{:02}",
         if exp < 0 { '-' } else { '+' },
         exp.abs()
     )
@@ -178,11 +177,10 @@ pub fn format_g6(v: f64) -> String {
 /// its parsed base-10 exponent.
 fn format_scientific_exp(v: f64, prec: usize) -> (String, i32) {
     let s = format!("{v:.prec$e}");
-    let epos = s.find('e').expect("scientific format has an exponent");
-    let exp: i32 = s[epos + 1..].parse().expect("scientific exponent");
+    let (mantissa, exp_str) = s.split_once('e').unwrap_or((&s, "0"));
+    let exp: i32 = exp_str.parse().unwrap_or(0);
     let text = format!(
-        "{}e{}{:02}",
-        &s[..epos],
+        "{mantissa}e{}{:02}",
         if exp < 0 { '-' } else { '+' },
         exp.abs()
     );
@@ -280,22 +278,39 @@ mod sim {
     //! the list head, `Null` when the bucket is empty). Same-bucket nodes are
     //! contiguous in the list.
 
-    /// First primes of libstdc++'s `__prime_list` (ample for any realistic
-    /// literal-array count).
-    const PRIMES: &[usize] = &[
+    /// Exact 32-bit prefix of GCC libstdc++ `__prime_list`
+    /// (`libstdc++-v3/src/shared/hashtable-aux.cc`), matching
+    /// `std::__detail::_Prime_rehash_policy::_M_next_bkt` across the full
+    /// `u32` offset space.
+    pub(super) const PRIMES: &[u32] = &[
         2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89,
         97, 103, 109, 113, 127, 137, 139, 149, 157, 167, 179, 193, 199, 211, 227, 241, 257, 277,
         293, 313, 337, 359, 383, 409, 439, 467, 503, 541, 577, 619, 661, 709, 761, 823, 887, 953,
-        1031, 1109, 1193, 1289, 1381, 1483, 1601, 1709, 1831, 1973, 2129, 2309, 2491, 2689, 2903,
-        3137, 3391, 3659, 3947, 4271, 4621, 4999, 5407, 5851, 6323, 6841, 7399, 7993, 8641, 9341,
-        10099, 10939, 11831, 12821, 13877, 15013, 16231, 17551, 18973, 20507, 22171, 23957,
+        1031, 1109, 1193, 1289, 1381, 1493, 1613, 1741, 1879, 2029, 2179, 2357, 2549, 2753, 2971,
+        3209, 3469, 3739, 4027, 4349, 4703, 5087, 5503, 5953, 6427, 6949, 7517, 8123, 8783, 9497,
+        10273, 11113, 12011, 12983, 14033, 15173, 16411, 17749, 19183, 20753, 22447, 24281, 26267,
+        28411, 30727, 33223, 35933, 38873, 42043, 45481, 49201, 53201, 57557, 62233, 67307, 72817,
+        78779, 85229, 92203, 99733, 107897, 116731, 126271, 136607, 147793, 159871, 172933, 187091,
+        202409, 218971, 236897, 256279, 277261, 299951, 324503, 351061, 379787, 410857, 444487,
+        480881, 520241, 562841, 608903, 658753, 712697, 771049, 834181, 902483, 976369, 1056323,
+        1142821, 1236397, 1337629, 1447153, 1565659, 1693859, 1832561, 1982627, 2144977, 2320627,
+        2510653, 2716249, 2938679, 3179303, 3439651, 3721303, 4026031, 4355707, 4712381, 5098259,
+        5515729, 5967347, 6456007, 6984629, 7556579, 8175383, 8844859, 9569143, 10352717, 11200489,
+        12117689, 13109983, 14183539, 15345007, 16601593, 17961079, 19431899, 21023161, 22744717,
+        24607243, 26622317, 28802401, 31160981, 33712729, 36473443, 39460231, 42691603, 46187573,
+        49969847, 54061849, 58488943, 63278561, 68460391, 74066549, 80131819, 86693767, 93793069,
+        101473717, 109783337, 118773397, 128499677, 139022417, 150406843, 162723577, 176048909,
+        190465427, 206062531, 222936881, 241193053, 260944219, 282312799, 305431229, 330442829,
+        357502601, 386778277, 418451333, 452718089, 489790921, 529899637, 573292817, 620239453,
+        671030513, 725980837, 785430967, 849749479, 919334987, 994618837, 1076067617, 1164186217,
+        1259520799, 1362662261, 1474249943, 1594975441, 1725587117, 1866894511, 2019773507,
+        2185171673, 2364114217, 2557710269, 2767159799, 2993761039, 3238918481, 3504151727,
+        3791104843, 4101556399, 4294967291,
     ];
 
     fn next_bkt(n: usize) -> usize {
-        match PRIMES.iter().position(|&p| p >= n) {
-            Some(i) => PRIMES[i],
-            None => n, // out of table: never reached at corpus scale
-        }
+        let idx = PRIMES.partition_point(|&p| (p as usize) < n);
+        PRIMES.get(idx).map_or(n, |&p| p as usize)
     }
 
     /// Bucket-slot value: the before-node of the bucket's first node.
@@ -315,10 +330,12 @@ mod sim {
         next_resize: usize,
     }
 
-    // `new` without `Default`: the only construction sites are the two
-    // `U32Set::new()` calls in `collect_literal_tables`; the Default impl
-    // was dead surface (clippy would want one, hence the allow).
-    #[allow(clippy::new_without_default)]
+    impl Default for U32Set {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     impl U32Set {
         pub fn new() -> Self {
             U32Set {
@@ -506,6 +523,11 @@ mod sim {
 
         pub fn first(&self) -> Option<u32> {
             self.head.map(|h| self.nodes[h].0)
+        }
+
+        #[cfg(test)]
+        pub(super) fn bucket_count(&self) -> usize {
+            self.buckets.len()
         }
     }
 }
@@ -711,7 +733,8 @@ impl<'f> Emitter<'f> {
 
     fn register_body_strings(&mut self, body: &MethodBody) {
         for bc in &body.bytecodes {
-            for (kind, id) in bc.entity_operands() {
+            let (ops, len) = bc.entity_operands_inline();
+            for &(kind, id) in &ops[..len] {
                 if kind == EntityKind::StringId
                     && let Some(&off) = body.entity_offsets.get(&(kind, id.0))
                 {
@@ -872,7 +895,7 @@ impl<'f> Emitter<'f> {
         labels: &mut BTreeMap<u32, String>,
         out: &mut Vec<u8>,
     ) {
-        let operands = bc.operands();
+        let (operands, len) = bc.operands_inline();
         // Upstream call-arg trimming (CALL-flagged pandasm opcodes) is
         // not needed here: BytecodeFlags::CALL exists in the ISA schema
         // but is never assigned to any instruction (regression test
@@ -880,7 +903,7 @@ impl<'f> Emitter<'f> {
         // trim_call_args/method_proto machinery was deleted as dead.
         let float = bc.has_flag(BytecodeFlags::FLOAT);
         out.extend_from_slice(bc.mnemonic().as_bytes());
-        for (i, op) in operands.iter().enumerate() {
+        for (i, op) in operands[..len].iter().enumerate() {
             out.extend_from_slice(if i == 0 { b" " } else { b", " });
             self.render_operand(bc, float, op, body, labels, out);
         }
@@ -1110,7 +1133,12 @@ impl<'f> Emitter<'f> {
     fn collect_literal_tables(&self) -> LiteralTables<'f> {
         let mut regular: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
         let mut modules: BTreeMap<Vec<u8>, &'f ModuleData> = BTreeMap::new();
-        if self.file.version <= LAST_HEADER_LITERAL_VERSION {
+        let uses_header_table = match self.file.dialect() {
+            Some(crate::Dialect::DynamicLegacy) => true,
+            Some(crate::Dialect::DynamicModern) => self.file.version <= LAST_HEADER_LITERAL_VERSION,
+            Some(crate::Dialect::Static) | None => false,
+        };
+        if uses_header_table {
             self.collect_header_literal_tables(&mut regular, &mut modules);
         } else {
             self.collect_simulated_literal_tables(&mut regular, &mut modules);
@@ -1251,7 +1279,8 @@ impl<'f> Emitter<'f> {
             for method in &class.methods {
                 let Some(body) = &method.body else { continue };
                 for bc in &body.bytecodes {
-                    for (kind, id) in bc.entity_operands() {
+                    let (ops, len) = bc.entity_operands_inline();
+                    for &(kind, id) in &ops[..len] {
                         if kind != EntityKind::LiteralarrayId {
                             continue;
                         }
@@ -2257,5 +2286,66 @@ mod tests {
         let err = emit_file_to_writer(&file, "dup.abc", &mut FailingWriter)
             .expect_err("broken writer must propagate io::Error");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn sim_primes_match_libstdcpp_and_cover_u32_space() {
+        assert_eq!(sim::PRIMES.len(), 256);
+        assert_eq!(sim::PRIMES[0], 2);
+        assert_eq!(*sim::PRIMES.last().unwrap(), 4_294_967_291);
+        for pair in sim::PRIMES.windows(2) {
+            assert!(pair[0] < pair[1], "primes must be strictly increasing");
+        }
+        for &p in sim::PRIMES {
+            assert!(p >= 2);
+            if p > 3 {
+                assert_ne!(p % 2, 0, "{p} is divisible by 2");
+                let mut d = 3u64;
+                let limit = u64::from(p);
+                while d * d <= limit {
+                    assert_ne!(limit % d, 0, "{p} is composite (divisible by {d})");
+                    d += 2;
+                }
+            }
+        }
+
+        let mut set = sim::U32Set::default();
+        for v in 0..1_110u32 {
+            set.insert(v);
+        }
+        assert_eq!(
+            set.bucket_count(),
+            2_357,
+            "libstdc++ _Prime_rehash_policy selects 2357 buckets at 1110 items"
+        );
+
+        let mut large = sim::U32Set::default();
+        for v in 0..25_000u32 {
+            large.insert(v);
+        }
+        assert_eq!(
+            large.bucket_count(),
+            42_043,
+            "U32Set must rehash through primes above the old 23,957 ceiling"
+        );
+        assert_eq!(large.iter().len(), 25_000);
+    }
+
+    #[test]
+    fn static_dialect_does_not_treat_version_as_dynamic_12x_header_table() {
+        let mut static_file = file_at(Version::new(0, 1, 0, 7));
+        static_file.file_type = crate::FileType::Static;
+        static_file.literal_arrays.push(crate::LiteralArray {
+            values: vec![LiteralValue::Integer(42)],
+        });
+        static_file.literal_array_offsets.insert(0x10, 0);
+        assert_eq!(static_file.dialect(), Some(crate::Dialect::Static));
+
+        let out = emit_file(&static_file, "static.abc");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("0 0x10"),
+            "Static 0.1.0.7 must not fall into <=12.0.6.0 dynamic header literal table: {text}"
+        );
     }
 }

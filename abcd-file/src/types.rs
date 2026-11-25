@@ -232,3 +232,37 @@ impl TryFrom<u8> for FunctionKind {
         }
     }
 }
+
+/// Bytecode container dialect classified from `(FileType, Version)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Dialect {
+    /// Modern dynamic ECMAScript / ArkTS 1.0–1.1 container (`9.0.0.0`..=`24.0.0.0`).
+    DynamicModern,
+    /// Legacy pre-2022-08-18 dynamic container (`0.0.0.2`).
+    DynamicLegacy,
+    /// Static ArkTS 1.2 / Panda static VM container (`0.1.0.7`).
+    Static,
+}
+
+impl Dialect {
+    /// Legacy dynamic `.abc` format version (`0.0.0.2`).
+    pub const LEGACY_VERSION: abcd_isa::Version = abcd_isa::Version::new(0, 0, 0, 2);
+
+    /// Classify an `.abc` header `(file_type, version)` into its [`Dialect`].
+    /// Returns `None` when `file_type` is [`sys::FileType::Invalid`].
+    #[inline]
+    pub const fn from_header(file_type: sys::FileType, version: abcd_isa::Version) -> Option<Self> {
+        match file_type {
+            sys::FileType::Static => Some(Self::Static),
+            sys::FileType::Dynamic => {
+                let b = version.as_bytes();
+                if b[0] == 0 && b[1] == 0 && b[2] == 0 && b[3] == 2 {
+                    Some(Self::DynamicLegacy)
+                } else {
+                    Some(Self::DynamicModern)
+                }
+            }
+            sys::FileType::Invalid => None,
+        }
+    }
+}

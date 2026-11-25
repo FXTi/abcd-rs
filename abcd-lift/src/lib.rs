@@ -937,7 +937,7 @@ mod tests {
         let cls = b.add_global_class();
         let proto = b.create_proto(Type::Void, &[]);
         for idx in 0..8 {
-            let (insns, _) = encode_bytecodes(&[
+            let (insns, offsets) = encode_bytecodes(&[
                 Bytecode::Lda(Reg(0)),
                 Bytecode::Return,
                 Bytecode::Sta(Reg(1)),
@@ -948,12 +948,12 @@ mod tests {
             let code = b.create_code(&insns, 2, 3);
             b.code_add_try_block(
                 code,
-                0,
-                2,
+                offsets[0],
+                offsets[2] - offsets[0],
                 &[CatchBlockDef {
                     type_class: None,
-                    handler_pc: 2,
-                    code_size: 3,
+                    handler_pc: offsets[2],
+                    code_size: insns.len() as u32 - offsets[2],
                 }],
             );
             let m = b.class_add_method(

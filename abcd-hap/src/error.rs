@@ -16,7 +16,8 @@ pub enum Error {
     #[error("malformed central directory: {0}")]
     BadCentralDirectory(&'static str),
     /// An entry's declared sizes cannot be processed (offset arithmetic
-    /// overflow or an allocation size that does not fit `usize`).
+    /// overflow, an allocation size that does not fit `usize`, or exceeding
+    /// configured [`crate::Limits`]).
     #[error("entry {name} is too large to process")]
     EntryTooLarge {
         /// Entry name.
@@ -45,14 +46,26 @@ pub enum Error {
     /// mis-parsed as 32-bit values.
     #[error("ZIP64 archives are not supported")]
     Zip64,
-    /// DEFLATE inflation failed for the named entry (corrupt stream, or the
-    /// inflated size does not match the central directory).
+    /// DEFLATE inflation failed for the named entry (corrupt stream,
+    /// compression-ratio bomb, or inflated size mismatch against the central
+    /// directory).
     #[error("failed to inflate entry {name}: {reason}")]
     Inflate {
         /// Entry name.
         name: String,
         /// Failure detail.
         reason: String,
+    },
+    /// Computed IEEE 802.3 CRC-32 of the uncompressed entry payload does not
+    /// match the checksum recorded in the central directory.
+    #[error("CRC-32 mismatch for entry {name}: expected {expected:#010x}, actual {actual:#010x}")]
+    CrcMismatch {
+        /// Entry name.
+        name: String,
+        /// Expected CRC-32 recorded in the central directory.
+        expected: u32,
+        /// Actual CRC-32 computed over the uncompressed payload.
+        actual: u32,
     },
     /// The container (or its nested modules) carries no `.abc` entry at all
     /// (neither `ets/modules.abc` nor any per-ability bytecode).

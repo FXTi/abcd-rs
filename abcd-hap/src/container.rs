@@ -1,5 +1,5 @@
 //! Container sniffing (`.hap` / `.hsp` / `.hqf` vs `.app`) and the
-//! `abc_modules` extraction entry point.
+//! `abc_modules` / `abc_modules_with_limits` extraction entry points.
 //!
 //! Classification is driven by the *entry set*, never by file extension:
 //!
@@ -13,7 +13,7 @@
 //! - anything else carries no extractable bytecode.
 
 use crate::Error;
-use crate::zip::{Compression, EntryData, EntryMeta, ZipArchive};
+use crate::zip::{Compression, EntryData, EntryMeta, Limits, ZipArchive};
 
 /// Fixed path of the first-class Ark bytecode entry inside a module
 /// container. When present it is always extracted first; any other `.abc`
@@ -27,7 +27,8 @@ pub const CONFIG_JSON: &str = "config.json";
 pub const PATCH_JSON: &str = "patch.json";
 
 /// Maximum container nesting depth: `.app` (1) containing `.hap` / `.hsp`
-/// (2). Deeper nesting is not recursed into.
+/// (2). Deeper nesting is not traversed, using an explicit iterative heap
+/// workstack with zero call-stack recursion.
 pub const MAX_CONTAINER_DEPTH: usize = 2;
 
 /// A sniffed container, classified by entry set rather than file extension.
@@ -68,18 +69,30 @@ impl<'a> Container<'a> {
     }
 }
 
+/// Allocation-free ASCII case-insensitive extension match.
+fn has_ascii_ext_ignore_case(name: &str, ext: &[u8]) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() >= ext.len() && bytes[bytes.len() - ext.len()..].eq_ignore_ascii_case(ext)
+}
+
 /// Entry-name predicate for Ark bytecode: the extension is matched
-/// case-insensitively, the rest of the path is unrestricted.
+/// case-insensitively without allocating; the rest of the path is unrestricted.
 fn is_abc_name(name: &str) -> bool {
-    name.to_ascii_lowercase().ends_with(".abc")
+    has_ascii_ext_ignore_case(name, b".abc")
+}
+
+/// Entry-name predicate for nested module containers inside an `.app`.
+fn is_nested_module_name(name: &str) -> bool {
+    has_ascii_ext_ignore_case(name, b".hap") || has_ascii_ext_ignore_case(name, b".hsp")
 }
 
 /// Metas of all `.abc` entries: `ets/modules.abc` first when present, the
 /// rest in central-directory order.
-fn abc_entry_metas<'m>(archive: &'m ZipArchive<'_>) -> Vec<&'m EntryMeta> {
-    let mut metas: Vec<&EntryMeta> = archive.entries().filter(|e| is_abc_name(&e.name)).collect();
+fn abc_entry_metas<'m, 'a>(archive: &'m ZipArchive<'a>) -> Vec<&'m EntryMeta<'a>> {
+    let mut metas: Vec<&EntryMeta<'a>> =
+        archive.entries().filter(|e| is_abc_name(&e.name)).collect();
     // Stable sort: modules.abc to the front, CD order preserved otherwise.
-    metas.sort_by_key(|e| usize::from(e.name != MODULE_ABC));
+    metas.sort_by_key(|e| usize::from(e.name.as_ref() != MODULE_ABC));
     metas
 }
 
@@ -87,11 +100,8 @@ fn abc_entry_metas<'m>(archive: &'m ZipArchive<'_>) -> Vec<&'m EntryMeta> {
 fn nested_module_names(archive: &ZipArchive<'_>) -> Vec<String> {
     archive
         .entries()
-        .filter(|e| {
-            let lower = e.name.to_ascii_lowercase();
-            lower.ends_with(".hap") || lower.ends_with(".hsp")
-        })
-        .map(|e| e.name.clone())
+        .filter(|e| is_nested_module_name(&e.name))
+        .map(|e| e.name.as_ref().to_owned())
         .collect()
 }
 
@@ -121,7 +131,7 @@ pub struct AbcModule<'a> {
     pub container_path: Vec<String>,
 }
 
-impl<'a> AbcModule<'a> {
+impl AbcModule<'_> {
     /// Lift into an `'static` module by owning all payloads (used when the
     /// backing bytes of a nested container do not outlive the call).
     fn into_static(self) -> AbcModule<'static> {
@@ -136,10 +146,45 @@ impl<'a> AbcModule<'a> {
     }
 }
 
-/// Read an entry if present, `Ok(None)` otherwise.
-fn read_optional<'a>(archive: &ZipArchive<'a>, name: &str) -> Result<Option<EntryData<'a>>, Error> {
+/// Read one entry against both `limits.max_entry_bytes` and the running
+/// `remaining_total` budget, deducting its uncompressed byte length on success.
+fn read_checked<'a>(
+    archive: &ZipArchive<'a>,
+    meta: &EntryMeta<'_>,
+    limits: Limits,
+    remaining_total: &mut u64,
+) -> Result<EntryData<'a>, Error> {
+    let step_limits = Limits {
+        max_entry_bytes: limits.max_entry_bytes,
+        max_total_bytes: *remaining_total,
+    };
+    let data = archive.read_entry_with_limits(meta, step_limits)?;
+    *remaining_total = remaining_total.saturating_sub(data.as_slice().len() as u64);
+    Ok(data)
+}
+
+/// Read a named entry against the running `Limits` budget.
+fn read_named_checked<'a>(
+    archive: &ZipArchive<'a>,
+    name: &str,
+    limits: Limits,
+    remaining_total: &mut u64,
+) -> Result<EntryData<'a>, Error> {
+    let meta = archive
+        .entry(name)
+        .ok_or_else(|| Error::EntryNotFound(name.to_string()))?;
+    read_checked(archive, meta, limits, remaining_total)
+}
+
+/// Read an optional entry if present, `Ok(None)` otherwise.
+fn read_optional_checked<'a>(
+    archive: &ZipArchive<'a>,
+    name: &str,
+    limits: Limits,
+    remaining_total: &mut u64,
+) -> Result<Option<EntryData<'a>>, Error> {
     match archive.entry(name) {
-        Some(meta) => Ok(Some(archive.read_entry(meta)?)),
+        Some(meta) => Ok(Some(read_checked(archive, meta, limits, remaining_total)?)),
         None => Ok(None),
     }
 }
@@ -161,19 +206,41 @@ fn extract_modules<'a>(
     archive: &ZipArchive<'a>,
     container_path: Vec<String>,
     force_owned: bool,
+    limits: Limits,
+    remaining_total: &mut u64,
 ) -> Result<Vec<AbcModule<'a>>, Error> {
-    let module_json = match read_optional(archive, MODULE_JSON)? {
+    let module_json = match read_optional_checked(archive, MODULE_JSON, limits, remaining_total)? {
         Some(json) => Some(json),
-        None => read_optional(archive, CONFIG_JSON)?,
+        None => read_optional_checked(archive, CONFIG_JSON, limits, remaining_total)?,
     };
-    let patch_json = read_optional(archive, PATCH_JSON)?;
-    let mut out = Vec::new();
-    for meta in abc_entry_metas(archive) {
-        let data = archive.read_entry(meta)?;
+    let patch_json = read_optional_checked(archive, PATCH_JSON, limits, remaining_total)?;
+    let metas = abc_entry_metas(archive);
+    let mut out = Vec::with_capacity(metas.len());
+    for (idx, meta) in metas.into_iter().enumerate() {
+        let data = read_checked(archive, meta, limits, remaining_total)?;
         let compression = archive.entry_compression(meta)?;
+        // Additional owned manifest clones (beyond the first module in a
+        // nested container) allocate heap copies and are charged to the
+        // cumulative total budget.
+        if force_owned && idx > 0 {
+            let extra_manifest_bytes = module_json
+                .as_ref()
+                .map_or(0u64, |d| d.as_slice().len() as u64)
+                .saturating_add(
+                    patch_json
+                        .as_ref()
+                        .map_or(0u64, |d| d.as_slice().len() as u64),
+                );
+            if extra_manifest_bytes > *remaining_total {
+                return Err(Error::EntryTooLarge {
+                    name: meta.name.as_ref().to_owned(),
+                });
+            }
+            *remaining_total -= extra_manifest_bytes;
+        }
         out.push(AbcModule {
             data: coerce(data, force_owned),
-            entry_name: meta.name.clone(),
+            entry_name: meta.name.as_ref().to_owned(),
             compression,
             module_json: module_json.clone().map(|d| coerce(d, force_owned)),
             patch_json: patch_json.clone().map(|d| coerce(d, force_owned)),
@@ -183,65 +250,120 @@ fn extract_modules<'a>(
     Ok(out)
 }
 
-/// Recurse into a nested container. All payloads are owned, so the results
-/// are `'static` and slot into any output vector regardless of the backing
-/// bytes' lifetime.
-fn collect_nested<'a>(
-    bytes: &[u8],
+/// Heap workstack frame for iterative nested container traversal (zero
+/// call-stack recursion).
+struct PendingContainer {
+    bytes: Vec<u8>,
     depth: usize,
-    path: &mut Vec<String>,
-    out: &mut Vec<AbcModule<'a>>,
-) -> Result<(), Error> {
-    if depth > MAX_CONTAINER_DEPTH {
-        return Ok(());
-    }
-    match Container::sniff(bytes)? {
-        Container::Module(archive) => {
-            // Per-element push (not extend): each module is coerced to
-            // 'static individually; extend would require exact Item equality
-            // against the invariant &mut Vec element type.
-            for m in extract_modules(&archive, path.clone(), true)? {
-                out.push(m.into_static());
-            }
-        }
-        Container::App { outer, modules } => {
-            for name in &modules {
-                let nested = outer.read(name)?.into_owned();
-                path.push(name.clone());
-                collect_nested(&nested, depth + 1, path, out)?;
-                path.pop();
-            }
-        }
-    }
-    Ok(())
+    path: Vec<String>,
 }
 
-/// Extract every Ark bytecode module from an in-memory container.
+/// Extract every Ark bytecode module from an in-memory container under
+/// [`Limits::DEFAULT`].
 ///
 /// - `.hap` / `.hsp` / `.hqf`: one module per `.abc` entry —
 ///   `ets/modules.abc` first when present, then the remaining entries in
 ///   central-directory order (per-ability `ets/**/*.abc`, FA-era
 ///   `assets/js/**/*.abc`, or any other `.abc` path; the entry name is the
 ///   module's identity).
-/// - `.app`: reads each nested `*.hap` / `*.hsp` entry (inflating as
-///   needed — nested modules are DEFLATED by the upstream packer), re-parses
-///   it, and flattens the results with provenance. Nesting deeper than
-///   [`MAX_CONTAINER_DEPTH`] is not recursed into.
+/// - `.app`: reads each nested `*.hap` / `*.hsp` entry via an explicit
+///   iterative heap workstack bounded by [`MAX_CONTAINER_DEPTH`], skipping
+///   valid resource-only nested archives that carry zero `.abc` entries while
+///   propagating corrupt archive errors.
 ///
 /// Data from nested containers is always owned; top-level STORED entries are
 /// zero-copy borrows of `bytes`. Returns [`Error::NoAbcEntry`] when the
-/// container yields no bytecode at all.
+/// entire container yields zero `.abc` modules.
 pub fn abc_modules(bytes: &[u8]) -> Result<Vec<AbcModule<'_>>, Error> {
+    abc_modules_with_limits(bytes, Limits::DEFAULT)
+}
+
+/// Extract every Ark bytecode module from an in-memory container under custom
+/// resource [`Limits`].
+///
+/// Enforces `limits.max_entry_bytes` on each entry and tracks cumulative
+/// extracted/inflated bytes across the outer archive and all nested
+/// `.hap` / `.hsp` archives against `limits.max_total_bytes`.
+pub fn abc_modules_with_limits(bytes: &[u8], limits: Limits) -> Result<Vec<AbcModule<'_>>, Error> {
+    let mut remaining_total = limits.max_total_bytes;
     let mut out = Vec::new();
     match Container::sniff(bytes)? {
         Container::Module(archive) => {
-            out.extend(extract_modules(&archive, Vec::new(), false)?);
+            out.extend(extract_modules(
+                &archive,
+                Vec::new(),
+                false,
+                limits,
+                &mut remaining_total,
+            )?);
         }
         Container::App { outer, modules } => {
-            for name in &modules {
-                let nested = outer.read(name)?.into_owned();
-                let mut path = vec![name.clone()];
-                collect_nested(&nested, 2, &mut path, &mut out)?;
+            let mut workstack: Vec<PendingContainer> = Vec::new();
+            for top_name in modules {
+                let nested_bytes =
+                    read_named_checked(&outer, &top_name, limits, &mut remaining_total)?
+                        .into_owned();
+                workstack.push(PendingContainer {
+                    bytes: nested_bytes,
+                    depth: 2,
+                    path: vec![top_name],
+                });
+                while let Some(item) = workstack.pop() {
+                    if item.depth > MAX_CONTAINER_DEPTH {
+                        continue;
+                    }
+                    let sniffed = match Container::sniff(&item.bytes) {
+                        Ok(container) => container,
+                        // Resource-only or native-only nested .hsp/.hap modules
+                        // inside an .app bundle carry no .abc entries; skip them
+                        // cleanly while propagating real archive corruption.
+                        Err(Error::NoAbcEntry) => continue,
+                        Err(err) => return Err(err),
+                    };
+                    match sniffed {
+                        Container::Module(archive) => {
+                            // Per-element push (not extend): each module is
+                            // coerced to 'static individually against the
+                            // invariant &mut Vec element lifetime.
+                            for m in extract_modules(
+                                &archive,
+                                item.path,
+                                true,
+                                limits,
+                                &mut remaining_total,
+                            )? {
+                                out.push(m.into_static());
+                            }
+                        }
+                        Container::App {
+                            outer: inner_outer,
+                            modules: inner_modules,
+                        } => {
+                            if item.depth < MAX_CONTAINER_DEPTH {
+                                let mut children = Vec::with_capacity(inner_modules.len());
+                                for child_name in inner_modules {
+                                    let child_bytes = read_named_checked(
+                                        &inner_outer,
+                                        &child_name,
+                                        limits,
+                                        &mut remaining_total,
+                                    )?
+                                    .into_owned();
+                                    let mut child_path = item.path.clone();
+                                    child_path.push(child_name);
+                                    children.push(PendingContainer {
+                                        bytes: child_bytes,
+                                        depth: item.depth + 1,
+                                        path: child_path,
+                                    });
+                                }
+                                for child in children.into_iter().rev() {
+                                    workstack.push(child);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

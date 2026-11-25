@@ -41,21 +41,32 @@
 //! assert!(jump.is_jump() && jump.is_terminator());
 //! ```
 
-#![allow(
+#[allow(
     non_upper_case_globals,
     non_camel_case_types,
     non_snake_case,
     dead_code,
-    clippy::all
+    unused_parens,
+    clippy::all,
+    clippy::undocumented_unsafe_blocks,
+    clippy::allow_attributes_without_reason,
+    reason = "pre-generated C FFI and ISA bindings emitted by scripts/vendor-gen.py"
 )]
+mod generated {
+    // Raw FFI bindings (pre-generated from bridge/isa_bridge.h).
+    include!("generated/bindings.rs");
 
-// Raw FFI bindings (pre-generated from bridge/isa_bridge.h).
-include!("generated/bindings.rs");
+    // Bytecode enum, operand newtypes, insn constructors (pre-generated from isa.yaml).
+    include!("generated/bytecode.rs");
+}
 
-// Bytecode enum, operand newtypes, insn constructors (pre-generated from isa.yaml).
-include!("generated/bytecode.rs");
+pub use generated::*;
 
 #[cfg(test)]
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "raw FFI smoke tests exercise generated unsafe extern C exports directly"
+)]
 mod tests {
     //! Raw-FFI smoke tests for the isa bridge exports that the safe layer
     //! pre-validates away (the emitter's UNBOUND_LABELS error switch arm) or

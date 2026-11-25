@@ -44,21 +44,29 @@ fn locate_unique(haystack: &[u8], needle: &[u8]) -> usize {
 /// Read a method's final (post-relocation) code bytes through the sys
 /// layer (same walk as legacy_decode.rs).
 fn method_code(data: &[u8], method_offset: u32) -> Vec<u8> {
-    let f = unsafe { abcd_file_sys::abc_file_open(data.as_ptr(), data.len()) };
-    assert!(!f.is_null(), "abc_file_open failed");
-    let mr = unsafe { abcd_file_sys::abc_method_open(f, method_offset) };
-    assert!(!mr.is_null(), "abc_method_open failed");
-    let code_off = unsafe { abcd_file_sys::abc_method_code_off(mr) };
-    unsafe { abcd_file_sys::abc_method_close(mr) };
-    assert_ne!(code_off, u32::MAX, "method has no code item");
-    let cr = unsafe { abcd_file_sys::abc_code_open(f, code_off) };
-    assert!(!cr.is_null(), "abc_code_open failed");
-    let ptr = unsafe { abcd_file_sys::abc_code_instructions(cr) };
-    let len = unsafe { abcd_file_sys::abc_code_code_size(cr) } as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-    unsafe { abcd_file_sys::abc_code_close(cr) };
-    unsafe { abcd_file_sys::abc_file_close(f) };
-    bytes
+    // SAFETY: `data` outlives `f`; all handles are checked for null and closed
+    // in reverse open order.
+    unsafe {
+        let f = abcd_file_sys::abc_file_open(data.as_ptr(), data.len());
+        assert!(!f.is_null(), "abc_file_open failed");
+        let mr = abcd_file_sys::abc_method_open(f, method_offset);
+        assert!(!mr.is_null(), "abc_method_open failed");
+        let code_off = abcd_file_sys::abc_method_code_off(mr);
+        abcd_file_sys::abc_method_close(mr);
+        assert_ne!(code_off, u32::MAX, "method has no code item");
+        let cr = abcd_file_sys::abc_code_open(f, code_off);
+        assert!(!cr.is_null(), "abc_code_open failed");
+        let ptr = abcd_file_sys::abc_code_instructions(cr);
+        let len = abcd_file_sys::abc_code_code_size(cr) as usize;
+        let bytes = if ptr.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(ptr, len).to_vec()
+        };
+        abcd_file_sys::abc_code_close(cr);
+        abcd_file_sys::abc_file_close(f);
+        bytes
+    }
 }
 
 /// Build a file whose `caller` method references a FOREIGN method through

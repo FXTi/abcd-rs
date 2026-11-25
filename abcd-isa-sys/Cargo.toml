@@ -2,11 +2,15 @@
 name = "abcd-isa-sys"
 description = "Low-level FFI bindings for the ArkCompiler bytecode ISA"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 readme = "README.md"
 keywords = ["arkcompiler", "bytecode", "ffi", "isa"]
 categories = ["api-bindings", "compilers"]
+
+[lints]
+workspace = true
 
 [dependencies]
 bitflags.workspace = true

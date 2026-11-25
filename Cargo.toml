@@ -6,6 +6,7 @@
 name = "abcd-rs"
 version = "0.0.0"
 edition = "2024"
+rust-version.workspace = true
 publish = false
 
 [workspace]
@@ -28,8 +29,16 @@ members = [
 
 [workspace.package]
 edition = "2024"
+rust-version = "1.88"
 license = "Apache-2.0"
 version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+allow_attributes_without_reason = "deny"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }

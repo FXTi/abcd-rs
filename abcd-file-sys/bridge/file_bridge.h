@@ -651,6 +651,9 @@ void abc_builder_lnp_emit_advance_pc(AbcBuilder *b, uint32_t lnp_handle,
                                       uint32_t debug_handle, uint32_t value);
 void abc_builder_lnp_emit_advance_line(AbcBuilder *b, uint32_t lnp_handle,
                                         uint32_t debug_handle, int32_t value);
+void abc_builder_lnp_emit_special_opcode(AbcBuilder *b, uint32_t lnp_handle,
+                                          uint32_t debug_handle,
+                                          uint32_t pc_inc, int32_t line_inc);
 void abc_builder_lnp_emit_column(AbcBuilder *b, uint32_t lnp_handle,
                                   uint32_t debug_handle, uint32_t pc_inc, uint32_t column);
 void abc_builder_lnp_emit_start_local(AbcBuilder *b, uint32_t lnp_handle,

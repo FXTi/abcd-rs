@@ -3,7 +3,10 @@
 //! All container bytes are generated in code — no binary fixtures live in
 //! the repo (see `design/hap-container.md`). Low-level writers are public so
 //! adversarial tests can compose malformed archives byte by byte.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared synthetic ZIP constants and builder helpers exposed across integration test submodules"
+)]
 
 pub const STORED: u16 = 0;
 pub const DEFLATE: u16 = 8;

@@ -8,6 +8,7 @@
  *   - panda::panda_file::File::Index / Index32
  *   - Transitive includes (span.h, bit_utils.h) for bytecode_emitter.cpp
  *   - LOG macro (via utils/logger.h)
+ *   - Silent ABORT_AND_UNREACHABLE / CHECK overrides (no std::cerr output)
  */
 
 #ifndef LIBPANDAFILE_FILE_H
@@ -15,20 +16,41 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <array>
 #include <map>
 
+//LOG macro — shim in `vendor/shim/utils/logger.h` replacing upstream logger.h.
+// Use `<...>` so `/I` / `-I` include priority (`bridge/shim` -> `vendor/shim`)
+// always wins over MSVC `/FI` parent-TU directory lookup.
+#include <utils/logger.h>
+
+// Pre-include upstream macros.h and strip host-stderr writes from
+// ABORT_AND_UNREACHABLE / CHECK (library crates must never write to stderr).
+#include "macros.h"
+#undef ABORT_AND_UNREACHABLE
+#define ABORT_AND_UNREACHABLE() \
+    do {                        \
+        std::abort();           \
+    } while (0)
+
+#undef CHECK
+#define CHECK(expr)               \
+    do {                          \
+        if (UNLIKELY(!(expr))) {  \
+            std::abort();         \
+        }                         \
+    } while (0)
+
+#undef CHECK_NOT_NULL
+#define CHECK_NOT_NULL(ptr) CHECK((ptr) != nullptr)
+
 // Transitive dependencies that the original file.h provides through helpers.h.
 // bytecode_emitter.cpp needs Span<T> and MinimumBitsToStore.
 #include "utils/span.h"
 #include "utils/bit_utils.h"
-
-// LOG macro — shim in `vendor/shim/utils/logger.h` replacing upstream logger.h.
-// Use `<...>` so `/I` / `-I` include priority (`bridge/shim` -> `vendor/shim`)
-// always wins over MSVC `/FI` parent-TU directory lookup.
-#include <utils/logger.h>
 
 namespace panda::panda_file {
 

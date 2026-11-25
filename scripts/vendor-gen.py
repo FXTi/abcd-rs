@@ -51,6 +51,13 @@ SUBTREES: Tuple[str, ...] = (
     "platforms",
 )
 SKIP_DIR_NAMES = {"test", "tests", "unittest", "benchmarks"}
+# Only the three header-only definitions needed for `pandasm::Value` static_assert
+# pins in `abcd-file-sys` are retained from `assembler/` (#39).
+ASSEMBLER_ALLOWED_FILES = {
+    "assembler/annotation.h",
+    "assembler/assembly-type.h",
+    "assembler/define.h",
+}
 
 
 def fail(msg: str) -> "NoReturn":  # type: ignore[name-defined]
@@ -159,6 +166,8 @@ def enumerate_upstream_subset(src_root: pathlib.Path) -> List[SnapshotEntry]:
                 if full.is_symlink() or not full.is_file():
                     continue
                 rel = full.relative_to(src_root).as_posix()
+                if st == "assembler" and rel not in ASSEMBLER_ALLOWED_FILES:
+                    continue
                 entries.append(SnapshotEntry(full, rel))
 
     entries.sort(key=lambda e: e.rel)

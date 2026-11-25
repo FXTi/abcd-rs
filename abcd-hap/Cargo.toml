@@ -2,6 +2,7 @@
 name = "abcd-hap"
 description = "In-memory, unpack-only reader for OpenHarmony HAP/HSP/APP/HQF containers (restricted ZIP dialect)"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 readme = "README.md"
@@ -16,3 +17,6 @@ miniz_oxide.workspace = true
 miniz_oxide.workspace = true
 # End-to-end container → decode test helpers (corpus gate in root tests/hap-file).
 abcd-file.workspace = true
+
+[lints]
+workspace = true

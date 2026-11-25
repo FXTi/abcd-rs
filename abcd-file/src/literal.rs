@@ -164,16 +164,33 @@ pub enum LiteralValue {
 }
 
 /// Context passed through the C callback for collecting literal values.
-pub(crate) struct LiteralCollectCtx {
+pub(crate) struct LiteralCollectCtx<'a> {
     pub file: *const sys::AbcFileHandle,
     pub strings: *mut crate::StringPool,
+    pub str_cache: Option<*mut crate::file::StringItemCache<'a>>,
     pub values: Vec<LiteralValue>,
+    pub error: Option<Error>,
 }
 
-/// Intern a literal-array string item losslessly into `ctx.strings` (#30).
-fn intern_literal_string(ctx: &mut LiteralCollectCtx, off: u32) -> crate::StringId {
+/// Intern a literal-array string item losslessly into `ctx.strings` (#30),
+/// rejecting unreadable string items with [`Error::InvalidString`].
+fn intern_literal_string(
+    ctx: &mut LiteralCollectCtx<'_>,
+    off: u32,
+) -> Result<crate::StringId, Error> {
+    // SAFETY: `ctx.strings` points to the caller's live `StringPool` with
+    // exclusive mutable access during this synchronous callback.
     let strings = unsafe { &mut *ctx.strings };
-    crate::file::intern_string(ctx.file, off, strings).unwrap_or_else(|| strings.get_or_intern(""))
+    if let Some(cache_ptr) = ctx.str_cache {
+        // SAFETY: `cache_ptr` points to the caller's live `StringItemCache`
+        // with exclusive mutable access during this synchronous callback.
+        let cache = unsafe { &mut *cache_ptr };
+        cache
+            .intern_lossy(off, strings)
+            .ok_or(Error::InvalidString(off))
+    } else {
+        crate::file::intern_string(ctx.file, off, strings).ok_or(Error::InvalidString(off))
+    }
 }
 
 /// Callback for collecting literal values from the C API.
@@ -181,60 +198,159 @@ pub(crate) unsafe extern "C" fn collect_literal_val_cb(
     val: *const sys::AbcLiteralVal,
     ctx: *mut c_void,
 ) {
-    let ctx = unsafe { &mut *(ctx as *mut LiteralCollectCtx) };
-    let v = unsafe { &*val };
-    let Ok(tag) = LiteralTag::try_from(v.tag) else {
+    // SAFETY: `ctx` is a valid non-null pointer to `LiteralCollectCtx` passed
+    // exclusively by the synchronous C enumeration caller.
+    let ctx = unsafe { &mut *ctx.cast::<LiteralCollectCtx<'_>>() };
+    if ctx.error.is_some() {
         return;
+    }
+    // SAFETY: `val` points to a stack-allocated `AbcLiteralVal` initialized by
+    // the C bridge for the duration of this callback.
+    let v = unsafe { &*val };
+    let tag = match LiteralTag::try_from(v.tag) {
+        Ok(tag) => tag,
+        Err(err) => {
+            ctx.error = Some(err);
+            return;
+        }
     };
     let lit = match tag {
-        LiteralTag::Bool => LiteralValue::Bool(unsafe { v.data.bool_val } != 0),
-        LiteralTag::Integer => LiteralValue::Integer(unsafe { v.data.u32_val }),
-        LiteralTag::Float => LiteralValue::Float(unsafe { v.data.f32_val }),
-        LiteralTag::Double => LiteralValue::Double(unsafe { v.data.f64_val }),
+        LiteralTag::Bool => {
+            // SAFETY: `v.tag == BOOL` selects `bool_val` initialized by the bridge.
+            LiteralValue::Bool(unsafe { v.data.bool_val } != 0)
+        }
+        LiteralTag::Integer => {
+            // SAFETY: `v.tag == INTEGER` selects `u32_val` initialized by the bridge.
+            LiteralValue::Integer(unsafe { v.data.u32_val })
+        }
+        LiteralTag::Float => {
+            // SAFETY: `v.tag == FLOAT` selects `f32_val` initialized by the bridge.
+            LiteralValue::Float(unsafe { v.data.f32_val })
+        }
+        LiteralTag::Double => {
+            // SAFETY: `v.tag == DOUBLE` selects `f64_val` initialized by the bridge.
+            LiteralValue::Double(unsafe { v.data.f64_val })
+        }
         LiteralTag::String => {
+            // SAFETY: `v.tag == STRING` selects `u32_val` initialized by the bridge.
             let off = unsafe { v.data.u32_val };
-            let sid = intern_literal_string(ctx, off);
-            LiteralValue::String(sid)
+            match intern_literal_string(ctx, off) {
+                Ok(sid) => LiteralValue::String(sid),
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            }
         }
         LiteralTag::EtsImplements => {
+            // SAFETY: `v.tag == ETS_IMPLEMENTS` selects `u32_val` initialized by the bridge.
             let off = unsafe { v.data.u32_val };
-            let sid = intern_literal_string(ctx, off);
-            LiteralValue::EtsImplements(sid)
+            match intern_literal_string(ctx, off) {
+                Ok(sid) => LiteralValue::EtsImplements(sid),
+                Err(err) => {
+                    ctx.error = Some(err);
+                    return;
+                }
+            }
         }
-        LiteralTag::Method => LiteralValue::Method(unsafe { v.data.u32_val }),
-        LiteralTag::GeneratorMethod => LiteralValue::GeneratorMethod(unsafe { v.data.u32_val }),
+        LiteralTag::Method => {
+            // SAFETY: `v.tag == METHOD` selects `u32_val`.
+            LiteralValue::Method(unsafe { v.data.u32_val })
+        }
+        LiteralTag::GeneratorMethod => {
+            // SAFETY: `v.tag == GENERATORMETHOD` selects `u32_val`.
+            LiteralValue::GeneratorMethod(unsafe { v.data.u32_val })
+        }
         LiteralTag::AsyncGeneratorMethod => {
+            // SAFETY: `v.tag == ASYNCGENERATORMETHOD` selects `u32_val`.
             LiteralValue::AsyncGeneratorMethod(unsafe { v.data.u32_val })
         }
-        LiteralTag::Accessor => LiteralValue::Accessor(unsafe { v.data.u8_val }),
-        LiteralTag::MethodAffiliate => LiteralValue::MethodAffiliate(unsafe { v.data.u16_val }),
-        LiteralTag::Getter => LiteralValue::Getter(unsafe { v.data.u32_val }),
-        LiteralTag::Setter => LiteralValue::Setter(unsafe { v.data.u32_val }),
+        LiteralTag::Accessor => {
+            // SAFETY: `v.tag == ACCESSOR` selects `u8_val`.
+            LiteralValue::Accessor(unsafe { v.data.u8_val })
+        }
+        LiteralTag::MethodAffiliate => {
+            // SAFETY: `v.tag == METHODAFFILIATE` selects `u16_val`.
+            LiteralValue::MethodAffiliate(unsafe { v.data.u16_val })
+        }
+        LiteralTag::Getter => {
+            // SAFETY: `v.tag == GETTER` selects `u32_val`.
+            LiteralValue::Getter(unsafe { v.data.u32_val })
+        }
+        LiteralTag::Setter => {
+            // SAFETY: `v.tag == SETTER` selects `u32_val`.
+            LiteralValue::Setter(unsafe { v.data.u32_val })
+        }
         LiteralTag::LiteralArray => {
+            // SAFETY: `v.tag == LITERALARRAY` selects `u32_val`.
             LiteralValue::LiteralArray(LiteralArrayIdx(unsafe { v.data.u32_val }))
         }
         LiteralTag::LiteralBufferIndex => {
+            // SAFETY: `v.tag == LITERALBUFFERINDEX` selects `u32_val`.
             LiteralValue::LiteralBufferIndex(LiteralArrayIdx(unsafe { v.data.u32_val }))
         }
-        LiteralTag::BuiltinTypeIndex => LiteralValue::BuiltinTypeIndex(unsafe { v.data.u8_val }),
-        LiteralTag::NullValue => LiteralValue::NullValue(unsafe { v.data.u8_val }),
-        LiteralTag::ArrayU1 => LiteralValue::ArrayU1(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayU8 => LiteralValue::ArrayU8(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayI8 => LiteralValue::ArrayI8(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayU16 => LiteralValue::ArrayU16(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayI16 => LiteralValue::ArrayI16(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayU32 => LiteralValue::ArrayU32(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayI32 => LiteralValue::ArrayI32(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayU64 => LiteralValue::ArrayU64(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayI64 => LiteralValue::ArrayI64(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayF32 => LiteralValue::ArrayF32(LiteralArrayIdx(unsafe { v.data.u32_val })),
-        LiteralTag::ArrayF64 => LiteralValue::ArrayF64(LiteralArrayIdx(unsafe { v.data.u32_val })),
+        LiteralTag::BuiltinTypeIndex => {
+            // SAFETY: `v.tag == BUILTINTYPEINDEX` selects `u8_val`.
+            LiteralValue::BuiltinTypeIndex(unsafe { v.data.u8_val })
+        }
+        LiteralTag::NullValue => {
+            // SAFETY: `v.tag == NULLVALUE` selects `u8_val`.
+            LiteralValue::NullValue(unsafe { v.data.u8_val })
+        }
+        LiteralTag::ArrayU1 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayU1(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayU8 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayU8(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayI8 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayI8(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayU16 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayU16(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayI16 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayI16(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayU32 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayU32(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayI32 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayI32(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayU64 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayU64(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayI64 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayI64(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayF32 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayF32(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
+        LiteralTag::ArrayF64 => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
+            LiteralValue::ArrayF64(LiteralArrayIdx(unsafe { v.data.u32_val }))
+        }
         LiteralTag::ArrayString => {
+            // SAFETY: `ARRAY_*` tags select `u32_val` payload offset.
             LiteralValue::ArrayString(LiteralArrayIdx(unsafe { v.data.u32_val }))
         }
         // TagValue (= INTEGER_8): a legal one-byte integer literal in
         // real 12.x files (audit finding #A1).
-        LiteralTag::TagValue => LiteralValue::Integer8(unsafe { v.data.u8_val }),
+        LiteralTag::TagValue => {
+            // SAFETY: `v.tag == TAGVALUE` selects `u8_val`.
+            LiteralValue::Integer8(unsafe { v.data.u8_val })
+        }
     };
     ctx.values.push(lit);
 }
@@ -258,35 +374,36 @@ mod tests {
         );
     }
 
-    /// The collector callback skips elements whose tag byte does not parse
-    /// — unreachable through `decode()`: the bridge's tolerant enumerator
-    /// STOPS at an unknown tag (file_bridge.cpp
-    /// `abc_literal_enumerate_vals_tolerant`'s `default: return`), so the
-    /// callback never sees one from a file. Driven directly here.
+    /// The collector callback records `UnknownLiteralTag` and skips pushing
+    /// when driven with an unknown tag byte.
     #[test]
     fn collector_skips_unparsable_tag() {
         let mut strings = crate::StringPool::default();
         let mut ctx = LiteralCollectCtx {
             file: std::ptr::null(),
             strings: &mut strings,
+            str_cache: None,
             values: Vec::new(),
+            error: None,
         };
         let val = sys::AbcLiteralVal {
             tag: 0xEE,
-            // SAFETY: the callback returns before reading `data` when the
-            // tag does not parse, so the zeroed union is never observed.
+            // SAFETY: `AbcLiteralVal_data` is a POD union of integer/float primitives;
+            // all-zero bytes are valid for every variant, and `collect_literal_val_cb`
+            // returns on the unknown tag before reading `data`.
             data: unsafe { std::mem::zeroed() },
             str_data: std::ptr::null(),
             str_utf16_len: 0,
         };
-        // SAFETY: `ctx` outlives the synchronous callback; the file pointer
-        // is never dereferenced on this path.
+        // SAFETY: `ctx` and `val` outlive the synchronous callback; `ctx.file`
+        // is never dereferenced on the unknown-tag path.
         unsafe {
-            collect_literal_val_cb(&val, &mut ctx as *mut LiteralCollectCtx as *mut c_void);
+            collect_literal_val_cb(&val, (&raw mut ctx).cast::<c_void>());
         }
         assert!(
             ctx.values.is_empty(),
             "an unparsable tag must be skipped, not pushed"
         );
+        assert!(matches!(ctx.error, Some(Error::UnknownLiteralTag(0xEE))));
     }
 }

@@ -83,6 +83,11 @@ impl StringPool {
     /// - Otherwise (lone surrogates or malformed MUTF-8), it interns as a
     ///   byte-backed entry deduplicated by exact `raw` bytes.
     pub fn intern_mutf8(&mut self, raw: &[u8]) -> StringId {
+        if !raw.contains(&0)
+            && let Ok(s) = std::str::from_utf8(raw)
+        {
+            return self.get_or_intern(s);
+        }
         if let Some(text) = mutf8_decode_utf8(raw) {
             return self.get_or_intern(&text);
         }
@@ -152,10 +157,12 @@ impl StringPool {
     }
 
     /// Canonical MUTF-8 wire bytes for any valid `id`: borrowed verbatim for
-    /// lossy entries, encoded on demand for lossless UTF-8 entries.
+    /// lossy entries and for lossless ASCII/BMP strings without `U+0000`,
+    /// or encoded as canonical MUTF-8 (`C0 80` NUL, 6-byte CESU-8 astral pairs)
+    /// when needed.
     pub fn to_mutf8_bytes(&self, id: StringId) -> Option<Cow<'_, [u8]>> {
         match self.entries.get(id.index())? {
-            PoolEntry::Utf8(s) => Some(Cow::Owned(mutf8_encode(s))),
+            PoolEntry::Utf8(s) => Some(mutf8_encode_cow(s)),
             PoolEntry::RawMutf8 { raw, .. } => Some(Cow::Borrowed(raw)),
         }
     }
@@ -197,6 +204,17 @@ impl StringPool {
             };
             (StringId(i as u32), s)
         })
+    }
+}
+
+/// Borrow `s` directly when its UTF-8 bytes are already canonical `es2abc`
+/// MUTF-8 (no `U+0000` and no 4-byte astral sequence `>= 0xF0`), or allocate
+/// via [`mutf8_encode`] otherwise (`O(n)` scan, zero allocations for ASCII/BMP).
+pub fn mutf8_encode_cow(s: &str) -> Cow<'_, [u8]> {
+    if s.bytes().all(|b| b != 0 && b < 0xF0) {
+        Cow::Borrowed(s.as_bytes())
+    } else {
+        Cow::Owned(mutf8_encode(s))
     }
 }
 
@@ -397,6 +415,34 @@ mod tests {
         assert_eq!(pool.lossy_count(), 0);
         assert_eq!(pool.as_str(id), Some("\0\u{1F600}"));
         assert_eq!(pool.to_mutf8_bytes(id).as_deref(), Some(&cesu[..]));
+
+        // 4-byte UTF-8 astral input (`F0 9F 98 80`) normalizes to the exact
+        // same lossless StringId and re-emits canonical 6-byte CESU-8.
+        let id_emoji_cesu = pool.intern_mutf8(&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]);
+        let id_emoji_utf8 = pool.intern_mutf8("\u{1F600}".as_bytes());
+        assert_eq!(id_emoji_cesu, id_emoji_utf8);
+        assert_eq!(pool.as_str(id_emoji_cesu), Some("\u{1F600}"));
+        assert_eq!(
+            pool.to_mutf8_bytes(id_emoji_utf8).as_deref(),
+            Some(&[0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80][..])
+        );
+    }
+
+    #[test]
+    fn mutf8_encode_cow_borrows_ascii_and_bmp_without_nul() {
+        let mut pool = StringPool::new();
+        let ascii = pool.get_or_intern("hello_world");
+        let pua = pool.get_or_intern("中\u{E000}\u{F8FF}");
+        let nul = pool.get_or_intern("a\0b");
+        let astral = pool.get_or_intern("😀");
+
+        assert!(matches!(
+            pool.to_mutf8_bytes(ascii),
+            Some(Cow::Borrowed(b"hello_world"))
+        ));
+        assert!(matches!(pool.to_mutf8_bytes(pua), Some(Cow::Borrowed(_))));
+        assert!(matches!(pool.to_mutf8_bytes(nul), Some(Cow::Owned(_))));
+        assert!(matches!(pool.to_mutf8_bytes(astral), Some(Cow::Owned(_))));
     }
 
     #[test]

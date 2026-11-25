@@ -24,14 +24,15 @@
 //!
 //! # Core Types
 //!
-//! - [`File`] — fully-decoded ABC file with classes, literal arrays, and entity map
+//! - [`File`] / [`Dialect`] — fully-decoded ABC file, container dialect classification (`DynamicModern`, `DynamicLegacy`, `Static`), classes, literal arrays, and entity map
 //! - [`Class`] / [`Method`] / [`Field`] — class hierarchy with access flags and annotations
 //! - [`MethodBody`] — decoded bytecodes ([`Bytecode`]) and try-catch blocks
 //! - [`Annotations`] / [`AnnotationValue`] — four retention policies, fully-typed values
 //! - [`LiteralArray`] / [`LiteralValue`] — literal data (strings, methods, typed arrays)
 //! - [`ModuleData`] / [`ModuleRecord`] — ES module import/export declarations
-//! - [`MethodDebugInfo`] — source mapping, local variables, parameter info
-//! - [`Builder`] — programmatic ABC file construction via handle-based API
+//! - [`MethodDebugInfo`] — source mapping, local variables, and parameter info decoded via a pure-Rust bounded DWARF/LNP state machine
+//! - [`StringPool`] — lossless MUTF-8 / UTF-8 string interner normalizing 6-byte CESU-8 and 4-byte UTF-8 in memory and emitting canonical `es2abc` MUTF-8 (`C0 80` NUL, 6-byte CESU-8 astral pairs)
+//! - [`EncodeOptions`] / [`encode_with_options`] / [`Builder`] — configurable re-encoding and programmatic ABC file construction
 //!
 //! # Safety
 //!
@@ -50,7 +51,7 @@ mod error;
 pub use error::Error;
 
 mod types;
-pub use types::{AccessFlags, FunctionKind, HasAccessFlags, SourceLang, Type};
+pub use types::{AccessFlags, Dialect, FunctionKind, HasAccessFlags, SourceLang, Type};
 
 mod model;
 pub use model::*;
@@ -80,7 +81,7 @@ pub mod pandasm;
 mod encode;
 pub use encode::{
     AnnotationElemDef, AnnotationElemDefEx, AnnotationElemValue, AnnotationHandle, Builder,
-    CatchBlockDef, ClassHandle, CodeEntity, CodeHandle, DebugInfoHandle, FieldHandle,
-    LiteralArrayHandle, LnpHandle, MethodHandle, MethodHandleItemHandle, ModuleRecordDef,
-    ParamHandle, ProtoHandle, StringHandle, encode,
+    CatchBlockDef, ClassHandle, CodeEntity, CodeHandle, DebugInfoHandle, EncodeOptions,
+    FieldHandle, LiteralArrayHandle, LnpHandle, MethodHandle, MethodHandleItemHandle,
+    ModuleRecordDef, ParamHandle, ProtoHandle, StringHandle, encode, encode_with_options,
 };

@@ -65,8 +65,8 @@ fn literal_array_count_huge_does_not_abort() {
     data[array_off..array_off + 4].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
     let result = decode(&data);
     assert!(
-        result.is_ok(),
-        "huge count must stop the walk, decode succeeds"
+        result.is_err(),
+        "huge count must fail checked literal-array enumeration cleanly"
     );
 }
 

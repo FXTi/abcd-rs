@@ -75,21 +75,29 @@ fn adler32(data: &[u8]) -> u32 {
 /// Read a method's final (post-relocation) code bytes through the sys layer,
 /// the same walk the archaeology probe uses.
 fn method_code(data: &[u8], method_offset: u32) -> Vec<u8> {
-    let f = unsafe { sys::abc_file_open(data.as_ptr(), data.len()) };
-    assert!(!f.is_null(), "abc_file_open failed");
-    let mr = unsafe { sys::abc_method_open(f, method_offset) };
-    assert!(!mr.is_null(), "abc_method_open failed");
-    let code_off = unsafe { sys::abc_method_code_off(mr) };
-    unsafe { sys::abc_method_close(mr) };
-    assert_ne!(code_off, u32::MAX, "method has no code item");
-    let cr = unsafe { sys::abc_code_open(f, code_off) };
-    assert!(!cr.is_null(), "abc_code_open failed");
-    let ptr = unsafe { sys::abc_code_instructions(cr) };
-    let len = unsafe { sys::abc_code_code_size(cr) } as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-    unsafe { sys::abc_code_close(cr) };
-    unsafe { sys::abc_file_close(f) };
-    bytes
+    // SAFETY: `data` outlives `f`; all handles are checked for null and closed
+    // in reverse open order.
+    unsafe {
+        let f = sys::abc_file_open(data.as_ptr(), data.len());
+        assert!(!f.is_null(), "abc_file_open failed");
+        let mr = sys::abc_method_open(f, method_offset);
+        assert!(!mr.is_null(), "abc_method_open failed");
+        let code_off = sys::abc_method_code_off(mr);
+        sys::abc_method_close(mr);
+        assert_ne!(code_off, u32::MAX, "method has no code item");
+        let cr = sys::abc_code_open(f, code_off);
+        assert!(!cr.is_null(), "abc_code_open failed");
+        let ptr = sys::abc_code_instructions(cr);
+        let len = sys::abc_code_code_size(cr) as usize;
+        let bytes = if ptr.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            std::slice::from_raw_parts(ptr, len).to_vec()
+        };
+        sys::abc_code_close(cr);
+        sys::abc_file_close(f);
+        bytes
+    }
 }
 
 /// Find the unique occurrence of `needle` in `haystack`.

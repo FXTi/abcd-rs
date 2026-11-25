@@ -1,10 +1,10 @@
 # Architecture Decisions & Canonical Invariant Registry
 
-This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-12`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
+This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-15`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
 
 ---
 
-## 1. Active Architectural Decisions (`ADR-01` – `ADR-12`)
+## 1. Active Architectural Decisions (`ADR-01` – `ADR-15`)
 
 ### ADR-01 — Container-Independent, Dialect-Aware SSA IR
 - **Ruling**: `abcd-ir` contains zero `.abc` file offsets, entity pool indices, ULEB immediates, or register-width opcode variants (`N46`, `N52`). At the same time, `Module` / `ClassData` / `FunctionData` explicitly model language dialect and calling-convention semantics (`SourceLang`, dynamic ECMAScript `0.0.0.2` & `9.0.0.0`–`24.0.0.0` vs. static ArkTS 1.2 `0.1.0.7`) so IR consumers never guess calling conventions from missing container annotations.
@@ -48,9 +48,10 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
 - **Ruling**: `abcd-isa::decode_legacy` translates OpenHarmony 3.2/4.0 (`0.0.0.2`, API 9 pre-freeze) opcodes into `Bytecode::Deprecated*` variants, and `abcd-lift` lifts every legacy opcode—including `deprecated.defineclasswithbuffer` (`v1 = lexenv`, `v2 = proto` per `interpreter_assembly.cpp:4624-4648`)—into canonical `abcd-ir`, unlocking `abcd info`, `dis`, `decompile`, `analyze`, and `taint` on 100% of wild legacy `.hap` packages. Because upstream `libpandafile`'s writer only targets modern format versions (`9.0.0.0`+), `abcd_file::encode` returns `Error::UnsupportedOutputVersion(0.0.0.2)` when asked to emit raw `0.0.0.2` bytes directly.
 - **Crates**: `abcd-isa`, `abcd-file`, `abcd-lift`.
 
-### ADR-09 — Dual-Bucket Lossless MUTF-8 Strings & Content-Keyed Literal Dedup (`N62`, `N72`, `N75`)
+### ADR-09 — Dual-Bucket Lossless MUTF-8 Strings & Content-Keyed Literal Dedup (`N62`, `N72`, `N75`, `D3`)
 - **Ruling**:
-  - `abcd_file::StringPool` and `abcd_ir::SymbolTable` deduplicate valid UTF-8 strings by content while preserving non-UTF-8 MUTF-8 wire sequences (unpaired UTF-16 surrogates) verbatim in a lossless raw-bytes side table (`N72`), rendered as `\uXXXX` escapes by `abcd-decompile` (`N75`).
+  - `abcd_file::StringPool` and `abcd_ir::SymbolTable` normalize both 6-byte CESU-8 (`es2abc`/`ets2panda` surrogate pairs) and 4-byte UTF-8 astral sequences (plus `C0 80` NUL) into deduplicated `Arc<str>` UTF-8 entries, reserving the raw-bytes side bucket (`RawMutf8`, `N72`) strictly for unpaired UTF-16 lone surrogates or ill-formed wire sequences (rendered as `\uXXXX` escapes by `abcd-decompile`, `N75`).
+  - On emission (`encode` and `pandasm`), all lossless strings serialize through a single unified MUTF-8 encoder (`es2abc`-canonical 6-byte CESU-8 for `U+10000..=U+10FFFF`, `C0 80` for `U+0000`, and a zero-allocation `Cow::Borrowed` slice fast path for ASCII/BMP strings without `0x00`), achieving 100% byte-identity with `es2abc` and `ark_disasm`.
   - During IR lowering/rewriting, identical `LiteralArray` shapes deduplicate by structural content (`N62`), an intentional size-reducing equivalence verified by the `ark_js_vm` oracle.
 - **Crates**: `abcd-file`, `abcd-ir`, `abcd-lift`, `abcd-lower`, `abcd-decompile`.
 
@@ -68,6 +69,21 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
 ### ADR-12 — Binary-Only Global Allocator Policy
 - **Ruling**: `abcd-cli` sets `mimalloc` (`#[global_allocator]`) across target platforms for fast multi-threaded arena allocation on macOS, Windows MSVC, and Linux; library crates never install a global allocator. Arena page-purge tuning or platform-specific allocator adjustments are governed by empirical multi-module RSS benchmarks (`#33`).
 - **Crates**: `abcd-cli`.
+
+### ADR-13 — Pure-Rust Table-Driven Modern ISA Codec & Fenwick Branch Relaxation (`D1`, `#43`, `#47`)
+- **Ruling**: Modern `9.0.0.0`–`24.0.0.0` `abcd_isa::decode`, `relocate_entity_id`, and `encode` run in 100% Safe Rust over `isa.yaml`-generated tables (`abcd-isa-sys/src/generated/`), using deterministic (`N20`) `O(N + J log N)` Fenwick-tree branch relaxation and inverted-branch + `jmp.32` trampolines across all 17 jump mnemonics when displacements exceed `±32 KiB`. Vendored C++ `BytecodeInst` and `BytecodeEmitter` in `isa_bridge.cpp` are retained strictly as automated differential test oracles.
+- **Crates**: `abcd-isa-sys`, `abcd-isa`.
+
+### ADR-14 — Pure-Rust Bounded LNP Decoder, Opt-In `EncodeOptions` Verification & Explicit `Dialect` (`D2`, `D4`, `D6`, `#44`, `#47`)
+- **Ruling**:
+  1. Both `abcd_file::decode` and `inspect_summary` extract method debug info and line/column/local-variable tables through a single bounded pure-Rust DWARF/LNP state machine over `&data[..size]` (retaining C++ `DebugInfoExtractor` solely as a differential test oracle), and `encode` commits every `line_table` row via `EmitSpecialOpcode` (`R1-H1`).
+  2. `abcd_file::encode` defaults to `EncodeOptions { verify: false }` so production rewrites do not pay a redundant full re-decode pass, while `encode_with_options(file, EncodeOptions { verify: true })` provides built-in round-trip verification (`D4`).
+  3. Container dialect is modeled explicitly via `Dialect::{DynamicModern, DynamicLegacy, Static}` (`D6`), preventing `0.1.0.x` static ArkTS 1.2 containers from falling into dynamic `24.0.0.0` ISA decoders or `version <= 12.0.6.0` header-literal heuristics; full pure-Rust `.abc` container reading (#49) and cross-layer `EntityRef` offset decoupling (#50) are tracked separately.
+- **Crates**: `abcd-file-sys`, `abcd-file`.
+
+### ADR-15 — Mandatory IEEE CRC-32 & Decompression-Bomb `Limits` in `abcd-hap` (`D5`, `#46`)
+- **Ruling**: `abcd-hap` verifies pure-Rust IEEE 802.3 CRC-32 (`Error::CrcMismatch`) on every `STORED` and `DEFLATE` entry read, enforces configurable per-entry and cumulative decompression `Limits` (`512 MiB` / `2 GiB` defaults plus RFC 1951 `1032×` DEFLATE ratio pre-checks) prior to allocation, skips resource-only nested `.hap`/`.hsp` siblings inside `.app` bundles cleanly, and bounds EOCD candidate walks (`MAX_EOCD_CANDIDATES = 64`).
+- **Crates**: `abcd-hap`.
 
 ---
 

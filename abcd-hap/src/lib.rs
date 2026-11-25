@@ -10,14 +10,17 @@
 //! # Design rules
 //!
 //! - **Total on arbitrary bytes.** Every index computation goes through
-//!   checked slice access; `open()`/`read()` never panic on hostile input.
+//!   checked slice access and bounded iterative walks; `open()`/`read()` never
+//!   panic or recurse on hostile input.
 //! - **In-memory only.** Entry names are lookup keys, never filesystem paths,
-//!   so no Zip Slip machinery is needed.
-//! - **Zero-copy where possible.** STORED entries are returned as borrowed
-//!   slices into the caller's buffer; DEFLATE entries are inflated into an
-//!   owned `Vec<u8>`.
-//! - **No CRC check by default** (the abc payload has its own integrity
-//!   story); data is returned regardless of CRC mismatches.
+//!   so no Zip Slip machinery is needed inside the unpacker.
+//! - **Zero-copy where possible.** Valid UTF-8 central-directory names borrow
+//!   directly into the input buffer (`Cow::Borrowed`), and top-level `STORED`
+//!   entries are returned as borrowed slices (`EntryData::Borrowed`).
+//! - **Mandatory IEEE CRC-32 & decompression-bomb guards.** Every entry read
+//!   verifies its IEEE 802.3 CRC-32 checksum against the central directory and
+//!   enforces configurable [`Limits`] alongside the RFC 1951 `1032×` DEFLATE
+//!   compression-ratio ceiling before allocation.
 //!
 //! # Quick start
 //!
@@ -29,7 +32,7 @@
 //! }
 //! ```
 
-#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 mod container;
@@ -38,7 +41,9 @@ mod zip;
 
 pub use container::{
     AbcModule, CONFIG_JSON, Container, MAX_CONTAINER_DEPTH, MODULE_ABC, MODULE_JSON, PATCH_JSON,
-    abc_modules,
+    abc_modules, abc_modules_with_limits,
 };
 pub use error::Error;
-pub use zip::{Compression, EntryData, EntryMeta, METHOD_DEFLATE, METHOD_STORED, ZipArchive};
+pub use zip::{
+    Compression, EntryData, EntryMeta, Limits, METHOD_DEFLATE, METHOD_STORED, ZipArchive,
+};

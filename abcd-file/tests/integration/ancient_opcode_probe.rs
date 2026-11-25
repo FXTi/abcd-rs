@@ -21,67 +21,66 @@ use std::path::PathBuf;
 use abcd_file_sys as sys;
 
 unsafe extern "C" fn push_off(offset: u32, ctx: *mut c_void) {
-    let vec = unsafe { &mut *(ctx as *mut Vec<u32>) };
+    // SAFETY: `ctx` points to the caller's live `Vec<u32>` during synchronous enumeration.
+    let vec = unsafe { &mut *ctx.cast::<Vec<u32>>() };
     vec.push(offset);
 }
 
 /// Open an abc file and return `(version, [(method_off, code_bytes)])`.
 fn dump_methods(data: &[u8]) -> ([u8; 4], Vec<(u32, Vec<u8>)>) {
-    let f = unsafe { sys::abc_file_open(data.as_ptr(), data.len()) };
-    assert!(!f.is_null(), "abc_file_open failed");
-    let mut version = [0u8; 4];
-    unsafe { sys::abc_file_version(f, version.as_mut_ptr()) };
+    // SAFETY: `data` outlives `f`; every opened handle is checked for null and
+    // closed before its parent handle is closed.
+    unsafe {
+        let f = sys::abc_file_open(data.as_ptr(), data.len());
+        assert!(!f.is_null(), "abc_file_open failed");
+        let mut version = [0u8; 4];
+        sys::abc_file_version(f, version.as_mut_ptr());
 
-    let mut out = Vec::new();
-    let num_classes = unsafe { sys::abc_file_num_classes(f) };
-    for i in 0..num_classes {
-        let class_off = unsafe { sys::abc_file_class_offset(f, i) };
-        if class_off == u32::MAX {
-            continue;
-        }
-        if unsafe { sys::abc_file_is_external(f, class_off) } != 0 {
-            continue;
-        }
-        let cr = unsafe { sys::abc_class_open(f, class_off) };
-        if cr.is_null() {
-            continue;
-        }
-        let mut moffs: Vec<u32> = Vec::new();
-        unsafe {
-            sys::abc_class_enumerate_methods(
-                cr,
-                Some(push_off),
-                &mut moffs as *mut Vec<u32> as *mut c_void,
-            )
-        };
-        for m in moffs {
-            let mr = unsafe { sys::abc_method_open(f, m) };
-            if mr.is_null() {
+        let mut out = Vec::new();
+        let num_classes = sys::abc_file_num_classes(f);
+        for i in 0..num_classes {
+            let class_off = sys::abc_file_class_offset(f, i);
+            if class_off == u32::MAX {
                 continue;
             }
-            let code_off = unsafe { sys::abc_method_code_off(mr) };
-            unsafe { sys::abc_method_close(mr) };
-            if code_off == u32::MAX {
+            if sys::abc_file_is_external(f, class_off) != 0 {
                 continue;
             }
-            let code = unsafe { sys::abc_code_open(f, code_off) };
-            if code.is_null() {
+            let cr = sys::abc_class_open(f, class_off);
+            if cr.is_null() {
                 continue;
             }
-            let ptr = unsafe { sys::abc_code_instructions(code) };
-            let len = unsafe { sys::abc_code_code_size(code) } as usize;
-            let bytes = if ptr.is_null() {
-                Vec::new()
-            } else {
-                unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
-            };
-            unsafe { sys::abc_code_close(code) };
-            out.push((m, bytes));
+            let mut moffs: Vec<u32> = Vec::new();
+            sys::abc_class_enumerate_methods(cr, Some(push_off), (&raw mut moffs).cast::<c_void>());
+            for m in moffs {
+                let mr = sys::abc_method_open(f, m);
+                if mr.is_null() {
+                    continue;
+                }
+                let code_off = sys::abc_method_code_off(mr);
+                sys::abc_method_close(mr);
+                if code_off == u32::MAX {
+                    continue;
+                }
+                let code = sys::abc_code_open(f, code_off);
+                if code.is_null() {
+                    continue;
+                }
+                let ptr = sys::abc_code_instructions(code);
+                let len = sys::abc_code_code_size(code) as usize;
+                let bytes = if ptr.is_null() || len == 0 {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(ptr, len).to_vec()
+                };
+                sys::abc_code_close(code);
+                out.push((m, bytes));
+            }
+            sys::abc_class_close(cr);
         }
-        unsafe { sys::abc_class_close(cr) };
+        sys::abc_file_close(f);
+        (version, out)
     }
-    unsafe { sys::abc_file_close(f) };
-    (version, out)
 }
 
 #[test]

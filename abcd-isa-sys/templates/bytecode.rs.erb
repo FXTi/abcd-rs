@@ -83,7 +83,7 @@ bitflags::bitflags! {
 }
 
 // ============================================================================
-// Bytecode enum
+// Bytecode enum & pure-Rust ISA codec tables
 // ============================================================================
 
 <%
@@ -92,6 +92,10 @@ bitflags::bitflags! {
   # "mov.64" -> "MovWide"
   def mnemonic_variant_name(mnemonic)
     mnemonic.split('.').map { |p| p == '64' ? 'Wide' : p.capitalize }.join
+  end
+
+  def entity_kind_variant(name)
+    name.to_s.split('_').map(&:capitalize).join
   end
 
   # Group instructions by mnemonic (per-mnemonic variants)
@@ -110,15 +114,181 @@ bitflags::bitflags! {
     end
   end
 
-  # Compute max operand count across all mnemonics
-  max_operands = mnemonic_groups.values.map { |g| g.first.operands.size }.max || 0
+  prop_bit_by_tag = {}
+  Panda::properties.each_with_index { |f, i| prop_bit_by_tag[f.tag] = (1 << i) }
+  exc_bit_by_tag = {}
+  Panda::exceptions.each_with_index { |f, i| exc_bit_by_tag[f.tag] = (1 << i) }
+
+  # Verify mnemonic-group invariants at codegen time
+  mnemonic_groups.each do |mnemonic, group|
+    first = group.first
+    group.each do |ins|
+      raise "Inconsistent properties in #{mnemonic}" if ins.real_properties != first.real_properties
+      raise "Inconsistent exceptions in #{mnemonic}" if ins.exceptions != first.exceptions
+      raise "Inconsistent range in #{mnemonic}" if ins.is_range_instruction? != first.is_range_instruction?
+      raise "Inconsistent ret/throw in #{mnemonic}" if (ins.is_return_instruction? || ins.is_unconditional_throw_instruction?) != (first.is_return_instruction? || first.is_unconditional_throw_instruction?)
+    end
+  end
+
+  max_operands = mnemonic_groups.values.map { |g| g.first.operands.size }.max || 1
+  max_id_operands = [mnemonic_groups.values.map { |g| g.first.operands.count(&:id?) }.max || 1, 1].max
+  min_prefix_opcode = Panda::prefixes.map(&:opcode_idx).min
+
+  INVERT_JUMP_MNEMONIC = {
+    'jeqz' => 'jnez',
+    'jnez' => 'jeqz',
+    'jstricteqz' => 'jnstricteqz',
+    'jnstricteqz' => 'jstricteqz',
+    'jeqnull' => 'jnenull',
+    'jnenull' => 'jeqnull',
+    'jstricteqnull' => 'jnstricteqnull',
+    'jnstricteqnull' => 'jstricteqnull',
+    'jequndefined' => 'jneundefined',
+    'jneundefined' => 'jequndefined',
+    'jstrictequndefined' => 'jnstrictequndefined',
+    'jnstrictequndefined' => 'jstrictequndefined',
+    'jeq' => 'jne',
+    'jne' => 'jeq',
+    'jstricteq' => 'jnstricteq',
+    'jnstricteq' => 'jstricteq',
+    'jlt' => 'jge',
+    'jge' => 'jlt',
+    'jgt' => 'jle',
+    'jle' => 'jgt',
+    'jltz' => 'jgez',
+    'jgez' => 'jltz',
+    'jgtz' => 'jlez',
+    'jlez' => 'jgtz',
+  }
+
+  jmp_imm32_insn = mnemonic_groups.fetch('jmp').find { |i| i.operands.first.width == 32 }
+  raise 'Missing jmp imm32 instruction in isa.yaml' unless jmp_imm32_insn && !jmp_imm32_insn.format.prefixed?
+  jmp_imm32_opcode = jmp_imm32_insn.opcode_idx
+
+  def decode_raw_bits_expr(op)
+    off = op.offset
+    w = op.width
+    byte_off = off / 8
+    bit_off = off % 8
+    case w
+    when 4
+      raise "bad 4-bit offset #{off}" unless [0, 4].include?(bit_off)
+      bit_off == 0 ? "b[#{byte_off}] & 0x0f" : "(b[#{byte_off}] >> 4) & 0x0f"
+    when 8
+      raise "unaligned 8-bit offset #{off}" unless bit_off == 0
+      "b[#{byte_off}]"
+    when 16
+      raise "unaligned 16-bit offset #{off}" unless bit_off == 0
+      "u16::from_le_bytes([b[#{byte_off}], b[#{byte_off + 1}]])"
+    when 32
+      raise "unaligned 32-bit offset #{off}" unless bit_off == 0
+      "u32::from_le_bytes([b[#{byte_off}], b[#{byte_off + 1}], b[#{byte_off + 2}], b[#{byte_off + 3}]])"
+    when 64
+      raise "unaligned 64-bit offset #{off}" unless bit_off == 0
+      "u64::from_le_bytes([b[#{byte_off}], b[#{byte_off + 1}], b[#{byte_off + 2}], b[#{byte_off + 3}], b[#{byte_off + 4}], b[#{byte_off + 5}], b[#{byte_off + 6}], b[#{byte_off + 7}]])"
+    else
+      raise "unsupported operand width #{w}"
+    end
+  end
+
+  def decode_operand_expr(op, is_jump)
+    raw = decode_raw_bits_expr(op)
+    w = op.width
+    if is_jump && op.imm?
+      case w
+      when 4 then "((((#{raw}) as i8) << 4) >> 4) as i64"
+      when 8 then "((#{raw}) as i8) as i64"
+      when 16 then "((#{raw}) as i16) as i64"
+      when 32 then "((#{raw}) as i32) as i64"
+      else raise "unsupported jump imm width #{w}"
+      end
+    elsif op.reg?
+      "Reg((#{raw}) as u16)"
+    elsif op.id?
+      "EntityId((#{raw}) as u32)"
+    elsif op.is_signed_imm? || op.is_float_imm?
+      case w
+      when 4 then "Imm(((((#{raw}) as i8) << 4) >> 4) as i64)"
+      when 8 then "Imm(((#{raw}) as i8) as i64)"
+      when 16 then "Imm(((#{raw}) as i16) as i64)"
+      when 32 then "Imm(((#{raw}) as i32) as i64)"
+      when 64 then "Imm((#{raw}) as i64)"
+      else raise "unsupported signed/float imm width #{w}"
+      end
+    elsif op.is_unsigned_imm?
+      "Imm((#{raw}) as i64)"
+    else
+      raise "unknown operand category #{op.inspect}"
+    end
+  end
+
+  def operand_fits_cond(var_expr, op, width)
+    if op.reg?
+      return nil if width >= 16
+      "#{var_expr}.0 <= #{(1 << width) - 1}"
+    elsif op.id?
+      return nil if width >= 32
+      "#{var_expr}.0 <= #{(1 << width) - 1}"
+    elsif op.is_unsigned_imm?
+      return nil if width >= 64
+      "#{var_expr}.0 >= 0 && #{var_expr}.0 <= #{(1 << width) - 1}"
+    elsif op.is_signed_imm?
+      return nil if width >= 64
+      min_v = -(1 << (width - 1))
+      max_v = (1 << (width - 1)) - 1
+      "#{var_expr}.0 >= #{min_v} && #{var_expr}.0 <= #{max_v}"
+    elsif op.is_float_imm?
+      return nil if width >= 64
+      if width == 32
+        "#{var_expr}.0 >= i32::MIN as i64 && #{var_expr}.0 <= i32::MAX as i64"
+      else
+        raise "unsupported float imm width #{width}"
+      end
+    else
+      raise "unknown operand kind #{op.inspect}"
+    end
+  end
+
+  def pack_operand_stmt(buf_ident, var_expr, op)
+    off = op.offset
+    w = op.width
+    byte_off = off / 8
+    bit_off = off % 8
+    raw_val = "#{var_expr}.0"
+    case w
+    when 4
+      raise "bad 4-bit offset #{off}" unless [0, 4].include?(bit_off)
+      shift_part = bit_off == 0 ? "(#{raw_val} as u8) & 0x0f" : "((#{raw_val} as u8) & 0x0f) << 4"
+      "#{buf_ident}[#{byte_off}] |= #{shift_part};"
+    when 8
+      raise "unaligned 8-bit offset #{off}" unless bit_off == 0
+      "#{buf_ident}[#{byte_off}] = #{raw_val} as u8;"
+    when 16
+      raise "unaligned 16-bit offset #{off}" unless bit_off == 0
+      "#{buf_ident}[#{byte_off}..#{byte_off + 2}].copy_from_slice(&(#{raw_val} as u16).to_le_bytes());"
+    when 32
+      raise "unaligned 32-bit offset #{off}" unless bit_off == 0
+      "#{buf_ident}[#{byte_off}..#{byte_off + 4}].copy_from_slice(&(#{raw_val} as u32).to_le_bytes());"
+    when 64
+      raise "unaligned 64-bit offset #{off}" unless bit_off == 0
+      "#{buf_ident}[#{byte_off}..#{byte_off + 8}].copy_from_slice(&(#{raw_val} as u64).to_le_bytes());"
+    else
+      raise "unsupported pack width #{w}"
+    end
+  end
 %>
+
+/// Minimum primary byte value that introduces a 2-byte prefixed opcode.
+pub const MIN_PREFIX_OPCODE: u8 = <%= min_prefix_opcode %>;
+
+/// Opcode byte for unconditional 32-bit jump (`jmp imm32`).
+pub const JMP_IMM32_OPCODE: u8 = <%= format("0x%02x", jmp_imm32_opcode) %>;
 
 /// Role of an entity operand, taken from the vendored ISA signatures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EntityKind {
 % Panda.instructions.flat_map(&:operands).select(&:id?).map(&:name).uniq.each do |name|
-    <%= name.to_s.split('_').map(&:capitalize).join %>,
+    <%= entity_kind_variant(name) %>,
 % end
 }
 
@@ -139,11 +309,67 @@ pub enum Operand {
     Label(u32),
 }
 
+/// Pure-Rust single-instruction decode failure reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModernDecodeFault {
+    /// Unassigned primary or prefixed opcode.
+    InvalidOpcode,
+    /// Input slice ends before the full opcode or operand payload.
+    Truncated,
+}
+
+/// Pure-Rust entity-ID slot lookup failure reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModernEntitySlotFault {
+    /// Empty slice, unassigned opcode, or truncated instruction bytes.
+    InvalidInstruction,
+    /// Instruction has no entity-ID operand at the requested ordinal.
+    MissingOperand,
+}
+
+/// Wide-displacement (`> i16`) encoding strategy for a jump mnemonic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WideJumpKind {
+    /// Direct 5-byte `op_imm32 rel32` instruction (`jmp`, `jeqz`, `jnez`).
+    NativeImm32(u8),
+    /// 7-byte trampoline: `inv_op_imm8 +7; jmp_imm32 (target - (pc + 2))`.
+    InvertImm8(u8),
+    /// 8-byte trampoline: `inv_op_v8_imm8 reg, +8; jmp_imm32 (target - (pc + 3))`.
+    InvertV8Imm8(u8),
+}
+
+/// Pure-Rust jump encoding metadata extracted from a [`Bytecode`] jump variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JumpEncodeMeta {
+    /// Target instruction index in the input slice.
+    pub target: Label,
+    /// Optional 8-bit register operand (`jeq`, `jne`, `jstricteq`, `jnstricteq`).
+    pub reg: Option<u8>,
+    /// Primary opcode for the 8-bit displacement form (`2` bytes without `reg`, `3` bytes with `reg`).
+    pub op_imm8: u8,
+    /// Primary opcode for the 16-bit displacement form (`3` bytes without `reg`, `4` bytes with `reg`).
+    pub op_imm16: u8,
+    /// Strategy when displacement exceeds `i16::MIN..=i16::MAX`.
+    pub wide: WideJumpKind,
+}
+
+/// Pure-Rust pre-encoded instruction classification for linear branch relaxation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeInsnKind {
+    /// Non-jump instruction pre-packed in its minimal legal format (`len <= 16`).
+    Fixed {
+        bytes: [u8; 16],
+        len: u8,
+    },
+    /// Jump instruction whose byte width (`2..=8`) is resolved during branch relaxation.
+    Jump(JumpEncodeMeta),
+}
+
 /// Decoded ArkCompiler bytecode instruction.
 ///
 /// Each variant represents a mnemonic (e.g. `Mov` merges `MOV_V4_V4`,
 /// `MOV_V8_V8`, `MOV_V16_V16`). Operands are stored as decoded typed fields.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bytecode {
 % mnemonic_groups.each do |mnemonic, group|
 %   vname = mnemonic_variant_name(mnemonic)
@@ -166,53 +392,89 @@ pub enum Bytecode {
 // ============================================================================
 
 impl Bytecode {
-    /// Entity operands in signature order, retaining their individual roles.
-    /// Values are raw encoded operands, not resolved file offsets.
-    pub fn entity_operands(&self) -> Vec<(EntityKind, EntityId)> {
-        match self {
+    /// Maximum number of explicit operands carried by any ISA instruction.
+    pub const MAX_OPERANDS: usize = <%= max_operands %>;
+
+    /// Maximum number of entity-ID operands carried by any ISA instruction.
+    pub const MAX_ENTITY_OPERANDS: usize = <%= max_id_operands %>;
+
+    /// Stack-allocated entity operands in signature order (`(items, len)`),
+    /// avoiding heap allocation in hot loops.
+    #[inline]
+    pub const fn entity_operands_inline(
+        &self,
+    ) -> ([(EntityKind, EntityId); Self::MAX_ENTITY_OPERANDS], usize) {
+        let dummy = (EntityKind::MethodId, EntityId(0));
+        let mut out = [dummy; Self::MAX_ENTITY_OPERANDS];
+        match *self {
 % mnemonic_groups.each do |mnemonic, group|
 %   ops = group.first.operands
 %   next unless ops.any?(&:id?)
 %   pats = ops.each_with_index.map { |op, i| op.id? ? "id#{i}" : '_' }
-%   refs = ops.each_with_index.select { |op, _| op.id? }.map { |op, i| "(EntityKind::#{op.name.to_s.split('_').map(&:capitalize).join}, *id#{i})" }
-            Bytecode::<%= mnemonic_variant_name(mnemonic) %>(<%= pats.join(', ') %>) => vec![<%= refs.join(', ') %>],
+%   id_pairs = ops.each_with_index.select { |op, _| op.id? }
+            Bytecode::<%= mnemonic_variant_name(mnemonic) %>(<%= pats.join(', ') %>) => {
+%   id_pairs.each_with_index do |(op, orig_i), slot_i|
+                out[<%= slot_i %>] = (EntityKind::<%= entity_kind_variant(op.name) %>, id<%= orig_i %>);
+%   end
+                (out, <%= id_pairs.size %>)
+            }
 % end
-            _ => Vec::new(),
+            _ => (out, 0),
         }
     }
 
-    /// All operands in ISA signature order, retaining per-operand roles.
-    pub fn operands(&self) -> Vec<Operand> {
-        match self {
+    /// Entity operands in signature order, retaining their individual roles.
+    /// Values are raw encoded operands, not resolved file offsets.
+    pub fn entity_operands(&self) -> Vec<(EntityKind, EntityId)> {
+        let (arr, n) = self.entity_operands_inline();
+        arr[..n].to_vec()
+    }
+
+    /// Stack-allocated operands in ISA signature order (`(items, len)`),
+    /// avoiding heap allocation in hot loops.
+    #[inline]
+    pub const fn operands_inline(&self) -> ([Operand; Self::MAX_OPERANDS], usize) {
+        let mut out = [Operand::Imm(0); Self::MAX_OPERANDS];
+        match *self {
 % mnemonic_groups.each do |mnemonic, group|
 %   vname = mnemonic_variant_name(mnemonic)
 %   is_jump = group.first.jump?
 %   ops = group.first.operands
 %   next if ops.empty?
 %   pats = ops.each_with_index.map { |_, i| "a#{i}" }
-%   exprs = ops.each_with_index.map { |op, i|
-%     if is_jump && op.imm?
+            Bytecode::<%= vname %>(<%= pats.join(', ') %>) => {
+%   ops.each_with_index do |op, i|
+%     expr = if is_jump && op.imm?
 %       "Operand::Label(a#{i}.0)"
 %     elsif op.reg?
 %       "Operand::Reg(a#{i}.0)"
 %     elsif op.id?
-%       "Operand::Entity(EntityKind::#{op.name.to_s.split('_').map(&:capitalize).join}, a#{i}.0)"
+%       "Operand::Entity(EntityKind::#{entity_kind_variant(op.name)}, a#{i}.0)"
 %     else
 %       "Operand::Imm(a#{i}.0)"
 %     end
-%   }
-            Bytecode::<%= vname %>(<%= pats.join(', ') %>) => vec![<%= exprs.join(', ') %>],
+                out[<%= i %>] = <%= expr %>;
+%   end
+                (out, <%= ops.size %>)
+            }
 % end
-            _ => Vec::new(),
+            _ => (out, 0),
         }
+    }
+
+    /// All operands in ISA signature order, retaining per-operand roles.
+    pub fn operands(&self) -> Vec<Operand> {
+        let (arr, n) = self.operands_inline();
+        arr[..n].to_vec()
     }
 
     /// Representative opcode for this mnemonic (largest format).
     ///
-    /// Used internally for FFI classification calls and emitter dispatch.
+    /// Used internally for FFI differential checks and emitter dispatch.
     /// All opcodes in a mnemonic group share the same properties, so the
     /// specific value does not matter.
-    fn representative_opcode(&self) -> u16 {
+    #[inline]
+    pub const fn representative_opcode(&self) -> u16 {
         match self {
 % mnemonic_groups.each do |mnemonic, group|
 %   vname = mnemonic_variant_name(mnemonic)
@@ -223,7 +485,8 @@ impl Bytecode {
     }
 
     /// Mnemonic name (e.g. `"mov"`, `"jmp"`).
-    pub fn mnemonic(&self) -> &'static str {
+    #[inline]
+    pub const fn mnemonic(&self) -> &'static str {
         match self {
 % mnemonic_groups.each do |mnemonic, group|
 %   vname = mnemonic_variant_name(mnemonic)
@@ -232,61 +495,108 @@ impl Bytecode {
         }
     }
 
-    // === Classification (delegates to opcode-based C FFI) ===
+    // === Pure-Rust Classification (zero FFI) ===
+
+    /// Full ISA property bitmask for this instruction.
+    #[inline]
+    pub const fn flags(&self) -> BytecodeFlags {
+        let bits = match self {
+% mnemonic_groups.each do |mnemonic, group|
+%   vname = mnemonic_variant_name(mnemonic)
+%   f_bits = group.first.real_properties.inject(0) { |acc, p| acc | prop_bit_by_tag.fetch(p) }
+            Bytecode::<%= vname %><%= group.first.operands.empty? ? '' : '(..)' %> => <%= format("0x%x", f_bits) %>,
+% end
+        };
+        BytecodeFlags::from_bits_retain(bits)
+    }
+
+    /// Full ISA exception bitmask for this instruction.
+    #[inline]
+    pub const fn exception_mask(&self) -> ExceptionType {
+        let bits = match self {
+% mnemonic_groups.each do |mnemonic, group|
+%   vname = mnemonic_variant_name(mnemonic)
+%   e_bits = group.first.exceptions.inject(0) { |acc, e| acc | exc_bit_by_tag.fetch(e) }
+            Bytecode::<%= vname %><%= group.first.operands.empty? ? '' : '(..)' %> => <%= format("0x%x", e_bits) %>,
+% end
+        };
+        ExceptionType::from_bits_retain(bits)
+    }
 
     /// Check if this instruction is a jump.
-    pub fn is_jump(&self) -> bool {
-        unsafe { crate::isa_is_jump_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn is_jump(&self) -> bool {
+        self.has_flag(BytecodeFlags::JUMP)
     }
 
     /// Check if this instruction can throw an exception.
-    pub fn can_throw(&self) -> bool {
-        unsafe { crate::isa_can_throw_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn can_throw(&self) -> bool {
+        match self {
+% mnemonic_groups.each do |mnemonic, group|
+%   next unless group.first.exceptions != ['x_none']
+%   vname = mnemonic_variant_name(mnemonic)
+            Bytecode::<%= vname %><%= group.first.operands.empty? ? '' : '(..)' %> => true,
+% end
+            _ => false,
+        }
     }
 
     /// Check if this instruction is a block terminator.
-    pub fn is_terminator(&self) -> bool {
-        unsafe { crate::isa_is_terminator_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn is_terminator(&self) -> bool {
+        self.has_flag(BytecodeFlags::RETURN)
+            || self.has_flag(BytecodeFlags::JUMP)
+            || self.is_throw_ex(ExceptionType::X_THROW)
     }
 
     /// Check if this instruction has a specific property flag.
-    ///
-    /// ```ignore
-    /// use abcd_isa_sys::BytecodeFlags;
-    /// if bc.has_flag(BytecodeFlags::CALL | BytecodeFlags::DYNAMIC) { /* ... */ }
-    /// ```
-    pub fn has_flag(&self, flag: BytecodeFlags) -> bool {
-        unsafe { crate::isa_has_flag_opcode(self.representative_opcode(), flag.bits()) != 0 }
+    #[inline]
+    pub const fn has_flag(&self, flag: BytecodeFlags) -> bool {
+        self.flags().contains(flag)
     }
 
     /// Check if this instruction is a range instruction.
-    pub fn is_range(&self) -> bool {
-        unsafe { crate::isa_is_range_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn is_range(&self) -> bool {
+        match self {
+% mnemonic_groups.each do |mnemonic, group|
+%   next unless group.first.is_range_instruction?
+%   vname = mnemonic_variant_name(mnemonic)
+            Bytecode::<%= vname %><%= group.first.operands.empty? ? '' : '(..)' %> => true,
+% end
+            _ => false,
+        }
     }
 
-    /// Check if this instruction is a return or throw.
-    pub fn is_return_or_throw(&self) -> bool {
-        unsafe { crate::isa_is_return_or_throw_opcode(self.representative_opcode()) != 0 }
+    /// Check if this instruction is a return or unconditional throw.
+    #[inline]
+    pub const fn is_return_or_throw(&self) -> bool {
+        match self {
+% mnemonic_groups.each do |mnemonic, group|
+%   next unless group.first.is_return_instruction? || group.first.is_unconditional_throw_instruction?
+%   vname = mnemonic_variant_name(mnemonic)
+            Bytecode::<%= vname %><%= group.first.operands.empty? ? '' : '(..)' %> => true,
+% end
+            _ => false,
+        }
     }
 
     /// Check if this instruction is a suspend point (generator/async yield).
-    pub fn is_suspend(&self) -> bool {
-        unsafe { crate::isa_is_suspend_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn is_suspend(&self) -> bool {
+        self.has_flag(BytecodeFlags::SUSPEND)
     }
 
     /// Check if this instruction throws a specific exception type.
-    ///
-    /// ```ignore
-    /// use abcd_isa_sys::ExceptionType;
-    /// if bc.is_throw_ex(ExceptionType::X_NULL | ExceptionType::X_BOUNDS) { /* ... */ }
-    /// ```
-    pub fn is_throw_ex(&self, mask: ExceptionType) -> bool {
-        unsafe { crate::isa_is_throw_ex_opcode(self.representative_opcode(), mask.bits()) != 0 }
+    #[inline]
+    pub const fn is_throw_ex(&self, mask: ExceptionType) -> bool {
+        self.exception_mask().contains(mask)
     }
 
     // === Emitter support ===
 
-    /// Extract opcode and operand values for the emitter.
+    /// Extract opcode and operand values for the C++ oracle emitter.
     ///
     /// Returns `(opcode, args, num_args)` where `args` contains operand values
     /// as `i64` in instruction operand order. For jump instructions, the
@@ -330,6 +640,7 @@ impl Bytecode {
     }
 
     /// Set the jump target label.
+    #[inline]
     pub fn set_label(&mut self, label: Label) {
         match self {
 % mnemonic_groups.each do |mnemonic, group|
@@ -338,17 +649,35 @@ impl Bytecode {
 %   ops = group.first.operands
 %   label_idx = ops.index { |op| op.imm? }
 %   next unless label_idx
-%   pats = ops.each_with_index.map { |op, i| i == label_idx ? 'l' : '_' }
+%   pats = ops.each_with_index.map { |_, i| i == label_idx ? 'l' : '_' }
             Bytecode::<%= vname %>(<%= pats.join(', ') %>) => *l = label,
 % end
             _ => {}
         }
     }
 
+    /// Jump target [`Label`] if this instruction is a jump, `None` otherwise.
+    #[inline]
+    pub const fn jump_label(&self) -> Option<Label> {
+        match *self {
+% mnemonic_groups.each do |mnemonic, group|
+%   next unless group.first.jump?
+%   vname = mnemonic_variant_name(mnemonic)
+%   ops = group.first.operands
+%   label_idx = ops.index { |op| op.imm? }
+%   next unless label_idx
+%   pats = ops.each_with_index.map { |_, i| i == label_idx ? 'l' : '_' }
+            Bytecode::<%= vname %>(<%= pats.join(', ') %>) => Some(l),
+% end
+            _ => None,
+        }
+    }
+
     /// Index of the label operand in [`emit_args`](Self::emit_args) output.
     ///
     /// Returns `Some(idx)` for jump instructions, `None` otherwise.
-    pub fn jump_label_arg_index(&self) -> Option<usize> {
+    #[inline]
+    pub const fn jump_label_arg_index(&self) -> Option<usize> {
         match self {
 % mnemonic_groups.each do |mnemonic, group|
 %   next unless group.first.jump?
@@ -357,6 +686,282 @@ impl Bytecode {
 %   label_idx = ops.index { |op| op.imm? }
 %   next unless label_idx
             Bytecode::<%= vname %>(..) => Some(<%= label_idx %>),
+% end
+            _ => None,
+        }
+    }
+}
+
+// ============================================================================
+// Pure-Rust Modern ISA Decode, Entity Slot Lookup & Encode Classification
+// ============================================================================
+
+/// Read the 1- or 2-byte modern (`24.0.0.0`) opcode at `bytes[0..]`.
+#[inline]
+fn read_modern_opcode(bytes: &[u8]) -> Result<u16, ModernDecodeFault> {
+    let Some(&b0) = bytes.first() else {
+        return Err(ModernDecodeFault::Truncated);
+    };
+    if b0 >= MIN_PREFIX_OPCODE {
+        let Some(&b1) = bytes.get(1) else {
+            return Err(ModernDecodeFault::Truncated);
+        };
+        Ok(((b1 as u16) << 8) | (b0 as u16))
+    } else {
+        Ok(b0 as u16)
+    }
+}
+
+/// Look up the `(byte_offset, byte_width)` of the `ordinal`-th entity-ID operand
+/// in the modern (`24.0.0.0`) instruction starting at `bytes`.
+///
+/// Validates both opcode assignment and full instruction byte length before
+/// inspecting operand slots.
+pub fn modern_entity_id_slot(bytes: &[u8], ordinal: u32) -> Result<(usize, u8), ModernEntitySlotFault> {
+    let opcode = read_modern_opcode(bytes).map_err(|_| ModernEntitySlotFault::InvalidInstruction)?;
+    match opcode {
+% Panda.instructions.each do |insn|
+%   size = insn.format.size
+%   id_ops = insn.operands.select(&:id?)
+        <%= insn.opcode_idx %> => {
+            if bytes.len() < <%= size %> {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+%   if id_ops.empty?
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+%   else
+            match ordinal {
+%     id_ops.each_with_index do |op, idx|
+%       raise "unaligned entity id in #{insn.opcode}" unless (op.offset % 8 == 0) && [8, 16, 32].include?(op.width)
+                <%= idx %> => Ok((<%= op.offset / 8 %>, <%= op.width / 8 %>)),
+%     end
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+%   end
+        }
+% end
+        _ => Err(ModernEntitySlotFault::InvalidInstruction),
+    }
+}
+
+impl Bytecode {
+    /// Pure-Rust modern (`24.0.0.0`) single-instruction decoder.
+    ///
+    /// Returns `(instruction, byte_len, raw_jump_offset)` where jump operands
+    /// hold placeholder `Label(0)` and `raw_jump_offset` carries the signed
+    /// byte displacement relative to the start of the instruction.
+    pub fn decode_modern(bytes: &[u8]) -> Result<(Self, usize, Option<i64>), ModernDecodeFault> {
+        let opcode = read_modern_opcode(bytes)?;
+        match opcode {
+% Panda.instructions.each do |insn|
+%   vname = mnemonic_variant_name(insn.mnemonic)
+%   size = insn.format.size
+%   is_jump = insn.jump?
+%   ops = insn.operands
+            <%= insn.opcode_idx %> => {
+                let Some(b) = bytes.get(..<%= size %>) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+%   if ops.empty?
+                let _ = b;
+                Ok((Bytecode::<%= vname %>, <%= size %>, None))
+%   else
+%     field_exprs = []
+%     jump_expr = nil
+%     ops.each do |op|
+%       if is_jump && op.imm?
+%         jump_expr = decode_operand_expr(op, true)
+%         field_exprs << 'Label(0)'
+%       else
+%         field_exprs << decode_operand_expr(op, false)
+%       end
+%     end
+%     if is_jump && jump_expr
+                let raw_imm = <%= jump_expr %>;
+                Ok((Bytecode::<%= vname %>(<%= field_exprs.join(', ') %>), <%= size %>, Some(raw_imm)))
+%     else
+                Ok((Bytecode::<%= vname %>(<%= field_exprs.join(', ') %>), <%= size %>, None))
+%     end
+%   end
+            }
+% end
+            _ => Err(ModernDecodeFault::InvalidOpcode),
+        }
+    }
+
+    /// Pure-Rust instruction encoder & jump classifier.
+    ///
+    /// Validates every non-label operand against the mnemonic's maximum legal
+    /// storage width (`Err(())` on overflow/underflow) and packs non-jump
+    /// instructions into their narrowest legal ISA format, matching upstream
+    /// `BytecodeEmitter` format selection bit-for-bit.
+    #[allow(clippy::too_many_lines, reason = "generated per-mnemonic dispatch")]
+    pub fn classify_for_encode(&self) -> Result<EncodeInsnKind, ()> {
+        match *self {
+% mnemonic_groups.each do |mnemonic, group|
+%   vname = mnemonic_variant_name(mnemonic)
+%   first = group.first
+%   ops = first.operands
+%   sorted_group = group.sort_by { |ins| ins.format.size }
+%   if first.jump?
+%     sorted_group.each { |ins| raise "prefixed jump unsupported: #{ins.opcode}" if ins.format.prefixed? }
+%     ins8 = sorted_group.find { |ins| ins.operands.find(&:imm?).width == 8 }
+%     ins16 = sorted_group.find { |ins| ins.operands.find(&:imm?).width == 16 }
+%     ins32 = sorted_group.find { |ins| ins.operands.find(&:imm?).width == 32 }
+%     raise "missing imm8/imm16 jump in #{mnemonic}" unless ins8 && ins16
+%     wide_expr = if ins32
+%       "WideJumpKind::NativeImm32(#{format('0x%02x', ins32.opcode_idx)})"
+%     else
+%       inv_mnem = INVERT_JUMP_MNEMONIC.fetch(mnemonic) { raise "No inverted mnemonic for jump #{mnemonic}" }
+%       inv_ins8 = mnemonic_groups.fetch(inv_mnem).find { |ins| ins.operands.find(&:imm?).width == 8 }
+%       raise "Missing imm8 inverted jump for #{inv_mnem}" unless inv_ins8 && !inv_ins8.format.prefixed?
+%       if ops.size == 1
+%         "WideJumpKind::InvertImm8(#{format('0x%02x', inv_ins8.opcode_idx)})"
+%       elsif ops.size == 2 && ops[0].reg? && ops[0].width == 8
+%         "WideJumpKind::InvertV8Imm8(#{format('0x%02x', inv_ins8.opcode_idx)})"
+%       else
+%         raise "Unexpected jump signature for #{mnemonic}"
+%       end
+%     end
+%     if ops.size == 1 && ops[0].imm?
+            Bytecode::<%= vname %>(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: <%= format("0x%02x", ins8.opcode_idx) %>,
+                op_imm16: <%= format("0x%02x", ins16.opcode_idx) %>,
+                wide: <%= wide_expr %>,
+            })),
+%     elsif ops.size == 2 && ops[0].reg? && ops[1].imm?
+            Bytecode::<%= vname %>(reg, target) => {
+                if reg.0 > 0xff {
+                    return Err(());
+                }
+                Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                    target,
+                    reg: Some(reg.0 as u8),
+                    op_imm8: <%= format("0x%02x", ins8.opcode_idx) %>,
+                    op_imm16: <%= format("0x%02x", ins16.opcode_idx) %>,
+                    wide: <%= wide_expr %>,
+                }))
+            }
+%     else
+%       raise "Unsupported jump operand layout in #{mnemonic}"
+%     end
+%   elsif ops.empty?
+%     ins = sorted_group.first
+            Bytecode::<%= vname %> => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = <%= format("0x%02x", ins.opcode_idx & 0xff) %>;
+%     if ins.format.prefixed?
+                bytes[1] = <%= format("0x%02x", (ins.opcode_idx >> 8) & 0xff) %>;
+%     end
+                Ok(EncodeInsnKind::Fixed {
+                    bytes,
+                    len: <%= ins.format.size %>,
+                })
+            }
+%   else
+%     pat_vars = ops.each_with_index.map { |_, i| "a#{i}" }
+%     widest_checks = []
+%     ops.each_with_index do |op, i|
+%       max_w = sorted_group.map { |ins| ins.operands[i].width }.max
+%       cond = operand_fits_cond("a#{i}", op, max_w)
+%       widest_checks << cond if cond
+%     end
+            Bytecode::<%= vname %>(<%= pat_vars.join(', ') %>) => {
+%     unless widest_checks.empty?
+                if !(<%= widest_checks.join(' && ') %>) {
+                    return Err(());
+                }
+%     end
+%     sorted_group[0...-1].each do |ins|
+%       fit_conds = []
+%       ins.operands.each_with_index do |op, i|
+%         max_w = sorted_group.map { |g_ins| g_ins.operands[i].width }.max
+%         next if op.width == max_w
+%         cond = operand_fits_cond("a#{i}", op, op.width)
+%         fit_conds << cond if cond
+%       end
+                if <%= fit_conds.empty? ? 'true' : fit_conds.join(' && ') %> {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = <%= format("0x%02x", ins.opcode_idx & 0xff) %>;
+%       if ins.format.prefixed?
+                    bytes[1] = <%= format("0x%02x", (ins.opcode_idx >> 8) & 0xff) %>;
+%       end
+%       ins.operands.each_with_index do |op, i|
+                    <%= pack_operand_stmt('bytes', "a#{i}", op) %>
+%       end
+                    return Ok(EncodeInsnKind::Fixed {
+                        bytes,
+                        len: <%= ins.format.size %>,
+                    });
+                }
+%     end
+%     ins = sorted_group.last
+                let mut bytes = [0u8; 16];
+                bytes[0] = <%= format("0x%02x", ins.opcode_idx & 0xff) %>;
+%     if ins.format.prefixed?
+                bytes[1] = <%= format("0x%02x", (ins.opcode_idx >> 8) & 0xff) %>;
+%     end
+%     ins.operands.each_with_index do |op, i|
+                <%= pack_operand_stmt('bytes', "a#{i}", op) %>
+%     end
+                Ok(EncodeInsnKind::Fixed {
+                    bytes,
+                    len: <%= ins.format.size %>,
+                })
+            }
+%   end
+% end
+        }
+    }
+
+    /// Decode a single instruction from raw bytes via C FFI (retained for
+    /// differential oracle verification against [`Self::decode_modern`]).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to at least `isa_get_size_by_opcode(opcode)` readable
+    /// bytes. `opcode` must have been obtained from `isa_get_opcode(ptr)`.
+    pub unsafe fn decode_one(ptr: *const u8, opcode: u16) -> Option<(Self, Option<i64>)> {
+        match opcode as u32 {
+% mnemonic_groups.each do |mnemonic, group|
+%   vname = mnemonic_variant_name(mnemonic)
+%   is_jump = group.first.jump?
+%   ops = group.first.operands
+%   opcode_literals = group.map { |i| "#{i.opcode_idx}" }
+            <%= opcode_literals.join(' | ') %> => {
+%   if ops.empty?
+                let _ = ptr;
+                Some((Bytecode::<%= vname %>, None))
+%   else
+%     type_indices = { reg?: 0, imm?: 0, id?: 0 }
+%     field_exprs = []
+%     raw_imm_expr = nil
+%     ops.each do |op|
+%       key = [:reg?, :imm?, :id?].find { |k| op.send(k) }
+%       tidx = type_indices[key]
+%       type_indices[key] += 1
+%       if is_jump && op.imm?
+%         raw_imm_expr = "unsafe { crate::isa_get_imm64(ptr, #{tidx}) }"
+%         field_exprs << 'Label(0)'
+%       elsif op.reg?
+%         field_exprs << "Reg(unsafe { crate::isa_get_vreg(ptr, #{tidx}) } as u16)"
+%       elsif op.id?
+%         field_exprs << "EntityId(unsafe { crate::isa_get_id(ptr, #{tidx}) })"
+%       else
+%         field_exprs << "Imm(unsafe { crate::isa_get_imm_data(ptr, #{tidx}) })"
+%       end
+%     end
+%     if is_jump && raw_imm_expr
+                let raw_imm = <%= raw_imm_expr %>;
+                Some((Bytecode::<%= vname %>(<%= field_exprs.join(', ') %>), Some(raw_imm)))
+%     else
+                Some((Bytecode::<%= vname %>(<%= field_exprs.join(', ') %>), None))
+%     end
+%   end
+            }
 % end
             _ => None,
         }
@@ -411,64 +1016,6 @@ impl core::fmt::Debug for Bytecode {
 }
 
 // ============================================================================
-// Single-instruction decode
-// ============================================================================
-
-impl Bytecode {
-    /// Decode a single instruction from raw bytes.
-    ///
-    /// Returns `Some((instruction, raw_jump_offset))` on success, or `None`
-    /// if the opcode is unknown. For jump instructions, `raw_jump_offset` is
-    /// `Some(byte_offset)` (the signed immediate); for non-jumps it is `None`.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must point to at least `isa_get_size_by_opcode(opcode)` readable
-    /// bytes. `opcode` must have been obtained from `isa_get_opcode(ptr)`.
-    pub unsafe fn decode_one(ptr: *const u8, opcode: u16) -> Option<(Self, Option<i64>)> {
-        match opcode as u32 {
-% mnemonic_groups.each do |mnemonic, group|
-%   vname = mnemonic_variant_name(mnemonic)
-%   is_jump = group.first.jump?
-%   ops = group.first.operands
-%   opcode_literals = group.map { |i| "#{i.opcode_idx}" }
-            <%= opcode_literals.join(' | ') %> => {
-%   if ops.empty?
-                Some((Bytecode::<%= vname %>, None))
-%   else
-%     type_indices = { reg?: 0, imm?: 0, id?: 0 }
-%     field_exprs = []
-%     raw_imm_expr = nil
-%     ops.each do |op|
-%       key = [:reg?, :imm?, :id?].find { |k| op.send(k) }
-%       tidx = type_indices[key]
-%       type_indices[key] += 1
-%       if is_jump && op.imm?
-%         raw_imm_expr = "unsafe { crate::isa_get_imm64(ptr, #{tidx}) }"
-%         field_exprs << 'Label(0)'
-%       elsif op.reg?
-%         field_exprs << "Reg(unsafe { crate::isa_get_vreg(ptr, #{tidx}) } as u16)"
-%       elsif op.id?
-%         field_exprs << "EntityId(unsafe { crate::isa_get_id(ptr, #{tidx}) })"
-%       else
-%         field_exprs << "Imm(unsafe { crate::isa_get_imm_data(ptr, #{tidx}) })"
-%       end
-%     end
-%     if is_jump && raw_imm_expr
-                let raw_imm = <%= raw_imm_expr %>;
-                Some((Bytecode::<%= vname %>(<%= field_exprs.join(', ') %>), Some(raw_imm)))
-%     else
-                Some((Bytecode::<%= vname %>(<%= field_exprs.join(', ') %>), None))
-%     end
-%   end
-            }
-% end
-            _ => None,
-        }
-    }
-}
-
-// ============================================================================
 // Per-mnemonic constructor structs
 // ============================================================================
 
@@ -502,11 +1049,13 @@ pub mod insn {
     pub struct <%= vname %>;
     impl <%= vname %> {
 %   if params.empty?
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::<%= vname %>
         }
 %   else
-        pub fn new(<%= params.join(', ') %>) -> Bytecode {
+        #[inline]
+        pub const fn new(<%= params.join(', ') %>) -> Bytecode {
             Bytecode::<%= vname %>(<%= args_list %>)
         }
 %   end

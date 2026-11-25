@@ -1,12 +1,9 @@
-use std::collections::HashMap;
-use std::ptr;
-
-use abcd_isa_sys::Bytecode;
+use abcd_isa_sys::{Bytecode, EncodeInsnKind, JMP_IMM32_OPCODE, JumpEncodeMeta, WideJumpKind};
 
 /// Errors from [`encode`].
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum EncodeError {
-    /// The underlying C++ emitter returned a non-specific error.
+    /// An internal invariant of the bytecode encoder was violated.
     #[error("internal emitter error")]
     Internal,
     /// The opcode is not recognized by the emitter.
@@ -26,136 +23,272 @@ pub enum EncodeError {
     TooManyInstructions(usize),
 }
 
-/// Encode a sequence of instructions into bytecode bytes.
+/// Byte width of a jump instruction at relaxation `tier` (`0 = imm8`, `1 = imm16`, `2 = wide`).
+#[inline]
+const fn jump_tier_size(meta: &JumpEncodeMeta, tier: u8) -> u8 {
+    match tier {
+        0 => {
+            if meta.reg.is_some() {
+                3
+            } else {
+                2
+            }
+        }
+        1 => {
+            if meta.reg.is_some() {
+                4
+            } else {
+                3
+            }
+        }
+        _ => match meta.wide {
+            WideJumpKind::NativeImm32(_) => 5,
+            WideJumpKind::InvertImm8(_) => 7,
+            WideJumpKind::InvertV8Imm8(_) => 8,
+        },
+    }
+}
+
+/// Prefix sum `sizes[0..k]` from a 1-indexed Fenwick tree (`k in 0..=n`).
+#[inline]
+fn fenwick_sum(bit: &[u64], k: usize) -> u64 {
+    let mut sum = 0u64;
+    let mut idx = k;
+    while idx > 0 {
+        sum += bit[idx];
+        idx &= idx - 1;
+    }
+    sum
+}
+
+/// Point-add `delta` to `sizes[i]` in a 1-indexed Fenwick tree.
+#[inline]
+fn fenwick_add(bit: &mut [u64], i: usize, delta: u64) {
+    let mut idx = i + 1;
+    while idx < bit.len() {
+        bit[idx] += delta;
+        idx += idx & idx.wrapping_neg();
+    }
+}
+
+/// Check one jump site against current Fenwick prefix offsets and widen its tier if needed.
+#[inline]
+fn relax_jump_site(
+    site: &mut (usize, JumpEncodeMeta, u8),
+    sizes: &mut [u8],
+    bit: &mut [u64],
+) -> bool {
+    let (insn_idx, meta, ref mut tier) = *site;
+    if *tier >= 2 {
+        return false;
+    }
+
+    let insn_off = fenwick_sum(bit, insn_idx) as i64;
+    let target_off = fenwick_sum(bit, meta.target.0 as usize) as i64;
+    let disp = target_off - insn_off;
+
+    if *tier == 0 {
+        if (i8::MIN as i64..=i8::MAX as i64).contains(&disp) {
+            return false;
+        }
+        *tier = 1;
+        let old_sz = sizes[insn_idx];
+        let new_sz = jump_tier_size(&meta, 1);
+        sizes[insn_idx] = new_sz;
+        fenwick_add(bit, insn_idx, u64::from(new_sz - old_sz));
+
+        // Re-evaluate immediately under updated prefix sums in case displacement already exceeds i16.
+        let insn_off = fenwick_sum(bit, insn_idx) as i64;
+        let target_off = fenwick_sum(bit, meta.target.0 as usize) as i64;
+        let disp = target_off - insn_off;
+        if !(i16::MIN as i64..=i16::MAX as i64).contains(&disp) {
+            *tier = 2;
+            let old_sz = sizes[insn_idx];
+            let new_sz = jump_tier_size(&meta, 2);
+            sizes[insn_idx] = new_sz;
+            fenwick_add(bit, insn_idx, u64::from(new_sz - old_sz));
+        }
+        return true;
+    }
+
+    // *tier == 1
+    if (i16::MIN as i64..=i16::MAX as i64).contains(&disp) {
+        return false;
+    }
+    *tier = 2;
+    let old_sz = sizes[insn_idx];
+    let new_sz = jump_tier_size(&meta, 2);
+    sizes[insn_idx] = new_sz;
+    fenwick_add(bit, insn_idx, u64::from(new_sz - old_sz));
+    true
+}
+
+/// Encode a sequence of instructions into bytecode bytes in pure Safe Rust.
 ///
 /// [`Label`](abcd_isa_sys::Label) operands in jump instructions are
 /// interpreted as instruction indices into `instructions`.
 ///
-/// Returns `(bytes, offsets)` where `offsets[i]` is the byte offset of
-/// instruction `i` within `bytes`. This is needed for try-block metadata
-/// which references instructions by byte offset.
+/// Returns `(bytes, offsets)` where `offsets[i]` is the starting byte offset of
+/// instruction `i` within `bytes` (`offsets.len() == instructions.len()` even
+/// when a far `> 32 KiB` conditional jump expands into an inverted-branch +
+/// `jmp.32` trampoline).
 ///
-/// ```no_run
-/// use abcd_isa::{encode, insn, Label, Bytecode};
+/// ```
+/// use abcd_isa::{Bytecode, Label, encode, insn};
 ///
 /// let program: &[Bytecode] = &[
-///     insn::Jmp::new(Label(1)).into(),
-///     insn::Ldundefined::new().into(),
+///     insn::Jmp::new(Label(1)),
+///     insn::Ldundefined::new(),
 /// ];
 /// let (bytes, offsets) = encode(program)?;
+/// assert_eq!(offsets, vec![0, 2]);
+/// assert_eq!(bytes.len(), 3);
 /// # Ok::<(), abcd_isa::EncodeError>(())
 /// ```
 pub fn encode(instructions: &[Bytecode]) -> Result<(Vec<u8>, Vec<u32>), EncodeError> {
-    // Label uses u32 indices; guard against truncation on 64-bit platforms.
-    if instructions.len() > u32::MAX as usize {
-        return Err(EncodeError::TooManyInstructions(instructions.len()));
+    let n = instructions.len();
+    if n == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if n > u32::MAX as usize {
+        return Err(EncodeError::TooManyInstructions(n));
     }
 
-    // 1. Collect jump targets and validate label bounds.
-    let mut targets: HashMap<u32, u32> = HashMap::new(); // insn_index → cpp_label_id (filled in step 2)
-    for bc in instructions {
-        if let Some(idx) = bc.jump_label_arg_index() {
-            let (_, args, _) = bc.emit_args();
-            let target = args[idx] as u32;
-            if target as usize >= instructions.len() {
-                return Err(EncodeError::LabelOutOfBounds(target, instructions.len()));
+    // 1. Pre-pack fixed instructions and collect jump sites at minimal (`imm8`) width.
+    let mut kinds: Vec<EncodeInsnKind> = Vec::with_capacity(n);
+    let mut sizes: Vec<u8> = Vec::with_capacity(n);
+    let mut jumps: Vec<(usize, JumpEncodeMeta, u8)> = Vec::new();
+
+    for (idx, bc) in instructions.iter().enumerate() {
+        let kind = bc
+            .classify_for_encode()
+            .map_err(|()| EncodeError::OperandOutOfRange)?;
+        match kind {
+            EncodeInsnKind::Fixed { len, .. } => {
+                sizes.push(len);
             }
-            targets.entry(target).or_insert(0);
-        }
-    }
-
-    // 2. Create C++ emitter and allocate a label for each target.
-    // SAFETY: no preconditions; returns null on allocation failure (checked below).
-    let raw = unsafe { abcd_isa_sys::isa_emitter_create() };
-    if raw.is_null() {
-        return Err(EncodeError::Internal);
-    }
-
-    // Ensure cleanup on all exit paths.
-    struct Guard(*mut abcd_isa_sys::IsaEmitter);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            // SAFETY: self.0 is the sole owner, obtained from isa_emitter_create.
-            unsafe { abcd_isa_sys::isa_emitter_destroy(self.0) };
-        }
-    }
-    let _guard = Guard(raw);
-
-    for cpp_id in targets.values_mut() {
-        // SAFETY: raw is non-null (checked above) and exclusively owned.
-        *cpp_id = unsafe { abcd_isa_sys::isa_emitter_create_label(raw) };
-    }
-
-    // 3. Emit instructions, binding labels at the right positions.
-    for (i, bc) in instructions.iter().enumerate() {
-        if let Some(&cpp_id) = targets.get(&(i as u32)) {
-            // SAFETY: raw is non-null; cpp_id was returned by create_label.
-            let rc = unsafe { abcd_isa_sys::isa_emitter_bind(raw, cpp_id) };
-            debug_assert_eq!(
-                rc,
-                abcd_isa_sys::ISA_EMIT_OK as i32,
-                "isa_emitter_bind failed for label {cpp_id}"
-            );
-        }
-
-        let (opcode, mut args, num_args) = bc.emit_args();
-
-        // Replace instruction index with C++ label ID for jump operands.
-        if let Some(label_idx) = bc.jump_label_arg_index() {
-            let target_insn = args[label_idx] as u32;
-            args[label_idx] = targets[&target_insn] as i64;
-        }
-
-        // SAFETY: raw is non-null; args points to a stack-allocated array
-        // with at least num_args elements.
-        let rc = unsafe { abcd_isa_sys::isa_emitter_emit(raw, opcode, args.as_ptr(), num_args) };
-        match rc {
-            x if x == abcd_isa_sys::ISA_EMIT_OK as i32 => {}
-            abcd_isa_sys::ISA_EMIT_UNKNOWN_OPCODE => return Err(EncodeError::UnknownOpcode),
-            abcd_isa_sys::ISA_EMIT_OPERAND_OUT_OF_RANGE => {
-                return Err(EncodeError::OperandOutOfRange);
-            }
-            _ => return Err(EncodeError::Internal),
-        }
-    }
-
-    // 4. Build final bytecode.
-    let mut buf: *mut u8 = ptr::null_mut();
-    let mut len: usize = 0;
-    // SAFETY: raw is non-null; buf and len are valid mutable references.
-    let rc = unsafe { abcd_isa_sys::isa_emitter_build(raw, &mut buf, &mut len) };
-    match rc {
-        x if x == abcd_isa_sys::ISA_BUILD_OK as i32 && !buf.is_null() => {
-            // SAFETY: buf is non-null (match guard) and points to `len` bytes
-            // allocated by isa_emitter_build.
-            let vec = unsafe { std::slice::from_raw_parts(buf, len) }.to_vec();
-            // SAFETY: buf was allocated by isa_emitter_build.
-            unsafe { abcd_isa_sys::isa_emitter_free_buf(buf) };
-
-            // Compute per-instruction byte offsets by scanning the built bytes.
-            // The C++ emitter may choose optimal formats, so we derive offsets
-            // from the actual output rather than predicting them.
-            let mut offsets = Vec::with_capacity(instructions.len());
-            let mut pos = 0usize;
-            while pos < vec.len() {
-                offsets.push(pos as u32);
-                // SAFETY: vec[pos..] has at least 1 byte; isa_get_size_from_bytes
-                // reads the opcode and returns the instruction size.
-                let size = unsafe { abcd_isa_sys::isa_get_size_from_bytes(vec[pos..].as_ptr()) };
-                if size == 0 {
-                    break;
+            EncodeInsnKind::Jump(meta) => {
+                if meta.target.0 as usize >= n {
+                    return Err(EncodeError::LabelOutOfBounds(meta.target.0, n));
                 }
-                pos += size;
+                sizes.push(jump_tier_size(&meta, 0));
+                jumps.push((idx, meta, 0));
             }
-
-            // The C++ emitter owns format selection and never drops an
-            // instruction; a shorter offset table means one was lost.
-            if offsets.len() != instructions.len() {
-                return Err(EncodeError::Internal);
-            }
-
-            Ok((vec, offsets))
         }
-        _ => Err(EncodeError::Internal),
+        kinds.push(kind);
     }
+
+    // 2. Deterministic O(N + J log N) Fenwick-tree branch relaxation.
+    if !jumps.is_empty() {
+        let mut bit = vec![0u64; n + 1];
+        for (i, &sz) in sizes.iter().enumerate() {
+            let idx1 = i + 1;
+            bit[idx1] += u64::from(sz);
+            let parent = idx1 + (idx1 & idx1.wrapping_neg());
+            if parent <= n {
+                bit[parent] += bit[idx1];
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for site in jumps.iter_mut().rev() {
+                if relax_jump_site(site, &mut sizes, &mut bit) {
+                    changed = true;
+                }
+            }
+            for site in &mut jumps {
+                if relax_jump_site(site, &mut sizes, &mut bit) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    // 3. Materialize exact per-instruction starting offsets.
+    let mut offsets: Vec<u32> = Vec::with_capacity(n);
+    let mut cur_off = 0u64;
+    for &sz in &sizes {
+        let off32 = u32::try_from(cur_off).map_err(|_| EncodeError::OperandOutOfRange)?;
+        offsets.push(off32);
+        cur_off += u64::from(sz);
+    }
+    let total_bytes = usize::try_from(cur_off).map_err(|_| EncodeError::OperandOutOfRange)?;
+
+    // 4. Single linear emission pass.
+    let mut out: Vec<u8> = Vec::with_capacity(total_bytes);
+    let mut jump_cursor = 0usize;
+    for (i, kind) in kinds.iter().enumerate() {
+        match *kind {
+            EncodeInsnKind::Fixed { ref bytes, len } => {
+                out.extend_from_slice(&bytes[..usize::from(len)]);
+            }
+            EncodeInsnKind::Jump(meta) => {
+                let (j_idx, _, tier) = jumps[jump_cursor];
+                debug_assert_eq!(j_idx, i);
+                jump_cursor += 1;
+
+                let insn_off = i64::from(offsets[i]);
+                let target_off = i64::from(offsets[meta.target.0 as usize]);
+
+                match tier {
+                    0 => {
+                        let disp = target_off - insn_off;
+                        debug_assert!((i8::MIN as i64..=i8::MAX as i64).contains(&disp));
+                        out.push(meta.op_imm8);
+                        if let Some(r) = meta.reg {
+                            out.push(r);
+                        }
+                        out.push((disp as i8) as u8);
+                    }
+                    1 => {
+                        let disp = target_off - insn_off;
+                        debug_assert!((i16::MIN as i64..=i16::MAX as i64).contains(&disp));
+                        out.push(meta.op_imm16);
+                        if let Some(r) = meta.reg {
+                            out.push(r);
+                        }
+                        out.extend_from_slice(&(disp as i16).to_le_bytes());
+                    }
+                    _ => match meta.wide {
+                        WideJumpKind::NativeImm32(op32) => {
+                            let disp = target_off - insn_off;
+                            let disp32 =
+                                i32::try_from(disp).map_err(|_| EncodeError::OperandOutOfRange)?;
+                            out.push(op32);
+                            out.extend_from_slice(&disp32.to_le_bytes());
+                        }
+                        WideJumpKind::InvertImm8(inv_op8) => {
+                            let jmp_pc = insn_off + 2;
+                            let disp = target_off - jmp_pc;
+                            let disp32 =
+                                i32::try_from(disp).map_err(|_| EncodeError::OperandOutOfRange)?;
+                            out.push(inv_op8);
+                            out.push(7u8);
+                            out.push(JMP_IMM32_OPCODE);
+                            out.extend_from_slice(&disp32.to_le_bytes());
+                        }
+                        WideJumpKind::InvertV8Imm8(inv_op8) => {
+                            let r = meta.reg.ok_or(EncodeError::Internal)?;
+                            let jmp_pc = insn_off + 3;
+                            let disp = target_off - jmp_pc;
+                            let disp32 =
+                                i32::try_from(disp).map_err(|_| EncodeError::OperandOutOfRange)?;
+                            out.push(inv_op8);
+                            out.push(r);
+                            out.push(8u8);
+                            out.push(JMP_IMM32_OPCODE);
+                            out.extend_from_slice(&disp32.to_le_bytes());
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    debug_assert_eq!(out.len(), total_bytes);
+    Ok((out, offsets))
 }

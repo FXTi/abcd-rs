@@ -53,7 +53,9 @@ fn decode_truncated_mid_stream() {
 #[test]
 fn decode_truncated_prefix_byte() {
     // A single prefix byte (>= min_prefix_opcode) with no second byte.
+    // SAFETY: stateless C++ constant query with no preconditions.
     let prefix_min = unsafe { abcd_isa_sys::isa_min_prefix_opcode() };
+    assert_eq!(prefix_min, abcd_isa_sys::MIN_PREFIX_OPCODE);
     let err = decode(&[prefix_min]).unwrap_err();
     assert!(
         matches!(err, DecodeError::Truncated(0)),

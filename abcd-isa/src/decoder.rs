@@ -1,4 +1,4 @@
-use abcd_isa_sys::{Bytecode, Label};
+use abcd_isa_sys::{Bytecode, Label, ModernDecodeFault};
 
 /// Errors from [`decode`].
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -18,8 +18,8 @@ pub enum DecodeError {
     TooManyInstructions(usize),
 }
 
-/// Decode a bytecode byte slice into a vector of `(instruction, byte_offset)`
-/// pairs with resolved jump targets.
+/// Decode a modern (`9.0.0.0`..`24.0.0.0`) bytecode byte slice into a vector of
+/// `(instruction, byte_offset)` pairs with resolved jump targets.
 ///
 /// Jump operands are converted to [`Label`] values whose inner `u32` is the
 /// index of the target instruction in the returned `Vec`.
@@ -28,73 +28,55 @@ pub enum DecodeError {
 /// the input slice. Instruction sizes can be derived from consecutive offsets
 /// (or `bytes.len() - offset` for the last instruction).
 pub fn decode(bytes: &[u8]) -> Result<Vec<(Bytecode, u32)>, DecodeError> {
-    let mut instructions: Vec<Bytecode> = Vec::new();
-    let mut byte_offsets: Vec<usize> = Vec::new();
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<(Bytecode, u32)> = Vec::with_capacity(bytes.len() / 3);
     // (insn_index, insn_byte_offset, raw_jump_offset)
     let mut jumps: Vec<(usize, usize, i64)> = Vec::new();
     let mut offset: usize = 0;
 
-    // Pass 1: decode instructions, record byte offsets.
-    // SAFETY: pure query, no preconditions.
-    let prefix_min = unsafe { abcd_isa_sys::isa_min_prefix_opcode() };
+    // Pass 1: pure-Rust linear scan of instructions and byte offsets.
     while offset < bytes.len() {
-        // Prefixed opcodes occupy 2 bytes; ensure we don't read past the end.
-        if bytes[offset] >= prefix_min && offset + 1 >= bytes.len() {
-            return Err(DecodeError::Truncated(offset));
-        }
-        let ptr = bytes[offset..].as_ptr();
-        // SAFETY: ptr points into `bytes[offset..]`; at least 1 byte is
-        // readable (loop condition), and 2 bytes for prefixed opcodes
-        // (checked above).
-        let opcode = unsafe { abcd_isa_sys::isa_get_opcode(ptr) };
-        // SAFETY: pure query, no preconditions.
-        let size = unsafe { abcd_isa_sys::isa_get_size_by_opcode(opcode) };
-        if size == 0 {
-            return Err(DecodeError::InvalidOpcode(offset));
-        }
-        if offset + size > bytes.len() {
-            return Err(DecodeError::Truncated(offset));
-        }
+        let (bc, size, jump_offset) =
+            Bytecode::decode_modern(&bytes[offset..]).map_err(|fault| match fault {
+                ModernDecodeFault::InvalidOpcode => DecodeError::InvalidOpcode(offset),
+                ModernDecodeFault::Truncated => DecodeError::Truncated(offset),
+            })?;
 
-        // SAFETY: ptr has at least `size` readable bytes (checked above);
-        // opcode was obtained from `isa_get_opcode(ptr)`.
-        let (bc, jump_offset) = unsafe { Bytecode::decode_one(ptr, opcode) }
-            .ok_or(DecodeError::InvalidOpcode(offset))?;
+        let off_u32 = u32::try_from(offset)
+            .map_err(|_| DecodeError::TooManyInstructions(out.len().saturating_add(1)))?;
 
         if let Some(raw_imm) = jump_offset {
-            jumps.push((instructions.len(), offset, raw_imm));
+            jumps.push((out.len(), offset, raw_imm));
         }
 
-        byte_offsets.push(offset);
-        instructions.push(bc);
+        out.push((bc, off_u32));
         offset += size;
     }
 
-    // Label uses u32 indices; guard against truncation on 64-bit platforms.
-    if instructions.len() > u32::MAX as usize {
-        return Err(DecodeError::TooManyInstructions(instructions.len()));
+    // Label uses u32 indices; guard against > u32::MAX 1-byte instructions on 64-bit platforms.
+    if out.len() > u32::MAX as usize {
+        return Err(DecodeError::TooManyInstructions(out.len()));
     }
 
-    // Pass 2: resolve jump targets to instruction indices.
+    // Pass 2: resolve jump byte displacements to instruction indices via binary search.
     for (insn_idx, insn_offset, raw_imm) in jumps {
-        // Use i128 to avoid overflow when computing the target byte offset.
         let raw_target = insn_offset as i128 + raw_imm as i128;
         let target_offset =
-            usize::try_from(raw_target).map_err(|_| DecodeError::InvalidJumpTarget {
+            u32::try_from(raw_target).map_err(|_| DecodeError::InvalidJumpTarget {
                 offset: insn_offset,
                 target: raw_target.clamp(i64::MIN as i128, i64::MAX as i128) as i64,
             })?;
-        let target_insn = byte_offsets.binary_search(&target_offset).map_err(|_| {
-            DecodeError::InvalidJumpTarget {
+        let target_insn = out
+            .binary_search_by_key(&target_offset, |&(_, off)| off)
+            .map_err(|_| DecodeError::InvalidJumpTarget {
                 offset: insn_offset,
-                target: target_offset as i64,
-            }
-        })?;
-        instructions[insn_idx].set_label(Label(target_insn as u32));
+                target: i64::from(target_offset),
+            })?;
+        out[insn_idx].0.set_label(Label(target_insn as u32));
     }
 
-    Ok(instructions
-        .into_iter()
-        .zip(byte_offsets.iter().map(|&o| o as u32))
-        .collect())
+    Ok(out)
 }

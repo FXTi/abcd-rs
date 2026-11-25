@@ -235,3 +235,110 @@ fn fuzz_sweep_never_panics() {
         }
     }
 }
+
+#[test]
+fn spoofed_400mib_deflate_uncompressed_size_rejected_before_allocation() {
+    let tiny_payload = b"sixteen-byte-msg";
+    let built = build_zip(&[ZipEntry::deflated("bomb.abc", tiny_payload)]);
+    let mut bytes = built.bytes;
+
+    // 400 MiB is deliberately below Limits::DEFAULT.max_entry_bytes (512 MiB)
+    // so the RFC 1951 1032x compression-ratio guard is what catches it before
+    // miniz_oxide ever allocates an output buffer.
+    let spoofed_size: u32 = 400 * 1024 * 1024;
+    let local_off = built.local_offsets[0];
+    bytes[local_off + 22..local_off + 26].copy_from_slice(&spoofed_size.to_le_bytes());
+    let cd_off = built.cd_offset;
+    bytes[cd_off + 24..cd_off + 28].copy_from_slice(&spoofed_size.to_le_bytes());
+
+    let archive = ZipArchive::open(&bytes).expect("CD layout remains structurally valid");
+    let err = archive
+        .read("bomb.abc")
+        .expect_err("spoofed 400 MiB ratio must fail");
+    assert!(
+        matches!(&err, Error::Inflate { name, reason } if name == "bomb.abc" && reason.contains("RFC 1951")),
+        "unexpected error: {err:?}"
+    );
+
+    // Zero-byte compressed stream claiming non-zero uncompressed output is also rejected.
+    let mut empty_deflate = ZipEntry::raw("empty_deflate.abc", b"non-empty", 8);
+    empty_deflate.compressed.clear();
+    let built_zero = build_zip(&[empty_deflate]);
+    let zero_archive = ZipArchive::open(&built_zero.bytes).expect("open");
+    assert!(matches!(
+        zero_archive.read("empty_deflate.abc"),
+        Err(Error::Inflate { .. })
+    ));
+}
+
+#[test]
+fn bogus_high_entry_count_on_tiny_buffer_fails_without_overalloc() {
+    let mut bytes = vec![0u8; 64];
+    bytes[0..4].copy_from_slice(b"PK\x01\x02");
+    // Claim 65,534 entries inside a 64-byte CD span: O(1) pre-check must reject.
+    push_eocd(&mut bytes, 0xFFFE, 64, 0, &[]);
+    assert!(matches!(
+        ZipArchive::open(&bytes),
+        Err(Error::BadCentralDirectory(_))
+    ));
+}
+
+#[test]
+fn eocd_candidate_flood_is_capped_and_survives_256kib_stack() {
+    // Construct > 1,000 back-to-back position-consistent fake EOCD records
+    // pointing at a fake central directory that fails partway through.
+    let fake_cd_entries = 128u16;
+    let cd_record_len = 46usize;
+    let fake_cd_size = usize::from(fake_cd_entries) * cd_record_len;
+    let mut flood = vec![0u8; fake_cd_size];
+    // Give the first 64 records valid PK\x01\x02 headers and corrupt record 64.
+    for i in 0..64 {
+        let off = i * cd_record_len;
+        flood[off..off + 4].copy_from_slice(b"PK\x01\x02");
+    }
+
+    let num_fake_eocds = 1200usize;
+    let total_tail = num_fake_eocds * 22;
+    assert!(total_tail <= 0xFFFF);
+    for idx in 0..num_fake_eocds {
+        let remaining_after = (num_fake_eocds - 1 - idx) * 22;
+        push_eocd(&mut flood, fake_cd_entries, fake_cd_size as u32, 0, &[]);
+        // Patch comment_len so pos + 22 + comment_len == final EOF for EVERY fake EOCD!
+        let comment_len_pos = flood.len() - 2;
+        flood[comment_len_pos..comment_len_pos + 2]
+            .copy_from_slice(&(remaining_after as u16).to_le_bytes());
+    }
+
+    // Build a nested .app bundle as well to exercise iterative container unpacking
+    // under the Engineering Invariant #1 256 KiB stack budget.
+    let inner_hap = build_zip(&[
+        ZipEntry::stored("module.json", br#"{"module":{"name":"entry"}}"#),
+        ZipEntry::stored("ets/modules.abc", b"PANDA\x00abc"),
+    ])
+    .bytes;
+    let res_hsp = build_zip(&[ZipEntry::stored(
+        "module.json",
+        br#"{"module":{"name":"res"}}"#,
+    )])
+    .bytes;
+    let app = build_zip(&[
+        ZipEntry::deflated("res.hsp", &res_hsp),
+        ZipEntry::deflated("entry.hap", &inner_hap),
+    ])
+    .bytes;
+
+    let handle = std::thread::Builder::new()
+        .name("hap-256k-stack".to_string())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            assert!(matches!(
+                ZipArchive::open(&flood),
+                Err(Error::BadCentralDirectory(_))
+            ));
+            let modules = abcd_hap::abc_modules(&app).expect("iterative app unpack");
+            assert_eq!(modules.len(), 1);
+            assert_eq!(modules[0].container_path, ["entry.hap".to_string()]);
+        })
+        .expect("spawn 256 KiB thread");
+    handle.join().expect("256 KiB stack thread panicked");
+}

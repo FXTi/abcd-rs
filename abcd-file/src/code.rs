@@ -2,7 +2,7 @@
 ///
 /// All indices/counts refer to positions in
 /// [`MethodBody::bytecodes`](crate::MethodBody::bytecodes).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TryBlock {
     /// Instruction index where the try region starts.
     pub start: u32,
@@ -15,7 +15,7 @@ pub struct TryBlock {
 ///
 /// All indices/counts refer to positions in
 /// [`MethodBody::bytecodes`](crate::MethodBody::bytecodes).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CatchBlock {
     /// Class entity offset of the caught type; `u32::MAX` = catch-all.
     /// (The file stores a region class *index* + 1; decode resolves it to

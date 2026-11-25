@@ -80,7 +80,7 @@ fn handler_gets_exception_param_and_exceptional_edges() {
         b.set_api(12, "");
         let cls = b.add_global_class();
         let proto = b.create_proto(Type::Void, &[]);
-        let (insns, _) = encode_bytecodes(&[
+        let (insns, offsets) = encode_bytecodes(&[
             Bytecode::Ldundefined,
             Bytecode::Return,
             Bytecode::Sta(Reg(0)),
@@ -91,12 +91,12 @@ fn handler_gets_exception_param_and_exceptional_edges() {
         let code = b.create_code(&insns, 1, 0);
         b.code_add_try_block(
             code,
-            0,
-            2,
+            offsets[0],
+            offsets[2] - offsets[0],
             &[CatchBlockDef {
                 type_class: None,
-                handler_pc: 2,
-                code_size: 3,
+                handler_pc: offsets[2],
+                code_size: insns.len() as u32 - offsets[2],
             }],
         );
         let m = b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &[], 0, 0);

@@ -8,16 +8,22 @@
 //! Most callers should use the safe `abcd-file` crate rather than calling raw
 //! FFI entry points directly.
 
-#![allow(
+#[allow(
     non_upper_case_globals,
     non_camel_case_types,
     non_snake_case,
     dead_code,
-    clippy::all
+    clippy::all,
+    clippy::undocumented_unsafe_blocks,
+    clippy::allow_attributes_without_reason,
+    reason = "pre-generated C FFI and enum bindings emitted by scripts/vendor-gen.py"
 )]
+mod generated {
+    include!("generated/bindings.rs");
+    include!("generated/enum_bindings.rs");
+}
 
-include!("generated/bindings.rs");
-include!("generated/enum_bindings.rs");
+pub use generated::*;
 
 // ---------------------------------------------------------------------------
 // Rust safe-type wrappers for C++ enums not exposed through bindgen
@@ -148,6 +154,10 @@ impl TryFrom<u8> for AnnotationValueType {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "raw FFI unit tests exercise generated unsafe extern C exports directly"
+)]
 mod tests {
     use super::*;
 
@@ -1265,6 +1275,136 @@ mod tests {
             let ptr = abc_builder_finalize(b, &mut out_len);
             assert!(!ptr.is_null(), "finalize after rejected staging");
             abc_builder_free(b);
+        }
+    }
+
+    /// Regression test for #43 (R1-C1): corrupt header table bounds (`file_size < 60`,
+    /// inflated `num_classes` / `num_lnps` / `num_indexes`, unaligned index tables)
+    /// must fail cleanly at `abc_file_open` / `abc_file_get_type` instead of SIGSEGV.
+    #[test]
+    fn open_rejects_corrupt_header_section_bounds_and_alignment() {
+        fn base_header() -> Vec<u8> {
+            let mut data = Vec::with_capacity(64);
+            data.extend_from_slice(b"PANDA\0\0\0");
+            data.extend_from_slice(&0u32.to_le_bytes()); // checksum
+            data.extend_from_slice(&[12, 0, 6, 0]); // version
+            data.extend_from_slice(&64u32.to_le_bytes()); // file_size
+            for _ in 0..10 {
+                data.extend_from_slice(&0u32.to_le_bytes());
+            }
+            data.extend_from_slice(&[0u8; 4]);
+            data
+        }
+
+        unsafe {
+            // 1. file_size smaller than 60-byte header (used to underflow ValidateChecksum)
+            let mut tiny = base_header();
+            tiny[16..20].copy_from_slice(&4u32.to_le_bytes());
+            assert!(abc_file_open(tiny.as_ptr(), tiny.len()).is_null());
+            assert_eq!(abc_file_get_type(tiny.as_ptr(), 4), -1);
+
+            // 2. Inflated num_classes past file_size (used to SIGSEGV in GetClassId)
+            let mut bad_cls = base_header();
+            bad_cls[28..32].copy_from_slice(&0x1000_0000u32.to_le_bytes()); // num_classes
+            bad_cls[32..36].copy_from_slice(&60u32.to_le_bytes()); // class_idx_off
+            assert!(abc_file_open(bad_cls.as_ptr(), bad_cls.len()).is_null());
+            assert_eq!(
+                abc_file_get_type(bad_cls.as_ptr(), bad_cls.len() as i32),
+                -1
+            );
+
+            // 3. Unaligned class_idx_off (UBSan misaligned uint32_t* span)
+            let mut unaligned = base_header();
+            unaligned.extend_from_slice(&[0u8; 8]);
+            let fsz = unaligned.len() as u32;
+            unaligned[16..20].copy_from_slice(&fsz.to_le_bytes());
+            unaligned[28..32].copy_from_slice(&1u32.to_le_bytes()); // num_classes = 1
+            unaligned[32..36].copy_from_slice(&61u32.to_le_bytes()); // unaligned offset!
+            assert!(abc_file_open(unaligned.as_ptr(), unaligned.len()).is_null());
+
+            // 4. Inflated num_lnps / num_indexes
+            let mut bad_lnp = base_header();
+            bad_lnp[36..40].copy_from_slice(&100u32.to_le_bytes()); // num_lnps
+            bad_lnp[40..44].copy_from_slice(&60u32.to_le_bytes()); // lnp_idx_off
+            assert!(abc_file_open(bad_lnp.as_ptr(), bad_lnp.len()).is_null());
+
+            let mut bad_idx = base_header();
+            bad_idx[52..56].copy_from_slice(&10u32.to_le_bytes()); // num_indexes
+            bad_idx[56..60].copy_from_slice(&60u32.to_le_bytes()); // index_section_off
+            assert!(abc_file_open(bad_idx.as_ptr(), bad_idx.len()).is_null());
+        }
+    }
+
+    /// Regression test for #44 (R1-H1): `abc_builder_lnp_emit_special_opcode`
+    /// commits multi-row line tables both within and outside the 1-byte special
+    /// opcode range.
+    #[test]
+    fn builder_lnp_emit_special_opcode_roundtrips_all_rows() {
+        unsafe extern "C" fn collect_method(off: u32, ctx: *mut std::ffi::c_void) {
+            unsafe { (*(ctx as *mut Vec<u32>)).push(off) };
+        }
+        unsafe extern "C" fn collect_line(
+            entry: *const AbcLineEntry,
+            ctx: *mut std::ffi::c_void,
+        ) -> i32 {
+            unsafe {
+                let e = &*entry;
+                (*(ctx as *mut Vec<(u32, u32)>)).push((e.offset, e.line));
+            }
+            0
+        }
+
+        unsafe {
+            let b = abc_builder_new();
+            abc_builder_set_api(b, 12, c"beta1".as_ptr());
+            let cls = abc_builder_add_global_class(b);
+            let proto = abc_builder_create_proto(b, Type_TypeId_TAGGED, std::ptr::null(), 0);
+            let code = [0x65u8; 64];
+            let m = abc_builder_class_add_method_with_proto(
+                b,
+                cls,
+                c"f".as_ptr(),
+                proto,
+                AbcAccessFlags_ABC_ACC_PUBLIC,
+                code.as_ptr(),
+                code.len() as u32,
+                1,
+                0,
+            );
+            let src = abc_builder_add_string(b, c"test.ts".as_ptr());
+            let lnp = abc_builder_create_lnp(b);
+            // Row 0 `(0, 10)` is seeded automatically by `line_number = 10` (`ProcessBegin`).
+            let dbg = abc_builder_create_debug_info(b, lnp, 10);
+            abc_builder_lnp_emit_set_file(b, lnp, dbg, src);
+            // Row 1: pc=2, line=13 (fits 1-byte special opcode)
+            abc_builder_lnp_emit_special_opcode(b, lnp, dbg, 2, 3);
+            // Row 2: pc=50, line=500 (exceeds 1-byte range -> fallback to advance + special(0,0))
+            abc_builder_lnp_emit_special_opcode(b, lnp, dbg, 48, 487);
+            abc_builder_lnp_emit_end(b, lnp);
+            abc_builder_method_set_debug_info(b, m, dbg);
+
+            let mut out_len = 0u32;
+            let ptr = abc_builder_finalize(b, &mut out_len);
+            assert!(!ptr.is_null());
+            let bytes = std::slice::from_raw_parts(ptr, out_len as usize);
+            let f = abc_file_open(bytes.as_ptr(), bytes.len());
+            assert!(!f.is_null());
+
+            let cls_off = abc_file_get_class_id(f, c"L_GLOBAL;".as_ptr());
+            let ca = abc_class_open(f, cls_off);
+            let mut methods = Vec::new();
+            abc_class_enumerate_methods(ca, Some(collect_method), (&raw mut methods).cast());
+            abc_class_close(ca);
+
+            let d = abc_debug_info_open(f);
+            assert!(!d.is_null());
+            let mut rows: Vec<(u32, u32)> = Vec::new();
+            abc_debug_get_line_table(d, methods[0], Some(collect_line), (&raw mut rows).cast());
+            abc_debug_info_close(d);
+            abc_file_close(f);
+            abc_builder_free(b);
+
+            assert_eq!(rows, vec![(0, 10), (2, 13), (50, 500)]);
         }
     }
 }

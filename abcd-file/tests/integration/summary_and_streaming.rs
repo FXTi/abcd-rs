@@ -505,11 +505,24 @@ fn local_corpus_and_modules_abc_parity_and_streaming_gate() {
         return;
     }
 
-    // 1. If `modules.abc` is present at repo root, verify 100% parity.
+    // 1. If `modules.abc` is present at repo root, verify 100% parity and
+    //    non-degenerate multi-entry `line_table` extraction (`D2` / `R1-H1`).
     let modules_abc = repo_root.join("modules.abc");
     if modules_abc.is_file() {
         let bytes = std::fs::read(&modules_abc).expect("read modules.abc");
-        assert_summary_parity(&bytes);
+        let file = decode(&bytes).expect("decode modules.abc");
+        let multi_line_methods = file
+            .all_methods()
+            .filter(|(_, m)| m.debug.as_ref().is_some_and(|d| d.line_table.len() > 1))
+            .count();
+        assert!(
+            multi_line_methods > 0,
+            "modules.abc must contain methods with multi-row debug line_table"
+        );
+        let fast = inspect_summary(&bytes, false).expect("fast summary");
+        let verified = inspect_summary(&bytes, true).expect("verified summary");
+        assert_eq!(fast, summary_from_decoded(&file, false));
+        assert_eq!(verified, summary_from_decoded(&file, true));
     }
 
     // 2. If `exports/corpus/index.jsonl` is present, verify pandasm byte-identity

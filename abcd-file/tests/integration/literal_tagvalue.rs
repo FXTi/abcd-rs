@@ -54,11 +54,14 @@ fn tagvalue_integer8_literal_decodes() {
 #[test]
 fn unknown_literal_tag_stops_without_abort() {
     let (mut data, array_off) = build_with_literal_array();
-    // count=2, unknown tag 0xee, value 0x01: must not abort, walk stops.
+    // count=2, unknown tag 0xee, value 0x01: checked enumeration rejects cleanly without aborting.
     data[array_off..array_off + 6].copy_from_slice(&[2, 0, 0, 0, 0xee, 0x01]);
 
-    let file = decode(&data).expect("decode with unknown literal tag");
-    assert!(file.literal_arrays[0].values.is_empty());
+    let result = decode(&data);
+    assert!(
+        result.is_err(),
+        "unknown literal tag must return Err cleanly without aborting"
+    );
 }
 
 #[test]

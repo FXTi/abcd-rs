@@ -38,7 +38,7 @@
 //! never sees the disassembler's sections; our emitter prints them, so the
 //! round-trip parser exploits them).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use abcd_isa::{BytecodeFlags, EntityKind, Version};
@@ -168,7 +168,7 @@ fn lossy(bytes: &[u8]) -> String {
 #[derive(Default)]
 struct Oracle {
     set: HashSet<Vec<u8>>,
-    multi: Vec<Vec<u8>>,
+    multi: BTreeSet<Box<[u8]>>,
 }
 
 impl Oracle {
@@ -177,8 +177,7 @@ impl Oracle {
             return;
         }
         if content.contains(&b'"') || content.contains(&b'\n') {
-            let idx = self.multi.partition_point(|s| s.as_slice() < content);
-            self.multi.insert(idx, content.to_vec());
+            self.multi.insert(content.into());
         }
     }
 
@@ -188,28 +187,46 @@ impl Oracle {
 
     /// Does any quote/newline-bearing oracle string start with `prefix`?
     fn has_string_prefix(&self, prefix: &[u8]) -> bool {
-        let idx = self.multi.partition_point(|s| s.as_slice() < prefix);
-        idx < self.multi.len() && self.multi[idx].starts_with(prefix)
+        use std::ops::Bound;
+        self.multi
+            .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
+            .next()
+            .is_some_and(|s| s.starts_with(prefix))
     }
 }
 
 /// Split a pandasm operand list at top-level commas, respecting
 /// `()`/`{}`/`[]` groups and oracle-delimited raw strings (ported from the
-/// dis-side comparison harness). Returns the tokens, the total matched
-/// string-content bytes (the longest-match signal for multi-line
-/// disambiguation) and the offset of the last string's opening quote.
-/// `None` = an opened string has no valid close yet (the caller appends the
-/// next physical line).
-fn split_operands(rest: &[u8], oracle: &Oracle) -> Option<(Vec<Vec<u8>>, usize, Option<usize>)> {
+/// dis-side comparison harness).
+///
+/// When `defer_oracle_prefix` is true, an opening quote whose remainder
+/// `&rest[i + 1..]` is an active prefix of a quote/newline-bearing oracle
+/// entry will NOT prematurely close on an embedded same-line `"`, and any
+/// unclosed string reports the earliest active-prefix opening quote (or the
+/// unclosed quote `i`) via `Err(open_idx)`.
+type SplitOperandsOk = (Vec<Vec<u8>>, usize, Option<usize>);
+
+fn split_operands_ext(
+    rest: &[u8],
+    oracle: &Oracle,
+    defer_oracle_prefix: bool,
+) -> Result<SplitOperandsOk, usize> {
     let mut out: Vec<Vec<u8>> = Vec::new();
     let mut cur: Vec<u8> = Vec::new();
     let mut string_bytes = 0usize;
     let mut last_open = None;
+    let mut prefix_open: Option<usize> = None;
     let mut depth = 0i32;
     let mut i = 0usize;
     while i < rest.len() {
         let b = rest[i];
         if b == b'"' {
+            if defer_oracle_prefix
+                && prefix_open.is_none()
+                && oracle.has_string_prefix(&rest[i + 1..])
+            {
+                prefix_open = Some(i);
+            }
             // Oracle close: latest `"` whose content is an oracle entry,
             // followed by a separator or the end of the text.
             let mut close = None;
@@ -221,7 +238,10 @@ fn split_operands(rest: &[u8], oracle: &Oracle) -> Option<(Vec<Vec<u8>>, usize, 
                     continue;
                 }
                 let mut k = j + 1;
-                while k < rest.len() && rest[k].is_ascii_whitespace() {
+                while k < rest.len()
+                    && (matches!(rest[k], b' ' | b'\t' | b'\r')
+                        || (!defer_oracle_prefix && rest[k] == b'\n'))
+                {
                     k += 1;
                 }
                 if k == rest.len() || matches!(rest[k], b',' | b']' | b'}') {
@@ -232,14 +252,32 @@ fn split_operands(rest: &[u8], oracle: &Oracle) -> Option<(Vec<Vec<u8>>, usize, 
             let close = match close {
                 Some(c) => c,
                 None => {
-                    // Not an oracle string (or the lossy class, whose
-                    // contents ARE in the oracle — this fallback covers
-                    // hand-written text): next quote on the same physical
-                    // line; a newline means the string spans lines — signal
-                    // the caller to extend.
+                    // Defer same-line quote pairing while the opened string
+                    // is a prefix of a quote/newline-bearing oracle entry so
+                    // embedded `"` characters on line 1 never split early.
+                    if defer_oracle_prefix && oracle.has_string_prefix(&rest[i + 1..]) {
+                        return Err(prefix_open.unwrap_or(i));
+                    }
+                    // Fallback for hand-written single-line strings absent
+                    // from the STRING oracle: next quote on the same line.
                     match rest[i + 1..].iter().position(|&b| b == b'"') {
-                        Some(off) if !rest[i + 1..i + 1 + off].contains(&b'\n') => i + 1 + off,
-                        _ => return None,
+                        Some(off) if !rest[i + 1..i + 1 + off].contains(&b'\n') => {
+                            let cand = i + 1 + off;
+                            if defer_oracle_prefix {
+                                let mut k = cand + 1;
+                                while k < rest.len() && matches!(rest[k], b' ' | b'\t' | b'\r') {
+                                    k += 1;
+                                }
+                                if k == rest.len() || matches!(rest[k], b',' | b']' | b'}') {
+                                    cand
+                                } else {
+                                    return Err(prefix_open.unwrap_or(i));
+                                }
+                            } else {
+                                cand
+                            }
+                        }
+                        _ => return Err(prefix_open.unwrap_or(i)),
                     }
                 }
             };
@@ -275,7 +313,11 @@ fn split_operands(rest: &[u8], oracle: &Oracle) -> Option<(Vec<Vec<u8>>, usize, 
     if !token.is_empty() {
         out.push(token.to_vec());
     }
-    Some((out, string_bytes, last_open))
+    Ok((out, string_bytes, prefix_open.or(last_open)))
+}
+
+fn split_operands(rest: &[u8], oracle: &Oracle) -> Option<(Vec<Vec<u8>>, usize, Option<usize>)> {
+    split_operands_ext(rest, oracle, false).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -584,19 +626,22 @@ impl Parser {
         // may span lines, so an entry runs to the next entry's line start.
         let mut starts = Vec::new();
         let mut pos = 0usize;
+        let mut line_no = base;
         while pos < body.len() {
             if body[pos..].starts_with(b"[offset:0x") {
-                starts.push(pos);
+                starts.push((pos, line_no));
             }
             match body[pos..].iter().position(|&b| b == b'\n') {
-                Some(nl) => pos += nl + 1,
+                Some(nl) => {
+                    pos += nl + 1;
+                    line_no += 1;
+                }
                 None => break,
             }
         }
-        for (i, &start) in starts.iter().enumerate() {
-            let end = starts.get(i + 1).copied().unwrap_or(body.len());
+        for (i, &(start, line)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map_or(body.len(), |&(next, _)| next);
             let entry = trim_end(&body[start..end]);
-            let line = base + body[..start].iter().filter(|&&b| b == b'\n').count();
             let Some(sep) = entry
                 .windows(b", name_value:".len())
                 .position(|w| w == b", name_value:")
@@ -1180,8 +1225,8 @@ impl Parser {
         Ok((name, parsed))
     }
 
-    /// Parse one instruction starting at physical line `i`, with the
-    /// bounded multi-line lookahead for raw strings that span lines.
+    /// Parse one instruction starting at physical line `i`, with
+    /// oracle-guided multi-line lookahead for raw strings that span lines.
     /// Returns the next unconsumed line index.
     fn parse_instruction(
         &mut self,
@@ -1190,56 +1235,41 @@ impl Parser {
         fun: &mut PaFunction,
         base: usize,
     ) -> Result<usize, ParseError> {
-        /// Multi-line string lookahead bound (physical lines).
-        const MAX_MULTILINE: usize = 64;
-        let mut acc = trim_start(lines[i]).to_vec();
-        let mut best: Option<(usize, Vec<u8>, usize)> = None;
-        let limit = (i + MAX_MULTILINE).min(lines.len());
+        type BestCandidate = (usize, Vec<u8>, Vec<Vec<u8>>, usize);
+        let first_line = trim_start(lines[i]);
+        let mut acc = first_line.to_vec();
+        let mut best: Option<BestCandidate> = None;
         let mut j = i + 1;
         loop {
-            match insn_ops_parse(&acc, &self.oracle) {
-                Some((string_bytes, last_open)) => {
+            let should_extend = match insn_ops_parse_ext(&acc, &self.oracle, true) {
+                Ok((mnemonic, tokens, string_bytes, probe_open)) => {
                     let better = match &best {
                         None => true,
-                        Some((_, _, prev)) => string_bytes > *prev,
+                        Some((_, _, _, prev)) => string_bytes > *prev,
                     };
                     if better {
-                        best = Some((j, acc.clone(), string_bytes));
+                        best = Some((j, mnemonic, tokens, string_bytes));
                     }
-                    let tail = last_open.map(|o| &acc[o + 1..]);
-                    if j >= limit || !tail.is_some_and(|t| self.oracle.has_string_prefix(t)) {
-                        break;
-                    }
+                    probe_open.is_some_and(|o| self.oracle.has_string_prefix(&acc[o + 1..]))
                 }
-                None => {
-                    let open = acc.iter().rposition(|&b| b == b'"');
-                    if j >= limit
-                        || !open.is_some_and(|o| self.oracle.has_string_prefix(&acc[o + 1..]))
-                    {
-                        break;
-                    }
-                }
-            }
-            if j >= lines.len() {
+                Err(open) => self.oracle.has_string_prefix(&acc[open + 1..]),
+            };
+            if !should_extend || j >= lines.len() {
                 break;
             }
             acc.push(b'\n');
             acc.extend_from_slice(lines[j]);
             j += 1;
         }
-        let Some((end, acc, _)) = best else {
+        if best.is_none()
+            && let Ok((mnemonic, tokens, string_bytes, _)) =
+                insn_ops_parse_ext(first_line, &self.oracle, false)
+        {
+            best = Some((i + 1, mnemonic, tokens, string_bytes));
+        }
+        let Some((end, mnemonic, tokens, _)) = best else {
             return err(base + i, "unterminated string in instruction");
         };
-        let split = acc
-            .iter()
-            .position(|b| b.is_ascii_whitespace())
-            .unwrap_or(acc.len());
-        let mnemonic = acc[..split].to_vec();
-        let (tokens, _, _) =
-            split_operands(&acc[split..], &self.oracle).ok_or_else(|| ParseError {
-                line: base + i,
-                message: "lookahead-resolved instruction failed to re-split".to_owned(),
-            })?;
         let mut ops = Vec::with_capacity(tokens.len());
         for token in &tokens {
             ops.push(parse_operand_token(token, base + i)?);
@@ -1291,7 +1321,14 @@ impl Parser {
         let mut record_classes: Vec<StringId> = Vec::new();
         for rec in &records {
             let desc = record_descriptor(&rec.name);
-            let sid = b.class_by_descriptor[&desc];
+            let sid = b
+                .class_by_descriptor
+                .get(&desc)
+                .copied()
+                .ok_or_else(|| ParseError {
+                    line: 0,
+                    message: "record descriptor missing".to_owned(),
+                })?;
             record_classes.push(sid);
             b.class_by_record_name.insert(rec.name.clone(), sid);
         }
@@ -1313,7 +1350,15 @@ impl Parser {
             let (owner_name, bare) = split_owner(&fun.name, &b.class_by_record_name);
             let bare = demangle(bare, fun.is_ctor, fun.is_cctor);
             let owner_sid = match owner_name {
-                Some(name) => b.class_by_record_name[name],
+                Some(name) => {
+                    b.class_by_record_name
+                        .get(name)
+                        .copied()
+                        .ok_or_else(|| ParseError {
+                            line: fun.line,
+                            message: "function owner record missing".to_owned(),
+                        })?
+                }
                 // System-type owners are never printed; unprefixed
                 // functions belong to the global record (synthesized above).
                 None => match b.global_class {
@@ -1870,8 +1915,13 @@ impl Parser {
             .unwrap_or(0);
 
         let insn_count = fun.insns.len() as u32;
-        let mut entity_offsets: HashMap<(EntityKind, u32), u32> = HashMap::new();
-        let mut next_raw: HashMap<EntityKind, u32> = HashMap::new();
+        let mut state = BodyBuildState {
+            fun,
+            num_vregs,
+            insn_count,
+            entity_offsets: HashMap::new(),
+            next_raw: HashMap::new(),
+        };
         let mut bytecodes = Vec::with_capacity(fun.insns.len());
 
         for insn in &fun.insns {
@@ -1900,19 +1950,8 @@ impl Parser {
                         message: format!("`{mnemonic}` expects more operands"),
                     })?
                 };
-                let raw = self.convert_operand(
-                    insn.line,
-                    fun,
-                    mnemonic,
-                    pos,
-                    *kind,
-                    op,
-                    num_vregs,
-                    insn_count,
-                    &mut entity_offsets,
-                    &mut next_raw,
-                    b,
-                )?;
+                let raw =
+                    self.convert_operand(insn.line, mnemonic, pos, *kind, op, &mut state, b)?;
                 raw_ops.push(raw);
             }
             if ops_iter.next().is_some() {
@@ -1934,7 +1973,7 @@ impl Parser {
             num_vregs,
             num_args: fun.params.len().saturating_sub(usize::from(!fun.is_static)) as u32,
             bytecodes,
-            entity_offsets,
+            entity_offsets: state.entity_offsets,
             try_blocks,
             ic_size: None,
         })
@@ -1942,19 +1981,18 @@ impl Parser {
 
     /// Convert one syntactic operand to its typed form per the spec kind,
     /// registering entities as needed.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "operand converter threads line/mnemonic/position diagnostics alongside body state and builder"
+    )]
     fn convert_operand(
         &mut self,
         line: usize,
-        fun: &PaFunction,
         mnemonic: &str,
         pos: usize,
         kind: OpKind,
         op: &PaOp,
-        num_vregs: u32,
-        insn_count: u32,
-        entity_offsets: &mut HashMap<(EntityKind, u32), u32>,
-        next_raw: &mut HashMap<EntityKind, u32>,
+        state: &mut BodyBuildState<'_>,
         b: &mut BuildCtx,
     ) -> Result<RawOperand, ParseError> {
         let mismatch = || ParseError {
@@ -1964,7 +2002,7 @@ impl Parser {
         match (kind, op) {
             (OpKind::Reg, PaOp::VReg(v)) => Ok(RawOperand::R(*v)),
             (OpKind::Reg, PaOp::AReg(a)) => {
-                let reg = num_vregs + *a as u32;
+                let reg = state.num_vregs + *a as u32;
                 let reg = u16::try_from(reg).map_err(|_| ParseError {
                     line,
                     message: format!("`{mnemonic}` register {reg} out of range"),
@@ -1975,9 +2013,9 @@ impl Parser {
             (OpKind::ImmFloat, PaOp::Float(v)) => Ok(RawOperand::I(v.to_bits() as i64)),
             (OpKind::ImmFloat, PaOp::Imm(v)) => Ok(RawOperand::I(*v)),
             (OpKind::Label, PaOp::LabelRef(name)) => {
-                let idx = match fun.labels.get(name) {
+                let idx = match state.fun.labels.get(name) {
                     Some(&idx) => idx,
-                    None if fun.trailing_empty_label => insn_count,
+                    None if state.fun.trailing_empty_label => state.insn_count,
                     None => {
                         return err(
                             line,
@@ -2003,10 +2041,12 @@ impl Parser {
                     }
                 };
                 b.entity_map.insert(offset, sid);
-                let raw = next_raw.entry(EntityKind::StringId).or_insert(0);
+                let raw = state.next_raw.entry(EntityKind::StringId).or_insert(0);
                 let id = *raw;
                 *raw += 1;
-                entity_offsets.insert((EntityKind::StringId, id), offset);
+                state
+                    .entity_offsets
+                    .insert((EntityKind::StringId, id), offset);
                 Ok(RawOperand::E(id))
             }
             (OpKind::Method, PaOp::MethodSig(sig)) => {
@@ -2021,10 +2061,12 @@ impl Parser {
                             String::from_utf8_lossy(sig)
                         ),
                     })?;
-                let raw = next_raw.entry(EntityKind::MethodId).or_insert(0);
+                let raw = state.next_raw.entry(EntityKind::MethodId).or_insert(0);
                 let id = *raw;
                 *raw += 1;
-                entity_offsets.insert((EntityKind::MethodId, id), offset);
+                state
+                    .entity_offsets
+                    .insert((EntityKind::MethodId, id), offset);
                 Ok(RawOperand::E(id))
             }
             (OpKind::LiteralArr, PaOp::Literal(text)) => {
@@ -2067,10 +2109,15 @@ impl Parser {
                         off
                     }
                 };
-                let raw = next_raw.entry(EntityKind::LiteralarrayId).or_insert(0);
+                let raw = state
+                    .next_raw
+                    .entry(EntityKind::LiteralarrayId)
+                    .or_insert(0);
                 let id = *raw;
                 *raw += 1;
-                entity_offsets.insert((EntityKind::LiteralarrayId, id), offset);
+                state
+                    .entity_offsets
+                    .insert((EntityKind::LiteralarrayId, id), offset);
                 Ok(RawOperand::E(id))
             }
             _ => Err(mismatch()),
@@ -2182,6 +2229,14 @@ struct MethodShell {
     owner: StringId,
     name_sid: StringId,
     offset: u32,
+}
+
+struct BodyBuildState<'a> {
+    fun: &'a PaFunction,
+    num_vregs: u32,
+    insn_count: u32,
+    entity_offsets: HashMap<(EntityKind, u32), u32>,
+    next_raw: HashMap<EntityKind, u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2425,7 +2480,8 @@ fn value_is_complete(acc: &[u8], oracle: &Oracle) -> bool {
     while i < acc.len() {
         let b = acc[i];
         if b == b'"' {
-            // Oracle close, else the next quote in the accumulated text.
+            // Oracle close followed by a separator, else defer while an
+            // oracle prefix is active, else the next quote in `acc`.
             let mut close = None;
             for j in (i + 1..acc.len()).rev() {
                 if acc[j] != b'"' {
@@ -2434,15 +2490,29 @@ fn value_is_complete(acc: &[u8], oracle: &Oracle) -> bool {
                 if !oracle.contains(&acc[i + 1..j]) {
                     continue;
                 }
-                close = Some(j);
-                break;
+                let mut k = j + 1;
+                while k < acc.len() && acc[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k == acc.len() || matches!(acc[k], b',' | b']' | b'}') {
+                    close = Some(j);
+                    break;
+                }
+            }
+            if close.is_some() && oracle.has_string_prefix(&acc[i + 1..]) {
+                return false;
             }
             let close = match close {
                 Some(c) => c,
-                None => match acc[i + 1..].iter().position(|&b| b == b'"') {
-                    Some(off) => i + 1 + off,
-                    None => return false,
-                },
+                None => {
+                    if oracle.has_string_prefix(&acc[i + 1..]) {
+                        return false;
+                    }
+                    match acc[i + 1..].iter().position(|&b| b == b'"') {
+                        Some(off) => i + 1 + off,
+                        None => return false,
+                    }
+                }
             };
             i = close + 1;
             continue;
@@ -2457,15 +2527,29 @@ fn value_is_complete(acc: &[u8], oracle: &Oracle) -> bool {
     depth == 0 && acc.ends_with(b"]}")
 }
 
-/// Try to split the operand list of one accumulated instruction text;
-/// `Some((matched_string_bytes, last_open_quote))` on success.
-fn insn_ops_parse(text: &[u8], oracle: &Oracle) -> Option<(usize, Option<usize>)> {
+/// Try to split the mnemonic and operand list of one accumulated instruction
+/// text; `Ok((mnemonic, tokens, matched_string_bytes, probe_open_quote))` on
+/// success, `Err(open_quote)` when an opened string is unclosed.
+type ParsedInsnOps = (Vec<u8>, Vec<Vec<u8>>, usize, Option<usize>);
+
+fn insn_ops_parse_ext(
+    text: &[u8],
+    oracle: &Oracle,
+    defer_oracle_prefix: bool,
+) -> Result<ParsedInsnOps, usize> {
     let split = text
         .iter()
         .position(|b| b.is_ascii_whitespace())
         .unwrap_or(text.len());
-    split_operands(&text[split..], oracle)
-        .map(|(_, n, last_open)| (n, last_open.map(|o| split + o)))
+    match split_operands_ext(&text[split..], oracle, defer_oracle_prefix) {
+        Ok((tokens, n, probe_open)) => Ok((
+            text[..split].to_vec(),
+            tokens,
+            n,
+            probe_open.map(|o| split + o),
+        )),
+        Err(open) => Err(split + open),
+    }
 }
 
 /// Parse a `vN`/`aN` register token body.
@@ -2490,8 +2574,9 @@ fn parse_operand_token(token: &[u8], line: usize) -> Result<PaOp, ParseError> {
     if token.starts_with(b"{") {
         return Ok(PaOp::Literal(token.to_vec()));
     }
-    if token.is_ascii() {
-        let text = std::str::from_utf8(token).expect("ASCII checked");
+    if let Ok(text) = std::str::from_utf8(token)
+        && text.is_ascii()
+    {
         if let Some(rest) = text.strip_prefix('v')
             && !rest.is_empty()
             && rest.bytes().all(|b| b.is_ascii_digit())
@@ -2670,23 +2755,22 @@ fn fix_literal_assignment(file: &mut File, target: &[(u32, u32)]) {
 /// The smallest `rank` among the literal arrays a method's instructions
 /// reference (`u32::MAX` when it references none).
 fn method_min_literal_rank(m: &Method, rank: &HashMap<u32, u32>) -> u32 {
-    m.body
-        .as_ref()
-        .map(|body| {
-            body.bytecodes
-                .iter()
-                .flat_map(|bc| bc.entity_operands())
-                .filter(|(kind, _)| *kind == EntityKind::LiteralarrayId)
-                .filter_map(|(kind, id)| {
-                    body.entity_offsets
-                        .get(&(kind, id.0))
-                        .and_then(|off| rank.get(off))
-                        .copied()
-                })
-                .min()
-                .unwrap_or(u32::MAX)
-        })
-        .unwrap_or(u32::MAX)
+    let Some(body) = &m.body else {
+        return u32::MAX;
+    };
+    let mut best = u32::MAX;
+    for bc in &body.bytecodes {
+        let (ops, len) = bc.entity_operands_inline();
+        for &(kind, id) in &ops[..len] {
+            if kind == EntityKind::LiteralarrayId
+                && let Some(&off) = body.entity_offsets.get(&(kind, id.0))
+                && let Some(&r) = rank.get(&off)
+            {
+                best = best.min(r);
+            }
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -4312,5 +4396,62 @@ mod tests {
                 "unexpected error for {bad_idx:#x}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn multiline_embedded_quotes_and_80_lines_round_trip() {
+        let mut long_str = String::from("line0 \"alpha\" and \"beta\" \"unbalanced");
+        for idx in 1..80 {
+            if idx % 3 == 0 {
+                long_str.push_str(&format!("\nline{idx} with \"embedded\" and ]}} tokens"));
+            } else {
+                long_str.push_str(&format!("\nline{idx} plain continuation"));
+            }
+        }
+        let comma_str = "bar\", \"baz\nsecond line";
+
+        let literals = format!("0 0x10 {{ 1 [ string:\"{long_str}\", ]}}\n");
+        let methods = format!(
+            ".language ECMAScript\n.function any f() <static> {{\n\tlda.str \"bar\"\n\tlda.str \"{comma_str}\"\n\tlda.str \"{long_str}\"\n\tcreatearraywithbuffer 0x0, {{ 1 [ string:\"{long_str}\", ]}}\n\treturnundefined\n}}\n"
+        );
+        let strings = format!(
+            "[offset:0x40, name_value:bar]\n[offset:0x50, name_value:{comma_str}]\n[offset:0x80, name_value:{long_str}]\n"
+        );
+        let input = doc(
+            literals.as_bytes(),
+            b"",
+            methods.as_bytes(),
+            strings.as_bytes(),
+        );
+
+        let file = parse_file_with_version(&input, Version::new(12, 0, 6, 0))
+            .expect("80-line embedded-quote string must parse");
+        assert!(file.strings.get(&long_str).is_some());
+        assert!(file.strings.get(comma_str).is_some());
+        let global = file.class_by_str("L_GLOBAL;").expect("global record");
+        let body = global.methods[0].body.as_ref().expect("body");
+        assert_eq!(body.bytecodes.len(), 5);
+
+        let emitted = super::super::emit_file(&file, "t.abc");
+        let reparsed = parse_file_with_version(&emitted, Version::new(12, 0, 6, 0))
+            .expect("canonical emitted pandasm must re-parse");
+        let reemitted = super::super::emit_file(&reparsed, "t.abc");
+        assert_eq!(
+            reemitted, emitted,
+            "emit -> parse -> emit must be byte-exact"
+        );
+
+        let encoded = crate::encode(&file).expect("encodes");
+        let decoded = crate::decode(&encoded).expect("decodes");
+        assert!(decoded.strings.get(&long_str).is_some());
+        assert!(decoded.strings.get(comma_str).is_some());
+        let bin_emitted = super::super::emit_file(&decoded, "t.abc");
+        let bin_reparsed = parse_file_with_version(&bin_emitted, decoded.version)
+            .expect("binary round-trip pandasm must re-parse");
+        assert_eq!(
+            super::super::emit_file(&bin_reparsed, "t.abc"),
+            bin_emitted,
+            "decode -> emit -> parse -> emit must be byte-exact"
+        );
     }
 }

@@ -8,12 +8,65 @@ use std::ffi::{CStr, c_void};
 use abcd_file_sys as sys;
 
 use crate::code::{CatchBlock, TryBlock};
-use crate::debug::{ColumnEntry, LineEntry, LocalVarInfo, ParamInfo};
+use crate::debug::{ModelDebugSink, decode_method_debug_item};
 use crate::error::Error;
-use crate::file::{ABSENT, is_external, read_string};
+use crate::file::{ABSENT, StringItemCache, is_external, read_string};
 use crate::model::*;
-use crate::types::{AccessFlags, FunctionKind, SourceLang, Type, TypeId};
+use crate::types::{AccessFlags, Dialect, FunctionKind, SourceLang, Type, TypeId};
 use crate::{StringId, StringPool};
+
+#[inline]
+fn decode_source_lang(raw: u8) -> Result<SourceLang, Error> {
+    if raw == u8::MAX {
+        Ok(SourceLang::PandaAssembly)
+    } else {
+        SourceLang::try_from(raw)
+    }
+}
+
+/// Decode the 8-bit `panda_file::FunctionKind` stored in `access_flags_` bits
+/// `8..15` (`file_items.h:74-85`). Upstream defines `SENDABLE_FUNCTION = 1 << 3`
+/// (`0x08`) as a bit flag combined with non-concurrent base kinds (`FUNCTION`,
+/// `NC_FUNCTION`, `GENERATOR_FUNCTION`, `ASYNC_FUNCTION`,
+/// `ASYNC_GENERATOR_FUNCTION`, `ASYNC_NC_FUNCTION`).
+#[inline]
+fn decode_function_kind_from_flags(raw_flags: u32) -> Result<FunctionKind, Error> {
+    let raw = ((raw_flags >> 8) & 0xFF) as u8;
+    if let Ok(kind) = FunctionKind::try_from(raw) {
+        return Ok(kind);
+    }
+    let sendable = sys::FunctionKind_SENDABLE_FUNCTION;
+    if (raw & !0x07) == sendable {
+        let base = raw & 0x07;
+        if base == sys::FunctionKind_FUNCTION {
+            return Ok(FunctionKind::SendableFunction);
+        }
+        if base != sys::FunctionKind_CONCURRENT_FUNCTION
+            && let Ok(kind) = FunctionKind::try_from(base)
+        {
+            return Ok(kind);
+        }
+    }
+    Err(Error::UnknownFunctionKind(raw))
+}
+
+#[inline]
+fn check_supported_dialect(
+    file_type: sys::FileType,
+    version: abcd_isa::Version,
+) -> Result<Dialect, Error> {
+    if version == abcd_isa::Version::new(0, 1, 0, 7) || file_type == sys::FileType::Static {
+        return Err(Error::Malformed {
+            field: "file_type",
+            context: format!("static .abc container (version {version}) is not supported"),
+        });
+    }
+    if version == Dialect::LEGACY_VERSION {
+        Ok(Dialect::DynamicLegacy)
+    } else {
+        Ok(Dialect::DynamicModern)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RAII guard for C handles
@@ -48,7 +101,8 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     // 16-bit global literal-array indices). Their bytecode is decoded via
     // abcd_isa::decode_legacy and their entity operands resolved with legacy
     // rules below.
-    let legacy = version == abcd_isa::Version::new(0, 0, 0, 2);
+    let dialect = check_supported_dialect(crate::file::file_type(data), version)?;
+    let legacy = dialect == Dialect::DynamicLegacy;
     let legacy_lit_table = if legacy {
         legacy_literalarray_table(data)
     } else {
@@ -57,204 +111,256 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
     let checksum = abc.checksum();
     let size = abc.size();
     let file_type = crate::file::file_type(data);
+    let file_bytes = data
+        .get(..size as usize)
+        .ok_or_else(|| Error::Open("declared file_size exceeds buffer".into()))?;
 
     let mut strings = StringPool::new();
+    let mut str_cache = StringItemCache::new(f, file_bytes);
 
-    // Open debug info (file-level, lives for entire decode).
-    //
-    // N55 (second half): a null handle means the vendored extractor
-    // THREW during construction — e.g. a debug item whose line program
-    // never SET_FILEs in a class without a source-file record leaves
-    // `file_ = File::EntityId(0)`, and reading it hits
-    // `GetSpanFromId`'s `ThrowIfWithCheck(..., INVALID_FILE_OFFSET)`
-    // (vendored file.h:186-193 via debug_info_extractor.cpp:252's
-    // `value_or(File::EntityId(0))` and line_number_program.h
-    // `LineProgramState::GetFile`); the bridge swallows the exception
-    // and returns nullptr (file_bridge.cpp `abc_debug_info_open`). A
-    // file with NO debug items never throws (the extractor skips
-    // methods without a debug_info_id), so null is never benign.
-    // Previously decode treated null as "no debug info" — silently
-    // dropping the WHOLE file's debug region. Per the N55 ruling that
-    // is now a hard error, never silent.
-    let debug_raw = unsafe { sys::abc_debug_info_open(f) };
-    if debug_raw.is_null() {
-        return Err(Error::DebugInfoExtraction);
+    struct StagedClass {
+        class_off: u32,
+        class_id: u32,
+        descriptor: StringId,
+        descriptor_str: String,
+        is_external: bool,
+        method_offs: Vec<u32>,
+        field_offs: Vec<u32>,
     }
-    let _debug_guard = HandleGuard(Some(move || unsafe {
-        sys::abc_debug_info_close(debug_raw)
-    }));
 
-    // Build entity_map: offset → interned descriptor/name.
+    // Pass 1: single-pass class/method/field header scan building `entity_map`
+    // and caching member offset lists so Pass 2 avoids re-enumerating headers.
     let mut entity_map = HashMap::new();
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let num_classes = unsafe { sys::abc_file_num_classes(f) };
+    let mut staged_classes = Vec::with_capacity(num_classes.min(size / 4) as usize);
     for i in 0..num_classes {
+        // SAFETY: `f` is a live `AbcFileHandle`.
         let class_off = unsafe { sys::abc_file_class_offset(f, i) };
         if class_off == ABSENT {
-            continue;
+            return Err(Error::InvalidOffset(class_off));
         }
         if is_external(f, class_off) {
-            // A foreign-class item is just a string item (no methods/fields):
-            // read its descriptor directly instead of building an accessor,
-            // which upstream only supports for non-external classes.
-            if let Some(sid) = crate::file::intern_string(f, class_off, &mut strings) {
+            if let Some(sid) = str_cache.intern_lossy(class_off, &mut strings) {
                 entity_map.insert(class_off, sid);
+                staged_classes.push(StagedClass {
+                    class_off,
+                    class_id: class_off,
+                    descriptor: sid,
+                    descriptor_str: String::new(),
+                    is_external: true,
+                    method_offs: Vec::new(),
+                    field_offs: Vec::new(),
+                });
             }
             continue;
         }
+        // SAFETY: `f` is live and `class_off` is non-external.
         let cr = unsafe { sys::abc_class_open(f, class_off) };
         if cr.is_null() {
-            continue;
+            return Err(Error::InvalidOffset(class_off));
         }
-        let _cg = HandleGuard(Some(|| unsafe { sys::abc_class_close(cr) }));
+        let _cg = HandleGuard(Some(|| {
+            // SAFETY: `cr` is non-null and owned by this scope.
+            unsafe { sys::abc_class_close(cr) };
+        }));
 
-        if let Some(desc) = read_class_descriptor(f, cr) {
-            let sid = strings.get_or_intern(&desc);
-            entity_map.insert(unsafe { sys::abc_class_get_class_id(cr) }, sid);
-        }
-        for off in collect_offsets_void(cr, sys::abc_class_enumerate_methods) {
+        // SAFETY: `cr` is a valid `AbcClassAccessor`.
+        let class_id = unsafe { sys::abc_class_get_class_id(cr) };
+        let Some((desc_sid, descriptor_str)) =
+            read_class_descriptor_cached(cr, class_id, &mut str_cache, &mut strings)
+        else {
+            continue;
+        };
+        entity_map.insert(class_id, desc_sid);
+
+        let method_offs = collect_offsets_void(cr, sys::abc_class_enumerate_methods);
+        for &off in &method_offs {
+            // SAFETY: `f` is live.
             let mr = unsafe { sys::abc_method_open(f, off) };
             if mr.is_null() {
                 continue;
             }
-            let _mg = HandleGuard(Some(|| unsafe { sys::abc_method_close(mr) }));
-            if let Some(name) = read_method_name(mr) {
-                let sid = strings.get_or_intern(&name);
+            let _mg = HandleGuard(Some(|| {
+                // SAFETY: `mr` is non-null and owned by this scope.
+                unsafe { sys::abc_method_close(mr) };
+            }));
+            if let Some(sid) = str_cache.intern_method_name(off, mr, &mut strings) {
+                // SAFETY: `mr` is valid.
                 entity_map.insert(unsafe { sys::abc_method_get_method_id(mr) }, sid);
             }
         }
-        for off in collect_offsets_void(cr, sys::abc_class_enumerate_fields) {
+
+        let field_offs = collect_offsets_void(cr, sys::abc_class_enumerate_fields);
+        for &off in &field_offs {
+            // SAFETY: `f` is live.
             let fr = unsafe { sys::abc_field_open(f, off) };
             if fr.is_null() {
                 continue;
             }
-            let _fg = HandleGuard(Some(|| unsafe { sys::abc_field_close(fr) }));
+            let _fg = HandleGuard(Some(|| {
+                // SAFETY: `fr` is non-null and owned by this scope.
+                unsafe { sys::abc_field_close(fr) };
+            }));
+            // SAFETY: `fr` is valid.
             let name_off = unsafe { sys::abc_field_name_off(fr) };
             if name_off != ABSENT
-                && let Some(sid) = crate::file::intern_string(f, name_off, &mut strings)
+                && let Some(sid) = str_cache.intern_lossy(name_off, &mut strings)
             {
+                // SAFETY: `fr` is valid.
                 entity_map.insert(unsafe { sys::abc_field_get_field_id(fr) }, sid);
             }
         }
+
+        staged_classes.push(StagedClass {
+            class_off,
+            class_id,
+            descriptor: desc_sid,
+            descriptor_str,
+            is_external: is_external(f, class_id),
+            method_offs,
+            field_offs,
+        });
     }
 
     // --- classes ---
     let mut classes = BTreeMap::new();
-    // Source offsets of module-record blobs (`_ESModuleRecord` field values)
-    // and scope-names literal arrays (`_ESScopeNamesRecord` field values).
-    // The former must be excluded from tagged literal-array decoding; the
-    // latter must be included even when no header table lists them (13.x+).
     let mut module_data_offsets: HashSet<u32> = HashSet::new();
     let mut scope_names_offsets: HashSet<u32> = HashSet::new();
-    // Untagged module-request-phase blobs (`moduleRequestPhaseIdx` field
-    // values): excluded from tagged literal-array decoding, like module blobs.
     let mut phase_blob_offsets: HashSet<u32> = HashSet::new();
-    for i in 0..num_classes {
-        let class_off = unsafe { sys::abc_file_class_offset(f, i) };
-        if class_off == ABSENT {
+    let mut ann_visiting: HashSet<u32> = HashSet::new();
+
+    for staged in staged_classes {
+        if classes.contains_key(&staged.descriptor) {
+            let dup = strings.resolve(staged.descriptor).unwrap_or("?").to_owned();
+            return Err(Error::Malformed {
+                field: "class",
+                context: format!("duplicate class descriptor {dup:?}"),
+            });
+        }
+        if staged.is_external
+            && staged.class_off == staged.class_id
+            && staged.descriptor_str.is_empty()
+        {
+            classes.insert(
+                staged.descriptor,
+                Class {
+                    descriptor: staged.descriptor,
+                    name: staged.descriptor,
+                    access_flags: AccessFlags::empty(),
+                    source_lang: SourceLang::PandaAssembly,
+                    source_file: None,
+                    is_external: true,
+                    super_class: None,
+                    interfaces: Vec::new(),
+                    methods: Vec::new(),
+                    fields: Vec::new(),
+                    annotations: Annotations::default(),
+                },
+            );
             continue;
         }
-        if is_external(f, class_off) {
-            // Foreign classes carry only a descriptor: surface them as
-            // minimal Class entries so super_class references resolve.
-            if let Some(descriptor) = crate::file::intern_string(f, class_off, &mut strings) {
-                classes.insert(
-                    descriptor,
-                    Class {
-                        descriptor,
-                        name: descriptor,
-                        access_flags: AccessFlags::empty(),
-                        source_lang: SourceLang::PandaAssembly,
-                        source_file: None,
-                        is_external: true,
-                        super_class: None,
-                        interfaces: Vec::new(),
-                        methods: Vec::new(),
-                        fields: Vec::new(),
-                        annotations: Annotations::default(),
-                    },
-                );
-            }
-            continue;
-        }
-        let cr = unsafe { sys::abc_class_open(f, class_off) };
+
+        // SAFETY: `f` is live and `staged.class_off` was already validated in Pass 1.
+        let cr = unsafe { sys::abc_class_open(f, staged.class_off) };
         if cr.is_null() {
-            continue;
+            return Err(Error::InvalidOffset(staged.class_off));
         }
-        let _cg = HandleGuard(Some(|| unsafe { sys::abc_class_close(cr) }));
+        let _cg = HandleGuard(Some(|| {
+            // SAFETY: `cr` is non-null and owned by this scope.
+            unsafe { sys::abc_class_close(cr) };
+        }));
 
-        let descriptor_str = match read_class_descriptor(f, cr) {
-            Some(d) => d,
-            None => continue,
+        let name = str_cache
+            .intern_utf8(staged.class_id, &mut strings)
+            .ok_or_else(|| Error::Malformed {
+                field: "name",
+                context: format!("class {}", staged.descriptor_str),
+            })?;
+
+        // SAFETY: `cr` is valid.
+        let sf_off = unsafe { sys::abc_class_source_file_off(cr) };
+        // SAFETY: `cr` is valid.
+        let source_lang = decode_source_lang(unsafe { sys::abc_class_get_source_lang(cr) })?;
+
+        let mut methods = Vec::with_capacity(staged.method_offs.len());
+        for off in staged.method_offs {
+            methods.push(decode_method_at(
+                f,
+                file_bytes,
+                off,
+                staged.class_id,
+                sf_off,
+                dialect,
+                &entity_map,
+                &mut strings,
+                &mut str_cache,
+                &mut ann_visiting,
+            )?);
+        }
+
+        let mut fields = Vec::with_capacity(staged.field_offs.len());
+        for off in staged.field_offs {
+            fields.push(decode_field_at(
+                f,
+                off,
+                &entity_map,
+                &mut strings,
+                &mut str_cache,
+                &mut ann_visiting,
+                &staged.descriptor_str,
+                &mut module_data_offsets,
+                &mut scope_names_offsets,
+                &mut phase_blob_offsets,
+            )?);
+        }
+
+        let annotations = decode_class_annotations(
+            f,
+            cr,
+            &entity_map,
+            &mut strings,
+            &mut str_cache,
+            &mut ann_visiting,
+        )?;
+
+        let source_file = if sf_off == ABSENT {
+            None
+        } else {
+            str_cache.intern_utf8(sf_off, &mut strings)
         };
-        let descriptor = strings.get_or_intern(&descriptor_str);
 
-        let name_str = read_class_name(f, cr).ok_or_else(|| Error::Malformed {
-            field: "name",
-            context: format!("class {descriptor_str}"),
-        })?;
-        let name = strings.get_or_intern(&name_str);
-
-        let methods: Result<Vec<_>, _> = collect_offsets_void(cr, sys::abc_class_enumerate_methods)
-            .into_iter()
-            .map(|off| decode_method_at(f, off, debug_raw, &entity_map, &mut strings, legacy))
-            .collect();
-        let methods = methods?;
-
-        let fields: Result<Vec<_>, _> = collect_offsets_void(cr, sys::abc_class_enumerate_fields)
-            .into_iter()
-            .map(|off| {
-                decode_field_at(
-                    f,
-                    off,
-                    &entity_map,
-                    &mut strings,
-                    &descriptor_str,
-                    &mut module_data_offsets,
-                    &mut scope_names_offsets,
-                    &mut phase_blob_offsets,
-                )
+        // SAFETY: `cr` is valid.
+        let access_flags =
+            AccessFlags::from_bits_truncate(unsafe { sys::abc_class_access_flags(cr) });
+        // SAFETY: `cr` is valid.
+        let super_off = unsafe { sys::abc_class_super_class_off(cr) };
+        let super_class = if super_off == 0 || super_off == ABSENT {
+            None
+        } else {
+            entity_map.get(&super_off).copied()
+        };
+        // SAFETY: `cr` is valid.
+        let n_ifaces = unsafe { sys::abc_class_get_ifaces_number(cr) };
+        let interfaces = (0..n_ifaces)
+            .filter_map(|i| {
+                // SAFETY: `cr` is valid and `i < n_ifaces`.
+                let off = unsafe { sys::abc_class_get_interface_id(cr, i) };
+                entity_map.get(&off).copied()
             })
             .collect();
-        let fields = fields?;
-
-        let annotations = decode_class_annotations(f, cr, &entity_map, &mut strings)?;
 
         classes.insert(
-            descriptor,
+            staged.descriptor,
             Class {
-                descriptor,
+                descriptor: staged.descriptor,
                 name,
-                access_flags: AccessFlags::from_bits_truncate(unsafe {
-                    sys::abc_class_access_flags(cr)
-                }),
-                source_lang: SourceLang::try_from(unsafe { sys::abc_class_get_source_lang(cr) })
-                    .unwrap_or(SourceLang::PandaAssembly),
-                source_file: {
-                    let off = unsafe { sys::abc_class_source_file_off(cr) };
-                    if off == ABSENT {
-                        None
-                    } else {
-                        read_string(f, off).map(|s| strings.get_or_intern(&s))
-                    }
-                },
-                is_external: is_external(f, unsafe { sys::abc_class_get_class_id(cr) }),
-                super_class: {
-                    let off = unsafe { sys::abc_class_super_class_off(cr) };
-                    if off == 0 || off == ABSENT {
-                        None
-                    } else {
-                        entity_map.get(&off).copied()
-                    }
-                },
-                interfaces: {
-                    let n = unsafe { sys::abc_class_get_ifaces_number(cr) };
-                    (0..n)
-                        .filter_map(|i| {
-                            let off = unsafe { sys::abc_class_get_interface_id(cr, i) };
-                            entity_map.get(&off).copied()
-                        })
-                        .collect()
-                },
+                access_flags,
+                source_lang,
+                source_file,
+                is_external: staged.is_external,
+                super_class,
+                interfaces,
                 methods,
                 fields,
                 annotations,
@@ -270,12 +376,9 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
             continue;
         };
         for bytecode in &body.bytecodes {
-            for (kind, id) in bytecode.entity_operands() {
+            let (ops, ops_len) = bytecode.entity_operands_inline();
+            for &(kind, id) in &ops[..ops_len] {
                 use abcd_isa::EntityKind;
-                // Vacuous today: EntityKind is generated with exactly these
-                // three variants (abcd-isa-sys templates/bytecode.rs.erb
-                // collects every `id?` operand role). Future-proofing
-                // against ISA-template growth, not a reachable filter.
                 if !matches!(
                     kind,
                     EntityKind::StringId | EntityKind::MethodId | EntityKind::LiteralarrayId
@@ -293,13 +396,6 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                     ),
                 };
                 if legacy {
-                    // Legacy (0.0.0.2) operand encoding: string operands are
-                    // direct 32-bit file offsets (the string index region did
-                    // not exist yet); method operands are 16-bit indices into
-                    // the method's index region (same layout as today);
-                    // literal-array operands are 16-bit indices into the
-                    // header's global literal-array table (deprecated by the
-                    // 2022-08-18 refactoring).
                     let offset = match kind {
                         EntityKind::StringId => {
                             let off = id.0;
@@ -310,6 +406,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                         }
                         EntityKind::MethodId => {
                             let index = u16::try_from(id.0).map_err(|_| invalid())?;
+                            // SAFETY: `f` is a live `AbcFileHandle`.
                             let offset = unsafe {
                                 sys::abc_resolve_offset_by_index(f, method.offset, index)
                             };
@@ -319,14 +416,6 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                             offset
                         }
                         EntityKind::LiteralarrayId => {
-                            // Unreachable by construction: no legacy opcode
-                            // decodes to a variant with a LiteralarrayId
-                            // entity operand (abcd-isa/src/legacy_table.rs
-                            // maps the create*withbuffer family to the
-                            // Imm-only Deprecated* variants); legacy
-                            // literal-array references arrive through the
-                            // blob pass below instead. Kept for symmetry
-                            // with the modern arm.
                             let Some((count, table_off)) = legacy_lit_table else {
                                 return Err(invalid());
                             };
@@ -354,25 +443,30 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                         continue;
                     }
                     if kind == EntityKind::StringId {
-                        let sid = crate::file::intern_string(f, offset, &mut strings)
+                        let sid = str_cache
+                            .intern_lossy(offset, &mut strings)
                             .ok_or_else(invalid)?;
                         entity_map.insert(offset, sid);
                         continue;
                     }
-                    let name = {
+                    let sid = {
+                        // SAFETY: `f` is live.
                         let accessor = unsafe { sys::abc_method_open(f, offset) };
                         if accessor.is_null() {
                             return Err(invalid());
                         }
-                        let _guard =
-                            HandleGuard(Some(|| unsafe { sys::abc_method_close(accessor) }));
-                        read_method_name(accessor)
+                        let _guard = HandleGuard(Some(|| {
+                            // SAFETY: `accessor` is non-null and owned by this scope.
+                            unsafe { sys::abc_method_close(accessor) };
+                        }));
+                        str_cache.intern_method_name(offset, accessor, &mut strings)
                     }
                     .ok_or_else(invalid)?;
-                    entity_map.insert(offset, strings.get_or_intern(&name));
+                    entity_map.insert(offset, sid);
                     continue;
                 }
                 let index = u16::try_from(id.0).map_err(|_| invalid())?;
+                // SAFETY: `f` is a live `AbcFileHandle`.
                 let offset = unsafe { sys::abc_resolve_offset_by_index(f, method.offset, index) };
                 if offset == ABSENT {
                     return Err(invalid());
@@ -385,21 +479,26 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
                     continue;
                 }
                 if kind == EntityKind::StringId {
-                    let sid =
-                        crate::file::intern_string(f, offset, &mut strings).ok_or_else(invalid)?;
+                    let sid = str_cache
+                        .intern_lossy(offset, &mut strings)
+                        .ok_or_else(invalid)?;
                     entity_map.insert(offset, sid);
                     continue;
                 }
-                let name = {
+                let sid = {
+                    // SAFETY: `f` is live.
                     let accessor = unsafe { sys::abc_method_open(f, offset) };
                     if accessor.is_null() {
                         return Err(invalid());
                     }
-                    let _guard = HandleGuard(Some(|| unsafe { sys::abc_method_close(accessor) }));
-                    read_method_name(accessor)
+                    let _guard = HandleGuard(Some(|| {
+                        // SAFETY: `accessor` is non-null and owned by this scope.
+                        unsafe { sys::abc_method_close(accessor) };
+                    }));
+                    str_cache.intern_method_name(offset, accessor, &mut strings)
                 }
                 .ok_or_else(invalid)?;
-                entity_map.insert(offset, strings.get_or_intern(&name));
+                entity_map.insert(offset, sid);
             }
         }
     }
@@ -487,6 +586,7 @@ pub fn decode(data: &[u8]) -> Result<File, Error> {
             f,
             size,
             &mut strings,
+            &mut str_cache,
             &referenced_literal_offsets,
             &module_data_offsets,
             &phase_blob_offsets,
@@ -544,6 +644,14 @@ pub struct FileSummary {
     pub verify: Option<VerifySummary>,
 }
 
+impl FileSummary {
+    /// Classify this `.abc` summary into its container [`Dialect`].
+    #[inline]
+    pub const fn dialect(&self) -> Option<crate::Dialect> {
+        crate::Dialect::from_header(self.file_type, self.version)
+    }
+}
+
 /// Compact open-addressed `u32` hash set using `u32::MAX` as the empty slot
 /// sentinel (with an explicit side flag for `u32::MAX` itself). Avoids std
 /// `HashSet` per-bucket metadata overhead when tracking ~100k file offsets.
@@ -570,7 +678,7 @@ impl CompactU32Set {
         self.len + usize::from(self.has_max)
     }
 
-    fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+    fn iter(&self) -> impl Iterator<Item = u32> {
         self.slots
             .iter()
             .copied()
@@ -899,12 +1007,14 @@ impl<'a> SummaryStrings<'a> {
     /// Equivalent to `read_method_name(mr)` + `strings.get_or_intern`, reusing
     /// one scratch UTF-16 buffer across methods.
     fn intern_method_name(&mut self, mr: *const sys::AbcMethodAccessor) -> bool {
+        // SAFETY: `mr` is a valid `AbcMethodAccessor`; null buffer queries unit count.
         let units = unsafe { sys::abc_method_get_name_utf16(mr, std::ptr::null_mut(), 0) };
         if units == 0 {
             return false;
         }
         self.utf16_scratch.clear();
         self.utf16_scratch.resize(units, 0);
+        // SAFETY: `mr` is valid and `utf16_scratch` holds `units` writable `u16`s.
         let written =
             unsafe { sys::abc_method_get_name_utf16(mr, self.utf16_scratch.as_mut_ptr(), units) };
         if written != units {
@@ -926,49 +1036,7 @@ impl<'a> SummaryStrings<'a> {
     }
 }
 
-#[inline]
-fn read_uleb128_slice(sp: &mut &[u8]) -> Option<u32> {
-    let mut result = 0u32;
-    for i in 0..5usize {
-        let &b = sp.get(i)?;
-        if i == 4 && (b & 0xF0) != 0 {
-            return None;
-        }
-        result |= u32::from(b & 0x7F) << (7 * i);
-        if (b & 0x80) == 0 {
-            *sp = &sp[i + 1..];
-            return Some(result);
-        }
-    }
-    None
-}
-
-#[inline]
-fn read_sleb128_slice(sp: &mut &[u8]) -> Option<i32> {
-    let mut result = 0u32;
-    for i in 0..5usize {
-        let &b = sp.get(i)?;
-        if i == 4 {
-            if (b & 0x80) != 0 {
-                return None;
-            }
-            let top = b & 0x78;
-            if top != 0 && top != 0x78 {
-                return None;
-            }
-        }
-        result |= u32::from(b & 0x7F) << (7 * i);
-        if (b & 0x80) == 0 {
-            let shift = 7 * (i + 1);
-            if shift < 32 && (b & 0x40) != 0 {
-                result |= !0u32 << shift;
-            }
-            *sp = &sp[i + 1..];
-            return Some(result as i32);
-        }
-    }
-    None
-}
+use crate::file::read_uleb128_slice;
 
 #[derive(Default)]
 struct ClassSummary {
@@ -1030,7 +1098,17 @@ fn inspect_summary_with_handle(
 ) -> Result<FileSummary, Error> {
     let f = abc.raw;
     let version = abc.version();
-    let legacy = version == abcd_isa::Version::new(0, 0, 0, 2);
+    let file_type = crate::file::file_type(data);
+    let dialect = if verify {
+        check_supported_dialect(file_type, version)?
+    } else if version == abcd_isa::Version::new(0, 1, 0, 7) || file_type == sys::FileType::Static {
+        Dialect::Static
+    } else if version == Dialect::LEGACY_VERSION {
+        Dialect::DynamicLegacy
+    } else {
+        Dialect::DynamicModern
+    };
+    let legacy = dialect == Dialect::DynamicLegacy;
     let legacy_lit_table = if legacy {
         legacy_literalarray_table(data)
     } else {
@@ -1038,36 +1116,22 @@ fn inspect_summary_with_handle(
     };
     let checksum = abc.checksum();
     let size = abc.size();
-    let file_type = crate::file::file_type(data);
     let file_bytes = data
         .get(..size as usize)
         .ok_or_else(|| Error::Open("declared file_size exceeds buffer".into()))?;
 
     let mut strings = SummaryStrings::new(file_bytes);
 
-    let debug_raw = if verify {
-        let raw = unsafe { sys::abc_debug_info_open(f) };
-        if raw.is_null() {
-            return Err(Error::DebugInfoExtraction);
-        }
-        raw
-    } else {
-        std::ptr::null_mut()
-    };
-    let _debug_guard = (!debug_raw.is_null()).then(|| {
-        HandleGuard(Some(move || unsafe {
-            sys::abc_debug_info_close(debug_raw)
-        }))
-    });
-
     // Pass 1: initial entity_map offsets (classes, methods, fields).
     let mut initial_entities = CompactU32Set::default();
     let mut valid_method_names = CompactU32Set::default();
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let num_classes = unsafe { sys::abc_file_num_classes(f) };
     for i in 0..num_classes {
+        // SAFETY: `f` is a live `AbcFileHandle`.
         let class_off = unsafe { sys::abc_file_class_offset(f, i) };
         if class_off == ABSENT {
-            continue;
+            return Err(Error::InvalidOffset(class_off));
         }
         if is_external(f, class_off) {
             if strings.intern_offset_lossy(f, class_off) {
@@ -1075,34 +1139,50 @@ fn inspect_summary_with_handle(
             }
             continue;
         }
+        // SAFETY: `f` is live and `class_off` is non-external.
         let cr = unsafe { sys::abc_class_open(f, class_off) };
         if cr.is_null() {
-            continue;
+            return Err(Error::InvalidOffset(class_off));
         }
-        let _cg = HandleGuard(Some(|| unsafe { sys::abc_class_close(cr) }));
+        let _cg = HandleGuard(Some(|| {
+            // SAFETY: `cr` is non-null and owned by this scope.
+            unsafe { sys::abc_class_close(cr) };
+        }));
 
         if read_class_descriptor_summary(f, cr, &mut strings).is_some() {
+            // SAFETY: `cr` is valid.
             initial_entities.insert(unsafe { sys::abc_class_get_class_id(cr) });
         }
         for off in collect_offsets_void(cr, sys::abc_class_enumerate_methods) {
+            // SAFETY: `f` is live.
             let mr = unsafe { sys::abc_method_open(f, off) };
             if mr.is_null() {
                 continue;
             }
-            let _mg = HandleGuard(Some(|| unsafe { sys::abc_method_close(mr) }));
+            let _mg = HandleGuard(Some(|| {
+                // SAFETY: `mr` is non-null and owned by this scope.
+                unsafe { sys::abc_method_close(mr) };
+            }));
             if strings.intern_method_name(mr) {
                 valid_method_names.insert(off);
+                // SAFETY: `mr` is valid.
                 initial_entities.insert(unsafe { sys::abc_method_get_method_id(mr) });
             }
         }
         for off in collect_offsets_void(cr, sys::abc_class_enumerate_fields) {
+            // SAFETY: `f` is live.
             let fr = unsafe { sys::abc_field_open(f, off) };
             if fr.is_null() {
                 continue;
             }
-            let _fg = HandleGuard(Some(|| unsafe { sys::abc_field_close(fr) }));
+            let _fg = HandleGuard(Some(|| {
+                // SAFETY: `fr` is non-null and owned by this scope.
+                unsafe { sys::abc_field_close(fr) };
+            }));
+            // SAFETY: `fr` is valid.
             let name_off = unsafe { sys::abc_field_name_off(fr) };
             if name_off != ABSENT && strings.intern_offset_lossy(f, name_off) {
+                // SAFETY: `fr` is valid.
                 initial_entities.insert(unsafe { sys::abc_field_get_field_id(fr) });
             }
         }
@@ -1117,14 +1197,23 @@ fn inspect_summary_with_handle(
     let mut phase_blob_offsets = CompactU32Set::default();
     let mut referenced_literal_offsets = CompactU32Set::default();
     let mut ann_nested_raw_targets: Vec<u32> = Vec::new();
+    let mut ann_visiting: HashSet<u32> = HashSet::new();
 
     for i in 0..num_classes {
+        // SAFETY: `f` is live.
         let class_off = unsafe { sys::abc_file_class_offset(f, i) };
         if class_off == ABSENT {
-            continue;
+            return Err(Error::InvalidOffset(class_off));
         }
         if is_external(f, class_off) {
             if let Some(desc_sym) = strings.intern_offset_lossy_sym(f, class_off) {
+                if classes.contains_key(&desc_sym) {
+                    let dup = strings.resolve_utf8(desc_sym).unwrap_or("?").to_owned();
+                    return Err(Error::Malformed {
+                        field: "class",
+                        context: format!("duplicate class descriptor {dup:?}"),
+                    });
+                }
                 classes.insert(
                     desc_sym,
                     ClassSummary {
@@ -1135,15 +1224,27 @@ fn inspect_summary_with_handle(
             }
             continue;
         }
+        // SAFETY: `f` is live and `class_off` is non-external.
         let cr = unsafe { sys::abc_class_open(f, class_off) };
         if cr.is_null() {
-            continue;
+            return Err(Error::InvalidOffset(class_off));
         }
-        let _cg = HandleGuard(Some(|| unsafe { sys::abc_class_close(cr) }));
+        let _cg = HandleGuard(Some(|| {
+            // SAFETY: `cr` is non-null and owned by this scope.
+            unsafe { sys::abc_class_close(cr) };
+        }));
 
         let Some(desc_sym) = read_class_descriptor_summary(f, cr, &mut strings) else {
             continue;
         };
+        if classes.contains_key(&desc_sym) {
+            let dup = strings.resolve_utf8(desc_sym).unwrap_or("?").to_owned();
+            return Err(Error::Malformed {
+                field: "class",
+                context: format!("duplicate class descriptor {dup:?}"),
+            });
+        }
+        // SAFETY: `cr` is valid.
         let class_id = unsafe { sys::abc_class_get_class_id(cr) };
         if !strings.intern_offset_utf8(f, class_id) {
             let desc_text = strings.resolve_utf8(desc_sym).unwrap_or("?").to_owned();
@@ -1152,10 +1253,13 @@ fn inspect_summary_with_handle(
                 context: format!("class {desc_text}"),
             });
         }
+        // SAFETY: `cr` is valid.
+        decode_source_lang(unsafe { sys::abc_class_get_source_lang(cr) })?;
         let is_mod_rec_cls = strings.resolve_utf8(desc_sym) == Some(ES_MODULE_RECORD_DESCRIPTOR);
         let is_scope_rec_cls =
             strings.resolve_utf8(desc_sym) == Some(ES_SCOPE_NAMES_RECORD_DESCRIPTOR);
 
+        // SAFETY: `cr` is valid.
         let sf_off = unsafe { sys::abc_class_source_file_off(cr) };
 
         let mut cls_summary = ClassSummary {
@@ -1171,9 +1275,7 @@ fn inspect_summary_with_handle(
                 method_off,
                 class_id,
                 sf_off,
-                debug_raw,
-                verify,
-                legacy,
+                dialect,
                 legacy_lit_table,
                 &valid_method_names,
                 &initial_entities,
@@ -1181,6 +1283,7 @@ fn inspect_summary_with_handle(
                 &mut strings,
                 &mut referenced_literal_offsets,
                 &mut ann_nested_raw_targets,
+                &mut ann_visiting,
                 &mut cls_summary,
             )?;
         }
@@ -1198,6 +1301,7 @@ fn inspect_summary_with_handle(
                 &mut scope_names_offsets,
                 &mut phase_blob_offsets,
                 &mut ann_nested_raw_targets,
+                &mut ann_visiting,
             )?;
             cls_summary.fields += 1;
         }
@@ -1215,6 +1319,7 @@ fn inspect_summary_with_handle(
                     &initial_entities,
                     &mut strings,
                     &mut ann_nested_raw_targets,
+                    &mut ann_visiting,
                 )?;
             }
         }
@@ -1225,9 +1330,6 @@ fn inspect_summary_with_handle(
 
         classes.insert(desc_sym, cls_summary);
     }
-
-    // Release C++ DebugInfoExtractor immediately if it was opened for `verify`.
-    drop(_debug_guard);
 
     // Seed scope-names and plausible annotation-embedded nested literal arrays.
     for off in scope_names_offsets.iter() {
@@ -1300,19 +1402,25 @@ fn read_class_descriptor_summary(
     cr: *const sys::AbcClassAccessor,
     strings: &mut SummaryStrings<'_>,
 ) -> Option<SymId> {
+    // SAFETY: `cr` is a valid `AbcClassAccessor`.
     let class_id = unsafe { sys::abc_class_get_class_id(cr) };
     if let Some(sym) = strings.intern_offset_utf8_sym(f, class_id) {
         return Some(sym);
     }
+    // SAFETY: `cr` is valid; returns null or a NUL-terminated descriptor inside `f`'s buffer.
     let ptr = unsafe { sys::abc_class_get_descriptor(cr) };
     if ptr.is_null() {
         return None;
     }
-    let cstr = unsafe { CStr::from_ptr(ptr as *const _) };
+    // SAFETY: `ptr` is non-null and NUL-terminated inside `f`'s zero-padded buffer.
+    let cstr = unsafe { CStr::from_ptr(ptr.cast::<std::os::raw::c_char>()) };
     Some(strings.intern_utf8_str(&cstr.to_string_lossy()))
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming method inspector threads distinct summary accumulators without intermediate allocations"
+)]
 fn inspect_method_at(
     f: *const sys::AbcFileHandle,
     raw_data: &[u8],
@@ -1320,9 +1428,7 @@ fn inspect_method_at(
     method_off: u32,
     class_id: u32,
     class_source_file_off: u32,
-    debug_raw: *mut sys::AbcDebugInfo,
-    verify: bool,
-    legacy: bool,
+    dialect: Dialect,
     legacy_lit_table: Option<(u32, u32)>,
     valid_method_names: &CompactU32Set,
     initial_entities: &CompactU32Set,
@@ -1330,14 +1436,20 @@ fn inspect_method_at(
     strings: &mut SummaryStrings<'_>,
     referenced_literal_offsets: &mut CompactU32Set,
     ann_nested_raw_targets: &mut Vec<u32>,
+    ann_visiting: &mut HashSet<u32>,
     cls_summary: &mut ClassSummary,
 ) -> Result<(), Error> {
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let mr = unsafe { sys::abc_method_open(f, method_off) };
     if mr.is_null() {
         return Err(Error::InvalidOffset(method_off));
     }
-    let _mg = HandleGuard(Some(|| unsafe { sys::abc_method_close(mr) }));
+    let _mg = HandleGuard(Some(|| {
+        // SAFETY: `mr` is non-null and owned by this scope.
+        unsafe { sys::abc_method_close(mr) };
+    }));
 
+    // SAFETY: `mr` is valid.
     let method_id = unsafe { sys::abc_method_get_method_id(mr) };
     if !valid_method_names.contains(method_off) && !strings.intern_method_name(mr) {
         return Err(Error::Malformed {
@@ -1346,28 +1458,41 @@ fn inspect_method_at(
         });
     }
 
+    // SAFETY: `mr` is valid.
+    let raw_flags = unsafe { sys::abc_method_access_flags(mr) };
+    if dialect != Dialect::Static {
+        decode_function_kind_from_flags(raw_flags)?;
+    }
+    // SAFETY: `mr` is valid.
+    decode_source_lang(unsafe { sys::abc_method_get_source_lang(mr) })?;
+
+    // SAFETY: `mr` is valid.
     let code_off = unsafe { sys::abc_method_code_off(mr) };
     if code_off != ABSENT {
         cls_summary.methods_with_body += 1;
-        cls_summary.instructions_decoded += inspect_code_at(
-            f,
-            raw_data,
-            method_off,
-            code_off,
-            legacy,
-            legacy_lit_table,
-            initial_entities,
-            extra_entities,
-            strings,
-            referenced_literal_offsets,
-        )?;
+        if dialect != Dialect::Static {
+            cls_summary.instructions_decoded += inspect_code_at(
+                f,
+                raw_data,
+                method_off,
+                code_off,
+                dialect,
+                legacy_lit_table,
+                initial_entities,
+                extra_entities,
+                strings,
+                referenced_literal_offsets,
+            )?;
+        }
     }
 
     let num_params = {
+        // SAFETY: `mr` is valid.
         let has_valid = unsafe { sys::abc_method_has_valid_proto(mr) } != 0;
         if !has_valid {
             0usize
         } else {
+            // SAFETY: `mr` is valid.
             let proto_id = unsafe { sys::abc_method_get_proto_id(mr) };
             if proto_id == ABSENT {
                 0usize
@@ -1390,26 +1515,25 @@ fn inspect_method_at(
                 initial_entities,
                 strings,
                 ann_nested_raw_targets,
+                ann_visiting,
             )?;
         }
     }
 
+    // SAFETY: `mr` is valid.
     let debug_off = unsafe { sys::abc_method_debug_info_off(mr) };
     if debug_off != ABSENT {
         cls_summary.debug_infos += 1;
-        if verify {
-            intern_debug_info_from_extractor(debug_raw, method_id, strings);
-        } else {
-            scan_debug_info_strings_raw(
-                f,
-                file_bytes,
-                class_id,
-                class_source_file_off,
-                mr,
-                debug_off,
-                strings,
-            )?;
-        }
+        let mut sink = SummaryDebugSink::new(strings);
+        decode_method_debug_item(
+            f,
+            file_bytes,
+            class_id,
+            class_source_file_off,
+            mr,
+            debug_off,
+            &mut sink,
+        )?;
     }
 
     inspect_param_annotations(
@@ -1419,56 +1543,74 @@ fn inspect_method_at(
         initial_entities,
         strings,
         ann_nested_raw_targets,
+        ann_visiting,
     )?;
 
     cls_summary.methods += 1;
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming code inspector resolves operands directly into summary sets without allocating MethodBody"
+)]
 fn inspect_code_at(
     f: *const sys::AbcFileHandle,
     data: &[u8],
     method_off: u32,
     code_off: u32,
-    legacy: bool,
+    dialect: Dialect,
     legacy_lit_table: Option<(u32, u32)>,
     initial_entities: &CompactU32Set,
     extra_entities: &mut CompactU32Set,
     strings: &mut SummaryStrings<'_>,
     referenced_literal_offsets: &mut CompactU32Set,
 ) -> Result<usize, Error> {
+    let legacy = dialect == Dialect::DynamicLegacy;
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let cr = unsafe { sys::abc_code_open(f, code_off) };
     if cr.is_null() {
         return Err(Error::InvalidOffset(code_off));
     }
-    let _cg = HandleGuard(Some(|| unsafe { sys::abc_code_close(cr) }));
+    let _cg = HandleGuard(Some(|| {
+        // SAFETY: `cr` is non-null and owned by this scope.
+        unsafe { sys::abc_code_close(cr) };
+    }));
 
     let raw_insns = {
+        // SAFETY: `cr` is valid.
         let ptr = unsafe { sys::abc_code_instructions(cr) };
+        // SAFETY: `cr` is valid.
         let len = unsafe { sys::abc_code_code_size(cr) } as usize;
         if ptr.is_null() || len == 0 {
             &[]
         } else {
+            // SAFETY: `ptr` points to `len` validated bytes inside `f`'s buffer.
             unsafe { std::slice::from_raw_parts(ptr, len) }
         }
     };
-    let decoded = if legacy {
-        abcd_isa::decode_legacy(raw_insns)
-    } else {
-        abcd_isa::decode(raw_insns)
+    let decoded = match dialect {
+        Dialect::DynamicLegacy => abcd_isa::decode_legacy(raw_insns),
+        Dialect::DynamicModern => abcd_isa::decode(raw_insns),
+        Dialect::Static => {
+            return Err(Error::Malformed {
+                field: "file_type",
+                context: "static .abc bytecode cannot be decoded with dynamic ISA".into(),
+            });
+        }
     }
     .map_err(|source| Error::BytecodeDecode {
         method_offset: method_off,
         source,
     })?;
 
-    // Validate try-block and catch-block spans without retaining TryBlock Vecs.
-    validate_try_block_spans(method_off, cr)?;
+    // Validate try-block and catch-block spans and catch class indices.
+    validate_try_block_spans(f, method_off, cr, raw_insns.len() as u32, &decoded)?;
 
     let insn_count = decoded.len();
     for (bytecode, _) in &decoded {
-        for (kind, id) in bytecode.entity_operands() {
+        let (ops, ops_len) = bytecode.entity_operands_inline();
+        for &(kind, id) in &ops[..ops_len] {
             use abcd_isa::EntityKind;
             if !matches!(
                 kind,
@@ -1497,6 +1639,7 @@ fn inspect_code_at(
                     }
                     EntityKind::MethodId => {
                         let index = u16::try_from(id.0).map_err(|_| invalid())?;
+                        // SAFETY: `f` is live.
                         let offset =
                             unsafe { sys::abc_resolve_offset_by_index(f, method_off, index) };
                         if offset == ABSENT {
@@ -1541,11 +1684,15 @@ fn inspect_code_at(
                     extra_entities.insert(offset);
                     continue;
                 }
+                // SAFETY: `f` is live.
                 let accessor = unsafe { sys::abc_method_open(f, offset) };
                 if accessor.is_null() {
                     return Err(invalid());
                 }
-                let _guard = HandleGuard(Some(|| unsafe { sys::abc_method_close(accessor) }));
+                let _guard = HandleGuard(Some(|| {
+                    // SAFETY: `accessor` is non-null and owned by this scope.
+                    unsafe { sys::abc_method_close(accessor) };
+                }));
                 if !strings.intern_method_name(accessor) {
                     return Err(invalid());
                 }
@@ -1554,6 +1701,7 @@ fn inspect_code_at(
             }
 
             let index = u16::try_from(id.0).map_err(|_| invalid())?;
+            // SAFETY: `f` is live.
             let offset = unsafe { sys::abc_resolve_offset_by_index(f, method_off, index) };
             if offset == ABSENT {
                 return Err(invalid());
@@ -1572,11 +1720,15 @@ fn inspect_code_at(
                 extra_entities.insert(offset);
                 continue;
             }
+            // SAFETY: `f` is live.
             let accessor = unsafe { sys::abc_method_open(f, offset) };
             if accessor.is_null() {
                 return Err(invalid());
             }
-            let _guard = HandleGuard(Some(|| unsafe { sys::abc_method_close(accessor) }));
+            let _guard = HandleGuard(Some(|| {
+                // SAFETY: `accessor` is non-null and owned by this scope.
+                unsafe { sys::abc_method_close(accessor) };
+            }));
             if !strings.intern_method_name(accessor) {
                 return Err(invalid());
             }
@@ -1627,60 +1779,148 @@ fn inspect_code_at(
     Ok(insn_count)
 }
 
-fn validate_try_block_spans(method_off: u32, cr: *mut sys::AbcCodeAccessor) -> Result<(), Error> {
-    struct SpanCheckCtx {
-        try_overflow: bool,
-        catch_overflow: bool,
+fn validate_try_block_spans(
+    f: *const sys::AbcFileHandle,
+    method_off: u32,
+    cr: *mut sys::AbcCodeAccessor,
+    code_byte_len: u32,
+    decoded: &[(abcd_isa::Bytecode, u32)],
+) -> Result<(), Error> {
+    struct SpanCheckCtx<'a> {
+        f: *const sys::AbcFileHandle,
+        method_off: u32,
+        code_byte_len: u32,
+        decoded: &'a [(abcd_isa::Bytecode, u32)],
+        err: Option<Error>,
+    }
+    #[inline]
+    fn check_pc(
+        pc: u32,
+        code_byte_len: u32,
+        decoded: &[(abcd_isa::Bytecode, u32)],
+        method_off: u32,
+        field: &'static str,
+        label: &str,
+    ) -> Result<(), Error> {
+        if pc == code_byte_len {
+            return Ok(());
+        }
+        decoded
+            .binary_search_by_key(&pc, |&(_, off)| off)
+            .map(|_| ())
+            .map_err(|_| Error::Malformed {
+                field,
+                context: format!(
+                    "method at offset {method_off:#x}: {label} PC {pc:#x} is not on an instruction boundary"
+                ),
+            })
     }
     unsafe extern "C" fn cb(
         try_info: *const sys::AbcTryBlockInfo,
         catches: *const sys::AbcCatchBlockInfo,
         ctx_raw: *mut c_void,
     ) -> i32 {
-        let ctx = unsafe { &mut *(ctx_raw as *mut SpanCheckCtx) };
-        if ctx.try_overflow || ctx.catch_overflow {
+        // SAFETY: `ctx_raw` points to the caller's live `SpanCheckCtx`.
+        let ctx = unsafe { &mut *ctx_raw.cast::<SpanCheckCtx<'_>>() };
+        if ctx.err.is_some() {
             return 0;
         }
+        // SAFETY: `try_info` is a valid non-null pointer supplied by C++.
         let info = unsafe { &*try_info };
-        if info.start_pc.checked_add(info.length).is_none() {
-            ctx.try_overflow = true;
+        let Some(end_pc) = info.start_pc.checked_add(info.length) else {
+            ctx.err = Some(Error::Malformed {
+                field: "try_block",
+                context: format!("method at offset {:#x}: try span overflow", ctx.method_off),
+            });
+            return 0;
+        };
+        if let Err(e) = check_pc(
+            info.start_pc,
+            ctx.code_byte_len,
+            ctx.decoded,
+            ctx.method_off,
+            "try_block",
+            "try start",
+        )
+        .and_then(|()| {
+            check_pc(
+                end_pc,
+                ctx.code_byte_len,
+                ctx.decoded,
+                ctx.method_off,
+                "try_block",
+                "try end",
+            )
+        }) {
+            ctx.err = Some(e);
             return 0;
         }
         let catch_slice = if info.num_catches > 0 {
+            // SAFETY: `catches` holds `info.num_catches` contiguous entries during callback.
             unsafe { std::slice::from_raw_parts(catches, info.num_catches as usize) }
         } else {
             &[]
         };
         for c in catch_slice {
-            if c.handler_pc.checked_add(c.code_size).is_none() {
-                ctx.catch_overflow = true;
+            if c.type_idx != u32::MAX {
+                let Ok(idx) = u16::try_from(c.type_idx) else {
+                    ctx.err = Some(Error::InvalidOffset(c.type_idx));
+                    return 0;
+                };
+                // SAFETY: `ctx.f` is a live `AbcFileHandle`.
+                let resolved = unsafe { sys::abc_resolve_class_index(ctx.f, ctx.method_off, idx) };
+                if resolved == ABSENT {
+                    ctx.err = Some(Error::InvalidOffset(c.type_idx));
+                    return 0;
+                }
+            }
+            let Some(handler_end) = c.handler_pc.checked_add(c.code_size) else {
+                ctx.err = Some(Error::Malformed {
+                    field: "catch_block",
+                    context: format!(
+                        "method at offset {:#x}: catch span overflow",
+                        ctx.method_off
+                    ),
+                });
+                return 0;
+            };
+            if let Err(e) = check_pc(
+                c.handler_pc,
+                ctx.code_byte_len,
+                ctx.decoded,
+                ctx.method_off,
+                "catch_block",
+                "catch handler",
+            )
+            .and_then(|()| {
+                check_pc(
+                    handler_end,
+                    ctx.code_byte_len,
+                    ctx.decoded,
+                    ctx.method_off,
+                    "catch_block",
+                    "catch end",
+                )
+            }) {
+                ctx.err = Some(e);
                 return 0;
             }
         }
         0
     }
     let mut ctx = SpanCheckCtx {
-        try_overflow: false,
-        catch_overflow: false,
+        f,
+        method_off,
+        code_byte_len,
+        decoded,
+        err: None,
     };
+    // SAFETY: `cr` and `ctx` are live for the synchronous enumeration call.
     unsafe {
-        sys::abc_code_enumerate_try_blocks_full(
-            cr,
-            Some(cb),
-            &mut ctx as *mut SpanCheckCtx as *mut c_void,
-        );
+        sys::abc_code_enumerate_try_blocks_full(cr, Some(cb), (&raw mut ctx).cast::<c_void>());
     }
-    if ctx.try_overflow {
-        return Err(Error::Malformed {
-            field: "try_block",
-            context: format!("method at offset {method_off:#x}: try span overflow"),
-        });
-    }
-    if ctx.catch_overflow {
-        return Err(Error::Malformed {
-            field: "catch_block",
-            context: format!("method at offset {method_off:#x}: catch span overflow"),
-        });
+    if let Some(err) = ctx.err {
+        return Err(err);
     }
     Ok(())
 }
@@ -1690,12 +1930,17 @@ fn inspect_proto_types(
     proto_off: u32,
     initial_entities: &CompactU32Set,
 ) -> Result<usize, Error> {
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let pr = unsafe { sys::abc_proto_open(f, proto_off) };
     if pr.is_null() {
         return Err(Error::InvalidOffset(proto_off));
     }
-    let _pg = HandleGuard(Some(|| unsafe { sys::abc_proto_close(pr) }));
+    let _pg = HandleGuard(Some(|| {
+        // SAFETY: `pr` is non-null and owned by this scope.
+        unsafe { sys::abc_proto_close(pr) };
+    }));
 
+    // SAFETY: `pr` is valid.
     let ref_num = unsafe { sys::abc_proto_get_ref_num(pr) };
     let mut next_ref = 0u32;
     let mut check_type = |raw: TypeId, ctx: &str| -> Result<(), Error> {
@@ -1706,6 +1951,7 @@ fn inspect_proto_types(
                     context: ctx.to_string(),
                 });
             }
+            // SAFETY: `pr` is valid and `next_ref < ref_num`.
             let off = unsafe { sys::abc_proto_get_reference_type(pr, next_ref) };
             next_ref += 1;
             if off == u32::MAX || !initial_entities.contains(off) {
@@ -1720,11 +1966,14 @@ fn inspect_proto_types(
         }
     };
 
+    // SAFETY: `pr` is valid.
     let raw_ret = TypeId::try_from(unsafe { sys::abc_proto_get_return_type(pr) })?;
     check_type(raw_ret, "return type")?;
 
+    // SAFETY: `pr` is valid.
     let num_args = unsafe { sys::abc_proto_num_args(pr) };
     for i in 0..num_args {
+        // SAFETY: `pr` is valid and `i < num_args`.
         let raw = TypeId::try_from(unsafe { sys::abc_proto_get_arg_type(pr, i) })?;
         check_type(raw, &format!("arg {i}"))?;
     }
@@ -1738,10 +1987,13 @@ fn inspect_param_annotations(
     initial_entities: &CompactU32Set,
     strings: &mut SummaryStrings<'_>,
     ann_nested_raw_targets: &mut Vec<u32>,
+    ann_visiting: &mut HashSet<u32>,
 ) -> Result<(), Error> {
     let _ = num_params;
     for item_off in [
+        // SAFETY: `mr` is valid.
         unsafe { sys::abc_method_get_param_annotation_id(mr) },
+        // SAFETY: `mr` is valid.
         unsafe { sys::abc_method_get_runtime_param_annotation_id(mr) },
     ] {
         if item_off == ABSENT {
@@ -1749,16 +2001,18 @@ fn inspect_param_annotations(
         }
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         unsafe extern "C" fn cb(param_idx: u32, annotation_off: u32, ctx: *mut c_void) -> i32 {
-            let pairs = unsafe { &mut *(ctx as *mut Vec<(u32, u32)>) };
+            // SAFETY: `ctx` points to the caller's live `Vec<(u32, u32)>`.
+            let pairs = unsafe { &mut *ctx.cast::<Vec<(u32, u32)>>() };
             pairs.push((param_idx, annotation_off));
             0
         }
+        // SAFETY: `f` and `pairs` are live for the synchronous enumeration call.
         let rc = unsafe {
             sys::abc_param_annotations_enumerate(
                 f,
                 item_off,
                 Some(cb),
-                &mut pairs as *mut Vec<(u32, u32)> as *mut c_void,
+                (&raw mut pairs).cast::<c_void>(),
             )
         };
         if rc != 0 {
@@ -1782,13 +2036,23 @@ fn inspect_param_annotations(
             }
         }
         for (_, off) in pairs {
-            inspect_annotation_at(f, off, initial_entities, strings, ann_nested_raw_targets)?;
+            inspect_annotation_at(
+                f,
+                off,
+                initial_entities,
+                strings,
+                ann_nested_raw_targets,
+                ann_visiting,
+            )?;
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming field inspector populates independent offset sets directly without allocating Field structs"
+)]
 fn inspect_field_at(
     f: *const sys::AbcFileHandle,
     field_off: u32,
@@ -1801,14 +2065,21 @@ fn inspect_field_at(
     scope_names_offsets: &mut CompactU32Set,
     phase_blob_offsets: &mut CompactU32Set,
     ann_nested_raw_targets: &mut Vec<u32>,
+    ann_visiting: &mut HashSet<u32>,
 ) -> Result<(), Error> {
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let fr = unsafe { sys::abc_field_open(f, field_off) };
     if fr.is_null() {
         return Err(Error::InvalidOffset(field_off));
     }
-    let _fg = HandleGuard(Some(|| unsafe { sys::abc_field_close(fr) }));
+    let _fg = HandleGuard(Some(|| {
+        // SAFETY: `fr` is non-null and owned by this scope.
+        unsafe { sys::abc_field_close(fr) };
+    }));
 
+    // SAFETY: `fr` is valid.
     let field_id = unsafe { sys::abc_field_get_field_id(fr) };
+    // SAFETY: `fr` is valid.
     let name_off = unsafe { sys::abc_field_name_off(fr) };
     let name_sym = if name_off == ABSENT {
         return Err(Error::Malformed {
@@ -1824,7 +2095,9 @@ fn inspect_field_at(
             })?
     };
 
+    // SAFETY: `fr` is valid.
     let type_raw = unsafe { sys::abc_field_type(fr) };
+    // SAFETY: `fr` is valid.
     let type_id = TypeId::try_from(unsafe { sys::abc_field_type_id(fr) })?;
     if type_id == TypeId::Reference {
         if !initial_entities.contains(type_raw) {
@@ -1840,6 +2113,7 @@ fn inspect_field_at(
 
     let u32_val = if type_id == TypeId::U32 {
         let mut v = 0i32;
+        // SAFETY: `fr` is valid and `&mut v` is writable.
         (unsafe { sys::abc_field_get_value_i32(fr, &mut v) } != 0).then_some(v)
     } else {
         match type_id {
@@ -1851,18 +2125,22 @@ fn inspect_field_at(
             | TypeId::I32
             | TypeId::Tagged => {
                 let mut v = 0i32;
+                // SAFETY: `fr` is valid and `&mut v` is writable.
                 unsafe { sys::abc_field_get_value_i32(fr, &mut v) };
             }
             TypeId::I64 | TypeId::U64 => {
                 let mut v = 0i64;
+                // SAFETY: `fr` is valid and `&mut v` is writable.
                 unsafe { sys::abc_field_get_value_i64(fr, &mut v) };
             }
             TypeId::F32 => {
                 let mut v = 0.0f32;
+                // SAFETY: `fr` is valid and `&mut v` is writable.
                 unsafe { sys::abc_field_get_value_f32(fr, &mut v) };
             }
             TypeId::F64 => {
                 let mut v = 0.0f64;
+                // SAFETY: `fr` is valid and `&mut v` is writable.
                 unsafe { sys::abc_field_get_value_f64(fr, &mut v) };
             }
             TypeId::Void | TypeId::Reference | TypeId::U32 => {}
@@ -1876,6 +2154,7 @@ fn inspect_field_at(
             let offset = off as u32;
             if offset != 0 {
                 if initial_entities.contains(offset)
+                    // SAFETY: `f` is live; null callback performs structural validation only.
                     || unsafe {
                         sys::abc_literal_enumerate_vals_checked(
                             f,
@@ -1951,6 +2230,7 @@ fn inspect_field_at(
                 initial_entities,
                 strings,
                 ann_nested_raw_targets,
+                ann_visiting,
             )?;
         }
     }
@@ -1959,6 +2239,7 @@ fn inspect_field_at(
 
 fn inspect_module_request_phase_at(f: *const sys::AbcFileHandle, offset: u32) -> Result<(), Error> {
     unsafe extern "C" fn noop(_flag: u8, _ctx: *mut c_void) {}
+    // SAFETY: `f` is live and `noop` does not dereference `ctx`.
     let n =
         unsafe { sys::abc_module_request_phase_read(f, offset, Some(noop), std::ptr::null_mut()) };
     if n < 0 {
@@ -1974,14 +2255,20 @@ fn inspect_module_data_at(
     offset: u32,
     strings: &mut SummaryStrings<'_>,
 ) -> Result<(), Error> {
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let mr = unsafe { sys::abc_module_open(f, offset) };
     if mr.is_null() {
         return Err(Error::InvalidOffset(offset));
     }
-    let _mg = HandleGuard(Some(|| unsafe { sys::abc_module_close(mr) }));
+    let _mg = HandleGuard(Some(|| {
+        // SAFETY: `mr` is non-null and owned by this scope.
+        unsafe { sys::abc_module_close(mr) };
+    }));
 
+    // SAFETY: `mr` is valid.
     let num_requests = unsafe { sys::abc_module_num_requests(mr) };
     for i in 0..num_requests {
+        // SAFETY: `mr` is valid and `i < num_requests`.
         let off = unsafe { sys::abc_module_request_off(mr, i) };
         if off == ABSENT || !strings.intern_offset_utf8(f, off) {
             return Err(Error::InvalidString(off));
@@ -2002,7 +2289,8 @@ fn inspect_module_data_at(
         local_off: u32,
         ctx: *mut c_void,
     ) {
-        unsafe { &mut *(ctx as *mut Vec<RawRec>) }.push(RawRec {
+        // SAFETY: `ctx` points to the caller's live `Vec<RawRec>`.
+        unsafe { &mut *ctx.cast::<Vec<RawRec>>() }.push(RawRec {
             tag,
             export_off,
             import_off,
@@ -2010,12 +2298,9 @@ fn inspect_module_data_at(
         });
     }
     let mut raw: Vec<RawRec> = Vec::new();
+    // SAFETY: `mr` and `raw` are live for the synchronous enumeration call.
     unsafe {
-        sys::abc_module_enumerate_records(
-            mr,
-            Some(collect_rec),
-            &mut raw as *mut Vec<RawRec> as *mut c_void,
-        );
+        sys::abc_module_enumerate_records(mr, Some(collect_rec), (&raw mut raw).cast::<c_void>());
     }
     for rec in raw {
         match rec.tag {
@@ -2068,6 +2353,7 @@ fn resolve_foreign_entity_name_summary(
     if initial_entities.contains(off) {
         return;
     }
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let name_off = unsafe { sys::abc_foreign_item_name_off(f, off) };
     if name_off == ABSENT || !strings.intern_offset_utf8(f, name_off) {
         strings.intern_utf8_str("");
@@ -2094,12 +2380,14 @@ fn open_summary_ann_frame(
             context: format!("cyclic annotation reference at offset {off:#x}"),
         });
     }
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let ar = unsafe { sys::abc_annotation_open(f, off) };
     if ar.is_null() {
         visiting.remove(&off);
         return Err(Error::InvalidOffset(off));
     }
     let ar = OpenAnnotation(ar);
+    // SAFETY: `ar.0` is non-null and valid.
     let class_off = unsafe { sys::abc_annotation_class_off(ar.0) };
     if !initial_entities.contains(class_off) {
         visiting.remove(&off);
@@ -2108,6 +2396,7 @@ fn open_summary_ann_frame(
             context: format!("annotation at offset {off:#x}"),
         });
     }
+    // SAFETY: `ar.0` is non-null and valid.
     let count = unsafe { sys::abc_annotation_count(ar.0) };
     Ok(SummaryAnnFrame {
         off,
@@ -2126,15 +2415,16 @@ fn inspect_annotation_at(
     initial_entities: &CompactU32Set,
     strings: &mut SummaryStrings<'_>,
     ann_nested_raw_targets: &mut Vec<u32>,
+    visiting: &mut HashSet<u32>,
 ) -> Result<(), Error> {
     use sys::AnnotationValueType as AVT;
 
-    let mut visiting: HashSet<u32> = HashSet::new();
+    visiting.clear();
     let mut stack = vec![open_summary_ann_frame(
         f,
         root_off,
         initial_entities,
-        &mut visiting,
+        visiting,
     )?];
 
     while let Some(frame) = stack.last_mut() {
@@ -2142,7 +2432,7 @@ fn inspect_annotation_at(
             && let Some(next_off) = remaining.next()
         {
             frame.pending_array = Some(remaining);
-            let child = open_summary_ann_frame(f, next_off, initial_entities, &mut visiting)?;
+            let child = open_summary_ann_frame(f, next_off, initial_entities, visiting)?;
             stack.push(child);
             continue;
         }
@@ -2159,6 +2449,7 @@ fn inspect_annotation_at(
                 tag: 0,
                 value: 0,
             };
+            // SAFETY: `ar` is valid and `&mut out` is writable.
             if unsafe { sys::abc_annotation_get_element(ar, idx, &mut out) } != 0 {
                 return Err(Error::Malformed {
                     field: "annotation element",
@@ -2183,6 +2474,7 @@ fn inspect_annotation_at(
                 | AVT::Unknown => {}
                 AVT::I64 => {
                     let mut v = 0i64;
+                    // SAFETY: `ar` is valid and `&mut v` is writable.
                     if unsafe { sys::abc_annotation_get_value_i64(ar, idx, &mut v) } != 0 {
                         return Err(Error::Malformed {
                             field: "annotation element value",
@@ -2194,6 +2486,7 @@ fn inspect_annotation_at(
                 }
                 AVT::U64 => {
                     let mut v = 0u64;
+                    // SAFETY: `ar` is valid and `&mut v` is writable.
                     if unsafe { sys::abc_annotation_get_value_u64(ar, idx, &mut v) } != 0 {
                         return Err(Error::Malformed {
                             field: "annotation element value",
@@ -2205,6 +2498,7 @@ fn inspect_annotation_at(
                 }
                 AVT::F64 => {
                     let mut v = 0.0f64;
+                    // SAFETY: `ar` is valid and `&mut v` is writable.
                     if unsafe { sys::abc_annotation_get_value_f64(ar, idx, &mut v) } != 0 {
                         return Err(Error::Malformed {
                             field: "annotation element value",
@@ -2232,13 +2526,14 @@ fn inspect_annotation_at(
                         f,
                         out.value,
                         initial_entities,
-                        &mut visiting,
+                        visiting,
                     )?);
                     break;
                 }
                 AVT::MethodHandle => {
                     let mut handle_type_raw = 0u8;
                     let mut entity_off = 0u32;
+                    // SAFETY: `f` is live and out-pointers are writable.
                     if unsafe {
                         sys::abc_method_handle_read(
                             f,
@@ -2278,6 +2573,7 @@ fn inspect_annotation_at(
                         count: 0,
                         entity_off: 0,
                     };
+                    // SAFETY: `ar` is valid and `&mut arr` is writable.
                     if unsafe { sys::abc_annotation_get_array_element(ar, idx, &mut arr) } != 0 {
                         return Err(Error::Malformed {
                             field: "annotation array element",
@@ -2297,7 +2593,7 @@ fn inspect_annotation_at(
                             f,
                             first_off,
                             initial_entities,
-                            &mut visiting,
+                            visiting,
                         )?);
                         break;
                     }
@@ -2323,6 +2619,7 @@ fn inspect_annotation_at(
                         count: 0,
                         entity_off: 0,
                     };
+                    // SAFETY: `ar` is valid and `&mut arr` is writable.
                     if unsafe { sys::abc_annotation_get_array_element(ar, idx, &mut arr) } != 0 {
                         return Err(Error::Malformed {
                             field: "annotation array element",
@@ -2365,6 +2662,7 @@ fn inspect_annotation_at(
                             AVT::ArrayMethodHandle => {
                                 let mut handle_type_raw = 0u8;
                                 let mut entity_off = 0u32;
+                                // SAFETY: `f` is live and out-pointers are writable.
                                 if unsafe {
                                     sys::abc_method_handle_read(
                                         f,
@@ -2422,22 +2720,34 @@ struct SummaryLiteralCbCtx<'a, 's> {
     file: *const sys::AbcFileHandle,
     strings: &'s mut SummaryStrings<'a>,
     nested: &'s mut Vec<u32>,
+    error: Option<Error>,
 }
 
 unsafe extern "C" fn summary_literal_val_cb(val: *const sys::AbcLiteralVal, ctx: *mut c_void) {
-    let ctx = unsafe { &mut *(ctx as *mut SummaryLiteralCbCtx<'_, '_>) };
-    let v = unsafe { &*val };
-    let Ok(tag) = crate::literal::LiteralTag::try_from(v.tag) else {
+    // SAFETY: `ctx` points to the caller's live `SummaryLiteralCbCtx`.
+    let ctx = unsafe { &mut *ctx.cast::<SummaryLiteralCbCtx<'_, '_>>() };
+    if ctx.error.is_some() {
         return;
+    }
+    // SAFETY: `val` is a valid non-null pointer supplied by C++.
+    let v = unsafe { &*val };
+    let tag = match crate::literal::LiteralTag::try_from(v.tag) {
+        Ok(t) => t,
+        Err(e) => {
+            ctx.error = Some(e);
+            return;
+        }
     };
     match tag {
         crate::literal::LiteralTag::String | crate::literal::LiteralTag::EtsImplements => {
+            // SAFETY: `STRING` and `ETS_IMPLEMENTS` populate `u32_val`.
             let off = unsafe { v.data.u32_val };
             if !ctx.strings.intern_offset_lossy(ctx.file, off) {
-                ctx.strings.intern_utf8_str("");
+                ctx.error = Some(Error::InvalidString(off));
             }
         }
         crate::literal::LiteralTag::LiteralArray => {
+            // SAFETY: `LITERALARRAY` populates `u32_val`.
             ctx.nested.push(unsafe { v.data.u32_val });
         }
         _ => {}
@@ -2454,15 +2764,20 @@ fn inspect_checked_literal_array_at(
         file: f,
         strings,
         nested: nested_out,
+        error: None,
     };
+    // SAFETY: `f` and `ctx` are live for the synchronous enumeration call.
     let rc = unsafe {
         sys::abc_literal_enumerate_vals_checked(
             f,
             offset,
             Some(summary_literal_val_cb),
-            &mut ctx as *mut SummaryLiteralCbCtx<'_, '_> as *mut c_void,
+            (&raw mut ctx).cast::<c_void>(),
         )
     };
+    if let Some(err) = ctx.error {
+        return Err(err);
+    }
     if rc != 0 {
         return Err(Error::InvalidOffset(offset));
     }
@@ -2477,11 +2792,13 @@ fn count_literal_arrays_summary(
     module_data_offsets: &CompactU32Set,
     phase_blob_offsets: &CompactU32Set,
 ) -> Result<usize, Error> {
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
     let mut offsets = Vec::new();
     let mut seen = CompactU32Set::default();
     if n != 0 {
         for i in 0..n {
+            // SAFETY: `f` is live and `i < n`.
             let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
             if off != ABSENT
                 && !module_data_offsets.contains(off)
@@ -2511,13 +2828,6 @@ fn count_literal_arrays_summary(
         return Ok(0);
     }
 
-    let first_off = offsets[0];
-    let lr = unsafe { sys::abc_literal_open(f, first_off) };
-    if lr.is_null() {
-        return Err(Error::InvalidOffset(first_off));
-    }
-    let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
-
     let mut decoded = 0usize;
     let mut raw_nested = Vec::new();
     while decoded < offsets.len() {
@@ -2528,14 +2838,22 @@ fn count_literal_arrays_summary(
                 file: f,
                 strings,
                 nested: &mut raw_nested,
+                error: None,
             };
-            unsafe {
-                sys::abc_literal_enumerate_vals(
-                    lr,
+            // SAFETY: `f` and `ctx` are live for the synchronous enumeration call.
+            let rc = unsafe {
+                sys::abc_literal_enumerate_vals_checked(
+                    f,
                     off,
                     Some(summary_literal_val_cb),
-                    &mut ctx as *mut SummaryLiteralCbCtx<'_, '_> as *mut c_void,
-                );
+                    (&raw mut ctx).cast::<c_void>(),
+                )
+            };
+            if let Some(err) = ctx.error {
+                return Err(err);
+            }
+            if rc != 0 {
+                return Err(Error::InvalidOffset(off));
             }
             for &target in &raw_nested {
                 if is_plausible_literal_array_offset(
@@ -2561,336 +2879,104 @@ fn count_literal_arrays_summary(
     Ok(offsets.len())
 }
 
-fn intern_debug_info_from_extractor(
-    debug_raw: *mut sys::AbcDebugInfo,
-    method_off: u32,
-    strings: &mut SummaryStrings<'_>,
-) {
-    for ptr in [
-        unsafe { sys::abc_debug_get_source_file(debug_raw, method_off) },
-        unsafe { sys::abc_debug_get_source_code(debug_raw, method_off) },
-    ] {
-        if !ptr.is_null() {
-            let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
-            if !s.is_empty() {
-                strings.intern_utf8_str(&s);
+struct SummaryDebugSink<'a, 's> {
+    strings: &'s mut SummaryStrings<'a>,
+    started_regs: Vec<i32>,
+}
+
+impl<'a, 's> SummaryDebugSink<'a, 's> {
+    fn new(strings: &'s mut SummaryStrings<'a>) -> Self {
+        Self {
+            strings,
+            started_regs: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn intern_required(&mut self, s: crate::debug::RawDebugStr<'_>) {
+        match s {
+            crate::debug::RawDebugStr::Empty => {
+                self.strings.intern_utf8_str("");
+            }
+            crate::debug::RawDebugStr::Static(text) => {
+                self.strings.intern_utf8_str(text);
+            }
+            crate::debug::RawDebugStr::Borrowed(_, start, len) => {
+                self.strings.intern_in_place_utf8(start, len);
+            }
+            crate::debug::RawDebugStr::Owned(text) => {
+                self.strings.intern_utf8_str(&text);
             }
         }
     }
 
-    unsafe extern "C" fn local_cb(info: *const sys::AbcLocalVarInfo, ctx: *mut c_void) -> i32 {
-        let strings = unsafe { &mut *(ctx as *mut SummaryStrings<'_>) };
-        let i = unsafe { &*info };
-        for ptr in [i.name, i.type_, i.type_signature] {
-            if ptr.is_null() {
-                strings.intern_utf8_str("");
-            } else {
-                let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
-                strings.intern_utf8_str(&s);
+    #[inline]
+    fn intern_optional(&mut self, s: crate::debug::RawDebugStr<'_>) {
+        match s {
+            crate::debug::RawDebugStr::Empty => {}
+            crate::debug::RawDebugStr::Static(text) => {
+                if !text.is_empty() {
+                    self.strings.intern_utf8_str(text);
+                }
+            }
+            crate::debug::RawDebugStr::Borrowed(_, start, len) => {
+                self.strings.intern_in_place_utf8(start, len);
+            }
+            crate::debug::RawDebugStr::Owned(text) => {
+                if !text.is_empty() {
+                    self.strings.intern_utf8_str(&text);
+                }
             }
         }
-        0
     }
-    unsafe {
-        sys::abc_debug_get_local_vars(
-            debug_raw,
-            method_off,
-            Some(local_cb),
-            strings as *mut SummaryStrings<'_> as *mut c_void,
-        );
+}
+
+impl crate::debug::DebugSink for SummaryDebugSink<'_, '_> {
+    fn set_source_file(&mut self, s: crate::debug::RawDebugStr<'_>) {
+        self.intern_optional(s);
     }
 
-    unsafe extern "C" fn param_cb(info: *const sys::AbcParamInfo, ctx: *mut c_void) -> i32 {
-        let strings = unsafe { &mut *(ctx as *mut SummaryStrings<'_>) };
-        let i = unsafe { &*info };
-        for ptr in [i.name, i.signature] {
-            if ptr.is_null() {
-                strings.intern_utf8_str("");
-            } else {
-                let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
-                strings.intern_utf8_str(&s);
-            }
+    fn set_source_code(&mut self, s: crate::debug::RawDebugStr<'_>) {
+        self.intern_optional(s);
+    }
+
+    fn push_line(&mut self, _pc_offset: u32, _line: u32) {}
+
+    fn push_column(&mut self, _pc_offset: u32, _column: u32) {}
+
+    fn start_local(
+        &mut self,
+        reg_number: i32,
+        name: crate::debug::RawDebugStr<'_>,
+        type_name: crate::debug::RawDebugStr<'_>,
+        type_sig: Option<crate::debug::RawDebugStr<'_>>,
+        _pc_offset: u32,
+    ) {
+        self.intern_required(name);
+        self.intern_required(type_name);
+        if let Some(sig) = type_sig {
+            self.intern_required(sig);
         }
-        0
+        self.started_regs.push(reg_number);
     }
-    unsafe {
-        sys::abc_debug_get_parameter_info(
-            debug_raw,
-            method_off,
-            Some(param_cb),
-            strings as *mut SummaryStrings<'_> as *mut c_void,
-        );
-    }
-}
 
-fn intern_debug_cstr_at(
-    file_bytes: &[u8],
-    offset: u32,
-    intern_empty: bool,
-    strings: &mut SummaryStrings<'_>,
-) -> Result<(), Error> {
-    if offset <= 60 || (offset as usize) >= file_bytes.len() {
-        return Err(Error::DebugInfoExtraction);
-    }
-    let mut sp = &file_bytes[offset as usize..];
-    let before = sp.len();
-    read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
-    let prefix_len = before - sp.len();
-    let nul_pos = sp
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or(Error::DebugInfoExtraction)?;
-    if nul_pos == 0 {
-        if intern_empty {
-            strings.intern_utf8_str("");
-        }
-        return Ok(());
-    }
-    let raw = &sp[..nul_pos];
-    if std::str::from_utf8(raw).is_ok() {
-        strings.intern_in_place_utf8(offset as usize + prefix_len, nul_pos);
-    } else {
-        let lossy = String::from_utf8_lossy(raw);
-        strings.intern_utf8_str(&lossy);
-    }
-    Ok(())
-}
-
-fn primitive_type_signature(type_id_raw: u8) -> Option<&'static str> {
-    match TypeId::try_from(type_id_raw).ok()? {
-        TypeId::Void => Some("V"),
-        TypeId::U1 => Some("Z"),
-        TypeId::I8 => Some("B"),
-        TypeId::U8 => Some("H"),
-        TypeId::I16 => Some("S"),
-        TypeId::U16 => Some("C"),
-        TypeId::I32 => Some("I"),
-        TypeId::U32 => Some("U"),
-        TypeId::I64 => Some("J"),
-        TypeId::U64 => Some("Q"),
-        TypeId::F32 => Some("F"),
-        TypeId::F64 => Some("D"),
-        TypeId::Reference => Some("L"),
-        TypeId::Tagged => Some("A"),
-    }
-}
-
-/// Zero-allocation Rust LNP / `DebugInfoItem` scanner used when `verify == false`
-/// so `inspect_summary` avoids `abc_debug_info_open` while preserving exact
-/// string-pool parity and N55 malformed-LNP diagnostics.
-fn scan_debug_info_strings_raw(
-    f: *const sys::AbcFileHandle,
-    file_bytes: &[u8],
-    class_id: u32,
-    class_source_file_off: u32,
-    mr: *mut sys::AbcMethodAccessor,
-    debug_off: u32,
-    strings: &mut SummaryStrings<'_>,
-) -> Result<(), Error> {
-    if debug_off <= 60 || (debug_off as usize) >= file_bytes.len() {
-        return Err(Error::DebugInfoExtraction);
-    }
-    let mut sp = &file_bytes[debug_off as usize..];
-    let _line_start = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
-    let num_params = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
-
-    // Mirror DebugInfoExtractor::ExtractMethodParams.
-    let has_valid_proto = unsafe { sys::abc_method_has_valid_proto(mr) } != 0;
-    let proto_id = unsafe { sys::abc_method_get_proto_id(mr) };
-    let pr = if has_valid_proto || num_params > 0 {
-        let p = unsafe { sys::abc_proto_open(f, proto_id) };
-        if p.is_null() {
+    fn end_local(&mut self, reg_number: i32, _pc_offset: u32) -> Result<(), Error> {
+        if !self.started_regs.contains(&reg_number) {
             return Err(Error::DebugInfoExtraction);
         }
-        p
-    } else {
-        std::ptr::null_mut()
-    };
-    let _pg = (!pr.is_null()).then(|| HandleGuard(Some(|| unsafe { sys::abc_proto_close(pr) })));
-
-    if num_params > 0 {
-        let is_static =
-            (unsafe { sys::abc_method_access_flags(mr) } & sys::AbcAccessFlags_ABC_ACC_STATIC) != 0;
-        let proto_num_args = if pr.is_null() {
-            0
-        } else {
-            unsafe { sys::abc_proto_num_args(pr) }
-        };
-        let proto_ref_num = if pr.is_null() {
-            0
-        } else {
-            unsafe { sys::abc_proto_get_ref_num(pr) }
-        };
-        let mut idx_arg = 0u32;
-        let mut idx_ref = if has_valid_proto
-            && !pr.is_null()
-            && unsafe { sys::abc_proto_get_return_type(pr) } == TypeId::Reference as u8
-        {
-            1u32
-        } else {
-            0u32
-        };
-        let mut first_param = true;
-
-        for _ in 0..num_params {
-            let param_id = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
-            if param_id > 60 && !has_valid_proto {
-                intern_debug_cstr_at(file_bytes, param_id, true, strings)?;
-                strings.intern_utf8_str("A");
-                continue;
-            }
-            if param_id <= 60 {
-                first_param = false;
-                strings.intern_utf8_str("");
-                continue;
-            }
-            intern_debug_cstr_at(file_bytes, param_id, true, strings)?;
-            if first_param && !is_static {
-                intern_debug_cstr_at(file_bytes, class_id, true, strings)?;
-            } else {
-                if idx_arg >= proto_num_args {
-                    return Err(Error::DebugInfoExtraction);
-                }
-                let arg_tid = unsafe { sys::abc_proto_get_arg_type(pr, idx_arg) };
-                idx_arg += 1;
-                if arg_tid == TypeId::Reference as u8 {
-                    if idx_ref >= proto_ref_num {
-                        return Err(Error::DebugInfoExtraction);
-                    }
-                    let ref_off = unsafe { sys::abc_proto_get_reference_type(pr, idx_ref) };
-                    idx_ref += 1;
-                    intern_debug_cstr_at(file_bytes, ref_off, true, strings)?;
-                } else {
-                    let sig =
-                        primitive_type_signature(arg_tid).ok_or(Error::DebugInfoExtraction)?;
-                    strings.intern_utf8_str(sig);
-                }
-            }
-            first_param = false;
-        }
+        Ok(())
     }
 
-    let cp_size = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)? as usize;
-    if sp.len() < cp_size {
-        return Err(Error::DebugInfoExtraction);
-    }
-    let mut cp = &sp[..cp_size];
-    sp = &sp[cp_size..];
-    let lnp_idx = read_uleb128_slice(&mut sp).ok_or(Error::DebugInfoExtraction)?;
+    fn finish_locals(&mut self, _final_pc_offset: u32) {}
 
-    // Header layout: num_lnps at 36..40, lnp_idx_off at 40..44.
-    let num_lnps = u32::from_le_bytes(
-        file_bytes
-            .get(36..40)
-            .and_then(|s| s.try_into().ok())
-            .ok_or(Error::DebugInfoExtraction)?,
-    );
-    let lnp_idx_off = u32::from_le_bytes(
-        file_bytes
-            .get(40..44)
-            .and_then(|s| s.try_into().ok())
-            .ok_or(Error::DebugInfoExtraction)?,
-    );
-    if lnp_idx >= num_lnps {
-        return Err(Error::DebugInfoExtraction);
+    fn push_param(
+        &mut self,
+        name: crate::debug::RawDebugStr<'_>,
+        sig: crate::debug::RawDebugStr<'_>,
+    ) {
+        self.intern_required(name);
+        self.intern_required(sig);
     }
-    let entry_off = lnp_idx
-        .checked_mul(4)
-        .and_then(|n| lnp_idx_off.checked_add(n))
-        .and_then(|o| usize::try_from(o).ok())
-        .ok_or(Error::DebugInfoExtraction)?;
-    let lnp_off = u32::from_le_bytes(
-        file_bytes
-            .get(entry_off..entry_off + 4)
-            .and_then(|s| s.try_into().ok())
-            .ok_or(Error::DebugInfoExtraction)?,
-    );
-    if lnp_off <= 60 || (lnp_off as usize) >= file_bytes.len() {
-        return Err(Error::DebugInfoExtraction);
-    }
-
-    let mut prog = &file_bytes[lnp_off as usize..];
-    let mut file_off = if class_source_file_off == ABSENT {
-        0
-    } else {
-        class_source_file_off
-    };
-    let mut source_code_off = 0u32;
-    let mut started_regs: Vec<i32> = Vec::new();
-
-    loop {
-        let &opcode = prog.first().ok_or(Error::DebugInfoExtraction)?;
-        prog = &prog[1..];
-        match opcode {
-            0x00 => break, // END_SEQUENCE
-            0x01 => {
-                // ADVANCE_PC
-                read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-            }
-            0x02 => {
-                // ADVANCE_LINE
-                read_sleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-            }
-            0x03 => {
-                // START_LOCAL
-                let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
-                let name_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                let type_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                intern_debug_cstr_at(file_bytes, name_id, true, strings)?;
-                intern_debug_cstr_at(file_bytes, type_id, true, strings)?;
-                started_regs.push(reg);
-            }
-            0x04 => {
-                // START_LOCAL_EXTENDED
-                let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
-                let name_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                let type_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                let sig_id = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-                intern_debug_cstr_at(file_bytes, name_id, true, strings)?;
-                intern_debug_cstr_at(file_bytes, type_id, true, strings)?;
-                intern_debug_cstr_at(file_bytes, sig_id, true, strings)?;
-                started_regs.push(reg);
-            }
-            0x05 => {
-                // END_LOCAL
-                let reg = read_sleb128_slice(&mut prog).ok_or(Error::DebugInfoExtraction)?;
-                if !started_regs.contains(&reg) {
-                    return Err(Error::DebugInfoExtraction);
-                }
-            }
-            0x06 => {
-                // RESTART_LOCAL (unsupported fatal in vendor)
-                return Err(Error::DebugInfoExtraction);
-            }
-            0x07 | 0x08 => {
-                // SET_PROLOGUE_END / SET_EPILOGUE_BEGIN: note upstream handler
-                // leaves `res` unchanged from previous instruction (`bool res = false`),
-                // terminating the loop if no prior opcode set `res = true`!
-            }
-            0x09 => {
-                // SET_FILE
-                file_off = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-            }
-            0x0a => {
-                // SET_SOURCE_CODE
-                source_code_off = read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-            }
-            0x0b => {
-                // SET_COLUMN
-                read_uleb128_slice(&mut cp).ok_or(Error::DebugInfoExtraction)?;
-            }
-            _ => {
-                // Special opcode (>= 0x0c)
-            }
-        }
-    }
-
-    // N55: GetFile() reads GetStringData(file_), throwing if !file_.IsValid().
-    intern_debug_cstr_at(file_bytes, file_off, false, strings)?;
-    if source_code_off > 60 {
-        intern_debug_cstr_at(file_bytes, source_code_off, false, strings)?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2916,54 +3002,66 @@ fn legacy_literalarray_table(data: &[u8]) -> Option<(u32, u32)> {
     Some((count, table_off))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "method decoder threads class context, string cache, and reusable cycle-guard set directly"
+)]
 fn decode_method_at(
     f: *const sys::AbcFileHandle,
+    file_bytes: &[u8],
     method_off: u32,
-    debug_raw: *mut sys::AbcDebugInfo,
+    class_id: u32,
+    class_source_file_off: u32,
+    dialect: Dialect,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
-    legacy: bool,
+    str_cache: &mut StringItemCache<'_>,
+    ann_visiting: &mut HashSet<u32>,
 ) -> Result<Method, Error> {
-    let mr = unsafe { sys::abc_method_open(f as *mut _, method_off) };
+    // SAFETY: `f` is a live `AbcFileHandle`.
+    let mr = unsafe { sys::abc_method_open(f, method_off) };
     if mr.is_null() {
         return Err(Error::InvalidOffset(method_off));
     }
-    let _mg = HandleGuard(Some(|| unsafe { sys::abc_method_close(mr) }));
+    let _mg = HandleGuard(Some(|| {
+        // SAFETY: `mr` is non-null and owned by this scope.
+        unsafe { sys::abc_method_close(mr) };
+    }));
 
+    // SAFETY: `mr` is valid.
     let method_id = unsafe { sys::abc_method_get_method_id(mr) };
 
-    let name_str = read_method_name(mr).ok_or_else(|| Error::Malformed {
-        field: "name",
-        context: format!("method at offset {method_id:#x}"),
-    })?;
-    let name = strings.get_or_intern(&name_str);
+    let name = str_cache
+        .intern_method_name(method_off, mr, strings)
+        .ok_or_else(|| Error::Malformed {
+            field: "name",
+            context: format!("method at offset {method_id:#x}"),
+        })?;
 
-    let function_kind = {
-        let ia = unsafe { sys::abc_index_open(f, method_id) };
-        if ia.is_null() {
-            FunctionKind::None
-        } else {
-            let _ig = HandleGuard(Some(|| unsafe { sys::abc_index_close(ia) }));
-            FunctionKind::try_from(unsafe { sys::abc_index_get_function_kind(ia) })
-                .unwrap_or(FunctionKind::None)
-        }
-    };
+    // SAFETY: `mr` is valid.
+    let raw_flags = unsafe { sys::abc_method_access_flags(mr) };
+    let function_kind = decode_function_kind_from_flags(raw_flags)?;
+    // SAFETY: `mr` is valid.
+    let source_lang = decode_source_lang(unsafe { sys::abc_method_get_source_lang(mr) })?;
 
     let (body, byte_offsets) = {
+        // SAFETY: `mr` is valid.
         let code_off = unsafe { sys::abc_method_code_off(mr) };
         if code_off == ABSENT {
             (None, Vec::new())
         } else {
-            let (b, bo) = decode_code_at(f, method_off, code_off, legacy)?;
+            let (b, bo) = decode_code_at(f, method_off, code_off, dialect)?;
             (Some(b), bo)
         }
     };
 
     let (return_type, arg_types) = {
+        // SAFETY: `mr` is valid.
         let has_valid = unsafe { sys::abc_method_has_valid_proto(mr) } != 0;
         if !has_valid {
             (None, Vec::new())
         } else {
+            // SAFETY: `mr` is valid.
             let proto_id = unsafe { sys::abc_method_get_proto_id(mr) };
             if proto_id == ABSENT {
                 (None, Vec::new())
@@ -2980,57 +3078,71 @@ fn decode_method_at(
             &collect_offsets_int(mr, sys::abc_method_enumerate_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
         runtime: decode_annotation_list(
             f,
             &collect_offsets_int(mr, sys::abc_method_enumerate_runtime_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
         compile_time_type: decode_annotation_list(
             f,
             &collect_offsets_int(mr, sys::abc_method_enumerate_type_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
         runtime_type: decode_annotation_list(
             f,
             &collect_offsets_int(mr, sys::abc_method_enumerate_runtime_type_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
     };
 
-    // N55: attach a debug record ONLY when the method structurally has
-    // a debug info item (its own index entry, read via the method
-    // accessor — independent of the extractor). Previously EVERY method
-    // got `Some(..)` whenever the file-level extractor opened, and the
-    // extractor's ""-for-missing answers (vendored
-    // DebugInfoExtractor::GetSourceFile/GetSourceCode,
-    // debug_info_extractor.cpp:318-333) were wrapped in `Some`,
-    // inventing `debug: Some(source_file: Some(""))` for methods that
-    // have no debug info at all.
-    let has_debug_item = unsafe { sys::abc_method_debug_info_off(mr) } != ABSENT;
-    let debug = if debug_raw.is_null() || !has_debug_item {
+    // N55 + D2: decode debug info directly in Rust ONLY when the method
+    // structurally carries a `DebugInfoItem`.
+    // SAFETY: `mr` is valid.
+    let debug_off = unsafe { sys::abc_method_debug_info_off(mr) };
+    let debug = if debug_off == ABSENT {
         None
     } else {
-        Some(read_debug_info(
-            debug_raw,
-            method_id,
-            &byte_offsets,
-            strings,
-        ))
+        let mut sink = ModelDebugSink::new(strings);
+        decode_method_debug_item(
+            f,
+            file_bytes,
+            class_id,
+            class_source_file_off,
+            mr,
+            debug_off,
+            &mut sink,
+        )?;
+        Some(sink.into_debug_info(&byte_offsets))
     };
 
-    let param_annotations = decode_param_annotations(f, mr, arg_types.len(), entity_map, strings)?;
+    let param_annotations = decode_param_annotations(
+        f,
+        mr,
+        arg_types.len(),
+        entity_map,
+        strings,
+        str_cache,
+        ann_visiting,
+    )?;
 
     Ok(Method {
         name,
         offset: method_off,
-        access_flags: AccessFlags::from_bits_truncate(unsafe { sys::abc_method_access_flags(mr) }),
+        access_flags: AccessFlags::from_bits_truncate(raw_flags),
         function_kind,
-        source_lang: SourceLang::try_from(unsafe { sys::abc_method_get_source_lang(mr) })
-            .unwrap_or(SourceLang::PandaAssembly),
+        source_lang,
         is_external: is_external(f, method_id),
         return_type,
         arg_types,
@@ -3041,45 +3153,38 @@ fn decode_method_at(
     })
 }
 
-/// Decode per-parameter annotations for a method.
-///
-/// Each ParamAnnotationsItem enumerates (param_idx, annotation_off) pairs;
-/// the annotations are decoded individually and grouped by parameter index.
-/// Buckets are sized to the method's parameter count (or the highest seen
-/// index + 1 when that exceeds the proto's arity), with empty Vecs for
-/// unannotated parameters. A method without the item leaves its bucket
-/// empty.
 fn decode_param_annotations(
     f: *const sys::AbcFileHandle,
     mr: *mut sys::AbcMethodAccessor,
     num_params: usize,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    str_cache: &mut StringItemCache<'_>,
+    ann_visiting: &mut HashSet<u32>,
 ) -> Result<ParamAnnotations, Error> {
     let mut result = ParamAnnotations::default();
-    for (is_runtime, item_off) in [
-        (false, unsafe {
-            sys::abc_method_get_param_annotation_id(mr)
-        }),
-        (true, unsafe {
-            sys::abc_method_get_runtime_param_annotation_id(mr)
-        }),
-    ] {
+    // SAFETY: `mr` is valid.
+    let ct_off = unsafe { sys::abc_method_get_param_annotation_id(mr) };
+    // SAFETY: `mr` is valid.
+    let rt_off = unsafe { sys::abc_method_get_runtime_param_annotation_id(mr) };
+    for (is_runtime, item_off) in [(false, ct_off), (true, rt_off)] {
         if item_off == ABSENT {
             continue;
         }
         let mut pairs: Vec<(u32, u32)> = Vec::new();
         unsafe extern "C" fn cb(param_idx: u32, annotation_off: u32, ctx: *mut c_void) -> i32 {
-            let pairs = unsafe { &mut *(ctx as *mut Vec<(u32, u32)>) };
+            // SAFETY: `ctx` points to the caller's live `Vec<(u32, u32)>`.
+            let pairs = unsafe { &mut *ctx.cast::<Vec<(u32, u32)>>() };
             pairs.push((param_idx, annotation_off));
             0
         }
+        // SAFETY: `f` and `pairs` are live for the synchronous enumeration call.
         let rc = unsafe {
             sys::abc_param_annotations_enumerate(
                 f,
                 item_off,
                 Some(cb),
-                &mut pairs as *mut Vec<(u32, u32)> as *mut c_void,
+                (&raw mut pairs).cast::<c_void>(),
             )
         };
         if rc != 0 {
@@ -3110,7 +3215,8 @@ fn decode_param_annotations(
         let len = num_params.max(max_end);
         bucket.resize(len, Vec::new());
         for (idx, off) in pairs {
-            let anns = decode_annotation_list(f, &[off], entity_map, strings)?;
+            let anns =
+                decode_annotation_list(f, &[off], entity_map, strings, str_cache, ann_visiting)?;
             bucket[idx as usize].extend(anns);
         }
     }
@@ -3189,34 +3295,39 @@ fn decode_module_data_at(
     f: *const sys::AbcFileHandle,
     offset: u32,
     strings: &mut StringPool,
+    str_cache: &mut StringItemCache<'_>,
 ) -> Result<ModuleData, Error> {
-    fn intern_string_at(
-        f: *const sys::AbcFileHandle,
-        off: u32,
-        strings: &mut StringPool,
-    ) -> Result<StringId, Error> {
-        let s = read_string(f, off).ok_or(Error::InvalidString(off))?;
-        Ok(strings.get_or_intern(&s))
-    }
+    let mut intern_str = |off: u32, pool: &mut StringPool| -> Result<StringId, Error> {
+        str_cache
+            .intern_utf8(off, pool)
+            .ok_or(Error::InvalidString(off))
+    };
 
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let mr = unsafe { sys::abc_module_open(f, offset) };
     if mr.is_null() {
         return Err(Error::InvalidOffset(offset));
     }
-    let _mg = HandleGuard(Some(|| unsafe { sys::abc_module_close(mr) }));
+    let _mg = HandleGuard(Some(|| {
+        // SAFETY: `mr` is non-null and owned by this scope.
+        unsafe { sys::abc_module_close(mr) };
+    }));
 
+    // SAFETY: `f` and `mr` are valid.
+    let file_size = unsafe { sys::abc_file_size(f) };
+    // SAFETY: `mr` is valid.
     let num_requests = unsafe { sys::abc_module_num_requests(mr) };
-    let mut requests = Vec::with_capacity(num_requests as usize);
+    let cap = num_requests.min(file_size.saturating_sub(offset) / 4) as usize;
+    let mut requests = Vec::with_capacity(cap);
     for i in 0..num_requests {
+        // SAFETY: `mr` is valid and `i < num_requests`.
         let off = unsafe { sys::abc_module_request_off(mr, i) };
         if off == ABSENT {
             return Err(Error::InvalidString(off));
         }
-        requests.push(intern_string_at(f, off, strings)?);
+        requests.push(intern_str(off, strings)?);
     }
 
-    // The bridge callback cannot fail (no early stop), so collect raw
-    // offsets first and resolve strings afterwards, where `?` works.
     struct RawRecord {
         tag: u8,
         export_off: u32,
@@ -3232,7 +3343,8 @@ fn decode_module_data_at(
         local_off: u32,
         ctx: *mut c_void,
     ) {
-        unsafe { &mut *(ctx as *mut Vec<RawRecord>) }.push(RawRecord {
+        // SAFETY: `ctx` points to the caller's live `Vec<RawRecord>`.
+        unsafe { &mut *ctx.cast::<Vec<RawRecord>>() }.push(RawRecord {
             tag,
             export_off,
             request_idx,
@@ -3241,33 +3353,34 @@ fn decode_module_data_at(
         });
     }
     let mut raw: Vec<RawRecord> = Vec::new();
+    // SAFETY: `mr` and `raw` are live for the synchronous enumeration call.
     unsafe {
         sys::abc_module_enumerate_records(
             mr,
             Some(collect_record),
-            &mut raw as *mut Vec<RawRecord> as *mut c_void,
-        )
-    };
+            (&raw mut raw).cast::<c_void>(),
+        );
+    }
 
     let mut records = Vec::with_capacity(raw.len());
     for rec in raw {
         let record = match rec.tag {
             t if t == sys::ModuleTag_REGULAR_IMPORT => ModuleRecord::RegularImport {
-                local_name: intern_string_at(f, rec.local_off, strings)?,
-                import_name: intern_string_at(f, rec.import_off, strings)?,
+                local_name: intern_str(rec.local_off, strings)?,
+                import_name: intern_str(rec.import_off, strings)?,
                 module_request_idx: rec.request_idx,
             },
             t if t == sys::ModuleTag_NAMESPACE_IMPORT => ModuleRecord::NamespaceImport {
-                local_name: intern_string_at(f, rec.local_off, strings)?,
+                local_name: intern_str(rec.local_off, strings)?,
                 module_request_idx: rec.request_idx,
             },
             t if t == sys::ModuleTag_LOCAL_EXPORT => ModuleRecord::LocalExport {
-                local_name: intern_string_at(f, rec.local_off, strings)?,
-                export_name: intern_string_at(f, rec.export_off, strings)?,
+                local_name: intern_str(rec.local_off, strings)?,
+                export_name: intern_str(rec.export_off, strings)?,
             },
             t if t == sys::ModuleTag_INDIRECT_EXPORT => ModuleRecord::IndirectExport {
-                export_name: intern_string_at(f, rec.export_off, strings)?,
-                import_name: intern_string_at(f, rec.import_off, strings)?,
+                export_name: intern_str(rec.export_off, strings)?,
+                import_name: intern_str(rec.import_off, strings)?,
                 module_request_idx: rec.request_idx,
             },
             t if t == sys::ModuleTag_STAR_EXPORT => ModuleRecord::StarExport {
@@ -3289,24 +3402,22 @@ fn decode_module_data_at(
     })
 }
 
-/// Layout (vendored runtime reader `ModuleLazyImportFlagAccessor`,
-/// ecmascript/module/module_data_extractor.cpp:178-189): `[u32 item count]`
-/// (written by the literal-array item itself) then one raw u8 per module
-/// request — UNtagged, unlike a normal literal array.
 fn decode_module_request_phase_at(
     f: *const sys::AbcFileHandle,
     offset: u32,
 ) -> Result<crate::ModuleRequestPhase, Error> {
     let mut flags: Vec<u8> = Vec::new();
     unsafe extern "C" fn collect(flag: u8, ctx: *mut c_void) {
-        unsafe { &mut *(ctx as *mut Vec<u8>) }.push(flag);
+        // SAFETY: `ctx` points to the caller's live `Vec<u8>`.
+        unsafe { &mut *ctx.cast::<Vec<u8>>() }.push(flag);
     }
+    // SAFETY: `f` and `flags` are live for the synchronous read call.
     let n = unsafe {
         sys::abc_module_request_phase_read(
             f,
             offset,
             Some(collect),
-            &mut flags as *mut Vec<u8> as *mut c_void,
+            (&raw mut flags).cast::<c_void>(),
         )
     };
     if n < 0 {
@@ -3320,28 +3431,36 @@ fn decode_module_request_phase_at(
     })
 }
 
-// Each argument is a distinct decode-context facet (the three offset
-// sets are independent discovery channels); a bundling struct would
-// only rename the plumbing.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "field decoder threads distinct discovery-offset sets, string cache, and annotation cycle set directly"
+)]
 fn decode_field_at(
     f: *const sys::AbcFileHandle,
     field_off: u32,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    str_cache: &mut StringItemCache<'_>,
+    ann_visiting: &mut HashSet<u32>,
     class_descriptor: &str,
     module_data_offsets: &mut HashSet<u32>,
     scope_names_offsets: &mut HashSet<u32>,
     phase_blob_offsets: &mut HashSet<u32>,
 ) -> Result<Field, Error> {
-    let fr = unsafe { sys::abc_field_open(f as *mut _, field_off) };
+    // SAFETY: `f` is a live `AbcFileHandle`.
+    let fr = unsafe { sys::abc_field_open(f, field_off) };
     if fr.is_null() {
         return Err(Error::InvalidOffset(field_off));
     }
-    let _fg = HandleGuard(Some(|| unsafe { sys::abc_field_close(fr) }));
+    let _fg = HandleGuard(Some(|| {
+        // SAFETY: `fr` is non-null and owned by this scope.
+        unsafe { sys::abc_field_close(fr) };
+    }));
 
+    // SAFETY: `fr` is valid.
     let field_id = unsafe { sys::abc_field_get_field_id(fr) };
 
+    // SAFETY: `fr` is valid.
     let name_off = unsafe { sys::abc_field_name_off(fr) };
     let name = if name_off == ABSENT {
         return Err(Error::Malformed {
@@ -3349,17 +3468,17 @@ fn decode_field_at(
             context: format!("field at offset {field_id:#x}"),
         });
     } else {
-        crate::file::intern_string(f, name_off, strings).ok_or_else(|| Error::Malformed {
-            field: "name",
-            context: format!("field at offset {field_id:#x}"),
-        })?
+        str_cache
+            .intern_lossy(name_off, strings)
+            .ok_or_else(|| Error::Malformed {
+                field: "name",
+                context: format!("field at offset {field_id:#x}"),
+            })?
     };
 
-    // `abc_field_type` returns the type entity offset. For primitive types the
-    // vendor class-index entry is a PrimitiveTypeItem whose "offset" is the
-    // field encoding (a small integer), not a file offset — classify via the
-    // vendored GetTypeFromFieldEncoding instead of the entity_map.
+    // SAFETY: `fr` is valid.
     let type_raw = unsafe { sys::abc_field_type(fr) };
+    // SAFETY: `fr` is valid.
     let type_id = TypeId::try_from(unsafe { sys::abc_field_type_id(fr) })?;
     let field_type = if type_id == TypeId::Reference {
         let type_sid = entity_map
@@ -3374,10 +3493,6 @@ fn decode_field_at(
         Type::from_raw(type_id, None)?
     };
 
-    // The vendor GetValue<T> does std::get<T-width> on the variant, so probing
-    // getters in the wrong width throws std::bad_variant_access across the FFI
-    // (and silently misreads float bit patterns as ints). Dispatch on the
-    // field's type id instead.
     let initial_value = match type_id {
         TypeId::U1
         | TypeId::I8
@@ -3388,6 +3503,7 @@ fn decode_field_at(
         | TypeId::U32
         | TypeId::Tagged => {
             let mut v = 0i32;
+            // SAFETY: `fr` is valid and `&mut v` is writable.
             if unsafe { sys::abc_field_get_value_i32(fr, &mut v) } != 0 {
                 Some(FieldValue::I32(v))
             } else {
@@ -3396,6 +3512,7 @@ fn decode_field_at(
         }
         TypeId::I64 | TypeId::U64 => {
             let mut v = 0i64;
+            // SAFETY: `fr` is valid and `&mut v` is writable.
             if unsafe { sys::abc_field_get_value_i64(fr, &mut v) } != 0 {
                 Some(FieldValue::I64(v))
             } else {
@@ -3404,6 +3521,7 @@ fn decode_field_at(
         }
         TypeId::F32 => {
             let mut v = 0.0f32;
+            // SAFETY: `fr` is valid and `&mut v` is writable.
             if unsafe { sys::abc_field_get_value_f32(fr, &mut v) } != 0 {
                 Some(FieldValue::F32(v))
             } else {
@@ -3412,6 +3530,7 @@ fn decode_field_at(
         }
         TypeId::F64 => {
             let mut v = 0.0f64;
+            // SAFETY: `fr` is valid and `&mut v` is writable.
             if unsafe { sys::abc_field_get_value_f64(fr, &mut v) } != 0 {
                 Some(FieldValue::F64(v))
             } else {
@@ -3421,34 +3540,16 @@ fn decode_field_at(
         TypeId::Void | TypeId::Reference => None,
     };
 
-    // Module-record classes (upstream names: abc2program/common/
-    // abc_file_utils.h ES_MODULE_RECORD / ES_SCOPE_NAMES_RECORD). Their u32
-    // field values are SOURCE-FILE OFFSETS, not scalars:
-    // - `_ESModuleRecord` → untagged ModuleDataAccessor blob; decode it
-    //   structurally so encode can re-emit and relocate it.
-    // - `_ESScopeNamesRecord` → ordinary tagged literal array; keep a
-    //   reference so encode rewires the field to the re-emitted array, and
-    //   collect the offset for literal-array decoding (13.x+ has no header
-    //   table entry for it).
     let initial_value = match (class_descriptor, type_id, initial_value) {
-        // A valued u32 field named `typeSummaryOffset` (any class — wild es2abc
-        // 4.x–5.x hangs it on AbilityStage/Application and module records)
-        // carries either `0` (`TYPE_SUMMARY_OFFSET_NOT_FOUND` sentinel) or the
-        // offset of a tagged summary literal array whose `0x18` entries point
-        // at per-type literal arrays. This arm must come FIRST so the
-        // `_ESModuleRecord` catch-all u32 arm below never mis-routes it into
-        // the untagged module-data blob decoder.
         (_, TypeId::U32, Some(FieldValue::I32(off)))
             if strings.resolve(name) == Some(TYPE_SUMMARY_OFFSET_FIELD) =>
         {
-            // Bit-cast, not try_from: the wire value is a u32 and the
-            // bridge ABI reads it through an i32 out-param, so offsets
-            // above 0x7fff_ffff arrive negative — preserve the bits.
             let offset = off as u32;
             if offset == 0 {
                 Some(FieldValue::I32(0))
             } else {
                 if entity_map.contains_key(&offset)
+                    // SAFETY: `f` is live; null callback performs structural validation only.
                     || unsafe {
                         sys::abc_literal_enumerate_vals_checked(
                             f,
@@ -3464,16 +3565,6 @@ fn decode_field_at(
                 Some(FieldValue::LiteralArrayRef(offset))
             }
         }
-        // `moduleRequestPhaseIdx` u32 fields (any class — merge-abc emits
-        // them on the module's own record) reference untagged
-        // module-request-phase blobs by file offset; decode structurally so
-        // encode can re-emit and relocate (same dangling-offset class as
-        // _ESModuleRecord/_ESScopeNamesRecord). This name guard must come
-        // BEFORE the `_ESModuleRecord` catch-all u32 arm below (N56):
-        // merge-abc hangs the phase field on the module record itself, and
-        // the catch-all would otherwise mis-route the phase-blob offset
-        // into the module-data blob decoder (hard `invalid entity offset`,
-        // whole file undecodable).
         (_, TypeId::U32, Some(FieldValue::I32(off)))
             if strings.resolve(name) == Some(MODULE_REQUEST_PHASE_FIELD) =>
         {
@@ -3499,7 +3590,7 @@ fn decode_field_at(
                     "{class_descriptor} field at {field_off:#x}: negative blob offset {off}"
                 ))
             })?;
-            let data = decode_module_data_at(f, offset, strings).map_err(|e| {
+            let data = decode_module_data_at(f, offset, strings, str_cache).map_err(|e| {
                 Error::ModuleData(format!("{class_descriptor} field at {field_off:#x}: {e}"))
             })?;
             module_data_offsets.insert(offset);
@@ -3524,7 +3615,8 @@ fn decode_field_at(
             if offset == 0 {
                 return Err(Error::InvalidString(0));
             }
-            let content = crate::file::intern_string(f, offset, strings)
+            let content = str_cache
+                .intern_lossy(offset, strings)
                 .ok_or(Error::InvalidString(offset))?;
             Some(FieldValue::JsonFileContent {
                 source_offset: offset,
@@ -3540,61 +3632,66 @@ fn decode_field_at(
             &collect_offsets_int(fr, sys::abc_field_enumerate_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
         runtime: decode_annotation_list(
             f,
             &collect_offsets_int(fr, sys::abc_field_enumerate_runtime_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
         compile_time_type: decode_annotation_list(
             f,
             &collect_offsets_int(fr, sys::abc_field_enumerate_type_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
         runtime_type: decode_annotation_list(
             f,
             &collect_offsets_int(fr, sys::abc_field_enumerate_runtime_type_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
     };
 
+    // SAFETY: `fr` is valid.
+    let access_flags = AccessFlags::from_bits_truncate(unsafe { sys::abc_field_access_flags(fr) });
     Ok(Field {
         name,
         offset: field_off,
         field_type,
-        access_flags: AccessFlags::from_bits_truncate(unsafe { sys::abc_field_access_flags(fr) }),
+        access_flags,
         is_external: is_external(f, field_id),
         initial_value,
         annotations,
     })
 }
 
-/// Resolve the interned name of an entity offset. Falls back to reading the
-/// name directly from a foreign field/method item via the bridge (which
-/// bounds-checks the item+4 name_off read against the header-declared
-/// foreign region and file size) when the entity_map has no entry — foreign
-/// members are not class members and never enter the entity_map (test
-/// group A).
 fn resolve_foreign_entity_name(
     f: *const sys::AbcFileHandle,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    str_cache: &mut StringItemCache<'_>,
     off: u32,
 ) -> StringId {
     if let Some(&sid) = entity_map.get(&off) {
         return sid;
     }
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let name_off = unsafe { sys::abc_foreign_item_name_off(f, off) };
     if name_off == ABSENT {
         return strings.get_or_intern("");
     }
-    match read_string(f, name_off) {
-        Some(name) => strings.get_or_intern(&name),
-        None => strings.get_or_intern(""),
-    }
+    str_cache
+        .intern_utf8(name_off, strings)
+        .unwrap_or_else(|| strings.get_or_intern(""))
 }
 
 /// Returns `(MethodBody, byte_offsets)` where `byte_offsets[i]` is the byte
@@ -3604,48 +3701,64 @@ fn decode_code_at(
     f: *const sys::AbcFileHandle,
     method_off: u32,
     code_off: u32,
-    legacy: bool,
+    dialect: Dialect,
 ) -> Result<(MethodBody, Vec<u32>), Error> {
-    let cr = unsafe { sys::abc_code_open(f as *mut _, code_off) };
+    // SAFETY: `f` is a live `AbcFileHandle`.
+    let cr = unsafe { sys::abc_code_open(f, code_off) };
     if cr.is_null() {
         return Err(Error::InvalidOffset(code_off));
     }
-    let _cg = HandleGuard(Some(|| unsafe { sys::abc_code_close(cr) }));
+    let _cg = HandleGuard(Some(|| {
+        // SAFETY: `cr` is non-null and owned by this scope.
+        unsafe { sys::abc_code_close(cr) };
+    }));
 
     let raw_insns = {
+        // SAFETY: `cr` is valid.
         let ptr = unsafe { sys::abc_code_instructions(cr) };
+        // SAFETY: `cr` is valid.
         let len = unsafe { sys::abc_code_code_size(cr) } as usize;
         if ptr.is_null() || len == 0 {
             &[]
         } else {
+            // SAFETY: `ptr` points to `len` validated bytes inside `f`'s buffer.
             unsafe { std::slice::from_raw_parts(ptr, len) }
         }
     };
-    let decoded = if legacy {
-        abcd_isa::decode_legacy(raw_insns)
-    } else {
-        abcd_isa::decode(raw_insns)
+    let decoded = match dialect {
+        Dialect::DynamicLegacy => abcd_isa::decode_legacy(raw_insns),
+        Dialect::DynamicModern => abcd_isa::decode(raw_insns),
+        Dialect::Static => {
+            return Err(Error::Malformed {
+                field: "file_type",
+                context: "static .abc bytecode cannot be decoded with dynamic ISA".into(),
+            });
+        }
     }
     .map_err(|source| Error::BytecodeDecode {
         method_offset: method_off,
         source,
     })?;
 
-    // Split into instructions and a byte-offset table for try-block conversion.
     let (bytecodes, byte_offsets): (Vec<_>, Vec<_>) = decoded.into_iter().unzip();
     let code_byte_len = raw_insns.len() as u32;
 
-    // Convert a byte offset to an instruction index.
-    // If the offset equals code_byte_len (one past the end), return bytecodes.len().
-    let offset_to_index = |off: u32| -> u32 {
-        if off == code_byte_len {
-            bytecodes.len() as u32
-        } else {
-            byte_offsets.binary_search(&off).unwrap_or_else(|i| i) as u32
+    let exact_pc_to_index = |pc: u32, field: &'static str, label: &str| -> Result<u32, Error> {
+        if pc == code_byte_len {
+            return Ok(bytecodes.len() as u32);
         }
+        byte_offsets
+            .binary_search(&pc)
+            .map(|i| i as u32)
+            .map_err(|_| Error::Malformed {
+                field,
+                context: format!(
+                    "method at offset {method_off:#x}: {label} PC {pc:#x} is not on an instruction boundary"
+                ),
+            })
     };
 
-    let try_blocks = collect_try_blocks(f, method_off, cr)
+    let try_blocks = collect_try_blocks(f, method_off, cr)?
         .into_iter()
         .map(|tb| {
             let end_pc = tb
@@ -3655,8 +3768,8 @@ fn decode_code_at(
                     field: "try_block",
                     context: format!("method at offset {method_off:#x}: try span overflow"),
                 })?;
-            let start = offset_to_index(tb.start);
-            let end = offset_to_index(end_pc);
+            let start = exact_pc_to_index(tb.start, "try_block", "try start")?;
+            let end = exact_pc_to_index(end_pc, "try_block", "try end")?;
             let catches = tb
                 .catches
                 .into_iter()
@@ -3670,8 +3783,9 @@ fn decode_code_at(
                                     "method at offset {method_off:#x}: catch span overflow"
                                 ),
                             })?;
-                    let handler = offset_to_index(cb.handler);
-                    let handler_end = offset_to_index(handler_end_pc);
+                    let handler = exact_pc_to_index(cb.handler, "catch_block", "catch handler")?;
+                    let handler_end =
+                        exact_pc_to_index(handler_end_pc, "catch_block", "catch end")?;
                     Ok(CatchBlock {
                         type_idx: cb.type_idx,
                         handler,
@@ -3687,7 +3801,9 @@ fn decode_code_at(
         })
         .collect::<Result<Vec<_>, Error>>()?;
 
+    // SAFETY: `cr` is valid.
     let num_vregs = unsafe { sys::abc_code_num_vregs(cr) };
+    // SAFETY: `cr` is valid.
     let num_args = unsafe { sys::abc_code_num_args(cr) };
 
     Ok((
@@ -3697,9 +3813,6 @@ fn decode_code_at(
             bytecodes,
             entity_offsets: HashMap::new(),
             try_blocks,
-            // Decoded bodies keep the source file's SlotNumber annotation
-            // verbatim on re-encode (byte identity); only lowered bodies
-            // carry a recomputed count (model.rs `ic_size` doc, N73).
             ic_size: None,
         },
         byte_offsets,
@@ -3712,50 +3825,57 @@ fn decode_proto_types(
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
 ) -> Result<(Type, Vec<Type>), Error> {
-    let pr = unsafe { sys::abc_proto_open(f as *mut _, proto_off) };
+    // SAFETY: `f` is a live `AbcFileHandle`.
+    let pr = unsafe { sys::abc_proto_open(f, proto_off) };
     if pr.is_null() {
         return Err(Error::InvalidOffset(proto_off));
     }
-    let _pg = HandleGuard(Some(|| unsafe { sys::abc_proto_close(pr) }));
+    let _pg = HandleGuard(Some(|| {
+        // SAFETY: `pr` is non-null and owned by this scope.
+        unsafe { sys::abc_proto_close(pr) };
+    }));
 
+    // SAFETY: `pr` is valid.
     let ref_num = unsafe { sys::abc_proto_get_ref_num(pr) };
-    let ref_descs: Vec<Option<StringId>> = (0..ref_num)
-        .map(|i| {
-            let off = unsafe { sys::abc_proto_get_reference_type(pr, i) };
-            if off == u32::MAX {
-                None
-            } else {
-                entity_map.get(&off).copied()
-            }
-        })
-        .collect();
-    let mut ref_iter = ref_descs.into_iter();
-
+    let mut next_ref = 0u32;
     let mut resolve = |raw: TypeId, ctx: &str| -> Result<Type, Error> {
         if raw == TypeId::Reference {
-            let desc = ref_iter.next().flatten().ok_or_else(|| Error::Malformed {
-                field: "reference_type",
-                context: ctx.to_string(),
-            })?;
+            if next_ref >= ref_num {
+                return Err(Error::Malformed {
+                    field: "reference_type",
+                    context: ctx.to_string(),
+                });
+            }
+            // SAFETY: `pr` is valid and `next_ref < ref_num`.
+            let off = unsafe { sys::abc_proto_get_reference_type(pr, next_ref) };
+            next_ref += 1;
+            let desc = (off != u32::MAX)
+                .then(|| entity_map.get(&off).copied())
+                .flatten()
+                .ok_or_else(|| Error::Malformed {
+                    field: "reference_type",
+                    context: ctx.to_string(),
+                })?;
             Ok(Type::Reference(desc))
         } else {
             Type::from_raw(raw, None)
         }
     };
 
+    // SAFETY: `pr` is valid.
     let raw_ret = TypeId::try_from(unsafe { sys::abc_proto_get_return_type(pr) })?;
     let return_type = resolve(raw_ret, "return type")?;
 
+    // SAFETY: `pr` is valid.
     let num_args = unsafe { sys::abc_proto_num_args(pr) };
     let arg_types = (0..num_args)
         .map(|i| {
+            // SAFETY: `pr` is valid and `i < num_args`.
             let raw = TypeId::try_from(unsafe { sys::abc_proto_get_arg_type(pr, i) })?;
             resolve(raw, &format!("arg {i}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Suppress unused variable warning — strings is reserved for future use
-    // when reference type descriptors need interning at this level.
     let _ = strings;
 
     Ok((return_type, arg_types))
@@ -3766,6 +3886,8 @@ fn decode_class_annotations(
     cr: *mut sys::AbcClassAccessor,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    str_cache: &mut StringItemCache<'_>,
+    ann_visiting: &mut HashSet<u32>,
 ) -> Result<Annotations, Error> {
     Ok(Annotations {
         compile_time: decode_annotation_list(
@@ -3773,24 +3895,32 @@ fn decode_class_annotations(
             &collect_offsets_int(cr, sys::abc_class_enumerate_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
         runtime: decode_annotation_list(
             f,
             &collect_offsets_int(cr, sys::abc_class_enumerate_runtime_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
         compile_time_type: decode_annotation_list(
             f,
             &collect_offsets_int(cr, sys::abc_class_enumerate_type_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
         runtime_type: decode_annotation_list(
             f,
             &collect_offsets_int(cr, sys::abc_class_enumerate_runtime_type_annotations),
             entity_map,
             strings,
+            str_cache,
+            ann_visiting,
         )?,
     })
 }
@@ -3800,10 +3930,12 @@ fn decode_annotation_list(
     offsets: &[u32],
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    str_cache: &mut StringItemCache<'_>,
+    ann_visiting: &mut HashSet<u32>,
 ) -> Result<Vec<Annotation>, Error> {
     offsets
         .iter()
-        .map(|&off| decode_annotation_at(f, off, entity_map, strings))
+        .map(|&off| decode_annotation_at(f, off, entity_map, strings, str_cache, ann_visiting))
         .collect()
 }
 
@@ -3814,6 +3946,7 @@ struct OpenAnnotation(*mut sys::AbcAnnotationAccessor);
 impl Drop for OpenAnnotation {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: `self.0` was returned by `abc_annotation_open` and is non-null.
             unsafe { sys::abc_annotation_close(self.0) };
         }
     }
@@ -3853,13 +3986,15 @@ fn open_ann_frame(
             context: format!("cyclic annotation reference at offset {off:#x}"),
         });
     }
-    let ar = unsafe { sys::abc_annotation_open(f as *mut _, off) };
+    // SAFETY: `f` is a live `AbcFileHandle`.
+    let ar = unsafe { sys::abc_annotation_open(f, off) };
     if ar.is_null() {
         visiting.remove(&off);
         return Err(Error::InvalidOffset(off));
     }
     let ar = OpenAnnotation(ar);
 
+    // SAFETY: `ar.0` is non-null and valid.
     let class_off = unsafe { sys::abc_annotation_class_off(ar.0) };
     let Some(class_descriptor) = entity_map.get(&class_off).copied() else {
         visiting.remove(&off);
@@ -3869,14 +4004,18 @@ fn open_ann_frame(
         });
     };
 
+    // SAFETY: `ar.0` and `f` are valid.
     let count = unsafe { sys::abc_annotation_count(ar.0) };
+    // SAFETY: `f` is valid; each annotation element occupies 9 bytes (`u32 name_off + u32 val + u8 tag`).
+    let file_size = unsafe { sys::abc_file_size(f) };
+    let max_elems = (file_size.saturating_sub(off) / 9) as usize;
     Ok(AnnDecodeFrame {
         off,
         ar,
         class_descriptor,
         count,
         next_idx: 0,
-        elements: Vec::with_capacity(count as usize),
+        elements: Vec::with_capacity((count as usize).min(max_elems)),
         pending: None,
     })
 }
@@ -3888,12 +4027,13 @@ fn decode_annotation_at(
     root_off: u32,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    str_cache: &mut StringItemCache<'_>,
+    visiting: &mut HashSet<u32>,
 ) -> Result<Annotation, Error> {
     use sys::AnnotationValueType as AVT;
 
-    let mut visiting: HashSet<u32> = HashSet::new();
-    let mut stack: Vec<AnnDecodeFrame> =
-        vec![open_ann_frame(f, root_off, entity_map, &mut visiting)?];
+    visiting.clear();
+    let mut stack: Vec<AnnDecodeFrame> = vec![open_ann_frame(f, root_off, entity_map, visiting)?];
     let mut completed: Option<Annotation> = None;
 
     while let Some(frame) = stack.last_mut() {
@@ -3919,7 +4059,7 @@ fn decode_annotation_at(
                             remaining,
                             decoded,
                         });
-                        let child = open_ann_frame(f, next_off, entity_map, &mut visiting)?;
+                        let child = open_ann_frame(f, next_off, entity_map, visiting)?;
                         stack.push(child);
                         continue;
                     }
@@ -3947,8 +4087,7 @@ fn decode_annotation_at(
                 tag: 0,
                 value: 0,
             };
-            // Loud-error convention: every element-read failure below is a
-            // hard error (malformed input), never a silent skip/fallback.
+            // SAFETY: `ar` is valid and `&mut out` is writable.
             let rc = unsafe { sys::abc_annotation_get_element(ar, idx, &mut out) };
             if rc != 0 {
                 return Err(Error::Malformed {
@@ -3956,9 +4095,9 @@ fn decode_annotation_at(
                     context: format!("annotation at offset {off:#x}, element {idx}"),
                 });
             }
-            let name_str =
-                read_string(f, out.name_off).ok_or(Error::InvalidString(out.name_off))?;
-            let name = strings.get_or_intern(&name_str);
+            let name = str_cache
+                .intern_utf8(out.name_off, strings)
+                .ok_or(Error::InvalidString(out.name_off))?;
             let tag = AVT::try_from(out.tag).unwrap_or(AVT::Unknown);
             let value = match tag {
                 AVT::U1 => AnnotationValue::Bool(out.value != 0),
@@ -3970,6 +4109,7 @@ fn decode_annotation_at(
                 AVT::U32 => AnnotationValue::U32(out.value),
                 AVT::I64 => {
                     let mut v = 0i64;
+                    // SAFETY: `ar` is valid and `&mut v` is writable.
                     if unsafe { sys::abc_annotation_get_value_i64(ar, idx, &mut v) } == 0 {
                         AnnotationValue::I64(v)
                     } else {
@@ -3983,6 +4123,7 @@ fn decode_annotation_at(
                 }
                 AVT::U64 => {
                     let mut v = 0u64;
+                    // SAFETY: `ar` is valid and `&mut v` is writable.
                     if unsafe { sys::abc_annotation_get_value_u64(ar, idx, &mut v) } == 0 {
                         AnnotationValue::U64(v)
                     } else {
@@ -3997,6 +4138,7 @@ fn decode_annotation_at(
                 AVT::F32 => AnnotationValue::F32(f32::from_bits(out.value)),
                 AVT::F64 => {
                     let mut v = 0.0f64;
+                    // SAFETY: `ar` is valid and `&mut v` is writable.
                     if unsafe { sys::abc_annotation_get_value_f64(ar, idx, &mut v) } == 0 {
                         AnnotationValue::F64(v)
                     } else {
@@ -4009,8 +4151,9 @@ fn decode_annotation_at(
                     }
                 }
                 AVT::String => {
-                    let s = read_string(f, out.value).ok_or(Error::InvalidString(out.value))?;
-                    let sid = strings.get_or_intern(&s);
+                    let sid = str_cache
+                        .intern_utf8(out.value, strings)
+                        .ok_or(Error::InvalidString(out.value))?;
                     AnnotationValue::String(sid)
                 }
                 AVT::Record => {
@@ -4021,14 +4164,16 @@ fn decode_annotation_at(
                     AnnotationValue::Record(sid)
                 }
                 AVT::Method => {
-                    let sid = resolve_foreign_entity_name(f, entity_map, strings, out.value);
+                    let sid =
+                        resolve_foreign_entity_name(f, entity_map, strings, str_cache, out.value);
                     AnnotationValue::Method {
                         name: sid,
                         offset: out.value,
                     }
                 }
                 AVT::Enum => {
-                    let sid = resolve_foreign_entity_name(f, entity_map, strings, out.value);
+                    let sid =
+                        resolve_foreign_entity_name(f, entity_map, strings, str_cache, out.value);
                     AnnotationValue::Enum {
                         name: sid,
                         offset: out.value,
@@ -4036,15 +4181,16 @@ fn decode_annotation_at(
                 }
                 AVT::Annotation => {
                     frame.pending = Some(PendingAnnSlot::Scalar { name });
-                    next_child = Some(open_ann_frame(f, out.value, entity_map, &mut visiting)?);
+                    next_child = Some(open_ann_frame(f, out.value, entity_map, visiting)?);
                     break;
                 }
                 AVT::MethodHandle => {
                     let mut handle_type_raw = 0u8;
                     let mut entity_off = 0u32;
+                    // SAFETY: `f` is live and out-pointers are writable.
                     let rc = unsafe {
                         sys::abc_method_handle_read(
-                            f as *mut _,
+                            f,
                             out.value,
                             &mut handle_type_raw,
                             &mut entity_off,
@@ -4075,8 +4221,6 @@ fn decode_annotation_at(
                     })
                 }
                 AVT::LiteralArray => {
-                    // '#' is the SCALAR literal-array tag in the vendored data
-                    // model (GetScalarValue, disassembler.cpp:569-574).
                     let values = decode_literal_array_at(f, out.value, strings)?;
                     AnnotationValue::LiteralArray(values)
                 }
@@ -4087,6 +4231,7 @@ fn decode_annotation_at(
                         count: 0,
                         entity_off: 0,
                     };
+                    // SAFETY: `ar` is valid and `&mut arr` is writable.
                     if unsafe { sys::abc_annotation_get_array_element(ar, idx, &mut arr) } != 0 {
                         return Err(Error::Malformed {
                             field: "annotation array element",
@@ -4107,7 +4252,7 @@ fn decode_annotation_at(
                             decoded: Vec::with_capacity(offsets_iter.len().saturating_add(1)),
                             remaining: offsets_iter,
                         });
-                        next_child = Some(open_ann_frame(f, first_off, entity_map, &mut visiting)?);
+                        next_child = Some(open_ann_frame(f, first_off, entity_map, visiting)?);
                         break;
                     }
                     AnnotationValue::Array {
@@ -4136,6 +4281,7 @@ fn decode_annotation_at(
                         count: 0,
                         entity_off: 0,
                     };
+                    // SAFETY: `ar` is valid and `&mut arr` is writable.
                     if unsafe { sys::abc_annotation_get_array_element(ar, idx, &mut arr) } != 0 {
                         return Err(Error::Malformed {
                             field: "annotation array element",
@@ -4149,6 +4295,7 @@ fn decode_annotation_at(
                         arr.entity_off,
                         entity_map,
                         strings,
+                        Some(str_cache),
                     )?;
                     AnnotationValue::Array {
                         tag: out.tag,
@@ -4226,6 +4373,7 @@ fn read_annotation_array_raw(
         return Ok((avt, Vec::new()));
     }
 
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let file_size = unsafe { sys::abc_file_size(f) };
     let max_by_span = file_size.saturating_sub(entity_offset) / element_size;
     let alloc_count = count.min(max_by_span);
@@ -4241,6 +4389,7 @@ fn read_annotation_array_raw(
             context: format!("annotation array at offset {entity_offset:#x}"),
         })?;
     raw_values.resize(alloc_len, 0u64);
+    // SAFETY: `f` is live and `raw_values` holds `alloc_count` writable `u64`s.
     let n = unsafe {
         sys::abc_annotation_array_read(
             f,
@@ -4271,9 +4420,6 @@ fn read_annotation_array_raw(
 }
 
 /// Resolve annotation array elements at the given entity offset.
-///
-/// The `tag` determines element type and size; raw values are read via the
-/// C bridge `abc_annotation_array_read` and converted to `AnnotationValue`.
 fn decode_annotation_array_elements(
     f: *const sys::AbcFileHandle,
     tag: u8,
@@ -4281,105 +4427,152 @@ fn decode_annotation_array_elements(
     entity_offset: u32,
     entity_map: &HashMap<u32, StringId>,
     strings: &mut StringPool,
+    mut str_cache: Option<&mut StringItemCache<'_>>,
 ) -> Result<Vec<AnnotationValue>, Error> {
     use sys::AnnotationValueType as AVT;
 
     let (avt, raw_values) = read_annotation_array_raw(f, tag, count, entity_offset)?;
 
-    raw_values
-        .into_iter()
-        .map(|raw| -> Result<AnnotationValue, Error> {
-            let value = match avt {
-                AVT::ArrayU1 => AnnotationValue::Bool(raw != 0),
-                AVT::ArrayI8 => AnnotationValue::I8(raw as i8),
-                AVT::ArrayU8 => AnnotationValue::U8(raw as u8),
-                AVT::ArrayI16 => AnnotationValue::I16(raw as i16),
-                AVT::ArrayU16 => AnnotationValue::U16(raw as u16),
-                AVT::ArrayI32 => AnnotationValue::I32(raw as i32),
-                AVT::ArrayU32 => AnnotationValue::U32(raw as u32),
-                AVT::ArrayI64 => AnnotationValue::I64(raw as i64),
-                AVT::ArrayU64 => AnnotationValue::U64(raw),
-                AVT::ArrayF32 => AnnotationValue::F32(f32::from_bits(raw as u32)),
-                AVT::ArrayF64 => AnnotationValue::F64(f64::from_bits(raw)),
-                AVT::ArrayString => {
+    let mut out = Vec::with_capacity(raw_values.len());
+    for raw in raw_values {
+        let value = match avt {
+            AVT::ArrayU1 => AnnotationValue::Bool(raw != 0),
+            AVT::ArrayI8 => AnnotationValue::I8(raw as i8),
+            AVT::ArrayU8 => AnnotationValue::U8(raw as u8),
+            AVT::ArrayI16 => AnnotationValue::I16(raw as i16),
+            AVT::ArrayU16 => AnnotationValue::U16(raw as u16),
+            AVT::ArrayI32 => AnnotationValue::I32(raw as i32),
+            AVT::ArrayU32 => AnnotationValue::U32(raw as u32),
+            AVT::ArrayI64 => AnnotationValue::I64(raw as i64),
+            AVT::ArrayU64 => AnnotationValue::U64(raw),
+            AVT::ArrayF32 => AnnotationValue::F32(f32::from_bits(raw as u32)),
+            AVT::ArrayF64 => AnnotationValue::F64(f64::from_bits(raw)),
+            AVT::ArrayString => {
+                let sid = if let Some(cache) = str_cache.as_deref_mut() {
+                    cache
+                        .intern_utf8(raw as u32, strings)
+                        .ok_or(Error::InvalidString(raw as u32))?
+                } else {
                     let s = read_string(f, raw as u32).ok_or(Error::InvalidString(raw as u32))?;
-                    AnnotationValue::String(strings.get_or_intern(&s))
-                }
-                AVT::ArrayRecord => {
-                    let sid = entity_map
-                        .get(&(raw as u32))
-                        .copied()
-                        .ok_or(Error::InvalidOffset(raw as u32))?;
-                    AnnotationValue::Record(sid)
-                }
-                AVT::ArrayMethod => {
-                    let sid = resolve_foreign_entity_name(f, entity_map, strings, raw as u32);
-                    AnnotationValue::Method {
-                        name: sid,
-                        offset: raw as u32,
+                    strings.get_or_intern(&s)
+                };
+                AnnotationValue::String(sid)
+            }
+            AVT::ArrayRecord => {
+                let sid = entity_map
+                    .get(&(raw as u32))
+                    .copied()
+                    .ok_or(Error::InvalidOffset(raw as u32))?;
+                AnnotationValue::Record(sid)
+            }
+            AVT::ArrayMethod => {
+                let sid = if let Some(cache) = str_cache.as_deref_mut() {
+                    resolve_foreign_entity_name(f, entity_map, strings, cache, raw as u32)
+                } else if let Some(&sid) = entity_map.get(&(raw as u32)) {
+                    sid
+                } else {
+                    // SAFETY: `f` is live.
+                    let name_off = unsafe { sys::abc_foreign_item_name_off(f, raw as u32) };
+                    match (name_off != ABSENT)
+                        .then(|| read_string(f, name_off))
+                        .flatten()
+                    {
+                        Some(n) => strings.get_or_intern(&n),
+                        None => strings.get_or_intern(""),
                     }
+                };
+                AnnotationValue::Method {
+                    name: sid,
+                    offset: raw as u32,
                 }
-                AVT::ArrayEnum => {
-                    let sid = resolve_foreign_entity_name(f, entity_map, strings, raw as u32);
-                    AnnotationValue::Enum {
-                        name: sid,
-                        offset: raw as u32,
+            }
+            AVT::ArrayEnum => {
+                let sid = if let Some(cache) = str_cache.as_deref_mut() {
+                    resolve_foreign_entity_name(f, entity_map, strings, cache, raw as u32)
+                } else if let Some(&sid) = entity_map.get(&(raw as u32)) {
+                    sid
+                } else {
+                    // SAFETY: `f` is live.
+                    let name_off = unsafe { sys::abc_foreign_item_name_off(f, raw as u32) };
+                    match (name_off != ABSENT)
+                        .then(|| read_string(f, name_off))
+                        .flatten()
+                    {
+                        Some(n) => strings.get_or_intern(&n),
+                        None => strings.get_or_intern(""),
                     }
+                };
+                AnnotationValue::Enum {
+                    name: sid,
+                    offset: raw as u32,
                 }
-                AVT::ArrayAnnotation => {
-                    let nested = decode_annotation_at(f, raw as u32, entity_map, strings)?;
-                    AnnotationValue::Annotation(Box::new(nested))
-                }
-                AVT::LiteralArray => {
-                    AnnotationValue::LiteralArray(decode_literal_array_at(f, raw as u32, strings)?)
-                }
-                AVT::ArrayMethodHandle => {
-                    let mut handle_type_raw = 0u8;
-                    let mut entity_off = 0u32;
-                    let rc = unsafe {
-                        sys::abc_method_handle_read(
-                            f as *mut _,
-                            raw as u32,
-                            &mut handle_type_raw,
-                            &mut entity_off,
-                        )
-                    };
-                    if rc != 0 {
-                        return Err(Error::Malformed {
-                            field: "method_handle",
-                            context: format!("annotation array at offset {entity_offset:#x}"),
-                        });
-                    }
-                    let ht = MethodHandleType::from_u8(handle_type_raw).ok_or_else(|| {
-                        Error::Malformed {
-                            field: "method_handle_type",
-                            context: format!(
-                                "annotation array at offset {entity_offset:#x}: unknown handle type {handle_type_raw:#x}"
-                            ),
-                        }
-                    })?;
-                    let entity = entity_map
-                        .get(&entity_off)
-                        .copied()
-                        .unwrap_or_else(|| strings.get_or_intern(""));
-                    AnnotationValue::MethodHandle(ResolvedMethodHandle {
-                        handle_type: ht,
-                        entity,
-                        entity_offset: entity_off,
-                    })
-                }
-                _ => {
+            }
+            AVT::ArrayAnnotation => {
+                let Some(cache) = str_cache.as_deref_mut() else {
+                    return Err(Error::InvalidOffset(raw as u32));
+                };
+                let mut sub_visiting = HashSet::new();
+                let nested = decode_annotation_at(
+                    f,
+                    raw as u32,
+                    entity_map,
+                    strings,
+                    cache,
+                    &mut sub_visiting,
+                )?;
+                AnnotationValue::Annotation(Box::new(nested))
+            }
+            AVT::LiteralArray => {
+                AnnotationValue::LiteralArray(decode_literal_array_at(f, raw as u32, strings)?)
+            }
+            AVT::ArrayMethodHandle => {
+                let mut handle_type_raw = 0u8;
+                let mut entity_off = 0u32;
+                // SAFETY: `f` is live and out-pointers are writable.
+                let rc = unsafe {
+                    sys::abc_method_handle_read(
+                        f,
+                        raw as u32,
+                        &mut handle_type_raw,
+                        &mut entity_off,
+                    )
+                };
+                if rc != 0 {
                     return Err(Error::Malformed {
-                        field: "annotation array element tag",
-                        context: format!(
-                            "annotation array at offset {entity_offset:#x}: tag {tag:#x} has no value conversion"
-                        ),
+                        field: "method_handle",
+                        context: format!("annotation array at offset {entity_offset:#x}"),
                     });
                 }
-            };
-            Ok(value)
-        })
-        .collect()
+                let ht = MethodHandleType::from_u8(handle_type_raw).ok_or_else(|| {
+                    Error::Malformed {
+                        field: "method_handle_type",
+                        context: format!(
+                            "annotation array at offset {entity_offset:#x}: unknown handle type {handle_type_raw:#x}"
+                        ),
+                    }
+                })?;
+                let entity = entity_map
+                    .get(&entity_off)
+                    .copied()
+                    .unwrap_or_else(|| strings.get_or_intern(""));
+                AnnotationValue::MethodHandle(ResolvedMethodHandle {
+                    handle_type: ht,
+                    entity,
+                    entity_offset: entity_off,
+                })
+            }
+            _ => {
+                return Err(Error::Malformed {
+                    field: "annotation array element tag",
+                    context: format!(
+                        "annotation array at offset {entity_offset:#x}: tag {tag:#x} has no value conversion"
+                    ),
+                });
+            }
+        };
+        out.push(value);
+    }
+    Ok(out)
 }
 
 /// Decode a single literal array at the given entity offset, strictly
@@ -4389,22 +4582,25 @@ fn decode_literal_array_at(
     offset: u32,
     strings: &mut StringPool,
 ) -> Result<Vec<crate::LiteralValue>, Error> {
-    // N72: annotation-embedded literal arrays are compile-time metadata;
-    // their strings intern plain (no raw-bytes capture — NULL side
-    // table), exactly the pre-N72 behavior on this path.
     let mut ctx = crate::literal::LiteralCollectCtx {
         file: f,
-        strings: strings as *mut StringPool,
+        strings: std::ptr::from_mut(strings),
+        str_cache: None,
         values: Vec::new(),
+        error: None,
     };
+    // SAFETY: `f` and `ctx` are live for the synchronous enumeration call.
     let rc = unsafe {
         sys::abc_literal_enumerate_vals_checked(
             f,
             offset,
             Some(crate::literal::collect_literal_val_cb),
-            &mut ctx as *mut crate::literal::LiteralCollectCtx as *mut c_void,
+            (&raw mut ctx).cast::<c_void>(),
         )
     };
+    if let Some(err) = ctx.error {
+        return Err(err);
+    }
     if rc != 0 {
         return Err(Error::InvalidOffset(offset));
     }
@@ -4604,90 +4800,61 @@ fn rewrite_annotation_nested_literal_refs(
 /// the pandasm emitter's byte-identity with upstream ark_disasm).
 type LiteralArrayTable = (Vec<LiteralArray>, HashMap<u32, u32>, Vec<u32>);
 
-fn decode_literal_arrays(
+fn decode_literal_arrays<'a>(
     f: *const sys::AbcFileHandle,
     file_size: u32,
     strings: &mut StringPool,
+    str_cache: &mut StringItemCache<'a>,
     referenced_offsets: &HashSet<u32>,
     module_data_offsets: &HashSet<u32>,
     phase_blob_offsets: &HashSet<u32>,
 ) -> Result<LiteralArrayTable, Error> {
+    // SAFETY: `f` is a live `AbcFileHandle`.
     let n = unsafe { sys::abc_file_num_literalarrays(f) };
-    // The raw header table, unfiltered: the pandasm emitter's byte-identity
-    // with upstream ark_disasm needs the original header positions of the
-    // module/phase blobs that the decoded table excludes.
     let mut header_offsets = Vec::new();
     let mut offsets = Vec::new();
+    let mut seen = CompactU32Set::default();
     if n != 0 {
         for i in 0..n {
+            // SAFETY: `f` is live and `i < n`.
             let off = unsafe { sys::abc_file_literalarray_offset(f, i) };
             if off != ABSENT {
                 header_offsets.push(off);
             }
-            // Module-record and module-request-phase blobs ride the legacy
-            // header table on <=12.x but are NOT tagged literal arrays; they
-            // are modeled structurally (FieldValue::ModuleData /
-            // FieldValue::ModuleRequestPhase) and must never be decoded here.
             if off != ABSENT
                 && !module_data_offsets.contains(&off)
                 && !phase_blob_offsets.contains(&off)
+                && seen.insert(off)
             {
                 offsets.push(off);
             }
         }
     }
-    // N20: `referenced_offsets` is a HashSet — iterating it directly would
-    // append the extras in hash order, permuting the decoded literal-array
-    // table (and every LiteralarrayId table index derived from it) between
-    // runs. Sort the candidates so the table order is canonical.
     let mut referenced: Vec<u32> = referenced_offsets
         .iter()
         .copied()
         .filter(|&off| {
             off != ABSENT
-                && !offsets.contains(&off)
+                && !seen.contains(off)
                 && !module_data_offsets.contains(&off)
                 && !phase_blob_offsets.contains(&off)
         })
         .collect();
     referenced.sort_unstable();
-    offsets.extend(referenced);
+    for off in referenced {
+        if seen.insert(off) {
+            offsets.push(off);
+        }
+    }
     if offsets.is_empty() {
         return Ok((Vec::new(), HashMap::new(), header_offsets));
     }
 
-    // Collect file offsets first so nested LiteralArray references (which
-    // store the referenced array's file offset) can be rewritten to table
-    // indices — the model's documented semantic.
-    let mut offset_to_index: HashMap<u32, u32> = HashMap::new();
+    let mut offset_to_index: HashMap<u32, u32> = HashMap::with_capacity(offsets.len());
     for (i, &off) in offsets.iter().enumerate() {
         offset_to_index.insert(off, i as u32);
     }
 
-    let first_off = offsets[0];
-    let lr = unsafe { sys::abc_literal_open(f, first_off) };
-    if lr.is_null() {
-        // Loud-error convention: `offsets` is non-empty (guarded above), so
-        // returning Ok here would hand the caller a POPULATED offset map over
-        // an EMPTY array table — every mapped LiteralarrayId would index a
-        // nonexistent table entry (silent structural inconsistency). A header
-        // table entry that does not parse as a literal array is malformed
-        // input: hard error, like every other accessor-open failure in this
-        // file.
-        return Err(Error::InvalidOffset(first_off));
-    }
-    let _lg = HandleGuard(Some(|| unsafe { sys::abc_literal_close(lr) }));
-
-    // Nested-reference recovery (v2-P1a): a LITERALARRAY payload holds the
-    // target array's FILE OFFSET, and class buffers (sendable classes on
-    // 13.x/24.x) as well as type annotations (`L_ESTypeAnnotation;`)
-    // reference arrays registered nowhere — not in the header table and not
-    // in any method index region. Recover them transitively: `offsets`
-    // doubles as the worklist, and an offset is registered in
-    // `offset_to_index` BEFORE its array is decoded, so reference cycles
-    // terminate and every offset is decoded at most once per table entry.
-    // Newly discovered offsets are appended in sorted batches, keeping the
-    // table order deterministic (N20).
     let mut arrays: Vec<LiteralArray> = Vec::with_capacity(offsets.len());
     let mut decoded = 0usize;
     while decoded < offsets.len() {
@@ -4695,16 +4862,26 @@ fn decode_literal_arrays(
         for &off in &offsets[decoded..] {
             let mut ctx = crate::literal::LiteralCollectCtx {
                 file: f,
-                strings: strings as *mut StringPool,
+                strings: std::ptr::from_mut(strings),
+                str_cache: Some(std::ptr::from_mut(str_cache)),
                 values: Vec::new(),
+                error: None,
             };
-            unsafe {
-                sys::abc_literal_enumerate_vals(
-                    lr,
+            // SAFETY: `f`, `strings`, `str_cache`, and `ctx` are live and unaliased
+            // across this synchronous enumeration call.
+            let rc = unsafe {
+                sys::abc_literal_enumerate_vals_checked(
+                    f,
                     off,
                     Some(crate::literal::collect_literal_val_cb),
-                    &mut ctx as *mut crate::literal::LiteralCollectCtx as *mut c_void,
-                );
+                    (&raw mut ctx).cast::<c_void>(),
+                )
+            };
+            if let Some(err) = ctx.error {
+                return Err(err);
+            }
+            if rc != 0 {
+                return Err(Error::InvalidOffset(off));
             }
             for value in &ctx.values {
                 if let LiteralValue::LiteralArray(idx) = value {
@@ -4714,7 +4891,7 @@ fn decode_literal_arrays(
                         file_size,
                         module_data_offsets,
                         phase_blob_offsets,
-                    ) && !offset_to_index.contains_key(&target)
+                    ) && !seen.contains(target)
                     {
                         nested.push(target);
                     }
@@ -4726,12 +4903,13 @@ fn decode_literal_arrays(
         nested.sort_unstable();
         nested.dedup();
         for off in nested {
-            offset_to_index.insert(off, offsets.len() as u32);
-            offsets.push(off);
+            if seen.insert(off) {
+                offset_to_index.insert(off, offsets.len() as u32);
+                offsets.push(off);
+            }
         }
     }
 
-    // Rewrite nested references (file offset → table index).
     let array_count = arrays.len();
     for arr in &mut arrays {
         for v in &mut arr.values {
@@ -4747,282 +4925,26 @@ fn decode_literal_arrays(
     Ok((arrays, offset_to_index, header_offsets))
 }
 
-/// Intermediate struct for collecting debug info strings before interning.
-struct RawLocalVarInfo {
-    name: String,
-    type_name: String,
-    type_signature: String,
-    reg_number: i32,
-    start: u32,
-    end: u32,
-}
-
-struct RawParamInfo {
-    name: String,
-    signature: String,
-}
-
-fn read_debug_info(
-    debug_raw: *mut sys::AbcDebugInfo,
-    method_off: u32,
-    byte_offsets: &[u32],
+fn read_class_descriptor_cached(
+    cr: *const sys::AbcClassAccessor,
+    class_id: u32,
+    str_cache: &mut StringItemCache<'_>,
     strings: &mut StringPool,
-) -> MethodDebugInfo {
-    // Convert a raw byte offset to an instruction index using the byte_offsets
-    // table produced by decode_code_at.  Falls back to identity when the table
-    // is empty (no bytecode).
-    let to_index = |off: u32| -> u32 {
-        if byte_offsets.is_empty() {
-            return off;
-        }
-        byte_offsets.binary_search(&off).unwrap_or_else(|i| i) as u32
-    };
-
-    // N55: the vendored extractor answers "" for MISSING entries
-    // (DebugInfoExtractor::GetSourceFile/GetSourceCode,
-    // debug_info_extractor.cpp:318-333) — "" is the vendor's
-    // "no value", not a value. Map it to `None` instead of wrapping it
-    // in `Some` (the old behavior invented `source_file: Some("")`
-    // for methods with no recorded file; encode already treats empty
-    // debug strings as no content, 980ec16). Null (bridge catch) maps
-    // to `None` too.
-    let source_file = {
-        let ptr = unsafe { sys::abc_debug_get_source_file(debug_raw, method_off) };
-        if ptr.is_null() {
-            None
-        } else {
-            let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
-            if s.is_empty() {
-                None
-            } else {
-                Some(strings.get_or_intern(s.as_ref()))
-            }
-        }
-    };
-    let source_code = {
-        let ptr = unsafe { sys::abc_debug_get_source_code(debug_raw, method_off) };
-        if ptr.is_null() {
-            None
-        } else {
-            let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
-            if s.is_empty() {
-                None
-            } else {
-                Some(strings.get_or_intern(s.as_ref()))
-            }
-        }
-    };
-
-    // Collect raw byte-offset entries, then convert to instruction indices.
-    let mut line_table: Vec<LineEntry> = {
-        let mut result = Vec::new();
-        unsafe extern "C" fn cb(entry: *const sys::AbcLineEntry, ctx: *mut c_void) -> i32 {
-            let vec = unsafe { &mut *(ctx as *mut Vec<LineEntry>) };
-            let e = unsafe { &*entry };
-            vec.push(LineEntry {
-                index: e.offset,
-                line: e.line,
-            });
-            0
-        }
-        unsafe {
-            sys::abc_debug_get_line_table(
-                debug_raw,
-                method_off,
-                Some(cb),
-                &mut result as *mut Vec<LineEntry> as *mut c_void,
-            );
-        }
-        result
-    };
-    for entry in &mut line_table {
-        entry.index = to_index(entry.index);
+) -> Option<(StringId, String)> {
+    if let Some(sid) = str_cache.intern_utf8(class_id, strings) {
+        let s = strings.resolve(sid).unwrap_or_default().to_owned();
+        return Some((sid, s));
     }
-
-    let mut column_table: Vec<ColumnEntry> = {
-        let mut result = Vec::new();
-        unsafe extern "C" fn cb(entry: *const sys::AbcColumnEntry, ctx: *mut c_void) -> i32 {
-            let vec = unsafe { &mut *(ctx as *mut Vec<ColumnEntry>) };
-            let e = unsafe { &*entry };
-            vec.push(ColumnEntry {
-                index: e.offset,
-                column: e.column,
-            });
-            0
-        }
-        unsafe {
-            sys::abc_debug_get_column_table(
-                debug_raw,
-                method_off,
-                Some(cb),
-                &mut result as *mut Vec<ColumnEntry> as *mut c_void,
-            );
-        }
-        result
-    };
-    for entry in &mut column_table {
-        entry.index = to_index(entry.index);
-    }
-
-    // Collect raw local var info first (with owned Strings), then intern.
-    let mut raw_local_vars: Vec<RawLocalVarInfo> = {
-        let mut result = Vec::new();
-        unsafe extern "C" fn cb(info: *const sys::AbcLocalVarInfo, ctx: *mut c_void) -> i32 {
-            let vec = unsafe { &mut *(ctx as *mut Vec<RawLocalVarInfo>) };
-            let i = unsafe { &*info };
-            let name = if i.name.is_null() {
-                String::new()
-            } else {
-                unsafe { CStr::from_ptr(i.name) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            let type_name = if i.type_.is_null() {
-                String::new()
-            } else {
-                unsafe { CStr::from_ptr(i.type_) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            let type_signature = if i.type_signature.is_null() {
-                String::new()
-            } else {
-                unsafe { CStr::from_ptr(i.type_signature) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            vec.push(RawLocalVarInfo {
-                name,
-                type_name,
-                type_signature,
-                reg_number: i.reg_number,
-                start: i.start_offset,
-                end: i.end_offset,
-            });
-            0
-        }
-        unsafe {
-            sys::abc_debug_get_local_vars(
-                debug_raw,
-                method_off,
-                Some(cb),
-                &mut result as *mut Vec<RawLocalVarInfo> as *mut c_void,
-            );
-        }
-        result
-    };
-    for var in &mut raw_local_vars {
-        var.start = to_index(var.start);
-        var.end = to_index(var.end);
-    }
-    let local_vars: Vec<LocalVarInfo> = raw_local_vars
-        .into_iter()
-        .map(|rv| LocalVarInfo {
-            name: strings.get_or_intern(&rv.name),
-            type_name: strings.get_or_intern(&rv.type_name),
-            type_signature: strings.get_or_intern(&rv.type_signature),
-            reg_number: rv.reg_number,
-            start: rv.start,
-            end: rv.end,
-        })
-        .collect();
-
-    // Collect raw param info first, then intern.
-    let raw_params: Vec<RawParamInfo> = {
-        let mut result = Vec::new();
-        unsafe extern "C" fn cb(info: *const sys::AbcParamInfo, ctx: *mut c_void) -> i32 {
-            let vec = unsafe { &mut *(ctx as *mut Vec<RawParamInfo>) };
-            let i = unsafe { &*info };
-            let name = if i.name.is_null() {
-                String::new()
-            } else {
-                unsafe { CStr::from_ptr(i.name) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            let signature = if i.signature.is_null() {
-                String::new()
-            } else {
-                unsafe { CStr::from_ptr(i.signature) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            vec.push(RawParamInfo { name, signature });
-            0
-        }
-        unsafe {
-            sys::abc_debug_get_parameter_info(
-                debug_raw,
-                method_off,
-                Some(cb),
-                &mut result as *mut Vec<RawParamInfo> as *mut c_void,
-            );
-        }
-        result
-    };
-    let params: Vec<ParamInfo> = raw_params
-        .into_iter()
-        .map(|rp| ParamInfo {
-            name: strings.get_or_intern(&rp.name),
-            signature: strings.get_or_intern(&rp.signature),
-        })
-        .collect();
-
-    MethodDebugInfo {
-        source_file,
-        source_code,
-        line_table,
-        column_table,
-        local_vars,
-        params,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FFI helper: read strings from C accessors
-// ---------------------------------------------------------------------------
-
-fn read_class_descriptor(
-    f: *const sys::AbcFileHandle,
-    cr: *const sys::AbcClassAccessor,
-) -> Option<String> {
-    let class_id = unsafe { sys::abc_class_get_class_id(cr) };
-    // The class item starts with its descriptor string; go through the
-    // lossless string reader instead of the raw MUTF-8 pointer.
-    read_string(f, class_id).or_else(|| {
-        let ptr = unsafe { sys::abc_class_get_descriptor(cr) };
-        if ptr.is_null() {
-            return None;
-        }
-        let cstr = unsafe { CStr::from_ptr(ptr as *const _) };
-        Some(cstr.to_string_lossy().into_owned())
-    })
-}
-
-fn read_class_name(
-    f: *const sys::AbcFileHandle,
-    cr: *const sys::AbcClassAccessor,
-) -> Option<String> {
-    // The class item's name is its descriptor string; read it through the
-    // lossless MUTF-8 path (same source as read_class_descriptor) instead of
-    // the raw-byte abc_class_get_name view, which corrupts embedded NULs
-    // (C0 80) and astral characters.
-    let class_id = unsafe { sys::abc_class_get_class_id(cr) };
-    read_string(f, class_id)
-}
-
-fn read_method_name(mr: *const sys::AbcMethodAccessor) -> Option<String> {
-    // Lossless: MUTF-8 -> UTF-16 via the bridge (the raw C-string view
-    // corrupts embedded NULs encoded as C0 80 — test group G).
-    let units = unsafe { sys::abc_method_get_name_utf16(mr, std::ptr::null_mut(), 0) };
-    if units == 0 {
+    // SAFETY: `cr` is valid; returns null or a NUL-terminated descriptor inside `f`'s buffer.
+    let ptr = unsafe { sys::abc_class_get_descriptor(cr) };
+    if ptr.is_null() {
         return None;
     }
-    let mut buf = vec![0u16; units as usize];
-    unsafe {
-        sys::abc_method_get_name_utf16(mr, buf.as_mut_ptr(), buf.len());
-    }
-    String::from_utf16(&buf).ok()
+    // SAFETY: `ptr` is non-null and NUL-terminated inside `f`'s zero-padded buffer.
+    let cstr = unsafe { CStr::from_ptr(ptr.cast::<std::os::raw::c_char>()) };
+    let text = cstr.to_string_lossy().into_owned();
+    let sid = strings.get_or_intern(&text);
+    Some((sid, text))
 }
 
 // ---------------------------------------------------------------------------
@@ -5040,10 +4962,12 @@ fn collect_offsets_void<T>(
 ) -> Vec<u32> {
     let mut result = Vec::new();
     unsafe extern "C" fn cb(offset: u32, ctx: *mut c_void) {
-        let vec = unsafe { &mut *(ctx as *mut Vec<u32>) };
+        // SAFETY: `ctx` points to the caller's live `Vec<u32>`.
+        let vec = unsafe { &mut *ctx.cast::<Vec<u32>>() };
         vec.push(offset);
     }
-    unsafe { enumerate(raw, Some(cb), &mut result as *mut Vec<u32> as *mut c_void) };
+    // SAFETY: `raw` and `result` are live for the synchronous enumeration call.
+    unsafe { enumerate(raw, Some(cb), (&raw mut result).cast::<c_void>()) };
     result
 }
 
@@ -5058,68 +4982,91 @@ fn collect_offsets_int<T>(
 ) -> Vec<u32> {
     let mut result = Vec::new();
     unsafe extern "C" fn cb(offset: u32, ctx: *mut c_void) -> i32 {
-        let vec = unsafe { &mut *(ctx as *mut Vec<u32>) };
+        // SAFETY: `ctx` points to the caller's live `Vec<u32>`.
+        let vec = unsafe { &mut *ctx.cast::<Vec<u32>>() };
         vec.push(offset);
         0
     }
-    unsafe { enumerate(raw, Some(cb), &mut result as *mut Vec<u32> as *mut c_void) };
+    // SAFETY: `raw` and `result` are live for the synchronous enumeration call.
+    unsafe { enumerate(raw, Some(cb), (&raw mut result).cast::<c_void>()) };
     result
 }
 
-/// Collect try-blocks from a code accessor. Typed catch entries store a
-/// region class *index* in the file; decode resolves it to the class entity
-/// offset so the model carries entity identity (catch-all stays UINT32_MAX).
+/// Collect try-blocks from a code accessor, strictly resolving typed catch
+/// class indices to entity offsets.
 fn collect_try_blocks(
     f: *const sys::AbcFileHandle,
     method_off: u32,
     cr: *mut sys::AbcCodeAccessor,
-) -> Vec<TryBlock> {
+) -> Result<Vec<TryBlock>, Error> {
     struct Ctx {
         f: *const sys::AbcFileHandle,
         method_off: u32,
         blocks: Vec<TryBlock>,
+        err: Option<Error>,
     }
     let mut ctx = Ctx {
         f,
         method_off,
         blocks: Vec::new(),
+        err: None,
     };
     unsafe extern "C" fn cb(
         try_info: *const sys::AbcTryBlockInfo,
         catches: *const sys::AbcCatchBlockInfo,
         ctx_raw: *mut c_void,
     ) -> i32 {
-        let ctx = unsafe { &mut *(ctx_raw as *mut Ctx) };
+        // SAFETY: `ctx_raw` points to the caller's live `Ctx`.
+        let ctx = unsafe { &mut *ctx_raw.cast::<Ctx>() };
+        if ctx.err.is_some() {
+            return 0;
+        }
+        // SAFETY: `try_info` is a valid non-null pointer supplied by C++.
         let info = unsafe { &*try_info };
         let catch_slice = if info.num_catches > 0 {
+            // SAFETY: `catches` holds `info.num_catches` contiguous entries during callback.
             unsafe { std::slice::from_raw_parts(catches, info.num_catches as usize) }
         } else {
             &[]
         };
+        let mut decoded_catches = Vec::with_capacity(catch_slice.len());
+        for c in catch_slice {
+            let type_idx = if c.type_idx == u32::MAX {
+                u32::MAX
+            } else {
+                let Ok(idx) = u16::try_from(c.type_idx) else {
+                    ctx.err = Some(Error::InvalidOffset(c.type_idx));
+                    return 0;
+                };
+                // SAFETY: `ctx.f` is a live `AbcFileHandle`.
+                let resolved = unsafe { sys::abc_resolve_class_index(ctx.f, ctx.method_off, idx) };
+                if resolved == ABSENT {
+                    ctx.err = Some(Error::InvalidOffset(c.type_idx));
+                    return 0;
+                }
+                resolved
+            };
+            decoded_catches.push(CatchBlock {
+                type_idx,
+                handler: c.handler_pc,
+                len: c.code_size,
+            });
+        }
         ctx.blocks.push(TryBlock {
             start: info.start_pc,
             len: info.length,
-            catches: catch_slice
-                .iter()
-                .map(|c| CatchBlock {
-                    type_idx: if c.type_idx == u32::MAX {
-                        u32::MAX
-                    } else {
-                        unsafe {
-                            sys::abc_resolve_class_index(ctx.f, ctx.method_off, c.type_idx as u16)
-                        }
-                    },
-                    handler: c.handler_pc,
-                    len: c.code_size,
-                })
-                .collect(),
+            catches: decoded_catches,
         });
         0
     }
+    // SAFETY: `cr` and `ctx` are live for the synchronous enumeration call.
     unsafe {
-        sys::abc_code_enumerate_try_blocks_full(cr, Some(cb), &mut ctx as *mut Ctx as *mut c_void);
+        sys::abc_code_enumerate_try_blocks_full(cr, Some(cb), (&raw mut ctx).cast::<c_void>());
     }
-    ctx.blocks
+    if let Some(err) = ctx.err {
+        return Err(err);
+    }
+    Ok(ctx.blocks)
 }
 
 #[cfg(test)]
@@ -5163,6 +5110,7 @@ mod tests {
             0xFFFF_FF00,
             &entity_map,
             &mut strings,
+            None,
         );
         assert!(
             matches!(
@@ -5252,6 +5200,7 @@ mod tests {
             payload_pos,
             &entity_map,
             &mut strings,
+            None,
         )
         .expect("literal-array element must decode");
         assert_eq!(result.len(), 1);
@@ -5325,6 +5274,7 @@ mod tests {
             payload_pos,
             &entity_map,
             &mut strings,
+            None,
         );
         assert!(
             matches!(result, Err(Error::InvalidOffset(o)) if o == bogus),
@@ -5395,6 +5345,7 @@ mod tests {
             payload_pos,
             &entity_map,
             &mut strings,
+            None,
         );
         assert!(
             matches!(
@@ -5494,6 +5445,7 @@ mod tests {
                 payload_pos,
                 &entity_map,
                 &mut strings,
+                None,
             );
             assert!(
                 matches!(

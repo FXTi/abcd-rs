@@ -78,7 +78,8 @@ This document establishes the binding architectural, algorithmic, safety, and te
    - `vendor/arkcompiler_runtime_core/` pins an exact upstream release (`vendor/UPSTREAM.toml`) verified by per-file SHA-256 in Tier-1 CI (`python3 scripts/vendor-gen.py verify`).
    - Rust FFI declarations (`ffi_bindings.rs`), ISA tables, and the `109` C++17 `static_assert` enum checks (`file_bridge_enum_checks.h`) are generated deterministically by `scripts/vendor-gen.py codegen`—zero `bindgen`/`libclang` and zero build-time Ruby.
 2. **C99 Exception & Bounds Firewall**:
-   - Every `extern "C"` entrypoint in `abcd-isa-sys` and `abcd-file-sys` catches all C++ exceptions (`SUPPORT_KNOWN_EXCEPTION` + `LOG(FATAL)` throw conversion in `vendor/shim/utils/logger.h`) before crossing into Rust.
+   - Every `extern "C"` entrypoint in `abcd-file-sys` (and allocating/STL entrypoints in `abcd-isa-sys`, while pure `noexcept` lookup queries validate opcodes directly) catches all C++ exceptions (`SUPPORT_KNOWN_EXCEPTION` + `LogVoidify::operator&` throw conversion in `vendor/shim/utils/logger.h`, never throwing from a destructor, plus silent `ABORT_AND_UNREACHABLE`/`CHECK` shims) before crossing into Rust.
+   - Header table spans (`file_size`, `foreign`, `classes`, `lnps`, `literalarrays`, `indexes`) and 4-byte index-table alignments are validated in 64-bit arithmetic before constructing `panda_file::File`.
    - Never call raw `strlen` or `strcmp` on `.abc` string bytes; bound every string read by both its declared MUTF-8 length prefix and the file payload span (`bounded_cstr_len`).
    - Clamp every wire-declared element count against remaining payload bytes before allocating buffers (`>= 1` byte per element) to prevent crafted multi-gigabyte OOM panics.
 

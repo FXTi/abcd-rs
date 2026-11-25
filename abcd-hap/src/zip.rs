@@ -4,19 +4,24 @@
 //!
 //! Layout of the reader (see `design/hap-container.md`):
 //!
-//! 1. Scan backwards at most 64 KiB + EOCD for `PK\x05\x06`; a candidate is
-//!    only real if its comment length lands exactly on EOF *and* the central
-//!    directory it points at walks cleanly — so a fake EOCD magic hidden in
-//!    the comment cannot hijack the scan.
-//! 2. Walk central headers `PK\x01\x02`: name, method, CRC, sizes,
-//!    local-header offset. The walk must consume the declared CD size
-//!    exactly.
-//! 3. Per entry: seek the local header `PK\x03\x04`, skip name+extra using
-//!    the *local* header's lengths, take `compressed_size` bytes of data.
+//! 1. Scan backwards at most 64 KiB + EOCD for `PK\x05\x06` (evaluating at most
+//!    `MAX_EOCD_CANDIDATES` position-consistent candidates); a candidate is
+//!    only real if its comment length lands exactly on EOF, its central
+//!    directory begins with `PK\x01\x02` when non-empty, *and* the central
+//!    directory walks cleanly from start to end — so fake EOCD magics hidden
+//!    in comments neither hijack the scan nor trigger quadratic walks.
+//! 2. Walk central headers `PK\x01\x02`: zero-copy UTF-8 entry name, method,
+//!    CRC-32, sizes, and local-header offset. The walk must consume the
+//!    declared CD size exactly.
+//! 3. Per entry: enforce [`Limits`] and the RFC 1951 `1032×` DEFLATE ratio
+//!    bound before allocation, seek the local header `PK\x03\x04`, skip
+//!    name+extra using the *local* header's lengths, read/inflate the payload,
+//!    and verify the IEEE 802.3 CRC-32 against `meta.crc32`.
 //!
 //! Every offset/size computation goes through checked slice access; no
 //! input byte pattern can panic the parser.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use crate::Error;
@@ -37,9 +42,52 @@ const LOCAL_HEADER_LEN: usize = 30;
 const ZIP64_LOCATOR_LEN: usize = 20;
 /// Longest legal EOCD comment; bounds the backward scan window.
 const MAX_COMMENT_LEN: usize = 0xFFFF;
+/// Maximum number of position-consistent EOCD candidates validated via
+/// central-directory walks, preventing quadratic `O(W * N)` scans on crafted
+/// comment floods.
+const MAX_EOCD_CANDIDATES: usize = 64;
 
 /// General-purpose flag bit 0: entry is encrypted.
 const FLAG_ENCRYPTED: u16 = 0x1;
+
+/// Theoretical maximum compression ratio of a valid RFC 1951 DEFLATE stream
+/// (`258` max match length at `2` bits per match = `1032×`).
+const MAX_DEFLATE_RATIO: u64 = 1032;
+/// Small byte slack added to the `1032×` ratio ceiling for minimal block
+/// headers on tiny streams.
+const DEFLATE_RATIO_SLACK: u64 = 64;
+
+/// Precomputed IEEE 802.3 reflected CRC-32 lookup table (polynomial
+/// `0xEDB8_8320`).
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// Compute the IEEE 802.3 CRC-32 checksum of `bytes` (polynomial `0xEDB8_8320`).
+pub(crate) fn crc32_ieee(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in bytes {
+        let idx = ((crc as u8) ^ b) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[idx];
+    }
+    !crc
+}
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let s = bytes.get(offset..offset.checked_add(2)?)?;
@@ -55,18 +103,46 @@ fn sig_at(bytes: &[u8], offset: usize, sig: &[u8; 4]) -> bool {
     offset.checked_add(4).and_then(|end| bytes.get(offset..end)) == Some(&sig[..])
 }
 
+/// Resource limits enforced while reading and inflating container entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum uncompressed size in bytes permitted for a single entry.
+    pub max_entry_bytes: u64,
+    /// Maximum cumulative extracted/inflated bytes permitted across a
+    /// container operation (including nested `.hap` / `.hsp` archives inside
+    /// an `.app` bundle).
+    pub max_total_bytes: u64,
+}
+
+impl Limits {
+    /// Default resource caps: `512 MiB` per entry and `2 GiB` cumulative total.
+    pub const DEFAULT: Self = Self {
+        max_entry_bytes: 512 * 1024 * 1024,
+        max_total_bytes: 2 * 1024 * 1024 * 1024,
+    };
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Metadata for one central-directory entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EntryMeta {
-    /// Entry name (lossy-decoded; used as a lookup key only, never as a
-    /// filesystem path).
-    pub name: String,
+pub struct EntryMeta<'a> {
+    /// Entry name: zero-copy `Cow::Borrowed` slice into the archive buffer for
+    /// valid UTF-8 names, falling back to lossy `Cow::Owned` only when raw
+    /// central-directory name bytes are invalid UTF-8. Used strictly as an
+    /// in-memory lookup key, never as a host filesystem path.
+    pub name: Cow<'a, str>,
     /// Raw ZIP compression method number (`METHOD_STORED` /
     /// `METHOD_DEFLATE`).
     pub method: u16,
     /// Raw general-purpose bit flags.
     pub flags: u16,
-    /// CRC-32 as recorded in the central directory (not verified on read).
+    /// Expected IEEE 802.3 CRC-32 recorded in the central directory and
+    /// verified on read.
     pub crc32: u32,
     /// Compressed size in bytes.
     pub compressed_size: u64,
@@ -99,7 +175,7 @@ pub enum EntryData<'a> {
     Owned(Vec<u8>),
 }
 
-impl<'a> EntryData<'a> {
+impl EntryData<'_> {
     /// View the payload as a byte slice.
     pub fn as_slice(&self) -> &[u8] {
         match self {
@@ -128,16 +204,17 @@ impl<'a> EntryData<'a> {
 #[derive(Clone, Debug)]
 pub struct ZipArchive<'a> {
     data: &'a [u8],
-    entries: Vec<EntryMeta>,
+    entries: Vec<EntryMeta<'a>>,
 }
 
 impl<'a> ZipArchive<'a> {
     /// Parse the central directory of a ZIP archive held in memory.
     ///
     /// Locates the EOCD by scanning backwards (at most 64 KiB plus the EOCD
-    /// itself), rejects fake EOCD magics hidden in the comment by validating
-    /// CD offset/size/count self-consistency, and tolerates signing-block
-    /// junk between the last entry and the central directory.
+    /// itself), evaluates at most `MAX_EOCD_CANDIDATES` position-consistent
+    /// candidates, rejects fake EOCD magics hidden in the comment by validating
+    /// CD offset/size/count/signature self-consistency, and tolerates
+    /// signing-block bytes between the last entry and the central directory.
     pub fn open(bytes: &'a [u8]) -> Result<Self, Error> {
         if bytes.len() < EOCD_LEN {
             return Err(Error::NotZip);
@@ -147,24 +224,24 @@ impl<'a> ZipArchive<'a> {
         // EOF: that is the most plausible real EOCD, so its failure mode is
         // the one worth reporting when no candidate validates.
         let mut candidate_error: Option<Error> = None;
+        let mut candidates_checked = 0usize;
         let mut pos = bytes.len() - EOCD_LEN;
         loop {
-            if sig_at(bytes, pos, EOCD_SIG) {
-                // Candidate filter: the comment must land exactly on EOF.
-                // Magic bytes failing this (e.g. inside entry data) are not
-                // EOCDs at all and must not influence error reporting.
-                let position_consistent = read_u16(bytes, pos + 20)
-                    .map(|cl| pos + EOCD_LEN + cl as usize == bytes.len())
-                    .unwrap_or(false);
-                if position_consistent {
-                    match Self::try_open_at_eocd(bytes, pos) {
-                        Ok(archive) => return Ok(archive),
-                        Err(err) => {
-                            if candidate_error.is_none() {
-                                candidate_error = Some(err);
-                            }
+            if sig_at(bytes, pos, EOCD_SIG)
+                && let Some(cl) = read_u16(bytes, pos + 20)
+                && pos + EOCD_LEN + cl as usize == bytes.len()
+            {
+                candidates_checked += 1;
+                match Self::try_open_at_eocd(bytes, pos) {
+                    Ok(archive) => return Ok(archive),
+                    Err(err) => {
+                        if candidate_error.is_none() {
+                            candidate_error = Some(err);
                         }
                     }
+                }
+                if candidates_checked >= MAX_EOCD_CANDIDATES {
+                    break;
                 }
             }
             if pos == window_start {
@@ -209,18 +286,34 @@ impl<'a> ZipArchive<'a> {
         }
 
         let cd_start = cd_offset as usize;
-        let cd_end =
-            (cd_offset as u64)
-                .checked_add(cd_size as u64)
-                .ok_or(Error::BadCentralDirectory(
-                    "central directory range overflows",
-                ))?;
+        let cd_end = u64::from(cd_offset).checked_add(u64::from(cd_size)).ok_or(
+            Error::BadCentralDirectory("central directory range overflows"),
+        )?;
         if cd_end > pos as u64 {
             return Err(Error::BadCentralDirectory(
                 "central directory overlaps or passes the EOCD",
             ));
         }
-        Self::walk_central_directory(bytes, cd_start, cd_end as usize, count as usize)
+
+        let count_usize = count as usize;
+        let cd_size_usize = cd_size as usize;
+        if count_usize > 0 {
+            // O(1) structural pre-checks before allocating or walking:
+            // count records of at least 46 bytes must fit in cd_size, and the
+            // first record must carry the PK\x01\x02 signature.
+            if count_usize.saturating_mul(CD_HEADER_LEN) > cd_size_usize {
+                return Err(Error::BadCentralDirectory(
+                    "central directory record overruns its declared size",
+                ));
+            }
+            if !sig_at(bytes, cd_start, CD_SIG) {
+                return Err(Error::BadCentralDirectory(
+                    "bad central file header signature",
+                ));
+            }
+        }
+
+        Self::walk_central_directory(bytes, cd_start, cd_end as usize, count_usize)
     }
 
     /// Walk `count` central file headers starting at `cd_start`; the walk
@@ -231,7 +324,8 @@ impl<'a> ZipArchive<'a> {
         cd_end: usize,
         count: usize,
     ) -> Result<Self, Error> {
-        let mut entries = Vec::with_capacity(count);
+        let cap = count.min(bytes.len() / CD_HEADER_LEN);
+        let mut entries = Vec::with_capacity(cap);
         let mut cursor = cd_start;
         for _ in 0..count {
             let fixed_end = cursor
@@ -314,7 +408,7 @@ impl<'a> ZipArchive<'a> {
                 .ok_or(Error::Truncated {
                     context: "central directory entry name",
                 })?;
-            let name = String::from_utf8_lossy(name_bytes).into_owned();
+            let name = String::from_utf8_lossy(name_bytes);
 
             entries.push(EntryMeta {
                 name,
@@ -339,58 +433,113 @@ impl<'a> ZipArchive<'a> {
     }
 
     /// Iterate over central-directory entries in archive order.
-    pub fn entries(&self) -> impl Iterator<Item = &EntryMeta> {
+    pub fn entries(&self) -> impl Iterator<Item = &EntryMeta<'a>> {
         self.entries.iter()
     }
 
     /// Look up an entry by exact name.
-    pub fn entry(&self, name: &str) -> Option<&EntryMeta> {
+    pub fn entry(&self, name: &str) -> Option<&EntryMeta<'a>> {
         self.entries.iter().find(|e| e.name == name)
     }
 
-    /// Read (and inflate, if needed) an entry by name.
+    /// Read (and inflate, if needed) an entry by name under [`Limits::DEFAULT`],
+    /// verifying its IEEE 802.3 CRC-32 checksum.
     pub fn read(&self, name: &str) -> Result<EntryData<'a>, Error> {
+        self.read_with_limits(name, Limits::DEFAULT)
+    }
+
+    /// Read (and inflate, if needed) an entry by name under custom [`Limits`],
+    /// verifying its IEEE 802.3 CRC-32 checksum.
+    pub fn read_with_limits(&self, name: &str, limits: Limits) -> Result<EntryData<'a>, Error> {
         let meta = self
             .entry(name)
             .ok_or_else(|| Error::EntryNotFound(name.to_string()))?;
-        self.read_entry(meta)
+        self.read_entry_with_limits(meta, limits)
     }
 
-    /// Read (and inflate, if needed) an entry by metadata.
-    ///
-    /// CRC-32 is not verified on read (see `design/hap-container.md`); the data
-    /// is returned as recorded.
-    pub fn read_entry(&self, meta: &EntryMeta) -> Result<EntryData<'a>, Error> {
+    /// Read (and inflate, if needed) an entry by metadata under
+    /// [`Limits::DEFAULT`], verifying its IEEE 802.3 CRC-32 checksum.
+    pub fn read_entry(&self, meta: &EntryMeta<'_>) -> Result<EntryData<'a>, Error> {
+        self.read_entry_with_limits(meta, Limits::DEFAULT)
+    }
+
+    /// Read (and inflate, if needed) an entry by metadata under custom
+    /// [`Limits`], verifying its IEEE 802.3 CRC-32 checksum against
+    /// `meta.crc32` (see `design/hap-container.md`).
+    pub fn read_entry_with_limits(
+        &self,
+        meta: &EntryMeta<'_>,
+        limits: Limits,
+    ) -> Result<EntryData<'a>, Error> {
         if meta.flags & FLAG_ENCRYPTED != 0 {
             return Err(Error::Encrypted {
-                name: meta.name.clone(),
+                name: meta.name.as_ref().to_owned(),
             });
         }
+        if meta.method != METHOD_STORED && meta.method != METHOD_DEFLATE {
+            return Err(Error::UnsupportedMethod {
+                name: meta.name.as_ref().to_owned(),
+                method: meta.method,
+            });
+        }
+        if meta.uncompressed_size > limits.max_entry_bytes
+            || meta.uncompressed_size > limits.max_total_bytes
+        {
+            return Err(Error::EntryTooLarge {
+                name: meta.name.as_ref().to_owned(),
+            });
+        }
+
+        let range = self.entry_data_range(meta)?;
+        let data = self.data.get(range).ok_or(Error::Truncated {
+            context: "entry data",
+        })?;
+
         match meta.method {
             METHOD_STORED => {
-                let range = self.entry_data_range(meta)?;
-                let data = self.data.get(range).ok_or(Error::Truncated {
-                    context: "entry data",
-                })?;
+                if meta.compressed_size != meta.uncompressed_size {
+                    return Err(Error::BadCentralDirectory(
+                        "stored entry compressed and uncompressed sizes differ",
+                    ));
+                }
+                let actual = crc32_ieee(data);
+                if actual != meta.crc32 {
+                    return Err(Error::CrcMismatch {
+                        name: meta.name.as_ref().to_owned(),
+                        expected: meta.crc32,
+                        actual,
+                    });
+                }
                 Ok(EntryData::Borrowed(data))
             }
             METHOD_DEFLATE => {
-                let range = self.entry_data_range(meta)?;
-                let data = self.data.get(range).ok_or(Error::Truncated {
-                    context: "entry data",
-                })?;
+                if (meta.compressed_size == 0 && meta.uncompressed_size > 0)
+                    || meta.uncompressed_size
+                        > meta
+                            .compressed_size
+                            .saturating_mul(MAX_DEFLATE_RATIO)
+                            .saturating_add(DEFLATE_RATIO_SLACK)
+                {
+                    return Err(Error::Inflate {
+                        name: meta.name.as_ref().to_owned(),
+                        reason: format!(
+                            "declared uncompressed size {} exceeds RFC 1951 maximum ratio for {} compressed bytes",
+                            meta.uncompressed_size, meta.compressed_size
+                        ),
+                    });
+                }
                 let limit =
                     usize::try_from(meta.uncompressed_size).map_err(|_| Error::EntryTooLarge {
-                        name: meta.name.clone(),
+                        name: meta.name.as_ref().to_owned(),
                     })?;
                 let inflated = miniz_oxide::inflate::decompress_to_vec_with_limit(data, limit)
                     .map_err(|e| Error::Inflate {
-                        name: meta.name.clone(),
+                        name: meta.name.as_ref().to_owned(),
                         reason: format!("{e:?}"),
                     })?;
                 if inflated.len() as u64 != meta.uncompressed_size {
                     return Err(Error::Inflate {
-                        name: meta.name.clone(),
+                        name: meta.name.as_ref().to_owned(),
                         reason: format!(
                             "inflated size {} does not match central directory {}",
                             inflated.len(),
@@ -398,10 +547,18 @@ impl<'a> ZipArchive<'a> {
                         ),
                     });
                 }
+                let actual = crc32_ieee(&inflated);
+                if actual != meta.crc32 {
+                    return Err(Error::CrcMismatch {
+                        name: meta.name.as_ref().to_owned(),
+                        expected: meta.crc32,
+                        actual,
+                    });
+                }
                 Ok(EntryData::Owned(inflated))
             }
             method => Err(Error::UnsupportedMethod {
-                name: meta.name.clone(),
+                name: meta.name.as_ref().to_owned(),
                 method,
             }),
         }
@@ -409,7 +566,7 @@ impl<'a> ZipArchive<'a> {
 
     /// Classify how the entry's data is stored; computes the absolute data
     /// offset for STORED entries by consulting the local file header.
-    pub fn entry_compression(&self, meta: &EntryMeta) -> Result<Compression, Error> {
+    pub fn entry_compression(&self, meta: &EntryMeta<'_>) -> Result<Compression, Error> {
         match meta.method {
             METHOD_STORED => {
                 let range = self.entry_data_range(meta)?;
@@ -419,7 +576,7 @@ impl<'a> ZipArchive<'a> {
             }
             METHOD_DEFLATE => Ok(Compression::Deflated),
             method => Err(Error::UnsupportedMethod {
-                name: meta.name.clone(),
+                name: meta.name.as_ref().to_owned(),
                 method,
             }),
         }
@@ -429,9 +586,9 @@ impl<'a> ZipArchive<'a> {
     /// name/extra lengths are authoritative and may differ from the CD
     /// record). The range may extend past the input; callers bounds-check at
     /// slice time and report `Truncated`.
-    fn entry_data_range(&self, meta: &EntryMeta) -> Result<Range<usize>, Error> {
+    fn entry_data_range(&self, meta: &EntryMeta<'_>) -> Result<Range<usize>, Error> {
         let too_large = || Error::EntryTooLarge {
-            name: meta.name.clone(),
+            name: meta.name.as_ref().to_owned(),
         };
         let local = usize::try_from(meta.local_header_offset).map_err(|_| too_large())?;
         let fixed_end = local.checked_add(LOCAL_HEADER_LEN).ok_or_else(too_large)?;
@@ -456,5 +613,17 @@ impl<'a> ZipArchive<'a> {
         let compressed = usize::try_from(meta.compressed_size).map_err(|_| too_large())?;
         let data_end = data_start.checked_add(compressed).ok_or_else(too_large)?;
         Ok(data_start..data_end)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crc32_ieee;
+
+    #[test]
+    fn crc32_ieee_matches_standard_vectors() {
+        assert_eq!(crc32_ieee(b""), 0x0000_0000);
+        assert_eq!(crc32_ieee(b"a"), 0xE8B7_BE43);
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
     }
 }

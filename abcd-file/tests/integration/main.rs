@@ -38,6 +38,7 @@ mod output_version;
 mod param_annotations;
 mod phase05_fixes;
 mod proto_queries;
+mod round1_regressions;
 mod roundtrip;
 mod string_boundaries;
 mod string_terminator_mutation;

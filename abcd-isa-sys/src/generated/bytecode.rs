@@ -121,8 +121,14 @@ bitflags::bitflags! {
 }
 
 // ============================================================================
-// Bytecode enum
+// Bytecode enum & pure-Rust ISA codec tables
 // ============================================================================
+
+/// Minimum primary byte value that introduces a 2-byte prefixed opcode.
+pub const MIN_PREFIX_OPCODE: u8 = 251;
+
+/// Opcode byte for unconditional 32-bit jump (`jmp imm32`).
+pub const JMP_IMM32_OPCODE: u8 = 0x98;
 
 /// Role of an entity operand, taken from the vendored ISA signatures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -149,11 +155,64 @@ pub enum Operand {
     Label(u32),
 }
 
+/// Pure-Rust single-instruction decode failure reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModernDecodeFault {
+    /// Unassigned primary or prefixed opcode.
+    InvalidOpcode,
+    /// Input slice ends before the full opcode or operand payload.
+    Truncated,
+}
+
+/// Pure-Rust entity-ID slot lookup failure reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModernEntitySlotFault {
+    /// Empty slice, unassigned opcode, or truncated instruction bytes.
+    InvalidInstruction,
+    /// Instruction has no entity-ID operand at the requested ordinal.
+    MissingOperand,
+}
+
+/// Wide-displacement (`> i16`) encoding strategy for a jump mnemonic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WideJumpKind {
+    /// Direct 5-byte `op_imm32 rel32` instruction (`jmp`, `jeqz`, `jnez`).
+    NativeImm32(u8),
+    /// 7-byte trampoline: `inv_op_imm8 +7; jmp_imm32 (target - (pc + 2))`.
+    InvertImm8(u8),
+    /// 8-byte trampoline: `inv_op_v8_imm8 reg, +8; jmp_imm32 (target - (pc + 3))`.
+    InvertV8Imm8(u8),
+}
+
+/// Pure-Rust jump encoding metadata extracted from a [`Bytecode`] jump variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JumpEncodeMeta {
+    /// Target instruction index in the input slice.
+    pub target: Label,
+    /// Optional 8-bit register operand (`jeq`, `jne`, `jstricteq`, `jnstricteq`).
+    pub reg: Option<u8>,
+    /// Primary opcode for the 8-bit displacement form (`2` bytes without `reg`, `3` bytes with `reg`).
+    pub op_imm8: u8,
+    /// Primary opcode for the 16-bit displacement form (`3` bytes without `reg`, `4` bytes with `reg`).
+    pub op_imm16: u8,
+    /// Strategy when displacement exceeds `i16::MIN..=i16::MAX`.
+    pub wide: WideJumpKind,
+}
+
+/// Pure-Rust pre-encoded instruction classification for linear branch relaxation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeInsnKind {
+    /// Non-jump instruction pre-packed in its minimal legal format (`len <= 16`).
+    Fixed { bytes: [u8; 16], len: u8 },
+    /// Jump instruction whose byte width (`2..=8`) is resolved during branch relaxation.
+    Jump(JumpEncodeMeta),
+}
+
 /// Decoded ArkCompiler bytecode instruction.
 ///
 /// Each variant represents a mnemonic (e.g. `Mov` merges `MOV_V4_V4`,
 /// `MOV_V8_V8`, `MOV_V16_V16`). Operands are stored as decoded typed fields.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Bytecode {
     /// `ldundefined` (opcodes: 0x0000)
     Ldundefined,
@@ -698,585 +757,1375 @@ pub enum Bytecode {
 // ============================================================================
 
 impl Bytecode {
+    /// Maximum number of explicit operands carried by any ISA instruction.
+    pub const MAX_OPERANDS: usize = 6;
+
+    /// Maximum number of entity-ID operands carried by any ISA instruction.
+    pub const MAX_ENTITY_OPERANDS: usize = 2;
+
+    /// Stack-allocated entity operands in signature order (`(items, len)`),
+    /// avoiding heap allocation in hot loops.
+    #[inline]
+    pub const fn entity_operands_inline(
+        &self,
+    ) -> ([(EntityKind, EntityId); Self::MAX_ENTITY_OPERANDS], usize) {
+        let dummy = (EntityKind::MethodId, EntityId(0));
+        let mut out = [dummy; Self::MAX_ENTITY_OPERANDS];
+        match *self {
+            Bytecode::Createarraywithbuffer(_, id1) => {
+                out[0] = (EntityKind::LiteralarrayId, id1);
+                (out, 1)
+            }
+            Bytecode::Createobjectwithbuffer(_, id1) => {
+                out[0] = (EntityKind::LiteralarrayId, id1);
+                (out, 1)
+            }
+            Bytecode::Definefunc(_, id1, _) => {
+                out[0] = (EntityKind::MethodId, id1);
+                (out, 1)
+            }
+            Bytecode::Definemethod(_, id1, _) => {
+                out[0] = (EntityKind::MethodId, id1);
+                (out, 1)
+            }
+            Bytecode::Defineclasswithbuffer(_, id1, id2, _, _) => {
+                out[0] = (EntityKind::MethodId, id1);
+                out[1] = (EntityKind::LiteralarrayId, id2);
+                (out, 2)
+            }
+            Bytecode::LdaStr(id0) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::Tryldglobalbyname(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Trystglobalbyname(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Ldglobalvar(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Ldobjbyname(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Stobjbyname(_, id1, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Ldsuperbyname(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Stconsttoglobalrecord(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Sttoglobalrecord(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Ldthisbyname(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Stthisbyname(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Createregexpwithliteral(_, id1, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Stownbyname(_, id1, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Stglobalvar(_, id1) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Stownbynamewithnameset(_, id1, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Newlexenvwithname(_, id1) => {
+                out[0] = (EntityKind::LiteralarrayId, id1);
+                (out, 1)
+            }
+            Bytecode::Stsuperbyname(_, id1, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Ldbigint(id0) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::Definefieldbyname(_, id1, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Definepropertybyname(_, id1, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Callthis0withname(_, id1, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Callthis1withname(_, id1, _, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Callthis2withname(_, id1, _, _, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Callthis3withname(_, id1, _, _, _, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::Callthisrangewithname(_, _, id2, _) => {
+                out[0] = (EntityKind::StringId, id2);
+                (out, 1)
+            }
+            Bytecode::WideNewlexenvwithname(_, id1) => {
+                out[0] = (EntityKind::LiteralarrayId, id1);
+                (out, 1)
+            }
+            Bytecode::CallruntimeCreateprivateproperty(_, id1) => {
+                out[0] = (EntityKind::LiteralarrayId, id1);
+                (out, 1)
+            }
+            Bytecode::CallruntimeDefinesendableclass(_, id1, id2, _, _) => {
+                out[0] = (EntityKind::MethodId, id1);
+                out[1] = (EntityKind::LiteralarrayId, id2);
+                (out, 2)
+            }
+            Bytecode::ThrowUndefinedifholewithname(id0) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedDefineclasswithbuffer(id0, _, _, _, _) => {
+                out[0] = (EntityKind::MethodId, id0);
+                (out, 1)
+            }
+            Bytecode::WideCallthisrangewithname(_, id1, _) => {
+                out[0] = (EntityKind::StringId, id1);
+                (out, 1)
+            }
+            Bytecode::DeprecatedGetmodulenamespace(id0) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedStmodulevar(id0) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedLdobjbyname(id0, _) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedLdsuperbyname(id0, _) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedLdmodulevar(id0, _) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedStconsttoglobalrecord(id0) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedStlettoglobalrecord(id0) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedStclasstoglobalrecord(id0) => {
+                out[0] = (EntityKind::StringId, id0);
+                (out, 1)
+            }
+            _ => (out, 0),
+        }
+    }
+
     /// Entity operands in signature order, retaining their individual roles.
     /// Values are raw encoded operands, not resolved file offsets.
     pub fn entity_operands(&self) -> Vec<(EntityKind, EntityId)> {
-        match self {
-            Bytecode::Createarraywithbuffer(_, id1) => vec![(EntityKind::LiteralarrayId, *id1)],
-            Bytecode::Createobjectwithbuffer(_, id1) => vec![(EntityKind::LiteralarrayId, *id1)],
-            Bytecode::Definefunc(_, id1, _) => vec![(EntityKind::MethodId, *id1)],
-            Bytecode::Definemethod(_, id1, _) => vec![(EntityKind::MethodId, *id1)],
-            Bytecode::Defineclasswithbuffer(_, id1, id2, _, _) => vec![
-                (EntityKind::MethodId, *id1),
-                (EntityKind::LiteralarrayId, *id2),
-            ],
-            Bytecode::LdaStr(id0) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::Tryldglobalbyname(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Trystglobalbyname(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Ldglobalvar(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Ldobjbyname(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Stobjbyname(_, id1, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Ldsuperbyname(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Stconsttoglobalrecord(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Sttoglobalrecord(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Ldthisbyname(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Stthisbyname(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Createregexpwithliteral(_, id1, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Stownbyname(_, id1, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Stglobalvar(_, id1) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Stownbynamewithnameset(_, id1, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Newlexenvwithname(_, id1) => vec![(EntityKind::LiteralarrayId, *id1)],
-            Bytecode::Stsuperbyname(_, id1, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Ldbigint(id0) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::Definefieldbyname(_, id1, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Definepropertybyname(_, id1, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Callthis0withname(_, id1, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Callthis1withname(_, id1, _, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Callthis2withname(_, id1, _, _, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Callthis3withname(_, id1, _, _, _, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::Callthisrangewithname(_, _, id2, _) => vec![(EntityKind::StringId, *id2)],
-            Bytecode::WideNewlexenvwithname(_, id1) => vec![(EntityKind::LiteralarrayId, *id1)],
-            Bytecode::CallruntimeCreateprivateproperty(_, id1) => {
-                vec![(EntityKind::LiteralarrayId, *id1)]
+        let (arr, n) = self.entity_operands_inline();
+        arr[..n].to_vec()
+    }
+
+    /// Stack-allocated operands in ISA signature order (`(items, len)`),
+    /// avoiding heap allocation in hot loops.
+    #[inline]
+    pub const fn operands_inline(&self) -> ([Operand; Self::MAX_OPERANDS], usize) {
+        let mut out = [Operand::Imm(0); Self::MAX_OPERANDS];
+        match *self {
+            Bytecode::Createemptyarray(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
             }
-            Bytecode::CallruntimeDefinesendableclass(_, id1, id2, _, _) => vec![
-                (EntityKind::MethodId, *id1),
-                (EntityKind::LiteralarrayId, *id2),
-            ],
-            Bytecode::ThrowUndefinedifholewithname(id0) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::DeprecatedDefineclasswithbuffer(id0, _, _, _, _) => {
-                vec![(EntityKind::MethodId, *id0)]
+            Bytecode::Createarraywithbuffer(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::LiteralarrayId, a1.0);
+                (out, 2)
             }
-            Bytecode::WideCallthisrangewithname(_, id1, _) => vec![(EntityKind::StringId, *id1)],
-            Bytecode::DeprecatedGetmodulenamespace(id0) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::DeprecatedStmodulevar(id0) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::DeprecatedLdobjbyname(id0, _) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::DeprecatedLdsuperbyname(id0, _) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::DeprecatedLdmodulevar(id0, _) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::DeprecatedStconsttoglobalrecord(id0) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::DeprecatedStlettoglobalrecord(id0) => vec![(EntityKind::StringId, *id0)],
-            Bytecode::DeprecatedStclasstoglobalrecord(id0) => vec![(EntityKind::StringId, *id0)],
-            _ => Vec::new(),
+            Bytecode::Createobjectwithbuffer(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::LiteralarrayId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Newobjrange(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Newlexenv(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Add2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Sub2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Mul2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Div2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Mod2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Eq(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Noteq(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Less(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Lesseq(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Greater(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Greatereq(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Shl2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Shr2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Ashr2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::And2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Or2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Xor2(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Exp(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Typeof(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Tonumber(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Tonumeric(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Neg(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Not(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Inc(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Dec(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Isin(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Instanceof(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Strictnoteq(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Stricteq(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Callarg0(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Callarg1(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Callargs2(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Callargs3(a0, a1, a2, a3) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                (out, 4)
+            }
+            Bytecode::Callthis0(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Callthis1(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Callthis2(a0, a1, a2, a3) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                (out, 4)
+            }
+            Bytecode::Callthis3(a0, a1, a2, a3, a4) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                out[4] = Operand::Reg(a4.0);
+                (out, 5)
+            }
+            Bytecode::Callthisrange(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Supercallthisrange(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Definefunc(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::MethodId, a1.0);
+                out[2] = Operand::Imm(a2.0);
+                (out, 3)
+            }
+            Bytecode::Definemethod(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::MethodId, a1.0);
+                out[2] = Operand::Imm(a2.0);
+                (out, 3)
+            }
+            Bytecode::Defineclasswithbuffer(a0, a1, a2, a3, a4) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::MethodId, a1.0);
+                out[2] = Operand::Entity(EntityKind::LiteralarrayId, a2.0);
+                out[3] = Operand::Imm(a3.0);
+                out[4] = Operand::Reg(a4.0);
+                (out, 5)
+            }
+            Bytecode::Getnextpropname(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Ldobjbyvalue(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Stobjbyvalue(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Ldsuperbyvalue(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Ldobjbyindex(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::Stobjbyindex(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Imm(a2.0);
+                (out, 3)
+            }
+            Bytecode::Ldlexvar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::Stlexvar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::LdaStr(a0) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                (out, 1)
+            }
+            Bytecode::Tryldglobalbyname(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Trystglobalbyname(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Ldglobalvar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Ldobjbyname(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Stobjbyname(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Mov(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Ldsuperbyname(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Stconsttoglobalrecord(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Sttoglobalrecord(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Ldthisbyname(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Stthisbyname(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Ldthisbyvalue(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Stthisbyvalue(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Jmp(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jeqz(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jnez(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jstricteqz(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jnstricteqz(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jeqnull(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jnenull(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jstricteqnull(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jnstricteqnull(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jequndefined(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jneundefined(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jstrictequndefined(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jnstrictequndefined(a0) => {
+                out[0] = Operand::Label(a0.0);
+                (out, 1)
+            }
+            Bytecode::Jeq(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Label(a1.0);
+                (out, 2)
+            }
+            Bytecode::Jne(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Label(a1.0);
+                (out, 2)
+            }
+            Bytecode::Jstricteq(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Label(a1.0);
+                (out, 2)
+            }
+            Bytecode::Jnstricteq(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Label(a1.0);
+                (out, 2)
+            }
+            Bytecode::Lda(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Sta(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Ldai(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Fldai(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Getiterator(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Closeiterator(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Createregexpwithliteral(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Imm(a2.0);
+                (out, 3)
+            }
+            Bytecode::Callrange(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Gettemplateobject(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Setobjectwithproto(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Stownbyvalue(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Stownbyindex(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Imm(a2.0);
+                (out, 3)
+            }
+            Bytecode::Stownbyname(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Getmodulenamespace(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Stmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Ldlocalmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Ldexternalmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Stglobalvar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Stownbynamewithnameset(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Asyncgeneratorreject(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Stownbyvaluewithnameset(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Creategeneratorobj(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Createiterresultobj(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Createobjectwithexcludedkeys(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Newobjapply(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Newlexenvwithname(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::LiteralarrayId, a1.0);
+                (out, 2)
+            }
+            Bytecode::Createasyncgeneratorobj(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Asyncgeneratorresolve(a0, a1, a2) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Supercallspread(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Apply(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Supercallarrowrange(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Definegettersetterbyvalue(a0, a1, a2, a3) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                (out, 4)
+            }
+            Bytecode::Delobjprop(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Suspendgenerator(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Asyncfunctionawaituncaught(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Copydataproperties(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Starrayspread(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::Stsuperbyvalue(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Asyncfunctionresolve(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Asyncfunctionreject(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::Copyrestargs(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Stsuperbyname(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Ldbigint(a0) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                (out, 1)
+            }
+            Bytecode::Setgeneratorstate(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Getasynciterator(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::Ldprivateproperty(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Imm(a2.0);
+                (out, 3)
+            }
+            Bytecode::Stprivateproperty(a0, a1, a2, a3) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Imm(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                (out, 4)
+            }
+            Bytecode::Testin(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Imm(a2.0);
+                (out, 3)
+            }
+            Bytecode::Definefieldbyname(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Definepropertybyname(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Callthis0withname(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::Callthis1withname(a0, a1, a2, a3) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                (out, 4)
+            }
+            Bytecode::Callthis2withname(a0, a1, a2, a3, a4) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                out[4] = Operand::Reg(a4.0);
+                (out, 5)
+            }
+            Bytecode::Callthis3withname(a0, a1, a2, a3, a4, a5) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                out[4] = Operand::Reg(a4.0);
+                out[5] = Operand::Reg(a5.0);
+                (out, 6)
+            }
+            Bytecode::Callthisrangewithname(a0, a1, a2, a3) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Entity(EntityKind::StringId, a2.0);
+                out[3] = Operand::Reg(a3.0);
+                (out, 4)
+            }
+            Bytecode::WideCreateobjectwithexcludedkeys(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::CallruntimeDefinefieldbyvalue(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::WideNewobjrange(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeDefinefieldbyindex(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::DeprecatedGetiteratornext(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::WideNewlexenv(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedCreatearraywithbuffer(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideNewlexenvwithname(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::LiteralarrayId, a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeCreateprivateproperty(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::LiteralarrayId, a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedCreateobjectwithbuffer(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideCallrange(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::ThrowConstassignment(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeDefineprivateproperty(a0, a1, a2, a3) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Imm(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                (out, 4)
+            }
+            Bytecode::DeprecatedTonumber(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideCallthisrange(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::ThrowIfnotobject(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeCallinit(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedTonumeric(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideSupercallthisrange(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::ThrowUndefinedifhole(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeDefinesendableclass(a0, a1, a2, a3, a4) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::MethodId, a1.0);
+                out[2] = Operand::Entity(EntityKind::LiteralarrayId, a2.0);
+                out[3] = Operand::Imm(a3.0);
+                out[4] = Operand::Reg(a4.0);
+                (out, 5)
+            }
+            Bytecode::DeprecatedNeg(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideSupercallarrowrange(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::ThrowIfsupernotcorrectcall(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeLdsendableclass(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedNot(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideLdobjbyindex(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeLdsendableexternalmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedInc(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideStobjbyindex(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::ThrowUndefinedifholewithname(a0) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeWideldsendableexternalmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedDec(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideStownbyindex(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeNewsendableenv(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedCallarg0(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideCopyrestargs(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeWidenewsendableenv(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedCallarg1(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::WideLdlexvar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeStsendablevar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedCallargs2(a0, a1, a2) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::WideStlexvar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedCallargs3(a0, a1, a2, a3) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                (out, 4)
+            }
+            Bytecode::WideGetmodulenamespace(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeWidestsendablevar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedCallrange(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::WideStmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeLdsendablevar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedCallspread(a0, a1, a2) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::WideLdlocalmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedCallthisrange(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::WideLdexternalmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeWideldsendablevar(a0, a1) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedDefineclasswithbuffer(a0, a1, a2, a3, a4) => {
+                out[0] = Operand::Entity(EntityKind::MethodId, a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Imm(a2.0);
+                out[3] = Operand::Reg(a3.0);
+                out[4] = Operand::Reg(a4.0);
+                (out, 5)
+            }
+            Bytecode::WideLdpatchvar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeIstrue(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedResumegenerator(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideStpatchvar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeIsfalse(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedGetresumemode(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::WideCallthisrangewithname(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Entity(EntityKind::StringId, a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::CallruntimeLdlazymodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedGettemplateobject(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::CallruntimeWideldlazymodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedDelobjprop(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeLdlazysendablemodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedSuspendgenerator(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeWideldlazysendablemodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedAsyncfunctionawaituncaught(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeSupercallforwardallargs(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedCopydataproperties(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeLdsendablelocalmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedSetobjectwithproto(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::CallruntimeWideldsendablelocalmodulevar(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedLdobjbyvalue(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedLdsuperbyvalue(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedLdobjbyindex(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedAsyncfunctionresolve(a0, a1, a2) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::DeprecatedAsyncfunctionreject(a0, a1, a2) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::DeprecatedStlexvar(a0, a1, a2) => {
+                out[0] = Operand::Imm(a0.0);
+                out[1] = Operand::Imm(a1.0);
+                out[2] = Operand::Reg(a2.0);
+                (out, 3)
+            }
+            Bytecode::DeprecatedGetmodulenamespace(a0) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedStmodulevar(a0) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedLdobjbyname(a0, a1) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedLdsuperbyname(a0, a1) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedLdmodulevar(a0, a1) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                out[1] = Operand::Imm(a1.0);
+                (out, 2)
+            }
+            Bytecode::DeprecatedStconsttoglobalrecord(a0) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedStlettoglobalrecord(a0) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedStclasstoglobalrecord(a0) => {
+                out[0] = Operand::Entity(EntityKind::StringId, a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedCreateobjecthavingmethod(a0) => {
+                out[0] = Operand::Imm(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedDynamicimport(a0) => {
+                out[0] = Operand::Reg(a0.0);
+                (out, 1)
+            }
+            Bytecode::DeprecatedAsyncgeneratorreject(a0, a1) => {
+                out[0] = Operand::Reg(a0.0);
+                out[1] = Operand::Reg(a1.0);
+                (out, 2)
+            }
+            _ => (out, 0),
         }
     }
 
     /// All operands in ISA signature order, retaining per-operand roles.
     pub fn operands(&self) -> Vec<Operand> {
-        match self {
-            Bytecode::Createemptyarray(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Createarraywithbuffer(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::LiteralarrayId, a1.0),
-            ],
-            Bytecode::Createobjectwithbuffer(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::LiteralarrayId, a1.0),
-            ],
-            Bytecode::Newobjrange(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Newlexenv(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Add2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Sub2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Mul2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Div2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Mod2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Eq(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Noteq(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Less(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Lesseq(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Greater(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Greatereq(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Shl2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Shr2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Ashr2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::And2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Or2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Xor2(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Exp(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Typeof(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Tonumber(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Tonumeric(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Neg(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Not(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Inc(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Dec(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Isin(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Instanceof(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Strictnoteq(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Stricteq(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Callarg0(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Callarg1(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Callargs2(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Callargs3(a0, a1, a2, a3) => vec![
-                Operand::Imm(a0.0),
-                Operand::Reg(a1.0),
-                Operand::Reg(a2.0),
-                Operand::Reg(a3.0),
-            ],
-            Bytecode::Callthis0(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Callthis1(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Callthis2(a0, a1, a2, a3) => vec![
-                Operand::Imm(a0.0),
-                Operand::Reg(a1.0),
-                Operand::Reg(a2.0),
-                Operand::Reg(a3.0),
-            ],
-            Bytecode::Callthis3(a0, a1, a2, a3, a4) => vec![
-                Operand::Imm(a0.0),
-                Operand::Reg(a1.0),
-                Operand::Reg(a2.0),
-                Operand::Reg(a3.0),
-                Operand::Reg(a4.0),
-            ],
-            Bytecode::Callthisrange(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Supercallthisrange(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Definefunc(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::MethodId, a1.0),
-                Operand::Imm(a2.0),
-            ],
-            Bytecode::Definemethod(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::MethodId, a1.0),
-                Operand::Imm(a2.0),
-            ],
-            Bytecode::Defineclasswithbuffer(a0, a1, a2, a3, a4) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::MethodId, a1.0),
-                Operand::Entity(EntityKind::LiteralarrayId, a2.0),
-                Operand::Imm(a3.0),
-                Operand::Reg(a4.0),
-            ],
-            Bytecode::Getnextpropname(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Ldobjbyvalue(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Stobjbyvalue(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Ldsuperbyvalue(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Ldobjbyindex(a0, a1) => vec![Operand::Imm(a0.0), Operand::Imm(a1.0)],
-            Bytecode::Stobjbyindex(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Imm(a2.0)]
-            }
-            Bytecode::Ldlexvar(a0, a1) => vec![Operand::Imm(a0.0), Operand::Imm(a1.0)],
-            Bytecode::Stlexvar(a0, a1) => vec![Operand::Imm(a0.0), Operand::Imm(a1.0)],
-            Bytecode::LdaStr(a0) => vec![Operand::Entity(EntityKind::StringId, a0.0)],
-            Bytecode::Tryldglobalbyname(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Trystglobalbyname(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Ldglobalvar(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Ldobjbyname(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Stobjbyname(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-            ],
-            Bytecode::Mov(a0, a1) => vec![Operand::Reg(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Ldsuperbyname(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Stconsttoglobalrecord(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Sttoglobalrecord(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Ldthisbyname(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Stthisbyname(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Ldthisbyvalue(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Stthisbyvalue(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Jmp(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jeqz(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jnez(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jstricteqz(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jnstricteqz(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jeqnull(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jnenull(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jstricteqnull(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jnstricteqnull(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jequndefined(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jneundefined(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jstrictequndefined(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jnstrictequndefined(a0) => vec![Operand::Label(a0.0)],
-            Bytecode::Jeq(a0, a1) => vec![Operand::Reg(a0.0), Operand::Label(a1.0)],
-            Bytecode::Jne(a0, a1) => vec![Operand::Reg(a0.0), Operand::Label(a1.0)],
-            Bytecode::Jstricteq(a0, a1) => vec![Operand::Reg(a0.0), Operand::Label(a1.0)],
-            Bytecode::Jnstricteq(a0, a1) => vec![Operand::Reg(a0.0), Operand::Label(a1.0)],
-            Bytecode::Lda(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Sta(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Ldai(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Fldai(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Getiterator(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Closeiterator(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Createregexpwithliteral(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Imm(a2.0),
-            ],
-            Bytecode::Callrange(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Gettemplateobject(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Setobjectwithproto(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Stownbyvalue(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Stownbyindex(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Imm(a2.0)]
-            }
-            Bytecode::Stownbyname(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-            ],
-            Bytecode::Getmodulenamespace(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Stmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Ldlocalmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Ldexternalmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Stglobalvar(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-            ],
-            Bytecode::Stownbynamewithnameset(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-            ],
-            Bytecode::Asyncgeneratorreject(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Stownbyvaluewithnameset(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Creategeneratorobj(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Createiterresultobj(a0, a1) => vec![Operand::Reg(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Createobjectwithexcludedkeys(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Newobjapply(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Newlexenvwithname(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::LiteralarrayId, a1.0),
-            ],
-            Bytecode::Createasyncgeneratorobj(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Asyncgeneratorresolve(a0, a1, a2) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Supercallspread(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Apply(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Supercallarrowrange(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Definegettersetterbyvalue(a0, a1, a2, a3) => vec![
-                Operand::Reg(a0.0),
-                Operand::Reg(a1.0),
-                Operand::Reg(a2.0),
-                Operand::Reg(a3.0),
-            ],
-            Bytecode::Delobjprop(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Suspendgenerator(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Asyncfunctionawaituncaught(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Copydataproperties(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Starrayspread(a0, a1) => vec![Operand::Reg(a0.0), Operand::Reg(a1.0)],
-            Bytecode::Stsuperbyvalue(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::Asyncfunctionresolve(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Asyncfunctionreject(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::Copyrestargs(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Stsuperbyname(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-            ],
-            Bytecode::Ldbigint(a0) => vec![Operand::Entity(EntityKind::StringId, a0.0)],
-            Bytecode::Setgeneratorstate(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Getasynciterator(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::Ldprivateproperty(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0), Operand::Imm(a2.0)]
-            }
-            Bytecode::Stprivateproperty(a0, a1, a2, a3) => vec![
-                Operand::Imm(a0.0),
-                Operand::Imm(a1.0),
-                Operand::Imm(a2.0),
-                Operand::Reg(a3.0),
-            ],
-            Bytecode::Testin(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0), Operand::Imm(a2.0)]
-            }
-            Bytecode::Definefieldbyname(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-            ],
-            Bytecode::Definepropertybyname(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-            ],
-            Bytecode::Callthis0withname(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-            ],
-            Bytecode::Callthis1withname(a0, a1, a2, a3) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-                Operand::Reg(a3.0),
-            ],
-            Bytecode::Callthis2withname(a0, a1, a2, a3, a4) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-                Operand::Reg(a3.0),
-                Operand::Reg(a4.0),
-            ],
-            Bytecode::Callthis3withname(a0, a1, a2, a3, a4, a5) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-                Operand::Reg(a3.0),
-                Operand::Reg(a4.0),
-                Operand::Reg(a5.0),
-            ],
-            Bytecode::Callthisrangewithname(a0, a1, a2, a3) => vec![
-                Operand::Imm(a0.0),
-                Operand::Imm(a1.0),
-                Operand::Entity(EntityKind::StringId, a2.0),
-                Operand::Reg(a3.0),
-            ],
-            Bytecode::WideCreateobjectwithexcludedkeys(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::CallruntimeDefinefieldbyvalue(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::WideNewobjrange(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::CallruntimeDefinefieldbyindex(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::DeprecatedGetiteratornext(a0, a1) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::WideNewlexenv(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedCreatearraywithbuffer(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::WideNewlexenvwithname(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::LiteralarrayId, a1.0),
-            ],
-            Bytecode::CallruntimeCreateprivateproperty(a0, a1) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::LiteralarrayId, a1.0),
-            ],
-            Bytecode::DeprecatedCreateobjectwithbuffer(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::WideCallrange(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::ThrowConstassignment(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::CallruntimeDefineprivateproperty(a0, a1, a2, a3) => vec![
-                Operand::Imm(a0.0),
-                Operand::Imm(a1.0),
-                Operand::Imm(a2.0),
-                Operand::Reg(a3.0),
-            ],
-            Bytecode::DeprecatedTonumber(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::WideCallthisrange(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::ThrowIfnotobject(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::CallruntimeCallinit(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::DeprecatedTonumeric(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::WideSupercallthisrange(a0, a1) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::ThrowUndefinedifhole(a0, a1) => vec![Operand::Reg(a0.0), Operand::Reg(a1.0)],
-            Bytecode::CallruntimeDefinesendableclass(a0, a1, a2, a3, a4) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::MethodId, a1.0),
-                Operand::Entity(EntityKind::LiteralarrayId, a2.0),
-                Operand::Imm(a3.0),
-                Operand::Reg(a4.0),
-            ],
-            Bytecode::DeprecatedNeg(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::WideSupercallarrowrange(a0, a1) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::ThrowIfsupernotcorrectcall(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::CallruntimeLdsendableclass(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedNot(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::WideLdobjbyindex(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::CallruntimeLdsendableexternalmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedInc(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::WideStobjbyindex(a0, a1) => vec![Operand::Reg(a0.0), Operand::Imm(a1.0)],
-            Bytecode::ThrowUndefinedifholewithname(a0) => {
-                vec![Operand::Entity(EntityKind::StringId, a0.0)]
-            }
-            Bytecode::CallruntimeWideldsendableexternalmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedDec(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::WideStownbyindex(a0, a1) => vec![Operand::Reg(a0.0), Operand::Imm(a1.0)],
-            Bytecode::CallruntimeNewsendableenv(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedCallarg0(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::WideCopyrestargs(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::CallruntimeWidenewsendableenv(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedCallarg1(a0, a1) => vec![Operand::Reg(a0.0), Operand::Reg(a1.0)],
-            Bytecode::WideLdlexvar(a0, a1) => vec![Operand::Imm(a0.0), Operand::Imm(a1.0)],
-            Bytecode::CallruntimeStsendablevar(a0, a1) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0)]
-            }
-            Bytecode::DeprecatedCallargs2(a0, a1, a2) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::WideStlexvar(a0, a1) => vec![Operand::Imm(a0.0), Operand::Imm(a1.0)],
-            Bytecode::DeprecatedCallargs3(a0, a1, a2, a3) => vec![
-                Operand::Reg(a0.0),
-                Operand::Reg(a1.0),
-                Operand::Reg(a2.0),
-                Operand::Reg(a3.0),
-            ],
-            Bytecode::WideGetmodulenamespace(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::CallruntimeWidestsendablevar(a0, a1) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0)]
-            }
-            Bytecode::DeprecatedCallrange(a0, a1) => vec![Operand::Imm(a0.0), Operand::Reg(a1.0)],
-            Bytecode::WideStmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::CallruntimeLdsendablevar(a0, a1) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0)]
-            }
-            Bytecode::DeprecatedCallspread(a0, a1, a2) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::WideLdlocalmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedCallthisrange(a0, a1) => {
-                vec![Operand::Imm(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::WideLdexternalmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::CallruntimeWideldsendablevar(a0, a1) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0)]
-            }
-            Bytecode::DeprecatedDefineclasswithbuffer(a0, a1, a2, a3, a4) => vec![
-                Operand::Entity(EntityKind::MethodId, a0.0),
-                Operand::Imm(a1.0),
-                Operand::Imm(a2.0),
-                Operand::Reg(a3.0),
-                Operand::Reg(a4.0),
-            ],
-            Bytecode::WideLdpatchvar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::CallruntimeIstrue(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedResumegenerator(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::WideStpatchvar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::CallruntimeIsfalse(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedGetresumemode(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::WideCallthisrangewithname(a0, a1, a2) => vec![
-                Operand::Imm(a0.0),
-                Operand::Entity(EntityKind::StringId, a1.0),
-                Operand::Reg(a2.0),
-            ],
-            Bytecode::CallruntimeLdlazymodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedGettemplateobject(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::CallruntimeWideldlazymodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedDelobjprop(a0, a1) => vec![Operand::Reg(a0.0), Operand::Reg(a1.0)],
-            Bytecode::CallruntimeLdlazysendablemodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedSuspendgenerator(a0, a1) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::CallruntimeWideldlazysendablemodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedAsyncfunctionawaituncaught(a0, a1) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::CallruntimeSupercallforwardallargs(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::DeprecatedCopydataproperties(a0, a1) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::CallruntimeLdsendablelocalmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedSetobjectwithproto(a0, a1) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::CallruntimeWideldsendablelocalmodulevar(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedLdobjbyvalue(a0, a1) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::DeprecatedLdsuperbyvalue(a0, a1) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0)]
-            }
-            Bytecode::DeprecatedLdobjbyindex(a0, a1) => {
-                vec![Operand::Reg(a0.0), Operand::Imm(a1.0)]
-            }
-            Bytecode::DeprecatedAsyncfunctionresolve(a0, a1, a2) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::DeprecatedAsyncfunctionreject(a0, a1, a2) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::DeprecatedStlexvar(a0, a1, a2) => {
-                vec![Operand::Imm(a0.0), Operand::Imm(a1.0), Operand::Reg(a2.0)]
-            }
-            Bytecode::DeprecatedGetmodulenamespace(a0) => {
-                vec![Operand::Entity(EntityKind::StringId, a0.0)]
-            }
-            Bytecode::DeprecatedStmodulevar(a0) => {
-                vec![Operand::Entity(EntityKind::StringId, a0.0)]
-            }
-            Bytecode::DeprecatedLdobjbyname(a0, a1) => vec![
-                Operand::Entity(EntityKind::StringId, a0.0),
-                Operand::Reg(a1.0),
-            ],
-            Bytecode::DeprecatedLdsuperbyname(a0, a1) => vec![
-                Operand::Entity(EntityKind::StringId, a0.0),
-                Operand::Reg(a1.0),
-            ],
-            Bytecode::DeprecatedLdmodulevar(a0, a1) => vec![
-                Operand::Entity(EntityKind::StringId, a0.0),
-                Operand::Imm(a1.0),
-            ],
-            Bytecode::DeprecatedStconsttoglobalrecord(a0) => {
-                vec![Operand::Entity(EntityKind::StringId, a0.0)]
-            }
-            Bytecode::DeprecatedStlettoglobalrecord(a0) => {
-                vec![Operand::Entity(EntityKind::StringId, a0.0)]
-            }
-            Bytecode::DeprecatedStclasstoglobalrecord(a0) => {
-                vec![Operand::Entity(EntityKind::StringId, a0.0)]
-            }
-            Bytecode::DeprecatedCreateobjecthavingmethod(a0) => vec![Operand::Imm(a0.0)],
-            Bytecode::DeprecatedDynamicimport(a0) => vec![Operand::Reg(a0.0)],
-            Bytecode::DeprecatedAsyncgeneratorreject(a0, a1) => {
-                vec![Operand::Reg(a0.0), Operand::Reg(a1.0)]
-            }
-            _ => Vec::new(),
-        }
+        let (arr, n) = self.operands_inline();
+        arr[..n].to_vec()
     }
 
     /// Representative opcode for this mnemonic (largest format).
     ///
-    /// Used internally for FFI classification calls and emitter dispatch.
+    /// Used internally for FFI differential checks and emitter dispatch.
     /// All opcodes in a mnemonic group share the same properties, so the
     /// specific value does not matter.
-    fn representative_opcode(&self) -> u16 {
+    #[inline]
+    pub const fn representative_opcode(&self) -> u16 {
         match self {
             Bytecode::Ldundefined => 0,
             Bytecode::Ldnull => 1,
@@ -1550,7 +2399,8 @@ impl Bytecode {
     }
 
     /// Mnemonic name (e.g. `"mov"`, `"jmp"`).
-    pub fn mnemonic(&self) -> &'static str {
+    #[inline]
+    pub const fn mnemonic(&self) -> &'static str {
         match self {
             Bytecode::Ldundefined => "ldundefined",
             Bytecode::Ldnull => "ldnull",
@@ -1841,61 +2691,644 @@ impl Bytecode {
         }
     }
 
-    // === Classification (delegates to opcode-based C FFI) ===
+    // === Pure-Rust Classification (zero FFI) ===
+
+    /// Full ISA property bitmask for this instruction.
+    #[inline]
+    pub const fn flags(&self) -> BytecodeFlags {
+        let bits = match self {
+            Bytecode::Ldundefined => 0x24000000,
+            Bytecode::Ldnull => 0x24000000,
+            Bytecode::Ldtrue => 0x24000000,
+            Bytecode::Ldfalse => 0x24000000,
+            Bytecode::Createemptyobject => 0x20000000,
+            Bytecode::Createemptyarray(..) => 0x20450000,
+            Bytecode::Createarraywithbuffer(..) => 0x20450008,
+            Bytecode::Createobjectwithbuffer(..) => 0x20450008,
+            Bytecode::Newobjrange(..) => 0x21490000,
+            Bytecode::Newlexenv(..) => 0x20000000,
+            Bytecode::Add2(..) => 0x30160000,
+            Bytecode::Sub2(..) => 0x30160000,
+            Bytecode::Mul2(..) => 0x30160000,
+            Bytecode::Div2(..) => 0x30160000,
+            Bytecode::Mod2(..) => 0x30160000,
+            Bytecode::Eq(..) => 0x30160000,
+            Bytecode::Noteq(..) => 0x30160000,
+            Bytecode::Less(..) => 0x30160000,
+            Bytecode::Lesseq(..) => 0x30160000,
+            Bytecode::Greater(..) => 0x30160000,
+            Bytecode::Greatereq(..) => 0x30160000,
+            Bytecode::Shl2(..) => 0x30160000,
+            Bytecode::Shr2(..) => 0x30160000,
+            Bytecode::Ashr2(..) => 0x30160000,
+            Bytecode::And2(..) => 0x30160000,
+            Bytecode::Or2(..) => 0x30160000,
+            Bytecode::Xor2(..) => 0x30160000,
+            Bytecode::Exp(..) => 0x30160000,
+            Bytecode::Typeof(..) => 0x30290000,
+            Bytecode::Tonumber(..) => 0x30160000,
+            Bytecode::Tonumeric(..) => 0x30160000,
+            Bytecode::Neg(..) => 0x30160000,
+            Bytecode::Not(..) => 0x30160000,
+            Bytecode::Inc(..) => 0x30160000,
+            Bytecode::Dec(..) => 0x30160000,
+            Bytecode::Istrue => 0x30000000,
+            Bytecode::Isfalse => 0x30000000,
+            Bytecode::Isin(..) => 0x30160000,
+            Bytecode::Instanceof(..) => 0x301a0000,
+            Bytecode::Strictnoteq(..) => 0x30160000,
+            Bytecode::Stricteq(..) => 0x30160000,
+            Bytecode::Callarg0(..) => 0x301a0000,
+            Bytecode::Callarg1(..) => 0x301a0000,
+            Bytecode::Callargs2(..) => 0x301a0000,
+            Bytecode::Callargs3(..) => 0x301a0000,
+            Bytecode::Callthis0(..) => 0x301a0000,
+            Bytecode::Callthis1(..) => 0x301a0000,
+            Bytecode::Callthis2(..) => 0x301a0000,
+            Bytecode::Callthis3(..) => 0x301a0000,
+            Bytecode::Callthisrange(..) => 0x311a0000,
+            Bytecode::Supercallthisrange(..) => 0x211a0000,
+            Bytecode::Definefunc(..) => 0x20450002,
+            Bytecode::Definemethod(..) => 0x30450002,
+            Bytecode::Defineclasswithbuffer(..) => 0x2045000a,
+            Bytecode::Getnextpropname(..) => 0x20000000,
+            Bytecode::Ldobjbyvalue(..) => 0x30490000,
+            Bytecode::Stobjbyvalue(..) => 0x10490000,
+            Bytecode::Ldsuperbyvalue(..) => 0x30490000,
+            Bytecode::Ldobjbyindex(..) => 0x30490000,
+            Bytecode::Stobjbyindex(..) => 0x10490000,
+            Bytecode::Ldlexvar(..) => 0x20000000,
+            Bytecode::Stlexvar(..) => 0x10000000,
+            Bytecode::LdaStr(..) => 0x20006004,
+            Bytecode::Tryldglobalbyname(..) => 0x20450004,
+            Bytecode::Trystglobalbyname(..) => 0x10450004,
+            Bytecode::Ldglobalvar(..) => 0x20250004,
+            Bytecode::Ldobjbyname(..) => 0x30490004,
+            Bytecode::Stobjbyname(..) => 0x10490004,
+            Bytecode::Mov(..) => 0x8001000,
+            Bytecode::Ldsuperbyname(..) => 0x30490004,
+            Bytecode::Stconsttoglobalrecord(..) => 0x10250004,
+            Bytecode::Sttoglobalrecord(..) => 0x10250004,
+            Bytecode::Ldthisbyname(..) => 0x20490004,
+            Bytecode::Stthisbyname(..) => 0x10490004,
+            Bytecode::Ldthisbyvalue(..) => 0x30490000,
+            Bytecode::Stthisbyvalue(..) => 0x10490000,
+            Bytecode::Jmp(..) => 0x8000200,
+            Bytecode::Jeqz(..) => 0x10000600,
+            Bytecode::Jnez(..) => 0x10000600,
+            Bytecode::Jstricteqz(..) => 0x10000600,
+            Bytecode::Jnstricteqz(..) => 0x10000600,
+            Bytecode::Jeqnull(..) => 0x10000600,
+            Bytecode::Jnenull(..) => 0x10000600,
+            Bytecode::Jstricteqnull(..) => 0x10000600,
+            Bytecode::Jnstricteqnull(..) => 0x10000600,
+            Bytecode::Jequndefined(..) => 0x10000600,
+            Bytecode::Jneundefined(..) => 0x10000600,
+            Bytecode::Jstrictequndefined(..) => 0x10000600,
+            Bytecode::Jnstrictequndefined(..) => 0x10000600,
+            Bytecode::Jeq(..) => 0x10000600,
+            Bytecode::Jne(..) => 0x10000600,
+            Bytecode::Jstricteq(..) => 0x10000600,
+            Bytecode::Jnstricteq(..) => 0x10000600,
+            Bytecode::Lda(..) => 0x20001000,
+            Bytecode::Sta(..) => 0x10001000,
+            Bytecode::Ldai(..) => 0x20001000,
+            Bytecode::Fldai(..) => 0x20001800,
+            Bytecode::Return => 0x10001080,
+            Bytecode::Returnundefined => 0x8001080,
+            Bytecode::Getpropiterator => 0x30000000,
+            Bytecode::Getiterator(..) => 0x30490000,
+            Bytecode::Closeiterator(..) => 0x20490000,
+            Bytecode::Poplexenv => 0x8000000,
+            Bytecode::Ldnan => 0x24000000,
+            Bytecode::Ldinfinity => 0x24000000,
+            Bytecode::Getunmappedargs => 0x20000000,
+            Bytecode::Ldglobal => 0x20000000,
+            Bytecode::Ldnewtarget => 0x20000000,
+            Bytecode::Ldthis => 0x20000000,
+            Bytecode::Ldhole => 0x24000000,
+            Bytecode::Createregexpwithliteral(..) => 0x20490004,
+            Bytecode::Callrange(..) => 0x311a0000,
+            Bytecode::Gettemplateobject(..) => 0x30450000,
+            Bytecode::Setobjectwithproto(..) => 0x10490000,
+            Bytecode::Stownbyvalue(..) => 0x10490000,
+            Bytecode::Stownbyindex(..) => 0x10490000,
+            Bytecode::Stownbyname(..) => 0x10490004,
+            Bytecode::Getmodulenamespace(..) => 0x20000000,
+            Bytecode::Stmodulevar(..) => 0x10000000,
+            Bytecode::Ldlocalmodulevar(..) => 0x20000000,
+            Bytecode::Ldexternalmodulevar(..) => 0x20000000,
+            Bytecode::Stglobalvar(..) => 0x10250004,
+            Bytecode::Stownbynamewithnameset(..) => 0x10490004,
+            Bytecode::Asyncgeneratorreject(..) => 0x30000000,
+            Bytecode::Stownbyvaluewithnameset(..) => 0x10490000,
+            Bytecode::Ldsymbol => 0x20000000,
+            Bytecode::Asyncfunctionenter => 0x20000000,
+            Bytecode::Ldfunction => 0x20000000,
+            Bytecode::Debugger => 0x8000000,
+            Bytecode::Creategeneratorobj(..) => 0x20000000,
+            Bytecode::Createiterresultobj(..) => 0x20000000,
+            Bytecode::Createobjectwithexcludedkeys(..) => 0x22000000,
+            Bytecode::Newobjapply(..) => 0x30490000,
+            Bytecode::Newlexenvwithname(..) => 0x20000008,
+            Bytecode::Createasyncgeneratorobj(..) => 0x20000000,
+            Bytecode::Asyncgeneratorresolve(..) => 0x20000000,
+            Bytecode::Supercallspread(..) => 0x301a0000,
+            Bytecode::Apply(..) => 0x301a0000,
+            Bytecode::Supercallarrowrange(..) => 0x311a0000,
+            Bytecode::Definegettersetterbyvalue(..) => 0x30000000,
+            Bytecode::Dynamicimport => 0x30000000,
+            Bytecode::Resumegenerator => 0x30000000,
+            Bytecode::Getresumemode => 0x30000000,
+            Bytecode::Delobjprop(..) => 0x30000000,
+            Bytecode::Suspendgenerator(..) => 0x30000000,
+            Bytecode::Asyncfunctionawaituncaught(..) => 0x30000000,
+            Bytecode::Copydataproperties(..) => 0x30000000,
+            Bytecode::Starrayspread(..) => 0x30000000,
+            Bytecode::Stsuperbyvalue(..) => 0x10490000,
+            Bytecode::Asyncfunctionresolve(..) => 0x30000000,
+            Bytecode::Asyncfunctionreject(..) => 0x30000000,
+            Bytecode::Copyrestargs(..) => 0x20000000,
+            Bytecode::Stsuperbyname(..) => 0x10490004,
+            Bytecode::Ldbigint(..) => 0x20000004,
+            Bytecode::Nop => 0x8000000,
+            Bytecode::Setgeneratorstate(..) => 0x10000000,
+            Bytecode::Getasynciterator(..) => 0x30190000,
+            Bytecode::Ldprivateproperty(..) => 0x30190000,
+            Bytecode::Stprivateproperty(..) => 0x10190000,
+            Bytecode::Testin(..) => 0x30190000,
+            Bytecode::Definefieldbyname(..) => 0x10190004,
+            Bytecode::Definepropertybyname(..) => 0x10190004,
+            Bytecode::Callthis0withname(..) => 0x301a0004,
+            Bytecode::Callthis1withname(..) => 0x301a0004,
+            Bytecode::Callthis2withname(..) => 0x301a0004,
+            Bytecode::Callthis3withname(..) => 0x301a0004,
+            Bytecode::Callthisrangewithname(..) => 0x311a0004,
+            Bytecode::CallruntimeNotifyconcurrentresult => 0x10000000,
+            Bytecode::DeprecatedLdlexenv => 0x20000000,
+            Bytecode::WideCreateobjectwithexcludedkeys(..) => 0x22000000,
+            Bytecode::Throw => 0x10000000,
+            Bytecode::CallruntimeDefinefieldbyvalue(..) => 0x10190000,
+            Bytecode::DeprecatedPoplexenv => 0x20000000,
+            Bytecode::WideNewobjrange(..) => 0x21000000,
+            Bytecode::ThrowNotexists => 0x8000000,
+            Bytecode::CallruntimeDefinefieldbyindex(..) => 0x10190000,
+            Bytecode::DeprecatedGetiteratornext(..) => 0x20000000,
+            Bytecode::WideNewlexenv(..) => 0x20000000,
+            Bytecode::ThrowPatternnoncoercible => 0x8000000,
+            Bytecode::CallruntimeTopropertykey => 0x30000000,
+            Bytecode::DeprecatedCreatearraywithbuffer(..) => 0x20000000,
+            Bytecode::WideNewlexenvwithname(..) => 0x20000008,
+            Bytecode::ThrowDeletesuperproperty => 0x8000000,
+            Bytecode::CallruntimeCreateprivateproperty(..) => 0x8000008,
+            Bytecode::DeprecatedCreateobjectwithbuffer(..) => 0x20000000,
+            Bytecode::WideCallrange(..) => 0x31000000,
+            Bytecode::ThrowConstassignment(..) => 0x8000000,
+            Bytecode::CallruntimeDefineprivateproperty(..) => 0x10190000,
+            Bytecode::DeprecatedTonumber(..) => 0x30000000,
+            Bytecode::WideCallthisrange(..) => 0x32000000,
+            Bytecode::ThrowIfnotobject(..) => 0x8800000,
+            Bytecode::CallruntimeCallinit(..) => 0x101a0000,
+            Bytecode::DeprecatedTonumeric(..) => 0x30000000,
+            Bytecode::WideSupercallthisrange(..) => 0x21000000,
+            Bytecode::ThrowUndefinedifhole(..) => 0x8800000,
+            Bytecode::CallruntimeDefinesendableclass(..) => 0x2025000a,
+            Bytecode::DeprecatedNeg(..) => 0x20000000,
+            Bytecode::WideSupercallarrowrange(..) => 0x31000000,
+            Bytecode::ThrowIfsupernotcorrectcall(..) => 0x10800000,
+            Bytecode::CallruntimeLdsendableclass(..) => 0x20000000,
+            Bytecode::DeprecatedNot(..) => 0x20000000,
+            Bytecode::WideLdobjbyindex(..) => 0x30000000,
+            Bytecode::CallruntimeLdsendableexternalmodulevar(..) => 0x20000000,
+            Bytecode::DeprecatedInc(..) => 0x20000000,
+            Bytecode::WideStobjbyindex(..) => 0x10000000,
+            Bytecode::ThrowUndefinedifholewithname(..) => 0x10800004,
+            Bytecode::CallruntimeWideldsendableexternalmodulevar(..) => 0x20000000,
+            Bytecode::DeprecatedDec(..) => 0x20000000,
+            Bytecode::WideStownbyindex(..) => 0x10000000,
+            Bytecode::CallruntimeNewsendableenv(..) => 0x8000000,
+            Bytecode::DeprecatedCallarg0(..) => 0x20000000,
+            Bytecode::WideCopyrestargs(..) => 0x20000000,
+            Bytecode::CallruntimeWidenewsendableenv(..) => 0x8000000,
+            Bytecode::DeprecatedCallarg1(..) => 0x20000000,
+            Bytecode::WideLdlexvar(..) => 0x20000000,
+            Bytecode::CallruntimeStsendablevar(..) => 0x10000000,
+            Bytecode::DeprecatedCallargs2(..) => 0x20000000,
+            Bytecode::WideStlexvar(..) => 0x10000000,
+            Bytecode::DeprecatedCallargs3(..) => 0x20000000,
+            Bytecode::WideGetmodulenamespace(..) => 0x20000000,
+            Bytecode::CallruntimeWidestsendablevar(..) => 0x10000000,
+            Bytecode::DeprecatedCallrange(..) => 0x21000000,
+            Bytecode::WideStmodulevar(..) => 0x10000000,
+            Bytecode::CallruntimeLdsendablevar(..) => 0x20000000,
+            Bytecode::DeprecatedCallspread(..) => 0x20000000,
+            Bytecode::WideLdlocalmodulevar(..) => 0x20000000,
+            Bytecode::DeprecatedCallthisrange(..) => 0x22000000,
+            Bytecode::WideLdexternalmodulevar(..) => 0x20000000,
+            Bytecode::CallruntimeWideldsendablevar(..) => 0x20000000,
+            Bytecode::DeprecatedDefineclasswithbuffer(..) => 0x20000002,
+            Bytecode::WideLdpatchvar(..) => 0x20000000,
+            Bytecode::CallruntimeIstrue(..) => 0x30150000,
+            Bytecode::DeprecatedResumegenerator(..) => 0x20000000,
+            Bytecode::WideStpatchvar(..) => 0x10000000,
+            Bytecode::CallruntimeIsfalse(..) => 0x30150000,
+            Bytecode::DeprecatedGetresumemode(..) => 0x20000000,
+            Bytecode::WideCallthisrangewithname(..) => 0x32000004,
+            Bytecode::CallruntimeLdlazymodulevar(..) => 0x20000000,
+            Bytecode::DeprecatedGettemplateobject(..) => 0x30000000,
+            Bytecode::CallruntimeWideldlazymodulevar(..) => 0x20000000,
+            Bytecode::DeprecatedDelobjprop(..) => 0x20000000,
+            Bytecode::CallruntimeLdlazysendablemodulevar(..) => 0x20000000,
+            Bytecode::DeprecatedSuspendgenerator(..) => 0x20000000,
+            Bytecode::CallruntimeWideldlazysendablemodulevar(..) => 0x20000000,
+            Bytecode::DeprecatedAsyncfunctionawaituncaught(..) => 0x20000000,
+            Bytecode::CallruntimeSupercallforwardallargs(..) => 0x20000000,
+            Bytecode::DeprecatedCopydataproperties(..) => 0x20000000,
+            Bytecode::CallruntimeLdsendablelocalmodulevar(..) => 0x20000000,
+            Bytecode::DeprecatedSetobjectwithproto(..) => 0x8000000,
+            Bytecode::CallruntimeWideldsendablelocalmodulevar(..) => 0x20000000,
+            Bytecode::DeprecatedLdobjbyvalue(..) => 0x20000000,
+            Bytecode::DeprecatedLdsuperbyvalue(..) => 0x20000000,
+            Bytecode::DeprecatedLdobjbyindex(..) => 0x20000000,
+            Bytecode::DeprecatedAsyncfunctionresolve(..) => 0x20000000,
+            Bytecode::DeprecatedAsyncfunctionreject(..) => 0x20000000,
+            Bytecode::DeprecatedStlexvar(..) => 0x8000000,
+            Bytecode::DeprecatedGetmodulenamespace(..) => 0x20000004,
+            Bytecode::DeprecatedStmodulevar(..) => 0x10000004,
+            Bytecode::DeprecatedLdobjbyname(..) => 0x20000004,
+            Bytecode::DeprecatedLdsuperbyname(..) => 0x20000004,
+            Bytecode::DeprecatedLdmodulevar(..) => 0x20000004,
+            Bytecode::DeprecatedStconsttoglobalrecord(..) => 0x10000004,
+            Bytecode::DeprecatedStlettoglobalrecord(..) => 0x10000004,
+            Bytecode::DeprecatedStclasstoglobalrecord(..) => 0x10000004,
+            Bytecode::DeprecatedLdhomeobject => 0x20000000,
+            Bytecode::DeprecatedCreateobjecthavingmethod(..) => 0x30000000,
+            Bytecode::DeprecatedDynamicimport(..) => 0x20000000,
+            Bytecode::DeprecatedAsyncgeneratorreject(..) => 0x20000000,
+        };
+        BytecodeFlags::from_bits_retain(bits)
+    }
+
+    /// Full ISA exception bitmask for this instruction.
+    #[inline]
+    pub const fn exception_mask(&self) -> ExceptionType {
+        let bits = match self {
+            Bytecode::Ldundefined => 0x1,
+            Bytecode::Ldnull => 0x1,
+            Bytecode::Ldtrue => 0x1,
+            Bytecode::Ldfalse => 0x1,
+            Bytecode::Createemptyobject => 0x1,
+            Bytecode::Createemptyarray(..) => 0x1,
+            Bytecode::Createarraywithbuffer(..) => 0x1,
+            Bytecode::Createobjectwithbuffer(..) => 0x1,
+            Bytecode::Newobjrange(..) => 0x1,
+            Bytecode::Newlexenv(..) => 0x1,
+            Bytecode::Add2(..) => 0x1,
+            Bytecode::Sub2(..) => 0x1,
+            Bytecode::Mul2(..) => 0x1,
+            Bytecode::Div2(..) => 0x1,
+            Bytecode::Mod2(..) => 0x1,
+            Bytecode::Eq(..) => 0x1,
+            Bytecode::Noteq(..) => 0x1,
+            Bytecode::Less(..) => 0x1,
+            Bytecode::Lesseq(..) => 0x1,
+            Bytecode::Greater(..) => 0x1,
+            Bytecode::Greatereq(..) => 0x1,
+            Bytecode::Shl2(..) => 0x1,
+            Bytecode::Shr2(..) => 0x1,
+            Bytecode::Ashr2(..) => 0x1,
+            Bytecode::And2(..) => 0x1,
+            Bytecode::Or2(..) => 0x1,
+            Bytecode::Xor2(..) => 0x1,
+            Bytecode::Exp(..) => 0x1,
+            Bytecode::Typeof(..) => 0x1,
+            Bytecode::Tonumber(..) => 0x1,
+            Bytecode::Tonumeric(..) => 0x1,
+            Bytecode::Neg(..) => 0x1,
+            Bytecode::Not(..) => 0x1,
+            Bytecode::Inc(..) => 0x1,
+            Bytecode::Dec(..) => 0x1,
+            Bytecode::Istrue => 0x1,
+            Bytecode::Isfalse => 0x1,
+            Bytecode::Isin(..) => 0x1,
+            Bytecode::Instanceof(..) => 0x1,
+            Bytecode::Strictnoteq(..) => 0x1,
+            Bytecode::Stricteq(..) => 0x1,
+            Bytecode::Callarg0(..) => 0x1,
+            Bytecode::Callarg1(..) => 0x1,
+            Bytecode::Callargs2(..) => 0x1,
+            Bytecode::Callargs3(..) => 0x1,
+            Bytecode::Callthis0(..) => 0x1,
+            Bytecode::Callthis1(..) => 0x1,
+            Bytecode::Callthis2(..) => 0x1,
+            Bytecode::Callthis3(..) => 0x1,
+            Bytecode::Callthisrange(..) => 0x1,
+            Bytecode::Supercallthisrange(..) => 0x1,
+            Bytecode::Definefunc(..) => 0x1,
+            Bytecode::Definemethod(..) => 0x1,
+            Bytecode::Defineclasswithbuffer(..) => 0x1,
+            Bytecode::Getnextpropname(..) => 0x1,
+            Bytecode::Ldobjbyvalue(..) => 0x1,
+            Bytecode::Stobjbyvalue(..) => 0x1,
+            Bytecode::Ldsuperbyvalue(..) => 0x1,
+            Bytecode::Ldobjbyindex(..) => 0x1,
+            Bytecode::Stobjbyindex(..) => 0x1,
+            Bytecode::Ldlexvar(..) => 0x1,
+            Bytecode::Stlexvar(..) => 0x1,
+            Bytecode::LdaStr(..) => 0x200,
+            Bytecode::Tryldglobalbyname(..) => 0x1,
+            Bytecode::Trystglobalbyname(..) => 0x1,
+            Bytecode::Ldglobalvar(..) => 0x1,
+            Bytecode::Ldobjbyname(..) => 0x1,
+            Bytecode::Stobjbyname(..) => 0x1,
+            Bytecode::Mov(..) => 0x1,
+            Bytecode::Ldsuperbyname(..) => 0x1,
+            Bytecode::Stconsttoglobalrecord(..) => 0x1,
+            Bytecode::Sttoglobalrecord(..) => 0x1,
+            Bytecode::Ldthisbyname(..) => 0x1,
+            Bytecode::Stthisbyname(..) => 0x1,
+            Bytecode::Ldthisbyvalue(..) => 0x1,
+            Bytecode::Stthisbyvalue(..) => 0x1,
+            Bytecode::Jmp(..) => 0x1,
+            Bytecode::Jeqz(..) => 0x1,
+            Bytecode::Jnez(..) => 0x1,
+            Bytecode::Jstricteqz(..) => 0x1,
+            Bytecode::Jnstricteqz(..) => 0x1,
+            Bytecode::Jeqnull(..) => 0x1,
+            Bytecode::Jnenull(..) => 0x1,
+            Bytecode::Jstricteqnull(..) => 0x1,
+            Bytecode::Jnstricteqnull(..) => 0x1,
+            Bytecode::Jequndefined(..) => 0x1,
+            Bytecode::Jneundefined(..) => 0x1,
+            Bytecode::Jstrictequndefined(..) => 0x1,
+            Bytecode::Jnstrictequndefined(..) => 0x1,
+            Bytecode::Jeq(..) => 0x1,
+            Bytecode::Jne(..) => 0x1,
+            Bytecode::Jstricteq(..) => 0x1,
+            Bytecode::Jnstricteq(..) => 0x1,
+            Bytecode::Lda(..) => 0x1,
+            Bytecode::Sta(..) => 0x1,
+            Bytecode::Ldai(..) => 0x1,
+            Bytecode::Fldai(..) => 0x1,
+            Bytecode::Return => 0x1,
+            Bytecode::Returnundefined => 0x1,
+            Bytecode::Getpropiterator => 0x1,
+            Bytecode::Getiterator(..) => 0x1,
+            Bytecode::Closeiterator(..) => 0x1,
+            Bytecode::Poplexenv => 0x1,
+            Bytecode::Ldnan => 0x1,
+            Bytecode::Ldinfinity => 0x1,
+            Bytecode::Getunmappedargs => 0x1,
+            Bytecode::Ldglobal => 0x1,
+            Bytecode::Ldnewtarget => 0x1,
+            Bytecode::Ldthis => 0x1,
+            Bytecode::Ldhole => 0x1,
+            Bytecode::Createregexpwithliteral(..) => 0x1,
+            Bytecode::Callrange(..) => 0x1,
+            Bytecode::Gettemplateobject(..) => 0x1,
+            Bytecode::Setobjectwithproto(..) => 0x1,
+            Bytecode::Stownbyvalue(..) => 0x1,
+            Bytecode::Stownbyindex(..) => 0x1,
+            Bytecode::Stownbyname(..) => 0x1,
+            Bytecode::Getmodulenamespace(..) => 0x1,
+            Bytecode::Stmodulevar(..) => 0x1,
+            Bytecode::Ldlocalmodulevar(..) => 0x1,
+            Bytecode::Ldexternalmodulevar(..) => 0x1,
+            Bytecode::Stglobalvar(..) => 0x1,
+            Bytecode::Stownbynamewithnameset(..) => 0x1,
+            Bytecode::Asyncgeneratorreject(..) => 0x1,
+            Bytecode::Stownbyvaluewithnameset(..) => 0x1,
+            Bytecode::Ldsymbol => 0x1,
+            Bytecode::Asyncfunctionenter => 0x1,
+            Bytecode::Ldfunction => 0x1,
+            Bytecode::Debugger => 0x1,
+            Bytecode::Creategeneratorobj(..) => 0x1,
+            Bytecode::Createiterresultobj(..) => 0x1,
+            Bytecode::Createobjectwithexcludedkeys(..) => 0x1,
+            Bytecode::Newobjapply(..) => 0x1,
+            Bytecode::Newlexenvwithname(..) => 0x1,
+            Bytecode::Createasyncgeneratorobj(..) => 0x1,
+            Bytecode::Asyncgeneratorresolve(..) => 0x1,
+            Bytecode::Supercallspread(..) => 0x1,
+            Bytecode::Apply(..) => 0x1,
+            Bytecode::Supercallarrowrange(..) => 0x1,
+            Bytecode::Definegettersetterbyvalue(..) => 0x1,
+            Bytecode::Dynamicimport => 0x1,
+            Bytecode::Resumegenerator => 0x1,
+            Bytecode::Getresumemode => 0x1,
+            Bytecode::Delobjprop(..) => 0x1,
+            Bytecode::Suspendgenerator(..) => 0x1,
+            Bytecode::Asyncfunctionawaituncaught(..) => 0x1,
+            Bytecode::Copydataproperties(..) => 0x1,
+            Bytecode::Starrayspread(..) => 0x1,
+            Bytecode::Stsuperbyvalue(..) => 0x1,
+            Bytecode::Asyncfunctionresolve(..) => 0x1,
+            Bytecode::Asyncfunctionreject(..) => 0x1,
+            Bytecode::Copyrestargs(..) => 0x1,
+            Bytecode::Stsuperbyname(..) => 0x1,
+            Bytecode::Ldbigint(..) => 0x1,
+            Bytecode::Nop => 0x1,
+            Bytecode::Setgeneratorstate(..) => 0x1,
+            Bytecode::Getasynciterator(..) => 0x1,
+            Bytecode::Ldprivateproperty(..) => 0x1,
+            Bytecode::Stprivateproperty(..) => 0x1,
+            Bytecode::Testin(..) => 0x1,
+            Bytecode::Definefieldbyname(..) => 0x1,
+            Bytecode::Definepropertybyname(..) => 0x1,
+            Bytecode::Callthis0withname(..) => 0x1,
+            Bytecode::Callthis1withname(..) => 0x1,
+            Bytecode::Callthis2withname(..) => 0x1,
+            Bytecode::Callthis3withname(..) => 0x1,
+            Bytecode::Callthisrangewithname(..) => 0x1,
+            Bytecode::CallruntimeNotifyconcurrentresult => 0x1,
+            Bytecode::DeprecatedLdlexenv => 0x1,
+            Bytecode::WideCreateobjectwithexcludedkeys(..) => 0x1,
+            Bytecode::Throw => 0x1001,
+            Bytecode::CallruntimeDefinefieldbyvalue(..) => 0x1,
+            Bytecode::DeprecatedPoplexenv => 0x1,
+            Bytecode::WideNewobjrange(..) => 0x1,
+            Bytecode::ThrowNotexists => 0x1,
+            Bytecode::CallruntimeDefinefieldbyindex(..) => 0x1,
+            Bytecode::DeprecatedGetiteratornext(..) => 0x1,
+            Bytecode::WideNewlexenv(..) => 0x1,
+            Bytecode::ThrowPatternnoncoercible => 0x1,
+            Bytecode::CallruntimeTopropertykey => 0x1,
+            Bytecode::DeprecatedCreatearraywithbuffer(..) => 0x1,
+            Bytecode::WideNewlexenvwithname(..) => 0x1,
+            Bytecode::ThrowDeletesuperproperty => 0x1,
+            Bytecode::CallruntimeCreateprivateproperty(..) => 0x1,
+            Bytecode::DeprecatedCreateobjectwithbuffer(..) => 0x1,
+            Bytecode::WideCallrange(..) => 0x1,
+            Bytecode::ThrowConstassignment(..) => 0x1,
+            Bytecode::CallruntimeDefineprivateproperty(..) => 0x1,
+            Bytecode::DeprecatedTonumber(..) => 0x1,
+            Bytecode::WideCallthisrange(..) => 0x1,
+            Bytecode::ThrowIfnotobject(..) => 0x1,
+            Bytecode::CallruntimeCallinit(..) => 0x1,
+            Bytecode::DeprecatedTonumeric(..) => 0x1,
+            Bytecode::WideSupercallthisrange(..) => 0x1,
+            Bytecode::ThrowUndefinedifhole(..) => 0x1,
+            Bytecode::CallruntimeDefinesendableclass(..) => 0x1,
+            Bytecode::DeprecatedNeg(..) => 0x1,
+            Bytecode::WideSupercallarrowrange(..) => 0x1,
+            Bytecode::ThrowIfsupernotcorrectcall(..) => 0x1,
+            Bytecode::CallruntimeLdsendableclass(..) => 0x1,
+            Bytecode::DeprecatedNot(..) => 0x1,
+            Bytecode::WideLdobjbyindex(..) => 0x1,
+            Bytecode::CallruntimeLdsendableexternalmodulevar(..) => 0x1,
+            Bytecode::DeprecatedInc(..) => 0x1,
+            Bytecode::WideStobjbyindex(..) => 0x1,
+            Bytecode::ThrowUndefinedifholewithname(..) => 0x1,
+            Bytecode::CallruntimeWideldsendableexternalmodulevar(..) => 0x1,
+            Bytecode::DeprecatedDec(..) => 0x1,
+            Bytecode::WideStownbyindex(..) => 0x1,
+            Bytecode::CallruntimeNewsendableenv(..) => 0x1,
+            Bytecode::DeprecatedCallarg0(..) => 0x1,
+            Bytecode::WideCopyrestargs(..) => 0x1,
+            Bytecode::CallruntimeWidenewsendableenv(..) => 0x1,
+            Bytecode::DeprecatedCallarg1(..) => 0x1,
+            Bytecode::WideLdlexvar(..) => 0x1,
+            Bytecode::CallruntimeStsendablevar(..) => 0x1,
+            Bytecode::DeprecatedCallargs2(..) => 0x1,
+            Bytecode::WideStlexvar(..) => 0x1,
+            Bytecode::DeprecatedCallargs3(..) => 0x1,
+            Bytecode::WideGetmodulenamespace(..) => 0x1,
+            Bytecode::CallruntimeWidestsendablevar(..) => 0x1,
+            Bytecode::DeprecatedCallrange(..) => 0x1,
+            Bytecode::WideStmodulevar(..) => 0x1,
+            Bytecode::CallruntimeLdsendablevar(..) => 0x1,
+            Bytecode::DeprecatedCallspread(..) => 0x1,
+            Bytecode::WideLdlocalmodulevar(..) => 0x1,
+            Bytecode::DeprecatedCallthisrange(..) => 0x1,
+            Bytecode::WideLdexternalmodulevar(..) => 0x1,
+            Bytecode::CallruntimeWideldsendablevar(..) => 0x1,
+            Bytecode::DeprecatedDefineclasswithbuffer(..) => 0x1,
+            Bytecode::WideLdpatchvar(..) => 0x1,
+            Bytecode::CallruntimeIstrue(..) => 0x1,
+            Bytecode::DeprecatedResumegenerator(..) => 0x1,
+            Bytecode::WideStpatchvar(..) => 0x1,
+            Bytecode::CallruntimeIsfalse(..) => 0x1,
+            Bytecode::DeprecatedGetresumemode(..) => 0x1,
+            Bytecode::WideCallthisrangewithname(..) => 0x1,
+            Bytecode::CallruntimeLdlazymodulevar(..) => 0x1,
+            Bytecode::DeprecatedGettemplateobject(..) => 0x1,
+            Bytecode::CallruntimeWideldlazymodulevar(..) => 0x1,
+            Bytecode::DeprecatedDelobjprop(..) => 0x1,
+            Bytecode::CallruntimeLdlazysendablemodulevar(..) => 0x1,
+            Bytecode::DeprecatedSuspendgenerator(..) => 0x1,
+            Bytecode::CallruntimeWideldlazysendablemodulevar(..) => 0x1,
+            Bytecode::DeprecatedAsyncfunctionawaituncaught(..) => 0x1,
+            Bytecode::CallruntimeSupercallforwardallargs(..) => 0x1,
+            Bytecode::DeprecatedCopydataproperties(..) => 0x1,
+            Bytecode::CallruntimeLdsendablelocalmodulevar(..) => 0x1,
+            Bytecode::DeprecatedSetobjectwithproto(..) => 0x1,
+            Bytecode::CallruntimeWideldsendablelocalmodulevar(..) => 0x1,
+            Bytecode::DeprecatedLdobjbyvalue(..) => 0x1,
+            Bytecode::DeprecatedLdsuperbyvalue(..) => 0x1,
+            Bytecode::DeprecatedLdobjbyindex(..) => 0x1,
+            Bytecode::DeprecatedAsyncfunctionresolve(..) => 0x1,
+            Bytecode::DeprecatedAsyncfunctionreject(..) => 0x1,
+            Bytecode::DeprecatedStlexvar(..) => 0x1,
+            Bytecode::DeprecatedGetmodulenamespace(..) => 0x1,
+            Bytecode::DeprecatedStmodulevar(..) => 0x1,
+            Bytecode::DeprecatedLdobjbyname(..) => 0x1,
+            Bytecode::DeprecatedLdsuperbyname(..) => 0x1,
+            Bytecode::DeprecatedLdmodulevar(..) => 0x1,
+            Bytecode::DeprecatedStconsttoglobalrecord(..) => 0x1,
+            Bytecode::DeprecatedStlettoglobalrecord(..) => 0x1,
+            Bytecode::DeprecatedStclasstoglobalrecord(..) => 0x1,
+            Bytecode::DeprecatedLdhomeobject => 0x1,
+            Bytecode::DeprecatedCreateobjecthavingmethod(..) => 0x1,
+            Bytecode::DeprecatedDynamicimport(..) => 0x1,
+            Bytecode::DeprecatedAsyncgeneratorreject(..) => 0x1,
+        };
+        ExceptionType::from_bits_retain(bits)
+    }
 
     /// Check if this instruction is a jump.
-    pub fn is_jump(&self) -> bool {
-        unsafe { crate::isa_is_jump_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn is_jump(&self) -> bool {
+        self.has_flag(BytecodeFlags::JUMP)
     }
 
     /// Check if this instruction can throw an exception.
-    pub fn can_throw(&self) -> bool {
-        unsafe { crate::isa_can_throw_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn can_throw(&self) -> bool {
+        match self {
+            Bytecode::LdaStr(..) => true,
+            Bytecode::Throw => true,
+            _ => false,
+        }
     }
 
     /// Check if this instruction is a block terminator.
-    pub fn is_terminator(&self) -> bool {
-        unsafe { crate::isa_is_terminator_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn is_terminator(&self) -> bool {
+        self.has_flag(BytecodeFlags::RETURN)
+            || self.has_flag(BytecodeFlags::JUMP)
+            || self.is_throw_ex(ExceptionType::X_THROW)
     }
 
     /// Check if this instruction has a specific property flag.
-    ///
-    /// ```ignore
-    /// use abcd_isa_sys::BytecodeFlags;
-    /// if bc.has_flag(BytecodeFlags::CALL | BytecodeFlags::DYNAMIC) { /* ... */ }
-    /// ```
-    pub fn has_flag(&self, flag: BytecodeFlags) -> bool {
-        unsafe { crate::isa_has_flag_opcode(self.representative_opcode(), flag.bits()) != 0 }
+    #[inline]
+    pub const fn has_flag(&self, flag: BytecodeFlags) -> bool {
+        self.flags().contains(flag)
     }
 
     /// Check if this instruction is a range instruction.
-    pub fn is_range(&self) -> bool {
-        unsafe { crate::isa_is_range_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn is_range(&self) -> bool {
+        match self {
+            Bytecode::Newobjrange(..) => true,
+            Bytecode::Callthisrange(..) => true,
+            Bytecode::Supercallthisrange(..) => true,
+            Bytecode::Callrange(..) => true,
+            Bytecode::Createobjectwithexcludedkeys(..) => true,
+            Bytecode::Supercallarrowrange(..) => true,
+            Bytecode::Callthisrangewithname(..) => true,
+            Bytecode::WideCreateobjectwithexcludedkeys(..) => true,
+            Bytecode::WideNewobjrange(..) => true,
+            Bytecode::WideCallrange(..) => true,
+            Bytecode::WideCallthisrange(..) => true,
+            Bytecode::WideSupercallthisrange(..) => true,
+            Bytecode::WideSupercallarrowrange(..) => true,
+            Bytecode::DeprecatedCallrange(..) => true,
+            Bytecode::DeprecatedCallthisrange(..) => true,
+            Bytecode::WideCallthisrangewithname(..) => true,
+            _ => false,
+        }
     }
 
-    /// Check if this instruction is a return or throw.
-    pub fn is_return_or_throw(&self) -> bool {
-        unsafe { crate::isa_is_return_or_throw_opcode(self.representative_opcode()) != 0 }
+    /// Check if this instruction is a return or unconditional throw.
+    #[inline]
+    pub const fn is_return_or_throw(&self) -> bool {
+        match self {
+            Bytecode::Return => true,
+            Bytecode::Returnundefined => true,
+            Bytecode::Throw => true,
+            Bytecode::ThrowNotexists => true,
+            Bytecode::ThrowPatternnoncoercible => true,
+            Bytecode::ThrowDeletesuperproperty => true,
+            Bytecode::ThrowConstassignment(..) => true,
+            _ => false,
+        }
     }
 
     /// Check if this instruction is a suspend point (generator/async yield).
-    pub fn is_suspend(&self) -> bool {
-        unsafe { crate::isa_is_suspend_opcode(self.representative_opcode()) != 0 }
+    #[inline]
+    pub const fn is_suspend(&self) -> bool {
+        self.has_flag(BytecodeFlags::SUSPEND)
     }
 
     /// Check if this instruction throws a specific exception type.
-    ///
-    /// ```ignore
-    /// use abcd_isa_sys::ExceptionType;
-    /// if bc.is_throw_ex(ExceptionType::X_NULL | ExceptionType::X_BOUNDS) { /* ... */ }
-    /// ```
-    pub fn is_throw_ex(&self, mask: ExceptionType) -> bool {
-        unsafe { crate::isa_is_throw_ex_opcode(self.representative_opcode(), mask.bits()) != 0 }
+    #[inline]
+    pub const fn is_throw_ex(&self, mask: ExceptionType) -> bool {
+        self.exception_mask().contains(mask)
     }
 
     // === Emitter support ===
 
-    /// Extract opcode and operand values for the emitter.
+    /// Extract opcode and operand values for the C++ oracle emitter.
     ///
     /// Returns `(opcode, args, num_args)` where `args` contains operand values
     /// as `i64` in instruction operand order. For jump instructions, the
@@ -3086,6 +4519,7 @@ impl Bytecode {
     }
 
     /// Set the jump target label.
+    #[inline]
     pub fn set_label(&mut self, label: Label) {
         match self {
             Bytecode::Jmp(l) => *l = label,
@@ -3109,10 +4543,36 @@ impl Bytecode {
         }
     }
 
+    /// Jump target [`Label`] if this instruction is a jump, `None` otherwise.
+    #[inline]
+    pub const fn jump_label(&self) -> Option<Label> {
+        match *self {
+            Bytecode::Jmp(l) => Some(l),
+            Bytecode::Jeqz(l) => Some(l),
+            Bytecode::Jnez(l) => Some(l),
+            Bytecode::Jstricteqz(l) => Some(l),
+            Bytecode::Jnstricteqz(l) => Some(l),
+            Bytecode::Jeqnull(l) => Some(l),
+            Bytecode::Jnenull(l) => Some(l),
+            Bytecode::Jstricteqnull(l) => Some(l),
+            Bytecode::Jnstricteqnull(l) => Some(l),
+            Bytecode::Jequndefined(l) => Some(l),
+            Bytecode::Jneundefined(l) => Some(l),
+            Bytecode::Jstrictequndefined(l) => Some(l),
+            Bytecode::Jnstrictequndefined(l) => Some(l),
+            Bytecode::Jeq(_, l) => Some(l),
+            Bytecode::Jne(_, l) => Some(l),
+            Bytecode::Jstricteq(_, l) => Some(l),
+            Bytecode::Jnstricteq(_, l) => Some(l),
+            _ => None,
+        }
+    }
+
     /// Index of the label operand in [`emit_args`](Self::emit_args) output.
     ///
     /// Returns `Some(idx)` for jump instructions, `None` otherwise.
-    pub fn jump_label_arg_index(&self) -> Option<usize> {
+    #[inline]
+    pub const fn jump_label_arg_index(&self) -> Option<usize> {
         match self {
             Bytecode::Jmp(..) => Some(0),
             Bytecode::Jeqz(..) => Some(0),
@@ -3131,6 +4591,10543 @@ impl Bytecode {
             Bytecode::Jne(..) => Some(1),
             Bytecode::Jstricteq(..) => Some(1),
             Bytecode::Jnstricteq(..) => Some(1),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================================
+// Pure-Rust Modern ISA Decode, Entity Slot Lookup & Encode Classification
+// ============================================================================
+
+/// Read the 1- or 2-byte modern (`24.0.0.0`) opcode at `bytes[0..]`.
+#[inline]
+fn read_modern_opcode(bytes: &[u8]) -> Result<u16, ModernDecodeFault> {
+    let Some(&b0) = bytes.first() else {
+        return Err(ModernDecodeFault::Truncated);
+    };
+    if b0 >= MIN_PREFIX_OPCODE {
+        let Some(&b1) = bytes.get(1) else {
+            return Err(ModernDecodeFault::Truncated);
+        };
+        Ok(((b1 as u16) << 8) | (b0 as u16))
+    } else {
+        Ok(b0 as u16)
+    }
+}
+
+/// Look up the `(byte_offset, byte_width)` of the `ordinal`-th entity-ID operand
+/// in the modern (`24.0.0.0`) instruction starting at `bytes`.
+///
+/// Validates both opcode assignment and full instruction byte length before
+/// inspecting operand slots.
+pub fn modern_entity_id_slot(
+    bytes: &[u8],
+    ordinal: u32,
+) -> Result<(usize, u8), ModernEntitySlotFault> {
+    let opcode =
+        read_modern_opcode(bytes).map_err(|_| ModernEntitySlotFault::InvalidInstruction)?;
+    match opcode {
+        0 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        6 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        7 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        8 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        9 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        10 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        11 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        12 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        13 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        14 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        15 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        16 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        17 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        18 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        19 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        20 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        21 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        22 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        23 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        24 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        25 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        26 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        27 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        28 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        29 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        30 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        31 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        32 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        33 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        34 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        35 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        36 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        37 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        38 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        39 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        40 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        41 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        42 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        43 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        44 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        45 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        46 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        47 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        48 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        49 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        50 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        51 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        52 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        53 => {
+            if bytes.len() < 9 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                1 => Ok((4, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        54 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        55 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        56 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        57 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        58 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        59 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        60 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        61 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        62 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((1, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        63 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        64 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        65 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        66 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        67 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        68 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        69 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        70 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        71 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        72 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        73 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        74 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        75 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        76 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        77 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        78 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        79 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        80 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        81 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        82 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        83 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        84 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        85 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        86 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        87 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        88 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        89 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        90 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        91 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        92 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        93 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        94 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        95 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        96 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        97 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        98 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        99 => {
+            if bytes.len() < 9 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        100 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        101 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        102 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        103 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        104 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        105 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        106 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        107 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        108 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        109 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        110 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        111 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        112 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        113 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        114 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        115 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        116 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        117 => {
+            if bytes.len() < 10 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                1 => Ok((5, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        118 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        119 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        120 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        121 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        122 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        123 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        124 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        125 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        126 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        127 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        128 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        129 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        130 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        131 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        132 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        133 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        134 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        135 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        136 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        137 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        138 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        139 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        140 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        141 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        142 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        143 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        144 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        145 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        146 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        147 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        148 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        149 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        150 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        151 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        152 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        153 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        154 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        155 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        156 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        157 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        158 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        159 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        160 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        161 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        162 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        163 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        164 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        165 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        166 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        167 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        168 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        169 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        170 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        171 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        172 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        173 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        174 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        175 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        176 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        177 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        178 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        179 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        180 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        181 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        182 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        183 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        184 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        185 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        186 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        187 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        188 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        189 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        190 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        191 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        192 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        193 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        194 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        195 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        196 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        197 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        198 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        199 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        200 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        201 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        202 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        203 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        204 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        205 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        206 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        207 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        208 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        209 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        210 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        211 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((1, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        212 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        213 => {
+            if bytes.len() < 1 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        214 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        215 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        216 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        217 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        218 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        219 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        220 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        221 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        222 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        223 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        224 => {
+            if bytes.len() < 8 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        225 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((3, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        251 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        252 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        253 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        254 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        507 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        508 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        509 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        510 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        763 => {
+            if bytes.len() < 8 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        764 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        765 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        766 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1019 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1020 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1021 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((4, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        1022 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1275 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((4, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        1276 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1277 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1278 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1531 => {
+            if bytes.len() < 8 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1532 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1533 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1534 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1787 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1788 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1789 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        1790 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2043 => {
+            if bytes.len() < 11 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((4, 2)),
+                1 => Ok((6, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        2044 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2045 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2046 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2299 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2300 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2301 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2302 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2555 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2556 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2557 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2558 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        2811 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2812 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        2813 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3067 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3068 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3069 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3323 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3324 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3325 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3579 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3580 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3581 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3835 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3836 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        3837 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4091 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4092 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4093 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4347 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4348 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4349 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4603 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4604 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4605 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4859 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        4860 => {
+            if bytes.len() < 10 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        4861 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5115 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5116 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5117 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5371 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5372 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5373 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((4, 2)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        5627 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5628 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5883 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        5884 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        6139 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        6140 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        6395 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        6396 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        6651 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        6652 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        6907 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        6908 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        7163 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        7164 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        7420 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        7676 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        7932 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        8188 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        8444 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        8700 => {
+            if bytes.len() < 5 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        8956 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        9212 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 4)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        9468 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 4)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        9724 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 4)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        9980 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 4)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        10236 => {
+            if bytes.len() < 7 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 4)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        10492 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 4)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        10748 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 4)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        11004 => {
+            if bytes.len() < 6 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            match ordinal {
+                0 => Ok((2, 4)),
+                _ => Err(ModernEntitySlotFault::MissingOperand),
+            }
+        }
+        11260 => {
+            if bytes.len() < 2 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        11516 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        11772 => {
+            if bytes.len() < 3 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        12028 => {
+            if bytes.len() < 4 {
+                return Err(ModernEntitySlotFault::InvalidInstruction);
+            }
+            let _ = ordinal;
+            Err(ModernEntitySlotFault::MissingOperand)
+        }
+        _ => Err(ModernEntitySlotFault::InvalidInstruction),
+    }
+}
+
+impl Bytecode {
+    /// Pure-Rust modern (`24.0.0.0`) single-instruction decoder.
+    ///
+    /// Returns `(instruction, byte_len, raw_jump_offset)` where jump operands
+    /// hold placeholder `Label(0)` and `raw_jump_offset` carries the signed
+    /// byte displacement relative to the start of the instruction.
+    pub fn decode_modern(bytes: &[u8]) -> Result<(Self, usize, Option<i64>), ModernDecodeFault> {
+        let opcode = read_modern_opcode(bytes)?;
+        match opcode {
+            0 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldundefined, 1, None))
+            }
+            1 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldnull, 1, None))
+            }
+            2 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldtrue, 1, None))
+            }
+            3 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldfalse, 1, None))
+            }
+            4 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Createemptyobject, 1, None))
+            }
+            5 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Createemptyarray(Imm((b[1]) as i64)), 2, None))
+            }
+            6 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createarraywithbuffer(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            7 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createobjectwithbuffer(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            8 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Newobjrange(
+                        Imm((b[1]) as i64),
+                        Imm((b[2]) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            9 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Newlexenv(Imm((b[1]) as i64)), 2, None))
+            }
+            10 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Add2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            11 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Sub2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            12 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Mul2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            13 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Div2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            14 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Mod2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            15 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Eq(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            16 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Noteq(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            17 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Less(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            18 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Lesseq(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            19 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Greater(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            20 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Greatereq(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            21 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Shl2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            22 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Shr2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            23 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ashr2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            24 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::And2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            25 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Or2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            26 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Xor2(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            27 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Exp(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            28 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Typeof(Imm((b[1]) as i64)), 2, None))
+            }
+            29 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Tonumber(Imm((b[1]) as i64)), 2, None))
+            }
+            30 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Tonumeric(Imm((b[1]) as i64)), 2, None))
+            }
+            31 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Neg(Imm((b[1]) as i64)), 2, None))
+            }
+            32 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Not(Imm((b[1]) as i64)), 2, None))
+            }
+            33 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Inc(Imm((b[1]) as i64)), 2, None))
+            }
+            34 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Dec(Imm((b[1]) as i64)), 2, None))
+            }
+            35 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Istrue, 1, None))
+            }
+            36 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Isfalse, 1, None))
+            }
+            37 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Isin(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            38 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Instanceof(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            39 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Strictnoteq(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            40 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stricteq(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            41 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Callarg0(Imm((b[1]) as i64)), 2, None))
+            }
+            42 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callarg1(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            43 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callargs2(Imm((b[1]) as i64), Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            44 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callargs3(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            45 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthis0(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            46 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthis1(Imm((b[1]) as i64), Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            47 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthis2(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            48 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthis3(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                        Reg((b[5]) as u16),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            49 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthisrange(
+                        Imm((b[1]) as i64),
+                        Imm((b[2]) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            50 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Supercallthisrange(
+                        Imm((b[1]) as i64),
+                        Imm((b[2]) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            51 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Definefunc(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Imm((b[4]) as i64),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            52 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Definemethod(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Imm((b[4]) as i64),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            53 => {
+                let Some(b) = bytes.get(..9) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Defineclasswithbuffer(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        EntityId((u16::from_le_bytes([b[4], b[5]])) as u32),
+                        Imm((u16::from_le_bytes([b[6], b[7]])) as i64),
+                        Reg((b[8]) as u16),
+                    ),
+                    9,
+                    None,
+                ))
+            }
+            54 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Getnextpropname(Reg((b[1]) as u16)), 2, None))
+            }
+            55 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldobjbyvalue(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            56 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stobjbyvalue(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            57 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldsuperbyvalue(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            58 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldobjbyindex(
+                        Imm((b[1]) as i64),
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            59 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stobjbyindex(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Imm((u16::from_le_bytes([b[3], b[4]])) as i64),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            60 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldlexvar(Imm((b[1] & 0x0f) as i64), Imm(((b[1] >> 4) & 0x0f) as i64)),
+                    2,
+                    None,
+                ))
+            }
+            61 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stlexvar(Imm((b[1] & 0x0f) as i64), Imm(((b[1] >> 4) & 0x0f) as i64)),
+                    2,
+                    None,
+                ))
+            }
+            62 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::LdaStr(EntityId((u16::from_le_bytes([b[1], b[2]])) as u32)),
+                    3,
+                    None,
+                ))
+            }
+            63 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Tryldglobalbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            64 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Trystglobalbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            65 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldglobalvar(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            66 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldobjbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            67 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stobjbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            68 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Mov(Reg((b[1] & 0x0f) as u16), Reg(((b[1] >> 4) & 0x0f) as u16)),
+                    2,
+                    None,
+                ))
+            }
+            69 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Mov(Reg((b[1]) as u16), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            70 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldsuperbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            71 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stconsttoglobalrecord(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            72 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Sttoglobalrecord(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            73 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldthisbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            74 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stthisbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            75 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Ldthisbyvalue(Imm((b[1]) as i64)), 2, None))
+            }
+            76 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stthisbyvalue(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            77 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jmp(Label(0)), 2, Some(raw_imm)))
+            }
+            78 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jmp(Label(0)), 3, Some(raw_imm)))
+            }
+            79 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jeqz(Label(0)), 2, Some(raw_imm)))
+            }
+            80 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jeqz(Label(0)), 3, Some(raw_imm)))
+            }
+            81 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jnez(Label(0)), 2, Some(raw_imm)))
+            }
+            82 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jstricteqz(Label(0)), 2, Some(raw_imm)))
+            }
+            83 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jnstricteqz(Label(0)), 2, Some(raw_imm)))
+            }
+            84 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jeqnull(Label(0)), 2, Some(raw_imm)))
+            }
+            85 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jnenull(Label(0)), 2, Some(raw_imm)))
+            }
+            86 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jstricteqnull(Label(0)), 2, Some(raw_imm)))
+            }
+            87 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jnstricteqnull(Label(0)), 2, Some(raw_imm)))
+            }
+            88 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jequndefined(Label(0)), 2, Some(raw_imm)))
+            }
+            89 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jneundefined(Label(0)), 2, Some(raw_imm)))
+            }
+            90 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jstrictequndefined(Label(0)), 2, Some(raw_imm)))
+            }
+            91 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[1]) as i8) as i64;
+                Ok((Bytecode::Jnstrictequndefined(Label(0)), 2, Some(raw_imm)))
+            }
+            92 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[2]) as i8) as i64;
+                Ok((
+                    Bytecode::Jeq(Reg((b[1]) as u16), Label(0)),
+                    3,
+                    Some(raw_imm),
+                ))
+            }
+            93 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[2]) as i8) as i64;
+                Ok((
+                    Bytecode::Jne(Reg((b[1]) as u16), Label(0)),
+                    3,
+                    Some(raw_imm),
+                ))
+            }
+            94 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[2]) as i8) as i64;
+                Ok((
+                    Bytecode::Jstricteq(Reg((b[1]) as u16), Label(0)),
+                    3,
+                    Some(raw_imm),
+                ))
+            }
+            95 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((b[2]) as i8) as i64;
+                Ok((
+                    Bytecode::Jnstricteq(Reg((b[1]) as u16), Label(0)),
+                    3,
+                    Some(raw_imm),
+                ))
+            }
+            96 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Lda(Reg((b[1]) as u16)), 2, None))
+            }
+            97 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Sta(Reg((b[1]) as u16)), 2, None))
+            }
+            98 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldai(Imm(
+                        ((u32::from_le_bytes([b[1], b[2], b[3], b[4]])) as i32) as i64
+                    )),
+                    5,
+                    None,
+                ))
+            }
+            99 => {
+                let Some(b) = bytes.get(..9) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Fldai(Imm((u64::from_le_bytes([
+                        b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8],
+                    ])) as i64)),
+                    9,
+                    None,
+                ))
+            }
+            100 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Return, 1, None))
+            }
+            101 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Returnundefined, 1, None))
+            }
+            102 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Getpropiterator, 1, None))
+            }
+            103 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Getiterator(Imm((b[1]) as i64)), 2, None))
+            }
+            104 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Closeiterator(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            105 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Poplexenv, 1, None))
+            }
+            106 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldnan, 1, None))
+            }
+            107 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldinfinity, 1, None))
+            }
+            108 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Getunmappedargs, 1, None))
+            }
+            109 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldglobal, 1, None))
+            }
+            110 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldnewtarget, 1, None))
+            }
+            111 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldthis, 1, None))
+            }
+            112 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldhole, 1, None))
+            }
+            113 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createregexpwithliteral(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Imm((b[4]) as i64),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            114 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createregexpwithliteral(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                        Imm((b[5]) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            115 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callrange(Imm((b[1]) as i64), Imm((b[2]) as i64), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            116 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Definefunc(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                        Imm((b[5]) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            117 => {
+                let Some(b) = bytes.get(..10) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Defineclasswithbuffer(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                        EntityId((u16::from_le_bytes([b[5], b[6]])) as u32),
+                        Imm((u16::from_le_bytes([b[7], b[8]])) as i64),
+                        Reg((b[9]) as u16),
+                    ),
+                    10,
+                    None,
+                ))
+            }
+            118 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Gettemplateobject(Imm((b[1]) as i64)), 2, None))
+            }
+            119 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Setobjectwithproto(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            120 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbyvalue(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            121 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbyindex(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Imm((u16::from_le_bytes([b[3], b[4]])) as i64),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            122 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            123 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Getmodulenamespace(Imm((b[1]) as i64)), 2, None))
+            }
+            124 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Stmodulevar(Imm((b[1]) as i64)), 2, None))
+            }
+            125 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Ldlocalmodulevar(Imm((b[1]) as i64)), 2, None))
+            }
+            126 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Ldexternalmodulevar(Imm((b[1]) as i64)), 2, None))
+            }
+            127 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stglobalvar(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            128 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createemptyarray(Imm((u16::from_le_bytes([b[1], b[2]])) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            129 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createarraywithbuffer(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            130 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createobjectwithbuffer(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            131 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Newobjrange(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Imm((b[3]) as i64),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            132 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Typeof(Imm((u16::from_le_bytes([b[1], b[2]])) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            133 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldobjbyvalue(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            134 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stobjbyvalue(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            135 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldsuperbyvalue(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            136 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldobjbyindex(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Imm((u16::from_le_bytes([b[3], b[4]])) as i64),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            137 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stobjbyindex(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            138 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldlexvar(Imm((b[1]) as i64), Imm((b[2]) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            139 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stlexvar(Imm((b[1]) as i64), Imm((b[2]) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            140 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Tryldglobalbyname(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            141 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Trystglobalbyname(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            142 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbynamewithnameset(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            143 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Mov(
+                        Reg((u16::from_le_bytes([b[1], b[2]])) as u16),
+                        Reg((u16::from_le_bytes([b[3], b[4]])) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            144 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldobjbyname(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            145 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stobjbyname(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                        Reg((b[5]) as u16),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            146 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldsuperbyname(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            147 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldthisbyname(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            148 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stthisbyname(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            149 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldthisbyvalue(Imm((u16::from_le_bytes([b[1], b[2]])) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            150 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stthisbyvalue(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            151 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Asyncgeneratorreject(Reg((b[1]) as u16)), 2, None))
+            }
+            152 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u32::from_le_bytes([b[1], b[2], b[3], b[4]])) as i32) as i64;
+                Ok((Bytecode::Jmp(Label(0)), 5, Some(raw_imm)))
+            }
+            153 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbyvaluewithnameset(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            154 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u32::from_le_bytes([b[1], b[2], b[3], b[4]])) as i32) as i64;
+                Ok((Bytecode::Jeqz(Label(0)), 5, Some(raw_imm)))
+            }
+            155 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jnez(Label(0)), 3, Some(raw_imm)))
+            }
+            156 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u32::from_le_bytes([b[1], b[2], b[3], b[4]])) as i32) as i64;
+                Ok((Bytecode::Jnez(Label(0)), 5, Some(raw_imm)))
+            }
+            157 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jstricteqz(Label(0)), 3, Some(raw_imm)))
+            }
+            158 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jnstricteqz(Label(0)), 3, Some(raw_imm)))
+            }
+            159 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jeqnull(Label(0)), 3, Some(raw_imm)))
+            }
+            160 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jnenull(Label(0)), 3, Some(raw_imm)))
+            }
+            161 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jstricteqnull(Label(0)), 3, Some(raw_imm)))
+            }
+            162 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jnstricteqnull(Label(0)), 3, Some(raw_imm)))
+            }
+            163 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jequndefined(Label(0)), 3, Some(raw_imm)))
+            }
+            164 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jneundefined(Label(0)), 3, Some(raw_imm)))
+            }
+            165 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jstrictequndefined(Label(0)), 3, Some(raw_imm)))
+            }
+            166 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[1], b[2]])) as i16) as i64;
+                Ok((Bytecode::Jnstrictequndefined(Label(0)), 3, Some(raw_imm)))
+            }
+            167 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[2], b[3]])) as i16) as i64;
+                Ok((
+                    Bytecode::Jeq(Reg((b[1]) as u16), Label(0)),
+                    4,
+                    Some(raw_imm),
+                ))
+            }
+            168 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[2], b[3]])) as i16) as i64;
+                Ok((
+                    Bytecode::Jne(Reg((b[1]) as u16), Label(0)),
+                    4,
+                    Some(raw_imm),
+                ))
+            }
+            169 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[2], b[3]])) as i16) as i64;
+                Ok((
+                    Bytecode::Jstricteq(Reg((b[1]) as u16), Label(0)),
+                    4,
+                    Some(raw_imm),
+                ))
+            }
+            170 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let raw_imm = ((u16::from_le_bytes([b[2], b[3]])) as i16) as i64;
+                Ok((
+                    Bytecode::Jnstricteq(Reg((b[1]) as u16), Label(0)),
+                    4,
+                    Some(raw_imm),
+                ))
+            }
+            171 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Getiterator(Imm((u16::from_le_bytes([b[1], b[2]])) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            172 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Closeiterator(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            173 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldsymbol, 1, None))
+            }
+            174 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Asyncfunctionenter, 1, None))
+            }
+            175 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Ldfunction, 1, None))
+            }
+            176 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Debugger, 1, None))
+            }
+            177 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Creategeneratorobj(Reg((b[1]) as u16)), 2, None))
+            }
+            178 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createiterresultobj(Reg((b[1]) as u16), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            179 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createobjectwithexcludedkeys(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            180 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Newobjapply(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            181 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Newobjapply(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            182 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Newlexenvwithname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            183 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Createasyncgeneratorobj(Reg((b[1]) as u16)),
+                    2,
+                    None,
+                ))
+            }
+            184 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Asyncgeneratorresolve(
+                        Reg((b[1]) as u16),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            185 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Supercallspread(Imm((b[1]) as i64), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            186 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Apply(Imm((b[1]) as i64), Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            187 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Supercallarrowrange(
+                        Imm((b[1]) as i64),
+                        Imm((b[2]) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            188 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Definegettersetterbyvalue(
+                        Reg((b[1]) as u16),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            189 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Dynamicimport, 1, None))
+            }
+            190 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Definemethod(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                        Imm((b[5]) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            191 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Resumegenerator, 1, None))
+            }
+            192 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Getresumemode, 1, None))
+            }
+            193 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Gettemplateobject(Imm((u16::from_le_bytes([b[1], b[2]])) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            194 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Delobjprop(Reg((b[1]) as u16)), 2, None))
+            }
+            195 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Suspendgenerator(Reg((b[1]) as u16)), 2, None))
+            }
+            196 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Asyncfunctionawaituncaught(Reg((b[1]) as u16)),
+                    2,
+                    None,
+                ))
+            }
+            197 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Copydataproperties(Reg((b[1]) as u16)), 2, None))
+            }
+            198 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Starrayspread(Reg((b[1]) as u16), Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            199 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Setobjectwithproto(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            200 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbyvalue(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            201 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stsuperbyvalue(
+                        Imm((b[1]) as i64),
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            202 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stsuperbyvalue(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            203 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbyindex(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            204 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbyname(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                        Reg((b[5]) as u16),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            205 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Asyncfunctionresolve(Reg((b[1]) as u16)), 2, None))
+            }
+            206 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Asyncfunctionreject(Reg((b[1]) as u16)), 2, None))
+            }
+            207 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Copyrestargs(Imm((b[1]) as i64)), 2, None))
+            }
+            208 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stsuperbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            209 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stsuperbyname(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                        Reg((b[5]) as u16),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            210 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbyvaluewithnameset(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            211 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldbigint(EntityId((u16::from_le_bytes([b[1], b[2]])) as u32)),
+                    3,
+                    None,
+                ))
+            }
+            212 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stownbynamewithnameset(
+                        Imm((u16::from_le_bytes([b[1], b[2]])) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                        Reg((b[5]) as u16),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            213 => {
+                let Some(b) = bytes.get(..1) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Nop, 1, None))
+            }
+            214 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Setgeneratorstate(Imm((b[1]) as i64)), 2, None))
+            }
+            215 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::Getasynciterator(Imm((b[1]) as i64)), 2, None))
+            }
+            216 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Ldprivateproperty(
+                        Imm((b[1]) as i64),
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            217 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Stprivateproperty(
+                        Imm((b[1]) as i64),
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                        Reg((b[6]) as u16),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            218 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Testin(
+                        Imm((b[1]) as i64),
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            219 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Definefieldbyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            220 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Definepropertybyname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            221 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthis0withname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            222 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthis1withname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                        Reg((b[5]) as u16),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            223 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthis2withname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                        Reg((b[5]) as u16),
+                        Reg((b[6]) as u16),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            224 => {
+                let Some(b) = bytes.get(..8) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthis3withname(
+                        Imm((b[1]) as i64),
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Reg((b[4]) as u16),
+                        Reg((b[5]) as u16),
+                        Reg((b[6]) as u16),
+                        Reg((b[7]) as u16),
+                    ),
+                    8,
+                    None,
+                ))
+            }
+            225 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::Callthisrangewithname(
+                        Imm((b[1]) as i64),
+                        Imm((b[2]) as i64),
+                        EntityId((u16::from_le_bytes([b[3], b[4]])) as u32),
+                        Reg((b[5]) as u16),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            251 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::CallruntimeNotifyconcurrentresult, 2, None))
+            }
+            252 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::DeprecatedLdlexenv, 2, None))
+            }
+            253 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideCreateobjectwithexcludedkeys(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Reg((b[4]) as u16),
+                        Reg((b[5]) as u16),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            254 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::Throw, 2, None))
+            }
+            507 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeDefinefieldbyvalue(
+                        Imm((b[2]) as i64),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            508 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::DeprecatedPoplexenv, 2, None))
+            }
+            509 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideNewobjrange(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            510 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::ThrowNotexists, 2, None))
+            }
+            763 => {
+                let Some(b) = bytes.get(..8) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeDefinefieldbyindex(
+                        Imm((b[2]) as i64),
+                        Imm((u32::from_le_bytes([b[3], b[4], b[5], b[6]])) as i64),
+                        Reg((b[7]) as u16),
+                    ),
+                    8,
+                    None,
+                ))
+            }
+            764 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedGetiteratornext(Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            765 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideNewlexenv(Imm((u16::from_le_bytes([b[2], b[3]])) as i64)),
+                    4,
+                    None,
+                ))
+            }
+            766 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::ThrowPatternnoncoercible, 2, None))
+            }
+            1019 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::CallruntimeTopropertykey, 2, None))
+            }
+            1020 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCreatearraywithbuffer(Imm(
+                        (u16::from_le_bytes([b[2], b[3]])) as i64,
+                    )),
+                    4,
+                    None,
+                ))
+            }
+            1021 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideNewlexenvwithname(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        EntityId((u16::from_le_bytes([b[4], b[5]])) as u32),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            1022 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::ThrowDeletesuperproperty, 2, None))
+            }
+            1275 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeCreateprivateproperty(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        EntityId((u16::from_le_bytes([b[4], b[5]])) as u32),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            1276 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCreateobjectwithbuffer(Imm((u16::from_le_bytes([
+                        b[2], b[3],
+                    ])) as i64)),
+                    4,
+                    None,
+                ))
+            }
+            1277 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideCallrange(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            1278 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::ThrowConstassignment(Reg((b[2]) as u16)), 3, None))
+            }
+            1531 => {
+                let Some(b) = bytes.get(..8) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeDefineprivateproperty(
+                        Imm((b[2]) as i64),
+                        Imm((u16::from_le_bytes([b[3], b[4]])) as i64),
+                        Imm((u16::from_le_bytes([b[5], b[6]])) as i64),
+                        Reg((b[7]) as u16),
+                    ),
+                    8,
+                    None,
+                ))
+            }
+            1532 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::DeprecatedTonumber(Reg((b[2]) as u16)), 3, None))
+            }
+            1533 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideCallthisrange(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            1534 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::ThrowIfnotobject(Reg((b[2]) as u16)), 3, None))
+            }
+            1787 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeCallinit(Imm((b[2]) as i64), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            1788 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::DeprecatedTonumeric(Reg((b[2]) as u16)), 3, None))
+            }
+            1789 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideSupercallthisrange(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            1790 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::ThrowUndefinedifhole(Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            2043 => {
+                let Some(b) = bytes.get(..11) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeDefinesendableclass(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        EntityId((u16::from_le_bytes([b[4], b[5]])) as u32),
+                        EntityId((u16::from_le_bytes([b[6], b[7]])) as u32),
+                        Imm((u16::from_le_bytes([b[8], b[9]])) as i64),
+                        Reg((b[10]) as u16),
+                    ),
+                    11,
+                    None,
+                ))
+            }
+            2044 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::DeprecatedNeg(Reg((b[2]) as u16)), 3, None))
+            }
+            2045 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideSupercallarrowrange(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            2046 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::ThrowIfsupernotcorrectcall(Imm((b[2]) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            2299 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeLdsendableclass(Imm(
+                        (u16::from_le_bytes([b[2], b[3]])) as i64
+                    )),
+                    4,
+                    None,
+                ))
+            }
+            2300 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::DeprecatedNot(Reg((b[2]) as u16)), 3, None))
+            }
+            2301 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideLdobjbyindex(Imm(
+                        (u32::from_le_bytes([b[2], b[3], b[4], b[5]])) as i64
+                    )),
+                    6,
+                    None,
+                ))
+            }
+            2302 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::ThrowIfsupernotcorrectcall(Imm(
+                        (u16::from_le_bytes([b[2], b[3]])) as i64
+                    )),
+                    4,
+                    None,
+                ))
+            }
+            2555 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeLdsendableexternalmodulevar(Imm((b[2]) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            2556 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::DeprecatedInc(Reg((b[2]) as u16)), 3, None))
+            }
+            2557 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideStobjbyindex(
+                        Reg((b[2]) as u16),
+                        Imm((u32::from_le_bytes([b[3], b[4], b[5], b[6]])) as i64),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            2558 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::ThrowUndefinedifholewithname(EntityId(
+                        (u16::from_le_bytes([b[2], b[3]])) as u32,
+                    )),
+                    4,
+                    None,
+                ))
+            }
+            2811 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeWideldsendableexternalmodulevar(Imm(
+                        (u16::from_le_bytes([b[2], b[3]])) as i64,
+                    )),
+                    4,
+                    None,
+                ))
+            }
+            2812 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::DeprecatedDec(Reg((b[2]) as u16)), 3, None))
+            }
+            2813 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideStownbyindex(
+                        Reg((b[2]) as u16),
+                        Imm((u32::from_le_bytes([b[3], b[4], b[5], b[6]])) as i64),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            3067 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeNewsendableenv(Imm((b[2]) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            3068 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::DeprecatedCallarg0(Reg((b[2]) as u16)), 3, None))
+            }
+            3069 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideCopyrestargs(Imm((u16::from_le_bytes([b[2], b[3]])) as i64)),
+                    4,
+                    None,
+                ))
+            }
+            3323 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeWidenewsendableenv(Imm(
+                        (u16::from_le_bytes([b[2], b[3]])) as i64,
+                    )),
+                    4,
+                    None,
+                ))
+            }
+            3324 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCallarg1(Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            3325 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideLdlexvar(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            3579 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeStsendablevar(
+                        Imm((b[2] & 0x0f) as i64),
+                        Imm(((b[2] >> 4) & 0x0f) as i64),
+                    ),
+                    3,
+                    None,
+                ))
+            }
+            3580 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCallargs2(
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            3581 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideStlexvar(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            3835 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeStsendablevar(Imm((b[2]) as i64), Imm((b[3]) as i64)),
+                    4,
+                    None,
+                ))
+            }
+            3836 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCallargs3(
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                        Reg((b[5]) as u16),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            3837 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideGetmodulenamespace(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            4091 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeWidestsendablevar(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            4092 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCallrange(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            4093 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideStmodulevar(Imm((u16::from_le_bytes([b[2], b[3]])) as i64)),
+                    4,
+                    None,
+                ))
+            }
+            4347 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeLdsendablevar(
+                        Imm((b[2] & 0x0f) as i64),
+                        Imm(((b[2] >> 4) & 0x0f) as i64),
+                    ),
+                    3,
+                    None,
+                ))
+            }
+            4348 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCallspread(
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            4349 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideLdlocalmodulevar(Imm((u16::from_le_bytes([b[2], b[3]])) as i64)),
+                    4,
+                    None,
+                ))
+            }
+            4603 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeLdsendablevar(Imm((b[2]) as i64), Imm((b[3]) as i64)),
+                    4,
+                    None,
+                ))
+            }
+            4604 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCallthisrange(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            4605 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideLdexternalmodulevar(Imm(
+                        (u16::from_le_bytes([b[2], b[3]])) as i64
+                    )),
+                    4,
+                    None,
+                ))
+            }
+            4859 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeWideldsendablevar(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                    ),
+                    6,
+                    None,
+                ))
+            }
+            4860 => {
+                let Some(b) = bytes.get(..10) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedDefineclasswithbuffer(
+                        EntityId((u16::from_le_bytes([b[2], b[3]])) as u32),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                        Imm((u16::from_le_bytes([b[6], b[7]])) as i64),
+                        Reg((b[8]) as u16),
+                        Reg((b[9]) as u16),
+                    ),
+                    10,
+                    None,
+                ))
+            }
+            4861 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideLdpatchvar(Imm((u16::from_le_bytes([b[2], b[3]])) as i64)),
+                    4,
+                    None,
+                ))
+            }
+            5115 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::CallruntimeIstrue(Imm((b[2]) as i64)), 3, None))
+            }
+            5116 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedResumegenerator(Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            5117 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideStpatchvar(Imm((u16::from_le_bytes([b[2], b[3]])) as i64)),
+                    4,
+                    None,
+                ))
+            }
+            5371 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((Bytecode::CallruntimeIsfalse(Imm((b[2]) as i64)), 3, None))
+            }
+            5372 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedGetresumemode(Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            5373 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::WideCallthisrangewithname(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        EntityId((u16::from_le_bytes([b[4], b[5]])) as u32),
+                        Reg((b[6]) as u16),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            5627 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeLdlazymodulevar(Imm((b[2]) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            5628 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedGettemplateobject(Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            5883 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeWideldlazymodulevar(Imm(
+                        (u16::from_le_bytes([b[2], b[3]])) as i64,
+                    )),
+                    4,
+                    None,
+                ))
+            }
+            5884 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedDelobjprop(Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            6139 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeLdlazysendablemodulevar(Imm((b[2]) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            6140 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedSuspendgenerator(Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            6395 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeWideldlazysendablemodulevar(Imm((u16::from_le_bytes([
+                        b[2], b[3],
+                    ]))
+                        as i64)),
+                    4,
+                    None,
+                ))
+            }
+            6396 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedAsyncfunctionawaituncaught(
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            6651 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeSupercallforwardallargs(Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            6652 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCopydataproperties(Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            6907 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeLdsendablelocalmodulevar(Imm((b[2]) as i64)),
+                    3,
+                    None,
+                ))
+            }
+            6908 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedSetobjectwithproto(Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            7163 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::CallruntimeWideldsendablelocalmodulevar(Imm((u16::from_le_bytes([
+                        b[2], b[3],
+                    ]))
+                        as i64)),
+                    4,
+                    None,
+                ))
+            }
+            7164 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedLdobjbyvalue(Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            7420 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedLdsuperbyvalue(Reg((b[2]) as u16), Reg((b[3]) as u16)),
+                    4,
+                    None,
+                ))
+            }
+            7676 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedLdobjbyindex(
+                        Reg((b[2]) as u16),
+                        Imm((u32::from_le_bytes([b[3], b[4], b[5], b[6]])) as i64),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            7932 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedAsyncfunctionresolve(
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            8188 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedAsyncfunctionreject(
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            8444 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedStlexvar(
+                        Imm((b[2] & 0x0f) as i64),
+                        Imm(((b[2] >> 4) & 0x0f) as i64),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            8700 => {
+                let Some(b) = bytes.get(..5) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedStlexvar(
+                        Imm((b[2]) as i64),
+                        Imm((b[3]) as i64),
+                        Reg((b[4]) as u16),
+                    ),
+                    5,
+                    None,
+                ))
+            }
+            8956 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedStlexvar(
+                        Imm((u16::from_le_bytes([b[2], b[3]])) as i64),
+                        Imm((u16::from_le_bytes([b[4], b[5]])) as i64),
+                        Reg((b[6]) as u16),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            9212 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedGetmodulenamespace(EntityId(
+                        (u32::from_le_bytes([b[2], b[3], b[4], b[5]])) as u32,
+                    )),
+                    6,
+                    None,
+                ))
+            }
+            9468 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedStmodulevar(EntityId(
+                        (u32::from_le_bytes([b[2], b[3], b[4], b[5]])) as u32,
+                    )),
+                    6,
+                    None,
+                ))
+            }
+            9724 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedLdobjbyname(
+                        EntityId((u32::from_le_bytes([b[2], b[3], b[4], b[5]])) as u32),
+                        Reg((b[6]) as u16),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            9980 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedLdsuperbyname(
+                        EntityId((u32::from_le_bytes([b[2], b[3], b[4], b[5]])) as u32),
+                        Reg((b[6]) as u16),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            10236 => {
+                let Some(b) = bytes.get(..7) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedLdmodulevar(
+                        EntityId((u32::from_le_bytes([b[2], b[3], b[4], b[5]])) as u32),
+                        Imm((b[6]) as i64),
+                    ),
+                    7,
+                    None,
+                ))
+            }
+            10492 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedStconsttoglobalrecord(EntityId(
+                        (u32::from_le_bytes([b[2], b[3], b[4], b[5]])) as u32,
+                    )),
+                    6,
+                    None,
+                ))
+            }
+            10748 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedStlettoglobalrecord(EntityId(
+                        (u32::from_le_bytes([b[2], b[3], b[4], b[5]])) as u32,
+                    )),
+                    6,
+                    None,
+                ))
+            }
+            11004 => {
+                let Some(b) = bytes.get(..6) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedStclasstoglobalrecord(EntityId(
+                        (u32::from_le_bytes([b[2], b[3], b[4], b[5]])) as u32,
+                    )),
+                    6,
+                    None,
+                ))
+            }
+            11260 => {
+                let Some(b) = bytes.get(..2) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                let _ = b;
+                Ok((Bytecode::DeprecatedLdhomeobject, 2, None))
+            }
+            11516 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedCreateobjecthavingmethod(Imm((u16::from_le_bytes([
+                        b[2], b[3],
+                    ]))
+                        as i64)),
+                    4,
+                    None,
+                ))
+            }
+            11772 => {
+                let Some(b) = bytes.get(..3) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedDynamicimport(Reg((b[2]) as u16)),
+                    3,
+                    None,
+                ))
+            }
+            12028 => {
+                let Some(b) = bytes.get(..4) else {
+                    return Err(ModernDecodeFault::Truncated);
+                };
+                Ok((
+                    Bytecode::DeprecatedAsyncgeneratorreject(
+                        Reg((b[2]) as u16),
+                        Reg((b[3]) as u16),
+                    ),
+                    4,
+                    None,
+                ))
+            }
+            _ => Err(ModernDecodeFault::InvalidOpcode),
+        }
+    }
+
+    /// Pure-Rust instruction encoder & jump classifier.
+    ///
+    /// Validates every non-label operand against the mnemonic's maximum legal
+    /// storage width (`Err(())` on overflow/underflow) and packs non-jump
+    /// instructions into their narrowest legal ISA format, matching upstream
+    /// `BytecodeEmitter` format selection bit-for-bit.
+    #[allow(clippy::too_many_lines, reason = "generated per-mnemonic dispatch")]
+    pub fn classify_for_encode(&self) -> Result<EncodeInsnKind, ()> {
+        match *self {
+            Bytecode::Ldundefined => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x00;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldnull => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x01;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldtrue => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x02;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldfalse => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x03;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Createemptyobject => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x04;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Createemptyarray(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x05;
+                    bytes[1] = a0.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 2 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x80;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Createarraywithbuffer(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x06;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x81;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Createobjectwithbuffer(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x07;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x82;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Newobjrange(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 >= 0 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x08;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    bytes[3] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x83;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Newlexenv(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x09;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Add2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x0a;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Sub2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x0b;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Mul2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x0c;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Div2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x0d;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Mod2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x0e;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Eq(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x0f;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Noteq(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x10;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Less(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x11;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Lesseq(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x12;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Greater(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x13;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Greatereq(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x14;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Shl2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x15;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Shr2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x16;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Ashr2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x17;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::And2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x18;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Or2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x19;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Xor2(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x1a;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Exp(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x1b;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Typeof(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x1c;
+                    bytes[1] = a0.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 2 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x84;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Tonumber(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x1d;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Tonumeric(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x1e;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Neg(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x1f;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Not(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x20;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Inc(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x21;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Dec(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x22;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Istrue => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x23;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Isfalse => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x24;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Isin(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x25;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Instanceof(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x26;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Strictnoteq(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x27;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Stricteq(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x28;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Callarg0(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x29;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Callarg1(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x2a;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Callargs2(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x2b;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Callargs3(a0, a1, a2, a3) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255 && a3.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x2c;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                bytes[4] = a3.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Callthis0(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x2d;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Callthis1(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x2e;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Callthis2(a0, a1, a2, a3) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255 && a3.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x2f;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                bytes[4] = a3.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Callthis3(a0, a1, a2, a3, a4) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 255
+                    && a1.0 <= 255
+                    && a2.0 <= 255
+                    && a3.0 <= 255
+                    && a4.0 <= 255)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x30;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                bytes[4] = a3.0 as u8;
+                bytes[5] = a4.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Callthisrange(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x31;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Supercallthisrange(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x32;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Definefunc(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535 && a2.0 >= 0 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x33;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    bytes[4] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x74;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[5] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Definemethod(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535 && a2.0 >= 0 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x34;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    bytes[4] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xbe;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[5] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Defineclasswithbuffer(a0, a1, a2, a3, a4) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 65535
+                    && a1.0 <= 65535
+                    && a2.0 <= 65535
+                    && a3.0 >= 0
+                    && a3.0 <= 65535
+                    && a4.0 <= 255)
+                {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x35;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    bytes[4..6].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                    bytes[6..8].copy_from_slice(&(a3.0 as u16).to_le_bytes());
+                    bytes[8] = a4.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 9 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x75;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[5..7].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                bytes[7..9].copy_from_slice(&(a3.0 as u16).to_le_bytes());
+                bytes[9] = a4.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 10 })
+            }
+            Bytecode::Getnextpropname(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x36;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Ldobjbyvalue(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x37;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x85;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Stobjbyvalue(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x38;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    bytes[3] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x86;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Ldsuperbyvalue(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x39;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x87;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Ldobjbyindex(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 >= 0 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x3a;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x88;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Stobjbyindex(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255 && a2.0 >= 0 && a2.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x3b;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    bytes[3..5].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x89;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                bytes[4..6].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Ldlexvar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 15 && a1.0 >= 0 && a1.0 <= 15 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x3c;
+                    bytes[1] |= (a0.0 as u8) & 0x0f;
+                    bytes[1] |= ((a1.0 as u8) & 0x0f) << 4;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 2 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x8a;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Stlexvar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 15 && a1.0 >= 0 && a1.0 <= 15 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x3d;
+                    bytes[1] |= (a0.0 as u8) & 0x0f;
+                    bytes[1] |= ((a1.0 as u8) & 0x0f) << 4;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 2 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x8b;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::LdaStr(a0) => {
+                if !(a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x3e;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Tryldglobalbyname(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x3f;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x8c;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Trystglobalbyname(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x40;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x8d;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Ldglobalvar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x41;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Ldobjbyname(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x42;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x90;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Stobjbyname(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x43;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    bytes[4] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x91;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[5] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Mov(a0, a1) => {
+                if a0.0 <= 15 && a1.0 <= 15 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x44;
+                    bytes[1] |= (a0.0 as u8) & 0x0f;
+                    bytes[1] |= ((a1.0 as u8) & 0x0f) << 4;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 2 });
+                }
+                if a0.0 <= 255 && a1.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x45;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x8f;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Ldsuperbyname(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x46;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x92;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Stconsttoglobalrecord(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x47;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Sttoglobalrecord(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x48;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Ldthisbyname(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x49;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x93;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Stthisbyname(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x4a;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x94;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Ldthisbyvalue(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x4b;
+                    bytes[1] = a0.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 2 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x95;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Stthisbyvalue(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x4c;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x96;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Jmp(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x4d,
+                op_imm16: 0x4e,
+                wide: WideJumpKind::NativeImm32(0x98),
+            })),
+            Bytecode::Jeqz(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x4f,
+                op_imm16: 0x50,
+                wide: WideJumpKind::NativeImm32(0x9a),
+            })),
+            Bytecode::Jnez(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x51,
+                op_imm16: 0x9b,
+                wide: WideJumpKind::NativeImm32(0x9c),
+            })),
+            Bytecode::Jstricteqz(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x52,
+                op_imm16: 0x9d,
+                wide: WideJumpKind::InvertImm8(0x53),
+            })),
+            Bytecode::Jnstricteqz(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x53,
+                op_imm16: 0x9e,
+                wide: WideJumpKind::InvertImm8(0x52),
+            })),
+            Bytecode::Jeqnull(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x54,
+                op_imm16: 0x9f,
+                wide: WideJumpKind::InvertImm8(0x55),
+            })),
+            Bytecode::Jnenull(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x55,
+                op_imm16: 0xa0,
+                wide: WideJumpKind::InvertImm8(0x54),
+            })),
+            Bytecode::Jstricteqnull(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x56,
+                op_imm16: 0xa1,
+                wide: WideJumpKind::InvertImm8(0x57),
+            })),
+            Bytecode::Jnstricteqnull(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x57,
+                op_imm16: 0xa2,
+                wide: WideJumpKind::InvertImm8(0x56),
+            })),
+            Bytecode::Jequndefined(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x58,
+                op_imm16: 0xa3,
+                wide: WideJumpKind::InvertImm8(0x59),
+            })),
+            Bytecode::Jneundefined(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x59,
+                op_imm16: 0xa4,
+                wide: WideJumpKind::InvertImm8(0x58),
+            })),
+            Bytecode::Jstrictequndefined(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x5a,
+                op_imm16: 0xa5,
+                wide: WideJumpKind::InvertImm8(0x5b),
+            })),
+            Bytecode::Jnstrictequndefined(target) => Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                target,
+                reg: None,
+                op_imm8: 0x5b,
+                op_imm16: 0xa6,
+                wide: WideJumpKind::InvertImm8(0x5a),
+            })),
+            Bytecode::Jeq(reg, target) => {
+                if reg.0 > 0xff {
+                    return Err(());
+                }
+                Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                    target,
+                    reg: Some(reg.0 as u8),
+                    op_imm8: 0x5c,
+                    op_imm16: 0xa7,
+                    wide: WideJumpKind::InvertV8Imm8(0x5d),
+                }))
+            }
+            Bytecode::Jne(reg, target) => {
+                if reg.0 > 0xff {
+                    return Err(());
+                }
+                Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                    target,
+                    reg: Some(reg.0 as u8),
+                    op_imm8: 0x5d,
+                    op_imm16: 0xa8,
+                    wide: WideJumpKind::InvertV8Imm8(0x5c),
+                }))
+            }
+            Bytecode::Jstricteq(reg, target) => {
+                if reg.0 > 0xff {
+                    return Err(());
+                }
+                Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                    target,
+                    reg: Some(reg.0 as u8),
+                    op_imm8: 0x5e,
+                    op_imm16: 0xa9,
+                    wide: WideJumpKind::InvertV8Imm8(0x5f),
+                }))
+            }
+            Bytecode::Jnstricteq(reg, target) => {
+                if reg.0 > 0xff {
+                    return Err(());
+                }
+                Ok(EncodeInsnKind::Jump(JumpEncodeMeta {
+                    target,
+                    reg: Some(reg.0 as u8),
+                    op_imm8: 0x5f,
+                    op_imm16: 0xaa,
+                    wide: WideJumpKind::InvertV8Imm8(0x5e),
+                }))
+            }
+            Bytecode::Lda(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x60;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Sta(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x61;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Ldai(a0) => {
+                if !(a0.0 >= -2147483648 && a0.0 <= 2147483647) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x62;
+                bytes[1..5].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Fldai(a0) => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x63;
+                bytes[1..9].copy_from_slice(&(a0.0 as u64).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 9 })
+            }
+            Bytecode::Return => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x64;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Returnundefined => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x65;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Getpropiterator => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x66;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Getiterator(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x67;
+                    bytes[1] = a0.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 2 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xab;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Closeiterator(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x68;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xac;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Poplexenv => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x69;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldnan => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x6a;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldinfinity => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x6b;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Getunmappedargs => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x6c;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldglobal => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x6d;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldnewtarget => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x6e;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldthis => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x6f;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldhole => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x70;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Createregexpwithliteral(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535 && a2.0 >= 0 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x71;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    bytes[4] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x72;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[5] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Callrange(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x73;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Gettemplateobject(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x76;
+                    bytes[1] = a0.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 2 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xc1;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Setobjectwithproto(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x77;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xc7;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Stownbyvalue(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x78;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    bytes[3] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xc8;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Stownbyindex(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255 && a2.0 >= 0 && a2.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x79;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    bytes[3..5].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xcb;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                bytes[4..6].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Stownbyname(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x7a;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    bytes[4] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xcc;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[5] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Getmodulenamespace(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x7b;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Stmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x7c;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Ldlocalmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x7d;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Ldexternalmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x7e;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Stglobalvar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x7f;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Stownbynamewithnameset(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x8e;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    bytes[4] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xd4;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[5] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Asyncgeneratorreject(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0x97;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Stownbyvaluewithnameset(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0x99;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    bytes[3] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xd2;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Ldsymbol => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xad;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Asyncfunctionenter => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xae;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Ldfunction => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xaf;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Debugger => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xb0;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Creategeneratorobj(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xb1;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Createiterresultobj(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xb2;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Createobjectwithexcludedkeys(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xb3;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Newobjapply(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0xb4;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xb5;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Newlexenvwithname(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xb6;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Createasyncgeneratorobj(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xb7;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Asyncgeneratorresolve(a0, a1, a2) => {
+                if !(a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xb8;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Supercallspread(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xb9;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Apply(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xba;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Supercallarrowrange(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xbb;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::Definegettersetterbyvalue(a0, a1, a2, a3) => {
+                if !(a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255 && a3.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xbc;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3] = a2.0 as u8;
+                bytes[4] = a3.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Dynamicimport => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xbd;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Resumegenerator => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xbf;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Getresumemode => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xc0;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Delobjprop(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xc2;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Suspendgenerator(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xc3;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Asyncfunctionawaituncaught(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xc4;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Copydataproperties(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xc5;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Starrayspread(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xc6;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Stsuperbyvalue(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0xc9;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2] = a1.0 as u8;
+                    bytes[3] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xca;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Asyncfunctionresolve(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xcd;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Asyncfunctionreject(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xce;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Copyrestargs(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xcf;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Stsuperbyname(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0xd0;
+                    bytes[1] = a0.0 as u8;
+                    bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                    bytes[4] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xd1;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[5] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Ldbigint(a0) => {
+                if !(a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xd3;
+                bytes[1..3].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::Nop => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xd5;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 1 })
+            }
+            Bytecode::Setgeneratorstate(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xd6;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Getasynciterator(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xd7;
+                bytes[1] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::Ldprivateproperty(a0, a1, a2) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 255
+                    && a1.0 >= 0
+                    && a1.0 <= 65535
+                    && a2.0 >= 0
+                    && a2.0 <= 65535)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xd8;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Stprivateproperty(a0, a1, a2, a3) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 255
+                    && a1.0 >= 0
+                    && a1.0 <= 65535
+                    && a2.0 >= 0
+                    && a2.0 <= 65535
+                    && a3.0 <= 255)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xd9;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                bytes[6] = a3.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::Testin(a0, a1, a2) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 255
+                    && a1.0 >= 0
+                    && a1.0 <= 65535
+                    && a2.0 >= 0
+                    && a2.0 <= 65535)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xda;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Definefieldbyname(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 65535 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xdb;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Definepropertybyname(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 65535 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xdc;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Callthis0withname(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 65535 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xdd;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::Callthis1withname(a0, a1, a2, a3) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 65535 && a2.0 <= 255 && a3.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xde;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[4] = a2.0 as u8;
+                bytes[5] = a3.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Callthis2withname(a0, a1, a2, a3, a4) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 255
+                    && a1.0 <= 65535
+                    && a2.0 <= 255
+                    && a3.0 <= 255
+                    && a4.0 <= 255)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xdf;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[4] = a2.0 as u8;
+                bytes[5] = a3.0 as u8;
+                bytes[6] = a4.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::Callthis3withname(a0, a1, a2, a3, a4, a5) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 255
+                    && a1.0 <= 65535
+                    && a2.0 <= 255
+                    && a3.0 <= 255
+                    && a4.0 <= 255
+                    && a5.0 <= 255)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xe0;
+                bytes[1] = a0.0 as u8;
+                bytes[2..4].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[4] = a2.0 as u8;
+                bytes[5] = a3.0 as u8;
+                bytes[6] = a4.0 as u8;
+                bytes[7] = a5.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 8 })
+            }
+            Bytecode::Callthisrangewithname(a0, a1, a2, a3) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 255
+                    && a1.0 >= 0
+                    && a1.0 <= 255
+                    && a2.0 <= 65535
+                    && a3.0 <= 255)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xe1;
+                bytes[1] = a0.0 as u8;
+                bytes[2] = a1.0 as u8;
+                bytes[3..5].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                bytes[5] = a3.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::CallruntimeNotifyconcurrentresult => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x00;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::DeprecatedLdlexenv => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x00;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::WideCreateobjectwithexcludedkeys(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x00;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4] = a1.0 as u8;
+                bytes[5] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::Throw => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfe;
+                bytes[1] = 0x00;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::CallruntimeDefinefieldbyvalue(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x01;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::DeprecatedPoplexenv => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x01;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::WideNewobjrange(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x01;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::ThrowNotexists => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfe;
+                bytes[1] = 0x01;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::CallruntimeDefinefieldbyindex(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 4294967295 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x02;
+                bytes[2] = a0.0 as u8;
+                bytes[3..7].copy_from_slice(&(a1.0 as u32).to_le_bytes());
+                bytes[7] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 8 })
+            }
+            Bytecode::DeprecatedGetiteratornext(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x02;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::WideNewlexenv(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x02;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::ThrowPatternnoncoercible => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfe;
+                bytes[1] = 0x02;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::CallruntimeTopropertykey => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x03;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::DeprecatedCreatearraywithbuffer(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x03;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::WideNewlexenvwithname(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x03;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::ThrowDeletesuperproperty => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfe;
+                bytes[1] = 0x03;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::CallruntimeCreateprivateproperty(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x04;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::DeprecatedCreateobjectwithbuffer(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x04;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::WideCallrange(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x04;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::ThrowConstassignment(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfe;
+                bytes[1] = 0x04;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::CallruntimeDefineprivateproperty(a0, a1, a2, a3) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 255
+                    && a1.0 >= 0
+                    && a1.0 <= 65535
+                    && a2.0 >= 0
+                    && a2.0 <= 65535
+                    && a3.0 <= 255)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x05;
+                bytes[2] = a0.0 as u8;
+                bytes[3..5].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[5..7].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                bytes[7] = a3.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 8 })
+            }
+            Bytecode::DeprecatedTonumber(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x05;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::WideCallthisrange(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x05;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::ThrowIfnotobject(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfe;
+                bytes[1] = 0x05;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::CallruntimeCallinit(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x06;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedTonumeric(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x06;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::WideSupercallthisrange(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x06;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::ThrowUndefinedifhole(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfe;
+                bytes[1] = 0x06;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeDefinesendableclass(a0, a1, a2, a3, a4) => {
+                if !(a0.0 >= 0
+                    && a0.0 <= 65535
+                    && a1.0 <= 65535
+                    && a2.0 <= 65535
+                    && a3.0 >= 0
+                    && a3.0 <= 65535
+                    && a4.0 <= 255)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x07;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[6..8].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                bytes[8..10].copy_from_slice(&(a3.0 as u16).to_le_bytes());
+                bytes[10] = a4.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 11 })
+            }
+            Bytecode::DeprecatedNeg(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x07;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::WideSupercallarrowrange(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x07;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::ThrowIfsupernotcorrectcall(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0xfe;
+                    bytes[1] = 0x07;
+                    bytes[2] = a0.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfe;
+                bytes[1] = 0x08;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeLdsendableclass(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x08;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedNot(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x08;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::WideLdobjbyindex(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 4294967295) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x08;
+                bytes[2..6].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::CallruntimeLdsendableexternalmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x09;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::DeprecatedInc(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x09;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::WideStobjbyindex(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 4294967295) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x09;
+                bytes[2] = a0.0 as u8;
+                bytes[3..7].copy_from_slice(&(a1.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::ThrowUndefinedifholewithname(a0) => {
+                if !(a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfe;
+                bytes[1] = 0x09;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeWideldsendableexternalmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x0a;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedDec(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x0a;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::WideStownbyindex(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 4294967295) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x0a;
+                bytes[2] = a0.0 as u8;
+                bytes[3..7].copy_from_slice(&(a1.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::CallruntimeNewsendableenv(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x0b;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::DeprecatedCallarg0(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x0b;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::WideCopyrestargs(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x0b;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeWidenewsendableenv(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x0c;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedCallarg1(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x0c;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::WideLdlexvar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 >= 0 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x0c;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::CallruntimeStsendablevar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 15 && a1.0 >= 0 && a1.0 <= 15 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0xfb;
+                    bytes[1] = 0x0d;
+                    bytes[2] |= (a0.0 as u8) & 0x0f;
+                    bytes[2] |= ((a1.0 as u8) & 0x0f) << 4;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x0e;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedCallargs2(a0, a1, a2) => {
+                if !(a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x0d;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::WideStlexvar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 >= 0 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x0d;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::DeprecatedCallargs3(a0, a1, a2, a3) => {
+                if !(a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255 && a3.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x0e;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                bytes[5] = a3.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::WideGetmodulenamespace(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x0e;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeWidestsendablevar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 >= 0 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x0f;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::DeprecatedCallrange(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x0f;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::WideStmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x0f;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeLdsendablevar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 15 && a1.0 >= 0 && a1.0 <= 15 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0xfb;
+                    bytes[1] = 0x10;
+                    bytes[2] |= (a0.0 as u8) & 0x0f;
+                    bytes[2] |= ((a1.0 as u8) & 0x0f) << 4;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 3 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x11;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedCallspread(a0, a1, a2) => {
+                if !(a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x10;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::WideLdlocalmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x10;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedCallthisrange(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x11;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::WideLdexternalmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x11;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeWideldsendablevar(a0, a1) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 >= 0 && a1.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x12;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::DeprecatedDefineclasswithbuffer(a0, a1, a2, a3, a4) => {
+                if !(a0.0 <= 65535
+                    && a1.0 >= 0
+                    && a1.0 <= 65535
+                    && a2.0 >= 0
+                    && a2.0 <= 65535
+                    && a3.0 <= 255
+                    && a4.0 <= 255)
+                {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x12;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[6..8].copy_from_slice(&(a2.0 as u16).to_le_bytes());
+                bytes[8] = a3.0 as u8;
+                bytes[9] = a4.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 10 })
+            }
+            Bytecode::WideLdpatchvar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x12;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeIstrue(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x13;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::DeprecatedResumegenerator(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x13;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::WideStpatchvar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x13;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeIsfalse(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x14;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::DeprecatedGetresumemode(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x14;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::WideCallthisrangewithname(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 <= 65535 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfd;
+                bytes[1] = 0x14;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[6] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::CallruntimeLdlazymodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x15;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::DeprecatedGettemplateobject(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x15;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::CallruntimeWideldlazymodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x16;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedDelobjprop(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x16;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeLdlazysendablemodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x17;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::DeprecatedSuspendgenerator(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x17;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeWideldlazysendablemodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x18;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedAsyncfunctionawaituncaught(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x18;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeSupercallforwardallargs(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x19;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::DeprecatedCopydataproperties(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x19;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeLdsendablelocalmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x1a;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::DeprecatedSetobjectwithproto(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x1a;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::CallruntimeWideldsendablelocalmodulevar(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfb;
+                bytes[1] = 0x1b;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedLdobjbyvalue(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x1b;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedLdsuperbyvalue(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x1c;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedLdobjbyindex(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 4294967295) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x1d;
+                bytes[2] = a0.0 as u8;
+                bytes[3..7].copy_from_slice(&(a1.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::DeprecatedAsyncfunctionresolve(a0, a1, a2) => {
+                if !(a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x1e;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::DeprecatedAsyncfunctionreject(a0, a1, a2) => {
+                if !(a0.0 <= 255 && a1.0 <= 255 && a2.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x1f;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                bytes[4] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 5 })
+            }
+            Bytecode::DeprecatedStlexvar(a0, a1, a2) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535 && a1.0 >= 0 && a1.0 <= 65535 && a2.0 <= 255) {
+                    return Err(());
+                }
+                if a0.0 >= 0 && a0.0 <= 15 && a1.0 >= 0 && a1.0 <= 15 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0xfc;
+                    bytes[1] = 0x20;
+                    bytes[2] |= (a0.0 as u8) & 0x0f;
+                    bytes[2] |= ((a1.0 as u8) & 0x0f) << 4;
+                    bytes[3] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 4 });
+                }
+                if a0.0 >= 0 && a0.0 <= 255 && a1.0 >= 0 && a1.0 <= 255 {
+                    let mut bytes = [0u8; 16];
+                    bytes[0] = 0xfc;
+                    bytes[1] = 0x21;
+                    bytes[2] = a0.0 as u8;
+                    bytes[3] = a1.0 as u8;
+                    bytes[4] = a2.0 as u8;
+                    return Ok(EncodeInsnKind::Fixed { bytes, len: 5 });
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x22;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                bytes[4..6].copy_from_slice(&(a1.0 as u16).to_le_bytes());
+                bytes[6] = a2.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::DeprecatedGetmodulenamespace(a0) => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x23;
+                bytes[2..6].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::DeprecatedStmodulevar(a0) => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x24;
+                bytes[2..6].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::DeprecatedLdobjbyname(a0, a1) => {
+                if !(a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x25;
+                bytes[2..6].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                bytes[6] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::DeprecatedLdsuperbyname(a0, a1) => {
+                if !(a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x26;
+                bytes[2..6].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                bytes[6] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::DeprecatedLdmodulevar(a0, a1) => {
+                if !(a1.0 >= 0 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x27;
+                bytes[2..6].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                bytes[6] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 7 })
+            }
+            Bytecode::DeprecatedStconsttoglobalrecord(a0) => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x28;
+                bytes[2..6].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::DeprecatedStlettoglobalrecord(a0) => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x29;
+                bytes[2..6].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::DeprecatedStclasstoglobalrecord(a0) => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x2a;
+                bytes[2..6].copy_from_slice(&(a0.0 as u32).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 6 })
+            }
+            Bytecode::DeprecatedLdhomeobject => {
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x2b;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 2 })
+            }
+            Bytecode::DeprecatedCreateobjecthavingmethod(a0) => {
+                if !(a0.0 >= 0 && a0.0 <= 65535) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x2c;
+                bytes[2..4].copy_from_slice(&(a0.0 as u16).to_le_bytes());
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+            Bytecode::DeprecatedDynamicimport(a0) => {
+                if !(a0.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x2d;
+                bytes[2] = a0.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 3 })
+            }
+            Bytecode::DeprecatedAsyncgeneratorreject(a0, a1) => {
+                if !(a0.0 <= 255 && a1.0 <= 255) {
+                    return Err(());
+                }
+                let mut bytes = [0u8; 16];
+                bytes[0] = 0xfc;
+                bytes[1] = 0x2e;
+                bytes[2] = a0.0 as u8;
+                bytes[3] = a1.0 as u8;
+                Ok(EncodeInsnKind::Fixed { bytes, len: 4 })
+            }
+        }
+    }
+
+    /// Decode a single instruction from raw bytes via C FFI (retained for
+    /// differential oracle verification against [`Self::decode_modern`]).
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must point to at least `isa_get_size_by_opcode(opcode)` readable
+    /// bytes. `opcode` must have been obtained from `isa_get_opcode(ptr)`.
+    pub unsafe fn decode_one(ptr: *const u8, opcode: u16) -> Option<(Self, Option<i64>)> {
+        match opcode as u32 {
+            0 => {
+                let _ = ptr;
+                Some((Bytecode::Ldundefined, None))
+            }
+            1 => {
+                let _ = ptr;
+                Some((Bytecode::Ldnull, None))
+            }
+            2 => {
+                let _ = ptr;
+                Some((Bytecode::Ldtrue, None))
+            }
+            3 => {
+                let _ = ptr;
+                Some((Bytecode::Ldfalse, None))
+            }
+            4 => {
+                let _ = ptr;
+                Some((Bytecode::Createemptyobject, None))
+            }
+            5 | 128 => Some((
+                Bytecode::Createemptyarray(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            6 | 129 => Some((
+                Bytecode::Createarraywithbuffer(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            7 | 130 => Some((
+                Bytecode::Createobjectwithbuffer(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            8 | 131 => Some((
+                Bytecode::Newobjrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            9 => Some((
+                Bytecode::Newlexenv(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            10 => Some((
+                Bytecode::Add2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            11 => Some((
+                Bytecode::Sub2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            12 => Some((
+                Bytecode::Mul2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            13 => Some((
+                Bytecode::Div2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            14 => Some((
+                Bytecode::Mod2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            15 => Some((
+                Bytecode::Eq(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            16 => Some((
+                Bytecode::Noteq(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            17 => Some((
+                Bytecode::Less(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            18 => Some((
+                Bytecode::Lesseq(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            19 => Some((
+                Bytecode::Greater(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            20 => Some((
+                Bytecode::Greatereq(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            21 => Some((
+                Bytecode::Shl2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            22 => Some((
+                Bytecode::Shr2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            23 => Some((
+                Bytecode::Ashr2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            24 => Some((
+                Bytecode::And2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            25 => Some((
+                Bytecode::Or2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            26 => Some((
+                Bytecode::Xor2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            27 => Some((
+                Bytecode::Exp(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            28 | 132 => Some((
+                Bytecode::Typeof(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            29 => Some((
+                Bytecode::Tonumber(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            30 => Some((
+                Bytecode::Tonumeric(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            31 => Some((
+                Bytecode::Neg(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            32 => Some((
+                Bytecode::Not(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            33 => Some((
+                Bytecode::Inc(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            34 => Some((
+                Bytecode::Dec(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            35 => {
+                let _ = ptr;
+                Some((Bytecode::Istrue, None))
+            }
+            36 => {
+                let _ = ptr;
+                Some((Bytecode::Isfalse, None))
+            }
+            37 => Some((
+                Bytecode::Isin(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            38 => Some((
+                Bytecode::Instanceof(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            39 => Some((
+                Bytecode::Strictnoteq(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            40 => Some((
+                Bytecode::Stricteq(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            41 => Some((
+                Bytecode::Callarg0(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            42 => Some((
+                Bytecode::Callarg1(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            43 => Some((
+                Bytecode::Callargs2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            44 => Some((
+                Bytecode::Callargs3(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                ),
+                None,
+            )),
+            45 => Some((
+                Bytecode::Callthis0(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            46 => Some((
+                Bytecode::Callthis1(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            47 => Some((
+                Bytecode::Callthis2(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                ),
+                None,
+            )),
+            48 => Some((
+                Bytecode::Callthis3(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 3) } as u16),
+                ),
+                None,
+            )),
+            49 => Some((
+                Bytecode::Callthisrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            50 => Some((
+                Bytecode::Supercallthisrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            51 | 116 => Some((
+                Bytecode::Definefunc(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            52 | 190 => Some((
+                Bytecode::Definemethod(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            53 | 117 => Some((
+                Bytecode::Defineclasswithbuffer(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 1) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            54 => Some((
+                Bytecode::Getnextpropname(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            55 | 133 => Some((
+                Bytecode::Ldobjbyvalue(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            56 | 134 => Some((
+                Bytecode::Stobjbyvalue(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            57 | 135 => Some((
+                Bytecode::Ldsuperbyvalue(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            58 | 136 => Some((
+                Bytecode::Ldobjbyindex(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            59 | 137 => Some((
+                Bytecode::Stobjbyindex(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            60 | 138 => Some((
+                Bytecode::Ldlexvar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            61 | 139 => Some((
+                Bytecode::Stlexvar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            62 => Some((
+                Bytecode::LdaStr(EntityId(unsafe { crate::isa_get_id(ptr, 0) })),
+                None,
+            )),
+            63 | 140 => Some((
+                Bytecode::Tryldglobalbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            64 | 141 => Some((
+                Bytecode::Trystglobalbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            65 => Some((
+                Bytecode::Ldglobalvar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            66 | 144 => Some((
+                Bytecode::Ldobjbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            67 | 145 => Some((
+                Bytecode::Stobjbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            68 | 69 | 143 => Some((
+                Bytecode::Mov(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            70 | 146 => Some((
+                Bytecode::Ldsuperbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            71 => Some((
+                Bytecode::Stconsttoglobalrecord(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            72 => Some((
+                Bytecode::Sttoglobalrecord(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            73 | 147 => Some((
+                Bytecode::Ldthisbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            74 | 148 => Some((
+                Bytecode::Stthisbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            75 | 149 => Some((
+                Bytecode::Ldthisbyvalue(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            76 | 150 => Some((
+                Bytecode::Stthisbyvalue(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            77 | 78 | 152 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jmp(Label(0)), Some(raw_imm)))
+            }
+            79 | 80 | 154 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jeqz(Label(0)), Some(raw_imm)))
+            }
+            81 | 155 | 156 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jnez(Label(0)), Some(raw_imm)))
+            }
+            82 | 157 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jstricteqz(Label(0)), Some(raw_imm)))
+            }
+            83 | 158 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jnstricteqz(Label(0)), Some(raw_imm)))
+            }
+            84 | 159 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jeqnull(Label(0)), Some(raw_imm)))
+            }
+            85 | 160 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jnenull(Label(0)), Some(raw_imm)))
+            }
+            86 | 161 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jstricteqnull(Label(0)), Some(raw_imm)))
+            }
+            87 | 162 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jnstricteqnull(Label(0)), Some(raw_imm)))
+            }
+            88 | 163 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jequndefined(Label(0)), Some(raw_imm)))
+            }
+            89 | 164 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jneundefined(Label(0)), Some(raw_imm)))
+            }
+            90 | 165 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jstrictequndefined(Label(0)), Some(raw_imm)))
+            }
+            91 | 166 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((Bytecode::Jnstrictequndefined(Label(0)), Some(raw_imm)))
+            }
+            92 | 167 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((
+                    Bytecode::Jeq(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16), Label(0)),
+                    Some(raw_imm),
+                ))
+            }
+            93 | 168 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((
+                    Bytecode::Jne(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16), Label(0)),
+                    Some(raw_imm),
+                ))
+            }
+            94 | 169 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((
+                    Bytecode::Jstricteq(
+                        Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                        Label(0),
+                    ),
+                    Some(raw_imm),
+                ))
+            }
+            95 | 170 => {
+                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
+                Some((
+                    Bytecode::Jnstricteq(
+                        Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                        Label(0),
+                    ),
+                    Some(raw_imm),
+                ))
+            }
+            96 => Some((
+                Bytecode::Lda(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            97 => Some((
+                Bytecode::Sta(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            98 => Some((
+                Bytecode::Ldai(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            99 => Some((
+                Bytecode::Fldai(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            100 => {
+                let _ = ptr;
+                Some((Bytecode::Return, None))
+            }
+            101 => {
+                let _ = ptr;
+                Some((Bytecode::Returnundefined, None))
+            }
+            102 => {
+                let _ = ptr;
+                Some((Bytecode::Getpropiterator, None))
+            }
+            103 | 171 => Some((
+                Bytecode::Getiterator(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            104 | 172 => Some((
+                Bytecode::Closeiterator(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            105 => {
+                let _ = ptr;
+                Some((Bytecode::Poplexenv, None))
+            }
+            106 => {
+                let _ = ptr;
+                Some((Bytecode::Ldnan, None))
+            }
+            107 => {
+                let _ = ptr;
+                Some((Bytecode::Ldinfinity, None))
+            }
+            108 => {
+                let _ = ptr;
+                Some((Bytecode::Getunmappedargs, None))
+            }
+            109 => {
+                let _ = ptr;
+                Some((Bytecode::Ldglobal, None))
+            }
+            110 => {
+                let _ = ptr;
+                Some((Bytecode::Ldnewtarget, None))
+            }
+            111 => {
+                let _ = ptr;
+                Some((Bytecode::Ldthis, None))
+            }
+            112 => {
+                let _ = ptr;
+                Some((Bytecode::Ldhole, None))
+            }
+            113 | 114 => Some((
+                Bytecode::Createregexpwithliteral(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            115 => Some((
+                Bytecode::Callrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            118 | 193 => Some((
+                Bytecode::Gettemplateobject(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            119 | 199 => Some((
+                Bytecode::Setobjectwithproto(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            120 | 200 => Some((
+                Bytecode::Stownbyvalue(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            121 | 203 => Some((
+                Bytecode::Stownbyindex(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            122 | 204 => Some((
+                Bytecode::Stownbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            123 => Some((
+                Bytecode::Getmodulenamespace(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            124 => Some((
+                Bytecode::Stmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            125 => Some((
+                Bytecode::Ldlocalmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            126 => Some((
+                Bytecode::Ldexternalmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            127 => Some((
+                Bytecode::Stglobalvar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            142 | 212 => Some((
+                Bytecode::Stownbynamewithnameset(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            151 => Some((
+                Bytecode::Asyncgeneratorreject(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            153 | 210 => Some((
+                Bytecode::Stownbyvaluewithnameset(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            173 => {
+                let _ = ptr;
+                Some((Bytecode::Ldsymbol, None))
+            }
+            174 => {
+                let _ = ptr;
+                Some((Bytecode::Asyncfunctionenter, None))
+            }
+            175 => {
+                let _ = ptr;
+                Some((Bytecode::Ldfunction, None))
+            }
+            176 => {
+                let _ = ptr;
+                Some((Bytecode::Debugger, None))
+            }
+            177 => Some((
+                Bytecode::Creategeneratorobj(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            178 => Some((
+                Bytecode::Createiterresultobj(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            179 => Some((
+                Bytecode::Createobjectwithexcludedkeys(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            180 | 181 => Some((
+                Bytecode::Newobjapply(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            182 => Some((
+                Bytecode::Newlexenvwithname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            183 => Some((
+                Bytecode::Createasyncgeneratorobj(Reg(
+                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
+                )),
+                None,
+            )),
+            184 => Some((
+                Bytecode::Asyncgeneratorresolve(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                ),
+                None,
+            )),
+            185 => Some((
+                Bytecode::Supercallspread(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            186 => Some((
+                Bytecode::Apply(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            187 => Some((
+                Bytecode::Supercallarrowrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            188 => Some((
+                Bytecode::Definegettersetterbyvalue(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 3) } as u16),
+                ),
+                None,
+            )),
+            189 => {
+                let _ = ptr;
+                Some((Bytecode::Dynamicimport, None))
+            }
+            191 => {
+                let _ = ptr;
+                Some((Bytecode::Resumegenerator, None))
+            }
+            192 => {
+                let _ = ptr;
+                Some((Bytecode::Getresumemode, None))
+            }
+            194 => Some((
+                Bytecode::Delobjprop(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            195 => Some((
+                Bytecode::Suspendgenerator(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            196 => Some((
+                Bytecode::Asyncfunctionawaituncaught(Reg(
+                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
+                )),
+                None,
+            )),
+            197 => Some((
+                Bytecode::Copydataproperties(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            198 => Some((
+                Bytecode::Starrayspread(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            201 | 202 => Some((
+                Bytecode::Stsuperbyvalue(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            205 => Some((
+                Bytecode::Asyncfunctionresolve(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            206 => Some((
+                Bytecode::Asyncfunctionreject(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            207 => Some((
+                Bytecode::Copyrestargs(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            208 | 209 => Some((
+                Bytecode::Stsuperbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            211 => Some((
+                Bytecode::Ldbigint(EntityId(unsafe { crate::isa_get_id(ptr, 0) })),
+                None,
+            )),
+            213 => {
+                let _ = ptr;
+                Some((Bytecode::Nop, None))
+            }
+            214 => Some((
+                Bytecode::Setgeneratorstate(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            215 => Some((
+                Bytecode::Getasynciterator(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            216 => Some((
+                Bytecode::Ldprivateproperty(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 2) }),
+                ),
+                None,
+            )),
+            217 => Some((
+                Bytecode::Stprivateproperty(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 2) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            218 => Some((
+                Bytecode::Testin(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 2) }),
+                ),
+                None,
+            )),
+            219 => Some((
+                Bytecode::Definefieldbyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            220 => Some((
+                Bytecode::Definepropertybyname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            221 => Some((
+                Bytecode::Callthis0withname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            222 => Some((
+                Bytecode::Callthis1withname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            223 => Some((
+                Bytecode::Callthis2withname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                ),
+                None,
+            )),
+            224 => Some((
+                Bytecode::Callthis3withname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 3) } as u16),
+                ),
+                None,
+            )),
+            225 => Some((
+                Bytecode::Callthisrangewithname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            251 => {
+                let _ = ptr;
+                Some((Bytecode::CallruntimeNotifyconcurrentresult, None))
+            }
+            252 => {
+                let _ = ptr;
+                Some((Bytecode::DeprecatedLdlexenv, None))
+            }
+            253 => Some((
+                Bytecode::WideCreateobjectwithexcludedkeys(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            254 => {
+                let _ = ptr;
+                Some((Bytecode::Throw, None))
+            }
+            507 => Some((
+                Bytecode::CallruntimeDefinefieldbyvalue(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            508 => {
+                let _ = ptr;
+                Some((Bytecode::DeprecatedPoplexenv, None))
+            }
+            509 => Some((
+                Bytecode::WideNewobjrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            510 => {
+                let _ = ptr;
+                Some((Bytecode::ThrowNotexists, None))
+            }
+            763 => Some((
+                Bytecode::CallruntimeDefinefieldbyindex(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            764 => Some((
+                Bytecode::DeprecatedGetiteratornext(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            765 => Some((
+                Bytecode::WideNewlexenv(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            766 => {
+                let _ = ptr;
+                Some((Bytecode::ThrowPatternnoncoercible, None))
+            }
+            1019 => {
+                let _ = ptr;
+                Some((Bytecode::CallruntimeTopropertykey, None))
+            }
+            1020 => Some((
+                Bytecode::DeprecatedCreatearraywithbuffer(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            1021 => Some((
+                Bytecode::WideNewlexenvwithname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            1022 => {
+                let _ = ptr;
+                Some((Bytecode::ThrowDeletesuperproperty, None))
+            }
+            1275 => Some((
+                Bytecode::CallruntimeCreateprivateproperty(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                ),
+                None,
+            )),
+            1276 => Some((
+                Bytecode::DeprecatedCreateobjectwithbuffer(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            1277 => Some((
+                Bytecode::WideCallrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            1278 => Some((
+                Bytecode::ThrowConstassignment(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            1531 => Some((
+                Bytecode::CallruntimeDefineprivateproperty(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 2) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            1532 => Some((
+                Bytecode::DeprecatedTonumber(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            1533 => Some((
+                Bytecode::WideCallthisrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            1534 => Some((
+                Bytecode::ThrowIfnotobject(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            1787 => Some((
+                Bytecode::CallruntimeCallinit(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            1788 => Some((
+                Bytecode::DeprecatedTonumeric(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            1789 => Some((
+                Bytecode::WideSupercallthisrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            1790 => Some((
+                Bytecode::ThrowUndefinedifhole(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            2043 => Some((
+                Bytecode::CallruntimeDefinesendableclass(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 1) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            2044 => Some((
+                Bytecode::DeprecatedNeg(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            2045 => Some((
+                Bytecode::WideSupercallarrowrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            2046 | 2302 => Some((
+                Bytecode::ThrowIfsupernotcorrectcall(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            2299 => Some((
+                Bytecode::CallruntimeLdsendableclass(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            2300 => Some((
+                Bytecode::DeprecatedNot(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            2301 => Some((
+                Bytecode::WideLdobjbyindex(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            2555 => Some((
+                Bytecode::CallruntimeLdsendableexternalmodulevar(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            2556 => Some((
+                Bytecode::DeprecatedInc(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            2557 => Some((
+                Bytecode::WideStobjbyindex(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                ),
+                None,
+            )),
+            2558 => Some((
+                Bytecode::ThrowUndefinedifholewithname(EntityId(unsafe {
+                    crate::isa_get_id(ptr, 0)
+                })),
+                None,
+            )),
+            2811 => Some((
+                Bytecode::CallruntimeWideldsendableexternalmodulevar(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            2812 => Some((
+                Bytecode::DeprecatedDec(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            2813 => Some((
+                Bytecode::WideStownbyindex(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                ),
+                None,
+            )),
+            3067 => Some((
+                Bytecode::CallruntimeNewsendableenv(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            3068 => Some((
+                Bytecode::DeprecatedCallarg0(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
+                None,
+            )),
+            3069 => Some((
+                Bytecode::WideCopyrestargs(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            3323 => Some((
+                Bytecode::CallruntimeWidenewsendableenv(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            3324 => Some((
+                Bytecode::DeprecatedCallarg1(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            3325 => Some((
+                Bytecode::WideLdlexvar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            3579 | 3835 => Some((
+                Bytecode::CallruntimeStsendablevar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            3580 => Some((
+                Bytecode::DeprecatedCallargs2(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                ),
+                None,
+            )),
+            3581 => Some((
+                Bytecode::WideStlexvar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            3836 => Some((
+                Bytecode::DeprecatedCallargs3(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 3) } as u16),
+                ),
+                None,
+            )),
+            3837 => Some((
+                Bytecode::WideGetmodulenamespace(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            4091 => Some((
+                Bytecode::CallruntimeWidestsendablevar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            4092 => Some((
+                Bytecode::DeprecatedCallrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            4093 => Some((
+                Bytecode::WideStmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            4347 | 4603 => Some((
+                Bytecode::CallruntimeLdsendablevar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            4348 => Some((
+                Bytecode::DeprecatedCallspread(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                ),
+                None,
+            )),
+            4349 => Some((
+                Bytecode::WideLdlocalmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            4604 => Some((
+                Bytecode::DeprecatedCallthisrange(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            4605 => Some((
+                Bytecode::WideLdexternalmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            4859 => Some((
+                Bytecode::CallruntimeWideldsendablevar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                ),
+                None,
+            )),
+            4860 => Some((
+                Bytecode::DeprecatedDefineclasswithbuffer(
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            4861 => Some((
+                Bytecode::WideLdpatchvar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            5115 => Some((
+                Bytecode::CallruntimeIstrue(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            5116 => Some((
+                Bytecode::DeprecatedResumegenerator(Reg(
+                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
+                )),
+                None,
+            )),
+            5117 => Some((
+                Bytecode::WideStpatchvar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            5371 => Some((
+                Bytecode::CallruntimeIsfalse(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
+                None,
+            )),
+            5372 => Some((
+                Bytecode::DeprecatedGetresumemode(Reg(
+                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
+                )),
+                None,
+            )),
+            5373 => Some((
+                Bytecode::WideCallthisrangewithname(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            5627 => Some((
+                Bytecode::CallruntimeLdlazymodulevar(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            5628 => Some((
+                Bytecode::DeprecatedGettemplateobject(Reg(
+                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
+                )),
+                None,
+            )),
+            5883 => Some((
+                Bytecode::CallruntimeWideldlazymodulevar(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            5884 => Some((
+                Bytecode::DeprecatedDelobjprop(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            6139 => Some((
+                Bytecode::CallruntimeLdlazysendablemodulevar(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            6140 => Some((
+                Bytecode::DeprecatedSuspendgenerator(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            6395 => Some((
+                Bytecode::CallruntimeWideldlazysendablemodulevar(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            6396 => Some((
+                Bytecode::DeprecatedAsyncfunctionawaituncaught(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            6651 => Some((
+                Bytecode::CallruntimeSupercallforwardallargs(Reg(unsafe {
+                    crate::isa_get_vreg(ptr, 0)
+                } as u16)),
+                None,
+            )),
+            6652 => Some((
+                Bytecode::DeprecatedCopydataproperties(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            6907 => Some((
+                Bytecode::CallruntimeLdsendablelocalmodulevar(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            6908 => Some((
+                Bytecode::DeprecatedSetobjectwithproto(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            7163 => Some((
+                Bytecode::CallruntimeWideldsendablelocalmodulevar(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            7164 => Some((
+                Bytecode::DeprecatedLdobjbyvalue(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            7420 => Some((
+                Bytecode::DeprecatedLdsuperbyvalue(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
+            7676 => Some((
+                Bytecode::DeprecatedLdobjbyindex(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                ),
+                None,
+            )),
+            7932 => Some((
+                Bytecode::DeprecatedAsyncfunctionresolve(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                ),
+                None,
+            )),
+            8188 => Some((
+                Bytecode::DeprecatedAsyncfunctionreject(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
+                ),
+                None,
+            )),
+            8444 | 8700 | 8956 => Some((
+                Bytecode::DeprecatedStlexvar(
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            9212 => Some((
+                Bytecode::DeprecatedGetmodulenamespace(EntityId(unsafe {
+                    crate::isa_get_id(ptr, 0)
+                })),
+                None,
+            )),
+            9468 => Some((
+                Bytecode::DeprecatedStmodulevar(EntityId(unsafe { crate::isa_get_id(ptr, 0) })),
+                None,
+            )),
+            9724 => Some((
+                Bytecode::DeprecatedLdobjbyname(
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            9980 => Some((
+                Bytecode::DeprecatedLdsuperbyname(
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                ),
+                None,
+            )),
+            10236 => Some((
+                Bytecode::DeprecatedLdmodulevar(
+                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
+                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
+                ),
+                None,
+            )),
+            10492 => Some((
+                Bytecode::DeprecatedStconsttoglobalrecord(EntityId(unsafe {
+                    crate::isa_get_id(ptr, 0)
+                })),
+                None,
+            )),
+            10748 => Some((
+                Bytecode::DeprecatedStlettoglobalrecord(EntityId(unsafe {
+                    crate::isa_get_id(ptr, 0)
+                })),
+                None,
+            )),
+            11004 => Some((
+                Bytecode::DeprecatedStclasstoglobalrecord(EntityId(unsafe {
+                    crate::isa_get_id(ptr, 0)
+                })),
+                None,
+            )),
+            11260 => {
+                let _ = ptr;
+                Some((Bytecode::DeprecatedLdhomeobject, None))
+            }
+            11516 => Some((
+                Bytecode::DeprecatedCreateobjecthavingmethod(Imm(unsafe {
+                    crate::isa_get_imm_data(ptr, 0)
+                })),
+                None,
+            )),
+            11772 => Some((
+                Bytecode::DeprecatedDynamicimport(Reg(
+                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
+                )),
+                None,
+            )),
+            12028 => Some((
+                Bytecode::DeprecatedAsyncgeneratorreject(
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
+                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
+                ),
+                None,
+            )),
             _ => None,
         }
     }
@@ -4099,1541 +16096,6 @@ impl core::fmt::Debug for Bytecode {
 }
 
 // ============================================================================
-// Single-instruction decode
-// ============================================================================
-
-impl Bytecode {
-    /// Decode a single instruction from raw bytes.
-    ///
-    /// Returns `Some((instruction, raw_jump_offset))` on success, or `None`
-    /// if the opcode is unknown. For jump instructions, `raw_jump_offset` is
-    /// `Some(byte_offset)` (the signed immediate); for non-jumps it is `None`.
-    ///
-    /// # Safety
-    ///
-    /// `ptr` must point to at least `isa_get_size_by_opcode(opcode)` readable
-    /// bytes. `opcode` must have been obtained from `isa_get_opcode(ptr)`.
-    pub unsafe fn decode_one(ptr: *const u8, opcode: u16) -> Option<(Self, Option<i64>)> {
-        match opcode as u32 {
-            0 => Some((Bytecode::Ldundefined, None)),
-            1 => Some((Bytecode::Ldnull, None)),
-            2 => Some((Bytecode::Ldtrue, None)),
-            3 => Some((Bytecode::Ldfalse, None)),
-            4 => Some((Bytecode::Createemptyobject, None)),
-            5 | 128 => Some((
-                Bytecode::Createemptyarray(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            6 | 129 => Some((
-                Bytecode::Createarraywithbuffer(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            7 | 130 => Some((
-                Bytecode::Createobjectwithbuffer(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            8 | 131 => Some((
-                Bytecode::Newobjrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            9 => Some((
-                Bytecode::Newlexenv(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            10 => Some((
-                Bytecode::Add2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            11 => Some((
-                Bytecode::Sub2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            12 => Some((
-                Bytecode::Mul2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            13 => Some((
-                Bytecode::Div2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            14 => Some((
-                Bytecode::Mod2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            15 => Some((
-                Bytecode::Eq(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            16 => Some((
-                Bytecode::Noteq(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            17 => Some((
-                Bytecode::Less(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            18 => Some((
-                Bytecode::Lesseq(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            19 => Some((
-                Bytecode::Greater(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            20 => Some((
-                Bytecode::Greatereq(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            21 => Some((
-                Bytecode::Shl2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            22 => Some((
-                Bytecode::Shr2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            23 => Some((
-                Bytecode::Ashr2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            24 => Some((
-                Bytecode::And2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            25 => Some((
-                Bytecode::Or2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            26 => Some((
-                Bytecode::Xor2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            27 => Some((
-                Bytecode::Exp(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            28 | 132 => Some((
-                Bytecode::Typeof(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            29 => Some((
-                Bytecode::Tonumber(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            30 => Some((
-                Bytecode::Tonumeric(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            31 => Some((
-                Bytecode::Neg(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            32 => Some((
-                Bytecode::Not(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            33 => Some((
-                Bytecode::Inc(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            34 => Some((
-                Bytecode::Dec(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            35 => Some((Bytecode::Istrue, None)),
-            36 => Some((Bytecode::Isfalse, None)),
-            37 => Some((
-                Bytecode::Isin(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            38 => Some((
-                Bytecode::Instanceof(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            39 => Some((
-                Bytecode::Strictnoteq(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            40 => Some((
-                Bytecode::Stricteq(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            41 => Some((
-                Bytecode::Callarg0(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            42 => Some((
-                Bytecode::Callarg1(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            43 => Some((
-                Bytecode::Callargs2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            44 => Some((
-                Bytecode::Callargs3(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                ),
-                None,
-            )),
-            45 => Some((
-                Bytecode::Callthis0(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            46 => Some((
-                Bytecode::Callthis1(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            47 => Some((
-                Bytecode::Callthis2(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                ),
-                None,
-            )),
-            48 => Some((
-                Bytecode::Callthis3(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 3) } as u16),
-                ),
-                None,
-            )),
-            49 => Some((
-                Bytecode::Callthisrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            50 => Some((
-                Bytecode::Supercallthisrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            51 | 116 => Some((
-                Bytecode::Definefunc(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            52 | 190 => Some((
-                Bytecode::Definemethod(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            53 | 117 => Some((
-                Bytecode::Defineclasswithbuffer(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 1) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            54 => Some((
-                Bytecode::Getnextpropname(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            55 | 133 => Some((
-                Bytecode::Ldobjbyvalue(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            56 | 134 => Some((
-                Bytecode::Stobjbyvalue(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            57 | 135 => Some((
-                Bytecode::Ldsuperbyvalue(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            58 | 136 => Some((
-                Bytecode::Ldobjbyindex(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            59 | 137 => Some((
-                Bytecode::Stobjbyindex(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            60 | 138 => Some((
-                Bytecode::Ldlexvar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            61 | 139 => Some((
-                Bytecode::Stlexvar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            62 => Some((
-                Bytecode::LdaStr(EntityId(unsafe { crate::isa_get_id(ptr, 0) })),
-                None,
-            )),
-            63 | 140 => Some((
-                Bytecode::Tryldglobalbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            64 | 141 => Some((
-                Bytecode::Trystglobalbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            65 => Some((
-                Bytecode::Ldglobalvar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            66 | 144 => Some((
-                Bytecode::Ldobjbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            67 | 145 => Some((
-                Bytecode::Stobjbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            68 | 69 | 143 => Some((
-                Bytecode::Mov(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            70 | 146 => Some((
-                Bytecode::Ldsuperbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            71 => Some((
-                Bytecode::Stconsttoglobalrecord(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            72 => Some((
-                Bytecode::Sttoglobalrecord(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            73 | 147 => Some((
-                Bytecode::Ldthisbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            74 | 148 => Some((
-                Bytecode::Stthisbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            75 | 149 => Some((
-                Bytecode::Ldthisbyvalue(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            76 | 150 => Some((
-                Bytecode::Stthisbyvalue(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            77 | 78 | 152 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jmp(Label(0)), Some(raw_imm)))
-            }
-            79 | 80 | 154 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jeqz(Label(0)), Some(raw_imm)))
-            }
-            81 | 155 | 156 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jnez(Label(0)), Some(raw_imm)))
-            }
-            82 | 157 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jstricteqz(Label(0)), Some(raw_imm)))
-            }
-            83 | 158 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jnstricteqz(Label(0)), Some(raw_imm)))
-            }
-            84 | 159 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jeqnull(Label(0)), Some(raw_imm)))
-            }
-            85 | 160 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jnenull(Label(0)), Some(raw_imm)))
-            }
-            86 | 161 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jstricteqnull(Label(0)), Some(raw_imm)))
-            }
-            87 | 162 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jnstricteqnull(Label(0)), Some(raw_imm)))
-            }
-            88 | 163 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jequndefined(Label(0)), Some(raw_imm)))
-            }
-            89 | 164 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jneundefined(Label(0)), Some(raw_imm)))
-            }
-            90 | 165 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jstrictequndefined(Label(0)), Some(raw_imm)))
-            }
-            91 | 166 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((Bytecode::Jnstrictequndefined(Label(0)), Some(raw_imm)))
-            }
-            92 | 167 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((
-                    Bytecode::Jeq(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16), Label(0)),
-                    Some(raw_imm),
-                ))
-            }
-            93 | 168 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((
-                    Bytecode::Jne(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16), Label(0)),
-                    Some(raw_imm),
-                ))
-            }
-            94 | 169 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((
-                    Bytecode::Jstricteq(
-                        Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                        Label(0),
-                    ),
-                    Some(raw_imm),
-                ))
-            }
-            95 | 170 => {
-                let raw_imm = unsafe { crate::isa_get_imm64(ptr, 0) };
-                Some((
-                    Bytecode::Jnstricteq(
-                        Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                        Label(0),
-                    ),
-                    Some(raw_imm),
-                ))
-            }
-            96 => Some((
-                Bytecode::Lda(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            97 => Some((
-                Bytecode::Sta(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            98 => Some((
-                Bytecode::Ldai(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            99 => Some((
-                Bytecode::Fldai(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            100 => Some((Bytecode::Return, None)),
-            101 => Some((Bytecode::Returnundefined, None)),
-            102 => Some((Bytecode::Getpropiterator, None)),
-            103 | 171 => Some((
-                Bytecode::Getiterator(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            104 | 172 => Some((
-                Bytecode::Closeiterator(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            105 => Some((Bytecode::Poplexenv, None)),
-            106 => Some((Bytecode::Ldnan, None)),
-            107 => Some((Bytecode::Ldinfinity, None)),
-            108 => Some((Bytecode::Getunmappedargs, None)),
-            109 => Some((Bytecode::Ldglobal, None)),
-            110 => Some((Bytecode::Ldnewtarget, None)),
-            111 => Some((Bytecode::Ldthis, None)),
-            112 => Some((Bytecode::Ldhole, None)),
-            113 | 114 => Some((
-                Bytecode::Createregexpwithliteral(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            115 => Some((
-                Bytecode::Callrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            118 | 193 => Some((
-                Bytecode::Gettemplateobject(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            119 | 199 => Some((
-                Bytecode::Setobjectwithproto(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            120 | 200 => Some((
-                Bytecode::Stownbyvalue(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            121 | 203 => Some((
-                Bytecode::Stownbyindex(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            122 | 204 => Some((
-                Bytecode::Stownbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            123 => Some((
-                Bytecode::Getmodulenamespace(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            124 => Some((
-                Bytecode::Stmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            125 => Some((
-                Bytecode::Ldlocalmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            126 => Some((
-                Bytecode::Ldexternalmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            127 => Some((
-                Bytecode::Stglobalvar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            142 | 212 => Some((
-                Bytecode::Stownbynamewithnameset(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            151 => Some((
-                Bytecode::Asyncgeneratorreject(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            153 | 210 => Some((
-                Bytecode::Stownbyvaluewithnameset(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            173 => Some((Bytecode::Ldsymbol, None)),
-            174 => Some((Bytecode::Asyncfunctionenter, None)),
-            175 => Some((Bytecode::Ldfunction, None)),
-            176 => Some((Bytecode::Debugger, None)),
-            177 => Some((
-                Bytecode::Creategeneratorobj(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            178 => Some((
-                Bytecode::Createiterresultobj(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            179 => Some((
-                Bytecode::Createobjectwithexcludedkeys(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            180 | 181 => Some((
-                Bytecode::Newobjapply(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            182 => Some((
-                Bytecode::Newlexenvwithname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            183 => Some((
-                Bytecode::Createasyncgeneratorobj(Reg(
-                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
-                )),
-                None,
-            )),
-            184 => Some((
-                Bytecode::Asyncgeneratorresolve(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                ),
-                None,
-            )),
-            185 => Some((
-                Bytecode::Supercallspread(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            186 => Some((
-                Bytecode::Apply(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            187 => Some((
-                Bytecode::Supercallarrowrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            188 => Some((
-                Bytecode::Definegettersetterbyvalue(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 3) } as u16),
-                ),
-                None,
-            )),
-            189 => Some((Bytecode::Dynamicimport, None)),
-            191 => Some((Bytecode::Resumegenerator, None)),
-            192 => Some((Bytecode::Getresumemode, None)),
-            194 => Some((
-                Bytecode::Delobjprop(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            195 => Some((
-                Bytecode::Suspendgenerator(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            196 => Some((
-                Bytecode::Asyncfunctionawaituncaught(Reg(
-                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
-                )),
-                None,
-            )),
-            197 => Some((
-                Bytecode::Copydataproperties(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            198 => Some((
-                Bytecode::Starrayspread(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            201 | 202 => Some((
-                Bytecode::Stsuperbyvalue(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            205 => Some((
-                Bytecode::Asyncfunctionresolve(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            206 => Some((
-                Bytecode::Asyncfunctionreject(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            207 => Some((
-                Bytecode::Copyrestargs(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            208 | 209 => Some((
-                Bytecode::Stsuperbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            211 => Some((
-                Bytecode::Ldbigint(EntityId(unsafe { crate::isa_get_id(ptr, 0) })),
-                None,
-            )),
-            213 => Some((Bytecode::Nop, None)),
-            214 => Some((
-                Bytecode::Setgeneratorstate(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            215 => Some((
-                Bytecode::Getasynciterator(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            216 => Some((
-                Bytecode::Ldprivateproperty(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 2) }),
-                ),
-                None,
-            )),
-            217 => Some((
-                Bytecode::Stprivateproperty(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 2) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            218 => Some((
-                Bytecode::Testin(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 2) }),
-                ),
-                None,
-            )),
-            219 => Some((
-                Bytecode::Definefieldbyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            220 => Some((
-                Bytecode::Definepropertybyname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            221 => Some((
-                Bytecode::Callthis0withname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            222 => Some((
-                Bytecode::Callthis1withname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            223 => Some((
-                Bytecode::Callthis2withname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                ),
-                None,
-            )),
-            224 => Some((
-                Bytecode::Callthis3withname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 3) } as u16),
-                ),
-                None,
-            )),
-            225 => Some((
-                Bytecode::Callthisrangewithname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            251 => Some((Bytecode::CallruntimeNotifyconcurrentresult, None)),
-            252 => Some((Bytecode::DeprecatedLdlexenv, None)),
-            253 => Some((
-                Bytecode::WideCreateobjectwithexcludedkeys(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            254 => Some((Bytecode::Throw, None)),
-            507 => Some((
-                Bytecode::CallruntimeDefinefieldbyvalue(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            508 => Some((Bytecode::DeprecatedPoplexenv, None)),
-            509 => Some((
-                Bytecode::WideNewobjrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            510 => Some((Bytecode::ThrowNotexists, None)),
-            763 => Some((
-                Bytecode::CallruntimeDefinefieldbyindex(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            764 => Some((
-                Bytecode::DeprecatedGetiteratornext(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            765 => Some((
-                Bytecode::WideNewlexenv(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            766 => Some((Bytecode::ThrowPatternnoncoercible, None)),
-            1019 => Some((Bytecode::CallruntimeTopropertykey, None)),
-            1020 => Some((
-                Bytecode::DeprecatedCreatearraywithbuffer(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            1021 => Some((
-                Bytecode::WideNewlexenvwithname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            1022 => Some((Bytecode::ThrowDeletesuperproperty, None)),
-            1275 => Some((
-                Bytecode::CallruntimeCreateprivateproperty(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                ),
-                None,
-            )),
-            1276 => Some((
-                Bytecode::DeprecatedCreateobjectwithbuffer(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            1277 => Some((
-                Bytecode::WideCallrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            1278 => Some((
-                Bytecode::ThrowConstassignment(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            1531 => Some((
-                Bytecode::CallruntimeDefineprivateproperty(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 2) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            1532 => Some((
-                Bytecode::DeprecatedTonumber(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            1533 => Some((
-                Bytecode::WideCallthisrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            1534 => Some((
-                Bytecode::ThrowIfnotobject(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            1787 => Some((
-                Bytecode::CallruntimeCallinit(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            1788 => Some((
-                Bytecode::DeprecatedTonumeric(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            1789 => Some((
-                Bytecode::WideSupercallthisrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            1790 => Some((
-                Bytecode::ThrowUndefinedifhole(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            2043 => Some((
-                Bytecode::CallruntimeDefinesendableclass(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 1) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            2044 => Some((
-                Bytecode::DeprecatedNeg(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            2045 => Some((
-                Bytecode::WideSupercallarrowrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            2046 | 2302 => Some((
-                Bytecode::ThrowIfsupernotcorrectcall(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            2299 => Some((
-                Bytecode::CallruntimeLdsendableclass(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            2300 => Some((
-                Bytecode::DeprecatedNot(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            2301 => Some((
-                Bytecode::WideLdobjbyindex(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            2555 => Some((
-                Bytecode::CallruntimeLdsendableexternalmodulevar(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            2556 => Some((
-                Bytecode::DeprecatedInc(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            2557 => Some((
-                Bytecode::WideStobjbyindex(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                ),
-                None,
-            )),
-            2558 => Some((
-                Bytecode::ThrowUndefinedifholewithname(EntityId(unsafe {
-                    crate::isa_get_id(ptr, 0)
-                })),
-                None,
-            )),
-            2811 => Some((
-                Bytecode::CallruntimeWideldsendableexternalmodulevar(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            2812 => Some((
-                Bytecode::DeprecatedDec(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            2813 => Some((
-                Bytecode::WideStownbyindex(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                ),
-                None,
-            )),
-            3067 => Some((
-                Bytecode::CallruntimeNewsendableenv(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            3068 => Some((
-                Bytecode::DeprecatedCallarg0(Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16)),
-                None,
-            )),
-            3069 => Some((
-                Bytecode::WideCopyrestargs(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            3323 => Some((
-                Bytecode::CallruntimeWidenewsendableenv(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            3324 => Some((
-                Bytecode::DeprecatedCallarg1(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            3325 => Some((
-                Bytecode::WideLdlexvar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            3579 | 3835 => Some((
-                Bytecode::CallruntimeStsendablevar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            3580 => Some((
-                Bytecode::DeprecatedCallargs2(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                ),
-                None,
-            )),
-            3581 => Some((
-                Bytecode::WideStlexvar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            3836 => Some((
-                Bytecode::DeprecatedCallargs3(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 3) } as u16),
-                ),
-                None,
-            )),
-            3837 => Some((
-                Bytecode::WideGetmodulenamespace(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            4091 => Some((
-                Bytecode::CallruntimeWidestsendablevar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            4092 => Some((
-                Bytecode::DeprecatedCallrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            4093 => Some((
-                Bytecode::WideStmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            4347 | 4603 => Some((
-                Bytecode::CallruntimeLdsendablevar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            4348 => Some((
-                Bytecode::DeprecatedCallspread(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                ),
-                None,
-            )),
-            4349 => Some((
-                Bytecode::WideLdlocalmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            4604 => Some((
-                Bytecode::DeprecatedCallthisrange(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            4605 => Some((
-                Bytecode::WideLdexternalmodulevar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            4859 => Some((
-                Bytecode::CallruntimeWideldsendablevar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                ),
-                None,
-            )),
-            4860 => Some((
-                Bytecode::DeprecatedDefineclasswithbuffer(
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            4861 => Some((
-                Bytecode::WideLdpatchvar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            5115 => Some((
-                Bytecode::CallruntimeIstrue(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            5116 => Some((
-                Bytecode::DeprecatedResumegenerator(Reg(
-                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
-                )),
-                None,
-            )),
-            5117 => Some((
-                Bytecode::WideStpatchvar(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            5371 => Some((
-                Bytecode::CallruntimeIsfalse(Imm(unsafe { crate::isa_get_imm_data(ptr, 0) })),
-                None,
-            )),
-            5372 => Some((
-                Bytecode::DeprecatedGetresumemode(Reg(
-                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
-                )),
-                None,
-            )),
-            5373 => Some((
-                Bytecode::WideCallthisrangewithname(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            5627 => Some((
-                Bytecode::CallruntimeLdlazymodulevar(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            5628 => Some((
-                Bytecode::DeprecatedGettemplateobject(Reg(
-                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
-                )),
-                None,
-            )),
-            5883 => Some((
-                Bytecode::CallruntimeWideldlazymodulevar(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            5884 => Some((
-                Bytecode::DeprecatedDelobjprop(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            6139 => Some((
-                Bytecode::CallruntimeLdlazysendablemodulevar(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            6140 => Some((
-                Bytecode::DeprecatedSuspendgenerator(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            6395 => Some((
-                Bytecode::CallruntimeWideldlazysendablemodulevar(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            6396 => Some((
-                Bytecode::DeprecatedAsyncfunctionawaituncaught(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            6651 => Some((
-                Bytecode::CallruntimeSupercallforwardallargs(Reg(unsafe {
-                    crate::isa_get_vreg(ptr, 0)
-                } as u16)),
-                None,
-            )),
-            6652 => Some((
-                Bytecode::DeprecatedCopydataproperties(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            6907 => Some((
-                Bytecode::CallruntimeLdsendablelocalmodulevar(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            6908 => Some((
-                Bytecode::DeprecatedSetobjectwithproto(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            7163 => Some((
-                Bytecode::CallruntimeWideldsendablelocalmodulevar(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            7164 => Some((
-                Bytecode::DeprecatedLdobjbyvalue(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            7420 => Some((
-                Bytecode::DeprecatedLdsuperbyvalue(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            7676 => Some((
-                Bytecode::DeprecatedLdobjbyindex(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                ),
-                None,
-            )),
-            7932 => Some((
-                Bytecode::DeprecatedAsyncfunctionresolve(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                ),
-                None,
-            )),
-            8188 => Some((
-                Bytecode::DeprecatedAsyncfunctionreject(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 2) } as u16),
-                ),
-                None,
-            )),
-            8444 | 8700 | 8956 => Some((
-                Bytecode::DeprecatedStlexvar(
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 1) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            9212 => Some((
-                Bytecode::DeprecatedGetmodulenamespace(EntityId(unsafe {
-                    crate::isa_get_id(ptr, 0)
-                })),
-                None,
-            )),
-            9468 => Some((
-                Bytecode::DeprecatedStmodulevar(EntityId(unsafe { crate::isa_get_id(ptr, 0) })),
-                None,
-            )),
-            9724 => Some((
-                Bytecode::DeprecatedLdobjbyname(
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            9980 => Some((
-                Bytecode::DeprecatedLdsuperbyname(
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                ),
-                None,
-            )),
-            10236 => Some((
-                Bytecode::DeprecatedLdmodulevar(
-                    EntityId(unsafe { crate::isa_get_id(ptr, 0) }),
-                    Imm(unsafe { crate::isa_get_imm_data(ptr, 0) }),
-                ),
-                None,
-            )),
-            10492 => Some((
-                Bytecode::DeprecatedStconsttoglobalrecord(EntityId(unsafe {
-                    crate::isa_get_id(ptr, 0)
-                })),
-                None,
-            )),
-            10748 => Some((
-                Bytecode::DeprecatedStlettoglobalrecord(EntityId(unsafe {
-                    crate::isa_get_id(ptr, 0)
-                })),
-                None,
-            )),
-            11004 => Some((
-                Bytecode::DeprecatedStclasstoglobalrecord(EntityId(unsafe {
-                    crate::isa_get_id(ptr, 0)
-                })),
-                None,
-            )),
-            11260 => Some((Bytecode::DeprecatedLdhomeobject, None)),
-            11516 => Some((
-                Bytecode::DeprecatedCreateobjecthavingmethod(Imm(unsafe {
-                    crate::isa_get_imm_data(ptr, 0)
-                })),
-                None,
-            )),
-            11772 => Some((
-                Bytecode::DeprecatedDynamicimport(Reg(
-                    unsafe { crate::isa_get_vreg(ptr, 0) } as u16
-                )),
-                None,
-            )),
-            12028 => Some((
-                Bytecode::DeprecatedAsyncgeneratorreject(
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 0) } as u16),
-                    Reg(unsafe { crate::isa_get_vreg(ptr, 1) } as u16),
-                ),
-                None,
-            )),
-            _ => None,
-        }
-    }
-}
-
-// ============================================================================
 // Per-mnemonic constructor structs
 // ============================================================================
 
@@ -5646,1876 +16108,2144 @@ pub mod insn {
 
     pub struct Ldundefined;
     impl Ldundefined {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldundefined
         }
     }
 
     pub struct Ldnull;
     impl Ldnull {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldnull
         }
     }
 
     pub struct Ldtrue;
     impl Ldtrue {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldtrue
         }
     }
 
     pub struct Ldfalse;
     impl Ldfalse {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldfalse
         }
     }
 
     pub struct Createemptyobject;
     impl Createemptyobject {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Createemptyobject
         }
     }
 
     pub struct Createemptyarray;
     impl Createemptyarray {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Createemptyarray(a0)
         }
     }
 
     pub struct Createarraywithbuffer;
     impl Createarraywithbuffer {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Createarraywithbuffer(a0, a1)
         }
     }
 
     pub struct Createobjectwithbuffer;
     impl Createobjectwithbuffer {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Createobjectwithbuffer(a0, a1)
         }
     }
 
     pub struct Newobjrange;
     impl Newobjrange {
-        pub fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
             Bytecode::Newobjrange(a0, a1, a2)
         }
     }
 
     pub struct Newlexenv;
     impl Newlexenv {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Newlexenv(a0)
         }
     }
 
     pub struct Add2;
     impl Add2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Add2(a0, a1)
         }
     }
 
     pub struct Sub2;
     impl Sub2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Sub2(a0, a1)
         }
     }
 
     pub struct Mul2;
     impl Mul2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Mul2(a0, a1)
         }
     }
 
     pub struct Div2;
     impl Div2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Div2(a0, a1)
         }
     }
 
     pub struct Mod2;
     impl Mod2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Mod2(a0, a1)
         }
     }
 
     pub struct Eq;
     impl Eq {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Eq(a0, a1)
         }
     }
 
     pub struct Noteq;
     impl Noteq {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Noteq(a0, a1)
         }
     }
 
     pub struct Less;
     impl Less {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Less(a0, a1)
         }
     }
 
     pub struct Lesseq;
     impl Lesseq {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Lesseq(a0, a1)
         }
     }
 
     pub struct Greater;
     impl Greater {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Greater(a0, a1)
         }
     }
 
     pub struct Greatereq;
     impl Greatereq {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Greatereq(a0, a1)
         }
     }
 
     pub struct Shl2;
     impl Shl2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Shl2(a0, a1)
         }
     }
 
     pub struct Shr2;
     impl Shr2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Shr2(a0, a1)
         }
     }
 
     pub struct Ashr2;
     impl Ashr2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Ashr2(a0, a1)
         }
     }
 
     pub struct And2;
     impl And2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::And2(a0, a1)
         }
     }
 
     pub struct Or2;
     impl Or2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Or2(a0, a1)
         }
     }
 
     pub struct Xor2;
     impl Xor2 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Xor2(a0, a1)
         }
     }
 
     pub struct Exp;
     impl Exp {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Exp(a0, a1)
         }
     }
 
     pub struct Typeof;
     impl Typeof {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Typeof(a0)
         }
     }
 
     pub struct Tonumber;
     impl Tonumber {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Tonumber(a0)
         }
     }
 
     pub struct Tonumeric;
     impl Tonumeric {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Tonumeric(a0)
         }
     }
 
     pub struct Neg;
     impl Neg {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Neg(a0)
         }
     }
 
     pub struct Not;
     impl Not {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Not(a0)
         }
     }
 
     pub struct Inc;
     impl Inc {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Inc(a0)
         }
     }
 
     pub struct Dec;
     impl Dec {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Dec(a0)
         }
     }
 
     pub struct Istrue;
     impl Istrue {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Istrue
         }
     }
 
     pub struct Isfalse;
     impl Isfalse {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Isfalse
         }
     }
 
     pub struct Isin;
     impl Isin {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Isin(a0, a1)
         }
     }
 
     pub struct Instanceof;
     impl Instanceof {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Instanceof(a0, a1)
         }
     }
 
     pub struct Strictnoteq;
     impl Strictnoteq {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Strictnoteq(a0, a1)
         }
     }
 
     pub struct Stricteq;
     impl Stricteq {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Stricteq(a0, a1)
         }
     }
 
     pub struct Callarg0;
     impl Callarg0 {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Callarg0(a0)
         }
     }
 
     pub struct Callarg1;
     impl Callarg1 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Callarg1(a0, a1)
         }
     }
 
     pub struct Callargs2;
     impl Callargs2 {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::Callargs2(a0, a1, a2)
         }
     }
 
     pub struct Callargs3;
     impl Callargs3 {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg, a3: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg, a3: Reg) -> Bytecode {
             Bytecode::Callargs3(a0, a1, a2, a3)
         }
     }
 
     pub struct Callthis0;
     impl Callthis0 {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Callthis0(a0, a1)
         }
     }
 
     pub struct Callthis1;
     impl Callthis1 {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::Callthis1(a0, a1, a2)
         }
     }
 
     pub struct Callthis2;
     impl Callthis2 {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg, a3: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg, a3: Reg) -> Bytecode {
             Bytecode::Callthis2(a0, a1, a2, a3)
         }
     }
 
     pub struct Callthis3;
     impl Callthis3 {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg, a3: Reg, a4: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg, a3: Reg, a4: Reg) -> Bytecode {
             Bytecode::Callthis3(a0, a1, a2, a3, a4)
         }
     }
 
     pub struct Callthisrange;
     impl Callthisrange {
-        pub fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
             Bytecode::Callthisrange(a0, a1, a2)
         }
     }
 
     pub struct Supercallthisrange;
     impl Supercallthisrange {
-        pub fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
             Bytecode::Supercallthisrange(a0, a1, a2)
         }
     }
 
     pub struct Definefunc;
     impl Definefunc {
-        pub fn new(a0: Imm, a1: EntityId, a2: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Imm) -> Bytecode {
             Bytecode::Definefunc(a0, a1, a2)
         }
     }
 
     pub struct Definemethod;
     impl Definemethod {
-        pub fn new(a0: Imm, a1: EntityId, a2: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Imm) -> Bytecode {
             Bytecode::Definemethod(a0, a1, a2)
         }
     }
 
     pub struct Defineclasswithbuffer;
     impl Defineclasswithbuffer {
-        pub fn new(a0: Imm, a1: EntityId, a2: EntityId, a3: Imm, a4: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: EntityId, a3: Imm, a4: Reg) -> Bytecode {
             Bytecode::Defineclasswithbuffer(a0, a1, a2, a3, a4)
         }
     }
 
     pub struct Getnextpropname;
     impl Getnextpropname {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Getnextpropname(a0)
         }
     }
 
     pub struct Ldobjbyvalue;
     impl Ldobjbyvalue {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Ldobjbyvalue(a0, a1)
         }
     }
 
     pub struct Stobjbyvalue;
     impl Stobjbyvalue {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::Stobjbyvalue(a0, a1, a2)
         }
     }
 
     pub struct Ldsuperbyvalue;
     impl Ldsuperbyvalue {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Ldsuperbyvalue(a0, a1)
         }
     }
 
     pub struct Ldobjbyindex;
     impl Ldobjbyindex {
-        pub fn new(a0: Imm, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm) -> Bytecode {
             Bytecode::Ldobjbyindex(a0, a1)
         }
     }
 
     pub struct Stobjbyindex;
     impl Stobjbyindex {
-        pub fn new(a0: Imm, a1: Reg, a2: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Imm) -> Bytecode {
             Bytecode::Stobjbyindex(a0, a1, a2)
         }
     }
 
     pub struct Ldlexvar;
     impl Ldlexvar {
-        pub fn new(a0: Imm, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm) -> Bytecode {
             Bytecode::Ldlexvar(a0, a1)
         }
     }
 
     pub struct Stlexvar;
     impl Stlexvar {
-        pub fn new(a0: Imm, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm) -> Bytecode {
             Bytecode::Stlexvar(a0, a1)
         }
     }
 
     pub struct LdaStr;
     impl LdaStr {
-        pub fn new(a0: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId) -> Bytecode {
             Bytecode::LdaStr(a0)
         }
     }
 
     pub struct Tryldglobalbyname;
     impl Tryldglobalbyname {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Tryldglobalbyname(a0, a1)
         }
     }
 
     pub struct Trystglobalbyname;
     impl Trystglobalbyname {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Trystglobalbyname(a0, a1)
         }
     }
 
     pub struct Ldglobalvar;
     impl Ldglobalvar {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Ldglobalvar(a0, a1)
         }
     }
 
     pub struct Ldobjbyname;
     impl Ldobjbyname {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Ldobjbyname(a0, a1)
         }
     }
 
     pub struct Stobjbyname;
     impl Stobjbyname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
             Bytecode::Stobjbyname(a0, a1, a2)
         }
     }
 
     pub struct Mov;
     impl Mov {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::Mov(a0, a1)
         }
     }
 
     pub struct Ldsuperbyname;
     impl Ldsuperbyname {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Ldsuperbyname(a0, a1)
         }
     }
 
     pub struct Stconsttoglobalrecord;
     impl Stconsttoglobalrecord {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Stconsttoglobalrecord(a0, a1)
         }
     }
 
     pub struct Sttoglobalrecord;
     impl Sttoglobalrecord {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Sttoglobalrecord(a0, a1)
         }
     }
 
     pub struct Ldthisbyname;
     impl Ldthisbyname {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Ldthisbyname(a0, a1)
         }
     }
 
     pub struct Stthisbyname;
     impl Stthisbyname {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Stthisbyname(a0, a1)
         }
     }
 
     pub struct Ldthisbyvalue;
     impl Ldthisbyvalue {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Ldthisbyvalue(a0)
         }
     }
 
     pub struct Stthisbyvalue;
     impl Stthisbyvalue {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Stthisbyvalue(a0, a1)
         }
     }
 
     pub struct Jmp;
     impl Jmp {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jmp(a0)
         }
     }
 
     pub struct Jeqz;
     impl Jeqz {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jeqz(a0)
         }
     }
 
     pub struct Jnez;
     impl Jnez {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jnez(a0)
         }
     }
 
     pub struct Jstricteqz;
     impl Jstricteqz {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jstricteqz(a0)
         }
     }
 
     pub struct Jnstricteqz;
     impl Jnstricteqz {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jnstricteqz(a0)
         }
     }
 
     pub struct Jeqnull;
     impl Jeqnull {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jeqnull(a0)
         }
     }
 
     pub struct Jnenull;
     impl Jnenull {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jnenull(a0)
         }
     }
 
     pub struct Jstricteqnull;
     impl Jstricteqnull {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jstricteqnull(a0)
         }
     }
 
     pub struct Jnstricteqnull;
     impl Jnstricteqnull {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jnstricteqnull(a0)
         }
     }
 
     pub struct Jequndefined;
     impl Jequndefined {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jequndefined(a0)
         }
     }
 
     pub struct Jneundefined;
     impl Jneundefined {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jneundefined(a0)
         }
     }
 
     pub struct Jstrictequndefined;
     impl Jstrictequndefined {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jstrictequndefined(a0)
         }
     }
 
     pub struct Jnstrictequndefined;
     impl Jnstrictequndefined {
-        pub fn new(a0: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Label) -> Bytecode {
             Bytecode::Jnstrictequndefined(a0)
         }
     }
 
     pub struct Jeq;
     impl Jeq {
-        pub fn new(a0: Reg, a1: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Label) -> Bytecode {
             Bytecode::Jeq(a0, a1)
         }
     }
 
     pub struct Jne;
     impl Jne {
-        pub fn new(a0: Reg, a1: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Label) -> Bytecode {
             Bytecode::Jne(a0, a1)
         }
     }
 
     pub struct Jstricteq;
     impl Jstricteq {
-        pub fn new(a0: Reg, a1: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Label) -> Bytecode {
             Bytecode::Jstricteq(a0, a1)
         }
     }
 
     pub struct Jnstricteq;
     impl Jnstricteq {
-        pub fn new(a0: Reg, a1: Label) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Label) -> Bytecode {
             Bytecode::Jnstricteq(a0, a1)
         }
     }
 
     pub struct Lda;
     impl Lda {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Lda(a0)
         }
     }
 
     pub struct Sta;
     impl Sta {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Sta(a0)
         }
     }
 
     pub struct Ldai;
     impl Ldai {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Ldai(a0)
         }
     }
 
     pub struct Fldai;
     impl Fldai {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Fldai(a0)
         }
     }
 
     pub struct Return;
     impl Return {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Return
         }
     }
 
     pub struct Returnundefined;
     impl Returnundefined {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Returnundefined
         }
     }
 
     pub struct Getpropiterator;
     impl Getpropiterator {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Getpropiterator
         }
     }
 
     pub struct Getiterator;
     impl Getiterator {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Getiterator(a0)
         }
     }
 
     pub struct Closeiterator;
     impl Closeiterator {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Closeiterator(a0, a1)
         }
     }
 
     pub struct Poplexenv;
     impl Poplexenv {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Poplexenv
         }
     }
 
     pub struct Ldnan;
     impl Ldnan {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldnan
         }
     }
 
     pub struct Ldinfinity;
     impl Ldinfinity {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldinfinity
         }
     }
 
     pub struct Getunmappedargs;
     impl Getunmappedargs {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Getunmappedargs
         }
     }
 
     pub struct Ldglobal;
     impl Ldglobal {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldglobal
         }
     }
 
     pub struct Ldnewtarget;
     impl Ldnewtarget {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldnewtarget
         }
     }
 
     pub struct Ldthis;
     impl Ldthis {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldthis
         }
     }
 
     pub struct Ldhole;
     impl Ldhole {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldhole
         }
     }
 
     pub struct Createregexpwithliteral;
     impl Createregexpwithliteral {
-        pub fn new(a0: Imm, a1: EntityId, a2: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Imm) -> Bytecode {
             Bytecode::Createregexpwithliteral(a0, a1, a2)
         }
     }
 
     pub struct Callrange;
     impl Callrange {
-        pub fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
             Bytecode::Callrange(a0, a1, a2)
         }
     }
 
     pub struct Gettemplateobject;
     impl Gettemplateobject {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Gettemplateobject(a0)
         }
     }
 
     pub struct Setobjectwithproto;
     impl Setobjectwithproto {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Setobjectwithproto(a0, a1)
         }
     }
 
     pub struct Stownbyvalue;
     impl Stownbyvalue {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::Stownbyvalue(a0, a1, a2)
         }
     }
 
     pub struct Stownbyindex;
     impl Stownbyindex {
-        pub fn new(a0: Imm, a1: Reg, a2: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Imm) -> Bytecode {
             Bytecode::Stownbyindex(a0, a1, a2)
         }
     }
 
     pub struct Stownbyname;
     impl Stownbyname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
             Bytecode::Stownbyname(a0, a1, a2)
         }
     }
 
     pub struct Getmodulenamespace;
     impl Getmodulenamespace {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Getmodulenamespace(a0)
         }
     }
 
     pub struct Stmodulevar;
     impl Stmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Stmodulevar(a0)
         }
     }
 
     pub struct Ldlocalmodulevar;
     impl Ldlocalmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Ldlocalmodulevar(a0)
         }
     }
 
     pub struct Ldexternalmodulevar;
     impl Ldexternalmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Ldexternalmodulevar(a0)
         }
     }
 
     pub struct Stglobalvar;
     impl Stglobalvar {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Stglobalvar(a0, a1)
         }
     }
 
     pub struct Stownbynamewithnameset;
     impl Stownbynamewithnameset {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
             Bytecode::Stownbynamewithnameset(a0, a1, a2)
         }
     }
 
     pub struct Asyncgeneratorreject;
     impl Asyncgeneratorreject {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Asyncgeneratorreject(a0)
         }
     }
 
     pub struct Stownbyvaluewithnameset;
     impl Stownbyvaluewithnameset {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::Stownbyvaluewithnameset(a0, a1, a2)
         }
     }
 
     pub struct Ldsymbol;
     impl Ldsymbol {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldsymbol
         }
     }
 
     pub struct Asyncfunctionenter;
     impl Asyncfunctionenter {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Asyncfunctionenter
         }
     }
 
     pub struct Ldfunction;
     impl Ldfunction {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Ldfunction
         }
     }
 
     pub struct Debugger;
     impl Debugger {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Debugger
         }
     }
 
     pub struct Creategeneratorobj;
     impl Creategeneratorobj {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Creategeneratorobj(a0)
         }
     }
 
     pub struct Createiterresultobj;
     impl Createiterresultobj {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::Createiterresultobj(a0, a1)
         }
     }
 
     pub struct Createobjectwithexcludedkeys;
     impl Createobjectwithexcludedkeys {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::Createobjectwithexcludedkeys(a0, a1, a2)
         }
     }
 
     pub struct Newobjapply;
     impl Newobjapply {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Newobjapply(a0, a1)
         }
     }
 
     pub struct Newlexenvwithname;
     impl Newlexenvwithname {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::Newlexenvwithname(a0, a1)
         }
     }
 
     pub struct Createasyncgeneratorobj;
     impl Createasyncgeneratorobj {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Createasyncgeneratorobj(a0)
         }
     }
 
     pub struct Asyncgeneratorresolve;
     impl Asyncgeneratorresolve {
-        pub fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::Asyncgeneratorresolve(a0, a1, a2)
         }
     }
 
     pub struct Supercallspread;
     impl Supercallspread {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::Supercallspread(a0, a1)
         }
     }
 
     pub struct Apply;
     impl Apply {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::Apply(a0, a1, a2)
         }
     }
 
     pub struct Supercallarrowrange;
     impl Supercallarrowrange {
-        pub fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
             Bytecode::Supercallarrowrange(a0, a1, a2)
         }
     }
 
     pub struct Definegettersetterbyvalue;
     impl Definegettersetterbyvalue {
-        pub fn new(a0: Reg, a1: Reg, a2: Reg, a3: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg, a2: Reg, a3: Reg) -> Bytecode {
             Bytecode::Definegettersetterbyvalue(a0, a1, a2, a3)
         }
     }
 
     pub struct Dynamicimport;
     impl Dynamicimport {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Dynamicimport
         }
     }
 
     pub struct Resumegenerator;
     impl Resumegenerator {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Resumegenerator
         }
     }
 
     pub struct Getresumemode;
     impl Getresumemode {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Getresumemode
         }
     }
 
     pub struct Delobjprop;
     impl Delobjprop {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Delobjprop(a0)
         }
     }
 
     pub struct Suspendgenerator;
     impl Suspendgenerator {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Suspendgenerator(a0)
         }
     }
 
     pub struct Asyncfunctionawaituncaught;
     impl Asyncfunctionawaituncaught {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Asyncfunctionawaituncaught(a0)
         }
     }
 
     pub struct Copydataproperties;
     impl Copydataproperties {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Copydataproperties(a0)
         }
     }
 
     pub struct Starrayspread;
     impl Starrayspread {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::Starrayspread(a0, a1)
         }
     }
 
     pub struct Stsuperbyvalue;
     impl Stsuperbyvalue {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::Stsuperbyvalue(a0, a1, a2)
         }
     }
 
     pub struct Asyncfunctionresolve;
     impl Asyncfunctionresolve {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Asyncfunctionresolve(a0)
         }
     }
 
     pub struct Asyncfunctionreject;
     impl Asyncfunctionreject {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::Asyncfunctionreject(a0)
         }
     }
 
     pub struct Copyrestargs;
     impl Copyrestargs {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Copyrestargs(a0)
         }
     }
 
     pub struct Stsuperbyname;
     impl Stsuperbyname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
             Bytecode::Stsuperbyname(a0, a1, a2)
         }
     }
 
     pub struct Ldbigint;
     impl Ldbigint {
-        pub fn new(a0: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId) -> Bytecode {
             Bytecode::Ldbigint(a0)
         }
     }
 
     pub struct Nop;
     impl Nop {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Nop
         }
     }
 
     pub struct Setgeneratorstate;
     impl Setgeneratorstate {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Setgeneratorstate(a0)
         }
     }
 
     pub struct Getasynciterator;
     impl Getasynciterator {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::Getasynciterator(a0)
         }
     }
 
     pub struct Ldprivateproperty;
     impl Ldprivateproperty {
-        pub fn new(a0: Imm, a1: Imm, a2: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Imm) -> Bytecode {
             Bytecode::Ldprivateproperty(a0, a1, a2)
         }
     }
 
     pub struct Stprivateproperty;
     impl Stprivateproperty {
-        pub fn new(a0: Imm, a1: Imm, a2: Imm, a3: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Imm, a3: Reg) -> Bytecode {
             Bytecode::Stprivateproperty(a0, a1, a2, a3)
         }
     }
 
     pub struct Testin;
     impl Testin {
-        pub fn new(a0: Imm, a1: Imm, a2: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Imm) -> Bytecode {
             Bytecode::Testin(a0, a1, a2)
         }
     }
 
     pub struct Definefieldbyname;
     impl Definefieldbyname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
             Bytecode::Definefieldbyname(a0, a1, a2)
         }
     }
 
     pub struct Definepropertybyname;
     impl Definepropertybyname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
             Bytecode::Definepropertybyname(a0, a1, a2)
         }
     }
 
     pub struct Callthis0withname;
     impl Callthis0withname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
             Bytecode::Callthis0withname(a0, a1, a2)
         }
     }
 
     pub struct Callthis1withname;
     impl Callthis1withname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg, a3: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg, a3: Reg) -> Bytecode {
             Bytecode::Callthis1withname(a0, a1, a2, a3)
         }
     }
 
     pub struct Callthis2withname;
     impl Callthis2withname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg, a3: Reg, a4: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg, a3: Reg, a4: Reg) -> Bytecode {
             Bytecode::Callthis2withname(a0, a1, a2, a3, a4)
         }
     }
 
     pub struct Callthis3withname;
     impl Callthis3withname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg, a3: Reg, a4: Reg, a5: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg, a3: Reg, a4: Reg, a5: Reg) -> Bytecode {
             Bytecode::Callthis3withname(a0, a1, a2, a3, a4, a5)
         }
     }
 
     pub struct Callthisrangewithname;
     impl Callthisrangewithname {
-        pub fn new(a0: Imm, a1: Imm, a2: EntityId, a3: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: EntityId, a3: Reg) -> Bytecode {
             Bytecode::Callthisrangewithname(a0, a1, a2, a3)
         }
     }
 
     pub struct CallruntimeNotifyconcurrentresult;
     impl CallruntimeNotifyconcurrentresult {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::CallruntimeNotifyconcurrentresult
         }
     }
 
     pub struct DeprecatedLdlexenv;
     impl DeprecatedLdlexenv {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::DeprecatedLdlexenv
         }
     }
 
     pub struct WideCreateobjectwithexcludedkeys;
     impl WideCreateobjectwithexcludedkeys {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::WideCreateobjectwithexcludedkeys(a0, a1, a2)
         }
     }
 
     pub struct Throw;
     impl Throw {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::Throw
         }
     }
 
     pub struct CallruntimeDefinefieldbyvalue;
     impl CallruntimeDefinefieldbyvalue {
-        pub fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::CallruntimeDefinefieldbyvalue(a0, a1, a2)
         }
     }
 
     pub struct DeprecatedPoplexenv;
     impl DeprecatedPoplexenv {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::DeprecatedPoplexenv
         }
     }
 
     pub struct WideNewobjrange;
     impl WideNewobjrange {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::WideNewobjrange(a0, a1)
         }
     }
 
     pub struct ThrowNotexists;
     impl ThrowNotexists {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::ThrowNotexists
         }
     }
 
     pub struct CallruntimeDefinefieldbyindex;
     impl CallruntimeDefinefieldbyindex {
-        pub fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
             Bytecode::CallruntimeDefinefieldbyindex(a0, a1, a2)
         }
     }
 
     pub struct DeprecatedGetiteratornext;
     impl DeprecatedGetiteratornext {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedGetiteratornext(a0, a1)
         }
     }
 
     pub struct WideNewlexenv;
     impl WideNewlexenv {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::WideNewlexenv(a0)
         }
     }
 
     pub struct ThrowPatternnoncoercible;
     impl ThrowPatternnoncoercible {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::ThrowPatternnoncoercible
         }
     }
 
     pub struct CallruntimeTopropertykey;
     impl CallruntimeTopropertykey {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::CallruntimeTopropertykey
         }
     }
 
     pub struct DeprecatedCreatearraywithbuffer;
     impl DeprecatedCreatearraywithbuffer {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::DeprecatedCreatearraywithbuffer(a0)
         }
     }
 
     pub struct WideNewlexenvwithname;
     impl WideNewlexenvwithname {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::WideNewlexenvwithname(a0, a1)
         }
     }
 
     pub struct ThrowDeletesuperproperty;
     impl ThrowDeletesuperproperty {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::ThrowDeletesuperproperty
         }
     }
 
     pub struct CallruntimeCreateprivateproperty;
     impl CallruntimeCreateprivateproperty {
-        pub fn new(a0: Imm, a1: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId) -> Bytecode {
             Bytecode::CallruntimeCreateprivateproperty(a0, a1)
         }
     }
 
     pub struct DeprecatedCreateobjectwithbuffer;
     impl DeprecatedCreateobjectwithbuffer {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::DeprecatedCreateobjectwithbuffer(a0)
         }
     }
 
     pub struct WideCallrange;
     impl WideCallrange {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::WideCallrange(a0, a1)
         }
     }
 
     pub struct ThrowConstassignment;
     impl ThrowConstassignment {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::ThrowConstassignment(a0)
         }
     }
 
     pub struct CallruntimeDefineprivateproperty;
     impl CallruntimeDefineprivateproperty {
-        pub fn new(a0: Imm, a1: Imm, a2: Imm, a3: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Imm, a3: Reg) -> Bytecode {
             Bytecode::CallruntimeDefineprivateproperty(a0, a1, a2, a3)
         }
     }
 
     pub struct DeprecatedTonumber;
     impl DeprecatedTonumber {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedTonumber(a0)
         }
     }
 
     pub struct WideCallthisrange;
     impl WideCallthisrange {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::WideCallthisrange(a0, a1)
         }
     }
 
     pub struct ThrowIfnotobject;
     impl ThrowIfnotobject {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::ThrowIfnotobject(a0)
         }
     }
 
     pub struct CallruntimeCallinit;
     impl CallruntimeCallinit {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::CallruntimeCallinit(a0, a1)
         }
     }
 
     pub struct DeprecatedTonumeric;
     impl DeprecatedTonumeric {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedTonumeric(a0)
         }
     }
 
     pub struct WideSupercallthisrange;
     impl WideSupercallthisrange {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::WideSupercallthisrange(a0, a1)
         }
     }
 
     pub struct ThrowUndefinedifhole;
     impl ThrowUndefinedifhole {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::ThrowUndefinedifhole(a0, a1)
         }
     }
 
     pub struct CallruntimeDefinesendableclass;
     impl CallruntimeDefinesendableclass {
-        pub fn new(a0: Imm, a1: EntityId, a2: EntityId, a3: Imm, a4: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: EntityId, a3: Imm, a4: Reg) -> Bytecode {
             Bytecode::CallruntimeDefinesendableclass(a0, a1, a2, a3, a4)
         }
     }
 
     pub struct DeprecatedNeg;
     impl DeprecatedNeg {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedNeg(a0)
         }
     }
 
     pub struct WideSupercallarrowrange;
     impl WideSupercallarrowrange {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::WideSupercallarrowrange(a0, a1)
         }
     }
 
     pub struct ThrowIfsupernotcorrectcall;
     impl ThrowIfsupernotcorrectcall {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::ThrowIfsupernotcorrectcall(a0)
         }
     }
 
     pub struct CallruntimeLdsendableclass;
     impl CallruntimeLdsendableclass {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeLdsendableclass(a0)
         }
     }
 
     pub struct DeprecatedNot;
     impl DeprecatedNot {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedNot(a0)
         }
     }
 
     pub struct WideLdobjbyindex;
     impl WideLdobjbyindex {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::WideLdobjbyindex(a0)
         }
     }
 
     pub struct CallruntimeLdsendableexternalmodulevar;
     impl CallruntimeLdsendableexternalmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeLdsendableexternalmodulevar(a0)
         }
     }
 
     pub struct DeprecatedInc;
     impl DeprecatedInc {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedInc(a0)
         }
     }
 
     pub struct WideStobjbyindex;
     impl WideStobjbyindex {
-        pub fn new(a0: Reg, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Imm) -> Bytecode {
             Bytecode::WideStobjbyindex(a0, a1)
         }
     }
 
     pub struct ThrowUndefinedifholewithname;
     impl ThrowUndefinedifholewithname {
-        pub fn new(a0: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId) -> Bytecode {
             Bytecode::ThrowUndefinedifholewithname(a0)
         }
     }
 
     pub struct CallruntimeWideldsendableexternalmodulevar;
     impl CallruntimeWideldsendableexternalmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeWideldsendableexternalmodulevar(a0)
         }
     }
 
     pub struct DeprecatedDec;
     impl DeprecatedDec {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedDec(a0)
         }
     }
 
     pub struct WideStownbyindex;
     impl WideStownbyindex {
-        pub fn new(a0: Reg, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Imm) -> Bytecode {
             Bytecode::WideStownbyindex(a0, a1)
         }
     }
 
     pub struct CallruntimeNewsendableenv;
     impl CallruntimeNewsendableenv {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeNewsendableenv(a0)
         }
     }
 
     pub struct DeprecatedCallarg0;
     impl DeprecatedCallarg0 {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedCallarg0(a0)
         }
     }
 
     pub struct WideCopyrestargs;
     impl WideCopyrestargs {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::WideCopyrestargs(a0)
         }
     }
 
     pub struct CallruntimeWidenewsendableenv;
     impl CallruntimeWidenewsendableenv {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeWidenewsendableenv(a0)
         }
     }
 
     pub struct DeprecatedCallarg1;
     impl DeprecatedCallarg1 {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedCallarg1(a0, a1)
         }
     }
 
     pub struct WideLdlexvar;
     impl WideLdlexvar {
-        pub fn new(a0: Imm, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm) -> Bytecode {
             Bytecode::WideLdlexvar(a0, a1)
         }
     }
 
     pub struct CallruntimeStsendablevar;
     impl CallruntimeStsendablevar {
-        pub fn new(a0: Imm, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm) -> Bytecode {
             Bytecode::CallruntimeStsendablevar(a0, a1)
         }
     }
 
     pub struct DeprecatedCallargs2;
     impl DeprecatedCallargs2 {
-        pub fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::DeprecatedCallargs2(a0, a1, a2)
         }
     }
 
     pub struct WideStlexvar;
     impl WideStlexvar {
-        pub fn new(a0: Imm, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm) -> Bytecode {
             Bytecode::WideStlexvar(a0, a1)
         }
     }
 
     pub struct DeprecatedCallargs3;
     impl DeprecatedCallargs3 {
-        pub fn new(a0: Reg, a1: Reg, a2: Reg, a3: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg, a2: Reg, a3: Reg) -> Bytecode {
             Bytecode::DeprecatedCallargs3(a0, a1, a2, a3)
         }
     }
 
     pub struct WideGetmodulenamespace;
     impl WideGetmodulenamespace {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::WideGetmodulenamespace(a0)
         }
     }
 
     pub struct CallruntimeWidestsendablevar;
     impl CallruntimeWidestsendablevar {
-        pub fn new(a0: Imm, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm) -> Bytecode {
             Bytecode::CallruntimeWidestsendablevar(a0, a1)
         }
     }
 
     pub struct DeprecatedCallrange;
     impl DeprecatedCallrange {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedCallrange(a0, a1)
         }
     }
 
     pub struct WideStmodulevar;
     impl WideStmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::WideStmodulevar(a0)
         }
     }
 
     pub struct CallruntimeLdsendablevar;
     impl CallruntimeLdsendablevar {
-        pub fn new(a0: Imm, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm) -> Bytecode {
             Bytecode::CallruntimeLdsendablevar(a0, a1)
         }
     }
 
     pub struct DeprecatedCallspread;
     impl DeprecatedCallspread {
-        pub fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::DeprecatedCallspread(a0, a1, a2)
         }
     }
 
     pub struct WideLdlocalmodulevar;
     impl WideLdlocalmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::WideLdlocalmodulevar(a0)
         }
     }
 
     pub struct DeprecatedCallthisrange;
     impl DeprecatedCallthisrange {
-        pub fn new(a0: Imm, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedCallthisrange(a0, a1)
         }
     }
 
     pub struct WideLdexternalmodulevar;
     impl WideLdexternalmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::WideLdexternalmodulevar(a0)
         }
     }
 
     pub struct CallruntimeWideldsendablevar;
     impl CallruntimeWideldsendablevar {
-        pub fn new(a0: Imm, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm) -> Bytecode {
             Bytecode::CallruntimeWideldsendablevar(a0, a1)
         }
     }
 
     pub struct DeprecatedDefineclasswithbuffer;
     impl DeprecatedDefineclasswithbuffer {
-        pub fn new(a0: EntityId, a1: Imm, a2: Imm, a3: Reg, a4: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId, a1: Imm, a2: Imm, a3: Reg, a4: Reg) -> Bytecode {
             Bytecode::DeprecatedDefineclasswithbuffer(a0, a1, a2, a3, a4)
         }
     }
 
     pub struct WideLdpatchvar;
     impl WideLdpatchvar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::WideLdpatchvar(a0)
         }
     }
 
     pub struct CallruntimeIstrue;
     impl CallruntimeIstrue {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeIstrue(a0)
         }
     }
 
     pub struct DeprecatedResumegenerator;
     impl DeprecatedResumegenerator {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedResumegenerator(a0)
         }
     }
 
     pub struct WideStpatchvar;
     impl WideStpatchvar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::WideStpatchvar(a0)
         }
     }
 
     pub struct CallruntimeIsfalse;
     impl CallruntimeIsfalse {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeIsfalse(a0)
         }
     }
 
     pub struct DeprecatedGetresumemode;
     impl DeprecatedGetresumemode {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedGetresumemode(a0)
         }
     }
 
     pub struct WideCallthisrangewithname;
     impl WideCallthisrangewithname {
-        pub fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: EntityId, a2: Reg) -> Bytecode {
             Bytecode::WideCallthisrangewithname(a0, a1, a2)
         }
     }
 
     pub struct CallruntimeLdlazymodulevar;
     impl CallruntimeLdlazymodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeLdlazymodulevar(a0)
         }
     }
 
     pub struct DeprecatedGettemplateobject;
     impl DeprecatedGettemplateobject {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedGettemplateobject(a0)
         }
     }
 
     pub struct CallruntimeWideldlazymodulevar;
     impl CallruntimeWideldlazymodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeWideldlazymodulevar(a0)
         }
     }
 
     pub struct DeprecatedDelobjprop;
     impl DeprecatedDelobjprop {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedDelobjprop(a0, a1)
         }
     }
 
     pub struct CallruntimeLdlazysendablemodulevar;
     impl CallruntimeLdlazysendablemodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeLdlazysendablemodulevar(a0)
         }
     }
 
     pub struct DeprecatedSuspendgenerator;
     impl DeprecatedSuspendgenerator {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedSuspendgenerator(a0, a1)
         }
     }
 
     pub struct CallruntimeWideldlazysendablemodulevar;
     impl CallruntimeWideldlazysendablemodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeWideldlazysendablemodulevar(a0)
         }
     }
 
     pub struct DeprecatedAsyncfunctionawaituncaught;
     impl DeprecatedAsyncfunctionawaituncaught {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedAsyncfunctionawaituncaught(a0, a1)
         }
     }
 
     pub struct CallruntimeSupercallforwardallargs;
     impl CallruntimeSupercallforwardallargs {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::CallruntimeSupercallforwardallargs(a0)
         }
     }
 
     pub struct DeprecatedCopydataproperties;
     impl DeprecatedCopydataproperties {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedCopydataproperties(a0, a1)
         }
     }
 
     pub struct CallruntimeLdsendablelocalmodulevar;
     impl CallruntimeLdsendablelocalmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeLdsendablelocalmodulevar(a0)
         }
     }
 
     pub struct DeprecatedSetobjectwithproto;
     impl DeprecatedSetobjectwithproto {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedSetobjectwithproto(a0, a1)
         }
     }
 
     pub struct CallruntimeWideldsendablelocalmodulevar;
     impl CallruntimeWideldsendablelocalmodulevar {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::CallruntimeWideldsendablelocalmodulevar(a0)
         }
     }
 
     pub struct DeprecatedLdobjbyvalue;
     impl DeprecatedLdobjbyvalue {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedLdobjbyvalue(a0, a1)
         }
     }
 
     pub struct DeprecatedLdsuperbyvalue;
     impl DeprecatedLdsuperbyvalue {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedLdsuperbyvalue(a0, a1)
         }
     }
 
     pub struct DeprecatedLdobjbyindex;
     impl DeprecatedLdobjbyindex {
-        pub fn new(a0: Reg, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Imm) -> Bytecode {
             Bytecode::DeprecatedLdobjbyindex(a0, a1)
         }
     }
 
     pub struct DeprecatedAsyncfunctionresolve;
     impl DeprecatedAsyncfunctionresolve {
-        pub fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::DeprecatedAsyncfunctionresolve(a0, a1, a2)
         }
     }
 
     pub struct DeprecatedAsyncfunctionreject;
     impl DeprecatedAsyncfunctionreject {
-        pub fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg, a2: Reg) -> Bytecode {
             Bytecode::DeprecatedAsyncfunctionreject(a0, a1, a2)
         }
     }
 
     pub struct DeprecatedStlexvar;
     impl DeprecatedStlexvar {
-        pub fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm, a1: Imm, a2: Reg) -> Bytecode {
             Bytecode::DeprecatedStlexvar(a0, a1, a2)
         }
     }
 
     pub struct DeprecatedGetmodulenamespace;
     impl DeprecatedGetmodulenamespace {
-        pub fn new(a0: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId) -> Bytecode {
             Bytecode::DeprecatedGetmodulenamespace(a0)
         }
     }
 
     pub struct DeprecatedStmodulevar;
     impl DeprecatedStmodulevar {
-        pub fn new(a0: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId) -> Bytecode {
             Bytecode::DeprecatedStmodulevar(a0)
         }
     }
 
     pub struct DeprecatedLdobjbyname;
     impl DeprecatedLdobjbyname {
-        pub fn new(a0: EntityId, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedLdobjbyname(a0, a1)
         }
     }
 
     pub struct DeprecatedLdsuperbyname;
     impl DeprecatedLdsuperbyname {
-        pub fn new(a0: EntityId, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedLdsuperbyname(a0, a1)
         }
     }
 
     pub struct DeprecatedLdmodulevar;
     impl DeprecatedLdmodulevar {
-        pub fn new(a0: EntityId, a1: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId, a1: Imm) -> Bytecode {
             Bytecode::DeprecatedLdmodulevar(a0, a1)
         }
     }
 
     pub struct DeprecatedStconsttoglobalrecord;
     impl DeprecatedStconsttoglobalrecord {
-        pub fn new(a0: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId) -> Bytecode {
             Bytecode::DeprecatedStconsttoglobalrecord(a0)
         }
     }
 
     pub struct DeprecatedStlettoglobalrecord;
     impl DeprecatedStlettoglobalrecord {
-        pub fn new(a0: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId) -> Bytecode {
             Bytecode::DeprecatedStlettoglobalrecord(a0)
         }
     }
 
     pub struct DeprecatedStclasstoglobalrecord;
     impl DeprecatedStclasstoglobalrecord {
-        pub fn new(a0: EntityId) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: EntityId) -> Bytecode {
             Bytecode::DeprecatedStclasstoglobalrecord(a0)
         }
     }
 
     pub struct DeprecatedLdhomeobject;
     impl DeprecatedLdhomeobject {
-        pub fn new() -> Bytecode {
+        #[inline]
+        pub const fn new() -> Bytecode {
             Bytecode::DeprecatedLdhomeobject
         }
     }
 
     pub struct DeprecatedCreateobjecthavingmethod;
     impl DeprecatedCreateobjecthavingmethod {
-        pub fn new(a0: Imm) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Imm) -> Bytecode {
             Bytecode::DeprecatedCreateobjecthavingmethod(a0)
         }
     }
 
     pub struct DeprecatedDynamicimport;
     impl DeprecatedDynamicimport {
-        pub fn new(a0: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg) -> Bytecode {
             Bytecode::DeprecatedDynamicimport(a0)
         }
     }
 
     pub struct DeprecatedAsyncgeneratorreject;
     impl DeprecatedAsyncgeneratorreject {
-        pub fn new(a0: Reg, a1: Reg) -> Bytecode {
+        #[inline]
+        pub const fn new(a0: Reg, a1: Reg) -> Bytecode {
             Bytecode::DeprecatedAsyncgeneratorreject(a0, a1)
         }
     }

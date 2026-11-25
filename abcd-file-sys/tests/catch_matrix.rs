@@ -17,6 +17,11 @@
 //! discovered through the bridge's own enumerate exports and patched in a
 //! copy of the bytes before re-opening.
 
+#![expect(
+    clippy::undocumented_unsafe_blocks,
+    reason = "raw FFI integration matrix exercises generated unsafe extern C exports directly"
+)]
+
 use abcd_file_sys::*;
 use std::ffi::c_void;
 
@@ -229,6 +234,36 @@ fn class_tag_section(data: &[u8], class_off: usize) -> (usize, Option<usize>) {
 fn truncate_at(data: &[u8], cut: usize) -> Vec<u8> {
     let mut out = data[..cut].to_vec();
     write_u32(&mut out, 16, cut as u32);
+    // Keep header-declared top-level section tables within `cut` so open()
+    // reaches the intended mid-item truncation guard instead of failing outer
+    // header validation (#43):
+    //   foreign: off@20, size@24
+    //   classes: num@28, off@32
+    //   lnps:    num@36, off@40
+    //   litarrs: num@44, off@48
+    //   indexes: num@52, off@56
+    let foreign_off = u32_at(&out, 20) as u64;
+    let foreign_sz = u32_at(&out, 24) as u64;
+    if foreign_off + foreign_sz > cut as u64 {
+        write_u32(&mut out, 20, 0);
+        write_u32(&mut out, 24, 0);
+    }
+    for (num_pos, off_pos, elem_sz, allow_sentinel) in [
+        (28usize, 32usize, 4u64, false),
+        (36, 40, 4, false),
+        (44, 48, 4, true),
+        (52, 56, 40, false),
+    ] {
+        let n = u32_at(&out, num_pos);
+        let off = u32_at(&out, off_pos);
+        if allow_sentinel && n == u32::MAX {
+            continue;
+        }
+        if (off as u64) + (n as u64) * elem_sz > cut as u64 {
+            write_u32(&mut out, num_pos, 0);
+            write_u32(&mut out, off_pos, 0);
+        }
+    }
     out
 }
 
@@ -1223,13 +1258,14 @@ fn string_getter_buffer_guards() {
 fn foreign_item_name_off_eof_guard() {
     let mut data = minimal_file(&[0u8; 8]);
     let file_size = data.len() as u32;
-    // foreign_off = file_size - 2, foreign_size = 4: the "item" at
-    // file_size - 2 is inside the region, but item+4+4 > file_size.
-    write_u32(&mut data, 20, file_size - 2);
-    write_u32(&mut data, 24, 4);
+    // foreign_off = file_size - 6, foreign_size = 6: the region [file_size-6..file_size]
+    // lies inside the declared file, and the item at file_size - 6 is inside
+    // the foreign region, but its u32 name field at item+4..item+8 crosses EOF.
+    write_u32(&mut data, 20, file_size - 6);
+    write_u32(&mut data, 24, 6);
     unsafe {
         let f = open(&data);
-        assert_eq!(abc_foreign_item_name_off(f, file_size - 2), u32::MAX);
+        assert_eq!(abc_foreign_item_name_off(f, file_size - 6), u32::MAX);
         // Outside the region entirely: the membership guard.
         assert_eq!(abc_foreign_item_name_off(f, 4), u32::MAX);
         abc_file_close(f);

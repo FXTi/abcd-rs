@@ -220,7 +220,7 @@ pub struct Annotation {
 }
 
 /// Per-method debug information.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MethodDebugInfo {
     pub source_file: Option<StringId>,
     pub source_code: Option<StringId>,
@@ -241,6 +241,12 @@ pub struct LiteralArray {
 // ---------------------------------------------------------------------------
 
 impl File {
+    /// Bytecode dialect implied by [`Self::file_type`] and [`Self::version`].
+    #[inline]
+    pub const fn dialect(&self) -> Option<crate::Dialect> {
+        crate::Dialect::from_header(self.file_type, self.version)
+    }
+
     /// Look up a class by descriptor string (convenience).
     pub fn class_by_str(&self, descriptor: &str) -> Option<&Class> {
         let sid = self.strings.get(descriptor)?;

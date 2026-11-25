@@ -2,7 +2,10 @@
 //! `.app` nesting with provenance.
 
 use crate::common;
-use abcd_hap::{Compression, Container, EntryData, Error, MODULE_ABC, abc_modules};
+use abcd_hap::{
+    Compression, Container, EntryData, Error, Limits, MODULE_ABC, abc_modules,
+    abc_modules_with_limits,
+};
 use common::*;
 
 const MODULE_JSON: &[u8] = br#"{"module":{"name":"entry","type":"entry"}}"#;
@@ -417,4 +420,88 @@ fn app_nested_hap_with_per_ability_layout_flattens() {
     }
     assert_eq!(modules[0].data.as_slice(), abc_bytes(0xE1).as_slice());
     assert_eq!(modules[1].data.as_slice(), abc_bytes(0xE2).as_slice());
+}
+
+#[test]
+fn app_skips_resource_only_nested_hsp_and_hap_siblings() {
+    let res_only_hsp = build_zip(&[
+        ZipEntry::stored(
+            "module.json",
+            br#"{"module":{"name":"skin","type":"shared"}}"#,
+        ),
+        ZipEntry::stored("resources/base/media/icon.png", b"\x89PNG-fake"),
+    ])
+    .bytes;
+    let entry_hap = stored_hap(0xF1);
+    let native_only_hap = build_zip(&[
+        ZipEntry::stored(
+            "module.json",
+            br#"{"module":{"name":"native","type":"feature"}}"#,
+        ),
+        ZipEntry::stored("libs/arm64-v8a/libnative.so", b"\x7fELF-fake"),
+    ])
+    .bytes;
+
+    let app = build_zip(&[
+        ZipEntry::stored("pack.info", PACK_INFO),
+        ZipEntry::deflated("skin.hsp", &res_only_hsp),
+        ZipEntry::deflated("entry.hap", &entry_hap),
+        ZipEntry::deflated("native.hap", &native_only_hap),
+    ])
+    .bytes;
+
+    let modules = abc_modules(&app).expect("resource-only nested siblings must be skipped");
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0].container_path, ["entry.hap".to_string()]);
+    assert_eq!(modules[0].entry_name, MODULE_ABC);
+    assert_eq!(modules[0].data.as_slice(), abc_bytes(0xF1).as_slice());
+
+    // Real corruption in a sibling nested .hsp (e.g. bad outer CRC) must still propagate.
+    let bad_app = build_zip(&[
+        ZipEntry::stored("pack.info", PACK_INFO),
+        ZipEntry::deflated("entry.hap", &entry_hap),
+        ZipEntry::deflated("corrupt.hsp", &res_only_hsp).with_crc(0xBAD0_C0DE),
+    ])
+    .bytes;
+    assert!(matches!(
+        abc_modules(&bad_app),
+        Err(Error::CrcMismatch { name, .. }) if name == "corrupt.hsp"
+    ));
+}
+
+#[test]
+fn abc_modules_with_limits_enforces_cumulative_max_total_bytes_across_app() {
+    let hap_a = stored_hap(0x31);
+    let hap_b = stored_hap(0x32);
+    let app = build_zip(&[
+        ZipEntry::stored("pack.info", PACK_INFO),
+        ZipEntry::deflated("a.hap", &hap_a),
+        ZipEntry::deflated("b.hap", &hap_b),
+    ])
+    .bytes;
+
+    // Generous budget succeeds and extracts both modules.
+    let all = abc_modules_with_limits(&app, Limits::DEFAULT).expect("within default limits");
+    assert_eq!(all.len(), 2);
+
+    // Budget sufficient for a.hap (~4.2 KiB archive + ~4.1 KiB .abc + json)
+    // but exceeded once b.hap + its .abc are accumulated (~16.7 KiB total).
+    let single_module_budget = Limits {
+        max_entry_bytes: 64 * 1024,
+        max_total_bytes: 10 * 1024,
+    };
+    assert!(matches!(
+        abc_modules_with_limits(&app, single_module_budget),
+        Err(Error::EntryTooLarge { .. })
+    ));
+
+    // Per-entry cap smaller than one .abc payload also rejects cleanly.
+    let tiny_entry_budget = Limits {
+        max_entry_bytes: 1024,
+        max_total_bytes: 1024 * 1024,
+    };
+    assert!(matches!(
+        abc_modules_with_limits(&app, tiny_entry_budget),
+        Err(Error::EntryTooLarge { .. })
+    ));
 }

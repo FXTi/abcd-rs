@@ -1064,6 +1064,15 @@ unsafe extern "C" {
     );
 }
 unsafe extern "C" {
+    pub fn abc_builder_lnp_emit_special_opcode(
+        b: *mut AbcBuilder,
+        lnp_handle: u32,
+        debug_handle: u32,
+        pc_inc: u32,
+        line_inc: i32,
+    );
+}
+unsafe extern "C" {
     pub fn abc_builder_lnp_emit_column(
         b: *mut AbcBuilder,
         lnp_handle: u32,

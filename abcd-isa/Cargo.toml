@@ -2,6 +2,7 @@
 name = "abcd-isa"
 description = "Safe Rust API for ArkCompiler bytecode ISA (decode, encode, version)"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 readme = "README.md"
@@ -11,3 +12,6 @@ categories = ["compilers", "parser-implementations"]
 [dependencies]
 abcd-isa-sys.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

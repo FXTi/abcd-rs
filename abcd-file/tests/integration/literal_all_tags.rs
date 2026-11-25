@@ -72,14 +72,13 @@ fn full_literal_tag_matrix_decodes() {
     new_arr.extend_from_slice(&(item_count as u32).to_le_bytes());
     new_arr.extend_from_slice(&body);
 
-    // Write the new array over the old one (grow into the slack before the
-    // next section; the file is ours, safe to append).
-    let old_len = 4 + 5; // count + [tag][4B offset]
-    let mut rebuilt: Vec<u8> = Vec::new();
-    rebuilt.extend_from_slice(&data[..array_off]);
-    rebuilt.extend_from_slice(&new_arr);
-    rebuilt.extend_from_slice(&data[array_off + old_len..]);
-    data = rebuilt;
+    // Append the rebuilt array at the end of the file and repoint the header
+    // literal-array table slot so existing string/entity offsets stay intact.
+    let literalarray_idx_off = u32::from_le_bytes(data[48..52].try_into().unwrap()) as usize;
+    let new_array_off = data.len() as u32;
+    data.extend_from_slice(&new_arr);
+    data[literalarray_idx_off..literalarray_idx_off + 4]
+        .copy_from_slice(&new_array_off.to_le_bytes());
     let file_size = data.len() as u32;
     data[16..20].copy_from_slice(&file_size.to_le_bytes());
 
@@ -87,7 +86,10 @@ fn full_literal_tag_matrix_decodes() {
     let la = &file.literal_arrays[0];
     let vals = &la.values;
     assert_eq!(vals.len(), 15);
-    assert!(matches!(vals[0], LiteralValue::String(_)));
+    assert_eq!(
+        vals[0],
+        LiteralValue::String(file.strings.get("hello").expect("hello string"))
+    );
     assert_eq!(vals[1], LiteralValue::Method(0));
     assert_eq!(vals[2], LiteralValue::Bool(true));
     assert_eq!(vals[3], LiteralValue::Integer(42));

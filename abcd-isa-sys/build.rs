@@ -9,7 +9,7 @@ use std::env;
 use std::path::Path;
 
 fn main() {
-    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set");
     let local_vendor = format!("{manifest}/vendor");
     let vendor_root = if Path::new(&format!("{local_vendor}/arkcompiler_runtime_core")).is_dir() {
         local_vendor

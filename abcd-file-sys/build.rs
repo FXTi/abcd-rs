@@ -10,7 +10,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set");
     let local_vendor = format!("{manifest}/vendor");
     let vendor_root = if Path::new(&format!("{local_vendor}/arkcompiler_runtime_core")).is_dir() {
         local_vendor
@@ -36,8 +36,11 @@ fn main() {
 
     let mut cpp_files: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(&vendor_pf).expect("read vendor libpandafile") {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy();
+        let path = entry.expect("read vendor dir entry").path();
+        let name = path
+            .file_name()
+            .expect("vendor entry must have file name")
+            .to_string_lossy();
         if path.extension().is_some_and(|e| e == "cpp") && !EXCLUDED.contains(&name.as_ref()) {
             cpp_files.push(path);
         }

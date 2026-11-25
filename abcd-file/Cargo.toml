@@ -2,6 +2,7 @@
 name = "abcd-file"
 description = "Safe Rust API for ArkCompiler .abc bytecode files (decode, encode, Builder, pandasm dis/asm)"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 readme = "README.md"
@@ -16,3 +17,6 @@ bitflags.workspace = true
 
 [dev-dependencies]
 serde_json = "1"
+
+[lints]
+workspace = true
