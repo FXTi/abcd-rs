@@ -13,7 +13,10 @@
 
 use crate::common;
 use abcd_ir::verify_module;
-use abcd_ir::{BinOp, CallKind, Const, FuncId, FunctionKind, InstId, Module, Op, UnOp, ValueId};
+use abcd_ir::{
+    BinOp, CallKind, Const, DefineClassData, FuncId, FunctionKind, InstId, Module, Op, UnOp,
+    ValueId,
+};
 use abcd_opt::peephole::Peephole;
 use abcd_opt::sccp::Sccp;
 use abcd_opt::{FuncPass, optimize_module};
@@ -237,12 +240,15 @@ fn pipeline_keeps_observable_v02_ops() {
         // runtime stub (CreateSharedClass) — observable.
         (
             "DefineSendableClass (N53)",
-            Box::new(|b, _p0, f| Op::DefineSendableClass {
-                ctor: f,
-                heritage: None,
-                members: b.konst(Const::ArrayLiteral(vec![])),
-                count: 0,
-                member_attrs: Vec::new(),
+            Box::new(|b, _p0, f| {
+                let members = b.konst(Const::ArrayLiteral(vec![]));
+                Op::DefineSendableClass(Box::new(DefineClassData {
+                    ctor: f,
+                    heritage: None,
+                    members,
+                    count: 0,
+                    member_attrs: Vec::new(),
+                }))
             }),
         ),
     ];
@@ -262,8 +268,11 @@ fn pipeline_keeps_observable_v02_ops() {
 /// content evaluated at runtime) is still dead-deletable.
 #[test]
 fn pipeline_deletes_dead_alloc_array() {
-    let survives = inst_survives_pipeline(|b, _p0, _f| Op::AllocArray {
-        shape: Some(b.konst(Const::ArrayLiteral(vec![Const::number(1.0)]))),
+    let survives = inst_survives_pipeline(|b, _p0, _f| {
+        let elem = b.konst(Const::number(1.0));
+        Op::AllocArray {
+            shape: Some(b.konst(Const::ArrayLiteral(vec![elem]))),
+        }
     });
     assert!(
         !survives,

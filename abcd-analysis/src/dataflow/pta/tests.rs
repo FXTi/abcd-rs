@@ -921,21 +921,20 @@ fn define_class_methods_capture_enclosing_lexical_env() {
         },
     );
     let work_sym = intern(&mut m, "work");
-    let members = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(work_sym),
-        Const::MethodRef(method),
-        Const::number(1.0),
-    ]));
+    let c_work = m.consts.intern(Const::String(work_sym));
+    let c_method = m.consts.intern(Const::MethodRef(method));
+    let c_one = m.consts.intern(Const::number(1.0));
+    let members = m.consts.push_array(vec![c_work, c_method, c_one]);
     let cls_val = emit(
         &mut m,
         main_b,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor,
             heritage: None,
             members,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     let inst = emit(
         &mut m,
@@ -1154,21 +1153,20 @@ fn root_sliced_pta_skips_dead_functions_and_resolves_oop_imports_and_callbacks()
             value: lex_obj,
         },
     );
-    let members = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(read_sym),
-        Const::MethodRef(svc_read),
-        Const::number(1.0),
-    ]));
+    let c_read = m.consts.intern(Const::String(read_sym));
+    let c_svc_read = m.consts.intern(Const::MethodRef(svc_read));
+    let c_one = m.consts.intern(Const::number(1.0));
+    let members = m.consts.push_array(vec![c_read, c_svc_read, c_one]);
     let svc_cls = emit(
         &mut m,
         eb,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor: svc_ctor,
             heritage: None,
             members,
             member_attrs: Vec::new(),
             count: 1,
-        },
+        })),
     );
     let secret_obj = alloc_object(&mut m, eb);
     let svc_inst = emit(
@@ -1368,21 +1366,20 @@ fn root_sliced_pta_filters_ohos_harness_unrelated_inits_and_views() {
             default: None,
         },
     );
-    let ab_members = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(on_create_sym),
-        Const::MethodRef(ab_on_create),
-        Const::number(1.0),
-    ]));
+    let c_oc = m.consts.intern(Const::String(on_create_sym));
+    let c_ab_oc = m.consts.intern(Const::MethodRef(ab_on_create));
+    let c_one = m.consts.intern(Const::number(1.0));
+    let ab_members = m.consts.push_array(vec![c_oc, c_ab_oc, c_one]);
     let _ = emit(
         &mut m,
         ei_b,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor: ab_ctor,
             heritage: Some(ui_base),
             members: ab_members,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     let vp_base = emit(
         &mut m,
@@ -1392,23 +1389,24 @@ fn root_sliced_pta_filters_ohos_harness_unrelated_inits_and_views() {
             default: None,
         },
     );
-    let rv_members = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(initial_render_sym),
-        Const::MethodRef(rv_render),
-        Const::String(rerender_sym),
-        Const::MethodRef(rv_rerender),
-        Const::number(2.0),
-    ]));
+    let c_ir = m.consts.intern(Const::String(initial_render_sym));
+    let c_rv_ren = m.consts.intern(Const::MethodRef(rv_render));
+    let c_rr = m.consts.intern(Const::String(rerender_sym));
+    let c_rv_rer = m.consts.intern(Const::MethodRef(rv_rerender));
+    let c_two = m.consts.intern(Const::number(2.0));
+    let rv_members = m
+        .consts
+        .push_array(vec![c_ir, c_rv_ren, c_rr, c_rv_rer, c_two]);
     let _ = emit(
         &mut m,
         ei_b,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor: rv_ctor,
             heritage: Some(vp_base),
             members: rv_members,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     emit_void(&mut m, ei_b, Op::Return { value: None });
 
@@ -1437,23 +1435,21 @@ fn root_sliced_pta_filters_ohos_harness_unrelated_inits_and_views() {
                 default: None,
             },
         );
-        let mem = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(initial_render_sym),
-            Const::MethodRef(u_ren),
-            Const::String(rerender_sym),
-            Const::MethodRef(u_rer),
-            Const::number(2.0),
-        ]));
+        let c_u_ren = m.consts.intern(Const::MethodRef(u_ren));
+        let c_u_rer = m.consts.intern(Const::MethodRef(u_rer));
+        let mem = m
+            .consts
+            .push_array(vec![c_ir, c_u_ren, c_rr, c_u_rer, c_two]);
         let _ = emit(
             &mut m,
             u_mb,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: u_ctor,
                 heritage: Some(base_g),
                 members: mem,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
+            })),
         );
         emit_void(&mut m, u_mb, Op::Return { value: None });
     }

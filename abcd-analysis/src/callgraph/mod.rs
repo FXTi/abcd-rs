@@ -471,10 +471,10 @@ fn trace(
                 Some(Op::DefineFunc { body, .. }) => {
                     funcs.insert(*body);
                 }
-                Some(Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. })
+                Some(Op::DefineClass(cls) | Op::DefineSendableClass(cls))
                     if call_kind == CallKind::New =>
                 {
-                    funcs.insert(*ctor);
+                    funcs.insert(cls.ctor);
                 }
                 Some(Op::LoadFunction) => {
                     funcs.insert(current);
@@ -1138,41 +1138,49 @@ mod tests {
 
         // Define Base and Sub in `main`.
         let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
-        let base_members = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_base_m),
-            Const::MethodRef(base_only),
-            Const::String(s_greet),
-            Const::MethodRef(base_greet),
-            Const::number(2.0),
-        ]));
+        let c_s_base_m = m.consts.intern(Const::String(s_base_m));
+        let c_base_only = m.consts.intern(Const::MethodRef(base_only));
+        let c_s_greet = m.consts.intern(Const::String(s_greet));
+        let c_base_greet = m.consts.intern(Const::MethodRef(base_greet));
+        let c_two = m.consts.intern(Const::number(2.0));
+        let base_members = m.consts.push_array(vec![
+            c_s_base_m,
+            c_base_only,
+            c_s_greet,
+            c_base_greet,
+            c_two,
+        ]);
         let base_cls = emit(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: base_ctor,
                 heritage: None,
                 members: base_members,
                 member_attrs: vec![],
                 count: 2,
-            },
+            })),
         );
-        let sub_members = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_helper),
-            Const::MethodRef(sub_helper),
-            Const::String(s_greet),
-            Const::MethodRef(sub_greet),
-            Const::number(2.0),
-        ]));
+        let c_s_helper = m.consts.intern(Const::String(s_helper));
+        let c_sub_helper = m.consts.intern(Const::MethodRef(sub_helper));
+        let c_sub_greet = m.consts.intern(Const::MethodRef(sub_greet));
+        let sub_members = m.consts.push_array(vec![
+            c_s_helper,
+            c_sub_helper,
+            c_s_greet,
+            c_sub_greet,
+            c_two,
+        ]);
         let _ = emit(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: sub_ctor,
                 heritage: Some(base_cls),
                 members: sub_members,
                 member_attrs: vec![],
                 count: 2,
-            },
+            })),
         );
         emit_void(&mut m, b_main, Op::Return { value: None });
 
@@ -1274,21 +1282,20 @@ mod tests {
         // `func_main_0`: lexical env storing `Service`, plus `DefineClass` for `Service` & `Controller`.
         let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
         let _ = emit(&mut m, b_main, Op::NewLexEnv { num_vars: 1 });
-        let svc_members = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_do_work),
-            Const::MethodRef(do_work),
-            Const::number(1.0),
-        ]));
+        let c_s_dw = m.consts.intern(Const::String(s_do_work));
+        let c_dw = m.consts.intern(Const::MethodRef(do_work));
+        let c_one = m.consts.intern(Const::number(1.0));
+        let svc_members = m.consts.push_array(vec![c_s_dw, c_dw, c_one]);
         let svc_cls = emit(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: svc_ctor,
                 heritage: None,
                 members: svc_members,
                 member_attrs: vec![],
                 count: 1,
-            },
+            })),
         );
         emit_void(
             &mut m,
@@ -1300,21 +1307,19 @@ mod tests {
             },
         );
         let s_run = intern(&mut m, "run");
-        let ctrl_members = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_run),
-            Const::MethodRef(ctrl_run),
-            Const::number(1.0),
-        ]));
+        let c_s_run = m.consts.intern(Const::String(s_run));
+        let c_ctrl_run = m.consts.intern(Const::MethodRef(ctrl_run));
+        let ctrl_members = m.consts.push_array(vec![c_s_run, c_ctrl_run, c_one]);
         let _ = emit(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: ctrl_ctor,
                 heritage: None,
                 members: ctrl_members,
                 member_attrs: vec![],
                 count: 1,
-            },
+            })),
         );
         emit_void(&mut m, b_main, Op::PopLexEnv);
         emit_void(&mut m, b_main, Op::Return { value: None });
@@ -1432,23 +1437,24 @@ mod tests {
         // and captures the lexical env into `caller_fn`.
         let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
         let _ = emit(&mut m, b_main, Op::NewLexEnv { num_vars: 1 });
-        let repo_members = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_fetch),
-            Const::MethodRef(fetch_fn),
-            Const::String(s_get_inst),
-            Const::MethodRef(get_inst_fn),
-            Const::number(1.0),
-        ]));
+        let c_s_fetch = m.consts.intern(Const::String(s_fetch));
+        let c_fetch = m.consts.intern(Const::MethodRef(fetch_fn));
+        let c_s_gi = m.consts.intern(Const::String(s_get_inst));
+        let c_gi = m.consts.intern(Const::MethodRef(get_inst_fn));
+        let c_one = m.consts.intern(Const::number(1.0));
+        let repo_members = m
+            .consts
+            .push_array(vec![c_s_fetch, c_fetch, c_s_gi, c_gi, c_one]);
         let repo_cls = emit(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: repo_ctor,
                 heritage: None,
                 members: repo_members,
                 member_attrs: vec![],
                 count: 1,
-            },
+            })),
         );
         emit_void(
             &mut m,
@@ -1544,23 +1550,24 @@ mod tests {
         emit_void(&mut m, b_mo, Op::Return { value: None });
 
         let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
-        let members = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_on_tap),
-            Const::MethodRef(on_tap_fn),
-            Const::String(s_mount),
-            Const::MethodRef(mount_fn),
-            Const::number(2.0),
-        ]));
+        let c_s_tap = m.consts.intern(Const::String(s_on_tap));
+        let c_tap = m.consts.intern(Const::MethodRef(on_tap_fn));
+        let c_s_mount = m.consts.intern(Const::String(s_mount));
+        let c_mount = m.consts.intern(Const::MethodRef(mount_fn));
+        let c_two = m.consts.intern(Const::number(2.0));
+        let members = m
+            .consts
+            .push_array(vec![c_s_tap, c_tap, c_s_mount, c_mount, c_two]);
         let _ = emit(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: view_ctor,
                 heritage: None,
                 members,
                 member_attrs: vec![],
                 count: 2,
-            },
+            })),
         );
         emit_void(&mut m, b_main, Op::Return { value: None });
 
@@ -1665,16 +1672,17 @@ mod tests {
         emit_void(&mut m, b_al, Op::Return { value: None });
 
         let (_, b_m0, _) = add_method_fn(&mut m, cid0, "func_main_0", FunctionKind::Function, 0);
-        let auth_members = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_login),
-            Const::MethodRef(auth_login),
-            Const::String(s_verify),
-            Const::MethodRef(auth_verify),
-        ]));
+        let c_s_login = m.consts.intern(Const::String(s_login));
+        let c_login = m.consts.intern(Const::MethodRef(auth_login));
+        let c_s_verify = m.consts.intern(Const::String(s_verify));
+        let c_verify = m.consts.intern(Const::MethodRef(auth_verify));
+        let auth_members = m
+            .consts
+            .push_array(vec![c_s_login, c_login, c_s_verify, c_verify]);
         let auth_cls = emit(
             &mut m,
             b_m0,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: auth_ctor,
                 heritage: None,
                 members: auth_members,
@@ -1689,7 +1697,7 @@ mod tests {
                     },
                 ],
                 count: 1,
-            },
+            })),
         );
         emit_void(
             &mut m,
@@ -1792,23 +1800,24 @@ mod tests {
         );
 
         let (_, b_m2, _) = add_method_fn(&mut m, cid2, "func_main_0", FunctionKind::Function, 0);
-        let log_members = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_info),
-            Const::MethodRef(log_info),
-            Const::String(s_create),
-            Const::MethodRef(log_create),
-            Const::number(1.0),
-        ]));
+        let c_s_info = m.consts.intern(Const::String(s_info));
+        let c_info = m.consts.intern(Const::MethodRef(log_info));
+        let c_s_create = m.consts.intern(Const::String(s_create));
+        let c_create = m.consts.intern(Const::MethodRef(log_create));
+        let c_one = m.consts.intern(Const::number(1.0));
+        let log_members = m
+            .consts
+            .push_array(vec![c_s_info, c_info, c_s_create, c_create, c_one]);
         let log_cls = emit(
             &mut m,
             b_m2,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: log_ctor,
                 heritage: None,
                 members: log_members,
                 member_attrs: vec![],
                 count: 1,
-            },
+            })),
         );
         emit_void(
             &mut m,
@@ -1930,22 +1939,21 @@ mod tests {
                         num_vars: DEPTH as u16,
                     },
                 );
-                let m0 = m.consts.push(Const::ArrayLiteral(vec![
-                    Const::String(s_ping),
-                    Const::MethodRef(ping_fn),
-                    Const::number(1.0),
-                ]));
-                let empty_mem = m.consts.push(Const::ArrayLiteral(vec![]));
+                let c_s_ping = m.consts.intern(Const::String(s_ping));
+                let c_ping = m.consts.intern(Const::MethodRef(ping_fn));
+                let c_one = m.consts.intern(Const::number(1.0));
+                let m0 = m.consts.push_array(vec![c_s_ping, c_ping, c_one]);
+                let empty_mem = m.consts.push_array(vec![]);
                 let mut prev_cls = emit(
                     &mut m,
                     b_main,
-                    Op::DefineClass {
+                    Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                         ctor: ctors[0],
                         heritage: None,
                         members: m0,
                         member_attrs: vec![],
                         count: 1,
-                    },
+                    })),
                 );
                 emit_void(
                     &mut m,
@@ -1962,13 +1970,13 @@ mod tests {
                     prev_cls = emit(
                         &mut m,
                         b_main,
-                        Op::DefineClass {
+                        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                             ctor: ctors[i],
                             heritage: Some(prev_cls),
                             members: empty_mem,
                             member_attrs: vec![],
                             count: 0,
-                        },
+                        })),
                     );
                     emit_void(
                         &mut m,
@@ -2151,25 +2159,26 @@ mod tests {
         );
 
         let (_, b_main, _) = add_method_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 0);
-        let send_members = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_work),
-            Const::MethodRef(work_fn),
-            Const::String(s_prop_get),
-            Const::MethodRef(getter_fn),
-            Const::String(s_shared),
-            Const::MethodRef(shared_fn),
-            Const::number(2.0),
-        ]));
+        let c_s_work = m.consts.intern(Const::String(s_work));
+        let c_work = m.consts.intern(Const::MethodRef(work_fn));
+        let c_s_pget = m.consts.intern(Const::String(s_prop_get));
+        let c_get = m.consts.intern(Const::MethodRef(getter_fn));
+        let c_s_shared = m.consts.intern(Const::String(s_shared));
+        let c_shared = m.consts.intern(Const::MethodRef(shared_fn));
+        let c_two = m.consts.intern(Const::number(2.0));
+        let send_members = m.consts.push_array(vec![
+            c_s_work, c_work, c_s_pget, c_get, c_s_shared, c_shared, c_two,
+        ]);
         let send_cls = emit(
             &mut m,
             b_main,
-            Op::DefineSendableClass {
+            Op::DefineSendableClass(Box::new(abcd_ir::DefineClassData {
                 ctor: send_ctor,
                 heritage: None,
                 members: send_members,
                 member_attrs: vec![],
                 count: 2,
-            },
+            })),
         );
         // Prototype attachment: `SendWorker.prototype.extra = extra_fn`
         let proto = emit(
@@ -2238,10 +2247,9 @@ mod tests {
         );
 
         // Object literal method resolution
-        let shape = m.consts.push(Const::ObjectLiteral {
-            keys: vec![Const::String(s_lit_fn)],
-            values: vec![Const::MethodRef(lit_fn)],
-        });
+        let c_s_lit = m.consts.intern(Const::String(s_lit_fn));
+        let c_lit = m.consts.intern(Const::MethodRef(lit_fn));
+        let shape = m.consts.push_object(vec![c_s_lit], vec![c_lit]);
         let obj = emit(&mut m, b_main, Op::AllocObject { shape });
         let lit_callee = emit(
             &mut m,

@@ -14,35 +14,37 @@ This document specifies the `abcd-ir` semantic SSA representation and the three 
 
 | Arena / Table | Purpose |
 | :--- | :--- |
-| `SymbolTable` (`module.sym`) | Content-deduplicated string interner (`Sym`) with a lossless raw-MUTF-8 side table for unpaired UTF-16 surrogates (`ADR-09`) |
-| `ConstPool` (`module.consts`) | Append-only constant arena (`Undefined`, `Hole`, `Null`, `Bool`, `Number(u64)`, `String(Sym)`, `BigInt(Sym)`, `ArrayLiteral`, `ObjectLiteral`, `MethodRef(FuncId)`) |
-| `classes: Vec<ClassData>` | Records/classes with `SourceLang`, fields, methods, annotations, per-record `EsModule` (`--merge-abc`), and `scope_names` |
+| `SymbolTable` (`module.sym`) | Content-deduplicated string interner (`Sym`) with a lossless raw-MUTF-8 side table reserved strictly for unpaired UTF-16 surrogates (`ADR-09`) |
+| `ConstPool` (`module.consts`) | Append-only / deduplicable flat constant arena (`Undefined`, `Hole`, `Null`, `Bool`, `Number(u64)`, `Int64(i64)`, `UInt64(u64)`, `String(Sym)`, `BigInt(Sym)`, `ArrayLiteral(Vec<ConstId>)`, `ObjectLiteral { keys: Vec<ConstId>, values: Vec<ConstId> }`, `MethodRef(FuncId)`) (`ADR-17`) |
+| `classes: Vec<ClassData>` | Records/classes with `SourceLang` (`EcmaScript`, `ArkTs`, `PandaAssembly`), fields, methods, annotations, per-record `EsModule` (`--merge-abc`), and `scope_names` |
 | `functions: Vec<FunctionData>` | Functions with `FunctionKind`, `Signature`, `params`, `frame_init_consts`, `blocks`, `try_regions`, annotations, and `DebugData` |
 | `blocks: Vec<Block>` | Basic blocks holding `preds: Vec<Edge>` (`EdgeKind::{Normal, Exceptional}`) and ordered `insts: Vec<InstId>` |
-| `insts: Vec<Inst>` | Instructions (`op: Op`, `result: Option<ValueId>`, `block: BlockId`, `loc: Option<SourceLoc>`) |
-| `values: Vec<Value>` | SSA values (`ValueDef::{Inst(InstId), Param(u16), ExceptionParam(BlockId)}`, `ty: Ty`) |
+| `insts: Vec<Inst>` | Instructions (`op: Op`, `result: Option<ValueId>`, `block: BlockId`, `loc: Loc`) |
+| `values: Vec<Value>` | SSA values (`ValueDef::{Inst(InstId), Param(u16), ExceptionParam(BlockId), Const(ConstId)}`, `ty: Ty`) |
 
 ---
 
-## 2. Op Taxonomy, Effects, Types & Frame Model
+## 2. Op Taxonomy, Effects, Types, CFG & Verifier
 
 1. **Closed `88`-Variant `Op` Enum (`src/op.rs`)**:
-   - Collapses register-width and call-arity bytecode variants into orthogonal semantic ops: compute (`BinaryOp`, `UnaryOp`, `Compare`, `Mov`, `LoadConst`), allocations (`AllocObject`, `AllocArray`, `AllocRegExp`, `AllocClosure`), property/own-property/super/private accesses, iterators, lexical/global/module bindings (`LoadModuleVar` with `ModuleVarKind`, `StoreGlobal` vs. `TryStoreGlobal` vs. `StoreGlobalRecord`), calls (`Call` with `CallKind`), class/sendable-class definitions (`MemberAttrs`), generator/async suspension ops, guards, `Phi`, and terminators (`Branch`, `CondBranch`, `Return`, `Throw`, `Unreachable`).
-   - All consumers inspect instructions exclusively via `Op::operands`, `Op::operands_mut`, `Op::effects`, `Op::has_result`, `Op::is_terminator`, and `Op::arity` (`ADR-02`).
-2. **First-Class Effects (`src/effects.rs`)**:
-   - Every `Op` declares `reads`, `writes` (`Heap`, `Global`, `Lexical`, `ModuleState`), `may_throw`, and `may_call`, serving as the single source of truth for ADCE, expression barrier checks, and static analysis.
+   - Collapses register-width and call-arity bytecode variants into orthogonal semantic ops: compute (`BinaryOp`, `UnaryOp`, `Compare`, `Mov`, `LoadConst`), allocations (`AllocObject`, `AllocArray`, `AllocRegExp`, `AllocClosure`), property/own-property/super/private accesses, iterators, lexical/global/module bindings (`LoadModuleVar` with `ModuleVarKind`, `StoreGlobal` vs. `TryStoreGlobal` vs. `StoreGlobalRecord`), calls (`Call` with `CallKind`), class/sendable-class definitions (`Box<DefineClassData>`, `MemberAttrs`), generator/async suspension ops, guards, `Phi`, and terminators (`Branch`, `CondBranch`, `Return`, `Throw`, `Unreachable`).
+   - All consumers inspect and mutate instructions through single-point visitors and queries: `Op::for_each_operand`, `Op::for_each_operand_mut`, `Op::for_each_const_id`, `Op::for_each_func_id`, `Op::for_each_sym`, `Op::effects`, `Op::effects_in`, `Op::has_result`, `Op::is_terminator`, and `Op::arity` (`ADR-02`).
+2. **Two-Tier First-Class Effects (`src/effects.rs`, `ADR-02`, `ADR-16`)**:
+   - `Op::effects(&self)` provides a sound untyped baseline over-approximation (`reads`, `writes` over `MemClasses`, `allocs`, `may_throw`, `may_call`): only unconditionally pure JS ops (`UnOp::{LogicalNot, IsTrue, IsFalse, TypeOf, Void}`, `CmpOp::{StrictEq, StrictNotEq}`) return `Effects::PURE` without type knowledge, while coercing arithmetic/relational/`in`/`instanceof` ops report `HEAP` (+ `PROTOTYPE`) / `may_throw` / `UnknownCallee`.
+   - `Op::effects_in(&self, module: &Module)` refines dynamic `UnaryOp`, `BinaryOp`, and `Compare` back to `Effects::PURE` when operand `Value::ty` or `ConstPool` definitions prove coercion-free primitive types, and `Effects::is_removable_if_unused()` drives `abcd-opt::Adce`.
 3. **Type Lattice (`src/ty.rs`) & Frame-Slot Calling Convention (`src/frame.rs`)**:
-   - `Ty` bridges dynamic ECMAScript (`Ty::Any`, `DynPrim`) and statically typed ArkTS (`StaticTy` primitives, `Reference(ClassId)`, `Ty::Union`).
+   - `Ty` bridges dynamic ECMAScript (`Ty::Any`, `DynPrim`) and statically typed ArkTS (`StaticTy` primitives, `Reference(ClassId)`, `Ty::Union(Box<[Ty]>)` with iterative `O(1)`-stack `Clone`/`Drop`/`Eq`/`Hash`/`Debug`).
    - `abcd_ir::frame` defines parameter slot layout (`ADR-05`): dynamic ECMAScript functions prepend `[func][new.target][this]` (`H = 3` default, or the subset encoded in `L_ESCallTypeAnnotation;`), while static ArkTS methods (`SourceLang::ArkTs` / static ABI) carry `H = 0` implicit JS slots.
-4. **Structural & Dominance Verifier (`src/verify.rs`)**:
-   - `verify_module` checks arena bounds, block/instruction ownership, terminator discipline, `TryRegion` ↔ `EdgeKind::Exceptional` consistency, phi predecessor bijections, reachable zero-predecessor phis (`N27`), Normal-edge SSA dominance (`N45`/`N64`), and emits `N38` warnings on multi-value catch-handler phis.
+4. **Shared Linear-Memory Dominator Infrastructure & Verifier (`src/cfg.rs`, `src/verify.rs`, `ADR-04`, `ADR-17`)**:
+   - `abcd_ir::cfg::DomTree` computes iterative Reverse Post-Order (RPO) + **Cooper–Harvey–Kennedy** `idom: Vec<u32>` (`O(B)` memory) + iterative Euler `(tin, tout)` intervals (`O(1)` dominance queries) over both Normal and Exception-Augmented CFGs, alongside dense `ExceptionHandlerMap` and inline `normal_succs_inline`.
+   - `verify_module` checks arena/symbol/entity bounds, iterative 3-color `ConstPool` acyclicity (`ConstCycle`), `Inst.result` ↔ `Op::has_result()` agreement, disjoint cross-function ownership, `CallKind` arity invariants, `TryRegion` ↔ `EdgeKind::Exceptional` symmetry, and **`O(1)` pre-throw / post-normal-exit augmented SSA dominance** (`R2-D1`, `ADR-04`).
 
 ---
 
 ## 3. Lifting (`abcd-lift`: `File → Module`)
 
 1. **Two-Pass Entity Reservation**: Pre-reserves `ClassId` and `FuncId` slots by file declaration and `method_offset` (`S1`/`N2`) before translating bodies so forward method/class/literal references resolve deterministically.
-2. **CFG & Pre-Entry Synthesis**: Splits decoded `Bytecode` streams at jump/fallthrough/try-boundary/handler leaders. If bytecode offset `0` has incoming jump or catch edges, `lift_method` synthesizes a pure zero-predecessor `pre_entry` trampoline so `blocks[0]` satisfies the entry invariant without disturbing standard functions.
+2. **CFG, Exact Try Boundaries & Pre-Throw Block Splitting (`R2-D1`)**: Splits decoded `Bytecode` streams at jump/fallthrough leaders, exact `[try_start, try_end)` boundaries, catch-handler entries, and before any register write (`sta` / `mov`) following a throwing bytecode inside a protected `try` range. If bytecode offset `0` has incoming jump or catch edges, `lift_method` synthesizes a pure zero-predecessor `pre_entry` trampoline so `blocks[0]` satisfies the entry invariant without disturbing standard functions.
 3. **Braun SSA & Exceptional Seeding**:
    - Materializes `EdgeKind::Normal` and `EdgeKind::Exceptional` predecessor edges up front.
    - Seeds catch handlers' `acc` with `ValueDef::ExceptionParam(handler)` (`N13`) and entry parameter registers `Reg(num_vregs + i)` with `ValueDef::Param(i)`.

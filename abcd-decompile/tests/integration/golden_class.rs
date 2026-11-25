@@ -73,9 +73,9 @@ fn b01_static_method_placement() {
     // { string:"move", method, affiliate, string:"has", method,
     //   affiliate, i32:1 } — one instance member (move), one static
     // (has).
-    let members = const_id(
+    let members = const_array(
         &mut m,
-        Const::ArrayLiteral(vec![
+        vec![
             Const::String(move_sym),
             Const::MethodRef(method),
             Const::number(0.0),
@@ -83,12 +83,12 @@ fn b01_static_method_placement() {
             Const::MethodRef(statik),
             Const::number(1.0),
             Const::number(1.0),
-        ]),
+        ],
     );
     let cls = emit(
         &mut m,
         b,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor,
             heritage: None,
             members,
@@ -103,7 +103,7 @@ fn b01_static_method_placement() {
                 },
             ],
             count: 0,
-        },
+        })),
     );
     emit_void(&mut m, b, Op::Return { value: Some(cls) });
 
@@ -151,19 +151,19 @@ fn b02_getter_kind_from_buffer_tag() {
     let b = entry_of(&m, f);
     let _this = add_param(&mut m, f);
     let x_sym = intern(&mut m, "x");
-    let members = const_id(
+    let members = const_array(
         &mut m,
-        Const::ArrayLiteral(vec![
+        vec![
             Const::String(x_sym),
             Const::MethodRef(getter),
             Const::number(0.0),
             Const::number(1.0),
-        ]),
+        ],
     );
     let cls = emit(
         &mut m,
         b,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor,
             heritage: None,
             members,
@@ -172,7 +172,7 @@ fn b02_getter_kind_from_buffer_tag() {
                 kind: FunctionKind::Getter,
             }],
             count: 0,
-        },
+        })),
     );
     emit_void(&mut m, b, Op::Return { value: Some(cls) });
 
@@ -267,17 +267,17 @@ fn b03_instance_initializer_class_field_fold() {
             value: closure,
         },
     );
-    let members = const_id(&mut m, Const::ArrayLiteral(vec![Const::number(0.0)]));
+    let members = const_array(&mut m, vec![Const::number(0.0)]);
     let cls = emit(
         &mut m,
         b,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor,
             heritage: None,
             members,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     emit_void(&mut m, b, Op::Return { value: Some(cls) });
 
@@ -338,19 +338,19 @@ fn b04_private_brand_bare_declaration_without_fold() {
     let b = entry_of(&m, f);
     let _this = add_param(&mut m, f);
     let has_sym = intern(&mut m, "has");
-    let members = const_id(
+    let members = const_array(
         &mut m,
-        Const::ArrayLiteral(vec![
+        vec![
             Const::String(has_sym),
             Const::MethodRef(has),
             Const::number(1.0),
             Const::number(0.0),
-        ]),
+        ],
     );
     let cls = emit(
         &mut m,
         b,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor,
             heritage: None,
             members,
@@ -359,7 +359,7 @@ fn b04_private_brand_bare_declaration_without_fold() {
                 kind: FunctionKind::Function,
             }],
             count: 0,
-        },
+        })),
     );
     emit_void(&mut m, b, Op::Return { value: Some(cls) });
 

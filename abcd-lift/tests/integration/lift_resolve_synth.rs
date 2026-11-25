@@ -180,8 +180,8 @@ fn lifted_attrs(file: &abcd_file::File) -> (Vec<MemberAttrs>, abcd_ir::Module) {
     let m = lift_file(file).expect("lift");
     verify_clean(&m);
     for inst in &m.insts {
-        if let Op::DefineClass { member_attrs, .. } = &inst.op {
-            return (member_attrs.clone(), m);
+        if let Op::DefineClass(data) = &inst.op {
+            return (data.member_attrs.clone(), m);
         }
     }
     panic!("DefineClass emitted")
@@ -292,8 +292,8 @@ fn literal_consumer_file(
     )
 }
 
-/// The pooled shape constant of the single AllocArray in `f`.
-fn lifted_array_shape(file: &abcd_file::File) -> Const {
+/// The lifted module and pooled shape `ConstId` of the single AllocArray in `f`.
+fn lifted_array_shape(file: &abcd_file::File) -> (abcd_ir::Module, abcd_ir::ConstId) {
     let m = lift_file(file).expect("lift");
     verify_clean(&m);
     let alloc = m
@@ -304,7 +304,7 @@ fn lifted_array_shape(file: &abcd_file::File) -> Const {
     let Op::AllocArray { shape: Some(shape) } = alloc.op else {
         unreachable!()
     };
-    m.consts.get(shape).expect("const").clone()
+    (m, shape)
 }
 
 #[test]
@@ -327,16 +327,14 @@ fn literal_value_rare_kinds() {
         ]],
         HashMap::new(),
     );
-    let shape = lifted_array_shape(&file);
+    let (mut m, shape) = lifted_array_shape(&file);
+    let c7 = m.consts.intern(Const::number(7.0));
+    let c25 = m.consts.intern(Const::number(2.5));
+    let c4 = m.consts.intern(Const::number(4.0));
+    let cm = m.consts.intern(Const::MethodRef(abcd_ir::FuncId::new(0)));
     assert_eq!(
-        shape,
-        Const::ArrayLiteral(vec![
-            Const::number(7.0),
-            Const::number(2.5),
-            Const::number(4.0),
-            Const::MethodRef(abcd_ir::FuncId::new(0)),
-            Const::MethodRef(abcd_ir::FuncId::new(0)),
-        ]),
+        m.consts.get(shape),
+        Some(&Const::ArrayLiteral(vec![c7, c25, c4, cm, cm])),
         "every literal value kind becomes a typed Const"
     );
 }
@@ -400,12 +398,13 @@ fn typed_array_payloads_resolve_through_the_direct_index_fallback() {
         vec![outer, inner],
         HashMap::new(),
     );
-    let shape = lifted_array_shape(&file);
-    let inner_tree = Const::ArrayLiteral(vec![Const::number(9.0)]);
+    let (mut m, shape) = lifted_array_shape(&file);
+    let c9 = m.consts.intern(Const::number(9.0));
+    let inner_cid = m.consts.intern(Const::ArrayLiteral(vec![c9]));
     assert_eq!(
-        shape,
-        Const::ArrayLiteral(vec![inner_tree; 12]),
-        "every typed-array payload resolves to the target array's tree \
+        m.consts.get(shape),
+        Some(&Const::ArrayLiteral(vec![inner_cid; 12])),
+        "every typed-array payload resolves to the target array's pooled ConstId \
          (the element-type tag is a lowering concern — documented)"
     );
 }
@@ -424,10 +423,12 @@ fn typed_array_payloads_prefer_the_offset_map() {
         vec![outer, inner],
         HashMap::from([(55, 1)]),
     );
-    let shape = lifted_array_shape(&file);
+    let (mut m, shape) = lifted_array_shape(&file);
+    let c9 = m.consts.intern(Const::number(9.0));
+    let inner_cid = m.consts.intern(Const::ArrayLiteral(vec![c9]));
     assert_eq!(
-        shape,
-        Const::ArrayLiteral(vec![Const::ArrayLiteral(vec![Const::number(9.0)])]),
+        m.consts.get(shape),
+        Some(&Const::ArrayLiteral(vec![inner_cid])),
         "offset 55 maps to table index 1"
     );
 }
@@ -446,10 +447,12 @@ fn literal_buffer_index_resolves_like_a_typed_array() {
         vec![outer, inner],
         HashMap::new(),
     );
-    let shape = lifted_array_shape(&file);
+    let (mut m, shape) = lifted_array_shape(&file);
+    let c9 = m.consts.intern(Const::number(9.0));
+    let inner_cid = m.consts.intern(Const::ArrayLiteral(vec![c9]));
     assert_eq!(
-        shape,
-        Const::ArrayLiteral(vec![Const::ArrayLiteral(vec![Const::number(9.0)])])
+        m.consts.get(shape),
+        Some(&Const::ArrayLiteral(vec![inner_cid]))
     );
 }
 
@@ -673,16 +676,16 @@ fn deep_literal_array_chain_lifts_without_recursion_overflow() {
         arrays,
         HashMap::new(),
     );
-    let shape = lifted_array_shape(&file);
-    let mut cur = &shape;
+    let (mut m, mut cur_cid) = lifted_array_shape(&file);
     for _ in 0..depth - 1 {
-        let Const::ArrayLiteral(elems) = cur else {
+        let Some(Const::ArrayLiteral(elems)) = m.consts.get(cur_cid) else {
             panic!("expected nested ArrayLiteral");
         };
         assert_eq!(elems.len(), 1);
-        cur = &elems[0];
+        cur_cid = elems[0];
     }
-    assert_eq!(cur, &Const::ArrayLiteral(vec![Const::number(42.0)]));
+    let c42 = m.consts.intern(Const::number(42.0));
+    assert_eq!(m.consts.get(cur_cid), Some(&Const::ArrayLiteral(vec![c42])));
 
     let cyc_depth = 4_000usize;
     let mut cyc_arrays = Vec::with_capacity(cyc_depth);

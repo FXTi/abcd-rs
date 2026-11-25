@@ -429,37 +429,20 @@ pub fn effective_kind(module: &Module, func: FuncId) -> FunctionKind {
     if has_enter { upgraded } else { f.kind }
 }
 
-/// Whether an op has observable effects for the inline barrier
-/// (`Effects.may_call`/`may_throw`/`writes` — §4.1).
-fn observable(op: &Op) -> bool {
-    let e = op.effects();
-    e.may_throw || e.may_call != abcd_ir::effects::CallEffect::None || !e.writes.is_empty()
-}
-
-/// JS-dynamic observability beyond the IR effects table (effects.rs
-/// deliberately marks the compute ops PURE — "coercion effects of the
-/// dynamic operators are a type-refined extension"): on non-primitive
-/// operands every `BinaryOp`, every non-strict `Compare` (`in` /
-/// `instanceof` included — proxy traps and `Symbol.hasInstance` are user
-/// code), and the numeric `UnaryOp`s can invoke user code
-/// (ToPrimitive/ToNumeric) or throw. A userless occurrence is an
-/// expression STATEMENT, never dead code (test262's coercion-order and
-/// throw-on-primitive tests — N74-W4). Strict equality and the
-/// boolean/typeof/void unaries are genuinely free of user code.
-fn js_dynamic_observable(op: &Op) -> bool {
+/// Whether an op acts as a Stage-A expression-inlining barrier (§4.1).
+///
+/// Value-compute operators (`BinaryOp`, `UnaryOp`, `Compare`) and
+/// `GetPropIterator` (`for..in` header plumbing) inline into their single
+/// same-block consumer when no side-effecting call/property/store barrier
+/// intervenes; unused occurrences still stay live statements via
+/// [`abcd_ir::Effects::is_removable_if_unused`] (`ADR-16` / `R2-D2`).
+fn inline_barrier(op: &Op) -> bool {
     match op {
-        Op::BinaryOp { .. } => true,
-        Op::Compare { op, .. } => !matches!(op, CmpOp::StrictEq | CmpOp::StrictNotEq),
-        Op::UnaryOp { op, .. } => matches!(
-            op,
-            abcd_ir::op::UnOp::Minus
-                | abcd_ir::op::UnOp::BitNot
-                | abcd_ir::op::UnOp::Inc
-                | abcd_ir::op::UnOp::Dec
-                | abcd_ir::op::UnOp::ToNumber
-                | abcd_ir::op::UnOp::ToNumeric
-        ),
-        _ => false,
+        Op::BinaryOp { .. }
+        | Op::UnaryOp { .. }
+        | Op::Compare { .. }
+        | Op::GetPropIterator { .. } => false,
+        _ => !op.effects().is_removable_if_unused(),
     }
 }
 
@@ -659,7 +642,7 @@ impl<'m> Recover<'m> {
                 let obs = self
                     .module
                     .inst(iid)
-                    .map(|i| observable(&i.op) as u32)
+                    .map(|i| inline_barrier(&i.op) as u32)
                     .unwrap_or(0);
                 prefix.push(prefix[pos] + obs);
             }
@@ -1030,7 +1013,7 @@ impl<'m> Recover<'m> {
                 }
                 // Never inline: phis; observable defs; statement-level
                 // ops (scope markers etc. — handled as statements).
-                if inst.op.is_phi() || observable(&inst.op) || is_statement_op(&inst.op) {
+                if inst.op.is_phi() || inline_barrier(&inst.op) || is_statement_op(&inst.op) {
                     continue;
                 }
                 let plain = self.chains.users_of(result);
@@ -1376,8 +1359,7 @@ impl<'m> Recover<'m> {
             // evidence (`...rest` reconstruction, N74-W4) even when the
             // rest array itself is unused (`function(...args) {}` —
             // `.length` still observes it).
-            if observable(op) || js_dynamic_observable(op) || matches!(op, Op::CopyRestArgs { .. })
-            {
+            if !op.effects().is_removable_if_unused() || matches!(op, Op::CopyRestArgs { .. }) {
                 self.record(op, base_outcome(op));
                 let value = self.expr_for(iid, op);
                 out.push(Stmt::Expr(value));
@@ -1846,7 +1828,7 @@ impl<'m> Recover<'m> {
         while i < items.len() {
             let key = match &items[i] {
                 Lit::String(s) => s.clone(),
-                Lit::Number(_) => {
+                Lit::Number(_) | Lit::Int64(_) | Lit::UInt64(_) => {
                     // Numeric key of a plain pair.
                     if i + 1 < items.len() && !matches!(items[i + 1], Lit::MethodRef(_)) {
                         plain.push((items[i].clone(), items[i + 1].clone()));
@@ -1881,7 +1863,10 @@ impl<'m> Recover<'m> {
                         },
                     ));
                     // Skip the trailing attributes payload when present.
-                    i += if matches!(items.get(i + 2), Some(Lit::Number(_))) {
+                    i += if matches!(
+                        items.get(i + 2),
+                        Some(Lit::Number(_) | Lit::Int64(_) | Lit::UInt64(_))
+                    ) {
                         3
                     } else {
                         2
@@ -2095,20 +2080,20 @@ impl<'m> Recover<'m> {
                 }
             }
             Op::DefineFunc { body, captures, .. } => self.closure_node(*body, captures.clone()),
-            Op::DefineClass {
-                ctor,
-                heritage,
-                members,
-                member_attrs,
-                ..
-            } => self.class_node(*ctor, *heritage, *members, member_attrs.clone(), false),
-            Op::DefineSendableClass {
-                ctor,
-                heritage,
-                members,
-                member_attrs,
-                ..
-            } => self.class_node(*ctor, *heritage, *members, member_attrs.clone(), true),
+            Op::DefineClass(cls) => self.class_node(
+                cls.ctor,
+                cls.heritage,
+                cls.members,
+                cls.member_attrs.clone(),
+                false,
+            ),
+            Op::DefineSendableClass(cls) => self.class_node(
+                cls.ctor,
+                cls.heritage,
+                cls.members,
+                cls.member_attrs.clone(),
+                true,
+            ),
             Op::LoadPrivate { obj, .. } => Expr::PrivateLoad {
                 object: Box::new(self.expr_of(*obj)),
                 name: self
@@ -2456,6 +2441,8 @@ impl<'m> Recover<'m> {
                     None
                 }
             }
+            Lit::Int64(x) => u32::try_from(x).ok(),
+            Lit::UInt64(x) => u32::try_from(x).ok(),
             _ => None,
         }
     }
@@ -2812,12 +2799,11 @@ mod tests {
         let b = entry_of(&m, f);
         let sa = m.sym.intern("a");
         let sb = m.sym.intern("b");
-        let shape = m.consts.push(Const::ArrayLiteral(vec![
-            Const::number(0.0),
-            Const::String(sa),
-            Const::number(1.0),
-            Const::String(sb),
-        ]));
+        let c0 = m.consts.intern(Const::number(0.0));
+        let csa = m.consts.intern(Const::String(sa));
+        let c1 = m.consts.intern(Const::number(1.0));
+        let csb = m.consts.intern(Const::String(sb));
+        let shape = m.consts.push_array(vec![c0, csa, c1, csb]);
         let v = emit_val(&mut m, b, Op::AllocObject { shape });
         push_inst(&mut m, b, Op::Return { value: Some(v) });
         let rf = recover_func(&m, f);
@@ -2840,21 +2826,17 @@ mod tests {
         let meth = add_fn(&mut m, "mm");
         let f = add_fn(&mut m, "f");
         let b = entry_of(&m, f);
+        let c0 = m.consts.intern(Const::number(0.0));
+        let cmeth = m.consts.intern(Const::MethodRef(meth));
+        let ctrue = m.consts.intern(Const::Bool(true));
         // (a) numeric key followed by a MethodRef (1597).
-        let shape_a = m.consts.push(Const::ArrayLiteral(vec![
-            Const::number(0.0),
-            Const::MethodRef(meth),
-        ]));
+        let shape_a = m.consts.push_array(vec![c0, cmeth]);
         // (b) a key that is neither String nor Number (1599).
-        let shape_b = m.consts.push(Const::ArrayLiteral(vec![
-            Const::Bool(true),
-            Const::number(0.0),
-        ]));
+        let shape_b = m.consts.push_array(vec![ctrue, c0]);
         // (c) a trailing key without a value (1632).
         let key_c = m.sym.intern("a");
-        let shape_c = m
-            .consts
-            .push(Const::ArrayLiteral(vec![Const::String(key_c)]));
+        let ckey_c = m.consts.intern(Const::String(key_c));
+        let shape_c = m.consts.push_array(vec![ckey_c]);
         for shape in [shape_a, shape_b, shape_c] {
             let v = emit_val(&mut m, b, Op::AllocObject { shape });
             push_inst(&mut m, b, Op::Return { value: Some(v) });
@@ -2887,17 +2869,13 @@ mod tests {
         let f = add_fn(&mut m, "f");
         let b = entry_of(&m, f);
         let mname = m.sym.intern("m");
+        let cmname = m.consts.intern(Const::String(mname));
+        let cmeth = m.consts.intern(Const::MethodRef(meth));
+        let c7 = m.consts.intern(Const::number(7.0));
         // No trailing attrs payload: `i += 2` (1624).
-        let shape_plain = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(mname),
-            Const::MethodRef(meth),
-        ]));
+        let shape_plain = m.consts.push_array(vec![cmname, cmeth]);
         // Trailing numeric attrs payload: `i += 3` (1621-1622).
-        let shape_attrs = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(mname),
-            Const::MethodRef(meth),
-            Const::number(7.0),
-        ]));
+        let shape_attrs = m.consts.push_array(vec![cmname, cmeth, c7]);
         for shape in [shape_plain, shape_attrs] {
             let v = emit_val(&mut m, b, Op::AllocObject { shape });
             push_inst(&mut m, b, Op::Return { value: Some(v) });
@@ -3065,7 +3043,8 @@ mod tests {
         let sc = load_string(&mut m, b, "c");
         // The cooked list as a direct const-array value (2101-2103).
         let ck_sym = m.sym.intern("ck");
-        let cooked = const_value(&mut m, Const::ArrayLiteral(vec![Const::String(ck_sym)]));
+        let ck_cid = m.consts.intern(Const::String(ck_sym));
+        let cooked = const_value(&mut m, Const::ArrayLiteral(vec![ck_cid]));
         let pair = emit_val(&mut m, b, Op::AllocArray { shape: None });
         let raw = emit_val(&mut m, b, Op::AllocArray { shape: None });
         // Element stores into `raw`: all three store forms.

@@ -22,8 +22,8 @@
 use std::collections::{HashMap, HashSet};
 
 use abcd_ir::{
-    BinOp, BlockId, CallKind, CmpOp, Const, ConstId, FuncId, Module, Op, SuperCheck, SuperKey, Sym,
-    UnOp, ValueDef, ValueId,
+    BinOp, BlockId, CallKind, CmpOp, Const, ConstId, DefineClassData, FuncId, Module, Op,
+    SuperCheck, SuperKey, Sym, UnOp, ValueDef, ValueId,
 };
 use abcd_isa::{Bytecode, BytecodeFlags, EntityId, EntityKind, Imm, Label, Reg};
 
@@ -915,6 +915,15 @@ fn const_load_bytecode(
         }
         Const::String(s) => Bytecode::LdaStr(tracer.eid(*s)),
         Const::BigInt(s) => Bytecode::Ldbigint(tracer.eid(*s)),
+        Const::Int64(_) | Const::UInt64(_) => {
+            return Err(LowerError::UnsupportedInstruction {
+                func: func_id,
+                message: format!(
+                    "LoadConst of 64-bit static integer ({c:?}) has no dynamic .abc \
+                     accumulator-load bytecode"
+                ),
+            });
+        }
         Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } | Const::MethodRef(_) => {
             return Err(LowerError::UnsupportedInstruction {
                 func: func_id,
@@ -1711,16 +1720,17 @@ fn select_inst(
             ));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
-        Op::DefineClass {
-            ctor,
-            heritage,
-            members,
-            // B2: member_attrs is a lift-time semantic projection of the
-            // buffer — lowering re-emits the RAW buffer (byte fidelity),
-            // so the projection is ignored here by construction.
-            member_attrs: _,
-            count,
-        } => {
+        Op::DefineClass(cls) => {
+            let DefineClassData {
+                ctor,
+                heritage,
+                members,
+                // B2: member_attrs is a lift-time semantic projection of the
+                // buffer — lowering re-emits the RAW buffer (byte fidelity),
+                // so the projection is ignored here by construction.
+                member_attrs: _,
+                count,
+            } = cls.as_ref();
             let Some(base) = heritage else {
                 return Err(LowerError::UnsupportedInstruction {
                     func: func_id,
@@ -1741,13 +1751,14 @@ fn select_inst(
             ));
             home_result(tracker, result, used, func_id, alloc, codes)?;
         }
-        Op::DefineSendableClass {
-            ctor,
-            heritage,
-            members,
-            member_attrs: _,
-            count,
-        } => {
+        Op::DefineSendableClass(cls) => {
+            let DefineClassData {
+                ctor,
+                heritage,
+                members,
+                member_attrs: _,
+                count,
+            } = cls.as_ref();
             // N53: re-emit the SENDABLE opcode
             // (`callruntime.definesendableclass`, isa.yaml:861-866 —
             // vendor `SlowRuntimeStub::CreateSharedClass`), NEVER the

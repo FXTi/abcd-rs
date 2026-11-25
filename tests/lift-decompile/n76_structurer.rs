@@ -157,7 +157,7 @@ fn try_switch_inside_finally_reconstruction() {
     // the never-taken outer `else` arm).
     let st3 = &text[text.find("___SwitchTest3").expect("SwitchTest3")..];
     assert!(
-        st3.contains("switch (v514) {\n      case undefined: {\n"),
+        st3.contains("switch (v516) {\n      case undefined: {\n"),
         "SwitchTest3's dispatch must fold to a switch over the completion marker:\n{}",
         &st3[..st3.len().min(2500)]
     );

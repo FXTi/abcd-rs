@@ -820,27 +820,7 @@ impl<'m> Emitter<'m> {
 
     /// A literal with JS-valid MethodRef rendering.
     pub(crate) fn render_lit_js(&self, lit: &Lit) -> String {
-        match lit {
-            Lit::MethodRef(f) => format!("undefined /*method fn#{}*/", f.index()),
-            Lit::Array(items) => {
-                let inner: Vec<String> = items.iter().map(|i| self.render_lit_js(i)).collect();
-                format!("[{}]", inner.join(", "))
-            }
-            Lit::Object(entries) => {
-                let inner: Vec<String> = entries
-                    .iter()
-                    .map(|(k, v)| {
-                        format!(
-                            "{}: {}",
-                            render_lit_key_pub(self.module, k),
-                            self.render_lit_js(v)
-                        )
-                    })
-                    .collect();
-                format!("{{{}}}", inner.join(", "))
-            }
-            other => render_lit_m(self.module, other),
-        }
+        crate::consts::render_lit_ex(lit, true)
     }
 }
 

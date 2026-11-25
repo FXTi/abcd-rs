@@ -1974,7 +1974,7 @@ impl<'m> Ctx<'m> {
     /// Sequence emission with [`RegionNode::Alternates`] pre-registration:
     /// arm-entry labels are in scope for everything emitted BEFORE the
     /// alternates node in the same sequence.
-    fn emit_seq_children(
+    pub(in crate::structure) fn emit_seq_children(
         &mut self,
         children: &[RegionId],
         active: Option<usize>,
@@ -1983,6 +1983,12 @@ impl<'m> Ctx<'m> {
     ) {
         let mut i = 0;
         while i < children.len() {
+            if let Some(cd) = self.f_mut().cut_defer.as_mut()
+                && cd.ids.remove(&children[i])
+            {
+                i += 1;
+                continue;
+            }
             // Try-run coalescing: a maximal run of consecutive children
             // uniformly inside the same plan wraps in ONE try/catch
             // (es2abc protected ranges are contiguous; without
@@ -1993,6 +1999,59 @@ impl<'m> Ctx<'m> {
                 let mut j = i + 1;
                 while j < children.len() && self.f_mut().cov(children[j]) == Cov::Uniform(Some(p)) {
                     j += 1;
+                }
+                if !self.is_suppressed(p) {
+                    // R2-C2 sub-slice join hoist: when unprotected items
+                    // preceded `p` (or trailing siblings follow), hoist
+                    // `children[j]`'s unprotected join after one single
+                    // `try/catch` wrapping `children[i..=j]`.
+                    if j < children.len() && self.f_mut().cov(children[j]) == Cov::Mixed {
+                        let after_fl = if j + 1 < children.len() {
+                            self.entry_of(children[j + 1])
+                        } else {
+                            follow
+                        };
+                        if (i > 0 || j + 1 < children.len())
+                            && self.emit_cut_try_slice(&children[i..=j], p, active, after_fl, out)
+                        {
+                            i = j + 1;
+                            continue;
+                        }
+                        // R2-C1 split before `If`: when `children[j]` is
+                        // a `Mixed` `If` headed by `p` that cannot hoist
+                        // (e.g. outer finally chain), `emit_mixed` would
+                        // `wrap_try` it in `p` anyway — coalesce into one
+                        // wrapper instead of splitting `p`.
+                        if let RegionNode::If { head, .. } = *self.f().node(children[j])
+                            && self.f_mut().plan_of(head) == Some(p)
+                            && !self.can_cut_try(children[j], p)
+                        {
+                            j += 1;
+                        }
+                    }
+                    // R2-C2 telescoping outer-chain prologues (`A7_T2`):
+                    // when `p` is an outer finally prologue (`v = undefined`)
+                    // falling cleanly into an inner plan `q ⊂ p` whose
+                    // wrap chain includes `p`, attach `children[i..j]` to
+                    // `q`'s outer `p` wrapper instead of wrapping `p` twice.
+                    if let Some((core_start, core_end, core_p, prologues)) =
+                        self.try_telescope_prologues(children, i, j, p)
+                    {
+                        let fl = if core_end < children.len() {
+                            self.entry_of(children[core_end])
+                        } else {
+                            follow
+                        };
+                        self.wrap_try_run_prologues(
+                            &children[core_start..core_end],
+                            core_p,
+                            &prologues,
+                            fl,
+                            out,
+                        );
+                        i = core_end;
+                        continue;
+                    }
                 }
                 let fl = if j < children.len() {
                     self.entry_of(children[j])

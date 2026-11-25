@@ -39,10 +39,10 @@ use crate::module::FunctionKind;
 ///   (`ecmascript/jspandafile/literal_data_extractor.cpp:588-624`,
 ///   `LiteralDataExtractor::DefineFunctionTemplate`).
 ///
-/// Derived at lift from the same literal array [`Op::DefineClass::members`]
+/// Derived at lift from the same literal array [`DefineClassData::members`]
 /// pools — a semantic PROJECTION, never new content: lowering ignores it
 /// and re-emits the raw buffer, so byte fidelity is unaffected.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MemberAttrs {
     /// `true` when the member installs on the class object (static
     /// placement — its pair index is at-or-past the buffer's trailing
@@ -51,6 +51,21 @@ pub struct MemberAttrs {
     /// The callable kind from the buffer entry's method-kind tag
     /// (`Function`, `Getter`, `Setter`, `Generator`, `AsyncGenerator`).
     pub kind: FunctionKind,
+}
+
+/// Shared payload for [`Op::DefineClass`] and [`Op::DefineSendableClass`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DefineClassData {
+    /// The constructor in the module's function table.
+    pub ctor: FuncId,
+    /// The heritage (`extends`) expression value, when present.
+    pub heritage: Option<ValueId>,
+    /// The member-buffer constant (`Const::ArrayLiteral` / `Const::ObjectLiteral`).
+    pub members: ConstId,
+    /// Per-member attribute payloads decoded from the buffer.
+    pub member_attrs: Vec<MemberAttrs>,
+    /// The class constructor's `.length` operand.
+    pub count: u16,
 }
 
 /// Binary arithmetic/bitwise operator kind. Typed twins
@@ -199,7 +214,7 @@ impl ModuleVarKind {
 /// | kind | `this` slot | `new.target` slot | formals |
 /// |------|-------------|-------------------|---------|
 /// | `Direct` | `call.this` | `undefined` | `args → params[H..]` |
-/// | `Dynamic` | computed at callee entry | `undefined` | `args → params[H..]` |
+/// | `Dynamic` | `call.this` when `Some` (`callthis*`), else computed at callee entry (`callarg*`/`callrange`) | `undefined` | `args → params[H..]` |
 /// | `Apply` | `call.this` (explicit receiver) | `undefined` | SPREAD of `args[0]` |
 /// | `Super` | inherited from enclosing ctor | inherited | `args → params[H..]` |
 /// | `SuperSpread` | inherited from enclosing ctor | inherited | SPREAD of `args[0]` |
@@ -212,9 +227,11 @@ impl ModuleVarKind {
 pub enum CallKind {
     /// A statically resolved callee with an explicit `this`.
     Direct,
-    /// A dynamically computed callee; `this` is computed at callee entry
-    /// (non-strict = global, strict = undefined), so `Call::this` is
-    /// `None`.
+    /// A dynamically computed callee: when `Call::this` is `Some(receiver)`
+    /// (`callthis*` / `callruntime.callinit`), that explicit receiver is passed
+    /// in the `this` slot; when `Call::this` is `None` (`callarg*` / `callrange`),
+    /// `this` is computed at callee entry (`undefined` in strict mode, global
+    /// object in sloppy mode).
     Dynamic,
     /// `func.apply(this, argsArray)` — vendor `apply imm, v_this, v_args`
     /// (`isa.yaml:1104`, the func in the acc): the receiver is explicit and
@@ -722,61 +739,18 @@ pub enum Op {
         /// parameter count the runtime installs).
         length: u16,
     },
-    /// Define a class with a member buffer.
-    DefineClass {
-        /// The constructor in the module's function table.
-        ctor: FuncId,
-        /// The heritage (`extends`) expression value, when present.
-        heritage: Option<ValueId>,
-        /// The member-buffer constant (an
-        /// [`Const::ObjectLiteral`](crate::consts::Const::ObjectLiteral)/
-        /// [`Const::ArrayLiteral`](crate::consts::Const::ArrayLiteral)
-        /// shape with [`Const::MethodRef`](crate::consts::Const::MethodRef)
-        /// entries).
-        members: ConstId,
-        /// Per-member attribute payloads decoded from the buffer (B2 —
-        /// [`MemberAttrs`]), parallel to the buffer's member sequence
-        /// (the `MethodRef` entries in order). Empty when the buffer
-        /// shape is outside the vendor-grounded member form (conservative
-        /// fallback — consumers treat attributes as unknown).
-        member_attrs: Vec<MemberAttrs>,
-        /// The class constructor's `.length` (vendor
-        /// `defineclasswithbuffer imm2`, `isa.yaml`) — the runtime consumes
-        /// it via `RuntimeSetClassConstructorLength` (`design/decisions.md`
-        /// N15); modeled for byte fidelity and semantics.
-        count: u16,
-    },
+    /// Define a class with a member buffer (boxed via [`DefineClassData`] so
+    /// [`Op`] stays compact).
+    DefineClass(Box<DefineClassData>),
     /// Define a SENDABLE (shared) class with a member buffer — vendor
     /// `callruntime.definesendableclass imm1:u16, method_id,
     /// literalarray_id, imm2:u16, v:in:top` (`isa.yaml:861-866`).
     ///
     /// Distinct from [`Op::DefineClass`] (`design/decisions.md` N53): the
     /// vendor runtime builds the class through
-    /// `SlowRuntimeStub::CreateSharedClass`
-    /// (`arkcompiler_ets_runtime-master/ecmascript/interpreter/interpreter_assembly.cpp:6157-6180`,
-    /// `HandleCallRuntimeDefineSendableClassPrefImm16Id16Id16Imm16V8` —
-    /// `ASSERT(res.IsJSSharedFunction())`), NOT
-    /// `defineclasswithbuffer`'s `SlowRuntimeStub::CreateClassWithBuffer`
-    /// (`interpreter_assembly.cpp:6007/6033`), so lowering must preserve the
-    /// sendable opcode identity.
-    DefineSendableClass {
-        /// The constructor in the module's function table.
-        ctor: FuncId,
-        /// The heritage (`extends`) expression value, when present
-        /// (vendor `v:in:top` — `base` in the handler).
-        heritage: Option<ValueId>,
-        /// The member-buffer constant (same shape as
-        /// [`Op::DefineClass::members`]).
-        members: ConstId,
-        /// Per-member attribute payloads (same shape as
-        /// [`Op::DefineClass::member_attrs`]).
-        member_attrs: Vec<MemberAttrs>,
-        /// The class constructor's `.length` (vendor `imm2`, `isa.yaml`) —
-        /// `CreateSharedClass` consumes it the way
-        /// `CreateClassWithBuffer` consumes [`Op::DefineClass::count`]
-        /// (`design/decisions.md` N15).
-        count: u16,
-    },
+    /// `SlowRuntimeStub::CreateSharedClass`, NOT `CreateClassWithBuffer`,
+    /// so lowering must preserve the sendable opcode identity.
+    DefineSendableClass(Box<DefineClassData>),
 
     // ── Private properties ─────────────────────────────────────────────
     /// Load a private field by environment level and slot.
@@ -1187,8 +1161,8 @@ impl Op {
                     f(v)?;
                 }
             }
-            DefineClass { heritage, .. } | DefineSendableClass { heritage, .. } => {
-                if let Some(h) = heritage {
+            DefineClass(d) | DefineSendableClass(d) => {
+                if let Some(h) = &d.heritage {
                     f(*h)?;
                 }
             }
@@ -1292,22 +1266,27 @@ impl Op {
         out
     }
 
-    /// Mutable views of all SSA operands, in the same order as
-    /// [`Op::operands`]. The single mutation point for passes that rewrite
-    /// uses.
-    pub fn operands_mut(&mut self) -> Vec<&mut ValueId> {
+    /// Visit each mutable SSA operand (use) of this op in exact
+    /// [`Op::operands`] order without allocating.
+    pub fn for_each_operand_mut<'a, F: FnMut(&'a mut ValueId)>(&'a mut self, mut f: F) {
         use Op::*;
         match self {
-            BinaryOp { left, right, .. } | Compare { left, right, .. } => vec![left, right],
-            UnaryOp { operand, .. } => vec![operand],
-            Mov { src } => vec![src],
-            LoadConst(_) | AllocObject { .. } | AllocArray { .. } | AllocRegExp { .. } => vec![],
-            AllocClosure { func } => vec![func],
-            LoadProp { object, .. } => vec![object],
-            StoreProp { object, value, .. } => vec![object, value],
-            StoreOwnPropName { object, value, .. } => vec![object, value],
+            BinaryOp { left, right, .. } | Compare { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            UnaryOp { operand, .. } => f(operand),
+            Mov { src } => f(src),
+            LoadConst(_) | AllocObject { .. } | AllocArray { .. } | AllocRegExp { .. } => {}
+            AllocClosure { func } => f(func),
+            LoadProp { object, .. } => f(object),
+            StoreProp { object, value, .. } | StoreOwnPropName { object, value, .. } => {
+                f(object);
+                f(value);
+            }
             LoadPropIdx { object, index } | LoadPropDyn { object, key: index } => {
-                vec![object, index]
+                f(object);
+                f(index);
             }
             StorePropIdx {
                 object,
@@ -1318,8 +1297,8 @@ impl Op {
                 object,
                 key: index,
                 value,
-            } => vec![object, index, value],
-            StoreOwnPropDyn {
+            }
+            | StoreOwnPropDyn {
                 object,
                 key: index,
                 value,
@@ -1328,106 +1307,183 @@ impl Op {
                 object,
                 index,
                 value,
-            } => vec![object, index, value],
-            DefineMethod { object, func, .. } => vec![object, func],
-            DeleteProp { object, key } => vec![object, key],
+            } => {
+                f(object);
+                f(index);
+                f(value);
+            }
+            DefineMethod { object, func, .. } => {
+                f(object);
+                f(func);
+            }
+            DeleteProp { object, key } => {
+                f(object);
+                f(key);
+            }
             TestProp { object, key } => {
-                let mut v = vec![object];
+                f(object);
                 match key {
                     PropKey::Name(_) => {}
-                    PropKey::Index(k) | PropKey::Dynamic(k) => v.push(k),
+                    PropKey::Index(k) | PropKey::Dynamic(k) => f(k),
                 }
-                v
             }
-            CopyDataProps { dst, src } => vec![dst, src],
-            SetObjectWithProto { proto, obj } => vec![proto, obj],
-            ArraySpread { dst, index, src } => vec![dst, index, src],
+            CopyDataProps { dst, src } => {
+                f(dst);
+                f(src);
+            }
+            SetObjectWithProto { proto, obj } => {
+                f(proto);
+                f(obj);
+            }
+            ArraySpread { dst, index, src } => {
+                f(dst);
+                f(index);
+                f(src);
+            }
             CreateObjectWithExcludedKeys { obj, keys } => {
-                let mut v = vec![obj];
-                v.extend(keys.iter_mut());
-                v
+                f(obj);
+                for k in keys {
+                    f(k);
+                }
             }
             DefineGetterSetterByValue {
                 obj,
                 key,
                 getter,
                 setter,
-            } => vec![obj, key, getter, setter],
-            GetTemplateObject { literal } => vec![literal],
-            CreateIterResultObj { value, done } => vec![value, done],
-            GetIterator { obj } | GetPropIterator { obj } | GetAsyncIterator { obj } => vec![obj],
+            } => {
+                f(obj);
+                f(key);
+                f(getter);
+                f(setter);
+            }
+            GetTemplateObject { literal } => f(literal),
+            CreateIterResultObj { value, done } => {
+                f(value);
+                f(done);
+            }
+            GetIterator { obj } | GetPropIterator { obj } | GetAsyncIterator { obj } => f(obj),
             IteratorNext { iterator }
             | IteratorReturn { iterator }
-            | IteratorThrow { iterator } => {
-                vec![iterator]
+            | IteratorThrow { iterator }
+            | NextPropName { iterator } => f(iterator),
+            NewLexEnv { .. }
+            | NewLexEnvWithName { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | CreatePrivateNames { .. }
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | AsyncFunctionEnter
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | Debugger => {}
+            PutLexVar { value, .. } => f(value),
+            TryGetGlobal { default, .. } => {
+                if let Some(v) = default {
+                    f(v);
+                }
             }
-            NextPropName { iterator } => vec![iterator],
-            NewLexEnv { .. } | NewLexEnvWithName { .. } | PopLexEnv | GetLexVar { .. } => vec![],
-            CreatePrivateNames { .. } => vec![],
-            LoadNewTarget | LoadGlobalObject | LoadFunction => vec![],
-            GetUnmappedArgs | CopyRestArgs { .. } | AsyncFunctionEnter => vec![],
-            ThrowNotExists | ThrowPatternNonCoercible | ThrowDeleteSuperProperty | Debugger => {
-                vec![]
-            }
-            PutLexVar { value, .. } => vec![value],
-            TryGetGlobal { default, .. } => default.iter_mut().collect(),
             StoreGlobal { value, .. }
             | StoreGlobalRecord { value, .. }
             | TryStoreGlobal { value, .. }
-            | StoreModuleVar { value, .. } => {
-                vec![value]
-            }
-            LoadModuleVar { .. } | GetModuleNamespace { .. } => vec![],
-            DynamicImport { specifier } => vec![specifier],
+            | StoreModuleVar { value, .. } => f(value),
+            LoadModuleVar { .. } | GetModuleNamespace { .. } => {}
+            DynamicImport { specifier } => f(specifier),
             Call {
                 callee, this, args, ..
             } => {
-                let mut v: Vec<&mut ValueId> = vec![callee];
-                v.extend(this.iter_mut());
-                v.extend(args.iter_mut());
-                v
+                f(callee);
+                if let Some(t) = this {
+                    f(t);
+                }
+                for arg in args {
+                    f(arg);
+                }
             }
-            DefineFunc { captures, .. } => captures.iter_mut().map(|(_, v)| v).collect(),
-            DefineClass { heritage, .. } | DefineSendableClass { heritage, .. } => {
-                heritage.iter_mut().collect()
+            DefineFunc { captures, .. } => {
+                for (_, v) in captures {
+                    f(v);
+                }
             }
-            LoadPrivate { obj, .. } | TestPrivate { obj, .. } => vec![obj],
+            DefineClass(d) | DefineSendableClass(d) => {
+                if let Some(h) = &mut d.heritage {
+                    f(h);
+                }
+            }
+            LoadPrivate { obj, .. } | TestPrivate { obj, .. } => f(obj),
             StorePrivate { obj, value, .. } | DefinePrivate { obj, value, .. } => {
-                vec![obj, value]
+                f(obj);
+                f(value);
             }
             Throw { value }
             | ThrowIfSuperNotCalled { value, .. }
             | ThrowConstAssignment { name: value }
             | ThrowIfNotObject { value }
             | ThrowUndefinedIfHoleWithName { value, .. }
-            | Await { value } => vec![value],
+            | Await { value } => f(value),
             AwaitUncaught { funcobj, value }
             | AsyncResolve { funcobj, value }
-            | AsyncReject { funcobj, value } => vec![funcobj, value],
-            ThrowUndefinedIfHole { name, value } => vec![name, value],
-            CreateGenerator { func } => vec![func],
-            SuspendGenerator { genobj, value } => vec![genobj, value],
-            ResumeGenerator { genobj } | GetResumeMode { genobj } => vec![genobj],
+            | AsyncReject { funcobj, value } => {
+                f(funcobj);
+                f(value);
+            }
+            ThrowUndefinedIfHole { name, value } => {
+                f(name);
+                f(value);
+            }
+            CreateGenerator { func } => f(func),
+            SuspendGenerator { genobj, value } => {
+                f(genobj);
+                f(value);
+            }
+            ResumeGenerator { genobj } | GetResumeMode { genobj } => f(genobj),
             LoadSuper { key, this_value } => match key {
-                SuperKey::Name(_) => vec![this_value],
-                SuperKey::Dynamic(k) => vec![k, this_value],
+                SuperKey::Name(_) => f(this_value),
+                SuperKey::Dynamic(k) => {
+                    f(k);
+                    f(this_value);
+                }
             },
             StoreSuper {
                 key,
                 this_value,
                 value,
             } => {
-                let mut v = vec![value, this_value];
+                f(value);
+                f(this_value);
                 if let SuperKey::Dynamic(k) = key {
-                    v.push(k);
+                    f(k);
                 }
-                v
             }
-            Branch { .. } | Unreachable => vec![],
-            CondBranch { cond, .. } => vec![cond],
-            Return { value } => value.iter_mut().collect(),
-            Phi { entries } => entries.iter_mut().map(|(_, v)| v).collect(),
+            Branch { .. } | Unreachable => {}
+            CondBranch { cond, .. } => f(cond),
+            Return { value } => {
+                if let Some(v) = value {
+                    f(v);
+                }
+            }
+            Phi { entries } => {
+                for (_, v) in entries {
+                    f(v);
+                }
+            }
         }
+    }
+
+    /// Mutable views of all SSA operands, in the same order as
+    /// [`Op::operands`]. Single-sourced wrapper over [`Op::for_each_operand_mut`].
+    pub fn operands_mut(&mut self) -> Vec<&mut ValueId> {
+        let mut out = match self.arity() {
+            Arity::Exact(n) => Vec::with_capacity(n),
+            Arity::Variadic => Vec::new(),
+        };
+        self.for_each_operand_mut(|v| out.push(v));
+        out
     }
 
     /// Whether this op produces an SSA result.
@@ -1569,13 +1625,312 @@ impl Op {
             | TryGetGlobal { .. }
             | Call { .. }
             | DefineFunc { .. }
-            | DefineClass { .. }
-            | DefineSendableClass { .. }
+            | DefineClass(_)
+            | DefineSendableClass(_)
             | CreateObjectWithExcludedKeys { .. }
             | LoadSuper { .. }
             | StoreSuper { .. }
             | Return { .. }
             | Phi { .. } => Arity::Variadic,
+        }
+    }
+
+    /// Visit every [`ConstId`] referenced directly by this op.
+    pub fn for_each_const_id<F: FnMut(ConstId)>(&self, mut f: F) {
+        use Op::*;
+        match self {
+            LoadConst(c) => f(*c),
+            AllocObject { shape } => f(*shape),
+            AllocArray { shape } => {
+                if let Some(c) = shape {
+                    f(*c);
+                }
+            }
+            NewLexEnvWithName { scope_names, .. } => f(*scope_names),
+            DefineClass(d) | DefineSendableClass(d) => f(d.members),
+            CreatePrivateNames { names, .. } => f(*names),
+            BinaryOp { .. }
+            | UnaryOp { .. }
+            | Compare { .. }
+            | Mov { .. }
+            | AllocRegExp { .. }
+            | AllocClosure { .. }
+            | LoadProp { .. }
+            | StoreProp { .. }
+            | LoadPropIdx { .. }
+            | StorePropIdx { .. }
+            | LoadPropDyn { .. }
+            | StorePropDyn { .. }
+            | StoreOwnPropName { .. }
+            | StoreOwnPropDyn { .. }
+            | StoreOwnPropIdx { .. }
+            | DefineMethod { .. }
+            | DeleteProp { .. }
+            | TestProp { .. }
+            | CopyDataProps { .. }
+            | SetObjectWithProto { .. }
+            | ArraySpread { .. }
+            | CreateObjectWithExcludedKeys { .. }
+            | DefineGetterSetterByValue { .. }
+            | GetTemplateObject { .. }
+            | CreateIterResultObj { .. }
+            | GetIterator { .. }
+            | GetAsyncIterator { .. }
+            | IteratorNext { .. }
+            | IteratorReturn { .. }
+            | IteratorThrow { .. }
+            | GetPropIterator { .. }
+            | NextPropName { .. }
+            | NewLexEnv { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | PutLexVar { .. }
+            | TryGetGlobal { .. }
+            | StoreGlobal { .. }
+            | StoreGlobalRecord { .. }
+            | TryStoreGlobal { .. }
+            | LoadModuleVar { .. }
+            | StoreModuleVar { .. }
+            | GetModuleNamespace { .. }
+            | DynamicImport { .. }
+            | Call { .. }
+            | DefineFunc { .. }
+            | LoadPrivate { .. }
+            | StorePrivate { .. }
+            | DefinePrivate { .. }
+            | TestPrivate { .. }
+            | Throw { .. }
+            | ThrowIfSuperNotCalled { .. }
+            | ThrowUndefinedIfHole { .. }
+            | ThrowUndefinedIfHoleWithName { .. }
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | ThrowConstAssignment { .. }
+            | ThrowIfNotObject { .. }
+            | CreateGenerator { .. }
+            | SuspendGenerator { .. }
+            | ResumeGenerator { .. }
+            | GetResumeMode { .. }
+            | Await { .. }
+            | AwaitUncaught { .. }
+            | AsyncFunctionEnter
+            | AsyncResolve { .. }
+            | AsyncReject { .. }
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | LoadSuper { .. }
+            | StoreSuper { .. }
+            | Branch { .. }
+            | CondBranch { .. }
+            | Return { .. }
+            | Phi { .. }
+            | Unreachable
+            | Debugger => {}
+        }
+    }
+
+    /// Visit every [`FuncId`] referenced directly by this op.
+    pub fn for_each_func_id<F: FnMut(FuncId)>(&self, mut f: F) {
+        use Op::*;
+        match self {
+            DefineFunc { body, .. } => f(*body),
+            DefineClass(d) | DefineSendableClass(d) => f(d.ctor),
+            BinaryOp { .. }
+            | UnaryOp { .. }
+            | Compare { .. }
+            | Mov { .. }
+            | LoadConst(_)
+            | AllocObject { .. }
+            | AllocArray { .. }
+            | AllocRegExp { .. }
+            | AllocClosure { .. }
+            | LoadProp { .. }
+            | StoreProp { .. }
+            | LoadPropIdx { .. }
+            | StorePropIdx { .. }
+            | LoadPropDyn { .. }
+            | StorePropDyn { .. }
+            | StoreOwnPropName { .. }
+            | StoreOwnPropDyn { .. }
+            | StoreOwnPropIdx { .. }
+            | DefineMethod { .. }
+            | DeleteProp { .. }
+            | TestProp { .. }
+            | CopyDataProps { .. }
+            | SetObjectWithProto { .. }
+            | ArraySpread { .. }
+            | CreateObjectWithExcludedKeys { .. }
+            | DefineGetterSetterByValue { .. }
+            | GetTemplateObject { .. }
+            | CreateIterResultObj { .. }
+            | GetIterator { .. }
+            | GetAsyncIterator { .. }
+            | IteratorNext { .. }
+            | IteratorReturn { .. }
+            | IteratorThrow { .. }
+            | GetPropIterator { .. }
+            | NextPropName { .. }
+            | NewLexEnv { .. }
+            | NewLexEnvWithName { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | PutLexVar { .. }
+            | TryGetGlobal { .. }
+            | StoreGlobal { .. }
+            | StoreGlobalRecord { .. }
+            | TryStoreGlobal { .. }
+            | LoadModuleVar { .. }
+            | StoreModuleVar { .. }
+            | GetModuleNamespace { .. }
+            | DynamicImport { .. }
+            | Call { .. }
+            | LoadPrivate { .. }
+            | StorePrivate { .. }
+            | DefinePrivate { .. }
+            | TestPrivate { .. }
+            | CreatePrivateNames { .. }
+            | Throw { .. }
+            | ThrowIfSuperNotCalled { .. }
+            | ThrowUndefinedIfHole { .. }
+            | ThrowUndefinedIfHoleWithName { .. }
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | ThrowConstAssignment { .. }
+            | ThrowIfNotObject { .. }
+            | CreateGenerator { .. }
+            | SuspendGenerator { .. }
+            | ResumeGenerator { .. }
+            | GetResumeMode { .. }
+            | Await { .. }
+            | AwaitUncaught { .. }
+            | AsyncFunctionEnter
+            | AsyncResolve { .. }
+            | AsyncReject { .. }
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | LoadSuper { .. }
+            | StoreSuper { .. }
+            | Branch { .. }
+            | CondBranch { .. }
+            | Return { .. }
+            | Phi { .. }
+            | Unreachable
+            | Debugger => {}
+        }
+    }
+
+    /// Visit every [`Sym`] referenced directly by this op (including capture
+    /// names in [`Op::DefineFunc`]).
+    pub fn for_each_sym<F: FnMut(Sym)>(&self, mut f: F) {
+        use Op::*;
+        match self {
+            AllocRegExp { pattern, .. } => f(*pattern),
+            LoadProp { name, .. }
+            | StoreProp { name, .. }
+            | StoreOwnPropName { name, .. }
+            | DefineMethod { name, .. }
+            | TryGetGlobal { name, .. }
+            | StoreGlobal { name, .. }
+            | StoreGlobalRecord { name, .. }
+            | TryStoreGlobal { name, .. }
+            | ThrowUndefinedIfHoleWithName { name, .. } => f(*name),
+            TestProp { key, .. } => {
+                if let PropKey::Name(s) = key {
+                    f(*s);
+                }
+            }
+            DefineFunc { captures, .. } => {
+                for &(s, _) in captures {
+                    f(s);
+                }
+            }
+            LoadSuper { key, .. } | StoreSuper { key, .. } => {
+                if let SuperKey::Name(s) = key {
+                    f(*s);
+                }
+            }
+            BinaryOp { .. }
+            | UnaryOp { .. }
+            | Compare { .. }
+            | Mov { .. }
+            | LoadConst(_)
+            | AllocObject { .. }
+            | AllocArray { .. }
+            | AllocClosure { .. }
+            | LoadPropIdx { .. }
+            | StorePropIdx { .. }
+            | LoadPropDyn { .. }
+            | StorePropDyn { .. }
+            | StoreOwnPropDyn { .. }
+            | StoreOwnPropIdx { .. }
+            | DeleteProp { .. }
+            | CopyDataProps { .. }
+            | SetObjectWithProto { .. }
+            | ArraySpread { .. }
+            | CreateObjectWithExcludedKeys { .. }
+            | DefineGetterSetterByValue { .. }
+            | GetTemplateObject { .. }
+            | CreateIterResultObj { .. }
+            | GetIterator { .. }
+            | GetAsyncIterator { .. }
+            | IteratorNext { .. }
+            | IteratorReturn { .. }
+            | IteratorThrow { .. }
+            | GetPropIterator { .. }
+            | NextPropName { .. }
+            | NewLexEnv { .. }
+            | NewLexEnvWithName { .. }
+            | PopLexEnv
+            | GetLexVar { .. }
+            | PutLexVar { .. }
+            | LoadModuleVar { .. }
+            | StoreModuleVar { .. }
+            | GetModuleNamespace { .. }
+            | DynamicImport { .. }
+            | Call { .. }
+            | DefineClass(_)
+            | DefineSendableClass(_)
+            | LoadPrivate { .. }
+            | StorePrivate { .. }
+            | DefinePrivate { .. }
+            | TestPrivate { .. }
+            | CreatePrivateNames { .. }
+            | Throw { .. }
+            | ThrowIfSuperNotCalled { .. }
+            | ThrowUndefinedIfHole { .. }
+            | ThrowNotExists
+            | ThrowPatternNonCoercible
+            | ThrowDeleteSuperProperty
+            | ThrowConstAssignment { .. }
+            | ThrowIfNotObject { .. }
+            | CreateGenerator { .. }
+            | SuspendGenerator { .. }
+            | ResumeGenerator { .. }
+            | GetResumeMode { .. }
+            | Await { .. }
+            | AwaitUncaught { .. }
+            | AsyncFunctionEnter
+            | AsyncResolve { .. }
+            | AsyncReject { .. }
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction
+            | GetUnmappedArgs
+            | CopyRestArgs { .. }
+            | Branch { .. }
+            | CondBranch { .. }
+            | Return { .. }
+            | Phi { .. }
+            | Unreachable
+            | Debugger => {}
         }
     }
 }
@@ -1703,20 +2058,20 @@ mod tests {
                 func: v(),
                 length: 1,
             },
-            Op::DefineClass {
+            Op::DefineClass(Box::new(DefineClassData {
                 ctor: FuncId::new(0),
                 heritage: Some(v()),
                 members: ConstId::new(0),
                 member_attrs: Vec::new(),
                 count: 2,
-            },
-            Op::DefineSendableClass {
+            })),
+            Op::DefineSendableClass(Box::new(DefineClassData {
                 ctor: FuncId::new(0),
                 heritage: Some(v()),
                 members: ConstId::new(0),
                 member_attrs: Vec::new(),
                 count: 2,
-            },
+            })),
             Op::CreatePrivateNames {
                 count: 2,
                 names: ConstId::new(0),
@@ -1937,27 +2292,27 @@ mod tests {
                 captures: vec![(s, v()), (s, v())],
                 length: 2,
             },
-            Op::DefineClass {
+            Op::DefineClass(Box::new(DefineClassData {
                 ctor: f,
                 heritage: None,
                 members: c,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
-            Op::DefineClass {
+            })),
+            Op::DefineClass(Box::new(DefineClassData {
                 ctor: f,
                 heritage: Some(v()),
                 members: c,
                 member_attrs: Vec::new(),
                 count: 1,
-            },
-            Op::DefineSendableClass {
+            })),
+            Op::DefineSendableClass(Box::new(DefineClassData {
                 ctor: f,
                 heritage: Some(v()),
                 members: c,
                 member_attrs: Vec::new(),
                 count: 1,
-            },
+            })),
             // Private properties (5)
             Op::LoadPrivate {
                 level: 0,

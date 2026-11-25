@@ -849,7 +849,7 @@ pub(in crate::folds) fn absorb_one(
             value,
             own: true,
         }) if !is_array && is_target(object) && clean(key) && clean(value) => Some(match key {
-            Expr::Lit(l @ (Lit::String(_) | Lit::Number(_))) => {
+            Expr::Lit(l @ (Lit::String(_) | Lit::Number(_) | Lit::Int64(_) | Lit::UInt64(_))) => {
                 Absorb::ObjKV(l.clone(), value.clone())
             }
             _ => Absorb::ObjComputed(key.clone(), value.clone()),
@@ -873,6 +873,8 @@ pub(in crate::folds) fn absorb_one(
                         let v = f64::from_bits(*bits);
                         (v.fract() == 0.0 && v >= 0.0).then_some(v as u64)
                     }
+                    Expr::Lit(Lit::Int64(v)) => u64::try_from(*v).ok(),
+                    Expr::Lit(Lit::UInt64(v)) => Some(*v),
                     _ => None,
                 };
                 let next = if so_far.iter().any(|a| matches!(a, Absorb::ArrSpread(_))) {
@@ -892,9 +894,9 @@ pub(in crate::folds) fn absorb_one(
                 }
             } else if *own {
                 match index {
-                    Expr::Lit(l @ (Lit::String(_) | Lit::Number(_))) => {
-                        Some(Absorb::ObjKV(l.clone(), value.clone()))
-                    }
+                    Expr::Lit(
+                        l @ (Lit::String(_) | Lit::Number(_) | Lit::Int64(_) | Lit::UInt64(_)),
+                    ) => Some(Absorb::ObjKV(l.clone(), value.clone())),
                     _ => Some(Absorb::ObjComputed(index.clone(), value.clone())),
                 }
             } else {

@@ -15,9 +15,9 @@ Format-aware lifter converting a decoded [`abcd_file::File`](../abcd-file/README
 | Stage | Module | Responsibility |
 | :--- | :--- | :--- |
 | Two-pass orchestration & dead-island sweep | [`lib.rs`](src/lib.rs) | Pre-reserves `ClassId` and `FuncId` tables, wires `TryRegion`s and `pre_entry` trampolines, drives Braun SSA sealing, and prunes unreachable blocks (`N18`) |
-| Entity & literal-array resolution | [`resolve.rs`](src/resolve.rs) | Maps method offsets to `FuncId` (`S1`/`N2`), interns lossless MUTF-8 symbols (`ADR-09`), and iteratively converts literal buffers and `MemberAttrs` into `ConstPool` trees (`N52`) |
+| Entity & literal-array resolution | [`resolve.rs`](src/resolve.rs) | Maps method offsets to `FuncId` (`S1`/`N2`), interns lossless MUTF-8 symbols (`ADR-09`), and iteratively converts literal buffers and `MemberAttrs` into flat `ConstId`-linked `ConstPool` entries (`N52`, `ADR-17`) |
 | Metadata, ES modules & debug info | [`metadata.rs`](src/metadata.rs) | Merges 4 annotation buckets, pairs standalone and `--merge-abc` `EsModule` / `ModuleRequestPhase` / `scopeNames` fields while ignoring compile-time `typeSummaryOffset` refs (`ADR-10`), and attaches LNP line/column/scope extents |
-| Leader-partition CFG builder | [`cfg.rs`](src/cfg.rs) | Splits flat `Bytecode` streams at jump targets, fall-throughs, terminators, and catch handlers, recording normal and try-overlap catch successors |
+| Leader-partition CFG builder | [`cfg.rs`](src/cfg.rs) | Splits flat `Bytecode` streams at jump targets, fall-throughs, terminators, exact `[try_start, try_end)` boundaries, catch handlers, and before register writes (`sta`/`mov`) following throwing bytecodes in try regions (`R2-D1`) |
 | Iterative Braun SSA builder | [`ssa.rs`](src/ssa.rs) | Unifies virtual registers and `acc` (`RegOrAcc`) into SSA `ValueId`s on an explicit heap workstack with `Edge`-keyed phis, trivial-phi collapse, and lazy `Undefined`/`Hole` frame-init constants |
 | Opcode translation (`88` IR ops) | [`translate.rs`](src/translate.rs) | Translates dynamic, `wide.*`, `callruntime.*`, `throw.*`, and `deprecated.*` bytecodes (including `deprecated.defineclasswithbuffer`) with vendor-grounded operand roles |
 
@@ -27,8 +27,8 @@ Full specification in [`../design/ir.md`](../design/ir.md) and canonical rulings
 
 1. **Offset-keyed identity & zero raw offsets (`ADR-01`, `S1`/`N2`, `N46`, `N52`)**:
    Method references resolve through source-file offsets into reserved `FuncId`s so identically named methods across classes never collide; all `Type::Reference`, annotation, and typed-array references become table-local IR IDs.
-2. **First-class exceptional CFG & handler seeding (`ADR-04`, `N11`, `N13`, `N18`)**:
-   Every `(protected block → catch handler)` pair is materialized in `Block.preds` as `EdgeKind::Exceptional` before SSA construction, catch entry seeds `acc` with `ValueDef::ExceptionParam(handler)`, and dead blocks are swept over exception-augmented reachability.
+2. **First-class exceptional CFG, exact try boundaries & pre-write splitting (`ADR-04`, `N11`, `N13`, `N18`, `R2-D1`)**:
+   Try-region `[try_start, try_end)` boundaries and register writes following throwing bytecodes split protected blocks so pre-throw vs. post-normal-completion register definitions satisfy `SplitValueDom`; every `(protected block → catch handler)` pair is materialized in `Block.preds` as `EdgeKind::Exceptional` before SSA construction, catch entry seeds `acc` with `ValueDef::ExceptionParam(handler)`, and dead blocks are swept over exception-augmented reachability.
 3. **Vendored frame-slot convention (`ADR-05`, `N66`/`N67`)**:
    Entry parameters bind `Reg(num_vregs + i)` to `ValueDef::Param(i)`, resolving `ldthis` via `abcd_ir::frame::this_param_index` (`params[2]` under dynamic `0xF`, annotation-aware via `L_ESCallTypeAnnotation;`).
 4. **Zero input-depth recursion & `N20` determinism**:

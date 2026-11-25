@@ -22,8 +22,8 @@
 
 use crate::common;
 use abcd_decompile::emit::{EmitOptions, decompile_module};
+use abcd_ir::Op;
 use abcd_ir::module::{ExportDecl, FunctionKind};
-use abcd_ir::{Const, Op};
 
 use common::*;
 
@@ -156,17 +156,17 @@ fn g02_defined_names_and_default_export() {
             },
         );
         // class Box → slot 0 (direct DefineClass store).
-        let members = const_id(&mut m, Const::ArrayLiteral(vec![]));
+        let members = m.consts.push_array(vec![]);
         let cls = emit(
             &mut m,
             b,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor,
                 heritage: None,
                 members,
                 member_attrs: vec![],
                 count: 0,
-            },
+            })),
         );
         emit_void(
             &mut m,
@@ -389,17 +389,17 @@ fn g05_mangled_internal_names_demangle() {
                 value: cl,
             },
         );
-        let members = const_id(&mut m, Const::ArrayLiteral(vec![]));
+        let members = m.consts.push_array(vec![]);
         let cls = emit(
             &mut m,
             b,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor,
                 heritage: None,
                 members,
                 member_attrs: vec![],
                 count: 0,
-            },
+            })),
         );
         emit_void(
             &mut m,

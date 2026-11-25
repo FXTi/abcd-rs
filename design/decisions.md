@@ -1,29 +1,29 @@
 # Architecture Decisions & Canonical Invariant Registry
 
-This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-15`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
+This document is the single authoritative registry of `abcd-rs`'s architectural decisions (`ADR-01`–`ADR-17`), historical `N*` invariant tags referenced in source comments, and retired legacy rulings.
 
 ---
 
-## 1. Active Architectural Decisions (`ADR-01` – `ADR-15`)
+## 1. Active Architectural Decisions (`ADR-01` – `ADR-17`)
 
 ### ADR-01 — Container-Independent, Dialect-Aware SSA IR
-- **Ruling**: `abcd-ir` contains zero `.abc` file offsets, entity pool indices, ULEB immediates, or register-width opcode variants (`N46`, `N52`). At the same time, `Module` / `ClassData` / `FunctionData` explicitly model language dialect and calling-convention semantics (`SourceLang`, dynamic ECMAScript `0.0.0.2` & `9.0.0.0`–`24.0.0.0` vs. static ArkTS 1.2 `0.1.0.7`) so IR consumers never guess calling conventions from missing container annotations.
+- **Ruling**: `abcd-ir` contains zero `.abc` file offsets, entity pool indices, ULEB immediates, or register-width opcode variants (`N46`, `N52`; remaining `Catch::type_idx` scheduled for `Option<ClassId>` in `#50`). At the same time, `Module` / `ClassData` / `FunctionData` explicitly model language dialect and calling-convention semantics (`SourceLang`, dynamic ECMAScript `0.0.0.2` & `9.0.0.0`–`24.0.0.0` vs. static ArkTS 1.2 `0.1.0.7`) so IR consumers never guess calling conventions from missing container annotations.
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-lower`.
 
-### ADR-02 — Single-Point `Op` Semantics & Derived Effects (`N48`, `N50`)
-- **Ruling**: `abcd_ir::Op` is a closed semantic enum (`88` variants). Every pass, verifier rule, expression recoverer, and taint transfer function queries `Op::operands()`, `Op::effects()`, `Op::has_result()`, and `Op::is_terminator()`. Dead-code elimination (`abcd-opt::dce`) derives root liveness strictly from `Op::effects()` (`writes`, `may_throw`, `may_call`), recognizing that `TryGetGlobal` (`ldglobalvar` / `tryldglobalbyname`) invokes prototype getters on slow paths and is **not** pure.
+### ADR-02 — Single-Point `Op` Semantics & Two-Tier Derived Effects (`N48`, `N50`, `R2-D2`)
+- **Ruling**: `abcd_ir::Op` is a closed semantic enum (`88` variants, with cold `DefineClass` / `DefineSendableClass` payloads boxed in `DefineClassData`). Every pass, verifier rule, expression recoverer, and taint transfer function queries `Op::for_each_operand()`, `Op::for_each_operand_mut()`, `Op::effects()` / `Op::effects_in(module)`, `Op::has_result()`, and `Op::is_terminator()`. Baseline `Op::effects()` conservatively over-approximates untyped dynamic JS coercion/proxy traps (`BinaryOp`, coercing `UnaryOp`, relational/`In`/`InstanceOf` `Compare`, `TryGetGlobal`, `TryStoreGlobal`, `StoreGlobal`), while `Op::effects_in(module)` refines operations on proven primitive operands back to `Effects::PURE`, and `Effects::is_removable_if_unused()` drives `abcd-opt::Adce`.
 - **Crates**: `abcd-ir`, `abcd-opt`, `abcd-analysis`, `abcd-decompile`.
 
 ### ADR-03 — Accumulator-as-Cache Lowering (`B4`)
 - **Ruling**: `abcd-lower`'s chordal register allocator assigns a virtual register home to every live SSA value and reserves up to 5 low scratch registers (`v0..v255`) for `lda`/`sta` (`op_v_8`) traffic plus a contiguous low-register call window for `*range` calls (`S2`). The physical accumulator (`acc`) is **never** a register-allocation color; `AccContent` tracks physical accumulator state purely during instruction selection to elide provably redundant `lda` loads.
 - **Crates**: `abcd-lower`.
 
-### ADR-04 — First-Class Exceptional CFG & Conservative Handler Joins (`N10`, `N11`, `N13`, `N21`, `N27`, `N38`, `N45`, `N64`)
+### ADR-04 — First-Class Exceptional CFG, Pre-Throw Split & Augmented Dominance (`N10`, `N11`, `N13`, `N21`, `N27`, `N38`, `N45`, `N64`, `R2-D1`)
 - **Ruling**:
-  1. Every `(protected block → catch handler)` pair is materialized in `Block.preds` as `EdgeKind::Exceptional` alongside structured `TryRegion` tables (`N11`). Reachability for dead-block elimination uses exception-augmented successors so handlers are never swept as dead code, while RPO layout places handlers after normal blocks (`N10`).
+  1. Every `(protected block → catch handler)` pair is materialized in `Block.preds` as `EdgeKind::Exceptional` alongside structured inner-first `TryRegion` tables (`N11`). `abcd-lift` marks exact `[try_start, try_end)` block leaders (`R2-C2`) and splits protected blocks before any register write (`sta` / `mov`) following a throwing bytecode (`R2-C1`), ensuring `EdgeKind::Exceptional` edges carry exact pre-throw reaching definitions.
   2. Catch handler entry seeds `acc` with `ValueDef::ExceptionParam(handler)` (`N13`, matching VM `SET_ACC(exception)`).
-  3. **Zero copies on exception edges (`N21`)**: VM exception dispatch jumps directly to the handler PC without executing edge trampolines; `abcd-lower` coalesces handler-phi incoming slots and rejects any residual exception-edge copy with `LowerError::HandlerEdgeCopies`.
-  4. **Dominance & constant propagation (`N27`, `N38`, `N45`, `N64`)**: Cross-block SSA dominance holds over Normal-reachable edges (ignoring unreachable Normal predecessors, `N64`), reachable zero-predecessor phis are invalid (`N27`), and handler phis joining distinct values across exception edges are forced to `Bottom` in `SCCP` (`N38`) because an instruction mid-block may throw before updating a register.
+  3. **Zero copies on exception edges (`N21`)**: VM exception dispatch jumps directly to the handler PC without executing edge trampolines; `abcd-lower` coalesces handler-phi incoming slots via pinned write-through stores and rejects any residual exception-edge copy with `LowerError::HandlerEdgeCopies`.
+  4. **Exception-augmented SSA dominance & constant propagation (`N27`, `N38`, `N45`, `N64`, `R2-H2`)**: `verify_module` checks SSA value dominance over the `<= 2B`-point pre-throw / post-normal-exit augmented CFG (`Normal ∪ Exceptional`, exempting only dead islands unreachable from `entry`, `N64`), validates `ExceptionParam(h)` by augmented dominance from `h`, rejects reachable zero-predecessor phis (`N27`), and `SCCP` forces multi-value catch-handler phis to `Bottom` (`N38`).
 - **Crates**: `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`, `abcd-analysis`, `abcd-decompile`.
 
 ### ADR-05 — Vendored Frame-Slot Calling Convention (`N66`, `N67`)
@@ -84,6 +84,18 @@ This document is the single authoritative registry of `abcd-rs`'s architectural 
 ### ADR-15 — Mandatory IEEE CRC-32 & Decompression-Bomb `Limits` in `abcd-hap` (`D5`, `#46`)
 - **Ruling**: `abcd-hap` verifies pure-Rust IEEE 802.3 CRC-32 (`Error::CrcMismatch`) on every `STORED` and `DEFLATE` entry read, enforces configurable per-entry and cumulative decompression `Limits` (`512 MiB` / `2 GiB` defaults plus RFC 1951 `1032×` DEFLATE ratio pre-checks) prior to allocation, skips resource-only nested `.hap`/`.hsp` siblings inside `.app` bundles cleanly, and bounds EOCD candidate walks (`MAX_EOCD_CANDIDATES = 64`).
 - **Crates**: `abcd-hap`.
+
+### ADR-16 — Conservative Dynamic `Op::effects()` Baseline & Typed Primitive Refinement (`R2-D2`, `#52`)
+- **Ruling**:
+  1. Untyped `Op::effects(&self)` returns `Effects::PURE` solely for operators that cannot coerce, trap, or invoke Proxy/accessor hooks on any runtime JS value (`UnOp::{LogicalNot, IsTrue, IsFalse, TypeOf, Void}`, `CmpOp::{StrictEq, StrictNotEq}`); coercing arithmetic/bitwise/relational/`In`/`InstanceOf` ops and global stores (`TryStoreGlobal`, `StoreGlobal`) conservatively declare their `HEAP` / `PROTOTYPE` / `GLOBAL` reads/writes, `may_throw: true`, and `CallEffect::UnknownCallee`.
+  2. `Op::effects_in(&self, module: &Module)` refines dynamic `UnaryOp`, `BinaryOp`, and `Compare` back to `Effects::PURE` when operand `Value::ty` or `ConstPool` definitions prove non-trapping primitive types, and `Effects::is_removable_if_unused()` governs dead-instruction removal in `abcd-opt::Adce`.
+- **Crates**: `abcd-ir`, `abcd-opt`.
+
+### ADR-17 — Flat `ConstId` Arena Literals, Shared Cooper–Harvey–Kennedy `DomTree` & Boxed Cold `Op`s (`R2-D3`, `R2-D4`, `R2-D5`, `#53`, `#54`)
+- **Ruling**:
+  1. `Const::ArrayLiteral(Vec<ConstId>)` and `Const::ObjectLiteral { keys: Vec<ConstId>, values: Vec<ConstId> }` reference `ConstPool` entries by `ConstId` (eliminating recursive `Const` trees and enabling structural sub-literal sharing and iterative 3-color `ConstCycle` verification), `Const::{Int64, UInt64}` preserve exact 64-bit integers for `#36`, and `Ty::Union(Box<[Ty]>)` uses iterative heap-workstack trait implementations.
+  2. `abcd_ir::cfg` provides the canonical iterative RPO + **Cooper–Harvey–Kennedy** `idom` + Euler `(tin, tout)` `DomTree` (`O(B)` memory, `O(1)` dominance queries), and `Op::DefineClass` / `Op::DefineSendableClass` box `DefineClassData` so `size_of::<Op>() <= 40` bytes across module-wide instruction arenas.
+- **Crates**: `abcd-ir`, `abcd-lift`, `abcd-opt`, `abcd-lower`, `abcd-analysis`, `abcd-taint`, `abcd-decompile`.
 
 ---
 

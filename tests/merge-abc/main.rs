@@ -1155,7 +1155,7 @@ fn assert_commercial_edge_invariants(file: &File) {
         .insts
         .iter()
         .filter_map(|inst| match &inst.op {
-            Op::DefineSendableClass { member_attrs, .. } => Some(member_attrs.len()),
+            Op::DefineSendableClass(cls) => Some(cls.member_attrs.len()),
             _ => None,
         })
         .collect();

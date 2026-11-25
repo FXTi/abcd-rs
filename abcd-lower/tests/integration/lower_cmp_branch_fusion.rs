@@ -827,21 +827,22 @@ fn dangling_cond_inst_lowers_from_home_with_jnez() {
 
 /// Iterative literal-array shape traversal pin: 64 nested `ArrayLiteral`
 /// levels succeed through `lower_module`, `EntityResolver::to_method_body`,
-/// and `abcd_lift::lift_file`, while 65 nested levels fail cleanly with
-/// `LowerError::UntraceableEntity` (zero call-stack recursion).
+/// and `abcd_lift::lift_file`, while 65 nested levels, cyclic `ConstId`
+/// graphs, and out-of-range child `ConstId`s fail cleanly with
+/// `LowerError::UntraceableEntity` (zero call-stack recursion, `R2-D3`).
 #[test]
 fn iterative_deep_literal_array_shapes_respect_depth_limit() {
     fn build_nested_array_module(nesting: usize) -> (Module, abcd_ir::FuncId) {
         let mut module = Module::new();
         let func = V2Builder::create_function(&mut module, "nested", FunctionKind::Function);
-        let mut cur = Const::ArrayLiteral(vec![Const::number(42.0)]);
+        let c42 = module.consts.intern(Const::number(42.0));
+        let mut cur = module.consts.push_array(vec![c42]);
         for _ in 0..nesting {
-            cur = Const::ArrayLiteral(vec![cur]);
+            cur = module.consts.push_array(vec![cur]);
         }
         {
             let mut builder = V2Builder::new(&mut module, func);
-            let shape = builder.konst(cur);
-            let arr = builder.emit_val(Op::AllocArray { shape: Some(shape) });
+            let arr = builder.emit_val(Op::AllocArray { shape: Some(cur) });
             builder.emit_void(Op::Return { value: Some(arr) });
         }
         finalize_test_func(&mut module, func);
@@ -868,4 +869,37 @@ fn iterative_deep_literal_array_shapes_respect_depth_limit() {
         matches!(err, LowerError::UntraceableEntity { .. }),
         "expected UntraceableEntity for over-deep literal array, got {err:?}"
     );
+
+    // Self-cyclic ConstId (c0 = ArrayLiteral([c0])) and out-of-range child ConstId
+    // must fail cleanly with UntraceableEntity in both lower_module and EntityResolver.
+    for make_bad_shape in [
+        |m: &mut Module| {
+            let self_id = abcd_ir::ConstId::new(m.consts.len() as u32);
+            m.consts.push_array(vec![self_id])
+        },
+        |m: &mut Module| m.consts.push_array(vec![abcd_ir::ConstId::new(999_999)]),
+    ] {
+        let mut bad_mod = Module::new();
+        let bad_fn = V2Builder::create_function(&mut bad_mod, "bad", FunctionKind::Function);
+        let bad_shape = make_bad_shape(&mut bad_mod);
+        {
+            let mut builder = V2Builder::new(&mut bad_mod, bad_fn);
+            let arr = builder.emit_val(Op::AllocArray {
+                shape: Some(bad_shape),
+            });
+            builder.emit_void(Op::Return { value: Some(arr) });
+        }
+        finalize_test_func(&mut bad_mod, bad_fn);
+
+        let err = lower_module(&bad_mod, Version::new(12, 0, 6, 0))
+            .expect_err("cyclic or dangling child ConstId must fail lower_module");
+        assert!(matches!(err, LowerError::UntraceableEntity { .. }));
+
+        let layout = lower_function(&bad_mod, bad_fn).expect("isel succeeds before relocation");
+        let resolver = EntityResolver::new(&bad_mod, &decoded);
+        let err2 = resolver
+            .to_method_body(bad_fn, &layout)
+            .expect_err("cyclic or dangling child ConstId must fail EntityResolver");
+        assert!(matches!(err2, LowerError::UntraceableEntity { .. }));
+    }
 }

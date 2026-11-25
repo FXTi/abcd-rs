@@ -1081,13 +1081,13 @@ pub fn translate_bytecode(
             let base = fx.read_reg(*base_reg, block);
             let v = fx.emit_val(
                 block,
-                Op::DefineClass {
+                Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                     ctor,
                     heritage: Some(base),
                     members,
                     member_attrs,
                     count: count.0 as u16,
-                },
+                })),
                 loc,
             );
             fx.write_acc(block, v);
@@ -1845,13 +1845,13 @@ pub fn translate_bytecode(
             let base = fx.read_reg(*base_reg, block);
             let v = fx.emit_val(
                 block,
-                Op::DefineSendableClass {
+                Op::DefineSendableClass(Box::new(abcd_ir::DefineClassData {
                     ctor,
                     heritage: Some(base),
                     members,
                     member_attrs,
                     count: count.0 as u16,
-                },
+                })),
                 loc,
             );
             fx.write_acc(block, v);
@@ -2252,13 +2252,13 @@ pub fn translate_bytecode(
             let base = fx.read_reg(*proto_reg, block);
             let v = fx.emit_val(
                 block,
-                Op::DefineClass {
+                Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                     ctor,
                     heritage: Some(base),
                     members,
                     member_attrs,
                     count: count_imm.0 as u16,
-                },
+                })),
                 loc,
             );
             fx.write_acc(block, v);

@@ -474,11 +474,10 @@ fn unknown_literal_shape_is_a_hard_error() {
     let func = V2Builder::create_function(&mut module, "f", FunctionKind::Function);
     {
         let mut builder = V2Builder::new(&mut module, func);
-        let shape = builder.konst(Const::ArrayLiteral(vec![
-            Const::number(1.0),
-            Const::number(2.0),
-            Const::number(3.0),
-        ]));
+        let c1 = builder.konst(Const::number(1.0));
+        let c2 = builder.konst(Const::number(2.0));
+        let c3 = builder.konst(Const::number(3.0));
+        let shape = builder.konst(Const::ArrayLiteral(vec![c1, c2, c3]));
         builder.emit_val(Op::AllocArray { shape: Some(shape) });
         builder.emit_void(Op::Return { value: None });
     }
@@ -724,22 +723,20 @@ fn literal_dedup_matches_rare_scalar_kinds() {
         ],
     );
     let mut module = Module::new();
-    let shape = module.consts.push(Const::ArrayLiteral(vec![
-        Const::number(42.0),
-        Const::number(2.5),
-        Const::number(7.0),
-    ]));
+    let c42 = module.consts.push(Const::number(42.0));
+    let c25 = module.consts.push(Const::number(2.5));
+    let c7 = module.consts.push(Const::number(7.0));
+    let shape = module.consts.push_array(vec![c42, c25, c7]);
     let body = resolve_shape(&file, &module, shape)
         .expect("Integer8/Float/BuiltinTypeIndex payloads match by value");
     assert_eq!(resolved_offset(&body, shape), 0x9500);
 
     // A payload mismatch (43 != 42) does NOT match — nothing resolves.
     let mut module = Module::new();
-    let wrong = module.consts.push(Const::ArrayLiteral(vec![
-        Const::number(43.0),
-        Const::number(2.5),
-        Const::number(7.0),
-    ]));
+    let c43 = module.consts.push(Const::number(43.0));
+    let c25 = module.consts.push(Const::number(2.5));
+    let c7 = module.consts.push(Const::number(7.0));
+    let wrong = module.consts.push_array(vec![c43, c25, c7]);
     let err = resolve_shape(&file, &module, wrong)
         .expect_err("a mismatched Integer8 payload must not resolve");
     assert!(
@@ -768,9 +765,8 @@ fn literal_dedup_matches_ets_implements_by_content() {
 
     let mut module = Module::new();
     let sym = module.sym.intern("payload");
-    let shape = module
-        .consts
-        .push(Const::ArrayLiteral(vec![Const::String(sym)]));
+    let c_sym = module.consts.push(Const::String(sym));
+    let shape = module.consts.push_array(vec![c_sym]);
     let body = resolve_shape(&file, &module, shape)
         .expect("EtsImplements matches a string const by content");
     assert_eq!(resolved_offset(&body, shape), 0x9510);
@@ -778,9 +774,8 @@ fn literal_dedup_matches_ets_implements_by_content() {
     // Different content must not match.
     let mut module = Module::new();
     let other = module.sym.intern("not-payload");
-    let wrong = module
-        .consts
-        .push(Const::ArrayLiteral(vec![Const::String(other)]));
+    let c_other = module.consts.push(Const::String(other));
+    let wrong = module.consts.push_array(vec![c_other]);
     let err = resolve_shape(&file, &module, wrong).expect_err("different content must not resolve");
     assert!(
         matches!(err, LowerError::UntraceableEntity { .. }),
@@ -812,11 +807,10 @@ fn literal_dedup_matches_rare_method_kinds() {
         push_array(&mut file, offset, vec![make(entities.target_offset)]);
 
         let mut module = Module::new();
-        let shape = module
+        let c_mref = module
             .consts
-            .push(Const::ArrayLiteral(vec![Const::MethodRef(FuncId::new(
-                target_index,
-            ))]));
+            .push(Const::MethodRef(FuncId::new(target_index)));
+        let shape = module.consts.push_array(vec![c_mref]);
         let body = resolve_shape(&file, &module, shape)
             .expect("async-generator/getter/setter tags resolve by table position");
         assert_eq!(resolved_offset(&body, shape), offset);
@@ -861,11 +855,12 @@ fn literal_dedup_matches_the_typed_array_family() {
     let outer = push_array(&mut file, 0x9800, outer_values);
     assert_eq!(outer, 2, "the input file starts with one literal array");
 
-    let inner_tree = Const::ArrayLiteral(vec![Const::number(7.0)]);
     let mut module = Module::new();
-    let shape = module.consts.push(Const::ArrayLiteral(
-        (0..13).map(|_| inner_tree.clone()).collect(),
-    ));
+    let c7 = module.consts.push(Const::number(7.0));
+    let inner_cid = module.consts.push_array(vec![c7]);
+    let shape = module
+        .consts
+        .push_array((0..13).map(|_| inner_cid).collect());
     let body = resolve_shape(&file, &module, shape)
         .expect("every typed-array payload kind resolves to the nested target");
     assert_eq!(resolved_offset(&body, shape), 0x9800);
@@ -882,9 +877,8 @@ fn literal_dedup_typed_array_unknown_offset_is_untraceable() {
         vec![LiteralValue::ArrayU8(LiteralArrayIdx(0xDEAD))],
     );
     let mut module = Module::new();
-    let shape = module
-        .consts
-        .push(Const::ArrayLiteral(vec![Const::ArrayLiteral(vec![])]));
+    let empty_arr = module.consts.push_array(vec![]);
+    let shape = module.consts.push_array(vec![empty_arr]);
     let err = resolve_shape(&file, &module, shape)
         .expect_err("an unmappable typed-array payload must not resolve");
     assert!(
@@ -914,13 +908,13 @@ fn literal_dedup_depth_guard_beyond_64_levels() {
             values: vec![LiteralValue::LiteralArray(LiteralArrayIdx(i + 1))],
         });
     }
-    // The matching const tree, 65 levels of nesting.
-    let mut tree = Const::ArrayLiteral(vec![]);
-    for _ in 0..65 {
-        tree = Const::ArrayLiteral(vec![tree]);
-    }
+    // The matching const pool chain, 65 levels of nesting.
     let mut module = Module::new();
-    let shape = module.consts.push(tree);
+    let mut cur = module.consts.push_array(vec![]);
+    for _ in 0..65 {
+        cur = module.consts.push_array(vec![cur]);
+    }
+    let shape = cur;
     let err =
         resolve_shape(&file, &module, shape).expect_err("a 65-deep nesting hits the depth guard");
     assert!(
@@ -964,9 +958,8 @@ fn literal_dedup_rejects_non_array_trees_and_oob_nested_indices() {
         vec![LiteralValue::LiteralArray(LiteralArrayIdx(999))],
     );
     let mut module = Module::new();
-    let shape = module
-        .consts
-        .push(Const::ArrayLiteral(vec![Const::ArrayLiteral(vec![])]));
+    let empty_arr = module.consts.push_array(vec![]);
+    let shape = module.consts.push_array(vec![empty_arr]);
     let err = resolve_shape(&file, &module, shape)
         .expect_err("an out-of-range nested index must not resolve");
     assert!(

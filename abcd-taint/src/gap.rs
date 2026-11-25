@@ -181,6 +181,8 @@ pub fn definitely_not_callable(module: &Module, value: ValueId) -> bool {
             Some(
                 Const::String(_)
                     | Const::Number(_)
+                    | Const::Int64(_)
+                    | Const::UInt64(_)
                     | Const::Bool(_)
                     | Const::Null
                     | Const::Undefined

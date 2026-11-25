@@ -402,12 +402,10 @@ fn t06_literal_builders() {
     let ka = intern(&mut m, "a");
     let kbc = intern(&mut m, "b c");
     let vx = intern(&mut m, "x");
-    let shape = const_id(
+    let shape = const_object(
         &mut m,
-        Const::ObjectLiteral {
-            keys: vec![Const::String(ka), Const::String(kbc)],
-            values: vec![Const::number(1.0), Const::String(vx)],
-        },
+        vec![Const::String(ka), Const::String(kbc)],
+        vec![Const::number(1.0), Const::String(vx)],
     );
     let obj = emit(&mut m, b, Op::AllocObject { shape });
     let ko = intern(&mut m, "o");
@@ -420,10 +418,7 @@ fn t06_literal_builders() {
             value: obj,
         },
     );
-    let arr_shape = const_id(
-        &mut m,
-        Const::ArrayLiteral(vec![Const::number(1.0), Const::number(2.0)]),
-    );
+    let arr_shape = const_array(&mut m, vec![Const::number(1.0), Const::number(2.0)]);
     let arr = emit(
         &mut m,
         b,
@@ -500,41 +495,29 @@ fn t07_closures_and_classes() {
             value: cl,
         },
     );
-    let members = const_id(
-        &mut m,
-        Const::ObjectLiteral {
-            keys: vec![],
-            values: vec![],
-        },
-    );
+    let members = m.consts.push_object(vec![], vec![]);
     let cls = emit(
         &mut m,
         b,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor: inner,
             heritage: Some(p1),
             members,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
-    let members2 = const_id(
-        &mut m,
-        Const::ObjectLiteral {
-            keys: vec![],
-            values: vec![],
-        },
-    );
+    let members2 = m.consts.push_object(vec![], vec![]);
     let _send = emit(
         &mut m,
         b,
-        Op::DefineSendableClass {
+        Op::DefineSendableClass(Box::new(abcd_ir::DefineClassData {
             ctor: inner,
             heritage: None,
             members: members2,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     emit_void(&mut m, b, Op::Return { value: Some(cls) });
 
@@ -890,10 +873,7 @@ fn t13_lexenv() {
     let _this = add_param(&mut m, f);
     let x = intern(&mut m, "x");
     let y = intern(&mut m, "y");
-    let names = const_id(
-        &mut m,
-        Const::ArrayLiteral(vec![Const::String(x), Const::String(y)]),
-    );
+    let names = const_array(&mut m, vec![Const::String(x), Const::String(y)]);
     let _ne = emit(
         &mut m,
         b,
@@ -1038,10 +1018,7 @@ fn t15_private_names() {
     let _ne = emit(&mut m, b, Op::NewLexEnv { num_vars: 1 });
     let a = intern(&mut m, "a");
     let bb = intern(&mut m, "b");
-    let names = const_id(
-        &mut m,
-        Const::ArrayLiteral(vec![Const::String(a), Const::String(bb)]),
-    );
+    let names = const_array(&mut m, vec![Const::String(a), Const::String(bb)]);
     emit_void(&mut m, b, Op::CreatePrivateNames { count: 2, names });
     let lp = emit(
         &mut m,
@@ -1115,10 +1092,7 @@ fn t16_template_objects() {
     let p1 = add_param(&mut m, f);
     let s1 = intern(&mut m, "hello ");
     let s2 = intern(&mut m, " world");
-    let arr = const_id(
-        &mut m,
-        Const::ArrayLiteral(vec![Const::String(s1), Const::String(s2)]),
-    );
+    let arr = const_array(&mut m, vec![Const::String(s1), Const::String(s2)]);
     let lit = emit(&mut m, b, Op::LoadConst(arr));
     let t1 = emit(&mut m, b, Op::GetTemplateObject { literal: lit });
     let t2 = emit(&mut m, b, Op::GetTemplateObject { literal: p1 });

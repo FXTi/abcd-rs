@@ -408,15 +408,15 @@ fn class_member_funcs(module: &Module, members: ConstId) -> Vec<FuncId> {
     let mut out = Vec::new();
     match module.consts.get(members) {
         Some(Const::ArrayLiteral(items)) => {
-            for item in items {
-                if let Const::MethodRef(mfid) = item {
+            for &item_cid in items {
+                if let Some(Const::MethodRef(mfid)) = module.consts.get(item_cid) {
                     out.push(*mfid);
                 }
             }
         }
         Some(Const::ObjectLiteral { values, .. }) => {
-            for item in values {
-                if let Const::MethodRef(mfid) = item {
+            for &item_cid in values {
+                if let Some(Const::MethodRef(mfid)) = module.consts.get(item_cid) {
                     out.push(*mfid);
                 }
             }
@@ -1258,14 +1258,14 @@ impl<'m> Pta<'m> {
                             self.activate(body_fn, None);
                         }
                     }
-                    Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
+                    Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
                         if let Some(r) = inst.result {
                             self.add_fact(
                                 local(r),
                                 Obj::Site {
                                     site: iid,
                                     ctx,
-                                    callable: Some(*ctor),
+                                    callable: Some(cls.ctor),
                                     keyed: false,
                                 },
                             );
@@ -2115,10 +2115,9 @@ fn env_analysis(module: &Module, max_depth: usize) -> (Vec<Arc<[EnvEntry]>>, Vec
                             capture_points.entry(body).or_default().insert(iid);
                         }
                     }
-                    Op::DefineClass { ctor, members, .. }
-                    | Op::DefineSendableClass { ctor, members, .. } => {
-                        capture_points.entry(*ctor).or_default().insert(iid);
-                        for mfid in class_member_funcs(module, *members) {
+                    Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+                        capture_points.entry(cls.ctor).or_default().insert(iid);
+                        for mfid in class_member_funcs(module, cls.members) {
                             capture_points.entry(mfid).or_default().insert(iid);
                         }
                     }

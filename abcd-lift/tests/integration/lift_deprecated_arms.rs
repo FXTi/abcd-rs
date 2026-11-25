@@ -971,12 +971,13 @@ fn deprecated_createobjecthavingmethod_lifts_to_alloc_object() {
     let mut m = lift_file(&file).expect("lift");
     verify_clean(&m);
     let s_sym = m.sym.intern("m");
+    let s_cid = m.consts.intern(Const::String(s_sym));
     let Op::AllocObject { shape } = find_op(&m, |o| matches!(o, Op::AllocObject { .. })) else {
         unreachable!()
     };
     assert_eq!(
         m.consts.get(*shape),
-        Some(&Const::ArrayLiteral(vec![Const::String(s_sym)])),
+        Some(&Const::ArrayLiteral(vec![s_cid])),
         "the raw-index literal array is the object shape"
     );
 }

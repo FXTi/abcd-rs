@@ -3389,9 +3389,9 @@ pub(crate) fn for_each_op_operand(op: &Op, mut f: impl FnMut(ValueId)) {
                 f(v);
             }
         }
-        DefineClass { heritage, .. } | DefineSendableClass { heritage, .. } => {
-            if let Some(h) = heritage {
-                f(*h);
+        DefineClass(data) | DefineSendableClass(data) => {
+            if let Some(h) = data.heritage {
+                f(h);
             }
         }
         LoadPrivate { obj, .. } | TestPrivate { obj, .. } => f(*obj),
@@ -4180,8 +4180,8 @@ fn collect_jsbridge_seeds(
             return None;
         };
         let mut set = HashSet::new();
-        for it in items {
-            if let Const::String(s) = it
+        for &it_cid in items {
+            if let Some(Const::String(s)) = module.consts.get(it_cid)
                 && let Some(txt) = module.sym.resolve(*s)
             {
                 set.insert(txt.to_owned());
@@ -4212,8 +4212,9 @@ fn collect_jsbridge_seeds(
         match &site_inst.op {
             Op::AllocObject { shape } => {
                 if let Some(Const::ObjectLiteral { keys, values }) = module.consts.get(*shape) {
-                    for (k, v) in keys.iter().zip(values.iter()) {
-                        if let (Const::String(ks), Const::MethodRef(mfid)) = (k, v)
+                    for (&k_cid, &v_cid) in keys.iter().zip(values.iter()) {
+                        if let (Some(Const::String(ks)), Some(Const::MethodRef(mfid))) =
+                            (module.consts.get(k_cid), module.consts.get(v_cid))
                             && let Some(mname) = module.sym.resolve(*ks)
                             && name_allowed(mname)
                         {
@@ -4266,16 +4267,15 @@ fn collect_jsbridge_seeds(
                 ..
             } => {
                 if let Some(ValueDef::Inst(cls_iid)) = module.value(*callee).map(|v| v.def)
-                    && let Some(
-                        Op::DefineClass { members, .. } | Op::DefineSendableClass { members, .. },
-                    ) = module.inst(cls_iid).map(|i| &i.op)
-                    && let Some(Const::ArrayLiteral(items)) = module.consts.get(*members)
+                    && let Some(Op::DefineClass(data) | Op::DefineSendableClass(data)) =
+                        module.inst(cls_iid).map(|i| &i.op)
+                    && let Some(Const::ArrayLiteral(items)) = module.consts.get(data.members)
                 {
                     let mut pending: Option<&str> = None;
-                    for it in items {
-                        match it {
-                            Const::String(s) => pending = module.sym.resolve(*s),
-                            Const::MethodRef(mfid) => {
+                    for &it_cid in items {
+                        match module.consts.get(it_cid) {
+                            Some(Const::String(s)) => pending = module.sym.resolve(*s),
+                            Some(Const::MethodRef(mfid)) => {
                                 if let Some(mname) = pending.take()
                                     && name_allowed(mname)
                                 {
@@ -4313,7 +4313,7 @@ fn collect_jsbridge_seeds(
 mod tests {
     use super::*;
     use abcd_ir::op::{BinOp, CmpOp, ModuleVarKind, SuperCheck, UnOp};
-    use abcd_ir::{ConstId, Edge, EdgeKind};
+    use abcd_ir::{ConstId, DefineClassData, Edge, EdgeKind};
 
     #[test]
     fn op_uses_value_and_visitor_match_operands_table() {
@@ -4502,20 +4502,20 @@ mod tests {
                 captures: vec![(s, v0), (s, v1)],
                 length: 0,
             },
-            Op::DefineClass {
+            Op::DefineClass(Box::new(DefineClassData {
                 ctor: f,
                 heritage: Some(v0),
                 members: c,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
-            Op::DefineSendableClass {
+            })),
+            Op::DefineSendableClass(Box::new(DefineClassData {
                 ctor: f,
                 heritage: None,
                 members: c,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
+            })),
             Op::LoadPrivate {
                 level: 0,
                 slot: 0,

@@ -76,7 +76,7 @@ pub fn plan_with_index(
         None => module.insts.iter().any(|inst| {
             matches!(
                 &inst.op,
-                Op::DefineClass { ctor: c, .. } | Op::DefineSendableClass { ctor: c, .. } if *c == ctor
+                Op::DefineClass(cls) | Op::DefineSendableClass(cls) if cls.ctor == ctor
             )
         }),
     };
@@ -258,7 +258,7 @@ mod tests {
     use abcd_ir::function::{Block, FunctionData, Inst, Value};
     use abcd_ir::module::{ClassData, FunctionKind};
     use abcd_ir::ty::Ty;
-    use abcd_ir::{BlockId, CallKind, ClassId, Const, ValueId};
+    use abcd_ir::{BlockId, CallKind, ClassId, Const, DefineClassData, ValueId};
 
     // ── Hand-built module scaffolding (mirrors src/recover.rs's tests) ──
 
@@ -384,17 +384,17 @@ mod tests {
         let init_this = m.func(init).unwrap().params[2];
 
         // The class definition site (wire hosts the es2abc wiring).
-        let members = m.consts.push(Const::ArrayLiteral(vec![]));
+        let members = m.consts.push_array(vec![]);
         let class_v = emit_val(
             &mut m,
             wire_b,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(DefineClassData {
                 ctor,
                 heritage: None,
                 members,
                 member_attrs: vec![],
                 count: 0,
-            },
+            })),
         );
         let ValueDef::Inst(class_iid) = m.value(class_v).unwrap().def else {
             panic!("the class definition is instruction-defined");
@@ -485,14 +485,15 @@ mod tests {
     #[test]
     fn fold_sendable_class_ctor() {
         let (m, fx) = fixture(&mut |m, fx| {
-            let members = m.consts.push(Const::ArrayLiteral(vec![]));
-            m.inst_mut(fx.class_iid).unwrap().op = Op::DefineSendableClass {
-                ctor: fx.ctor,
-                heritage: None,
-                members,
-                member_attrs: vec![],
-                count: 0,
-            };
+            let members = m.consts.push_array(vec![]);
+            m.inst_mut(fx.class_iid).unwrap().op =
+                Op::DefineSendableClass(Box::new(DefineClassData {
+                    ctor: fx.ctor,
+                    heritage: None,
+                    members,
+                    member_attrs: vec![],
+                    count: 0,
+                }));
         });
         assert!(plan(&m, fx.ctor).is_some());
     }
@@ -502,14 +503,14 @@ mod tests {
     #[test]
     fn bail_not_a_class_ctor() {
         let (m, fx) = fixture(&mut |m, fx| {
-            let members = m.consts.push(Const::ArrayLiteral(vec![]));
-            m.inst_mut(fx.class_iid).unwrap().op = Op::DefineClass {
+            let members = m.consts.push_array(vec![]);
+            m.inst_mut(fx.class_iid).unwrap().op = Op::DefineClass(Box::new(DefineClassData {
                 ctor: fx.init,
                 heritage: None,
                 members,
                 member_attrs: vec![],
                 count: 0,
-            };
+            }));
         });
         assert!(plan(&m, fx.ctor).is_none());
     }

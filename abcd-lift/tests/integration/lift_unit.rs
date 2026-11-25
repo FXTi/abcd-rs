@@ -193,11 +193,11 @@ fn literal_array_nested_and_method_ref() {
             .expect("target function") as u32,
     );
     let x_sym = m.sym.intern("x");
-    let expected = Const::ArrayLiteral(vec![
-        Const::number(7.0),
-        Const::ArrayLiteral(vec![Const::String(x_sym)]),
-        Const::MethodRef(target_fid),
-    ]);
+    let c_seven = m.consts.intern(Const::number(7.0));
+    let c_x = m.consts.intern(Const::String(x_sym));
+    let c_nested = m.consts.intern(Const::ArrayLiteral(vec![c_x]));
+    let c_target = m.consts.intern(Const::MethodRef(target_fid));
+    let expected = Const::ArrayLiteral(vec![c_seven, c_nested, c_target]);
     assert_eq!(m.consts.get(shape), Some(&expected));
     // The MethodRef points at the function named "target".
     let target_name = resolve(&m, m.functions[target_fid.index()].name);
@@ -396,9 +396,10 @@ fn scope_names_record_attaches_by_source_file() {
     let debug = main_fn.debug.as_ref().expect("debug data");
     let scope_const = debug.scope_names.expect("scope names attached");
     let box_sym = m.sym.intern("Box");
+    let box_cid = m.consts.intern(Const::String(box_sym));
     assert_eq!(
         m.consts.get(scope_const),
-        Some(&Const::ArrayLiteral(vec![Const::String(box_sym)]))
+        Some(&Const::ArrayLiteral(vec![box_cid]))
     );
 }
 
@@ -883,10 +884,11 @@ fn merge_abc_records_pair_phase_and_scope_names_per_class() {
     assert!(!es_a.module_requests[0].lazy);
     assert_eq!(es_a.imports.len(), 1);
     let alpha_sym = m.sym.intern("alpha");
+    let alpha_cid = m.consts.intern(Const::String(alpha_sym));
     let scope_a_cid = la.scope_names.expect("La.scope_names");
     assert_eq!(
         m.consts.get(scope_a_cid),
-        Some(&Const::ArrayLiteral(vec![Const::String(alpha_sym)]))
+        Some(&Const::ArrayLiteral(vec![alpha_cid]))
     );
     let fn_a = &m.functions[la.methods[0].index()];
     assert_eq!(
@@ -906,10 +908,11 @@ fn merge_abc_records_pair_phase_and_scope_names_per_class() {
     assert_eq!(reqs_b, [("./c", false), ("./lazy", true)]);
     assert_eq!(es_b.exports.len(), 1);
     let beta_sym = m.sym.intern("beta");
+    let beta_cid = m.consts.intern(Const::String(beta_sym));
     let scope_b_cid = lb.scope_names.expect("Lb.scope_names");
     assert_eq!(
         m.consts.get(scope_b_cid),
-        Some(&Const::ArrayLiteral(vec![Const::String(beta_sym)]))
+        Some(&Const::ArrayLiteral(vec![beta_cid]))
     );
 
     // Lcfg; jsonFileContent lifts to Const::String.
@@ -917,4 +920,144 @@ fn merge_abc_records_pair_phase_and_scope_names_per_class() {
     let json_sym = m.sym.intern("{\"v\":1}");
     let init_cid = lcfg.fields[0].initial_value.expect("json initial_value");
     assert_eq!(m.consts.get(init_cid), Some(&Const::String(json_sym)));
+}
+
+// ─── R2-D1 (`#51`): exact try boundaries & pre-write block splitting ──
+
+#[test]
+fn r2_d1_try_splits_before_reg_write_after_throwing_call() {
+    // let ok = false; try { call0(); ok = true; call1(); } catch { return ok; }
+    // [0] ldfalse
+    // [1] sta v0              // ok = false (outside try)
+    // [2] callarg0 0          // try_start: call0() (may_throw)
+    // [3] ldtrue
+    // [4] sta v0              // ok = true (split leader before reg write!)
+    // [5] callarg0 1          // call1() (may_throw)
+    // [6] returnundefined     // try_end (post-try)
+    // [7] lda v0              // catch handler: return ok
+    // [8] return
+    let file = build(|b| {
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        let proto = b.create_proto(Type::Void, &[]);
+        let (insns, offsets) = encode_bytecodes(&[
+            Bytecode::Ldfalse,
+            Bytecode::Sta(Reg(0)),
+            Bytecode::Callarg0(Imm(0)),
+            Bytecode::Ldtrue,
+            Bytecode::Sta(Reg(0)),
+            Bytecode::Callarg0(Imm(1)),
+            Bytecode::Returnundefined,
+            Bytecode::Lda(Reg(0)),
+            Bytecode::Return,
+        ])
+        .unwrap();
+        let code = b.create_code(&insns, 1, 0);
+        b.code_add_try_block(
+            code,
+            offsets[2],
+            offsets[6] - offsets[2],
+            &[CatchBlockDef {
+                type_class: None,
+                handler_pc: offsets[7],
+                code_size: insns.len() as u32 - offsets[7],
+            }],
+        );
+        let m = b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &[], 0, 0);
+        b.method_set_code(m, code);
+    });
+
+    let ir = lift_file(&file).expect("lift");
+    let report = abcd_ir::verify_module(&ir);
+    assert!(report.is_ok(), "verifier errors: {:?}", report.errors);
+
+    let f = &ir.functions[0];
+    assert_eq!(f.try_regions.len(), 1);
+    let region = &f.try_regions[0];
+    assert_eq!(
+        region.protected.len(),
+        2,
+        "protected range splits before `sta v0` following `callarg0`"
+    );
+    let handler = region.catches[0].handler;
+    let handler_block = &ir.blocks[handler.index()];
+    let mut joined_bools = Vec::new();
+    for &iid in &handler_block.insts {
+        if let Op::Phi { entries } = &ir.insts[iid.index()].op {
+            for (edge, val) in entries {
+                assert_eq!(edge.kind, EdgeKind::Exceptional);
+                if let ValueDef::Inst(def_iid) = ir.values[val.index()].def
+                    && let Op::LoadConst(cid) = ir.insts[def_iid.index()].op
+                    && let Some(Const::Bool(b)) = ir.consts.get(cid)
+                {
+                    joined_bools.push(*b);
+                }
+            }
+        }
+    }
+    joined_bools.sort_unstable();
+    assert_eq!(
+        joined_bools,
+        vec![false, true],
+        "catch handler phi must join both pre-write `false` and post-write `true`"
+    );
+}
+
+#[test]
+fn r2_d1_pre_try_fallthrough_instruction_not_in_protected_region() {
+    // [0] callarg0 0          // call_outside() immediately preceding try_start (no jump)
+    // [1] callarg0 1          // try_start: call_inside()
+    // [2] returnundefined     // try_end: post-try instruction
+    // [3] returnundefined     // catch handler
+    let file = build(|b| {
+        b.set_api(12, "");
+        let cls = b.add_global_class();
+        let proto = b.create_proto(Type::Void, &[]);
+        let (insns, offsets) = encode_bytecodes(&[
+            Bytecode::Callarg0(Imm(0)),
+            Bytecode::Callarg0(Imm(1)),
+            Bytecode::Returnundefined,
+            Bytecode::Returnundefined,
+        ])
+        .unwrap();
+        let code = b.create_code(&insns, 0, 0);
+        b.code_add_try_block(
+            code,
+            offsets[1],
+            offsets[2] - offsets[1],
+            &[CatchBlockDef {
+                type_class: None,
+                handler_pc: offsets[3],
+                code_size: insns.len() as u32 - offsets[3],
+            }],
+        );
+        let m = b.class_add_method(cls, "f", proto, AccessFlags::STATIC, &[], 0, 0);
+        b.method_set_code(m, code);
+    });
+
+    let ir = lift_file(&file).expect("lift");
+    let report = abcd_ir::verify_module(&ir);
+    assert!(report.is_ok(), "verifier errors: {:?}", report.errors);
+
+    let f = &ir.functions[0];
+    assert_eq!(f.try_regions.len(), 1);
+    let region = &f.try_regions[0];
+    assert_eq!(
+        region.protected.len(),
+        1,
+        "only the `[try_start, try_end)` block is protected"
+    );
+    let entry_bb = f.blocks[0];
+    assert!(
+        !region.protected.contains(&entry_bb),
+        "entry block containing pre-try `call_outside()` must not be in TryRegion.protected"
+    );
+    let entry_has_call = ir.blocks[entry_bb.index()]
+        .insts
+        .iter()
+        .any(|&iid| matches!(ir.insts[iid.index()].op, Op::Call { .. }));
+    assert!(
+        entry_has_call,
+        "pre-try call stays in the unprotected entry block"
+    );
 }

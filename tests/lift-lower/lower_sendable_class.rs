@@ -88,7 +88,7 @@ fn sendable_op_count(module: &Module) -> usize {
         .filter(|&iid| {
             module
                 .inst(iid)
-                .is_some_and(|inst| matches!(inst.op, Op::DefineSendableClass { .. }))
+                .is_some_and(|inst| matches!(inst.op, Op::DefineSendableClass(_)))
         })
         .count()
 }

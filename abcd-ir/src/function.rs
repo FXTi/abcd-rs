@@ -66,9 +66,13 @@ pub struct Inst {
 /// path edges and CFG analyses see it without consulting `TryRegion`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EdgeKind {
-    /// Ordinary control flow (terminator successor).
+    /// Ordinary control flow (terminator successor), carrying values defined
+    /// through the end of the source block.
     Normal,
-    /// Exception dispatch from a protected block to a catch handler.
+    /// Exception dispatch from a protected block to a catch handler. Only
+    /// values dominating the protected block's first potentially throwing
+    /// instruction (pre-throw entry point) are guaranteed available on an
+    /// `Exceptional` edge (`R2-D1`, `R2-C1`).
     Exceptional,
 }
 
@@ -109,6 +113,10 @@ pub struct Catch {
 /// A structured try region (`design/ir.md`): both structure (for lowering) and
 /// the source of [`EdgeKind::Exceptional`] edges — every protected block has
 /// an exceptional edge to every catch handler of the region.
+///
+/// [`FunctionData::try_regions`] are ordered in **inner-first dispatch
+/// priority** (`R2-M7`): when nested regions protect the same block, earlier
+/// entries in `try_regions` take precedence at runtime before outer handlers.
 #[derive(Clone, Debug)]
 pub struct TryRegion {
     /// Blocks whose executing instructions are protected.

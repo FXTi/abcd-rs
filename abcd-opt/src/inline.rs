@@ -607,8 +607,8 @@ fn eligibility(
             };
             match &inst.op {
                 Op::DefineFunc { body, .. } => nested_roots.push(*body),
-                Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
-                    nested_roots.push(*ctor)
+                Op::DefineClass(data) | Op::DefineSendableClass(data) => {
+                    nested_roots.push(data.ctor)
                 }
                 _ => {}
             }
@@ -796,9 +796,7 @@ fn nested_definitions_read_outer_env(module: &Module, roots: &[FuncId]) -> bool 
                     | Op::TestPrivate { .. }
                     | Op::CreatePrivateNames { .. } => return true,
                     Op::DefineFunc { body, .. } => stack.push(*body),
-                    Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
-                        stack.push(*ctor)
-                    }
+                    Op::DefineClass(data) | Op::DefineSendableClass(data) => stack.push(data.ctor),
                     _ => {}
                 }
             }
@@ -1329,73 +1327,71 @@ fn inline_site(
                 .collect()
         })
         .unwrap_or_default();
-    for region_idx in protecting {
-        let mut handlers: Vec<BlockId> = module
-            .func(caller)
-            .map(|f| {
-                f.try_regions[region_idx]
-                    .catches
+    let mut handlers: Vec<BlockId> = module
+        .func(caller)
+        .map(|f| {
+            protecting
+                .iter()
+                .flat_map(|&idx| f.try_regions[idx].catches.iter().map(|c| c.handler))
+                .collect()
+        })
+        .unwrap_or_default();
+    handlers.sort_by_key(|b| b.index());
+    handlers.dedup();
+    for handler in handlers {
+        let call_edge = Edge {
+            from: call_block,
+            kind: EdgeKind::Exceptional,
+        };
+        if let Some(handler_block) = module.block_mut(handler) {
+            for &x in &new_protected {
+                let edge = Edge {
+                    from: x,
+                    kind: EdgeKind::Exceptional,
+                };
+                if !handler_block.preds.contains(&edge) {
+                    handler_block.preds.push(edge);
+                }
+            }
+        }
+        let phi_ids: Vec<InstId> = module
+            .block(handler)
+            .map(|b| {
+                b.insts
                     .iter()
-                    .map(|c| c.handler)
+                    .copied()
+                    .take_while(|&id| module.inst(id).is_some_and(|i| i.op.is_phi()))
                     .collect()
             })
             .unwrap_or_default();
-        handlers.sort_unstable();
-        handlers.dedup();
-        for handler in handlers {
-            let call_edge = Edge {
-                from: call_block,
-                kind: EdgeKind::Exceptional,
-            };
-            if let Some(handler_block) = module.block_mut(handler) {
+        for phi_id in phi_ids {
+            if let Some(phi) = module.inst_mut(phi_id)
+                && let Op::Phi { entries } = &mut phi.op
+            {
+                // The value the original call-block edge carried — the caller
+                // register state visible at the call. Verified input
+                // guarantees the entry; stay defensive.
+                let Some(v) = entries
+                    .iter()
+                    .find(|(edge, _)| *edge == call_edge)
+                    .map(|(_, v)| *v)
+                else {
+                    continue;
+                };
                 for &x in &new_protected {
                     let edge = Edge {
                         from: x,
                         kind: EdgeKind::Exceptional,
                     };
-                    if !handler_block.preds.contains(&edge) {
-                        handler_block.preds.push(edge);
-                    }
-                }
-            }
-            let phi_ids: Vec<InstId> = module
-                .block(handler)
-                .map(|b| {
-                    b.insts
-                        .iter()
-                        .copied()
-                        .take_while(|&id| module.inst(id).is_some_and(|i| i.op.is_phi()))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for phi_id in phi_ids {
-                if let Some(phi) = module.inst_mut(phi_id)
-                    && let Op::Phi { entries } = &mut phi.op
-                {
-                    // The value the original call-block edge
-                    // carried — the caller register state
-                    // visible at the call. Verified input
-                    // guarantees the entry; stay defensive.
-                    let Some(v) = entries
-                        .iter()
-                        .find(|(edge, _)| *edge == call_edge)
-                        .map(|(_, v)| *v)
-                    else {
-                        continue;
-                    };
-                    for &x in &new_protected {
-                        entries.push((
-                            Edge {
-                                from: x,
-                                kind: EdgeKind::Exceptional,
-                            },
-                            v,
-                        ));
+                    if !entries.iter().any(|(e, _)| *e == edge) {
+                        entries.push((edge, v));
                     }
                 }
             }
         }
-        if let Some(func) = module.func_mut(caller) {
+    }
+    if let Some(func) = module.func_mut(caller) {
+        for region_idx in protecting {
             let region = &mut func.try_regions[region_idx];
             region.protected.extend(new_protected.iter().copied());
             region.protected.sort_by_key(|b| b.index());

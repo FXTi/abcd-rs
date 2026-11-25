@@ -963,21 +963,35 @@ impl Builder {
         }
     }
 
-    /// The merge of the loop with (natural) body `body`: the nearest
-    /// common post-dominator of the loop's exit targets, excluding targets
-    /// that leave the function (Return/Throw leaves — they are loop exits
-    /// but not continuations). `None` for infinite loops and for loops
-    /// whose exit tails never reconverge (those structure as
-    /// [`RegionNode::Alternates`] continuations).
-    fn loop_merge(&self, body: &BitSet) -> Option<BlockId> {
-        let mut targets = BitSet::empty(self.word_len);
-        for b in body.iter() {
-            for &s in &self.succs[b as usize] {
-                if !body.contains(s) && !self.succs[s as usize].is_empty() {
-                    targets.insert(s);
+    /// True when `s` is a Return/Throw leaf or a single-predecessor linear
+    /// chain ending in one (e.g. a straight-line return/throw tail split at
+    /// `may_throw` register-write boundaries under `R2-C1`), with no external
+    /// handler-rejoin predecessors along the chain.
+    fn is_leaf_tail(&self, mut s: u32) -> bool {
+        if self.succs[s as usize].is_empty() {
+            return true;
+        }
+        if self.preds[s as usize].len() != 1 || self.external_preds.contains(s) {
+            return false;
+        }
+        for _ in 0..=self.succs.len() {
+            match self.succs[s as usize].as_slice() {
+                [] => return true,
+                &[next]
+                    if next != s
+                        && self.preds[next as usize].len() == 1
+                        && !self.external_preds.contains(next) =>
+                {
+                    s = next;
                 }
+                _ => return false,
             }
         }
+        false
+    }
+
+    /// Deepest common post-dominator across a non-empty target set.
+    fn intersect_postdom(&self, targets: &BitSet) -> Option<BlockId> {
         let mut iter = targets.iter();
         let first = self.u_blocks[iter.next()? as usize];
         let mut chain = self.postdom.post_dominator_chain(first);
@@ -998,6 +1012,41 @@ impl Builder {
             chain = vec![found?];
         }
         chain.first().copied()
+    }
+
+    /// The merge of the loop with (natural) body `body`: the nearest
+    /// common post-dominator of the loop's exit targets, excluding targets
+    /// that leave the function (Return/Throw leaves — they are loop exits
+    /// but not continuations). `None` for infinite loops and for loops
+    /// whose exit tails never reconverge (those structure as
+    /// [`RegionNode::Alternates`] continuations).
+    fn loop_merge(&self, body: &BitSet) -> Option<BlockId> {
+        let mut raw_targets = BitSet::empty(self.word_len);
+        let mut raw_count = 0usize;
+        for b in body.iter() {
+            for &s in &self.succs[b as usize] {
+                if !body.contains(s)
+                    && !self.succs[s as usize].is_empty()
+                    && !raw_targets.contains(s)
+                {
+                    raw_targets.insert(s);
+                    raw_count += 1;
+                }
+            }
+        }
+        if let Some(m) = self.intersect_postdom(&raw_targets) {
+            return Some(m);
+        }
+        if raw_count < 2 {
+            return None;
+        }
+        let mut filtered = BitSet::empty(self.word_len);
+        for s in raw_targets.iter() {
+            if !self.is_leaf_tail(s) {
+                filtered.insert(s);
+            }
+        }
+        self.intersect_postdom(&filtered)
     }
 
     /// Forward reachability from `from` over `succs`, restricted to
@@ -3034,5 +3083,102 @@ mod tests {
         handle
             .join()
             .expect("projection must not overflow the stack");
+    }
+
+    /// Multi-block single-predecessor return chains (`InLoop -> Ret1 -> Ret2`,
+    /// as produced by `R2-C1` protected-block splitting) are treated as leaf
+    /// tails in `loop_merge` rather than poisoning reconvergence at `Merge`.
+    #[test]
+    fn loop_merge_ignores_split_return_leaf_chain() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let h = entry_of(&m, f);
+        let exit_pre = add_block(&mut m, f);
+        let in_loop = add_block(&mut m, f);
+        let ret1 = add_block(&mut m, f);
+        let ret2 = add_block(&mut m, f);
+        let brk = add_block(&mut m, f);
+        let latch = add_block(&mut m, f);
+        let merge = add_block(&mut m, f);
+        let ret_end = add_block(&mut m, f);
+
+        // Header: `H -> InLoop` (loop body) or `H -> ExitPre -> Merge -> Ret`.
+        cond_branch(&mut m, h, in_loop, exit_pre);
+        link(&mut m, h, in_loop);
+        link(&mut m, h, exit_pre);
+
+        branch(&mut m, exit_pre, merge);
+        link(&mut m, exit_pre, merge);
+
+        // InLoop: `InLoop -> Ret1 -> Ret2 (Return)` or `InLoop -> Brk`.
+        cond_branch(&mut m, in_loop, brk, ret1);
+        link(&mut m, in_loop, brk);
+        link(&mut m, in_loop, ret1);
+
+        branch(&mut m, ret1, ret2);
+        link(&mut m, ret1, ret2);
+        ret(&mut m, ret2);
+
+        // Brk: `Brk -> Merge` (break) or `Brk -> Latch -> H`.
+        cond_branch(&mut m, brk, merge, latch);
+        link(&mut m, brk, merge);
+        link(&mut m, brk, latch);
+
+        branch(&mut m, latch, h);
+        link(&mut m, latch, h);
+
+        branch(&mut m, merge, ret_end);
+        link(&mut m, merge, ret_end);
+        ret(&mut m, ret_end);
+
+        let tree = structure_regions(&m, f);
+        assert!(tree.errors.is_empty(), "{:?}", tree.errors);
+        assert!(
+            tree.escape_hatches.is_empty(),
+            "unexpected escape hatches: {:?}",
+            tree.escape_hatches
+        );
+        assert!(
+            !tree
+                .nodes
+                .iter()
+                .any(|n| matches!(n, RegionNode::Irreducible { .. })),
+            "unexpected Irreducible node in {:?}",
+            tree.nodes
+        );
+    }
+
+    /// Single-exit `while (true) { if (done) break; } finish1 -> finish2 (Return)`
+    /// keeps `finish1` as the post-loop continuation (`Seq([Loop, ...])`) rather
+    /// than absorbing it as an in-loop leaf tail.
+    #[test]
+    fn while_true_single_break_chain_stays_post_loop_continuation() {
+        let mut m = mk_module();
+        let f = add_func(&mut m);
+        let h = entry_of(&m, f);
+        let latch = add_block(&mut m, f);
+        let finish1 = add_block(&mut m, f);
+        let finish2 = add_block(&mut m, f);
+
+        cond_branch(&mut m, h, finish1, latch);
+        link(&mut m, h, finish1);
+        link(&mut m, h, latch);
+
+        branch(&mut m, latch, h);
+        link(&mut m, latch, h);
+
+        branch(&mut m, finish1, finish2);
+        link(&mut m, finish1, finish2);
+        ret(&mut m, finish2);
+
+        let tree = structure_regions(&m, f);
+        assert!(tree.errors.is_empty(), "{:?}", tree.errors);
+        assert!(tree.escape_hatches.is_empty(), "{:?}", tree.escape_hatches);
+        let root = tree.root.expect("root");
+        assert!(
+            matches!(tree.node(root), RegionNode::Seq(items) if matches!(tree.node(items[0]), RegionNode::Loop { .. })),
+            "expected Seq starting with Loop, got {:?}",
+            tree.nodes
+        );
     }
 }

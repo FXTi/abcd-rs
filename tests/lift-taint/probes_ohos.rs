@@ -14,7 +14,7 @@ use abcd_ir::id::{BlockId, ClassId, FuncId, InstId, ValueId};
 use abcd_ir::module::{
     ClassData, EsModule, ExportDecl, FunctionKind, ImportDecl, Modifiers, Module, ModuleRequest,
 };
-use abcd_ir::op::{CallKind, ModuleVarKind, Op};
+use abcd_ir::op::{CallKind, DefineClassData, ModuleVarKind, Op};
 use abcd_ir::ty::Ty;
 use abcd_ir::verify::verify_module;
 use abcd_ir::{Loc, ValueDef};
@@ -551,17 +551,17 @@ fn probe_ohos_02_kit_imports_cross_module_closure_and_class_instance() {
             value: leak_clos,
         },
     );
-    let empty_mem = m.consts.push(Const::ArrayLiteral(Vec::new()));
+    let empty_mem = m.consts.push_array(Vec::new());
     let sess_cls = emit_val(
         &mut m,
         b_svc,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor: f_ctor,
             heritage: None,
             members: empty_mem,
             member_attrs: Vec::new(),
             count: 1,
-        },
+        })),
     );
     emit_void(
         &mut m,
@@ -825,39 +825,35 @@ fn probe_ohos_03_uiability_want_lifecycle_and_receiver_isolation() {
     );
     let s_oc = m.sym.intern("onCreate");
     let s_fg = m.sym.intern("onForeground");
-    let mem1 = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(s_oc),
-        Const::MethodRef(oc1),
-        Const::String(s_fg),
-        Const::MethodRef(fg1),
-    ]));
+    let c_s_oc = m.consts.intern(Const::String(s_oc));
+    let c_s_fg = m.consts.intern(Const::String(s_fg));
+    let c_m_oc1 = m.consts.intern(Const::MethodRef(oc1));
+    let c_m_fg1 = m.consts.intern(Const::MethodRef(fg1));
+    let mem1 = m.consts.push_array(vec![c_s_oc, c_m_oc1, c_s_fg, c_m_fg1]);
     let _ = emit_val(
         &mut m,
         bmain,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor: ctor1,
             heritage: Some(base_uiab),
             members: mem1,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
-    let mem2 = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(s_oc),
-        Const::MethodRef(oc2),
-        Const::String(s_fg),
-        Const::MethodRef(fg2),
-    ]));
+    let c_m_oc2 = m.consts.intern(Const::MethodRef(oc2));
+    let c_m_fg2 = m.consts.intern(Const::MethodRef(fg2));
+    let mem2 = m.consts.push_array(vec![c_s_oc, c_m_oc2, c_s_fg, c_m_fg2]);
     let _ = emit_val(
         &mut m,
         bmain,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor: ctor2,
             heritage: Some(base_uiab),
             members: mem2,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     emit_void(&mut m, bmain, Op::Return { value: None });
 
@@ -928,20 +924,19 @@ fn probe_ohos_04_extension_ability_manifest_discovery_and_fs_sink() {
     // Define class WITHOUT heritage — relies on `manifest_json` `srcEntry` + `onAddForm`!
     let (_, bmain, _) = add_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 3);
     let s_af = m.sym.intern("onAddForm");
-    let mem = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(s_af),
-        Const::MethodRef(on_add),
-    ]));
+    let c_s_af = m.consts.intern(Const::String(s_af));
+    let c_m_add = m.consts.intern(Const::MethodRef(on_add));
+    let mem = m.consts.push_array(vec![c_s_af, c_m_add]);
     let _ = emit_val(
         &mut m,
         bmain,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor,
             heritage: None,
             members: mem,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     emit_void(&mut m, bmain, Op::Return { value: None });
 
@@ -1204,39 +1199,39 @@ fn probe_ohos_05_arkui_viewpu_lifecycle_lexenv_and_onclick_isolation() {
     let view_pu = try_global(&mut m, bmain, "ViewPU");
     let s_ata = m.sym.intern("aboutToAppear");
     let s_ir = m.sym.intern("initialRender");
-    let mem1 = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(s_ata),
-        Const::MethodRef(about1),
-        Const::String(s_ir),
-        Const::MethodRef(render1),
-    ]));
+    let c_s_ata = m.consts.intern(Const::String(s_ata));
+    let c_s_ir = m.consts.intern(Const::String(s_ir));
+    let c_m_about1 = m.consts.intern(Const::MethodRef(about1));
+    let c_m_render1 = m.consts.intern(Const::MethodRef(render1));
+    let mem1 = m
+        .consts
+        .push_array(vec![c_s_ata, c_m_about1, c_s_ir, c_m_render1]);
     let _ = emit_val(
         &mut m,
         bmain,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor: ctor1,
             heritage: Some(view_pu),
             members: mem1,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
-    let mem2 = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(s_ata),
-        Const::MethodRef(about2),
-        Const::String(s_ir),
-        Const::MethodRef(render2),
-    ]));
+    let c_m_about2 = m.consts.intern(Const::MethodRef(about2));
+    let c_m_render2 = m.consts.intern(Const::MethodRef(render2));
+    let mem2 = m
+        .consts
+        .push_array(vec![c_s_ata, c_m_about2, c_s_ir, c_m_render2]);
     let _ = emit_val(
         &mut m,
         bmain,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor: ctor2,
             heritage: Some(view_pu),
             members: mem2,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     emit_void(&mut m, bmain, Op::Return { value: None });
 
@@ -1677,9 +1672,8 @@ fn probe_ohos_07_webview_jsbridge_proxy_whitelist() {
     store_prop(&mut m, bmain, bridge, "privateHelper", c_prv);
 
     let s_on_web = m.sym.intern("onWebCmd");
-    let list_shape = m
-        .consts
-        .push(Const::ArrayLiteral(vec![Const::String(s_on_web)]));
+    let c_s_on_web = m.consts.intern(Const::String(s_on_web));
+    let list_shape = m.consts.push_array(vec![c_s_on_web]);
     let method_list = emit_val(
         &mut m,
         bmain,
@@ -2015,39 +2009,39 @@ fn probe_ohos_09_oop_inheritance_singleton_field_dispatch_and_normalized_har() {
     let s_noop = m.sym.intern("noop");
     let s_send = m.sym.intern("send");
     let s_forward = m.sym.intern("forward");
-    let base_mem = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(s_noop),
-        Const::MethodRef(base_noop),
-        Const::String(s_send),
-        Const::MethodRef(base_send),
-        Const::number(2.0),
-    ]));
+    let c_s_noop = m.consts.intern(Const::String(s_noop));
+    let c_m_noop = m.consts.intern(Const::MethodRef(base_noop));
+    let c_s_send = m.consts.intern(Const::String(s_send));
+    let c_m_send = m.consts.intern(Const::MethodRef(base_send));
+    let c_n2 = m.consts.intern(Const::number(2.0));
+    let base_mem = m
+        .consts
+        .push_array(vec![c_s_noop, c_m_noop, c_s_send, c_m_send, c_n2]);
     let base_cls_val = emit_val(
         &mut m,
         b_har_main,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor: base_ctor,
             heritage: None,
             members: base_mem,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
-    let oauth_mem = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(s_forward),
-        Const::MethodRef(oauth_fwd),
-        Const::number(1.0),
-    ]));
+    let c_s_fwd = m.consts.intern(Const::String(s_forward));
+    let c_m_fwd = m.consts.intern(Const::MethodRef(oauth_fwd));
+    let c_n1 = m.consts.intern(Const::number(1.0));
+    let oauth_mem = m.consts.push_array(vec![c_s_fwd, c_m_fwd, c_n1]);
     let oauth_cls_val = emit_val(
         &mut m,
         b_har_main,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor: oauth_ctor,
             heritage: Some(base_cls_val),
             members: oauth_mem,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     let gi_clo = mk_closure(&mut m, b_har_main, get_inst_fn);
     store_prop(&mut m, b_har_main, oauth_cls_val, "getInstance", gi_clo);
@@ -2147,21 +2141,20 @@ fn probe_ohos_09_oop_inheritance_singleton_field_dispatch_and_normalized_har() {
 
     let (_, b_app_main, _) = add_fn(&mut m, c_app, "func_main_0", FunctionKind::Function, 3);
     let s_sync = m.sym.intern("syncTainted");
-    let svc_mem = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(s_sync),
-        Const::MethodRef(svc_sync),
-        Const::number(1.0),
-    ]));
+    let c_s_sync = m.consts.intern(Const::String(s_sync));
+    let c_m_sync = m.consts.intern(Const::MethodRef(svc_sync));
+    let c_svc_n1 = m.consts.intern(Const::number(1.0));
+    let svc_mem = m.consts.push_array(vec![c_s_sync, c_m_sync, c_svc_n1]);
     let svc_cls = emit_val(
         &mut m,
         b_app_main,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor: svc_ctor,
             heritage: None,
             members: svc_mem,
             member_attrs: Vec::new(),
             count: 0,
-        },
+        })),
     );
     let svc_obj = emit_val(
         &mut m,
@@ -2257,21 +2250,20 @@ fn probe_ohos_10_large_bundle_demand_driven_pta_and_ifds_scalability() {
         }
 
         let (_, bm, _) = add_fn(&mut m, cid, "func_main_0", FunctionKind::Function, 3);
-        let mem = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_work),
-            Const::MethodRef(wk),
-            Const::number(1.0),
-        ]));
+        let c_s_work = m.consts.intern(Const::String(s_work));
+        let c_m_wk = m.consts.intern(Const::MethodRef(wk));
+        let c_wk_n1 = m.consts.intern(Const::number(1.0));
+        let mem = m.consts.push_array(vec![c_s_work, c_m_wk, c_wk_n1]);
         let cls_v = emit_val(
             &mut m,
             bm,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(DefineClassData {
                 ctor,
                 heritage: None,
                 members: mem,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
+            })),
         );
         let inst_v = emit_val(
             &mut m,
@@ -2386,17 +2378,18 @@ fn probe_ohos_10_large_bundle_demand_driven_pta_and_ifds_scalability() {
     emit_void(&mut m, b_vb, Op::Return { value: None });
 
     let (_, b_snk, _) = add_fn(&mut m, c_snk, "func_main_0", FunctionKind::Function, 3);
-    let vb_mem = m.consts.push(Const::ArrayLiteral(vec![Const::number(0.0)]));
+    let c_vb_n0 = m.consts.intern(Const::number(0.0));
+    let vb_mem = m.consts.push_array(vec![c_vb_n0]);
     let vb_cls = emit_val(
         &mut m,
         b_snk,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(DefineClassData {
             ctor: vbox_ctor,
             heritage: None,
             members: vb_mem,
             member_attrs: Vec::new(),
             count: 1,
-        },
+        })),
     );
     let imp_tok = emit_val(
         &mut m,

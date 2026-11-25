@@ -183,20 +183,9 @@ pub fn discover_components(
                     continue;
                 };
                 match &inst.op {
-                    Op::DefineClass {
-                        ctor,
-                        heritage,
-                        members,
-                        ..
-                    }
-                    | Op::DefineSendableClass {
-                        ctor,
-                        heritage,
-                        members,
-                        ..
-                    } => {
+                    Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
                         if let Some(res) = inst.result {
-                            class_defs.push((res, *ctor, *heritage, *members));
+                            class_defs.push((res, cls.ctor, cls.heritage, cls.members));
                         }
                     }
                     Op::LoadProp { object, name } if sym_str(module, *name) == "prototype" => {
@@ -545,12 +534,12 @@ fn collect_member_methods(module: &Module, members: ConstId) -> BTreeMap<String,
         return map;
     };
     let mut pending_name: Option<String> = None;
-    for item in items {
-        match item {
-            Const::String(s) => {
+    for &item_cid in items {
+        match module.consts.get(item_cid) {
+            Some(Const::String(s)) => {
                 pending_name = Some(sym_str(module, *s).to_owned());
             }
-            Const::MethodRef(fid) => {
+            Some(Const::MethodRef(fid)) => {
                 if let Some(name) = pending_name.take()
                     && !name.is_empty()
                 {
@@ -892,72 +881,69 @@ mod tests {
         let s_proto = m.sym.intern("prototype");
         let s_hb = m.sym.intern("HeaderBuilder");
 
-        let mem1 = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_oc),
-            Const::MethodRef(on_create1),
-            Const::String(s_fg),
-            Const::MethodRef(on_fg1),
-        ]));
+        let c_s_oc = m.consts.intern(Const::String(s_oc));
+        let c_oc1 = m.consts.intern(Const::MethodRef(on_create1));
+        let c_s_fg = m.consts.intern(Const::String(s_fg));
+        let c_fg1 = m.consts.intern(Const::MethodRef(on_fg1));
+        let mem1 = m.consts.push_array(vec![c_s_oc, c_oc1, c_s_fg, c_fg1]);
         let _ = emit_inst_val(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: ctor1,
                 heritage: Some(h_uiab),
                 members: mem1,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
+            })),
         );
 
-        let mem2 = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_fg),
-            Const::MethodRef(on_fg2),
-        ]));
+        let c_fg2 = m.consts.intern(Const::MethodRef(on_fg2));
+        let mem2 = m.consts.push_array(vec![c_s_fg, c_fg2]);
         let _ = emit_inst_val(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: ctor2,
                 heritage: Some(h_uiab),
                 members: mem2,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
+            })),
         );
 
-        let mem3 = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_af),
-            Const::MethodRef(on_add),
-        ]));
+        let c_s_af = m.consts.intern(Const::String(s_af));
+        let c_on_add = m.consts.intern(Const::MethodRef(on_add));
+        let mem3 = m.consts.push_array(vec![c_s_af, c_on_add]);
         let _ = emit_inst_val(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: ctor3,
                 heritage: Some(h_form),
                 members: mem3,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
+            })),
         );
 
-        let mem4 = m.consts.push(Const::ArrayLiteral(vec![
-            Const::String(s_ata),
-            Const::MethodRef(about),
-            Const::String(s_ir),
-            Const::MethodRef(render),
-        ]));
+        let c_s_ata = m.consts.intern(Const::String(s_ata));
+        let c_about = m.consts.intern(Const::MethodRef(about));
+        let c_s_ir = m.consts.intern(Const::String(s_ir));
+        let c_render = m.consts.intern(Const::MethodRef(render));
+        let mem4 = m
+            .consts
+            .push_array(vec![c_s_ata, c_about, c_s_ir, c_render]);
         let home_cls = emit_inst_val(
             &mut m,
             b_main,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: ctor4,
                 heritage: Some(h_view),
                 members: mem4,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
+            })),
         );
         let home_proto = emit_inst_val(
             &mut m,
@@ -1067,17 +1053,17 @@ mod tests {
                         name: s_uiab,
                     },
                 );
-                let empty_mem = m.consts.push(Const::ArrayLiteral(Vec::new()));
+                let empty_mem = m.consts.push_array(Vec::new());
                 let _ = emit_inst_val(
                     &mut m,
                     b_main,
-                    Op::DefineClass {
+                    Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                         ctor: ctor_deep,
                         heritage: Some(deep_heritage),
                         members: empty_mem,
                         member_attrs: Vec::new(),
                         count: 0,
-                    },
+                    })),
                 );
 
                 // Cyclic `LoadProp` chain (`v_cyc = LoadProp(v_cyc, "sub")`):
@@ -1101,13 +1087,13 @@ mod tests {
                 let _ = emit_inst_val(
                     &mut m,
                     b_main,
-                    Op::DefineClass {
+                    Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                         ctor: ctor_cyc,
                         heritage: Some(cyc_vid),
                         members: empty_mem,
                         member_attrs: Vec::new(),
                         count: 0,
-                    },
+                    })),
                 );
                 emit_inst_void(&mut m, b_main, Op::Return { value: None });
 

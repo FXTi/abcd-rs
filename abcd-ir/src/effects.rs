@@ -1,33 +1,20 @@
 //! First-class per-op effects (`design/ir.md`, requirement T3;
-//! `design/decisions.md` N48/N50).
+//! `design/decisions.md` N48/N50, R2-D2).
 //!
-//! [`Op::effects`] is computed mechanically from the op itself plus its
-//! operand *shapes* — never hand-maintained per pass. This table is the
-//! single source of effect truth: DCE, reordering, and taint propagation
-//! all read effects from here.
-//!
-//! Modelling notes (deliberate, documented):
-//!
-//! - JS coercion side effects of the dynamic compute ops (`BinaryOp`,
-//!   `UnaryOp`, `Compare` can invoke `valueOf`/`toString` on object
-//!   operands) are NOT modeled at the op level: the op alone cannot know
-//!   its operands' types (`ty` lives on values, not ops — `design/ir.md`). A
-//!   type-refined effect *refinement* (object-typed operand ⇒ may call)
-//!   is an analysis-layer extension over this baseline, not more entries
-//!   in this table.
-//! - [`CallEffect::KnownSummary`] and [`CallEffect::SelfRecursive`] are
-//!   produced by refinement (a callee-resolving analysis rewrites
-//!   `UnknownCallee`); the mechanical derivation only ever emits
-//!   `UnknownCallee` for call-capable ops.
+//! [`Op::effects`] provides the conservative mechanical baseline for untyped
+//! dynamic JS/TS (modeling `ToNumeric`/`ToPrimitive`/`ToPropertyKey` coercion
+//! and global accessor setters), while [`Op::effects_in`] refines compute ops
+//! (`UnaryOp`, `BinaryOp`, `Compare`) to [`Effects::PURE`] whenever operands
+//! are proven coercion-free and non-throwing via [`Ty`] or [`crate::ConstPool`].
 
-use crate::id::Sym;
-use crate::op::Op;
+use crate::consts::Const;
+use crate::function::ValueDef;
+use crate::id::{Sym, ValueId};
+use crate::module::Module;
+use crate::op::{BinOp, CmpOp, ModuleVarKind, Op, UnOp};
+use crate::ty::{DynPrim, StaticTy, Ty};
 
 /// A set of memory classes an op may read or write.
-///
-/// Memory is classified by *what is being accessed*, not by monolithic
-/// "the heap" (`design/ir.md`): field-sensitive taint tracks
-/// [`MemClasses::HEAP`] separately from lexical/global/module bindings.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MemClasses(u8);
 
@@ -50,16 +37,19 @@ impl MemClasses {
     pub const ALL: Self = Self(0x3F);
 
     /// Whether `other` is fully contained in this set.
+    #[must_use]
     pub const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
     /// Union of two sets.
+    #[must_use]
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
     /// Whether the set is empty.
+    #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -81,23 +71,20 @@ pub enum CallEffect {
     /// May call an unknown callee (getters/setters, Proxy traps, coercion,
     /// protocol methods, or a genuine call).
     UnknownCallee,
-    /// May call a callee that has a registered external summary (T6);
-    /// produced by refinement, keyed by the summary's symbol.
+    /// May call a callee that has a registered external summary (T6).
     KnownSummary(Sym),
-    /// May call the containing function (direct recursion); produced by
-    /// refinement.
+    /// May call the containing function (direct recursion).
     SelfRecursive,
 }
 
 /// What an op may allocate (T7 — allocation sites are unique ops; the
-/// [`InstId`](crate::id::InstId) of the instruction is the
-/// allocation-site identity).
+/// [`InstId`](crate::id::InstId) of the instruction is the allocation-site identity).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AllocKind {
     /// Allocates nothing.
     #[default]
     None,
-    /// A plain object (also namespace/iterator wrapper objects).
+    /// A plain object (also namespace/iterator-result wrapper objects).
     Object,
     /// An array.
     Array,
@@ -105,10 +92,11 @@ pub enum AllocKind {
     Closure,
     /// A RegExp.
     RegExp,
+    /// An iterator / property-name iterator record.
+    Iterator,
     /// A generator object.
     GeneratorObj,
-    /// May allocate arbitrary objects (calls, dynamic import) — the
-    /// conservative over-approximation of "any of the above".
+    /// May allocate arbitrary objects (calls, dynamic import).
     Unknown,
 }
 
@@ -137,17 +125,107 @@ impl Effects {
         allocs: AllocKind::None,
     };
 
-    /// Whether the op has no observable effect (DCE-eligible when its
-    /// result is unused).
+    /// Whether the op has zero memory reads/writes, cannot throw, cannot call,
+    /// and allocates nothing (`*self == Self::PURE`). For DCE eligibility of
+    /// unused reads or fresh allocations, see [`Self::is_removable_if_unused`].
+    #[must_use]
     pub fn is_pure(&self) -> bool {
         *self == Self::PURE
+    }
+
+    /// Whether an instruction with these effects may be removed by DCE when its
+    /// SSA result is unused (no writes, cannot throw, and cannot call).
+    #[must_use]
+    pub const fn is_removable_if_unused(&self) -> bool {
+        self.writes.is_empty() && !self.may_throw && matches!(self.may_call, CallEffect::None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimKind {
+    Dyn(DynPrim),
+    Static(StaticTy),
+}
+
+fn proven_const(module: &Module, v: ValueId) -> Option<&Const> {
+    let val = module.value(v)?;
+    match val.def {
+        ValueDef::Const(cid) => module.consts.get(cid),
+        ValueDef::Inst(iid) => match &module.inst(iid)?.op {
+            Op::LoadConst(cid) => module.consts.get(*cid),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn proven_prim(module: &Module, v: ValueId) -> Option<PrimKind> {
+    let val = module.value(v)?;
+    match &val.ty {
+        Ty::DynPrim(p) => return Some(PrimKind::Dyn(*p)),
+        Ty::Static(s) => return Some(PrimKind::Static(*s)),
+        _ => {}
+    }
+    match proven_const(module, v)? {
+        Const::Undefined => Some(PrimKind::Dyn(DynPrim::Undefined)),
+        Const::Null => Some(PrimKind::Dyn(DynPrim::Null)),
+        Const::Bool(_) => Some(PrimKind::Dyn(DynPrim::Bool)),
+        Const::Number(_) => Some(PrimKind::Dyn(DynPrim::Number)),
+        Const::String(_) => Some(PrimKind::Dyn(DynPrim::String)),
+        Const::BigInt(_) => Some(PrimKind::Dyn(DynPrim::BigInt)),
+        Const::Int64(_) => Some(PrimKind::Static(StaticTy::I64)),
+        Const::UInt64(_) => Some(PrimKind::Static(StaticTy::U64)),
+        Const::Hole
+        | Const::ArrayLiteral(_)
+        | Const::ObjectLiteral { .. }
+        | Const::MethodRef(_) => None,
+    }
+}
+
+const fn is_js_num_like(p: DynPrim) -> bool {
+    matches!(
+        p,
+        DynPrim::Number | DynPrim::Bool | DynPrim::Null | DynPrim::Undefined
+    )
+}
+
+const fn is_static_int(s: StaticTy) -> bool {
+    matches!(
+        s,
+        StaticTy::I8
+            | StaticTy::U8
+            | StaticTy::I16
+            | StaticTy::U16
+            | StaticTy::I32
+            | StaticTy::U32
+            | StaticTy::I64
+            | StaticTy::U64
+    )
+}
+
+const fn is_static_float_or_bool(s: StaticTy) -> bool {
+    matches!(s, StaticTy::U1 | StaticTy::F32 | StaticTy::F64)
+}
+
+fn is_nonzero_const(module: &Module, v: ValueId) -> bool {
+    match proven_const(module, v) {
+        Some(Const::Int64(n)) => *n != 0,
+        Some(Const::UInt64(n)) => *n != 0,
+        Some(Const::Number(bits)) => {
+            let f = f64::from_bits(*bits);
+            f.is_finite() && f != 0.0 && (f as i64) != 0
+        }
+        _ => false,
     }
 }
 
 impl Op {
-    /// The op's effects, mechanically derived from the taxonomy (T3).
-    /// This is the single source of effect truth; passes must not
-    /// hand-maintain their own lists.
+    /// Conservative baseline effects derived from the op alone (T3, `R2-D2`).
+    /// Dynamic compute ops (`BinaryOp`, coercing `UnaryOp`, non-strict
+    /// `Compare`) conservatively report heap coercion / `may_throw` /
+    /// `UnknownCallee`; use [`Op::effects_in`] when [`Module`] value types or
+    /// constants are available.
+    #[must_use]
     pub fn effects(&self) -> Effects {
         use crate::op::Op::*;
         let reads = |reads: MemClasses| Effects {
@@ -158,46 +236,73 @@ impl Op {
             writes,
             ..Effects::PURE
         };
-        let rw = |mem: MemClasses| Effects {
-            reads: mem,
-            writes: mem,
-            ..Effects::PURE
+        let coercion = Effects {
+            reads: MemClasses::HEAP,
+            writes: MemClasses::HEAP,
+            may_throw: true,
+            may_call: CallEffect::UnknownCallee,
+            allocs: AllocKind::None,
         };
         match self {
-            // Pure compute / value flow / control. (Coercion effects of
-            // dynamic operators are a type-refined extension — see module
-            // docs.)
-            BinaryOp { .. }
-            | UnaryOp { .. }
-            | Compare { .. }
-            | Mov { .. }
+            Mov { .. }
             | LoadConst(_)
             | Phi { .. }
             | Branch { .. }
             | CondBranch { .. }
             | Return { .. }
-            | Unreachable => Effects::PURE,
+            | Unreachable
+            | LoadNewTarget
+            | LoadGlobalObject
+            | LoadFunction => Effects::PURE,
 
-            // Frame-state loads: pure reads of the physical frame (vendor
-            // `acc: out:top`, no memory interaction).
-            LoadNewTarget | LoadGlobalObject | LoadFunction => Effects::PURE,
+            UnaryOp { op, .. } => match op {
+                UnOp::LogicalNot | UnOp::IsTrue | UnOp::IsFalse | UnOp::TypeOf | UnOp::Void => {
+                    Effects::PURE
+                }
+                UnOp::Minus
+                | UnOp::BitNot
+                | UnOp::Inc
+                | UnOp::Dec
+                | UnOp::ToNumber
+                | UnOp::ToNumeric => coercion,
+            },
+            BinaryOp { .. } => coercion,
+            Compare { op, .. } => match op {
+                CmpOp::StrictEq | CmpOp::StrictNotEq => Effects::PURE,
+                CmpOp::Eq
+                | CmpOp::NotEq
+                | CmpOp::Less
+                | CmpOp::LessEq
+                | CmpOp::Greater
+                | CmpOp::GreaterEq => coercion,
+                CmpOp::In | CmpOp::InstanceOf => Effects {
+                    reads: MemClasses::HEAP.union(MemClasses::PROTOTYPE),
+                    writes: MemClasses::HEAP,
+                    may_throw: true,
+                    may_call: CallEffect::UnknownCallee,
+                    allocs: AllocKind::None,
+                },
+            },
 
-            // Vendor `asyncfunctionenter`: dead-deletable when its result is
-            // unused, so modeled PURE.
-            AsyncFunctionEnter => Effects::PURE,
-
-            // Allocation sites (T7).
-            AllocObject { .. } => Effects {
+            // Vendor `asyncfunctionenter`: allocates the async context/promise,
+            // still removable when unused via `Effects::is_removable_if_unused`.
+            AsyncFunctionEnter => Effects {
                 allocs: AllocKind::Object,
                 ..Effects::PURE
             },
-            AllocArray { .. } => Effects {
+
+            // Allocation sites (T7).
+            AllocObject { .. } | GetUnmappedArgs | CreateIterResultObj { .. } => Effects {
+                allocs: AllocKind::Object,
+                ..Effects::PURE
+            },
+            AllocArray { .. } | CopyRestArgs { .. } => Effects {
                 allocs: AllocKind::Array,
                 ..Effects::PURE
             },
             AllocRegExp { .. } => Effects {
                 allocs: AllocKind::RegExp,
-                may_throw: true, // invalid pattern/flags
+                may_throw: true,
                 ..Effects::PURE
             },
             AllocClosure { .. } => Effects {
@@ -208,26 +313,6 @@ impl Op {
                 allocs: AllocKind::GeneratorObj,
                 ..Effects::PURE
             },
-            // The unmapped `arguments` exotic object.
-            GetUnmappedArgs => Effects {
-                allocs: AllocKind::Object,
-                ..Effects::PURE
-            },
-            // The rest-args array.
-            CopyRestArgs { .. } => Effects {
-                allocs: AllocKind::Array,
-                ..Effects::PURE
-            },
-            // The iterator result object `{ value, done }`.
-            CreateIterResultObj { .. } => Effects {
-                allocs: AllocKind::Object,
-                ..Effects::PURE
-            },
-            // Vendor `gettemplateobject` (isa.yaml:1279-1283): reads the
-            // template-object cache and allocates the (cached) template
-            // object on first call; the vendored handler is
-            // abrupt-checked (`INTERPRETER_RETURN_IF_ABRUPT`,
-            // interpreter_assembly.cpp:2079-2082).
             GetTemplateObject { .. } => Effects {
                 reads: MemClasses::HEAP,
                 may_throw: true,
@@ -235,9 +320,8 @@ impl Op {
                 ..Effects::PURE
             },
 
-            // Property access (T2/T3): getters/setters/Proxy traps may
-            // run arbitrary code.
-            LoadProp { .. } | LoadPropDyn { .. } => Effects {
+            // Property access (T2/T3).
+            LoadProp { .. } | LoadPropDyn { .. } | LoadSuper { .. } | TestProp { .. } => Effects {
                 reads: MemClasses::HEAP | MemClasses::PROTOTYPE,
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
@@ -249,77 +333,54 @@ impl Op {
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
-            StoreProp { .. } | StorePropDyn { .. } | StoreSuper { .. } => Effects {
+            StoreProp { .. }
+            | StorePropDyn { .. }
+            | StoreSuper { .. }
+            | StorePropIdx { .. }
+            | DeleteProp { .. } => Effects {
                 writes: MemClasses::HEAP,
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
-            StorePropIdx { .. } => Effects {
+            StoreOwnPropName { .. } | StoreOwnPropIdx { .. } => Effects {
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                ..Effects::PURE
+            },
+            // Computed key triggers ToPropertyKey on object keys (`R2-M3`).
+            StoreOwnPropDyn { .. } | DefineGetterSetterByValue { .. } => Effects {
                 writes: MemClasses::HEAP,
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
-            // Own-property DEFINITION (vendor stownby*/definefieldby*/
-            // definepropertybyname): CreateDataProperty semantics — no
-            // setters and no prototype-chain walk, so NO may_call
-            // (mirrors DefineMethod/DefineGetterSetterByValue); throws
-            // like defineproperty (define-on-non-extensible /
-            // non-configurable redefinition failure).
-            StoreOwnPropName { .. } | StoreOwnPropDyn { .. } | StoreOwnPropIdx { .. } => Effects {
+            DefineMethod { .. } => Effects {
+                reads: MemClasses::HEAP,
                 writes: MemClasses::HEAP,
                 may_throw: true,
-                ..Effects::PURE
-            },
-            LoadSuper { .. } => Effects {
-                reads: MemClasses::HEAP | MemClasses::PROTOTYPE,
-                may_throw: true,
-                may_call: CallEffect::UnknownCallee,
-                ..Effects::PURE
-            },
-            DefineMethod { .. } => writes(MemClasses::HEAP),
-            DeleteProp { .. } => Effects {
-                writes: MemClasses::HEAP,
-                may_throw: true,                     // strict-mode delete failures
-                may_call: CallEffect::UnknownCallee, // Proxy deleteProperty trap
-                ..Effects::PURE
-            },
-            TestProp { .. } => Effects {
-                reads: MemClasses::HEAP | MemClasses::PROTOTYPE,
-                may_throw: true,
-                may_call: CallEffect::UnknownCallee, // Proxy has trap
+                allocs: AllocKind::Closure,
                 ..Effects::PURE
             },
             CopyDataProps { .. } => Effects {
                 reads: MemClasses::HEAP,
                 writes: MemClasses::HEAP,
                 may_throw: true,
-                may_call: CallEffect::UnknownCallee, // source getters
+                may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
-            // Prototype-link mutation (vendor `setobjectwithproto`,
-            // isa.yaml:1333-1337): NOT a property copy — writes the
-            // object's prototype link directly.
             SetObjectWithProto { .. } => Effects {
                 writes: MemClasses::PROTOTYPE,
-                may_throw: true, // cyclic prototype chain
+                may_throw: true,
                 ..Effects::PURE
             },
-            // Vendor `starrayspread` (isa.yaml:1329-1332): drives the
-            // source's iterator protocol and mutates the destination
-            // array; the new-index result is the acc write-back.
             ArraySpread { .. } => Effects {
                 reads: MemClasses::ITERATOR | MemClasses::HEAP,
                 writes: MemClasses::HEAP,
                 may_throw: true,
-                may_call: CallEffect::UnknownCallee, // iterator protocol
+                may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
-            // Rest destructuring (`createobjectwithexcludedkeys`): copies
-            // the source's own enumerable properties except the excluded
-            // keys into a FRESH object — a heap read plus an allocation;
-            // the copy invokes getters (CopyDataProperties semantics).
             CreateObjectWithExcludedKeys { .. } => Effects {
                 reads: MemClasses::HEAP,
                 may_throw: true,
@@ -327,113 +388,89 @@ impl Op {
                 allocs: AllocKind::Object,
                 ..Effects::PURE
             },
-            // Accessor definition on an object
-            // (`definegettersetterbyvalue`): defines the property — the
-            // closures are installed, not invoked.
-            DefineGetterSetterByValue { .. } => Effects {
-                writes: MemClasses::HEAP,
-                may_throw: true,
-                ..Effects::PURE
-            },
 
-            // Iteration protocol.
-            GetIterator { .. } => Effects {
-                reads: MemClasses::HEAP, // @@iterator lookup
+            // Iteration protocol (`R2-M1`).
+            GetIterator { .. } | GetAsyncIterator { .. } => Effects {
+                reads: MemClasses::HEAP,
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
-                allocs: AllocKind::Object, // the iterator record
-                ..Effects::PURE
-            },
-            GetAsyncIterator { .. } => Effects {
-                reads: MemClasses::HEAP, // @@asyncIterator lookup
-                may_throw: true,
-                may_call: CallEffect::UnknownCallee,
-                allocs: AllocKind::Object, // the iterator record
+                allocs: AllocKind::Object,
                 ..Effects::PURE
             },
             GetPropIterator { .. } => Effects {
-                allocs: AllocKind::Object,
-                ..Effects::PURE
+                reads: MemClasses::HEAP | MemClasses::PROTOTYPE,
+                writes: MemClasses::HEAP,
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee, // Proxy `ownKeys` trap
+                allocs: AllocKind::Iterator,
             },
             IteratorNext { .. } | IteratorReturn { .. } | IteratorThrow { .. } => Effects {
                 reads: MemClasses::ITERATOR | MemClasses::HEAP,
                 writes: MemClasses::ITERATOR,
                 may_throw: true,
-                may_call: CallEffect::UnknownCallee, // next/return/throw methods
+                may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
-            NextPropName { .. } => rw(MemClasses::ITERATOR),
+            NextPropName { .. } => Effects {
+                reads: MemClasses::ITERATOR | MemClasses::HEAP,
+                writes: MemClasses::ITERATOR,
+                may_throw: true,
+                ..Effects::PURE
+            },
 
-            // Lexical / global / module bindings.
+            // Lexical / global / module bindings (`R2-H3`, `R2-M4`).
             GetLexVar { .. } => reads(MemClasses::LEX_ENV),
-            // Lexical-environment lifecycle: pushing/popping an
-            // environment mutates the scope stack.
-            NewLexEnv { .. } | NewLexEnvWithName { .. } | PopLexEnv => writes(MemClasses::LEX_ENV),
-            PutLexVar { .. } => writes(MemClasses::LEX_ENV),
+            NewLexEnv { .. } | NewLexEnvWithName { .. } | PopLexEnv | PutLexVar { .. } => {
+                writes(MemClasses::LEX_ENV)
+            }
             TryGetGlobal { .. } => Effects {
                 reads: MemClasses::GLOBAL,
-                // N48/N50 (design/decisions.md): BOTH source forms
-                // (`ldglobalvar` and `tryldglobalbyname`) are
-                // ADCE-essential — a dead result does not make the load
-                // dead. Vendor grounding:
-                // both handlers' slow paths run
-                // `JSTaggedValue::GetProperty` on the global's prototype
-                // chain, CALLING global getters, and abrupt-check the
-                // result (RuntimeStubs::RuntimeLdGlobalVarFromProto,
-                // stubs/runtime_stubs-inl.h:1782-1793 via
-                // SlowRuntimeStub::LdGlobalVarFromGlobalProto;
-                // RuntimeStubs::RuntimeTryLdGlobalByName,
-                // :1739-1748 via
-                // SlowRuntimeStub::TryLdGlobalByNameFromGlobalProto,
-                // interpreter/slow_runtime_stub.cpp; INTERPRETER_RETURN_
-                // IF_ABRUPT in both handlers, interpreter_assembly.cpp
-                // :2425/:2611). The try form additionally raises
-                // ReferenceError " is not defined" on a miss.
                 may_throw: true,
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
-            StoreGlobal { .. } => Effects {
+            // Both `stglobalvar` (`StoreGlobal`) and `trystglobalbyname`
+            // (`TryStoreGlobal`) invoke global accessor setters; `trystglobalbyname`
+            // additionally throws `ReferenceError` when the binding is absent (`R2-H3`).
+            StoreGlobal { .. } | TryStoreGlobal { .. } => Effects {
+                reads: MemClasses::GLOBAL,
                 writes: MemClasses::GLOBAL,
-                may_throw: true, // unresolved reference in strict mode
+                may_throw: true,
+                may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
-            // Vendor `stto/stconsttoglobalrecord`: declares the binding in
-            // the GlobalDictionary (the global LEXICAL record,
-            // RuntimeStGlobalRecord, runtime_stubs-inl.h:780) — SyntaxError
-            // "Duplicate identifier" on collision, so may_throw.
             StoreGlobalRecord { .. } => Effects {
                 writes: MemClasses::GLOBAL,
-                may_throw: true, // duplicate-identifier declaration
+                may_throw: true,
                 ..Effects::PURE
             },
-            // Vendor `trystglobalbyname`: the TOLERANT store — no
-            // ReferenceError when the global is absent (mirrors
-            // TryGetGlobal's "never throws").
-            TryStoreGlobal { .. } => writes(MemClasses::GLOBAL),
             LoadModuleVar { kind, .. } if kind.is_lazy() => Effects {
                 reads: MemClasses::ALL,
                 writes: MemClasses::ALL,
                 may_throw: true,
-                may_call: CallEffect::UnknownCallee, // first read evaluates target module
+                may_call: CallEffect::UnknownCallee,
                 allocs: AllocKind::Unknown,
             },
+            LoadModuleVar {
+                kind: ModuleVarKind::SendableClass,
+                ..
+            } => reads(MemClasses::MODULE.union(MemClasses::LEX_ENV)),
             LoadModuleVar { .. } => reads(MemClasses::MODULE),
             StoreModuleVar { .. } => writes(MemClasses::MODULE),
             GetModuleNamespace { .. } => Effects {
                 reads: MemClasses::MODULE,
-                allocs: AllocKind::Object, // the namespace exotic object
+                allocs: AllocKind::Object,
                 ..Effects::PURE
             },
             DynamicImport { .. } => Effects {
                 reads: MemClasses::MODULE,
                 may_throw: true,
-                may_call: CallEffect::UnknownCallee, // host hook
-                allocs: AllocKind::Unknown,          // the promise
+                may_call: CallEffect::UnknownCallee,
+                allocs: AllocKind::Unknown,
                 ..Effects::PURE
             },
 
-            // Calls / definitions (T4).
+            // Calls / definitions (T4, `R2-M2`).
             Call { .. } => Effects {
                 reads: MemClasses::ALL,
                 writes: MemClasses::ALL,
@@ -441,40 +478,30 @@ impl Op {
                 may_call: CallEffect::UnknownCallee,
                 allocs: AllocKind::Unknown,
             },
-            DefineFunc { .. } => reads(MemClasses::LEX_ENV), // capture env
-            DefineClass { .. } => Effects {
-                reads: MemClasses::HEAP | MemClasses::PROTOTYPE, // heritage
-                writes: MemClasses::HEAP,
+            DefineFunc { .. } => reads(MemClasses::LEX_ENV),
+            DefineClass(_) | DefineSendableClass(_) => Effects {
+                reads: MemClasses::HEAP | MemClasses::PROTOTYPE | MemClasses::LEX_ENV,
+                writes: MemClasses::HEAP | MemClasses::PROTOTYPE,
                 may_throw: true,
-                may_call: CallEffect::UnknownCallee, // heritage/proto machinery
-                allocs: AllocKind::Object,
-            },
-            // N53: same effect shape as DefineClass — the difference is
-            // the runtime stub (CreateSharedClass, shared/sendable
-            // machinery vs CreateClassWithBuffer), not the effect
-            // classes the IR tracks.
-            DefineSendableClass { .. } => Effects {
-                reads: MemClasses::HEAP | MemClasses::PROTOTYPE, // heritage
-                writes: MemClasses::HEAP,
-                may_throw: true,
-                may_call: CallEffect::UnknownCallee, // heritage/proto machinery
+                may_call: CallEffect::UnknownCallee,
                 allocs: AllocKind::Object,
             },
 
-            // Private properties.
+            // Private properties (`R2-M2`).
             LoadPrivate { .. } | TestPrivate { .. } => Effects {
-                reads: MemClasses::HEAP,
-                may_throw: true, // brand check failure
+                reads: MemClasses::HEAP | MemClasses::LEX_ENV,
+                may_throw: true,
                 ..Effects::PURE
             },
             StorePrivate { .. } | DefinePrivate { .. } => Effects {
+                reads: MemClasses::HEAP | MemClasses::LEX_ENV,
                 writes: MemClasses::HEAP,
-                may_throw: true, // brand check / redefinition failure
+                may_throw: true,
                 ..Effects::PURE
             },
             CreatePrivateNames { .. } => writes(MemClasses::LEX_ENV),
 
-            // Exceptions: conditional or unconditional throws.
+            // Exceptions.
             Throw { .. }
             | ThrowIfSuperNotCalled { .. }
             | ThrowUndefinedIfHole { .. }
@@ -488,38 +515,110 @@ impl Op {
                 ..Effects::PURE
             },
 
-            // Vendor `debugger`: a breakpoint can invoke the attached
-            // debugger's hook — kept non-pure so DCE preserves it.
             Debugger => Effects {
                 may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
 
-            // Generator / async protocol.
-            SuspendGenerator { .. } => Effects {
-                reads: MemClasses::ITERATOR,
-                writes: MemClasses::ITERATOR,
-                may_throw: true, // resume can throw back in
-                may_call: CallEffect::UnknownCallee,
-                ..Effects::PURE
-            },
-            ResumeGenerator { .. } => Effects {
+            // Generator / async suspension: while suspended (`SuspendGenerator`,
+            // `Await`, `AwaitUncaught`), arbitrary host/caller JS may run before
+            // resumption (`may_call: UnknownCallee` acts as the memory clobber
+            // barrier for analyses; `ResumeGenerator` reads the saved resume
+            // value from the generator object in `ecmascript`).
+            SuspendGenerator { .. } | ResumeGenerator { .. } => Effects {
                 reads: MemClasses::ITERATOR,
                 writes: MemClasses::ITERATOR,
                 may_throw: true,
-                may_call: CallEffect::UnknownCallee, // runs generator body
+                may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
             GetResumeMode { .. } => reads(MemClasses::ITERATOR),
             Await { .. } | AwaitUncaught { .. } => Effects {
                 may_throw: true,
-                may_call: CallEffect::UnknownCallee, // thenables
+                may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
             AsyncResolve { .. } | AsyncReject { .. } => Effects {
-                may_call: CallEffect::UnknownCallee, // promise reactions
+                may_call: CallEffect::UnknownCallee,
                 ..Effects::PURE
             },
+        }
+    }
+
+    /// Context-sensitive effect query (`R2-D2`): refines [`Op::effects`] to
+    /// [`Effects::PURE`] on `UnaryOp`, `BinaryOp`, and non-brand `Compare`
+    /// whenever operand types or constant definitions in `module` rule out
+    /// object coercion (`valueOf`/`toString`/`@@toPrimitive`) and runtime
+    /// exceptions (such as `Symbol` numeric coercion or `BigInt` division by zero).
+    #[must_use]
+    pub fn effects_in(&self, module: &Module) -> Effects {
+        match self {
+            Op::UnaryOp { op, operand } => {
+                let base = self.effects();
+                if base.is_pure() {
+                    return Effects::PURE;
+                }
+                match proven_prim(module, *operand) {
+                    Some(PrimKind::Dyn(p)) if is_js_num_like(p) || p == DynPrim::String => {
+                        let _ = op;
+                        Effects::PURE
+                    }
+                    Some(PrimKind::Static(s)) if is_static_float_or_bool(s) || is_static_int(s) => {
+                        Effects::PURE
+                    }
+                    _ => base,
+                }
+            }
+            Op::BinaryOp { op, left, right } => {
+                match (proven_prim(module, *left), proven_prim(module, *right)) {
+                    (Some(PrimKind::Dyn(l)), Some(PrimKind::Dyn(r))) => {
+                        let both_num_like = is_js_num_like(l) && is_js_num_like(r);
+                        let safe_add = *op == BinOp::Add
+                            && (is_js_num_like(l) || l == DynPrim::String)
+                            && (is_js_num_like(r) || r == DynPrim::String);
+                        if both_num_like || safe_add {
+                            Effects::PURE
+                        } else {
+                            self.effects()
+                        }
+                    }
+                    (Some(PrimKind::Static(l)), Some(PrimKind::Static(r))) => {
+                        if is_static_float_or_bool(l) && is_static_float_or_bool(r) {
+                            Effects::PURE
+                        } else if is_static_int(l) && is_static_int(r) {
+                            if matches!(op, BinOp::Div | BinOp::Mod)
+                                && !is_nonzero_const(module, *right)
+                            {
+                                self.effects()
+                            } else {
+                                Effects::PURE
+                            }
+                        } else {
+                            self.effects()
+                        }
+                    }
+                    _ => self.effects(),
+                }
+            }
+            Op::Compare { op, left, right } => {
+                if matches!(op, CmpOp::StrictEq | CmpOp::StrictNotEq) {
+                    return Effects::PURE;
+                }
+                if matches!(op, CmpOp::In | CmpOp::InstanceOf) {
+                    return self.effects();
+                }
+                let is_cmp_safe = |k: PrimKind| match k {
+                    PrimKind::Dyn(p) => {
+                        is_js_num_like(p) || matches!(p, DynPrim::String | DynPrim::BigInt)
+                    }
+                    PrimKind::Static(s) => is_static_float_or_bool(s) || is_static_int(s),
+                };
+                match (proven_prim(module, *left), proven_prim(module, *right)) {
+                    (Some(l), Some(r)) if is_cmp_safe(l) && is_cmp_safe(r) => Effects::PURE,
+                    _ => self.effects(),
+                }
+            }
+            _ => self.effects(),
         }
     }
 }
@@ -527,46 +626,100 @@ impl Op {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::{ConstId, ValueId};
-    use crate::op::{BinOp, CallKind};
+    use crate::function::Value;
+    use crate::id::{BlockId, ConstId, ValueId};
+    use crate::op::CallKind;
 
-    /// Pinned effect derivations (`design/ir.md`).
     #[test]
-    fn effects_spot_table() {
+    fn effects_spot_table_and_refinement() {
         let v = ValueId::new(0);
         let name = Sym::new(0);
 
-        // LoadConst is pure.
         assert_eq!(Op::LoadConst(ConstId::new(0)).effects(), Effects::PURE);
-        // Compute ops and control flow are pure at the op level.
+        assert_eq!(
+            Op::Branch {
+                dest: BlockId::new(0)
+            }
+            .effects(),
+            Effects::PURE
+        );
+
+        // Untyped BinaryOp is conservative; StrictEq and LogicalNot are pure.
+        let add_untyped = Op::BinaryOp {
+            op: BinOp::Add,
+            left: v,
+            right: v,
+        }
+        .effects();
+        assert!(add_untyped.may_throw);
+        assert_eq!(add_untyped.may_call, CallEffect::UnknownCallee);
+        assert_eq!(
+            Op::Compare {
+                op: CmpOp::StrictEq,
+                left: v,
+                right: v,
+            }
+            .effects(),
+            Effects::PURE
+        );
+        assert_eq!(
+            Op::UnaryOp {
+                op: UnOp::LogicalNot,
+                operand: v,
+            }
+            .effects(),
+            Effects::PURE
+        );
+
+        // AsyncFunctionEnter allocates Object, removable when unused.
+        let afe = Op::AsyncFunctionEnter.effects();
+        assert_eq!(afe.allocs, AllocKind::Object);
+        assert!(!afe.is_pure());
+        assert!(afe.is_removable_if_unused());
+
+        // StoreGlobal & TryStoreGlobal both read/write GLOBAL, may_throw, may_call.
+        for op in [
+            Op::StoreGlobal { name, value: v },
+            Op::TryStoreGlobal { name, value: v },
+        ] {
+            let e = op.effects();
+            assert!(e.reads.contains(MemClasses::GLOBAL));
+            assert!(e.writes.contains(MemClasses::GLOBAL));
+            assert!(e.may_throw);
+            assert_eq!(e.may_call, CallEffect::UnknownCallee);
+        }
+
+        // Typed/constant refinement via effects_in.
+        let mut m = Module::new();
+        let c1 = m.consts.push(Const::number(2.0));
+        let v_num = ValueId::new(0);
+        m.values.push(Value {
+            def: ValueDef::Const(c1),
+            ty: Ty::Any,
+        });
+        let v_sym = ValueId::new(1);
+        m.values.push(Value {
+            def: ValueDef::Param(0),
+            ty: Ty::DynPrim(DynPrim::Symbol),
+        });
         assert_eq!(
             Op::BinaryOp {
                 op: BinOp::Add,
-                left: v,
-                right: v
+                left: v_num,
+                right: v_num,
             }
-            .effects(),
+            .effects_in(&m),
             Effects::PURE
         );
-        assert_eq!(
-            Op::Branch {
-                dest: crate::id::BlockId::new(0)
+        assert!(
+            Op::BinaryOp {
+                op: BinOp::Add,
+                left: v_num,
+                right: v_sym,
             }
-            .effects(),
-            Effects::PURE
+            .effects_in(&m)
+            .may_throw
         );
-
-        // LoadProp reads Heap + may call a getter.
-        let e = Op::LoadProp { object: v, name }.effects();
-        assert!(e.reads.contains(MemClasses::HEAP));
-        assert_eq!(e.may_call, CallEffect::UnknownCallee);
-        assert!(e.writes.is_empty());
-        assert!(!e.is_pure());
-
-        // StoreGlobal writes Global.
-        let e = Op::StoreGlobal { name, value: v }.effects();
-        assert!(e.writes.contains(MemClasses::GLOBAL));
-        assert!(e.reads.is_empty());
 
         // Call touches everything.
         let e = Op::Call {
@@ -579,137 +732,17 @@ mod tests {
         assert_eq!(e.reads, MemClasses::ALL);
         assert_eq!(e.writes, MemClasses::ALL);
         assert!(e.may_throw);
-        assert_eq!(e.may_call, CallEffect::UnknownCallee);
-        assert_eq!(e.allocs, AllocKind::Unknown);
-
-        // Allocation sites have distinct kinds (T7).
-        assert_eq!(
-            Op::AllocArray { shape: None }.effects().allocs,
-            AllocKind::Array
-        );
-        assert_eq!(
-            Op::AllocClosure { func: v }.effects().allocs,
-            AllocKind::Closure
-        );
     }
 
-    /// Every op's effect record is constructible (the match is total —
-    /// this test fails to compile if a variant is added without an
-    /// effects entry, because `match` on `Op` is exhaustive).
-    #[test]
-    fn effects_total_over_taxonomy() {
-        let e = Op::GetLexVar { level: 0, slot: 0 }.effects();
-        assert!(e.reads.contains(MemClasses::LEX_ENV));
-        let e = Op::PutLexVar {
-            level: 0,
-            slot: 0,
-            value: ValueId::new(0),
-        }
-        .effects();
-        assert!(e.writes.contains(MemClasses::LEX_ENV));
-    }
-
-    /// Full-ISA op pins: extended ops carry their documented effect records.
-    #[test]
-    fn effects_taxonomy_growth_pins() {
-        let v = ValueId::new(0);
-
-        // Lexical-env lifecycle mutates the scope stack.
-        for op in [
-            Op::NewLexEnv { num_vars: 1 },
-            Op::NewLexEnvWithName {
-                num_vars: 1,
-                scope_names: ConstId::new(0),
-            },
-            Op::PopLexEnv,
-        ] {
-            let e = op.effects();
-            assert!(e.writes.contains(MemClasses::LEX_ENV), "{op:?}");
-        }
-
-        // SetObjectWithProto writes the prototype link, never the heap
-        // property space.
-        let e = Op::SetObjectWithProto { proto: v, obj: v }.effects();
-        assert!(e.writes.contains(MemClasses::PROTOTYPE));
-        assert!(!e.writes.contains(MemClasses::HEAP));
-        assert!(e.may_throw);
-
-        // ArraySpread: heap mutation + iterator protocol.
-        let e = Op::ArraySpread {
-            dst: v,
-            index: v,
-            src: v,
-        }
-        .effects();
-        assert!(e.reads.contains(MemClasses::ITERATOR));
-        assert!(e.writes.contains(MemClasses::HEAP));
-        assert_eq!(e.may_call, CallEffect::UnknownCallee);
-
-        // GetTemplateObject: cache read + first-call allocation + abrupt.
-        let e = Op::GetTemplateObject { literal: v }.effects();
-        assert!(e.reads.contains(MemClasses::HEAP));
-        assert_eq!(e.allocs, AllocKind::Object);
-        assert!(e.may_throw);
-
-        // Frame-state loaders are pure.
-        for op in [Op::LoadNewTarget, Op::LoadGlobalObject, Op::LoadFunction] {
-            assert!(op.effects().is_pure(), "{op:?}");
-        }
-
-        // The exotic allocations.
-        assert_eq!(Op::GetUnmappedArgs.effects().allocs, AllocKind::Object);
-        assert_eq!(
-            Op::CopyRestArgs { start_index: 0 }.effects().allocs,
-            AllocKind::Array
-        );
-        assert_eq!(
-            Op::CreateIterResultObj { value: v, done: v }
-                .effects()
-                .allocs,
-            AllocKind::Object
-        );
-
-        // The async forms.
-        let e = Op::AwaitUncaught {
-            funcobj: v,
-            value: v,
-        }
-        .effects();
-        assert!(e.may_throw);
-        assert_eq!(e.may_call, CallEffect::UnknownCallee);
-        assert!(Op::AsyncFunctionEnter.effects().is_pure());
-
-        // The dedicated throw ops throw.
-        for op in [
-            Op::ThrowUndefinedIfHoleWithName {
-                name: Sym::new(0),
-                value: v,
-            },
-            Op::ThrowNotExists,
-            Op::ThrowPatternNonCoercible,
-            Op::ThrowDeleteSuperProperty,
-        ] {
-            assert!(op.effects().may_throw, "{op:?}");
-        }
-
-        // Debugger stays essential via the hook call effect.
-        assert!(!Op::Debugger.effects().is_pure());
-    }
-
-    /// N48/N50 (`design/decisions.md`): every ADCE-essential observable load
-    /// derives non-pure from this table (a write, a possible throw, or a
-    /// possible call — the `abcd-opt` ADCE essentiality rule).
     #[test]
     fn effects_cover_observable_loads() {
         let v = ValueId::new(0);
         let name = Sym::new(0);
-        let essential = |op: Op| {
-            let e = op.effects();
-            !e.writes.is_empty() || e.may_throw || e.may_call != CallEffect::None
-        };
         let cases = [
             Op::GetIterator { obj: v },
             Op::GetAsyncIterator { obj: v },
+            Op::GetPropIterator { obj: v },
+            Op::NextPropName { iterator: v },
             Op::LoadProp { object: v, name },
             Op::LoadPropDyn { object: v, key: v },
             Op::LoadPropIdx {
@@ -730,8 +763,9 @@ mod tests {
                 pattern: name,
                 flags: 0,
             },
-            // Both throwing (`ldglobalvar`) and absence-tolerant
-            // (`tryldglobalbyname`) forms fold to `TryGetGlobal`.
+            // `ldglobalvar` (`default: None`) throws ReferenceError on missing binding
+            // and calls getters; `tryldglobalbyname` (`default: Some`) tolerates
+            // absence (`undefined`) yet still calls prototype getters (`N48`/`N50`).
             Op::TryGetGlobal {
                 name,
                 default: None,
@@ -746,26 +780,26 @@ mod tests {
             },
             Op::LoadModuleVar {
                 index: 0,
-                kind: crate::op::ModuleVarKind::Lazy,
+                kind: ModuleVarKind::Lazy,
             },
         ];
         for op in cases {
             assert!(
-                essential(op.clone()),
-                "observable load must derive non-pure (N48/N50): {op:?}"
+                !op.effects().is_removable_if_unused(),
+                "observable load must NOT be removable if unused: {op:?}"
             );
         }
 
-        // Control: pure reads / pure allocations stay dead-deletable.
+        // Pure reads and non-throwing allocations stay removable when unused.
         for op in [
             Op::GetLexVar { level: 0, slot: 0 },
             Op::LoadModuleVar {
                 index: 0,
-                kind: crate::op::ModuleVarKind::Local,
+                kind: ModuleVarKind::Local,
             },
             Op::LoadModuleVar {
                 index: 0,
-                kind: crate::op::ModuleVarKind::External,
+                kind: ModuleVarKind::SendableClass,
             },
             Op::GetResumeMode { genobj: v },
             Op::AllocObject {
@@ -773,11 +807,11 @@ mod tests {
             },
             Op::AllocArray { shape: None },
             Op::AllocClosure { func: v },
-            Op::GetPropIterator { obj: v },
+            Op::AsyncFunctionEnter,
         ] {
             assert!(
-                !essential(op.clone()),
-                "pure read/alloc must stay dead-deletable: {op:?}"
+                op.effects().is_removable_if_unused(),
+                "pure read/alloc must stay removable if unused: {op:?}"
             );
         }
     }

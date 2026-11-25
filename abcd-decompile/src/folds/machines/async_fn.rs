@@ -516,12 +516,24 @@ pub(in crate::folds) fn funcobj_uses_are_machinery(
     ok
 }
 
+/// Mode operand form at an async resume-mode dispatch site.
+#[derive(Clone, Copy)]
+pub(in crate::folds) enum AsyncMode {
+    /// Mode inlined directly inside the dispatch condition.
+    Inlined,
+    /// `const m = GetResumeMode(g);`
+    Raw(ValueId),
+    /// `const cmp = GetResumeMode(g) == 1;` (split before `isfalse`/`jeqz` by `R2-C1`).
+    EqThrow(ValueId),
+}
+
 /// One matched await site (immutable match; applied separately).
 pub(in crate::folds) struct AsyncSite {
-    /// Run leaf indices of the machinery leaves (descending).
-    pub(in crate::folds) remove: Vec<usize>,
-    /// Offset of the dispatch node from the machinery run (1 + the
-    /// number of intervening phi-partition runs).
+    /// `(node_idx, leaf_idx)` of the machinery leaves, pushed tail-first
+    /// so per-node leaf indices are strictly descending.
+    pub(in crate::folds) remove: Vec<(usize, usize)>,
+    /// Offset of the dispatch node from `nodes[i]` (1 + the number of
+    /// intervening phi-partition runs).
     pub(in crate::folds) dispatch_off: usize,
     /// The awaited value expression (moved into the folded `await`).
     pub(in crate::folds) awaited: Expr,
@@ -545,45 +557,106 @@ pub(in crate::folds) fn prev_non_phi(run: &[Leaf], cur: &mut usize) -> Option<us
     None
 }
 
-/// Match `nodes[i]` (a `Stmts` run ending in the await site:
-/// `[decl a = AwaitUncaught(v), SuspendGenerator-stmt(a), decl r =
-/// ResumeGenerator(g)?, decl m = GetResumeMode(g)?]`, phi assigns
-/// skipped) + `nodes[i+1]` (the `mode == THROW` dispatch).
+/// Previous non-phi-assign leaf walking backwards across adjacent
+/// `SNode::Stmts` runs (`R2-C1` splits protected blocks before
+/// handler-live `Sta` writes, spreading the await site across adjacent
+/// statement runs with block-end phi assigns in between).
+pub(in crate::folds) fn prev_non_phi_multi<'a>(
+    nodes: &'a [SNode],
+    ni: &mut usize,
+    li: &mut usize,
+) -> Option<(usize, usize, &'a Leaf)> {
+    loop {
+        let SNode::Stmts(run) = nodes.get(*ni)? else {
+            return None;
+        };
+        while *li > 0 {
+            *li -= 1;
+            if !matches!(run[*li], Leaf::Raw(Stmt::PhiAssign { .. })) {
+                return Some((*ni, *li, &run[*li]));
+            }
+        }
+        if *ni == 0 || !matches!(nodes.get(*ni - 1), Some(SNode::Stmts(_))) {
+            return None;
+        }
+        *ni -= 1;
+        let SNode::Stmts(prev_run) = &nodes[*ni] else {
+            unreachable!()
+        };
+        *li = prev_run.len();
+    }
+}
+
+/// Match an await site ending in `nodes[i]` (`[decl a = AwaitUncaught(v),
+/// SuspendGenerator-stmt(a), decl r = ResumeGenerator(g)?, decl m =
+/// GetResumeMode(g)?]`, possibly split across adjacent `SNode::Stmts`
+/// runs by `R2-C1`) + `nodes[i + dispatch_off]` (the `mode == THROW`
+/// dispatch).
 pub(in crate::folds) fn match_await_site(
     nodes: &[SNode],
     i: usize,
     cx: &mut AsyncMachineCx,
 ) -> Option<AsyncSite> {
-    let SNode::Stmts(run) = &nodes[i] else {
+    let SNode::Stmts(run_i) = &nodes[i] else {
         return None;
     };
-    let mut remove: Vec<usize> = Vec::new();
-    let mut cur = run.len();
+    let mut remove: Vec<(usize, usize)> = Vec::new();
+    let mut ni = i;
+    let mut li = run_i.len();
+    let mut spec_consts: BTreeSet<ValueId> = BTreeSet::new();
     // Optional mode decl (tail-most machinery decl).
-    let mut mode: Option<ValueId> = None;
-    let mut save = cur;
-    if let Some(j) = prev_non_phi(run, &mut cur) {
-        match &run[j] {
+    let mut mode = AsyncMode::Inlined;
+    let mut save = (ni, li);
+    if let Some((mni, mli, leaf)) = prev_non_phi_multi(nodes, &mut ni, &mut li) {
+        let is_mode_drv = |e: &Expr| {
+            matches!(
+                e,
+                Expr::GeneratorDriver {
+                    resume: false,
+                    genobj: mg,
+                } if temp_value(mg).is_some_and(|v| cx.aliases.contains(&v))
+            )
+        };
+        match leaf {
+            Leaf::Raw(Stmt::Declare {
+                value, value_id, ..
+            }) if is_mode_drv(value) => {
+                mode = AsyncMode::Raw(*value_id);
+                remove.push((mni, mli));
+            }
             Leaf::Raw(Stmt::Declare {
                 value:
-                    Expr::GeneratorDriver {
-                        resume: false,
-                        genobj: mg,
+                    Expr::Compare {
+                        op: CmpOp::Eq,
+                        left,
+                        right,
                     },
                 value_id,
                 ..
-            }) if temp_value(mg).is_some_and(|v| cx.aliases.contains(&v)) => {
-                mode = Some(*value_id);
-                remove.push(j);
+            }) if cx.uses.get(value_id).copied().unwrap_or(0) == 0 => {
+                let bits = if is_mode_drv(left) {
+                    resolve_num(right, &cx.const_env, &mut spec_consts)
+                } else if is_mode_drv(right) {
+                    resolve_num(left, &cx.const_env, &mut spec_consts)
+                } else {
+                    None
+                };
+                if bits.is_some_and(|b| f64::from_bits(b) == 1.0) {
+                    mode = AsyncMode::EqThrow(*value_id);
+                    remove.push((mni, mli));
+                } else {
+                    spec_consts.clear();
+                    (ni, li) = save;
+                }
             }
-            _ => cur = save,
+            _ => (ni, li) = save,
         }
     }
     // Optional resume decl.
     let mut resume: Option<(ValueId, String)> = None;
-    save = cur;
-    if let Some(j) = prev_non_phi(run, &mut cur) {
-        match &run[j] {
+    save = (ni, li);
+    if let Some((rni, rli, leaf)) = prev_non_phi_multi(nodes, &mut ni, &mut li) {
+        match leaf {
             Leaf::Raw(Stmt::Declare {
                 name,
                 value:
@@ -595,27 +668,26 @@ pub(in crate::folds) fn match_await_site(
                 ..
             }) if temp_value(rg).is_some_and(|v| cx.aliases.contains(&v)) => {
                 resume = Some((*value_id, name.clone()));
-                remove.push(j);
+                remove.push((rni, rli));
             }
-            _ => cur = save,
+            _ => (ni, li) = save,
         }
     }
     // Required: the suspend stmt (`SuspendGenerator` — recovered as a
     // `Yield` expression; in an async body that is never a source
     // yield).
-    let j = prev_non_phi(run, &mut cur)?;
-    let Leaf::Raw(Stmt::Expr(Expr::Yield { value })) = &run[j] else {
+    let (sni, sli, sleaf) = prev_non_phi_multi(nodes, &mut ni, &mut li)?;
+    let Leaf::Raw(Stmt::Expr(Expr::Yield { value })) = sleaf else {
         return None;
     };
     let awaited: Expr;
     match value.as_ref() {
         // Declared form: `const a = await v;` then the suspend of `a`.
         Expr::Temp { value: at, .. } => {
-            // The await temp's only use may be the suspend.
             if cx.uses.get(at).copied().unwrap_or(0) != 1 {
                 return None;
             }
-            let k = prev_non_phi(run, &mut cur)?;
+            let (ani, ali, aleaf) = prev_non_phi_multi(nodes, &mut ni, &mut li)?;
             let Leaf::Raw(Stmt::Declare {
                 value:
                     Expr::Await {
@@ -624,7 +696,7 @@ pub(in crate::folds) fn match_await_site(
                     },
                 value_id,
                 ..
-            }) = &run[k]
+            }) = aleaf
             else {
                 return None;
             };
@@ -632,8 +704,8 @@ pub(in crate::folds) fn match_await_site(
                 return None;
             }
             awaited = (**x).clone();
-            remove.push(j);
-            remove.push(k);
+            remove.push((sni, sli));
+            remove.push((ani, ali));
         }
         // Inlined form: the suspend carries the `await` directly.
         Expr::Await {
@@ -641,30 +713,34 @@ pub(in crate::folds) fn match_await_site(
             uncaught: true,
         } => {
             awaited = (**x).clone();
-            remove.push(j);
+            remove.push((sni, sli));
         }
         _ => return None,
     }
     // The dispatch follows, separated from the machinery run by any
-    // number of phi-partition runs (the structurer splits block-end phi
-    // materializations into their own `Stmts` runs).
+    // number of phi-partition / empty runs.
     let mut dispatch_off = 1;
     while matches!(
         nodes.get(i + dispatch_off),
         Some(SNode::Stmts(run))
-            if !run.is_empty()
-                && run
-                    .iter()
-                    .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })))
+            if run
+                .iter()
+                .all(|l| matches!(l, Leaf::Raw(Stmt::PhiAssign { .. })))
     ) {
         dispatch_off += 1;
     }
-    let continuation = match_async_dispatch(
+    let continuation = match_async_dispatch_mode(
         nodes.get(i + dispatch_off)?,
         mode,
         resume.as_ref().map(|(r, _)| *r),
         cx,
     )?;
+    if let AsyncMode::EqThrow(cid) = mode
+        && nodes_use_temp(&continuation, cid)
+    {
+        return None;
+    }
+    cx.consumed_consts.extend(spec_consts);
     Some(AsyncSite {
         remove,
         dispatch_off,
@@ -680,9 +756,20 @@ pub(in crate::folds) fn match_await_site(
 /// temp, the mode operand a `Temp` of the matched mode decl or an
 /// inlined `GetResumeMode`) whose THROW arm is exactly
 /// `throw <resume>;`; the other arm is the continuation.
+#[cfg(test)]
 pub(in crate::folds) fn match_async_dispatch(
     n: &SNode,
     mode: Option<ValueId>,
+    resume: Option<ValueId>,
+    cx: &mut AsyncMachineCx,
+) -> Option<Vec<SNode>> {
+    let amode = mode.map_or(AsyncMode::Inlined, AsyncMode::Raw);
+    match_async_dispatch_mode(n, amode, resume, cx)
+}
+
+pub(in crate::folds) fn match_async_dispatch_mode(
+    n: &SNode,
+    mode: AsyncMode,
     resume: Option<ValueId>,
     cx: &mut AsyncMachineCx,
 ) -> Option<Vec<SNode>> {
@@ -699,7 +786,7 @@ pub(in crate::folds) fn match_async_dispatch(
     loop {
         match e {
             Expr::Unary {
-                op: UnOp::IsFalse,
+                op: UnOp::IsFalse | UnOp::LogicalNot,
                 operand,
             } => {
                 positive = !positive;
@@ -714,37 +801,45 @@ pub(in crate::folds) fn match_async_dispatch(
             _ => break,
         }
     }
-    let Expr::Compare {
-        op: CmpOp::Eq,
-        left,
-        right,
-    } = e
-    else {
-        return None;
-    };
     let genobj = &cx.aliases;
-    let is_mode = |e: &Expr| match mode {
-        // Declared mode temp: the condition must reference it.
-        Some(md) => temp_value(e) == Some(md),
-        // Inlined `GetResumeMode` directly in the condition.
-        None => matches!(
-            e,
-            Expr::GeneratorDriver {
-                resume: false,
-                genobj: mg,
-            } if temp_value(mg).is_some_and(|v| genobj.contains(&v))
-        ),
-    };
-    let bits = if is_mode(left) {
-        resolve_num(right, &cx.const_env, &mut cx.consumed_consts)
-    } else if is_mode(right) {
-        resolve_num(left, &cx.const_env, &mut cx.consumed_consts)
-    } else {
-        None
-    }?;
-    // The ASYNC `HandleCompletion` tests THROW(1) only.
-    if f64::from_bits(bits) != 1.0 {
-        return None;
+    match mode {
+        AsyncMode::EqThrow(cid) => {
+            if temp_value(e) != Some(cid) {
+                return None;
+            }
+        }
+        AsyncMode::Raw(_) | AsyncMode::Inlined => {
+            let Expr::Compare {
+                op: CmpOp::Eq,
+                left,
+                right,
+            } = e
+            else {
+                return None;
+            };
+            let is_mode = |e: &Expr| match mode {
+                AsyncMode::Raw(md) => temp_value(e) == Some(md),
+                AsyncMode::Inlined => matches!(
+                    e,
+                    Expr::GeneratorDriver {
+                        resume: false,
+                        genobj: mg,
+                    } if temp_value(mg).is_some_and(|v| genobj.contains(&v))
+                ),
+                AsyncMode::EqThrow(_) => unreachable!(),
+            };
+            let bits = if is_mode(left) {
+                resolve_num(right, &cx.const_env, &mut cx.consumed_consts)
+            } else if is_mode(right) {
+                resolve_num(left, &cx.const_env, &mut cx.consumed_consts)
+            } else {
+                None
+            }?;
+            // The ASYNC `HandleCompletion` tests THROW(1) only.
+            if f64::from_bits(bits) != 1.0 {
+                return None;
+            }
+        }
     }
     let (throw_arm, cont) = if positive {
         (then, otherwise)
@@ -907,43 +1002,50 @@ pub(in crate::folds) fn async_machine_seq(
         let site = match_await_site(nodes, i, cx);
         match site {
             Some(site) => {
-                let SNode::Stmts(run) = &mut nodes[i] else {
-                    unreachable!()
-                };
-                // The machinery leaves were collected tail-first
-                // (descending indices) — removal in order is safe.
-                let insert_at = *site.remove.iter().min().expect("the suspend leaf");
-                for &j in &site.remove {
-                    run.remove(j);
+                // `site.remove` was collected tail-first, so per-node
+                // leaf indices are strictly descending — removal in
+                // order is index-safe across every touched `Stmts` run.
+                let &(insert_ni, insert_li) =
+                    site.remove.last().expect("at least the suspend leaf");
+                for &(rni, rli) in &site.remove {
+                    let SNode::Stmts(run) = &mut nodes[rni] else {
+                        unreachable!()
+                    };
+                    run.remove(rli);
                 }
-                let insert_at = insert_at.min(run.len());
                 let aw = Expr::Await {
                     value: Box::new(site.awaited),
                     uncaught: true,
                 };
-                match site.resume {
-                    // The resumption value has real uses beyond the
-                    // (removed) throw arm: bind it — `const t = await v`.
-                    Some((r, name)) if cx.uses.get(&r).copied().unwrap_or(0) > 1 => {
-                        run.insert(
-                            insert_at,
-                            Leaf::Raw(Stmt::Declare {
-                                name,
-                                mutable: false,
-                                value: aw,
-                                value_id: r,
-                            }),
-                        );
-                        stats.async_machine_bound += 1;
+                {
+                    let SNode::Stmts(run) = &mut nodes[insert_ni] else {
+                        unreachable!()
+                    };
+                    let insert_at = insert_li.min(run.len());
+                    match site.resume {
+                        // The resumption value has real uses beyond the
+                        // (removed) throw arm: bind it — `const t = await v`.
+                        Some((r, name)) if cx.uses.get(&r).copied().unwrap_or(0) > 1 => {
+                            run.insert(
+                                insert_at,
+                                Leaf::Raw(Stmt::Declare {
+                                    name,
+                                    mutable: false,
+                                    value: aw,
+                                    value_id: r,
+                                }),
+                            );
+                            stats.async_machine_bound += 1;
+                        }
+                        _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
                     }
-                    _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
                 }
                 stats.async_machine_sites += 1;
                 nodes.splice(
                     i + site.dispatch_off..i + site.dispatch_off + 1,
                     site.continuation,
                 );
-                i += 1;
+                i = insert_ni + 1;
             }
             None => i += 1,
         }

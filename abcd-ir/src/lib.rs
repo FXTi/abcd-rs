@@ -62,9 +62,11 @@
 //! finding is collected into [`VerifyReport`]; error types derive
 //! `thiserror::Error`.
 
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
 
+pub mod cfg;
 pub mod consts;
 pub mod effects;
 pub mod frame;
@@ -76,6 +78,7 @@ pub mod symbol;
 pub mod ty;
 pub mod verify;
 
+pub use cfg::{DomTree, ExceptionHandlerMap, normal_succs_inline};
 pub use consts::{Const, ConstPool};
 pub use effects::{AllocKind, CallEffect, Effects, MemClasses};
 pub use frame::{FrameSlots, this_param_index};
@@ -89,7 +92,8 @@ pub use module::{
     ImportDecl, Modifiers, Module, ModuleRequest, Signature, SourceLang,
 };
 pub use op::{
-    Arity, BinOp, CallKind, CmpOp, ModuleVarKind, Op, PropKey, SuperCheck, SuperKey, UnOp,
+    Arity, BinOp, CallKind, CmpOp, DefineClassData, MemberAttrs, ModuleVarKind, Op, PropKey,
+    SuperCheck, SuperKey, UnOp,
 };
 pub use symbol::SymbolTable;
 pub use ty::{DynPrim, StaticTy, Ty};

@@ -35,9 +35,12 @@
 //!   ending in `Return`/`Unreachable`), and [`ValueDef::ExceptionParam`](abcd_ir::ValueDef)
 //!   plus handler-block phis evaluate to lattice `Bottom`.
 //! - **Effects-derived ADCE**: instruction essentiality is derived solely from
-//!   [`Op::effects`](abcd_ir::Op::effects) (`T3` contract), sweeping unused
-//!   pure instructions and dead `FunctionData::frame_init_consts` while
-//!   keeping [`abcd_ir::verify_module`] clean after every pass.
+//!   [`Op::effects_in`](abcd_ir::Op::effects_in) and
+//!   [`Effects::is_removable_if_unused`](abcd_ir::Effects::is_removable_if_unused)
+//!   (`T3` / `R2-D2` contract), preserving untyped coercing operations and
+//!   global stores while sweeping proven-pure instructions, pure reads/allocs,
+//!   and dead `FunctionData::frame_init_consts` — keeping
+//!   [`abcd_ir::verify_module`] clean after every pass.
 //!
 //! ## Library rule
 //!

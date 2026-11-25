@@ -133,13 +133,9 @@ fn g02_dump_const_pool_pair() {
     let _this = add_param(&mut m, f);
     let r0 = intern(&mut m, "x\\t");
     let c0 = intern(&mut m, "x\t");
-    let pair = const_id(
-        &mut m,
-        Const::ArrayLiteral(vec![
-            Const::ArrayLiteral(vec![Const::String(r0)]),
-            Const::ArrayLiteral(vec![Const::String(c0)]),
-        ]),
-    );
+    let raw_arr = const_array(&mut m, vec![Const::String(r0)]);
+    let cooked_arr = const_array(&mut m, vec![Const::String(c0)]);
+    let pair = m.consts.push_array(vec![raw_arr, cooked_arr]);
     let lit = emit(&mut m, b, Op::LoadConst(pair));
     let tpl = emit(&mut m, b, Op::GetTemplateObject { literal: lit });
     emit_void(&mut m, b, Op::Return { value: Some(tpl) });
@@ -347,10 +343,7 @@ fn g08_emit_cooked_only_fallback() {
     let _this = add_param(&mut m, f);
     let s1 = intern(&mut m, "hello ");
     let s2 = intern(&mut m, " world");
-    let arr = const_id(
-        &mut m,
-        Const::ArrayLiteral(vec![Const::String(s1), Const::String(s2)]),
-    );
+    let arr = const_array(&mut m, vec![Const::String(s1), Const::String(s2)]);
     let lit = emit(&mut m, b, Op::LoadConst(arr));
     let tpl = emit(&mut m, b, Op::GetTemplateObject { literal: lit });
     emit_void(&mut m, b, Op::Return { value: Some(tpl) });

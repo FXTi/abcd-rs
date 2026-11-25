@@ -505,6 +505,7 @@ fn type_summary_offset_field_yields_no_initial_value_and_preserves_scope_names()
     );
 
     let alpha_sym = m.sym.intern("alpha_scope");
+    let alpha_cid = m.consts.intern(Const::String(alpha_sym));
     let c_merged = &m.classes[class_id_of(&m, "LMerged;").index()];
     assert_eq!(c_merged.fields[0].initial_value, None);
     assert_eq!(c_merged.fields[1].initial_value, None);
@@ -513,7 +514,7 @@ fn type_summary_offset_field_yields_no_initial_value_and_preserves_scope_names()
         .expect("scopeNames field populates ClassData::scope_names");
     assert_eq!(
         m.consts.get(scope_cid),
-        Some(&Const::ArrayLiteral(vec![Const::String(alpha_sym)])),
+        Some(&Const::ArrayLiteral(vec![alpha_cid])),
         "typeSummaryOffset LiteralArrayRef after scopeNames must not clobber scope_names"
     );
 }
@@ -734,72 +735,65 @@ fn annotation_element_kinds_matrix() {
         &AnnValue::Name(m_sym),
         "method handle keeps the entity name (registered gap)"
     );
+    let arr_elems = |v: &AnnValue| -> Vec<Const> {
+        let AnnValue::Const(c) = v else {
+            panic!("expected AnnValue::Const, got {v:?}")
+        };
+        let Some(Const::ArrayLiteral(ids)) = m.consts.get(*c) else {
+            panic!("expected ArrayLiteral, got {:?}", m.consts.get(*c))
+        };
+        ids.iter()
+            .map(|&id| m.consts.get(id).expect("elem const").clone())
+            .collect()
+    };
     assert_eq!(
-        const_of(by_name["litarray"]),
-        Const::ArrayLiteral(vec![Const::number(42.0)]),
-        "literal-array element → its const tree"
+        arr_elems(by_name["litarray"]),
+        vec![Const::number(42.0)],
+        "literal-array element → pooled ArrayLiteral"
     );
 
-    // ── the Array arm + annotation_value_as_const (metadata.rs:384-454)
+    // ── the Array arm + annotation_value_as_const_id (metadata.rs)
     assert_eq!(
-        const_of(by_name["arrbool"]),
-        Const::ArrayLiteral(vec![Const::Bool(true), Const::Bool(false)])
+        arr_elems(by_name["arrbool"]),
+        vec![Const::Bool(true), Const::Bool(false)]
+    );
+    assert_eq!(arr_elems(by_name["arri8"]), vec![Const::number(-8.0)]);
+    assert_eq!(arr_elems(by_name["arru8"]), vec![Const::number(250.0)]);
+    assert_eq!(arr_elems(by_name["arri16"]), vec![Const::number(-300.0)]);
+    assert_eq!(arr_elems(by_name["arru16"]), vec![Const::number(60000.0)]);
+    assert_eq!(arr_elems(by_name["arri32"]), vec![Const::number(-70000.0)]);
+    assert_eq!(
+        arr_elems(by_name["arru32"]),
+        vec![Const::number(7.0), Const::number(8.0)]
+    );
+    assert_eq!(arr_elems(by_name["arrf32"]), vec![Const::number(6.25)]);
+    assert_eq!(
+        arr_elems(by_name["arrstr"]),
+        vec![Const::String(s1_sym), Const::String(s2_sym)]
     );
     assert_eq!(
-        const_of(by_name["arri8"]),
-        Const::ArrayLiteral(vec![Const::number(-8.0)])
-    );
-    assert_eq!(
-        const_of(by_name["arru8"]),
-        Const::ArrayLiteral(vec![Const::number(250.0)])
-    );
-    assert_eq!(
-        const_of(by_name["arri16"]),
-        Const::ArrayLiteral(vec![Const::number(-300.0)])
-    );
-    assert_eq!(
-        const_of(by_name["arru16"]),
-        Const::ArrayLiteral(vec![Const::number(60000.0)])
-    );
-    assert_eq!(
-        const_of(by_name["arri32"]),
-        Const::ArrayLiteral(vec![Const::number(-70000.0)])
-    );
-    assert_eq!(
-        const_of(by_name["arru32"]),
-        Const::ArrayLiteral(vec![Const::number(7.0), Const::number(8.0)])
-    );
-    assert_eq!(
-        const_of(by_name["arrf32"]),
-        Const::ArrayLiteral(vec![Const::number(6.25)])
-    );
-    assert_eq!(
-        const_of(by_name["arrstr"]),
-        Const::ArrayLiteral(vec![Const::String(s1_sym), Const::String(s2_sym)])
-    );
-    assert_eq!(
-        const_of(by_name["arrrec"]),
-        Const::ArrayLiteral(vec![Const::String(inner_desc_sym)]),
+        arr_elems(by_name["arrrec"]),
+        vec![Const::String(inner_desc_sym)],
         "record array elements become descriptor strings (documented)"
     );
     assert_eq!(
-        const_of(by_name["arrmeth"]),
-        Const::ArrayLiteral(vec![Const::MethodRef(fid_m)]),
+        arr_elems(by_name["arrmeth"]),
+        vec![Const::MethodRef(fid_m)],
         "method array elements keep MethodRef identity"
     );
     assert_eq!(
-        const_of(by_name["arrenum"]),
-        Const::ArrayLiteral(vec![Const::String(fld_sym)]),
+        arr_elems(by_name["arrenum"]),
+        vec![Const::String(fld_sym)],
         "enum array elements become name strings (documented)"
     );
     assert_eq!(
-        const_of(by_name["arrann"]),
-        Const::ArrayLiteral(vec![Const::String(inner_desc_sym)]),
+        arr_elems(by_name["arrann"]),
+        vec![Const::String(inner_desc_sym)],
         "nested-annotation array elements become descriptor strings"
     );
     assert_eq!(
-        const_of(by_name["arrmh"]),
-        Const::ArrayLiteral(vec![Const::String(m_sym)]),
+        arr_elems(by_name["arrmh"]),
+        vec![Const::String(m_sym)],
         "method-handle array elements become name strings"
     );
 }
@@ -966,9 +960,16 @@ fn annotation_degrade_arms_for_dangling_identities() {
         AnnValue::Name(handlee),
         "method handle keeps the entity name"
     );
+    let lit_elems: Vec<Const> = match const_of(&by_name["lit"]) {
+        Const::ArrayLiteral(ids) => ids
+            .into_iter()
+            .map(|id| m.consts.get(id).expect("elem const").clone())
+            .collect(),
+        other => panic!("expected ArrayLiteral, got {other:?}"),
+    };
     assert_eq!(
-        const_of(&by_name["lit"]),
-        Const::ArrayLiteral(vec![Const::number(5.0), Const::Null]),
+        lit_elems,
+        vec![Const::number(5.0), Const::Null],
         "failing literal-array elements degrade to null inside the array"
     );
 }
@@ -1078,27 +1079,37 @@ fn annotation_value_as_const_exotic_array_elements() {
     let AnnValue::Const(arr_cid) = ann0.elements[0].1 else {
         panic!("expected Const, got {:?}", ann0.elements[0]);
     };
+    let c_neg3 = m.consts.intern(Const::number(-3.0));
+    let c_nine = m.consts.intern(Const::number(9.0));
+    let c_half = m.consts.intern(Const::number(0.5));
+    let c_eight = m.consts.intern(Const::number(8.0));
+    let c_null = m.consts.intern(Const::Null);
+    let c_lit_arr = m.consts.intern(Const::ArrayLiteral(vec![c_eight, c_null]));
+    let c_undef = m.consts.intern(Const::Undefined);
+    let c_true = m.consts.intern(Const::Bool(true));
+    let c_nested_arr = m.consts.intern(Const::ArrayLiteral(vec![c_true]));
+    let c_zz_ok = m.consts.intern(Const::String(zz_ok_sym));
+    let c_ann_desc = m.consts.intern(Const::String(ann_desc_sym));
     assert_eq!(
         m.consts.get(arr_cid),
         Some(&Const::ArrayLiteral(vec![
-            Const::number(-3.0), // I64
-            Const::number(9.0),  // U64
-            Const::number(0.5),  // F64
-            // LiteralArray (one element fails → Null in place)
-            Const::ArrayLiteral(vec![Const::number(8.0), Const::Null]),
-            Const::Undefined,                             // Void
-            Const::Null,                                  // StringNullptr
-            Const::ArrayLiteral(vec![Const::Bool(true)]), // nested Array
-            Const::String(zz_ok_sym),                     // Method miss, name ok
-            Const::Null,                                  // Method miss, dangling name
-            Const::Null,                                  // Record dangling
-            Const::Null,                                  // Enum dangling name
-            Const::String(zz_ok_sym),                     // MethodHandle, name ok
-            Const::Null,                                  // MethodHandle dangling
-            Const::String(ann_desc_sym),                  // nested Annotation, ok
-            Const::Null,                                  // nested Annotation, dangling
+            c_neg3,       // I64
+            c_nine,       // U64
+            c_half,       // F64
+            c_lit_arr,    // LiteralArray (one element fails → Null in place)
+            c_undef,      // Void
+            c_null,       // StringNullptr
+            c_nested_arr, // nested Array
+            c_zz_ok,      // Method miss, name ok
+            c_null,       // Method miss, dangling name
+            c_null,       // Record dangling
+            c_null,       // Enum dangling name
+            c_zz_ok,      // MethodHandle, name ok
+            c_null,       // MethodHandle dangling
+            c_ann_desc,   // nested Annotation, ok
+            c_null,       // nested Annotation, dangling
         ])),
-        "the full annotation_value_as_const matrix"
+        "the full annotation_value_as_const_id matrix"
     );
 }
 
@@ -1577,13 +1588,13 @@ fn deep_nested_annotation_array_lifts_iteratively() {
     let AnnValue::Const(cid) = ann.elements[0].1 else {
         panic!("expected pooled ArrayLiteral const");
     };
-    let mut cur = m.consts.get(cid).expect("const");
+    let mut cur_cid = cid;
     for _ in 0..depth {
-        let Const::ArrayLiteral(elems) = cur else {
+        let Some(Const::ArrayLiteral(elems)) = m.consts.get(cur_cid) else {
             panic!("expected ArrayLiteral");
         };
         assert_eq!(elems.len(), 1);
-        cur = &elems[0];
+        cur_cid = elems[0];
     }
-    assert_eq!(cur, &Const::Bool(true));
+    assert_eq!(m.consts.get(cur_cid), Some(&Const::Bool(true)));
 }

@@ -72,12 +72,19 @@ impl SymbolTable {
     }
 
     /// Intern a pre-classified lossy MUTF-8 sequence (`raw` has no lossless
-    /// UTF-8 `str` form; `lossy` is its replacement display text).
+    /// UTF-8 `str` form; `lossy` is its replacement display text). If `raw` is
+    /// actually lossless MUTF-8/UTF-8, routes to [`Self::intern`] so duplicate
+    /// UTF-8 vs raw symbols can never be created (`R2-M9`).
     pub fn intern_lossy_raw(&mut self, lossy: &str, raw: &[u8]) -> Sym {
+        if let Some(text) = mutf8_decode_utf8(raw) {
+            return self.intern(&text);
+        }
         if let Some(&sym) = self.raw_to_sym.get(raw) {
             return sym;
         }
-        let sym = Sym(self.entries.len() as u32);
+        let raw_idx =
+            u32::try_from(self.entries.len()).expect("SymbolTable exceeded u32::MAX entries");
+        let sym = Sym(raw_idx);
         let raw_arc: Arc<[u8]> = Arc::from(raw);
         self.entries.push(SymEntry::RawMutf8 {
             raw: Arc::clone(&raw_arc),
@@ -122,10 +129,17 @@ impl SymbolTable {
         }
     }
 
-    /// Canonical MUTF-8 wire bytes for any valid `sym`.
+    /// Canonical MUTF-8 wire bytes for any valid `sym`. ASCII and BMP UTF-8
+    /// strings without embedded `U+0000` borrow directly without allocating.
     pub fn to_mutf8_bytes(&self, sym: Sym) -> Option<Cow<'_, [u8]>> {
         match self.entries.get(sym.index())? {
-            SymEntry::Utf8(s) => Some(Cow::Owned(mutf8_encode(s))),
+            SymEntry::Utf8(s) => {
+                if s.bytes().all(|b| b != 0 && b < 0xF0) {
+                    Some(Cow::Borrowed(s.as_bytes()))
+                } else {
+                    Some(Cow::Owned(mutf8_encode(s)))
+                }
+            }
             SymEntry::RawMutf8 { raw, .. } => Some(Cow::Borrowed(raw)),
         }
     }

@@ -8,6 +8,8 @@
 //! shorter), and the non-finite values are mapped to their JS spellings
 //! (`NaN`, `Infinity`, `-Infinity`).
 
+use std::collections::HashSet;
+
 use abcd_ir::consts::Const;
 use abcd_ir::module::Module;
 use abcd_ir::{ConstId, Sym};
@@ -25,9 +27,11 @@ pub fn sym_str(module: &Module, sym: Sym) -> String {
 }
 
 /// Convert a pooled constant to a [`Lit`]; `None` for a [`ConstId`] the
-/// pool never issued (data, not a panic).
+/// pool never issued or a cyclic shape (data, not a panic).
 pub fn lit_of(module: &Module, id: ConstId) -> Option<Lit> {
-    const_to_lit(module, module.consts.get(id)?)
+    let mut active = HashSet::new();
+    active.insert(id);
+    const_to_lit_with_active(module, module.consts.get(id)?, &mut active)
 }
 
 /// Convert a [`Sym`] to its lossless [`Lit`] (`Lit::String` for valid UTF-8,
@@ -42,30 +46,172 @@ pub fn lit_of_sym(module: &Module, sym: Sym) -> Lit {
     }
 }
 
-/// Convert a [`Const`] tree to a [`Lit`] tree (recursive; shapes nest).
+/// Convert a [`Const`] entry (and any child [`ConstId`]s in `module.consts`)
+/// to a [`Lit`] tree iteratively with an active-ancestor cycle guard.
 pub fn const_to_lit(module: &Module, c: &Const) -> Option<Lit> {
+    let mut active = HashSet::new();
+    const_to_lit_with_active(module, c, &mut active)
+}
+
+enum ConstBuildFrame<'a> {
+    Array {
+        owner: Option<ConstId>,
+        items: &'a [ConstId],
+        idx: usize,
+        out: Vec<Lit>,
+    },
+    Object {
+        owner: Option<ConstId>,
+        keys: &'a [ConstId],
+        values: &'a [ConstId],
+        idx: usize,
+        pending_key: Option<Lit>,
+        out: Vec<(Lit, Lit)>,
+    },
+}
+
+fn scalar_const_to_lit(module: &Module, c: &Const) -> Option<Lit> {
     Some(match c {
         Const::Undefined => Lit::Undefined,
         Const::Hole => Lit::Hole,
         Const::Null => Lit::Null,
         Const::Bool(b) => Lit::Bool(*b),
         Const::Number(bits) => Lit::Number(*bits),
+        Const::Int64(v) => Lit::Int64(*v),
+        Const::UInt64(v) => Lit::UInt64(*v),
         Const::String(s) => lit_of_sym(module, *s),
         Const::BigInt(s) => Lit::BigInt(sym_str(module, *s)),
-        Const::ArrayLiteral(items) => Lit::Array(
-            items
-                .iter()
-                .map(|i| const_to_lit(module, i))
-                .collect::<Option<Vec<_>>>()?,
-        ),
-        Const::ObjectLiteral { keys, values } => Lit::Object(
-            keys.iter()
-                .zip(values.iter())
-                .map(|(k, v)| Some((const_to_lit(module, k)?, const_to_lit(module, v)?)))
-                .collect::<Option<Vec<_>>>()?,
-        ),
         Const::MethodRef(f) => Lit::MethodRef(*f),
+        Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => return None,
     })
+}
+
+fn push_const_frame<'a>(
+    c: &'a Const,
+    owner: Option<ConstId>,
+    frames: &mut Vec<ConstBuildFrame<'a>>,
+) {
+    match c {
+        Const::ArrayLiteral(items) => frames.push(ConstBuildFrame::Array {
+            owner,
+            items,
+            idx: 0,
+            out: Vec::with_capacity(items.len()),
+        }),
+        Const::ObjectLiteral { keys, values } => frames.push(ConstBuildFrame::Object {
+            owner,
+            keys,
+            values,
+            idx: 0,
+            pending_key: None,
+            out: Vec::with_capacity(keys.len().min(values.len())),
+        }),
+        _ => {}
+    }
+}
+
+fn const_to_lit_with_active(
+    module: &Module,
+    root: &Const,
+    active: &mut HashSet<ConstId>,
+) -> Option<Lit> {
+    if let Some(lit) = scalar_const_to_lit(module, root) {
+        return Some(lit);
+    }
+    let mut frames: Vec<ConstBuildFrame<'_>> = Vec::new();
+    push_const_frame(root, None, &mut frames);
+    let mut completed: Option<Lit> = None;
+
+    while let Some(top) = frames.last_mut() {
+        match top {
+            ConstBuildFrame::Array {
+                owner,
+                items,
+                idx,
+                out,
+            } => {
+                if let Some(child_lit) = completed.take() {
+                    out.push(child_lit);
+                }
+                if *idx < items.len() {
+                    let cid = items[*idx];
+                    *idx += 1;
+                    let child = module.consts.get(cid)?;
+                    if let Some(lit) = scalar_const_to_lit(module, child) {
+                        out.push(lit);
+                    } else {
+                        if !active.insert(cid) {
+                            return None;
+                        }
+                        push_const_frame(child, Some(cid), &mut frames);
+                    }
+                } else {
+                    if let Some(id) = *owner {
+                        active.remove(&id);
+                    }
+                    let done = Lit::Array(std::mem::take(out));
+                    frames.pop();
+                    if frames.is_empty() {
+                        return Some(done);
+                    }
+                    completed = Some(done);
+                }
+            }
+            ConstBuildFrame::Object {
+                owner,
+                keys,
+                values,
+                idx,
+                pending_key,
+                out,
+            } => {
+                let len = keys.len().min(values.len());
+                if let Some(child_lit) = completed.take() {
+                    if let Some(k_lit) = pending_key.take() {
+                        out.push((k_lit, child_lit));
+                    } else {
+                        *pending_key = Some(child_lit);
+                    }
+                }
+                if let Some(k_lit) = pending_key.take() {
+                    let vcid = values[*idx - 1];
+                    let vchild = module.consts.get(vcid)?;
+                    if let Some(vlit) = scalar_const_to_lit(module, vchild) {
+                        out.push((k_lit, vlit));
+                    } else {
+                        *pending_key = Some(k_lit);
+                        if !active.insert(vcid) {
+                            return None;
+                        }
+                        push_const_frame(vchild, Some(vcid), &mut frames);
+                    }
+                } else if *idx < len {
+                    let kcid = keys[*idx];
+                    *idx += 1;
+                    let kchild = module.consts.get(kcid)?;
+                    if let Some(klit) = scalar_const_to_lit(module, kchild) {
+                        *pending_key = Some(klit);
+                    } else {
+                        if !active.insert(kcid) {
+                            return None;
+                        }
+                        push_const_frame(kchild, Some(kcid), &mut frames);
+                    }
+                } else {
+                    if let Some(id) = *owner {
+                        active.remove(&id);
+                    }
+                    let done = Lit::Object(std::mem::take(out));
+                    frames.pop();
+                    if frames.is_empty() {
+                        return Some(done);
+                    }
+                    completed = Some(done);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Render an `f64` bit pattern as the shortest JS number literal that
@@ -291,56 +437,174 @@ pub fn render_pool_string(_module: &Module, s: &str) -> String {
 /// Render a [`Lit`] as its JS literal text (used by the dump; Stage C
 /// reuses the same renderer).
 pub fn render_lit(lit: &Lit) -> String {
-    render_lit_inner(None, lit)
+    render_lit_ex(lit, false)
 }
 
 /// [`render_lit`] with module context (Stage C entry point).
-pub fn render_lit_m(module: &Module, lit: &Lit) -> String {
-    render_lit_inner(Some(module), lit)
+pub fn render_lit_m(_module: &Module, lit: &Lit) -> String {
+    render_lit_ex(lit, false)
 }
 
-/// The shared [`render_lit`]/[`render_lit_m`] walker.
-fn render_lit_inner(module: Option<&Module>, lit: &Lit) -> String {
-    match lit {
-        Lit::Undefined => "undefined".to_string(),
-        // The hole has no JS spelling (see expr.rs); annotated.
-        Lit::Hole => "undefined/*hole*/".to_string(),
-        Lit::Null => "null".to_string(),
-        Lit::Bool(b) => b.to_string(),
-        Lit::Number(bits) => render_number(*bits),
-        Lit::String(s) => render_string(s),
-        Lit::Utf16(units) => render_utf16_string(units),
-        Lit::BigInt(s) => format!("{s}n"),
-        Lit::Array(items) => {
-            let inner: Vec<String> = items.iter().map(|i| render_lit_inner(module, i)).collect();
-            format!("[{}]", inner.join(", "))
-        }
-        Lit::Object(entries) => {
-            let inner: Vec<String> = entries
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{}: {}",
-                        render_lit_key_inner(module, k),
-                        render_lit_inner(module, v)
-                    )
-                })
-                .collect();
-            format!("{{{}}}", inner.join(", "))
-        }
-        Lit::MethodRef(f) => format!("<method fn#{}>", f.index()),
+/// Iterative [`Lit`] renderer shared between Stage-A dumps (`js_method_ref = false`)
+/// and Stage-C JS emission (`js_method_ref = true`).
+pub(crate) fn render_lit_ex(root: &Lit, js_method_ref: bool) -> String {
+    enum RenderFrame<'a> {
+        Array {
+            items: &'a [Lit],
+            idx: usize,
+            parts: Vec<String>,
+        },
+        Object {
+            entries: &'a [(Lit, Lit)],
+            idx: usize,
+            pending_key: Option<String>,
+            parts: Vec<String>,
+        },
     }
-}
+    let scalar = |lit: &Lit| -> Option<String> {
+        Some(match lit {
+            Lit::Undefined => "undefined".to_string(),
+            Lit::Hole => "undefined/*hole*/".to_string(),
+            Lit::Null => "null".to_string(),
+            Lit::Bool(b) => b.to_string(),
+            Lit::Number(bits) => render_number(*bits),
+            Lit::Int64(v) => v.to_string(),
+            Lit::UInt64(v) => v.to_string(),
+            Lit::String(s) => render_string(s),
+            Lit::Utf16(units) => render_utf16_string(units),
+            Lit::BigInt(s) => format!("{s}n"),
+            Lit::MethodRef(f) => {
+                if js_method_ref {
+                    format!("undefined /*method fn#{}*/", f.index())
+                } else {
+                    format!("<method fn#{}>", f.index())
+                }
+            }
+            Lit::Array(_) | Lit::Object(_) => return None,
+        })
+    };
+    if let Some(s) = scalar(root) {
+        return s;
+    }
+    let mut stack: Vec<RenderFrame<'_>> = Vec::new();
+    match root {
+        Lit::Array(items) => stack.push(RenderFrame::Array {
+            items,
+            idx: 0,
+            parts: Vec::with_capacity(items.len()),
+        }),
+        Lit::Object(entries) => stack.push(RenderFrame::Object {
+            entries,
+            idx: 0,
+            pending_key: None,
+            parts: Vec::with_capacity(entries.len()),
+        }),
+        _ => return String::new(),
+    }
+    let mut completed: Option<String> = None;
 
-/// [`render_lit_key_inner`]: an object-literal key: identifier form
-/// when legal, string form otherwise.
-fn render_lit_key_inner(module: Option<&Module>, lit: &Lit) -> String {
-    if let Lit::String(s) = lit
-        && crate::legalize::is_legal_ident(s)
-    {
-        return s.clone();
+    while let Some(top) = stack.last_mut() {
+        match top {
+            RenderFrame::Array { items, idx, parts } => {
+                if let Some(done) = completed.take() {
+                    parts.push(done);
+                }
+                if *idx < items.len() {
+                    let item = &items[*idx];
+                    *idx += 1;
+                    if let Some(s) = scalar(item) {
+                        parts.push(s);
+                    } else if let Lit::Array(sub) = item {
+                        stack.push(RenderFrame::Array {
+                            items: sub,
+                            idx: 0,
+                            parts: Vec::with_capacity(sub.len()),
+                        });
+                    } else if let Lit::Object(sub) = item {
+                        stack.push(RenderFrame::Object {
+                            entries: sub,
+                            idx: 0,
+                            pending_key: None,
+                            parts: Vec::with_capacity(sub.len()),
+                        });
+                    }
+                } else {
+                    let s = format!("[{}]", parts.join(", "));
+                    stack.pop();
+                    if stack.is_empty() {
+                        return s;
+                    }
+                    completed = Some(s);
+                }
+            }
+            RenderFrame::Object {
+                entries,
+                idx,
+                pending_key,
+                parts,
+            } => {
+                if let Some(done) = completed.take() {
+                    if let Some(k_str) = pending_key.take() {
+                        parts.push(format!("{k_str}: {done}"));
+                    } else {
+                        *pending_key = Some(done);
+                    }
+                }
+                if let Some(k_str) = pending_key.take() {
+                    let (_, v) = &entries[*idx - 1];
+                    if let Some(vs) = scalar(v) {
+                        parts.push(format!("{k_str}: {vs}"));
+                    } else if let Lit::Array(sub) = v {
+                        *pending_key = Some(k_str);
+                        stack.push(RenderFrame::Array {
+                            items: sub,
+                            idx: 0,
+                            parts: Vec::with_capacity(sub.len()),
+                        });
+                    } else if let Lit::Object(sub) = v {
+                        *pending_key = Some(k_str);
+                        stack.push(RenderFrame::Object {
+                            entries: sub,
+                            idx: 0,
+                            pending_key: None,
+                            parts: Vec::with_capacity(sub.len()),
+                        });
+                    }
+                } else if *idx < entries.len() {
+                    let (k, _) = &entries[*idx];
+                    *idx += 1;
+                    if let Lit::String(s) = k
+                        && crate::legalize::is_legal_ident(s)
+                    {
+                        *pending_key = Some(s.clone());
+                    } else if let Some(ks) = scalar(k) {
+                        *pending_key = Some(ks);
+                    } else if let Lit::Array(sub) = k {
+                        stack.push(RenderFrame::Array {
+                            items: sub,
+                            idx: 0,
+                            parts: Vec::with_capacity(sub.len()),
+                        });
+                    } else if let Lit::Object(sub) = k {
+                        stack.push(RenderFrame::Object {
+                            entries: sub,
+                            idx: 0,
+                            pending_key: None,
+                            parts: Vec::with_capacity(sub.len()),
+                        });
+                    }
+                } else {
+                    let s = format!("{{{}}}", parts.join(", "));
+                    stack.pop();
+                    if stack.is_empty() {
+                        return s;
+                    }
+                    completed = Some(s);
+                }
+            }
+        }
     }
-    render_lit_inner(module, lit)
+    String::new()
 }
 
 /// Map the vendor RegExp flag bits (arkcompiler
@@ -485,5 +749,43 @@ mod tests {
         assert_eq!(render_sym_string(&m, raw_sym), "\"\\uD800\"");
         assert_eq!(render_sym_string(&m, pua_sym), "\"\u{E000}icon\"");
         assert_eq!(render_pool_string(&m, "plain"), "\"plain\"");
+    }
+
+    #[test]
+    fn int64_uint64_and_deep_const_pool_shapes_on_256k_stack() {
+        let mut m = Module::new();
+        let ci = m.consts.intern(Const::Int64(i64::MIN));
+        let cu = m.consts.intern(Const::UInt64(u64::MAX));
+        let ksym = m.sym.intern("id");
+        let ck = m.consts.intern(Const::String(ksym));
+        let obj = m.consts.push_object(vec![ck], vec![ci]);
+        let arr = m.consts.push_array(vec![obj, cu]);
+        let lit = lit_of(&m, arr).expect("resolve flat ConstPool graph");
+        assert_eq!(
+            render_lit(&lit),
+            format!("[{{id: {}}}, {}]", i64::MIN, u64::MAX)
+        );
+
+        let mut deep_cid = cu;
+        for _ in 0..3_000 {
+            deep_cid = m.consts.push_array(vec![deep_cid]);
+        }
+
+        std::thread::scope(|s| {
+            let handle = std::thread::Builder::new()
+                .name("consts-256k-stack".to_string())
+                .stack_size(256 * 1024)
+                .spawn_scoped(s, || {
+                    let deep_lit = lit_of(&m, deep_cid).expect("deep array literal");
+                    let rendered = render_lit(&deep_lit);
+                    assert!(rendered.starts_with("[[["));
+                    let mut cur = deep_lit;
+                    while let Lit::Array(mut v) = cur {
+                        cur = v.pop().unwrap_or(Lit::Null);
+                    }
+                })
+                .expect("spawn 256k thread");
+            handle.join().expect("256k thread must not stack-overflow");
+        });
     }
 }

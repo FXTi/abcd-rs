@@ -115,8 +115,8 @@ impl DecompileIndex {
 
         let mut class_ctors = HashSet::new();
         for inst in &module.insts {
-            if let Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } = &inst.op {
-                class_ctors.insert(*ctor);
+            if let Op::DefineClass(cls) | Op::DefineSendableClass(cls) = &inst.op {
+                class_ctors.insert(cls.ctor);
             }
         }
 
@@ -415,33 +415,42 @@ fn common_prefix(a: &[EnvFrame], b: &[EnvFrame]) -> Vec<EnvFrame> {
 /// object-shape `MethodRef`s (all emitted inline at the site, so their
 /// captured chain is the site's env stack).
 fn defined_children(module: &Module, op: &Op) -> Vec<FuncId> {
-    fn method_refs(module: &Module, cid: ConstId, out: &mut Vec<FuncId>) {
-        if let Some(root) = module.consts.get(cid) {
-            let mut stack: Vec<&Const> = vec![root];
-            while let Some(c) = stack.pop() {
-                match c {
-                    Const::MethodRef(f) => out.push(*f),
-                    Const::ArrayLiteral(items) => {
-                        for i in items.iter().rev() {
-                            stack.push(i);
+    fn method_refs(module: &Module, root_cid: ConstId, out: &mut Vec<FuncId>) {
+        let mut visited: HashSet<ConstId> = HashSet::new();
+        if !visited.insert(root_cid) {
+            return;
+        }
+        let mut stack: Vec<ConstId> = vec![root_cid];
+        while let Some(cid) = stack.pop() {
+            let Some(c) = module.consts.get(cid) else {
+                continue;
+            };
+            match c {
+                Const::MethodRef(f) => out.push(*f),
+                Const::ArrayLiteral(items) => {
+                    for &item_cid in items.iter().rev() {
+                        if visited.insert(item_cid) {
+                            stack.push(item_cid);
                         }
                     }
-                    Const::ObjectLiteral { keys, values } => {
-                        for i in values.iter().rev().chain(keys.iter().rev()) {
-                            stack.push(i);
-                        }
-                    }
-                    _ => {}
                 }
+                Const::ObjectLiteral { keys, values } => {
+                    for &child_cid in values.iter().rev().chain(keys.iter().rev()) {
+                        if visited.insert(child_cid) {
+                            stack.push(child_cid);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
     let mut out = Vec::new();
     match op {
         Op::DefineFunc { body, .. } => out.push(*body),
-        Op::DefineClass { ctor, members, .. } | Op::DefineSendableClass { ctor, members, .. } => {
-            out.push(*ctor);
-            method_refs(module, *members, &mut out);
+        Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+            out.push(cls.ctor);
+            method_refs(module, cls.members, &mut out);
         }
         Op::AllocObject { shape } => method_refs(module, *shape, &mut out),
         _ => {}
@@ -500,8 +509,8 @@ fn step_inst(
         && matches!(
             op,
             Op::DefineFunc { .. }
-                | Op::DefineClass { .. }
-                | Op::DefineSendableClass { .. }
+                | Op::DefineClass(_)
+                | Op::DefineSendableClass(_)
                 | Op::AllocObject { .. }
         )
     {
@@ -607,7 +616,7 @@ fn string_array(module: &Module, id: abcd_ir::ConstId) -> Option<Vec<String>> {
     match module.consts.get(id)? {
         Const::ArrayLiteral(items) => items
             .iter()
-            .map(|c| match c {
+            .map(|&cid| match module.consts.get(cid)? {
                 Const::String(s) => Some(sym_str(module, *s)),
                 _ => None,
             })
@@ -689,8 +698,8 @@ pub fn op_name_hint(module: &Module, op: &Op) -> Option<String> {
         | Op::StoreGlobalRecord { name, .. }
         | Op::TryStoreGlobal { name, .. } => Some(sym_str(module, *name)),
         Op::DefineFunc { body, .. } => module.func(*body).map(|f| sym_str(module, f.name)),
-        Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
-            module.func(*ctor).map(|f| sym_str(module, f.name))
+        Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+            module.func(cls.ctor).map(|f| sym_str(module, f.name))
         }
         _ => None,
     }
@@ -845,9 +854,9 @@ fn defined_value_name(module: &Module, v: ValueId) -> Option<String> {
                     .func(*body)
                     .map(|f| demangle_internal_name(sym_str(module, f.name)));
             }
-            Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
+            Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
                 return module
-                    .func(*ctor)
+                    .func(cls.ctor)
                     .map(|f| demangle_internal_name(sym_str(module, f.name)));
             }
             _ => return None,
@@ -1110,7 +1119,8 @@ mod tests {
         let f = add_fn(&mut m, "f");
         let b = entry_of(&m, f);
         let nx = m.sym.intern("x");
-        let names = m.consts.push(Const::ArrayLiteral(vec![Const::String(nx)]));
+        let nx_cid = m.consts.intern(Const::String(nx));
+        let names = m.consts.push_array(vec![nx_cid]);
         // No NewLexEnv precedes it: there is no frame to register into.
         let iid = push_inst(&mut m, b, Op::CreatePrivateNames { count: 1, names });
         let scopes = NameScopes::build(&m, f);
@@ -1285,9 +1295,8 @@ mod tests {
             .map(|i| add_fn(&mut m, &format!("nest_{i}")))
             .collect();
         let outer_sym = m.sym.intern("capturedOuter");
-        let scope_arr = m
-            .consts
-            .push(Const::ArrayLiteral(vec![Const::String(outer_sym)]));
+        let outer_cid = m.consts.intern(Const::String(outer_sym));
+        let scope_arr = m.consts.push_array(vec![outer_cid]);
 
         // Root is `fids[depth - 1]`, defining `fids[depth - 2]` -> ... -> `fids[0]`.
         let root_b = entry_of(&m, fids[depth - 1]);

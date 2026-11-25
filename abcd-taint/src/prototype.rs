@@ -181,7 +181,7 @@ fn family_of_alloc(op: &Op) -> Option<ProtoFamily> {
 fn family_of_const(c: &Const) -> Option<ProtoFamily> {
     match c {
         Const::String(_) => Some(ProtoFamily::Str),
-        Const::Number(_) => Some(ProtoFamily::Num),
+        Const::Number(_) | Const::Int64(_) | Const::UInt64(_) => Some(ProtoFamily::Num),
         Const::Bool(_) => Some(ProtoFamily::Bool),
         _ => None,
     }

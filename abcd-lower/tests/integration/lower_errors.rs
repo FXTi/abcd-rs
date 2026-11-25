@@ -12,8 +12,8 @@ use crate::common;
 use std::collections::HashMap;
 
 use abcd_ir::{
-    BinOp, CallKind, Const, ConstId, FuncId, FunctionKind, InstId, Module, Op, PropKey, Ty, Value,
-    ValueDef, ValueId,
+    BinOp, CallKind, Const, ConstId, DefineClassData, FuncId, FunctionKind, InstId, Module, Op,
+    PropKey, Ty, Value, ValueDef, ValueId,
 };
 use abcd_isa::{Bytecode, Imm};
 use abcd_lower::regalloc::{RegAlloc, RegSlot};
@@ -111,15 +111,16 @@ fn load_const_of_an_unknown_constant_id_is_rejected() {
 #[test]
 fn load_const_of_a_literal_shape_or_methodref_is_rejected() {
     for shape in [
-        Const::ArrayLiteral(vec![Const::number(1.0)]),
+        Const::ArrayLiteral(vec![ConstId::new(0)]),
         Const::ObjectLiteral {
             keys: vec![],
-            values: vec![Const::number(1.0)],
+            values: vec![ConstId::new(0)],
         },
         Const::MethodRef(FuncId::new(0)),
     ] {
         let want = format!("{shape:?}");
         let (module, func) = lower_one_param(|b, _| {
+            let _c0 = b.konst(Const::number(1.0));
             let cid = b.konst(shape);
             b.emit_val(Op::LoadConst(cid));
         });
@@ -129,6 +130,26 @@ fn load_const_of_a_literal_shape_or_methodref_is_rejected() {
         assert!(
             msg.contains("literal shape / method reference"),
             "expected the literal-shape message for {want}, got {msg:?}"
+        );
+    }
+}
+
+/// 64-bit static integer constants (`Const::Int64`, `Const::UInt64`, `R2-D5`)
+/// have no dynamic `.abc` accumulator-load opcode and fail cleanly with
+/// `LowerError::UnsupportedInstruction`.
+#[test]
+fn load_const_of_64bit_static_int_is_rejected() {
+    for c in [Const::Int64(-9_000_000_000_000), Const::UInt64(u64::MAX)] {
+        let want = format!("{c:?}");
+        let (module, func) = lower_one_param(|b, _| {
+            let cid = b.konst(c);
+            b.emit_val(Op::LoadConst(cid));
+        });
+        let err = lower_function(&module, func).expect_err("64-bit static int LoadConst must fail");
+        let msg = unsupported_message(&err, func);
+        assert!(
+            msg.contains("64-bit static integer"),
+            "expected 64-bit static integer message for {want}, got {msg:?}"
         );
     }
 }
@@ -598,13 +619,13 @@ fn define_class_without_heritage_is_rejected() {
     {
         let mut b = V2Builder::new(&mut module, func);
         let members = b.konst(Const::ArrayLiteral(vec![]));
-        b.emit_val(Op::DefineClass {
+        b.emit_val(Op::DefineClass(Box::new(DefineClassData {
             ctor: FuncId::new(0),
             heritage: None,
             members,
             member_attrs: Vec::new(),
             count: 0,
-        });
+        })));
         b.emit_void(Op::Return { value: None });
     }
     let err = lower_function(&module, func).expect_err("missing heritage must be rejected");
@@ -624,13 +645,13 @@ fn define_sendable_class_without_heritage_is_rejected() {
     {
         let mut b = V2Builder::new(&mut module, func);
         let members = b.konst(Const::ArrayLiteral(vec![]));
-        b.emit_val(Op::DefineSendableClass {
+        b.emit_val(Op::DefineSendableClass(Box::new(DefineClassData {
             ctor: FuncId::new(0),
             heritage: None,
             members,
             member_attrs: Vec::new(),
             count: 0,
-        });
+        })));
         b.emit_void(Op::Return { value: None });
     }
     let err = lower_function(&module, func).expect_err("missing heritage must be rejected");

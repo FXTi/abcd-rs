@@ -441,7 +441,7 @@ fn sendable_class_with_trailing_field_layout_lifts_member_attrs() {
         .insts
         .iter()
         .find_map(|inst| match &inst.op {
-            Op::DefineSendableClass { member_attrs, .. } => Some(member_attrs.clone()),
+            Op::DefineSendableClass(data) => Some(data.member_attrs.clone()),
             _ => None,
         })
         .expect("DefineSendableClass emitted");
@@ -508,7 +508,7 @@ fn commercial_modules_abc_lifts_and_verifies_zero_errors() {
         .insts
         .iter()
         .filter_map(|i| match &i.op {
-            Op::DefineSendableClass { member_attrs, .. } => Some(member_attrs.len()),
+            Op::DefineSendableClass(data) => Some(data.member_attrs.len()),
             _ => None,
         })
         .collect();

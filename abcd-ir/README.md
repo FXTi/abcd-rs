@@ -17,13 +17,14 @@ Format-independent Static Single Assignment (SSA) intermediate representation fo
 | `Module`, `ClassData`, `Dialect`, `SourceLang` | [`module`](src/module.rs) | Top-level program container, global arenas (`insts`, `blocks`, `values`), class/field metadata, ES & `--merge-abc` module records |
 | `FunctionData`, `Block`, `Edge`, `TryRegion` | [`function`](src/function.rs) | Per-function CFG, leading phi prefix, `EdgeKind::{Normal, Exceptional}` edges, `ValueDef::ExceptionParam`, debug tables |
 | `FuncId`, `ClassId`, `BlockId`, `InstId`, `ValueId`, `Sym`, `ConstId` | [`id`](src/id.rs) | Typed `u32` append-only arena indices with module-wide uniqueness |
-| `Op` (`88` variants), `CallKind`, `Arity` | [`op`](src/op.rs) | Closed semantic op taxonomy with single-point `operands()`, `for_each_operand()`, `has_operand()`, `operands_mut()`, `has_result()`, `is_terminator()`, and `arity()` |
-| `Effects`, `MemClasses`, `CallEffect`, `AllocKind` | [`effects`](src/effects.rs) | Mechanically derived `Op::effects()` table (reads, writes, `may_throw`, `may_call`, `allocs`) |
-| `Ty`, `DynPrim`, `StaticTy` | [`ty`](src/ty.rs) | Dynamic-first type lattice (`Any`, `DynPrim`, `Union`, `Unknown`) plus `ClassId`-indexed `StaticTy` annotations |
-| `SymbolTable` | [`symbol`](src/symbol.rs) | Append-only dual-bucket string interner preserving both valid UTF-8 and lone-surrogate MUTF-8 byte sequences |
-| `ConstPool`, `Const` | [`consts`](src/consts.rs) | Append-only typed constant pool (primitives, bit-exact `f64`, `BigInt`, `ArrayLiteral` / `ObjectLiteral` trees, `MethodRef`) |
+| `Op` (`88` variants), `DefineClassData`, `CallKind`, `Arity` | [`op`](src/op.rs) | Closed semantic op taxonomy (`<= 40 B`) with single-point `operands()`, `for_each_operand()`, `for_each_operand_mut()`, `has_operand()`, `for_each_const_id()`, `for_each_func_id()`, `for_each_sym()`, `has_result()`, `is_terminator()`, and `arity()` |
+| `Effects`, `MemClasses`, `CallEffect`, `AllocKind` | [`effects`](src/effects.rs) | Conservative `Op::effects()` baseline plus context-sensitive `Op::effects_in(module)` primitive/constant refinement and `Effects::is_removable_if_unused()` |
+| `DomTree`, `ExceptionHandlerMap`, `normal_succs_inline` | [`cfg`](src/cfg.rs) | Iterative Cooper–Harvey–Kennedy (`2001`) dominator tree with `O(1)` Euler-interval queries and `O(1)` dense exception-handler lookup |
+| `Ty`, `DynPrim`, `StaticTy` | [`ty`](src/ty.rs) | Dynamic-first type lattice (`Any`, `DynPrim`, `Union(Box<[Ty]>)`, `Unknown`) with iterative heap-workstack traits plus `ClassId`-indexed `StaticTy` |
+| `SymbolTable` | [`symbol`](src/symbol.rs) | Append-only `Arc`-backed dual-bucket string interner preserving both valid UTF-8 and lone-surrogate MUTF-8 byte sequences |
+| `ConstPool`, `Const` | [`consts`](src/consts.rs) | Append-only & deduplicating (`intern`) typed constant pool (primitives, bit-exact `f64`, `Int64`/`UInt64`, `BigInt`, flat `ConstId`-indexed `ArrayLiteral`/`ObjectLiteral`, `MethodRef`) |
 | `FrameSlots`, `this_param_index` | [`frame`](src/frame.rs) | Calling-convention slot resolver across `Dialect::DynamicEcma` (`L_ESCallTypeAnnotation;` / `0xF`) and `Dialect::StaticArkTS` |
-| `verify_module`, `verify_func`, `VerifyReport` | [`verify`](src/verify.rs) | Non-panicking structural, CFG-symmetry, arity, and Normal-edge SSA dominance verifier |
+| `verify_module`, `verify_func`, `VerifyReport` | [`verify`](src/verify.rs) | Linear-time structural, entity-bounds, `ConstCycle`, and pre-throw / post-normal-exit split SSA dominance verifier |
 
 ## Key Semantic Invariants
 

@@ -79,8 +79,8 @@ pub fn op_name(op: &Op) -> &'static str {
         DynamicImport { .. } => "DynamicImport",
         Call { .. } => "Call",
         DefineFunc { .. } => "DefineFunc",
-        DefineClass { .. } => "DefineClass",
-        DefineSendableClass { .. } => "DefineSendableClass",
+        DefineClass(_) => "DefineClass",
+        DefineSendableClass(_) => "DefineSendableClass",
         LoadPrivate { .. } => "LoadPrivate",
         StorePrivate { .. } => "StorePrivate",
         DefinePrivate { .. } => "DefinePrivate",
@@ -164,7 +164,7 @@ pub fn fitness_of(op: &Op) -> Fitness {
         // ── H = 7 (driver plumbing / no surface syntax) ──
         IteratorReturn { .. }
         | IteratorThrow { .. }
-        | DefineSendableClass { .. }
+        | DefineSendableClass(_)
         | ResumeGenerator { .. }
         | GetResumeMode { .. }
         | AsyncResolve { .. }
@@ -214,7 +214,7 @@ pub fn fallback_note(op: &Op) -> &'static str {
         IteratorReturn { .. } | IteratorThrow { .. } => {
             "iterator-cleanup protocol (H); folding into for-of's implicit cleanup is d-P3 pattern work (§5 rows 32-33)"
         }
-        DefineSendableClass { .. } => {
+        DefineSendableClass(_) => {
             "ArkTS sendable/shared class (H); no JS surface syntax — emitted as `class` + `/* sendable */` at best (§5 row 51)"
         }
         ResumeGenerator { .. } | GetResumeMode { .. } => {

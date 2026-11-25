@@ -90,9 +90,7 @@ fn dead_dropped_functions(module: &abcd_ir::Module) -> usize {
                 };
                 let body = match &inst.op {
                     Op::DefineFunc { body, .. } => Some(*body),
-                    Op::DefineClass { ctor, .. } | Op::DefineSendableClass { ctor, .. } => {
-                        Some(*ctor)
-                    }
+                    Op::DefineClass(cls) | Op::DefineSendableClass(cls) => Some(cls.ctor),
                     _ => None,
                 };
                 if let (Some(body), Some(result)) = (body, inst.result)

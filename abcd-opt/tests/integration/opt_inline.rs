@@ -1704,3 +1704,28 @@ fn sym_roundtrip() {
     let s: Sym = module.sym.intern("x");
     assert_eq!(module.sym.resolve(s), Some("x"));
 }
+
+/// Shared catch handler across multiple protecting `TryRegion`s: splitting a
+/// protected `call_block` must deduplicate handler `BlockId`s so neither
+/// `handler.preds` nor handler `Phi` entries receive duplicate
+/// `EdgeKind::Exceptional` edges, and `verify_module` (`SplitValueDom`) passes.
+#[test]
+fn inline_inside_shared_handler_try_regions_dedupes_edges_and_verifies() {
+    let mut probe = build_n44_probe();
+    let exc = probe.module.functions[probe.caller.index()].try_regions[0].catches[0].exception;
+    probe.module.functions[probe.caller.index()]
+        .try_regions
+        .push(abcd_ir::TryRegion {
+            protected: vec![probe.call_block],
+            catches: vec![abcd_ir::Catch {
+                handler: probe.handler,
+                exception: exc,
+                type_idx: Some(1),
+            }],
+        });
+    verify_ok(&probe.module);
+
+    let report = inline_module(&mut probe.module, &default_policy());
+    assert_eq!(report.sites_inlined, 1, "{report:?}");
+    verify_ok(&probe.module);
+}

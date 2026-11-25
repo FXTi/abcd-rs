@@ -200,23 +200,17 @@ impl<'m> ClassHierarchyIndex<'m> {
                     };
                     let mut mark_lex_or_cap = false;
                     match &inst.op {
-                        Op::DefineClass {
-                            ctor,
-                            heritage,
-                            members,
-                            member_attrs,
-                            ..
-                        } => {
+                        Op::DefineClass(cls) => {
                             mark_lex_or_cap = true;
                             let cid = index_class_def(
                                 module,
                                 fid,
                                 record_class,
                                 inst.result,
-                                *ctor,
-                                *heritage,
-                                *members,
-                                member_attrs,
+                                cls.ctor,
+                                cls.heritage,
+                                cls.members,
+                                &cls.member_attrs,
                                 false,
                                 &mut classes,
                                 &mut ctor_to_classes,
@@ -230,23 +224,17 @@ impl<'m> ClassHierarchyIndex<'m> {
                                 *slot = Some(cid);
                             }
                         }
-                        Op::DefineSendableClass {
-                            ctor,
-                            heritage,
-                            members,
-                            member_attrs,
-                            ..
-                        } => {
+                        Op::DefineSendableClass(cls) => {
                             mark_lex_or_cap = true;
                             let cid = index_class_def(
                                 module,
                                 fid,
                                 record_class,
                                 inst.result,
-                                *ctor,
-                                *heritage,
-                                *members,
-                                member_attrs,
+                                cls.ctor,
+                                cls.heritage,
+                                cls.members,
+                                &cls.member_attrs,
                                 true,
                                 &mut classes,
                                 &mut ctor_to_classes,
@@ -264,8 +252,12 @@ impl<'m> ClassHierarchyIndex<'m> {
                             if let Some(Const::ObjectLiteral { keys, values }) =
                                 module.consts.get(*shape)
                             {
-                                for (k, v) in keys.iter().zip(values.iter()) {
-                                    if let (Const::String(k_sym), Const::MethodRef(mfid)) = (k, v) {
+                                for (&k_cid, &v_cid) in keys.iter().zip(values.iter()) {
+                                    if let (
+                                        Some(Const::String(k_sym)),
+                                        Some(Const::MethodRef(mfid)),
+                                    ) = (module.consts.get(k_cid), module.consts.get(v_cid))
+                                    {
                                         obj_lits
                                             .entry((iid, *k_sym))
                                             .or_default()
@@ -814,7 +806,7 @@ impl<'m> ClassHierarchyIndex<'m> {
                             Op::DefineFunc { body, .. } => {
                                 insert_prov(&mut frames[top_idx].out, Prov::Callable(*body));
                             }
-                            Op::DefineClass { .. } | Op::DefineSendableClass { .. } => {
+                            Op::DefineClass(_) | Op::DefineSendableClass(_) => {
                                 if let Some(cid) =
                                     self.class_by_inst.get(iid.index()).copied().flatten()
                                 {
@@ -1232,22 +1224,28 @@ fn index_class_def(
     let mut static_getters: BTreeMap<Sym, Vec<FuncId>> = BTreeMap::new();
 
     if let Some(Const::ArrayLiteral(items)) = module.consts.get(members) {
+        let tail_count = items
+            .last()
+            .and_then(|&tail_cid| match module.consts.get(tail_cid) {
+                Some(Const::Number(bits)) => {
+                    let v = f64::from_bits(*bits);
+                    (v.is_finite() && v >= 0.0).then_some(v as usize)
+                }
+                Some(Const::Int64(v)) => (*v >= 0).then_some(*v as usize),
+                Some(Const::UInt64(v)) => usize::try_from(*v).ok(),
+                _ => None,
+            });
         let mut idx = 0usize;
         let mut pair_idx = 0usize;
         while idx + 1 < items.len() {
-            if let (Const::String(name_sym), Const::MethodRef(mfid)) =
-                (&items[idx], &items[idx + 1])
-            {
+            if let (Some(Const::String(name_sym)), Some(Const::MethodRef(mfid))) = (
+                module.consts.get(items[idx]),
+                module.consts.get(items[idx + 1]),
+            ) {
                 let (is_static, kind_opt) = if let Some(attr) = member_attrs.get(pair_idx) {
                     (attr.is_static, Some(attr.kind))
                 } else if member_attrs.is_empty() {
-                    let static_by_tail = match items.last() {
-                        Some(Const::Number(bits)) => {
-                            let v = f64::from_bits(*bits);
-                            v.is_finite() && v >= 0.0 && pair_idx >= (v as usize)
-                        }
-                        _ => false,
-                    };
+                    let static_by_tail = tail_count.is_some_and(|n| pair_idx >= n);
                     (static_by_tail, module.func(*mfid).map(|f| f.kind))
                 } else {
                     (false, module.func(*mfid).map(|f| f.kind))
@@ -1284,7 +1282,7 @@ fn index_class_def(
                 pair_idx += 1;
                 idx += 2;
             } else {
-                if let Const::MethodRef(mfid) = &items[idx] {
+                if let Some(Const::MethodRef(mfid)) = module.consts.get(items[idx]) {
                     capture_sites.push((def_iid, *mfid));
                     push_unique_func(parent_children, *mfid);
                 }
@@ -1292,7 +1290,7 @@ fn index_class_def(
             }
         }
         if idx < items.len()
-            && let Const::MethodRef(mfid) = &items[idx]
+            && let Some(Const::MethodRef(mfid)) = module.consts.get(items[idx])
         {
             capture_sites.push((def_iid, *mfid));
             push_unique_func(parent_children, *mfid);

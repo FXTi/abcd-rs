@@ -28,13 +28,16 @@
 //! in [`VerifyError`], warnings in [`VerifyWarning`], both bundled in
 //! [`VerifyReport`].
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::cfg::{ExceptionHandlerMap, SplitValueDom, normal_succs_inline};
+use crate::consts::Const;
 use crate::function::{Edge, EdgeKind, ValueDef};
-use crate::id::{BlockId, ClassId, ConstId, FuncId, InstId, ValueId};
-use crate::module::Module;
-use crate::op::Op;
+use crate::id::{BlockId, ClassId, ConstId, FuncId, InstId, Sym, ValueId};
+use crate::module::{AnnValue, ExportDecl, ImportDecl, Module};
+use crate::op::{CallKind, Op};
+use crate::ty::{StaticTy, Ty};
 
 /// The error taxonomy. All variants derive their messages via thiserror
 /// (library rule: errors via thiserror, no panics on data).
@@ -241,6 +244,44 @@ pub enum VerifyErrorKind {
     /// A constant reference outside the const pool (module level).
     #[error("constant {0} is outside the const pool")]
     ConstOutOfRange(ConstId),
+    /// `Inst.result` presence disagrees with [`Op::has_result`].
+    #[error(
+        "instruction result presence ({has_result}) disagrees with op.has_result() ({op_expects_result})"
+    )]
+    ResultPresenceMismatch {
+        /// Whether `inst.result` is `Some`.
+        has_result: bool,
+        /// Whether `inst.op.has_result()` is `true`.
+        op_expects_result: bool,
+    },
+    /// An `InstId` listed more than once across blocks or functions.
+    #[error("duplicate instruction listing {0}")]
+    DuplicateInst(InstId),
+    /// A `ValueId` defined more than once (duplicate param, catch exception, or cross-function claim).
+    #[error("duplicate value definition {0}")]
+    DuplicateValueDef(ValueId),
+    /// `Op::Call` receiver/argument shape violates [`CallKind`] invariants.
+    #[error("invalid call operand shape for {kind:?}")]
+    InvalidCallShape {
+        /// The call kind whose structural contract was violated.
+        kind: CallKind,
+    },
+    /// A symbol reference outside `module.sym`.
+    #[error("symbol {0} is outside the symbol table")]
+    SymOutOfRange(Sym),
+    /// A cycle in `ConstPool` literal references (`ArrayLiteral` / `ObjectLiteral`).
+    #[error("constant {0} participates in a literal-shape cycle")]
+    ConstCycle(ConstId),
+    /// `Const::ObjectLiteral` `keys.len() != values.len()`.
+    #[error("object literal {const_id} has {keys} keys but {values} values")]
+    ObjectLiteralArityMismatch {
+        /// The malformed constant id.
+        const_id: ConstId,
+        /// Key count.
+        keys: usize,
+        /// Value count.
+        values: usize,
+    },
 }
 
 /// The warning taxonomy (non-fatal findings).
@@ -332,6 +373,7 @@ impl std::error::Error for VerifyWarning {
 
 /// The outcome of verifying a module or function: errors (hard
 /// violations) and warnings (N38 channel).
+#[must_use]
 #[derive(Clone, Debug, Default)]
 pub struct VerifyReport {
     /// Hard violations.
@@ -342,35 +384,29 @@ pub struct VerifyReport {
 
 impl VerifyReport {
     /// Whether no errors were found (warnings do not affect this).
+    #[must_use]
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
     }
 }
 
-/// Normal-edge successors of a block (terminator targets), restricted to
-/// in-function blocks by the caller.
-fn normal_succs(module: &Module, bb: BlockId) -> Vec<BlockId> {
+/// Stack-allocated Normal-edge successors of `bb` (`0..=2` targets).
+#[inline]
+fn block_normal_succs(module: &Module, bb: BlockId) -> ([BlockId; 2], usize) {
     let Some(block) = module.block(bb) else {
-        return Vec::new();
+        return ([BlockId::new(0); 2], 0);
     };
     let Some(&last) = block.insts.last() else {
-        return Vec::new();
+        return ([BlockId::new(0); 2], 0);
     };
     let Some(inst) = module.inst(last) else {
-        return Vec::new();
+        return ([BlockId::new(0); 2], 0);
     };
-    match &inst.op {
-        Op::Branch { dest } => vec![*dest],
-        Op::CondBranch {
-            true_dest,
-            false_dest,
-            ..
-        } => vec![*true_dest, *false_dest],
-        _ => Vec::new(),
-    }
+    normal_succs_inline(&inst.op)
 }
 
 /// Verify one function.
+#[must_use = "verification findings must be checked via VerifyReport::is_ok()"]
 pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
     let mut report = VerifyReport::default();
     let Some(func) = module.func(func_id) else {
@@ -461,12 +497,13 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             // Exceptional edges are first-class (T5): the handler lists
             // every protected block as an Exceptional predecessor.
             if let Some(handler) = module.block(catch.handler) {
+                let h_preds: HashSet<Edge> = handler.preds.iter().copied().collect();
                 for &p in &region.protected {
                     let edge = Edge {
                         from: p,
                         kind: EdgeKind::Exceptional,
                     };
-                    if func_blocks.contains(&p) && !handler.preds.contains(&edge) {
+                    if func_blocks.contains(&p) && !h_preds.contains(&edge) {
                         report.errors.push(err(
                             Some(catch.handler),
                             None,
@@ -481,36 +518,43 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         }
     }
 
-    let dispatches_to = |from: BlockId, handler: BlockId| {
-        func.try_regions.iter().any(|region| {
-            region.protected.contains(&from) && region.catches.iter().any(|c| c.handler == handler)
-        })
+    let Some(exc_map) = ExceptionHandlerMap::build(module, func_id) else {
+        return report;
     };
 
-    // ── Defined-value ownership scan ─────────────────────────────────
-    let mut defined: HashMap<ValueId, ()> = HashMap::new();
+    // ── Defined-value & instruction ownership scan ───────────────────
+    let mut defined: HashSet<ValueId> = HashSet::new();
+    let mut seen_insts: HashSet<InstId> = HashSet::new();
+    let mut inst_pos: HashMap<InstId, usize> = HashMap::new();
     for (i, &val) in func.params.iter().enumerate() {
+        let expected_idx = u16::try_from(i).ok();
         match module.value(val).map(|v| v.def) {
             None => report
                 .errors
                 .push(err(None, None, VerifyErrorKind::ValueOutOfArena(val))),
-            Some(def) if def != ValueDef::Param(i as u16) => report.errors.push(err(
-                None,
-                None,
-                VerifyErrorKind::ParamDefMismatch {
-                    value: val,
-                    actual: def,
-                },
-            )),
+            Some(def) if expected_idx.is_none_or(|idx| def != ValueDef::Param(idx)) => {
+                report.errors.push(err(
+                    None,
+                    None,
+                    VerifyErrorKind::ParamDefMismatch {
+                        value: val,
+                        actual: def,
+                    },
+                ));
+            }
             _ => {
-                defined.insert(val, ());
+                if !defined.insert(val) {
+                    report
+                        .errors
+                        .push(err(None, None, VerifyErrorKind::DuplicateValueDef(val)));
+                }
             }
         }
     }
     for region in &func.try_regions {
         for catch in &region.catches {
             if module.value(catch.exception).is_some() {
-                defined.insert(catch.exception, ());
+                defined.insert(catch.exception);
             }
         }
     }
@@ -519,8 +563,17 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             None => report
                 .errors
                 .push(err(None, None, VerifyErrorKind::ValueOutOfArena(val))),
-            Some(ValueDef::Const(c)) if module.consts.get(c).is_some() => {
-                defined.insert(val, ());
+            Some(ValueDef::Const(c)) => {
+                if module.consts.get(c).is_some() {
+                    defined.insert(val);
+                } else {
+                    report
+                        .errors
+                        .push(err(None, None, VerifyErrorKind::ConstOutOfRange(c)));
+                    report
+                        .errors
+                        .push(err(None, None, VerifyErrorKind::ForeignValue(val)));
+                }
             }
             Some(_) => report
                 .errors
@@ -531,7 +584,16 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         let Some(block) = module.block(bb) else {
             continue;
         };
-        for &inst_id in &block.insts {
+        for (pos, &inst_id) in block.insts.iter().enumerate() {
+            if !seen_insts.insert(inst_id) {
+                report.errors.push(err(
+                    Some(bb),
+                    Some(inst_id),
+                    VerifyErrorKind::DuplicateInst(inst_id),
+                ));
+            } else {
+                inst_pos.insert(inst_id, pos);
+            }
             let Some(inst) = module.inst(inst_id) else {
                 report.errors.push(err(
                     Some(bb),
@@ -550,6 +612,18 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                     },
                 ));
             }
+            let has_res = inst.result.is_some();
+            let expects_res = inst.op.has_result();
+            if has_res != expects_res {
+                report.errors.push(err(
+                    Some(bb),
+                    Some(inst_id),
+                    VerifyErrorKind::ResultPresenceMismatch {
+                        has_result: has_res,
+                        op_expects_result: expects_res,
+                    },
+                ));
+            }
             if let Some(val) = inst.result {
                 match module.value(val).map(|v| v.def) {
                     None => report.errors.push(err(
@@ -558,7 +632,13 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                         VerifyErrorKind::ValueOutOfArena(val),
                     )),
                     Some(ValueDef::Inst(def)) if def == inst_id => {
-                        defined.insert(val, ());
+                        if !defined.insert(val) {
+                            report.errors.push(err(
+                                Some(bb),
+                                Some(inst_id),
+                                VerifyErrorKind::DuplicateValueDef(val),
+                            ));
+                        }
                     }
                     Some(actual) => report.errors.push(err(
                         Some(bb),
@@ -570,13 +650,24 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         }
     }
 
-    // Entry predecessors: only a self-loop back-edge is legal.
+    // Entry predecessors: only a Normal self-loop back-edge is legal.
     if let Some(entry_block) = module.block(entry)
-        && entry_block.preds.iter().any(|e| e.from != entry)
+        && entry_block
+            .preds
+            .iter()
+            .any(|e| e.from != entry || e.kind != EdgeKind::Normal)
     {
         report
             .errors
             .push(err(Some(entry), None, VerifyErrorKind::EntryHasPred));
+    }
+
+    let mut block_pred_sets: HashMap<BlockId, HashSet<Edge>> =
+        HashMap::with_capacity(func.blocks.len());
+    for &bb in &func.blocks {
+        if let Some(b) = module.block(bb) {
+            block_pred_sets.insert(bb, b.preds.iter().copied().collect());
+        }
     }
 
     // ── Per-block structural checks ──────────────────────────────────
@@ -586,7 +677,7 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         };
 
         // Predecessor edge consistency.
-        let mut seen_edges = HashSet::new();
+        let mut seen_edges = HashSet::with_capacity(block.preds.len());
         for edge in &block.preds {
             if !seen_edges.insert(*edge) {
                 report
@@ -602,7 +693,8 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             }
             match edge.kind {
                 EdgeKind::Normal => {
-                    if !normal_succs(module, edge.from).contains(&bb) {
+                    let (targets, count) = block_normal_succs(module, edge.from);
+                    if !targets[..count].contains(&bb) {
                         report.errors.push(err(
                             Some(bb),
                             None,
@@ -611,7 +703,7 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                     }
                 }
                 EdgeKind::Exceptional => {
-                    if !dispatches_to(edge.from, bb) {
+                    if !exc_map.dispatches_to(edge.from, bb) {
                         report.errors.push(err(
                             Some(bb),
                             None,
@@ -653,8 +745,6 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             if !inst.op.is_phi() {
                 seen_non_phi = true;
             }
-            // Taxonomy arity drift guard (fixed-arity ops only; variadic
-            // ops are constrained by their own rules, e.g. phi/preds).
             if let crate::op::Arity::Exact(n) = inst.op.arity() {
                 let mut actual = 0usize;
                 inst.op.for_each_operand(|_| actual += 1);
@@ -669,6 +759,52 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                     ));
                 }
             }
+            if let Op::Call {
+                this, args, kind, ..
+            } = &inst.op
+            {
+                let valid_shape = match kind {
+                    CallKind::Apply => this.is_some() && args.len() == 1,
+                    CallKind::SuperSpread | CallKind::SuperForwardAllArgs => {
+                        this.is_none() && args.len() == 1
+                    }
+                    CallKind::Dynamic | CallKind::Direct | CallKind::Super | CallKind::New => true,
+                };
+                if !valid_shape {
+                    report.errors.push(err(
+                        Some(bb),
+                        Some(inst_id),
+                        VerifyErrorKind::InvalidCallShape { kind: *kind },
+                    ));
+                }
+            }
+            inst.op.for_each_const_id(|cid| {
+                if module.consts.get(cid).is_none() {
+                    report.errors.push(err(
+                        Some(bb),
+                        Some(inst_id),
+                        VerifyErrorKind::ConstOutOfRange(cid),
+                    ));
+                }
+            });
+            inst.op.for_each_func_id(|fid| {
+                if module.func(fid).is_none() {
+                    report.errors.push(err(
+                        Some(bb),
+                        Some(inst_id),
+                        VerifyErrorKind::FuncOutOfRange(fid),
+                    ));
+                }
+            });
+            inst.op.for_each_sym(|sym| {
+                if module.sym.resolve(sym).is_none() {
+                    report.errors.push(err(
+                        Some(bb),
+                        Some(inst_id),
+                        VerifyErrorKind::SymOutOfRange(sym),
+                    ));
+                }
+            });
         }
         let last_id = block.insts[block.insts.len() - 1];
         if let Some(last) = module.inst(last_id) {
@@ -679,16 +815,16 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                     VerifyErrorKind::MissingTerminator,
                 ));
             }
-            // Successor edge symmetry.
-            for succ in normal_succs(module, bb) {
+            let (targets, count) = normal_succs_inline(&last.op);
+            for &succ in &targets[..count] {
                 if !func_blocks.contains(&succ) {
                     report.errors.push(err(
                         Some(bb),
                         Some(last_id),
                         VerifyErrorKind::ForeignSuccessor(succ),
                     ));
-                } else if module.block(succ).is_some_and(|s| {
-                    !s.preds.contains(&Edge {
+                } else if block_pred_sets.get(&succ).is_some_and(|pset| {
+                    !pset.contains(&Edge {
                         from: bb,
                         kind: EdgeKind::Normal,
                     })
@@ -702,7 +838,7 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
             }
         }
 
-        // Phi arity and edge keys.
+        // Phi arity and edge keys (`O(1)` edge lookup via `seen_edges`).
         for &inst_id in &block.insts {
             let Some(inst) = module.inst(inst_id) else {
                 continue;
@@ -720,9 +856,9 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                     },
                 ));
             }
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::with_capacity(entries.len());
             for (edge, _) in entries {
-                if !block.preds.contains(edge) {
+                if !seen_edges.contains(edge) {
                     report.errors.push(err(
                         Some(bb),
                         Some(inst_id),
@@ -740,9 +876,13 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         }
     }
 
-    // ── Use existence / ownership ────────────────────────────────────
-    // (Dominance below reports its own errors; this pass reports only
-    // arena-bounds and cross-function ownership.)
+    // ── Pre-indexed catch exception ownership & split dominance ──────
+    let mut catch_pairs: HashSet<(BlockId, ValueId)> = HashSet::new();
+    for region in &func.try_regions {
+        for catch in &region.catches {
+            catch_pairs.insert((catch.handler, catch.exception));
+        }
+    }
     let ownership = |val: ValueId| -> Option<VerifyErrorKind> {
         let v = module.value(val)?;
         let owned = match v.def {
@@ -752,11 +892,7 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                 None => false,
             },
             ValueDef::Const(c) => module.consts.get(c).is_some(),
-            ValueDef::ExceptionParam(h) => func
-                .try_regions
-                .iter()
-                .flat_map(|r| &r.catches)
-                .any(|c| c.handler == h && c.exception == val),
+            ValueDef::ExceptionParam(h) => catch_pairs.contains(&(h, val)),
         };
         if owned {
             None
@@ -780,43 +916,39 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
                         Some(inst_id),
                         VerifyErrorKind::UndefinedValue(val),
                     ));
-                } else if let Some(kind) = ownership(val) {
-                    report.errors.push(err(Some(bb), Some(inst_id), kind));
+                } else {
+                    if let Some(ValueDef::Const(c)) = module.value(val).map(|v| v.def)
+                        && module.consts.get(c).is_none()
+                    {
+                        report.errors.push(err(
+                            Some(bb),
+                            Some(inst_id),
+                            VerifyErrorKind::ConstOutOfRange(c),
+                        ));
+                    }
+                    if let Some(kind) = ownership(val) {
+                        report.errors.push(err(Some(bb), Some(inst_id), kind));
+                    }
                 }
             });
         }
     }
 
-    // ── Reachability (over ALL edges: Normal + first-class Exceptional)
-    let all_succs = |bb: BlockId| -> Vec<BlockId> {
-        let mut out = normal_succs(module, bb);
-        for region in &func.try_regions {
-            if region.protected.contains(&bb) {
-                out.extend(region.catches.iter().map(|c| c.handler));
-            }
-        }
-        out.retain(|s| func_blocks.contains(s));
-        out
-    };
-    let reachable_all: HashSet<BlockId> = {
-        let mut seen = HashSet::from([entry]);
-        let mut queue = VecDeque::from([entry]);
-        while let Some(bb) = queue.pop_front() {
-            for succ in all_succs(bb) {
-                if seen.insert(succ) {
-                    queue.push_back(succ);
-                }
-            }
-        }
-        seen
-    };
+    let mut block_to_idx: HashMap<BlockId, usize> = HashMap::with_capacity(func.blocks.len());
+    for (idx, &bb) in func.blocks.iter().enumerate() {
+        block_to_idx.entry(bb).or_insert(idx);
+    }
+    let vdom = SplitValueDom::compute(module, &func.blocks, &block_to_idx, &exc_map);
 
     // ── N27: reachable zero-pred phi ─────────────────────────────────
     for &bb in &func.blocks {
         let Some(block) = module.block(bb) else {
             continue;
         };
-        if !reachable_all.contains(&bb) || !block.preds.is_empty() {
+        let Some(&bi) = block_to_idx.get(&bb) else {
+            continue;
+        };
+        if !vdom.is_pt_reachable(vdom.entry_pt(bi)) || !block.preds.is_empty() {
             continue;
         }
         for &inst_id in &block.insts {
@@ -828,12 +960,23 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
         }
     }
 
-    // ── N45 dominance over Normal edges ──────────────────────────────
-    verify_dominance(module, func_id, &reachable_all, &all_succs, &mut report);
+    // ── N45 / R2-D1 split dominance over Normal + Exceptional edges ──
+    verify_dominance(
+        module,
+        func_id,
+        &block_to_idx,
+        &inst_pos,
+        &vdom,
+        &mut report,
+    );
 
-    // ── N38: handler-phi imprecise-join warnings ─────────────────────
+    // ── N38: handler-phi imprecise-join warnings (deduped per handler)
+    let mut warned_handlers: HashSet<BlockId> = HashSet::new();
     for region in &func.try_regions {
         for catch in &region.catches {
+            if !warned_handlers.insert(catch.handler) {
+                continue;
+            }
             let Some(handler) = module.block(catch.handler) else {
                 continue;
             };
@@ -867,25 +1010,14 @@ pub fn verify_func(module: &Module, func_id: FuncId) -> VerifyReport {
     report
 }
 
-/// `N45` use-def dominance over **Normal** edges, with the documented
-/// exception-model exemptions (`design/decisions.md` N45, N64):
-///
-/// 1. Uses in blocks unreachable over the full edge graph are exempt
-///    (dead code carries junk; same standing as the N27 exemption).
-/// 2. Uses in blocks with no Normal-edge path from the entry (catch
-///    handlers and their Normal-only downstream) are exempt — exception
-///    dispatch is not Normal-edge dominance.
-/// 3. Phi entries are uses on the incoming edge: the value must be
-///    available at the END of the edge's source block.
-/// 4. Entry-defined values (params, constants, entry-block results)
-///    dominate everything, handlers included.
-/// 5. `ExceptionParam(h)` values are valid in `h` and its
-///    exceptional-reachable downstream, and on phi edges leaving it.
+/// `N45` / `R2-D1` SSA use-def dominance over the pre-throw (`entry_pt`) and
+/// post-normal-exit (`norm_pt`) split CFG (`O(1)` Euler-interval queries per operand).
 fn verify_dominance(
     module: &Module,
     func_id: FuncId,
-    reachable_all: &HashSet<BlockId>,
-    all_succs: &dyn Fn(BlockId) -> Vec<BlockId>,
+    index: &HashMap<BlockId, usize>,
+    inst_pos: &HashMap<InstId, usize>,
+    vdom: &SplitValueDom,
     report: &mut VerifyReport,
 ) {
     let Some(func) = module.func(func_id) else {
@@ -898,125 +1030,13 @@ fn verify_dominance(
         kind,
     };
 
-    let index: HashMap<BlockId, usize> = func
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| (b, i))
-        .collect();
-    let n = func.blocks.len();
-    let entry_i = 0usize;
-
-    // Normal-edge predecessors per block (in-function only).
-    let mut npreds: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for &bb in &func.blocks {
-        let Some(block) = module.block(bb) else {
-            continue;
-        };
-        let i = index[&bb];
-        for edge in &block.preds {
-            if edge.kind == EdgeKind::Normal
-                && let Some(&p) = index.get(&edge.from)
-            {
-                npreds[i].push(p);
-            }
-        }
-    }
-
-    // N64: Normal-edge reachability from the entry, then drop unreachable
-    // Normal predecessors. Without this, a REACHABLE block with any
-    // unreachable Normal pred loses `entry` from its dominator set
-    // (dom[unreachable] degenerates to a self-singleton that drags the
-    // intersection down) and is wrongly treated as Normal-unreachable —
-    // exempting its uses from the N45 checks below (weakening only, but
-    // wrong). Unreachable blocks themselves stay exempt via the
-    // `dom[i].contains(entry_i)` test either way.
-    let mut nsuccs: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, preds) in npreds.iter().enumerate() {
-        for &p in preds {
-            nsuccs[p].push(i);
-        }
-    }
-    let mut normal_reach = vec![false; n];
-    normal_reach[entry_i] = true;
-    let mut queue = VecDeque::from([entry_i]);
-    while let Some(b) = queue.pop_front() {
-        for &s in &nsuccs[b] {
-            if !normal_reach[s] {
-                normal_reach[s] = true;
-                queue.push_back(s);
-            }
-        }
-    }
-    for preds in npreds.iter_mut() {
-        preds.retain(|&p| normal_reach[p]);
-    }
-
-    // Iterative dominator sets over the Normal-edge CFG.
-    let all: HashSet<usize> = (0..n).collect();
-    let mut dom: Vec<HashSet<usize>> = vec![all; n];
-    dom[entry_i] = HashSet::from([entry_i]);
-    loop {
-        let mut changed = false;
-        for i in 0..n {
-            if i == entry_i || !normal_reach[i] {
-                continue;
-            }
-            let mut new: HashSet<usize> = if npreds[i].is_empty() {
-                HashSet::new()
-            } else {
-                let mut acc = dom[npreds[i][0]].clone();
-                for &p in &npreds[i][1..] {
-                    acc = acc.intersection(&dom[p]).copied().collect();
-                }
-                acc
-            };
-            new.insert(i);
-            if new != dom[i] {
-                dom[i] = new;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    // A block is Normal-reachable iff the entry dominates it.
-    let normal_reachable = |i: usize| dom[i].contains(&entry_i);
-    let dominates = |a: usize, b: usize| dom[b].contains(&a);
-
-    // Exceptional-reachable downstream per handler (over ALL edges).
-    let mut exc_region_cache: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
-    let mut exc_region = |handler: BlockId| -> HashSet<BlockId> {
-        if let Some(r) = exc_region_cache.get(&handler) {
-            return r.clone();
-        }
-        let mut seen = HashSet::from([handler]);
-        let mut queue = VecDeque::from([handler]);
-        while let Some(bb) = queue.pop_front() {
-            for succ in all_succs(bb) {
-                if seen.insert(succ) {
-                    queue.push_back(succ);
-                }
-            }
-        }
-        exc_region_cache.insert(handler, seen.clone());
-        seen
-    };
-
     for &bb in &func.blocks {
         let Some(block) = module.block(bb) else {
             continue;
         };
         let Some(&bi) = index.get(&bb) else { continue };
-
-        // Instruction positions for the same-block def-before-use check.
-        let position: HashMap<InstId, usize> = block
-            .insts
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| (id, i))
-            .collect();
+        let bb_entry_pt = vdom.entry_pt(bi);
+        let bb_reachable = vdom.is_pt_reachable(bb_entry_pt);
 
         for (pos, &inst_id) in block.insts.iter().enumerate() {
             let Some(inst) = module.inst(inst_id) else {
@@ -1024,18 +1044,22 @@ fn verify_dominance(
             };
 
             if let Op::Phi { entries } = &inst.op {
-                // Exemption 3: phi entries are uses at the END of the
-                // edge's source block.
                 for (edge, val) in entries {
                     let Some(v) = module.value(*val) else {
                         continue;
                     };
+                    let Some(&pi) = index.get(&edge.from) else {
+                        continue;
+                    };
+                    let use_pt = vdom.edge_use_pt(pi, edge.kind);
                     match v.def {
-                        // Exemption 4: entry-defined values dominate all.
                         ValueDef::Param(_) | ValueDef::Const(_) => {}
                         ValueDef::ExceptionParam(h) => {
-                            let region = exc_region(h);
-                            if !region.contains(&edge.from) && reachable_all.contains(&edge.from) {
+                            let Some(&hi) = index.get(&h) else {
+                                continue;
+                            };
+                            let h_pt = vdom.entry_pt(hi);
+                            if vdom.is_pt_reachable(use_pt) && !vdom.dominates_pt(h_pt, use_pt) {
                                 report.errors.push(err(
                                     Some(bb),
                                     Some(inst_id),
@@ -1054,15 +1078,12 @@ fn verify_dominance(
                             let Some(&di) = index.get(&def.block) else {
                                 continue;
                             };
-                            let Some(&pi) = index.get(&edge.from) else {
-                                continue;
-                            };
-                            // Def in the pred itself, entry-defined, or a
-                            // dead/unreachable pred: OK/exempt.
-                            if di == pi || di == entry_i || !normal_reachable(pi) {
+                            if !vdom.is_pt_reachable(use_pt) {
                                 continue;
                             }
-                            if !dominates(di, pi) {
+                            let def_p = inst_pos.get(&def_inst).copied().unwrap_or(usize::MAX);
+                            let def_pt = vdom.def_pt(di, def_p);
+                            if !vdom.dominates_pt(def_pt, use_pt) {
                                 report.errors.push(err(
                                     Some(bb),
                                     Some(inst_id),
@@ -1084,7 +1105,9 @@ fn verify_dominance(
                 match v.def {
                     ValueDef::Param(_) | ValueDef::Const(_) => {}
                     ValueDef::ExceptionParam(h) => {
-                        if !exc_region(h).contains(&bb) && reachable_all.contains(&bb) {
+                        let Some(&hi) = index.get(&h) else { return };
+                        let h_pt = vdom.entry_pt(hi);
+                        if bb_reachable && !vdom.dominates_pt(h_pt, bb_entry_pt) {
                             report.errors.push(err(
                                 Some(bb),
                                 Some(inst_id),
@@ -1100,10 +1123,8 @@ fn verify_dominance(
                             return;
                         };
                         if def.block == bb {
-                            // Same block: the definition must precede the
-                            // use (dominance is not just block-granular).
-                            let def_pos = position.get(&def_inst).copied().unwrap_or(usize::MAX);
-                            if def_pos >= pos {
+                            let def_p = inst_pos.get(&def_inst).copied().unwrap_or(usize::MAX);
+                            if def_p >= pos {
                                 report.errors.push(err(
                                     Some(bb),
                                     Some(inst_id),
@@ -1115,13 +1136,12 @@ fn verify_dominance(
                         let Some(&di) = index.get(&def.block) else {
                             return;
                         };
-                        // Exemption 4 (entry-defined) and exemptions 1-2
-                        // (dead blocks; blocks with no Normal-edge path
-                        // from entry — handlers).
-                        if di == entry_i || !normal_reachable(bi) {
+                        if !bb_reachable {
                             return;
                         }
-                        if !dominates(di, bi) {
+                        let def_p = inst_pos.get(&def_inst).copied().unwrap_or(usize::MAX);
+                        let def_pt = vdom.def_pt(di, def_p);
+                        if !vdom.dominates_pt(def_pt, bb_entry_pt) {
                             report.errors.push(err(
                                 Some(bb),
                                 Some(inst_id),
@@ -1138,8 +1158,95 @@ fn verify_dominance(
     }
 }
 
-/// Verify the whole module: every function, plus module-level reference
-/// integrity (class table, function table, const pool).
+fn check_ty_classes(module: &Module, ty: &Ty, out: &mut Vec<VerifyError>, func: Option<FuncId>) {
+    match ty {
+        Ty::Static(StaticTy::Reference(c)) => {
+            if module.class(*c).is_none() {
+                out.push(VerifyError {
+                    func,
+                    block: None,
+                    inst: None,
+                    kind: VerifyErrorKind::ClassOutOfRange(*c),
+                });
+            }
+        }
+        Ty::Union(xs) => {
+            let mut stack: Vec<&[Ty]> = vec![xs];
+            while let Some(slice) = stack.pop() {
+                for item in slice {
+                    match item {
+                        Ty::Static(StaticTy::Reference(c)) if module.class(*c).is_none() => {
+                            out.push(VerifyError {
+                                func,
+                                block: None,
+                                inst: None,
+                                kind: VerifyErrorKind::ClassOutOfRange(*c),
+                            });
+                        }
+                        Ty::Union(sub) if !sub.is_empty() => stack.push(sub),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn check_annotations(
+    module: &Module,
+    anns: &[crate::module::Annotation],
+    func: Option<FuncId>,
+    out: &mut Vec<VerifyError>,
+) {
+    for ann in anns {
+        if module.class(ann.class).is_none() {
+            out.push(VerifyError {
+                func,
+                block: None,
+                inst: None,
+                kind: VerifyErrorKind::ClassOutOfRange(ann.class),
+            });
+        }
+        for (name, val) in &ann.elements {
+            if module.sym.resolve(*name).is_none() {
+                out.push(VerifyError {
+                    func,
+                    block: None,
+                    inst: None,
+                    kind: VerifyErrorKind::SymOutOfRange(*name),
+                });
+            }
+            match val {
+                AnnValue::Const(c) if module.consts.get(*c).is_none() => out.push(VerifyError {
+                    func,
+                    block: None,
+                    inst: None,
+                    kind: VerifyErrorKind::ConstOutOfRange(*c),
+                }),
+                AnnValue::Class(c) | AnnValue::Field(c, _) if module.class(*c).is_none() => {
+                    out.push(VerifyError {
+                        func,
+                        block: None,
+                        inst: None,
+                        kind: VerifyErrorKind::ClassOutOfRange(*c),
+                    });
+                }
+                AnnValue::Name(s) if module.sym.resolve(*s).is_none() => out.push(VerifyError {
+                    func,
+                    block: None,
+                    inst: None,
+                    kind: VerifyErrorKind::SymOutOfRange(*s),
+                }),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Verify the whole module: every function, cross-function arena disjointness,
+/// and module-level reference & cycle integrity (`R2-H5`, `R2-D5`).
+#[must_use = "verification findings must be checked via VerifyReport::is_ok()"]
 pub fn verify_module(module: &Module) -> VerifyReport {
     let mut report = VerifyReport::default();
     let module_err = |kind: VerifyErrorKind| VerifyError {
@@ -1148,20 +1255,36 @@ pub fn verify_module(module: &Module) -> VerifyReport {
         inst: None,
         kind,
     };
+    let check_sym = |s: Sym, func: Option<FuncId>, out: &mut Vec<VerifyError>| {
+        if module.sym.resolve(s).is_none() {
+            out.push(VerifyError {
+                func,
+                block: None,
+                inst: None,
+                kind: VerifyErrorKind::SymOutOfRange(s),
+            });
+        }
+    };
 
     for class in &module.classes {
-        let mut check_class = |c: ClassId| {
-            if module.class(c).is_none() {
-                report
-                    .errors
-                    .push(module_err(VerifyErrorKind::ClassOutOfRange(c)));
-            }
-        };
-        if let Some(s) = class.super_class {
-            check_class(s);
+        check_sym(class.descriptor, None, &mut report.errors);
+        check_sym(class.name, None, &mut report.errors);
+        if let Some(sf) = class.source_file {
+            check_sym(sf, None, &mut report.errors);
+        }
+        if let Some(s) = class.super_class
+            && module.class(s).is_none()
+        {
+            report
+                .errors
+                .push(module_err(VerifyErrorKind::ClassOutOfRange(s)));
         }
         for &i in &class.interfaces {
-            check_class(i);
+            if module.class(i).is_none() {
+                report
+                    .errors
+                    .push(module_err(VerifyErrorKind::ClassOutOfRange(i)));
+            }
         }
         for &m in &class.methods {
             if module.func(m).is_none() {
@@ -1170,6 +1293,19 @@ pub fn verify_module(module: &Module) -> VerifyReport {
                     .push(module_err(VerifyErrorKind::FuncOutOfRange(m)));
             }
         }
+        for field in &class.fields {
+            check_sym(field.name, None, &mut report.errors);
+            check_ty_classes(module, &field.ty, &mut report.errors, None);
+            if let Some(iv) = field.initial_value
+                && module.consts.get(iv).is_none()
+            {
+                report
+                    .errors
+                    .push(module_err(VerifyErrorKind::ConstOutOfRange(iv)));
+            }
+            check_annotations(module, &field.annotations, None, &mut report.errors);
+        }
+        check_annotations(module, &class.annotations, None, &mut report.errors);
         if let Some(sn) = class.scope_names
             && module.consts.get(sn).is_none()
         {
@@ -1177,49 +1313,310 @@ pub fn verify_module(module: &Module) -> VerifyReport {
                 .errors
                 .push(module_err(VerifyErrorKind::ConstOutOfRange(sn)));
         }
+        if let Some(esm) = &class.es_module {
+            for imp in &esm.imports {
+                match imp {
+                    ImportDecl::Regular {
+                        local_name,
+                        import_name,
+                        module_request,
+                    } => {
+                        check_sym(*local_name, None, &mut report.errors);
+                        check_sym(*import_name, None, &mut report.errors);
+                        check_sym(*module_request, None, &mut report.errors);
+                    }
+                    ImportDecl::Namespace {
+                        local_name,
+                        module_request,
+                    } => {
+                        check_sym(*local_name, None, &mut report.errors);
+                        check_sym(*module_request, None, &mut report.errors);
+                    }
+                }
+            }
+            for exp in &esm.exports {
+                match exp {
+                    ExportDecl::Local {
+                        local_name,
+                        export_name,
+                    } => {
+                        check_sym(*local_name, None, &mut report.errors);
+                        check_sym(*export_name, None, &mut report.errors);
+                    }
+                    ExportDecl::Indirect {
+                        export_name,
+                        import_name,
+                        module_request,
+                    } => {
+                        check_sym(*export_name, None, &mut report.errors);
+                        check_sym(*import_name, None, &mut report.errors);
+                        check_sym(*module_request, None, &mut report.errors);
+                    }
+                    ExportDecl::Star { module_request } => {
+                        check_sym(*module_request, None, &mut report.errors);
+                    }
+                }
+            }
+            for req in &esm.module_requests {
+                check_sym(req.specifier, None, &mut report.errors);
+            }
+        }
     }
 
+    for imp in &module.imports {
+        match imp {
+            ImportDecl::Regular {
+                local_name,
+                import_name,
+                module_request,
+            } => {
+                check_sym(*local_name, None, &mut report.errors);
+                check_sym(*import_name, None, &mut report.errors);
+                check_sym(*module_request, None, &mut report.errors);
+            }
+            ImportDecl::Namespace {
+                local_name,
+                module_request,
+            } => {
+                check_sym(*local_name, None, &mut report.errors);
+                check_sym(*module_request, None, &mut report.errors);
+            }
+        }
+    }
+    for exp in &module.exports {
+        match exp {
+            ExportDecl::Local {
+                local_name,
+                export_name,
+            } => {
+                check_sym(*local_name, None, &mut report.errors);
+                check_sym(*export_name, None, &mut report.errors);
+            }
+            ExportDecl::Indirect {
+                export_name,
+                import_name,
+                module_request,
+            } => {
+                check_sym(*export_name, None, &mut report.errors);
+                check_sym(*import_name, None, &mut report.errors);
+                check_sym(*module_request, None, &mut report.errors);
+            }
+            ExportDecl::Star { module_request } => {
+                check_sym(*module_request, None, &mut report.errors);
+            }
+        }
+    }
+    for req in &module.module_requests {
+        check_sym(req.specifier, None, &mut report.errors);
+    }
+
+    let mut global_blocks: HashSet<BlockId> = HashSet::with_capacity(module.blocks.len());
+    let mut global_insts: HashSet<InstId> = HashSet::with_capacity(module.insts.len());
+    let mut global_values: HashSet<ValueId> = HashSet::with_capacity(module.values.len());
+
     for (fi, func) in module.functions.iter().enumerate() {
+        let fid = FuncId::new(fi as u32);
         if module.class(func.class_id).is_none() {
             report
                 .errors
                 .push(module_err(VerifyErrorKind::ClassOutOfRange(func.class_id)));
         }
-        let fr = verify_func(module, FuncId::new(fi as u32));
+        check_sym(func.name, Some(fid), &mut report.errors);
+        if let Some(sig) = &func.sig {
+            if let Some(ret) = &sig.return_ty {
+                check_ty_classes(module, ret, &mut report.errors, Some(fid));
+            }
+            for pty in &sig.param_tys {
+                check_ty_classes(module, pty, &mut report.errors, Some(fid));
+            }
+        }
+        check_annotations(module, &func.annotations, Some(fid), &mut report.errors);
+        if let Some(dbg) = &func.debug {
+            if let Some(sf) = dbg.source_file {
+                check_sym(sf, Some(fid), &mut report.errors);
+            }
+            for &pn in &dbg.param_names {
+                check_sym(pn, Some(fid), &mut report.errors);
+            }
+            for ln in &dbg.local_names {
+                check_sym(ln.name, Some(fid), &mut report.errors);
+                if let Some(ty) = &ln.ty {
+                    check_ty_classes(module, ty, &mut report.errors, Some(fid));
+                }
+            }
+            if let Some(sn) = dbg.scope_names
+                && module.consts.get(sn).is_none()
+            {
+                report.errors.push(VerifyError {
+                    func: Some(fid),
+                    block: None,
+                    inst: None,
+                    kind: VerifyErrorKind::ConstOutOfRange(sn),
+                });
+            }
+        }
+
+        let mut func_unique_blocks: HashSet<BlockId> = HashSet::with_capacity(func.blocks.len());
+        for &bb in &func.blocks {
+            if func_unique_blocks.insert(bb) && !global_blocks.insert(bb) {
+                report.errors.push(VerifyError {
+                    func: Some(fid),
+                    block: Some(bb),
+                    inst: None,
+                    kind: VerifyErrorKind::DuplicateBlock(bb),
+                });
+            }
+        }
+        let mut func_unique_vals: HashSet<ValueId> = HashSet::new();
+        for &v in func.params.iter().chain(func.frame_init_consts.iter()) {
+            if func_unique_vals.insert(v) && !global_values.insert(v) {
+                report.errors.push(VerifyError {
+                    func: Some(fid),
+                    block: None,
+                    inst: None,
+                    kind: VerifyErrorKind::DuplicateValueDef(v),
+                });
+            }
+        }
+        for region in &func.try_regions {
+            for catch in &region.catches {
+                if func_unique_vals.insert(catch.exception)
+                    && !global_values.insert(catch.exception)
+                {
+                    report.errors.push(VerifyError {
+                        func: Some(fid),
+                        block: Some(catch.handler),
+                        inst: None,
+                        kind: VerifyErrorKind::DuplicateValueDef(catch.exception),
+                    });
+                }
+            }
+        }
+        let mut func_unique_insts: HashSet<InstId> = HashSet::new();
+        for &bb in &func_unique_blocks {
+            if let Some(block) = module.block(bb) {
+                for &iid in &block.insts {
+                    if func_unique_insts.insert(iid) && !global_insts.insert(iid) {
+                        report.errors.push(VerifyError {
+                            func: Some(fid),
+                            block: Some(bb),
+                            inst: Some(iid),
+                            kind: VerifyErrorKind::DuplicateInst(iid),
+                        });
+                    }
+                    if let Some(inst) = module.inst(iid)
+                        && let Some(res) = inst.result
+                        && func_unique_vals.insert(res)
+                        && !global_values.insert(res)
+                    {
+                        report.errors.push(VerifyError {
+                            func: Some(fid),
+                            block: Some(bb),
+                            inst: Some(iid),
+                            kind: VerifyErrorKind::DuplicateValueDef(res),
+                        });
+                    }
+                }
+            }
+        }
+
+        let fr = verify_func(module, fid);
         report.errors.extend(fr.errors);
         report.warnings.extend(fr.warnings);
     }
 
-    // Const::MethodRef payloads reference the function table (nested
-    // literal shapes are inline trees — walk them).
-    fn check_const(module: &Module, c: &crate::consts::Const, out: &mut Vec<VerifyError>) {
+    for val in &module.values {
+        check_ty_classes(module, &val.ty, &mut report.errors, None);
+    }
+
+    // Iterative ConstPool bounds + 3-color cycle detection (`0=unvisited, 1=visiting, 2=done`).
+    let pool_len = module.consts.len();
+    for ci in 0..pool_len {
+        let cid = ConstId::new(ci as u32);
+        let Some(c) = module.consts.get(cid) else {
+            continue;
+        };
         match c {
-            crate::consts::Const::MethodRef(f) => {
-                if module.func(*f).is_none() {
-                    out.push(VerifyError {
-                        func: None,
-                        block: None,
-                        inst: None,
-                        kind: VerifyErrorKind::FuncOutOfRange(*f),
-                    });
+            Const::MethodRef(f) if module.func(*f).is_none() => {
+                report
+                    .errors
+                    .push(module_err(VerifyErrorKind::FuncOutOfRange(*f)));
+            }
+            Const::String(s) | Const::BigInt(s) => check_sym(*s, None, &mut report.errors),
+            Const::ArrayLiteral(items) => {
+                for &child in items {
+                    if module.consts.get(child).is_none() {
+                        report
+                            .errors
+                            .push(module_err(VerifyErrorKind::ConstOutOfRange(child)));
+                    }
                 }
             }
-            crate::consts::Const::ArrayLiteral(items) => {
-                for item in items {
-                    check_const(module, item, out);
+            Const::ObjectLiteral { keys, values } => {
+                if keys.len() != values.len() {
+                    report
+                        .errors
+                        .push(module_err(VerifyErrorKind::ObjectLiteralArityMismatch {
+                            const_id: cid,
+                            keys: keys.len(),
+                            values: values.len(),
+                        }));
                 }
-            }
-            crate::consts::Const::ObjectLiteral { keys, values } => {
-                for item in keys.iter().chain(values.iter()) {
-                    check_const(module, item, out);
+                for &child in keys.iter().chain(values.iter()) {
+                    if module.consts.get(child).is_none() {
+                        report
+                            .errors
+                            .push(module_err(VerifyErrorKind::ConstOutOfRange(child)));
+                    }
                 }
             }
             _ => {}
         }
     }
-    for ci in 0..module.consts.len() {
-        if let Some(c) = module.consts.get(ConstId::new(ci as u32)) {
-            check_const(module, c, &mut report.errors);
+
+    let mut color = vec![0u8; pool_len];
+    let mut dfs_stack: Vec<(usize, usize)> = Vec::new();
+    for root in 0..pool_len {
+        if color[root] != 0 {
+            continue;
+        }
+        color[root] = 1;
+        dfs_stack.push((root, 0));
+        while let Some((ci, child_pos)) = dfs_stack.last_mut() {
+            let cur = *ci;
+            let next_child = match module.consts.get(ConstId::new(cur as u32)) {
+                Some(Const::ArrayLiteral(items)) => items.get(*child_pos).copied(),
+                Some(Const::ObjectLiteral { keys, values }) => {
+                    let pos = *child_pos;
+                    if pos < keys.len() {
+                        Some(keys[pos])
+                    } else {
+                        values.get(pos - keys.len()).copied()
+                    }
+                }
+                _ => None,
+            };
+            if let Some(child_id) = next_child {
+                *child_pos += 1;
+                let ch_idx = child_id.index();
+                if ch_idx < pool_len {
+                    match color[ch_idx] {
+                        0 => {
+                            color[ch_idx] = 1;
+                            dfs_stack.push((ch_idx, 0));
+                        }
+                        1 => {
+                            report
+                                .errors
+                                .push(module_err(VerifyErrorKind::ConstCycle(child_id)));
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                color[cur] = 2;
+                dfs_stack.pop();
+            }
         }
     }
 
@@ -3256,14 +3653,16 @@ mod tests {
         let bogus_in_array = FuncId::new(79);
         m.consts.push(Const::MethodRef(bogus_direct));
         let key = m.sym.intern("k");
+        let k_cid = m.consts.push(Const::String(key));
+        let nested_cid = m.consts.push(Const::MethodRef(bogus_nested));
         m.consts.push(Const::ObjectLiteral {
-            keys: vec![Const::String(key)],
-            values: vec![Const::MethodRef(bogus_nested)],
+            keys: vec![k_cid],
+            values: vec![nested_cid],
         });
-        m.consts.push(Const::ArrayLiteral(vec![
-            Const::Null,
-            Const::MethodRef(bogus_in_array),
-        ]));
+        let null_cid = m.consts.push(Const::Null);
+        let arr_m_cid = m.consts.push(Const::MethodRef(bogus_in_array));
+        m.consts
+            .push(Const::ArrayLiteral(vec![null_cid, arr_m_cid]));
         let r = verify_module(&m);
         expect_error(
             &r,

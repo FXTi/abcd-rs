@@ -41,7 +41,7 @@
 //!   lists under the flag.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Write;
 
 use abcd_ir::function::Loc;
@@ -448,10 +448,9 @@ pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId>
             Op::DefineFunc { body, .. } => {
                 consumed.insert(*body);
             }
-            Op::DefineClass { ctor, members, .. }
-            | Op::DefineSendableClass { ctor, members, .. } => {
-                consumed.insert(*ctor);
-                collect_method_refs(module, *members, &mut consumed);
+            Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+                consumed.insert(cls.ctor);
+                collect_method_refs(module, cls.members, &mut consumed);
             }
             // Method entries in object shape buffers emit inline too
             // (`{name: function …}`) — never top-level.
@@ -464,32 +463,38 @@ pub fn consumed_functions(module: &Module) -> std::collections::BTreeSet<FuncId>
     consumed
 }
 
-/// Walk a const (iteratively via explicit heap workstack) for `MethodRef` functions.
+/// Walk a pooled constant graph (iteratively via an explicit heap workstack and
+/// visited-`ConstId` cycle guard) for `MethodRef` functions.
 pub(in crate::emit) fn collect_method_refs(
     module: &Module,
-    cid: abcd_ir::ConstId,
+    root_cid: abcd_ir::ConstId,
     out: &mut BTreeSet<FuncId>,
 ) {
-    if let Some(c) = module.consts.get(cid) {
-        collect_method_refs_const(c, out);
+    let mut visited: HashSet<abcd_ir::ConstId> = HashSet::new();
+    if !visited.insert(root_cid) {
+        return;
     }
-}
-
-pub(in crate::emit) fn collect_method_refs_const(root: &Const, out: &mut BTreeSet<FuncId>) {
-    let mut stack: Vec<&Const> = vec![root];
-    while let Some(c) = stack.pop() {
+    let mut stack: Vec<abcd_ir::ConstId> = vec![root_cid];
+    while let Some(cid) = stack.pop() {
+        let Some(c) = module.consts.get(cid) else {
+            continue;
+        };
         match c {
             Const::MethodRef(f) => {
                 out.insert(*f);
             }
             Const::ArrayLiteral(items) => {
-                for i in items.iter().rev() {
-                    stack.push(i);
+                for &i in items.iter().rev() {
+                    if visited.insert(i) {
+                        stack.push(i);
+                    }
                 }
             }
             Const::ObjectLiteral { keys, values } => {
-                for i in values.iter().rev().chain(keys.iter().rev()) {
-                    stack.push(i);
+                for &i in values.iter().rev().chain(keys.iter().rev()) {
+                    if visited.insert(i) {
+                        stack.push(i);
+                    }
                 }
             }
             _ => {}
@@ -549,14 +554,13 @@ pub(crate) fn try_extend_batch_funcs(
                             stack.push(*body);
                         }
                     }
-                    Op::DefineClass { ctor, members, .. }
-                    | Op::DefineSendableClass { ctor, members, .. } => {
-                        if visited.insert(*ctor) {
-                            added.push(*ctor);
-                            stack.push(*ctor);
+                    Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+                        if visited.insert(cls.ctor) {
+                            added.push(cls.ctor);
+                            stack.push(cls.ctor);
                         }
                         inline_refs.clear();
-                        collect_method_refs(module, *members, &mut inline_refs);
+                        collect_method_refs(module, cls.members, &mut inline_refs);
                         for &m in &inline_refs {
                             if visited.insert(m) {
                                 added.push(m);

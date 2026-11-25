@@ -2,6 +2,7 @@
 name = "abcd-ir"
 description = "The SSA IR — format-independent program representation (design/ir.md)"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 license.workspace = true
 readme = "README.md"
@@ -13,3 +14,6 @@ readme = "README.md"
 # structurally by the crate graph — do not add such a dependency.
 [dependencies]
 thiserror.workspace = true
+
+[lints]
+workspace = true

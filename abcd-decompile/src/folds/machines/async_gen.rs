@@ -415,44 +415,48 @@ pub(in crate::folds) fn agen_fold_seq(
         // The yield site first: the pre-yield await must fold with its
         // yield machinery, never as a bare `await`.
         if let Some(site) = match_ag_yield(nodes, i, cx) {
-            let SNode::Stmts(run) = &mut nodes[i] else {
-                unreachable!()
-            };
-            let insert_at = *site
+            let &(insert_ni, insert_li) = site
                 .await_site
                 .remove
-                .iter()
-                .min()
-                .expect("the suspend leaf");
-            for &j in &site.await_site.remove {
-                run.remove(j);
+                .last()
+                .expect("at least the suspend leaf");
+            for &(rni, rli) in &site.await_site.remove {
+                let SNode::Stmts(run) = &mut nodes[rni] else {
+                    unreachable!()
+                };
+                run.remove(rli);
             }
-            let insert_at = insert_at.min(run.len());
             let y = Expr::Yield {
                 value: Box::new(site.await_site.awaited),
             };
-            if nodes_use_temp(&site.continuation, site.ry) {
-                // `x = yield v` — the resumption value has real uses
-                // in the NEXT continuation; bind the temp.
-                run.insert(
-                    insert_at,
-                    Leaf::Raw(Stmt::Declare {
-                        name: site.ry_name,
-                        mutable: false,
-                        value: y,
-                        value_id: site.ry,
-                    }),
-                );
-                stats.agen_bound += 1;
-            } else {
-                run.insert(insert_at, Leaf::Raw(Stmt::Expr(y)));
+            {
+                let SNode::Stmts(run) = &mut nodes[insert_ni] else {
+                    unreachable!()
+                };
+                let insert_at = insert_li.min(run.len());
+                if nodes_use_temp(&site.continuation, site.ry) {
+                    // `x = yield v` — the resumption value has real uses
+                    // in the NEXT continuation; bind the temp.
+                    run.insert(
+                        insert_at,
+                        Leaf::Raw(Stmt::Declare {
+                            name: site.ry_name,
+                            mutable: false,
+                            value: y,
+                            value_id: site.ry,
+                        }),
+                    );
+                    stats.agen_bound += 1;
+                } else {
+                    run.insert(insert_at, Leaf::Raw(Stmt::Expr(y)));
+                }
             }
             stats.agen_yields += 1;
             nodes.splice(
                 i + site.await_site.dispatch_off..i + site.await_site.dispatch_off + 1,
                 site.continuation,
             );
-            i += 1;
+            i = insert_ni + 1;
             continue;
         }
         // A source-level await (d-P13's site shape) — guarded: a
@@ -461,39 +465,44 @@ pub(in crate::folds) fn agen_fold_seq(
         // continuation. If the yield match refused it, the whole site
         // stays loud.
         if let Some(site) = match_ag_await(nodes, i, cx) {
-            let SNode::Stmts(run) = &mut nodes[i] else {
-                unreachable!()
-            };
-            let insert_at = *site.remove.iter().min().expect("the suspend leaf");
-            for &j in &site.remove {
-                run.remove(j);
+            let &(insert_ni, insert_li) = site.remove.last().expect("at least the suspend leaf");
+            for &(rni, rli) in &site.remove {
+                let SNode::Stmts(run) = &mut nodes[rni] else {
+                    unreachable!()
+                };
+                run.remove(rli);
             }
-            let insert_at = insert_at.min(run.len());
             let aw = Expr::Await {
                 value: Box::new(site.awaited),
                 uncaught: true,
             };
-            match site.resume {
-                Some((r, name)) if cx.uses.get(&r).copied().unwrap_or(0) > 1 => {
-                    run.insert(
-                        insert_at,
-                        Leaf::Raw(Stmt::Declare {
-                            name,
-                            mutable: false,
-                            value: aw,
-                            value_id: r,
-                        }),
-                    );
-                    stats.agen_await_bound += 1;
+            {
+                let SNode::Stmts(run) = &mut nodes[insert_ni] else {
+                    unreachable!()
+                };
+                let insert_at = insert_li.min(run.len());
+                match site.resume {
+                    Some((r, name)) if cx.uses.get(&r).copied().unwrap_or(0) > 1 => {
+                        run.insert(
+                            insert_at,
+                            Leaf::Raw(Stmt::Declare {
+                                name,
+                                mutable: false,
+                                value: aw,
+                                value_id: r,
+                            }),
+                        );
+                        stats.agen_await_bound += 1;
+                    }
+                    _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
                 }
-                _ => run.insert(insert_at, Leaf::Raw(Stmt::Expr(aw))),
             }
             stats.agen_awaits += 1;
             nodes.splice(
                 i + site.dispatch_off..i + site.dispatch_off + 1,
                 site.continuation,
             );
-            i += 1;
+            i = insert_ni + 1;
             continue;
         }
         i += 1;

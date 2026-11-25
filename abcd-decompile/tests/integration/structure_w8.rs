@@ -5515,3 +5515,43 @@ fn loop_cut_subst_ident_temp() {
         s.stats
     );
 }
+
+/// R2-C2 + R2-C1 loop-cut shape: an unprotected pre-try loop header
+/// (`do { i++; try { pre_c(); if (…) throw; … } … } while (…)`) followed
+/// by a split protected spine block before the protected `If`.
+#[test]
+fn loop_cut_pre_try_header_and_split_spine() {
+    let (m, lc) = loop_cut_base(true, false, &mut |m, lc| {
+        let p1 = m.func(lc.f).unwrap().params[1];
+        let b0 = m.func(lc.f).unwrap().blocks[0];
+        let pre_hdr = add_block(m, lc.f);
+        let prot_pre = add_block(m, lc.f);
+        call_p1(m, pre_hdr, p1);
+        emit_void(m, pre_hdr, Op::Branch { dest: prot_pre });
+        call_p1(m, prot_pre, p1);
+        emit_void(m, prot_pre, Op::Branch { dest: lc.hdr });
+        set_term(m, b0, Op::Branch { dest: pre_hdr });
+        unlink(m, b0, lc.hdr);
+        link(m, b0, pre_hdr);
+        link(m, pre_hdr, prot_pre);
+        link(m, prot_pre, lc.hdr);
+        set_term(m, lc.tramp, Op::Branch { dest: pre_hdr });
+        unlink(m, lc.tramp, lc.hdr);
+        link(m, lc.tramp, pre_hdr);
+        m.func_mut(lc.f).unwrap().try_regions[0]
+            .protected
+            .push(prot_pre);
+        m.func_mut(lc.f).unwrap().try_regions[1]
+            .protected
+            .push(prot_pre);
+        link_exc(m, prot_pre, lc.h0);
+        link_exc(m, prot_pre, lc.h1);
+    });
+    let s = structure(&m, lc.f);
+    assert_eq!(
+        s.stats.loop_cut_rewrites, 1,
+        "unprotected pre-try header + split spine rewrites: {:?}",
+        s.stats
+    );
+    assert_eq!(s.stats.loop_cut_bails, 0, "no bail: {:?}", s.stats);
+}

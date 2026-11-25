@@ -1022,20 +1022,20 @@ fn s17_class_reconstruction() {
     let _this = add_param(&mut m, f);
     let move_sym = intern(&mut m, "move");
     let x_sym = intern(&mut m, "x");
-    let members = const_id(
+    let members = const_array(
         &mut m,
-        Const::ArrayLiteral(vec![
+        vec![
             Const::String(move_sym),
             Const::MethodRef(method),
             Const::String(x_sym),
             Const::MethodRef(getter),
             Const::number(0.0),
-        ]),
+        ],
     );
     let cls = emit(
         &mut m,
         b,
-        Op::DefineClass {
+        Op::DefineClass(Box::new(abcd_ir::DefineClassData {
             ctor,
             heritage: None,
             members,
@@ -1044,7 +1044,7 @@ fn s17_class_reconstruction() {
             // fallback is what this golden pins.
             member_attrs: Vec::new(),
             count: 2,
-        },
+        })),
     );
     emit_void(&mut m, b, Op::Return { value: Some(cls) });
 
@@ -2139,10 +2139,7 @@ fn s34_scope_fold() {
     let _this = add_param(&mut m, f);
     let x = intern(&mut m, "x");
     let y = intern(&mut m, "y");
-    let names = const_id(
-        &mut m,
-        Const::ArrayLiteral(vec![Const::String(x), Const::String(y)]),
-    );
+    let names = const_array(&mut m, vec![Const::String(x), Const::String(y)]);
     let _ne = emit(
         &mut m,
         b,
@@ -2204,10 +2201,7 @@ fn s35_scope_fold_partial() {
     let j = add_block(&mut m, f);
     let x = intern(&mut m, "x");
     let y = intern(&mut m, "y");
-    let names = const_id(
-        &mut m,
-        Const::ArrayLiteral(vec![Const::String(x), Const::String(y)]),
-    );
+    let names = const_array(&mut m, vec![Const::String(x), Const::String(y)]);
     let _ne = emit(
         &mut m,
         b,
@@ -2672,10 +2666,7 @@ fn s42_scope_fold_restore_no_redeclare() {
     let y = intern(&mut m, "y");
     // Three slots, two named — the unnamed slot keeps the scope-push
     // comment (the wild shape: `/* scope-push [<unnamed>] … */`).
-    let names = const_id(
-        &mut m,
-        Const::ArrayLiteral(vec![Const::String(x), Const::String(y)]),
-    );
+    let names = const_array(&mut m, vec![Const::String(x), Const::String(y)]);
     let _ne = emit(
         &mut m,
         b,

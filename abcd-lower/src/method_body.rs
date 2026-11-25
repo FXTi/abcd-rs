@@ -44,7 +44,7 @@
 //! [`LowerError::EntityIndexOverflow`] — nothing is invented, truncated, or
 //! passed through silently.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use abcd_file::{File, LiteralValue, MethodBody};
 use abcd_ir::{Const, ConstId, FuncId, Module, Sym};
@@ -123,9 +123,21 @@ pub struct EntityResolver<'a> {
     /// Literal-array table index → source offset (inverted
     /// `literal_array_offsets`).
     literal_index_to_offset: HashMap<u32, u32>,
-    /// Canonical `Const::ArrayLiteral` shape → smallest matching
+    /// Canonical literal-array element sequence → smallest matching
     /// literal-array table index.
-    shape_to_min_index: HashMap<Const, u32>,
+    shape_to_min_index: HashMap<Vec<CanonicalLitElem>, u32>,
+}
+
+/// Value-canonical element of a literal-array shape (`R2-D3`), decoupling
+/// structural content matching from `ConstPool` `ConstId` allocation order.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum CanonicalLitElem {
+    Bool(bool),
+    Number(u64),
+    String(Sym),
+    MethodRef(FuncId),
+    Null,
+    Array(Vec<CanonicalLitElem>),
 }
 
 impl<'a> EntityResolver<'a> {
@@ -159,12 +171,13 @@ impl<'a> EntityResolver<'a> {
             .map(|(&offset, &index)| (index, offset))
             .collect();
 
-        let mut shape_to_min_index: HashMap<Const, u32> =
+        let mut shape_to_min_index: HashMap<Vec<CanonicalLitElem>, u32> =
             HashMap::with_capacity(file.literal_arrays.len());
-        let mut cache: Vec<Option<Option<Const>>> = vec![None; file.literal_arrays.len()];
+        let mut cache: Vec<Option<Option<Vec<CanonicalLitElem>>>> =
+            vec![None; file.literal_arrays.len()];
         for idx in 0..file.literal_arrays.len() as u32 {
             if let Some(shape) =
-                build_literal_array_const(module, file, &method_offset_to_index, &mut cache, idx)
+                build_literal_array_shape(module, file, &method_offset_to_index, &mut cache, idx)
             {
                 shape_to_min_index.entry(shape).or_insert(idx);
             }
@@ -244,10 +257,150 @@ impl<'a> EntityResolver<'a> {
     /// [`ConstId`] (a literal shape) → source offset of the smallest
     /// literal-array table entry whose content matches the shape.
     pub(crate) fn literal_array_offset(&self, shape: ConstId) -> Option<u32> {
-        let tree = self.module.consts.get(shape)?;
-        let &index = self.shape_to_min_index.get(tree)?;
+        let canonical = canonicalize_const_shape(self.module, shape)?;
+        let &index = self.shape_to_min_index.get(&canonical)?;
         self.literal_index_to_offset.get(&index).copied()
     }
+}
+
+enum ConstShapeCursor<'m> {
+    Array {
+        items: &'m [ConstId],
+        next: usize,
+    },
+    Object {
+        keys: &'m [ConstId],
+        values: &'m [ConstId],
+        next: usize,
+    },
+}
+
+impl<'m> ConstShapeCursor<'m> {
+    fn from_const(c: &'m Const) -> Option<(Self, usize)> {
+        match c {
+            Const::ArrayLiteral(items) => Some((Self::Array { items, next: 0 }, items.len())),
+            Const::ObjectLiteral { keys, values } if keys.len() == values.len() => Some((
+                Self::Object {
+                    keys,
+                    values,
+                    next: 0,
+                },
+                keys.len() * 2,
+            )),
+            _ => None,
+        }
+    }
+
+    fn next_id(&mut self) -> Option<ConstId> {
+        match self {
+            Self::Array { items, next } => {
+                let id = *items.get(*next)?;
+                *next += 1;
+                Some(id)
+            }
+            Self::Object { keys, values, next } => {
+                let pair_idx = *next / 2;
+                let id = if *next % 2 == 0 {
+                    *keys.get(pair_idx)?
+                } else {
+                    *values.get(pair_idx)?
+                };
+                *next += 1;
+                Some(id)
+            }
+        }
+    }
+}
+
+struct ConstShapeFrame<'m> {
+    cid: ConstId,
+    cursor: ConstShapeCursor<'m>,
+    depth: u32,
+    subtree_height: u32,
+    items: Vec<CanonicalLitElem>,
+}
+
+/// Iteratively dereference a pooled [`Const::ArrayLiteral`] /
+/// [`Const::ObjectLiteral`] shape into a value-canonical tree, rejecting
+/// dangling child [`ConstId`]s, non-shape/unsupported elements, `ConstId`
+/// cycles, and nesting depths beyond `64` (`R2-D3`).
+fn canonicalize_const_shape(module: &Module, root: ConstId) -> Option<Vec<CanonicalLitElem>> {
+    let root_const = module.consts.get(root)?;
+    let (root_cursor, root_cap) = ConstShapeCursor::from_const(root_const)?;
+    let mut active: HashSet<ConstId> = HashSet::new();
+    active.insert(root);
+    let mut memo: HashMap<ConstId, (Vec<CanonicalLitElem>, u32)> = HashMap::new();
+    let mut stack = vec![ConstShapeFrame {
+        cid: root,
+        cursor: root_cursor,
+        depth: 0,
+        subtree_height: 0,
+        items: Vec::with_capacity(root_cap),
+    }];
+
+    'outer: while let Some(mut frame) = stack.pop() {
+        while let Some(child_cid) = frame.cursor.next_id() {
+            let child_const = module.consts.get(child_cid)?;
+            if matches!(
+                child_const,
+                Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }
+            ) {
+                if active.contains(&child_cid) {
+                    return None;
+                }
+                let child_depth = frame.depth + 1;
+                if child_depth > 64 {
+                    return None;
+                }
+                if let Some((cached_items, cached_height)) = memo.get(&child_cid) {
+                    if child_depth + *cached_height > 64 {
+                        return None;
+                    }
+                    frame.subtree_height = frame.subtree_height.max(*cached_height + 1);
+                    frame
+                        .items
+                        .push(CanonicalLitElem::Array(cached_items.clone()));
+                    continue;
+                }
+                let (child_cursor, child_cap) = ConstShapeCursor::from_const(child_const)?;
+                active.insert(child_cid);
+                stack.push(frame);
+                stack.push(ConstShapeFrame {
+                    cid: child_cid,
+                    cursor: child_cursor,
+                    depth: child_depth,
+                    subtree_height: 0,
+                    items: Vec::with_capacity(child_cap),
+                });
+                continue 'outer;
+            }
+            let scalar = match child_const {
+                Const::Bool(b) => CanonicalLitElem::Bool(*b),
+                Const::Number(bits) => CanonicalLitElem::Number(*bits),
+                Const::String(s) => CanonicalLitElem::String(*s),
+                Const::MethodRef(f) => CanonicalLitElem::MethodRef(*f),
+                Const::Null => CanonicalLitElem::Null,
+                Const::Undefined
+                | Const::Hole
+                | Const::Int64(_)
+                | Const::UInt64(_)
+                | Const::BigInt(_)
+                | Const::ArrayLiteral(_)
+                | Const::ObjectLiteral { .. } => return None,
+            };
+            frame.items.push(scalar);
+        }
+
+        active.remove(&frame.cid);
+        if let Some(parent) = stack.last_mut() {
+            memo.insert(frame.cid, (frame.items.clone(), frame.subtree_height));
+            parent.subtree_height = parent.subtree_height.max(frame.subtree_height + 1);
+            parent.items.push(CanonicalLitElem::Array(frame.items));
+        } else {
+            return Some(frame.items);
+        }
+    }
+    None
 }
 
 /// Explicit stack frame for iterative literal-array shape conversion.
@@ -255,21 +408,21 @@ struct LitArrayFrame {
     idx_usize: usize,
     depth: u32,
     next_elem: usize,
-    items: Vec<Const>,
+    items: Vec<CanonicalLitElem>,
 }
 
-/// Convert `file.literal_arrays[table_idx]` into its canonical [`Const`]
-/// shape (the exact inverse of `abcd-lift`'s `const_for_literal_array`)
-/// using an explicit stack (zero recursion), returning `None` if any
-/// element uses an uninterned string, unknown method offset, non-shape
-/// literal tag, cycle, or nesting depth > 64.
-fn build_literal_array_const(
+/// Convert `file.literal_arrays[table_idx]` into its canonical
+/// [`CanonicalLitElem`] sequence (the exact structural inverse of `abcd-lift`'s
+/// `const_for_literal_array`) using an explicit stack (zero recursion),
+/// returning `None` if any element uses an uninterned string, unknown method
+/// offset, non-shape literal tag, cycle, or nesting depth > 64.
+fn build_literal_array_shape(
     module: &Module,
     file: &File,
     method_offset_to_index: &HashMap<u32, u32>,
-    cache: &mut [Option<Option<Const>>],
+    cache: &mut [Option<Option<Vec<CanonicalLitElem>>>],
     table_idx: u32,
-) -> Option<Const> {
+) -> Option<Vec<CanonicalLitElem>> {
     let root_usize = table_idx as usize;
     let root_la = file.literal_arrays.get(root_usize)?;
     // Memoize depth-valid conversions (`None` inside `Some(None)` marks
@@ -314,7 +467,7 @@ fn build_literal_array_const(
                 let child_usize = child_idx as usize;
                 let child_la = file.literal_arrays.get(child_usize)?;
                 if let Some(cached) = &cache[child_usize] {
-                    frame.items.push(cached.clone()?);
+                    frame.items.push(CanonicalLitElem::Array(cached.clone()?));
                 } else {
                     cache[child_usize] = Some(None);
                     let child_cap = child_la.values.len();
@@ -328,7 +481,7 @@ fn build_literal_array_const(
                     continue 'outer;
                 }
             } else {
-                frame.items.push(scalar_literal_value_const(
+                frame.items.push(scalar_literal_value_elem(
                     module,
                     file,
                     method_offset_to_index,
@@ -337,10 +490,10 @@ fn build_literal_array_const(
             }
         }
 
-        let out = Const::ArrayLiteral(frame.items);
+        let out = frame.items;
         cache[frame.idx_usize] = Some(Some(out.clone()));
         if let Some(parent) = stack.last_mut() {
-            parent.items.push(out);
+            parent.items.push(CanonicalLitElem::Array(out));
         } else {
             return Some(out);
         }
@@ -348,29 +501,31 @@ fn build_literal_array_const(
     None
 }
 
-fn scalar_literal_value_const(
+fn scalar_literal_value_elem(
     module: &Module,
     file: &File,
     method_offset_to_index: &HashMap<u32, u32>,
     v: &LiteralValue,
-) -> Option<Const> {
+) -> Option<CanonicalLitElem> {
     match v {
-        LiteralValue::Bool(vb) => Some(Const::Bool(*vb)),
-        LiteralValue::Integer8(n) => Some(Const::Number((*n as f64).to_bits())),
-        LiteralValue::Integer(n) => Some(Const::Number((*n as f64).to_bits())),
-        LiteralValue::Float(x) => Some(Const::Number((*x as f64).to_bits())),
-        LiteralValue::Double(x) => Some(Const::Number(x.to_bits())),
-        LiteralValue::Accessor(n) => Some(Const::Number(f64::from(*n).to_bits())),
-        LiteralValue::MethodAffiliate(n) => Some(Const::Number(f64::from(*n).to_bits())),
-        LiteralValue::BuiltinTypeIndex(n) => Some(Const::Number(f64::from(*n).to_bits())),
+        LiteralValue::Bool(vb) => Some(CanonicalLitElem::Bool(*vb)),
+        LiteralValue::Integer8(n) => Some(CanonicalLitElem::Number((*n as f64).to_bits())),
+        LiteralValue::Integer(n) => Some(CanonicalLitElem::Number((*n as f64).to_bits())),
+        LiteralValue::Float(x) => Some(CanonicalLitElem::Number((*x as f64).to_bits())),
+        LiteralValue::Double(x) => Some(CanonicalLitElem::Number(x.to_bits())),
+        LiteralValue::Accessor(n) => Some(CanonicalLitElem::Number(f64::from(*n).to_bits())),
+        LiteralValue::MethodAffiliate(n) => Some(CanonicalLitElem::Number(f64::from(*n).to_bits())),
+        LiteralValue::BuiltinTypeIndex(n) => {
+            Some(CanonicalLitElem::Number(f64::from(*n).to_bits()))
+        }
         LiteralValue::String(sid) | LiteralValue::EtsImplements(sid) => {
             if let Some(raw) = file.strings.raw_mutf8(*sid) {
-                module.sym.get_raw_mutf8(raw).map(Const::String)
+                module.sym.get_raw_mutf8(raw).map(CanonicalLitElem::String)
             } else {
                 file.strings
                     .as_str(*sid)
                     .and_then(|s| module.sym.get(s))
-                    .map(Const::String)
+                    .map(CanonicalLitElem::String)
             }
         }
         LiteralValue::Method(off)
@@ -379,8 +534,8 @@ fn scalar_literal_value_const(
         | LiteralValue::Getter(off)
         | LiteralValue::Setter(off) => method_offset_to_index
             .get(off)
-            .map(|&idx| Const::MethodRef(FuncId::new(idx))),
-        LiteralValue::NullValue(_) => Some(Const::Null),
+            .map(|&idx| CanonicalLitElem::MethodRef(FuncId::new(idx))),
+        LiteralValue::NullValue(_) => Some(CanonicalLitElem::Null),
         LiteralValue::LiteralArray(_)
         | LiteralValue::LiteralBufferIndex(_)
         | LiteralValue::ArrayU1(_)

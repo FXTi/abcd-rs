@@ -52,8 +52,8 @@ fn build_class_file(
 fn lifted_attrs(file: &File) -> Vec<MemberAttrs> {
     let module = lift_file(file).expect("lift");
     for inst in &module.insts {
-        if let Op::DefineClass { member_attrs, .. } = &inst.op {
-            return member_attrs.clone();
+        if let Op::DefineClass(data) = &inst.op {
+            return data.member_attrs.clone();
         }
     }
     panic!("DefineClass emitted")

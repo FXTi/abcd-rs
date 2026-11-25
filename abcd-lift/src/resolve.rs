@@ -220,61 +220,9 @@ pub fn class_member_attrs_for_index(
         .collect())
 }
 
-/// Convert the literal array at `table_idx` into a pooled shape
-/// constant.
+/// Convert the literal array at `table_idx` into a pooled [`ConstId`]
+/// iteratively (memoized, cycle-guarded, O(1) native stack).
 pub fn const_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<ConstId, LiftError> {
-    let tree = const_tree_for_literal_array(lf, table_idx)?;
-    Ok(lf.const_shape(tree))
-}
-
-/// Step outcome when converting one [`LiteralValue`] without native
-/// call-stack recursion.
-enum LitStep {
-    /// Immediate scalar, string, or method-ref constant.
-    Ready(Const),
-    /// Nested literal-array reference at `table_idx` to expand on the
-    /// explicit work stack.
-    NestedArray(u32),
-}
-
-/// Active frame on the iterative literal-array conversion stack.
-struct LitFrame<'f> {
-    table_idx: u32,
-    values: &'f [LiteralValue],
-    next_elem: usize,
-    consts: Vec<Const>,
-}
-
-/// Look up `table_idx` in the memo cache or validate and activate a new
-/// [`LitFrame`] for iterative expansion.
-fn enter_literal_array<'f>(
-    lf: &mut Lifter<'f>,
-    table_idx: u32,
-) -> Result<Result<Const, LitFrame<'f>>, LiftError> {
-    if let Some(tree) = lf.lit_cache.get(&table_idx) {
-        return Ok(Ok(tree.clone()));
-    }
-    let file = lf.file;
-    let Some(arr) = file.literal_arrays.get(table_idx as usize) else {
-        return Err(LiftError::LiteralArrayOutOfRange(table_idx));
-    };
-    if !lf.lit_active.insert(table_idx) {
-        return Err(LiftError::LiteralArrayCycle(table_idx));
-    }
-    Ok(Err(LitFrame {
-        table_idx,
-        values: &arr.values,
-        next_elem: 0,
-        consts: Vec::with_capacity(arr.values.len()),
-    }))
-}
-
-/// Convert the literal array at `table_idx` into its [`Const`] tree
-/// iteratively (memoized, cycle-guarded, O(1) native stack). Literal
-/// shapes are inline TREES in v0.2's constant pool — a nested array is
-/// embedded by value, so this returns the tree itself rather than a pool
-/// reference.
-fn const_tree_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<Const, LiftError> {
     let first = match enter_literal_array(lf, table_idx)? {
         Ok(cached) => return Ok(cached),
         Err(frame) => frame,
@@ -298,8 +246,9 @@ fn const_tree_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<Const
             };
             match step {
                 LitStep::Ready(c) => {
+                    let cid = lf.module.consts.intern(c);
                     if let Some(parent) = stack.last_mut() {
-                        parent.consts.push(c);
+                        parent.consts.push(cid);
                     }
                 }
                 LitStep::NestedArray(child_idx) => match enter_literal_array(lf, child_idx) {
@@ -322,12 +271,12 @@ fn const_tree_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<Const
                 break;
             };
             lf.lit_active.remove(&finished.table_idx);
-            let tree = Const::ArrayLiteral(finished.consts);
-            lf.lit_cache.insert(finished.table_idx, tree.clone());
+            let cid = lf.const_shape(Const::ArrayLiteral(finished.consts));
+            lf.lit_cache.insert(finished.table_idx, cid);
             if let Some(parent) = stack.last_mut() {
-                parent.consts.push(tree);
+                parent.consts.push(cid);
             } else {
-                return Ok(tree);
+                return Ok(cid);
             }
         }
     }
@@ -335,15 +284,57 @@ fn const_tree_for_literal_array(lf: &mut Lifter, table_idx: u32) -> Result<Const
     unreachable!("literal-array stack always returns when popping the root frame")
 }
 
-/// Convert one literal value to a [`Const`] (N52: every reference is
-/// resolved — no raw offsets cross into the IR).
+/// Step outcome when converting one [`LiteralValue`] without native
+/// call-stack recursion.
+enum LitStep {
+    /// Immediate scalar, string, or method-ref constant.
+    Ready(Const),
+    /// Nested literal-array reference at `table_idx` to expand on the
+    /// explicit work stack.
+    NestedArray(u32),
+}
+
+/// Active frame on the iterative literal-array conversion stack.
+struct LitFrame<'f> {
+    table_idx: u32,
+    values: &'f [LiteralValue],
+    next_elem: usize,
+    consts: Vec<ConstId>,
+}
+
+/// Look up `table_idx` in the memo cache or validate and activate a new
+/// [`LitFrame`] for iterative expansion.
+fn enter_literal_array<'f>(
+    lf: &mut Lifter<'f>,
+    table_idx: u32,
+) -> Result<Result<ConstId, LitFrame<'f>>, LiftError> {
+    if let Some(&cid) = lf.lit_cache.get(&table_idx) {
+        return Ok(Ok(cid));
+    }
+    let file = lf.file;
+    let Some(arr) = file.literal_arrays.get(table_idx as usize) else {
+        return Err(LiftError::LiteralArrayOutOfRange(table_idx));
+    };
+    if !lf.lit_active.insert(table_idx) {
+        return Err(LiftError::LiteralArrayCycle(table_idx));
+    }
+    Ok(Err(LitFrame {
+        table_idx,
+        values: &arr.values,
+        next_elem: 0,
+        consts: Vec::with_capacity(arr.values.len()),
+    }))
+}
+
+/// Convert one literal value to a pooled [`ConstId`] (N52: every reference
+/// is resolved — no raw offsets cross into the IR).
 pub(crate) fn const_for_literal_value(
     lf: &mut Lifter,
     v: &LiteralValue,
-) -> Result<Const, LiftError> {
+) -> Result<ConstId, LiftError> {
     match step_literal_value(lf, v)? {
-        LitStep::Ready(c) => Ok(c),
-        LitStep::NestedArray(idx) => const_tree_for_literal_array(lf, idx),
+        LitStep::Ready(c) => Ok(lf.module.consts.intern(c)),
+        LitStep::NestedArray(idx) => const_for_literal_array(lf, idx),
     }
 }
 

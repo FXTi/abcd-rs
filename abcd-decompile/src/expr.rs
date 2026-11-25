@@ -50,6 +50,10 @@ pub enum Lit {
     /// preserved; [`crate::consts::render_number`] prints the shortest
     /// round-trip form).
     Number(u64),
+    /// A signed 64-bit integer literal (`Const::Int64`).
+    Int64(i64),
+    /// An unsigned 64-bit integer literal (`Const::UInt64`).
+    UInt64(u64),
     /// A string literal (unescaped content).
     String(String),
     /// A lone-surrogate string literal as exact UTF-16 code units (#30).

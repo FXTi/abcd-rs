@@ -3868,20 +3868,19 @@ fn large_bundle_demand_pta_roots_and_zero_needed_slice_unrelated_subgraphs() {
             add_param(&mut m, exp_main, i);
         }
         let wrap_sym = intern(&mut m, "wrap");
-        let members = push_const(
-            &mut m,
-            Const::ArrayLiteral(vec![Const::String(wrap_sym), Const::MethodRef(wrap_fn)]),
-        );
+        let wrap_name_cid = m.consts.intern(Const::String(wrap_sym));
+        let wrap_fn_cid = m.consts.intern(Const::MethodRef(wrap_fn));
+        let members = m.consts.push_array(vec![wrap_name_cid, wrap_fn_cid]);
         let cls_val = emit(
             &mut m,
             b,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: ctor_fn,
                 heritage: None,
                 members,
                 member_attrs: Vec::new(),
                 count: 1,
-            },
+            })),
         );
         let inst = emit(
             &mut m,

@@ -11,7 +11,7 @@
 //!    from `&abcd_ir::Module` + [`abcd_file::Version`] directly to a complete,
 //!    encodable [`abcd_file::File`] with zero source `File` dependency.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use abcd_file::{
     AccessFlags, Annotation, AnnotationElem, AnnotationValue, Annotations, Class, ColumnEntry,
@@ -655,7 +655,8 @@ struct Materializer<'m, 'f> {
     method_offsets: &'m [u32],
     next_offset: u32,
     string_offsets: HashMap<Box<[u8]>, u32>,
-    synth_shape_offsets: HashMap<ConstId, u32>,
+    /// Materialized shape `(table_idx, file_offset, subtree_height)` per [`ConstId`].
+    synth_shapes: HashMap<ConstId, (u32, u32, u32)>,
 }
 
 impl<'m, 'f> Materializer<'m, 'f> {
@@ -683,7 +684,7 @@ impl<'m, 'f> Materializer<'m, 'f> {
             method_offsets,
             next_offset,
             string_offsets,
-            synth_shape_offsets: HashMap::new(),
+            synth_shapes: HashMap::new(),
         }
     }
 
@@ -772,35 +773,58 @@ impl<'m, 'f> Materializer<'m, 'f> {
     }
 
     fn literal_array_offset(&mut self, shape: ConstId) -> Option<u32> {
-        if let Some(&off) = self.synth_shape_offsets.get(&shape) {
+        if let Some(&(_idx, off, _height)) = self.synth_shapes.get(&shape) {
             return Some(off);
         }
-        let tree = self.module.consts.get(shape)?.clone();
-        let (_idx, off) = self.materialize_shape_tree(&tree)?;
-        self.synth_shape_offsets.insert(shape, off);
+        let (_idx, off) = self.materialize_shape_tree(shape)?;
         Some(off)
     }
 
-    fn materialize_shape_tree(&mut self, tree: &Const) -> Option<(u32, u32)> {
-        let (root_cursor, root_cap) = ShapeCursor::from_const(tree)?;
+    fn materialize_shape_tree(&mut self, root_cid: ConstId) -> Option<(u32, u32)> {
+        let module = self.module;
+        let root_const = module.consts.get(root_cid)?;
+        let (root_cursor, root_cap) = ShapeCursor::from_const(root_const)?;
+        let mut active: HashSet<ConstId> = HashSet::new();
+        active.insert(root_cid);
         let mut stack = vec![ShapeFrame {
+            cid: root_cid,
             cursor: root_cursor,
             depth: 0,
+            subtree_height: 0,
             values: Vec::with_capacity(root_cap),
         }];
 
         'outer: while let Some(mut frame) = stack.pop() {
-            while let Some(elem) = frame.cursor.next_elem() {
+            while let Some(child_cid) = frame.cursor.next_id() {
+                let elem = module.consts.get(child_cid)?;
                 if matches!(elem, Const::ArrayLiteral(_) | Const::ObjectLiteral { .. }) {
+                    if active.contains(&child_cid) {
+                        return None;
+                    }
                     let child_depth = frame.depth + 1;
                     if child_depth > 64 {
                         return None;
                     }
+                    if let Some(&(child_idx, _child_off, child_height)) =
+                        self.synth_shapes.get(&child_cid)
+                    {
+                        if child_depth + child_height > 64 {
+                            return None;
+                        }
+                        frame.subtree_height = frame.subtree_height.max(child_height + 1);
+                        frame
+                            .values
+                            .push(LiteralValue::LiteralArray(LiteralArrayIdx(child_idx)));
+                        continue;
+                    }
                     let (child_cursor, child_cap) = ShapeCursor::from_const(elem)?;
+                    active.insert(child_cid);
                     stack.push(frame);
                     stack.push(ShapeFrame {
+                        cid: child_cid,
                         cursor: child_cursor,
                         depth: child_depth,
+                        subtree_height: 0,
                         values: Vec::with_capacity(child_cap),
                     });
                     continue 'outer;
@@ -808,13 +832,17 @@ impl<'m, 'f> Materializer<'m, 'f> {
                 frame.values.push(self.materialize_scalar_elem(elem)?);
             }
 
+            active.remove(&frame.cid);
             let idx = self.file.literal_arrays.len() as u32;
             let off = self.alloc_offset().ok()?;
             self.file.literal_arrays.push(LiteralArray {
                 values: frame.values,
             });
             self.file.literal_array_offsets.insert(off, idx);
+            self.synth_shapes
+                .insert(frame.cid, (idx, off, frame.subtree_height));
             if let Some(parent) = stack.last_mut() {
+                parent.subtree_height = parent.subtree_height.max(frame.subtree_height + 1);
                 parent
                     .values
                     .push(LiteralValue::LiteralArray(LiteralArrayIdx(idx)));
@@ -855,19 +883,22 @@ impl<'m, 'f> Materializer<'m, 'f> {
                     _ => LiteralValue::Method(off),
                 }
             }
-            Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => return None,
+            Const::Int64(_)
+            | Const::UInt64(_)
+            | Const::ArrayLiteral(_)
+            | Const::ObjectLiteral { .. } => return None,
         })
     }
 }
 
 enum ShapeCursor<'t> {
     Array {
-        items: &'t [Const],
+        items: &'t [ConstId],
         next: usize,
     },
     Object {
-        keys: &'t [Const],
-        values: &'t [Const],
+        keys: &'t [ConstId],
+        values: &'t [ConstId],
         next: usize,
     },
 }
@@ -893,30 +924,32 @@ impl<'t> ShapeCursor<'t> {
         }
     }
 
-    fn next_elem(&mut self) -> Option<&'t Const> {
+    fn next_id(&mut self) -> Option<ConstId> {
         match self {
             Self::Array { items, next } => {
-                let elem = items.get(*next)?;
+                let id = *items.get(*next)?;
                 *next += 1;
-                Some(elem)
+                Some(id)
             }
             Self::Object { keys, values, next } => {
                 let pair_idx = *next / 2;
-                let elem = if *next % 2 == 0 {
-                    keys.get(pair_idx)?
+                let id = if *next % 2 == 0 {
+                    *keys.get(pair_idx)?
                 } else {
-                    values.get(pair_idx)?
+                    *values.get(pair_idx)?
                 };
                 *next += 1;
-                Some(elem)
+                Some(id)
             }
         }
     }
 }
 
 struct ShapeFrame<'t> {
+    cid: ConstId,
     cursor: ShapeCursor<'t>,
     depth: u32,
+    subtree_height: u32,
     values: Vec<LiteralValue>,
 }
 
@@ -1181,6 +1214,8 @@ fn build_field(
     let field_type = ty_to_file(&fdata.ty, class_desc_sids);
     let initial_value = match fdata.initial_value.and_then(|cid| module.consts.get(cid)) {
         Some(Const::Bool(b)) => Some(FieldValue::I32(i32::from(*b))),
+        Some(Const::Int64(n)) => Some(FieldValue::I64(*n)),
+        Some(Const::UInt64(n)) => Some(FieldValue::I64(*n as i64)),
         Some(Const::Number(bits)) => {
             let v = f64::from_bits(*bits);
             match field_type {
@@ -1265,6 +1300,8 @@ fn ann_value_to_file(
         AnnValue::Const(cid) => {
             match module.consts.get(*cid)? {
                 Const::Bool(b) => Some(AnnotationValue::Bool(*b)),
+                Const::Int64(n) => Some(AnnotationValue::I64(*n)),
+                Const::UInt64(n) => Some(AnnotationValue::U64(*n)),
                 Const::Number(bits) => {
                     let v = f64::from_bits(*bits);
                     if *bits != (-0.0f64).to_bits()
@@ -1499,10 +1536,9 @@ mod tests {
 
         // func_main_0 allocates an array `[1, "\u{E000}icon"]`, defines `helper`, and returns it.
         let pua_sym = m.sym.intern("\u{E000}icon");
-        let arr_shape = m.consts.push(Const::ArrayLiteral(vec![
-            Const::number(1.0),
-            Const::String(pua_sym),
-        ]));
+        let c_one = m.consts.intern(Const::number(1.0));
+        let c_pua = m.consts.intern(Const::String(pua_sym));
+        let arr_shape = m.consts.push_array(vec![c_one, c_pua]);
         let v_arr = ValueId::new(m.values.len() as u32);
         let i_arr = InstId::new(m.insts.len() as u32);
         m.values.push(Value {
@@ -1654,9 +1690,8 @@ mod tests {
         // Rewrite `func_main_0` to allocate a brand-new `[42]` literal array and reference `synth_helper`.
         let main_bb = module.functions[0].blocks[0];
         module.blocks[main_bb.index()].insts.clear();
-        let arr_cid = module
-            .consts
-            .push(Const::ArrayLiteral(vec![Const::number(42.0)]));
+        let c42 = module.consts.intern(Const::number(42.0));
+        let arr_cid = module.consts.push_array(vec![c42]);
         let v_arr = ValueId::new(module.values.len() as u32);
         let i_arr = InstId::new(module.insts.len() as u32);
         module.values.push(Value {
@@ -1721,5 +1756,64 @@ mod tests {
         assert!(decoded.strings.get("synthesized-string").is_some());
         assert_eq!(decoded.all_methods().count(), 2);
         assert_eq!(decoded.literal_arrays.len(), 1);
+    }
+
+    /// 64-bit static integer constants (`Const::Int64`, `Const::UInt64`, `R2-D5`)
+    /// lower cleanly in field initializers and compile-time annotations, while
+    /// failing cleanly with `UntraceableEntity` inside dynamic JS literal buffers.
+    #[test]
+    fn int64_and_uint64_field_and_annotation_consts_lower_cleanly() {
+        let mut m = Module::new();
+        let ann_desc = m.sym.intern("LMyAnn;");
+        let ann_cls = ClassData::new(ann_desc, ann_desc);
+        let ann_cid = ClassId::new(m.classes.len() as u32);
+        m.classes.push(ann_cls);
+
+        let cls_desc = m.sym.intern("LMyRecord;");
+        let mut cls = ClassData::new(cls_desc, cls_desc);
+        cls.modifiers = Modifiers::PUBLIC;
+
+        let i64_val: i64 = (1_i64 << 55) + 7;
+        let u64_val: u64 = (1_u64 << 63) + 99;
+        let c_i64 = m.consts.intern(Const::Int64(i64_val));
+        let c_u64 = m.consts.intern(Const::UInt64(u64_val));
+
+        let f1_name = m.sym.intern("signed_f");
+        let f2_name = m.sym.intern("unsigned_f");
+        let e1_name = m.sym.intern("s");
+        let e2_name = m.sym.intern("u");
+        cls.fields.push(FieldData {
+            name: f1_name,
+            ty: Ty::Static(StaticTy::I64),
+            modifiers: Modifiers::PUBLIC.union(Modifiers::STATIC),
+            initial_value: Some(c_i64),
+            annotations: vec![abcd_ir::Annotation {
+                class: ann_cid,
+                elements: vec![
+                    (e1_name, AnnValue::Const(c_i64)),
+                    (e2_name, AnnValue::Const(c_u64)),
+                ],
+            }],
+        });
+        cls.fields.push(FieldData {
+            name: f2_name,
+            ty: Ty::Static(StaticTy::U64),
+            modifiers: Modifiers::PUBLIC.union(Modifiers::STATIC),
+            initial_value: Some(c_u64),
+            annotations: Vec::new(),
+        });
+        m.classes.push(cls);
+
+        let file = lower_module(&m, Version::new(12, 0, 6, 0)).expect("lower 64-bit fields/anns");
+        let rec_sid = file.strings.get("LMyRecord;").expect("record descriptor");
+        let rec = &file.classes[&rec_sid];
+        assert_eq!(rec.fields[0].initial_value, Some(FieldValue::I64(i64_val)));
+        assert_eq!(
+            rec.fields[1].initial_value,
+            Some(FieldValue::I64(u64_val as i64))
+        );
+        let elems = &rec.fields[0].annotations.compile_time[0].elements;
+        assert_eq!(elems[0].value, AnnotationValue::I64(i64_val));
+        assert_eq!(elems[1].value, AnnotationValue::U64(u64_val));
     }
 }

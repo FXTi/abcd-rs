@@ -184,14 +184,8 @@ pub(crate) struct Lifter<'f> {
     /// [`FuncId`] (method i of the class is `base + i` — exact even for
     /// hand-built files with duplicate method offsets).
     pub(crate) func_bases: HashMap<abcd_file::StringId, u32>,
-    /// Scalar-constant dedup (a lift-layer policy; the pool itself is
-    /// append-only).
-    scalar_consts: HashMap<ScalarKey, ConstId>,
-    /// Shape-constant (array/object/method-ref trees) dedup — O(1) hash
-    /// lookup over structural equality (`Const: Eq + Hash`).
-    shape_consts: HashMap<Const, ConstId>,
-    /// Literal-array table index → converted shape tree (memoized).
-    pub(crate) lit_cache: HashMap<u32, Const>,
+    /// Literal-array table index → pooled [`ConstId`] (memoized).
+    pub(crate) lit_cache: HashMap<u32, ConstId>,
     /// Cycle guard for nested literal arrays.
     pub(crate) lit_active: BTreeSet<u32>,
     /// `_ESModuleRecord` blobs, in class/field iteration order.
@@ -203,18 +197,6 @@ pub(crate) struct Lifter<'f> {
     pub(crate) scope_name_fields: Vec<(Sym, ConstId)>,
 }
 
-/// Content key for scalar-constant dedup.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum ScalarKey {
-    Undefined,
-    Hole,
-    Null,
-    Bool(bool),
-    Number(u64),
-    String(Sym),
-    BigInt(Sym),
-}
-
 impl<'f> Lifter<'f> {
     fn new(file: &'f File) -> Self {
         Self {
@@ -224,8 +206,6 @@ impl<'f> Lifter<'f> {
             class_to_id: HashMap::new(),
             field_to_id: HashMap::new(),
             func_bases: HashMap::new(),
-            scalar_consts: HashMap::new(),
-            shape_consts: HashMap::new(),
             lit_cache: HashMap::new(),
             lit_active: BTreeSet::new(),
             module_datas: Vec::new(),
@@ -273,40 +253,15 @@ impl<'f> Lifter<'f> {
         Some(cid)
     }
 
-    /// Pool a scalar constant (deduplicated).
+    /// Pool a scalar constant (deduplicated via [`abcd_ir::ConstPool::intern`]).
     pub(crate) fn const_scalar(&mut self, c: Const) -> ConstId {
-        let key = match &c {
-            Const::Undefined => ScalarKey::Undefined,
-            Const::Hole => ScalarKey::Hole,
-            Const::Null => ScalarKey::Null,
-            Const::Bool(b) => ScalarKey::Bool(*b),
-            Const::Number(bits) => ScalarKey::Number(*bits),
-            Const::String(s) => ScalarKey::String(*s),
-            Const::BigInt(s) => ScalarKey::BigInt(*s),
-            // unreachable: every call site (metadata.rs field values /
-            // annotation elements, translate.rs load_const family) passes
-            // Number/Bool/String/Null/Undefined/Hole/BigInt, all of which
-            // have ScalarKeys — no caller can pass ArrayLiteral/
-            // ObjectLiteral/MethodRef — c-COV diagnosis
-            other => return self.const_shape(other.clone()),
-        };
-        if let Some(&id) = self.scalar_consts.get(&key) {
-            return id;
-        }
-        let id = self.module.consts.push(c);
-        self.scalar_consts.insert(key, id);
-        id
+        self.module.consts.intern(c)
     }
 
-    /// Pool a shape constant (array/object/method-ref tree; structural
-    /// dedup).
+    /// Pool a shape constant (array/object/method-ref; structural dedup via
+    /// [`abcd_ir::ConstPool::intern`]).
     pub(crate) fn const_shape(&mut self, c: Const) -> ConstId {
-        if let Some(&id) = self.shape_consts.get(&c) {
-            return id;
-        }
-        let id = self.module.consts.push(c.clone());
-        self.shape_consts.insert(c, id);
-        id
+        self.module.consts.intern(c)
     }
 
     /// The shared empty object shape (for `createemptyobject`).

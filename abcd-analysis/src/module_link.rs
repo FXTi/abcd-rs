@@ -964,16 +964,8 @@ fn append_module(dst: &mut Module, mod_name: &str, src: &Module) {
     let map_iid = |i: InstId| InstId::new(inst_base + i.index() as u32);
     let map_vid = |v: ValueId| ValueId::new(val_base + v.index() as u32);
 
-    // Map constants into `dst.consts`.
-    let mut const_map: Vec<ConstId> = Vec::with_capacity(src.consts.len());
-    for i in 0..src.consts.len() {
-        let old_cid = ConstId::new(i as u32);
-        let mapped = match src.consts.get(old_cid) {
-            Some(c) => remap_const(c, src, dst, &map_fid),
-            None => Const::Undefined,
-        };
-        const_map.push(dst.consts.push(mapped));
-    }
+    // Map constants into `dst.consts` iteratively with cycle guards.
+    let const_map = remap_consts_into(src, dst, &map_fid);
     let map_const = |c: ConstId| const_map.get(c.index()).copied().unwrap_or(c);
 
     let map_ann = |dst: &mut Module, a: &Annotation| -> Annotation {
@@ -1209,80 +1201,134 @@ fn remap_ty(ty: &Ty, map_cid: &impl Fn(ClassId) -> ClassId) -> Ty {
             TyStep::Enter(other) => results.push(other.clone()),
             TyStep::MakeUnion(n) => {
                 let members = results.split_off(results.len() - n);
-                results.push(Ty::Union(members));
+                results.push(Ty::union(members));
             }
         }
     }
     results.pop().unwrap_or(Ty::Any)
 }
 
-fn remap_const(
-    c: &Const,
+fn remap_consts_into(
     src: &Module,
     dst: &mut Module,
     map_fid: &impl Fn(FuncId) -> FuncId,
-) -> Const {
-    match c {
-        Const::String(s) => return Const::String(map_sym_from(src, dst, *s)),
-        Const::BigInt(s) => return Const::BigInt(map_sym_from(src, dst, *s)),
-        Const::MethodRef(f) => return Const::MethodRef(map_fid(*f)),
-        Const::ArrayLiteral(_) | Const::ObjectLiteral { .. } => {}
-        other => return other.clone(),
+) -> Vec<ConstId> {
+    enum ConstVisit {
+        Enter(ConstId),
+        FinishArray(ConstId, Vec<ConstId>),
+        FinishObject(ConstId, Vec<ConstId>, Vec<ConstId>),
     }
-    enum ConstStep<'a> {
-        Enter(&'a Const),
-        MakeArray(usize),
-        MakeObject { keys_len: usize, values_len: usize },
-    }
-    let mut stack = vec![ConstStep::Enter(c)];
-    let mut results: Vec<Const> = Vec::new();
-    while let Some(step) = stack.pop() {
-        match step {
-            ConstStep::Enter(Const::String(s)) => {
-                results.push(Const::String(map_sym_from(src, dst, *s)));
-            }
-            ConstStep::Enter(Const::BigInt(s)) => {
-                results.push(Const::BigInt(map_sym_from(src, dst, *s)));
-            }
-            ConstStep::Enter(Const::MethodRef(f)) => {
-                results.push(Const::MethodRef(map_fid(*f)));
-            }
-            ConstStep::Enter(Const::ArrayLiteral(items)) => {
-                stack.push(ConstStep::MakeArray(items.len()));
-                for it in items.iter().rev() {
-                    stack.push(ConstStep::Enter(it));
+
+    let len = src.consts.len();
+    let mut mapped: Vec<Option<ConstId>> = vec![None; len];
+    let mut in_progress: HashSet<ConstId> = HashSet::new();
+    let mut undef_fallback: Option<ConstId> = None;
+    let mut stack: Vec<ConstVisit> = Vec::new();
+
+    for root_idx in 0..len {
+        let root_cid = ConstId::new(root_idx as u32);
+        if mapped[root_idx].is_some() {
+            continue;
+        }
+        stack.push(ConstVisit::Enter(root_cid));
+        while let Some(step) = stack.pop() {
+            match step {
+                ConstVisit::Enter(cid) => {
+                    let Some(slot) = mapped.get(cid.index()) else {
+                        continue;
+                    };
+                    if slot.is_some() || !in_progress.insert(cid) {
+                        continue;
+                    }
+                    let leaf = match src.consts.get(cid) {
+                        None | Some(Const::Undefined) => Some(Const::Undefined),
+                        Some(Const::Hole) => Some(Const::Hole),
+                        Some(Const::Null) => Some(Const::Null),
+                        Some(Const::Bool(b)) => Some(Const::Bool(*b)),
+                        Some(Const::Number(bits)) => Some(Const::Number(*bits)),
+                        Some(Const::Int64(v)) => Some(Const::Int64(*v)),
+                        Some(Const::UInt64(v)) => Some(Const::UInt64(*v)),
+                        Some(Const::String(s)) => Some(Const::String(map_sym_from(src, dst, *s))),
+                        Some(Const::BigInt(s)) => Some(Const::BigInt(map_sym_from(src, dst, *s))),
+                        Some(Const::MethodRef(f)) => Some(Const::MethodRef(map_fid(*f))),
+                        Some(Const::ArrayLiteral(items)) => {
+                            let items_cloned = items.clone();
+                            stack.push(ConstVisit::FinishArray(cid, items.clone()));
+                            for &ch in items_cloned.iter().rev() {
+                                if mapped.get(ch.index()).is_some_and(Option::is_none) {
+                                    stack.push(ConstVisit::Enter(ch));
+                                }
+                            }
+                            None
+                        }
+                        Some(Const::ObjectLiteral { keys, values }) => {
+                            let keys_cloned = keys.clone();
+                            let values_cloned = values.clone();
+                            stack.push(ConstVisit::FinishObject(cid, keys.clone(), values.clone()));
+                            for &ch in values_cloned.iter().rev() {
+                                if mapped.get(ch.index()).is_some_and(Option::is_none) {
+                                    stack.push(ConstVisit::Enter(ch));
+                                }
+                            }
+                            for &ch in keys_cloned.iter().rev() {
+                                if mapped.get(ch.index()).is_some_and(Option::is_none) {
+                                    stack.push(ConstVisit::Enter(ch));
+                                }
+                            }
+                            None
+                        }
+                    };
+                    if let Some(c) = leaf {
+                        in_progress.remove(&cid);
+                        mapped[cid.index()] = Some(dst.consts.push(c));
+                    }
                 }
-            }
-            ConstStep::Enter(Const::ObjectLiteral { keys, values }) => {
-                stack.push(ConstStep::MakeObject {
-                    keys_len: keys.len(),
-                    values_len: values.len(),
-                });
-                // Push `values` first so `keys` pop and intern symbols first,
-                // matching the original traversal order.
-                for it in values.iter().rev() {
-                    stack.push(ConstStep::Enter(it));
+                ConstVisit::FinishArray(cid, items) => {
+                    in_progress.remove(&cid);
+                    let mut out_items = Vec::with_capacity(items.len());
+                    for ch in items {
+                        let m = match mapped.get(ch.index()).copied().flatten() {
+                            Some(id) => id,
+                            None => *undef_fallback
+                                .get_or_insert_with(|| dst.consts.push(Const::Undefined)),
+                        };
+                        out_items.push(m);
+                    }
+                    mapped[cid.index()] = Some(dst.consts.push(Const::ArrayLiteral(out_items)));
                 }
-                for it in keys.iter().rev() {
-                    stack.push(ConstStep::Enter(it));
+                ConstVisit::FinishObject(cid, keys, values) => {
+                    in_progress.remove(&cid);
+                    let mut out_keys = Vec::with_capacity(keys.len());
+                    for ch in keys {
+                        let m = match mapped.get(ch.index()).copied().flatten() {
+                            Some(id) => id,
+                            None => *undef_fallback
+                                .get_or_insert_with(|| dst.consts.push(Const::Undefined)),
+                        };
+                        out_keys.push(m);
+                    }
+                    let mut out_values = Vec::with_capacity(values.len());
+                    for ch in values {
+                        let m = match mapped.get(ch.index()).copied().flatten() {
+                            Some(id) => id,
+                            None => *undef_fallback
+                                .get_or_insert_with(|| dst.consts.push(Const::Undefined)),
+                        };
+                        out_values.push(m);
+                    }
+                    mapped[cid.index()] = Some(dst.consts.push(Const::ObjectLiteral {
+                        keys: out_keys,
+                        values: out_values,
+                    }));
                 }
-            }
-            ConstStep::Enter(other) => results.push(other.clone()),
-            ConstStep::MakeArray(n) => {
-                let items = results.split_off(results.len() - n);
-                results.push(Const::ArrayLiteral(items));
-            }
-            ConstStep::MakeObject {
-                keys_len,
-                values_len,
-            } => {
-                let values = results.split_off(results.len() - values_len);
-                let keys = results.split_off(results.len() - keys_len);
-                results.push(Const::ObjectLiteral { keys, values });
             }
         }
     }
-    results.pop().unwrap_or(Const::Undefined)
+
+    mapped
+        .into_iter()
+        .map(|opt| opt.unwrap_or_else(|| dst.consts.push(Const::Undefined)))
+        .collect()
 }
 
 fn remap_ann_val(
@@ -1408,9 +1454,9 @@ fn remap_op(
                 *cap_name = map_sym_from(src, dst, *cap_name);
             }
         }
-        Op::DefineClass { ctor, members, .. } | Op::DefineSendableClass { ctor, members, .. } => {
-            *ctor = map_fid(*ctor);
-            *members = map_const(*members);
+        Op::DefineClass(cls) | Op::DefineSendableClass(cls) => {
+            cls.ctor = map_fid(cls.ctor);
+            cls.members = map_const(cls.members);
         }
         Op::CreatePrivateNames { names, .. } => *names = map_const(*names),
         Op::Branch { dest } => *dest = map_bid(*dest),
@@ -1881,13 +1927,13 @@ mod tests {
         let (_, cls_val) = emit_val(
             &mut m,
             b_lib,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: f_ctor,
                 heritage: None,
                 members: empty_members,
                 member_attrs: Vec::new(),
                 count: 1,
-            },
+            })),
         );
         emit_void(
             &mut m,
@@ -2137,18 +2183,21 @@ mod tests {
                 }
 
                 // Deeply nested `Ty::Union` and `Const::ArrayLiteral` / `Const::ObjectLiteral`
-                // for iterative `remap_ty` and `remap_const`.
+                // plus `Int64` / `UInt64` and a cyclic `ConstPool` entry for `remap_consts_into`.
                 let mut deep_ty = Ty::Static(StaticTy::Reference(ClassId::new(0)));
-                let mut deep_const = Const::String(s_val);
+                let c_key = m1.consts.intern(Const::String(s_val));
+                let _ = m1.consts.push(Const::Int64(-99));
+                let _ = m1.consts.push(Const::UInt64(99));
+                let mut deep_cid = c_key;
                 for _ in 0..DEPTH {
-                    deep_ty = Ty::Union(vec![deep_ty]);
-                    deep_const = Const::ObjectLiteral {
-                        keys: vec![Const::String(s_val)],
-                        values: vec![Const::ArrayLiteral(vec![deep_const])],
-                    };
+                    deep_ty = Ty::union(vec![deep_ty]);
+                    let arr_cid = m1.consts.push_array(vec![deep_cid]);
+                    deep_cid = m1.consts.push_object(vec![c_key], vec![arr_cid]);
                 }
+                // Malformed self-referential `ArrayLiteral` cycle (`cyc_cid -> cyc_cid`).
+                let cyc_cid = ConstId::new(m1.consts.len() as u32);
+                let _ = m1.consts.push_array(vec![cyc_cid, deep_cid]);
                 m1.values[0].ty = deep_ty;
-                let _ = m1.consts.push(deep_const);
 
                 let mut m2 = Module::new();
                 let dg = m2.sym.intern("L_GLOBAL;");

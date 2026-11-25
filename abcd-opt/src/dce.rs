@@ -11,11 +11,13 @@
 //! invoke user getters, check private brands, or raise `SyntaxError` /
 //! `ReferenceError` / `TypeError` even when their result is dead. Rather than
 //! maintaining a separate list in the optimizer, that runtime evidence lives in
-//! ONE place — the `T3` effects table ([`abcd_ir::Op::effects`],
-//! `design/ir.md`): an instruction is essential iff it is a terminator or its
-//! effects record shows a write, a possible throw, or a possible call. Pure
-//! reads (lexical/module loads that cannot throw or call) and pure allocations
-//! remain dead-deletable.
+//! ONE place — the `T3` effects model ([`abcd_ir::Op::effects_in`] and
+//! [`abcd_ir::Effects::is_removable_if_unused`], `design/ir.md`): untyped
+//! dynamic compute ops conservatively model `ToNumeric`/`ToPrimitive` coercion,
+//! while operands proven primitive via `Value::ty` or `ConstPool` refine back
+//! to `Effects::PURE`. Pure reads (lexical/module loads that cannot throw or
+//! call), proven coercion-free compute ops, and pure allocations remain
+//! dead-deletable.
 //!
 //! CFG simplify: merge single-pred/single-succ block pairs, eliminate
 //! empty jump-only blocks, remove unreachable blocks — all
@@ -63,7 +65,7 @@ impl FuncPass for Adce {
             let Some(inst) = module.inst(inst_id) else {
                 continue;
             };
-            if is_essential(&inst.op) {
+            if is_essential(module, &inst.op) {
                 live.insert(inst_id);
                 worklist.push_back(inst_id);
             }
@@ -138,20 +140,15 @@ impl FuncPass for Adce {
     }
 }
 
-/// An instruction is essential if it has side effects or is a terminator.
+/// An instruction is essential if it is a terminator or its context-refined
+/// effects forbid dead-result removal (`R2-D2`, `N48`/`N50`, `design/ir.md`).
 ///
-/// Derived from the `T3` effects table (`N48`/`N50`, `design/ir.md`): a write
-/// to any memory class, a possible throw, or a possible call makes the
-/// instruction observable even when its result is dead. Pure reads (e.g.
-/// `GetLexVar`, `LoadModuleVar`, `GetResumeMode`) and pure allocations
-/// (e.g. `AllocObject`, `AllocArray`, `AllocClosure`) are dead-deletable
-/// when their result is unused.
-fn is_essential(op: &Op) -> bool {
-    if op.is_terminator() {
-        return true;
-    }
-    let effects = op.effects();
-    !effects.writes.is_empty() || effects.may_throw || effects.may_call != abcd_ir::CallEffect::None
+/// [`Op::effects_in`] refines `UnaryOp`/`BinaryOp`/`Compare` to
+/// [`abcd_ir::Effects::PURE`] when operand types or constants prove
+/// coercion-free, non-throwing execution, while keeping untyped coercing ops,
+/// global stores, and observable loads alive.
+fn is_essential(module: &Module, op: &Op) -> bool {
+    op.is_terminator() || !op.effects_in(module).is_removable_if_unused()
 }
 
 // ─── CFG Simplify ────────────────────────────────────────────────────────────

@@ -1019,43 +1019,79 @@ pub(in crate::folds) fn rebuild_loop_body(
     out.remove(0); // the header stmts (matched exhaustively)
     drop_self_assign_tail(&mut out);
     // The value binding: first declare of the first remaining node
-    // (plain or cleanup-try-wrapped).
+    // (plain or cleanup-try-wrapped; leading honesty comments / empty
+    // runs tolerated). Under R2-C2, `const x = res.value` sits just
+    // before `try_begin` while the rest of the loop body is wrapped in
+    // the `IteratorClose` cleanup try.
     let mut binding: Option<String> = None;
-    let mut splice_try = false;
-    match out.first_mut() {
-        Some(SNode::Stmts(leaves)) => {
-            if let Some(b) = take_value_declare(leaves, &res_name) {
-                binding = Some(b);
-            }
-        }
-        Some(SNode::Try {
-            body: tbody,
-            catches,
-            ..
-        }) => {
-            // The try body may lead with honesty comments (cut-boundary
-            // placement) — find the first `Stmts` node.
-            for n in tbody.iter_mut() {
-                if let SNode::Stmts(leaves) = n
-                    && let Some(b) = take_value_declare(leaves, &res_name)
-                {
+    let mut splice_idx: Option<usize> = None;
+    for (bi, n) in out.iter_mut().enumerate() {
+        match n {
+            SNode::Honest(_) => continue,
+            SNode::Stmts(leaves) if leaves.is_empty() => continue,
+            SNode::Stmts(leaves) => {
+                if let Some(b) = take_value_declare(leaves, &res_name) {
                     binding = Some(b);
-                    break;
+                    let empty = leaves.is_empty();
+                    let next_idx = if empty {
+                        out.remove(bi);
+                        bi
+                    } else {
+                        bi + 1
+                    };
+                    let mut ti = next_idx;
+                    while ti < out.len()
+                        && matches!(
+                            &out[ti],
+                            SNode::Honest(_) | SNode::Stmts(_)
+                                if matches!(&out[ti], SNode::Honest(_))
+                                    || matches!(&out[ti], SNode::Stmts(r) if r.is_empty())
+                        )
+                    {
+                        ti += 1;
+                    }
+                    if let Some(SNode::Try { catches, .. }) = out.get(ti)
+                        && out[ti + 1..].iter().all(|tail_n| {
+                            matches!(tail_n, SNode::Honest(_) | SNode::Continue { label: None })
+                                || matches!(tail_n, SNode::Stmts(r) if r.is_empty())
+                        })
+                        && cleanup_handlers_ok(catches)
+                    {
+                        splice_idx = Some(ti);
+                    }
                 }
+                break;
             }
-            if binding.is_some() {
-                if !cleanup_handlers_ok(catches) {
-                    return None;
+            SNode::Try {
+                body: tbody,
+                catches,
+                ..
+            } => {
+                // The try body may lead with honesty comments (cut-boundary
+                // placement) — find the first `Stmts` node.
+                for n2 in tbody.iter_mut() {
+                    if let SNode::Stmts(leaves) = n2
+                        && let Some(b) = take_value_declare(leaves, &res_name)
+                    {
+                        binding = Some(b);
+                        break;
+                    }
                 }
-                splice_try = true;
+                if binding.is_some() {
+                    if !cleanup_handlers_ok(catches) {
+                        return None;
+                    }
+                    splice_idx = Some(bi);
+                }
+                break;
             }
+            _ => break,
         }
-        _ => {}
     }
     let binding = binding?;
-    if splice_try {
+    if let Some(ti) = splice_idx {
         // Replace the cleanup try with its body (loudly).
-        let Some(SNode::Try { body: inner, .. }) = out.first().cloned() else {
+        let Some(SNode::Try { body: inner, .. }) = out.get(ti).cloned() else {
             unreachable!()
         };
         let mut replacement: Vec<SNode> = vec![SNode::Honest(
@@ -1063,7 +1099,7 @@ pub(in crate::folds) fn rebuild_loop_body(
                 .to_string(),
         )];
         replacement.extend(inner);
-        out.splice(0..1, replacement);
+        out.splice(ti..ti + 1, replacement);
     }
     // No remaining uses of the loop's internal temps.
     let mut internals: Vec<String> = folded.phi_names.clone();
@@ -1389,14 +1425,37 @@ pub(in crate::folds) fn match_for_await_driver(nodes: &[SNode], i: usize) -> Opt
     body_nodes.retain(|n| !matches!(n, SNode::Stmts(run) if run.is_empty()));
 
     // ── The value binding (`const x = tmp.value`), plain or
-    // cleanup-try-wrapped (leading honesty comments tolerated).
+    // cleanup-try-wrapped (leading honesty comments tolerated). Under
+    // R2-C2, `const x = tmp.value` precedes `try_begin` while the body
+    // sits inside the `IteratorClose` cleanup try.
     let mut binding: Option<String> = None;
     let mut splice_idx: Option<usize> = None;
     for (bi, n) in body_nodes.iter_mut().enumerate() {
         match n {
             SNode::Honest(_) => continue,
             SNode::Stmts(leaves) => {
-                binding = take_value_declare(leaves, &await_name);
+                if let Some(b) = take_value_declare(leaves, &await_name) {
+                    binding = Some(b);
+                    let empty = leaves.is_empty();
+                    let next_idx = if empty {
+                        body_nodes.remove(bi);
+                        bi
+                    } else {
+                        bi + 1
+                    };
+                    let mut ti = next_idx;
+                    while matches!(body_nodes.get(ti), Some(SNode::Honest(_))) {
+                        ti += 1;
+                    }
+                    if let Some(SNode::Try { catches, .. }) = body_nodes.get(ti)
+                        && body_nodes[ti + 1..]
+                            .iter()
+                            .all(|tail_n| matches!(tail_n, SNode::Honest(_)))
+                        && cleanup_handlers_ok(catches)
+                    {
+                        splice_idx = Some(ti);
+                    }
+                }
                 break;
             }
             SNode::Try {

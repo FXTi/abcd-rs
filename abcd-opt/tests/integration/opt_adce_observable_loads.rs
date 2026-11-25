@@ -43,7 +43,9 @@
 
 use crate::common;
 use abcd_ir::verify_module;
-use abcd_ir::{BinOp, Const, FunctionKind, Module, Op, SuperKey, UnOp, ValueId};
+use abcd_ir::{
+    BinOp, CmpOp, Const, DynPrim, FunctionKind, Module, Op, SuperKey, Ty, UnOp, ValueId,
+};
 use abcd_opt::FuncPass;
 use abcd_opt::dce::Adce;
 
@@ -169,16 +171,190 @@ fn adce_keeps_n50_observable_loads_with_dead_results() {
     );
 }
 
-/// Control: a genuinely PURE computation with a dead result must still
-/// be eliminated (the effects-derived essentiality must not neuter ADCE).
+/// Control: a genuinely PURE computation (proven coercion-free via
+/// `Ty::DynPrim(DynPrim::Number)`) with a dead result must still be eliminated
+/// (`R2-D2`: `Op::effects_in` refines typed primitive arithmetic to `PURE`).
 #[test]
 fn adce_still_deletes_pure_dead_computations() {
-    let survives = inst_survives_adce(|_b, p0| Op::BinaryOp {
-        op: BinOp::Add,
-        left: p0,
-        right: p0,
+    let survives = inst_survives_adce(|b, p0| {
+        b.module.values[p0.index()].ty = Ty::DynPrim(DynPrim::Number);
+        Op::BinaryOp {
+            op: BinOp::Add,
+            left: p0,
+            right: p0,
+        }
     });
-    assert!(!survives, "dead-result pure binop must still be swept");
+    assert!(!survives, "dead-result typed number binop must be swept");
+}
+
+/// R2-D2 (`#52`: `R2-H1`, `R2-H3`): ADCE must PRESERVE unused coercing ops on
+/// untyped `Ty::Any` parameters (`BinaryOp::Add`, `CmpOp::In`,
+/// `CmpOp::InstanceOf`, `UnOp::ToNumber` — each may invoke user coercion hooks
+/// or throw `TypeError`) and must PRESERVE `TryStoreGlobal` / `StoreGlobal`.
+#[test]
+fn adce_preserves_untyped_coercing_ops_and_global_stores() {
+    let cases: Vec<LoadCase> = vec![
+        (
+            "BinaryOp::Add on Ty::Any (ToPrimitive / ToNumeric)",
+            Box::new(|_b, p0| Op::BinaryOp {
+                op: BinOp::Add,
+                left: p0,
+                right: p0,
+            }),
+        ),
+        (
+            "Compare::In on Ty::Any (non-object rhs TypeError / Proxy has trap)",
+            Box::new(|_b, p0| Op::Compare {
+                op: CmpOp::In,
+                left: p0,
+                right: p0,
+            }),
+        ),
+        (
+            "Compare::InstanceOf on Ty::Any (@@hasInstance call / TypeError)",
+            Box::new(|_b, p0| Op::Compare {
+                op: CmpOp::InstanceOf,
+                left: p0,
+                right: p0,
+            }),
+        ),
+        (
+            "UnaryOp::ToNumber on Ty::Any (valueOf / Symbol TypeError)",
+            Box::new(|_b, p0| Op::UnaryOp {
+                op: UnOp::ToNumber,
+                operand: p0,
+            }),
+        ),
+        (
+            "TryStoreGlobal (global write + setter / ReferenceError)",
+            Box::new(|b, p0| Op::TryStoreGlobal {
+                name: b.sym("g"),
+                value: p0,
+            }),
+        ),
+        (
+            "StoreGlobal (global write + setter)",
+            Box::new(|b, p0| Op::StoreGlobal {
+                name: b.sym("g"),
+                value: p0,
+            }),
+        ),
+        (
+            "GetPropIterator (Proxy ownKeys trap — R2-M1)",
+            Box::new(|_b, p0| Op::GetPropIterator { obj: p0 }),
+        ),
+    ];
+    let mut deleted = Vec::new();
+    for (name, make) in cases {
+        if !inst_survives_adce(make) {
+            deleted.push(name);
+        }
+    }
+    assert!(
+        deleted.is_empty(),
+        "ADCE deleted observable untyped coercing ops or global stores (R2-D2): {deleted:?}"
+    );
+}
+
+/// R2-D2 (`#52`): ADCE must REMOVE unused `BinaryOp::Add`, `CmpOp::Less`, and
+/// `UnOp::Minus` when operands are `LoadConst(Const::number(..))` or
+/// `Ty::DynPrim(DynPrim::Number)`, and must REMOVE unused `UnOp::LogicalNot`
+/// and `CmpOp::StrictEq` even on untyped `Ty::Any` parameters.
+#[test]
+fn adce_removes_proven_coercion_free_ops_and_non_coercing_any_ops() {
+    let cases: Vec<LoadCase> = vec![
+        (
+            "BinaryOp::Add on LoadConst(number)",
+            Box::new(|b, _p0| {
+                let x = b.emit_number(2.0);
+                let y = b.emit_number(3.0);
+                Op::BinaryOp {
+                    op: BinOp::Add,
+                    left: x,
+                    right: y,
+                }
+            }),
+        ),
+        (
+            "Compare::Less on LoadConst(number)",
+            Box::new(|b, _p0| {
+                let x = b.emit_number(2.0);
+                let y = b.emit_number(3.0);
+                Op::Compare {
+                    op: CmpOp::Less,
+                    left: x,
+                    right: y,
+                }
+            }),
+        ),
+        (
+            "UnaryOp::Minus on LoadConst(number)",
+            Box::new(|b, _p0| {
+                let x = b.emit_number(5.0);
+                Op::UnaryOp {
+                    op: UnOp::Minus,
+                    operand: x,
+                }
+            }),
+        ),
+        (
+            "BinaryOp::Add on Ty::DynPrim(Number)",
+            Box::new(|b, p0| {
+                b.module.values[p0.index()].ty = Ty::DynPrim(DynPrim::Number);
+                Op::BinaryOp {
+                    op: BinOp::Add,
+                    left: p0,
+                    right: p0,
+                }
+            }),
+        ),
+        (
+            "Compare::Less on Ty::DynPrim(Number)",
+            Box::new(|b, p0| {
+                b.module.values[p0.index()].ty = Ty::DynPrim(DynPrim::Number);
+                Op::Compare {
+                    op: CmpOp::Less,
+                    left: p0,
+                    right: p0,
+                }
+            }),
+        ),
+        (
+            "UnaryOp::Minus on Ty::DynPrim(Number)",
+            Box::new(|b, p0| {
+                b.module.values[p0.index()].ty = Ty::DynPrim(DynPrim::Number);
+                Op::UnaryOp {
+                    op: UnOp::Minus,
+                    operand: p0,
+                }
+            }),
+        ),
+        (
+            "UnaryOp::LogicalNot on Ty::Any",
+            Box::new(|_b, p0| Op::UnaryOp {
+                op: UnOp::LogicalNot,
+                operand: p0,
+            }),
+        ),
+        (
+            "Compare::StrictEq on Ty::Any",
+            Box::new(|_b, p0| Op::Compare {
+                op: CmpOp::StrictEq,
+                left: p0,
+                right: p0,
+            }),
+        ),
+    ];
+    let mut kept = Vec::new();
+    for (name, make) in cases {
+        if inst_survives_adce(make) {
+            kept.push(name);
+        }
+    }
+    assert!(
+        kept.is_empty(),
+        "ADCE kept proven coercion-free or non-coercing dead ops (R2-D2): {kept:?}"
+    );
 }
 
 /// Control: the dead load's OPERAND chain stays alive through the load —
@@ -209,8 +385,7 @@ fn adce_keeps_operand_chain_of_observable_load() {
     );
 }
 
-/// Pure reads and pure allocations with dead results stay dead-deletable
-/// (v0.1 parity — they were NOT on the v0.1 essential list).
+/// Pure reads and pure allocations with dead results stay dead-deletable.
 #[test]
 fn adce_still_deletes_pure_reads_and_allocs() {
     let cases: Vec<LoadCase> = vec![
@@ -238,10 +413,6 @@ fn adce_still_deletes_pure_reads_and_allocs() {
             "AllocArray (empty)",
             Box::new(|_b, _p0| Op::AllocArray { shape: None }),
         ),
-        (
-            "GetPropIterator",
-            Box::new(|_b, p0| Op::GetPropIterator { obj: p0 }),
-        ),
     ];
     let mut kept = Vec::new();
     for (name, make) in cases {
@@ -251,7 +422,7 @@ fn adce_still_deletes_pure_reads_and_allocs() {
     }
     assert!(
         kept.is_empty(),
-        "pure reads/allocs with dead results must still be swept (v0.1 parity): {kept:?}"
+        "pure reads/allocs with dead results must still be swept: {kept:?}"
     );
 }
 

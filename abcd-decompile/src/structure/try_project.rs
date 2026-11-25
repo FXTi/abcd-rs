@@ -3,6 +3,8 @@
 
 use super::*;
 
+type TryPrologue = (BTreeSet<BlockId>, Vec<RegionId>, Follow);
+
 impl<'m> Ctx<'m> {
     // ── Handler shims ────────────────────────────────────────────────
 
@@ -365,10 +367,25 @@ impl<'m> Ctx<'m> {
         follow: Follow,
         out: &mut Vec<SNode>,
     ) {
+        self.wrap_try_run_prologues(ids, p, &[], follow, out);
+    }
+
+    /// Wrap `ids` in `p` while prepending optional outer-plan prologue
+    /// slices `(q_prot, pre_ids, next_fl)` at the matching `chain[k]`
+    /// wrapper levels (R2-C2: an outer finally's completion-slot init
+    /// before the inner `try_begin` sits in `q` directly preceding `p`).
+    pub(in crate::structure) fn wrap_try_run_prologues(
+        &mut self,
+        ids: &[RegionId],
+        p: usize,
+        prologues: &[TryPrologue],
+        follow: Follow,
+        out: &mut Vec<SNode>,
+    ) {
         // N77: the de-absorbed tower path (handler unique prefixes +
         // joins emitted once per level). Falls through to the legacy
         // absorbed emission whenever a guard fails.
-        if self.emit_deabsorb_tower(ids, p, follow, out) {
+        if self.emit_deabsorb_tower(ids, p, prologues, follow, out) {
             return;
         }
         let (region, cuts, handlers) = {
@@ -525,8 +542,25 @@ impl<'m> Ctx<'m> {
                 }
             }
             self.suppress_wraps.truncate(qsuppress_mark);
+            let mut qbody = Vec::new();
+            if let Some((_, pre_ids, next_fl)) =
+                prologues.iter().find(|(qp, _, _)| *qp == chain_prots[k])
+            {
+                let active_q = self
+                    .f()
+                    .plans
+                    .iter()
+                    .position(|pl| pl.protected == chain_prots[k]);
+                let psuppress = self.suppress_wraps.len();
+                for cp in &chain_prots[k + 1..] {
+                    self.suppress_wraps.push(cp.clone());
+                }
+                self.emit_seq_children(pre_ids, active_q, *next_fl, &mut qbody);
+                self.suppress_wraps.truncate(psuppress);
+            }
+            qbody.push(node);
             node = SNode::Try {
-                body: vec![node],
+                body: qbody,
                 catches: qcatches,
                 note: Some(format!(
                     "try region {qregion}: handler-protecting outer try (finally idiom) — wrapped around region {region}'s try/catch (wrapper #{wraps})"
@@ -913,6 +947,7 @@ impl<'m> Ctx<'m> {
         &mut self,
         ids: &[RegionId],
         p: usize,
+        prologues: &[TryPrologue],
         follow: Follow,
         out: &mut Vec<SNode>,
     ) -> bool {
@@ -1409,8 +1444,25 @@ impl<'m> Ctx<'m> {
             self.stats.try_catches += 1;
             // The join for this level lands inside chain[k]'s try body,
             // right after the inner construct (both the inner node's
-            // fall-outs and its normal completion reach it).
-            let mut inner = vec![node];
+            // fall-outs and its normal completion reach it). Any R2-C2
+            // outer-plan prologue for `q` precedes `node`.
+            let mut inner = Vec::new();
+            if let Some((_, pre_ids, next_fl)) =
+                prologues.iter().find(|(qp, _, _)| *qp == chain_prots[k])
+            {
+                let active_q = self
+                    .f()
+                    .plans
+                    .iter()
+                    .position(|pl| pl.protected == chain_prots[k]);
+                let psuppress = self.suppress_wraps.len();
+                for cp in &chain_prots[k + 1..] {
+                    self.suppress_wraps.push(cp.clone());
+                }
+                self.emit_seq_children(pre_ids, active_q, *next_fl, &mut inner);
+                self.suppress_wraps.truncate(psuppress);
+            }
+            inner.push(node);
             if let Some((jhead, jset)) = &joins[k] {
                 self.emit_join_level(*jhead, jset, &mut inner);
             }
@@ -1761,6 +1813,219 @@ impl<'m> Ctx<'m> {
                     return false;
                 }
             }
+        }
+        true
+    }
+
+    /// Pure pre-check for [`Ctx::emit_cut_try`]: whether `id` satisfies
+    /// every join-hoist analysis guard for plan `p`.
+    pub(in crate::structure) fn can_cut_try(&mut self, id: RegionId, p: usize) -> bool {
+        let Some(split) = self.cut_classify(id, p) else {
+            return false;
+        };
+        if matches!(split, CutSplit::Prot | CutSplit::Defer) {
+            return false;
+        }
+        let mut defers = Vec::new();
+        self.collect_defers(id, &split, &mut defers);
+        let Some(&first) = defers.first() else {
+            return false;
+        };
+        if !matches!(self.entry_of(first), Follow::Entry(_)) {
+            return false;
+        }
+        let Some(rejoin) = self.handler_rejoin_index(p, &defers) else {
+            return false;
+        };
+        if rejoin > 0 && !self.defer_prefix_phi_only(&defers[..rejoin]) {
+            return false;
+        }
+        let handlers = self.f().plans[p].handlers.clone();
+        self.outer_wrap_plan(
+            &[self.f().plans[p].protected.clone()].into_iter().collect(),
+            &handlers,
+        )
+        .is_none()
+    }
+
+    /// Whether every Normal exit edge out of `slice` targets the entry of
+    /// `next_region` with no structural action or cross-arm jump (so
+    /// `slice` cannot jump over `next_region`).
+    pub(in crate::structure) fn slice_falls_cleanly(
+        &mut self,
+        slice: &[RegionId],
+        next_region: RegionId,
+    ) -> bool {
+        if slice.is_empty()
+            || slice
+                .iter()
+                .any(|&c| matches!(self.f().node(c), RegionNode::Alternates(_)))
+        {
+            return false;
+        }
+        let Follow::Entry(next_e) = self.entry_of(next_region) else {
+            return false;
+        };
+        let mut blocks = BTreeSet::new();
+        for &c in slice {
+            blocks.extend(self.f_mut().node_blocks(c));
+        }
+        for &b in &blocks {
+            for s in block_succs(self.module, b) {
+                if blocks.contains(&s) {
+                    continue;
+                }
+                if s != next_e || self.edge_has_action(b, s) || self.f().cross_arm.contains(&(b, s))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Sub-sequence join hoist (R2-C2 extension of N69): `slice` is a
+    /// contiguous `Cov::Uniform(Some(p))` prefix followed by one
+    /// `Cov::Mixed` node `last` whose unprotected continuation is hoisted
+    /// after the single `try/catch` wrapper.
+    pub(in crate::structure) fn emit_cut_try_slice(
+        &mut self,
+        slice: &[RegionId],
+        p: usize,
+        active: Option<usize>,
+        follow: Follow,
+        out: &mut Vec<SNode>,
+    ) -> bool {
+        if slice.len() < 2 {
+            return false;
+        }
+        let last = *slice.last().expect("len >= 2");
+        let prefix_slice = &slice[..slice.len() - 1];
+        if !self.slice_falls_cleanly(prefix_slice, last) {
+            return false;
+        }
+        let Some(split) = self.cut_classify(last, p) else {
+            return false;
+        };
+        if matches!(split, CutSplit::Prot | CutSplit::Defer) {
+            return false;
+        }
+        let mut defers = Vec::new();
+        self.collect_defers(last, &split, &mut defers);
+        let Some(&first) = defers.first() else {
+            return false;
+        };
+        if !matches!(self.entry_of(first), Follow::Entry(_)) {
+            return false;
+        }
+        let Some(rejoin) = self.handler_rejoin_index(p, &defers) else {
+            return false;
+        };
+        if rejoin > 0 && !self.defer_prefix_phi_only(&defers[..rejoin]) {
+            return false;
+        }
+        let hoisted = &defers[rejoin..];
+        let handlers = self.f().plans[p].handlers.clone();
+        if self
+            .outer_wrap_plan(
+                &[self.f().plans[p].protected.clone()].into_iter().collect(),
+                &handlers,
+            )
+            .is_some()
+        {
+            return false;
+        }
+        let (region, cuts) = {
+            let plan = &self.f().plans[p];
+            (plan.region, plan.cuts)
+        };
+        let wraps = {
+            let f = self.f_mut();
+            let n = f.wrap_counts.entry(p).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if wraps > 1 {
+            self.stats.try_splits += 1;
+        }
+        if cuts {
+            self.stats.try_cuts += 1;
+        }
+        self.stats.try_catches += 1;
+        self.stats.try_join_hoists += 1;
+        let mut body = Vec::new();
+        if cuts {
+            body.push(SNode::Honest(format!(
+                "try region {region}: the protected range cuts a structured region (es2abc ranges are bytecode-contiguous, not structure-aligned) — the try body is placed at the cut boundary"
+            )));
+        }
+        if wraps > 1 {
+            body.push(SNode::Honest(format!(
+                "try region {region}: protected statements are not contiguous in the structured output — this is wrapper #{wraps} for the same region (catch body duplicated, finally-style)"
+            )));
+        }
+        let buried = "nested below the protected run in the region tree";
+        if rejoin > 0 {
+            body.push(SNode::Honest(format!(
+                "try region {region}: the handler continuation (the try's join) is {buried} — the rejoin suffix is hoisted to after the try/catch; the try-path-only phi prefix stays inline (it cannot throw, so over-protection is impossible)"
+            )));
+        } else {
+            body.push(SNode::Honest(format!(
+                "try region {region}: the handler continuation (the try's join) is {buried} — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there)"
+            )));
+        }
+        let defer_ids: HashSet<RegionId> = hoisted.iter().copied().collect();
+        self.f_mut().cut_defer = Some(CutDefer { ids: defer_ids });
+        let skel_fl = self.entry_of(hoisted[0]);
+        self.emit_seq_children(slice, Some(p), skel_fl, &mut body);
+        let leftover = match self.f_mut().cut_defer.take() {
+            Some(cd) => !cd.ids.is_empty(),
+            None => false,
+        };
+        if leftover {
+            body.push(SNode::Honest(format!(
+                "try region {region}: join-hoist analysis/emission mismatch — part of the tail stayed inline (phase-3 tail remains authoritative)"
+            )));
+        }
+        let rejoin_entry = hoisted.first().and_then(|&d| match self.entry_of(d) {
+            Follow::Entry(b) => Some(b),
+            _ => None,
+        });
+        if let Some(b) = rejoin_entry {
+            self.hoist_rejoins.push(b);
+        }
+        let mut catches = Vec::new();
+        let mut seen = HashSet::new();
+        for h in &handlers {
+            if seen.insert(*h) {
+                catches.push(self.emit_handler(*h));
+            }
+        }
+        if rejoin_entry.is_some() {
+            self.hoist_rejoins.pop();
+        }
+        let note = if catches.len() > 1 {
+            self.stats.multi_catch += 1;
+            Some(format!(
+                "try region {region}: {} catch handlers (typed catches have no JS surface syntax) — bodies merged in dispatch order",
+                catches.len()
+            ))
+        } else {
+            None
+        };
+        out.push(SNode::Try {
+            body,
+            catches,
+            note,
+            finally: None,
+        });
+        for (i, &d) in hoisted.iter().enumerate() {
+            let fl = if i + 1 < hoisted.len() {
+                self.entry_of(hoisted[i + 1])
+            } else {
+                follow
+            };
+            self.emit_node(d, active, fl, out);
         }
         true
     }
@@ -2233,16 +2498,83 @@ impl<'m> Ctx<'m> {
                 _ => {}
             }
         }
-        // The spine walk: from the body region down to the test region.
-        // `If` levels stay in the skeleton (the head must be protected
-        // by p0 — the condition evaluation is protected — and the
-        // non-spine arm protected by p0 and terminal-only: falling out
-        // of it would route through the tail the try path owns). The
-        // tail below the deepest `If` is a Seq spine whose items before
-        // the test are the prefix/mid tail.
-        let mut spine = body_r;
-        let defer_root = loop {
-            match self.f().node(spine).clone() {
+        // The spine walk: strip any R2-C2 unprotected pre-try header
+        // prefix (`do { i++; try { … } … } while (…)`), then walk from
+        // the cut-plan roots down to the deferred tail (allowing R2-C1
+        // `Cov::Uniform(Some(p0))` blocks before `If` levels on the
+        // spine).
+        let (pre_try, p0_roots): (Vec<RegionId>, Vec<RegionId>) =
+            if self.f_mut().plan_of(header).is_none() {
+                let RegionNode::Seq(top_children) = self.f().node(body_r).clone() else {
+                    bail!("unprotected header without a sequence body");
+                };
+                let mut pre_end = 0;
+                while pre_end < top_children.len()
+                    && self.f_mut().cov(top_children[pre_end]) == Cov::Uniform(None)
+                {
+                    pre_end += 1;
+                }
+                if pre_end == 0 || pre_end >= top_children.len() {
+                    bail!("invalid unprotected pre-try prefix");
+                }
+                if !self.slice_falls_cleanly(&top_children[..pre_end], top_children[pre_end]) {
+                    bail!("pre-try prefix does not fall cleanly into the cut plan");
+                }
+                (
+                    top_children[..pre_end].to_vec(),
+                    top_children[pre_end..].to_vec(),
+                )
+            } else {
+                (Vec::new(), vec![body_r])
+            };
+        let tramp_set: BTreeSet<BlockId> = tramps.iter().copied().collect();
+        let mut saw_protected_if = false;
+        let mut slice = p0_roots.clone();
+        let mut slice_parent: Option<RegionId> = None;
+        let defer_roots: Vec<RegionId> = loop {
+            if slice.len() == 1
+                && let RegionNode::Seq(ch) = self.f().node(slice[0]).clone()
+            {
+                slice_parent = Some(slice[0]);
+                slice = ch;
+                continue;
+            }
+            let Some(pos) = slice
+                .iter()
+                .position(|&c| self.f_mut().node_blocks(c).contains(&test))
+            else {
+                bail!("the test is not below the spine");
+            };
+            if pos + 1 != slice.len() {
+                bail!("content after the loop test in the tail");
+            }
+            let mut k = 0;
+            while k < pos && self.f_mut().cov(slice[k]) == Cov::Uniform(Some(p0)) {
+                if !self.slice_falls_cleanly(&slice[k..=k], slice[k + 1]) {
+                    bail!("protected spine prefix item jumps past the next spine node");
+                }
+                k += 1;
+            }
+            if k < pos {
+                if k == 0
+                    && let Some(parent) = slice_parent
+                {
+                    break vec![parent];
+                }
+                break slice[k..].to_vec();
+            }
+            let target = slice[pos];
+            let tblocks = self.f_mut().node_blocks(target);
+            if tblocks.contains(&test)
+                && tblocks.iter().all(|&b| b == test || tramp_set.contains(&b))
+            {
+                break vec![target];
+            }
+            match self.f().node(target).clone() {
+                RegionNode::Seq(ch) => {
+                    slice_parent = Some(target);
+                    slice = ch;
+                }
                 RegionNode::If {
                     head,
                     then,
@@ -2250,10 +2582,13 @@ impl<'m> Ctx<'m> {
                     ..
                 } => {
                     if self.f_mut().plan_of(head) != Some(p0) {
-                        bail!(
-                            "spine If head B{} not protected by the cut plan",
-                            head.index()
-                        );
+                        if !saw_protected_if {
+                            bail!(
+                                "spine If head B{} not protected by the cut plan",
+                                head.index()
+                            );
+                        }
+                        break vec![target];
                     }
                     let then_has =
                         then.is_some_and(|a| self.f_mut().node_blocks(a).contains(&test));
@@ -2267,10 +2602,6 @@ impl<'m> Ctx<'m> {
                     } else {
                         (otherwise.expect("checked"), then)
                     };
-                    // A missing non-spine arm means the head's other
-                    // edge falls out of the `If` — with the spine arm
-                    // deferred, that fall-out would land inside the
-                    // try body at an unverified target. Bail.
                     let Some(o) = other else {
                         bail!("spine If B{} has a missing arm", head.index());
                     };
@@ -2283,27 +2614,25 @@ impl<'m> Ctx<'m> {
                             );
                         }
                     }
-                    // The head's edge into the spine arm must be
-                    // structural: an action (break/continue) would be
-                    // emitted inside the try while the arm is deferred.
                     match self.entry_of(arm) {
                         Follow::Entry(se) if !self.edge_has_action(head, se) => {}
                         _ => bail!("spine edge out of B{} carries an action", head.index()),
                     }
-                    spine = arm;
+                    saw_protected_if = true;
+                    slice_parent = None;
+                    slice = vec![arm];
                 }
-                _ => break spine,
+                _ => break vec![target],
             }
         };
-        if defer_root == body_r {
+        if !saw_protected_if {
             bail!("no protected If above the tail (a flat sequence — the d-P5 hoist owns it)");
         }
-        // The tail: nested Seqs from defer_root down to the test region
+        // The tail: nested Seqs from defer_roots down to the test region
         // ({test} + the latch trampolines). The items before the test,
         // in emission order, are the prefix/mid tail.
-        let tramp_set: BTreeSet<BlockId> = tramps.iter().copied().collect();
-        let mut items: Vec<RegionId> = Vec::new();
-        let mut cur = defer_root;
+        let mut items: Vec<RegionId> = defer_roots[..defer_roots.len() - 1].to_vec();
+        let mut cur = *defer_roots.last().expect("non-empty defer_roots");
         let test_region = loop {
             let blocks = self.f_mut().node_blocks(cur);
             if blocks.contains(&test) && blocks.iter().all(|&b| b == test || tramp_set.contains(&b))
@@ -2440,9 +2769,13 @@ impl<'m> Ctx<'m> {
             .map(|&i| self.entry_of(i))
             .unwrap_or(Follow::Entry(test));
         self.f_mut().cut_defer = Some(CutDefer {
-            ids: [defer_root].into_iter().collect(),
+            ids: defer_roots.iter().copied().collect(),
         });
-        self.emit_content(body_r, Some(p0), skeleton_follow, &mut skel);
+        if pre_try.is_empty() {
+            self.emit_content(body_r, Some(p0), skeleton_follow, &mut skel);
+        } else {
+            self.emit_seq_children(&p0_roots, Some(p0), skeleton_follow, &mut skel);
+        }
         let leftover = match self.f_mut().cut_defer.take() {
             Some(cd) => !cd.ids.is_empty(),
             None => false,
@@ -2490,6 +2823,10 @@ impl<'m> Ctx<'m> {
             finally: None,
         };
         let mut loop_body: Vec<SNode> = Vec::new();
+        if !pre_try.is_empty() {
+            let p0_fl = self.entry_of(p0_roots[0]);
+            self.emit_seq_children(&pre_try, None, p0_fl, &mut loop_body);
+        }
         if let Some(q1) = p1 {
             let (region1, cuts1) = {
                 let plan = &self.f().plans[q1];
@@ -2588,6 +2925,135 @@ impl<'m> Ctx<'m> {
         true
     }
 
+    /// Candidate cut plan for an R2-C2 loop whose header is unprotected
+    /// (`do { i++; try { … } catch { …; continue; } … } while (…)`):
+    /// `body` starts with a non-empty unprotected prefix followed by a
+    /// non-suppressed plan `p` whose handlers have an out-of-shim cut
+    /// edge into an in-loop block (`!= header`).
+    pub(in crate::structure) fn pre_try_loop_cut_plan(
+        &mut self,
+        header: BlockId,
+        body: RegionId,
+        active: Option<usize>,
+    ) -> Option<usize> {
+        let RegionNode::Seq(children) = self.f().node(body).clone() else {
+            return None;
+        };
+        let mut pre_end = 0;
+        while pre_end < children.len() && self.f_mut().cov(children[pre_end]) == Cov::Uniform(None)
+        {
+            pre_end += 1;
+        }
+        if pre_end == 0 || pre_end >= children.len() {
+            return None;
+        }
+        let p = self.leading_plan(children[pre_end])?;
+        if active == Some(p) || self.is_suppressed(p) {
+            return None;
+        }
+        let body_blocks = self.f_mut().node_blocks(body);
+        let handlers = self.f().plans[p].handlers.clone();
+        let has_in_loop_cut = handlers.iter().any(|h| {
+            self.shim_sets.get(h).is_some_and(|set| {
+                set.iter().any(|&b| {
+                    block_succs(self.module, b)
+                        .into_iter()
+                        .any(|s| !set.contains(&s) && s != header && body_blocks.contains(&s))
+                })
+            })
+        });
+        has_in_loop_cut.then_some(p)
+    }
+
+    /// Telescope outer-chain prologue runs `(q0 ⊃ q1 ⊃ … ⊃ core_p)` into
+    /// `(core_start, core_end, core_p, prologues)` when every outer step
+    /// `q` is part of `core_p`'s wrap chain (`A7_T2`).
+    pub(in crate::structure) fn try_telescope_prologues(
+        &mut self,
+        children: &[RegionId],
+        first_start: usize,
+        first_end: usize,
+        first_p: usize,
+    ) -> Option<(usize, usize, usize, Vec<TryPrologue>)> {
+        let mut prologues: Vec<TryPrologue> = Vec::new();
+        let mut cur_p = first_p;
+        let mut cur_start = first_start;
+        let mut cur_end = first_end;
+        while cur_end < children.len() {
+            if (cur_start..cur_end)
+                .any(|idx| self.f_mut().cov(children[idx]) != Cov::Uniform(Some(cur_p)))
+            {
+                break;
+            }
+            if !self.slice_falls_cleanly(&children[cur_start..cur_end], children[cur_end]) {
+                break;
+            }
+            let next_child = children[cur_end];
+            let next_info: Option<(usize, usize)> = match self.f_mut().cov(next_child) {
+                Cov::Uniform(Some(np)) if np != cur_p && !self.is_suppressed(np) => {
+                    let mut ne = cur_end + 1;
+                    while ne < children.len()
+                        && self.f_mut().cov(children[ne]) == Cov::Uniform(Some(np))
+                    {
+                        ne += 1;
+                    }
+                    if ne < children.len()
+                        && self.f_mut().cov(children[ne]) == Cov::Mixed
+                        && let RegionNode::If { head, .. } = *self.f().node(children[ne])
+                        && self.f_mut().plan_of(head) == Some(np)
+                        && !self.can_cut_try(children[ne], np)
+                    {
+                        ne += 1;
+                    }
+                    Some((np, ne))
+                }
+                Cov::Mixed => match self.f().node(next_child).clone() {
+                    RegionNode::If { head, .. } => match self.f_mut().plan_of(head) {
+                        Some(np)
+                            if np != cur_p
+                                && !self.is_suppressed(np)
+                                && !self.can_cut_try(next_child, np) =>
+                        {
+                            Some((np, cur_end + 1))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some((next_p, next_end)) = next_info else {
+                break;
+            };
+            let cur_prot = self.f().plans[cur_p].protected.clone();
+            let is_strict_subset = {
+                let next_prot = &self.f().plans[next_p].protected;
+                next_prot.len() < cur_prot.len() && next_prot.is_subset(&cur_prot)
+            };
+            if !is_strict_subset {
+                break;
+            }
+            let next_fl = self.entry_of(next_child);
+            prologues.push((cur_prot, children[cur_start..cur_end].to_vec(), next_fl));
+            cur_p = next_p;
+            cur_start = cur_end;
+            cur_end = next_end;
+        }
+        if prologues.is_empty() {
+            return None;
+        }
+        let handlers = self.f().plans[cur_p].handlers.clone();
+        let chain = self.select_wrap_chain(cur_p, &handlers);
+        if !prologues.iter().all(|(qp_prot, _, _)| {
+            chain
+                .iter()
+                .any(|&(fq, q)| self.frames[fq].plans[q].protected == *qp_prot)
+        }) {
+            return None;
+        }
+        Some((cur_start, cur_end, cur_p, prologues))
+    }
+
     /// A mixed-coverage node: descend (or wrap whole when the head is
     /// protected — the documented cut approximation).
     pub(in crate::structure) fn emit_mixed(
@@ -2657,6 +3123,10 @@ impl<'m> Ctx<'m> {
                         return;
                     }
                     self.wrap_try(id, p, follow, out);
+                } else if hp.is_none()
+                    && let Some(p) = self.pre_try_loop_cut_plan(header, body, active)
+                    && self.try_loop_cut_do_while(header, body, p, active, follow, out)
+                {
                 } else {
                     self.emit_loop(id, header, kind, body, active, follow, out);
                 }

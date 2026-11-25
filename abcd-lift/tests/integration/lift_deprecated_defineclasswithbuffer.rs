@@ -105,24 +105,24 @@ fn deprecated_defineclasswithbuffer_direct_table_index_lifts_define_class() {
         .iter()
         .enumerate()
         .find_map(|(idx, inst)| {
-            matches!(inst.op, Op::DefineClass { .. })
+            matches!(inst.op, Op::DefineClass(_))
                 .then_some((abcd_ir::InstId::new(idx as u32), inst.result.unwrap()))
         })
         .expect("DefineClass emitted");
 
-    let Op::DefineClass {
-        ctor,
-        heritage,
-        members,
-        member_attrs,
-        count,
-    } = &m.insts[def_iid.index()].op
-    else {
+    let Op::DefineClass(data) = &m.insts[def_iid.index()].op else {
         unreachable!()
     };
+    let (ctor, heritage, members, member_attrs, count) = (
+        data.ctor,
+        data.heritage,
+        data.members,
+        &data.member_attrs,
+        data.count,
+    );
 
-    assert_eq!(*ctor, ctor_fid, "method_id resolves to constructor FuncId");
-    assert_eq!(*count, 3, "count_imm preserved as class .length");
+    assert_eq!(ctor, ctor_fid, "method_id resolves to constructor FuncId");
+    assert_eq!(count, 3, "count_imm preserved as class .length");
     let base = heritage.expect("v2 proto register populates heritage");
     assert_eq!(
         const_of(&m, base),
@@ -137,14 +137,12 @@ fn deprecated_defineclasswithbuffer_direct_table_index_lifts_define_class() {
         }],
         "direct table-index fallback extracts class_member_attrs"
     );
+    let c_greet = m.consts.intern(Const::String(greet_sym));
+    let c_member = m.consts.intern(Const::MethodRef(member_fid));
+    let c_one = m.consts.intern(Const::number(1.0));
     assert_eq!(
-        m.consts.get(*members),
-        Some(&Const::ArrayLiteral(vec![
-            Const::String(greet_sym),
-            Const::MethodRef(member_fid),
-            Const::number(1.0),
-            Const::number(1.0),
-        ])),
+        m.consts.get(members),
+        Some(&Const::ArrayLiteral(vec![c_greet, c_member, c_one, c_one])),
         "members pool constant matches literal array"
     );
 
@@ -292,24 +290,27 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
     verify_clean(&m);
 
     let mem_sym = m.sym.intern("staticFn");
+    let c_mem = m.consts.intern(Const::String(mem_sym));
+    let c_fn = m.consts.intern(Const::MethodRef(abcd_ir::FuncId::new(1)));
+    let c_zero = m.consts.intern(Const::number(0.0));
     let def_inst = m
         .insts
         .iter()
-        .find(|inst| matches!(inst.op, Op::DefineClass { .. }))
+        .find(|inst| matches!(inst.op, Op::DefineClass(_)))
         .expect("DefineClass emitted");
-    let Op::DefineClass {
-        ctor,
-        heritage,
-        members,
-        member_attrs,
-        count,
-    } = &def_inst.op
-    else {
+    let Op::DefineClass(data) = &def_inst.op else {
         unreachable!()
     };
+    let (ctor, heritage, members, member_attrs, count) = (
+        data.ctor,
+        data.heritage,
+        data.members,
+        &data.member_attrs,
+        data.count,
+    );
 
-    assert_eq!(*ctor, abcd_ir::FuncId::new(0));
-    assert_eq!(*count, 2);
+    assert_eq!(ctor, abcd_ir::FuncId::new(0));
+    assert_eq!(count, 2);
     assert_eq!(
         const_of(&m, heritage.expect("heritage present")),
         Const::number(77.0),
@@ -324,13 +325,8 @@ fn deprecated_defineclasswithbuffer_entity_offsets_and_lexenv_read() {
         "entity_offsets resolved literal array index 1 (static method), not decoy index 0"
     );
     assert_eq!(
-        m.consts.get(*members),
-        Some(&Const::ArrayLiteral(vec![
-            Const::String(mem_sym),
-            Const::MethodRef(abcd_ir::FuncId::new(1)),
-            Const::number(0.0),
-            Const::number(0.0),
-        ]))
+        m.consts.get(members),
+        Some(&Const::ArrayLiteral(vec![c_mem, c_fn, c_zero, c_zero]))
     );
 
     // Join block must carry the non-trivial Phi joining `[1.0, 2.0]` materialized

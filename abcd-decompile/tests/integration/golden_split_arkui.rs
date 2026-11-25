@@ -1003,24 +1003,26 @@ fn arkui_reconstructs_entry_struct_decorators_builders_and_ui_tree() {
         let s_rerender = m.sym.intern("rerender");
         let s_appear = m.sym.intern("aboutToAppear");
         let s_render = m.sym.intern("initialRender");
-        let members = m.consts.push(Const::ArrayLiteral(vec![
+        let member_items = [
             Const::String(s_rerender),
             Const::MethodRef(f_rerender),
             Const::String(s_appear),
             Const::MethodRef(f_appear),
             Const::String(s_render),
             Const::MethodRef(f_render),
-        ]));
+        ]
+        .map(|c| m.consts.intern(c));
+        let members = m.consts.push_array(member_items.to_vec());
         let cls_val = emit_val(
             &mut m,
             b_join,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor: f_ctor,
                 heritage: Some(vpu),
                 members,
                 member_attrs: vec![],
                 count: 3,
-            },
+            })),
         );
         let cls_proto = emit_val(
             &mut m,

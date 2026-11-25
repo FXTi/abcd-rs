@@ -588,10 +588,9 @@ fn class_method_quoted_key() {
     let ctor = add_ret_fn(&mut m, "C");
     let m_fn = add_ret_fn(&mut m, "meth");
     let key = m.sym.intern("1bad");
-    let members = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(key),
-        Const::MethodRef(m_fn),
-    ]));
+    let ckey = m.consts.intern(Const::String(key));
+    let cmfn = m.consts.intern(Const::MethodRef(m_fn));
+    let members = m.consts.push_array(vec![ckey, cmfn]);
     let opts = EmitOptions::default();
     let mut em = emitter(&m, &opts);
     let mut out = String::new();
@@ -654,31 +653,27 @@ fn consumed_functions_const_shapes() {
     let holder = add_fn(&mut m, "h");
     let hb = entry_of(&m, holder);
     let key = m.sym.intern("k");
+    let ckey = m.consts.intern(Const::String(key));
+    let cmb = m.consts.intern(Const::MethodRef(m_b));
+    let cmc = m.consts.intern(Const::MethodRef(m_c));
     // Bare MethodRef members constant (383-385).
     let cid_a = m.consts.push(Const::MethodRef(m_a));
     // Flat ObjectLiteral members (393-394 via the const walker).
-    let cid_b = m.consts.push(Const::ObjectLiteral {
-        keys: vec![Const::String(key)],
-        values: vec![Const::MethodRef(m_b)],
-    });
+    let cid_b = m.consts.push_object(vec![ckey], vec![cmb]);
     // ObjectLiteral NESTED in an ArrayLiteral (410-413).
-    let cid_c = m
-        .consts
-        .push(Const::ArrayLiteral(vec![Const::ObjectLiteral {
-            keys: vec![Const::String(key)],
-            values: vec![Const::MethodRef(m_c)],
-        }]));
+    let nested_obj = m.consts.push_object(vec![ckey], vec![cmc]);
+    let cid_c = m.consts.push_array(vec![nested_obj]);
     for (ctor, members) in [(ctor_a, cid_a), (ctor_b, cid_b), (ctor_c, cid_c)] {
         emit_val(
             &mut m,
             hb,
-            Op::DefineClass {
+            Op::DefineClass(Box::new(abcd_ir::DefineClassData {
                 ctor,
                 heritage: None,
                 members,
                 member_attrs: Vec::new(),
                 count: 0,
-            },
+            })),
         );
     }
     let consumed = consumed_functions(&m);
@@ -708,7 +703,7 @@ fn ty_ts_variants() {
     assert_eq!(
         ty_ts(
             &m,
-            &Ty::Union(vec![
+            &Ty::union(vec![
                 Ty::DynPrim(DynPrim::Number),
                 Ty::DynPrim(DynPrim::String),
             ]),
@@ -847,10 +842,9 @@ fn collect_private_names_arms() {
     // CreatePrivateNames with a string-array constant (2276-2283).
     let nx = m.sym.intern("x");
     let ny = m.sym.intern("y");
-    let names = m.consts.push(Const::ArrayLiteral(vec![
-        Const::String(nx),
-        Const::String(ny),
-    ]));
+    let cnx = m.consts.intern(Const::String(nx));
+    let cny = m.consts.intern(Const::String(ny));
+    let names = m.consts.push_array(vec![cnx, cny]);
     push_inst(&mut m, b, Op::CreatePrivateNames { count: 2, names });
     let mut set = BTreeSet::new();
     collect_private_names(&m, f, &mut set);
@@ -1067,7 +1061,8 @@ fn orphan_lexenv_prefilter_matches_naive_full_module_scan() {
     {
         let b_p = entry_of(&m, f_named_parent);
         let s_x = m.sym.intern("namedSlot");
-        let arr = m.consts.push(Const::ArrayLiteral(vec![Const::String(s_x)]));
+        let cs_x = m.consts.intern(Const::String(s_x));
+        let arr = m.consts.push_array(vec![cs_x]);
         let _ = emit_val(
             &mut m,
             b_p,
@@ -1298,11 +1293,6 @@ fn emit_walkers_survive_deep_nesting_and_cycles_on_256k_stack() {
         histogram: BTreeMap::new(),
     };
 
-    let mut deep_const = Const::MethodRef(FuncId::new(7));
-    for _ in 0..5_000 {
-        deep_const = Const::ArrayLiteral(vec![deep_const]);
-    }
-
     let mut deep_nodes = vec![SNode::Stmts(vec![
         Leaf::Raw(Stmt::ScopePush { names: vec![None] }),
         Leaf::Raw(Stmt::LexStore {
@@ -1344,8 +1334,13 @@ fn emit_walkers_survive_deep_nesting_and_cycles_on_256k_stack() {
         },
     );
 
-    // Flat 5,000-function DefineFunc chain + cycle (`f_4999 -> f_0`).
+    // Flat 5,000-function DefineFunc chain + cycle (`f_4999 -> f_0`) and a
+    // 5,000-deep ConstPool ArrayLiteral chain.
     let mut m = mk_module();
+    let mut deep_const_id = m.consts.push(Const::MethodRef(FuncId::new(7)));
+    for _ in 0..5_000 {
+        deep_const_id = m.consts.push_array(vec![deep_const_id]);
+    }
     let chain_len = 5_000usize;
     let chain: Vec<FuncId> = (0..chain_len)
         .map(|i| add_fn(&mut m, &format!("f_{i}")))
@@ -1374,7 +1369,7 @@ fn emit_walkers_survive_deep_nesting_and_cycles_on_256k_stack() {
                 assert_eq!(orphans, BTreeSet::from(["v12_34".to_string()]));
 
                 let mut mrefs = BTreeSet::new();
-                collect_method_refs_const(&deep_const, &mut mrefs);
+                collect_method_refs(&m, deep_const_id, &mut mrefs);
                 assert_eq!(mrefs, BTreeSet::from([FuncId::new(7)]));
 
                 assert_eq!(lex_decls(&deep_nodes, &[]), vec!["inner_lex".to_string()]);
@@ -1396,9 +1391,6 @@ fn emit_walkers_survive_deep_nesting_and_cycles_on_256k_stack() {
         while let Expr::Unary { operand, .. } = cur {
             cur = *operand;
         }
-    }
-    while let Const::ArrayLiteral(mut v) = deep_const {
-        deep_const = v.pop().unwrap_or(Const::Null);
     }
     while let Some(node) = deep_nodes.pop() {
         match node {

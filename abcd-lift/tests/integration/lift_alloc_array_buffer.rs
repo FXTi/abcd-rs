@@ -85,9 +85,10 @@ fn createarraywithbuffer_lifts_to_alloc_array_with_shape() {
         unreachable!()
     };
     let x = m.sym.intern("x");
+    let x_cid = m.consts.intern(Const::String(x));
     assert_eq!(
         m.consts.get(shape),
-        Some(&Const::ArrayLiteral(vec![Const::String(x)])),
+        Some(&Const::ArrayLiteral(vec![x_cid])),
         "the literal buffer content rides the shape"
     );
     // And no AllocObject was invented for the same instruction.

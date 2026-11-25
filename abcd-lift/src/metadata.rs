@@ -433,10 +433,11 @@ fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
         AnnotationValue::LiteralArray(values) => {
             let mut consts = Vec::with_capacity(values.len());
             for v in values {
-                match resolve::const_for_literal_value(lf, v) {
-                    Ok(c) => consts.push(c),
-                    Err(_) => consts.push(Const::Null),
-                }
+                let cid = match resolve::const_for_literal_value(lf, v) {
+                    Ok(id) => id,
+                    Err(_) => lf.const_scalar(Const::Null),
+                };
+                consts.push(cid);
             }
             AnnValue::Const(lf.const_shape(Const::ArrayLiteral(consts)))
         }
@@ -444,11 +445,10 @@ fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
         AnnotationValue::StringNullptr => AnnValue::Const(lf.const_scalar(Const::Null)),
         AnnotationValue::Array { .. } => {
             // Typed element tag is not part of v0.2's Const
-            // (documented); elements convert to constants iteratively,
+            // (documented); elements convert to pooled ConstIds iteratively,
             // with name-carrying payloads preserved as string constants
             // (documented policy).
-            let arr = annotation_value_as_const(lf, v);
-            AnnValue::Const(lf.const_shape(arr))
+            AnnValue::Const(annotation_value_as_const_id(lf, v))
         }
     }
 }
@@ -457,15 +457,15 @@ fn annotation_value(lf: &mut Lifter, v: &AnnotationValue) -> AnnValue {
 struct AnnArrayFrame<'a> {
     values: &'a [AnnotationValue],
     next_idx: usize,
-    consts: Vec<Const>,
+    consts: Vec<ConstId>,
 }
 
-/// Convert an annotation value inside an annotation ARRAY to a
-/// [`Const`] iteratively (scalars/strings/methods exact; name-carrying
+/// Convert an annotation value inside an annotation ARRAY to a pooled
+/// [`ConstId`] iteratively (scalars/strings/methods exact; name-carrying
 /// payloads as string constants — documented).
-fn annotation_value_as_const(lf: &mut Lifter, root: &AnnotationValue) -> Const {
+fn annotation_value_as_const_id(lf: &mut Lifter, root: &AnnotationValue) -> ConstId {
     let AnnotationValue::Array { values, .. } = root else {
-        return scalar_annotation_value_as_const(lf, root);
+        return scalar_annotation_value_as_const_id(lf, root);
     };
     let mut stack = vec![AnnArrayFrame {
         values,
@@ -488,29 +488,29 @@ fn annotation_value_as_const(lf: &mut Lifter, root: &AnnotationValue) -> Const {
                     consts: Vec::with_capacity(child_vals.len()),
                 });
             } else {
-                let c = scalar_annotation_value_as_const(lf, elem);
+                let cid = scalar_annotation_value_as_const_id(lf, elem);
                 if let Some(parent) = stack.last_mut() {
-                    parent.consts.push(c);
+                    parent.consts.push(cid);
                 }
             }
         } else {
             let Some(finished) = stack.pop() else {
                 break;
             };
-            let arr = Const::ArrayLiteral(finished.consts);
+            let arr_cid = lf.const_shape(Const::ArrayLiteral(finished.consts));
             if let Some(parent) = stack.last_mut() {
-                parent.consts.push(arr);
+                parent.consts.push(arr_cid);
             } else {
-                return arr;
+                return arr_cid;
             }
         }
     }
     unreachable!("annotation-array stack always returns when popping the root frame")
 }
 
-/// Convert a single non-`Array` [`AnnotationValue`] element to a [`Const`].
-fn scalar_annotation_value_as_const(lf: &mut Lifter, v: &AnnotationValue) -> Const {
-    match v {
+/// Convert a single non-`Array` [`AnnotationValue`] element to a pooled [`ConstId`].
+fn scalar_annotation_value_as_const_id(lf: &mut Lifter, v: &AnnotationValue) -> ConstId {
+    let c = match v {
         AnnotationValue::Bool(b) => Const::Bool(*b),
         AnnotationValue::I8(x) => Const::number(*x as f64),
         AnnotationValue::U8(x) => Const::number(*x as f64),
@@ -546,19 +546,21 @@ fn scalar_annotation_value_as_const(lf: &mut Lifter, v: &AnnotationValue) -> Con
         AnnotationValue::LiteralArray(values) => {
             let mut consts = Vec::with_capacity(values.len());
             for v in values {
-                match resolve::const_for_literal_value(lf, v) {
-                    Ok(c) => consts.push(c),
-                    Err(_) => consts.push(Const::Null),
-                }
+                let cid = match resolve::const_for_literal_value(lf, v) {
+                    Ok(id) => id,
+                    Err(_) => lf.const_scalar(Const::Null),
+                };
+                consts.push(cid);
             }
-            Const::ArrayLiteral(consts)
+            return lf.const_shape(Const::ArrayLiteral(consts));
         }
         AnnotationValue::Void => Const::Undefined,
         AnnotationValue::StringNullptr => Const::Null,
         AnnotationValue::Array { .. } => {
-            unreachable!("handled iteratively by annotation_value_as_const")
+            unreachable!("handled iteratively by annotation_value_as_const_id")
         }
-    }
+    };
+    lf.module.consts.intern(c)
 }
 
 /// Whether a decoded debug record carries no content. Since the N55

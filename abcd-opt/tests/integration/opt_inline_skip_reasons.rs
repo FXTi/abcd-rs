@@ -10,8 +10,8 @@
 use crate::common;
 use abcd_ir::verify_module;
 use abcd_ir::{
-    AnnValue, BlockId, CallKind, ClassId, Const, Edge, EdgeKind, FuncId, FunctionKind, Module, Op,
-    ValueId,
+    AnnValue, BlockId, CallKind, ClassId, Const, DefineClassData, Edge, EdgeKind, FuncId,
+    FunctionKind, Module, Op, ValueId,
 };
 use abcd_opt::inline::{InlineReport, SkipReason, inline_module};
 
@@ -490,20 +490,20 @@ fn nested_class_roots_walk() {
             keys: vec![],
             values: vec![],
         });
-        b.emit_val(Op::DefineClass {
+        b.emit_val(Op::DefineClass(Box::new(DefineClassData {
             ctor: ctor_ok,
             heritage: None,
             members,
             member_attrs: vec![],
             count: 0,
-        });
-        b.emit_val(Op::DefineSendableClass {
+        })));
+        b.emit_val(Op::DefineSendableClass(Box::new(DefineClassData {
             ctor: ctor_send,
             heritage: None,
             members,
             member_attrs: vec![],
             count: 0,
-        });
+        })));
         b.emit_void(Op::Return { value: Some(_p) });
     }
     let g_bad = create_static(&mut module, "g_bad");
@@ -515,13 +515,13 @@ fn nested_class_roots_walk() {
             keys: vec![],
             values: vec![],
         });
-        b.emit_val(Op::DefineClass {
+        b.emit_val(Op::DefineClass(Box::new(DefineClassData {
             ctor: ctor_bad,
             heritage: None,
             members,
             member_attrs: vec![],
             count: 0,
-        });
+        })));
         b.emit_void(Op::Return { value: Some(_p) });
     }
     let f = create_static(&mut module, "f");
@@ -1025,13 +1025,13 @@ fn nested_walk_descends_into_class_ctors() {
         });
         // The ctor's body defines a class: the walk descends into
         // deep_ctor (env-clean) through the class edge.
-        b.emit_val(Op::DefineClass {
+        b.emit_val(Op::DefineClass(Box::new(DefineClassData {
             ctor: deep_ctor,
             heritage: None,
             members,
             member_attrs: vec![],
             count: 0,
-        });
+        })));
         b.emit_void(Op::Return { value: None });
     }
     let g = create_static(&mut module, "g");
@@ -1043,13 +1043,13 @@ fn nested_walk_descends_into_class_ctors() {
             keys: vec![],
             values: vec![],
         });
-        b.emit_val(Op::DefineClass {
+        b.emit_val(Op::DefineClass(Box::new(DefineClassData {
             ctor,
             heritage: None,
             members,
             member_attrs: vec![],
             count: 0,
-        });
+        })));
         b.emit_void(Op::Return { value: Some(_p) });
     }
     let f = create_static(&mut module, "f");

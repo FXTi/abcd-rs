@@ -466,50 +466,80 @@ pub(in crate::emit) fn method_prefix(kind: FunctionKind) -> &'static str {
 }
 
 /// Render an IR type as a TypeScript annotation (the `--ts` flag).
-/// `Reference` types resolve through the module's own class table.
+/// `Reference` types resolve through the module's own class table; `Union`
+/// slices walk iteratively over an explicit heap stack.
 pub(in crate::emit) fn ty_ts(module: &Module, ty: &Ty) -> String {
-    match ty {
-        Ty::Any => "any".to_string(),
-        Ty::Unknown => "unknown".to_string(),
-        Ty::DynPrim(p) => match p {
-            DynPrim::Undefined => "undefined".to_string(),
-            DynPrim::Null => "null".to_string(),
-            DynPrim::Bool => "boolean".to_string(),
-            DynPrim::Number => "number".to_string(),
-            DynPrim::String => "string".to_string(),
-            DynPrim::Symbol => "symbol".to_string(),
-            DynPrim::BigInt => "bigint".to_string(),
-            DynPrim::Object => "object".to_string(),
-        },
-        Ty::Union(ts) => ts
-            .iter()
-            .map(|t| ty_ts(module, t))
-            .collect::<Vec<_>>()
-            .join(" | "),
-        Ty::Static(s) => match s {
-            StaticTy::Void => "void".to_string(),
-            StaticTy::Reference(cid) => {
-                let raw = module
-                    .class(*cid)
-                    .map(|c| sym_str(module, c.name))
-                    .unwrap_or_default();
-                // A descriptor `Lfoo/Bar;` unwraps to its simple name.
-                let simple = raw
-                    .strip_prefix('L')
-                    .and_then(|r| r.strip_suffix(';'))
-                    .and_then(|r| r.rsplit('/').next().map(str::to_string))
-                    .unwrap_or(raw);
-                let name = sanitize(&simple);
-                if is_legal_ident(&name) {
-                    name
-                } else {
-                    "object".to_string()
+    fn leaf_ty_ts(module: &Module, ty: &Ty) -> Option<String> {
+        Some(match ty {
+            Ty::Any => "any".to_string(),
+            Ty::Unknown => "unknown".to_string(),
+            Ty::DynPrim(p) => match p {
+                DynPrim::Undefined => "undefined".to_string(),
+                DynPrim::Null => "null".to_string(),
+                DynPrim::Bool => "boolean".to_string(),
+                DynPrim::Number => "number".to_string(),
+                DynPrim::String => "string".to_string(),
+                DynPrim::Symbol => "symbol".to_string(),
+                DynPrim::BigInt => "bigint".to_string(),
+                DynPrim::Object => "object".to_string(),
+            },
+            Ty::Static(s) => match s {
+                StaticTy::Void => "void".to_string(),
+                StaticTy::Reference(cid) => {
+                    let raw = module
+                        .class(*cid)
+                        .map(|c| sym_str(module, c.name))
+                        .unwrap_or_default();
+                    // A descriptor `Lfoo/Bar;` unwraps to its simple name.
+                    let simple = raw
+                        .strip_prefix('L')
+                        .and_then(|r| r.strip_suffix(';'))
+                        .and_then(|r| r.rsplit('/').next().map(str::to_string))
+                        .unwrap_or(raw);
+                    let name = sanitize(&simple);
+                    if is_legal_ident(&name) {
+                        name
+                    } else {
+                        "object".to_string()
+                    }
                 }
-            }
-            // The ArkTS numeric statics all surface as TS `number`.
-            _ => "number".to_string(),
-        },
+                // The ArkTS numeric statics all surface as TS `number`.
+                _ => "number".to_string(),
+            },
+            Ty::Union(_) => return None,
+        })
     }
+    if let Some(s) = leaf_ty_ts(module, ty) {
+        return s;
+    }
+    let Ty::Union(root) = ty else {
+        return "any".to_string();
+    };
+    let mut stack: Vec<(&[Ty], usize, Vec<String>)> =
+        vec![(root, 0, Vec::with_capacity(root.len()))];
+    let mut completed: Option<String> = None;
+    while let Some((slice, idx, parts)) = stack.last_mut() {
+        if let Some(done) = completed.take() {
+            parts.push(done);
+        }
+        if *idx < slice.len() {
+            let item = &slice[*idx];
+            *idx += 1;
+            if let Some(s) = leaf_ty_ts(module, item) {
+                parts.push(s);
+            } else if let Ty::Union(sub) = item {
+                stack.push((sub, 0, Vec::with_capacity(sub.len())));
+            }
+        } else {
+            let joined = parts.join(" | ");
+            stack.pop();
+            if stack.is_empty() {
+                return joined;
+            }
+            completed = Some(joined);
+        }
+    }
+    String::new()
 }
 
 /// The `(params)` text and the TS return annotation for one function.

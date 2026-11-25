@@ -90,7 +90,6 @@ fn golden_yield_star_delegate_gen() {
 var outer;
 let log;
 function func_main_0() {
-  /* rethrow-only try/catch dissolved (semantic no-op) */
   inner = function* ___inner() {
   /* rethrow-only try/catch dissolved (semantic no-op) */
   yield 1.0;
@@ -98,7 +97,7 @@ function func_main_0() {
   return "inner-done";
 };
   outer = function* ___outer() {
-  /* cross-arm edges unfolded (B30→B31, B24→B30, B29→B30); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
+  /* cross-arm edges unfolded (B31→B32, B24→B31, B30→B31); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   /* rethrow-only try/catch dissolved (semantic no-op) */
   const v45 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
   const inner$1 = inner;
@@ -107,6 +106,7 @@ function func_main_0() {
   return undefined;
 };
   let log = [];
+  /* rethrow-only try/catch dissolved (semantic no-op) */
   const outer$1 = outer;
   const v166 = outer$1();
   for (const value of v166) {
@@ -137,9 +137,8 @@ fn golden_yield_star_delegate_array() {
     let expected = r#"var outer;
 let log;
 function func_main_0() {
-  /* rethrow-only try/catch dissolved (semantic no-op) */
   outer = function* ___outer() {
-  /* cross-arm edges unfolded (B20→B21, B14→B20, B19→B20); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
+  /* cross-arm edges unfolded (B21→B22, B14→B21, B20→B21); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   /* rethrow-only try/catch dissolved (semantic no-op) */
   const v5 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
   yield 0.0;
@@ -148,6 +147,7 @@ function func_main_0() {
   return undefined;
 };
   let log = [];
+  /* rethrow-only try/catch dissolved (semantic no-op) */
   const outer$1 = outer;
   const v136 = outer$1();
   for (const value of v136) {
@@ -185,9 +185,7 @@ var outer;
 let it;
 let log;
 function func_main_0() {
-  try {
-    /* try region 0: the handler continuation (the try's join) is nested below the protected run in the region tree — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there) */
-    boom = function* ___boom() {
+  boom = function* ___boom() {
   /* rethrow-only try/catch dissolved (semantic no-op) */
   yield "before";
   const Error$1 = Error;
@@ -195,8 +193,8 @@ function func_main_0() {
   throw v30;
   /* unreachable */
 };
-    outer = function* ___outer() {
-  /* cross-arm edges unfolded (B27→B28, B21→B27, B26→B27); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
+  outer = function* ___outer() {
+  /* cross-arm edges unfolded (B28→B29, B21→B28, B27→B28); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   /* rethrow-only try/catch dissolved (semantic no-op) */
   const v37 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
   const boom$1 = boom;
@@ -204,10 +202,12 @@ function func_main_0() {
   yield "after";
   return undefined;
 };
-    const outer$1 = outer;
-    const v156 = outer$1();
-    let it = v156;
-    log = [];
+  const outer$1 = outer;
+  const v156 = outer$1();
+  let it = v156;
+  let log = [];
+  try {
+    /* try region 0: the handler continuation (the try's join) is nested below the protected run in the region tree — the unprotected tail is hoisted out of the try body to after the try/catch (the VM's PC-range dispatch rejoins there) */
     const it$1 = it;
     const next = it$1.next;
     const v161 = next.call(it$1);
@@ -279,7 +279,7 @@ fn golden_yield_star_delegate_async() {
     let outer = outer.split("};").next().expect("outer body end");
     let expected = r#"
   var inner$1; /* hoisted temp: used outside its def's block */
-  /* cross-arm edges unfolded (B51→B52, B43→B51, B50→B51); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
+  /* cross-arm edges unfolded (B52→B53, B44→B52, B51→B52); the tail-duplication fold bailed (budget/complexity) — the shared tail is NOT duplicated and the conditions are NOT merged; affected flow may read oddly */
   try {
     const v144 = /*CreateGenerator plumbing*/ undefined /*fallback Param(funcobj): the hidden function-object slot has no JS surface form*/;
     inner$1 = inner;

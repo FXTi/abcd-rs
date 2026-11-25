@@ -171,6 +171,19 @@ pub fn const_id(m: &mut Module, c: Const) -> ConstId {
     m.consts.push(c)
 }
 
+/// Intern scalar element constants and push a `Const::ArrayLiteral` referencing them.
+pub fn const_array(m: &mut Module, items: Vec<Const>) -> ConstId {
+    let ids: Vec<ConstId> = items.into_iter().map(|c| m.consts.intern(c)).collect();
+    m.consts.push_array(ids)
+}
+
+/// Intern scalar key/value constants and push a `Const::ObjectLiteral` referencing them.
+pub fn const_object(m: &mut Module, keys: Vec<Const>, values: Vec<Const>) -> ConstId {
+    let kids: Vec<ConstId> = keys.into_iter().map(|c| m.consts.intern(c)).collect();
+    let vids: Vec<ConstId> = values.into_iter().map(|c| m.consts.intern(c)).collect();
+    m.consts.push_object(kids, vids)
+}
+
 /// `left + right` (semantic order — N36: the IR stores `left` = acc
 /// operand, `right` = vreg operand, and the vendored handlers compute
 /// `vreg OP acc`, so the fields are swapped on construction).
